@@ -477,6 +477,54 @@ fn best_effort_recovers_objstm_compressed_entries() {
     );
 }
 
+/// An ObjStm whose stream payload contains a header-like line (`9 0 obj`) makes
+/// the linear scan record a spurious object *inside* the stream, whose offset
+/// would truncate the ObjStm's recovery window before its declared `/Length`.
+/// The bounded-window pass therefore fails to parse it; the read-to-end fallback
+/// recovers it from the stream's own `/Length`, so the packed object (7) still
+/// gets a compressed entry.
+#[test]
+fn best_effort_recovers_objstm_truncated_by_in_stream_header() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    // Payload: the `7 0` pair (compressed object 7 at intra-stream offset 0),
+    // then a line that looks like an indirect-object header. The linear scan
+    // records `9 0 obj` at its in-stream offset, truncating object 5's window.
+    let objstm_data = b"7 0\n9 0 obj\n".to_vec();
+    let objstm_obj = format!(
+        "5 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n",
+        objstm_data.len()
+    )
+    .into_bytes();
+    let objstm_offset = bytes.len() as u64;
+    bytes.extend_from_slice(&objstm_obj);
+    bytes.extend_from_slice(&objstm_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    // The ObjStm itself recovers as a normal offset entry.
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(5, 0)),
+        Some(&XrefOffset::Offset(objstm_offset))
+    );
+    // The packed object recovers despite the in-stream header truncating the
+    // bounded window — proof the fallback ran.
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(7, 0)),
+        Some(&XrefOffset::Compressed {
+            stream: 5,
+            index: 0,
+        })
+    );
+}
+
 /// Build a best-effort fixture whose only `/Type /ObjStm` object carries the
 /// given `dict_body` (between `<<` and `>>`) and `stream_payload`. The xref
 /// keyword is corrupted so strict parsing fails and best-effort falls into the

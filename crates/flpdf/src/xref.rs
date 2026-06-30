@@ -273,16 +273,25 @@ fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefOffset>>
     Ok(entries)
 }
 
+/// Upper bound on read-to-end fallbacks during ObjStm recovery (see
+/// [`recover_objstm_compressed_entries`]). Each fallback may parse to end of
+/// file, so the count is capped to keep the total work O(file size) while still
+/// recovering a handful of object streams whose payloads happen to contain a
+/// header-like line.
+const MAX_OBJSTM_RECOVERY_FALLBACKS: u32 = 64;
+
 /// Recover the compressed objects packed in any recovered `/Type /ObjStm`,
 /// emitting `XrefOffset::Compressed` entries that point back at the stream.
 ///
-/// Each recovered object is parsed only within the window that ends at the next
+/// Each recovered object is parsed within the window that ends at the next
 /// recovered object's offset (or end-of-file for the last). The windows are
-/// disjoint, so the total parse work is bounded by the file size — a single
-/// malformed object cannot drive the parse to end-of-file once per candidate.
-/// A genuine ObjStm whose payload extends past the next recovered object (only
-/// possible when a spurious `int int obj` was recorded inside its stream data)
-/// is silently skipped rather than recovered: degraded, never quadratic.
+/// disjoint, so the common case is bounded by the file size — a malformed object
+/// cannot drive the parse to end-of-file once per candidate. When a window does
+/// not hold a complete object — a header-like line (`int int obj`) recorded
+/// inside an object stream's payload became the next offset and truncated it —
+/// it retries against the rest of the file so the stream's own `/Length`
+/// delimits it. Those retries are capped by [`MAX_OBJSTM_RECOVERY_FALLBACKS`] so
+/// a flood of stream-like candidates cannot reintroduce quadratic cost.
 fn recover_objstm_compressed_entries(bytes: &[u8], entries: &mut BTreeMap<ObjectRef, XrefOffset>) {
     // The line scan only ever inserts `XrefOffset::Offset`, so every entry here is
     // an uncompressed object whose offset bounds a window.
@@ -294,20 +303,41 @@ fn recover_objstm_compressed_entries(bytes: &[u8], entries: &mut BTreeMap<Object
     }
     offsets.sort_unstable();
 
+    let mut fallbacks = MAX_OBJSTM_RECOVERY_FALLBACKS;
     for (index, &offset) in offsets.iter().enumerate() {
         let start = offset as usize;
         let window_end = offsets
             .get(index + 1)
             .map_or(bytes.len(), |next| *next as usize);
-        if let Ok((object_ref, Object::Stream(stream))) =
-            parse_indirect_object(&bytes[start..window_end])
-        {
+        if try_recover_objstm_in(entries, &bytes[start..window_end]) {
+            continue;
+        }
+        // The bounded window stopped short of a complete object. Retry against
+        // the rest of the file so a real ObjStm truncated by a header-like line
+        // in its payload is still recovered, capped so it stays linear.
+        if window_end < bytes.len() && fallbacks > 0 {
+            fallbacks -= 1;
+            try_recover_objstm_in(entries, &bytes[start..]);
+        }
+    }
+}
+
+/// Parse the indirect object in `slice`; if it is a `/Type /ObjStm`, insert its
+/// packed objects' compressed entries. Returns `false` only when `slice` did not
+/// contain a complete object (a parse error) — the signal that a bounded window
+/// may have truncated a real stream and a wider retry is worthwhile.
+fn try_recover_objstm_in(entries: &mut BTreeMap<ObjectRef, XrefOffset>, slice: &[u8]) -> bool {
+    match parse_indirect_object(slice) {
+        Ok((object_ref, Object::Stream(stream))) => {
             if let Some(Object::Name(type_name)) = stream.dict.get("Type") {
                 if type_name.as_slice() == b"ObjStm" {
                     recover_compressed_offsets_from_objstm(entries, object_ref, &stream);
                 }
             }
+            true
         }
+        Ok(_) => true,
+        Err(_) => false,
     }
 }
 
