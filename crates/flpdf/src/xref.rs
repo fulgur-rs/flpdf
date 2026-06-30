@@ -234,32 +234,34 @@ pub fn load_xref_and_trailer_best_effort<R: Read + Seek>(reader: &mut R) -> Resu
     load_xref_and_trailer_with_repair(reader, true)
 }
 
+/// Recover uncompressed object offsets by replaying qpdf's `reconstruct_xref`
+/// (`libqpdf/QPDF.cc`, qpdf 11.9.0): scan the file line by line, and on each line
+/// whose first token sequence is `int int obj`, record the object at the offset of
+/// its *number* token. Only the first token of a line is inspected, object bodies
+/// are never parsed, and the last occurrence of an object in the file wins (qpdf's
+/// `insertReconstructedXrefEntry` overwrites). Inspecting at most three short
+/// tokens per line — never re-parsing a body to end-of-file — makes the scan
+/// linear in the file size, unlike a per-candidate full-object parse which an
+/// unterminated literal string can drive to quadratic cost.
 fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefOffset>> {
     let mut entries = BTreeMap::new();
-    let mut cursor = 0usize;
-    while cursor < bytes.len() {
-        if bytes[cursor].is_ascii_digit() && is_token_boundary(cursor, bytes) {
-            if let Ok((object_ref, _)) = parse_indirect_object(&bytes[cursor..]) {
-                entries.insert(object_ref, XrefOffset::Offset(cursor as u64));
-                if let Ok((_object_ref, Object::Stream(stream))) =
-                    parse_indirect_object(&bytes[cursor..])
-                {
-                    if let Some(Object::Name(type_name)) = stream.dict.get("Type") {
-                        if type_name.as_slice() == b"ObjStm" {
-                            recover_compressed_offsets_from_objstm(
-                                &mut entries,
-                                _object_ref,
-                                &stream,
-                            );
-                        }
-                    }
-                }
-                cursor = cursor.saturating_add(1);
-                continue;
-            }
+    let mut line_start = 0usize;
+    while line_start < bytes.len() {
+        let next_line_start = next_line_start(bytes, line_start);
+        if let Some((object_ref, offset)) =
+            scan_object_header_at_line(bytes, line_start, next_line_start)
+        {
+            entries.insert(object_ref, XrefOffset::Offset(offset));
         }
-        cursor = cursor.saturating_add(1);
+        line_start = next_line_start;
     }
+
+    // qpdf records only uncompressed (type-1) entries during reconstruction and
+    // declines to look inside object streams (`reconstruct_xref` trailing comment
+    // in QPDF.cc). flpdf additionally recovers the objects packed in a recovered
+    // `/Type /ObjStm` so they remain resolvable without a usable xref; this extra
+    // pass is bounded per object to keep recovery linear (see below).
+    recover_objstm_compressed_entries(bytes, &mut entries);
 
     if entries.is_empty() {
         return Err(Error::parse(
@@ -269,6 +271,74 @@ fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefOffset>>
     }
 
     Ok(entries)
+}
+
+/// Upper bound on read-to-end fallbacks during ObjStm recovery (see
+/// [`recover_objstm_compressed_entries`]). Each fallback may parse to end of
+/// file, so the count is capped to keep the total work O(file size) while still
+/// recovering a handful of object streams whose payloads happen to contain a
+/// header-like line.
+const MAX_OBJSTM_RECOVERY_FALLBACKS: u32 = 64;
+
+/// Recover the compressed objects packed in any recovered `/Type /ObjStm`,
+/// emitting `XrefOffset::Compressed` entries that point back at the stream.
+///
+/// Each recovered object is parsed within the window that ends at the next
+/// recovered object's offset (or end-of-file for the last). The windows are
+/// disjoint, so the common case is bounded by the file size — a malformed object
+/// cannot drive the parse to end-of-file once per candidate. When a window does
+/// not hold a complete object — a header-like line (`int int obj`) recorded
+/// inside an object stream's payload became the next offset and truncated it —
+/// it retries against the rest of the file so the stream's own `/Length`
+/// delimits it. Those retries are capped by [`MAX_OBJSTM_RECOVERY_FALLBACKS`] so
+/// a flood of stream-like candidates cannot reintroduce quadratic cost.
+fn recover_objstm_compressed_entries(bytes: &[u8], entries: &mut BTreeMap<ObjectRef, XrefOffset>) {
+    // The line scan only ever inserts `XrefOffset::Offset`, so every entry here is
+    // an uncompressed object whose offset bounds a window.
+    let mut offsets: Vec<u64> = Vec::new();
+    for entry in entries.values() {
+        if let XrefOffset::Offset(offset) = entry {
+            offsets.push(*offset);
+        }
+    }
+    offsets.sort_unstable();
+
+    let mut fallbacks = MAX_OBJSTM_RECOVERY_FALLBACKS;
+    for (index, &offset) in offsets.iter().enumerate() {
+        let start = offset as usize;
+        let window_end = offsets
+            .get(index + 1)
+            .map_or(bytes.len(), |next| *next as usize);
+        if try_recover_objstm_in(entries, &bytes[start..window_end]) {
+            continue;
+        }
+        // The bounded window stopped short of a complete object. Retry against
+        // the rest of the file so a real ObjStm truncated by a header-like line
+        // in its payload is still recovered, capped so it stays linear.
+        if window_end < bytes.len() && fallbacks > 0 {
+            fallbacks -= 1;
+            try_recover_objstm_in(entries, &bytes[start..]);
+        }
+    }
+}
+
+/// Parse the indirect object in `slice`; if it is a `/Type /ObjStm`, insert its
+/// packed objects' compressed entries. Returns `false` only when `slice` did not
+/// contain a complete object (a parse error) — the signal that a bounded window
+/// may have truncated a real stream and a wider retry is worthwhile.
+fn try_recover_objstm_in(entries: &mut BTreeMap<ObjectRef, XrefOffset>, slice: &[u8]) -> bool {
+    match parse_indirect_object(slice) {
+        Ok((object_ref, Object::Stream(stream))) => {
+            if let Some(Object::Name(type_name)) = stream.dict.get("Type") {
+                if type_name.as_slice() == b"ObjStm" {
+                    recover_compressed_offsets_from_objstm(entries, object_ref, &stream);
+                }
+            }
+            true
+        }
+        Ok(_) => true,
+        Err(_) => false,
+    }
 }
 
 fn recover_compressed_offsets_from_objstm(
@@ -372,27 +442,170 @@ fn recover_trailer(bytes: &[u8]) -> Result<Dictionary> {
     }
 }
 
-fn is_token_boundary(index: usize, bytes: &[u8]) -> bool {
-    if index == 0 {
-        return true;
+/// Return the offset just past the next end-of-line at or after `from`, or
+/// `bytes.len()` when no further end-of-line exists. A run of consecutive
+/// `\r`/`\n` bytes is treated as a single line terminator (mirroring qpdf's
+/// `findAndSkipNextEOL`, which collapses `\r\n` and blank lines). When
+/// `from < bytes.len()` the result is always strictly greater than `from`, so
+/// the line scan in [`recover_xref_entries`] always makes progress.
+fn next_line_start(bytes: &[u8], from: usize) -> usize {
+    let mut pos = from;
+    while pos < bytes.len() && !matches!(bytes[pos], b'\n' | b'\r') {
+        pos += 1;
+    }
+    // Skip the run of end-of-line bytes so blank lines do not become their own
+    // iterations; this keeps the scan linear by advancing `line_start` past the
+    // whole run that a forward token read would otherwise re-scan. When no
+    // end-of-line exists this loop is a no-op and `pos` is already `bytes.len()`.
+    while pos < bytes.len() && matches!(bytes[pos], b'\n' | b'\r') {
+        pos += 1;
+    }
+    pos
+}
+
+/// PDF whitespace: NUL, TAB, LF, FF, CR, and space (ISO 32000-2 Table 1).
+fn is_pdf_whitespace(byte: u8) -> bool {
+    matches!(byte, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
+}
+
+/// PDF delimiters plus `%` (comment introducer); any of these ends a regular
+/// token (ISO 32000-2 Table 2).
+fn is_pdf_delimiter(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+    )
+}
+
+/// Advance `pos` past PDF whitespace and `%...EOL` comments — the two ignorable
+/// constructs allowed between tokens — but never beyond `limit`. qpdf's
+/// tokenizer skips comments in this position too, so an object header with a
+/// comment between its tokens (`1 %c<EOL>0 obj`) is still recovered.
+fn skip_ignorable(bytes: &[u8], mut pos: usize, limit: usize) -> usize {
+    loop {
+        while pos < limit && is_pdf_whitespace(bytes[pos]) {
+            pos += 1;
+        }
+        if pos < limit && bytes[pos] == b'%' {
+            while pos < limit && !matches!(bytes[pos], b'\n' | b'\r') {
+                pos += 1;
+            }
+        } else {
+            return pos;
+        }
+    }
+}
+
+/// A token read by the reconstruction scanner, with its byte range. Only the
+/// distinctions the `int int obj` match needs are modelled.
+struct ScanToken {
+    start: usize,
+    end: usize,
+    kind: ScanKind,
+}
+
+enum ScanKind {
+    /// A numeric token (`[+-]?[0-9]+` that fits `i64`).
+    Integer(i64),
+    /// A non-numeric regular token (compared to `obj` via the byte range).
+    Word,
+    /// A delimiter-led token. The scanner stops as soon as a slot it expected to
+    /// be `int`/`obj` is one of these.
+    Delimiter,
+}
+
+/// Read the next token whose start lies in `[from, limit)`, skipping leading
+/// whitespace and `%...EOL` comments. Returns `None` when no token starts before
+/// `limit` (the region is only whitespace/comments).
+///
+/// `limit` bounds where the token may *start*, not where it ends — a regular
+/// token still runs to the next whitespace/delimiter. Passing `next_line_start`
+/// for the first token keeps the scan linear: a whitespace- or comment-only line
+/// is rejected after scanning only its own bytes, instead of skipping forward
+/// into later lines and re-scanning that suffix on every iteration (an O(n^2)
+/// blowup). Later tokens pass `bytes.len()` so an `int int obj` header may span
+/// lines, matching qpdf.
+fn read_scan_token(bytes: &[u8], from: usize, limit: usize) -> Option<ScanToken> {
+    let start = skip_ignorable(bytes, from, limit);
+    if start >= limit {
+        return None;
+    }
+    let first = bytes[start];
+    if is_pdf_delimiter(first) {
+        return Some(ScanToken {
+            start,
+            end: start + 1,
+            kind: ScanKind::Delimiter,
+        });
     }
 
-    matches!(
-        bytes[index - 1],
-        b'\0'
-            | b'\t'
-            | b'\n'
-            | b'\r'
-            | b' '
-            | b'\x0c'
-            | b'['
-            | b']'
-            | b'<'
-            | b'>'
-            | b'('
-            | b')'
-            | b'/',
-    )
+    let mut pos = start;
+    while pos < bytes.len() && !is_pdf_whitespace(bytes[pos]) && !is_pdf_delimiter(bytes[pos]) {
+        pos += 1;
+    }
+    let end = pos;
+    let kind = match parse_scan_integer(&bytes[start..end]) {
+        Some(value) => ScanKind::Integer(value),
+        None => ScanKind::Word,
+    };
+    Some(ScanToken { start, end, kind })
+}
+
+/// Classify a regular token as an unsigned PDF integer (`[0-9]+` that fits
+/// `i64`). Returns `None` for any token containing a non-digit (a word such as
+/// `obj`) or a digit run too long to fit `i64`. Object and generation numbers in
+/// real PDFs are unsigned, so a leading sign is treated as a word; this only ever
+/// changes the outcome for synthetic `+N`/`-N` headers, which qpdf's
+/// `obj > 0`/`gen >= 0` guards reject anyway.
+fn parse_scan_integer(token: &[u8]) -> Option<i64> {
+    if token.is_empty() || !token.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(token).ok()?.parse().ok()
+}
+
+/// If the line beginning at `line_start` opens with an `int int obj` token
+/// sequence, return the recovered object and the offset of its number token.
+///
+/// Mirrors qpdf's `reconstruct_xref` per-line logic: the first token must begin
+/// on this line (otherwise the line records nothing — qpdf's
+/// `token_start >= next_line_start` guard, here enforced by bounding the first
+/// token read to `next_line_start`), the second and third tokens may spill onto
+/// following lines, and the object/generation must satisfy qpdf's
+/// `insertReconstructedXrefEntry` guards (`obj > 0`, `0 <= gen < 65535`).
+fn scan_object_header_at_line(
+    bytes: &[u8],
+    line_start: usize,
+    next_line_start: usize,
+) -> Option<(ObjectRef, u64)> {
+    // Bounding the first token to this line is what keeps a whitespace- or
+    // comment-only line from re-scanning the remaining file on every iteration.
+    let number_token = read_scan_token(bytes, line_start, next_line_start)?;
+    let ScanKind::Integer(obj) = number_token.kind else {
+        return None;
+    };
+
+    let gen_token = read_scan_token(bytes, number_token.end, bytes.len())?;
+    let ScanKind::Integer(gen) = gen_token.kind else {
+        return None;
+    };
+
+    let obj_token = read_scan_token(bytes, gen_token.end, bytes.len())?;
+    if !matches!(obj_token.kind, ScanKind::Word) || &bytes[obj_token.start..obj_token.end] != b"obj"
+    {
+        return None;
+    }
+
+    // qpdf's `insertReconstructedXrefEntry` guards (`obj > 0`, `0 <= gen < 65535`).
+    if obj <= 0 || !(0..65535).contains(&gen) {
+        return None;
+    }
+    let number = u32::try_from(obj).ok()?;
+    let generation = u16::try_from(gen).ok()?;
+    Some((
+        ObjectRef::new(number, generation),
+        number_token.start as u64,
+    ))
 }
 
 fn parse_xref_table(

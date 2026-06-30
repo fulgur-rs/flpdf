@@ -52,6 +52,19 @@ pub struct Pdf<R: Read + Seek> {
     repair_diagnostics: Diagnostics,
     cache: ObjectCache,
     compressed_member_parents: BTreeMap<ObjectRef, (ObjectRef, u32)>,
+    /// Every uncompressed object offset, sorted ascending and deduplicated. Used
+    /// to bound a single object read to the start of the next object in the file
+    /// (objects do not overlap in a well-formed PDF), so resolving one object
+    /// cannot read/parse the whole remaining file — which would make resolving
+    /// many objects quadratic, a CPU DoS on a crafted (e.g. repaired) document.
+    sorted_object_offsets: Vec<u64>,
+    /// Remaining read-to-end fallbacks allowed when a bounded object window does
+    /// not contain a complete object (a corrupt offset pointing inside another
+    /// object, or a header-like line recorded inside stream data during repair).
+    /// Each fallback may scan to EOF, so the count is capped: a handful of bad
+    /// boundaries in an otherwise valid file still resolve, but a document full
+    /// of objects whose bodies run to EOF cannot revive the quadratic cost.
+    resolution_fallbacks_remaining: u32,
     source_xref_offsets: Vec<(ObjectRef, u64)>,
     source_xref_entries: BTreeMap<ObjectRef, XrefOffset>,
     dirty_object_refs: BTreeSet<ObjectRef>,
@@ -227,6 +240,14 @@ pub struct PdfOpenOptions {
 // most one or two deep, so 100 only rejects pathological input and matches the
 // crate's other tree-walk depth limits.
 const MAX_OBJECT_STREAM_CHAIN_DEPTH: usize = 100;
+
+// Upper bound on read-to-end fallbacks during object resolution (see
+// `resolution_fallbacks_remaining`). Each fallback may scan to EOF, so the total
+// fallback work is bounded by this many file scans — O(file size), not the
+// quadratic cost an unbounded read-to-end per object would incur. 64 tolerates a
+// handful of corrupt/overlapping offsets in an otherwise valid file while still
+// defeating a flood of objects whose bodies run to EOF.
+const MAX_RESOLUTION_FALLBACKS: u32 = 64;
 
 impl<R: Read + Seek> Pdf<R> {
     /// Open a document strictly: parse the cross-reference and trailer, but do not run
@@ -474,6 +495,16 @@ impl<R: Read + Seek> Pdf<R> {
                 crate::XrefOffset::Compressed { .. } => None,
             })
             .collect();
+        let mut sorted_object_offsets: Vec<u64> = loaded
+            .entries
+            .values()
+            .filter_map(|offset| match offset {
+                crate::XrefOffset::Offset(offset) => Some(*offset),
+                _ => None,
+            })
+            .collect();
+        sorted_object_offsets.sort_unstable();
+        sorted_object_offsets.dedup();
         let cache = ObjectCache::from_offsets(&loaded.entries);
         // Sniff the file header for the `%QDF-1.0` marker (flpdf-9hc.28). It
         // sits within the first few lines (`%PDF-x.y`, binary marker,
@@ -499,6 +530,8 @@ impl<R: Read + Seek> Pdf<R> {
             repair_diagnostics: loaded.repair_diagnostics,
             cache,
             compressed_member_parents: BTreeMap::new(),
+            sorted_object_offsets,
+            resolution_fallbacks_remaining: MAX_RESOLUTION_FALLBACKS,
             source_xref_offsets,
             source_xref_entries,
             dirty_object_refs: BTreeSet::new(),
@@ -939,6 +972,71 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(&NULL_OBJECT)
     }
 
+    /// Read and parse the indirect object stored at `offset`, returning the read
+    /// bytes alongside the parse result.
+    ///
+    /// The read is bounded to the start of the next object in the file. Objects
+    /// in a well-formed PDF do not overlap, so that window contains the object in
+    /// full, and resolving every object stays linear in the file size — an
+    /// unbounded read-to-end per object is quadratic and a CPU DoS on a document
+    /// (e.g. a repaired one) that exposes many objects whose bodies run toward
+    /// EOF. When the bounded window does not parse — a recorded offset points
+    /// inside this object (corrupt xref, or a header-like line captured inside
+    /// stream data during repair) — it falls back to reading to EOF, but only
+    /// while [`Self::resolution_fallbacks_remaining`] permits, so a flood of such
+    /// objects cannot revive the quadratic cost.
+    fn read_object_at(
+        &mut self,
+        offset: u64,
+    ) -> Result<(
+        Vec<u8>,
+        ObjectRef,
+        Object,
+        Option<crate::parser::IndirectStreamLength>,
+    )> {
+        let next = self.next_object_offset(offset);
+        self.reader.seek(SeekFrom::Start(offset))?;
+        let mut bytes = Vec::new();
+        match next {
+            Some(next) => {
+                let len = next.saturating_sub(offset);
+                self.reader.by_ref().take(len).read_to_end(&mut bytes)?;
+            }
+            None => {
+                self.reader.read_to_end(&mut bytes)?;
+            }
+        }
+
+        match parse_indirect_object_detailed(&bytes) {
+            Ok((parsed_ref, object, indirect_len)) => Ok((bytes, parsed_ref, object, indirect_len)),
+            // The window stopped short of a complete object. Only a bounded
+            // window (`next` is `Some`) can do this; if we already read to EOF,
+            // the input itself is the limit and the error is real.
+            Err(window_err) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
+                self.resolution_fallbacks_remaining -= 1;
+                self.reader.seek(SeekFrom::Start(offset))?;
+                let mut full = Vec::new();
+                self.reader.read_to_end(&mut full)?;
+                // Prefer the full parse, but keep the window error if even the
+                // full read cannot parse (so the failure stays the parser's).
+                match parse_indirect_object_detailed(&full) {
+                    Ok((parsed_ref, object, indirect_len)) => {
+                        Ok((full, parsed_ref, object, indirect_len))
+                    }
+                    Err(_) => Err(window_err),
+                }
+            }
+            Err(window_err) => Err(window_err),
+        }
+    }
+
+    /// Offset of the first recorded object that starts strictly after `offset`,
+    /// or `None` when `offset` belongs to the last object in the file.
+    fn next_object_offset(&self, offset: u64) -> Option<u64> {
+        let index = self.sorted_object_offsets.partition_point(|&o| o <= offset);
+        self.sorted_object_offsets.get(index).copied()
+    }
+
     fn resolve_to_cache(&mut self, object_ref: ObjectRef) -> Result<bool> {
         let entry = self.cache.entry(object_ref);
         if matches!(entry, Some(CacheEntry::Resolved(_))) {
@@ -947,11 +1045,7 @@ impl<R: Read + Seek> Pdf<R> {
 
         match entry.cloned() {
             Some(CacheEntry::Unresolved { offset }) => {
-                self.reader.seek(SeekFrom::Start(offset))?;
-                let mut bytes = Vec::new();
-                self.reader.read_to_end(&mut bytes)?;
-                let (parsed_ref, mut object, indirect_len) =
-                    parse_indirect_object_detailed(&bytes)?;
+                let (bytes, parsed_ref, mut object, indirect_len) = self.read_object_at(offset)?;
                 if parsed_ref != object_ref {
                     return Ok(false);
                 }
@@ -1142,16 +1236,12 @@ impl<R: Read + Seek> Pdf<R> {
         let stream_object = match self.cache.entry(stream_ref).cloned() {
             Some(CacheEntry::Resolved(object)) => object,
             Some(CacheEntry::Unresolved { offset }) => {
-                self.reader.seek(SeekFrom::Start(offset))?;
-                let mut bytes = Vec::new();
-                self.reader.read_to_end(&mut bytes)?;
-                // Use the detailed parser so an ObjStm container whose own
-                // /Length is an indirect reference (including the adjacent
-                // no-EOL `endstream` case) goes through the same authoritative
-                // re-slice as top-level streams; otherwise its compressed
-                // members would be unreadable.
-                let (parsed_ref, mut object, indirect_len) =
-                    parse_indirect_object_detailed(&bytes)?;
+                // Use the detailed parser (via `read_object_at`) so an ObjStm
+                // container whose own /Length is an indirect reference (including
+                // the adjacent no-EOL `endstream` case) goes through the same
+                // authoritative re-slice as top-level streams; otherwise its
+                // compressed members would be unreadable.
+                let (bytes, parsed_ref, mut object, indirect_len) = self.read_object_at(offset)?;
                 if parsed_ref != stream_ref {
                     return Ok(false);
                 }

@@ -477,6 +477,54 @@ fn best_effort_recovers_objstm_compressed_entries() {
     );
 }
 
+/// An ObjStm whose stream payload contains a header-like line (`9 0 obj`) makes
+/// the linear scan record a spurious object *inside* the stream, whose offset
+/// would truncate the ObjStm's recovery window before its declared `/Length`.
+/// The bounded-window pass therefore fails to parse it; the read-to-end fallback
+/// recovers it from the stream's own `/Length`, so the packed object (7) still
+/// gets a compressed entry.
+#[test]
+fn best_effort_recovers_objstm_truncated_by_in_stream_header() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    // Payload: the `7 0` pair (compressed object 7 at intra-stream offset 0),
+    // then a line that looks like an indirect-object header. The linear scan
+    // records `9 0 obj` at its in-stream offset, truncating object 5's window.
+    let objstm_data = b"7 0\n9 0 obj\n".to_vec();
+    let objstm_obj = format!(
+        "5 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n",
+        objstm_data.len()
+    )
+    .into_bytes();
+    let objstm_offset = bytes.len() as u64;
+    bytes.extend_from_slice(&objstm_obj);
+    bytes.extend_from_slice(&objstm_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    // The ObjStm itself recovers as a normal offset entry.
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(5, 0)),
+        Some(&XrefOffset::Offset(objstm_offset))
+    );
+    // The packed object recovers despite the in-stream header truncating the
+    // bounded window — proof the fallback ran.
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(7, 0)),
+        Some(&XrefOffset::Compressed {
+            stream: 5,
+            index: 0,
+        })
+    );
+}
+
 /// Build a best-effort fixture whose only `/Type /ObjStm` object carries the
 /// given `dict_body` (between `<<` and `>>`) and `stream_payload`. The xref
 /// keyword is corrupted so strict parsing fails and best-effort falls into the
@@ -630,6 +678,173 @@ fn best_effort_errors_when_no_objects_to_recover() {
         "got {message}"
     );
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+/// Build a damaged document that strict parsing rejects (corrupt `xref` keyword)
+/// so best-effort falls into the linear scan: a recoverable catalog (object 1),
+/// then `count` malformed candidate objects each beginning with `body_suffix`
+/// after their `N 0 obj` header and never closed, then a valid trailer. The
+/// candidates use distinct object numbers (2..=count+1) so they cannot collapse
+/// to a single recovered entry — exercising the per-candidate cost.
+fn linear_scan_dos_fixture(count: u32, body_suffix: &str) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    for number in 2..=count + 1 {
+        bytes.extend_from_slice(format!("\n{number} 0 obj {body_suffix}").as_bytes());
+    }
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"\nzref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
+/// A flood of candidate objects whose bodies are unterminated literal strings
+/// (`N 0 obj (`) must not drive recovery to quadratic cost. The pre-fix scan
+/// re-parsed each candidate to end-of-file at every advancing byte; the
+/// qpdf-style line scan reads only the `N 0 obj` header per line and never parses
+/// the body, so every distinct candidate is recovered and recovery completes.
+#[test]
+fn best_effort_unterminated_literal_flood_is_linear() {
+    // Large enough that the pre-fix O(n^2) parse would take many seconds (the
+    // validated PoC timed out past ~25k candidates); the linear scan is instant.
+    let count: u32 = 30_000;
+    let loaded =
+        load_xref_and_trailer_best_effort(&mut Cursor::new(linear_scan_dos_fixture(count, "(")))
+            .unwrap();
+
+    // The catalog (object 1) and every distinct candidate are recovered: the
+    // header scan never bails out early at a malformed body.
+    assert!(loaded.entries.contains_key(&ObjectRef::new(1, 0)));
+    assert!(loaded.entries.contains_key(&ObjectRef::new(count + 1, 0)));
+    assert_eq!(loaded.entries.len(), count as usize + 1);
+}
+
+/// The companion attack whose candidate bodies open a dictionary with an
+/// unterminated literal (`N 0 obj << /K (`). This is the case that proves the
+/// ObjStm-recovery second pass stays linear: each candidate starts with `<<`, so
+/// it is parsed, but only within the window bounded by the next candidate's
+/// offset, so the unterminated literal cannot scan to end-of-file.
+#[test]
+fn best_effort_unterminated_dict_flood_is_linear() {
+    let count: u32 = 30_000;
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(linear_scan_dos_fixture(
+        count, "<< /K (",
+    )))
+    .unwrap();
+
+    assert!(loaded.entries.contains_key(&ObjectRef::new(1, 0)));
+    assert!(loaded.entries.contains_key(&ObjectRef::new(count + 1, 0)));
+    assert_eq!(loaded.entries.len(), count as usize + 1);
+}
+
+/// Build a damaged document whose recoverable region (catalog object 1, then a
+/// second object) is separated by `count` copies of `filler_line`. With a
+/// `filler_line` that records nothing — a whitespace-only or comment-only line —
+/// the first-token read for each filler line must be bounded to that line.
+/// Otherwise it skips forward to object 2 and re-scans the same suffix on every
+/// iteration, an O(n^2) blowup.
+fn linear_scan_filler_fixture(count: u32, filler_line: &[u8]) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    for _ in 0..count {
+        bytes.extend_from_slice(filler_line);
+    }
+    bytes.extend_from_slice(b"5 0 obj\n<< >>\nendobj\n");
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
+/// A flood of whitespace-only lines (`<spaces>\n`) between two objects must not
+/// drive recovery to quadratic cost. Spaces break up the end-of-line run so
+/// `next_line_start` cannot collapse them, so the linearity relies on bounding
+/// the first-token read to the current line.
+#[test]
+fn best_effort_whitespace_only_line_flood_is_linear() {
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(linear_scan_filler_fixture(
+        60_000, b"   \n",
+    )))
+    .unwrap();
+    assert!(loaded.entries.contains_key(&ObjectRef::new(1, 0)));
+    assert!(loaded.entries.contains_key(&ObjectRef::new(5, 0)));
+    assert_eq!(loaded.entries.len(), 2);
+}
+
+/// A flood of comment-only lines (`%...\n`) must likewise stay linear: comments
+/// are skipped like whitespace when reading a token, so without the per-line
+/// bound each comment line would skip forward to the next object and re-scan.
+#[test]
+fn best_effort_comment_only_line_flood_is_linear() {
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(linear_scan_filler_fixture(
+        60_000,
+        b"%filler comment\n",
+    )))
+    .unwrap();
+    assert!(loaded.entries.contains_key(&ObjectRef::new(1, 0)));
+    assert!(loaded.entries.contains_key(&ObjectRef::new(5, 0)));
+    assert_eq!(loaded.entries.len(), 2);
+}
+
+/// A comment between an object header's tokens (`7 %c<EOL>0 obj`) must still be
+/// recovered: qpdf's tokenizer skips `%...EOL` comments in token-leading
+/// position, so the header is recovered at the number-token offset. qpdf 11.9.0
+/// recovers `7/0` from this fixture.
+#[test]
+fn best_effort_recovers_object_with_comment_between_header_tokens() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let obj7_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"7 %a comment\n0 obj\n<< >>\nendobj\n");
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(7, 0)),
+        Some(&XrefOffset::Offset(obj7_offset))
+    );
+}
+
+/// The line scan must honour qpdf's `reconstruct_xref` guards: a token sequence
+/// that does not begin on its own line is attributed to the line where it starts
+/// (not a preceding whitespace-only line), and `insertReconstructedXrefEntry`
+/// rejects `obj <= 0` and `gen` outside `0..65535`. qpdf 11.9.0 recovers only
+/// object 1 from this fixture.
+#[test]
+fn best_effort_line_scan_honours_qpdf_reconstruct_guards() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    // Recovered normally.
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    // A whitespace-only line before the next object records nothing: its first
+    // token does not begin on this line (the first-token read is bounded to it).
+    bytes.extend_from_slice(b"   \n");
+    // obj 0 is rejected (`obj > 0`).
+    bytes.extend_from_slice(b"0 0 obj\n<< >>\nendobj\n");
+    // generation 65535 is rejected (`gen < 65535`).
+    bytes.extend_from_slice(b"2 65535 obj\n<< >>\nendobj\n");
+
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefOffset::Offset(9))
+    );
+    assert!(!loaded.entries.contains_key(&ObjectRef::new(0, 0)));
+    assert!(!loaded.entries.contains_key(&ObjectRef::new(2, 65535)));
+    assert_eq!(loaded.entries.len(), 1);
 }
 
 /// When recovery finds objects but no `trailer` keyword exists, `recover_trailer`
@@ -1512,12 +1727,3 @@ fn rejects_xref_table_missing_object_count() {
 //   `recover_compressed_offsets_from_objstm` is likewise unreachable on 64-bit
 //   targets: `/N` is parsed as a non-negative `u64`, and `usize::try_from(u64)`
 //   cannot overflow when `usize` is 64-bit.
-//
-// * The `index == 0` true branch of `is_token_boundary` is unreachable via the
-//   public API. Its sole caller in `recover_xref_entries` is guarded by
-//   `bytes[cursor].is_ascii_digit() && is_token_boundary(cursor, bytes)`.
-//   `load_xref_and_trailer_with_repair` calls `parse_header(&bytes)?` before any
-//   path that reaches recovery, so a non-`%PDF-` header is a hard failure: by the
-//   time `recover_xref_entries` runs, byte 0 is always `%` (not a digit). The
-//   `is_ascii_digit` short-circuit therefore never calls `is_token_boundary` at
-//   index 0.
