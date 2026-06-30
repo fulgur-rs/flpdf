@@ -691,6 +691,80 @@ fn best_effort_unterminated_dict_flood_is_linear() {
     assert_eq!(loaded.entries.len(), count as usize + 1);
 }
 
+/// Build a damaged document whose recoverable region (catalog object 1, then a
+/// second object) is separated by `count` copies of `filler_line`. With a
+/// `filler_line` that records nothing — a whitespace-only or comment-only line —
+/// the first-token read for each filler line must be bounded to that line.
+/// Otherwise it skips forward to object 2 and re-scans the same suffix on every
+/// iteration, an O(n^2) blowup.
+fn linear_scan_filler_fixture(count: u32, filler_line: &[u8]) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    for _ in 0..count {
+        bytes.extend_from_slice(filler_line);
+    }
+    bytes.extend_from_slice(b"5 0 obj\n<< >>\nendobj\n");
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
+/// A flood of whitespace-only lines (`<spaces>\n`) between two objects must not
+/// drive recovery to quadratic cost. Spaces break up the end-of-line run so
+/// `next_line_start` cannot collapse them, so the linearity relies on bounding
+/// the first-token read to the current line.
+#[test]
+fn best_effort_whitespace_only_line_flood_is_linear() {
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(linear_scan_filler_fixture(
+        60_000, b"   \n",
+    )))
+    .unwrap();
+    assert!(loaded.entries.contains_key(&ObjectRef::new(1, 0)));
+    assert!(loaded.entries.contains_key(&ObjectRef::new(5, 0)));
+    assert_eq!(loaded.entries.len(), 2);
+}
+
+/// A flood of comment-only lines (`%...\n`) must likewise stay linear: comments
+/// are skipped like whitespace when reading a token, so without the per-line
+/// bound each comment line would skip forward to the next object and re-scan.
+#[test]
+fn best_effort_comment_only_line_flood_is_linear() {
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(linear_scan_filler_fixture(
+        60_000,
+        b"%filler comment\n",
+    )))
+    .unwrap();
+    assert!(loaded.entries.contains_key(&ObjectRef::new(1, 0)));
+    assert!(loaded.entries.contains_key(&ObjectRef::new(5, 0)));
+    assert_eq!(loaded.entries.len(), 2);
+}
+
+/// A comment between an object header's tokens (`7 %c<EOL>0 obj`) must still be
+/// recovered: qpdf's tokenizer skips `%...EOL` comments in token-leading
+/// position, so the header is recovered at the number-token offset. qpdf 11.9.0
+/// recovers `7/0` from this fixture.
+#[test]
+fn best_effort_recovers_object_with_comment_between_header_tokens() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let obj7_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"7 %a comment\n0 obj\n<< >>\nendobj\n");
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(7, 0)),
+        Some(&XrefOffset::Offset(obj7_offset))
+    );
+}
+
 /// The line scan must honour qpdf's `reconstruct_xref` guards: a token sequence
 /// that does not begin on its own line is attributed to the line where it starts
 /// (not a preceding whitespace-only line), and `insertReconstructedXrefEntry`
@@ -701,9 +775,8 @@ fn best_effort_line_scan_honours_qpdf_reconstruct_guards() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     // Recovered normally.
     bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
-    // A whitespace-only line before the next object: its first token starts on a
-    // later line, so this line records nothing (the `start >= next_line_start`
-    // guard).
+    // A whitespace-only line before the next object records nothing: its first
+    // token does not begin on this line (the first-token read is bounded to it).
     bytes.extend_from_slice(b"   \n");
     // obj 0 is rejected (`obj > 0`).
     bytes.extend_from_slice(b"0 0 obj\n<< >>\nendobj\n");

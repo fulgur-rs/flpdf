@@ -447,6 +447,25 @@ fn is_pdf_delimiter(byte: u8) -> bool {
     )
 }
 
+/// Advance `pos` past PDF whitespace and `%...EOL` comments — the two ignorable
+/// constructs allowed between tokens — but never beyond `limit`. qpdf's
+/// tokenizer skips comments in this position too, so an object header with a
+/// comment between its tokens (`1 %c<EOL>0 obj`) is still recovered.
+fn skip_ignorable(bytes: &[u8], mut pos: usize, limit: usize) -> usize {
+    loop {
+        while pos < limit && is_pdf_whitespace(bytes[pos]) {
+            pos += 1;
+        }
+        if pos < limit && bytes[pos] == b'%' {
+            while pos < limit && !matches!(bytes[pos], b'\n' | b'\r') {
+                pos += 1;
+            }
+        } else {
+            return pos;
+        }
+    }
+}
+
 /// A token read by the reconstruction scanner, with its byte range. Only the
 /// distinctions the `int int obj` match needs are modelled.
 struct ScanToken {
@@ -465,15 +484,23 @@ enum ScanKind {
     Delimiter,
 }
 
-/// Read the next token at or after `from`, skipping leading PDF whitespace.
-/// Returns `None` only when nothing but whitespace remains.
-fn read_scan_token(bytes: &[u8], from: usize) -> Option<ScanToken> {
-    let mut pos = from;
-    while pos < bytes.len() && is_pdf_whitespace(bytes[pos]) {
-        pos += 1;
+/// Read the next token whose start lies in `[from, limit)`, skipping leading
+/// whitespace and `%...EOL` comments. Returns `None` when no token starts before
+/// `limit` (the region is only whitespace/comments).
+///
+/// `limit` bounds where the token may *start*, not where it ends — a regular
+/// token still runs to the next whitespace/delimiter. Passing `next_line_start`
+/// for the first token keeps the scan linear: a whitespace- or comment-only line
+/// is rejected after scanning only its own bytes, instead of skipping forward
+/// into later lines and re-scanning that suffix on every iteration (an O(n^2)
+/// blowup). Later tokens pass `bytes.len()` so an `int int obj` header may span
+/// lines, matching qpdf.
+fn read_scan_token(bytes: &[u8], from: usize, limit: usize) -> Option<ScanToken> {
+    let start = skip_ignorable(bytes, from, limit);
+    if start >= limit {
+        return None;
     }
-    let start = pos;
-    let &first = bytes.get(pos)?;
+    let first = bytes[start];
     if is_pdf_delimiter(first) {
         return Some(ScanToken {
             start,
@@ -482,6 +509,7 @@ fn read_scan_token(bytes: &[u8], from: usize) -> Option<ScanToken> {
         });
     }
 
+    let mut pos = start;
     while pos < bytes.len() && !is_pdf_whitespace(bytes[pos]) && !is_pdf_delimiter(bytes[pos]) {
         pos += 1;
     }
@@ -510,8 +538,9 @@ fn parse_scan_integer(token: &[u8]) -> Option<i64> {
 /// sequence, return the recovered object and the offset of its number token.
 ///
 /// Mirrors qpdf's `reconstruct_xref` per-line logic: the first token must begin
-/// on this line (a token starting at or after `next_line_start` is handled when
-/// the scan reaches its own line), the second and third tokens may spill onto
+/// on this line (otherwise the line records nothing — qpdf's
+/// `token_start >= next_line_start` guard, here enforced by bounding the first
+/// token read to `next_line_start`), the second and third tokens may spill onto
 /// following lines, and the object/generation must satisfy qpdf's
 /// `insertReconstructedXrefEntry` guards (`obj > 0`, `0 <= gen < 65535`).
 fn scan_object_header_at_line(
@@ -519,23 +548,19 @@ fn scan_object_header_at_line(
     line_start: usize,
     next_line_start: usize,
 ) -> Option<(ObjectRef, u64)> {
-    let number_token = read_scan_token(bytes, line_start)?;
-    // A first token starting at or after the next line belongs to a later line
-    // and is processed when the scan reaches that line (qpdf's
-    // `token_start >= next_line_start` guard).
-    if number_token.start >= next_line_start {
-        return None;
-    }
+    // Bounding the first token to this line is what keeps a whitespace- or
+    // comment-only line from re-scanning the remaining file on every iteration.
+    let number_token = read_scan_token(bytes, line_start, next_line_start)?;
     let ScanKind::Integer(obj) = number_token.kind else {
         return None;
     };
 
-    let gen_token = read_scan_token(bytes, number_token.end)?;
+    let gen_token = read_scan_token(bytes, number_token.end, bytes.len())?;
     let ScanKind::Integer(gen) = gen_token.kind else {
         return None;
     };
 
-    let obj_token = read_scan_token(bytes, gen_token.end)?;
+    let obj_token = read_scan_token(bytes, gen_token.end, bytes.len())?;
     if !matches!(obj_token.kind, ScanKind::Word) || &bytes[obj_token.start..obj_token.end] != b"obj"
     {
         return None;
