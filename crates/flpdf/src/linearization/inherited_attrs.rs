@@ -642,7 +642,9 @@ mod tests {
         );
 
         // Both interior nodes must have /Resources stripped.
-        let grandparent = pdf.resolve(ObjectRef::new(2, 0)).expect("grandparent resolves");
+        let grandparent = pdf
+            .resolve(ObjectRef::new(2, 0))
+            .expect("grandparent resolves");
         let Object::Dictionary(gp_dict) = grandparent else {
             panic!("grandparent is not a dictionary");
         };
@@ -694,7 +696,10 @@ mod tests {
         // Must return (Ok or Err), not hang. The test harness's own timeout
         // is the real backstop; this assertion documents the expected outcome.
         let result = push_inherited_attributes_to_pages(&mut pdf);
-        assert!(result.is_ok(), "a self-referential /Kids entry must be skipped, not error");
+        assert!(
+            result.is_ok(),
+            "a self-referential /Kids entry must be skipped, not error"
+        );
     }
 
     /// `/Root /Pages` (2) itself resolves to a non-dictionary object (a bare
@@ -786,6 +791,70 @@ mod tests {
             Some(&Object::Integer(90)),
             "the one valid leaf must still receive the inherited /Rotate despite \
              the malformed sibling entries in /Kids"
+        );
+    }
+
+    /// A /Pages chain `MAX_DEPTH + 1` nodes deep, terminating in one /Page leaf.
+    fn pdf_with_excessive_pages_depth() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let depth = MAX_DEPTH + 1;
+        // Object numbers: 1 = Catalog, 2..=(1+depth) = Pages chain,
+        // (2+depth) = the leaf Page.
+        let leaf_num = 2 + depth as u32;
+        let mut offsets: Vec<u64> = Vec::with_capacity(1 + depth + 1);
+
+        offsets.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        for level in 0..depth {
+            let this_num = 2 + level as u32;
+            let next_ref = if level + 1 == depth {
+                leaf_num
+            } else {
+                this_num + 1
+            };
+            offsets.push(pdf.len() as u64);
+            pdf.extend_from_slice(
+                format!(
+                    "{this_num} 0 obj\n<< /Type /Pages /Kids [{next_ref} 0 R] /Count 1 >>\nendobj\n"
+                )
+                .as_bytes(),
+            );
+        }
+
+        offsets.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            format!(
+                "{leaf_num} 0 obj\n<< /Type /Page /Parent {} 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+                leaf_num - 1
+            )
+            .as_bytes(),
+        );
+
+        let total = offsets.len() + 1; // +1 for the free-list head at object 0
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn excessive_depth_returns_unsupported_error() {
+        let bytes = pdf_with_excessive_pages_depth();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        let result = push_inherited_attributes_to_pages(&mut pdf);
+        assert!(
+            matches!(result, Err(Error::Unsupported(_))),
+            "a /Pages tree deeper than MAX_DEPTH must error, not stack-overflow: {result:?}"
         );
     }
 }
