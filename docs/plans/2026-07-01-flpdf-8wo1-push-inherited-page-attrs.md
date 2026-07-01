@@ -939,20 +939,123 @@ terminate, not hang or stack-overflow.
     }
 ```
 
+**Step 1b: Malformed-node fixtures (added after Task 2's code-quality review flagged these three
+branches as otherwise uncovered through Task 11)**
+
+Three defensive branches in `push_internal` are not reachable from any well-formed fixture in
+Tasks 1–6: the "resolved node is not a dictionary" bail, the "`/Kids` entry is not a `Reference`"
+skip, and the "kid `Reference` resolves to a non-dictionary" skip. Cover them here, alongside the
+cycle guard, since they're the same "defend against a malformed tree" concern.
+
+```rust
+    /// `/Root /Pages` (2) itself resolves to a non-dictionary object (a bare
+    /// integer). The walk's very first `push_internal` call must bail via the
+    /// "resolved node is not a dictionary" branch, not panic.
+    fn pdf_with_non_dictionary_pages_root() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n42\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn non_dictionary_pages_root_is_a_no_op() {
+        let bytes = pdf_with_non_dictionary_pages_root();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        let result = push_inherited_attributes_to_pages(&mut pdf);
+        assert!(
+            result.is_ok(),
+            "a non-dictionary /Pages root must be a no-op, not an error: {result:?}"
+        );
+    }
+
+    /// `/Pages` (2)'s `/Kids` mixes a direct (non-reference) entry (`42`), a
+    /// reference to a non-dictionary object (3, a literal string), and one
+    /// real `/Page` leaf (4). Both malformed entries must be skipped; the
+    /// real leaf must still receive the inherited `/Rotate`.
+    fn pdf_with_malformed_kids_entries() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [42 3 0 R 4 0 R] /Count 1 /Rotate 90 >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(b"3 0 obj\n(not a dictionary)\nendobj\n");
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn malformed_kids_entries_are_skipped_valid_leaf_still_pushed() {
+        let bytes = pdf_with_malformed_kids_entries();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let leaf = pdf.resolve(ObjectRef::new(4, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary");
+        };
+        assert_eq!(
+            leaf_dict.get("Rotate"),
+            Some(&Object::Integer(90)),
+            "the one valid leaf must still receive the inherited /Rotate despite \
+             the malformed sibling entries in /Kids"
+        );
+    }
+```
+
 **Step 2: Run**
 
 Run: `cargo test -p flpdf --lib inherited_attrs:: -- --nocapture`
 
-Expected: PASSES immediately against the Task 2 implementation (the `visited` guard already
-handles this) — this test exists to lock the behavior in and to cover the
-`if !visited.insert(node_ref) { return Ok(()); }` line for the patch-coverage gate, which would
-otherwise be unreachable from the other tests (none of them revisit a node).
+Expected: all tests PASS immediately against the Task 2 implementation (every guard these tests
+exercise already exists) — these tests exist to lock the behavior in and to cover, for the
+patch-coverage gate: `if !visited.insert(node_ref) { return Ok(()); }` (cycle guard), the
+non-dictionary-node bail, the non-`Reference` `/Kids` entry skip, and the non-dictionary-leaf skip —
+none of which are reachable from any other task's well-formed fixtures.
 
 **Step 3: Commit**
 
 ```bash
 git add crates/flpdf/src/linearization/inherited_attrs.rs
-git commit -m "test(linearize): confirm cyclic /Kids entry terminates the push walk (flpdf-8wo1)"
+git commit -m "test(linearize): confirm cyclic /Kids entry and malformed nodes terminate the push walk safely (flpdf-8wo1)"
 ```
 
 ---
@@ -1294,3 +1397,7 @@ git commit -m "chore(linearize): fix coverage gaps for inherited-attribute push 
 - Do not attempt to fix indirect `/Kids` array handling (qpdf dereferences transparently; flpdf's
   existing `PageWalk` and this new `push_internal` both require `/Kids` to be a direct array) — this
   is a pre-existing, separate gap shared with `pages.rs::PageWalk`, out of scope here.
+- Do not attempt to fix indirect `/Type` handling either (qpdf's `isDictionaryOfType` dereferences
+  transparently; `push_internal`'s `is_pages_node` check does not) — same rationale as the `/Kids`
+  gap above: it matches `PageWalk`'s existing precedent in `pages.rs`, is a pre-existing, separate
+  gap, and is out of scope here.
