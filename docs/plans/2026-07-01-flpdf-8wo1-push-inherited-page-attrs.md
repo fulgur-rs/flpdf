@@ -568,21 +568,21 @@ git commit -m "feat(linearize): mint shared indirect object for direct non-scala
 qpdf's, and needs its own test**
 
 `INHERITABLE_KEYS`'s declaration order (`MediaBox, CropBox, Resources, Rotate`, set in Task 1) does
-NOT match qpdf's actual iteration order. qpdf's `Pages::items` is a `std::map<std::string,
-QPDFObjectHandle>` (`QPDF_Dictionary` — `libqpdf/qpdf/QPDFObject_private.hh`), so
-`cur_pages.getKeys()` (`QPDF_pages.cc:346`) visits inheritable keys alphabetically:
-`CropBox, MediaBox, Resources, Rotate`. This matters for real output bytes, not just style: when a
-single `/Pages` node needs to mint more than one direct non-scalar value in the same visit, mint
-order determines which new object gets the lower number, and
-`crates/flpdf/src/linearization/plan.rs:987` sorts Part-3 objects by number — so a wrong mint order
-puts different content at the same output position relative to qpdf.
+NOT match qpdf's actual iteration order. qpdf's `cur_pages.getKeys()` (`QPDF_Dictionary.cc`)
+returns keys via a sorted `std::set<std::string>` built from the dict's backing
+`std::map<std::string, QPDFObjectHandle>` (`QPDFObject_private.hh`), so `QPDF_pages.cc:346`'s push
+loop visits inheritable keys alphabetically: `CropBox, MediaBox, Resources, Rotate`. This matters
+for real output bytes, not just style: when a single `/Pages` node needs to mint more than one
+direct non-scalar value in the same visit, mint order determines which new object gets the lower
+number, and `crates/flpdf/src/linearization/plan.rs:987` sorts Part-3 objects by number — so a wrong
+mint order puts different content at the same output position relative to qpdf.
 
 Fix `INHERITABLE_KEYS` to alphabetical order:
 
 ```rust
-// Alphabetical order, matching qpdf's own iteration order: `Pages::items` is a
-// `std::map<std::string, QPDFObjectHandle>` (QPDF_Dictionary, QPDF_pages.cc),
-// so `cur_pages.getKeys()` visits inheritable keys as CropBox, MediaBox,
+// Alphabetical order, matching qpdf's own iteration order: `cur_pages.getKeys()`
+// (QPDF_Dictionary.cc) returns keys via a sorted `std::set<std::string>`, so
+// `QPDF_pages.cc`'s push loop visits inheritable keys as CropBox, MediaBox,
 // Resources, Rotate. When a single node needs to mint more than one of these
 // in the same visit (direct, non-indirect values), the mint order — and thus
 // which new object number each gets — must match qpdf's, so this array is
