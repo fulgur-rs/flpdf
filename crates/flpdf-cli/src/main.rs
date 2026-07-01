@@ -2915,6 +2915,22 @@ fn run_rewrite(
     if linearize {
         let mut pdf = open_pdf(&input, repair, password)?;
         reject_encrypted_write(&pdf)?;
+        // --remove-restrictions must strip signatures BEFORE the linearization
+        // plan is computed: disable_digital_signatures deletes signature dicts and
+        // erases /Sig fields from /Fields, changing the reachable/first-page object
+        // set. The plan (and its per-page hint tables) is built from `pdf`, so it
+        // must see the post-strip graph; the independent write copy (pdf2) is
+        // stripped identically below. Both opens are stripped deterministically, so
+        // the plan and the written objects agree (a plan built pre-strip would
+        // count objects the write no longer emits — a hint-table mismatch).
+        let had_signatures = if remove_restrictions {
+            pdf_has_signature_evidence(&mut pdf)?
+        } else {
+            false
+        };
+        if had_signatures {
+            disable_digital_signatures(&mut pdf)?;
+        }
         let use_generate = options.object_streams == ObjectStreamMode::Generate;
         let plan = LinearizationPlan::from_pdf(&mut pdf, use_generate)?;
         let renumber = RenumberMap::from_plan(&plan);
@@ -2922,11 +2938,6 @@ fn run_rewrite(
         // Re-open the PDF so `write_linearized` can seek/read objects independently.
         let mut pdf2 = open_pdf(&input, repair, password)?;
         reject_encrypted_write(&pdf2)?;
-        let had_signatures = if remove_restrictions {
-            pdf_has_signature_evidence(&mut pdf2)?
-        } else {
-            false
-        };
         let mut options = options;
         if had_signatures {
             options.full_rewrite = true;

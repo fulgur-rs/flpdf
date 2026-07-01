@@ -263,6 +263,72 @@ fn rewrite_linearize_remove_restrictions_strips_signatures_and_warns() {
 }
 
 #[test]
+fn rewrite_linearize_remove_restrictions_strips_docmdp_perms() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("docmdp.pdf");
+    let output = temp.path().join("out-linearized.pdf");
+    std::fs::write(&input, signed_perms_docmdp_pdf()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--linearize", "--remove-restrictions"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("signatures are now invalidated"));
+
+    let output_bytes = std::fs::read(&output).unwrap();
+    for tok in [&b"/Perms"[..], &b"/DocMDP"[..], &b"/ByteRange"[..]] {
+        assert!(
+            !output_bytes.windows(tok.len()).any(|w| w == tok),
+            "linearized --remove-restrictions must drop {:?}",
+            std::str::from_utf8(tok).unwrap()
+        );
+    }
+    let file = File::open(&output).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    assert!(pdf.signatures().unwrap().is_empty());
+}
+
+#[test]
+fn rewrite_linearize_remove_restrictions_keeps_widget_annotation() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("widget.pdf");
+    let output = temp.path().join("out-linearized.pdf");
+    std::fs::write(&input, signed_widget_acroform_pdf()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--linearize", "--remove-restrictions"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("signatures are now invalidated"));
+
+    let output_bytes = std::fs::read(&output).unwrap();
+    // Widget annotation survives (reachable from page /Annots) ...
+    assert!(output_bytes
+        .windows(b"/Widget".len())
+        .any(|w| w == b"/Widget"));
+    // ... but its signature keys are gone.
+    assert!(!output_bytes
+        .windows(b"/ByteRange".len())
+        .any(|w| w == b"/ByteRange"));
+
+    let file = File::open(&output).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
+    assert_eq!(
+        acroform_fields_len(&mut pdf),
+        Some(0),
+        "top-level /Fields must be emptied"
+    );
+    assert!(pdf.signatures().unwrap().is_empty());
+}
+
+#[test]
 fn rewrite_remove_restrictions_strips_docmdp_perms_and_warns() {
     // A certification (DocMDP) signature can live only in the catalog /Perms
     // dictionary, with no /AcroForm. qpdf --remove-restrictions drops /Perms
