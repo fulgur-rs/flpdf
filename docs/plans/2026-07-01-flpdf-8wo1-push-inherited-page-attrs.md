@@ -1553,7 +1553,25 @@ git commit -m "test(linearize): confirm push-inherited-attrs step is idempotent 
 
 ### Task 11: qpdf-oracle byte-identical emission test
 
-**Files:**
+**SUPERSEDED by Task 9b.** An advisor-recommended resequencing (do the integration/oracle
+validation before polishing isolated unit tests) pulled this task's substance forward: Task 9b
+added `tests/fixtures/compat/inherited-resources-one-page.pdf`, its qpdf 11.9.0 golden, and
+`inherited_resources_one_page_byte_identical_to_qpdf` in `cmp_linearize_tests.rs` — independently
+re-verified twice (once by a spec reviewer re-running the byte comparison from a clean rebuild and
+via the real CLI binary, once by a code-quality reviewer reproducing the exact failure mode by
+reverting the fix). This IS the oracle test this task specifies; there is nothing left to do here.
+Left in place, unexecuted, only as a record of what was originally planned and where it actually
+landed.
+
+**Follow-up items identified during Task 9b's review, NOT done here (tracked for Task 12 /
+post-plan beads issues, not blockers):**
+- No dedicated qpdf-byte-identity fixture for the pure-scalar `/Rotate` inheritance case (shares
+  the same code path as the tested `/Resources`-minting case, but has no end-to-end oracle pin of
+  its own — only the `inherited_attrs.rs` unit test covers it).
+- No dedicated test for `write_linearized`'s new `push_inherited_attributes_to_pages(pdf)?` call's
+  error arm (only the happy path is exercised through the write path).
+
+**Files (original spec, not executed):**
 - Create: a new fixture-driving test, placed alongside the project's existing `qpdf-zlib-compat`-gated
   byte-identical tests. First locate the existing pattern:
 
