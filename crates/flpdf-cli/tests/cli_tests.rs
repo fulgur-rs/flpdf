@@ -200,11 +200,22 @@ fn rewrite_remove_restrictions_strips_signatures_and_warns() {
         pdf.signatures().unwrap().is_empty(),
         "--remove-restrictions output must not report signed fields"
     );
+    // qpdf disableDigitalSignatures erases the /Sig field from the top-level
+    // /Fields array; the field-only object here is then garbage-collected.
+    assert_eq!(
+        acroform_fields_len(&mut pdf),
+        Some(0),
+        "AcroForm must survive with an emptied /Fields array"
+    );
 
     let output_bytes = std::fs::read(&output).unwrap();
     assert!(
         !output_bytes.windows(3).any(|window| window == b"/V "),
         "signature field /V entries must be removed"
+    );
+    assert!(
+        !output_bytes.windows(3).any(|window| window == b"/FT"),
+        "signature field /FT entries must be removed (field object GC'd)"
     );
     assert!(
         !output_bytes
@@ -248,6 +259,114 @@ fn rewrite_linearize_remove_restrictions_strips_signatures_and_warns() {
             .windows(b"/ByteRange".len())
             .any(|window| window == b"/ByteRange"),
         "linearized output must remove orphaned signature dictionaries"
+    );
+}
+
+#[test]
+fn rewrite_remove_restrictions_strips_docmdp_perms_and_warns() {
+    // A certification (DocMDP) signature can live only in the catalog /Perms
+    // dictionary, with no /AcroForm. qpdf --remove-restrictions drops /Perms
+    // unconditionally (QPDF::removeSecurityRestrictions), which orphans the
+    // signature dictionary. This exercises the catalog-/Perms detection branch.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("certified.pdf");
+    let output = temp.path().join("uncertified.pdf");
+    std::fs::write(&input, signed_perms_docmdp_pdf()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--remove-restrictions"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("signatures are now invalidated"));
+
+    let file = File::open(&output).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    assert!(
+        pdf.signatures().unwrap().is_empty(),
+        "DocMDP --remove-restrictions output must not report signed fields"
+    );
+
+    let output_bytes = std::fs::read(&output).unwrap();
+    assert!(
+        !output_bytes
+            .windows(b"/Perms".len())
+            .any(|window| window == b"/Perms"),
+        "catalog /Perms must be removed"
+    );
+    assert!(
+        !output_bytes
+            .windows(b"/DocMDP".len())
+            .any(|window| window == b"/DocMDP"),
+        "the /DocMDP dictionary must be removed with /Perms"
+    );
+    assert!(
+        !output_bytes
+            .windows(b"/ByteRange".len())
+            .any(|window| window == b"/ByteRange"),
+        "the orphaned DocMDP signature dictionary must be garbage-collected"
+    );
+}
+
+#[test]
+fn rewrite_remove_restrictions_keeps_widget_annotation() {
+    // When the signature field doubles as a page /Widget annotation, qpdf
+    // disableDigitalSignatures erases it from /AcroForm /Fields and strips
+    // /FT /V, but the object survives because the page /Annots still references
+    // it. The now-orphaned signature dictionary is garbage-collected.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("signed-widget.pdf");
+    let output = temp.path().join("unsigned-widget.pdf");
+    std::fs::write(&input, signed_widget_acroform_pdf()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--remove-restrictions"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("signatures are now invalidated"));
+
+    let file = File::open(&output).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
+    assert!(
+        pdf.signatures().unwrap().is_empty(),
+        "widget --remove-restrictions output must not report signed fields"
+    );
+    assert_eq!(
+        acroform_fields_len(&mut pdf),
+        Some(0),
+        "AcroForm must survive with an emptied /Fields array"
+    );
+
+    let output_bytes = std::fs::read(&output).unwrap();
+    // The widget annotation survives (still referenced from the page /Annots)...
+    assert!(
+        output_bytes
+            .windows(b"/Subtype /Widget".len())
+            .any(|window| window == b"/Subtype /Widget"),
+        "the widget annotation must survive as a page annotation"
+    );
+    assert!(
+        output_bytes
+            .windows(b"/T (Approval)".len())
+            .any(|window| window == b"/T (Approval)"),
+        "the surviving widget must keep its /T field name"
+    );
+    // ...but its signature identity is stripped.
+    assert!(
+        !output_bytes.windows(3).any(|window| window == b"/FT"),
+        "the surviving widget must lose its /FT (signature field type)"
+    );
+    assert!(
+        !output_bytes
+            .windows(b"/ByteRange".len())
+            .any(|window| window == b"/ByteRange"),
+        "the orphaned signature dictionary must be garbage-collected"
     );
 }
 
@@ -1183,6 +1302,86 @@ fn signed_acroform_pdf() -> Vec<u8> {
         format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
     );
     bytes
+}
+
+/// A certified PDF whose only signature lives in the catalog `/Perms /DocMDP`
+/// dictionary — there is NO `/AcroForm`. This exercises the catalog-`/Perms`
+/// detection branch of `pdf_has_signature_evidence`. The DocMDP signature is
+/// obj 4 (referenced only via `/Perms`), so dropping `/Perms` orphans it and it
+/// is garbage-collected on the full rewrite.
+fn signed_perms_docmdp_pdf() -> Vec<u8> {
+    let objects: Vec<&[u8]> = vec![
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Perms << /DocMDP 4 0 R >> >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        b"4 0 obj\n<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 10 20 30] /Contents <00> >>\nendobj\n",
+    ];
+    build_classic_pdf(&objects)
+}
+
+/// Like [`signed_acroform_pdf`], but the signature field is a `/Widget`
+/// annotation that is ALSO referenced from the page's `/Annots`. After
+/// `--remove-restrictions` the field is erased from `/AcroForm /Fields` and its
+/// `/FT` `/V` are stripped, but the object survives (as a plain widget) because
+/// the page still references it. The orphaned signature dictionary (obj 6) is
+/// garbage-collected.
+fn signed_widget_acroform_pdf() -> Vec<u8> {
+    let objects: Vec<&[u8]> = vec![
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>\nendobj\n",
+        b"4 0 obj\n<< /Fields [5 0 R] /SigFlags 3 >>\nendobj\n",
+        b"5 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Sig /T (Approval) /V 6 0 R /Rect [10 20 30 40] /P 3 0 R >>\nendobj\n",
+        b"6 0 obj\n<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 10 20 30] /Contents <00> >>\nendobj\n",
+    ];
+    build_classic_pdf(&objects)
+}
+
+/// Assemble a classic (uncompressed) PDF from pre-serialized `N 0 obj … endobj`
+/// bodies, emitting a contiguous xref table (obj 0 free + one `n` entry per
+/// body) and a trailer with `/Size` = bodies + 1. Mirrors the xref-building
+/// style of [`signed_acroform_pdf`].
+fn build_classic_pdf(objects: &[&[u8]]) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for object in objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+    let size = offsets.len() + 1;
+    let xref_start = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    bytes
+}
+
+/// Walk Catalog → `/AcroForm` → `/Fields` (resolving an indirect reference at
+/// each hop) and return the number of field entries. Returns `None` when the
+/// document has no `/AcroForm` dictionary or no `/Fields` array — distinct from
+/// `Some(0)` (an AcroForm that survives with an emptied `/Fields`).
+fn acroform_fields_len(pdf: &mut Pdf<BufReader<File>>) -> Option<usize> {
+    let root_ref = pdf.root_ref()?;
+    let Object::Dictionary(catalog) = pdf.resolve(root_ref).ok()? else {
+        return None;
+    };
+    let acroform = resolve_maybe_indirect(pdf, catalog.get("AcroForm")?.clone())?;
+    let fields = resolve_maybe_indirect(pdf, acroform.as_dict()?.get("Fields")?.clone())?;
+    Some(fields.as_array()?.len())
+}
+
+/// Resolve `object` if it is an indirect reference, otherwise return it as-is.
+fn resolve_maybe_indirect(pdf: &mut Pdf<BufReader<File>>, object: Object) -> Option<Object> {
+    match object {
+        Object::Reference(object_ref) => pdf.resolve(object_ref).ok(),
+        direct => Some(direct),
+    }
 }
 
 fn encrypted_v1_owner_password_fixture() -> Vec<u8> {
