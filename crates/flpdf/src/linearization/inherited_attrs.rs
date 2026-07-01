@@ -424,4 +424,82 @@ mod tests {
              order), got CropBox={crop_ref} MediaBox={media_ref}"
         );
     }
+
+    /// `/Pages` (2) has `/Resources` as an *existing* indirect reference (4 0 R)
+    /// rather than a direct dict. Two leaves (3, 5) both lack their own
+    /// /Resources, so both must end up pointing at the SAME object 4 — no
+    /// minting.
+    fn pdf_with_already_indirect_resources_shared_by_two_pages() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 /Resources 4 0 R >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< /Font << /F1 6 0 R >> >>\nendobj\n");
+
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let off6 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off5:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off6:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn already_indirect_value_is_shared_not_reminted() {
+        let bytes = pdf_with_already_indirect_resources_shared_by_two_pages();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        let before_count = pdf.object_refs().len();
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        assert_eq!(
+            pdf.object_refs().len(),
+            before_count,
+            "an already-indirect inherited value must never be re-minted"
+        );
+
+        for page_num in [3u32, 5] {
+            let page = pdf
+                .resolve(ObjectRef::new(page_num, 0))
+                .unwrap_or_else(|e| panic!("page {page_num} resolves: {e}"));
+            let Object::Dictionary(page_dict) = page else {
+                panic!("page {page_num} is not a dictionary");
+            };
+            assert_eq!(
+                page_dict.get("Resources"),
+                Some(&Object::Reference(ObjectRef::new(4, 0))),
+                "page {page_num} must share the original object 4, not a copy"
+            );
+        }
+    }
 }
