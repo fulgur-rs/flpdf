@@ -92,3 +92,55 @@ fn acroform_sig_field_only_is_byte_identical_to_qpdf() {
 fn acroform_sig_widget_survives_as_annotation_byte_identical_to_qpdf() {
     assert_parity("acroform-sig-widget.pdf", "acroform-sig-widget");
 }
+
+#[test]
+fn acroform_sig_nonterminal_parent_keeps_signature_byte_identical_to_qpdf() {
+    // A /Sig parent groups a widget via /Kids: only the widget is a form field,
+    // it carries no signature keys of its own, and it is not a top-level /Fields
+    // entry, so qpdf keeps the whole signature; only /SigFlags is zeroed.
+    assert_parity(
+        "acroform-sig-nonterminal-parent.pdf",
+        "acroform-sig-nonterminal-parent",
+    );
+}
+
+#[test]
+fn acroform_sig_nonannotation_terminal_kept_byte_identical_to_qpdf() {
+    // A terminal /Sig field with no /Rect//Subtype//AP is not an annotation, so
+    // it is not a form field; qpdf keeps it and only zeroes /SigFlags.
+    assert_parity(
+        "acroform-sig-nonannotation-terminal.pdf",
+        "acroform-sig-nonannotation-terminal",
+    );
+}
+
+#[test]
+fn acroform_sig_orphan_widget_disabled_byte_identical_to_qpdf() {
+    // A /FT /Sig widget in a page /Annots but absent from /Fields is discovered
+    // by qpdf's orphan-widget pass and disabled (/FT//V removed, sig dict GC'd).
+    assert_parity(
+        "acroform-sig-orphan-widget.pdf",
+        "acroform-sig-orphan-widget",
+    );
+}
+
+#[test]
+fn acroform_sig_unsigned_placeholder_disabled_byte_identical_to_qpdf() {
+    // A /FT /Sig widget with no /V and no /SigFlags is still a form field;
+    // qpdf removes /FT and erases it from /Fields (the widget itself survives).
+    assert_parity(
+        "acroform-sig-unsigned-placeholder.pdf",
+        "acroform-sig-unsigned-placeholder",
+    );
+}
+
+#[test]
+fn acroform_sig_parent_pure_widget_kid_disables_parent_byte_identical_to_qpdf() {
+    // A /Sig parent whose /Kids holds a pure widget (no /Parent, no /T): the
+    // widget is an annotation but not a field, so its owning field is the
+    // parent, which qpdf disables and erases from /Fields (parent then GC's).
+    assert_parity(
+        "acroform-sig-parent-pure-widget-kid.pdf",
+        "acroform-sig-parent-pure-widget-kid",
+    );
+}

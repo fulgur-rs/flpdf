@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use flpdf::disable_digital_signatures;
 use flpdf::filespec_helper::ascii_filename_fallback;
 use flpdf::{
     acroform_field_prune::prune_acroform_after_subset,
@@ -9,10 +10,6 @@ use flpdf::{
     page_split::split_pages, page_tree_rebuild::rebuild_page_tree,
     struct_tree_pg::drop_struct_elem_dangling_pg, subset_prune::prune_after_subset,
     thread_bead_p::drop_thread_bead_dangling_p, InputSpec, PageRange, RotateSpec,
-};
-use flpdf::{
-    acroform_sig_flags, disable_digital_signatures, SIG_FLAGS_APPEND_ONLY,
-    SIG_FLAGS_SIGNATURES_EXIST,
 };
 use flpdf::{
     check_reader_with_options_and_limits, enumerate_document_annotations, filters,
@@ -2922,15 +2919,15 @@ fn run_rewrite(
         // must see the post-strip graph; the independent write copy (pdf2) is
         // stripped identically below. Both opens are stripped deterministically, so
         // the plan and the written objects agree (a plan built pre-strip would
-        // count objects the write no longer emits — a hint-table mismatch).
+        // count objects the write no longer emits — a hint-table mismatch). qpdf
+        // runs disableDigitalSignatures unconditionally under
+        // --remove-restrictions; the returned `had_signatures` reports whether
+        // anything changed, driving the full-rewrite promotion and the warning.
         let had_signatures = if remove_restrictions {
-            pdf_has_signature_evidence(&mut pdf)?
+            disable_digital_signatures(&mut pdf)?
         } else {
             false
         };
-        if had_signatures {
-            disable_digital_signatures(&mut pdf)?;
-        }
         let use_generate = options.object_streams == ObjectStreamMode::Generate;
         let plan = LinearizationPlan::from_pdf(&mut pdf, use_generate)?;
         let renumber = RenumberMap::from_plan(&plan);
@@ -2939,9 +2936,13 @@ fn run_rewrite(
         let mut pdf2 = open_pdf(&input, repair, password)?;
         reject_encrypted_write(&pdf2)?;
         let mut options = options;
+        // Strip the write copy identically whenever restrictions are removed, so
+        // pdf2 matches pdf's post-strip graph regardless of whether it changed.
+        if remove_restrictions {
+            disable_digital_signatures(&mut pdf2)?;
+        }
         if had_signatures {
             options.full_rewrite = true;
-            disable_digital_signatures(&mut pdf2)?;
         }
         let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &options)?;
         doc.back_patch()?;
@@ -2961,8 +2962,15 @@ fn run_rewrite(
         // below drops /Encrypt, so this must be sampled while the in-memory
         // model still reflects the input.
         let was_encrypted = pdf.is_encrypted();
+        // qpdf runs disableDigitalSignatures unconditionally under
+        // --remove-restrictions: remove catalog /Perms, zero /AcroForm
+        // /SigFlags, strip /FT /V /SV /Lock from /Sig form fields, and erase them
+        // from the top-level /Fields array (a field still reachable from a page
+        // /Annots survives as a plain annotation; orphaned signature dicts are
+        // dropped by the full-rewrite GC). The returned flag reports whether
+        // anything changed, driving the full-rewrite promotion and the warning.
         let had_signatures = if remove_restrictions {
-            pdf_has_signature_evidence(&mut pdf)?
+            disable_digital_signatures(&mut pdf)?
         } else {
             false
         };
@@ -2972,13 +2980,6 @@ fn run_rewrite(
         }
         if had_signatures {
             options.full_rewrite = true;
-            // --remove-restrictions mirrors qpdf's disableDigitalSignatures:
-            // remove catalog /Perms, zero /AcroForm /SigFlags, strip /FT /V /SV
-            // /Lock from /Sig fields, and erase them from the top-level /Fields
-            // array (a field still reachable from a page /Annots survives as a
-            // plain annotation; orphaned signature dicts are dropped by the
-            // full-rewrite GC).
-            disable_digital_signatures(&mut pdf)?;
         }
 
         // ── Content mutation pass ─────────────────────────────────────────────
@@ -3184,26 +3185,6 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
     }
 
     Ok(())
-}
-
-fn pdf_has_signature_evidence<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<bool> {
-    let has_sig_flags = acroform_sig_flags(pdf)?
-        .is_some_and(|flags| flags & (SIG_FLAGS_SIGNATURES_EXIST | SIG_FLAGS_APPEND_ONLY) != 0);
-    if has_sig_flags || !pdf.signatures()?.is_empty() {
-        return Ok(true);
-    }
-    // A certification signature can live only in the catalog /Perms /DocMDP
-    // dictionary with no /AcroForm evidence. qpdf --remove-restrictions removes
-    // /Perms unconditionally (QPDF::removeSecurityRestrictions), so detect it
-    // here too. /DSS is intentionally NOT treated as evidence: qpdf does not
-    // strip it, so a /DSS-only document must not trigger the (destructive)
-    // signature-removal path or its "signatures invalidated" warning.
-    if let Some(root_ref) = pdf.root_ref() {
-        if let Object::Dictionary(catalog) = pdf.resolve(root_ref)? {
-            return Ok(catalog.get("Perms").is_some());
-        }
-    }
-    Ok(false)
 }
 
 // ===========================================================================

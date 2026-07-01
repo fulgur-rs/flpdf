@@ -339,11 +339,28 @@ fn build_disable_sig_widget_pdf() -> Vec<u8> {
     build_pdf(&objects)
 }
 
-/// A top-level field with no local `/FT` whose type must be resolved up a
-/// `/Parent` chain longer than the depth limit, so the walk over the top-level
-/// `/Fields` array propagates the depth-limit error out of
-/// `disable_digital_signatures`.
-fn build_deep_parent_chain_top_field_pdf() -> Vec<u8> {
+/// A non-signature (`/Tx`) terminal form field that is also a page `/Widget`
+/// annotation, so it is enumerated as a form field but its `/FT` is not `/Sig`.
+fn build_non_sig_widget_field_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R /Annots [5 0 R] >>"),
+        (4, b"<< /Fields [5 0 R] /SigFlags 3 >>"),
+        (
+            5,
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (Name) /V (Alice) /Rect [0 0 10 10] /P 3 0 R >>",
+        ),
+    ];
+    build_pdf(&objects)
+}
+
+/// A `/Kids` tree (`5 -> [6] -> [7] -> ...`) deeper than the traversal depth
+/// limit, so the analyze/traverseField enumeration raises the depth-limit error.
+fn build_deep_kids_tree_pdf() -> Vec<u8> {
     let hops = DEFAULT_MAX_SIGNATURE_FIELD_DEPTH as u32 + 30;
     let mut objects: Vec<(u32, Vec<u8>)> = vec![
         (
@@ -357,11 +374,11 @@ fn build_deep_parent_chain_top_field_pdf() -> Vec<u8> {
         (3, b"<< /Type /Page /Parent 2 0 R >>".to_vec()),
         (4, b"<< /Fields [5 0 R] >>".to_vec()),
     ];
-    // Field 5 (top-level) has no /FT; its /FT is sought up 5 -> 6 -> 7 -> ...
+    // Field 5 groups 6, which groups 7, ... a /Kids chain deeper than the limit.
     for level in 0..hops {
         let obj = 5 + level;
         let next = obj + 1;
-        objects.push((obj, format!("<< /Parent {next} 0 R >>").into_bytes()));
+        objects.push((obj, format!("<< /Kids [{next} 0 R] >>").into_bytes()));
     }
     let tail = 5 + hops;
     objects.push((tail, b"<< >>".to_vec()));
@@ -369,10 +386,10 @@ fn build_deep_parent_chain_top_field_pdf() -> Vec<u8> {
     build_pdf(&borrowed)
 }
 
-/// A top-level `/Sig` field whose kid has no local `/FT` and a `/Parent` chain
-/// longer than the depth limit, so the error is raised while descending into
-/// `/Kids` and propagates back out through the kids walker.
-fn build_deep_parent_chain_kid_pdf() -> Vec<u8> {
+/// A top-level form field that is an annotation (`/Rect`) whose inherited `/FT`
+/// must be resolved up a `/Parent` chain longer than the depth limit, so
+/// `getFieldType` overflows inside the disable loop.
+fn build_deep_parent_chain_widget_field_pdf() -> Vec<u8> {
     let hops = DEFAULT_MAX_SIGNATURE_FIELD_DEPTH as u32 + 30;
     let mut objects: Vec<(u32, Vec<u8>)> = vec![
         (
@@ -385,9 +402,10 @@ fn build_deep_parent_chain_kid_pdf() -> Vec<u8> {
         ),
         (3, b"<< /Type /Page /Parent 2 0 R >>".to_vec()),
         (4, b"<< /Fields [5 0 R] >>".to_vec()),
-        (5, b"<< /FT /Sig /Kids [6 0 R] >>".to_vec()),
+        // Field 5 is a terminal annotation (has /Rect); its /FT is sought up
+        // 5 -> 6 -> 7 -> ... a /Parent chain longer than the limit.
+        (5, b"<< /Rect [0 0 1 1] /Parent 6 0 R >>".to_vec()),
     ];
-    // Kid 6 has no /FT; its /FT is sought up 6 -> 7 -> 8 -> ...
     for level in 0..hops {
         let obj = 6 + level;
         let next = obj + 1;
@@ -720,50 +738,73 @@ fn disable_digital_signatures_is_noop_when_fields_have_no_signatures() {
 }
 
 #[test]
-fn disable_digital_signatures_strips_nested_sig_fields_and_keeps_non_sig() {
+fn disable_digital_signatures_keeps_nonterminal_sig_parent_signature() {
+    // The /Sig field (5) is a non-terminal parent: it groups a widget (8) via
+    // /Kids. Mirroring qpdf's getFormFields, only the widget is a form field,
+    // and it carries no signature keys of its own, so the signature survives —
+    // /FT, /V, and the signature dictionary are all kept. Only /SigFlags is
+    // zeroed by removeSecurityRestrictions.
     let mut pdf = open(build_nested_signature_fields_pdf());
-    assert!(disable_digital_signatures(&mut pdf).unwrap());
+    assert!(
+        disable_digital_signatures(&mut pdf).unwrap(),
+        "returns true because /SigFlags changed"
+    );
 
-    // Parent /Sig field (5): /FT /V stripped, /T preserved.
+    // Parent /Sig field (5): /FT and /V are intact.
     let f5 = ObjectRef::new(5, 0);
-    assert!(!has_entry(&mut pdf, f5, "FT"));
-    assert!(!has_entry(&mut pdf, f5, "V"));
-    assert!(has_entry(&mut pdf, f5, "T"));
-    // Child field (6) inherits /Sig and loses /V.
-    assert!(!has_entry(&mut pdf, ObjectRef::new(6, 0), "V"));
+    assert!(has_entry(&mut pdf, f5, "FT"));
+    assert!(has_entry(&mut pdf, f5, "V"));
+    // Child field (6) keeps its /V.
+    assert!(has_entry(&mut pdf, ObjectRef::new(6, 0), "V"));
     // Non-/Sig text field (9) is untouched.
     assert!(has_entry(&mut pdf, ObjectRef::new(9, 0), "FT"));
     assert!(has_entry(&mut pdf, ObjectRef::new(9, 0), "V"));
 
-    // The orphaned signature dictionary (7) is deleted.
-    assert_eq!(pdf.resolve(ObjectRef::new(7, 0)).unwrap(), Object::Null);
-    assert!(pdf.signatures().unwrap().is_empty());
-
-    // Only the top-level /Sig ref (5) is erased; the text field (9) and the
-    // bare integer entry (11) remain.
-    let fields = acroform_fields(&mut pdf);
-    assert_eq!(
-        fields.len(),
-        2,
-        "only field 5 erased from top-level /Fields"
+    // The signature dictionary (7) survives (still referenced by 5 and 6).
+    assert_ne!(pdf.resolve(ObjectRef::new(7, 0)).unwrap(), Object::Null);
+    assert!(
+        !pdf.signatures().unwrap().is_empty(),
+        "the signature is preserved"
     );
+
+    // The top-level /Fields is unchanged: the widget (8) was never a /Fields
+    // entry, so removeFormFields finds nothing to erase.
+    let fields = acroform_fields(&mut pdf);
+    assert_eq!(fields.len(), 3, "/Fields unchanged");
+    assert!(fields.contains(&Object::Reference(ObjectRef::new(5, 0))));
     assert!(fields.contains(&Object::Reference(ObjectRef::new(9, 0))));
     assert!(fields.contains(&Object::Integer(11)));
     assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
 }
 
 #[test]
-fn disable_digital_signatures_propagates_depth_error_from_top_field() {
-    // A top-level field whose /FT resolution overflows the /Parent depth limit
-    // surfaces the error out of the top-level /Fields walk.
-    let mut pdf = open(build_deep_parent_chain_top_field_pdf());
+fn disable_digital_signatures_ignores_non_sig_form_field() {
+    // The /Tx widget is enumerated as a form field, but its inherited /FT is not
+    // /Sig, so it is skipped: /FT and /V survive and /Fields is untouched. Only
+    // /SigFlags is zeroed by removeSecurityRestrictions.
+    let mut pdf = open(build_non_sig_widget_field_pdf());
+    assert!(disable_digital_signatures(&mut pdf).unwrap());
+    let f5 = ObjectRef::new(5, 0);
+    assert!(has_entry(&mut pdf, f5, "FT"), "/Tx field type is preserved");
+    assert!(has_entry(&mut pdf, f5, "V"), "/Tx field value is preserved");
+    let fields = acroform_fields(&mut pdf);
+    assert_eq!(fields, vec![Object::Reference(f5)], "/Fields is untouched");
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
+}
+
+#[test]
+fn disable_digital_signatures_errs_on_deep_kids_tree() {
+    // A /Kids tree deeper than the traversal depth limit surfaces the error out
+    // of the analyze/traverseField enumeration.
+    let mut pdf = open(build_deep_kids_tree_pdf());
     assert!(disable_digital_signatures(&mut pdf).is_err());
 }
 
 #[test]
-fn disable_digital_signatures_propagates_depth_error_from_kid() {
-    // The same depth-limit error, but raised while descending into a /Sig
-    // field's /Kids, must propagate back through the kids walker.
-    let mut pdf = open(build_deep_parent_chain_kid_pdf());
+fn disable_digital_signatures_errs_on_deep_parent_field_type() {
+    // A form field (annotation) whose inherited /FT must be resolved up a
+    // /Parent chain longer than the limit overflows getFieldType, and that
+    // error propagates out of the disable loop.
+    let mut pdf = open(build_deep_parent_chain_widget_field_pdf());
     assert!(disable_digital_signatures(&mut pdf).is_err());
 }
