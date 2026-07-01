@@ -15,7 +15,14 @@ use crate::{Error, Pdf, Result};
 
 /// The four page attributes a `/Pages` node may pass down to its descendants
 /// (ISO 32000-2 §7.7.3.4 Table 30, "Inheritable").
-const INHERITABLE_KEYS: [&[u8]; 4] = [b"MediaBox", b"CropBox", b"Resources", b"Rotate"];
+// Alphabetical order, matching qpdf's own iteration order: `Pages::items` is a
+// `std::map<std::string, QPDFObjectHandle>` (QPDF_pages.cc), so
+// `cur_pages.getKeys()` visits inheritable keys as CropBox, MediaBox,
+// Resources, Rotate. When a single node needs to mint more than one of these
+// in the same visit (direct, non-indirect values), the mint order — and thus
+// which new object number each gets — must match qpdf's, so this array is
+// kept in that same order rather than declaration-convenient order.
+const INHERITABLE_KEYS: [&[u8]; 4] = [b"CropBox", b"MediaBox", b"Resources", b"Rotate"];
 
 /// Defensive cycle/depth bound. qpdf relies on an earlier `cache()` pass (which
 /// repairs duplicate page objects and detects loops) before its own recursive
