@@ -28,6 +28,15 @@
 //!      -> the parent is the owning field: disabled and erased from `/Fields`
 //!      (parent then GC'd).
 //!
+//! Plus two structural corner cases:
+//!   9. `/V` signature dict also reachable from catalog `/DSS` -> the dict is
+//!      kept (only the field's `/V` is removed; the write-time reachability GC
+//!      keeps it because `/DSS` still references it), `/Fields` emptied,
+//!      `/SigFlags` 0, the widget survives as a plain annotation;
+//!  10. `/AcroForm /Fields` is an indirect array -> the array object is mutated
+//!      in place (erased to empty) and `/Fields` stays a reference, matching
+//!      qpdf (it does not inline a new direct array).
+//!
 //! These fixtures are content-stream-free, so byte-identity is independent of the
 //! deflate backend — this file is NOT gated on `qpdf-zlib-compat`.
 
@@ -159,5 +168,24 @@ fn acroform_sig_parent_pure_widget_kid_disables_parent_byte_identical_to_qpdf() 
     assert_parity(
         "acroform-sig-parent-pure-widget-kid.pdf",
         "acroform-sig-parent-pure-widget-kid",
+    );
+}
+
+#[test]
+fn dss_shared_sig_dict_survives_byte_identical_to_qpdf() {
+    // The /V signature dict is also referenced from catalog /DSS, so qpdf's
+    // write-time GC keeps it (only the field's /V is removed). flpdf must not
+    // eagerly delete it, or the /DSS reference would dangle to null.
+    assert_parity("acroform-sig-dss-shared.pdf", "acroform-sig-dss-shared");
+}
+
+#[test]
+fn indirect_fields_array_preserved_byte_identical_to_qpdf() {
+    // /AcroForm /Fields is an indirect array: qpdf erases items from the
+    // original array object and keeps /Fields indirect, rather than inlining a
+    // new direct array into the /AcroForm dictionary.
+    assert_parity(
+        "acroform-sig-indirect-fields.pdf",
+        "acroform-sig-indirect-fields",
     );
 }

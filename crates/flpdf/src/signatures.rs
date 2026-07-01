@@ -286,12 +286,18 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
 ///    `/AcroForm /Fields`, plus orphan `/Subtype /Widget` annotations on page
 ///    `/Annots` that were not associated with a field during that walk.
 /// 3. For every enumerated form field whose inherited `/FT` is `/Sig`, removes
-///    `/FT`, `/V`, `/SV`, and `/Lock` (the field name `/T` is preserved) and
-///    deletes the now-orphaned signature dictionary referenced by `/V`.
+///    `/FT`, `/V`, `/SV`, and `/Lock` (the field name `/T` is preserved). The
+///    signature dictionary previously referenced by `/V` is not deleted
+///    explicitly; on a full rewrite the reachability-based garbage collector
+///    drops it when it is no longer referenced, but keeps it when it is still
+///    reachable elsewhere (for example from the catalog `/DSS`).
 /// 4. Erases those fields' references from the top-level `/AcroForm /Fields`
-///    array. On a full rewrite a field still reachable from a page `/Annots`
-///    survives as a plain annotation; a field-only entry becomes unreferenced
-///    and is dropped by garbage collection.
+///    array. An indirect `/Fields` array is mutated in place (the array object
+///    is kept and the `/AcroForm /Fields` entry stays indirect); a direct
+///    `/Fields` array is rewritten inside the `/AcroForm` dictionary. On a full
+///    rewrite a field still reachable from a page `/Annots` survives as a plain
+///    annotation; a field-only entry becomes unreferenced and is dropped by
+///    garbage collection.
 ///
 /// A `/Sig` field whose `/FT`/`/V` live on a non-terminal parent (the parent
 /// groups a widget via `/Kids`) is left intact: only the widget is a form
@@ -330,7 +336,6 @@ pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bo
         let Object::Dictionary(mut dict) = pdf.resolve(field_ref)? else {
             continue; // cov:ignore: a /Sig form-field ref always resolves to a dictionary
         };
-        let signature_value_ref = dict.get("V").and_then(Object::as_ref_id);
         let mut field_changed = false;
         for key in ["FT", "V", "SV", "Lock"] {
             if dict.remove(key).is_some() {
@@ -340,11 +345,12 @@ pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bo
         if field_changed {
             pdf.set_object(field_ref, Object::Dictionary(dict));
             changed = true;
-            // The old /V target is now unreferenced by this field; delete it so
-            // the write-time GC drops the orphaned signature dictionary.
-            if let Some(signature_ref) = signature_value_ref {
-                pdf.delete_object(signature_ref);
-            }
+            // The old /V target is intentionally not deleted here. qpdf's
+            // disableDigitalSignatures only strips the field keys and lets the
+            // write-time reachability GC drop the signature dictionary if it is
+            // now unreferenced. A dictionary still reachable elsewhere (for
+            // example from the catalog /DSS) must survive, so deleting it here
+            // would over-delete and leave a dangling reference.
         }
     }
 
@@ -359,6 +365,12 @@ pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bo
     let Some(fields_obj) = acroform.get("Fields").cloned() else {
         return Ok(changed);
     };
+    // qpdf erases items from the original /Fields array handle. Capture whether
+    // /Fields is stored indirectly before `resolve_array` consumes the value: an
+    // indirect array stays indirect (the array object is mutated in place, so
+    // the /AcroForm /Fields entry keeps its reference), while a direct array
+    // stays direct (rewritten inside the /AcroForm dictionary).
+    let fields_ref = fields_obj.as_ref_id();
     let fields = resolve_array(pdf, fields_obj)?;
     let original_len = fields.len();
     let new_fields: Vec<Object> = fields
@@ -366,8 +378,13 @@ pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bo
         .filter(|f| !matches!(f, Object::Reference(r) if to_remove.contains(r)))
         .collect();
     if new_fields.len() != original_len {
-        acroform.insert("Fields", Object::Array(new_fields));
-        write_back_acroform(pdf, home, acroform);
+        match fields_ref {
+            Some(fields_ref) => pdf.set_object(fields_ref, Object::Array(new_fields)),
+            None => {
+                acroform.insert("Fields", Object::Array(new_fields));
+                write_back_acroform(pdf, home, acroform);
+            }
+        }
         changed = true;
     }
 

@@ -677,8 +677,18 @@ fn disable_digital_signatures_strips_sig_field_keys_and_erases_from_fields() {
         has_entry(&mut pdf, f5, "T"),
         "/T (field name) must be preserved"
     );
-    // the /V signature dictionary is deleted
-    assert_eq!(pdf.resolve(ObjectRef::new(6, 0)).unwrap(), Object::Null);
+    // The /V signature dictionary is NOT eagerly deleted: qpdf relies on the
+    // write-time reachability GC to drop it once it is unreferenced (so a dict
+    // still reachable elsewhere, e.g. catalog /DSS, survives). In the in-memory
+    // model it therefore stays present; the full-rewrite drop is pinned
+    // byte-for-byte by the remove_restrictions_qpdf_parity fixtures.
+    assert!(
+        matches!(
+            pdf.resolve(ObjectRef::new(6, 0)).unwrap(),
+            Object::Dictionary(_)
+        ),
+        "sig dict must not be eagerly deleted; write-time GC drops orphans"
+    );
     // top-level /Fields is now empty
     assert!(acroform_fields(&mut pdf).is_empty());
     assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
