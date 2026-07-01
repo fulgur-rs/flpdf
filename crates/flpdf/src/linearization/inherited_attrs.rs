@@ -82,6 +82,20 @@ fn push_internal<R: Read + Seek>(
         return Ok(()); // Non-dictionary node: leave untouched (matches PageWalk's silent skip).
     };
 
+    // Only an interior /Pages node has attributes to push down; a /Page leaf
+    // reached here directly (e.g. a malformed /Root/Pages pointing straight at
+    // a /Page, which flpdf's PageWalk tolerates leniently) has no /Kids to
+    // push its own attributes to, so stripping them would drop real content.
+    // qpdf never reaches an equivalent state: `Pages::cache()` (called before
+    // its own push) throws on a /Kids-less root, or force-retypes a /Kids-
+    // bearing one to /Pages first (QPDF_pages.cc) — flpdf has no matching
+    // repair step, so guard here instead.
+    let is_pages_node =
+        matches!(dict.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Pages");
+    if !is_pages_node {
+        return Ok(());
+    }
+
     let mut own_keys: Vec<&'static [u8]> = Vec::new();
     for &key in &INHERITABLE_KEYS {
         let Some(value) = dict.remove(key) else {
@@ -128,7 +142,19 @@ fn push_internal<R: Read + Seek>(
                     continue;
                 };
                 for (&key, values) in key_ancestors.iter() {
-                    if leaf.get(key).is_none() {
+                    // A direct or indirect `null` counts as absent, matching
+                    // qpdf's `contains()` (`!(*this)[key].null()` — resolves
+                    // references transparently). Otherwise an explicit
+                    // `/Resources null` leaf would keep the null instead of
+                    // inheriting the ancestor's real value.
+                    let leaf_value_is_present = match leaf.get(key) {
+                        None | Some(Object::Null) => false,
+                        Some(Object::Reference(r)) => {
+                            !matches!(pdf.resolve_borrowed(*r)?, Object::Null)
+                        }
+                        Some(_) => true,
+                    };
+                    if !leaf_value_is_present {
                         if let Some(v) = values.last() {
                             leaf.insert(key, v.clone());
                         }
@@ -1005,6 +1031,195 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Unsupported(_))),
             "a /Pages tree deeper than MAX_DEPTH must error, not stack-overflow: {result:?}"
+        );
+    }
+
+    /// `/Pages` (2) has `/Resources` (4 0 R). Leaf `/Page` (3) has its own
+    /// `/Resources` set to a DIRECT `null` (not absent). qpdf's `contains()`
+    /// (`!(*this)[key].null()`) treats a null value the same as absent, so
+    /// the ancestor's real value must still be inherited.
+    fn pdf_with_leaf_direct_null_resources() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 4 0 R >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources null >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< /Font << /F1 5 0 R >> >>\nendobj\n");
+
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off5:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn explicit_null_leaf_value_is_treated_as_absent() {
+        let bytes = pdf_with_leaf_direct_null_resources();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary");
+        };
+        assert_eq!(
+            leaf_dict.get("Resources"),
+            Some(&Object::Reference(ObjectRef::new(4, 0))),
+            "a direct null /Resources on the leaf must be treated as absent \
+             and replaced by the inherited value, not left as null"
+        );
+    }
+
+    /// Same shape as [`pdf_with_leaf_direct_null_resources`], but the leaf's
+    /// `/Resources` is an INDIRECT reference (6 0 R) to an object that itself
+    /// resolves to `null`, rather than a direct `null`. qpdf's `contains()`
+    /// resolves references transparently before the null check.
+    fn pdf_with_leaf_indirect_null_resources() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 4 0 R >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources 6 0 R >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< /Font << /F1 5 0 R >> >>\nendobj\n");
+
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        let off6 = pdf.len() as u64;
+        pdf.extend_from_slice(b"6 0 obj\nnull\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off5:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off6:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn indirect_reference_resolving_to_null_is_treated_as_absent() {
+        let bytes = pdf_with_leaf_indirect_null_resources();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary");
+        };
+        assert_eq!(
+            leaf_dict.get("Resources"),
+            Some(&Object::Reference(ObjectRef::new(4, 0))),
+            "an indirect /Resources reference resolving to null must be treated \
+             as absent and replaced by the inherited value"
+        );
+    }
+
+    /// `/Root/Pages` (2) points DIRECTLY at a `/Type /Page` object with its own
+    /// direct `/MediaBox` and no `/Kids` -- a malformed shape flpdf's `PageWalk`
+    /// tolerates leniently. qpdf never reaches an equivalent state (`cache()`
+    /// throws on a /Kids-less root, or force-retypes a /Kids-bearing one to
+    /// /Pages first); flpdf must not strip this node's own attributes with
+    /// nowhere to push them.
+    fn pdf_with_page_typed_root_pages() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Page /MediaBox [0 0 612 792] >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn page_typed_root_pages_keeps_its_own_attributes() {
+        let bytes = pdf_with_page_typed_root_pages();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        let before_count = pdf.object_refs().len();
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed, not error");
+
+        assert_eq!(
+            pdf.object_refs().len(),
+            before_count,
+            "no object should be minted when the root itself is not a /Pages node"
+        );
+        let root_page = pdf
+            .resolve(ObjectRef::new(2, 0))
+            .expect("root page resolves");
+        let Object::Dictionary(root_page_dict) = root_page else {
+            panic!("root page is not a dictionary");
+        };
+        assert_eq!(
+            root_page_dict.get("MediaBox"),
+            Some(&Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+                Object::Integer(792),
+            ])),
+            "/MediaBox must NOT be stripped from a /Page reached as the (malformed) \
+             /Root/Pages entry, since it has no /Kids to push the value to"
         );
     }
 }
