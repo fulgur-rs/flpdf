@@ -14,10 +14,17 @@ single entry point, `push_inherited_attributes_to_pages`, that DFS-walks the `/P
 `set_object` (write-back) idiom used throughout this crate. It is called as the very first
 statement inside `LinearizationPlan::from_pdf` (`crates/flpdf/src/linearization/plan.rs:712`),
 before any object-ref collection happens, so every downstream step (closure computation, object
-numbering, emission) sees the already-pushed tree. Non-scalar inherited values stored directly
-(not by reference) are minted as new indirect objects via the crate's established
-`next_object_ref` + `set_object` convention, so siblings share one object instead of duplicating
-it — this is the only case that adds new objects to the document.
+numbering, emission) sees the already-pushed tree **within that one `Pdf` handle**. Non-scalar
+inherited values stored directly (not by reference) are minted as new indirect objects via the
+crate's established `next_object_ref` + `set_object` convention, so siblings share one object
+instead of duplicating it — this is the only case that adds new objects to the document.
+
+**Correction added after Task 9's code review (see Task 9b):** the crate's real write path
+(the CLI, and this module's own test helper `build_linearized()`) opens a SECOND, independent
+`Pdf` handle for the actual write and never sees the first handle's mutation. `write_linearized`
+must also call the push step on its own handle — Task 9b adds this and verifies it against a real
+qpdf byte-identical golden. Do not assume `from_pdf`'s mutation alone is sufficient for the
+write path; it only wires the *planning* side correctly.
 
 **Tech Stack:** Rust, the `flpdf` crate's existing `Pdf<R: Read + Seek>` object-cache API. No new
 dependencies.
@@ -1317,6 +1324,168 @@ Expected: all crates report `0 failed`.
 ```bash
 git add crates/flpdf/src/linearization/plan.rs
 git commit -m "feat(linearize): push inherited page attributes before computing the linearization plan (flpdf-8wo1)"
+```
+
+---
+
+### Task 9b: Fix `write_linearized`'s independent `Pdf` handle (critical — found by Task 9's code review)
+
+**Why this task exists:** Task 9's code-quality reviewer discovered that every real caller in this
+crate (the CLI's `--linearize` path, and this module's own `build_linearized()` test helper used by
+~20 tests) builds `plan`/`renumber` from ONE `Pdf` handle via `LinearizationPlan::from_pdf`, then
+calls [`write_linearized`] on a **separately, independently re-opened** second handle (see the
+comment `// Re-open the PDF so write_linearized can seek/read objects independently.` at
+`crates/flpdf-cli/src/main.rs`). Task 9 made `from_pdf` mutate its handle (push/strip inherited
+attrs, mint new objects) — but `write_linearized` never sees that mutation on ITS handle. The
+reviewer reproduced byte-for-byte divergence from real qpdf 11.9.0 on both the minting case
+(`/Resources` direct on a `/Pages` node — the primary scenario this whole issue exists to fix) and
+the pure-scalar case (`/Rotate`): the interior `/Pages` node keeps its inherited key (never
+stripped), the leaf never receives it, and a minted-object reference from the plan resolves to
+`Object::Null` on the write handle (a dangling reference, since that object only exists on the
+planning handle). **Task 9 as committed does not actually fix the bug flpdf-8wo1 describes when
+exercised through the crate's real, primary calling convention.**
+
+**Files:**
+- Modify: `crates/flpdf/src/linearization/writer.rs` (`write_linearized`)
+- Modify: `crates/flpdf/src/linearization/plan.rs` (`from_pdf`'s `# Errors` doc)
+- Create: `tests/fixtures/compat/inherited-resources-one-page.pdf`
+- Modify: `tests/golden/regenerate.sh` (add golden generation for the new fixture)
+- Create: `tests/golden/references/inherited-resources-one-page/linearize.pdf` (generated, not
+  hand-written)
+- Modify: `crates/flpdf/tests/cmp_linearize_tests.rs` (new byte-identical test)
+- Modify: `.github/workflows/ci.yml` (add the new test to the explicit `qpdf-zlib-compat` list)
+
+**Step 1: Fix `write_linearized`**
+
+In `crates/flpdf/src/linearization/writer.rs`, make `push_inherited_attributes_to_pages` run on
+`write_linearized`'s OWN `pdf` parameter too — it's documented idempotent (a no-op if already
+pushed), so this is safe whether or not the caller's planning handle and this handle are the same
+object. Add as the very first statement in the function body (before the existing
+`deterministic_id`/`static_id` mutual-exclusivity check):
+
+```rust
+pub fn write_linearized<R: Read + Seek>(
+    plan: &LinearizationPlan,
+    renumber: &RenumberMap,
+    pdf: &mut Pdf<R>,
+    options: &WriteOptions,
+) -> Result<LinearizedDocument> {
+    // `plan`/`renumber` are built from a separate `Pdf` handle opened on the
+    // same source bytes (every real caller — the CLI, and this module's own
+    // `build_linearized()` test helper — re-opens the input for writing rather
+    // than reusing the planning handle: "Re-open the PDF so write_linearized
+    // can seek/read objects independently"). Push here too, on THIS handle, so
+    // the objects this function actually resolves and writes match what the
+    // plan assumed — including any newly minted object for a direct
+    // non-scalar inherited attribute, which otherwise resolves to a dangling
+    // `Object::Null` on this handle. Idempotent: a no-op if `pdf` was already
+    // pushed (e.g. a caller that reuses one handle for both steps).
+    crate::linearization::inherited_attrs::push_inherited_attributes_to_pages(pdf)?;
+
+    // `--deterministic-id` and `--static-id` are mutually exclusive: ...
+```
+
+**Step 2: Update `from_pdf`'s `# Errors` doc**
+
+In `crates/flpdf/src/linearization/plan.rs`, the existing `# Errors` doc block on `from_pdf`
+(directly above `pub fn from_pdf`) lists errors from `page_refs` and closure resolution, but was
+never updated for the Task 9 wiring. Add one line noting that the new push step can itself fail —
+propagates any [`Error`] from resolving an object while walking the `/Pages` tree, and returns
+[`Error::Unsupported`] if the tree exceeds the page-tree depth bound. Per
+`.claude/rules/pdf-rust-doc-review-patterns.md` rule 3, a public `Result`-returning function's
+`# Errors` section must be complete.
+
+**Step 3: Build the fixture**
+
+Write a small one-off Rust program (or a `#[test]`-adjacent helper you delete after use, or
+`cargo run --example` scratch file — your choice of mechanism, it doesn't ship) that constructs a
+REALISTIC single-page PDF with:
+- `/Pages` (object 2) holding a DIRECT `/Resources` dict (`<< /Font << /F1 5 0 R >> >>`) — not a
+  reference — so writing it exercises the minting path.
+- `/Page` (object 3) with `/MediaBox`, `/Parent 2 0 R`, `/Contents 4 0 R`, and NO local `/Resources`
+  (so it must inherit).
+- `/Contents` (object 4): a content stream that actually uses `/F1`, e.g.
+  `BT /F1 24 Tf 100 700 Td (Hello) Tj ET` (so the fixture is genuinely realistic, not a
+  content-free structural probe — qpdf's hint-stream/page-offset computation depends on real
+  content).
+- `/Font` (object 5): `<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>`.
+
+Write the resulting bytes to `tests/fixtures/compat/inherited-resources-one-page.pdf`. Verify it
+opens cleanly with `flpdf::Pdf::open` and that `qpdf --check inherited-resources-one-page.pdf`
+reports no errors (`qpdf` 11.9.0 is installed at `/usr/bin/qpdf` in this environment — confirm with
+`qpdf --version`, must print exactly `11.9.0`; the golden bytes below are pinned to that version per
+`tests/golden/README.md`).
+
+**Step 4: Generate the golden**
+
+Add a new section to `tests/golden/regenerate.sh`, following the existing pattern (e.g. the
+`nonid-id0` block):
+
+```bash
+mkdir -p "$REF/inherited-resources-one-page"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/inherited-resources-one-page.pdf" "$REF/inherited-resources-one-page/linearize.pdf"
+echo "inherited-resources-one-page/linearize.pdf"
+```
+
+Run `bash tests/golden/regenerate.sh` (idempotent — it skips fixtures that already exist, but the
+new golden output path doesn't exist yet, so it will be generated). Confirm
+`tests/golden/references/inherited-resources-one-page/linearize.pdf` now exists.
+
+**Step 5: Add the byte-identical test**
+
+In `crates/flpdf/tests/cmp_linearize_tests.rs`, add (following the file's existing pattern — reuse
+its `flpdf_linearized`, `golden`, and `first_diff` helpers, don't duplicate them):
+
+```rust
+#[test]
+fn inherited_resources_one_page_byte_identical_to_qpdf() {
+    let flpdf_bytes = flpdf_linearized("inherited-resources-one-page.pdf");
+    let qpdf_bytes = golden("inherited-resources-one-page");
+    if let Some(offset) = first_diff(&flpdf_bytes, &qpdf_bytes) {
+        panic!(
+            "byte mismatch at offset {offset}: flpdf len={}, qpdf len={}",
+            flpdf_bytes.len(),
+            qpdf_bytes.len()
+        );
+    }
+}
+```
+
+(Adjust the exact call signature to match whatever `first_diff`/`golden`/`flpdf_linearized`
+actually require in this file — read them first, this is illustrative of the shape, not a
+guaranteed drop-in given the file's exact existing helper signatures.)
+
+**Step 6: Run and verify**
+
+Run: `cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_tests
+inherited_resources_one_page -- --nocapture`
+
+**This is the load-bearing check for this entire plan.** If it FAILS, do not weaken the test or
+give up on byte-identity — read the actual diff (dump both files, `qpdf --qdf` normalize if needed
+per this project's own tooling conventions, compare the `/Pages` dict and the leaf's `/Resources`
+key specifically) and report the exact divergence. A failure here means the fix in Step 1 is
+incomplete or the minting/push algorithm itself has a bug that Tasks 1-3's isolated unit tests
+didn't catch (they never exercised the real two-handle write path or a real qpdf comparison).
+
+If it PASSES: also run the full existing `cargo test -p flpdf --features qpdf-zlib-compat` suite to
+confirm no existing golden regressed, and `cargo test --workspace` (without the feature) to confirm
+the ordinary suite is still green.
+
+**Step 7: Add to the CI explicit test list**
+
+Per this repo's convention (`qpdf-zlib-compat`-gated tests are not picked up automatically), add
+`inherited_resources_one_page_byte_identical_to_qpdf` to wherever `.github/workflows/ci.yml`
+enumerates the existing `cmp_linearize_tests` test names.
+
+**Step 8: Commit**
+
+```bash
+git add crates/flpdf/src/linearization/writer.rs crates/flpdf/src/linearization/plan.rs \
+        tests/fixtures/compat/inherited-resources-one-page.pdf tests/golden/regenerate.sh \
+        tests/golden/references/inherited-resources-one-page/linearize.pdf \
+        crates/flpdf/tests/cmp_linearize_tests.rs .github/workflows/ci.yml
+git commit -m "fix(linearize): push inherited attrs on write_linearized's own Pdf handle, verified byte-identical to qpdf (flpdf-8wo1)"
 ```
 
 ---
