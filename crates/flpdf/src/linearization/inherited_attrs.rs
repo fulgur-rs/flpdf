@@ -567,4 +567,91 @@ mod tests {
              ancestor's (4 0 R)"
         );
     }
+
+    /// 3-level tree: grandparent /Pages (2) supplies /Resources (4 0 R).
+    /// Parent /Pages (3) supplies its OWN /Resources (5 0 R), shadowing the
+    /// grandparent's for everything under it. Leaf /Page (6) has neither, so
+    /// it must inherit the NEAREST ancestor's value (5 0 R from the parent),
+    /// not the grandparent's (4 0 R).
+    fn pdf_with_three_level_nearest_ancestor_wins() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 4 0 R >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Pages /Parent 2 0 R /Kids [6 0 R] /Count 1 \
+              /Resources 5 0 R >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< /Font << /F1 7 0 R >> >>\nendobj\n");
+
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n<< /Font << /F2 7 0 R >> >>\nendobj\n");
+
+        let off6 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"6 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let off7 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off5:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off6:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off7:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn nearest_ancestor_value_wins_in_three_level_tree() {
+        let bytes = pdf_with_three_level_nearest_ancestor_wins();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let leaf = pdf.resolve(ObjectRef::new(6, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary");
+        };
+        assert_eq!(
+            leaf_dict.get("Resources"),
+            Some(&Object::Reference(ObjectRef::new(5, 0))),
+            "the leaf must inherit the NEAREST ancestor's /Resources (5 0 R, \
+             from the parent /Pages), not the grandparent's (4 0 R)"
+        );
+
+        // Both interior nodes must have /Resources stripped.
+        let grandparent = pdf.resolve(ObjectRef::new(2, 0)).expect("grandparent resolves");
+        let Object::Dictionary(gp_dict) = grandparent else {
+            panic!("grandparent is not a dictionary");
+        };
+        assert!(gp_dict.get("Resources").is_none());
+
+        let parent = pdf.resolve(ObjectRef::new(3, 0)).expect("parent resolves");
+        let Object::Dictionary(parent_dict) = parent else {
+            panic!("parent is not a dictionary");
+        };
+        assert!(parent_dict.get("Resources").is_none());
+    }
 }
