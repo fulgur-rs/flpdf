@@ -1,0 +1,94 @@
+//! Byte-identity: flpdf `disable_digital_signatures` + full rewrite ==
+//! `qpdf --remove-restrictions --static-id`.
+//!
+//! Proves flpdf's `--remove-restrictions` signature handling is a byte-for-byte
+//! faithful port of qpdf 11.9.0's `QPDFAcroFormDocumentHelper::disableDigitalSignatures`
+//! across the three cases qpdf distinguishes:
+//!   1. catalog `/Perms /DocMDP` only (no `/AcroForm`) -> `/Perms` removed, sig GC'd;
+//!   2. AcroForm `/Sig` field not referenced from a page `/Annots` -> `/Fields`
+//!      emptied, field + sig dict GC'd, `/SigFlags` 0;
+//!   3. AcroForm `/Sig` field also referenced from `/Annots` (merged widget) ->
+//!      `/Fields` emptied, widget survives as a plain annotation (`/FT`/`/V`
+//!      stripped, `/T` kept), sig dict GC'd, `/SigFlags` 0.
+//!
+//! These fixtures are content-stream-free, so byte-identity is independent of the
+//! deflate backend — this file is NOT gated on `qpdf-zlib-compat`.
+
+use flpdf::{
+    disable_digital_signatures, write_pdf_with_options, NewlineBeforeEndstream, Pdf, WriteOptions,
+};
+use std::path::Path;
+
+/// Full-rewrite `fixture` after `disable_digital_signatures`, with the
+/// qpdf-matching option set, and return the bytes.
+fn remove_restrictions_qpdf_equivalent(fixture: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
+
+    disable_digital_signatures(&mut pdf).unwrap();
+
+    let mut opts = WriteOptions::default();
+    opts.full_rewrite = true;
+    opts.static_id = true;
+    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+
+    let mut out = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
+    out
+}
+
+fn golden(stem: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/references")
+        .join(stem)
+        .join("remove-restrictions.pdf");
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read golden {path:?}: {e}"))
+}
+
+fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
+    if a == b {
+        return None;
+    }
+    let common = a.len().min(b.len());
+    for i in 0..common {
+        if a[i] != b[i] {
+            return Some(i);
+        }
+    }
+    Some(common)
+}
+
+fn assert_parity(fixture: &str, stem: &str) {
+    let actual = remove_restrictions_qpdf_equivalent(fixture);
+    let expected = golden(stem);
+    if let Some(off) = first_diff(&actual, &expected) {
+        let lo = off.saturating_sub(16);
+        panic!(
+            "{fixture}: not byte-identical to qpdf --remove-restrictions golden \
+             (flpdf={} bytes, golden={} bytes, first diff at byte {off})\n\
+             flpdf : {:?}\ngolden: {:?}",
+            actual.len(),
+            expected.len(),
+            &actual[lo..(off + 16).min(actual.len())],
+            &expected[lo..(off + 16).min(expected.len())],
+        );
+    }
+}
+
+#[test]
+fn perms_docmdp_only_is_byte_identical_to_qpdf() {
+    assert_parity("perms-docmdp-one-page.pdf", "perms-docmdp-one-page");
+}
+
+#[test]
+fn acroform_sig_field_only_is_byte_identical_to_qpdf() {
+    assert_parity("acroform-sig-field-only.pdf", "acroform-sig-field-only");
+}
+
+#[test]
+fn acroform_sig_widget_survives_as_annotation_byte_identical_to_qpdf() {
+    assert_parity("acroform-sig-widget.pdf", "acroform-sig-widget");
+}
