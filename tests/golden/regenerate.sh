@@ -363,6 +363,44 @@ else
     echo "Skipping pages-ext-firstpage-shared-one-page.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/inherited-resources-one-page.pdf" ]]; then
+    echo "Generating inherited-resources-one-page.pdf ..."
+    # flpdf-8wo1: a realistic single-page document exercising inherited-attribute
+    # push during linearization. The /Pages node (obj 2) holds a DIRECT
+    # /Resources dict (not a reference), so pushing it down to the /Page leaf
+    # (obj 3, which has no local /Resources) mints a fresh indirect object for
+    # the copy while stripping the source dict from the now-interior /Pages
+    # node. The content stream (obj 4) genuinely uses the inherited font /F1
+    # (obj 5), so the fixture is a real rendering case, not a structure-only
+    # probe.
+    python3 - "$FIX/inherited-resources-one-page.pdf" <<'PY'
+import sys
+objs = {
+    1: b"<< /Type /Catalog /Pages 2 0 R >>",
+    2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /Font << /F1 5 0 R >> >> >>",
+    3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+    5: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+}
+c = b"BT /F1 24 Tf 100 700 Td (Hello) Tj ET"
+objs[4] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c), c)
+order = [1, 2, 3, 4, 5]
+out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+offs = {}
+for n in order:
+    offs[n] = len(out)
+    out += b"%d 0 obj\n" % n + objs[n] + b"\nendobj\n"
+xo = len(out)
+size = 6
+out += b"xref\n0 %d\n" % size + b"0000000000 65535 f \n"
+for n in range(1, size):
+    out += (b"%010d 00000 n \n" % offs[n]) if n in offs else b"0000000000 65535 f \n"
+out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (size, xo)
+open(sys.argv[1], "wb").write(out)
+PY
+else
+    echo "Skipping inherited-resources-one-page.pdf (already exists)"
+fi
+
 # flpdf-0gyq: a null-resolving ref as an ARRAY element is resurrected by qpdf as
 # an indirect null body object (NOT dropped, NOT inlined). Two equal-shape 1-page
 # docs whose Catalog has /Arr [<ref> 8 0 R]: the FREE variant references obj 9
@@ -734,6 +772,14 @@ echo "nonid-id0/linearize.pdf"
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/nonid-id0.pdf" "$REF/nonid-id0/linearize-objstm.pdf"
 echo "nonid-id0/linearize-objstm.pdf"
+
+# --- inherited-resources-one-page: linearize (flpdf-8wo1, direct /Resources on
+# an interior /Pages node pushed down to the /Page leaf and minted as a fresh
+# indirect object) ---
+mkdir -p "$REF/inherited-resources-one-page"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/inherited-resources-one-page.pdf" "$REF/inherited-resources-one-page/linearize.pdf"
+echo "inherited-resources-one-page/linearize.pdf"
 
 # --- missing-trailer-info: dangling /Info 99 0 R dropped, then linearized
 # (flpdf-4vpi). Malformed input → qpdf warns, so --warning-exit-0. Pins the

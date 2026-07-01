@@ -2421,6 +2421,18 @@ pub fn write_linearized<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &WriteOptions,
 ) -> Result<LinearizedDocument> {
+    // `plan`/`renumber` are built from a separate `Pdf` handle opened on the
+    // same source bytes (every real caller — the CLI, and this module's own
+    // `build_linearized()` test helper — re-opens the input for writing rather
+    // than reusing the planning handle: "Re-open the PDF so write_linearized
+    // can seek/read objects independently"). Push here too, on THIS handle, so
+    // the objects this function actually resolves and writes match what the
+    // plan assumed — including any newly minted object for a direct
+    // non-scalar inherited attribute, which otherwise resolves to a dangling
+    // `Object::Null` on this handle. Idempotent: a no-op if `pdf` was already
+    // pushed (e.g. a caller that reuses one handle for both steps).
+    crate::linearization::inherited_attrs::push_inherited_attributes_to_pages(pdf)?;
+
     // `--deterministic-id` and `--static-id` are mutually exclusive: a
     // content-derived `/ID` and qpdf's fixed test constant cannot both be the
     // identifier. The flat (`crate::writer::write_pdf_full_rewrite`) path
