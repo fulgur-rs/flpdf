@@ -3827,6 +3827,33 @@ mod tests {
         );
     }
 
+    /// `LinearizationPlan::from_pdf` mutates the `Pdf` in place (pushing
+    /// inherited attributes). `writer.rs`'s `force_version_below_1_5` path
+    /// calls it a second time on the same `Pdf` to rebuild the plan in disable
+    /// mode — the second call must be a no-op for the push step: no new
+    /// objects minted, same plan membership.
+    #[test]
+    fn from_pdf_push_step_is_idempotent_across_two_calls() {
+        let bytes = two_level_pages_inherited_resources_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("multi-level Pages PDF should parse");
+
+        let first = LinearizationPlan::from_pdf(&mut pdf, false).expect("first plan");
+        let count_after_first = pdf.object_refs().len();
+
+        let second = LinearizationPlan::from_pdf(&mut pdf, false).expect("second plan");
+        let count_after_second = pdf.object_refs().len();
+
+        assert_eq!(
+            count_after_first, count_after_second,
+            "a second from_pdf call on the same Pdf must not mint any new object"
+        );
+        assert_eq!(
+            first.all_assigned_refs(),
+            second.all_assigned_refs(),
+            "a second from_pdf call must produce the same set of assigned refs"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // flpdf-ws2: compute_closure's /Parent-chain walk must propagate
     // pdf.resolve errors instead of swallowing them.
