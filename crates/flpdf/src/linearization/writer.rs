@@ -2446,6 +2446,20 @@ pub fn write_linearized<R: Read + Seek>(
         ));
     }
 
+    // `plan`/`renumber` are built from a separate `Pdf` handle opened on the
+    // same source bytes (every real caller — the CLI, and this module's own
+    // `build_linearized()` test helper — re-opens the input for writing rather
+    // than reusing the planning handle: "Re-open the PDF so write_linearized
+    // can seek/read objects independently"). Push here too, on THIS handle, so
+    // the objects this function actually resolves and writes match what the
+    // plan assumed — including any newly minted object for a direct
+    // non-scalar inherited attribute, which otherwise resolves to a dangling
+    // `Object::Null` on this handle. Idempotent: a no-op if `pdf` was already
+    // pushed (e.g. a caller that reuses one handle for both steps). Runs after
+    // the option guards above so an invalid option combination returns its
+    // error without mutating the caller's `Pdf` first.
+    crate::linearization::inherited_attrs::push_inherited_attributes_to_pages(pdf)?;
+
     // Live object set (object 0 / missing-xref refs excluded). The source
     // document is immutable across the probe + final passes, so compute it once
     // here and share it with every `do_write_pass` rather than re-scanning the

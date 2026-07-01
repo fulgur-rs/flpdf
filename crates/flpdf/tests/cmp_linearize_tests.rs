@@ -160,6 +160,29 @@ fn nonid_id0_linearized_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("nonid-id0.pdf", "nonid-id0");
 }
 
+// flpdf-8wo1: the /Pages node holds a DIRECT /Resources dict (not a
+// reference) and the /Page leaf has no local /Resources, so linearization
+// must push the inherited /Resources down to the leaf (minting a fresh
+// indirect object for the copy) and strip it from the now-interior /Pages
+// node. This exercises the fix on `write_linearized`'s own `Pdf` handle (a
+// separate handle from the one `LinearizationPlan::from_pdf` planned with,
+// exactly as the CLI and this file's `flpdf_linearized` helper both do).
+// Confirmed (by temporarily reverting the fix) that without it, this fixture
+// diverges from qpdf: the interior /Pages node keeps its /Resources dict
+// unstripped, the /Page leaf never gains a /Resources key at all (the mutation
+// simply never happened on this handle), and the minted object that should
+// hold the pushed-down copy resolves to `Object::Null` on this (unpushed)
+// handle and ends up dropped from the output entirely — one fewer object than
+// qpdf's golden, with every later object number, offset, and hint value
+// (`/E`, `/L`) shifted as a result.
+#[test]
+fn inherited_resources_one_page_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "inherited-resources-one-page.pdf",
+        "inherited-resources-one-page",
+    );
+}
+
 #[test]
 fn relinearize_one_page_is_byte_identical_to_qpdf() {
     // Re-linearizing an already-linearized input: the source's old /Linearized

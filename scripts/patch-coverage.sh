@@ -133,10 +133,13 @@ with open(lcov_path, encoding="utf-8", errors="replace") as fh:
         elif line.startswith("end_of_record"):
             cur = None
 
-# 2. diff -> {relpath: set(added new-file line numbers)}.
+# 2. diff -> {relpath: set(added new-file line numbers)}, plus which paths
+#    were newly created (old side is /dev/null) vs. pre-existing modifications.
 added = {}
+new_files = set()
 cur = None
 new_ln = None
+old_is_devnull = False
 hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 with open(diff_path, encoding="utf-8", errors="replace") as fh:
     for line in fh:
@@ -144,6 +147,10 @@ with open(diff_path, encoding="utf-8", errors="replace") as fh:
             # New file block: reset so a later "+++ " is read as the header.
             cur = None
             new_ln = None
+            old_is_devnull = False
+        elif line.startswith("--- ") and new_ln is None:
+            # Same one-header-per-block guard as "+++ " below.
+            old_is_devnull = line[4:].strip() == "/dev/null"
         elif line.startswith("+++ ") and new_ln is None:
             # Only a header before any hunk; inside a hunk new_ln is set, so an
             # added line whose content starts with "++ " (diff: "+++ ...") falls
@@ -154,6 +161,8 @@ with open(diff_path, encoding="utf-8", errors="replace") as fh:
             else:
                 cur = path[2:] if path[:2] in ("a/", "b/") else path
                 added.setdefault(cur, set())
+                if old_is_devnull:
+                    new_files.add(cur)
         elif line.startswith("@@"):
             m = hunk_re.match(line)
             new_ln = int(m.group(1)) if m else None
@@ -252,7 +261,7 @@ def excluded_lines(relpath):
 # 4. Classify changed lines per crate group.
 groups = {"gate": {}, "report": {}}
 marker_errors = {}
-missing_cov = []  # gated files with added lines but no coverage entry at all
+missing_cov = []  # newly-added gated files with no coverage entry at all
 for relpath, lines in added.items():
     if relpath.startswith(GATE_PREFIX):
         grp = "gate"
@@ -260,16 +269,25 @@ for relpath, lines in added.items():
         grp = "report"
     else:
         continue
-    # A reused --lcov report may predate this file; if a gated file has added
-    # lines but no coverage entry at all, the new code was never measured and
-    # the 100% gate would pass vacuously. Treat that as an error. (A fresh
-    # whole-workspace run instead means the file is genuinely non-executable.)
-    if grp == "gate" and lines and relpath not in cov and lcov_mode == "reused":
-        missing_cov.append(relpath)
-    file_cov = cov.get(relpath, {})
     excl, errs = excluded_lines(relpath)
     if errs:
         marker_errors[relpath] = errs
+    # A reused --lcov report may predate a file created in this diff; if a
+    # newly-added gated file has (non-excluded) added lines but no coverage
+    # entry at all, the new code was never measured and the 100% gate would
+    # pass vacuously. Restrict to new files: an existing, merely-modified file
+    # can be legitimately absent from cov (e.g. a pure `mod`/`use`-declarations
+    # file with zero executable regions — llvm-cov never emits an SF: record
+    # for those, fresh or not), so that case is not evidence of staleness.
+    if (
+        grp == "gate"
+        and lcov_mode == "reused"
+        and relpath in new_files
+        and relpath not in cov
+        and (lines - excl)
+    ):
+        missing_cov.append(relpath)
+    file_cov = cov.get(relpath, {})
     changed_exec = [n for n in lines if n in file_cov and n not in excl]
     uncovered = sorted(n for n in changed_exec if file_cov[n] == 0)
     if changed_exec:
@@ -284,7 +302,7 @@ if marker_errors or missing_cov:
             for ln, msg in marker_errors[relpath]:
                 print(f"  {relpath}:{ln}: {msg}")
     if missing_cov:
-        print("ERROR: no coverage data for changed flpdf files (stale/incomplete --lcov?):")
+        print("ERROR: no coverage data for newly-added flpdf files (stale/incomplete --lcov?):")
         for relpath in sorted(missing_cov):
             print(f"  {relpath}")
         print("  Regenerate coverage (omit --lcov to measure a fresh workspace run).")
