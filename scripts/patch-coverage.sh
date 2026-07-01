@@ -177,14 +177,15 @@ with open(diff_path, encoding="utf-8", errors="replace") as fh:
 #    unterminated block, a stray -end, or a nested -start are errors.
 _MARKER_RE = re.compile(r"\s*cov:ignore(-start|-end)?\b\s*(:?)\s*(.*?)\s*$")
 
-def _comment_text(src):
-    """Return the text after the first real `//` line comment, or None.
+def _find_line_comment(src):
+    """Return the index where a real `//` line comment starts, or None.
 
     Tracks double-quoted strings (with backslash escapes) so a `//` inside a
     string literal — a URL, or a literal "// ..." — is not read as a comment.
     Single quotes are left untracked so Rust lifetimes (`'a`) don't confuse it;
     a char literal containing a quote is not handled (put the marker on its own
-    line in that rare case).
+    line in that rare case). Shared by `_comment_text` (cov:ignore marker
+    parsing) and `_code_before_comment` (declaration-line classification).
     """
     in_str = False
     esc = False
@@ -201,9 +202,19 @@ def _comment_text(src):
         elif ch == '"':
             in_str = True
         elif ch == "/" and src[i + 1:i + 2] == "/":
-            return src[i + 2:]
+            return i
         i += 1
     return None
+
+def _comment_text(src):
+    """Return the text after the first real `//` line comment, or None."""
+    idx = _find_line_comment(src)
+    return None if idx is None else src[idx + 2:]
+
+def _code_before_comment(src):
+    """Return the code portion of a line, with any trailing `//` comment removed."""
+    idx = _find_line_comment(src)
+    return src if idx is None else src[:idx]
 
 def excluded_lines(relpath):
     excl = set()
@@ -251,15 +262,17 @@ def excluded_lines(relpath):
 
 # 3b. A file is "declaration-only" if every line is a module/use declaration
 #     (optionally multi-line, e.g. `pub use foo::{\n  a,\n  b,\n};`), a `//`
-#     comment (incl. `//!`/`///`), a module-level attribute, or blank. Such a
-#     file compiles to zero executable regions, so llvm-cov never emits an
-#     SF: record for it — in a fresh run just as much as a reused one. Used
-#     only to exempt these files from the missing-coverage check below; a
-#     single non-matching line (a real function, expression, or braced inline
-#     `mod name { ... }`) makes the whole file ineligible, falling back to the
-#     safe default of still flagging it.
-_DECL_MOD_RE = re.compile(r"^(pub(\(\w+\))?\s+)?mod\s+\w+\s*;\s*$")
-_DECL_USE_RE = re.compile(r"^(pub(\(\w+\))?\s+)?use\s+")
+#     comment (incl. `//!`/`///`, and a trailing `// ...` after a declaration),
+#     a module-level attribute, or blank. Such a file compiles to zero
+#     executable regions, so llvm-cov never emits an SF: record for it — in a
+#     fresh run just as much as a reused one. Used only to exempt these files
+#     from the missing-coverage check below; a single non-matching line (a
+#     real function, expression, or braced inline `mod name { ... }`) makes
+#     the whole file ineligible, falling back to the safe default of still
+#     flagging it. `pub(...)` accepts any restricted-visibility path (`pub(crate)`,
+#     `pub(super)`, `pub(in crate::foo)`), not just a single identifier.
+_DECL_MOD_RE = re.compile(r"^(pub(\([^)]+\))?\s+)?mod\s+\w+\s*;\s*$")
+_DECL_USE_RE = re.compile(r"^(pub(\([^)]+\))?\s+)?use\s+")
 
 def is_declaration_only_file(relpath):
     full = os.path.join(repo_root, relpath)
@@ -268,12 +281,12 @@ def is_declaration_only_file(relpath):
     in_multiline_use = False
     with open(full, encoding="utf-8", errors="replace") as fh:
         for src in fh:
-            stripped = src.strip()
+            stripped = _code_before_comment(src).strip()
             if in_multiline_use:
                 if stripped.endswith(";"):
                     in_multiline_use = False
                 continue
-            if not stripped or stripped.startswith("//") or stripped.startswith("#"):
+            if not stripped or stripped.startswith("#"):
                 continue
             if _DECL_MOD_RE.match(stripped):
                 continue
