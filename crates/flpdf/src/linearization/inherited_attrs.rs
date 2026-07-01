@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 use crate::object::{Object, ObjectRef};
+use crate::ref_chain::terminal_ref_of_chain;
 use crate::{Error, Pdf, Result};
 
 /// The four page attributes a `/Pages` node may pass down to its descendants
@@ -103,15 +104,18 @@ fn push_internal<R: Read + Seek>(
         };
         // qpdf's collection loop iterates `cur_pages.getKeys()`
         // (QPDF_Dictionary.cc), which filters out any key whose value
-        // resolves (through indirect references) to null — such a key is
-        // invisible to qpdf's loop, so it is neither erased from this node
-        // nor pushed to descendants. Put a null value back and skip it here
-        // to match: otherwise a null-valued key on an interior /Pages node
-        // would shadow a real ancestor value further up the stack instead of
-        // being transparent to it.
+        // resolves — following the FULL indirect-reference chain, not just
+        // one hop — to null. Such a key is invisible to qpdf's loop, so it is
+        // neither erased from this node nor pushed to descendants. Put a null
+        // value back and skip it here to match: otherwise a null-valued key
+        // on an interior /Pages node would shadow a real ancestor value
+        // further up the stack instead of being transparent to it.
         let is_null = match &value {
             Object::Null => true,
-            Object::Reference(r) => matches!(pdf.resolve_borrowed(*r)?, Object::Null),
+            Object::Reference(r) => {
+                let terminal = terminal_ref_of_chain(pdf, *r)?;
+                matches!(pdf.resolve_borrowed(terminal)?, Object::Null)
+            }
             _ => false,
         };
         if is_null {
@@ -161,13 +165,14 @@ fn push_internal<R: Read + Seek>(
                 for (&key, values) in key_ancestors.iter() {
                     // A direct or indirect `null` counts as absent, matching
                     // qpdf's `contains()` (`!(*this)[key].null()` — resolves
-                    // references transparently). Otherwise an explicit
-                    // `/Resources null` leaf would keep the null instead of
-                    // inheriting the ancestor's real value.
+                    // the FULL reference chain, not just one hop). Otherwise
+                    // an explicit `/Resources null` leaf would keep the null
+                    // instead of inheriting the ancestor's real value.
                     let leaf_value_is_present = match leaf.get(key) {
                         None | Some(Object::Null) => false,
                         Some(Object::Reference(r)) => {
-                            !matches!(pdf.resolve_borrowed(*r)?, Object::Null)
+                            let terminal = terminal_ref_of_chain(pdf, *r)?;
+                            !matches!(pdf.resolve_borrowed(terminal)?, Object::Null)
                         }
                         Some(_) => true,
                     };
@@ -1236,6 +1241,78 @@ mod tests {
         );
     }
 
+    /// Same shape as [`pdf_with_leaf_indirect_null_resources`], but the null
+    /// is reached through a TWO-hop holder chain (6 0 R -> 7 0 R -> null),
+    /// not a single hop. qpdf's `contains()` (`.null()` / `type_code()`)
+    /// resolves the full reference chain, not just one hop.
+    fn pdf_with_leaf_multi_hop_null_resources() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 4 0 R >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources 6 0 R >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< /Font << /F1 5 0 R >> >>\nendobj\n");
+
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        let off6 = pdf.len() as u64;
+        pdf.extend_from_slice(b"6 0 obj\n7 0 R\nendobj\n");
+
+        let off7 = pdf.len() as u64;
+        pdf.extend_from_slice(b"7 0 obj\nnull\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off5:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off6:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off7:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn leaf_multi_hop_null_reference_chain_is_treated_as_absent() {
+        let bytes = pdf_with_leaf_multi_hop_null_resources();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            leaf_dict.get("Resources"),
+            Some(&Object::Reference(ObjectRef::new(4, 0))),
+            "a /Resources reaching null through a two-hop reference chain \
+             (6 0 R -> 7 0 R -> null) must be treated as absent and replaced \
+             by the inherited value, not just a single-hop null"
+        );
+    }
+
     /// `/Root/Pages` (2) points DIRECTLY at a `/Type /Page` object with its own
     /// direct `/MediaBox` and no `/Kids` -- a malformed shape flpdf's `PageWalk`
     /// tolerates leniently. qpdf never reaches an equivalent state (`cache()`
@@ -1458,6 +1535,93 @@ mod tests {
             Some(&Object::Reference(ObjectRef::new(5, 0))),
             "the leaf must inherit the GRANDPARENT's real /Resources, not be \
              shadowed by the child's indirect-null value"
+        );
+    }
+
+    /// Same shape as [`pdf_with_ancestor_indirect_null_resources`], but the
+    /// child `/Pages`' null is reached through a TWO-hop holder chain
+    /// (7 0 R -> 8 0 R -> null), not a single hop.
+    fn pdf_with_ancestor_multi_hop_null_resources() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 5 0 R >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 \
+              /Resources 7 0 R >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n<< /Font << /F1 6 0 R >> >>\nendobj\n");
+
+        let off6 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        let off7 = pdf.len() as u64;
+        pdf.extend_from_slice(b"7 0 obj\n8 0 R\nendobj\n");
+
+        let off8 = pdf.len() as u64;
+        pdf.extend_from_slice(b"8 0 obj\nnull\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 9\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off5:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off6:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off7:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off8:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 9 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn ancestor_multi_hop_null_reference_chain_does_not_shadow_grandparent() {
+        let bytes = pdf_with_ancestor_multi_hop_null_resources();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let child = pdf.resolve(ObjectRef::new(3, 0)).expect("child resolves");
+        let Object::Dictionary(child_dict) = child else {
+            panic!("child is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            child_dict.get("Resources"),
+            Some(&Object::Reference(ObjectRef::new(7, 0))),
+            "a /Resources reaching null through a two-hop reference chain on \
+             the child /Pages node must be left in place, not erased"
+        );
+
+        let leaf = pdf.resolve(ObjectRef::new(4, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            leaf_dict.get("Resources"),
+            Some(&Object::Reference(ObjectRef::new(5, 0))),
+            "the leaf must inherit the GRANDPARENT's real /Resources, not be \
+             shadowed by the child's two-hop null reference chain"
         );
     }
 }
