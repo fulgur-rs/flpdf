@@ -273,6 +273,160 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
     Ok(changed)
 }
 
+/// Disable digital signatures for `--remove-restrictions`, mirroring qpdf's
+/// `QPDFAcroFormDocumentHelper::disableDigitalSignatures` (qpdf 11.9.0).
+///
+/// 1. Calls [`remove_security_restrictions`] (drop catalog `/Perms`, zero
+///    `/AcroForm /SigFlags`).
+/// 2. For every terminal AcroForm field whose inherited `/FT` is `/Sig`, removes
+///    `/FT`, `/V`, `/SV`, and `/Lock` (the field name `/T` is preserved) and
+///    deletes the now-orphaned signature dictionary referenced by `/V`.
+/// 3. Erases those fields' references from the top-level `/AcroForm /Fields`
+///    array. On a full rewrite a field still reachable from a page `/Annots`
+///    survives as a plain annotation; a field-only entry becomes unreferenced
+///    and is dropped by garbage collection.
+///
+/// Returns `true` when anything changed. `/DSS` is intentionally left untouched,
+/// matching qpdf (`removeSecurityRestrictions` removes only `/Perms`).
+///
+/// # Errors
+///
+/// Propagates any error from resolving the catalog, `/AcroForm`, `/Fields`, and
+/// field-tree objects (surfaced by [`Pdf::resolve`]), and the depth-limit error
+/// path shared with the other signature walkers.
+pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
+    let mut changed = remove_security_restrictions(pdf)?;
+
+    let Some((home, mut acroform)) = resolve_catalog_acroform(pdf)? else {
+        return Ok(changed);
+    };
+    let Some(fields_obj) = acroform.get("Fields").cloned() else {
+        return Ok(changed);
+    };
+    let fields = resolve_array(pdf, fields_obj)?;
+
+    let mut to_remove: Vec<ObjectRef> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for field in &fields {
+        if let Object::Reference(field_ref) = field {
+            disable_sig_field(
+                pdf,
+                *field_ref,
+                None,
+                0,
+                &mut seen,
+                &mut to_remove,
+                &mut changed,
+            )?;
+        }
+    }
+
+    if !to_remove.is_empty() {
+        let new_fields: Vec<Object> = fields
+            .into_iter()
+            .filter(|f| !matches!(f, Object::Reference(r) if to_remove.contains(r)))
+            .collect();
+        acroform.insert("Fields", Object::Array(new_fields));
+        write_back_acroform(pdf, home, acroform);
+        changed = true;
+    }
+    Ok(changed)
+}
+
+/// Strip signature keys from a single AcroForm field and, for `/Sig` terminals,
+/// record the field ref in `to_remove` so it can be erased from the top-level
+/// `/Fields` array. Mirrors [`strip_signature_values_from_field`] but removes
+/// `/FT`, `/V`, `/SV`, and `/Lock` from any `/Sig` field (not only fields that
+/// carry a `/V`) and collects the ref.
+fn disable_sig_field<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field_ref: ObjectRef,
+    inherited_type: Option<Vec<u8>>,
+    depth: usize,
+    seen: &mut BTreeSet<ObjectRef>,
+    to_remove: &mut Vec<ObjectRef>,
+    changed: &mut bool,
+) -> Result<()> {
+    if depth > DEFAULT_MAX_SIGNATURE_FIELD_DEPTH || !seen.insert(field_ref) {
+        return Ok(());
+    }
+
+    let Object::Dictionary(mut dict) = pdf.resolve(field_ref)? else {
+        return Ok(());
+    };
+
+    let field_type = inherited_name(pdf, &dict, "FT")?.or(inherited_type);
+    let kids_obj = dict.get("Kids").cloned();
+
+    if field_type.as_deref() == Some(b"Sig") {
+        let signature_value_ref = dict.get("V").and_then(Object::as_ref_id);
+        dict.remove("FT");
+        dict.remove("V");
+        dict.remove("SV");
+        dict.remove("Lock");
+        pdf.set_object(field_ref, Object::Dictionary(dict));
+        if let Some(signature_ref) = signature_value_ref {
+            pdf.delete_object(signature_ref);
+        }
+        to_remove.push(field_ref);
+        *changed = true;
+        if depth == DEFAULT_MAX_SIGNATURE_FIELD_DEPTH {
+            return Ok(());
+        }
+
+        let Some(kids_obj) = kids_obj else {
+            return Ok(());
+        };
+        return disable_sig_field_kids(pdf, kids_obj, field_type, depth, seen, to_remove, changed);
+    }
+
+    if depth == DEFAULT_MAX_SIGNATURE_FIELD_DEPTH {
+        return Ok(());
+    }
+
+    let Some(kids_obj) = kids_obj else {
+        return Ok(());
+    };
+    disable_sig_field_kids(pdf, kids_obj, field_type, depth, seen, to_remove, changed)
+}
+
+/// Descend into a field's `/Kids`, disabling signature keys on each child field.
+/// Mirrors [`strip_signature_values_from_kids`] but threads `to_remove` through
+/// [`disable_sig_field`]; pure widget kids are skipped exactly as there.
+fn disable_sig_field_kids<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    kids_obj: Object,
+    field_type: Option<Vec<u8>>,
+    depth: usize,
+    seen: &mut BTreeSet<ObjectRef>,
+    to_remove: &mut Vec<ObjectRef>,
+    changed: &mut bool,
+) -> Result<()> {
+    for kid in resolve_array(pdf, kids_obj)? {
+        let Object::Reference(kid_ref) = kid else {
+            continue;
+        };
+        let kid_obj = pdf.resolve_borrowed(kid_ref)?;
+        let Object::Dictionary(kid_dict) = kid_obj else {
+            continue;
+        };
+        if is_pure_widget(kid_dict) {
+            continue;
+        }
+        disable_sig_field(
+            pdf,
+            kid_ref,
+            field_type.clone(),
+            depth + 1,
+            seen,
+            to_remove,
+            changed,
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Write an updated `/AcroForm` dictionary back to wherever it lives.
 ///
 /// For an indirect `/AcroForm` the dictionary is stored to its own object; for
@@ -1103,5 +1257,208 @@ mod tests {
         let start_dict = parent_chain(&mut pdf, 2, 4, "V");
         let got = inherited_field_value(&mut pdf, &start_dict, "V").unwrap();
         assert_eq!(got, Some(Object::Integer(42)));
+    }
+
+    // Build a dictionary from (key, Object) pairs for the disable_sig_field
+    // walker unit tests below.
+    fn dict(pairs: Vec<(&str, Object)>) -> Object {
+        let mut d = Dictionary::new();
+        for (k, v) in pairs {
+            d.insert(k, v);
+        }
+        Object::Dictionary(d)
+    }
+
+    fn sig_name() -> Object {
+        Object::Name(b"Sig".to_vec())
+    }
+
+    #[test]
+    fn disable_sig_field_skips_already_seen_ref() {
+        let mut pdf = empty_pdf();
+        let field_ref = ObjectRef::new(2, 0);
+        pdf.set_object(field_ref, dict(vec![("FT", sig_name())]));
+
+        let mut seen = BTreeSet::new();
+        seen.insert(field_ref); // already visited: the walker must bail out
+        let mut to_remove = Vec::new();
+        let mut changed = false;
+        disable_sig_field(
+            &mut pdf,
+            field_ref,
+            None,
+            0,
+            &mut seen,
+            &mut to_remove,
+            &mut changed,
+        )
+        .unwrap();
+
+        assert!(!changed);
+        assert!(to_remove.is_empty());
+        assert!(
+            matches!(pdf.resolve(field_ref).unwrap(), Object::Dictionary(d) if d.get("FT").is_some()),
+            "seen ref must be left untouched"
+        );
+    }
+
+    #[test]
+    fn disable_sig_field_ignores_non_dictionary() {
+        let mut pdf = empty_pdf();
+        let field_ref = ObjectRef::new(2, 0);
+        pdf.set_object(field_ref, Object::Integer(7));
+
+        let mut seen = BTreeSet::new();
+        let mut to_remove = Vec::new();
+        let mut changed = false;
+        disable_sig_field(
+            &mut pdf,
+            field_ref,
+            None,
+            0,
+            &mut seen,
+            &mut to_remove,
+            &mut changed,
+        )
+        .unwrap();
+
+        assert!(!changed);
+        assert!(to_remove.is_empty());
+    }
+
+    #[test]
+    fn disable_sig_field_sig_stops_recursion_at_depth_limit() {
+        let mut pdf = empty_pdf();
+        let parent = ObjectRef::new(2, 0);
+        let child = ObjectRef::new(3, 0);
+        let sig = ObjectRef::new(5, 0);
+        pdf.set_object(
+            parent,
+            dict(vec![
+                ("FT", sig_name()),
+                ("V", Object::Reference(sig)),
+                ("Kids", Object::Array(vec![Object::Reference(child)])),
+            ]),
+        );
+        pdf.set_object(child, dict(vec![("FT", sig_name())]));
+        pdf.set_object(sig, dict(vec![("Type", sig_name())]));
+
+        let mut seen = BTreeSet::new();
+        let mut to_remove = Vec::new();
+        let mut changed = false;
+        disable_sig_field(
+            &mut pdf,
+            parent,
+            None,
+            DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
+            &mut seen,
+            &mut to_remove,
+            &mut changed,
+        )
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(to_remove, vec![parent]);
+        assert!(matches!(
+            pdf.resolve(parent).unwrap(),
+            Object::Dictionary(p) if p.get("FT").is_none() && p.get("V").is_none()
+        ));
+        assert_eq!(pdf.resolve(sig).unwrap(), Object::Null);
+        // At the depth limit the /Kids are not descended, so the child keeps /FT.
+        assert!(
+            matches!(pdf.resolve(child).unwrap(), Object::Dictionary(c) if c.get("FT").is_some()),
+            "child must not be walked at depth limit"
+        );
+    }
+
+    #[test]
+    fn disable_sig_field_non_sig_stops_recursion_at_depth_limit() {
+        let mut pdf = empty_pdf();
+        let parent = ObjectRef::new(2, 0);
+        let child = ObjectRef::new(3, 0);
+        pdf.set_object(
+            parent,
+            dict(vec![
+                ("FT", Object::Name(b"Tx".to_vec())),
+                ("Kids", Object::Array(vec![Object::Reference(child)])),
+            ]),
+        );
+        pdf.set_object(
+            child,
+            dict(vec![("FT", sig_name()), ("V", Object::Integer(1))]),
+        );
+
+        let mut seen = BTreeSet::new();
+        let mut to_remove = Vec::new();
+        let mut changed = false;
+        disable_sig_field(
+            &mut pdf,
+            parent,
+            None,
+            DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
+            &mut seen,
+            &mut to_remove,
+            &mut changed,
+        )
+        .unwrap();
+
+        assert!(
+            !changed,
+            "non-/Sig field at the depth limit changes nothing"
+        );
+        assert!(to_remove.is_empty());
+        assert!(matches!(
+            pdf.resolve(child).unwrap(),
+            Object::Dictionary(c) if c.get("FT").is_some() && c.get("V").is_some()
+        ));
+    }
+
+    #[test]
+    fn disable_sig_field_non_sig_descends_into_kids() {
+        let mut pdf = empty_pdf();
+        let parent = ObjectRef::new(2, 0);
+        let child = ObjectRef::new(3, 0);
+        let sig = ObjectRef::new(5, 0);
+        // Non-/Sig parent grouping a /Sig child: the non-/Sig arm must still
+        // recurse into /Kids and strip the child.
+        pdf.set_object(
+            parent,
+            dict(vec![
+                ("FT", Object::Name(b"Tx".to_vec())),
+                ("Kids", Object::Array(vec![Object::Reference(child)])),
+            ]),
+        );
+        pdf.set_object(
+            child,
+            dict(vec![("FT", sig_name()), ("V", Object::Reference(sig))]),
+        );
+        pdf.set_object(sig, dict(vec![("Type", sig_name())]));
+
+        let mut seen = BTreeSet::new();
+        let mut to_remove = Vec::new();
+        let mut changed = false;
+        disable_sig_field(
+            &mut pdf,
+            parent,
+            None,
+            0,
+            &mut seen,
+            &mut to_remove,
+            &mut changed,
+        )
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(to_remove, vec![child], "only the /Sig child is recorded");
+        assert!(matches!(
+            pdf.resolve(child).unwrap(),
+            Object::Dictionary(c) if c.get("FT").is_none() && c.get("V").is_none()
+        ));
+        assert_eq!(pdf.resolve(sig).unwrap(), Object::Null);
+        // The non-/Sig parent itself is preserved.
+        assert!(matches!(
+            pdf.resolve(parent).unwrap(),
+            Object::Dictionary(p) if p.get("FT") == Some(&Object::Name(b"Tx".to_vec()))
+        ));
     }
 }

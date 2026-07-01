@@ -1,9 +1,10 @@
 //! Tests for /AcroForm /SigFlags reading, preservation, surfacing, and clearing.
 
 use flpdf::{
-    acroform_sig_flags, clear_sig_flags, remove_security_restrictions, signature_rewrite_impact,
-    strip_signature_values, write_pdf, write_pdf_with_options, Object, ObjectRef, Pdf,
-    SignatureWriteMode, WriteOptions, SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
+    acroform_sig_flags, clear_sig_flags, disable_digital_signatures, remove_security_restrictions,
+    signature_rewrite_impact, strip_signature_values, write_pdf, write_pdf_with_options, Object,
+    ObjectRef, Pdf, SignatureWriteMode, WriteOptions, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
+    SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -272,6 +273,132 @@ fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
 }
 
+/// Read the top-level `/AcroForm /Fields` array via public API.
+fn acroform_fields(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<Object> {
+    let root_ref = pdf.root_ref().unwrap();
+    let Object::Dictionary(cat) = pdf.resolve(root_ref).unwrap() else {
+        return Vec::new();
+    };
+    let Some(af) = cat.get("AcroForm").cloned() else {
+        return Vec::new();
+    };
+    let af = match af {
+        Object::Reference(r) => pdf.resolve(r).unwrap(),
+        other => other,
+    };
+    let Object::Dictionary(afd) = af else {
+        return Vec::new();
+    };
+    match afd.get("Fields").cloned() {
+        Some(Object::Array(a)) => a,
+        Some(Object::Reference(r)) => match pdf.resolve(r).unwrap() {
+            Object::Array(a) => a,
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// A single top-level `/Sig` field referenced only from `/AcroForm /Fields`
+/// (not from any page `/Annots`), so on rewrite it becomes unreferenced.
+fn build_disable_sig_field_only_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>"),
+        (4, b"<< /Fields [5 0 R] /SigFlags 3 >>"),
+        (
+            5,
+            b"<< /FT /Sig /T (Approval) /V 6 0 R /SV << /Type /SV >> /Lock << /Type /SigFieldLock >> /Rect [0 0 0 0] >>",
+        ),
+        (6, b"<< /Type /Sig /ByteRange [0 10 20 30] >>"),
+    ];
+    build_pdf(&objects)
+}
+
+/// A `/Sig` field that is also a page `/Annots` widget, so on rewrite the
+/// stripped field survives as a plain annotation.
+fn build_disable_sig_widget_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R /Annots [5 0 R] >>"),
+        (4, b"<< /Fields [5 0 R] /SigFlags 3 >>"),
+        (
+            5,
+            b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Approval) /V 6 0 R /Rect [10 20 30 40] /P 3 0 R >>",
+        ),
+        (6, b"<< /Type /Sig /ByteRange [0 10 20 30] >>"),
+    ];
+    build_pdf(&objects)
+}
+
+/// A top-level field with no local `/FT` whose type must be resolved up a
+/// `/Parent` chain longer than the depth limit, so the walk over the top-level
+/// `/Fields` array propagates the depth-limit error out of
+/// `disable_digital_signatures`.
+fn build_deep_parent_chain_top_field_pdf() -> Vec<u8> {
+    let hops = DEFAULT_MAX_SIGNATURE_FIELD_DEPTH as u32 + 30;
+    let mut objects: Vec<(u32, Vec<u8>)> = vec![
+        (
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".to_vec(),
+        ),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>".to_vec()),
+        (4, b"<< /Fields [5 0 R] >>".to_vec()),
+    ];
+    // Field 5 (top-level) has no /FT; its /FT is sought up 5 -> 6 -> 7 -> ...
+    for level in 0..hops {
+        let obj = 5 + level;
+        let next = obj + 1;
+        objects.push((obj, format!("<< /Parent {next} 0 R >>").into_bytes()));
+    }
+    let tail = 5 + hops;
+    objects.push((tail, b"<< >>".to_vec()));
+    let borrowed: Vec<(u32, &[u8])> = objects.iter().map(|(n, b)| (*n, b.as_slice())).collect();
+    build_pdf(&borrowed)
+}
+
+/// A top-level `/Sig` field whose kid has no local `/FT` and a `/Parent` chain
+/// longer than the depth limit, so the error is raised while descending into
+/// `/Kids` and propagates back out through the kids walker.
+fn build_deep_parent_chain_kid_pdf() -> Vec<u8> {
+    let hops = DEFAULT_MAX_SIGNATURE_FIELD_DEPTH as u32 + 30;
+    let mut objects: Vec<(u32, Vec<u8>)> = vec![
+        (
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".to_vec(),
+        ),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>".to_vec()),
+        (4, b"<< /Fields [5 0 R] >>".to_vec()),
+        (5, b"<< /FT /Sig /Kids [6 0 R] >>".to_vec()),
+    ];
+    // Kid 6 has no /FT; its /FT is sought up 6 -> 7 -> 8 -> ...
+    for level in 0..hops {
+        let obj = 6 + level;
+        let next = obj + 1;
+        objects.push((obj, format!("<< /Parent {next} 0 R >>").into_bytes()));
+    }
+    let tail = 6 + hops;
+    objects.push((tail, b"<< >>".to_vec()));
+    let borrowed: Vec<(u32, &[u8])> = objects.iter().map(|(n, b)| (*n, b.as_slice())).collect();
+    build_pdf(&borrowed)
+}
+
 #[test]
 fn reads_sig_flags_bitfield() {
     let mut pdf = open(build_signed_acroform_pdf());
@@ -516,4 +643,127 @@ fn remove_security_restrictions_is_noop_when_root_missing() {
 fn remove_security_restrictions_is_noop_when_root_not_dictionary() {
     let mut pdf = open(build_nondict_root_pdf());
     assert!(!remove_security_restrictions(&mut pdf).unwrap());
+}
+
+#[test]
+fn disable_digital_signatures_strips_sig_field_keys_and_erases_from_fields() {
+    let mut pdf = open(build_disable_sig_field_only_pdf());
+    assert!(disable_digital_signatures(&mut pdf).unwrap());
+    // field 5: /FT /V removed, /T kept
+    let f5 = ObjectRef::new(5, 0);
+    assert!(!has_entry(&mut pdf, f5, "FT"));
+    assert!(!has_entry(&mut pdf, f5, "V"));
+    assert!(!has_entry(&mut pdf, f5, "SV"));
+    assert!(!has_entry(&mut pdf, f5, "Lock"));
+    assert!(
+        has_entry(&mut pdf, f5, "T"),
+        "/T (field name) must be preserved"
+    );
+    // the /V signature dictionary is deleted
+    assert_eq!(pdf.resolve(ObjectRef::new(6, 0)).unwrap(), Object::Null);
+    // top-level /Fields is now empty
+    assert!(acroform_fields(&mut pdf).is_empty());
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
+    assert!(pdf.signatures().unwrap().is_empty());
+}
+
+#[test]
+fn disable_digital_signatures_keeps_widget_but_strips_sig_keys() {
+    let mut pdf = open(build_disable_sig_widget_pdf());
+    assert!(disable_digital_signatures(&mut pdf).unwrap());
+    let f5 = ObjectRef::new(5, 0);
+    assert!(
+        has_entry(&mut pdf, f5, "Subtype"),
+        "widget annotation survives"
+    );
+    assert!(has_entry(&mut pdf, f5, "T"));
+    assert!(!has_entry(&mut pdf, f5, "FT"));
+    assert!(!has_entry(&mut pdf, f5, "V"));
+    assert!(acroform_fields(&mut pdf).is_empty());
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
+}
+
+#[test]
+fn disable_digital_signatures_docmdp_only_removes_perms() {
+    let mut pdf = open(build_perms_docmdp_only_pdf());
+    assert!(disable_digital_signatures(&mut pdf).unwrap());
+    let root_ref = pdf.root_ref().unwrap();
+    let Object::Dictionary(cat) = pdf.resolve(root_ref).unwrap() else {
+        panic!()
+    };
+    assert!(cat.get("Perms").is_none());
+}
+
+#[test]
+fn disable_digital_signatures_is_noop_on_unsigned() {
+    let mut pdf = open(build_unsigned_pdf());
+    assert!(!disable_digital_signatures(&mut pdf).unwrap());
+}
+
+#[test]
+fn disable_digital_signatures_zeros_sigflags_when_fields_absent() {
+    // /AcroForm carries /SigFlags but no /Fields: removeSecurityRestrictions
+    // zeros /SigFlags (changed = true) and the /Fields early-return leaves the
+    // form otherwise untouched.
+    let mut pdf = open(build_acroform_without_fields_pdf());
+    assert!(disable_digital_signatures(&mut pdf).unwrap());
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
+}
+
+#[test]
+fn disable_digital_signatures_is_noop_when_fields_have_no_signatures() {
+    // /AcroForm with an empty /Fields, no /SigFlags, no /Perms: nothing to
+    // strip, so `to_remove` stays empty and the function reports no change.
+    let mut pdf = open(build_acroform_without_sig_flags_pdf());
+    assert!(!disable_digital_signatures(&mut pdf).unwrap());
+    assert!(acroform_fields(&mut pdf).is_empty());
+}
+
+#[test]
+fn disable_digital_signatures_strips_nested_sig_fields_and_keeps_non_sig() {
+    let mut pdf = open(build_nested_signature_fields_pdf());
+    assert!(disable_digital_signatures(&mut pdf).unwrap());
+
+    // Parent /Sig field (5): /FT /V stripped, /T preserved.
+    let f5 = ObjectRef::new(5, 0);
+    assert!(!has_entry(&mut pdf, f5, "FT"));
+    assert!(!has_entry(&mut pdf, f5, "V"));
+    assert!(has_entry(&mut pdf, f5, "T"));
+    // Child field (6) inherits /Sig and loses /V.
+    assert!(!has_entry(&mut pdf, ObjectRef::new(6, 0), "V"));
+    // Non-/Sig text field (9) is untouched.
+    assert!(has_entry(&mut pdf, ObjectRef::new(9, 0), "FT"));
+    assert!(has_entry(&mut pdf, ObjectRef::new(9, 0), "V"));
+
+    // The orphaned signature dictionary (7) is deleted.
+    assert_eq!(pdf.resolve(ObjectRef::new(7, 0)).unwrap(), Object::Null);
+    assert!(pdf.signatures().unwrap().is_empty());
+
+    // Only the top-level /Sig ref (5) is erased; the text field (9) and the
+    // bare integer entry (11) remain.
+    let fields = acroform_fields(&mut pdf);
+    assert_eq!(
+        fields.len(),
+        2,
+        "only field 5 erased from top-level /Fields"
+    );
+    assert!(fields.contains(&Object::Reference(ObjectRef::new(9, 0))));
+    assert!(fields.contains(&Object::Integer(11)));
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
+}
+
+#[test]
+fn disable_digital_signatures_propagates_depth_error_from_top_field() {
+    // A top-level field whose /FT resolution overflows the /Parent depth limit
+    // surfaces the error out of the top-level /Fields walk.
+    let mut pdf = open(build_deep_parent_chain_top_field_pdf());
+    assert!(disable_digital_signatures(&mut pdf).is_err());
+}
+
+#[test]
+fn disable_digital_signatures_propagates_depth_error_from_kid() {
+    // The same depth-limit error, but raised while descending into a /Sig
+    // field's /Kids, must propagate back through the kids walker.
+    let mut pdf = open(build_deep_parent_chain_kid_pdf());
+    assert!(disable_digital_signatures(&mut pdf).is_err());
 }
