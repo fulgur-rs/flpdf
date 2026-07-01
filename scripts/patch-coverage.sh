@@ -133,13 +133,10 @@ with open(lcov_path, encoding="utf-8", errors="replace") as fh:
         elif line.startswith("end_of_record"):
             cur = None
 
-# 2. diff -> {relpath: set(added new-file line numbers)}, plus which paths
-#    were newly created (old side is /dev/null) vs. pre-existing modifications.
+# 2. diff -> {relpath: set(added new-file line numbers)}.
 added = {}
-new_files = set()
 cur = None
 new_ln = None
-old_is_devnull = False
 hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 with open(diff_path, encoding="utf-8", errors="replace") as fh:
     for line in fh:
@@ -147,10 +144,6 @@ with open(diff_path, encoding="utf-8", errors="replace") as fh:
             # New file block: reset so a later "+++ " is read as the header.
             cur = None
             new_ln = None
-            old_is_devnull = False
-        elif line.startswith("--- ") and new_ln is None:
-            # Same one-header-per-block guard as "+++ " below.
-            old_is_devnull = line[4:].strip() == "/dev/null"
         elif line.startswith("+++ ") and new_ln is None:
             # Only a header before any hunk; inside a hunk new_ln is set, so an
             # added line whose content starts with "++ " (diff: "+++ ...") falls
@@ -161,8 +154,6 @@ with open(diff_path, encoding="utf-8", errors="replace") as fh:
             else:
                 cur = path[2:] if path[:2] in ("a/", "b/") else path
                 added.setdefault(cur, set())
-                if old_is_devnull:
-                    new_files.add(cur)
         elif line.startswith("@@"):
             m = hunk_re.match(line)
             new_ln = int(m.group(1)) if m else None
@@ -258,10 +249,45 @@ def excluded_lines(relpath):
         errors.append((start_line, "cov:ignore-start without matching end"))
     return excl, errors
 
+# 3b. A file is "declaration-only" if every line is a module/use declaration
+#     (optionally multi-line, e.g. `pub use foo::{\n  a,\n  b,\n};`), a `//`
+#     comment (incl. `//!`/`///`), a module-level attribute, or blank. Such a
+#     file compiles to zero executable regions, so llvm-cov never emits an
+#     SF: record for it — in a fresh run just as much as a reused one. Used
+#     only to exempt these files from the missing-coverage check below; a
+#     single non-matching line (a real function, expression, or braced inline
+#     `mod name { ... }`) makes the whole file ineligible, falling back to the
+#     safe default of still flagging it.
+_DECL_MOD_RE = re.compile(r"^(pub(\(\w+\))?\s+)?mod\s+\w+\s*;\s*$")
+_DECL_USE_RE = re.compile(r"^(pub(\(\w+\))?\s+)?use\s+")
+
+def is_declaration_only_file(relpath):
+    full = os.path.join(repo_root, relpath)
+    if not os.path.isfile(full):
+        return False
+    in_multiline_use = False
+    with open(full, encoding="utf-8", errors="replace") as fh:
+        for src in fh:
+            stripped = src.strip()
+            if in_multiline_use:
+                if stripped.endswith(";"):
+                    in_multiline_use = False
+                continue
+            if not stripped or stripped.startswith("//") or stripped.startswith("#"):
+                continue
+            if _DECL_MOD_RE.match(stripped):
+                continue
+            if _DECL_USE_RE.match(stripped):
+                if not stripped.endswith(";"):
+                    in_multiline_use = True
+                continue
+            return False
+    return not in_multiline_use
+
 # 4. Classify changed lines per crate group.
 groups = {"gate": {}, "report": {}}
 marker_errors = {}
-missing_cov = []  # newly-added gated files with no coverage entry at all
+missing_cov = []  # gated files with (non-excluded) added lines never measured
 for relpath, lines in added.items():
     if relpath.startswith(GATE_PREFIX):
         grp = "gate"
@@ -272,19 +298,19 @@ for relpath, lines in added.items():
     excl, errs = excluded_lines(relpath)
     if errs:
         marker_errors[relpath] = errs
-    # A reused --lcov report may predate a file created in this diff; if a
-    # newly-added gated file has (non-excluded) added lines but no coverage
-    # entry at all, the new code was never measured and the 100% gate would
-    # pass vacuously. Restrict to new files: an existing, merely-modified file
-    # can be legitimately absent from cov (e.g. a pure `mod`/`use`-declarations
-    # file with zero executable regions — llvm-cov never emits an SF: record
-    # for those, fresh or not), so that case is not evidence of staleness.
+    # A reused --lcov report may be stale or incomplete; if a gated file has
+    # (non-excluded) added lines but no coverage entry at all, the new code
+    # may have never been measured, which would let the 100% gate pass
+    # vacuously. Exempt declaration-only files: llvm-cov never emits an SF:
+    # record for one regardless of report freshness, so its total absence
+    # from cov is not evidence of staleness (unlike a file that does contain
+    # executable code, where total absence is always suspicious).
     if (
         grp == "gate"
         and lcov_mode == "reused"
-        and relpath in new_files
         and relpath not in cov
         and (lines - excl)
+        and not is_declaration_only_file(relpath)
     ):
         missing_cov.append(relpath)
     file_cov = cov.get(relpath, {})
@@ -302,7 +328,7 @@ if marker_errors or missing_cov:
             for ln, msg in marker_errors[relpath]:
                 print(f"  {relpath}:{ln}: {msg}")
     if missing_cov:
-        print("ERROR: no coverage data for newly-added flpdf files (stale/incomplete --lcov?):")
+        print("ERROR: no coverage data for changed flpdf files (stale/incomplete --lcov?):")
         for relpath in sorted(missing_cov):
             print(f"  {relpath}")
         print("  Regenerate coverage (omit --lcov to measure a fresh workspace run).")
