@@ -654,4 +654,138 @@ mod tests {
         };
         assert!(parent_dict.get("Resources").is_none());
     }
+
+    /// /Pages (2)'s /Kids includes itself (2 0 R) alongside a real leaf (3 0 R).
+    /// The walk must not loop forever.
+    fn pdf_with_self_referential_pages_node() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [2 0 R 3 0 R] /Count 1 >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn self_referential_pages_node_terminates() {
+        let bytes = pdf_with_self_referential_pages_node();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        // Must return (Ok or Err), not hang. The test harness's own timeout
+        // is the real backstop; this assertion documents the expected outcome.
+        let result = push_inherited_attributes_to_pages(&mut pdf);
+        assert!(result.is_ok(), "a self-referential /Kids entry must be skipped, not error");
+    }
+
+    /// `/Root /Pages` (2) itself resolves to a non-dictionary object (a bare
+    /// integer). The walk's very first `push_internal` call must bail via the
+    /// "resolved node is not a dictionary" branch, not panic.
+    fn pdf_with_non_dictionary_pages_root() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n42\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn non_dictionary_pages_root_is_a_no_op() {
+        let bytes = pdf_with_non_dictionary_pages_root();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        let result = push_inherited_attributes_to_pages(&mut pdf);
+        assert!(
+            result.is_ok(),
+            "a non-dictionary /Pages root must be a no-op, not an error: {result:?}"
+        );
+    }
+
+    /// `/Pages` (2)'s `/Kids` mixes a direct (non-reference) entry (`42`), a
+    /// reference to a non-dictionary object (3, a literal string), and one
+    /// real `/Page` leaf (4). Both malformed entries must be skipped; the
+    /// real leaf must still receive the inherited `/Rotate`.
+    fn pdf_with_malformed_kids_entries() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [42 3 0 R 4 0 R] /Count 1 /Rotate 90 >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(b"3 0 obj\n(not a dictionary)\nendobj\n");
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn malformed_kids_entries_are_skipped_valid_leaf_still_pushed() {
+        let bytes = pdf_with_malformed_kids_entries();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let leaf = pdf.resolve(ObjectRef::new(4, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary");
+        };
+        assert_eq!(
+            leaf_dict.get("Rotate"),
+            Some(&Object::Integer(90)),
+            "the one valid leaf must still receive the inherited /Rotate despite \
+             the malformed sibling entries in /Kids"
+        );
+    }
 }
