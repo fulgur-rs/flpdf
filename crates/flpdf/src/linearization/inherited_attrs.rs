@@ -80,8 +80,20 @@ fn push_internal<R: Read + Seek>(
         let Some(value) = dict.remove(key) else {
             continue;
         };
-        // Task 3 will add the non-scalar (Array/Dictionary) minting branch here.
-        // For now every value is treated as scalar (copied by value).
+        let value = match value {
+            Object::Reference(_) => value, // already indirect: descendants share this ref
+            Object::Array(_) | Object::Dictionary(_) => {
+                // Direct (non-indirect) non-scalar value: mint a new indirect
+                // object so descendants share ONE object instead of each
+                // duplicating the structure inline (mirrors qpdf's
+                // makeIndirectObject call in QPDF_pages.cc:355-360).
+                let new_ref = next_object_ref(pdf)?;
+                pdf.set_object(new_ref, value);
+                Object::Reference(new_ref)
+            }
+            // Integer/Real/Boolean/Name/String/Null: copy by value, no minting.
+            scalar => scalar,
+        };
         key_ancestors.entry(key).or_default().push(value);
         own_keys.push(key);
     }
@@ -129,6 +141,20 @@ fn push_internal<R: Read + Seek>(
         }
     }
     Ok(())
+}
+
+/// Allocate a fresh indirect-object reference (the new-object idiom used across
+/// the crate): one past the current highest object number.
+fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
+    let n = pdf
+        .object_refs()
+        .iter()
+        .map(|r| r.number)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+    Ok(ObjectRef::new(n, 0))
 }
 
 #[cfg(test)]
@@ -251,6 +277,88 @@ mod tests {
             page_dict.get("Rotate"),
             Some(&Object::Integer(90)),
             "/Rotate must be pushed to the leaf as a direct (literal) value"
+        );
+    }
+
+    /// `/Pages` (2) has a direct `/Resources` dict (non-scalar). `/Page` (3) has
+    /// none. Object layout: 1 Catalog, 2 Pages, 3 Page.
+    fn pdf_with_inherited_direct_resources() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 \
+              /Resources << /Font << /F1 4 0 R >> >> >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn direct_non_scalar_resources_is_minted_as_new_object() {
+        let bytes = pdf_with_inherited_direct_resources();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        let before_count = pdf.object_refs().len();
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        assert_eq!(
+            pdf.object_refs().len(),
+            before_count + 1,
+            "a direct non-scalar inherited value must mint exactly one new object"
+        );
+
+        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let Object::Dictionary(pages_dict) = pages else {
+            panic!("pages is not a dictionary");
+        };
+        assert!(
+            pages_dict.get("Resources").is_none(),
+            "/Resources must be stripped from the interior /Pages node"
+        );
+
+        let page = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
+        let Object::Dictionary(page_dict) = page else {
+            panic!("page is not a dictionary");
+        };
+        let Some(Object::Reference(resources_ref)) = page_dict.get("Resources") else {
+            panic!("/Resources must be pushed to the leaf as an indirect reference, not inline");
+        };
+        assert_eq!(
+            resources_ref.number, 5,
+            "the minted object must be the next free object number (4 was already in use)"
+        );
+        let minted = pdf.resolve(*resources_ref).expect("minted object resolves");
+        let Object::Dictionary(minted_dict) = minted else {
+            panic!("minted object is not a dictionary");
+        };
+        assert!(
+            minted_dict.get("Font").is_some(),
+            "the minted object must carry the original /Resources content"
         );
     }
 }
