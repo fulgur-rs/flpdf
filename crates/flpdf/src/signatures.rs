@@ -234,6 +234,51 @@ pub fn clear_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     if !clear_sig_flags_in_dict(&mut acroform) {
         return Ok(false);
     }
+    write_back_acroform(pdf, home, acroform);
+    Ok(true)
+}
+
+/// Remove qpdf-supported security restrictions, mirroring
+/// `QPDF::removeSecurityRestrictions` (qpdf 11.9.0).
+///
+/// Drops the catalog `/Perms` entry unconditionally and, when `/AcroForm` is a
+/// dictionary that carries `/SigFlags`, sets `/SigFlags` to `0`. Returns `true`
+/// when either change was applied. Used by the `--remove-restrictions`
+/// signature-stripping path; it does not remove signature fields.
+///
+/// # Errors
+///
+/// Propagates any error from resolving the catalog and `/AcroForm` objects
+/// (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
+pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(false);
+    };
+    let Object::Dictionary(mut catalog) = pdf.resolve(root_ref)? else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    if catalog.remove("Perms").is_some() {
+        pdf.set_object(root_ref, Object::Dictionary(catalog));
+        changed = true;
+    }
+    if let Some((home, mut acroform)) = resolve_catalog_acroform(pdf)? {
+        if acroform.get("SigFlags").is_some() && sig_flags_from_acroform_dict(&acroform) != Some(0)
+        {
+            acroform.insert("SigFlags", Object::Integer(0));
+            write_back_acroform(pdf, home, acroform);
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+/// Write an updated `/AcroForm` dictionary back to wherever it lives.
+///
+/// For an indirect `/AcroForm` the dictionary is stored to its own object; for
+/// an inline `/AcroForm` the carried catalog is patched and re-stored so the
+/// catalog is not clobbered.
+fn write_back_acroform<R: Read + Seek>(pdf: &mut Pdf<R>, home: AcroformHome, acroform: Dictionary) {
     match home {
         AcroformHome::Object(acroform_ref) => {
             pdf.set_object(acroform_ref, Object::Dictionary(acroform));
@@ -246,7 +291,6 @@ pub fn clear_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
             pdf.set_object(root_ref, Object::Dictionary(catalog));
         }
     }
-    Ok(true)
 }
 
 /// Remove signature values (`/V`) from AcroForm signature fields.

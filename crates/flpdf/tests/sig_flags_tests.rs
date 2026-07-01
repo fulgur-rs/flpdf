@@ -1,9 +1,9 @@
 //! Tests for /AcroForm /SigFlags reading, preservation, surfacing, and clearing.
 
 use flpdf::{
-    acroform_sig_flags, clear_sig_flags, signature_rewrite_impact, strip_signature_values,
-    write_pdf, write_pdf_with_options, Object, ObjectRef, Pdf, SignatureWriteMode, WriteOptions,
-    SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
+    acroform_sig_flags, clear_sig_flags, remove_security_restrictions, signature_rewrite_impact,
+    strip_signature_values, write_pdf, write_pdf_with_options, Object, ObjectRef, Pdf,
+    SignatureWriteMode, WriteOptions, SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -209,6 +209,65 @@ fn build_acroform_non_dict_inline_pdf() -> Vec<u8> {
     build_pdf(&objects)
 }
 
+/// Catalog with both a `/Perms` dictionary and an indirect `/AcroForm` that
+/// carries `/SigFlags 3`, exercising the combined Perms-drop + SigFlags-zero path.
+fn build_perms_and_acroform_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /Perms << /DocMDP 5 0 R >> /AcroForm 4 0 R >>",
+        ),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>"),
+        (4, b"<< /Fields [] /SigFlags 3 >>"),
+        (5, b"<< /Type /Sig /ByteRange [0 10 20 30] >>"),
+    ];
+    build_pdf(&objects)
+}
+
+/// Catalog with a `/Perms` dictionary but no `/AcroForm`, exercising the
+/// Perms-drop path when there is no signature form to touch.
+fn build_perms_docmdp_only_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /Perms << /DocMDP 4 0 R >> >>",
+        ),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>"),
+        (4, b"<< /Type /Sig /ByteRange [0 10 20 30] >>"),
+    ];
+    build_pdf(&objects)
+}
+
+/// Catalog `/Root` resolves to a non-dictionary object, exercising the guard
+/// that bails out when the catalog is not a dictionary.
+fn build_nondict_root_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, &[u8])> = vec![(1, b"[1 2 3]")];
+    build_pdf(&objects)
+}
+
+/// Trailer without a `/Root`, so `root_ref()` is `None` and removal is a no-op.
+fn build_no_root_pdf() -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let off1 = out.len() as u64;
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref_pos = out.len() as u64;
+    out.extend_from_slice(
+        format!(
+            "xref\n0 2\n0000000000 65535 f \n{off1:010} 00000 n \ntrailer\n<< /Size 2 >>\nstartxref\n{xref_pos}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    out
+}
+
 fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
 }
@@ -408,4 +467,53 @@ fn clear_sig_flags_clears_inline_acroform_without_clobbering_catalog() {
         catalog.get("Pages"),
         Some(&Object::Reference(ObjectRef::new(2, 0)))
     );
+}
+
+#[test]
+fn remove_security_restrictions_drops_perms_and_zeros_sigflags() {
+    let mut pdf = open(build_perms_and_acroform_pdf());
+    assert!(remove_security_restrictions(&mut pdf).unwrap());
+    let root_ref = pdf.root_ref().unwrap();
+    let Object::Dictionary(cat) = pdf.resolve(root_ref).unwrap() else {
+        panic!("catalog")
+    };
+    assert!(cat.get("Perms").is_none(), "/Perms must be removed");
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
+}
+
+#[test]
+fn remove_security_restrictions_removes_perms_when_acroform_absent() {
+    let mut pdf = open(build_perms_docmdp_only_pdf());
+    assert!(remove_security_restrictions(&mut pdf).unwrap());
+    let root_ref = pdf.root_ref().unwrap();
+    let Object::Dictionary(cat) = pdf.resolve(root_ref).unwrap() else {
+        panic!("catalog")
+    };
+    assert!(cat.get("Perms").is_none());
+}
+
+#[test]
+fn remove_security_restrictions_is_noop_without_perms_or_sigflags() {
+    let mut pdf = open(build_unsigned_pdf());
+    assert!(!remove_security_restrictions(&mut pdf).unwrap());
+}
+
+#[test]
+fn remove_security_restrictions_zeros_sigflags_without_perms() {
+    // AcroForm /SigFlags present but no catalog /Perms -> changed via SigFlags only.
+    let mut pdf = open(build_signed_acroform_pdf());
+    assert!(remove_security_restrictions(&mut pdf).unwrap());
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
+}
+
+#[test]
+fn remove_security_restrictions_is_noop_when_root_missing() {
+    let mut pdf = open(build_no_root_pdf());
+    assert!(!remove_security_restrictions(&mut pdf).unwrap());
+}
+
+#[test]
+fn remove_security_restrictions_is_noop_when_root_not_dictionary() {
+    let mut pdf = open(build_nondict_root_pdf());
+    assert!(!remove_security_restrictions(&mut pdf).unwrap());
 }
