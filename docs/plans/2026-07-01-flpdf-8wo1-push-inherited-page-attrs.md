@@ -564,6 +564,101 @@ git add crates/flpdf/src/linearization/inherited_attrs.rs
 git commit -m "feat(linearize): mint shared indirect object for direct non-scalar inherited values (flpdf-8wo1)"
 ```
 
+**Step 6 (added after this task's own spec review flagged it): key iteration order must match
+qpdf's, and needs its own test**
+
+`INHERITABLE_KEYS`'s declaration order (`MediaBox, CropBox, Resources, Rotate`, set in Task 1) does
+NOT match qpdf's actual iteration order. qpdf's `Pages::items` is a `std::map<std::string,
+QPDFObjectHandle>` (`QPDF_Dictionary` — `libqpdf/qpdf/QPDFObject_private.hh`), so
+`cur_pages.getKeys()` (`QPDF_pages.cc:346`) visits inheritable keys alphabetically:
+`CropBox, MediaBox, Resources, Rotate`. This matters for real output bytes, not just style: when a
+single `/Pages` node needs to mint more than one direct non-scalar value in the same visit, mint
+order determines which new object gets the lower number, and
+`crates/flpdf/src/linearization/plan.rs:987` sorts Part-3 objects by number — so a wrong mint order
+puts different content at the same output position relative to qpdf.
+
+Fix `INHERITABLE_KEYS` to alphabetical order:
+
+```rust
+// Alphabetical order, matching qpdf's own iteration order: `Pages::items` is a
+// `std::map<std::string, QPDFObjectHandle>` (QPDF_Dictionary, QPDF_pages.cc),
+// so `cur_pages.getKeys()` visits inheritable keys as CropBox, MediaBox,
+// Resources, Rotate. When a single node needs to mint more than one of these
+// in the same visit (direct, non-indirect values), the mint order — and thus
+// which new object number each gets — must match qpdf's, so this array is
+// kept in that same order rather than declaration-convenient order.
+const INHERITABLE_KEYS: [&[u8]; 4] = [b"CropBox", b"MediaBox", b"Resources", b"Rotate"];
+```
+
+Then add a dedicated test proving the order (mirror `pdf_with_inherited_direct_resources`'s shape:
+one `/Pages` node, one `/Page` leaf, but now with TWO direct non-scalar keys on the Pages node):
+
+```rust
+    /// `/Pages` (2) has BOTH a direct `/CropBox` array and a direct `/MediaBox`
+    /// array (both non-scalar, both need minting). `/Page` (3) has neither.
+    /// qpdf mints in alphabetical key order (CropBox before MediaBox), so the
+    /// CropBox object must get the lower object number.
+    fn pdf_with_two_direct_non_scalar_keys_on_one_node() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 \
+              /CropBox [0 0 100 100] /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn multiple_direct_non_scalar_keys_mint_in_qpdf_alphabetical_order() {
+        let bytes = pdf_with_two_direct_non_scalar_keys_on_one_node();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary");
+        };
+        let Some(Object::Reference(crop_ref)) = leaf_dict.get("CropBox") else {
+            panic!("/CropBox must be pushed as an indirect reference");
+        };
+        let Some(Object::Reference(media_ref)) = leaf_dict.get("MediaBox") else {
+            panic!("/MediaBox must be pushed as an indirect reference");
+        };
+        assert!(
+            crop_ref.number < media_ref.number,
+            "/CropBox must mint before /MediaBox (qpdf's alphabetical getKeys() \
+             order), got CropBox={crop_ref} MediaBox={media_ref}"
+        );
+    }
+```
+
+Run: `cargo test -p flpdf --lib inherited_attrs:: -- --nocapture` — expect 4 passed; 0 failed.
+Commit:
+
+```bash
+git add crates/flpdf/src/linearization/inherited_attrs.rs
+git commit -m "fix(linearize): order INHERITABLE_KEYS alphabetically to match qpdf's dict-key iteration (flpdf-8wo1)"
+```
+
 ---
 
 ### Task 4: Already-indirect values are reused, not re-minted

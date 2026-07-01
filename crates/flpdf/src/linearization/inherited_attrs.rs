@@ -368,4 +368,60 @@ mod tests {
             "the minted object must carry the original /Resources content"
         );
     }
+
+    /// `/Pages` (2) has BOTH a direct `/CropBox` array and a direct `/MediaBox`
+    /// array (both non-scalar, both need minting). `/Page` (3) has neither.
+    /// qpdf mints in alphabetical key order (CropBox before MediaBox), so the
+    /// CropBox object must get the lower object number.
+    fn pdf_with_two_direct_non_scalar_keys_on_one_node() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 \
+              /CropBox [0 0 100 100] /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn multiple_direct_non_scalar_keys_mint_in_qpdf_alphabetical_order() {
+        let bytes = pdf_with_two_direct_non_scalar_keys_on_one_node();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary");
+        };
+        let Some(Object::Reference(crop_ref)) = leaf_dict.get("CropBox") else {
+            panic!("/CropBox must be pushed as an indirect reference");
+        };
+        let Some(Object::Reference(media_ref)) = leaf_dict.get("MediaBox") else {
+            panic!("/MediaBox must be pushed as an indirect reference");
+        };
+        assert!(
+            crop_ref.number < media_ref.number,
+            "/CropBox must mint before /MediaBox (qpdf's alphabetical getKeys() \
+             order), got CropBox={crop_ref} MediaBox={media_ref}"
+        );
+    }
 }
