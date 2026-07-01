@@ -145,7 +145,11 @@ fn push_internal<R: Read + Seek>(
             if stack.is_empty() {
                 key_ancestors.remove(key);
             }
-        }
+        } // cov:ignore: unreachable — `own_keys` holds exactly the keys this
+          // frame pushed onto `key_ancestors` above; every nested `push_internal`
+          // call pops what it pushes before returning (balanced push/pop) and
+          // any early `?` return skips this cleanup loop entirely, so the
+          // stack for a key in `own_keys` is always still present here.
     }
     Ok(())
 }
@@ -214,7 +218,7 @@ mod tests {
         );
         let page = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
         let Object::Dictionary(page_dict) = page else {
-            panic!("page is not a dictionary");
+            panic!("page is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert!(
             page_dict.get("MediaBox").is_some(),
@@ -269,7 +273,7 @@ mod tests {
 
         let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
         let Object::Dictionary(pages_dict) = pages else {
-            panic!("pages is not a dictionary");
+            panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert!(
             pages_dict.get("Rotate").is_none(),
@@ -278,7 +282,7 @@ mod tests {
 
         let page = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
         let Object::Dictionary(page_dict) = page else {
-            panic!("page is not a dictionary");
+            panic!("page is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(
             page_dict.get("Rotate"),
@@ -341,7 +345,7 @@ mod tests {
 
         let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
         let Object::Dictionary(pages_dict) = pages else {
-            panic!("pages is not a dictionary");
+            panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert!(
             pages_dict.get("Resources").is_none(),
@@ -350,10 +354,12 @@ mod tests {
 
         let page = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
         let Object::Dictionary(page_dict) = page else {
-            panic!("page is not a dictionary");
+            panic!("page is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         let Some(Object::Reference(resources_ref)) = page_dict.get("Resources") else {
+            // cov:ignore-start: unreachable — fixture always resolves to the expected type
             panic!("/Resources must be pushed to the leaf as an indirect reference, not inline");
+            // cov:ignore-end
         };
         assert_eq!(
             resources_ref.number, 5,
@@ -361,7 +367,7 @@ mod tests {
         );
         let minted = pdf.resolve(*resources_ref).expect("minted object resolves");
         let Object::Dictionary(minted_dict) = minted else {
-            panic!("minted object is not a dictionary");
+            panic!("minted object is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert!(
             minted_dict.get("Font").is_some(),
@@ -410,13 +416,13 @@ mod tests {
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
-            panic!("leaf is not a dictionary");
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         let Some(Object::Reference(crop_ref)) = leaf_dict.get("CropBox") else {
-            panic!("/CropBox must be pushed as an indirect reference");
+            panic!("/CropBox must be pushed as an indirect reference"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         let Some(Object::Reference(media_ref)) = leaf_dict.get("MediaBox") else {
-            panic!("/MediaBox must be pushed as an indirect reference");
+            panic!("/MediaBox must be pushed as an indirect reference"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert!(
             crop_ref.number < media_ref.number,
@@ -493,7 +499,7 @@ mod tests {
                 .resolve(ObjectRef::new(page_num, 0))
                 .unwrap_or_else(|e| panic!("page {page_num} resolves: {e}"));
             let Object::Dictionary(page_dict) = page else {
-                panic!("page {page_num} is not a dictionary");
+                panic!("page {page_num} is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
             };
             assert_eq!(
                 page_dict.get("Resources"),
@@ -558,7 +564,7 @@ mod tests {
 
         let page = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
         let Object::Dictionary(page_dict) = page else {
-            panic!("page is not a dictionary");
+            panic!("page is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(
             page_dict.get("Resources"),
@@ -632,7 +638,7 @@ mod tests {
 
         let leaf = pdf.resolve(ObjectRef::new(6, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
-            panic!("leaf is not a dictionary");
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(
             leaf_dict.get("Resources"),
@@ -646,13 +652,13 @@ mod tests {
             .resolve(ObjectRef::new(2, 0))
             .expect("grandparent resolves");
         let Object::Dictionary(gp_dict) = grandparent else {
-            panic!("grandparent is not a dictionary");
+            panic!("grandparent is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert!(gp_dict.get("Resources").is_none());
 
         let parent = pdf.resolve(ObjectRef::new(3, 0)).expect("parent resolves");
         let Object::Dictionary(parent_dict) = parent else {
-            panic!("parent is not a dictionary");
+            panic!("parent is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert!(parent_dict.get("Resources").is_none());
     }
@@ -738,6 +744,150 @@ mod tests {
         );
     }
 
+    /// Trailer has no `/Root` entry at all. `push_inherited_attributes_to_pages`
+    /// must bail out via its very first guard (`pdf.root_ref()` returns `None`).
+    fn pdf_without_root() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 2 >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn missing_root_is_a_no_op() {
+        let bytes = pdf_without_root();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF even without /Root");
+        assert!(
+            pdf.root_ref().is_none(),
+            "fixture must have no /Root for this test to be meaningful"
+        );
+
+        let result = push_inherited_attributes_to_pages(&mut pdf);
+        assert!(
+            result.is_ok(),
+            "a document with no /Root must be a no-op, not an error: {result:?}"
+        );
+    }
+
+    /// `/Root` (1) itself resolves to a non-dictionary object (a bare integer),
+    /// rather than a Catalog. `push_inherited_attributes_to_pages` must bail out
+    /// via its "root did not resolve to a dictionary" match arm.
+    fn pdf_with_non_dictionary_root() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n42\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn non_dictionary_root_is_a_no_op() {
+        let bytes = pdf_with_non_dictionary_root();
+        let mut pdf =
+            Pdf::open(Cursor::new(bytes)).expect("valid PDF even with a non-dictionary /Root");
+
+        let result = push_inherited_attributes_to_pages(&mut pdf);
+        assert!(
+            result.is_ok(),
+            "a non-dictionary /Root must be a no-op, not an error: {result:?}"
+        );
+    }
+
+    /// `/Root` (1) is a dictionary (a Catalog) but has no `/Pages` key at all.
+    /// `push_inherited_attributes_to_pages` must bail out via the "no /Pages
+    /// entry" branch, distinct from the non-dictionary-root case above.
+    fn pdf_with_root_missing_pages_key() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn root_dict_without_pages_key_is_a_no_op() {
+        let bytes = pdf_with_root_missing_pages_key();
+        let mut pdf =
+            Pdf::open(Cursor::new(bytes)).expect("valid PDF even with /Root lacking /Pages");
+
+        let result = push_inherited_attributes_to_pages(&mut pdf);
+        assert!(
+            result.is_ok(),
+            "a /Root dictionary with no /Pages key must be a no-op, not an error: {result:?}"
+        );
+    }
+
+    /// The root `/Pages` node (2) carries an inheritable key (`/Rotate`) but has
+    /// no `/Kids` entry at all (malformed — every `/Pages` node must have one).
+    /// The walk must still strip `/Rotate` from the node and return `Ok`, not
+    /// panic, even though there are no children to push it to.
+    fn pdf_with_pages_node_missing_kids() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Rotate 90 >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn pages_node_without_kids_is_a_no_op_not_a_panic() {
+        let bytes = pdf_with_pages_node_missing_kids();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        let result = push_inherited_attributes_to_pages(&mut pdf);
+        assert!(
+            result.is_ok(),
+            "a /Pages node without /Kids must be a no-op, not an error: {result:?}"
+        );
+
+        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        assert!(
+            matches!(&pages, Object::Dictionary(d) if d.get("Rotate").is_none()),
+            "/Rotate must still be stripped from the /Pages node even with no \
+             /Kids to push it to: {pages:?}"
+        );
+    }
+
     /// `/Pages` (2)'s `/Kids` mixes a direct (non-reference) entry (`42`), a
     /// reference to a non-dictionary object (3, a literal string), and one
     /// real `/Page` leaf (4). Both malformed entries must be skipped; the
@@ -784,7 +934,7 @@ mod tests {
 
         let leaf = pdf.resolve(ObjectRef::new(4, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
-            panic!("leaf is not a dictionary");
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(
             leaf_dict.get("Rotate"),
