@@ -1034,6 +1034,61 @@ mod tests {
         );
     }
 
+    /// `/Pages` (2) has a scalar `/Rotate 90`. Leaf `/Page` (3) has its OWN
+    /// direct, non-null, non-reference `/Rotate 270` — the `Some(_) => true`
+    /// branch of the leaf-presence check (distinct from
+    /// [`leaf_local_value_is_never_overwritten`], whose leaf override is an
+    /// indirect reference and so exercises the `Object::Reference` arm
+    /// instead).
+    fn pdf_with_leaf_direct_scalar_override() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /Rotate 90 >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Rotate 270 >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn leaf_direct_scalar_override_is_never_overwritten() {
+        let bytes = pdf_with_leaf_direct_scalar_override();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            leaf_dict.get("Rotate"),
+            Some(&Object::Integer(270)),
+            "the leaf's own direct (non-reference, non-null) /Rotate must win \
+             over the ancestor's /Rotate 90"
+        );
+    }
+
     /// `/Pages` (2) has `/Resources` (4 0 R). Leaf `/Page` (3) has its own
     /// `/Resources` set to a DIRECT `null` (not absent). qpdf's `contains()`
     /// (`!(*this)[key].null()`) treats a null value the same as absent, so
@@ -1087,7 +1142,7 @@ mod tests {
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
-            panic!("leaf is not a dictionary");
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(
             leaf_dict.get("Resources"),
@@ -1154,7 +1209,7 @@ mod tests {
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
-            panic!("leaf is not a dictionary");
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(
             leaf_dict.get("Resources"),
@@ -1208,7 +1263,7 @@ mod tests {
             .resolve(ObjectRef::new(2, 0))
             .expect("root page resolves");
         let Object::Dictionary(root_page_dict) = root_page else {
-            panic!("root page is not a dictionary");
+            panic!("root page is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(
             root_page_dict.get("MediaBox"),
