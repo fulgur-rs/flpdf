@@ -713,6 +713,16 @@ impl LinearizationPlan {
         pdf: &mut Pdf<R>,
         use_generate_objstm: bool,
     ) -> crate::Result<Self> {
+        // Push inherited page attributes (/MediaBox /CropBox /Resources
+        // /Rotate) down to /Page leaves and strip them from interior /Pages
+        // nodes, mirroring qpdf's pushInheritedAttributesToPage — this always
+        // runs for linearized output (QPDF_linearization.cc:127-130, called
+        // only from QPDFWriter::writeLinearized). Must run before every step
+        // below: closure computation and object-ref collection both need to
+        // see the already-pushed tree, and any newly minted object must
+        // already exist by the time `pdf.object_refs()` is captured.
+        crate::linearization::inherited_attrs::push_inherited_attributes_to_pages(pdf)?;
+
         // ----------------------------------------------------------------
         // Step 1: collect all known object refs (Part 4 initial state).
         // The free-list head at object 0 is excluded per ISO 32000-1 §7.5.4.
