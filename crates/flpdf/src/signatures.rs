@@ -281,11 +281,10 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
 ///
 /// 1. Calls [`remove_security_restrictions`] (drop catalog `/Perms`, zero
 ///    `/AcroForm /SigFlags`).
-/// 2. Enumerates the document's AcroForm form fields exactly like qpdf's
-///    `getFormFields` (its `analyze`/`traverseField` field map): terminal
-///    annotation-fields discovered while walking `/AcroForm /Fields`, plus
-///    orphan `/Subtype /Widget` annotations found on page `/Annots` that were
-///    not associated with any field during that walk.
+/// 2. Enumerates the document's AcroForm form fields the way qpdf's
+///    `getFormFields` does: terminal annotation-fields discovered while walking
+///    `/AcroForm /Fields`, plus orphan `/Subtype /Widget` annotations on page
+///    `/Annots` that were not associated with a field during that walk.
 /// 3. For every enumerated form field whose inherited `/FT` is `/Sig`, removes
 ///    `/FT`, `/V`, `/SV`, and `/Lock` (the field name `/T` is preserved) and
 ///    deletes the now-orphaned signature dictionary referenced by `/V`.

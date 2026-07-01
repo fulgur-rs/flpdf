@@ -2,14 +2,31 @@
 //! `qpdf --remove-restrictions --static-id`.
 //!
 //! Proves flpdf's `--remove-restrictions` signature handling is a byte-for-byte
-//! faithful port of qpdf 11.9.0's `QPDFAcroFormDocumentHelper::disableDigitalSignatures`
-//! across the three cases qpdf distinguishes:
+//! faithful port of qpdf 11.9.0's `QPDFAcroFormDocumentHelper::disableDigitalSignatures`.
+//!
+//! The three common cases:
 //!   1. catalog `/Perms /DocMDP` only (no `/AcroForm`) -> `/Perms` removed, sig GC'd;
 //!   2. AcroForm `/Sig` field not referenced from a page `/Annots` -> `/Fields`
 //!      emptied, field + sig dict GC'd, `/SigFlags` 0;
 //!   3. AcroForm `/Sig` field also referenced from `/Annots` (merged widget) ->
 //!      `/Fields` emptied, widget survives as a plain annotation (`/FT`/`/V`
 //!      stripped, `/T` kept), sig dict GC'd, `/SigFlags` 0.
+//!
+//! Plus five `getFormFields` edge cases that decide which `/Sig` fields are
+//! disabled:
+//!   4. non-terminal `/Sig` parent grouping a widget via `/Kids` -> signature
+//!      kept (only the widget is a field; the parent carries no signature keys),
+//!      only `/SigFlags` zeroed;
+//!   5. terminal `/Sig` field that is not an annotation (no `/Rect`/`/Subtype`/
+//!      `/AP`) -> not a form field, signature kept, only `/SigFlags` zeroed;
+//!   6. `/FT /Sig` widget on a page `/Annots` but absent from `/Fields` ->
+//!      discovered by the orphan-widget pass and disabled (`/FT`/`/V` removed,
+//!      sig dict GC'd);
+//!   7. unsigned `/FT /Sig` widget (no `/V`, no `/SigFlags`) -> still a form
+//!      field, `/FT` removed and erased from `/Fields` (widget survives);
+//!   8. `/Sig` parent whose `/Kids` holds a pure widget (no `/Parent`, no `/T`)
+//!      -> the parent is the owning field: disabled and erased from `/Fields`
+//!      (parent then GC'd).
 //!
 //! These fixtures are content-stream-free, so byte-identity is independent of the
 //! deflate backend — this file is NOT gated on `qpdf-zlib-compat`.

@@ -10,6 +10,11 @@ use std::io::Write;
 mod common;
 use common::first_widget_ref;
 
+/// `true` when `needle` appears as a contiguous byte subslice of `hay`.
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
 #[test]
 fn check_valid_fixture_exits_successfully() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
@@ -210,17 +215,15 @@ fn rewrite_remove_restrictions_strips_signatures_and_warns() {
 
     let output_bytes = std::fs::read(&output).unwrap();
     assert!(
-        !output_bytes.windows(3).any(|window| window == b"/V "),
+        !contains(&output_bytes, b"/V "),
         "signature field /V entries must be removed"
     );
     assert!(
-        !output_bytes.windows(3).any(|window| window == b"/FT"),
+        !contains(&output_bytes, b"/FT"),
         "signature field /FT entries must be removed (field object GC'd)"
     );
     assert!(
-        !output_bytes
-            .windows(b"/ByteRange".len())
-            .any(|window| window == b"/ByteRange"),
+        !contains(&output_bytes, b"/ByteRange"),
         "orphaned signature dictionaries must be removed"
     );
 }
@@ -251,13 +254,11 @@ fn rewrite_linearize_remove_restrictions_strips_signatures_and_warns() {
 
     let output_bytes = std::fs::read(&output).unwrap();
     assert!(
-        !output_bytes.windows(3).any(|window| window == b"/V "),
+        !contains(&output_bytes, b"/V "),
         "linearized signature field /V entries must be removed"
     );
     assert!(
-        !output_bytes
-            .windows(b"/ByteRange".len())
-            .any(|window| window == b"/ByteRange"),
+        !contains(&output_bytes, b"/ByteRange"),
         "linearized output must remove orphaned signature dictionaries"
     );
 }
@@ -281,7 +282,7 @@ fn rewrite_linearize_remove_restrictions_strips_docmdp_perms() {
     let output_bytes = std::fs::read(&output).unwrap();
     for tok in [&b"/Perms"[..], &b"/DocMDP"[..], &b"/ByteRange"[..]] {
         assert!(
-            !output_bytes.windows(tok.len()).any(|w| w == tok),
+            !contains(&output_bytes, tok),
             "linearized --remove-restrictions must drop {:?}",
             std::str::from_utf8(tok).unwrap()
         );
@@ -309,13 +310,9 @@ fn rewrite_linearize_remove_restrictions_keeps_widget_annotation() {
 
     let output_bytes = std::fs::read(&output).unwrap();
     // Widget annotation survives (reachable from page /Annots) ...
-    assert!(output_bytes
-        .windows(b"/Widget".len())
-        .any(|w| w == b"/Widget"));
+    assert!(contains(&output_bytes, b"/Widget"));
     // ... but its signature keys are gone.
-    assert!(!output_bytes
-        .windows(b"/ByteRange".len())
-        .any(|w| w == b"/ByteRange"));
+    assert!(!contains(&output_bytes, b"/ByteRange"));
 
     let file = File::open(&output).unwrap();
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
@@ -357,21 +354,15 @@ fn rewrite_remove_restrictions_strips_docmdp_perms_and_warns() {
 
     let output_bytes = std::fs::read(&output).unwrap();
     assert!(
-        !output_bytes
-            .windows(b"/Perms".len())
-            .any(|window| window == b"/Perms"),
+        !contains(&output_bytes, b"/Perms"),
         "catalog /Perms must be removed"
     );
     assert!(
-        !output_bytes
-            .windows(b"/DocMDP".len())
-            .any(|window| window == b"/DocMDP"),
+        !contains(&output_bytes, b"/DocMDP"),
         "the /DocMDP dictionary must be removed with /Perms"
     );
     assert!(
-        !output_bytes
-            .windows(b"/ByteRange".len())
-            .any(|window| window == b"/ByteRange"),
+        !contains(&output_bytes, b"/ByteRange"),
         "the orphaned DocMDP signature dictionary must be garbage-collected"
     );
 }
@@ -412,26 +403,20 @@ fn rewrite_remove_restrictions_keeps_widget_annotation() {
     let output_bytes = std::fs::read(&output).unwrap();
     // The widget annotation survives (still referenced from the page /Annots)...
     assert!(
-        output_bytes
-            .windows(b"/Subtype /Widget".len())
-            .any(|window| window == b"/Subtype /Widget"),
+        contains(&output_bytes, b"/Subtype /Widget"),
         "the widget annotation must survive as a page annotation"
     );
     assert!(
-        output_bytes
-            .windows(b"/T (Approval)".len())
-            .any(|window| window == b"/T (Approval)"),
+        contains(&output_bytes, b"/T (Approval)"),
         "the surviving widget must keep its /T field name"
     );
     // ...but its signature identity is stripped.
     assert!(
-        !output_bytes.windows(3).any(|window| window == b"/FT"),
+        !contains(&output_bytes, b"/FT"),
         "the surviving widget must lose its /FT (signature field type)"
     );
     assert!(
-        !output_bytes
-            .windows(b"/ByteRange".len())
-            .any(|window| window == b"/ByteRange"),
+        !contains(&output_bytes, b"/ByteRange"),
         "the orphaned signature dictionary must be garbage-collected"
     );
 }
@@ -1371,10 +1356,10 @@ fn signed_acroform_pdf() -> Vec<u8> {
 }
 
 /// A certified PDF whose only signature lives in the catalog `/Perms /DocMDP`
-/// dictionary — there is NO `/AcroForm`. This exercises the catalog-`/Perms`
-/// detection branch of `pdf_has_signature_evidence`. The DocMDP signature is
-/// obj 4 (referenced only via `/Perms`), so dropping `/Perms` orphans it and it
-/// is garbage-collected on the full rewrite.
+/// dictionary — there is NO `/AcroForm`. `--remove-restrictions` drops `/Perms`
+/// unconditionally (matching qpdf's `removeSecurityRestrictions`), orphaning the
+/// DocMDP signature dict (obj 4, referenced only via `/Perms`) so it is
+/// garbage-collected on the full rewrite.
 fn signed_perms_docmdp_pdf() -> Vec<u8> {
     let objects: Vec<&[u8]> = vec![
         b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Perms << /DocMDP 4 0 R >> >>\nendobj\n",

@@ -18,7 +18,7 @@
 
 ---
 
-## Task 1: 3 fixture + qpdf golden を追加 (検証インフラの前提)
+### Task 1: 3 fixture + qpdf golden を追加 (検証インフラの前提)
 
 **Files:**
 - Modify: `tests/golden/regenerate.sh` (Phase 1 に fixture 生成, Phase 2 に golden 生成)
@@ -135,7 +135,7 @@ git commit -m "test(hn1g.15): add /Perms-DocMDP + AcroForm-sig fixtures and qpdf
 
 ---
 
-## Task 2: ライブラリ `remove_security_restrictions` (qpdf QPDF::removeSecurityRestrictions)
+### Task 2: ライブラリ `remove_security_restrictions` (qpdf QPDF::removeSecurityRestrictions)
 
 **Files:**
 - Modify: `crates/flpdf/src/signatures.rs` (新 pub fn 追加; `resolve_catalog_acroform` / `AcroformHome` 再利用)
@@ -223,7 +223,7 @@ git commit -m "feat(signatures): add remove_security_restrictions (qpdf QPDF::re
 
 ---
 
-## Task 3: ライブラリ `disable_digital_signatures` (qpdf disableDigitalSignatures)
+### Task 3: ライブラリ `disable_digital_signatures` (qpdf disableDigitalSignatures)
 
 **Files:**
 - Modify: `crates/flpdf/src/signatures.rs` (新 pub fn + 内部 walker `disable_sig_field` + `erase_fields_from_acroform`)
@@ -334,7 +334,7 @@ git commit -m "feat(signatures): add disable_digital_signatures (qpdf disableDig
 
 ---
 
-## Task 4: CLI 配線 — 検出拡張 + 新関数への置換
+### Task 4: CLI 配線 — 検出拡張 + 新関数への置換
 
 **Files:**
 - Modify: `crates/flpdf-cli/src/main.rs` (`pdf_has_signature_evidence` ~3177, 2 経路 ~2925-2935 / ~2954-2970)
@@ -381,7 +381,7 @@ git commit -m "fix(cli): --remove-restrictions detects catalog /Perms + uses dis
 
 ---
 
-## Task 5: byte-identity oracle テスト (capstone, 3 ケース)
+### Task 5: byte-identity oracle テスト (capstone, 3 ケース)
 
 **Files:**
 - Create: `crates/flpdf/tests/remove_restrictions_qpdf_parity.rs`
@@ -442,7 +442,7 @@ git commit -m "test(hn1g.15): byte-identity vs qpdf --remove-restrictions for /P
 
 ---
 
-## Task 6: CLI behavioral テスト (DocMDP + merged widget) + 既存テスト補強
+### Task 6: CLI behavioral テスト (DocMDP + merged widget) + 既存テスト補強
 
 **Files:**
 - Modify: `crates/flpdf-cli/tests/cli_tests.rs` (fixture builder + 新テスト)
@@ -466,7 +466,7 @@ git commit -m "test(cli): --remove-restrictions DocMDP /Perms + merged-widget su
 
 ---
 
-## Task 7: 品質ゲート (PR 作成前)
+### Task 7: 品質ゲート (PR 作成前)
 
 **Step 1:** worktree を commit 済みにする (patch-coverage は HEAD を diff)。
 **Step 2:** patch-coverage:
