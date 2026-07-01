@@ -11,7 +11,7 @@ use flpdf::{
     thread_bead_p::drop_thread_bead_dangling_p, InputSpec, PageRange, RotateSpec,
 };
 use flpdf::{
-    acroform_sig_flags, clear_sig_flags, strip_signature_values, SIG_FLAGS_APPEND_ONLY,
+    acroform_sig_flags, disable_digital_signatures, SIG_FLAGS_APPEND_ONLY,
     SIG_FLAGS_SIGNATURES_EXIST,
 };
 use flpdf::{
@@ -2930,8 +2930,7 @@ fn run_rewrite(
         let mut options = options;
         if had_signatures {
             options.full_rewrite = true;
-            clear_sig_flags(&mut pdf2)?;
-            strip_signature_values(&mut pdf2)?;
+            disable_digital_signatures(&mut pdf2)?;
         }
         let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &options)?;
         doc.back_patch()?;
@@ -2962,11 +2961,13 @@ fn run_rewrite(
         }
         if had_signatures {
             options.full_rewrite = true;
-            // --remove-restrictions intentionally clears signature protection:
-            // strip_signature_values removes each field's /V (preserving the
-            // /FT /Sig field dictionary) and clear_sig_flags clears /SigFlags.
-            clear_sig_flags(&mut pdf)?;
-            strip_signature_values(&mut pdf)?;
+            // --remove-restrictions mirrors qpdf's disableDigitalSignatures:
+            // remove catalog /Perms, zero /AcroForm /SigFlags, strip /FT /V /SV
+            // /Lock from /Sig fields, and erase them from the top-level /Fields
+            // array (a field still reachable from a page /Annots survives as a
+            // plain annotation; orphaned signature dicts are dropped by the
+            // full-rewrite GC).
+            disable_digital_signatures(&mut pdf)?;
         }
 
         // ── Content mutation pass ─────────────────────────────────────────────
@@ -3177,7 +3178,21 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
 fn pdf_has_signature_evidence<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<bool> {
     let has_sig_flags = acroform_sig_flags(pdf)?
         .is_some_and(|flags| flags & (SIG_FLAGS_SIGNATURES_EXIST | SIG_FLAGS_APPEND_ONLY) != 0);
-    Ok(has_sig_flags || !pdf.signatures()?.is_empty())
+    if has_sig_flags || !pdf.signatures()?.is_empty() {
+        return Ok(true);
+    }
+    // A certification signature can live only in the catalog /Perms /DocMDP
+    // dictionary with no /AcroForm evidence. qpdf --remove-restrictions removes
+    // /Perms unconditionally (QPDF::removeSecurityRestrictions), so detect it
+    // here too. /DSS is intentionally NOT treated as evidence: qpdf does not
+    // strip it, so a /DSS-only document must not trigger the (destructive)
+    // signature-removal path or its "signatures invalidated" warning.
+    if let Some(root_ref) = pdf.root_ref() {
+        if let Object::Dictionary(catalog) = pdf.resolve(root_ref)? {
+            return Ok(catalog.get("Perms").is_some());
+        }
+    }
+    Ok(false)
 }
 
 // ===========================================================================
