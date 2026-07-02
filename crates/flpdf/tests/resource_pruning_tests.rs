@@ -1750,6 +1750,79 @@ fn test_aliased_refs_to_same_terminal_pruned_consistently() {
     );
 }
 
+// A resource-less Form reached under TWO scopes that resolve its nested `Do`
+// name differently must contribute BOTH scopes' names. Keying `visited` on the
+// Form alone (ignoring scope) would mark it seen on the first reach and skip the
+// second, over-pruning a resource the page renders. (flpdf-u79t / Codex review
+// r3516069927 of PR #442.)
+//
+// Layout: page content `/Fa Do /Fx Do`.
+//   - Fa (6) has its own /Resources mapping only /Fx.  Content: `/Fx Do`.
+//   - Fx (7) is resource-less.  Content: `/G Do`.
+//   - Page /XObject maps /G to Form 8, which uses page font /F1.
+// Under Fa's scope, Fx's `/G` does not resolve (Fa lacks /G); only under the
+// PAGE scope does `/G` reach Form 8 and its /F1. Verified with qpdf 11.9.0
+// (--remove-unreferenced-resources=yes) which keeps /F1.
+#[test]
+fn test_resource_less_form_two_scopes_diverging_do_keeps_page_font() {
+    let form_obj = |num: u32, extra: &str, body: &[u8]| -> Vec<u8> {
+        let mut v = format!(
+            "{num} 0 obj\n<< /Subtype /Form {extra}/Length {} >>\nstream\n",
+            body.len()
+        )
+        .into_bytes();
+        v.extend_from_slice(body);
+        v.extend_from_slice(b"\nendstream\nendobj\n");
+        v
+    };
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Fa Do /Fx Do")),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> >> \
+                   /XObject << /Fa 6 0 R /Fx 7 0 R /G 8 0 R >> >>",
+            ),
+        ),
+        // Fa: own /Resources maps only /Fx; invokes /Fx.
+        (
+            6,
+            form_obj(6, "/Resources << /XObject << /Fx 7 0 R >> >> ", b"/Fx Do"),
+        ),
+        // Fx: resource-less; invokes /G.
+        (7, form_obj(7, "", b"/G Do")),
+        // G: resource-less; uses page font /F1.
+        (8, form_obj(8, "", b"BT /F1 10 Tf (g) Tj ET")),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open scope-divergent PDF");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
+    else {
+        panic!("5 0 R is not a dictionary");
+    };
+    let Some(Object::Dictionary(font_dict)) = res_dict.get("Font") else {
+        panic!("/Font must survive: the page's /Fx Do -> /G Do -> Form 8 uses /F1");
+    };
+    assert!(
+        font_dict.get("F1").is_some(),
+        "/F1 must be kept — reachable only via Fx under the PAGE scope, which a \
+         Form-only visited key would skip after Fx is seen under Fa: {font_dict:?}"
+    );
+}
+
 #[test]
 fn test_roborev3_indirect_xobject_category_form_recurse_font_kept() {
     // The /XObject *resource category* is itself an indirect reference

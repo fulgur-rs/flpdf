@@ -598,18 +598,24 @@ fn collect_used_names_for_page<R: Read + Seek>(
     let page_resources = crate::pages::resolve_inherited_resources(pdf, page_ref)?;
 
     let mut used: UsedNames = BTreeMap::new();
-    let mut visited_xobjects: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut visited_forms: BTreeSet<(ObjectRef, ObjectRef)> = BTreeSet::new();
 
     // `collect_from_stream` returns `false` when tokenisation stopped early on a
     // malformed token: the collected names are then incomplete → retain. The
-    // page records its own directly-referenced names (`record_direct = true`).
+    // page records its own directly-referenced names (`record_direct = true`) and
+    // owns the initial scope (`owner = page_ref`).
     let complete = {
         let mut ctx = CollectCtx {
             pdf,
             used: &mut used,
-            visited: &mut visited_xobjects,
+            visited: &mut visited_forms,
         };
-        collect_from_stream(&mut ctx, &content_bytes, page_resources.as_ref(), true, 0)?
+        let page_scope = Scope {
+            resources: page_resources.as_ref(),
+            record_direct: true,
+            owner: page_ref,
+        };
+        collect_from_stream(&mut ctx, &content_bytes, page_scope, 0)?
     };
 
     Ok(complete.then_some(used))
@@ -617,10 +623,10 @@ fn collect_used_names_for_page<R: Read + Seek>(
 
 /// Maximum recursion depth for Form XObject traversal.
 ///
-/// Each indirect Form XObject is expanded at most once (`visited` is an
-/// ever-seen set, matching qpdf's `QPDFObjGen::set`), so cycles and shared/DAG
-/// references cannot loop. This cap is a stack-overflow safeguard for content
-/// that nests a very long chain of *distinct* Form XObjects.
+/// Each `(Form, scope)` pair is expanded at most once (`visited` is an ever-seen
+/// set), so cycles and shared/DAG references cannot loop. This cap is a
+/// stack-overflow safeguard for content that nests a very long chain of
+/// *distinct* Form XObjects.
 const MAX_FORM_DEPTH: usize = 64;
 
 /// State threaded through the (mutually recursive) resource-name collection walk.
@@ -628,29 +634,53 @@ const MAX_FORM_DEPTH: usize = 64;
 /// Bundling the three mutable borrows carried through every level keeps each
 /// helper's parameter list short enough to stay on one line, so rustfmt does not
 /// reflow the calls across multiple lines (a reflowed `)?` closing line
-/// fragments the call's coverage region). The per-scope inputs (`resources`,
-/// `record_direct`, `depth`) vary per call and are passed separately.
+/// fragments the call's coverage region). The per-call [`Scope`] and `depth` vary
+/// per call and are passed separately.
 struct CollectCtx<'a, R: Read + Seek> {
     pdf: &'a mut Pdf<R>,
     /// The page's real used-name accumulator — the bubble target for the names
     /// of resource-less Form XObjects, wherever they sit in the Form tree.
     used: &'a mut UsedNames,
-    /// Ever-seen set of expanded indirect Form XObjects (cycle / DAG guard):
-    /// each is expanded at most once, bounding traversal to O(V+E).
-    visited: &'a mut BTreeSet<ObjectRef>,
+    /// Ever-seen set of expanded `(Form ref, scope owner)` pairs.
+    ///
+    /// A Form with its own `/Resources` resolves its names against its own scope
+    /// no matter how it is reached, so it is keyed on `(ref, ref)` and expanded
+    /// once. A resource-less Form resolves nested `Do` names against the
+    /// *inherited* scope, so it is keyed on `(ref, inherited scope owner)` and
+    /// expanded once per distinct scope it is reached under — this preserves the
+    /// same name set qpdf collects (a shared resource-less Form whose nested
+    /// names resolve differently per scope contributes each scope's names) while
+    /// still expanding each pair once. Bounded by O(V²) pairs (no exponential
+    /// blow-up); realistic documents have few distinct scopes, so it is ~O(V).
+    visited: &'a mut BTreeSet<(ObjectRef, ObjectRef)>,
+}
+
+/// The resource scope in force while walking a content stream.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    /// The `/Resources` dict that names in this stream resolve against.
+    resources: Option<&'a Dictionary>,
+    /// Whether this stream's *direct* names are page-relevant and recorded into
+    /// `ctx.used`. True for the page and resource-less Forms; false for a Form
+    /// with its own `/Resources` (its direct names are scoped to itself).
+    record_direct: bool,
+    /// Identity of the scope for `visited` keying: the page, or the `ObjectRef`
+    /// of the nearest Form with its own `/Resources`. A resource-less Form
+    /// inherits its caller's `owner`; an own-`/Resources` Form becomes its own.
+    owner: ObjectRef,
 }
 
 /// Core recursive walker: tokenises `stream_bytes` and records every resource
-/// reference into `ctx.used`. `resources` is the `/Resources` dict in scope for
-/// this stream (the page dict's or a Form XObject's).
+/// reference into `ctx.used`. `scope` is the resource scope in force for this
+/// stream (see [`Scope`]).
 ///
-/// `record_direct` controls whether names referenced *directly* by this stream
-/// are attributed to `ctx.used`. It is `true` for the page and for resource-less
-/// Form XObjects (whose names are page-relevant), and `false` for a Form with
-/// its own `/Resources` (whose direct names resolve against that Form's own
-/// scope and must not affect page-level pruning). Nested Form XObjects are still
-/// traversed regardless, so a resource-less Form nested inside an own-resources
-/// Form still contributes its names to the page.
+/// `scope.record_direct` controls whether names referenced *directly* by this
+/// stream are attributed to `ctx.used`. It is `true` for the page and for
+/// resource-less Form XObjects (whose names are page-relevant), and `false` for
+/// a Form with its own `/Resources` (whose direct names resolve against that
+/// Form's own scope and must not affect page-level pruning). Nested Form XObjects
+/// are still traversed regardless, so a resource-less Form nested inside an
+/// own-resources Form still contributes its names to the page.
 ///
 /// Returns `Ok(true)` when the stream was tokenised to the end, `Ok(false)` when
 /// tokenisation stopped early on a malformed token (so `ctx.used` is incomplete
@@ -659,8 +689,7 @@ struct CollectCtx<'a, R: Read + Seek> {
 fn collect_from_stream<R: Read + Seek>(
     ctx: &mut CollectCtx<'_, R>,
     stream_bytes: &[u8],
-    resources: Option<&Dictionary>,
-    record_direct: bool,
+    scope: Scope<'_>,
     depth: usize,
 ) -> Result<bool> {
     let parser = ContentStreamParser::new(stream_bytes);
@@ -674,11 +703,11 @@ fn collect_from_stream<R: Read + Seek>(
 
         match token {
             ContentToken::Op { operands, operator } => {
-                if !process_operator(ctx, &operator, &operands, resources, record_direct, depth)? {
+                if !process_operator(ctx, &operator, &operands, scope, depth)? {
                     return Ok(false);
                 }
             }
-            ContentToken::InlineImage { dict, .. } if record_direct => {
+            ContentToken::InlineImage { dict, .. } if scope.record_direct => {
                 // /CS operand in an inline image may reference /ColorSpace.
                 // Abbreviated key is /CS (ISO 32000-1 Table 93).
                 let cs_val = dict.get("CS").or_else(|| dict.get("ColorSpace")).cloned();
@@ -707,8 +736,7 @@ fn process_operator<R: Read + Seek>(
     ctx: &mut CollectCtx<'_, R>,
     operator: &[u8],
     operands: &[Object],
-    resources: Option<&Dictionary>,
-    record_direct: bool,
+    scope: Scope<'_>,
     depth: usize,
 ) -> Result<bool> {
     match operator {
@@ -718,7 +746,7 @@ fn process_operator<R: Read + Seek>(
         // itself to `ctx.used` when this stream's names are page-relevant.
         b"Do" => {
             if let Some(name) = operands.first().and_then(Object::as_name) {
-                if record_direct {
+                if scope.record_direct {
                     ctx.used
                         .entry(b"XObject".to_vec())
                         .or_default()
@@ -726,7 +754,7 @@ fn process_operator<R: Read + Seek>(
                 }
 
                 // Recurse into Form XObjects, propagating their completeness.
-                return recurse_form_xobject(ctx, name, resources, depth);
+                return recurse_form_xobject(ctx, name, scope, depth);
             }
         }
 
@@ -734,7 +762,7 @@ fn process_operator<R: Read + Seek>(
         // stream is a Form with its own /Resources (`record_direct == false`),
         // its direct names resolve against that Form's own scope and are
         // irrelevant to page-level pruning, so skip recording them entirely.
-        _ if !record_direct => {}
+        _ if !scope.record_direct => {}
 
         // /Font — `name size Tf`
         b"Tf" => {
@@ -856,7 +884,7 @@ fn process_operator<R: Read + Seek>(
 fn recurse_form_xobject<R: Read + Seek>(
     ctx: &mut CollectCtx<'_, R>,
     xobject_name: &[u8],
-    page_resources: Option<&Dictionary>,
+    caller: Scope<'_>,
     depth: usize,
 ) -> Result<bool> {
     // Stack-overflow safeguard for a very long chain of *distinct* Forms.
@@ -873,7 +901,7 @@ fn recurse_form_xobject<R: Read + Seek>(
     // same way `apply_pruning` already treats indirect category dicts. The
     // reference may itself be reached through more than one indirect hop
     // (ref -> ref -> dict); follow the chain to its terminal dictionary.
-    let xobj_val: Option<Object> = match page_resources.and_then(|res| res.get("XObject")) {
+    let xobj_val: Option<Object> = match caller.resources.and_then(|res| res.get("XObject")) {
         Some(Object::Dictionary(xobj_dict)) => xobj_dict.get(xobject_name).cloned(),
         Some(cat_ref @ Object::Reference(_)) => resolve_ref_chain(ctx.pdf, cat_ref)?
             .0
@@ -930,20 +958,35 @@ fn recurse_form_xobject<R: Read + Seek>(
         return Ok(true);
     }
 
-    // ── Ever-seen guard (matches qpdf's `QPDFObjGen::set seen`) ──────────────
-    // Insert and NEVER remove: each indirect Form is expanded at most once, so
-    // cycles (A → B → A) and shared / DAG references cannot loop or fan out
-    // exponentially. Inserted before decode so a decode failure also marks the
-    // Form seen (decoding depends only on the stream bytes, not the path).
-    if !ctx.visited.insert(xobj_ref) {
-        return Ok(true); // already expanded — its page-relevant names are recorded
-    }
-
-    // Determine whether the Form has its own /Resources entry (checked before
-    // decode so a decode failure can report the right completeness). We check for
-    // key *presence* (not the resolved value) because an empty or indirect
-    // /Resources still means the Form owns its resource scope.
+    // Determine whether the Form has its own /Resources entry (checked before the
+    // visited key and before decode so both use the right scope / completeness).
+    // We check for key *presence* (not the resolved value) because an empty or
+    // indirect /Resources still means the Form owns its resource scope.
     let form_has_own_resources = stream.dict.get("Resources").is_some();
+
+    // A Form with its own /Resources resolves its names against its own scope, so
+    // it is scope-independent (owner = itself) and expanded once. A resource-less
+    // Form resolves nested `Do` names against the *inherited* scope, so its owner
+    // is the caller's — it is expanded once per distinct scope it is reached
+    // under.
+    let scope_owner = if form_has_own_resources {
+        xobj_ref
+    } else {
+        caller.owner
+    };
+
+    // ── Ever-seen guard, keyed on (Form ref, scope owner) ────────────────────
+    // Insert and NEVER remove: each `(Form, scope)` pair is expanded at most
+    // once, so cycles (A → B → A) and shared / DAG references cannot loop or fan
+    // out exponentially. Keying on the scope owner — not the Form alone — lets a
+    // resource-less Form reached under two scopes that resolve its nested `Do`
+    // names differently contribute each scope's names (matching qpdf and the
+    // previous stack-pop walk) without re-walking, so pruning never drops a
+    // resource the page actually renders. Keyed before decode so a decode failure
+    // also marks the pair seen (decoding depends only on the bytes, not the path).
+    if !ctx.visited.insert((xobj_ref, scope_owner)) {
+        return Ok(true); // already expanded under this scope
+    }
 
     // Decode the Form's content stream. On failure, the Form's resource usage is
     // unknown: that makes the page incomplete when the Form (or a resource-less
@@ -968,18 +1011,27 @@ fn recurse_form_xobject<R: Read + Seek>(
             _ => None,
         };
 
-        // The Form's *direct* names resolve against its own /Resources, so they
-        // must not pollute the page (`record_direct = false`). We still walk the
-        // content to reach nested resource-less Forms whose names DO bubble to
-        // the page, and propagate the completeness of that walk: an incomplete
-        // tokenisation may have missed such a nested page-relevant name.
-        collect_from_stream(ctx, &form_bytes, form_resources.as_ref(), false, depth + 1)
+        // The Form owns its scope (`owner = xobj_ref`); its direct names are not
+        // page-relevant (`record_direct = false`), but nested resource-less Forms
+        // still bubble to the page. Propagate the walk's completeness: an
+        // incomplete tokenisation may have missed such a nested page-relevant name.
+        let child = Scope {
+            resources: form_resources.as_ref(),
+            record_direct: false,
+            owner: xobj_ref,
+        };
+        collect_from_stream(ctx, &form_bytes, child, depth + 1)
     } else {
-        // No /Resources key → Form inherits the calling scope's resources.
+        // No /Resources key → Form inherits the caller's scope and owner.
         // Attribute its names to the page's used set (`record_direct = true`).
         // The Form's completeness IS the page's completeness here: an incomplete
         // tokenisation means page-scoped names may be missing → retain.
-        collect_from_stream(ctx, &form_bytes, page_resources, true, depth + 1)
+        let child = Scope {
+            resources: caller.resources,
+            record_direct: true,
+            owner: caller.owner,
+        };
+        collect_from_stream(ctx, &form_bytes, child, depth + 1)
     }
 }
 
