@@ -1091,7 +1091,7 @@ fn test_roborev1_shared_indirect_font_subdict_auto_protected() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// roborev 指摘2: 直接 Stream の Form XObject で再帰スキップ
+// Direct-stream Form XObject → conservatively retain the page (flpdf-u79t)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // Setup: the /XObject sub-dict in the page /Resources contains a *direct*
@@ -1099,15 +1099,21 @@ fn test_roborev1_shared_indirect_font_subdict_auto_protected() {
 // /Resources of its own, so it inherits the page's resources.  The Form
 // content uses /F1 via Tf.  Page content just invokes the Form via Do.
 //
-// Without the fix, get_ref() returns None for a direct Stream value, so the
-// Form is never recursed into and /F1 appears unused → incorrectly pruned.
-// After the fix, /F1 must be kept because the Form uses it.
+// A direct (inline) stream is malformed per ISO 32000-2 §7.3.8 (streams shall
+// be indirect objects) and has no ObjectRef identity, so the ever-seen cycle
+// guard cannot dedup a self-reference reached through inherited resources
+// (`/Fm0 Do /Fm0 Do` would recurse exponentially — see
+// `test_direct_stream_form_self_recursion_no_dos`).  qpdf does not even parse an
+// inline stream as a Form (it tokenises `stream` as a stray string and mangles
+// the surrounding dictionary), so there is no byte-identical target here.
 //
-// Building a raw PDF with a direct Stream inside a dict value requires writing
-// the stream inline.  We construct the bytes manually.
+// flpdf therefore refuses to recurse into a direct-stream Form and reports the
+// page as incomplete, conservatively retaining ALL of the page's resources.
+// That avoids both the DoS and dropping /F1 (which the Form genuinely uses under
+// flpdf's more-lenient parse): nothing is pruned, so /F1 and /F2 both survive.
 
 #[test]
-fn test_roborev2_direct_stream_form_xobject_font_kept() {
+fn test_direct_stream_form_xobject_page_conservatively_retained() {
     // Form XObject content: uses /F1 via Tf.
     // The Form has no /Resources — it inherits the page's scope.
     let form_content = b"BT /F1 10 Tf (direct form) Tj ET";
@@ -1158,8 +1164,8 @@ fn test_roborev2_direct_stream_form_xobject_font_kept() {
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open PDF with direct-stream Form");
     remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
 
-    // /F1 must remain — the direct-stream Form uses it via inherited scope.
-    // /F2 must be pruned — neither the page nor the Form references it.
+    // The page contains a direct-stream Form → flpdf cannot safely analyse its
+    // resource usage, so it retains the whole page. Both /F1 and /F2 survive.
     let res_obj = pdf
         .resolve(ObjectRef::new(5, 0))
         .expect("resolve resources");
@@ -1176,11 +1182,408 @@ fn test_roborev2_direct_stream_form_xobject_font_kept() {
         .collect();
     assert!(
         keys.contains(&"F1".to_string()),
-        "roborev2: /F1 must be kept (direct-stream Form uses it via inherited scope): {keys:?}"
+        "direct-stream Form: /F1 must be kept (page conservatively retained): {keys:?}"
     );
     assert!(
-        !keys.contains(&"F2".to_string()),
-        "roborev2: /F2 must be pruned (unused by page and Form): {keys:?}"
+        keys.contains(&"F2".to_string()),
+        "direct-stream Form: /F2 must also be kept — the page is retained, not pruned: {keys:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DoS regression: Form XObject traversal must not blow up exponentially
+// (flpdf-u79t; ChatGPT Codex Cloud security finding 31f83f8b)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// (A) Direct-stream Form self-recursion via inherited resources. The page maps
+// /Fm0 to a direct stream whose content is `/Fm0 Do /Fm0 Do`; with no ObjectRef
+// identity the old stack-pop guard could not dedup it, so branching recursion
+// blew up to 2^depth. The fix refuses to recurse into direct-stream Forms, so
+// pruning must complete promptly (the test harness would otherwise hang).
+#[test]
+fn test_direct_stream_form_self_recursion_no_dos() {
+    let form_content = b"/Fm0 Do /Fm0 Do";
+    let res_obj_body = format!(
+        "<< /Font << /F1 << /Type /Font >> >> \
+         /XObject << /Fm0 << /Subtype /Form /Length {} >> stream\n{}\nendstream >> >>",
+        form_content.len(),
+        std::str::from_utf8(form_content).unwrap()
+    );
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Fm0 Do")),
+        (5, obj_bytes(5, &res_obj_body)),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open recursive direct-stream Form PDF");
+    // Must return promptly rather than recursing exponentially.
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect("prune must complete without exponential recursion");
+
+    // Direct-stream Form ⇒ page conservatively retained ⇒ /F1 kept.
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
+    else {
+        panic!("5 0 R is not a dictionary");
+    };
+    let Some(Object::Dictionary(font_dict)) = res_dict.get("Font") else {
+        panic!("/Font key must exist");
+    };
+    assert!(
+        font_dict.get("F1").is_some(),
+        "direct-stream self-recursion: page retained, /F1 kept"
+    );
+}
+
+// (B) Indirect-reference DAG: Fm(i)'s content is `/Fm(i+1) Do /Fm(i+1) Do`, a
+// chain of 40 *distinct* indirect Forms. This is not a cycle, so a stack-pop
+// `visited` guard would re-traverse each node 2^level times (≈2^40). The
+// ever-seen guard expands each Form once, so pruning completes in O(V+E) and
+// matches qpdf: every reachable Form is kept (each resource-less Form's used
+// /Fm(i+1) bubbles to the page), while an unused page font is still pruned.
+//
+// Verified against qpdf 11.9.0:
+//   qpdf --remove-unreferenced-resources=yes --split-pages=1 dag.pdf out.pdf
+//   → completes in ~0.00s; page /XObject keeps all /Fm0../Fm40; unused /F2 pruned.
+#[test]
+fn test_indirect_dag_forms_no_exponential_blowup() {
+    const N: u32 = 40;
+    let mut objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources 4 0 R >>",
+            ),
+        ),
+    ];
+    // Page /Resources (4): /XObject maps Fm0..FmN to objects 100+i; plus an
+    // unused /F2 font that must still be pruned.
+    let mut xobj_entries = String::new();
+    for i in 0..=N {
+        xobj_entries.push_str(&format!("/Fm{i} {} 0 R ", 100 + i));
+    }
+    objects.push((
+        4,
+        obj_bytes(
+            4,
+            &format!("<< /Font << /F2 << /Type /Font >> >> /XObject << {xobj_entries} >> >>"),
+        ),
+    ));
+    // Page content invokes Fm0 once.
+    objects.push((5, stream_obj(5, b"/Fm0 Do")));
+    // Form objects 100+i: no /Resources (inherit page), content branches twice.
+    for i in 0..=N {
+        let content = if i < N {
+            format!("/Fm{} Do /Fm{} Do", i + 1, i + 1)
+        } else {
+            String::new()
+        };
+        let mut v = format!(
+            "{} 0 obj\n<< /Subtype /Form /Length {} >>\nstream\n",
+            100 + i,
+            content.len()
+        )
+        .into_bytes();
+        v.extend_from_slice(content.as_bytes());
+        v.extend_from_slice(b"\nendstream\nendobj\n");
+        objects.push((100 + i, v));
+    }
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open indirect-DAG PDF");
+    // Must complete in O(V+E), not 2^N.
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect("prune must complete without exponential recursion");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve res")
+    else {
+        panic!("4 0 R is not a dictionary");
+    };
+    // Every reachable Form is kept (bubbled up through the resource-less chain),
+    // matching qpdf.
+    let Some(Object::Dictionary(xobj_dict)) = res_dict.get("XObject") else {
+        panic!("/XObject key must exist");
+    };
+    for i in 0..=N {
+        assert!(
+            xobj_dict.get(format!("Fm{i}").as_bytes()).is_some(),
+            "indirect-DAG: /Fm{i} must be kept (reachable Form)"
+        );
+    }
+    // The unused page font is still pruned.
+    assert!(
+        res_dict.get("Font").is_none()
+            || matches!(res_dict.get("Font"), Some(Object::Dictionary(d)) if d.get("F2").is_none()),
+        "indirect-DAG: unused /F2 must be pruned"
+    );
+}
+
+// An inline image inside an own-/Resources Form must not leak its /CS colour
+// space to the page's used set (record_direct == false path). The page's own
+// /ColorSpace with the same abbreviation is therefore still pruned. (flpdf-u79t)
+#[test]
+fn test_inline_image_in_own_resources_form_cs_not_bubbled_to_page() {
+    // Form Fm0 (6 0 R): has its OWN /Resources; content is a single inline image
+    // referencing colour space /Foo. Because the Form owns its resources, that
+    // /Foo resolves against the Form's scope and must NOT be attributed to the
+    // page.
+    let form_content = b"BI /CS /Foo /W 1 /H 1 /BPC 8 ID \x00 EI";
+    let form_stream = {
+        let res = "/Resources << /ColorSpace << /Foo [ /CalRGB << >> ] >> >>";
+        let mut b = format!(
+            "6 0 obj\n<< /Subtype /Form {} /Length {} >>\nstream\n",
+            res,
+            form_content.len()
+        )
+        .into_bytes();
+        b.extend_from_slice(form_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Fm0 Do")),
+        // Page /Resources: an own /ColorSpace/Foo the page never references, plus
+        // the Form XObject.
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /ColorSpace << /Foo [ /CalRGB << >> ] >> /XObject << /Fm0 6 0 R >> >>",
+            ),
+        ),
+        (6, form_stream),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
+    else {
+        panic!("5 0 R is not a dictionary");
+    };
+    assert!(
+        res_dict.get("ColorSpace").is_none(),
+        "page /ColorSpace/Foo must be pruned — the inline image lives in the Form's \
+         own resource scope, not the page's: {:?}",
+        res_dict.get("ColorSpace")
+    );
+}
+
+// An indirect /XObject entry whose ref-chain terminal is NOT a stream (e.g. a
+// dictionary) is simply not recursed into; the page stays complete and prunes
+// normally. (flpdf-u79t: covers the non-stream terminal arm.)
+#[test]
+fn test_indirect_xobject_entry_non_stream_terminal_handled() {
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Fm0 Do")),
+        // /Fm0 is an indirect reference to a NON-stream object (a plain dict).
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F2 << /Type /Font >> >> /XObject << /Fm0 9 0 R >> >>",
+            ),
+        ),
+        (9, obj_bytes(9, "<< /NotA /Stream >>")),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
+    else {
+        panic!("5 0 R is not a dictionary");
+    };
+    // /Fm0 is recorded as used by the page's Do → its category survives.
+    let Some(Object::Dictionary(xobj_dict)) = res_dict.get("XObject") else {
+        panic!("/XObject must survive (Fm0 used via Do)");
+    };
+    assert!(
+        xobj_dict.get("Fm0").is_some(),
+        "/XObject/Fm0 must remain (used by page): {xobj_dict:?}"
+    );
+    // The unused page font is still pruned (page stayed complete).
+    assert!(
+        res_dict.get("Font").is_none(),
+        "unused /Font must be pruned — a non-stream XObject terminal keeps the page complete: {res_dict:?}"
+    );
+}
+
+// A Form XObject whose content stream fails to DECODE (corrupt filter) makes the
+// page incomplete → its resources are conservatively retained. (flpdf-u79t:
+// covers the Form decode-failure arm.)
+#[test]
+fn test_form_decode_failure_retains_page() {
+    // Fm0 (6 0 R): declares /Filter /FlateDecode but the body is not valid flate.
+    let bad_body = b"this is not valid flate data";
+    let form_stream = {
+        let mut b = format!(
+            "6 0 obj\n<< /Subtype /Form /Filter /FlateDecode /Length {} >>\nstream\n",
+            bad_body.len()
+        )
+        .into_bytes();
+        b.extend_from_slice(bad_body);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Fm0 Do")),
+        // Page has an unused font that would normally be pruned.
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> >> /XObject << /Fm0 6 0 R >> >>",
+            ),
+        ),
+        (6, form_stream),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
+    else {
+        panic!("5 0 R is not a dictionary");
+    };
+    // The Form could not be decoded → page conservatively retained → /F1 kept
+    // even though the page's own content never references it.
+    let Some(Object::Dictionary(font_dict)) = res_dict.get("Font") else {
+        panic!("/Font must be retained when a Form fails to decode");
+    };
+    assert!(
+        font_dict.get("F1").is_some(),
+        "decode failure: page retained, /F1 kept: {font_dict:?}"
+    );
+}
+
+// A page-level inline image referencing a NON-built-in colour space records that
+// name in the page's used set, keeping it while an unused sibling is pruned.
+// (flpdf-u79t: covers the inline-image /CS recording under record_direct.)
+#[test]
+fn test_page_inline_image_nonbuiltin_cs_kept() {
+    // /Foo is used by the inline image; /Bar is never referenced.
+    let content = b"BI /CS /Foo /W 1 /H 1 /BPC 8 ID \x00 EI";
+    let res_body = "<< /ColorSpace << /Foo [ /CalRGB << >> ] /Bar [ /CalRGB << >> ] >> >>";
+    let extra = vec![(4u32, stream_obj(4, content)), (5, obj_bytes(5, res_body))];
+    let page_body = "/Contents 4 0 R /Resources 5 0 R";
+    let pdf_bytes = build_pdf(&[page_body], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(res) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res") else {
+        panic!("5 0 R is not a dictionary");
+    };
+    let Some(Object::Dictionary(cs)) = res.get("ColorSpace") else {
+        panic!("/ColorSpace must survive (/Foo used by inline image)");
+    };
+    assert!(
+        cs.get("Foo").is_some(),
+        "/ColorSpace/Foo must be kept (used by inline image): {cs:?}"
+    );
+    assert!(
+        cs.get("Bar").is_none(),
+        "/ColorSpace/Bar must be pruned (unused): {cs:?}"
+    );
+}
+
+// A Form XObject whose OWN /Resources is an indirect reference is resolved via
+// that reference; its names stay scoped to the Form and do not leak to the page.
+// (flpdf-u79t: covers the indirect own-/Resources resolution arm.)
+#[test]
+fn test_form_own_resources_indirect_reference_resolved() {
+    // Fm0 (6 0 R): own /Resources is `7 0 R`; content uses /FA (its own font).
+    let form_content = b"BT /FA 10 Tf (own res) Tj ET";
+    let form_stream = {
+        let mut b = format!(
+            "6 0 obj\n<< /Subtype /Form /Resources 7 0 R /Length {} >>\nstream\n",
+            form_content.len()
+        )
+        .into_bytes();
+        b.extend_from_slice(form_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Fm0 Do")),
+        // Page /Font/FA shares the Form font's name but the page never uses it →
+        // it must be pruned (the Form's /FA is scoped to the Form's own resources).
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /FA << /Type /Font >> >> /XObject << /Fm0 6 0 R >> >>",
+            ),
+        ),
+        (6, form_stream),
+        // Form's own /Resources (indirect): its own /FA font.
+        (7, obj_bytes(7, "<< /Font << /FA << /Type /Font >> >> >>")),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
+    else {
+        panic!("5 0 R is not a dictionary");
+    };
+    // The Form owns its resource scope (resolved via 7 0 R), so its /FA does not
+    // bubble to the page; the page's own unused /FA font is pruned.
+    assert!(
+        res_dict.get("Font").is_none(),
+        "page /Font must be pruned — the Form's /FA is scoped to its own (indirect) /Resources: {res_dict:?}"
     );
 }
 
@@ -1449,34 +1852,34 @@ fn test_medium2_non_utf8_xobject_name_form_font_kept() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// roborev medium 指摘1 (resources.rs:552): visited がスタック-local でない
+// Shared resource-less Form reached via two paths keeps its page-level font
+// (flpdf-u79t: ever-seen traversal + bubble-to-page attribution)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// Bug scenario:
+// Scenario:
 //   - Form Fa (7 0 R) has its own /Resources with /XObject << /Fx 8 0 R >>.
 //     Fa's content invokes /Fx via Do.
 //   - Form Fx (8 0 R) has NO /Resources — it inherits the calling scope.
 //     Fx's content uses BT /F1 10 Tf.
 //   - Page /Resources has /XObject << /Fa 7 0 R /Fx 8 0 R >> and /Font << /F1 >>.
-//   - Page content: /Fa Do /Fx Do  (Fa first, so Fx is visited inside Fa's scope
-//     with form_used as accumulator, then Fa returns).
+//   - Page content: /Fa Do /Fx Do  (Fa is processed first, reaching Fx inside
+//     Fa's own-resources scope; then the page reaches Fx directly).
 //
-// With the old "global visited" bug:
-//   1. Page processes /Fa Do → recurse into Fa (own /Resources).
-//      Fa's Do invokes /Fx → visited.insert(8 0 R) → recurse into Fx.
-//      Fx uses /F1, but accumulator is form_used (Fa's throwaway) → F1 NOT
-//      recorded in page `used`.
-//      Return from Fx; 8 0 R stays in visited (never removed).
-//   2. Page processes /Fx Do → visited contains 8 0 R → skipped entirely.
-//      F1 never recorded → F1 incorrectly pruned.
+// The traversal uses an *ever-seen* `visited` set (each indirect Form expanded
+// once, matching qpdf), so Fx is walked only on its FIRST reach (via Fa). The
+// key invariant that keeps /F1 is that a resource-less Form attributes its used
+// names to the PAGE's real `used` set regardless of which scope reached it
+// (mirroring qpdf's path-independent "unresolved" names). So on that single
+// visit, Fx's /F1 lands in the page's `used` and /F1 is kept; the later direct
+// `/Fx Do` is correctly a no-op (already seen) rather than a re-traversal.
 //
-// With the stack-pop fix:
-//   1. Recurse Fa → recurse Fx → pop Fx from visited on return from Fx.
-//   2. Page /Fx Do: insert 8 0 R (fresh), recurse Fx in PAGE scope → F1 recorded
-//      in page `used` → F1 kept.
+// A naive ever-seen set WITHOUT that bubble-to-page rule would attribute Fx's
+// /F1 to Fa's throwaway and then skip the page's direct reach → /F1 wrongly
+// pruned. A stack-pop set would instead RE-traverse Fx, which reintroduces the
+// exponential DoS this fix removes (see test_indirect_dag_forms_no_exponential_blowup).
 
 #[test]
-fn test_roborev_medium_visited_stack_pop_shared_fx_not_blocked() {
+fn test_shared_resource_less_form_font_kept_via_bubble_to_page() {
     // Form Fx (8 0 R): no own /Resources, content uses /F1.
     let fx_content = b"BT /F1 10 Tf (from Fx) Tj ET";
     let fx_stream = {
@@ -1540,8 +1943,9 @@ fn test_roborev_medium_visited_stack_pop_shared_fx_not_blocked() {
     let font_keys = font_dict_keys(&mut pdf, ObjectRef::new(5, 0));
     assert!(
         font_keys.contains(&"F1".to_string()),
-        "visited stack-pop: /F1 must be KEPT — page's direct /Fx Do uses F1 via inherited scope; \
-         old bug: Fx skipped because visited contains its ref from Fa's scope: {font_keys:?}"
+        "/F1 must be KEPT — the resource-less Form Fx bubbles its used /F1 to the \
+         page's `used` set on its single (ever-seen) visit, independent of the \
+         scope that reached it: {font_keys:?}"
     );
 }
 
