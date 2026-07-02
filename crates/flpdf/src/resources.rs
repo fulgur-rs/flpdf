@@ -896,11 +896,16 @@ fn recurse_form_xobject<R: Read + Seek>(
     // stream as a Form, so there is no byte-identical target for this case.
     let (stream, xobj_ref) = match xobj_val {
         Object::Reference(r) => {
-            match resolve_ref_chain(ctx.pdf, &Object::Reference(r))?
-                .0
-                .into_stream()
-            {
-                Some(s) => (s, r),
+            // Key the `visited` set on the *terminal* ref, not the first hop, so a
+            // Form reached via distinct reference chains (`r_a -> T`, `r_b -> T`)
+            // is expanded once — matching qpdf, which keys on the terminal
+            // object's `QPDFObjGen`. First-hop keying would re-expand the shared
+            // terminal once per aliasing name (redundant work, and the only lever
+            // that could re-walk a subtree once inherited scopes diverge);
+            // terminal keying makes each Form's expansion path-independent.
+            let (resolved, terminal) = resolve_ref_chain(ctx.pdf, &Object::Reference(r))?;
+            match resolved.into_stream() {
+                Some(s) => (s, terminal.unwrap_or(r)),
                 None => return Ok(true), // non-stream terminal → nothing to recurse into
             }
         }
@@ -949,13 +954,17 @@ fn recurse_form_xobject<R: Read + Seek>(
     };
 
     if form_has_own_resources {
-        // Resolve the Form's own /Resources dict (may be direct or indirect).
+        // Resolve the Form's own /Resources dict (may be direct or indirect). The
+        // reference may be a multi-hop holder chain (ref -> ref -> dict); follow
+        // it to the terminal dictionary, the same way the `/XObject` category is
+        // resolved above. A single-hop read would drop a chained /Resources and
+        // treat the Form as having an empty scope, so a resource-less Form nested
+        // inside it (whose names bubble to the page) would be missed → over-prune.
         let form_resources: Option<Dictionary> = match stream.dict.get("Resources").cloned() {
             Some(Object::Dictionary(d)) => Some(d),
-            Some(Object::Reference(r)) => match ctx.pdf.resolve_borrowed(r)? {
-                Object::Dictionary(d) => Some(d.clone()),
-                _ => None, // broken ref → treat as empty own scope
-            },
+            Some(res_ref @ Object::Reference(_)) => {
+                resolve_ref_chain(ctx.pdf, &res_ref)?.0.into_dict()
+            }
             _ => None,
         };
 

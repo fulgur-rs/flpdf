@@ -1587,6 +1587,169 @@ fn test_form_own_resources_indirect_reference_resolved() {
     );
 }
 
+// A Form whose OWN /Resources is a MULTI-hop holder chain (ref -> ref -> dict)
+// must be followed to its terminal dict; otherwise a resource-less Form nested
+// inside it is unreachable and its page-relevant font is wrongly pruned.
+// (flpdf-u79t / gemini review of PR #442; supersedes flpdf-73cp now that nested
+// Forms under own-resources Forms bubble to the page.)
+#[test]
+fn test_form_own_resources_multi_hop_chain_nested_form_font_kept() {
+    // Fm0 (6): own /Resources is `7 0 R` → `8 0 R` → dict (2-hop). That dict maps
+    // /Fx to a resource-less Form (9) which uses the PAGE font /FP.
+    let fm0_content = b"/Fx Do";
+    let fm0 = {
+        let mut b = format!(
+            "6 0 obj\n<< /Subtype /Form /Resources 7 0 R /Length {} >>\nstream\n",
+            fm0_content.len()
+        )
+        .into_bytes();
+        b.extend_from_slice(fm0_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+    let fx_content = b"BT /FP 10 Tf (nested) Tj ET";
+    let fx = {
+        let mut b = format!(
+            "9 0 obj\n<< /Subtype /Form /Length {} >>\nstream\n",
+            fx_content.len()
+        )
+        .into_bytes();
+        b.extend_from_slice(fx_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Fm0 Do")),
+        // Page /Font: /FP is used by the nested Form (via bubble-to-page); /FQ is
+        // unused and must be pruned.
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /FP << /Type /Font >> /FQ << /Type /Font >> >> /XObject << /Fm0 6 0 R >> >>",
+            ),
+        ),
+        (6, fm0),
+        // 2-hop holder chain for Fm0's own /Resources: 7 -> 8 -> dict.
+        (7, obj_bytes(7, "8 0 R")),
+        (8, obj_bytes(8, "<< /XObject << /Fx 9 0 R >> >>")),
+        (9, fx),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
+    else {
+        panic!("5 0 R is not a dictionary");
+    };
+    let Some(Object::Dictionary(font_dict)) = res_dict.get("Font") else {
+        panic!("/Font must survive (/FP used by nested Form via 2-hop /Resources)");
+    };
+    let keys: Vec<String> = font_dict
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(
+        keys.contains(&"FP".to_string()),
+        "multi-hop /Resources: /FP must be kept — the nested resource-less Form uses \
+         it, but is only reachable if Fm0's chained /Resources is followed: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"FQ".to_string()),
+        "multi-hop /Resources: unused /FQ must still be pruned: {keys:?}"
+    );
+}
+
+// Two DISTINCT reference aliases that resolve to the SAME terminal Form are
+// deduplicated once, keyed on the terminal ref (matching qpdf's terminal
+// `QPDFObjGen`). Pruning completes and yields the same result either way — this
+// documents the aliasing scenario and guards against a crash / regression in the
+// terminal-ref resolution. (flpdf-u79t / gemini review of PR #442.)
+//
+// NB: first-hop keying is *not* exponential for shared aliases — a shared
+// terminal's children carry fixed refs that dedup after the first walk, so the
+// redundant re-entry is O(children). The terminal-ref key still matches qpdf and
+// removes that redundancy; it also closes the one path that could re-walk a
+// subtree (a resource-less Form reached under divergent inherited scopes).
+#[test]
+fn test_aliased_refs_to_same_terminal_pruned_consistently() {
+    // Page content invokes /Aa and /Ab; both alias the SAME Form (7 0 R) through
+    // distinct one-hop objects (5 0 R, 6 0 R). That Form uses page font /FP.
+    let form_content = b"BT /FP 10 Tf (shared terminal) Tj ET";
+    let form = {
+        let mut b = format!(
+            "7 0 obj\n<< /Subtype /Form /Length {} >>\nstream\n",
+            form_content.len()
+        )
+        .into_bytes();
+        b.extend_from_slice(form_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 8 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Aa Do /Ab Do")),
+        // /Aa and /Ab are distinct one-hop objects, both aliasing terminal 7 0 R.
+        (5, obj_bytes(5, "7 0 R")),
+        (6, obj_bytes(6, "7 0 R")),
+        (7, form),
+        // Page /Resources: the two aliases + /FP (used by the shared Form) and
+        // /FQ (unused → pruned).
+        (
+            8,
+            obj_bytes(
+                8,
+                "<< /Font << /FP << /Type /Font >> /FQ << /Type /Font >> >> \
+                   /XObject << /Aa 5 0 R /Ab 6 0 R >> >>",
+            ),
+        ),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open aliased-terminal PDF");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect("prune must complete");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(8, 0)).expect("resolve res")
+    else {
+        panic!("8 0 R is not a dictionary");
+    };
+    let Some(Object::Dictionary(font_dict)) = res_dict.get("Font") else {
+        panic!("/Font must survive (/FP used by the shared terminal Form)");
+    };
+    let keys: Vec<String> = font_dict
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(
+        keys.contains(&"FP".to_string()),
+        "aliased terminal: /FP must be kept (used by the shared Form): {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"FQ".to_string()),
+        "aliased terminal: unused /FQ must be pruned: {keys:?}"
+    );
+}
+
 #[test]
 fn test_roborev3_indirect_xobject_category_form_recurse_font_kept() {
     // The /XObject *resource category* is itself an indirect reference
