@@ -8,7 +8,10 @@
 //!   that read, surface, and clear the SignaturesExist/AppendOnly bits.
 
 use crate::json_inspect::decode_pdf_text_string;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, WriteOptions};
+use crate::{
+    Dictionary, Error, FormFieldObjectHelper, Object, ObjectRef, Pdf, Result, WriteOptions,
+    DEFAULT_MAX_ACROFORM_DEPTH,
+};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
@@ -234,6 +237,342 @@ pub fn clear_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     if !clear_sig_flags_in_dict(&mut acroform) {
         return Ok(false);
     }
+    write_back_acroform(pdf, home, acroform);
+    Ok(true)
+}
+
+/// Remove qpdf-supported security restrictions, mirroring
+/// `QPDF::removeSecurityRestrictions` (qpdf 11.9.0).
+///
+/// Drops the catalog `/Perms` entry unconditionally and, when `/AcroForm` is a
+/// dictionary that carries `/SigFlags`, sets `/SigFlags` to `0`. Returns `true`
+/// when either change was applied. Used by the `--remove-restrictions`
+/// signature-stripping path; it does not remove signature fields.
+///
+/// # Errors
+///
+/// Propagates any error from resolving the catalog and `/AcroForm` objects
+/// (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
+pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(false);
+    };
+    let Object::Dictionary(mut catalog) = pdf.resolve(root_ref)? else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    if catalog.remove("Perms").is_some() {
+        pdf.set_object(root_ref, Object::Dictionary(catalog));
+        changed = true;
+    }
+    if let Some((home, mut acroform)) = resolve_catalog_acroform(pdf)? {
+        if acroform.get("SigFlags").is_some() && sig_flags_from_acroform_dict(&acroform) != Some(0)
+        {
+            acroform.insert("SigFlags", Object::Integer(0));
+            write_back_acroform(pdf, home, acroform);
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+/// Disable digital signatures for `--remove-restrictions`, mirroring qpdf's
+/// `QPDFAcroFormDocumentHelper::disableDigitalSignatures` (qpdf 11.9.0).
+///
+/// 1. Calls [`remove_security_restrictions`] (drop catalog `/Perms`, zero
+///    `/AcroForm /SigFlags`).
+/// 2. Enumerates the document's AcroForm form fields the way qpdf's
+///    `getFormFields` does: terminal annotation-fields discovered while walking
+///    `/AcroForm /Fields`, plus orphan `/Subtype /Widget` annotations on page
+///    `/Annots` that were not associated with a field during that walk.
+/// 3. For every enumerated form field whose inherited `/FT` is `/Sig`, removes
+///    `/FT`, `/V`, `/SV`, and `/Lock` (the field name `/T` is preserved). The
+///    signature dictionary previously referenced by `/V` is not deleted
+///    explicitly; on a full rewrite the reachability-based garbage collector
+///    drops it when it is no longer referenced, but keeps it when it is still
+///    reachable elsewhere (for example from the catalog `/DSS`).
+/// 4. Erases those fields' references from the top-level `/AcroForm /Fields`
+///    array. An indirect `/Fields` array is mutated in place (the array object
+///    is kept and the `/AcroForm /Fields` entry stays indirect); a direct
+///    `/Fields` array is rewritten inside the `/AcroForm` dictionary. On a full
+///    rewrite a field still reachable from a page `/Annots` survives as a plain
+///    annotation; a field-only entry becomes unreferenced and is dropped by
+///    garbage collection.
+///
+/// A `/Sig` field whose `/FT`/`/V` live on a non-terminal parent (the parent
+/// groups a widget via `/Kids`) is left intact: only the widget is a form
+/// field, it carries no signature keys of its own, and it is not a top-level
+/// `/Fields` entry, so the signature survives — matching qpdf.
+///
+/// Returns `true` when anything changed. `/DSS` is intentionally left untouched,
+/// matching qpdf (`removeSecurityRestrictions` removes only `/Perms`).
+///
+/// # Errors
+///
+/// Propagates any error from resolving the catalog, `/AcroForm`, `/Fields`,
+/// page, and field-tree objects (surfaced by [`Pdf::resolve`]), and
+/// [`Error::Unsupported`] when the field-tree traversal depth limit
+/// ([`DEFAULT_MAX_ACROFORM_DEPTH`]) or a field's `/Parent` chain depth limit is
+/// exceeded.
+pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
+    let mut changed = remove_security_restrictions(pdf)?;
+
+    let form_fields = collect_signature_form_field_refs(pdf)?;
+
+    let mut to_remove: Vec<ObjectRef> = Vec::new();
+    for field_ref in form_fields {
+        let field_type = FormFieldObjectHelper::new(field_ref, pdf).field_type()?;
+        if field_type.as_deref() != Some(b"Sig") {
+            continue;
+        }
+        // qpdf records every /Sig form field in `to_remove` unconditionally,
+        // before attempting removeKey. A field whose /FT//V live on a
+        // non-terminal parent has nothing of its own to strip, but is still
+        // recorded (removeFormFields then finds it absent from /Fields).
+        to_remove.push(field_ref);
+
+        // `field_type` above resolved this ref through the field tree, so it is
+        // always a dictionary here.
+        let Object::Dictionary(mut dict) = pdf.resolve(field_ref)? else {
+            continue; // cov:ignore: a /Sig form-field ref always resolves to a dictionary
+        };
+        let mut field_changed = false;
+        for key in ["FT", "V", "SV", "Lock"] {
+            if dict.remove(key).is_some() {
+                field_changed = true;
+            }
+        }
+        if field_changed {
+            pdf.set_object(field_ref, Object::Dictionary(dict));
+            changed = true;
+            // The old /V target is intentionally not deleted here. qpdf's
+            // disableDigitalSignatures only strips the field keys and lets the
+            // write-time reachability GC drop the signature dictionary if it is
+            // now unreferenced. A dictionary still reachable elsewhere (for
+            // example from the catalog /DSS) must survive, so deleting it here
+            // would over-delete and leave a dangling reference.
+        }
+    }
+
+    // removeFormFields: erase the recorded refs from the top-level /AcroForm
+    // /Fields array. qpdf runs this unconditionally; with an empty `to_remove`
+    // nothing matches and the array is left untouched. Only refs that are
+    // actually top-level /Fields entries are dropped; a field reachable only via
+    // a parent's /Kids is unaffected.
+    let Some((home, mut acroform)) = resolve_catalog_acroform(pdf)? else {
+        return Ok(changed);
+    };
+    let Some(fields_obj) = acroform.get("Fields").cloned() else {
+        return Ok(changed);
+    };
+    // qpdf erases items from the original /Fields array handle. Capture whether
+    // /Fields is stored indirectly before `resolve_array` consumes the value: an
+    // indirect array stays indirect (the array object is mutated in place, so
+    // the /AcroForm /Fields entry keeps its reference), while a direct array
+    // stays direct (rewritten inside the /AcroForm dictionary).
+    let fields_ref = fields_obj.as_ref_id();
+    let fields = resolve_array(pdf, fields_obj)?;
+    let original_len = fields.len();
+    let new_fields: Vec<Object> = fields
+        .into_iter()
+        .filter(|f| !matches!(f, Object::Reference(r) if to_remove.contains(r)))
+        .collect();
+    if new_fields.len() != original_len {
+        match fields_ref {
+            Some(fields_ref) => pdf.set_object(fields_ref, Object::Array(new_fields)),
+            None => {
+                acroform.insert("Fields", Object::Array(new_fields));
+                write_back_acroform(pdf, home, acroform);
+            }
+        }
+        changed = true;
+    }
+
+    Ok(changed)
+}
+
+/// Collect the object refs of every AcroForm form field, mirroring the
+/// `field_to_annotations` map keys built by qpdf's
+/// `QPDFAcroFormDocumentHelper::analyze` + `traverseField` +
+/// `getFormFields` (qpdf 11.9.0).
+///
+/// Returns an empty set when the catalog `/AcroForm` is absent, is not a
+/// dictionary, or carries no `/Fields` key — in which case qpdf's `analyze`
+/// returns before its page `/Annots` orphan-widget pass, so that pass is
+/// skipped here too.
+fn collect_signature_form_field_refs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<BTreeSet<ObjectRef>> {
+    let mut form_field_keys: BTreeSet<ObjectRef> = BTreeSet::new();
+    // The ObjGens of annotation nodes already associated with a field (qpdf's
+    // annotation_to_field key set), so the orphan pass skips them.
+    let mut annotations_seen: BTreeSet<ObjectRef> = BTreeSet::new();
+
+    let Some((_, acroform)) = resolve_catalog_acroform(pdf)? else {
+        return Ok(form_field_keys);
+    };
+    let Some(fields_obj) = acroform.get("Fields").cloned() else {
+        return Ok(form_field_keys);
+    };
+    // A present-but-non-array /Fields is treated as empty (qpdf warns and uses
+    // an empty array), but the orphan pass below still runs.
+    let fields = resolve_array(pdf, fields_obj)?;
+
+    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+    for field in fields {
+        if let Object::Reference(field_ref) = field {
+            traverse_field(
+                pdf,
+                field_ref,
+                None,
+                0,
+                &mut visited,
+                &mut form_field_keys,
+                &mut annotations_seen,
+            )?;
+        }
+    }
+
+    // Orphan page-widget pass: a /Subtype /Widget annotation reachable from a
+    // page /Annots that was not associated with a field during the /Fields
+    // traversal becomes its own form field.
+    for page_ref in crate::pages::page_refs(pdf)? {
+        for annot_ref in page_widget_annotation_refs(pdf, page_ref)? {
+            if annotations_seen.insert(annot_ref) {
+                form_field_keys.insert(annot_ref);
+            }
+        }
+    }
+
+    Ok(form_field_keys)
+}
+
+/// One node of qpdf's `traverseField`: classify `field_ref` as a field and/or
+/// annotation, recording the owning form-field ref when it is an annotation,
+/// and recurse into an array `/Kids`.
+fn traverse_field<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field_ref: ObjectRef,
+    parent_ref: Option<ObjectRef>,
+    depth: usize,
+    visited: &mut BTreeSet<ObjectRef>,
+    form_field_keys: &mut BTreeSet<ObjectRef>,
+    annotations_seen: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    if depth > DEFAULT_MAX_ACROFORM_DEPTH {
+        return Err(Error::Unsupported(format!(
+            "AcroForm field tree depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH} at {field_ref}"
+        )));
+    }
+    // Non-dictionary fields/annotations are ignored (qpdf warns and skips).
+    let Object::Dictionary(dict) = pdf.resolve(field_ref)? else {
+        return Ok(());
+    };
+    // Loop guard, keyed on the object ref (qpdf's ObjGen visited set).
+    if !visited.insert(field_ref) {
+        return Ok(());
+    }
+
+    // A terminal field that looks like an annotation is an annotation (merged
+    // widget/field). A node with an array /Kids groups sub-fields instead.
+    let mut is_annotation = false;
+    let mut is_field = depth == 0;
+
+    if let Some(kids) = resolve_kids_array(pdf, &dict)? {
+        is_field = true;
+        for kid in kids {
+            if let Object::Reference(kid_ref) = kid {
+                traverse_field(
+                    pdf,
+                    kid_ref,
+                    Some(field_ref),
+                    depth + 1,
+                    visited,
+                    form_field_keys,
+                    annotations_seen,
+                )?;
+            }
+        }
+    } else {
+        if dict.get("Parent").is_some() {
+            is_field = true;
+        }
+        if dict.get("Subtype").is_some() || dict.get("Rect").is_some() || dict.get("AP").is_some() {
+            is_annotation = true;
+        }
+    }
+
+    if is_annotation {
+        // our_field = is_field ? field : parent. `is_field` is false only when
+        // depth > 0, where the caller always supplies a parent, so the
+        // fallback is never reached.
+        let our_field = if is_field {
+            field_ref
+        } else {
+            parent_ref.unwrap_or(field_ref)
+        };
+        form_field_keys.insert(our_field);
+        annotations_seen.insert(field_ref);
+    }
+
+    Ok(())
+}
+
+/// Resolve a dictionary's `/Kids` value to its array items, following one
+/// indirect reference. Returns `None` when `/Kids` is absent or does not
+/// resolve to an array (qpdf's `kids.isArray()` gate), distinguishing that from
+/// an empty array (`Some(vec![])`).
+fn resolve_kids_array<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dict: &Dictionary,
+) -> Result<Option<Vec<Object>>> {
+    match dict.get("Kids").cloned() {
+        Some(Object::Array(items)) => Ok(Some(items)),
+        Some(Object::Reference(kids_ref)) => match pdf.resolve(kids_ref)? {
+            Object::Array(items) => Ok(Some(items)),
+            _ => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+/// Return the object refs of the `/Subtype /Widget` annotations in a leaf
+/// page's `/Annots` array, mirroring qpdf's `getWidgetAnnotationsForPage`
+/// (`QPDFPageObjectHelper::getAnnotations("/Widget")`). An indirect `/Annots`
+/// array is resolved; non-reference entries are skipped.
+fn page_widget_annotation_refs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<Vec<ObjectRef>> {
+    let annots_obj = match pdf.resolve(page_ref)? {
+        Object::Dictionary(page) => page.get("Annots").cloned(),
+        _ => None,
+    };
+    let Some(annots_obj) = annots_obj else {
+        return Ok(Vec::new());
+    };
+
+    let mut widgets = Vec::new();
+    for annot in resolve_array(pdf, annots_obj)? {
+        let Object::Reference(annot_ref) = annot else {
+            continue;
+        };
+        if let Object::Dictionary(annot_dict) = pdf.resolve(annot_ref)? {
+            if matches!(annot_dict.get("Subtype"), Some(Object::Name(name)) if name.as_slice() == b"Widget")
+            {
+                widgets.push(annot_ref);
+            }
+        }
+    }
+    Ok(widgets)
+}
+
+/// Write an updated `/AcroForm` dictionary back to wherever it lives.
+///
+/// For an indirect `/AcroForm` the dictionary is stored to its own object; for
+/// an inline `/AcroForm` the carried catalog is patched and re-stored so the
+/// catalog is not clobbered.
+fn write_back_acroform<R: Read + Seek>(pdf: &mut Pdf<R>, home: AcroformHome, acroform: Dictionary) {
     match home {
         AcroformHome::Object(acroform_ref) => {
             pdf.set_object(acroform_ref, Object::Dictionary(acroform));
@@ -246,7 +585,6 @@ pub fn clear_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
             pdf.set_object(root_ref, Object::Dictionary(catalog));
         }
     }
-    Ok(true)
 }
 
 /// Remove signature values (`/V`) from AcroForm signature fields.
@@ -1059,5 +1397,184 @@ mod tests {
         let start_dict = parent_chain(&mut pdf, 2, 4, "V");
         let got = inherited_field_value(&mut pdf, &start_dict, "V").unwrap();
         assert_eq!(got, Some(Object::Integer(42)));
+    }
+
+    // Build a dictionary from (key, Object) pairs for the traverse-based
+    // enumeration unit tests below.
+    fn dict_value(pairs: Vec<(&str, Object)>) -> Dictionary {
+        let mut d = Dictionary::new();
+        for (k, v) in pairs {
+            d.insert(k, v);
+        }
+        d
+    }
+
+    fn dict(pairs: Vec<(&str, Object)>) -> Object {
+        Object::Dictionary(dict_value(pairs))
+    }
+
+    fn refs_vec(pairs: &[u32]) -> Vec<Object> {
+        pairs
+            .iter()
+            .map(|n| Object::Reference(ObjectRef::new(*n, 0)))
+            .collect()
+    }
+
+    fn refs(pairs: &[u32]) -> Object {
+        Object::Array(refs_vec(pairs))
+    }
+
+    #[test]
+    fn traverse_field_visited_guard_breaks_kids_cycle() {
+        // 5 -> /Kids [6] -> /Kids [5]: the loop guard must stop re-descending 5.
+        let mut pdf = empty_pdf();
+        pdf.set_object(ObjectRef::new(5, 0), dict(vec![("Kids", refs(&[6]))]));
+        pdf.set_object(ObjectRef::new(6, 0), dict(vec![("Kids", refs(&[5]))]));
+
+        let mut visited = BTreeSet::new();
+        let mut keys = BTreeSet::new();
+        let mut annots = BTreeSet::new();
+        traverse_field(
+            &mut pdf,
+            ObjectRef::new(5, 0),
+            None,
+            0,
+            &mut visited,
+            &mut keys,
+            &mut annots,
+        )
+        .unwrap();
+
+        assert!(visited.contains(&ObjectRef::new(5, 0)));
+        assert!(visited.contains(&ObjectRef::new(6, 0)));
+        // Neither node is an annotation, so no form-field key is recorded.
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn traverse_field_ignores_non_dictionary_node() {
+        // A non-dictionary field/annotation is skipped without visiting it.
+        let mut pdf = empty_pdf();
+        pdf.set_object(ObjectRef::new(5, 0), Object::Integer(7));
+
+        let mut visited = BTreeSet::new();
+        let mut keys = BTreeSet::new();
+        let mut annots = BTreeSet::new();
+        traverse_field(
+            &mut pdf,
+            ObjectRef::new(5, 0),
+            None,
+            0,
+            &mut visited,
+            &mut keys,
+            &mut annots,
+        )
+        .unwrap();
+
+        assert!(keys.is_empty());
+        assert!(!visited.contains(&ObjectRef::new(5, 0)));
+    }
+
+    #[test]
+    fn traverse_field_errs_past_depth_limit() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(ObjectRef::new(5, 0), dict(vec![]));
+
+        let mut visited = BTreeSet::new();
+        let mut keys = BTreeSet::new();
+        let mut annots = BTreeSet::new();
+        let err = traverse_field(
+            &mut pdf,
+            ObjectRef::new(5, 0),
+            None,
+            DEFAULT_MAX_ACROFORM_DEPTH + 1,
+            &mut visited,
+            &mut keys,
+            &mut annots,
+        );
+        assert!(matches!(err, Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn resolve_kids_array_resolves_indirect_and_rejects_non_array() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(ObjectRef::new(9, 0), refs(&[6, 7]));
+        pdf.set_object(ObjectRef::new(10, 0), Object::Integer(1));
+
+        // Direct array.
+        let direct = dict_value(vec![("Kids", refs(&[6]))]);
+        assert_eq!(
+            resolve_kids_array(&mut pdf, &direct).unwrap(),
+            Some(refs_vec(&[6]))
+        );
+
+        // Indirect reference to an array.
+        let indirect = dict_value(vec![("Kids", Object::Reference(ObjectRef::new(9, 0)))]);
+        assert_eq!(
+            resolve_kids_array(&mut pdf, &indirect).unwrap(),
+            Some(refs_vec(&[6, 7]))
+        );
+
+        // Indirect reference to a non-array resolves to None.
+        let non_array = dict_value(vec![("Kids", Object::Reference(ObjectRef::new(10, 0)))]);
+        assert_eq!(resolve_kids_array(&mut pdf, &non_array).unwrap(), None);
+
+        // Absent /Kids, and a direct non-array /Kids, both yield None.
+        assert_eq!(
+            resolve_kids_array(&mut pdf, &dict_value(vec![])).unwrap(),
+            None
+        );
+        let name_kids = dict_value(vec![("Kids", Object::Name(b"x".to_vec()))]);
+        assert_eq!(resolve_kids_array(&mut pdf, &name_kids).unwrap(), None);
+    }
+
+    #[test]
+    fn page_widget_annotation_refs_filters_widgets_and_edge_entries() {
+        let mut pdf = empty_pdf();
+        // page /Annots mixes: a widget, a non-widget, a non-dict, and a direct
+        // (non-reference) entry — only the widget ref is returned.
+        pdf.set_object(
+            ObjectRef::new(3, 0),
+            dict(vec![(
+                "Annots",
+                Object::Array(vec![
+                    Object::Reference(ObjectRef::new(5, 0)),
+                    Object::Reference(ObjectRef::new(6, 0)),
+                    Object::Reference(ObjectRef::new(7, 0)),
+                    Object::Integer(99),
+                ]),
+            )]),
+        );
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            dict(vec![("Subtype", Object::Name(b"Widget".to_vec()))]),
+        );
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            dict(vec![("Subtype", Object::Name(b"Link".to_vec()))]),
+        );
+        pdf.set_object(ObjectRef::new(7, 0), Object::Integer(0));
+
+        let widgets = page_widget_annotation_refs(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert_eq!(widgets, vec![ObjectRef::new(5, 0)]);
+    }
+
+    #[test]
+    fn page_widget_annotation_refs_handles_non_dict_page_and_missing_annots() {
+        let mut pdf = empty_pdf();
+        // A non-dictionary page yields no widgets.
+        pdf.set_object(ObjectRef::new(3, 0), Object::Integer(1));
+        assert!(page_widget_annotation_refs(&mut pdf, ObjectRef::new(3, 0))
+            .unwrap()
+            .is_empty());
+
+        // A page dictionary without /Annots yields no widgets.
+        pdf.set_object(
+            ObjectRef::new(3, 0),
+            dict(vec![("Type", Object::Name(b"Page".to_vec()))]),
+        );
+        assert!(page_widget_annotation_refs(&mut pdf, ObjectRef::new(3, 0))
+            .unwrap()
+            .is_empty());
     }
 }

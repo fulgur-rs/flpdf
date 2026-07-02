@@ -727,6 +727,289 @@ else
     echo "Skipping objstm-lin-cap-boundary-199-bearing.pdf (already exists)"
 fi
 
+# --- hn1g.15: --remove-restrictions == qpdf disableDigitalSignatures fixtures ---
+# All content-stream-free (deflate-independent). Pin the 3 qpdf --remove-restrictions cases:
+#  perms-docmdp : catalog /Perms /DocMDP only (no AcroForm) -> /Perms removed, Sig GC'd
+#  field-only   : AcroForm /Fields[sig], Sig not in /Annots -> /Fields[], field GC'd, SigFlags 0
+#  widget       : Sig also referenced from page /Annots (merged) -> /Fields[], field survives as annot, Sig GC'd
+if [[ ! -f "$FIX/perms-docmdp-one-page.pdf" ]]; then
+    echo "Generating perms-docmdp-one-page.pdf ..."
+    python3 - "$FIX/perms-docmdp-one-page.pdf" <<'PY'
+import sys
+objs = {
+  1: b"<< /Type /Catalog /Pages 2 0 R /Perms << /DocMDP 4 0 R >> >>",
+  2: b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+  3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+  4: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 10 20 30] /Contents <00> >>",
+}
+order=[1,2,3,4]
+out=bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"); offs={}
+for n in order: offs[n]=len(out); out+=b"%d 0 obj\n"%n+objs[n]+b"\nendobj\n"
+xo=len(out); size=len(order)+1
+out+=b"xref\n0 %d\n0000000000 65535 f \n"%size
+for n in range(1,size): out+=b"%010d 00000 n \n"%offs[n]
+out+=b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"%(size,xo)
+open(sys.argv[1],"wb").write(out)
+PY
+else
+    echo "Skipping perms-docmdp-one-page.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/acroform-sig-field-only.pdf" ]]; then
+    echo "Generating acroform-sig-field-only.pdf ..."
+    python3 - "$FIX/acroform-sig-field-only.pdf" <<'PY'
+import sys
+objs = {
+  1: b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>",
+  2: b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+  3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+  4: b"<< /Fields [5 0 R] /SigFlags 3 >>",
+  5: b"<< /FT /Sig /T (Approval) /V 6 0 R /Rect [0 0 0 0] >>",
+  6: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 10 20 30] /Contents <00> >>",
+}
+order=[1,2,3,4,5,6]
+out=bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"); offs={}
+for n in order: offs[n]=len(out); out+=b"%d 0 obj\n"%n+objs[n]+b"\nendobj\n"
+xo=len(out); size=len(order)+1
+out+=b"xref\n0 %d\n0000000000 65535 f \n"%size
+for n in range(1,size): out+=b"%010d 00000 n \n"%offs[n]
+out+=b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"%(size,xo)
+open(sys.argv[1],"wb").write(out)
+PY
+else
+    echo "Skipping acroform-sig-field-only.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/acroform-sig-widget.pdf" ]]; then
+    echo "Generating acroform-sig-widget.pdf ..."
+    python3 - "$FIX/acroform-sig-widget.pdf" <<'PY'
+import sys
+objs = {
+  1: b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>",
+  2: b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+  3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+  4: b"<< /Fields [5 0 R] /SigFlags 3 >>",
+  5: b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Approval) /V 6 0 R /Rect [10 20 30 40] /P 3 0 R >>",
+  6: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 10 20 30] /Contents <00> >>",
+}
+order=[1,2,3,4,5,6]
+out=bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"); offs={}
+for n in order: offs[n]=len(out); out+=b"%d 0 obj\n"%n+objs[n]+b"\nendobj\n"
+xo=len(out); size=len(order)+1
+out+=b"xref\n0 %d\n0000000000 65535 f \n"%size
+for n in range(1,size): out+=b"%010d 00000 n \n"%offs[n]
+out+=b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"%(size,xo)
+open(sys.argv[1],"wb").write(out)
+PY
+else
+    echo "Skipping acroform-sig-widget.pdf (already exists)"
+fi
+
+# --- hn1g.15: getFormFields edge-case matrix (qpdf disableDigitalSignatures) ---
+# Five more content-stream-free fixtures pinning the terminal-annotation-field
+# selection qpdf's getFormFields() performs (fields from /AcroForm /Fields plus
+# orphan page /Annots widgets, disabling those whose inherited /FT is /Sig):
+#  nonterminal-parent   : /Sig parent w/ widget kid (parent non-terminal) -> KEPT
+#  nonannotation-terminal: terminal /Sig field w/o /Rect//Subtype//AP      -> KEPT
+#  orphan-widget         : /FT /Sig widget in /Annots, not in /Fields      -> DISABLED
+#  unsigned-placeholder  : /FT /Sig widget, no /V//SigFlags//Perms         -> DISABLED
+#  parent-pure-widget-kid: /Sig parent w/ pure-annotation kid (no /T//Parent) -> parent DISABLED
+# Each uses the gap-aware xref helper (order=sorted, size=max+1, `f` rows for
+# absent object numbers) so fixtures with an object-number hole stay valid.
+if [[ ! -f "$FIX/acroform-sig-nonterminal-parent.pdf" ]]; then
+    echo "Generating acroform-sig-nonterminal-parent.pdf ..."
+    python3 - "$FIX/acroform-sig-nonterminal-parent.pdf" <<'PY'
+import sys
+objs = {
+  1: b"<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>",
+  2: b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+  3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+  4: b"<< /FT /Sig /T (Sig1) /V 7 0 R /Kids [5 0 R] >>",
+  5: b"<< /Type /Annot /Subtype /Widget /Rect [10 20 30 40] /P 3 0 R /Parent 4 0 R >>",
+  6: b"<< /Fields [4 0 R] /SigFlags 3 >>",
+  7: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 10 20 30] /Contents <00> >>",
+}
+order=sorted(objs)
+out=bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"); offs={}
+for n in order: offs[n]=len(out); out+=b"%d 0 obj\n"%n+objs[n]+b"\nendobj\n"
+xo=len(out); size=max(order)+1
+out+=b"xref\n0 %d\n0000000000 65535 f \n"%size
+for n in range(1,size):
+    out+=(b"%010d 00000 n \n"%offs[n]) if n in offs else b"0000000000 65535 f \n"
+out+=b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"%(size,xo)
+open(sys.argv[1],"wb").write(out)
+PY
+else
+    echo "Skipping acroform-sig-nonterminal-parent.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/acroform-sig-nonannotation-terminal.pdf" ]]; then
+    echo "Generating acroform-sig-nonannotation-terminal.pdf ..."
+    python3 - "$FIX/acroform-sig-nonannotation-terminal.pdf" <<'PY'
+import sys
+objs = {
+  1: b"<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>",
+  2: b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+  3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+  4: b"<< /FT /Sig /T (Sig1) /V 7 0 R >>",
+  6: b"<< /Fields [4 0 R] /SigFlags 3 >>",
+  7: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 10 20 30] /Contents <00> >>",
+}
+order=sorted(objs)
+out=bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"); offs={}
+for n in order: offs[n]=len(out); out+=b"%d 0 obj\n"%n+objs[n]+b"\nendobj\n"
+xo=len(out); size=max(order)+1
+out+=b"xref\n0 %d\n0000000000 65535 f \n"%size
+for n in range(1,size):
+    out+=(b"%010d 00000 n \n"%offs[n]) if n in offs else b"0000000000 65535 f \n"
+out+=b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"%(size,xo)
+open(sys.argv[1],"wb").write(out)
+PY
+else
+    echo "Skipping acroform-sig-nonannotation-terminal.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/acroform-sig-orphan-widget.pdf" ]]; then
+    echo "Generating acroform-sig-orphan-widget.pdf ..."
+    python3 - "$FIX/acroform-sig-orphan-widget.pdf" <<'PY'
+import sys
+objs = {
+  1: b"<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>",
+  2: b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+  3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+  5: b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Orphan) /V 7 0 R /Rect [10 20 30 40] /P 3 0 R >>",
+  6: b"<< /Fields [] /SigFlags 3 >>",
+  7: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 10 20 30] /Contents <00> >>",
+}
+order=sorted(objs)
+out=bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"); offs={}
+for n in order: offs[n]=len(out); out+=b"%d 0 obj\n"%n+objs[n]+b"\nendobj\n"
+xo=len(out); size=max(order)+1
+out+=b"xref\n0 %d\n0000000000 65535 f \n"%size
+for n in range(1,size):
+    out+=(b"%010d 00000 n \n"%offs[n]) if n in offs else b"0000000000 65535 f \n"
+out+=b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"%(size,xo)
+open(sys.argv[1],"wb").write(out)
+PY
+else
+    echo "Skipping acroform-sig-orphan-widget.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/acroform-sig-unsigned-placeholder.pdf" ]]; then
+    echo "Generating acroform-sig-unsigned-placeholder.pdf ..."
+    python3 - "$FIX/acroform-sig-unsigned-placeholder.pdf" <<'PY'
+import sys
+objs = {
+  1: b"<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>",
+  2: b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+  3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+  5: b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Unsigned) /Rect [10 20 30 40] /P 3 0 R >>",
+  6: b"<< /Fields [5 0 R] >>",
+}
+order=sorted(objs)
+out=bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"); offs={}
+for n in order: offs[n]=len(out); out+=b"%d 0 obj\n"%n+objs[n]+b"\nendobj\n"
+xo=len(out); size=max(order)+1
+out+=b"xref\n0 %d\n0000000000 65535 f \n"%size
+for n in range(1,size):
+    out+=(b"%010d 00000 n \n"%offs[n]) if n in offs else b"0000000000 65535 f \n"
+out+=b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"%(size,xo)
+open(sys.argv[1],"wb").write(out)
+PY
+else
+    echo "Skipping acroform-sig-unsigned-placeholder.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/acroform-sig-parent-pure-widget-kid.pdf" ]]; then
+    echo "Generating acroform-sig-parent-pure-widget-kid.pdf ..."
+    python3 - "$FIX/acroform-sig-parent-pure-widget-kid.pdf" <<'PY'
+import sys
+objs = {
+  1: b"<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>",
+  2: b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+  3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+  4: b"<< /FT /Sig /T (Sig1) /V 7 0 R /Kids [5 0 R] >>",
+  5: b"<< /Type /Annot /Subtype /Widget /Rect [10 20 30 40] /P 3 0 R >>",
+  6: b"<< /Fields [4 0 R] /SigFlags 3 >>",
+  7: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 10 20 30] /Contents <00> >>",
+}
+order=sorted(objs)
+out=bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"); offs={}
+for n in order: offs[n]=len(out); out+=b"%d 0 obj\n"%n+objs[n]+b"\nendobj\n"
+xo=len(out); size=max(order)+1
+out+=b"xref\n0 %d\n0000000000 65535 f \n"%size
+for n in range(1,size):
+    out+=(b"%010d 00000 n \n"%offs[n]) if n in offs else b"0000000000 65535 f \n"
+out+=b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"%(size,xo)
+open(sys.argv[1],"wb").write(out)
+PY
+else
+    echo "Skipping acroform-sig-parent-pure-widget-kid.pdf (already exists)"
+fi
+
+# --- hn1g.15: sig-dict reachability + indirect /Fields edge cases ---
+# Two more content-stream-free fixtures pinning qpdf's disableDigitalSignatures
+# behaviour on two structural corner cases:
+#  dss-shared     : the /V signature dict is ALSO referenced from catalog /DSS,
+#                   so qpdf's write-time GC KEEPS it (only the field's /V is
+#                   removed) -> sig dict survives, /DSS survives, /SigFlags 0.
+#  indirect-fields: /AcroForm /Fields is an INDIRECT array (obj 8); qpdf erases
+#                   items from that original array handle, so /Fields stays a
+#                   reference and the referenced array object is mutated to [].
+# Both use the gap-aware xref helper (obj 4 is absent).
+if [[ ! -f "$FIX/acroform-sig-dss-shared.pdf" ]]; then
+    echo "Generating acroform-sig-dss-shared.pdf ..."
+    python3 - "$FIX/acroform-sig-dss-shared.pdf" <<'PY'
+import sys
+objs = {
+  1: b"<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R /DSS << /Sigs [7 0 R] >> >>",
+  2: b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+  3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+  5: b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (S) /V 7 0 R /Rect [10 20 30 40] /P 3 0 R >>",
+  6: b"<< /Fields [5 0 R] /SigFlags 3 >>",
+  7: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 10 20 30] /Contents <00> >>",
+}
+order=sorted(objs)
+out=bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"); offs={}
+for n in order: offs[n]=len(out); out+=b"%d 0 obj\n"%n+objs[n]+b"\nendobj\n"
+xo=len(out); size=max(order)+1
+out+=b"xref\n0 %d\n0000000000 65535 f \n"%size
+for n in range(1,size):
+    out+=(b"%010d 00000 n \n"%offs[n]) if n in offs else b"0000000000 65535 f \n"
+out+=b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"%(size,xo)
+open(sys.argv[1],"wb").write(out)
+PY
+else
+    echo "Skipping acroform-sig-dss-shared.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/acroform-sig-indirect-fields.pdf" ]]; then
+    echo "Generating acroform-sig-indirect-fields.pdf ..."
+    python3 - "$FIX/acroform-sig-indirect-fields.pdf" <<'PY'
+import sys
+objs = {
+  1: b"<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>",
+  2: b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+  3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+  5: b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (S) /V 7 0 R /Rect [10 20 30 40] /P 3 0 R >>",
+  6: b"<< /Fields 8 0 R /SigFlags 3 >>",
+  7: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 10 20 30] /Contents <00> >>",
+  8: b"[5 0 R]",
+}
+order=sorted(objs)
+out=bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"); offs={}
+for n in order: offs[n]=len(out); out+=b"%d 0 obj\n"%n+objs[n]+b"\nendobj\n"
+xo=len(out); size=max(order)+1
+out+=b"xref\n0 %d\n0000000000 65535 f \n"%size
+for n in range(1,size):
+    out+=(b"%010d 00000 n \n"%offs[n]) if n in offs else b"0000000000 65535 f \n"
+out+=b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"%(size,xo)
+open(sys.argv[1],"wb").write(out)
+PY
+else
+    echo "Skipping acroform-sig-indirect-fields.pdf (already exists)"
+fi
+
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -1144,6 +1427,18 @@ for stem in objstm-lin-od-indirect-length objstm-lin-od-indirect-length-flate \
         "$FIX/$stem.pdf" "$REF/$stem/linearize-classic.pdf"
     qpdf --check "$REF/$stem/linearize-classic.pdf" >/dev/null
     echo "$stem/linearize-classic.pdf"
+done
+
+# --- hn1g.15: qpdf --remove-restrictions == disableDigitalSignatures oracle ---
+for stem in perms-docmdp-one-page acroform-sig-field-only acroform-sig-widget \
+            acroform-sig-nonterminal-parent acroform-sig-nonannotation-terminal \
+            acroform-sig-orphan-widget acroform-sig-unsigned-placeholder \
+            acroform-sig-parent-pure-widget-kid \
+            acroform-sig-dss-shared acroform-sig-indirect-fields; do
+    mkdir -p "$REF/$stem"
+    qpdf --remove-restrictions --static-id --warning-exit-0 \
+        "$FIX/$stem.pdf" "$REF/$stem/remove-restrictions.pdf"
+    echo "$stem/remove-restrictions.pdf"
 done
 
 echo ""
