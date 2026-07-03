@@ -50,6 +50,37 @@ pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(pdf: &mut Pdf<R
         return Ok(());
     };
 
+    // qpdf's `pushInheritedAttributesToPage` calls `(void)cache()` first
+    // (QPDF_pages.cc:315-317). As a side effect, `cache()`/`getAllPagesInternal`
+    // clones any `/Page` leaf reachable more than once in the `/Kids` tree
+    // (QPDF_pages.cc:202-213) so the push below applies inherited attributes to
+    // each occurrence independently. qpdf only clones when the xref was NOT
+    // reconstructed (QPDF_pages.cc:205); a reconstructed input instead takes a
+    // drop-and-flatten arm that flpdf does not yet implement, so gate the clone
+    // off for reconstructed inputs to avoid introducing a new divergence.
+    let reconstructed = pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .any(|d| d.message.contains("reconstruct cross-reference"));
+    if !reconstructed {
+        let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
+        let mut clone_visited: BTreeSet<ObjectRef> = BTreeSet::new();
+        // Compute the first free object number once and carry it through the
+        // walk, incrementing per clone. Re-deriving it with `next_object_ref`
+        // for every clone would rescan all object refs each time, making a
+        // `/Kids` array with many duplicate leaves quadratic.
+        let mut next_clone = next_object_ref(pdf)?;
+        resolve_duplicate_page_leaves(
+            pdf,
+            pages_ref,
+            &mut seen,
+            &mut clone_visited,
+            &mut next_clone,
+            0,
+        )?;
+    }
+
     let mut key_ancestors: BTreeMap<&'static [u8], Vec<Object>> = BTreeMap::new();
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     push_internal(pdf, pages_ref, &mut key_ancestors, &mut visited, 0)?;
@@ -198,6 +229,94 @@ fn push_internal<R: Read + Seek>(
           // call pops what it pushes before returning (balanced push/pop) and
           // any early `?` return skips this cleanup loop entirely, so the
           // stack for a key in `own_keys` is always still present here.
+    }
+    Ok(())
+}
+
+/// qpdf-`cache()`-equivalent duplicate-page resolution: clone any `/Page` leaf
+/// reachable more than once in the `/Kids` tree so the subsequent inherited-
+/// attribute push treats each occurrence as an independent object. Mirrors
+/// `getAllPagesInternal`'s seen-set clone (QPDF_pages.cc:202-213): the first
+/// occurrence of a leaf is recorded; each later occurrence is replaced, in the
+/// parent's `/Kids` array, by a fresh shallow copy of the leaf dict (indirect
+/// sub-objects such as `/Contents` stay shared, and the original leaf's
+/// `/Parent` is kept — the clone arm never flattens). A well-formed tree (no
+/// shared leaf) is a complete no-op.
+///
+/// The walk order matches `getAllPagesInternal` (depth-first, recursing into any
+/// kid that has a `/Kids` key) so the minted clone object numbers match qpdf's.
+/// `next_clone` is the running next free object number, threaded through the walk
+/// and incremented per clone (qpdf allocates from a running maximum rather than
+/// rescanning), which keeps cloning many duplicates linear rather than quadratic.
+fn resolve_duplicate_page_leaves<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    node_ref: ObjectRef,
+    seen: &mut BTreeSet<ObjectRef>,
+    visited: &mut BTreeSet<ObjectRef>,
+    next_clone: &mut ObjectRef,
+    depth: usize,
+) -> Result<()> {
+    if depth >= MAX_DEPTH {
+        return Err(Error::Unsupported(format!(
+            "page tree depth exceeds maximum of {MAX_DEPTH} at {node_ref}"
+        )));
+    }
+    if !visited.insert(node_ref) {
+        // Cycle guard: qpdf throws here; flpdf tolerates (matching PageWalk) and
+        // stops descending. A well-formed tree never hits this.
+        return Ok(());
+    }
+    let Object::Dictionary(mut dict) = pdf.resolve(node_ref)? else {
+        return Ok(()); // Non-dictionary node: nothing to walk.
+    };
+    let Some(mut kids) = dict
+        .get("Kids")
+        .and_then(Object::as_array)
+        .map(<[Object]>::to_vec)
+    else {
+        return Ok(()); // No /Kids: a leaf reached directly, or a malformed node.
+    };
+
+    // `kids` is a local copy that does not borrow `pdf`, so we can rewrite an
+    // entry in place while separately resolving/minting through `pdf`.
+    let mut changed = false;
+    for kid in kids.iter_mut() {
+        let kid_ref = match &*kid {
+            Object::Reference(r) => *r,
+            _ => continue, // Direct (non-reference) /Kids entry: skip, as push does.
+        };
+        // Decide the action in a scope that ends the immutable borrow of `pdf`
+        // before we mutate it (recurse or mint a clone).
+        let (recurse, clone) = {
+            let Object::Dictionary(kid_dict) = pdf.resolve_borrowed(kid_ref)? else {
+                continue; // Reference to a non-dictionary: skip, as push does.
+            };
+            if kid_dict.get("Kids").is_some() {
+                (true, None) // Interior /Pages node (has /Kids): descend.
+            } else if seen.insert(kid_ref) {
+                (false, None) // First occurrence of this leaf.
+            } else {
+                (false, Some(kid_dict.clone())) // Duplicate leaf: clone it.
+            }
+        };
+        if recurse {
+            resolve_duplicate_page_leaves(pdf, kid_ref, seen, visited, next_clone, depth + 1)?;
+        } else if let Some(clone) = clone {
+            let new_ref = *next_clone;
+            let next_num = new_ref
+                .number
+                .checked_add(1)
+                .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+            *next_clone = ObjectRef::new(next_num, 0);
+            pdf.set_object(new_ref, Object::Dictionary(clone));
+            seen.insert(new_ref);
+            *kid = Object::Reference(new_ref);
+            changed = true;
+        }
+    }
+    if changed {
+        dict.insert("Kids", Object::Array(kids));
+        pdf.set_object(node_ref, Object::Dictionary(dict));
     }
     Ok(())
 }
@@ -1622,6 +1741,362 @@ mod tests {
             Some(&Object::Reference(ObjectRef::new(5, 0))),
             "the leaf must inherit the GRANDPARENT's real /Resources, not be \
              shadowed by the child's two-hop null reference chain"
+        );
+    }
+
+    /// The SAME `/Page` leaf (5) is a kid of TWO different `/Pages` parents:
+    /// A (3, `/Rotate 90`) and B (4, `/Rotate 180`). Object layout:
+    /// 1 Catalog, 2 root /Pages [3 4], 3 /Pages A [5], 4 /Pages B [5],
+    /// 5 /Page (shared) /Contents 6, 6 (shared /Contents target).
+    fn pdf_with_leaf_shared_by_two_parents() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Pages /Parent 2 0 R /Kids [5 0 R] /Count 1 /Rotate 90 >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Pages /Parent 2 0 R /Kids [5 0 R] /Count 1 /Rotate 180 >>\nendobj\n",
+        );
+
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] \
+              /Contents 6 0 R >>\nendobj\n",
+        );
+
+        let off6 = pdf.len() as u64;
+        pdf.extend_from_slice(b"6 0 obj\n<< >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off5:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off6:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn duplicate_leaf_across_two_parents_is_cloned() {
+        let bytes = pdf_with_leaf_shared_by_two_parents();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        let before_count = pdf.object_refs().len();
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        // Exactly one clone minted (object 7 = next after the highest, 6).
+        assert_eq!(
+            pdf.object_refs().len(),
+            before_count + 1,
+            "a leaf shared by two parents must mint exactly one clone"
+        );
+
+        // Parent A keeps the original leaf; parent B now points at the clone.
+        let a = pdf.resolve(ObjectRef::new(3, 0)).expect("A resolves");
+        let Object::Dictionary(a_dict) = a else {
+            panic!("A not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            a_dict.get("Kids"),
+            Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+                5, 0
+            ))])),
+            "parent A must keep the original leaf 5 in its /Kids"
+        );
+        let b = pdf.resolve(ObjectRef::new(4, 0)).expect("B resolves");
+        let Object::Dictionary(b_dict) = b else {
+            panic!("B not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            b_dict.get("Kids"),
+            Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+                7, 0
+            ))])),
+            "parent B's /Kids entry must be rewritten to the clone (7)"
+        );
+
+        // Original leaf inherits A's /Rotate 90; clone inherits B's /Rotate 180.
+        let leaf = pdf.resolve(ObjectRef::new(5, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(leaf_dict.get("Rotate"), Some(&Object::Integer(90)));
+        let clone = pdf.resolve(ObjectRef::new(7, 0)).expect("clone resolves");
+        let Object::Dictionary(clone_dict) = clone else {
+            panic!("clone not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            clone_dict.get("Rotate"),
+            Some(&Object::Integer(180)),
+            "the clone must inherit parent B's /Rotate 180 independently — a naive \
+             skip would drop it"
+        );
+
+        // The clone keeps the ORIGINAL leaf's /Parent (3 = A), not B (4): the
+        // clone arm never flattens, so qpdf leaves /Parent unfixed.
+        assert_eq!(
+            clone_dict.get("Parent"),
+            Some(&Object::Reference(ObjectRef::new(3, 0))),
+            "the clone must keep the original leaf's /Parent (A), not be re-pointed to B"
+        );
+
+        // Shallow copy: leaf and clone share the same indirect /Contents (6).
+        assert_eq!(
+            leaf_dict.get("Contents"),
+            Some(&Object::Reference(ObjectRef::new(6, 0)))
+        );
+        assert_eq!(
+            clone_dict.get("Contents"),
+            Some(&Object::Reference(ObjectRef::new(6, 0))),
+            "shallowCopy keeps indirect sub-objects (/Contents) shared, not duplicated"
+        );
+
+        // The root /Count is untouched (clone arm never flattens).
+        let root_pages = pdf
+            .resolve(ObjectRef::new(2, 0))
+            .expect("root pages resolves");
+        let Object::Dictionary(rp) = root_pages else {
+            panic!("root pages not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            rp.get("Count"),
+            Some(&Object::Integer(2)),
+            "/Count must be unchanged"
+        );
+    }
+
+    /// One `/Pages` node lists the SAME leaf (3) twice in its `/Kids`.
+    fn pdf_with_leaf_listed_twice() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 3 0 R] /Count 2 >>\nendobj\n",
+        );
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn leaf_listed_twice_in_one_parent_is_cloned() {
+        let bytes = pdf_with_leaf_listed_twice();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        let before_count = pdf.object_refs().len();
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        assert_eq!(
+            pdf.object_refs().len(),
+            before_count + 1,
+            "one clone minted"
+        );
+        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let Object::Dictionary(pages_dict) = pages else {
+            panic!("not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            pages_dict.get("Kids"),
+            Some(&Object::Array(vec![
+                Object::Reference(ObjectRef::new(3, 0)),
+                Object::Reference(ObjectRef::new(4, 0)),
+            ])),
+            "the second occurrence must be rewritten to the clone (4), first kept as 3"
+        );
+    }
+
+    /// One `/Pages` node lists the same leaf (3) THREE times: two clones minted.
+    fn pdf_with_leaf_listed_thrice() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 3 0 R 3 0 R] /Count 3 >>\nendobj\n",
+        );
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn leaf_appearing_three_times_mints_two_clones() {
+        let bytes = pdf_with_leaf_listed_thrice();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        let before_count = pdf.object_refs().len();
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        assert_eq!(
+            pdf.object_refs().len(),
+            before_count + 2,
+            "two clones minted"
+        );
+        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let Object::Dictionary(pages_dict) = pages else {
+            panic!("not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            pages_dict.get("Kids"),
+            Some(&Object::Array(vec![
+                Object::Reference(ObjectRef::new(3, 0)),
+                Object::Reference(ObjectRef::new(4, 0)),
+                Object::Reference(ObjectRef::new(5, 0)),
+            ])),
+            "3x occurrence must become three distinct refs [3, clone 4, clone 5]"
+        );
+    }
+
+    /// An ordinary two-page tree with NO shared leaf: the clone pass is a no-op.
+    fn pdf_with_two_distinct_pages() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        );
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn no_duplicate_leaf_mints_nothing() {
+        let bytes = pdf_with_two_distinct_pages();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        let before_count = pdf.object_refs().len();
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        assert_eq!(
+            pdf.object_refs().len(),
+            before_count,
+            "a tree with no shared leaf must mint nothing (the clone pass is a no-op)"
+        );
+    }
+
+    #[test]
+    fn clone_pass_is_idempotent() {
+        let bytes = pdf_with_leaf_shared_by_two_parents();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("first push");
+        let after_first = pdf.object_refs().len();
+        push_inherited_attributes_to_pages(&mut pdf).expect("second push");
+
+        assert_eq!(
+            pdf.object_refs().len(),
+            after_first,
+            "re-running the pass must not clone again (no leaf appears twice after \
+             the first run)"
+        );
+    }
+
+    /// The shared-leaf fixture, but with a bogus `startxref` offset so opening
+    /// forces qpdf-style xref reconstruction. qpdf clones only when the xref was
+    /// NOT reconstructed (QPDF_pages.cc:205); flpdf must likewise skip the clone
+    /// pass for reconstructed inputs (they take a separate drop+flatten arm not
+    /// yet implemented), leaving the current behaviour unchanged.
+    fn pdf_shared_leaf_damaged_xref() -> Vec<u8> {
+        let mut bytes = pdf_with_leaf_shared_by_two_parents();
+        // Repoint startxref at a byte offset that is not an xref table, forcing
+        // the strict parse to fail and recovery to run.
+        let needle = b"startxref\n";
+        let pos = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("fixture has startxref");
+        let num_start = pos + needle.len();
+        let num_end = bytes[num_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| num_start + i)
+            .expect("startxref value ends in newline");
+        bytes.splice(num_start..num_end, b"9".to_vec());
+        bytes
+    }
+
+    #[test]
+    fn reconstructed_xref_input_does_not_clone() {
+        let bytes = pdf_shared_leaf_damaged_xref();
+        let mut pdf = Pdf::open_with_repair(Cursor::new(bytes)).expect("recovers");
+        assert!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|d| d.message.contains("reconstruct cross-reference")),
+            "fixture must actually reconstruct its xref for this test to be meaningful"
+        );
+        let before_count = pdf.object_refs().len();
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        assert_eq!(
+            pdf.object_refs().len(),
+            before_count,
+            "a reconstructed-xref input must NOT clone the shared leaf (qpdf gates \
+             the clone arm on !reconstructed_xref)"
         );
     }
 }

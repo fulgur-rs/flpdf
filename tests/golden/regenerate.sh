@@ -1070,6 +1070,28 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/one-page.pdf" "$REF/one-page/linearize.pdf"
 echo "one-page/linearize.pdf"
 
+# --- shared-page-two-parents: the same /Page leaf is a kid of two different
+# /Pages parents that carry different inherited /Rotate (A: 90, B: 180). qpdf's
+# cache()/getAllPagesInternal clones the 2nd occurrence into a new page object;
+# the original inherits /Rotate 90 and the clone inherits /Rotate 180, with the
+# clone keeping the original leaf's /Parent (no flatten in the clone arm). qpdf
+# warns ("appears more than once ... creating a new page object as a copy"), so
+# --warning-exit-0 keeps the golden reproducible (flpdf-52md). ---
+mkdir -p "$REF/shared-page-two-parents"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/shared-page-two-parents.pdf" "$REF/shared-page-two-parents/linearize.pdf"
+echo "shared-page-two-parents/linearize.pdf"
+
+# --- shared-page-two-parents-pushmint: as above, but parent A also carries a
+# DIRECT (non-scalar) /Resources that the inherited-attribute push mints into a
+# new indirect object. Pins the relative object-number ordering of the clone
+# (minted first, in the cache()-equivalent pass) vs the push-mint (flpdf-52md). ---
+mkdir -p "$REF/shared-page-two-parents-pushmint"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/shared-page-two-parents-pushmint.pdf" \
+    "$REF/shared-page-two-parents-pushmint/linearize.pdf"
+echo "shared-page-two-parents-pushmint/linearize.pdf"
+
 # --- no-stream-one-page: degenerate catalog/pages/page with no /Contents and no
 # /Resources. Pins the DEFLATE-backend hint-stream size delta as the sole
 # sanctioned deviation — byte-identical to qpdf under qpdf-zlib-compat (flpdf-05jt). ---

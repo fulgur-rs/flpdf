@@ -199,6 +199,32 @@ fn inherited_resources_one_page_byte_identical_to_qpdf() {
     );
 }
 
+// A `/Page` leaf shared by two `/Pages` parents that carry different inherited
+// `/Rotate` values (A: 90, B: 180). qpdf's `pushInheritedAttributesToPage`
+// begins with `(void)cache()`, whose `getAllPagesInternal` clones the 2nd
+// occurrence of the shared leaf into a distinct page object (QPDF_pages.cc:202).
+// The original leaf then inherits parent A's `/Rotate 90` and the clone inherits
+// parent B's `/Rotate 180`; the clone keeps the original leaf's `/Parent` (the
+// clone arm never flattens) and both share the `/Contents` stream. The param
+// dict must report `/N 2` and the root `/Count` stays 2 (flpdf-52md).
+#[test]
+fn shared_page_two_parents_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("shared-page-two-parents.pdf", "shared-page-two-parents");
+}
+
+// As above, but parent A also carries a DIRECT (non-scalar) `/Resources` that the
+// inherited-attribute push mints into a fresh indirect object. This pins the
+// relative object numbers of the clone (minted first, in the cache()-equivalent
+// pass) and the push-minted `/Resources` (minted after), which must match qpdf's
+// cache()-then-push order (flpdf-52md).
+#[test]
+fn shared_page_two_parents_pushmint_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "shared-page-two-parents-pushmint.pdf",
+        "shared-page-two-parents-pushmint",
+    );
+}
+
 #[test]
 fn relinearize_one_page_is_byte_identical_to_qpdf() {
     // Re-linearizing an already-linearized input: the source's old /Linearized
