@@ -3341,6 +3341,101 @@ mod tests {
         }
     }
 
+    /// Build a two-page PDF where page 2's font (obj 6) is reached ONLY by page 2
+    /// AND by a Catalog non-open-document key (`/Ref2`).  Layout:
+    ///   1 – Catalog  (/Pages 2 0 R, /Ref2 6 0 R)
+    ///   2 – Pages node  (Kids: [3 0 R, 4 0 R])
+    ///   3 – Page 1  → /Resources << /Font << /F1 5 0 R >> >>, /Contents 7 0 R
+    ///   4 – Page 2  → /Resources << /Font << /F2 6 0 R >> >>, /Contents 8 0 R
+    ///   5 – Font  (page-1-private, first-page)
+    ///   6 – Font  (page-2-private AND Catalog /Ref2 → others>0)
+    ///   7 – Content stream (page 1 only)
+    ///   8 – Content stream (page 2 only)
+    /// No `/Info` in the trailer, mirroring the compat fixture.
+    fn two_page_catalog_otherpage_other_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = [0u64; 9];
+        let mut push = |pdf: &mut Vec<u8>, n: usize, body: &[u8]| {
+            offs[n] = pdf.len() as u64;
+            pdf.extend_from_slice(format!("{n} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        };
+        push(&mut pdf, 1, b"<< /Type /Catalog /Pages 2 0 R /Ref2 6 0 R >>");
+        push(
+            &mut pdf,
+            2,
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+        );
+        push(&mut pdf, 3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R >>");
+        push(&mut pdf, 4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F2 6 0 R >> >> /Contents 8 0 R >>");
+        push(
+            &mut pdf,
+            5,
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Name /F1 >>",
+        );
+        push(
+            &mut pdf,
+            6,
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /Name /F2 >>",
+        );
+        push(&mut pdf, 7, b"<< /Length 5 >>\nstream\nBT ET\nendstream");
+        push(&mut pdf, 8, b"<< /Length 5 >>\nstream\nBT ET\nendstream");
+
+        let xref_start = pdf.len() as u64;
+        let mut xref = String::from("xref\n0 9\n0000000000 65535 f \n");
+        for off in offs.iter().skip(1) {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 9 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    // Non-gated integration guard for the Step-6b `others` route (flpdf-zda0): a
+    // non-first-page object reached by exactly one other page AND by a Catalog
+    // non-open-document key (others>0) must land in `part4_rest` (qpdf part9 /
+    // lc_other), NOT `part4_other_pages_private` (part7). qpdf gates part7 on
+    // others==0 (QPDF_linearization.cc:1128). Pins the classification and the
+    // page's part7 `object_count` hint independently of the qpdf-zlib-compat byte
+    // test.
+    #[test]
+    fn document_other_ref_routes_other_page_object_to_part9() {
+        let mut pdf = Pdf::open(Cursor::new(two_page_catalog_otherpage_other_bytes())).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+        let font = ObjectRef::new(6, 0); // page-2-private AND Catalog /Ref2 (others>0)
+
+        assert!(
+            plan.part4_rest.contains(&font),
+            "others>0 other-page object must be part4_rest (part9 / lc_other); \
+             part4_rest={:?}",
+            plan.part4_rest
+        );
+        assert!(
+            !plan.part4_other_pages_private.contains(&font),
+            "others>0 other-page object must NOT be part7 (other_pages_private); \
+             part4_other_pages_private={:?}",
+            plan.part4_other_pages_private
+        );
+        // The page-2 content stream (obj 8) is genuinely page-2-private (others==0)
+        // and stays in part7, so the routing is object-specific, not blanket.
+        let page2_content = ObjectRef::new(8, 0);
+        assert!(
+            plan.part4_other_pages_private.contains(&page2_content),
+            "page-2-private content (others==0) must remain part7"
+        );
+        // Hint effect: page 2's part7 object_count excludes the demoted font — the
+        // page dict + its content stream only (oracle: qpdf page-1 nobjects==2).
+        assert_eq!(
+            plan.page_hints[1].object_count, 2,
+            "page 2 object_count must exclude the others>0 font (page dict + content)"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // 4. Part 4 receives objects not in Part 2 or 3
     // -----------------------------------------------------------------------
