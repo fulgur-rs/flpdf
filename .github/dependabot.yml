@@ -17,14 +17,14 @@ updates:
       github-actions:
         patterns:
           - "*"
-    # Categorize dependabot PRs into the "Internal" release-notes bucket
-    # directly (release.yml maps release-notes:internal -> Internal). Dependabot
-    # applies this at PR creation, so categorization does not depend on the
-    # pr-labeler workflow parsing a grouped-update PR title (whose title is
-    # derived from the group identifier, not the commit prefix). NB: specifying
-    # `labels` replaces dependabot's default "dependencies" label — we
-    # intentionally drop it (the repo defines no "dependencies" label).
+    # Label dependabot PRs at creation, independent of pr-labeler parsing the PR
+    # title. `release-notes:internal` puts them in the "Internal" release-notes
+    # bucket (release.yml maps it); `dependencies` restores the standard
+    # dependency-PR filter label. NB: specifying `labels` replaces dependabot's
+    # default label set, so both are listed explicitly (both exist in the repo —
+    # dependabot auto-created `dependencies` on the first update PR).
     labels:
+      - "dependencies"
       - "release-notes:internal"
     commit-message:
       # "build(deps): …" keeps the merged commit message conventional; it is no
@@ -48,6 +48,7 @@ updates:
         patterns:
           - "*"
     labels:
+      - "dependencies"
       - "release-notes:internal"
     commit-message:
       prefix: "build"
