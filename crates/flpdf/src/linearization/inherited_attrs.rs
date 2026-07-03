@@ -1791,7 +1791,7 @@ mod tests {
         // Parent A keeps the original leaf; parent B now points at the clone.
         let a = pdf.resolve(ObjectRef::new(3, 0)).expect("A resolves");
         let Object::Dictionary(a_dict) = a else {
-            panic!("A not a dict")
+            panic!("A not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(
             a_dict.get("Kids"),
@@ -1802,7 +1802,7 @@ mod tests {
         );
         let b = pdf.resolve(ObjectRef::new(4, 0)).expect("B resolves");
         let Object::Dictionary(b_dict) = b else {
-            panic!("B not a dict")
+            panic!("B not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(
             b_dict.get("Kids"),
@@ -1815,12 +1815,12 @@ mod tests {
         // Original leaf inherits A's /Rotate 90; clone inherits B's /Rotate 180.
         let leaf = pdf.resolve(ObjectRef::new(5, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
-            panic!("leaf not a dict")
+            panic!("leaf not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(leaf_dict.get("Rotate"), Some(&Object::Integer(90)));
         let clone = pdf.resolve(ObjectRef::new(7, 0)).expect("clone resolves");
         let Object::Dictionary(clone_dict) = clone else {
-            panic!("clone not a dict")
+            panic!("clone not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(
             clone_dict.get("Rotate"),
@@ -1853,7 +1853,7 @@ mod tests {
             .resolve(ObjectRef::new(2, 0))
             .expect("root pages resolves");
         let Object::Dictionary(rp) = root_pages else {
-            panic!("root pages not a dict")
+            panic!("root pages not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(
             rp.get("Count"),
@@ -1903,7 +1903,7 @@ mod tests {
         );
         let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
         let Object::Dictionary(pages_dict) = pages else {
-            panic!("not a dict")
+            panic!("not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(
             pages_dict.get("Kids"),
@@ -1956,7 +1956,7 @@ mod tests {
         );
         let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
         let Object::Dictionary(pages_dict) = pages else {
-            panic!("not a dict")
+            panic!("not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(
             pages_dict.get("Kids"),
