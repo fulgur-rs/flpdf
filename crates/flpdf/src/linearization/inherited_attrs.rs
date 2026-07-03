@@ -53,13 +53,15 @@ pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(pdf: &mut Pdf<R
 
     // qpdf's `pushInheritedAttributesToPage` calls `getAllPages` first
     // (QPDF_optimization.cc:138-140). As a side effect, `getAllPages` /
-    // `getAllPagesInternal` (QPDF_pages.cc:39-75 / :77-138) clones any `/Page`
-    // leaf reachable more than once in the `/Kids` tree (QPDF_pages.cc:119-130)
-    // so the push below applies inherited attributes to each occurrence
-    // independently. 11.9.0's `getAllPagesInternal` has no xref-reconstruction
-    // gate and clones unconditionally; flpdf instead skips the clone pass for
-    // reconstructed inputs (a deliberate flpdf-specific divergence — flpdf has
-    // no matching repair for damaged files), gating it off below.
+    // `getAllPagesInternal` (QPDF_pages.cc:39-75 / :77-138) repairs the page
+    // tree — cloning any `/Page` leaf reachable more than once in the `/Kids`
+    // tree (QPDF_pages.cc:119-130) and overriding mistyped interior/leaf `/Type`
+    // keys (:89-92, :131-134) — so the push below sees a well-formed tree.
+    // 11.9.0's `getAllPagesInternal` has no xref-reconstruction gate and does
+    // these repairs unconditionally; flpdf instead skips the whole
+    // `repair_page_tree` pass (clone AND /Type override) for reconstructed
+    // inputs, a deliberate flpdf-specific divergence — flpdf has no matching
+    // repair for damaged files. Tracked as flpdf-s5i2.
     let reconstructed = pdf
         .repair_diagnostics()
         .entries()
@@ -2202,12 +2204,14 @@ mod tests {
             pdf.repair_diagnostics().entries().is_empty(),
             "fixture must NOT trip xref reconstruction, else the repair pass is \
              skipped behind the !reconstructed gate: {:?}",
-            pdf.repair_diagnostics().entries()
+            pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 
         push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
 
-        let interior = pdf.resolve(ObjectRef::new(3, 0)).expect("interior resolves");
+        let interior = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .expect("interior resolves");
         let Object::Dictionary(interior_dict) = interior else {
             panic!("interior is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2356,7 +2360,9 @@ mod tests {
 
         push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
 
-        let interior = pdf.resolve(ObjectRef::new(3, 0)).expect("interior resolves");
+        let interior = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .expect("interior resolves");
         let Object::Dictionary(interior_dict) = interior else {
             panic!("interior is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
