@@ -598,44 +598,90 @@ fn collect_used_names_for_page<R: Read + Seek>(
     let page_resources = crate::pages::resolve_inherited_resources(pdf, page_ref)?;
 
     let mut used: UsedNames = BTreeMap::new();
-    let mut visited_xobjects: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut visited_forms: BTreeSet<(ObjectRef, ObjectRef)> = BTreeSet::new();
 
     // `collect_from_stream` returns `false` when tokenisation stopped early on a
-    // malformed token: the collected names are then incomplete → retain.
-    let complete = collect_from_stream(
-        pdf,
-        &content_bytes,
-        page_resources.as_ref(),
-        &mut used,
-        &mut visited_xobjects,
-        0,
-    )?;
+    // malformed token: the collected names are then incomplete → retain. The
+    // page records its own directly-referenced names (`record_direct = true`) and
+    // owns the initial scope (`owner = page_ref`).
+    let complete = {
+        let mut ctx = CollectCtx {
+            pdf,
+            used: &mut used,
+            visited: &mut visited_forms,
+        };
+        let page_scope = Scope {
+            resources: page_resources.as_ref(),
+            record_direct: true,
+            owner: page_ref,
+        };
+        collect_from_stream(&mut ctx, &content_bytes, page_scope, 0)?
+    };
 
     Ok(complete.then_some(used))
 }
 
 /// Maximum recursion depth for Form XObject traversal.
 ///
-/// Indirect Form XObjects are guarded by `visited` (ObjectRef cycle detection).
-/// Direct-stream Form XObjects are owned by their containing dict and cannot
-/// form cycles in well-formed PDFs, but we cap depth as an extra safeguard.
+/// Each `(Form, scope)` pair is expanded at most once (`visited` is an ever-seen
+/// set), so cycles and shared/DAG references cannot loop. This cap is a
+/// stack-overflow safeguard for content that nests a very long chain of
+/// *distinct* Form XObjects.
 const MAX_FORM_DEPTH: usize = 64;
 
+/// State threaded unchanged through every level of the (mutually recursive)
+/// resource-name collection walk: the reader, the used-name accumulator, and the
+/// dedup set. Only the per-call [`Scope`] and `depth` vary, so they are passed
+/// separately. (Keeping the invariant borrows in one parameter also keeps the
+/// recursive call sites on a single line, which stops rustfmt from reflowing a
+/// `)?` onto its own line and fragmenting its coverage region.)
+struct CollectCtx<'a, R: Read + Seek> {
+    pdf: &'a mut Pdf<R>,
+    /// The page's real used-name accumulator — the bubble target for the names
+    /// of resource-less Form XObjects, wherever they sit in the Form tree.
+    used: &'a mut UsedNames,
+    /// Ever-seen set of expanded `(Form ref, scope owner)` pairs — the traversal
+    /// dedup guard. Keying on the pair (not the Form alone) lets a resource-less
+    /// Form reached under diverging scopes be explored once per scope. See the
+    /// `recurse_form_xobject` "Traversal bound" doc for the full rationale.
+    visited: &'a mut BTreeSet<(ObjectRef, ObjectRef)>,
+}
+
+/// The resource scope in force while walking a content stream.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    /// The `/Resources` dict that names in this stream resolve against.
+    resources: Option<&'a Dictionary>,
+    /// Whether this stream's *direct* names are page-relevant and recorded into
+    /// `ctx.used`. True for the page and resource-less Forms; false for a Form
+    /// with its own `/Resources` (its direct names are scoped to itself).
+    record_direct: bool,
+    /// Identity of the scope for `visited` keying: the page, or the `ObjectRef`
+    /// of the nearest Form with its own `/Resources`. A resource-less Form
+    /// inherits its caller's `owner`; an own-`/Resources` Form becomes its own.
+    owner: ObjectRef,
+}
+
 /// Core recursive walker: tokenises `stream_bytes` and records every resource
-/// reference into `used`. `resources` is the `/Resources` dict in scope for
-/// this stream (the page dict's or a Form XObject's). `visited` prevents
-/// infinite recursion through cyclic Form XObjects.
+/// reference into `ctx.used`. `scope` is the resource scope in force for this
+/// stream (see [`Scope`]).
+///
+/// `scope.record_direct` controls whether names referenced *directly* by this
+/// stream are attributed to `ctx.used`. It is `true` for the page and for
+/// resource-less Form XObjects (whose names are page-relevant), and `false` for
+/// a Form with its own `/Resources` (whose direct names resolve against that
+/// Form's own scope and must not affect page-level pruning). Nested Form XObjects
+/// are still traversed regardless, so a resource-less Form nested inside an
+/// own-resources Form still contributes its names to the page.
 ///
 /// Returns `Ok(true)` when the stream was tokenised to the end, `Ok(false)` when
-/// tokenisation stopped early on a malformed token (so `used` is incomplete and
-/// the page must be conservatively retained). Structural errors from
+/// tokenisation stopped early on a malformed token (so `ctx.used` is incomplete
+/// and the page must be conservatively retained). Structural errors from
 /// nested Form XObject resolution propagate as `Err`.
 fn collect_from_stream<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+    ctx: &mut CollectCtx<'_, R>,
     stream_bytes: &[u8],
-    resources: Option<&Dictionary>,
-    used: &mut UsedNames,
-    visited: &mut BTreeSet<ObjectRef>,
+    scope: Scope<'_>,
     depth: usize,
 ) -> Result<bool> {
     let parser = ContentStreamParser::new(stream_bytes);
@@ -649,115 +695,119 @@ fn collect_from_stream<R: Read + Seek>(
 
         match token {
             ContentToken::Op { operands, operator } => {
-                if !process_operator(pdf, &operator, &operands, resources, used, visited, depth)? {
+                if !process_operator(ctx, &operator, &operands, scope, depth)? {
                     return Ok(false);
                 }
             }
-            ContentToken::InlineImage { dict, .. } => {
+            ContentToken::InlineImage { dict, .. } if scope.record_direct => {
                 // /CS operand in an inline image may reference /ColorSpace.
                 // Abbreviated key is /CS (ISO 32000-1 Table 93).
                 let cs_val = dict.get("CS").or_else(|| dict.get("ColorSpace")).cloned();
                 if let Some(name) = cs_val.and_then(Object::into_name) {
                     if !is_builtin_inline_image_cs(&name) {
-                        used.entry(b"ColorSpace".to_vec()).or_default().insert(name);
+                        ctx.used
+                            .entry(b"ColorSpace".to_vec())
+                            .or_default()
+                            .insert(name);
                     }
                 }
             }
-            ContentToken::Comment(_) => {}
+            ContentToken::InlineImage { .. } | ContentToken::Comment(_) => {}
         }
     }
     Ok(true)
 }
 
 /// Process a single content-stream operator and record any resource references
-/// into `used`.
+/// into `ctx.used`.
 ///
 /// Returns the completeness flag of any nested Form XObject recursion (`true`
 /// for non-recursing operators): `false` propagates an incomplete collection up
 /// so the page is conservatively retained.
 fn process_operator<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+    ctx: &mut CollectCtx<'_, R>,
     operator: &[u8],
     operands: &[Object],
-    resources: Option<&Dictionary>,
-    used: &mut UsedNames,
-    visited: &mut BTreeSet<ObjectRef>,
+    scope: Scope<'_>,
     depth: usize,
 ) -> Result<bool> {
-    match operator {
-        // /XObject — `name Do`
-        b"Do" => {
-            if let Some(name) = operands.first().and_then(Object::as_name) {
-                used.entry(b"XObject".to_vec())
-                    .or_default()
-                    .insert(name.to_vec());
-
-                // Recurse into Form XObjects, propagating their completeness.
-                return recurse_form_xobject(pdf, name, resources, used, visited, depth);
-            }
-        }
-
-        // /Font — `name size Tf`
-        b"Tf" => {
-            if let Some(name) = operands.first().and_then(Object::as_name) {
-                used.entry(b"Font".to_vec())
+    // /XObject — `name Do` is the only recursing operator. Recurse into Form
+    // XObjects regardless of `record_direct` (a Form nested in an own-resources
+    // Form may still be resource-less and page-relevant), but attribute the
+    // XObject name itself to `ctx.used` only when this stream's names are
+    // page-relevant.
+    if operator == b"Do" {
+        if let Some(name) = operands.first().and_then(Object::as_name) {
+            if scope.record_direct {
+                ctx.used
+                    .entry(b"XObject".to_vec())
                     .or_default()
                     .insert(name.to_vec());
             }
+            // Recurse into Form XObjects, propagating their completeness.
+            return recurse_form_xobject(ctx, name, scope, depth);
         }
+        return Ok(true);
+    }
 
-        // /ExtGState — `name gs`
-        b"gs" => {
-            if let Some(name) = operands.first().and_then(Object::as_name) {
-                used.entry(b"ExtGState".to_vec())
-                    .or_default()
-                    .insert(name.to_vec());
-            }
-        }
+    // Every remaining operator only *records* a name; none recurse. When this
+    // stream is a Form with its own /Resources, those names resolve against the
+    // Form's own scope and are irrelevant to page-level pruning, so skip them.
+    if !scope.record_direct {
+        return Ok(true);
+    }
 
-        // /ColorSpace — `name cs` (non-stroking) / `name CS` (stroking)
-        b"cs" | b"CS" => {
-            if let Some(name) = operands.first().and_then(Object::as_name) {
-                if !is_builtin_color_space_cs_op(name) {
-                    used.entry(b"ColorSpace".to_vec())
-                        .or_default()
-                        .insert(name.to_vec());
-                }
-            }
-        }
-
-        // /Pattern — `scn` / `SCN`: last operand may be a Name (pattern name).
-        b"scn" | b"SCN" => {
-            if let Some(name) = operands.last().and_then(Object::as_name) {
-                used.entry(b"Pattern".to_vec())
-                    .or_default()
-                    .insert(name.to_vec());
-            }
-        }
-
-        // /Shading — `name sh`
-        b"sh" => {
-            if let Some(name) = operands.first().and_then(Object::as_name) {
-                used.entry(b"Shading".to_vec())
-                    .or_default()
-                    .insert(name.to_vec());
-            }
-        }
-
-        // /Properties — `tag props BDC` / `tag props DP`
-        // Operand index 1 is the property list: a Name → /Properties ref, or
-        // a direct dict << … >> (not a /Properties ref; skip).
-        b"BDC" | b"DP" => {
-            if let Some(name) = operands.get(1).and_then(Object::as_name) {
-                used.entry(b"Properties".to_vec())
-                    .or_default()
-                    .insert(name.to_vec());
-            }
-        }
-
-        _ => {}
+    // Map operator → (resource category, referenced name). The operand carrying
+    // the name — and, for `cs`/`CS`, an extra built-in filter — vary per operator;
+    // the recording into `ctx.used` is otherwise uniform.
+    let recorded: Option<(&[u8], &[u8])> = match operator {
+        // `name size Tf`
+        b"Tf" => operands
+            .first()
+            .and_then(Object::as_name)
+            .map(|n| (&b"Font"[..], n)),
+        // `name gs`
+        b"gs" => operands
+            .first()
+            .and_then(Object::as_name)
+            .map(|n| (&b"ExtGState"[..], n)),
+        // `name cs` (non-stroking) / `name CS` (stroking) — skip built-in names.
+        b"cs" | b"CS" => operands
+            .first()
+            .and_then(Object::as_name)
+            .filter(|n| !is_builtin_color_space_cs_op(n))
+            .map(|n| (&b"ColorSpace"[..], n)),
+        // `scn` / `SCN` — the *last* operand may be a pattern name.
+        b"scn" | b"SCN" => operands
+            .last()
+            .and_then(Object::as_name)
+            .map(|n| (&b"Pattern"[..], n)),
+        // `name sh`
+        b"sh" => operands
+            .first()
+            .and_then(Object::as_name)
+            .map(|n| (&b"Shading"[..], n)),
+        // `tag props BDC` / `tag props DP` — operand 1 may be a /Properties name
+        // (a direct `<< … >>` dict is not a /Properties ref, so it is skipped).
+        b"BDC" | b"DP" => operands
+            .get(1)
+            .and_then(Object::as_name)
+            .map(|n| (&b"Properties"[..], n)),
+        _ => None,
+    };
+    if let Some((category, name)) = recorded {
+        ctx.used
+            .entry(category.to_vec())
+            .or_default()
+            .insert(name.to_vec());
     }
     Ok(true)
+}
+
+/// Whether an (already resource-resolved) XObject stream dict is a Form XObject
+/// (`/Subtype /Form`).
+fn is_form_xobject(dict: &Dictionary) -> bool {
+    matches!(dict.get("Subtype"), Some(Object::Name(n)) if n.as_slice() == b"Form")
 }
 
 /// If `xobject_name` resolves to a Form XObject, decode and recurse into its
@@ -768,40 +818,62 @@ fn process_operator<R: Read + Seek>(
 ///   inside the Form resolve against the Form's own resources dict. Those names
 ///   must NOT be added to the calling page's `used` set — doing so would cause
 ///   page-level resources with the same name (but unused by the page itself) to
-///   be incorrectly retained when pruning.
+///   be incorrectly retained when pruning. The Form's content is still walked to
+///   reach nested resource-less Form XObjects, whose names ARE page-relevant.
 /// - If the Form XObject has no `/Resources` entry, it inherits the calling
 ///   scope's resources; names referenced inside the Form are attributed to the
-///   page's `used` set as before.
+///   page's `used` set.
 ///
-/// The XObject entry in `/Resources/XObject` may be either an indirect
-/// `Object::Reference` (the common case) or a direct `Object::Stream` (allowed
-/// by the PDF spec for inline stream objects).  Both are handled here.
+/// # Traversal bound
 ///
-/// Indirect references use `visited` (an `ObjectRef` set) for cycle detection.
-/// Direct streams are owned by their containing dictionary and therefore cannot
-/// be reached through a cycle in well-formed PDFs; `depth` provides an extra
-/// guard against pathological documents.
+/// `visited` is an *ever-seen* set of `(Form ref, scope owner)` pairs. A Form
+/// with its own `/Resources` resolves its names against its own scope, so it is
+/// keyed as `(ref, ref)` and expanded once regardless of how it is reached; a
+/// resource-less Form resolves nested `Do` names against the inherited scope, so
+/// it is keyed as `(ref, inherited scope owner)` and expanded once per distinct
+/// scope it is reached under. This bounds shared / DAG-shaped Form trees (e.g. a
+/// `/Fm(i) Do /Fm(i) Do` chain, which a "currently-on-stack" set would
+/// re-traverse `2^depth` times) without collapsing scope-divergent resolution:
+/// a resource-less Form reached under two scopes that resolve its nested names
+/// differently contributes each scope's names, so no page-rendered resource is
+/// dropped. Bounded by O(V²) pairs (no exponential blow-up); realistic documents
+/// have few distinct scopes, so it is ~O(V).
 ///
-/// Returns `Ok(true)` when the Form (if any) was tokenised completely, `Ok(false)`
-/// when the Form's content could not be fully decoded/tokenised AND its names
-/// feed the calling page's scope — signalling the page must be conservatively
-/// retained. A Form with its **own** `/Resources` cannot make the
-/// page incomplete (its names are scoped to itself and discarded here), so it
-/// always reports `Ok(true)`. Non-Form / absent / cycle / depth-limit cases also
-/// report `Ok(true)` (nothing page-relevant was lost). Structural resolution
-/// errors propagate as `Err`.
+/// # Direct-stream Form XObjects
+///
+/// The `/Resources/XObject` entry may also be a direct (inline) `Object::Stream`
+/// rather than an `Object::Reference`. Inline streams are malformed per ISO
+/// 32000-2 §7.3.8 (a stream shall be an indirect object); qpdf does not even
+/// parse them as Form XObjects. Such a stream carries no `ObjectRef` identity,
+/// so the `visited` guard cannot dedup a self-reference reached through
+/// inherited resources — recursing would blow up exponentially. We therefore do
+/// not recurse into direct-stream Forms and instead report the page as
+/// incomplete (`Ok(false)`), conservatively retaining its resources. This
+/// avoids both the DoS and dropping fonts the Form uses.
+///
+/// # Return value
+///
+/// Returns `Ok(true)` when the referenced Form (if any) was tokenised completely
+/// or nothing page-relevant could be lost (non-Form / absent / already-visited /
+/// depth-limit). Returns `Ok(false)` when the page's `used` set may be
+/// incomplete — a decode/tokenise failure whose names feed the page, or a
+/// direct-stream Form — signalling the page must be conservatively retained.
+/// Structural resolution errors propagate as `Err`.
 fn recurse_form_xobject<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+    ctx: &mut CollectCtx<'_, R>,
     xobject_name: &[u8],
-    page_resources: Option<&Dictionary>,
-    used: &mut UsedNames,
-    visited: &mut BTreeSet<ObjectRef>,
+    caller: Scope<'_>,
     depth: usize,
 ) -> Result<bool> {
-    // Guard against excessively deep recursion (applies to direct-stream forms
-    // in particular, since indirect refs are additionally guarded by `visited`).
+    // Stack-overflow safeguard for a very long chain of *distinct* Forms.
+    // Cycles / shared references are already bounded by the ever-seen
+    // `ctx.visited` set below, so this is not the DoS guard — it caps recursion
+    // depth only. Report the page as incomplete rather than complete: cutting the
+    // walk off here means a resource-less Form beyond the limit could reference a
+    // page resource we never recorded, so the page must be conservatively
+    // retained rather than pruned against a partial used-name set.
     if depth >= MAX_FORM_DEPTH {
-        return Ok(true);
+        return Ok(false);
     }
 
     // Locate the XObject entry in the current /Resources scope. The
@@ -810,9 +882,9 @@ fn recurse_form_xobject<R: Read + Seek>(
     // same way `apply_pruning` already treats indirect category dicts. The
     // reference may itself be reached through more than one indirect hop
     // (ref -> ref -> dict); follow the chain to its terminal dictionary.
-    let xobj_val: Option<Object> = match page_resources.and_then(|res| res.get("XObject")) {
+    let xobj_val: Option<Object> = match caller.resources.and_then(|res| res.get("XObject")) {
         Some(Object::Dictionary(xobj_dict)) => xobj_dict.get(xobject_name).cloned(),
-        Some(cat_ref @ Object::Reference(_)) => resolve_ref_chain(pdf, cat_ref)?
+        Some(cat_ref @ Object::Reference(_)) => resolve_ref_chain(ctx.pdf, cat_ref)?
             .0
             .into_dict()
             .and_then(|xobj_dict| xobj_dict.get(xobject_name).cloned()),
@@ -823,122 +895,110 @@ fn recurse_form_xobject<R: Read + Seek>(
         return Ok(true);
     };
 
-    // For indirect XObject references, record the ObjectRef so we can do
-    // stack-pop cycle detection (see below).  Direct streams cannot form cycles
-    // in well-formed PDFs, so no entry is needed for them.
-    let indirect_ref: Option<ObjectRef> = match &xobj_val {
-        Object::Reference(r) => Some(*r),
-        _ => None,
-    };
-
-    // Resolve to a Stream, handling both indirect references and direct streams.
-    // An indirect XObject may be reached through more than one indirect hop
-    // (ref -> ref -> stream); follow the chain to its terminal and move the
-    // owned Stream out rather than cloning it again. (`indirect_ref` above keeps
-    // the *first* hop for the `visited` stack-pop cycle guard — unaffected here.)
-    // A non-Stream terminal, a non-reference/non-stream value, and (above) an
-    // absent entry all mean "nothing to recurse into" → the page stays complete.
-    let stream: Option<crate::object::Stream> = match xobj_val {
-        Object::Reference(xobj_ref) => resolve_ref_chain(pdf, &Object::Reference(xobj_ref))?
-            .0
-            .into_stream(),
-        // Direct stream: owned by its parent dict, so cycles are impossible in
-        // well-formed PDFs.  Depth guard above is sufficient.
-        Object::Stream(s) => Some(s),
-        _ => None,
-    };
-    let Some(stream) = stream else {
-        return Ok(true);
+    // Resolve to a Stream. An indirect XObject may be reached through more than
+    // one indirect hop (ref -> ref -> stream); follow the chain to its terminal.
+    // A direct (inline) stream is handled separately: it has no `ObjectRef`
+    // identity, so the `visited` guard cannot protect against a self-reference
+    // reached through inherited resources. Rather than recurse (unbounded) or
+    // prune (dropping fonts the Form uses), we report the page as incomplete so
+    // its resources are conservatively retained. qpdf never parses an inline
+    // stream as a Form, so there is no byte-identical target for this case.
+    let (stream, xobj_ref) = match xobj_val {
+        Object::Reference(r) => {
+            // Key the `visited` set on the *terminal* ref, not the first hop, so a
+            // Form reached via distinct reference chains (`r_a -> T`, `r_b -> T`)
+            // is expanded once — matching qpdf, which keys on the terminal
+            // object's `QPDFObjGen`. First-hop keying would re-expand the shared
+            // terminal once per aliasing name (redundant work, and the only lever
+            // that could re-walk a subtree once inherited scopes diverge);
+            // terminal keying makes each Form's expansion path-independent.
+            let (resolved, terminal) = resolve_ref_chain(ctx.pdf, &Object::Reference(r))?;
+            match resolved.into_stream() {
+                Some(s) => (s, terminal.unwrap_or(r)),
+                None => return Ok(true), // non-stream terminal → nothing to recurse into
+            }
+        }
+        Object::Stream(s) => {
+            // A direct-stream Form → retain the page (`Ok(false)`); a direct-stream
+            // non-Form (e.g. an inline image) → nothing to recurse into (`Ok(true)`).
+            return Ok(!is_form_xobject(&s.dict));
+        }
+        _ => return Ok(true), // not a reference or stream → nothing to recurse into
     };
 
     // Only recurse into Form XObjects.
-    let is_form = stream
-        .dict
-        .get("Subtype")
-        .is_some_and(|v| matches!(v, Object::Name(n) if n.as_slice() == b"Form"));
-    if !is_form {
+    if !is_form_xobject(&stream.dict) {
         return Ok(true);
     }
 
-    // Determine whether the Form has its own /Resources entry (checked before
-    // decode so a decode failure can report the right completeness). We check for
-    // key *presence* (not the resolved value) because an empty or indirect
-    // /Resources still means the Form owns its resource scope.
-    let form_has_own_resources = stream.dict.get("Resources").is_some();
+    // Determine whether the Form has its own /Resources entry (checked before the
+    // visited key and before decode so both use the right scope / completeness).
+    // Resolve the Form's own `/Resources` to a dictionary, if it has one. The
+    // entry may be a direct dict or a holder chain (ref -> ref -> dict), which we
+    // follow to its terminal — the same way the `/XObject` category is resolved
+    // above; a single-hop read would drop a chained /Resources.
+    //
+    // Whether the Form *owns* a resource scope is then `is_some()`, NOT bare key
+    // presence: per ISO 32000-2 §7.3.9 a `null` value — direct (`/Resources null`)
+    // or at the end of the chain (`/Resources 7 0 R` → `null`) — is equivalent to
+    // an absent entry, and so is any non-dictionary value. Treating those as owned
+    // would walk the Form with `record_direct = false` and an empty scope, so a
+    // page-inherited name it uses would never be recorded → over-prune. (Resolved
+    // objects are cached, so re-resolving on a later visit is O(1).)
+    let form_resources: Option<Dictionary> = match stream.dict.get("Resources") {
+        Some(Object::Dictionary(d)) => Some(d.clone()),
+        Some(res_ref @ Object::Reference(_)) => resolve_ref_chain(ctx.pdf, res_ref)?.0.into_dict(),
+        _ => None,
+    };
+    let form_has_own_resources = form_resources.is_some();
+
+    // A Form with its own /Resources is scope-independent (owner = itself); a
+    // resource-less Form inherits the caller's scope owner. (See "Traversal
+    // bound" for why the owner keys the dedup below.)
+    let scope_owner = if form_has_own_resources {
+        xobj_ref
+    } else {
+        caller.owner
+    };
+
+    // Ever-seen dedup: insert the (Form, scope owner) pair and NEVER remove, so
+    // each pair is expanded at most once. Keyed *before* decode so a decode
+    // failure also marks the pair seen — decoding depends only on the bytes, not
+    // the path.
+    if !ctx.visited.insert((xobj_ref, scope_owner)) {
+        return Ok(true); // already expanded under this scope
+    }
 
     // Decode the Form's content stream. On failure, the Form's resource usage is
-    // unknown: that only makes the *page* incomplete when the Form inherits the
-    // page scope (its names feed `used`). A Form with its own /Resources scopes
-    // its names to itself (discarded here), so the page stays complete.
+    // unknown: that makes the page incomplete when the Form (or a resource-less
+    // Form nested within it) feeds the page's `used` set.
     let form_bytes = match decode_stream_data(&stream.dict, &stream.data) {
         Ok(b) => b,
-        Err(_) => return Ok(form_has_own_resources),
+        Err(_) => return Ok(false),
     };
 
-    // ── Cycle guard (stack-pop style, roborev medium 指摘1) ──────────────────
-    //
-    // The cycle check is deferred until just before recursion so that early
-    // returns above (non-Stream, non-Form, decode failure) never leave the
-    // ObjectRef stranded in `visited`.
-    //
-    // By inserting here and removing *after* the recursive call returns, `visited`
-    // acts as a "currently on the call stack" set rather than a "ever visited"
-    // set.  This means that the same XObject can be legitimately visited via
-    // multiple independent paths (e.g. first inside a Form with its own
-    // /Resources, then directly from the page scope) without the first path
-    // blocking the second.
-    //
-    // True cycles (A → B → A) are still caught: while recursing into A, `visited`
-    // contains A; when B tries to recurse into A again, `insert` returns false
-    // and we return immediately, breaking the loop.  Once B returns and we remove
-    // A from `visited`, no infinite loop is possible.
-    if let Some(r) = indirect_ref {
-        if !visited.insert(r) {
-            return Ok(true); // cycle detected — already on the current call stack
+    let child = if form_has_own_resources {
+        // The Form owns its scope (`owner = scope_owner = xobj_ref`); its direct
+        // names are not page-relevant (`record_direct = false`), but nested
+        // resource-less Forms still bubble to the page.
+        Scope {
+            resources: form_resources.as_ref(),
+            record_direct: false,
+            owner: scope_owner,
         }
-    }
-
-    let page_complete = if form_has_own_resources {
-        // Resolve the Form's own /Resources dict (may be direct or indirect).
-        let form_resources: Option<Dictionary> = match stream.dict.get("Resources").cloned() {
-            Some(Object::Dictionary(d)) => Some(d),
-            Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
-                Object::Dictionary(d) => Some(d.clone()),
-                _ => None, // broken ref → treat as empty own scope
-            },
-            _ => None,
-        };
-
-        // Use a throwaway accumulator so that resource names referenced inside
-        // the Form do NOT pollute the calling page's used set. Because those
-        // names are scoped to the Form and discarded, an incomplete tokenisation
-        // here cannot make the *page* unreliable — the page stays complete.
-        let mut form_used: UsedNames = BTreeMap::new();
-        collect_from_stream(
-            pdf,
-            &form_bytes,
-            form_resources.as_ref(),
-            &mut form_used,
-            visited,
-            depth + 1,
-        )?;
-        // form_used is intentionally discarded; Form's own /Resources pruning
-        // is out of scope for this minimum fix (flpdf-9hc.12.4).
-        true
     } else {
-        // No /Resources key → Form inherits the calling scope's resources.
-        // Attribute all references to the page's used set (original behaviour).
-        // The Form's completeness IS the page's completeness here: an incomplete
-        // tokenisation means page-scoped names may be missing → retain.
-        collect_from_stream(pdf, &form_bytes, page_resources, used, visited, depth + 1)?
+        // No own /Resources → the Form inherits the caller's scope and owner and
+        // attributes its names to the page's used set (`record_direct = true`).
+        Scope {
+            resources: caller.resources,
+            record_direct: true,
+            owner: scope_owner,
+        }
     };
-
-    // ── Stack pop: remove from visited so sibling/later paths can visit this ref ─
-    if let Some(r) = indirect_ref {
-        visited.remove(&r);
-    }
-
-    Ok(page_complete)
+    // The child walk's completeness IS the page's completeness: an incomplete
+    // tokenisation may have missed a page-relevant (inherited or nested) name, so
+    // it propagates up and the page is conservatively retained.
+    collect_from_stream(ctx, &form_bytes, child, depth + 1)
 }
 
 /// Prune `res_ref` (an indirect /Resources object) in-place: remove every
