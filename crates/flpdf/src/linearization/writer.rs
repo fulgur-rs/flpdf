@@ -3521,6 +3521,115 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // 1b. write_linearized surfaces a too-deep `/Pages` tree as an
+    //     Error::Unsupported — not a panic, hang, or stack overflow.
+    //
+    // write_linearized re-runs push_inherited_attributes_to_pages on its own
+    // write-handle (writer.rs, right after the option guards) before it emits
+    // the layout. A `/Pages` chain deeper than DEFAULT_MAX_PAGE_TREE_DEPTH makes
+    // that push return Error::Unsupported, which the `?` propagates out.
+    //
+    // Construction: the plan/renumber are built from the valid tiny PDF, NOT the
+    // deep fixture. LinearizationPlan::from_pdf pushes inherited attributes too,
+    // so a deep source is rejected at plan-build time and can never reach
+    // write_linearized. Pairing a valid plan with a deep write-handle is the
+    // only way to drive a deep tree into write_linearized at all.
+    //
+    // This depth guard is defense-in-depth, so the test asserts the observable
+    // BEHAVIOR (deep tree -> depth-overflow Unsupported), not that any single
+    // line is the unique source. In real single-source use, plan construction
+    // rejects a deep tree first; and even with write_linearized's own push
+    // removed, the downstream page walk (pages::page_refs and friends) raises a
+    // byte-identical depth-overflow error. The push in isolation is covered by
+    // inherited_attrs.rs::excessive_depth_returns_unsupported_error.
+    // -----------------------------------------------------------------------
+
+    /// A `/Pages` chain `DEFAULT_MAX_PAGE_TREE_DEPTH + 1` nodes deep, ending in
+    /// one `/Page` leaf — one level past the walk's depth bound.
+    fn deep_pages_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let depth = crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH + 1;
+        // Object numbers: 1 = Catalog, 2..=(1+depth) = Pages chain,
+        // (2+depth) = the leaf Page.
+        let leaf_num = 2 + depth as u32;
+        let mut offsets: Vec<u64> = Vec::with_capacity(1 + depth + 1);
+
+        offsets.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        for level in 0..depth {
+            let this_num = 2 + level as u32;
+            let next_ref = if level + 1 == depth {
+                leaf_num
+            } else {
+                this_num + 1
+            };
+            offsets.push(pdf.len() as u64);
+            pdf.extend_from_slice(
+                format!(
+                    "{this_num} 0 obj\n<< /Type /Pages /Kids [{next_ref} 0 R] /Count 1 >>\nendobj\n"
+                )
+                .as_bytes(),
+            );
+        }
+
+        offsets.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            format!(
+                "{leaf_num} 0 obj\n<< /Type /Page /Parent {} 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+                leaf_num - 1
+            )
+            .as_bytes(),
+        );
+
+        let total = offsets.len() + 1; // +1 for the free-list head at object 0
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn write_linearized_propagates_excessive_depth_error() {
+        // Valid plan/renumber from the tiny fixture (see the note above for why
+        // they cannot be built from the deep fixture).
+        let mut plan_pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut plan_pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+
+        // Deep write-handle. WriteOptions::default() leaves deterministic_id /
+        // static_id false and encrypt / copy_encryption None, so the option
+        // guards ahead of the push are no-ops and the push is the first fallible
+        // step reached.
+        let mut deep_pdf =
+            Pdf::open(Cursor::new(deep_pages_pdf_bytes())).expect("deep fixture parses");
+
+        let result = write_linearized(&plan, &renumber, &mut deep_pdf, &WriteOptions::default());
+        // Match on the depth-overflow message too, not merely the Unsupported
+        // variant, so an unrelated Unsupported can't satisfy the test. (The
+        // message does not by itself localize the failure to one line — the same
+        // "page tree depth exceeds maximum of N ..." string is emitted from
+        // several page-tree walkers; see the note above on defense-in-depth.)
+        let is_depth_overflow = matches!(
+            &result,
+            Err(crate::Error::Unsupported(msg)) if msg.contains("page tree depth exceeds maximum of")
+        );
+        assert!(
+            is_depth_overflow,
+            "write_linearized must surface a too-deep /Pages tree as a \
+             depth-overflow Error::Unsupported, got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // 2. Output starts with %PDF-
     // -----------------------------------------------------------------------
     #[test]
