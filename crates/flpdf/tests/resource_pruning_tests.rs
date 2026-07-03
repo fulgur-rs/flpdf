@@ -1888,6 +1888,75 @@ fn test_form_resources_null_is_inherited_not_own_scope() {
     );
 }
 
+// The `/Resources null` inheritance rule also applies when the null is reached
+// through an indirect reference (`/Resources 7 0 R` where 7 0 R resolves to
+// null, or a holder chain ending in null): key presence is not enough, the
+// reference must be resolved. Verified with qpdf 11.9.0
+// (--remove-unreferenced-resources=yes keeps /F1). (flpdf-u79t / Codex review
+// r3517182000 of PR #442.)
+#[test]
+fn test_form_resources_indirect_null_is_inherited() {
+    let form_content = b"BT /F1 10 Tf (indirect-null-res form) Tj ET";
+    let form = {
+        let mut b = format!(
+            "6 0 obj\n<< /Subtype /Form /Resources 7 0 R /Length {} >>\nstream\n",
+            form_content.len()
+        )
+        .into_bytes();
+        b.extend_from_slice(form_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Fm0 Do")),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> /XObject << /Fm0 6 0 R >> >>",
+            ),
+        ),
+        (6, form),
+        // The Form's /Resources reference resolves to null → inherited.
+        (7, obj_bytes(7, "null")),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open indirect-null /Resources PDF");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
+    else {
+        panic!("5 0 R is not a dictionary");
+    };
+    let Some(Object::Dictionary(font_dict)) = res_dict.get("Font") else {
+        panic!(
+            "/Font must survive — the Form's /Resources resolves to null (inherited) and uses /F1"
+        );
+    };
+    let keys: Vec<String> = font_dict
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "indirect-null /Resources inherits page scope → /F1 kept: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"F2".to_string()),
+        "unused /F2 must still be pruned: {keys:?}"
+    );
+}
+
 // When Form nesting exceeds MAX_FORM_DEPTH the walk is cut off; the page must
 // then be conservatively RETAINED (not pruned against the partial name set),
 // because a Form beyond the cutoff may reference a page resource we never
@@ -1996,6 +2065,68 @@ fn test_bare_do_operator_without_name_is_noop() {
     assert!(
         !font_keys.contains(&"F2".to_string()),
         "unused /F2 must still be pruned: {font_keys:?}"
+    );
+}
+
+// An indirect XObject reference that resolves to a *non-Form* stream (e.g. an
+// image) is recorded as used but not recursed into. The page stays complete and
+// prunes normally. (flpdf-u79t.)
+#[test]
+fn test_indirect_image_xobject_kept_not_recursed() {
+    // Object 6 is an image XObject (/Subtype /Image), referenced via `/Im0 Do`.
+    let img_body: &[u8] = b"\x00";
+    let img = {
+        let mut b = format!(
+            "6 0 obj\n<< /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 \
+             /ColorSpace /DeviceGray /Length {} >>\nstream\n",
+            img_body.len()
+        )
+        .into_bytes();
+        b.extend_from_slice(img_body);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Im0 Do")),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> >> /XObject << /Im0 6 0 R >> >>",
+            ),
+        ),
+        (6, img),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open indirect-image PDF");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
+    else {
+        panic!("5 0 R is not a dictionary");
+    };
+    // /Im0 is used by the page → kept; the image is not a Form, so nothing is
+    // recursed and the unused /F1 font is pruned (page stayed complete).
+    let Some(Object::Dictionary(xobj_dict)) = res_dict.get("XObject") else {
+        panic!("/XObject must survive (/Im0 used by page)");
+    };
+    assert!(
+        xobj_dict.get("Im0").is_some(),
+        "/XObject/Im0 must remain (used by page): {xobj_dict:?}"
+    );
+    assert!(
+        res_dict.get("Font").is_none(),
+        "unused /F1 must be pruned — an image XObject keeps the page complete: {res_dict:?}"
     );
 }
 

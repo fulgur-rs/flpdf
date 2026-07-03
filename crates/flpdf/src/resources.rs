@@ -933,14 +933,24 @@ fn recurse_form_xobject<R: Read + Seek>(
 
     // Determine whether the Form has its own /Resources entry (checked before the
     // visited key and before decode so both use the right scope / completeness).
-    // Key *presence* — not the resolved value — suffices, because an empty or
-    // indirect /Resources still means the Form owns its resource scope. A `null`
-    // value is the one exception: per ISO 32000-2 §7.3.9 a null entry is
-    // equivalent to an absent one, so `/Resources null` means the Form inherits
-    // the calling scope (treating it as own-resources would drop the Form's
-    // page-inherited names → over-prune).
-    let resources_entry = stream.dict.get("Resources");
-    let form_has_own_resources = !matches!(resources_entry, None | Some(Object::Null));
+    // Resolve the Form's own `/Resources` to a dictionary, if it has one. The
+    // entry may be a direct dict or a holder chain (ref -> ref -> dict), which we
+    // follow to its terminal — the same way the `/XObject` category is resolved
+    // above; a single-hop read would drop a chained /Resources.
+    //
+    // Whether the Form *owns* a resource scope is then `is_some()`, NOT bare key
+    // presence: per ISO 32000-2 §7.3.9 a `null` value — direct (`/Resources null`)
+    // or at the end of the chain (`/Resources 7 0 R` → `null`) — is equivalent to
+    // an absent entry, and so is any non-dictionary value. Treating those as owned
+    // would walk the Form with `record_direct = false` and an empty scope, so a
+    // page-inherited name it uses would never be recorded → over-prune. (Resolved
+    // objects are cached, so re-resolving on a later visit is O(1).)
+    let form_resources: Option<Dictionary> = match stream.dict.get("Resources") {
+        Some(Object::Dictionary(d)) => Some(d.clone()),
+        Some(res_ref @ Object::Reference(_)) => resolve_ref_chain(ctx.pdf, res_ref)?.0.into_dict(),
+        _ => None,
+    };
+    let form_has_own_resources = form_resources.is_some();
 
     // A Form with its own /Resources is scope-independent (owner = itself); a
     // resource-less Form inherits the caller's scope owner. (See "Traversal
@@ -967,45 +977,28 @@ fn recurse_form_xobject<R: Read + Seek>(
         Err(_) => return Ok(false),
     };
 
-    if form_has_own_resources {
-        // Resolve the Form's own /Resources dict (may be direct or indirect). The
-        // reference may be a multi-hop holder chain (ref -> ref -> dict); follow
-        // it to the terminal dictionary, the same way the `/XObject` category is
-        // resolved above. A single-hop read would drop a chained /Resources and
-        // treat the Form as having an empty scope, so a resource-less Form nested
-        // inside it (whose names bubble to the page) would be missed → over-prune.
-        let form_resources: Option<Dictionary> = match resources_entry {
-            Some(Object::Dictionary(d)) => Some(d.clone()),
-            Some(res_ref @ Object::Reference(_)) => {
-                resolve_ref_chain(ctx.pdf, res_ref)?.0.into_dict()
-            }
-            _ => None,
-        };
-
+    let child = if form_has_own_resources {
         // The Form owns its scope (`owner = scope_owner = xobj_ref`); its direct
         // names are not page-relevant (`record_direct = false`), but nested
-        // resource-less Forms still bubble to the page. Propagate the walk's
-        // completeness: an incomplete tokenisation may have missed such a nested
-        // page-relevant name.
-        let child = Scope {
+        // resource-less Forms still bubble to the page.
+        Scope {
             resources: form_resources.as_ref(),
             record_direct: false,
             owner: scope_owner,
-        };
-        collect_from_stream(ctx, &form_bytes, child, depth + 1)
+        }
     } else {
-        // No /Resources key → Form inherits the caller's scope and owner
-        // (`scope_owner = caller.owner`). Attribute its names to the page's used
-        // set (`record_direct = true`). The Form's completeness IS the page's
-        // completeness here: an incomplete tokenisation means page-scoped names
-        // may be missing → retain.
-        let child = Scope {
+        // No own /Resources → the Form inherits the caller's scope and owner and
+        // attributes its names to the page's used set (`record_direct = true`).
+        Scope {
             resources: caller.resources,
             record_direct: true,
             owner: scope_owner,
-        };
-        collect_from_stream(ctx, &form_bytes, child, depth + 1)
-    }
+        }
+    };
+    // The child walk's completeness IS the page's completeness: an incomplete
+    // tokenisation may have missed a page-relevant (inherited or nested) name, so
+    // it propagates up and the page is conservatively retained.
+    collect_from_stream(ctx, &form_bytes, child, depth + 1)
 }
 
 /// Prune `res_ref` (an indirect /Resources object) in-place: remove every
