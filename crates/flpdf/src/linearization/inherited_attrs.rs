@@ -1,16 +1,17 @@
 //! Push inherited page attributes down to `/Page` leaves and strip them from
 //! interior `/Pages` nodes, mirroring qpdf's `pushInheritedAttributesToPage`
-//! (`QPDF_pages.cc:298-410`). Linearization runs this unconditionally before
-//! computing the linearization plan — qpdf's `Lin::optimize` always passes
-//! `allow_changes=true` for linearized output (`QPDF_linearization.cc:127-130`,
-//! called only from `QPDFWriter::writeLinearized`). The normal (non-linearized)
-//! write path never performs this step and must keep emitting `/Pages` nodes
-//! verbatim.
+//! (`QPDF_optimization.cc:127-156`) together with the page-tree repairs its
+//! `getAllPages` call performs first (`QPDF_pages.cc:39-138`). Linearization
+//! runs this unconditionally before computing the linearization plan — qpdf
+//! calls `optimize(..., allow_changes=true)` for linearized output
+//! (`QPDFWriter.cc:2553`, in `QPDFWriter::writeLinearized`). The normal
+//! (non-linearized) write path never performs this step and must keep emitting
+//! `/Pages` nodes verbatim.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
-use crate::object::{Object, ObjectRef};
+use crate::object::{Dictionary, Object, ObjectRef};
 use crate::ref_chain::terminal_ref_of_chain;
 use crate::{Error, Pdf, Result};
 
@@ -50,14 +51,15 @@ pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(pdf: &mut Pdf<R
         return Ok(());
     };
 
-    // qpdf's `pushInheritedAttributesToPage` calls `(void)cache()` first
-    // (QPDF_pages.cc:315-317). As a side effect, `cache()`/`getAllPagesInternal`
-    // clones any `/Page` leaf reachable more than once in the `/Kids` tree
-    // (QPDF_pages.cc:202-213) so the push below applies inherited attributes to
-    // each occurrence independently. qpdf only clones when the xref was NOT
-    // reconstructed (QPDF_pages.cc:205); a reconstructed input instead takes a
-    // drop-and-flatten arm that flpdf does not yet implement, so gate the clone
-    // off for reconstructed inputs to avoid introducing a new divergence.
+    // qpdf's `pushInheritedAttributesToPage` calls `getAllPages` first
+    // (QPDF_optimization.cc:138-140). As a side effect, `getAllPages` /
+    // `getAllPagesInternal` (QPDF_pages.cc:39-75 / :77-138) clones any `/Page`
+    // leaf reachable more than once in the `/Kids` tree (QPDF_pages.cc:119-130)
+    // so the push below applies inherited attributes to each occurrence
+    // independently. 11.9.0's `getAllPagesInternal` has no xref-reconstruction
+    // gate and clones unconditionally; flpdf instead skips the clone pass for
+    // reconstructed inputs (a deliberate flpdf-specific divergence — flpdf has
+    // no matching repair for damaged files), gating it off below.
     let reconstructed = pdf
         .repair_diagnostics()
         .entries()
@@ -71,7 +73,7 @@ pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(pdf: &mut Pdf<R
         // for every clone would rescan all object refs each time, making a
         // `/Kids` array with many duplicate leaves quadratic.
         let mut next_clone = next_object_ref(pdf)?;
-        resolve_duplicate_page_leaves(
+        repair_page_tree(
             pdf,
             pages_ref,
             &mut seen,
@@ -159,7 +161,7 @@ fn push_internal<R: Read + Seek>(
                 // Direct (non-indirect) non-scalar value: mint a new indirect
                 // object so descendants share ONE object instead of each
                 // duplicating the structure inline (mirrors qpdf's
-                // makeIndirectObject call in QPDF_pages.cc:355-360).
+                // makeIndirectObject call in QPDF_optimization.cc:186-196).
                 let new_ref = next_object_ref(pdf)?;
                 pdf.set_object(new_ref, value);
                 Object::Reference(new_ref)
@@ -233,22 +235,33 @@ fn push_internal<R: Read + Seek>(
     Ok(())
 }
 
-/// qpdf-`cache()`-equivalent duplicate-page resolution: clone any `/Page` leaf
-/// reachable more than once in the `/Kids` tree so the subsequent inherited-
-/// attribute push treats each occurrence as an independent object. Mirrors
-/// `getAllPagesInternal`'s seen-set clone (QPDF_pages.cc:202-213): the first
-/// occurrence of a leaf is recorded; each later occurrence is replaced, in the
-/// parent's `/Kids` array, by a fresh shallow copy of the leaf dict (indirect
-/// sub-objects such as `/Contents` stay shared, and the original leaf's
-/// `/Parent` is kept — the clone arm never flattens). A well-formed tree (no
-/// shared leaf) is a complete no-op.
+/// Partial mirror of qpdf 11.9.0 `getAllPagesInternal` (QPDF_pages.cc:77-138):
+/// walk the `/Kids` tree depth-first, repairing page-tree nodes in place so the
+/// subsequent inherited-attribute push sees a well-formed tree. Three repairs
+/// from `getAllPagesInternal` are applied:
 ///
-/// The walk order matches `getAllPagesInternal` (depth-first, recursing into any
-/// kid that has a `/Kids` key) so the minted clone object numbers match qpdf's.
-/// `next_clone` is the running next free object number, threaded through the walk
-/// and incremented per clone (qpdf allocates from a running maximum rather than
-/// rescanning), which keeps cloning many duplicates linear rather than quadratic.
-fn resolve_duplicate_page_leaves<R: Read + Seek>(
+/// - **Interior `/Type`** (:89-92): a node reached as an interior node (one with
+///   `/Kids`) whose `/Type` is not `/Pages` has it overridden to `/Pages`.
+/// - **Duplicate leaf** (:119-130): the first occurrence of a `/Page` leaf is
+///   recorded; each later occurrence is replaced, in the parent's `/Kids` array,
+///   by a fresh shallow copy of the leaf dict (indirect sub-objects such as
+///   `/Contents` stay shared, and the original leaf's `/Parent` is kept — the
+///   clone arm never flattens).
+/// - **Leaf `/Type`** (:131-134): a leaf (no `/Kids`) whose `/Type` is not
+///   `/Page` has it overridden to `/Page`, for both a first-occurrence leaf and
+///   a freshly minted clone.
+///
+/// A well-formed tree (correct `/Type` keys, no shared leaf) is a complete
+/// no-op — no node is rewritten and no object is minted. The walk order matches
+/// `getAllPagesInternal` (depth-first, recursing into any kid that has a `/Kids`
+/// key) so the minted clone object numbers match qpdf's. `next_clone` is the
+/// running next free object number, threaded through the walk and incremented
+/// per clone (qpdf allocates from a running maximum rather than rescanning),
+/// which keeps cloning many duplicates linear rather than quadratic.
+///
+/// The `/MediaBox` default (:104-112) and direct-kid → indirect (:113-118)
+/// repairs `getAllPagesInternal` also performs are not mirrored here.
+fn repair_page_tree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     node_ref: ObjectRef,
     seen: &mut BTreeSet<ObjectRef>,
@@ -280,6 +293,17 @@ fn resolve_duplicate_page_leaves<R: Read + Seek>(
     // `kids` is a local copy that does not borrow `pdf`, so we can rewrite an
     // entry in place while separately resolving/minting through `pdf`.
     let mut changed = false;
+
+    // (2i) Override this interior node's /Type to /Pages if it is not already
+    // (QPDF_pages.cc:89-92). qpdf runs getAllPagesInternal only on /Kids-bearing
+    // nodes (getAllPages gates the root on `pages.hasKey("/Kids")`, recursion on
+    // the kid's /Kids), so reaching here — past the /Kids guard — is exactly that
+    // condition. An already-`/Pages` node is left untouched (no rewrite).
+    if !type_name_is(&dict, b"Pages") {
+        dict.insert("Type", Object::Name(b"Pages".to_vec()));
+        changed = true;
+    }
+
     for kid in kids.iter_mut() {
         let kid_ref = match &*kid {
             Object::Reference(r) => *r,
@@ -300,8 +324,14 @@ fn resolve_duplicate_page_leaves<R: Read + Seek>(
             }
         };
         if recurse {
-            resolve_duplicate_page_leaves(pdf, kid_ref, seen, visited, next_clone, depth + 1)?;
-        } else if let Some(clone) = clone {
+            repair_page_tree(pdf, kid_ref, seen, visited, next_clone, depth + 1)?;
+            continue;
+        }
+        // Leaf branch. `leaf_ref` is the original leaf for a first occurrence, or
+        // the freshly minted clone for a duplicate; qpdf overrides the leaf /Type
+        // AFTER this clone decision (QPDF_pages.cc:131-134), so both flow through
+        // the (2l) override below.
+        let leaf_ref = if let Some(clone) = clone {
             let new_ref = *next_clone;
             let next_num = new_ref
                 .number
@@ -312,6 +342,22 @@ fn resolve_duplicate_page_leaves<R: Read + Seek>(
             seen.insert(new_ref);
             *kid = Object::Reference(new_ref);
             changed = true;
+            new_ref
+        } else {
+            kid_ref
+        };
+        // (2l) Override the leaf /Type to /Page if it is not already
+        // (QPDF_pages.cc:131-134). Check via a borrow so a correctly typed leaf
+        // (the common case) is never cloned or rewritten.
+        let wrong_type = matches!(
+            pdf.resolve_borrowed(leaf_ref)?,
+            Object::Dictionary(d) if !type_name_is(d, b"Page")
+        );
+        if wrong_type {
+            if let Object::Dictionary(mut leaf) = pdf.resolve(leaf_ref)? {
+                leaf.insert("Type", Object::Name(b"Page".to_vec()));
+                pdf.set_object(leaf_ref, Object::Dictionary(leaf));
+            }
         }
     }
     if changed {
@@ -333,6 +379,15 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
         .checked_add(1)
         .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
     Ok(ObjectRef::new(n, 0))
+}
+
+/// True iff `dict`'s `/Type` is a `Name` equal to `want`. Mirrors the dictionary
+/// half of qpdf's `isDictionaryOfType` (QPDFObjectHandle.cc:462-466); the caller
+/// has already established that the object is a dictionary. `/Type` is matched
+/// directly — missing, or a non-matching name, yields `false` — like the other
+/// page-tree `/Type` checks in this module.
+fn type_name_is(dict: &Dictionary, want: &[u8]) -> bool {
+    matches!(dict.get("Type"), Some(Object::Name(n)) if n.as_slice() == want)
 }
 
 #[cfg(test)]
@@ -2054,10 +2109,11 @@ mod tests {
     }
 
     /// The shared-leaf fixture, but with a bogus `startxref` offset so opening
-    /// forces qpdf-style xref reconstruction. qpdf clones only when the xref was
-    /// NOT reconstructed (QPDF_pages.cc:205); flpdf must likewise skip the clone
-    /// pass for reconstructed inputs (they take a separate drop+flatten arm not
-    /// yet implemented), leaving the current behaviour unchanged.
+    /// forces qpdf-style xref reconstruction. 11.9.0's `getAllPagesInternal`
+    /// clones duplicate leaves unconditionally (QPDF_pages.cc:119-130, no
+    /// reconstruction gate); flpdf deliberately skips the clone pass for
+    /// reconstructed inputs (a flpdf-specific divergence — it has no matching
+    /// repair for damaged files), which this test pins.
     fn pdf_shared_leaf_damaged_xref() -> Vec<u8> {
         let mut bytes = pdf_with_leaf_shared_by_two_parents();
         // Repoint startxref at a byte offset that is not an xref table, forcing
