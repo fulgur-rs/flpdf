@@ -2099,4 +2099,225 @@ mod tests {
              the clone arm on !reconstructed_xref)"
         );
     }
+
+    /// An interior node (has `/Kids`) whose `/Type` is `/Foo`, not `/Pages`, and
+    /// which carries an inheritable `/Rotate 90`. qpdf 11.9.0 getAllPagesInternal
+    /// overrides the interior `/Type` to `/Pages` (QPDF_pages.cc:89-92); with the
+    /// node correctly typed, the inherited-attribute push then strips its `/Rotate`
+    /// and pushes it down to the leaf.
+    fn pdf_with_interior_type_not_pages() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Foo /Parent 2 0 R /Kids [4 0 R] /Count 1 /Rotate 90 >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn interior_type_not_pages_is_overridden() {
+        let bytes = pdf_with_interior_type_not_pages();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        assert!(
+            pdf.repair_diagnostics().entries().is_empty(),
+            "fixture must NOT trip xref reconstruction, else the repair pass is \
+             skipped behind the !reconstructed gate: {:?}",
+            pdf.repair_diagnostics().entries()
+        );
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let interior = pdf.resolve(ObjectRef::new(3, 0)).expect("interior resolves");
+        let Object::Dictionary(interior_dict) = interior else {
+            panic!("interior is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            interior_dict.get("Type"),
+            Some(&Object::Name(b"Pages".to_vec())),
+            "the interior node's mistyped /Type /Foo must be overridden to /Pages"
+        );
+        assert!(
+            interior_dict.get("Rotate").is_none(),
+            "/Rotate must be stripped from the now-correctly-typed interior /Pages node"
+        );
+
+        let leaf = pdf.resolve(ObjectRef::new(4, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            leaf_dict.get("Rotate"),
+            Some(&Object::Integer(90)),
+            "/Rotate must be pushed to the leaf — proving the interior override \
+             let the push recognise the node as a /Pages node"
+        );
+    }
+
+    /// A leaf (no `/Kids`) whose `/Type` is `/Bar`, not `/Page`. qpdf 11.9.0
+    /// getAllPagesInternal overrides the leaf `/Type` to `/Page`
+    /// (QPDF_pages.cc:131-134).
+    fn pdf_with_leaf_type_not_page() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Bar /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn leaf_type_not_page_is_overridden() {
+        let bytes = pdf_with_leaf_type_not_page();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            leaf_dict.get("Type"),
+            Some(&Object::Name(b"Page".to_vec())),
+            "the leaf's mistyped /Type /Bar must be overridden to /Page"
+        );
+    }
+
+    #[test]
+    fn correct_types_unchanged_no_mint() {
+        // A well-formed tree (root /Pages, leaf /Page): the /Type-override pass
+        // is a complete no-op — no /Type is mutated and no object is minted.
+        let bytes = pdf_with_no_inheritable_keys();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        let before_count = pdf.object_refs().len();
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        assert_eq!(
+            pdf.object_refs().len(),
+            before_count,
+            "a correctly-typed tree must not mint any object"
+        );
+        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let Object::Dictionary(pages_dict) = pages else {
+            panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            pages_dict.get("Type"),
+            Some(&Object::Name(b"Pages".to_vec())),
+            "an already-correct interior /Type must be left untouched"
+        );
+        let page = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
+        let Object::Dictionary(page_dict) = page else {
+            panic!("page is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            page_dict.get("Type"),
+            Some(&Object::Name(b"Page".to_vec())),
+            "an already-correct leaf /Type must be left untouched"
+        );
+    }
+
+    /// An interior node and a leaf that BOTH omit `/Type` entirely. qpdf 11.9.0
+    /// getAllPagesInternal treats a missing `/Type` the same as a wrong one:
+    /// `isDictionaryOfType` is false, so it sets `/Type` to `/Pages` (interior)
+    /// and `/Page` (leaf).
+    fn pdf_with_missing_types() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(b"3 0 obj\n<< /Parent 2 0 R /Kids [4 0 R] /Count 1 >>\nendobj\n");
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< /Parent 3 0 R /MediaBox [0 0 612 792] >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn type_missing_is_set() {
+        let bytes = pdf_with_missing_types();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let interior = pdf.resolve(ObjectRef::new(3, 0)).expect("interior resolves");
+        let Object::Dictionary(interior_dict) = interior else {
+            panic!("interior is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            interior_dict.get("Type"),
+            Some(&Object::Name(b"Pages".to_vec())),
+            "an interior node with no /Type must have /Type set to /Pages"
+        );
+
+        let leaf = pdf.resolve(ObjectRef::new(4, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            leaf_dict.get("Type"),
+            Some(&Object::Name(b"Page".to_vec())),
+            "a leaf with no /Type must have /Type set to /Page"
+        );
+    }
 }
