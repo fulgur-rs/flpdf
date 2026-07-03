@@ -1958,6 +1958,47 @@ fn test_form_depth_limit_retains_page() {
     );
 }
 
+// A `Do` operator with no name operand (malformed content) is a no-op — it does
+// not record an XObject and does not stop the walk, so surrounding operators are
+// still processed and pruning proceeds normally. (flpdf-u79t.)
+#[test]
+fn test_bare_do_operator_without_name_is_noop() {
+    // Content: a bare `Do` (no operand) followed by a real font use.
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"Do BT /F1 10 Tf (x) Tj ET")),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >>",
+            ),
+        ),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open bare-Do PDF");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let font_keys = font_dict_keys(&mut pdf, ObjectRef::new(5, 0));
+    assert!(
+        font_keys.contains(&"F1".to_string()),
+        "bare Do is a no-op → the following /F1 Tf is still recorded: {font_keys:?}"
+    );
+    assert!(
+        !font_keys.contains(&"F2".to_string()),
+        "unused /F2 must still be pruned: {font_keys:?}"
+    );
+}
+
 #[test]
 fn test_roborev3_indirect_xobject_category_form_recurse_font_kept() {
     // The /XObject *resource category* is itself an indirect reference
