@@ -1010,6 +1010,34 @@ else
     echo "Skipping acroform-sig-indirect-fields.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/no-stream-one-page.pdf" ]]; then
+    echo "Generating no-stream-one-page.pdf ..."
+    # flpdf-05jt: the degenerate 3-object catalog/pages/page shape with NO
+    # /Contents and NO /Resources. Its linearized primary hint stream has the
+    # same uncompressed bytes as qpdf's, so it isolates the DEFLATE-backend size
+    # delta (miniz vs zlib) from any encoder divergence — a shape the
+    # content-stream-carrying one/two/three-page corpus never exercised.
+    python3 - "$FIX/no-stream-one-page.pdf" <<'PY'
+import sys
+objs = {
+  1: b"<< /Type /Catalog /Pages 2 0 R >>",
+  2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+  3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+}
+order=sorted(objs)
+out=bytearray(b"%PDF-1.4\n"); offs={}
+for n in order: offs[n]=len(out); out+=b"%d 0 obj\n"%n+objs[n]+b"\nendobj\n"
+xo=len(out); size=max(order)+1
+out+=b"xref\n0 %d\n0000000000 65535 f \n"%size
+for n in range(1,size):
+    out+=(b"%010d 00000 n \n"%offs[n]) if n in offs else b"0000000000 65535 f \n"
+out+=b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"%(size,xo)
+open(sys.argv[1],"wb").write(out)
+PY
+else
+    echo "Skipping no-stream-one-page.pdf (already exists)"
+fi
+
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -1041,6 +1069,14 @@ echo "one-page/static-id.pdf"
 qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/one-page.pdf" "$REF/one-page/linearize.pdf"
 echo "one-page/linearize.pdf"
+
+# --- no-stream-one-page: degenerate catalog/pages/page with no /Contents and no
+# /Resources. Pins the DEFLATE-backend hint-stream size delta as the sole
+# sanctioned deviation — byte-identical to qpdf under qpdf-zlib-compat (flpdf-05jt). ---
+mkdir -p "$REF/no-stream-one-page"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/no-stream-one-page.pdf" "$REF/no-stream-one-page/linearize.pdf"
+echo "no-stream-one-page/linearize.pdf"
 
 # --- nonid-id0: linearize (non-16-byte /ID[0] preservation, flpdf-9hc.13.11) ---
 mkdir -p "$REF/nonid-id0"

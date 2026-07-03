@@ -153,6 +153,22 @@ fn three_page_linearized_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("three-page.pdf", "three-page");
 }
 
+// flpdf-05jt: a degenerate first page — the 3-object catalog/pages/page shape
+// with NO /Contents and NO /Resources (no content stream, no inheritable
+// resources to push down). The one/two/three-page corpus above all carry a page
+// content stream, so this pins the no-stream shape that was previously
+// uncovered. The primary hint stream's *uncompressed* bytes are already
+// byte-identical to qpdf's for this shape (61 bytes, same content) — the encoder
+// does not over-emit; the only delta on a default (miniz_oxide) build is the
+// FlateDecode-*compressed* hint-stream size (qpdf 32 vs miniz 38 bytes, which
+// shifts /L /E /T by 6), the sole sanctioned DEFLATE-backend deviation. Under
+// qpdf-zlib-compat the compressed hint stream — and thus the whole file — is
+// byte-identical to qpdf --linearize --deterministic-id, which this pins.
+#[test]
+fn no_stream_one_page_linearized_is_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("no-stream-one-page.pdf", "no-stream-one-page");
+}
+
 #[test]
 fn nonid_id0_linearized_is_byte_identical_to_qpdf() {
     // Non-16-byte (20-byte) source /ID[0] preserved verbatim on the linearized
