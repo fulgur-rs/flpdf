@@ -1092,6 +1092,14 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$REF/shared-page-two-parents-pushmint/linearize.pdf"
 echo "shared-page-two-parents-pushmint/linearize.pdf"
 
+# --- mistyped-page-tree: interior node /Type != /Pages and leaf /Type != /Page;
+# qpdf 11.9.0 getAllPagesInternal overrides both (QPDF_pages.cc:89-92, 131-134)
+# (flpdf-nd38 repair 2). ---
+mkdir -p "$REF/mistyped-page-tree"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/mistyped-page-tree.pdf" "$REF/mistyped-page-tree/linearize.pdf"
+echo "mistyped-page-tree/linearize.pdf"
+
 # --- no-stream-one-page: degenerate catalog/pages/page with no /Contents and no
 # /Resources. Pins the DEFLATE-backend hint-stream size delta as the sole
 # sanctioned deviation — byte-identical to qpdf under qpdf-zlib-compat (flpdf-05jt). ---
