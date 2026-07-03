@@ -17,10 +17,18 @@ updates:
       github-actions:
         patterns:
           - "*"
+    # Categorize dependabot PRs into the "Internal" release-notes bucket
+    # directly (release.yml maps release-notes:internal -> Internal). Dependabot
+    # applies this at PR creation, so categorization does not depend on the
+    # pr-labeler workflow parsing a grouped-update PR title (whose title is
+    # derived from the group identifier, not the commit prefix). NB: specifying
+    # `labels` replaces dependabot's default "dependencies" label — we
+    # intentionally drop it (the repo defines no "dependencies" label).
+    labels:
+      - "release-notes:internal"
     commit-message:
-      # "build(deps): …" — the pr-labeler workflow maps the `build` prefix to
-      # release-notes:internal, so dependabot PRs auto-categorize in release
-      # notes without manual labeling.
+      # "build(deps): …" keeps the merged commit message conventional; it is no
+      # longer relied on for release-notes categorization (see `labels` above).
       prefix: "build"
       include: "scope"
     # github-actions supports only default-days for cooldown (the semver-*-days
@@ -39,6 +47,8 @@ updates:
       cargo:
         patterns:
           - "*"
+    labels:
+      - "release-notes:internal"
     commit-message:
       prefix: "build"
       include: "scope"
