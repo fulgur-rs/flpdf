@@ -212,6 +212,19 @@ fn shared_page_two_parents_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("shared-page-two-parents.pdf", "shared-page-two-parents");
 }
 
+// As above, but parent A also carries a DIRECT (non-scalar) `/Resources` that the
+// inherited-attribute push mints into a fresh indirect object. This pins the
+// relative object numbers of the clone (minted first, in the cache()-equivalent
+// pass) and the push-minted `/Resources` (minted after), which must match qpdf's
+// cache()-then-push order (flpdf-52md).
+#[test]
+fn shared_page_two_parents_pushmint_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "shared-page-two-parents-pushmint.pdf",
+        "shared-page-two-parents-pushmint",
+    );
+}
+
 #[test]
 fn relinearize_one_page_is_byte_identical_to_qpdf() {
     // Re-linearizing an already-linearized input: the source's old /Linearized

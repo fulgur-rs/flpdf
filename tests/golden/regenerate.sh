@@ -1082,6 +1082,16 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/shared-page-two-parents.pdf" "$REF/shared-page-two-parents/linearize.pdf"
 echo "shared-page-two-parents/linearize.pdf"
 
+# --- shared-page-two-parents-pushmint: as above, but parent A also carries a
+# DIRECT (non-scalar) /Resources that the inherited-attribute push mints into a
+# new indirect object. Pins the relative object-number ordering of the clone
+# (minted first, in the cache()-equivalent pass) vs the push-mint (flpdf-52md). ---
+mkdir -p "$REF/shared-page-two-parents-pushmint"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/shared-page-two-parents-pushmint.pdf" \
+    "$REF/shared-page-two-parents-pushmint/linearize.pdf"
+echo "shared-page-two-parents-pushmint/linearize.pdf"
+
 # --- no-stream-one-page: degenerate catalog/pages/page with no /Contents and no
 # /Resources. Pins the DEFLATE-backend hint-stream size delta as the sole
 # sanctioned deviation — byte-identical to qpdf under qpdf-zlib-compat (flpdf-05jt). ---
