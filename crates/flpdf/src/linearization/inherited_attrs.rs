@@ -66,7 +66,19 @@ pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(pdf: &mut Pdf<R
     if !reconstructed {
         let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
         let mut clone_visited: BTreeSet<ObjectRef> = BTreeSet::new();
-        resolve_duplicate_page_leaves(pdf, pages_ref, &mut seen, &mut clone_visited, 0)?;
+        // Compute the first free object number once and carry it through the
+        // walk, incrementing per clone. Re-deriving it with `next_object_ref`
+        // for every clone would rescan all object refs each time, making a
+        // `/Kids` array with many duplicate leaves quadratic.
+        let mut next_clone = next_object_ref(pdf)?;
+        resolve_duplicate_page_leaves(
+            pdf,
+            pages_ref,
+            &mut seen,
+            &mut clone_visited,
+            &mut next_clone,
+            0,
+        )?;
     }
 
     let mut key_ancestors: BTreeMap<&'static [u8], Vec<Object>> = BTreeMap::new();
@@ -233,11 +245,15 @@ fn push_internal<R: Read + Seek>(
 ///
 /// The walk order matches `getAllPagesInternal` (depth-first, recursing into any
 /// kid that has a `/Kids` key) so the minted clone object numbers match qpdf's.
+/// `next_clone` is the running next free object number, threaded through the walk
+/// and incremented per clone (qpdf allocates from a running maximum rather than
+/// rescanning), which keeps cloning many duplicates linear rather than quadratic.
 fn resolve_duplicate_page_leaves<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     node_ref: ObjectRef,
     seen: &mut BTreeSet<ObjectRef>,
     visited: &mut BTreeSet<ObjectRef>,
+    next_clone: &mut ObjectRef,
     depth: usize,
 ) -> Result<()> {
     if depth >= MAX_DEPTH {
@@ -284,9 +300,14 @@ fn resolve_duplicate_page_leaves<R: Read + Seek>(
             }
         };
         if recurse {
-            resolve_duplicate_page_leaves(pdf, kid_ref, seen, visited, depth + 1)?;
+            resolve_duplicate_page_leaves(pdf, kid_ref, seen, visited, next_clone, depth + 1)?;
         } else if let Some(clone) = clone {
-            let new_ref = next_object_ref(pdf)?;
+            let new_ref = *next_clone;
+            let next_num = new_ref
+                .number
+                .checked_add(1)
+                .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+            *next_clone = ObjectRef::new(next_num, 0);
             pdf.set_object(new_ref, Object::Dictionary(clone));
             seen.insert(new_ref);
             *kid = Object::Reference(new_ref);
