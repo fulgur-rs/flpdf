@@ -1103,6 +1103,18 @@ impl LinearizationPlan {
                     if all_outline_refs.contains(r) {
                         return false;
                     }
+                    // qpdf routes a non-first-page object to lc_other_page_private
+                    // (part7) ONLY when others==0 (QPDF_linearization.cc:1128). An
+                    // object also reached by a document-level `others` reference
+                    // (a Catalog non-open-document key, or a trailer key other than
+                    // /Root,/Encrypt) is lc_other (part9) even at other_pages==1.
+                    // Keep it out of the per-page-private set so it is neither placed
+                    // in part7 nor counted in this page's part7 object_count hint; it
+                    // flows through part4_provisional into the part8/part9 loop and
+                    // lands in part4_rest (part9) (flpdf-zda0).
+                    if document_other_set.contains(r) {
+                        return false;
+                    }
                     page_reach.get(r).copied() == Some(1)
                 })
                 .collect();
@@ -1217,9 +1229,10 @@ impl LinearizationPlan {
             if reach >= 2 {
                 part4_other_pages_shared.push(r);
             } else {
-                // reach == 0, or reach == 1 but not captured as private (shouldn't
-                // happen since per_page_private_objects captures all reach-1
-                // non-first objects). Everything else goes to part9.
+                // reach == 0 (trailer-/document-only), or reach == 1 with others>0
+                // (excluded from per_page_private above, so it is lc_other not
+                // lc_other_page_private — QPDF_linearization.cc:1128, flpdf-zda0).
+                // Both are qpdf part9.
                 part4_rest.push(r);
             }
         }

@@ -288,6 +288,22 @@ fn catalog_firstpage_shared_two_page_classic_byte_identical_to_qpdf() {
     );
 }
 
+// flpdf-zda0: a NON-first-page object (page-2 font, obj 7) reached by exactly one
+// other page AND by a document-level `others` reference (Catalog /Ref2) is qpdf
+// `lc_other` (part9), not `lc_other_page_private` (part7): part7 requires
+// others==0 (QPDF_linearization.cc:1128). The demoted object takes a part9 object
+// number (after the pages tree) and page 1's part7 `object_count` hint excludes
+// it (oracle: page-1 nobjects==2). On `main` flpdf routes it to part7, shifting
+// object numbers and the hint; the fix makes it byte-identical. (Generate mode
+// for this shape is tracked in flpdf-pn7h, so only the classic layout is pinned.)
+#[test]
+fn catalog_otherpage_other_two_page_classic_is_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "catalog-otherpage-other-two-page.pdf",
+        "catalog-otherpage-other-two-page",
+    );
+}
+
 // flpdf-8891 (page-tree custom key): a custom extension key on an interior
 // /Pages node references the first-page Font. qpdf keeps non-inheritable custom
 // keys on /Pages nodes (only the inheritable /Resources,/MediaBox,/CropBox,
