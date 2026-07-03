@@ -1823,6 +1823,141 @@ fn test_resource_less_form_two_scopes_diverging_do_keeps_page_font() {
     );
 }
 
+// A Form XObject with `/Resources null` inherits the calling scope (ISO 32000-2
+// §7.3.9: a null entry is equivalent to absent), so its inherited names are
+// page-relevant and recorded. Verified with qpdf 11.9.0
+// (--remove-unreferenced-resources=yes keeps /F1, prunes /F2). Treating the key
+// as present (own-resources) would drop /F1 → over-prune. (flpdf-u79t /
+// coderabbit review of PR #442.)
+#[test]
+fn test_form_resources_null_is_inherited_not_own_scope() {
+    let form_content = b"BT /F1 10 Tf (null-res form) Tj ET";
+    let form = {
+        let mut b = format!(
+            "6 0 obj\n<< /Subtype /Form /Resources null /Length {} >>\nstream\n",
+            form_content.len()
+        )
+        .into_bytes();
+        b.extend_from_slice(form_content);
+        b.extend_from_slice(b"\nendstream\nendobj\n");
+        b
+    };
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Fm0 Do")),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> /XObject << /Fm0 6 0 R >> >>",
+            ),
+        ),
+        (6, form),
+    ];
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open /Resources null PDF");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
+    else {
+        panic!("5 0 R is not a dictionary");
+    };
+    let Some(Object::Dictionary(font_dict)) = res_dict.get("Font") else {
+        panic!("/Font must survive — the null-/Resources Form inherits and uses /F1");
+    };
+    let keys: Vec<String> = font_dict
+        .iter()
+        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+        .collect();
+    assert!(
+        keys.contains(&"F1".to_string()),
+        "/Resources null Form inherits page scope → /F1 kept: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"F2".to_string()),
+        "unused /F2 must still be pruned: {keys:?}"
+    );
+}
+
+// When Form nesting exceeds MAX_FORM_DEPTH the walk is cut off; the page must
+// then be conservatively RETAINED (not pruned against the partial name set),
+// because a Form beyond the cutoff may reference a page resource we never
+// recorded. (flpdf-u79t / coderabbit review of PR #442.)
+#[test]
+fn test_form_depth_limit_retains_page() {
+    // A chain of 70 resource-less Forms (Fm0 → Fm1 → … → Fm70), deeper than the
+    // 64-level cap. Fm70 uses page font /F1, which the walk never reaches.
+    const N: u32 = 70;
+    let mut objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, obj_bytes(1, "<< /Type /Catalog /Pages 2 0 R >>")),
+        (2, obj_bytes(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")),
+        (
+            3,
+            obj_bytes(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>",
+            ),
+        ),
+        (4, stream_obj(4, b"/Fm0 Do")),
+    ];
+    // Page /Resources: all Forms live in the page /XObject (resource-less Forms
+    // inherit the page scope), plus a font /F1 used only by the deepest Form.
+    let mut xobj = String::new();
+    for i in 0..=N {
+        xobj.push_str(&format!("/Fm{i} {} 0 R ", 100 + i));
+    }
+    objects.push((
+        5,
+        obj_bytes(
+            5,
+            &format!("<< /Font << /F1 << /Type /Font >> >> /XObject << {xobj} >> >>"),
+        ),
+    ));
+    for i in 0..=N {
+        let content = if i < N {
+            format!("/Fm{} Do", i + 1)
+        } else {
+            "BT /F1 10 Tf (deep) Tj ET".to_string()
+        };
+        let mut v = format!(
+            "{} 0 obj\n<< /Subtype /Form /Length {} >>\nstream\n",
+            100 + i,
+            content.len()
+        )
+        .into_bytes();
+        v.extend_from_slice(content.as_bytes());
+        v.extend_from_slice(b"\nendstream\nendobj\n");
+        objects.push((100 + i, v));
+    }
+    let pdf_bytes = build_pdf_raw(&objects);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open deep-nesting PDF");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
+    else {
+        panic!("5 0 R is not a dictionary");
+    };
+    // The walk stops at the depth cap before reaching Fm70's /F1, so the page is
+    // retained rather than pruned against the partial set → /F1 survives.
+    let Some(Object::Dictionary(font_dict)) = res_dict.get("Font") else {
+        panic!("/Font must be retained when the Form nesting exceeds the depth cap");
+    };
+    assert!(
+        font_dict.get("F1").is_some(),
+        "depth cap: page retained, /F1 (used beyond the cutoff) kept: {font_dict:?}"
+    );
+}
+
 #[test]
 fn test_roborev3_indirect_xobject_category_form_recurse_font_kept() {
     // The /XObject *resource category* is itself an indirect reference

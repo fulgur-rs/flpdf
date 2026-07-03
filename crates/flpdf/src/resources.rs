@@ -849,17 +849,18 @@ fn process_operator<R: Read + Seek>(
 ///
 /// # Traversal bound
 ///
-/// `visited` is an *ever-seen* `ObjectRef` set (mirroring qpdf's
-/// `QPDFObjGen::set` in `QPDFPageObjectHelper::forEachXObject`): each indirect
-/// Form XObject is expanded at most once, no matter how many references reach
-/// it. This makes traversal O(V+E) and immune to exponential blow-up from
-/// shared / DAG-shaped Form trees (e.g. a `/Fm(i) Do /Fm(i) Do` chain, which a
-/// "currently-on-stack" set would re-traverse `2^depth` times). Because a
-/// resource-less Form attributes its *own* names to the page's real `used` set,
-/// that single visit records them for the page. (A Form reached from two scopes
-/// is expanded only under the first-reach scope; if those scopes resolved its
-/// nested `Do` targets to *different* objects the second set is not explored —
-/// an exactness/DoS trade-off that only arises for pathological documents.)
+/// `visited` is an *ever-seen* set of `(Form ref, scope owner)` pairs. A Form
+/// with its own `/Resources` resolves its names against its own scope, so it is
+/// keyed as `(ref, ref)` and expanded once regardless of how it is reached; a
+/// resource-less Form resolves nested `Do` names against the inherited scope, so
+/// it is keyed as `(ref, inherited scope owner)` and expanded once per distinct
+/// scope it is reached under. This bounds shared / DAG-shaped Form trees (e.g. a
+/// `/Fm(i) Do /Fm(i) Do` chain, which a "currently-on-stack" set would
+/// re-traverse `2^depth` times) without collapsing scope-divergent resolution:
+/// a resource-less Form reached under two scopes that resolve its nested names
+/// differently contributes each scope's names, so no page-rendered resource is
+/// dropped. Bounded by O(V²) pairs (no exponential blow-up); realistic documents
+/// have few distinct scopes, so it is ~O(V).
 ///
 /// # Direct-stream Form XObjects
 ///
@@ -890,9 +891,12 @@ fn recurse_form_xobject<R: Read + Seek>(
     // Stack-overflow safeguard for a very long chain of *distinct* Forms.
     // Cycles / shared references are already bounded by the ever-seen
     // `ctx.visited` set below, so this is not the DoS guard — it caps recursion
-    // depth only.
+    // depth only. Report the page as incomplete rather than complete: cutting the
+    // walk off here means a resource-less Form beyond the limit could reference a
+    // page resource we never recorded, so the page must be conservatively
+    // retained rather than pruned against a partial used-name set.
     if depth >= MAX_FORM_DEPTH {
-        return Ok(true);
+        return Ok(false);
     }
 
     // Locate the XObject entry in the current /Resources scope. The
@@ -960,9 +964,14 @@ fn recurse_form_xobject<R: Read + Seek>(
 
     // Determine whether the Form has its own /Resources entry (checked before the
     // visited key and before decode so both use the right scope / completeness).
-    // We check for key *presence* (not the resolved value) because an empty or
-    // indirect /Resources still means the Form owns its resource scope.
-    let form_has_own_resources = stream.dict.get("Resources").is_some();
+    // Key *presence* — not the resolved value — suffices, because an empty or
+    // indirect /Resources still means the Form owns its resource scope. A `null`
+    // value is the one exception: per ISO 32000-2 §7.3.9 a null entry is
+    // equivalent to an absent one, so `/Resources null` means the Form inherits
+    // the calling scope (treating it as own-resources would drop the Form's
+    // page-inherited names → over-prune).
+    let resources_entry = stream.dict.get("Resources");
+    let form_has_own_resources = !matches!(resources_entry, None | Some(Object::Null));
 
     // A Form with its own /Resources resolves its names against its own scope, so
     // it is scope-independent (owner = itself) and expanded once. A resource-less
