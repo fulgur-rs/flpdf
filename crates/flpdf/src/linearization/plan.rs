@@ -3362,7 +3362,11 @@ mod tests {
             pdf.extend_from_slice(body);
             pdf.extend_from_slice(b"\nendobj\n");
         };
-        push(&mut pdf, 1, b"<< /Type /Catalog /Pages 2 0 R /Ref2 6 0 R >>");
+        push(
+            &mut pdf,
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /Ref2 6 0 R >>",
+        );
         push(
             &mut pdf,
             2,
