@@ -1,0 +1,52 @@
+# Keep SHA-pinned GitHub Actions and workspace crates from silently rotting.
+# Every action in .github/workflows/*.yml is pinned to an exact commit SHA and
+# crates are locked in Cargo.lock; without automation those pins never move.
+# Dependabot opens grouped, cooldown-gated PRs that preserve pinning while
+# surfacing upgrades. Dependabot only proposes: merges stay gated by CI — the
+# "bytes-identical zlib compat" step in ci.yml runs the qpdf-zlib-compat
+# byte-parity suite on every pull_request, so any bump that changes output
+# bytes fails before merge.
+version: 2
+updates:
+  # GitHub Actions referenced by .github/workflows/*.yml (all SHA-pinned).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      # "build(deps): …" — the pr-labeler workflow maps the `build` prefix to
+      # release-notes:internal, so dependabot PRs auto-categorize in release
+      # notes without manual labeling.
+      prefix: "build"
+      include: "scope"
+    # github-actions supports only default-days for cooldown (the semver-*-days
+    # keys apply to semver ecosystems such as cargo, not to actions).
+    cooldown:
+      default-days: 7
+
+  # Rust crates in the root workspace (crates/flpdf, crates/flpdf-cli).
+  # `fuzz/` is a separate nightly-only workspace (Cargo.toml `exclude`) and is
+  # intentionally not tracked here.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      cargo:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    # Let fresh releases settle before bumping; longer windows for wider-blast-
+    # radius majors. This matters most for the DEFLATE-backend crates
+    # (miniz_oxide / flate2) whose output byte-parity CI gates.
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 14
+      semver-patch-days: 7

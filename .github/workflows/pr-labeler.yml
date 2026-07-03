@@ -89,13 +89,24 @@ jobs:
             }
 
             if (desired && !existing.includes(desired)) {
-              await github.rest.issues.addLabels({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: pr.number,
-                labels: [desired],
-              });
-              core.info(`Added ${desired} to PR #${pr.number}`);
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  labels: [desired],
+                });
+                core.info(`Added ${desired} to PR #${pr.number}`);
+              } catch (err) {
+                // Dependabot-authored PRs may run this workflow under a
+                // restricted GITHUB_TOKEN; a 403 on labeling should warn, not
+                // fail the job. Symmetric with the removeLabel 404 guard below.
+                if (err.status === 403) {
+                  core.warning(`No permission to label PR #${pr.number} (restricted token?): ${err.message}`);
+                } else {
+                  throw err;
+                }
+              }
             }
 
             for (const stale of existing) {
