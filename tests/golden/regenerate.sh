@@ -1183,6 +1183,19 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/direct-leaf-kid.pdf" "$REF/direct-leaf-kid/linearize.pdf"
 echo "direct-leaf-kid/linearize.pdf"
 
+# --- root-pages-points-into-tree: the catalog's /Pages points at the first-page
+# LEAF (whose /Parent is the true root) instead of at the true page-tree root.
+# qpdf 11.9.0 getAllPages walks the /Parent chain up to the real root and
+# rewrites the catalog /Pages (QPDF_pages.cc:50-67) (flpdf-nd38 repair 6). Every
+# other aspect is well-formed, so only the root->/Pages correction fires. qpdf
+# warns ("document page tree root (root -> /Pages) doesn't point to the root of
+# the page tree; attempting to correct"), so --warning-exit-0 keeps the golden
+# reproducible. ---
+mkdir -p "$REF/root-pages-points-into-tree"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/root-pages-points-into-tree.pdf" "$REF/root-pages-points-into-tree/linearize.pdf"
+echo "root-pages-points-into-tree/linearize.pdf"
+
 # --- no-stream-one-page: degenerate catalog/pages/page with no /Contents and no
 # /Resources. Pins the DEFLATE-backend hint-stream size delta as the sole
 # sanctioned deviation — byte-identical to qpdf under qpdf-zlib-compat (flpdf-05jt). ---
