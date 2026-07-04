@@ -55,8 +55,10 @@ pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(pdf: &mut Pdf<R
     // (QPDF_optimization.cc:138-140). As a side effect, `getAllPages` /
     // `getAllPagesInternal` (QPDF_pages.cc:39-75 / :77-138) repairs the page
     // tree — cloning any `/Page` leaf reachable more than once in the `/Kids`
-    // tree (QPDF_pages.cc:119-130) and overriding mistyped interior/leaf `/Type`
-    // keys (:89-92, :131-134) — so the push below sees a well-formed tree.
+    // tree (QPDF_pages.cc:119-130), overriding mistyped interior/leaf `/Type`
+    // keys (:89-92, :131-134), and defaulting a leaf's missing/invalid
+    // `/MediaBox` to letter / ANSI A `[0 0 612 792]` when no ancestor supplies a
+    // rectangle (:93-96, :104-112) — so the push below sees a well-formed tree.
     // 11.9.0's `getAllPagesInternal` has no xref-reconstruction gate and does
     // these repairs unconditionally; flpdf instead skips the whole
     // `repair_page_tree` pass (clone AND /Type override) for reconstructed
@@ -82,6 +84,7 @@ pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(pdf: &mut Pdf<R
             &mut clone_visited,
             &mut next_clone,
             0,
+            false,
         )?;
     }
 
@@ -239,11 +242,18 @@ fn push_internal<R: Read + Seek>(
 
 /// Partial mirror of qpdf 11.9.0 `getAllPagesInternal` (QPDF_pages.cc:77-138):
 /// walk the `/Kids` tree depth-first, repairing page-tree nodes in place so the
-/// subsequent inherited-attribute push sees a well-formed tree. Three repairs
+/// subsequent inherited-attribute push sees a well-formed tree. Four repairs
 /// from `getAllPagesInternal` are applied:
 ///
 /// - **Interior `/Type`** (:89-92): a node reached as an interior node (one with
 ///   `/Kids`) whose `/Type` is not `/Pages` has it overridden to `/Pages`.
+/// - **`/MediaBox` default** (:93-96, :104-112): `media_box` tracks whether this
+///   node or any ancestor already supplies a `/MediaBox` rectangle; it is set
+///   from this node's own `/MediaBox` (:93-96) and threaded into the recursion.
+///   A leaf that lacks a valid `/MediaBox` rectangle while `media_box` is false
+///   has its `/MediaBox` set to a direct letter / ANSI A array `[0 0 612 792]`.
+///   Applied to the original leaf *before* the duplicate-clone decision (qpdf
+///   order :104-112 before :119-130), so a clone inherits the defaulted box.
 /// - **Duplicate leaf** (:119-130): the first occurrence of a `/Page` leaf is
 ///   recorded; each later occurrence is replaced, in the parent's `/Kids` array,
 ///   by a fresh shallow copy of the leaf dict (indirect sub-objects such as
@@ -253,16 +263,18 @@ fn push_internal<R: Read + Seek>(
 ///   `/Page` has it overridden to `/Page`, for both a first-occurrence leaf and
 ///   a freshly minted clone.
 ///
-/// A well-formed tree (correct `/Type` keys, no shared leaf) is a complete
-/// no-op — no node is rewritten and no object is minted. The walk order matches
+/// A well-formed tree (correct `/Type` keys, every leaf with a `/MediaBox` or an
+/// ancestor supplying one, no shared leaf) is a complete no-op — no node is
+/// rewritten and no object is minted. The walk order matches
 /// `getAllPagesInternal` (depth-first, recursing into any kid that has a `/Kids`
 /// key) so the minted clone object numbers match qpdf's. `next_clone` is the
 /// running next free object number, threaded through the walk and incremented
 /// per clone (qpdf allocates from a running maximum rather than rescanning),
 /// which keeps cloning many duplicates linear rather than quadratic.
 ///
-/// The `/MediaBox` default (:104-112) and direct-kid → indirect (:113-118)
-/// repairs `getAllPagesInternal` also performs are not mirrored here.
+/// The direct-kid → indirect repair (:113-118) `getAllPagesInternal` also
+/// performs is not mirrored here (direct `/Kids` entries are skipped, as the
+/// inherited-attribute push does).
 fn repair_page_tree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     node_ref: ObjectRef,
@@ -270,6 +282,7 @@ fn repair_page_tree<R: Read + Seek>(
     visited: &mut BTreeSet<ObjectRef>,
     next_clone: &mut ObjectRef,
     depth: usize,
+    media_box: bool,
 ) -> Result<()> {
     if depth >= MAX_DEPTH {
         return Err(Error::Unsupported(format!(
@@ -306,47 +319,69 @@ fn repair_page_tree<R: Read + Seek>(
         changed = true;
     }
 
+    // (2m) Track whether this node or any ancestor supplies a /MediaBox rectangle
+    // (QPDF_pages.cc:93-96). Once true it stays true down the subtree, so a leaf
+    // that inherits a rectangle is not defaulted. Threaded into the recursion.
+    let media_box = media_box || is_rectangle(pdf, dict.get("MediaBox"))?;
+
     for kid in kids.iter_mut() {
         let kid_ref = match &*kid {
             Object::Reference(r) => *r,
             _ => continue, // Direct (non-reference) /Kids entry: skip, as push does.
         };
-        // Decide the action in a scope that ends the immutable borrow of `pdf`
-        // before we mutate it (recurse or mint a clone).
-        let (recurse, clone) = {
-            let Object::Dictionary(kid_dict) = pdf.resolve_borrowed(kid_ref)? else {
-                continue; // Reference to a non-dictionary: skip, as push does.
-            };
-            if kid_dict.get("Kids").is_some() {
-                (true, None) // Interior /Pages node (has /Kids): descend.
-            } else if seen.insert(kid_ref) {
-                (false, None) // First occurrence of this leaf.
-            } else {
-                (false, Some(kid_dict.clone())) // Duplicate leaf: clone it.
-            }
+        // Classify the kid (interior /Pages node vs leaf) and, for a leaf,
+        // snapshot its own /MediaBox value — all in a scope that ends the
+        // immutable borrow of `pdf` before we mutate it. `leaf_media_box` is
+        // unused for an interior node (the snapshot is a small scalar/array/ref).
+        let (has_kids, leaf_media_box) = match pdf.resolve_borrowed(kid_ref)? {
+            Object::Dictionary(d) => (d.get("Kids").is_some(), d.get("MediaBox").cloned()),
+            _ => continue, // Reference to a non-dictionary: skip, as push does.
         };
-        if recurse {
-            repair_page_tree(pdf, kid_ref, seen, visited, next_clone, depth + 1)?;
+        if has_kids {
+            // Interior /Pages node: descend, threading the /MediaBox flag.
+            repair_page_tree(pdf, kid_ref, seen, visited, next_clone, depth + 1, media_box)?;
             continue;
         }
-        // Leaf branch. `leaf_ref` is the original leaf for a first occurrence, or
-        // the freshly minted clone for a duplicate; qpdf overrides the leaf /Type
-        // AFTER this clone decision (QPDF_pages.cc:131-134), so both flow through
-        // the (2l) override below.
-        let leaf_ref = if let Some(clone) = clone {
+        // Leaf branch.
+        // (2b) Default a missing/invalid /MediaBox on the ORIGINAL leaf FIRST —
+        // before the duplicate-clone decision below — so a clone inherits the
+        // defaulted box (QPDF_pages.cc:104-112 precedes :119-130). An ancestor
+        // rectangle (tracked by `media_box`) suppresses the default.
+        if !media_box && !is_rectangle(pdf, leaf_media_box.as_ref())? {
+            if let Object::Dictionary(mut leaf) = pdf.resolve(kid_ref)? {
+                leaf.insert(
+                    "MediaBox",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ]),
+                );
+                pdf.set_object(kid_ref, Object::Dictionary(leaf));
+            }
+        }
+        // (2c) Duplicate-leaf clone (QPDF_pages.cc:119-130). `leaf_ref` is the
+        // original leaf for a first occurrence, or the freshly minted clone for a
+        // duplicate; qpdf overrides the leaf /Type AFTER this clone decision
+        // (:131-134), so both flow through the (2l) override below. The clone is
+        // taken from the (possibly defaulted) original via `resolve`, so it
+        // inherits any /MediaBox default applied just above.
+        let leaf_ref = if seen.insert(kid_ref) {
+            kid_ref // First occurrence of this leaf.
+        } else {
+            let clone = pdf.resolve(kid_ref)?; // Owned copy of the leaf dict.
             let new_ref = *next_clone;
             let next_num = new_ref
                 .number
                 .checked_add(1)
                 .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
             *next_clone = ObjectRef::new(next_num, 0);
-            pdf.set_object(new_ref, Object::Dictionary(clone));
+            pdf.set_object(new_ref, clone);
             seen.insert(new_ref);
             *kid = Object::Reference(new_ref);
             changed = true;
             new_ref
-        } else {
-            kid_ref
         };
         // (2l) Override the leaf /Type to /Page if it is not already
         // (QPDF_pages.cc:131-134). Check via a borrow so a correctly typed leaf
@@ -390,6 +425,40 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 /// page-tree `/Type` checks in this module.
 fn type_name_is(dict: &Dictionary, want: &[u8]) -> bool {
     matches!(dict.get("Type"), Some(Object::Name(n)) if n.as_slice() == want)
+}
+
+/// True iff `value` resolves to a `/MediaBox` rectangle: an `Array` of exactly
+/// four numbers (`Integer` or `Real`). Mirrors qpdf's
+/// `QPDFObjectHandle::isRectangle` (QPDFObjectHandle.cc:789-800 — an array whose
+/// size is 4 and whose first four items are numbers), resolving through any
+/// indirect-reference chain first, as qpdf's `getKey("/MediaBox").isRectangle()`
+/// does. A missing key (`None`), a wrong-length array, or a non-numeric element
+/// yields `false`.
+//
+// Note: qpdf's per-element `isNumber()` dereferences, so it would accept an
+// element that is itself an indirect reference to a number (e.g.
+// `[0 0 612 5 0 R]`); this helper matches the element kinds directly, treating
+// such a pathological array as not-a-rectangle. This is a deliberate, untested
+// divergence — real MediaBoxes hold direct numbers.
+fn is_rectangle<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<&Object>) -> Result<bool> {
+    fn is_rect_array(obj: &Object) -> bool {
+        matches!(
+            obj,
+            Object::Array(items)
+                if items.len() == 4
+                    && items
+                        .iter()
+                        .all(|e| matches!(e, Object::Integer(_) | Object::Real(_)))
+        )
+    }
+    Ok(match value {
+        None => false,
+        Some(Object::Reference(r)) => {
+            let terminal = terminal_ref_of_chain(pdf, *r)?;
+            is_rect_array(pdf.resolve_borrowed(terminal)?)
+        }
+        Some(obj) => is_rect_array(obj),
+    })
 }
 
 #[cfg(test)]
@@ -2617,6 +2686,60 @@ mod tests {
                 Object::Integer(100),
             ])),
             "a leaf with an already-valid /MediaBox must be left unchanged (no default)"
+        );
+    }
+
+    /// A `/Page` leaf whose `/MediaBox` is an *indirect reference* (4 0 R) to a
+    /// valid 4-number array, with no ancestor `/MediaBox`. qpdf's
+    /// `getKey("/MediaBox").isRectangle()` dereferences the reference before
+    /// testing the shape, so it is a rectangle and the default is suppressed; the
+    /// leaf keeps its reference untouched. Exercises `is_rectangle`'s indirect-
+    /// reference arm (and `terminal_ref_of_chain`).
+    fn pdf_with_indirect_reference_mediabox_leaf() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox 4 0 R >>\nendobj\n");
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n[0 0 300 400]\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn indirect_reference_mediabox_leaf_is_recognized_and_not_defaulted() {
+        let bytes = pdf_with_indirect_reference_mediabox_leaf();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            leaf_dict.get("MediaBox"),
+            Some(&Object::Reference(ObjectRef::new(4, 0))),
+            "a leaf whose /MediaBox is an indirect reference to a valid rectangle \
+             must be recognized as a rectangle and left as the reference (no default)"
         );
     }
 }
