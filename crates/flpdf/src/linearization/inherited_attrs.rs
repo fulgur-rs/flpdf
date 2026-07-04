@@ -63,70 +63,62 @@ pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(pdf: &mut Pdf<R
     // :131-134), and defaulting a leaf's missing/invalid `/MediaBox` to
     // letter / ANSI A `[0 0 612 792]` when no ancestor supplies a rectangle
     // (:93-96, :104-112) — so the push below sees a well-formed tree.
-    // 11.9.0's `getAllPagesInternal` has no xref-reconstruction gate and does
-    // these repairs unconditionally; flpdf instead skips the whole repair pass
-    // (the root->/Pages correction AND `repair_page_tree`) for reconstructed
-    // inputs, a deliberate flpdf-specific divergence — flpdf has no matching
-    // repair for damaged files. Tracked as flpdf-s5i2.
-    let reconstructed = pdf
-        .repair_diagnostics()
-        .entries()
-        .iter()
-        .any(|d| d.message.contains("reconstruct cross-reference"));
-    if !reconstructed {
-        // (6) Correct a catalog whose `/Pages` points into the tree instead of at
-        // the true root, by walking `/Parent` up (QPDF_pages.cc:50-67). This runs
-        // before `repair_page_tree` so the subsequent walk (and `push_internal`
-        // below) start from the corrected root, matching qpdf's getAllPages order.
-        let mut seen_parent: BTreeSet<ObjectRef> = BTreeSet::new();
-        let mut corrected = pages_ref;
-        let mut changed_pages = false;
-        loop {
-            let parent = match pdf.resolve_borrowed(corrected)? {
-                Object::Dictionary(d) => match d.get("Parent") {
-                    Some(Object::Reference(r)) => Some(*r),
-                    // No `/Parent` (the true root) or a non-reference `/Parent`:
-                    // stop. qpdf would follow a direct-dict parent as a handle, but
-                    // flpdf needs a ref to rewrite/continue; such inputs are
-                    // unrealistic and have no golden.
-                    _ => None,
-                },
-                _ => None, // Not a dictionary: stop.
-            };
-            let Some(parent_ref) = parent else {
-                break;
-            };
-            if !seen_parent.insert(corrected) {
-                break; // Loop guard (qpdf's `seen.add`): a `/Parent` cycle.
-            }
-            corrected = parent_ref;
-            changed_pages = true;
-        }
-        if changed_pages {
-            if let Object::Dictionary(mut root_dict) = pdf.resolve(root_ref)? {
-                root_dict.insert("Pages", Object::Reference(corrected));
-                pdf.set_object(root_ref, Object::Dictionary(root_dict));
-            }
-            pages_ref = corrected;
-        }
+    // qpdf 11.9.0's `getAllPagesInternal` performs these repairs unconditionally
+    // (there is no xref-reconstruction gate anywhere in QPDF_pages.cc:77-138), so
+    // flpdf runs them for every input, whether or not the xref was reconstructed.
 
-        let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-        let mut clone_visited: BTreeSet<ObjectRef> = BTreeSet::new();
-        // Compute the first free object number once and carry it through the
-        // walk, incrementing per clone. Re-deriving it with `next_object_ref`
-        // for every clone would rescan all object refs each time, making a
-        // `/Kids` array with many duplicate leaves quadratic.
-        let mut next_clone = next_object_ref(pdf)?;
-        repair_page_tree(
-            pdf,
-            pages_ref,
-            &mut seen,
-            &mut clone_visited,
-            &mut next_clone,
-            0,
-            false,
-        )?;
+    // (6) Correct a catalog whose `/Pages` points into the tree instead of at
+    // the true root, by walking `/Parent` up (QPDF_pages.cc:50-67). This runs
+    // before `repair_page_tree` so the subsequent walk (and `push_internal`
+    // below) start from the corrected root, matching qpdf's getAllPages order.
+    let mut seen_parent: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut corrected = pages_ref;
+    let mut changed_pages = false;
+    loop {
+        let parent = match pdf.resolve_borrowed(corrected)? {
+            Object::Dictionary(d) => match d.get("Parent") {
+                Some(Object::Reference(r)) => Some(*r),
+                // No `/Parent` (the true root) or a non-reference `/Parent`:
+                // stop. qpdf would follow a direct-dict parent as a handle, but
+                // flpdf needs a ref to rewrite/continue; such inputs are
+                // unrealistic and have no golden.
+                _ => None,
+            },
+            _ => None, // Not a dictionary: stop.
+        };
+        let Some(parent_ref) = parent else {
+            break;
+        };
+        if !seen_parent.insert(corrected) {
+            break; // Loop guard (qpdf's `seen.add`): a `/Parent` cycle.
+        }
+        corrected = parent_ref;
+        changed_pages = true;
     }
+    if changed_pages {
+        if let Object::Dictionary(mut root_dict) = pdf.resolve(root_ref)? {
+            root_dict.insert("Pages", Object::Reference(corrected));
+            pdf.set_object(root_ref, Object::Dictionary(root_dict));
+        }
+        pages_ref = corrected;
+    }
+
+    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut clone_visited: BTreeSet<ObjectRef> = BTreeSet::new();
+    // Compute the first free object number once and carry it through the
+    // walk, incrementing per clone. Re-deriving it with `next_object_ref`
+    // for every clone would rescan all object refs each time, making a
+    // `/Kids` array with many duplicate leaves quadratic.
+    let mut next_clone = next_object_ref(pdf)?;
+    repair_page_tree(
+        pdf,
+        pages_ref,
+        &mut seen,
+        &mut clone_visited,
+        &mut next_clone,
+        0,
+        false,
+    )?;
 
     let mut key_ancestors: BTreeMap<&'static [u8], Vec<Object>> = BTreeMap::new();
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
@@ -2288,16 +2280,9 @@ mod tests {
         );
     }
 
-    /// The shared-leaf fixture, but with a bogus `startxref` offset so opening
-    /// forces qpdf-style xref reconstruction. 11.9.0's `getAllPagesInternal`
-    /// clones duplicate leaves unconditionally (QPDF_pages.cc:119-130, no
-    /// reconstruction gate); flpdf deliberately skips the clone pass for
-    /// reconstructed inputs (a flpdf-specific divergence — it has no matching
-    /// repair for damaged files), which this test pins.
-    fn pdf_shared_leaf_damaged_xref() -> Vec<u8> {
-        let mut bytes = pdf_with_leaf_shared_by_two_parents();
-        // Repoint startxref at a byte offset that is not an xref table, forcing
-        // the strict parse to fail and recovery to run.
+    /// Repoint a fixture's `startxref` value to a bogus offset (9) so the strict
+    /// parse fails and `open_with_repair` reconstructs the cross-reference table.
+    fn damage_startxref(mut bytes: Vec<u8>) -> Vec<u8> {
         let needle = b"startxref\n";
         let pos = bytes
             .windows(needle.len())
@@ -2313,9 +2298,121 @@ mod tests {
         bytes
     }
 
+    /// The shared-leaf fixture, but with a bogus `startxref` offset so opening
+    /// forces qpdf-style xref reconstruction. qpdf 11.9.0's `getAllPagesInternal`
+    /// clones duplicate leaves unconditionally (QPDF_pages.cc:119-130, no
+    /// reconstruction gate), and flpdf matches: the clone pass runs for
+    /// reconstructed inputs too.
+    fn pdf_shared_leaf_damaged_xref() -> Vec<u8> {
+        damage_startxref(pdf_with_leaf_shared_by_two_parents())
+    }
+
     #[test]
-    fn reconstructed_xref_input_does_not_clone() {
+    fn reconstructed_xref_input_clones_shared_leaf() {
         let bytes = pdf_shared_leaf_damaged_xref();
+        let mut pdf = Pdf::open_with_repair(Cursor::new(bytes)).expect("recovers");
+        assert!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|d| d.message.contains("reconstruct cross-reference")),
+            "fixture must actually reconstruct its xref for this test to be meaningful"
+        );
+        let before_count = pdf.object_refs().len();
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        // qpdf 11.9.0's getAllPagesInternal has no reconstruction gate, so the
+        // duplicate leaf is cloned even for a reconstructed input (mirroring the
+        // clean-parse `duplicate_leaf_across_two_parents_is_cloned`). Exactly one
+        // clone minted (object 7 = next after the highest, 6).
+        assert_eq!(
+            pdf.object_refs().len(),
+            before_count + 1,
+            "a reconstructed-xref shared leaf must mint exactly one clone"
+        );
+
+        // Parent A keeps the original leaf 5; parent B is rewritten to the clone 7.
+        let a = pdf.resolve(ObjectRef::new(3, 0)).expect("A resolves");
+        let Object::Dictionary(a_dict) = a else {
+            panic!("A not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            a_dict.get("Kids"),
+            Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+                5, 0
+            ))])),
+            "parent A must keep the original leaf 5 in its /Kids"
+        );
+        let b = pdf.resolve(ObjectRef::new(4, 0)).expect("B resolves");
+        let Object::Dictionary(b_dict) = b else {
+            panic!("B not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            b_dict.get("Kids"),
+            Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+                7, 0
+            ))])),
+            "parent B's /Kids entry must be rewritten to the clone (7)"
+        );
+
+        // Original leaf inherits A's /Rotate 90; the clone inherits B's /Rotate
+        // 180 independently — a naive skip would drop the 180 entirely.
+        let leaf = pdf.resolve(ObjectRef::new(5, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(leaf_dict.get("Rotate"), Some(&Object::Integer(90)));
+        let clone = pdf.resolve(ObjectRef::new(7, 0)).expect("clone resolves");
+        let Object::Dictionary(clone_dict) = clone else {
+            panic!("clone not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            clone_dict.get("Rotate"),
+            Some(&Object::Integer(180)),
+            "the clone must inherit parent B's /Rotate 180 independently"
+        );
+    }
+
+    #[test]
+    fn reconstructed_interior_type_not_pages_is_overridden() {
+        let bytes = damage_startxref(pdf_with_interior_type_not_pages());
+        let mut pdf = Pdf::open_with_repair(Cursor::new(bytes)).expect("recovers");
+        assert!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|d| d.message.contains("reconstruct cross-reference")),
+            "fixture must actually reconstruct its xref for this test to be meaningful"
+        );
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        // qpdf 11.9.0's getAllPagesInternal overrides a mistyped interior /Type
+        // unconditionally (QPDF_pages.cc:89-92, no reconstruction gate), so the
+        // override runs for a reconstructed input too.
+        let interior = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .expect("interior resolves");
+        let Object::Dictionary(interior_dict) = interior else {
+            panic!("interior is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            interior_dict.get("Type"),
+            Some(&Object::Name(b"Pages".to_vec())),
+            "the interior node's mistyped /Type /Foo must be overridden to /Pages \
+             even when the xref was reconstructed"
+        );
+    }
+
+    #[test]
+    fn reconstructed_clean_input_is_a_no_op_repair() {
+        // A well-formed single-page tree (no duplicate leaf, correct /Type,
+        // correct root /Pages) with a damaged startxref. Removing the
+        // `!reconstructed` gate must NOT regress such an input: repair (6) and
+        // repair_page_tree are both no-ops, so no object is minted and the
+        // inherited /Rotate is still pushed to the leaf as before.
+        let bytes = damage_startxref(pdf_with_inherited_scalar_rotate());
         let mut pdf = Pdf::open_with_repair(Cursor::new(bytes)).expect("recovers");
         assert!(
             pdf.repair_diagnostics()
@@ -2331,8 +2428,24 @@ mod tests {
         assert_eq!(
             pdf.object_refs().len(),
             before_count,
-            "a reconstructed-xref input must NOT clone the shared leaf (qpdf gates \
-             the clone arm on !reconstructed_xref)"
+            "a clean reconstructed input must not mint any object (repairs are no-ops)"
+        );
+        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let Object::Dictionary(pages_dict) = pages else {
+            panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert!(
+            pages_dict.get("Rotate").is_none(),
+            "/Rotate must still be stripped from the interior /Pages node"
+        );
+        let page = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
+        let Object::Dictionary(page_dict) = page else {
+            panic!("page is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            page_dict.get("Rotate"),
+            Some(&Object::Integer(90)),
+            "/Rotate must still be pushed to the leaf"
         );
     }
 
@@ -2380,8 +2493,8 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         assert!(
             pdf.repair_diagnostics().entries().is_empty(),
-            "fixture must NOT trip xref reconstruction, else the repair pass is \
-             skipped behind the !reconstructed gate: {:?}",
+            "fixture must parse without xref reconstruction (authored as a \
+             clean-parse repair case): {:?}",
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 
@@ -2595,8 +2708,8 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         assert!(
             pdf.repair_diagnostics().entries().is_empty(),
-            "fixture must NOT trip xref reconstruction, else the repair pass is \
-             skipped behind the !reconstructed gate: {:?}",
+            "fixture must parse without xref reconstruction (authored as a \
+             clean-parse repair case): {:?}",
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 
@@ -3251,8 +3364,8 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         assert!(
             pdf.repair_diagnostics().entries().is_empty(),
-            "fixture must NOT trip xref reconstruction, else the repair pass is \
-             skipped behind the !reconstructed gate: {:?}",
+            "fixture must parse without xref reconstruction (authored as a \
+             clean-parse repair case): {:?}",
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
         let before_count = pdf.object_refs().len();
@@ -3358,8 +3471,8 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         assert!(
             pdf.repair_diagnostics().entries().is_empty(),
-            "fixture must NOT trip xref reconstruction, else the repair pass is \
-             skipped behind the !reconstructed gate: {:?}",
+            "fixture must parse without xref reconstruction (authored as a \
+             clean-parse repair case): {:?}",
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 
@@ -3570,8 +3683,8 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         assert!(
             pdf.repair_diagnostics().entries().is_empty(),
-            "fixture must NOT trip xref reconstruction, else the repair pass is \
-             skipped behind the !reconstructed gate: {:?}",
+            "fixture must parse without xref reconstruction (authored as a \
+             clean-parse repair case): {:?}",
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 
@@ -3638,8 +3751,8 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         assert!(
             pdf.repair_diagnostics().entries().is_empty(),
-            "fixture must NOT trip xref reconstruction, else repair (6) is skipped \
-             behind the !reconstructed gate: {:?}",
+            "fixture must parse without xref reconstruction (authored as a \
+             clean-parse repair case): {:?}",
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 
@@ -3724,8 +3837,8 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         assert!(
             pdf.repair_diagnostics().entries().is_empty(),
-            "fixture must NOT trip xref reconstruction, else repair (6) is skipped \
-             behind the !reconstructed gate (masking the loop guard): {:?}",
+            "fixture must parse without xref reconstruction (authored as a \
+             clean-parse repair case; reconstruction would mask the loop guard): {:?}",
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 
@@ -3795,8 +3908,8 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         assert!(
             pdf.repair_diagnostics().entries().is_empty(),
-            "fixture must NOT trip xref reconstruction, else repair (6) is skipped \
-             behind the !reconstructed gate: {:?}",
+            "fixture must parse without xref reconstruction (authored as a \
+             clean-parse repair case): {:?}",
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 

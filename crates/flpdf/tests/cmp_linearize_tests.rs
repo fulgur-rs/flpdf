@@ -57,6 +57,31 @@ fn flpdf_linearized(fixture: &str) -> Vec<u8> {
     doc.bytes
 }
 
+/// As [`flpdf_linearized`], but opens the fixture with `open_with_repair` so an
+/// input whose xref must be reconstructed still parses. Both the plan handle and
+/// the write handle repair independently (each re-opens the file).
+fn flpdf_linearized_repair(fixture: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+
+    let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open_with_repair(std::io::BufReader::new(file)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+    let renumber = RenumberMap::from_plan(&plan);
+
+    let file2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf2 = Pdf::open_with_repair(std::io::BufReader::new(file2)).unwrap();
+
+    let mut opts = WriteOptions::default();
+    opts.deterministic_id = true;
+    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+
+    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
+    doc.back_patch().unwrap();
+    doc.bytes
+}
+
 fn golden(fixture_stem: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/golden/references")
@@ -89,6 +114,25 @@ fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
 
 fn assert_linearize_byte_identical(fixture: &str, stem: &str) {
     let actual = flpdf_linearized(fixture);
+    let expected = golden(stem);
+    if let Some(off) = first_diff(&actual, &expected) {
+        let lo = off.saturating_sub(16);
+        panic!(
+            "{fixture}: not byte-identical to qpdf --linearize --deterministic-id golden \
+             (flpdf={} bytes, golden={} bytes, first diff at byte {off})\n\
+             flpdf : {:?}\ngolden: {:?}",
+            actual.len(),
+            expected.len(),
+            &actual[lo..(off + 16).min(actual.len())],
+            &expected[lo..(off + 16).min(expected.len())],
+        );
+    }
+}
+
+/// As [`assert_linearize_byte_identical`], but drives the writer via
+/// [`flpdf_linearized_repair`] for a fixture whose xref must be reconstructed.
+fn assert_linearize_byte_identical_repair(fixture: &str, stem: &str) {
+    let actual = flpdf_linearized_repair(fixture);
     let expected = golden(stem);
     if let Some(off) = first_diff(&actual, &expected) {
         let lo = off.saturating_sub(16);
@@ -222,6 +266,20 @@ fn shared_page_two_parents_pushmint_byte_identical_to_qpdf() {
     assert_linearize_byte_identical(
         "shared-page-two-parents-pushmint.pdf",
         "shared-page-two-parents-pushmint",
+    );
+}
+
+// The shared-leaf fixture with a damaged startxref, forcing xref reconstruction
+// on open. qpdf 11.9.0's getAllPagesInternal has no reconstruction gate
+// (QPDF_pages.cc:77-138), so it STILL clones the duplicate leaf into a distinct
+// page object; flpdf mirrors this unconditionally (the `!reconstructed` gate was
+// removed in flpdf-s5i2). Pins the reconstructed-xref linearize path to the qpdf
+// 11.9.0 golden.
+#[test]
+fn shared_page_two_parents_reconstructed_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical_repair(
+        "shared-page-two-parents-reconstructed.pdf",
+        "shared-page-two-parents-reconstructed",
     );
 }
 
