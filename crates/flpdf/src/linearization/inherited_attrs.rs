@@ -339,7 +339,15 @@ fn repair_page_tree<R: Read + Seek>(
         };
         if has_kids {
             // Interior /Pages node: descend, threading the /MediaBox flag.
-            repair_page_tree(pdf, kid_ref, seen, visited, next_clone, depth + 1, media_box)?;
+            repair_page_tree(
+                pdf,
+                kid_ref,
+                seen,
+                visited,
+                next_clone,
+                depth + 1,
+                media_box,
+            )?;
             continue;
         }
         // Leaf branch.
@@ -2706,7 +2714,9 @@ mod tests {
         pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
 
         let off3 = pdf.len() as u64;
-        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox 4 0 R >>\nendobj\n");
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox 4 0 R >>\nendobj\n",
+        );
 
         let off4 = pdf.len() as u64;
         pdf.extend_from_slice(b"4 0 obj\n[0 0 300 400]\nendobj\n");
