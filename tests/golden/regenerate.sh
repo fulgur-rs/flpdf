@@ -442,6 +442,46 @@ else
     echo "Skipping inherited-resources-one-page.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/inherited-rotate-one-page.pdf" ]]; then
+    echo "Generating inherited-rotate-one-page.pdf ..."
+    # flpdf-d8pc: the pure-SCALAR sibling of inherited-resources-one-page. The
+    # /Pages node (obj 2) holds a DIRECT scalar /Rotate 90 and the /Page leaf
+    # (obj 3) carries no /Rotate. During linearization qpdf's
+    # pushInheritedAttributesToPage copies the scalar down to the leaf BY VALUE
+    # (a literal /Rotate 90, no new indirect object minted) and strips it from
+    # the now-interior /Pages node — distinct from the /Resources case, whose
+    # non-scalar dict mints a fresh object. The leaf keeps its OWN /Resources so
+    # the fixture isolates /Rotate inheritance, and its content stream (obj 4)
+    # genuinely uses the font /F1 (obj 5), making it a real rendering case.
+    python3 - "$FIX/inherited-rotate-one-page.pdf" <<'PY'
+import sys
+objs = {
+    1: b"<< /Type /Catalog /Pages 2 0 R >>",
+    2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 /Rotate 90 >>",
+    3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
+       b" /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    5: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+}
+c = b"BT /F1 24 Tf 100 700 Td (Hello) Tj ET"
+objs[4] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c), c)
+order = [1, 2, 3, 4, 5]
+out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+offs = {}
+for n in order:
+    offs[n] = len(out)
+    out += b"%d 0 obj\n" % n + objs[n] + b"\nendobj\n"
+xo = len(out)
+size = 6
+out += b"xref\n0 %d\n" % size + b"0000000000 65535 f \n"
+for n in range(1, size):
+    out += (b"%010d 00000 n \n" % offs[n]) if n in offs else b"0000000000 65535 f \n"
+out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (size, xo)
+open(sys.argv[1], "wb").write(out)
+PY
+else
+    echo "Skipping inherited-rotate-one-page.pdf (already exists)"
+fi
+
 # flpdf-0gyq: a null-resolving ref as an ARRAY element is resurrected by qpdf as
 # an indirect null body object (NOT dropped, NOT inlined). Two equal-shape 1-page
 # docs whose Catalog has /Arr [<ref> 8 0 R]: the FREE variant references obj 9
@@ -1225,6 +1265,14 @@ mkdir -p "$REF/inherited-resources-one-page"
 qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/inherited-resources-one-page.pdf" "$REF/inherited-resources-one-page/linearize.pdf"
 echo "inherited-resources-one-page/linearize.pdf"
+
+# --- inherited-rotate-one-page: linearize (flpdf-d8pc, direct SCALAR /Rotate on
+# an interior /Pages node copied down to the /Page leaf by value — no new object
+# minted, unlike the /Resources dict case above) ---
+mkdir -p "$REF/inherited-rotate-one-page"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/inherited-rotate-one-page.pdf" "$REF/inherited-rotate-one-page/linearize.pdf"
+echo "inherited-rotate-one-page/linearize.pdf"
 
 # --- missing-trailer-info: dangling /Info 99 0 R dropped, then linearized
 # (flpdf-4vpi). Malformed input → qpdf warns, so --warning-exit-0. Pins the

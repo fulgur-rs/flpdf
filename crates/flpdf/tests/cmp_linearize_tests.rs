@@ -199,6 +199,20 @@ fn inherited_resources_one_page_byte_identical_to_qpdf() {
     );
 }
 
+// flpdf-d8pc: the pure-SCALAR sibling of the /Resources case above. The /Pages
+// node holds a DIRECT /Rotate 90 and the /Page leaf has none, so linearization
+// copies the scalar down to the leaf BY VALUE (a literal /Rotate 90) and strips
+// it from the now-interior /Pages node — WITHOUT minting a new indirect object,
+// unlike the non-scalar /Resources dict which mints a fresh copy. Both share the
+// same `push_internal` code path; this pins its copy-by-value arm end-to-end
+// (the `scalar_rotate_is_copied_by_value_not_minted` unit test covers only the
+// object model, not the serialized bytes). The leaf carries its own /Resources
+// so the fixture isolates /Rotate inheritance.
+#[test]
+fn inherited_rotate_one_page_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("inherited-rotate-one-page.pdf", "inherited-rotate-one-page");
+}
+
 // A `/Page` leaf shared by two `/Pages` parents that carry different inherited
 // `/Rotate` values (A: 90, B: 180). qpdf's `pushInheritedAttributesToPage`
 // begins with `(void)cache()`, whose `getAllPagesInternal` clones the 2nd
