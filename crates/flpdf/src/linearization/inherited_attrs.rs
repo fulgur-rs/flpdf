@@ -3480,4 +3480,147 @@ mod tests {
             "the scalar /Kids entry must stay a direct integer (not minted to a ref)"
         );
     }
+
+    /// The catalog's `/Pages` points INTO the page tree — at the first-page LEAF
+    /// (obj 3), whose `/Parent` is the true root `/Pages` node (obj 2). Object
+    /// layout: 1 Catalog (`/Pages 3 0 R`, WRONG), 2 the true root `/Pages` (no
+    /// `/Parent`), 3 the `/Page` leaf (`/Parent 2 0 R`), 4 the leaf's `/Contents`
+    /// target.
+    fn pdf_with_root_pages_pointing_into_tree() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 4 0 R >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// A catalog whose mis-aimed `/Pages` points at the leaf must have it walked
+    /// up its `/Parent` chain to the true root and rewritten, mirroring qpdf
+    /// 11.9.0 getAllPages's root->/Pages correction (QPDF_pages.cc:50-67).
+    /// Observed from the qpdf 11.9.0 golden of the `root-pages-points-into-tree`
+    /// fixture: the output catalog `/Pages` points at the true root `/Pages` node
+    /// (the one with `/Kids` and no `/Parent`), NOT the leaf.
+    #[test]
+    fn root_pages_pointing_into_tree_is_corrected() {
+        let bytes = pdf_with_root_pages_pointing_into_tree();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        assert!(
+            pdf.repair_diagnostics().entries().is_empty(),
+            "fixture must NOT trip xref reconstruction, else the repair pass is \
+             skipped behind the !reconstructed gate: {:?}",
+            pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
+        );
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let catalog = pdf.resolve(ObjectRef::new(1, 0)).expect("catalog resolves");
+        let Object::Dictionary(catalog_dict) = catalog else {
+            panic!("catalog is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            catalog_dict.get("Pages"),
+            Some(&Object::Reference(ObjectRef::new(2, 0))),
+            "the catalog's /Pages must be corrected from the leaf (3 0 R) to the \
+             true root /Pages node (2 0 R)"
+        );
+    }
+
+    #[test]
+    fn correct_root_pages_is_unchanged() {
+        // A well-formed tree: the catalog's /Pages already points at the true root
+        // /Pages node (obj 2, no /Parent). The root->/Pages correction is a
+        // complete no-op — /Pages is left pointing at the same object.
+        let bytes = pdf_with_no_inheritable_keys();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let catalog = pdf.resolve(ObjectRef::new(1, 0)).expect("catalog resolves");
+        let Object::Dictionary(catalog_dict) = catalog else {
+            panic!("catalog is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            catalog_dict.get("Pages"),
+            Some(&Object::Reference(ObjectRef::new(2, 0))),
+            "a catalog /Pages already at the true root must be left unchanged"
+        );
+    }
+
+    /// The catalog's `/Pages` (node A, obj 2) has a `/Parent` cycle: A's `/Parent`
+    /// is B (obj 3) and B's `/Parent` is A. Object layout: 1 Catalog
+    /// (`/Pages 2 0 R`), 2 node A (`/Parent 3 0 R`, `/Kids [4 0 R]`), 3 node B
+    /// (`/Parent 2 0 R`), 4 the `/Page` leaf under A. Walking the `/Parent` chain
+    /// to find the true root must terminate on the loop guard, not spin forever.
+    fn pdf_with_root_pages_parent_cycle() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Parent 3 0 R /Kids [4 0 R] /Count 1 >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Parent 2 0 R >>\nendobj\n");
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn root_pages_parent_cycle_terminates() {
+        let bytes = pdf_with_root_pages_parent_cycle();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        // The /Parent chain A -> B -> A is a cycle; the root->/Pages correction's
+        // walk up the chain must terminate on the loop guard, not hang. The
+        // harness timeout is the real backstop; this assertion documents the
+        // expected outcome (pins the loop guard).
+        let result = push_inherited_attributes_to_pages(&mut pdf);
+        assert!(
+            result.is_ok(),
+            "a /Parent cycle above the page tree root must terminate, not error: {result:?}"
+        );
+    }
 }
