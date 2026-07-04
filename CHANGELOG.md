@@ -5,6 +5,168 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-07-04
+
+<!-- Release notes generated using configuration in .github/release.yml at main -->
+
+### Features
+* feat(writer): NewlineBeforeEndstream::Never + cmp-diff-0 vs qpdf [flpdf-onao] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/303
+* feat(flpdf): qpdf null-out parity for --pages outline/named-dest remap (flpdf-9hc.20.32) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/313
+* feat(flpdf): qpdf null-out parity for --pages link-annot & /OpenAction dests (flpdf-9hc.20.33) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/315
+* feat(flpdf): qpdf drop parity for --pages struct-tree StructElem /Pg (flpdf-9hc.20.35) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/316
+* feat(workflow): pre-PR patch-coverage gate (flpdf 100%, cli best-effort) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/319
+* feat(flpdf): qpdf --pages MCR/OBJR /Pg drop parity (flpdf-h2sm) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/318
+* feat(flpdf): qpdf --pages thread-bead /P drop parity (flpdf-9hc.20.34) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/320
+* feat(cli): qpdf-format stderr diagnostics (WARNING: <file>: <msg>) (flpdf-tc3e) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/321
+* feat(cli): qpdf --check stdout checking block (flpdf-l3jx) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/324
+* feat(flpdf): extract_pages multi-page extract with shared-resource dedup (flpdf-5h5.4) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/325
+* feat(fuzz): cargo-fuzz whole-document harness open→check→write (flpdf-hn1g.2) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/331
+* feat(flpdf): multi-document merge primitive (merge_documents) — qpdf --pages parity (flpdf-5h5.6) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/329
+* feat(flpdf): #![forbid(unsafe_code)] on flpdf + flpdf-cli (flpdf-hn1g.6) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/335
+* feat(flpdf): opt-in decode-output limits + /Filter chain length cap (flpdf-hn1g.4) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/338
+* feat(flpdf): qpdf-equivalent --deterministic-id (flpdf-9hc.13.3/.13.6/.13.7) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/337
+* feat(flpdf): byte-level qpdf /ID parity for --deterministic-id (flpdf-9hc.13.9) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/339
+* feat(flpdf): deterministic /ID for linearized output (flpdf-9hc.13.8) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/340
+* feat(flpdf): --check decodes page content streams, errors on decode failure (flpdf-gvyz) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/345
+* feat(flpdf): --check opt-in decode-memory-limit (zip-bomb guard) (flpdf-svbm) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/348
+* feat(flpdf): linearized output byte-identical to qpdf --linearize --deterministic-id (flpdf-9hc.13.10) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/350
+* feat(flpdf): preserve already-lone-/FlateDecode streams verbatim (qpdf parity) (flpdf-9slx) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/354
+* feat(flpdf): deterministic /ID direct-write — flat paths, qpdf mechanism (L1, flpdf-9hc.13.12) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/360
+* feat(flpdf): deterministic /ID direct-write — classic linearized (qpdf 2-pass) (L2, flpdf-u5m8) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/361
+* feat(flpdf-cli): overlay/underlay segment parser (flpdf-9hc.16.1) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/362
+* feat(flpdf): overlay/underlay page content patching + byte gate (flpdf-9hc.16.3) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/364
+* feat(flpdf): overlay/underlay page-range mapping (flpdf-9hc.16.4) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/365
+* feat(flpdf): compose multiple overlay/underlay specs (flpdf-9hc.16.5) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/366
+* feat(flpdf-cli): wire --overlay/--underlay into rewrite (flpdf-9hc.16.6) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/367
+* feat(flpdf): floor linearized ObjStm header to 1.5 on real emission (flpdf-6pcx · stack 2/3) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/372
+* feat(flpdf): qpdf-faithful xref-stream encoder — predictor 12, /W [1 2 1] (flpdf-6pcx · stack 3/3) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/373
+* feat(flpdf): wire qpdf xref-stream encoder into linearized writer — two-pass writePad (flpdf-4z56 · stack 4/5) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/374
+* feat(flpdf): ObjStm container byte-parity — qpdf offset table + dict key order (flpdf-0i0s · stack 5/5) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/375
+* feat(flpdf): deterministic /ID[1] byte-parity via qpdf pass-1 digest (flpdf-9ntt · stack 6/6) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/376
+* feat(flpdf): ObjStm linearized qpdf structural parity (numbering/member-set/check-clean) — epic flpdf-ihb by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/371
+* feat(flpdf): qpdf generate-mode ObjStm port — DFS order, even split, container-first renumber (flpdf-g6hb.1, WIP) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/381
+* feat(flpdf): show-linearization (qpdf --show-linearization compat) + hint-stream decoder by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/383
+* feat(flpdf-cli): qpdf-zlib-compat feature + E2E byte-identical CLI verification by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/385
+* feat(flpdf): linearized generate ObjStm byte-identical at >cap (Phase 2, flpdf-g6hb.2) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/382
+* feat(flpdf): in_open_document linearization category (objstm-generate) (flpdf-1dmy) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/386
+* feat(flpdf): in_outlines linearization category — Outlines hint table (objstm-generate part9) (flpdf-rm09) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/387
+* feat(linearization): thumbnail lc categories route to part9 (flpdf-b2lp) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/395
+* feat(flpdf-9hc.13.11): preserve non-16-byte /ID[0] under --deterministic-id (qpdf getOriginalID1 parity) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/417
+### Bug Fixes
+* fix(writer): never emit object 0 as a body object in plain rewrite [flpdf-9hc.31] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/296
+* fix(extract): neutralize cross-page annotation destinations [flpdf-4924] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/299
+* fix(writer): Catalog-first object renumbering for plain rewrite [flpdf-9hc.32] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/300
+* fix(writer): emit stream dicts in qpdf key order (/Length pulled out) [flpdf-tqu1] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/301
+* fix(writer): classic trailer on the 'trailer' line in qpdf key order [flpdf-9hc.20.28] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/302
+* fix(extract): neutralize /SD and cross-page /P vectors targeting absent pages (flpdf-2tmg) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/307
+* fix: resolve indirect /V and /DV in FormFieldObjectHelper::field_value by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/309
+* fix: re-open qdf+Never output with indirect /Length holder (flpdf-9hc.20.31) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/310
+* fix: normalize indirect stream-valued fonts to their dictionary (flpdf-k8ms) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/312
+* fix(flpdf): emit qpdf-compatible warning sequence for xref repair (flpdf-ny1f) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/317
+* fix(flpdf): null-out guards surviving remapped refs (flpdf-9hc.20.36) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/323
+* fix(flpdf): bound parser recursion depth to prevent stack overflow (flpdf-hn1g.1) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/327
+* fix(flpdf): bound object-stream /Extends chain depth to prevent stack overflow (flpdf-hn1g.7) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/328
+* fix(cli): gate deprecated R=5 (AES-256) write behind --allow-weak-crypto by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/330
+* fix(flpdf): bound ref-walker inline structural depth across 8 walkers (flpdf-hn1g.9) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/332
+* fix(flpdf): bound inherited_field_value /Parent chain depth (flpdf-hn1g.3) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/334
+* fix(flpdf): preserve /DR resource named /P on standalone field-copy path (flpdf-4ue7) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/333
+* fix(flpdf): eradicate remaining holder-chain matching gaps via shared resolve_ref_chain (flpdf-k7xx) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/336
+* fix(flpdf): drop /GoTo /SD in primary inline /OpenAction, fall back to /D (flpdf-ahkf) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/342
+* fix(flpdf): follow holder chains across structural one-hop resolve sites (flpdf-3x23) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/341
+* fix(flpdf): collapse ResourcesLoc::Indirect holder chain to terminal (flpdf-12jh) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/343
+* fix(flpdf): name/number tree root omits /Limits (ISO 32000-2 7.9.6/7.9.7, qpdf parity) (flpdf-k42w) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/347
+* fix(flpdf): repair private-item rustdoc intra-doc links (flpdf-2mn) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/351
+* fix(flpdf): show-encryption[-key] weak-crypto correct-password parity with qpdf (flpdf-ysb5) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/353
+* fix(flpdf): --check opens weak-crypto files as read-only inspection (flpdf-mc7f) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/355
+* fix(flpdf): drop OBJR /Obj-survived annotation /P, GC orphan page (qpdf --pages parity) (flpdf-u2kh) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/356
+* fix(flpdf): drop thread-bead /P to a removed page nulled by a surviving dest (flpdf-eyey) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/358
+* fix(flpdf): linearized ObjStm byte-parity for ineligible first-page shared stream (flpdf-ihb.2) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/380
+* fix(flpdf): drop source ObjStm/XRef structural containers from linearized body (flpdf-zbf9) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/388
+* fix(flpdf): route UseOutlines ObjStm outline containers to first-page section (flpdf-vvjr.1) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/389
+* fix(flpdf): route classic linearize outline objects to correct half (flpdf-vvjr.2) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/390
+* fix(in_outlines): exclude second-half ObjStm containers from Shared Object Hint Table by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/392
+* fix(hint): in_open_document precedence + skip OD ObjStm containers from first-page SOHT by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/393
+* fix(plan): verify multi-container OD ordering (flpdf-699x) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/394
+* fix(linearization): preserve keeps source ObjStm grouping at >cap (flpdf-ihb.4) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/397
+* fix(overlay): close 4 Form XObject byte-parity gaps vs qpdf (flpdf-9hc.16.10) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/399
+* fix(linearize): drop orphaned indirect /Length holders to match qpdf GC (flpdf-2vfg) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/400
+* fix(rewrite): drop orphaned indirect /Length holders on full-rewrite paths (flpdf-sqkq) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/401
+* fix(cli): close overlay/underlay behavior & qpdf-parity gaps (flpdf-9hc.16.9) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/402
+* fix(linearize): order in_outlines above in_open_document for shared streams (flpdf-ci0r) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/403
+* fix(cli): honor explicit empty --to= / --repeat= in overlay (flpdf-9hc.16.11) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/404
+* fix(writer): suppress generated object/xref streams under forced sub-1.5 header (flpdf-ipc6) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/406
+* fix(writer): downgrade inherited xref-stream form to classic table when force<1.5 (flpdf-w35w) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/407
+* fix(linearize): exclude part9 outline-routed containers from part8 SOHT (flpdf-7aek) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/405
+* fix(linearize): emit second-half ObjStm containers in part rank order (flpdf-g1eu) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/409
+* fix(linearize): emit ineligible part6 outline stream after its container (flpdf-q9o3) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/408
+* fix(writer): directize /Length for kept-holder passthrough/non-decodable streams (flpdf-q1j2) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/410
+* fix(linearize): first-page closure ignores /Length holders + part6 source-number order (flpdf-hwx0) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/411
+* fix(linearize): route open-document closure to part4 in preserve/disable mode (flpdf-lubb) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/412
+* fix(writer): direct-ize /Length under --stream-data=preserve (flpdf-3g8o) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/414
+* fix(linearize): GC unreachable source lin-artifacts when re-linearizing (flpdf-phfu) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/413
+* fix(cli): plain rewrite must not prune /Resources entries (flpdf-79ef) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/415
+* fix(writer): skip /Length edges in renumber walk, drop pre-GC orphan scan (flpdf-orv9) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/416
+* fix(linearize): apply in_outlines>first-page precedence on classic path (flpdf-q2zw) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/418
+* fix(overlay): normalize box geometry like qpdf getArrayAsRectangle (flpdf-lkk7) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/419
+* fix(golden): tolerate placeholder-JPEG warning in kept-indirect-length --check (flpdf-rnai) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/420
+* fix(linearize): drop unplanned refs from generate-mode ObjStm batches (flpdf-4vpi) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/421
+* fix(linearize): harden canonical_shared_hints sort against missing renumber entry (flpdf-hn1g.10) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/422
+* fix(pages): null-out only removed original page leaves, not arbitrary dest targets (flpdf-hn1g.11) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/423
+* fix(signatures): proceed on signed full-rewrite like qpdf, drop the refusal (flpdf-hn1g.13) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/424
+* fix(signatures): add seen-set to walk_signature_rewrite_field to prevent AcroForm DoS (flpdf-4ydy) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/425
+* fix(filters): guard PNG predictor empty-input allocation against DoS (flpdf-te5g) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/426
+* fix(objstm): drop dangling trailer refs in non-linearized generate (flpdf-ndjy) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/429
+* fix(qdf): bound regenerated xref by object-count completeness, fixing dense-xref DoS + max_num overflow (flpdf-rnnr) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/428
+* fix(qdf): tighten fix_qdf to strict 1..N file order now writer is canonical (flpdf-o10m) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/431
+* fix(linearize): drop/null-ize dangling & object-0 body refs (flpdf-5apf) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/432
+* fix(linearize): resurrect missing-xref array refs as null objects (flpdf-0gyq) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/433
+* fix(linearize): classify first-page objects shared via document-level refs (flpdf-8891) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/435
+* fix(linearize): classify first-page-direct missing array refs into Part 2 (flpdf-o9im) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/434
+* fix(xref): rewrite repair scan to qpdf line-by-line reconstruct — O(n²) DoS (flpdf-m3oe) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/436
+* fix(linearize): push inherited page attributes before linearization (flpdf-8wo1) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/438
+* fix(coverage): scope patch-coverage.sh missing_cov exemption to declaration-only files by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/439
+* fix(hn1g.15): --remove-restrictions strips /Perms /DocMDP + AcroForm sig fields (qpdf disableDigitalSignatures parity) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/440
+* fix(resources): ever-seen Form XObject traversal fixes exponential-recursion DoS (flpdf-u79t) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/442
+* fix(linearize): clone /Page leaves shared across /Pages parents (qpdf cache() parity, flpdf-52md) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/449
+* fix(flpdf-zda0): other-page object with others>0 is lc_other (part9), not part7 by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/451
+* fix(linearize): override page-tree /Type keys (qpdf 11.9.0 getAllPagesInternal parity, flpdf-nd38 PR1/4) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/452
+* fix(linearize): default missing leaf /MediaBox to letter/ANSI A (qpdf 11.9.0 parity, flpdf-nd38 PR2/4) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/453
+* fix(linearize): convert direct /Kids leaf to indirect (qpdf 11.9.0 parity, flpdf-nd38 PR3/4) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/454
+### Documentation
+* docs: cookbook examples + API cross-references [flpdf-9hc.18.9] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/306
+* docs(flpdf): verify thread-bead /P remap vs qpdf 11.9.0 duplicate-page (flpdf-77ra) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/322
+* docs(flpdf): add threat model and security policy (flpdf-pcor) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/326
+* docs(flpdf): mandate qpdf byte-identical mimicry as top-priority pre-v1.0 policy (flpdf-jiw6) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/359
+### Internal
+* fix: bounds-check xref stream offset before slicing (DoS, #304) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/305
+* test(flpdf): helper API smoke + round-trip capstone [flpdf-9hc.18.10] by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/308
+* test(flpdf): cover public helper error paths (fonts, page/annotation helpers) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/311
+* test(flpdf): cover xref.rs repair/recovery + strict error arms (flpdf-tq35) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/314
+* perf(flpdf): share visited set across extract_pages closure union (flpdf-11lj) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/344
+* perf(flpdf): share visited set across merge_documents closure unions (flpdf-kaej) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/346
+* test(flpdf): merge trim×+N-rename composition on a secondary non-terminal field (flpdf-2c7k) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/349
+* ci(flpdf): gate broken intra-doc links in the quality job (flpdf-80xq) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/352
+* test(flpdf): cover linearized /F external-file lone-Flate exclusion outcome (flpdf-2tdg) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/357
+* test(flpdf-vvjr.3): verify multi-container outline group_length with K=200 fixture by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/391
+* test(linearization): verify-and-close ihb.3 cap-boundary stranded container by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/396
+* test(linearization): correct stale SOHT comment now that fmlf is fixed by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/398
+* ci(flpdf-3nrm): add PR labeler for release-notes:* labels (phase 1) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/427
+* ci: add .github/release.yml for release-notes categorization (flpdf-q04y) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/437
+* ci(flpdf-0i8y): pin release.yml credential/publish actions to commit SHA by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/441
+* test(linearize): pin no-stream page hint-stream byte-parity; +6 gap is DEFLATE-backend, not encoder (flpdf-05jt) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/443
+* test(linearize): add write_linearized depth-overflow error-arm test (flpdf-60gv) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/444
+* ci(flpdf-6ri8): add dependabot.yml (github-actions + cargo) + harden pr-labeler by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/445
+* ci(flpdf-zgvb): dependabot self-labels release-notes:internal + pr-labeler skips dependabot by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/448
+* build(deps): bump the github-actions group across 1 directory with 3 updates by @dependabot[bot] in https://github.com/fulgur-rs/flpdf/pull/446
+* ci(flpdf-r9ff): restore dependabot "dependencies" label alongside release-notes:internal by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/450
+### Other Changes
+* QDF: emit length-holders in sequential emission order for idempotence by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/430
+
+## New Contributors
+* @dependabot[bot] made their first contribution in https://github.com/fulgur-rs/flpdf/pull/446
+
+**Full Changelog**: https://github.com/fulgur-rs/flpdf/compare/v0.1.6...v0.1.7
+
 ## [0.1.6] - 2026-06-07
 
 * fix(outline_dest_remap): saturating /Count accumulation (flpdf-35z) by @mitsuru in https://github.com/fulgur-rs/flpdf/pull/273
