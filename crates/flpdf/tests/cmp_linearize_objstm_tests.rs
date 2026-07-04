@@ -887,6 +887,37 @@ fn outlines_otherpage_two_container_empty_first_page_byte_identical_to_qpdf() {
     );
 }
 
+// otherpage-others-48-50 (flpdf-pn7h): a two-container part7/part9 layout. Page 0
+// is fontless (no first-page ObjStm member), page 1 has 48 private fonts, page 2
+// has 50 private fonts. The even split yields C1 = {Pages tree node + the 48
+// page-1 fonts} and C2 = {the 50 page-2 fonts}. C1's union has other_pages=={1}
+// AND others>0 (the /Pages tree node is reached via ou_root_key "/Pages", which is
+// not an open-document key nor /Outlines), so qpdf categorizes it lc_other (part9);
+// C2 has other_pages=={2}, others==0, so it is lc_other_page_private (part7). qpdf
+// emits/numbers the second half in strict part order — C2 (part7) before C1
+// (part9). Before flpdf-pn7h, `route_objstm_containers` routed C1 to part7 by
+// other_pages.len()==1 alone (ignoring `others`), AND `second_half_container_anchors`
+// classified C1 as part7 because it holds a page-private member — both diverging
+// from qpdf. This pins the part7/part9 container ordering AND numbering. Distinct
+// from the outlines-otherpage fixtures above, which cover part8/part9 (shared) —
+// this is the part7 (other-page-private) `others` gate.
+#[test]
+fn otherpage_others_two_container_objstm_structurally_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-otherpage-others-48-50.pdf",
+        "objstm-lin-otherpage-others-48-50",
+    );
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn otherpage_others_two_container_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-otherpage-others-48-50.pdf",
+        "objstm-lin-otherpage-others-48-50",
+    );
+}
+
 // outline-od-shared-stream: a /JS action stream reachable from BOTH the catalog's
 // /OpenAction subtree (in_open_document) AND an outline item's /A (in_outlines).
 // qpdf's canonical classification orders in_outlines ABOVE in_open_document

@@ -794,6 +794,18 @@ fi
 #                     Shared Object Hint Table enumeration tail (the flpdf-7aek
 #                     guards + part-rank ordering already keep it byte-identical;
 #                     no extra part9 enumeration-tail guard is needed).
+#  - otherpage-others-48-50 (flpdf-pn7h): a 2-container part7/part9 layout. Page 0
+#                     is fontless; page 1 has 48 private fonts, page 2 has 50. The
+#                     even split yields C1={Pages node + 48 page-1 fonts} and C2={50
+#                     page-2 fonts}. C1's union has other_pages=={1} AND others>0 (the
+#                     /Pages tree node, ou_root_key "/Pages") => qpdf lc_other (part9);
+#                     C2 has other_pages=={2}, others==0 => lc_other_page_private
+#                     (part7). qpdf orders/numbers C2 (part7) before C1 (part9).
+#                     Before flpdf-pn7h BOTH route_objstm_containers (other_pages==1
+#                     alone) AND second_half_container_anchors (page-private member
+#                     => part7) ignored the `others` gate and diverged. Distinct from
+#                     the outlines-otherpage part8/part9 fixtures above: this is the
+#                     part7 (other-page-private) `others` gate.
 declare -A G6HB2_FIX=(
     [objstm-lin-sharedfonts-100]="gen_shared_fonts.py 100"
     [objstm-lin-cap-boundary-199]="gen_shared_fonts.py 199"
@@ -811,6 +823,7 @@ declare -A G6HB2_FIX=(
     [objstm-lin-outlines-otherpage-0-60-20]="gen_outlines_otherpage_shared.py 0 60 20"
     [objstm-lin-outlines-otherpage-2-120-20]="gen_outlines_otherpage_shared.py 2 120 20"
     [objstm-lin-outlines-otherpage-0-120-20]="gen_outlines_otherpage_shared.py 0 120 20"
+    [objstm-lin-otherpage-others-48-50]="gen_otherpage_others_private.py 48 50"
     [objstm-lin-outline-od-shared-stream]="gen_outline_open_action_shared_stream.py"
     [objstm-lin-useoutline-od-shared-stream]="gen_outline_open_action_shared_stream.py --use-outlines"
     [objstm-lin-acroform-widget-page0-5-10]="gen_acroform_widget_page0.py 5 10"
@@ -1589,6 +1602,7 @@ for stem in objstm-lin-sharedfonts-100 objstm-lin-cap-boundary-199 \
             objstm-lin-outlines-otherpage-0-60-20 \
             objstm-lin-outlines-otherpage-2-120-20 \
             objstm-lin-outlines-otherpage-0-120-20 \
+            objstm-lin-otherpage-others-48-50 \
             objstm-lin-outline-od-shared-stream \
             objstm-lin-useoutline-od-shared-stream \
             objstm-lin-acroform-widget-page0-5-10 \

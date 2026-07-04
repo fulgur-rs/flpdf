@@ -2743,7 +2743,12 @@ fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::
 /// ([`ContainerPart::FirstPage`]); otherwise it is part 7 / part 8 / part 9 by
 /// the number of *distinct non-first* pages its members reach (one →
 /// [`ContainerPart::OtherPagePrivate`], two or more →
-/// [`ContainerPart::OtherPageShared`], none → [`ContainerPart::Rest`]).
+/// [`ContainerPart::OtherPageShared`], none → [`ContainerPart::Rest`]). The
+/// one-page case is part 7 ONLY when the member union has no document-level
+/// `others` object (QPDF_linearization.cc:1128 gates lc_other_page_private on
+/// `others==0`); a member in [`document_other_set`] demotes it to part 9
+/// ([`ContainerPart::Rest`]). The two-or-more case is part 8 regardless of
+/// `others` (QPDF_linearization.cc:1130).
 ///
 /// The page-user signals (first-page closure and the per-object referencing-page
 /// map) are recomputed exactly as [`LinearizationPlan::from_pdf`] derives them.
@@ -2779,6 +2784,13 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
     };
 
     let open_doc_set = open_document_set(pdf)?;
+    // Document-level `others` set (Catalog non-open-document keys, trailer keys
+    // other than /Root,/Encrypt). qpdf categorizes a non-first-page container to
+    // lc_other_page_private (part7) ONLY when others==0
+    // (QPDF_linearization.cc:1128); a container whose member union includes an
+    // `others` object at other_pages==1 falls through to lc_other (part9). Same
+    // set the classic path uses for the identical gate (flpdf-zda0).
+    let document_other_set = document_other_set(pdf)?;
 
     let page_refs = crate::pages::page_refs(pdf)?;
 
@@ -2836,7 +2848,14 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
             }
             match other_pages.len() {
                 0 => ContainerPart::Rest,
+                // other_pages==1 is lc_other_page_private (part7) ONLY when the
+                // union has others==0 (QPDF_linearization.cc:1128). A member in
+                // `document_other_set` makes others>0, so the container is
+                // lc_other (part9) instead (flpdf-zda0 gate, generate path).
+                1 if members.iter().any(|m| document_other_set.contains(m)) => ContainerPart::Rest,
                 1 => ContainerPart::OtherPagePrivate,
+                // other_pages>1 is lc_other_page_shared (part8) regardless of
+                // others (QPDF_linearization.cc:1130), so no gate here.
                 _ => ContainerPart::OtherPageShared,
             }
         })
@@ -5892,6 +5911,122 @@ mod tests {
         let synthetic = vec![vec![info_ref]];
         let routes = route_objstm_containers(&mut pdf, &synthetic).unwrap();
         assert_eq!(routes, vec![ContainerPart::Rest]);
+    }
+
+    /// Build a two-page PDF whose FIRST page is fontless (no first-page
+    /// compressible object) and whose SECOND page carries two private fonts:
+    ///   1 – Catalog  (/Pages 2 0 R, /Ref2 6 0 R)
+    ///   2 – Pages node  (Kids: [3 0 R, 4 0 R])
+    ///   3 – Page 1  → /Contents 7 0 R              (fontless)
+    ///   4 – Page 2  → /Resources << /Font << /FA 5 0 R /FB 6 0 R >> >>, /Contents 8 0 R
+    ///   5 – Font  (page-2-private, others==0)       → lc_other_page_private (part7)
+    ///   6 – Font  (page-2-private AND Catalog /Ref2) → others>0 → lc_other (part9)
+    ///   7 – Content stream (page 1 only)
+    ///   8 – Content stream (page 2 only)
+    /// No `/Info`. With page 1 fontless, the generate-mode even split yields a
+    /// single container {Pages(2), FA(5), FB(6)} with no first-page member, so it
+    /// reaches the other-page arm — exactly the shape the compat golden would use.
+    fn two_page_otherpage_others_and_private_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = [0u64; 9];
+        let mut push = |pdf: &mut Vec<u8>, n: usize, body: &[u8]| {
+            offs[n] = pdf.len() as u64;
+            pdf.extend_from_slice(format!("{n} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        };
+        push(
+            &mut pdf,
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /Ref2 6 0 R >>",
+        );
+        push(
+            &mut pdf,
+            2,
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+        );
+        push(
+            &mut pdf,
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 7 0 R >>",
+        );
+        push(&mut pdf, 4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /FA 5 0 R /FB 6 0 R >> >> /Contents 8 0 R >>");
+        push(
+            &mut pdf,
+            5,
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Name /FA >>",
+        );
+        push(
+            &mut pdf,
+            6,
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /Name /FB >>",
+        );
+        push(&mut pdf, 7, b"<< /Length 5 >>\nstream\nBT ET\nendstream");
+        push(&mut pdf, 8, b"<< /Length 5 >>\nstream\nBT ET\nendstream");
+
+        let xref_start = pdf.len() as u64;
+        let mut xref = String::from("xref\n0 9\n0000000000 65535 f \n");
+        for off in offs.iter().skip(1) {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 9 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    // Generate-path sibling of the classic `document_other_ref_routes_other_page
+    // _object_to_part9` (flpdf-zda0 / flpdf-pn7h): `route_objstm_containers` must
+    // gate the `other_pages==1` (part7) arm on others==0
+    // (QPDF_linearization.cc:1128). A container whose member union includes a
+    // `document_other_set` object is lc_other (part9 / Rest), not part7.
+    #[test]
+    fn generate_route_others_gate_demotes_other_page_container_to_rest() {
+        let mut pdf =
+            Pdf::open(Cursor::new(two_page_otherpage_others_and_private_bytes())).unwrap();
+        let fa = ObjectRef::new(5, 0); // page-2-private, others==0
+        let fb = ObjectRef::new(6, 0); // page-2-private AND Catalog /Ref2 (others>0)
+
+        // A container holding ONLY the others==0 page-2 font stays part7 (the
+        // surviving `1 => OtherPagePrivate` arm).
+        let routes = route_objstm_containers(&mut pdf, &[vec![fa]]).unwrap();
+        assert_eq!(
+            routes,
+            vec![ContainerPart::OtherPagePrivate],
+            "others==0 other-page container is lc_other_page_private (part7)"
+        );
+
+        // Add the /Ref2 font: the union now has others>0, so the whole container
+        // is demoted to Rest (part9) — the gate under test.
+        let routes = route_objstm_containers(&mut pdf, &[vec![fb], vec![fa, fb]]).unwrap();
+        assert_eq!(
+            routes,
+            vec![ContainerPart::Rest, ContainerPart::Rest],
+            "any document-`others` member (Catalog /Ref2) demotes part7 to part9"
+        );
+
+        // Integration: the real generate-mode even split (page 1 fontless) yields
+        // a single container {Pages(2), FA(5), FB(6)} with no first-page member;
+        // it routes to Rest because the union has others>0 (the Pages node via
+        // /Pages and FB via /Ref2). Mirrors qpdf's part9 for this shape.
+        let assigned = LinearizationPlan::from_pdf(&mut pdf, true)
+            .unwrap()
+            .renumber_assigned_refs();
+        let containers = objstm_membership_linearized(&mut pdf, &assigned).unwrap();
+        assert_eq!(
+            containers.len(),
+            1,
+            "3 eligible => a single even-split container"
+        );
+        let routes = route_objstm_containers(&mut pdf, &containers).unwrap();
+        assert_eq!(
+            routes,
+            vec![ContainerPart::Rest],
+            "the {{Pages, FA, FB}} container is lc_other (part9); containers={containers:?}"
+        );
     }
 
     /// A catalog `/OpenAction` whose action's `/D` destination reaches a `/Page`

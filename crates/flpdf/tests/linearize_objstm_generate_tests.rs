@@ -603,6 +603,33 @@ fn disc_part7_part8_generate_round_trips() {
     }
 }
 
+// flpdf-pn7h: a two-container part7/part9 layout. Page 0 is fontless, page 1 has
+// 48 private fonts, page 2 has 50. The even split yields a part9 container ({Pages
+// node + page-1 fonts}: other_pages=={1} AND others>0 via the /Pages tree node)
+// and a part7 container ({page-2 fonts}: other_pages=={2}, others==0). This
+// exercises the `others` gate on BOTH route_objstm_containers and
+// second_half_container_anchors and round-trips (default features: marker count +
+// resolve, no qpdf/zlib). Byte parity with qpdf is pinned in
+// cmp_linearize_objstm_tests under qpdf-zlib-compat.
+#[test]
+fn otherpage_others_two_container_generate_round_trips() {
+    let bytes = linearize_generate("objstm-lin-otherpage-others-48-50.pdf");
+
+    let n_objstm = count_objstm_markers(&bytes);
+    assert_eq!(
+        n_objstm, 2,
+        "otherpage-others generate must emit exactly two ObjStm containers, found {n_objstm}"
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
+    let refs = pdf.object_refs();
+    assert!(!refs.is_empty(), "round-tripped doc must expose objects");
+    for r in refs {
+        pdf.resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
+
 // flpdf-zbf9: linearizing an ObjStm-bearing input must NOT leak the source's
 // /Type /ObjStm and /Type /XRef containers into the body. After the fix the
 // output carries exactly one freshly-generated ObjStm container and the two
