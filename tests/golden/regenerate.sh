@@ -366,6 +366,49 @@ else
     echo "Skipping catalog-otherpage-other-two-page.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/catalog-otherpage-other-info-two-page.pdf" ]]; then
+    echo "Generating catalog-otherpage-other-info-two-page.pdf ..."
+    # flpdf-jggp: the catalog-otherpage-other-two-page shape (page-2 font obj 7 is
+    # lc_other/part9 via /Ref2, flpdf-zda0) PLUS a real /Info dict (obj 10). qpdf
+    # treats /Info as an ordinary member of the number-sorted part9 remaining
+    # lc_other set (QPDF_linearization.cc:1335, std::set<QPDFObjGen>), so the font
+    # (obj 7 < 10) precedes /Info: qpdf gives the font new number 4 and /Info 5.
+    # flpdf used to promote /Info to a fixed part9-head slot (before the font),
+    # diverging at the trailer /Info N 0 R. CLASSIC ONLY (generate sibling tracked
+    # separately). obj 5 stays free (mirrors the base fixture's numbering gap).
+    python3 - "$FIX/catalog-otherpage-other-info-two-page.pdf" <<'PY'
+import sys
+objs = {
+    1: b"<< /Type /Catalog /Pages 2 0 R /Ref2 7 0 R >>",
+    2: b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+    3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 6 0 R >> >> /Contents 8 0 R >>",
+    4: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F2 7 0 R >> >> /Contents 9 0 R >>",
+    6: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Name /F1 >>",
+    7: b"<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /Name /F2 >>",
+    10: b"<< /Producer (flpdf-test) >>",
+}
+c1 = b"BT /F1 12 Tf 72 720 Td (P1) Tj ET"
+c2 = b"BT /F2 12 Tf 72 720 Td (P2) Tj ET"
+objs[8] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c1), c1)
+objs[9] = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(c2), c2)
+order = [1, 2, 3, 4, 6, 7, 8, 9, 10]
+out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+offs = {}
+for n in order:
+    offs[n] = len(out)
+    out += b"%d 0 obj\n" % n + objs[n] + b"\nendobj\n"
+xo = len(out)
+size = 11
+out += b"xref\n0 %d\n" % size + b"0000000000 65535 f \n"
+for n in range(1, size):
+    out += (b"%010d 00000 n \n" % offs[n]) if n in offs else b"0000000000 65535 f \n"
+out += b"trailer\n<< /Size %d /Root 1 0 R /Info 10 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (size, xo)
+open(sys.argv[1], "wb").write(out)
+PY
+else
+    echo "Skipping catalog-otherpage-other-info-two-page.pdf (already exists)"
+fi
+
 if [[ ! -f "$FIX/pages-ext-firstpage-shared-one-page.pdf" ]]; then
     echo "Generating pages-ext-firstpage-shared-one-page.pdf ..."
     # flpdf-8891 (page-tree custom key): the interior /Pages node carries a custom
@@ -1285,6 +1328,17 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/catalog-otherpage-other-two-page.pdf" \
     "$REF/catalog-otherpage-other-two-page/linearize.pdf"
 echo "catalog-otherpage-other-two-page/linearize.pdf"
+
+# --- catalog-otherpage-other-info-two-page: the catalog-otherpage-other shape
+# plus a real /Info dict (obj 10). qpdf orders /Info as a number-sorted member of
+# the part9 remaining lc_other set, so the lower-numbered font (obj 7) precedes it
+# (font -> new 4, /Info -> new 5). Pins that flpdf no longer promotes /Info to a
+# fixed part9-head slot (flpdf-jggp). CLASSIC ONLY. ---
+mkdir -p "$REF/catalog-otherpage-other-info-two-page"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/catalog-otherpage-other-info-two-page.pdf" \
+    "$REF/catalog-otherpage-other-info-two-page/linearize.pdf"
+echo "catalog-otherpage-other-info-two-page/linearize.pdf"
 
 # --- pages-ext-firstpage-shared-one-page: a custom extension key on an interior
 # /Pages node references a first-page object, which qpdf keeps (non-inheritable)
