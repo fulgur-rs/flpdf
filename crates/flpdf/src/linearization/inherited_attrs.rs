@@ -2752,4 +2752,233 @@ mod tests {
              must be recognized as a rectangle and left as the reference (no default)"
         );
     }
+
+    /// A `/Page` leaf shared by two `/Pages` parents where ONLY parent A (3)
+    /// carries a `/MediaBox [0 0 200 300]`; parent B (4) has none and the shared
+    /// leaf (5) has none. This makes qpdf 11.9.0's MediaBox-default-BEFORE-clone
+    /// order observable: the leaf is first visited via A (media_box=true ⇒ default
+    /// suppressed), then via B (media_box=false), where the default `[0 0 612 792]`
+    /// is applied to the shared ORIGINAL (QPDF_pages.cc:104-112) and the clone is
+    /// copied from it (`:119-130`). A same-parent duplicate cannot observe this —
+    /// the first occurrence always defaults the original first.
+    fn pdf_with_shared_leaf_mediabox_default() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        );
+
+        // Parent A carries a /MediaBox ⇒ the leaf's first visit sees media_box=true.
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Pages /Parent 2 0 R /Kids [5 0 R] /Count 1 \
+              /MediaBox [0 0 200 300] >>\nendobj\n",
+        );
+
+        // Parent B has NO /MediaBox ⇒ the leaf's second visit sees media_box=false.
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Pages /Parent 2 0 R /Kids [5 0 R] /Count 1 >>\nendobj\n",
+        );
+
+        // Shared leaf: correctly typed /Page, NO local /MediaBox.
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Page /Parent 3 0 R /Contents 6 0 R >>\nendobj\n",
+        );
+
+        let off6 = pdf.len() as u64;
+        pdf.extend_from_slice(b"6 0 obj\n<< >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off5:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off6:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn shared_leaf_mediabox_default_before_clone_ordering() {
+        let bytes = pdf_with_shared_leaf_mediabox_default();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        // The duplicate leaf is cloned during the repair pass (which runs before the
+        // push), so the clone takes the first free object number, 7. Parent B's
+        // /Kids entry is rewritten to it. (The push separately mints A's direct
+        // /MediaBox into an indirect object, object 8, so the total object count
+        // grows by two — the clone is specifically 7.)
+        let b = pdf.resolve(ObjectRef::new(4, 0)).expect("B resolves");
+        let Object::Dictionary(b_dict) = b else {
+            panic!("B not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            b_dict.get("Kids"),
+            Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+                7, 0
+            ))])),
+            "parent B's /Kids entry must be rewritten to the clone (7)"
+        );
+
+        // The default runs BEFORE the clone and mutates the shared ORIGINAL on its
+        // 2nd (B) visit, so the A page (the original leaf, 5) ends up [0 0 612 792]
+        // — NOT A's inherited [0 0 200 300]. A reversed order (clone before default)
+        // would leave the original at [0 0 200 300] and only default the clone.
+        let default_box = Some(&Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(612),
+            Object::Integer(792),
+        ]));
+        let leaf = pdf.resolve(ObjectRef::new(5, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            leaf_dict.get("MediaBox"),
+            default_box,
+            "the shared original (A's page) must be defaulted to [0 0 612 792] on \
+             the B visit, not keep A's inherited [0 0 200 300] (default-before-clone)"
+        );
+        let clone = pdf.resolve(ObjectRef::new(7, 0)).expect("clone resolves");
+        let Object::Dictionary(clone_dict) = clone else {
+            panic!("clone not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            clone_dict.get("MediaBox"),
+            default_box,
+            "the clone (B's page) must inherit the defaulted [0 0 612 792]"
+        );
+        // The clone keeps the original leaf's /Parent (3 = A); the clone arm never
+        // flattens.
+        assert_eq!(
+            clone_dict.get("Parent"),
+            Some(&Object::Reference(ObjectRef::new(3, 0))),
+            "the clone must keep the original leaf's /Parent (A)"
+        );
+    }
+
+    /// A `/Page` leaf whose `/MediaBox` is a 4-element array with a NON-numeric
+    /// element (`[0 0 612 /Foo]`), no ancestor `/MediaBox`. qpdf's `isRectangle()`
+    /// requires every element to be a number, so this is not a rectangle and the
+    /// default fires. Exercises `is_rectangle`'s non-numeric-element arm.
+    fn pdf_with_non_numeric_mediabox_leaf() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 /Foo] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn non_numeric_mediabox_element_gets_default() {
+        let bytes = pdf_with_non_numeric_mediabox_leaf();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            leaf_dict.get("MediaBox"),
+            Some(&Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+                Object::Integer(792),
+            ])),
+            "a /MediaBox array with a non-numeric element is not a rectangle and \
+             must be replaced with the [0 0 612 792] default"
+        );
+    }
+
+    /// A `/Page` leaf whose `/MediaBox` is four `Real` values
+    /// (`[0.0 0.0 612.0 792.0]`), no ancestor `/MediaBox`. `Real` elements are
+    /// numbers, so `isRectangle()` is true and the default is suppressed — the leaf
+    /// keeps its real-valued box. Exercises `is_rectangle`'s `Real` arm.
+    fn pdf_with_real_mediabox_leaf() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0.0 0.0 612.0 792.0] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn real_mediabox_leaf_is_recognized_and_not_defaulted() {
+        let bytes = pdf_with_real_mediabox_leaf();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            leaf_dict.get("MediaBox"),
+            Some(&Object::Array(vec![
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(612.0),
+                Object::Real(792.0),
+            ])),
+            "a /MediaBox of four Real values is a valid rectangle and must be left \
+             unchanged (no default)"
+        );
+    }
 }

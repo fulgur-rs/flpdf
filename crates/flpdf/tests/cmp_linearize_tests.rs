@@ -242,6 +242,25 @@ fn missing_mediabox_leaf_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("missing-mediabox-leaf.pdf", "missing-mediabox-leaf");
 }
 
+/// A /Page leaf shared by two /Pages parents where ONLY parent A carries a
+/// /MediaBox [0 0 200 300]. This pins qpdf 11.9.0's MediaBox-default-BEFORE-clone
+/// ordering (QPDF_pages.cc:104-112 runs before the duplicate-clone at :119-130):
+/// the shared original is first visited via A (media_box=true, default
+/// suppressed), then via B (media_box=false), where the default [0 0 612 792] is
+/// applied to the shared ORIGINAL and the clone is then copied from it — so BOTH
+/// the A page (the original) and the B page (the clone) end up /MediaBox
+/// [0 0 612 792] with /Parent -> A (verified from the qpdf 11.9.0 golden). Were
+/// the order reversed (clone before default), the A page would keep A's inherited
+/// [0 0 200 300] and only the clone would be [0 0 612 792] — a divergence this
+/// guards (flpdf-nd38 repair 3).
+#[test]
+fn shared_leaf_mediabox_default_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "shared-leaf-mediabox-default.pdf",
+        "shared-leaf-mediabox-default",
+    );
+}
+
 #[test]
 fn relinearize_one_page_is_byte_identical_to_qpdf() {
     // Re-linearizing an already-linearized input: the source's old /Linearized

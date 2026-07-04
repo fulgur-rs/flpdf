@@ -1108,6 +1108,17 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/missing-mediabox-leaf.pdf" "$REF/missing-mediabox-leaf/linearize.pdf"
 echo "missing-mediabox-leaf/linearize.pdf"
 
+# --- shared-leaf-mediabox-default: a /Page leaf shared by two /Pages parents
+# where only parent A carries a /MediaBox. This makes qpdf 11.9.0's
+# MediaBox-default-BEFORE-clone ordering observable (QPDF_pages.cc:104-112 before
+# :119-130): the shared original is defaulted to [0 0 612 792] on its 2nd visit
+# (via the /MediaBox-less parent B) and the minted clone inherits it, so BOTH
+# pages end up [0 0 612 792] (flpdf-nd38 repair 3 ordering guard). ---
+mkdir -p "$REF/shared-leaf-mediabox-default"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/shared-leaf-mediabox-default.pdf" "$REF/shared-leaf-mediabox-default/linearize.pdf"
+echo "shared-leaf-mediabox-default/linearize.pdf"
+
 # --- no-stream-one-page: degenerate catalog/pages/page with no /Contents and no
 # /Resources. Pins the DEFLATE-backend hint-stream size delta as the sole
 # sanctioned deviation — byte-identical to qpdf under qpdf-zlib-compat (flpdf-05jt). ---
