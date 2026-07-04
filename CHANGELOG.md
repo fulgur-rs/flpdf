@@ -232,6 +232,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/fulgur-rs/flpdf/compare/v0.1.7...v0.1.8) - 2026-07-04
+
+### Fixed
+
+- *(linearize)* repair page tree unconditionally, matching qpdf 11.9.0 getAllPagesInternal (no reconstruction gate) (flpdf-s5i2)
+- *(flpdf-jggp)* /Info is number-sorted lc_other, not a fixed part9-head slot
+
+### Other
+
+- Merge pull request #458 from fulgur-rs/test/flpdf-d8pc-rotate-inheritance-byte
+- *(linearize)* add flpdf-s5i2 implementation plan; rustfmt test reflow
+- *(linearize)* qpdf-oracle byte-identical golden for reconstructed shared-page input (flpdf-s5i2)
+- *(linearize)* reconstructed interior /Type override + clean-input no-op regression (flpdf-s5i2)
+
 ### Added
 
 * flpdf-9hc.9.9: `/Rotate` flattening — `flatten_rotation_on_pages` bakes a page's
