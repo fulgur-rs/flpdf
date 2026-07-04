@@ -2280,15 +2280,9 @@ mod tests {
         );
     }
 
-    /// The shared-leaf fixture, but with a bogus `startxref` offset so opening
-    /// forces qpdf-style xref reconstruction. qpdf 11.9.0's `getAllPagesInternal`
-    /// clones duplicate leaves unconditionally (QPDF_pages.cc:119-130, no
-    /// reconstruction gate), and flpdf matches: the clone pass runs for
-    /// reconstructed inputs too.
-    fn pdf_shared_leaf_damaged_xref() -> Vec<u8> {
-        let mut bytes = pdf_with_leaf_shared_by_two_parents();
-        // Repoint startxref at a byte offset that is not an xref table, forcing
-        // the strict parse to fail and recovery to run.
+    /// Repoint a fixture's `startxref` value to a bogus offset (9) so the strict
+    /// parse fails and `open_with_repair` reconstructs the cross-reference table.
+    fn damage_startxref(mut bytes: Vec<u8>) -> Vec<u8> {
         let needle = b"startxref\n";
         let pos = bytes
             .windows(needle.len())
@@ -2302,6 +2296,15 @@ mod tests {
             .expect("startxref value ends in newline");
         bytes.splice(num_start..num_end, b"9".to_vec());
         bytes
+    }
+
+    /// The shared-leaf fixture, but with a bogus `startxref` offset so opening
+    /// forces qpdf-style xref reconstruction. qpdf 11.9.0's `getAllPagesInternal`
+    /// clones duplicate leaves unconditionally (QPDF_pages.cc:119-130, no
+    /// reconstruction gate), and flpdf matches: the clone pass runs for
+    /// reconstructed inputs too.
+    fn pdf_shared_leaf_damaged_xref() -> Vec<u8> {
+        damage_startxref(pdf_with_leaf_shared_by_two_parents())
     }
 
     #[test]
@@ -2364,6 +2367,81 @@ mod tests {
             clone_dict.get("Rotate"),
             Some(&Object::Integer(180)),
             "the clone must inherit parent B's /Rotate 180 independently"
+        );
+    }
+
+    #[test]
+    fn reconstructed_interior_type_not_pages_is_overridden() {
+        let bytes = damage_startxref(pdf_with_interior_type_not_pages());
+        let mut pdf = Pdf::open_with_repair(Cursor::new(bytes)).expect("recovers");
+        assert!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|d| d.message.contains("reconstruct cross-reference")),
+            "fixture must actually reconstruct its xref for this test to be meaningful"
+        );
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        // qpdf 11.9.0's getAllPagesInternal overrides a mistyped interior /Type
+        // unconditionally (QPDF_pages.cc:89-92, no reconstruction gate), so the
+        // override runs for a reconstructed input too.
+        let interior = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .expect("interior resolves");
+        let Object::Dictionary(interior_dict) = interior else {
+            panic!("interior is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            interior_dict.get("Type"),
+            Some(&Object::Name(b"Pages".to_vec())),
+            "the interior node's mistyped /Type /Foo must be overridden to /Pages \
+             even when the xref was reconstructed"
+        );
+    }
+
+    #[test]
+    fn reconstructed_clean_input_is_a_no_op_repair() {
+        // A well-formed single-page tree (no duplicate leaf, correct /Type,
+        // correct root /Pages) with a damaged startxref. Removing the
+        // `!reconstructed` gate must NOT regress such an input: repair (6) and
+        // repair_page_tree are both no-ops, so no object is minted and the
+        // inherited /Rotate is still pushed to the leaf as before.
+        let bytes = damage_startxref(pdf_with_inherited_scalar_rotate());
+        let mut pdf = Pdf::open_with_repair(Cursor::new(bytes)).expect("recovers");
+        assert!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|d| d.message.contains("reconstruct cross-reference")),
+            "fixture must actually reconstruct its xref for this test to be meaningful"
+        );
+        let before_count = pdf.object_refs().len();
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        assert_eq!(
+            pdf.object_refs().len(),
+            before_count,
+            "a clean reconstructed input must not mint any object (repairs are no-ops)"
+        );
+        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let Object::Dictionary(pages_dict) = pages else {
+            panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert!(
+            pages_dict.get("Rotate").is_none(),
+            "/Rotate must still be stripped from the interior /Pages node"
+        );
+        let page = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
+        let Object::Dictionary(page_dict) = page else {
+            panic!("page is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            page_dict.get("Rotate"),
+            Some(&Object::Integer(90)),
+            "/Rotate must still be pushed to the leaf"
         );
     }
 
