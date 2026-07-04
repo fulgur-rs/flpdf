@@ -11,9 +11,8 @@
 //! | 1..M        | part7: other pages' private objects (qpdf part7). |
 //! | M+1..N      | part8: other pages' shared objects (qpdf part8). |
 //! | N+1         | Pages tree (qpdf part9 head). Skipped if absent. |
-//! | N+2         | Info dict (qpdf `lc_other`). Skipped if absent. |
-//! | N+3..O      | part9 outline objects (qpdf `lc_outlines`, classic). Skipped if absent. |
-//! | O+1..P      | Remaining `part4_rest` objects (e.g. `lc_thumbnail`). Skipped if absent. |
+//! | N+2..O      | part9 outline objects (qpdf `lc_outlines`, classic). Skipped if absent. |
+//! | O+1..P      | Remaining `part4_rest`, object-number sorted — qpdf `lc_other` (includes `/Info` and `lc_thumbnail`). Skipped if absent. |
 //! | param       | **Reserved** — linearization parameter dictionary (Part 1). |
 //! | catalog     | Catalog (qpdf `lc_root`). Skipped if absent. |
 //! | hint        | **Reserved** — primary hint stream. |
@@ -31,6 +30,13 @@
 //! - one-page:   1=Pages, 2=Info, 3=ParamDict, 4=Catalog, 5=HintStream, 6+=Part2
 //! - two-page:   1=Page2dict, 2=Page2content, 3=Pages, 4=Info, 5=ParamDict, 6=Catalog, 7=Hint, 8+=Part2
 //! - three-page: 1-4=Page2+3 objs, 5=Pages, 6=Info, 7=ParamDict, 8=Catalog, 9=Hint, 10+=Part2
+//!
+//! In these fixtures `/Info` sits at the slot right after the pages tree only
+//! because it is the *lowest-numbered* remaining `lc_other`: it is placed in
+//! object-number order among the remaining `lc_other`, not in a reserved slot.
+//! qpdf iterates that set as a `std::set<QPDFObjGen>`
+//! (`QPDF_linearization.cc`), so a lower-numbered `lc_other` sibling takes the
+//! earlier number and `/Info` follows it.
 //!
 //! All new object numbers carry `generation = 0` (the linearization spec does
 //! not require preserving generation numbers, and the writer starts fresh).
@@ -143,15 +149,21 @@ impl RenumberMap {
     /// renumber pass:
     /// 1. **part7**: `plan.part4_other_pages_private` in plan order.
     /// 2. **part8**: `plan.part4_other_pages_shared` in plan order.
-    /// 3. **pages tree**: `plan.pages_tree_ref` when in `part4_rest`.
-    /// 4. **info dict**: `plan.info_ref` when in `part4_rest`.
-    /// 5. **Param dict** (reserved sentinel): linearization parameter dict.
-    /// 6. **Catalog**: `plan.root_ref` when in `part4_rest`.
-    /// 7. **Hint stream** (reserved sentinel): primary hint stream.
-    /// 8. Part 2 objects in plan order.
-    /// 9. Part 3 objects in plan order.
-    /// 10. Remaining `part4_rest` objects in plan order (any ref already
-    ///     promoted above is skipped so each ref maps exactly once).
+    /// 3. **pages tree**: `plan.pages_tree_ref` when in `part4_rest` (qpdf places
+    ///    the pages tree first in part9, ahead of the remaining `lc_other` set).
+    /// 4. **part9 outline objects**: `plan.part9_outline_objects` (classic,
+    ///    `!UseOutlines`).
+    /// 5. **Remaining `part4_rest`**, object-number sorted: qpdf's remaining
+    ///    `lc_other` set. This includes `/Info` (`plan.info_ref`) — placed here in
+    ///    original-object-number order, NOT in a reserved head slot — and
+    ///    `lc_thumbnail` objects. Refs already placed above (pages tree, outlines)
+    ///    and `plan.root_ref` (kept first-half, promoted at step 7) are skipped so
+    ///    each ref maps exactly once.
+    /// 6. **Param dict** (reserved sentinel): linearization parameter dict.
+    /// 7. **Catalog**: `plan.root_ref` when in `part4_rest`.
+    /// 8. **Hint stream** (reserved sentinel): primary hint stream.
+    /// 9. Part 2 objects in plan order.
+    /// 10. Part 3 objects in plan order.
     ///
     /// A ref counts as *promotable* when the [`Option`] is `Some(r)` and `r`
     /// is a member of `plan.part4_rest`. Absent or non-`part4_rest` refs are
@@ -219,10 +231,9 @@ impl RenumberMap {
         //
         //  slot 1..    part7 (other pages' private) in plan order
         //  slot N+1..  part8 (other pages' shared) in plan order
-        //  slot ..     pages_tree (if in part4_rest)
-        //  slot ..     info (if in part4_rest)
+        //  slot ..     pages_tree (if in part4_rest) — qpdf places it first in part9
         //  slot ..     part9 outline objects (classic, !UseOutlines) — qpdf lc_outlines
-        //  slot ..     part4_rest remaining (e.g. lc_thumbnail_private/shared)
+        //  slot ..     part4_rest remaining, number-sorted (qpdf lc_other, incl /Info)
         //  slot ..     <param dict reserved>
         //  slot ..     root_ref / Catalog (if in part4_rest)
         //  slot ..     <hint stream reserved>
@@ -242,24 +253,34 @@ impl RenumberMap {
             push_real(original, &mut by_new_number, &mut by_original);
         }
 
-        // 3. pages_tree, 4. info — the two "part9 head" promotions from part4_rest.
+        // 3. pages_tree — the sole "part9 head" promotion from part4_rest.
+        // qpdf places the pages tree first in part9 (QPDF_linearization.cc:1286),
+        // ahead of the remaining lc_other set regardless of object number.
+        // /Info is NOT promoted here: qpdf treats it as an ordinary member of the
+        // number-sorted remaining lc_other set (QPDF_linearization.cc:1335,
+        // `for (auto const& og: lc_other)` over a std::set<QPDFObjGen>), so it flows
+        // through the part4_rest loop below (step 3c) in original-object-number
+        // order — behind any lc_other sibling with a lower object number.
         promote(plan.pages_tree_ref, &mut by_new_number, &mut by_original);
-        promote(plan.info_ref, &mut by_new_number, &mut by_original);
 
         // 3b. part9 outline objects (classic, !UseOutlines).
-        // qpdf places lc_outlines between info and the param dict in the
-        // second-half renumber pass, giving them consecutive second-half numbers.
+        // qpdf places lc_outlines after the pages tree / thumbnails and before the
+        // remaining lc_other set (QPDF_linearization.cc:1331 then :1335), so they
+        // precede the number-sorted part4_rest remainder (which includes /Info).
         for &original in &plan.part9_outline_objects {
             push_real(original, &mut by_new_number, &mut by_original);
         }
 
-        // 3c. Remaining part4_rest objects (e.g. lc_thumbnail_private/shared) go to
-        // the second half, after the part9 head promotions and before the param dict.
+        // 3c. Remaining part4_rest objects go to the second half, after the pages
+        // tree / outline promotions and before the param dict. This is qpdf's
+        // number-sorted remaining lc_other set: part4_rest is object-number sorted
+        // (part4_provisional derives from the sorted all_refs), so /Info and any
+        // other lc_other sibling land here in original-object-number order.
         // root_ref (catalog) is excluded — it is a first-half standalone object
         // that gets its slot via the promote() call at step 6 below.
         for &original in &plan.part4_rest {
             if by_original.contains_key(&original) {
-                continue; // already placed: pages_tree, info, or outline objects
+                continue; // already placed: pages_tree or outline objects
             }
             if plan.root_ref == Some(original) {
                 continue; // catalog stays first-half; promoted at step 6
@@ -1182,6 +1203,47 @@ mod tests {
         assert_eq!(rn.hint_stream_slot(), 6);
         // Part 2 starts immediately after the hint stream slot.
         assert_eq!(rn.new_for_original(ObjectRef::new(2, 0)).unwrap().number, 7);
+    }
+
+    /// `/Info` is a number-sorted member of qpdf's part9 remaining `lc_other`
+    /// set (QPDF_linearization.cc:1335 `for (auto const& og: lc_other)` over a
+    /// `std::set<QPDFObjGen>`), NOT a fixed slot pinned right after the pages
+    /// tree. So when another `lc_other` object has a LOWER original number than
+    /// `/Info`, it must receive the lower new number. Here a demoted font
+    /// (orig 7, a part9 `lc_other` sibling per flpdf-zda0) precedes `/Info`
+    /// (orig 10): the pages tree is still placed first (qpdf pulls it ahead of
+    /// the remaining set), then font, then `/Info`, by original number.
+    #[test]
+    fn info_is_number_sorted_lc_other_not_fixed_head_slot() {
+        let font_ref = ObjectRef::new(7, 0); // lc_other sibling, lower than Info
+        let pages_ref = ObjectRef::new(8, 0);
+        let info_ref = ObjectRef::new(10, 0);
+
+        // part4_rest is number-sorted (as the plan builder produces it).
+        let plan = LinearizationPlan {
+            part2_objects: vec![ObjectRef::new(2, 0)],
+            part4_rest: vec![font_ref, pages_ref, info_ref],
+            total_object_count: 4,
+            pages_tree_ref: Some(pages_ref),
+            info_ref: Some(info_ref),
+            ..Default::default()
+        };
+
+        let rn = RenumberMap::from_plan(&plan);
+
+        // Pages tree is pulled ahead of the remaining lc_other set (qpdf places
+        // it first in part9), regardless of its object number.
+        assert_eq!(rn.new_for_original(pages_ref).unwrap().number, 1);
+        // font (orig 7) < Info (orig 10): number-sorted, font takes the lower
+        // slot. Under the old fixed-head-slot behaviour Info would take slot 2
+        // and font slot 3 — the divergence this fix removes.
+        assert_eq!(rn.new_for_original(font_ref).unwrap().number, 2);
+        assert_eq!(rn.new_for_original(info_ref).unwrap().number, 3);
+        assert!(
+            rn.new_for_original(font_ref).unwrap().number
+                < rn.new_for_original(info_ref).unwrap().number,
+            "a lower-numbered lc_other sibling must precede /Info in part9"
+        );
     }
 
     /// When pages/info refs are absent, their slots collapse and the param

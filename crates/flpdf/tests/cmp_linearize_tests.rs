@@ -370,6 +370,23 @@ fn catalog_otherpage_other_two_page_classic_is_byte_identical_to_qpdf() {
     );
 }
 
+// flpdf-jggp: the catalog-otherpage-other shape PLUS a real /Info dict (obj 10).
+// qpdf treats /Info as an ordinary member of the number-sorted part9 remaining
+// lc_other set (QPDF_linearization.cc:1335, `for (auto const& og: lc_other)` over
+// a std::set<QPDFObjGen>), so the lower-numbered font (obj 7) precedes /Info: qpdf
+// assigns the font new number 4 and /Info new number 5 (golden trailer /Info 5 0 R).
+// flpdf previously promoted /Info to a FIXED part9-head slot right after the pages
+// tree (before the font), diverging at the trailer /Info N 0 R and every downstream
+// offset. The fix drops that promotion so /Info flows through the number-sorted
+// remaining lc_other loop. CLASSIC ONLY (generate sibling tracked in flpdf-pn7h).
+#[test]
+fn catalog_otherpage_other_info_two_page_classic_is_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "catalog-otherpage-other-info-two-page.pdf",
+        "catalog-otherpage-other-info-two-page",
+    );
+}
+
 // flpdf-8891 (page-tree custom key): a custom extension key on an interior
 // /Pages node references the first-page Font. qpdf keeps non-inheritable custom
 // keys on /Pages nodes (only the inheritable /Resources,/MediaBox,/CropBox,
