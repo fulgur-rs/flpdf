@@ -207,7 +207,10 @@ fn inherited_resources_one_page_byte_identical_to_qpdf() {
 // same `push_internal` code path; this pins its copy-by-value arm end-to-end
 // (the `scalar_rotate_is_copied_by_value_not_minted` unit test covers only the
 // object model, not the serialized bytes). The leaf carries its own /Resources
-// so the fixture isolates /Rotate inheritance.
+// so the fixture isolates /Rotate inheritance. Confirmed (by temporarily
+// routing the scalar arm through the mint path) that a regression diverges:
+// flpdf then writes an extra indirect object and `/Rotate N 0 R` instead of the
+// literal, growing the output by 40 bytes and failing this assertion.
 #[test]
 fn inherited_rotate_one_page_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("inherited-rotate-one-page.pdf", "inherited-rotate-one-page");
