@@ -126,7 +126,10 @@ each job grants only what it needs.
   aux-sync step** (unlike fulgur: commit-based changelog is native, and the
   flpdf-cli path-dep version is auto-updated by release-plz). `permissions:
   contents: write, pull-requests: write`; `persist-credentials: false`.
-- **`release`** — `needs: [release-pr, check-releases]`,
+  Guarded `if: github.ref == 'refs/heads/main'` — `release-plz release-pr` opens
+  its PR from the checked-out ref, so a manual `workflow_dispatch` off a feature
+  branch could otherwise bundle unmerged commits into the Release PR.
+- **`release`** — `needs: [check-releases]` (detector only),
   `if: needs.check-releases.outputs.has_releases == 'true'`,
   `environment: release` (gate ②), `concurrency: release-plz-publish`.
   Steps: App token → `rust-lang/crates-io-auth-action` (OIDC) →
@@ -134,6 +137,19 @@ each job grants only what it needs.
   `CARGO_REGISTRY_TOKEN` (OIDC). release-plz publishes flpdf then flpdf-cli,
   creates the `v{{version}}` tag, and creates the GitHub Release with the
   changelog body. `permissions: contents: write, id-token: write`.
+  Depends on `check-releases` only, NOT `release-pr` (matches fulgur-chart, not
+  fulgur): publishing the merged/approved version must not be blocked by a
+  failure maintaining the *next* Release PR. The two release-plz commands touch
+  different refs (PR branch vs main tag) and run concurrently without racing.
+
+`release_always` is left at its default (`true`). A spurious `check-releases`
+match (or the manual `workflow_dispatch` hatch) would still `release-plz release`
+an unpublished version, but gate ② (the `release` environment's required
+reviewers) is the execution-time human authorization that backstops it — the
+same posture as `fulgur`/`fulgur-chart`, which also leave `release_always`
+default. `release_always = false` is deliberately NOT used: it additionally
+risks not recognizing a merge-committed Release PR (HEAD is the merge commit, not
+release-plz's `chore: release` commit), which could break the normal path.
 
 Pin all actions by SHA (repo convention). Reuse the pinned SHAs already in
 `release.yml`/`fulgur` (create-github-app-token v3.2.0, crates-io-auth-action

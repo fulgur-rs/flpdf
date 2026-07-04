@@ -96,6 +96,13 @@ jobs:
   release-pr:
     name: Release-plz PR
     runs-on: ubuntu-latest
+    # Only maintain the Release PR from main. `push` only ever fires on main, but
+    # workflow_dispatch can be launched from any ref — and `release-plz
+    # release-pr` opens its PR against the default branch from the CHECKED-OUT
+    # ref, so a manual run off a feature branch could bundle not-yet-merged
+    # commits into the `release-plz-*` Release PR. Guard so release-pr prepares
+    # only what has actually landed on main.
+    if: github.ref == 'refs/heads/main'
     permissions:
       contents: write        # push the Release PR branch
       pull-requests: write   # create/update the Release PR
@@ -148,7 +155,13 @@ jobs:
 
   release:
     name: Release-plz release
-    needs: [release-pr, check-releases]
+    # Depend ONLY on the detector, not on release-pr. Publishing the
+    # already-approved, already-merged version must not be blocked by a failure
+    # in the (independent) maintenance of the NEXT Release PR — otherwise main
+    # would be bumped while crates.io stays behind. The two release-plz commands
+    # touch different refs (release-pr → PR branch, release → main tag), so they
+    # run concurrently without racing.
+    needs: [check-releases]
     # Only run — and thus only hit the `release` approval gate — on an actual
     # release. See check-releases above (this is what keeps ordinary merges to
     # main from pausing on a release approval).

@@ -61,20 +61,19 @@ settings (below) — the workflows alone do not enforce them.
 Everything below is configured once in GitHub / crates.io; the workflows cannot
 create it for you.
 
-### 1. GitHub App (`RELEASE_APP`)
+### 1. GitHub App (`RELEASE_APP`) — already configured
 
 The Release PR must be authored by a GitHub App, not the default
 `GITHUB_TOKEN` — a PR/commit authored by `GITHUB_TOKEN` does not trigger other
 workflows, so CI would never run on the Release PR, and the release tag/GitHub
 Release would not be able to fire follow-up workflows.
 
-- Create (or reuse) a GitHub App installed on this repository with repository
-  permissions: **Contents: Read and write**, **Pull requests: Read and write**,
-  **Workflows: Read and write** (the last is needed when a release branch/tag
-  spans a commit that touched `.github/workflows/*`).
-- Store its credentials as repository secrets:
-  - `RELEASE_APP_ID`
-  - `RELEASE_APP_PRIVATE_KEY`
+This App already exists from the previous release pipeline: it is installed on
+this repository with **Contents: Read and write**, **Pull requests: Read and
+write**, and **Workflows: Read and write** (the last covers a release branch/tag
+that spans a commit touching `.github/workflows/*`), and its credentials are
+already stored as the `RELEASE_APP_ID` / `RELEASE_APP_PRIVATE_KEY` secrets.
+Nothing to do here beyond confirming those permissions are still granted.
 
 ### 2. `release` environment with required reviewers
 
@@ -83,7 +82,13 @@ The `release` job references `environment: release`.
 - Create a repository **Environment** named `release`.
 - Add the maintainer(s) as **Required reviewers**. This is gate ②.
 
-### 3. crates.io Trusted Publisher (per crate)
+### 3. crates.io Trusted Publisher (per crate) — after this workflow is on `main`
+
+> **Ordering:** crates.io validates the publisher against the workflow on the
+> repository's default branch, so this registration can only be completed once
+> `release-plz.yml` has landed on `main` (i.e. after the migration PR merges).
+> Do it before the first Release PR is merged, so the `release` job's first
+> crates.io publish has a Trusted Publisher to authenticate against.
 
 Trusted Publishing is configured per crate. On each crate's crates.io page →
 Settings → Trusted Publishing → add a GitHub publisher:
