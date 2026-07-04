@@ -2397,10 +2397,19 @@ fn second_half_container_anchors(
             }
             let batch_rank: (u8, usize) = if shared || pages.len() >= 2 {
                 (1, 0) // part8 (other-page-shared)
-            } else if let Some(&i) = pages.iter().next() {
-                (0, i) // part7 (private to one other page)
+            } else if let Some(&i) = pages.iter().next().filter(|_| !rest) {
+                // part7 (private to one other page) ONLY when the container's member
+                // union has no document-`others` object. A `rest`-set member (a
+                // Catalog non-open-document key / trailer key = document_other, or
+                // the /Pages tree) makes others>0, so qpdf categorizes the whole
+                // container lc_other (part9), matching `route_objstm_containers`'
+                // others gate (QPDF_linearization.cc:1128). Without this `!rest`
+                // guard the container object would be numbered at a part7 anchor
+                // while its members are numbered in the part9 range — an internally
+                // inconsistent layout that diverges from qpdf.
+                (0, i)
             } else if rest {
-                (2, 0) // part9 (rest)
+                (2, 0) // part9 (rest / others-demoted)
             } else {
                 return None; // cov:ignore: every Part-4 batch member is page-private, shared, or rest
             };
