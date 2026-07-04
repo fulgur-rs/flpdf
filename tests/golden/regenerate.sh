@@ -1176,6 +1176,18 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$REF/shared-page-two-parents-pushmint/linearize.pdf"
 echo "shared-page-two-parents-pushmint/linearize.pdf"
 
+# --- shared-page-two-parents-reconstructed: the shared-leaf fixture with a
+# damaged startxref, forcing qpdf-style xref reconstruction on open. qpdf 11.9.0's
+# getAllPagesInternal has NO reconstruction gate (QPDF_pages.cc:77-138), so it
+# STILL clones the duplicate leaf; this pins flpdf's gate-free repair on the
+# reconstructed-xref path (flpdf-s5i2). --warning-exit-0 absorbs the
+# reconstruction warnings. ---
+mkdir -p "$REF/shared-page-two-parents-reconstructed"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/shared-page-two-parents-reconstructed.pdf" \
+    "$REF/shared-page-two-parents-reconstructed/linearize.pdf"
+echo "shared-page-two-parents-reconstructed/linearize.pdf"
+
 # --- mistyped-page-tree: interior node /Type != /Pages and leaf /Type != /Page;
 # qpdf 11.9.0 getAllPagesInternal overrides both (QPDF_pages.cc:89-92, 131-134)
 # (flpdf-nd38 repair 2). ---
