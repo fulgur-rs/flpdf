@@ -3589,6 +3589,76 @@ mod tests {
         );
     }
 
+    /// The catalog's `/Pages` points at the LEAF two `/Parent` hops below the true
+    /// root. Object layout: 1 Catalog (`/Pages 4 0 R`, WRONG), 2 the true root
+    /// `/Pages` (no `/Parent`), 3 a mid `/Pages` (`/Parent 2 0 R`, `/Kids [4 0 R]`),
+    /// 4 the `/Page` leaf (`/Parent 3 0 R`). The walk must follow 4 -> 3 -> 2 all
+    /// the way to the true root, not stop after the first hop.
+    fn pdf_with_root_pages_two_hop_chain() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 4 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] \
+              /Contents 5 0 R >>\nendobj\n",
+        );
+
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n<< >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off5:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn root_pages_two_hop_chain_corrected_to_true_root() {
+        let bytes = pdf_with_root_pages_two_hop_chain();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        assert!(
+            pdf.repair_diagnostics().entries().is_empty(),
+            "fixture must NOT trip xref reconstruction, else repair (6) is skipped \
+             behind the !reconstructed gate: {:?}",
+            pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
+        );
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        // The walk must climb BOTH hops (4 -> 3 -> 2) to the true root, not stop at
+        // the first parent (3). A "stop after one hop" bug would leave /Pages at 3.
+        let catalog = pdf.resolve(ObjectRef::new(1, 0)).expect("catalog resolves");
+        let Object::Dictionary(catalog_dict) = catalog else {
+            panic!("catalog is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            catalog_dict.get("Pages"),
+            Some(&Object::Reference(ObjectRef::new(2, 0))),
+            "the catalog's /Pages must be corrected two hops up to the true root \
+             (2 0 R), not left at the mid node (3 0 R)"
+        );
+    }
+
     #[test]
     fn correct_root_pages_is_unchanged() {
         // A well-formed tree: the catalog's /Pages already points at the true root
@@ -3652,15 +3722,34 @@ mod tests {
     fn root_pages_parent_cycle_terminates() {
         let bytes = pdf_with_root_pages_parent_cycle();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        assert!(
+            pdf.repair_diagnostics().entries().is_empty(),
+            "fixture must NOT trip xref reconstruction, else repair (6) is skipped \
+             behind the !reconstructed gate (masking the loop guard): {:?}",
+            pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
+        );
 
-        // The /Parent chain A -> B -> A is a cycle; the root->/Pages correction's
-        // walk up the chain must terminate on the loop guard, not hang. The
-        // harness timeout is the real backstop; this assertion documents the
-        // expected outcome (pins the loop guard).
+        // The /Parent chain A(2) -> B(3) -> A(2) is a cycle; the root->/Pages
+        // correction's walk up the chain must terminate on the loop guard, not
+        // hang. The harness timeout is the real backstop; this assertion documents
+        // the expected outcome (pins the loop guard).
         let result = push_inherited_attributes_to_pages(&mut pdf);
         assert!(
             result.is_ok(),
             "a /Parent cycle above the page tree root must terminate, not error: {result:?}"
+        );
+
+        // qpdf's walk breaks when it re-visits A: pages = A(2) -> B(3) -> A(2)
+        // (already seen) -> break, leaving pages = A(2), which it then writes back.
+        // flpdf lands on the same node, so /Pages stays 2 0 R.
+        let catalog = pdf.resolve(ObjectRef::new(1, 0)).expect("catalog resolves");
+        let Object::Dictionary(catalog_dict) = catalog else {
+            panic!("catalog is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            catalog_dict.get("Pages"),
+            Some(&Object::Reference(ObjectRef::new(2, 0))),
+            "a /Parent cycle must leave /Pages at the node where the guard broke (2 0 R)"
         );
     }
 
