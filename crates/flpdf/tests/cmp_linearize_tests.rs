@@ -272,6 +272,14 @@ fn indirect_mediabox_element_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("indirect-mediabox-element.pdf", "indirect-mediabox-element");
 }
 
+/// A /Pages node whose single /Kids entry is a DIRECT (inline) /Page dictionary
+/// rather than an indirect reference. qpdf 11.9.0's getAllPagesInternal converts
+/// it to an indirect object (QPDF_pages.cc:113-118) (flpdf-nd38 repair 1).
+#[test]
+fn direct_leaf_kid_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("direct-leaf-kid.pdf", "direct-leaf-kid");
+}
+
 #[test]
 fn relinearize_one_page_is_byte_identical_to_qpdf() {
     // Re-linearizing an already-linearized input: the source's old /Linearized
