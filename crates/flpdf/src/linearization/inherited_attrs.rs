@@ -3413,4 +3413,63 @@ mod tests {
             "the direct interior node must stay a direct dict (out-of-scope, not minted)"
         );
     }
+
+    /// A `/Pages` node whose single `/Kids` entry is a DIRECT non-dictionary
+    /// value (a bare integer). Object layout: 1 Catalog, 2 Pages (holding the
+    /// scalar in `/Kids`).
+    fn pdf_with_direct_scalar_kid() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [42] /Count 1 >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// A DIRECT non-dictionary `/Kids` entry (a bare integer) is skipped: qpdf's
+    /// leaf branch would still call `makeIndirectObject` on it (its `isIndirect`
+    /// check does not require a dictionary), but flpdf's reference-keyed repair
+    /// pass mints only direct *dictionary* leaves and otherwise leaves the entry
+    /// as the inherited-attribute push does. This pins the no-panic behavior and
+    /// that the scalar entry stays direct — NOT byte parity (no golden for this
+    /// malformed shape).
+    #[test]
+    fn direct_non_dictionary_kid_is_skipped() {
+        let bytes = pdf_with_direct_scalar_kid();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        let before_count = pdf.object_refs().len();
+
+        let result = push_inherited_attributes_to_pages(&mut pdf);
+        assert!(
+            result.is_ok(),
+            "a direct non-dictionary /Kids entry must be skipped, not panic or error: {result:?}"
+        );
+        assert_eq!(
+            pdf.object_refs().len(),
+            before_count,
+            "a direct non-dictionary /Kids entry must never mint an object"
+        );
+
+        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let Object::Dictionary(pages_dict) = pages else {
+            panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            pages_dict.get("Kids"),
+            Some(&Object::Array(vec![Object::Integer(42)])),
+            "the scalar /Kids entry must stay a direct integer (not minted to a ref)"
+        );
+    }
 }
