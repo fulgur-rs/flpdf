@@ -242,7 +242,7 @@ fn push_internal<R: Read + Seek>(
 
 /// Partial mirror of qpdf 11.9.0 `getAllPagesInternal` (QPDF_pages.cc:77-138):
 /// walk the `/Kids` tree depth-first, repairing page-tree nodes in place so the
-/// subsequent inherited-attribute push sees a well-formed tree. Four repairs
+/// subsequent inherited-attribute push sees a well-formed tree. Five repairs
 /// from `getAllPagesInternal` are applied:
 ///
 /// - **Interior `/Type`** (:89-92): a node reached as an interior node (one with
@@ -252,8 +252,18 @@ fn push_internal<R: Read + Seek>(
 ///   from this node's own `/MediaBox` (:93-96) and threaded into the recursion.
 ///   A leaf that lacks a valid `/MediaBox` rectangle while `media_box` is false
 ///   has its `/MediaBox` set to a direct letter / ANSI A array `[0 0 612 792]`.
-///   Applied to the original leaf *before* the duplicate-clone decision (qpdf
-///   order :104-112 before :119-130), so a clone inherits the defaulted box.
+///   Applied to the original leaf *before* the direct-leaf and duplicate-clone
+///   decisions (qpdf order :104-112 before :113-130), so a minted object
+///   inherits the defaulted box.
+/// - **Direct leaf → indirect** (:113-118): a `/Kids` entry that is a direct
+///   (inline) `/Page` dict with no `/Kids` of its own is minted into a fresh
+///   indirect object (via the same running allocator as the clone below) and the
+///   entry is rewritten to that reference (qpdf's `makeIndirectObject`). The
+///   minted object carries NO synthesized `/Parent` (`makeIndirectObject` adds
+///   none). A direct *interior* node (a direct dict WITH `/Kids`) is out of
+///   scope: qpdf recurses into it in place (:101-102), which flpdf's
+///   reference-keyed walk cannot do, so it is left direct and untouched (no
+///   golden exists for this exotic shape).
 /// - **Duplicate leaf** (:119-130): the first occurrence of a `/Page` leaf is
 ///   recorded; each later occurrence is replaced, in the parent's `/Kids` array,
 ///   by a fresh shallow copy of the leaf dict (indirect sub-objects such as
@@ -272,9 +282,10 @@ fn push_internal<R: Read + Seek>(
 /// per clone (qpdf allocates from a running maximum rather than rescanning),
 /// which keeps cloning many duplicates linear rather than quadratic.
 ///
-/// The direct-kid → indirect repair (:113-118) `getAllPagesInternal` also
-/// performs is not mirrored here (direct `/Kids` entries are skipped, as the
-/// inherited-attribute push does).
+/// Direct `/Kids` entries: a direct *leaf* is mirrored (minted to indirect, the
+/// **Direct leaf → indirect** repair above); a direct *interior* node remains
+/// out of scope (qpdf's recurse-in-place at :101-102 is not mirrored). A direct
+/// non-dictionary entry is skipped, as the inherited-attribute push does.
 fn repair_page_tree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     node_ref: ObjectRef,
@@ -325,9 +336,44 @@ fn repair_page_tree<R: Read + Seek>(
     let media_box = media_box || is_rectangle(pdf, dict.get("MediaBox"))?;
 
     for kid in kids.iter_mut() {
-        let kid_ref = match &*kid {
-            Object::Reference(r) => *r,
-            _ => continue, // Direct (non-reference) /Kids entry: skip, as push does.
+        let kid_ref = if let Object::Reference(r) = &*kid {
+            *r
+        } else if let Object::Dictionary(d) = &*kid {
+            // A DIRECT (inline) /Kids entry. qpdf 11.9.0's getAllPagesInternal
+            // classifies interior-vs-leaf by `kid.hasKey("/Kids")` before any
+            // direct→indirect conversion (QPDF_pages.cc:100-118), so branch the
+            // same way here.
+            if d.get("Kids").is_some() {
+                // (1i) Direct *interior* node (a direct dict WITH /Kids). qpdf
+                // recurses into it in place (:101-102); flpdf's reference-keyed
+                // walk has no non-reference recursion path, so this is out of
+                // scope — leave the entry direct and untouched. No golden exists
+                // for this exotic shape.
+                continue;
+            }
+            // (1l) Direct *leaf* (no /Kids): mint it into a fresh indirect object
+            // and rewrite the /Kids entry to the new reference (makeIndirectObject,
+            // :113-118). Draw from the SAME running allocator the duplicate-clone
+            // arm uses so the object numbering matches qpdf. qpdf applies the
+            // /MediaBox default (:104-112) to the direct dict BEFORE
+            // makeIndirectObject (:113-118); minting first here and letting the
+            // existing leaf branch below apply the default to the now-indirect
+            // object yields the SAME object content and — since defaulting never
+            // mints — the SAME object numbers, so this reordering is byte-faithful.
+            let new_ref = *next_clone;
+            let next_num = new_ref
+                .number
+                .checked_add(1)
+                .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+            *next_clone = ObjectRef::new(next_num, 0);
+            // Move the inline dict out of the /Kids entry WITHOUT cloning; the
+            // moved dict carries no /Parent and makeIndirectObject adds none.
+            let owned = std::mem::replace(kid, Object::Reference(new_ref));
+            pdf.set_object(new_ref, owned);
+            changed = true;
+            new_ref
+        } else {
+            continue; // Direct (non-dictionary) /Kids entry: skip, as push does.
         };
         // Classify the kid (interior /Pages node vs leaf) and, for a leaf,
         // snapshot its own /MediaBox value — all in a scope that ends the
@@ -3116,6 +3162,322 @@ mod tests {
             ])),
             "a /MediaBox of four Real values is a valid rectangle and must be left \
              unchanged (no default)"
+        );
+    }
+
+    /// The root `/Pages` node's single `/Kids` entry is a DIRECT (inline) `/Page`
+    /// dictionary, NOT an indirect reference. The inline leaf carries its own
+    /// valid `/MediaBox` and correct `/Type /Page`, so ONLY the direct → indirect
+    /// repair applies. Object layout: 1 Catalog, 2 Pages (holding the inline leaf
+    /// in `/Kids`), 3 the leaf's `/Contents` target.
+    fn pdf_with_direct_leaf_kid() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [<< /Type /Page \
+              /MediaBox [0 0 612 792] /Contents 3 0 R >>] /Count 1 >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(b"3 0 obj\n<< >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// A DIRECT (inline) `/Page` leaf in `/Kids` must be minted into a fresh
+    /// indirect object and the `/Kids` entry rewritten to the new reference,
+    /// mirroring qpdf 11.9.0 `getAllPagesInternal`'s `makeIndirectObject`
+    /// (QPDF_pages.cc:113-118). Observed from the qpdf 11.9.0 golden of the
+    /// `direct-leaf-kid` fixture: the now-indirect leaf keeps its own `/MediaBox`,
+    /// its `/Contents` reference, and `/Type /Page`, and gains NO `/Parent`
+    /// (`makeIndirectObject` does not add one).
+    #[test]
+    fn direct_leaf_kid_is_made_indirect() {
+        let bytes = pdf_with_direct_leaf_kid();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        assert!(
+            pdf.repair_diagnostics().entries().is_empty(),
+            "fixture must NOT trip xref reconstruction, else the repair pass is \
+             skipped behind the !reconstructed gate: {:?}",
+            pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
+        );
+        let before_count = pdf.object_refs().len();
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        assert_eq!(
+            pdf.object_refs().len(),
+            before_count + 1,
+            "the direct leaf must be minted into exactly one new indirect object"
+        );
+
+        // The /Pages node's /Kids[0] must be rewritten from the inline dict to a
+        // reference to the minted leaf (the next free number, 4).
+        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let Object::Dictionary(pages_dict) = pages else {
+            panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            pages_dict.get("Kids"),
+            Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+                4, 0
+            ))])),
+            "/Kids[0] must be rewritten to an indirect reference to the minted leaf (4)"
+        );
+
+        // Resolving the minted reference yields the leaf dict unchanged.
+        let leaf = pdf
+            .resolve(ObjectRef::new(4, 0))
+            .expect("minted leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("minted leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            leaf_dict.get("Type"),
+            Some(&Object::Name(b"Page".to_vec())),
+            "the minted leaf must keep /Type /Page"
+        );
+        assert_eq!(
+            leaf_dict.get("MediaBox"),
+            Some(&Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+                Object::Integer(792),
+            ])),
+            "the minted leaf must keep its own /MediaBox"
+        );
+        assert_eq!(
+            leaf_dict.get("Contents"),
+            Some(&Object::Reference(ObjectRef::new(3, 0))),
+            "the minted leaf must preserve its /Contents reference"
+        );
+        // qpdf's makeIndirectObject does NOT synthesize a /Parent (the golden's
+        // minted leaf has none); flpdf moves the inline dict verbatim and must not
+        // add one either.
+        assert_eq!(
+            leaf_dict.get("Parent"),
+            None,
+            "the minted leaf must not gain a synthesized /Parent (makeIndirectObject adds none)"
+        );
+    }
+
+    /// A DIRECT (inline) `/Page` leaf with NO `/MediaBox` and no ancestor
+    /// `/MediaBox`. Object layout: 1 Catalog, 2 Pages (holding the inline leaf in
+    /// `/Kids`), 3 the leaf's `/Contents` target.
+    fn pdf_with_direct_leaf_kid_no_mediabox() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [<< /Type /Page \
+              /Contents 3 0 R >>] /Count 1 >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(b"3 0 obj\n<< >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// A direct leaf with no `/MediaBox` must, after the pass, be minted into an
+    /// indirect object that carries the `[0 0 612 792]` default. This pins qpdf
+    /// 11.9.0's per-kid ORDER: the `/MediaBox` default (QPDF_pages.cc:104-112)
+    /// runs BEFORE `makeIndirectObject` (:113-118), so the minted object inherits
+    /// the defaulted box rather than being minted from the box-less original.
+    #[test]
+    fn direct_leaf_without_mediabox_minted_object_gets_default() {
+        let bytes = pdf_with_direct_leaf_kid_no_mediabox();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        assert!(
+            pdf.repair_diagnostics().entries().is_empty(),
+            "fixture must NOT trip xref reconstruction, else the repair pass is \
+             skipped behind the !reconstructed gate: {:?}",
+            pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
+        );
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        // The minted leaf takes the next free object number (4).
+        let leaf = pdf
+            .resolve(ObjectRef::new(4, 0))
+            .expect("minted leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("minted leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            leaf_dict.get("MediaBox"),
+            Some(&Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+                Object::Integer(792),
+            ])),
+            "the minted indirect leaf must carry the [0 0 612 792] default \
+             (default-before-makeIndirectObject ordering)"
+        );
+    }
+
+    /// A `/Pages` node whose single `/Kids` entry is a DIRECT dict that itself has
+    /// `/Kids` — a direct *interior* node. Object layout: 1 Catalog, 2 Pages
+    /// (holding the inline interior node in `/Kids`), 3 the real `/Page` leaf
+    /// under the interior node, 4 the leaf's `/Contents` target.
+    fn pdf_with_direct_interior_node() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [<< /Type /Pages \
+              /Kids [3 0 R] /Count 1 >>] /Count 1 >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 4 0 R >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n<< >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// A direct *interior* node (a direct dict WITH `/Kids`) is out of scope for
+    /// the direct → indirect repair: 11.9.0's `makeIndirectObject` conversion is
+    /// LEAF-ONLY (QPDF_pages.cc:113-118 is in the `else` branch, i.e. a kid with
+    /// no `/Kids`), while a direct interior node is recursed in place (:101-102).
+    /// flpdf's reference-keyed repair pass has no non-reference recursion path, so
+    /// it leaves such a node direct and untouched. This test pins the no-panic
+    /// behavior and that the direct entry stays direct — NOT byte parity (there is
+    /// no qpdf golden for this exotic shape).
+    #[test]
+    fn direct_interior_node_is_skipped() {
+        let bytes = pdf_with_direct_interior_node();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        assert!(
+            pdf.repair_diagnostics().entries().is_empty(),
+            "fixture must NOT trip xref reconstruction: {:?}",
+            pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
+        );
+
+        let result = push_inherited_attributes_to_pages(&mut pdf);
+        assert!(
+            result.is_ok(),
+            "a direct interior node must be skipped, not panic or error: {result:?}"
+        );
+
+        // The direct interior /Kids entry is left direct (not converted to a ref).
+        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let Object::Dictionary(pages_dict) = pages else {
+            panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        let Some(Object::Array(kids)) = pages_dict.get("Kids") else {
+            panic!("/Kids must still be an array"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert!(
+            matches!(kids.first(), Some(Object::Dictionary(_))),
+            "the direct interior node must stay a direct dict (out-of-scope, not minted)"
+        );
+    }
+
+    /// A `/Pages` node whose single `/Kids` entry is a DIRECT non-dictionary
+    /// value (a bare integer). Object layout: 1 Catalog, 2 Pages (holding the
+    /// scalar in `/Kids`).
+    fn pdf_with_direct_scalar_kid() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [42] /Count 1 >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// A DIRECT non-dictionary `/Kids` entry (a bare integer) is skipped: qpdf's
+    /// leaf branch would still call `makeIndirectObject` on it (its `isIndirect`
+    /// check does not require a dictionary), but flpdf's reference-keyed repair
+    /// pass mints only direct *dictionary* leaves and otherwise leaves the entry
+    /// as the inherited-attribute push does. This pins the no-panic behavior and
+    /// that the scalar entry stays direct — NOT byte parity (no golden for this
+    /// malformed shape).
+    #[test]
+    fn direct_non_dictionary_kid_is_skipped() {
+        let bytes = pdf_with_direct_scalar_kid();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        let before_count = pdf.object_refs().len();
+
+        let result = push_inherited_attributes_to_pages(&mut pdf);
+        assert!(
+            result.is_ok(),
+            "a direct non-dictionary /Kids entry must be skipped, not panic or error: {result:?}"
+        );
+        assert_eq!(
+            pdf.object_refs().len(),
+            before_count,
+            "a direct non-dictionary /Kids entry must never mint an object"
+        );
+
+        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let Object::Dictionary(pages_dict) = pages else {
+            panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            pages_dict.get("Kids"),
+            Some(&Object::Array(vec![Object::Integer(42)])),
+            "the scalar /Kids entry must stay a direct integer (not minted to a ref)"
         );
     }
 }
