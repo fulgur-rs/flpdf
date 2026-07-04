@@ -1,0 +1,88 @@
+name: Release PR approval gate
+
+# Require a maintainer approval on release-plz Release PRs before they can be
+# merged — merging a Release PR is what triggers the actual crates.io release
+# (release-plz.yml's `release` job). This is enforced by reporting a
+# `release-pr-approval` commit status that the `main` branch ruleset marks as a
+# required status check. Ordinary (non-release) PRs get an immediate `success`,
+# so this gate never blocks normal contributions and does not require approvals
+# on your own PRs.
+#
+# SECURITY: this uses `pull_request_target` (a writable token, available even for
+# fork PRs) so it can set the status on every PR — but it NEVER checks out or
+# executes PR-authored code. It only reads reviews and writes a commit status
+# through the API, so there is no untrusted-code-with-secrets exposure.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: release-pr-approval-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Require maintainer approval (release PRs)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate approval and report status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          CONTEXT="release-pr-approval"
+
+          set_status() {
+            gh api -X POST "repos/$REPO/statuses/$HEAD_SHA" \
+              -f state="$1" -f context="$CONTEXT" -f description="$2" >/dev/null
+          }
+
+          # Only release-plz Release PRs (head branch `release-plz-*`) are gated.
+          case "$HEAD_REF" in
+            release-plz-*) : ;;
+            *)
+              set_status success "Not a release PR — not gated"
+              exit 0
+              ;;
+          esac
+
+          # An approval counts only if it is: the reviewer's latest review, made
+          # on the CURRENT head commit (a new push re-closes the gate), by an
+          # OWNER / MEMBER / COLLABORATOR who is not the PR author (the release
+          # bot). This mirrors "dismiss stale reviews" + "require last push
+          # approval" without needing branch-wide required reviews.
+          approvals=$(gh api "repos/$REPO/pulls/$PR/reviews?per_page=100" \
+            | jq --arg sha "$HEAD_SHA" --arg author "$AUTHOR" '
+                [ .[]
+                  | select(.commit_id == $sha)
+                  | select(.user.login != $author)
+                ]
+                | group_by(.user.login)
+                | map(sort_by(.submitted_at) | last)
+                | map(select(
+                    .state == "APPROVED"
+                    and (.author_association | IN("OWNER", "MEMBER", "COLLABORATOR"))
+                  ))
+                | length')
+
+          if [ "${approvals:-0}" -ge 1 ]; then
+            set_status success "Approved by a maintainer on the current commit"
+          else
+            # `pending` (not `failure`): a Release PR awaiting approval is not a
+            # broken build. A required check must be `success` to merge, so
+            # `pending` still blocks the merge — but it shows a neutral "waiting"
+            # indicator instead of a red ✗ that looks like a CI failure.
+            set_status pending "Waiting for a maintainer approval on the current commit"
+          fi
