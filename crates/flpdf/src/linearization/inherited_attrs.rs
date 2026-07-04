@@ -3663,4 +3663,67 @@ mod tests {
             "a /Parent cycle above the page tree root must terminate, not error: {result:?}"
         );
     }
+
+    /// The catalog's `/Pages` (obj 2, a valid `/Kids`-bearing root) carries a
+    /// DIRECT-dictionary `/Parent` rather than an indirect reference. Object
+    /// layout: 1 Catalog (`/Pages 2 0 R`), 2 the root `/Pages` (`/Parent << >>`,
+    /// `/Kids [3 0 R]`), 3 the `/Page` leaf (`/Parent 2 0 R`). The root->/Pages
+    /// correction stops at the non-reference `/Parent` (flpdf needs a ref to
+    /// continue; qpdf would follow a direct-dict parent as a handle), leaving
+    /// `/Pages` unchanged.
+    fn pdf_with_root_pages_non_reference_parent() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Parent << >> /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        );
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn root_pages_non_reference_parent_stops_correction() {
+        let bytes = pdf_with_root_pages_non_reference_parent();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        assert!(
+            pdf.repair_diagnostics().entries().is_empty(),
+            "fixture must NOT trip xref reconstruction, else repair (6) is skipped \
+             behind the !reconstructed gate: {:?}",
+            pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
+        );
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        // A non-reference /Parent is a stop condition for the /Parent walk: the
+        // catalog's /Pages must be left pointing at the same object (2 0 R), not
+        // rewritten. This pins the non-reference-/Parent break arm.
+        let catalog = pdf.resolve(ObjectRef::new(1, 0)).expect("catalog resolves");
+        let Object::Dictionary(catalog_dict) = catalog else {
+            panic!("catalog is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            catalog_dict.get("Pages"),
+            Some(&Object::Reference(ObjectRef::new(2, 0))),
+            "a non-reference /Parent must stop the walk, leaving /Pages unchanged"
+        );
+    }
 }
