@@ -1100,6 +1100,14 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/mistyped-page-tree.pdf" "$REF/mistyped-page-tree/linearize.pdf"
 echo "mistyped-page-tree/linearize.pdf"
 
+# --- missing-mediabox-leaf: leaf with no /MediaBox and no ancestor /MediaBox;
+# qpdf 11.9.0 getAllPagesInternal defaults it to [0 0 612 792]
+# (QPDF_pages.cc:104-112) (flpdf-nd38 repair 3). ---
+mkdir -p "$REF/missing-mediabox-leaf"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/missing-mediabox-leaf.pdf" "$REF/missing-mediabox-leaf/linearize.pdf"
+echo "missing-mediabox-leaf/linearize.pdf"
+
 # --- no-stream-one-page: degenerate catalog/pages/page with no /Contents and no
 # /Resources. Pins the DEFLATE-backend hint-stream size delta as the sole
 # sanctioned deviation — byte-identical to qpdf under qpdf-zlib-compat (flpdf-05jt). ---
