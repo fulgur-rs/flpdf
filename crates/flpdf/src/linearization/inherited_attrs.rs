@@ -44,7 +44,7 @@ pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(pdf: &mut Pdf<R
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(());
     };
-    let Some(pages_ref) = (match pdf.resolve_borrowed(root_ref)? {
+    let Some(mut pages_ref) = (match pdf.resolve_borrowed(root_ref)? {
         Object::Dictionary(d) => d.get_ref("Pages"),
         _ => None,
     }) else {
@@ -52,16 +52,20 @@ pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(pdf: &mut Pdf<R
     };
 
     // qpdf's `pushInheritedAttributesToPage` calls `getAllPages` first
-    // (QPDF_optimization.cc:138-140). As a side effect, `getAllPages` /
-    // `getAllPagesInternal` (QPDF_pages.cc:39-75 / :77-138) repairs the page
-    // tree — cloning any `/Page` leaf reachable more than once in the `/Kids`
-    // tree (QPDF_pages.cc:119-130), overriding mistyped interior/leaf `/Type`
-    // keys (:89-92, :131-134), and defaulting a leaf's missing/invalid
-    // `/MediaBox` to letter / ANSI A `[0 0 612 792]` when no ancestor supplies a
-    // rectangle (:93-96, :104-112) — so the push below sees a well-formed tree.
+    // (QPDF_optimization.cc:138-140). `getAllPages` performs two families of
+    // page-tree repair before the push sees the tree. First (QPDF_pages.cc:50-67)
+    // it corrects a catalog whose `/Pages` points INTO the tree (e.g. at the
+    // first page) instead of at the true root, by walking `/Parent` up to the
+    // real root and rewriting the root `/Pages` — repair (6) below. Then
+    // `getAllPagesInternal` (QPDF_pages.cc:77-138) repairs the tree itself:
+    // cloning any `/Page` leaf reachable more than once in the `/Kids` tree
+    // (:119-130), overriding mistyped interior/leaf `/Type` keys (:89-92,
+    // :131-134), and defaulting a leaf's missing/invalid `/MediaBox` to
+    // letter / ANSI A `[0 0 612 792]` when no ancestor supplies a rectangle
+    // (:93-96, :104-112) — so the push below sees a well-formed tree.
     // 11.9.0's `getAllPagesInternal` has no xref-reconstruction gate and does
-    // these repairs unconditionally; flpdf instead skips the whole
-    // `repair_page_tree` pass (clone AND /Type override) for reconstructed
+    // these repairs unconditionally; flpdf instead skips the whole repair pass
+    // (the root->/Pages correction AND `repair_page_tree`) for reconstructed
     // inputs, a deliberate flpdf-specific divergence — flpdf has no matching
     // repair for damaged files. Tracked as flpdf-s5i2.
     let reconstructed = pdf
@@ -70,6 +74,42 @@ pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(pdf: &mut Pdf<R
         .iter()
         .any(|d| d.message.contains("reconstruct cross-reference"));
     if !reconstructed {
+        // (6) Correct a catalog whose `/Pages` points into the tree instead of at
+        // the true root, by walking `/Parent` up (QPDF_pages.cc:50-67). This runs
+        // before `repair_page_tree` so the subsequent walk (and `push_internal`
+        // below) start from the corrected root, matching qpdf's getAllPages order.
+        let mut seen_parent: BTreeSet<ObjectRef> = BTreeSet::new();
+        let mut corrected = pages_ref;
+        let mut changed_pages = false;
+        loop {
+            let parent = match pdf.resolve_borrowed(corrected)? {
+                Object::Dictionary(d) => match d.get("Parent") {
+                    Some(Object::Reference(r)) => Some(*r),
+                    // No `/Parent` (the true root) or a non-reference `/Parent`:
+                    // stop. qpdf would follow a direct-dict parent as a handle, but
+                    // flpdf needs a ref to rewrite/continue; such inputs are
+                    // unrealistic and have no golden.
+                    _ => None,
+                },
+                _ => None, // Not a dictionary: stop.
+            };
+            let Some(parent_ref) = parent else {
+                break;
+            };
+            if !seen_parent.insert(corrected) {
+                break; // Loop guard (qpdf's `seen.add`): a `/Parent` cycle.
+            }
+            corrected = parent_ref;
+            changed_pages = true;
+        }
+        if changed_pages {
+            if let Object::Dictionary(mut root_dict) = pdf.resolve(root_ref)? {
+                root_dict.insert("Pages", Object::Reference(corrected));
+                pdf.set_object(root_ref, Object::Dictionary(root_dict));
+            }
+            pages_ref = corrected;
+        }
+
         let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
         let mut clone_visited: BTreeSet<ObjectRef> = BTreeSet::new();
         // Compute the first free object number once and carry it through the
