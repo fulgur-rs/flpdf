@@ -1129,6 +1129,19 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/indirect-mediabox-element.pdf" "$REF/indirect-mediabox-element/linearize.pdf"
 echo "indirect-mediabox-element/linearize.pdf"
 
+# --- direct-leaf-kid: the root /Pages node's single /Kids entry is a DIRECT
+# (inline) /Page dict rather than an indirect reference. qpdf 11.9.0
+# getAllPagesInternal mints it into a fresh indirect object via
+# makeIndirectObject and rewrites the /Kids entry to the new ref
+# (QPDF_pages.cc:113-118) (flpdf-nd38 repair 1). The leaf carries its own valid
+# /MediaBox and correct /Type /Page, so only the direct->indirect repair fires.
+# qpdf warns ("kid 0 (from 0) is direct; converting to indirect"), so
+# --warning-exit-0 keeps the golden reproducible. ---
+mkdir -p "$REF/direct-leaf-kid"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/direct-leaf-kid.pdf" "$REF/direct-leaf-kid/linearize.pdf"
+echo "direct-leaf-kid/linearize.pdf"
+
 # --- no-stream-one-page: degenerate catalog/pages/page with no /Contents and no
 # /Resources. Pins the DEFLATE-backend hint-stream size delta as the sole
 # sanctioned deviation — byte-identical to qpdf under qpdf-zlib-compat (flpdf-05jt). ---
