@@ -2339,7 +2339,9 @@ mod tests {
         };
         assert_eq!(
             a_dict.get("Kids"),
-            Some(&Object::Array(vec![Object::Reference(ObjectRef::new(5, 0))])),
+            Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+                5, 0
+            ))])),
             "parent A must keep the original leaf 5 in its /Kids"
         );
         let b = pdf.resolve(ObjectRef::new(4, 0)).expect("B resolves");
@@ -2348,7 +2350,9 @@ mod tests {
         };
         assert_eq!(
             b_dict.get("Kids"),
-            Some(&Object::Array(vec![Object::Reference(ObjectRef::new(7, 0))])),
+            Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+                7, 0
+            ))])),
             "parent B's /Kids entry must be rewritten to the clone (7)"
         );
 
