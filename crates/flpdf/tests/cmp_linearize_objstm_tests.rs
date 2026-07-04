@@ -268,6 +268,31 @@ fn catalog_firstpage_shared_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// flpdf-9vkl: the two-page sibling — font 6 is cross-page-shared and font 7 is
+// document-`others`-shared (via Catalog /Ref2) *and* a first-page object, so it
+// is lc_first_page_shared. An earlier generate-mode divergence (first-page ObjStm
+// /O, /L, container /N) was resolved by the post-8891 closure-classification
+// fixes; this pins generate mode to qpdf's own oracle. It also locks the
+// %PDF-1.4 -> 1.5 version-floor bump qpdf applies when emitting object streams
+// (the fixture header is 1.4; the linearized generate output must be 1.5). The
+// single first-page ObjStm container here does not exercise multi-container
+// private-before-shared ordering (that latent gap is a separate follow-up).
+#[test]
+fn catalog_firstpage_shared_two_page_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "catalog-firstpage-shared-two-page.pdf",
+        "catalog-firstpage-shared-two-page",
+    );
+}
+
+#[test]
+fn catalog_firstpage_shared_two_page_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "catalog-firstpage-shared-two-page.pdf",
+        "catalog-firstpage-shared-two-page",
+    );
+}
+
 // flpdf-0gyq: under --object-streams=generate the resurrected null body object is
 // compressed as the TRAILING ObjStm member (qpdf compresses it last). free and
 // missing variants must both match.

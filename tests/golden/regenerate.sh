@@ -1371,13 +1371,20 @@ echo "catalog-firstpage-shared-one-page/linearize-objstm.pdf"
 
 # --- catalog-firstpage-shared-two-page: cross-page sharing (font 6) and
 # document-`others` sharing (font 7 via Catalog /Ref2) coexist in part6's shared
-# group (flpdf-8891). CLASSIC ONLY: the generate-mode multi-page ObjStm packing
-# has a separate, pre-existing layout divergence tracked elsewhere. ---
+# group (flpdf-8891). Both the classic and the generate-mode multi-page ObjStm
+# packing are byte-identical to qpdf; the earlier generate-mode divergence
+# (flpdf-9vkl) was resolved by the post-8891 closure-classification fixes and the
+# generate golden pins it (it also locks the %PDF-1.4->1.5 version-floor bump qpdf
+# applies when emitting object streams). ---
 mkdir -p "$REF/catalog-firstpage-shared-two-page"
 qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/catalog-firstpage-shared-two-page.pdf" \
     "$REF/catalog-firstpage-shared-two-page/linearize.pdf"
 echo "catalog-firstpage-shared-two-page/linearize.pdf"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/catalog-firstpage-shared-two-page.pdf" \
+    "$REF/catalog-firstpage-shared-two-page/linearize-objstm.pdf"
+echo "catalog-firstpage-shared-two-page/linearize-objstm.pdf"
 
 # --- catalog-otherpage-other-two-page: a page-2-private object (font obj 7) also
 # referenced by a Catalog non-OD key (/Ref2) is lc_other (part9), not
