@@ -3266,6 +3266,14 @@ mod tests {
             Some(&Object::Reference(ObjectRef::new(3, 0))),
             "the minted leaf must preserve its /Contents reference"
         );
+        // qpdf's makeIndirectObject does NOT synthesize a /Parent (the golden's
+        // minted leaf has none); flpdf moves the inline dict verbatim and must not
+        // add one either.
+        assert_eq!(
+            leaf_dict.get("Parent"),
+            None,
+            "the minted leaf must not gain a synthesized /Parent (makeIndirectObject adds none)"
+        );
     }
 
     /// A DIRECT (inline) `/Page` leaf with NO `/MediaBox` and no ancestor
