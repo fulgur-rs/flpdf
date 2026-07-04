@@ -280,6 +280,17 @@ fn direct_leaf_kid_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("direct-leaf-kid.pdf", "direct-leaf-kid");
 }
 
+/// A catalog whose /Pages points INTO the page tree (at the first page) instead
+/// of at the true root. qpdf 11.9.0's getAllPages walks /Parent up to the real
+/// root and rewrites the catalog /Pages (QPDF_pages.cc:50-67) (flpdf-nd38 repair 6).
+#[test]
+fn root_pages_points_into_tree_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "root-pages-points-into-tree.pdf",
+        "root-pages-points-into-tree",
+    );
+}
+
 #[test]
 fn relinearize_one_page_is_byte_identical_to_qpdf() {
     // Re-linearizing an already-linearized input: the source's old /Linearized
