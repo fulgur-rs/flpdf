@@ -225,6 +225,15 @@ fn shared_page_two_parents_pushmint_byte_identical_to_qpdf() {
     );
 }
 
+/// An interior /Pages node whose /Type is not /Pages and a leaf whose /Type is not
+/// /Page. qpdf 11.9.0's getAllPagesInternal overrides both /Type keys
+/// (QPDF_pages.cc:89-92, 131-134); the corrected interior node then has its inherited
+/// /Rotate pushed down to the leaf (flpdf-nd38 repair 2).
+#[test]
+fn mistyped_page_tree_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("mistyped-page-tree.pdf", "mistyped-page-tree");
+}
+
 #[test]
 fn relinearize_one_page_is_byte_identical_to_qpdf() {
     // Re-linearizing an already-linearized input: the source's old /Linearized
