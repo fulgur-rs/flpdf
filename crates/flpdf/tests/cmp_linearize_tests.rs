@@ -234,6 +234,44 @@ fn mistyped_page_tree_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("mistyped-page-tree.pdf", "mistyped-page-tree");
 }
 
+/// A /Page leaf with no /MediaBox and no ancestor /MediaBox. qpdf 11.9.0's
+/// getAllPagesInternal defaults it to letter/ANSI A [0 0 612 792]
+/// (QPDF_pages.cc:104-112) (flpdf-nd38 repair 3).
+#[test]
+fn missing_mediabox_leaf_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("missing-mediabox-leaf.pdf", "missing-mediabox-leaf");
+}
+
+/// A /Page leaf shared by two /Pages parents where ONLY parent A carries a
+/// /MediaBox [0 0 200 300]. This pins qpdf 11.9.0's MediaBox-default-BEFORE-clone
+/// ordering (QPDF_pages.cc:104-112 runs before the duplicate-clone at :119-130):
+/// the shared original is first visited via A (media_box=true, default
+/// suppressed), then via B (media_box=false), where the default [0 0 612 792] is
+/// applied to the shared ORIGINAL and the clone is then copied from it — so BOTH
+/// the A page (the original) and the B page (the clone) end up /MediaBox
+/// [0 0 612 792] with /Parent -> A (verified from the qpdf 11.9.0 golden). Were
+/// the order reversed (clone before default), the A page would keep A's inherited
+/// [0 0 200 300] and only the clone would be [0 0 612 792] — a divergence this
+/// guards (flpdf-nd38 repair 3).
+#[test]
+fn shared_leaf_mediabox_default_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "shared-leaf-mediabox-default.pdf",
+        "shared-leaf-mediabox-default",
+    );
+}
+
+/// A /Page leaf whose /MediaBox is a direct array with an indirect-reference
+/// element ([0 0 612 4 0 R], obj 4 = 792). qpdf 11.9.0's isRectangle()
+/// dereferences each element via isNumber(), so the box is a valid rectangle and
+/// is kept, NOT overwritten with the [0 0 612 792] default. is_rectangle must
+/// resolve each element before defaulting (flpdf-nd38 repair 3; codex review
+/// r3522482671 on PR #453).
+#[test]
+fn indirect_mediabox_element_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("indirect-mediabox-element.pdf", "indirect-mediabox-element");
+}
+
 #[test]
 fn relinearize_one_page_is_byte_identical_to_qpdf() {
     // Re-linearizing an already-linearized input: the source's old /Linearized

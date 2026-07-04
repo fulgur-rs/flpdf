@@ -1141,6 +1141,35 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/mistyped-page-tree.pdf" "$REF/mistyped-page-tree/linearize.pdf"
 echo "mistyped-page-tree/linearize.pdf"
 
+# --- missing-mediabox-leaf: leaf with no /MediaBox and no ancestor /MediaBox;
+# qpdf 11.9.0 getAllPagesInternal defaults it to [0 0 612 792]
+# (QPDF_pages.cc:104-112) (flpdf-nd38 repair 3). ---
+mkdir -p "$REF/missing-mediabox-leaf"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/missing-mediabox-leaf.pdf" "$REF/missing-mediabox-leaf/linearize.pdf"
+echo "missing-mediabox-leaf/linearize.pdf"
+
+# --- shared-leaf-mediabox-default: a /Page leaf shared by two /Pages parents
+# where only parent A carries a /MediaBox. This makes qpdf 11.9.0's
+# MediaBox-default-BEFORE-clone ordering observable (QPDF_pages.cc:104-112 before
+# :119-130): the shared original is defaulted to [0 0 612 792] on its 2nd visit
+# (via the /MediaBox-less parent B) and the minted clone inherits it, so BOTH
+# pages end up [0 0 612 792] (flpdf-nd38 repair 3 ordering guard). ---
+mkdir -p "$REF/shared-leaf-mediabox-default"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/shared-leaf-mediabox-default.pdf" "$REF/shared-leaf-mediabox-default/linearize.pdf"
+echo "shared-leaf-mediabox-default/linearize.pdf"
+
+# --- indirect-mediabox-element: a /Page leaf /MediaBox is a direct array with an
+# indirect-reference element ([0 0 612 4 0 R]). qpdf 11.9.0's isRectangle()
+# dereferences each element via isNumber(), so it is a valid rectangle and is
+# kept (NOT defaulted) — repair (3) must resolve each element before defaulting
+# (flpdf-nd38, codex review r3522482671). ---
+mkdir -p "$REF/indirect-mediabox-element"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/indirect-mediabox-element.pdf" "$REF/indirect-mediabox-element/linearize.pdf"
+echo "indirect-mediabox-element/linearize.pdf"
+
 # --- no-stream-one-page: degenerate catalog/pages/page with no /Contents and no
 # /Resources. Pins the DEFLATE-backend hint-stream size delta as the sole
 # sanctioned deviation — byte-identical to qpdf under qpdf-zlib-compat (flpdf-05jt). ---
