@@ -261,6 +261,17 @@ fn shared_leaf_mediabox_default_byte_identical_to_qpdf() {
     );
 }
 
+/// A /Page leaf whose /MediaBox is a direct array with an indirect-reference
+/// element ([0 0 612 4 0 R], obj 4 = 792). qpdf 11.9.0's isRectangle()
+/// dereferences each element via isNumber(), so the box is a valid rectangle and
+/// is kept, NOT overwritten with the [0 0 612 792] default. is_rectangle must
+/// resolve each element before defaulting (flpdf-nd38 repair 3; codex review
+/// r3522482671 on PR #453).
+#[test]
+fn indirect_mediabox_element_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("indirect-mediabox-element.pdf", "indirect-mediabox-element");
+}
+
 #[test]
 fn relinearize_one_page_is_byte_identical_to_qpdf() {
     // Re-linearizing an already-linearized input: the source's old /Linearized

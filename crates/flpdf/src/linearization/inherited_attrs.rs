@@ -438,35 +438,50 @@ fn type_name_is(dict: &Dictionary, want: &[u8]) -> bool {
 /// True iff `value` resolves to a `/MediaBox` rectangle: an `Array` of exactly
 /// four numbers (`Integer` or `Real`). Mirrors qpdf's
 /// `QPDFObjectHandle::isRectangle` (QPDFObjectHandle.cc:789-800 — an array whose
-/// size is 4 and whose first four items are numbers), resolving through any
-/// indirect-reference chain first, as qpdf's `getKey("/MediaBox").isRectangle()`
-/// does. A missing key (`None`), a wrong-length array, or a non-numeric element
-/// yields `false`.
-//
-// Note: qpdf's per-element `isNumber()` dereferences, so it would accept an
-// element that is itself an indirect reference to a number (e.g.
-// `[0 0 612 5 0 R]`); this helper matches the element kinds directly, treating
-// such a pathological array as not-a-rectangle. This is a deliberate, untested
-// divergence — real MediaBoxes hold direct numbers.
+/// size is 4 and whose first four items are numbers). Both the array value and
+/// each of its four elements are resolved through any indirect-reference chain
+/// first, matching qpdf: `getKey("/MediaBox").isRectangle()` resolves the array,
+/// and its per-item `isNumber()` dereferences an element that is itself an
+/// indirect reference to a number (e.g. `[0 0 612 5 0 R]`, kept — not defaulted —
+/// on qpdf 11.9.0). A missing key (`None`), a wrong-length array, or an element
+/// that does not resolve to a number yields `false`.
 fn is_rectangle<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<&Object>) -> Result<bool> {
-    fn is_rect_array(obj: &Object) -> bool {
-        matches!(
-            obj,
-            Object::Array(items)
-                if items.len() == 4
-                    && items
-                        .iter()
-                        .all(|e| matches!(e, Object::Integer(_) | Object::Real(_)))
-        )
-    }
-    Ok(match value {
-        None => false,
+    // Resolve the /MediaBox value itself through any indirect chain (as qpdf's
+    // `getKey("/MediaBox")` does) and, if it is a four-element array, snapshot its
+    // elements. The snapshot (four small scalars/refs — never a stream) is needed
+    // to release the borrow on `pdf` before resolving each element below.
+    let items: Vec<Object> = match value {
+        None => return Ok(false),
         Some(Object::Reference(r)) => {
             let terminal = terminal_ref_of_chain(pdf, *r)?;
-            is_rect_array(pdf.resolve_borrowed(terminal)?)
+            match pdf.resolve_borrowed(terminal)? {
+                Object::Array(items) if items.len() == 4 => items.clone(),
+                _ => return Ok(false),
+            }
         }
-        Some(obj) => is_rect_array(obj),
-    })
+        Some(Object::Array(items)) if items.len() == 4 => items.clone(),
+        Some(_) => return Ok(false),
+    };
+    // Every element must resolve to a number. qpdf's `isRectangle()` tests each
+    // item with `isNumber()`, which dereferences an indirect reference before the
+    // type check — verified on qpdf 11.9.0: a `/MediaBox [0 0 612 5 0 R]` whose
+    // last element is an indirect number is kept, NOT overwritten with the default
+    // — so each element's indirect chain is resolved here as well.
+    for e in &items {
+        let is_num = match e {
+            Object::Integer(_) | Object::Real(_) => true,
+            Object::Reference(r) => {
+                let terminal = terminal_ref_of_chain(pdf, *r)?;
+                let resolved = pdf.resolve_borrowed(terminal)?;
+                matches!(resolved, Object::Integer(_) | Object::Real(_))
+            }
+            _ => false,
+        };
+        if !is_num {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -2750,6 +2765,128 @@ mod tests {
             Some(&Object::Reference(ObjectRef::new(4, 0))),
             "a leaf whose /MediaBox is an indirect reference to a valid rectangle \
              must be recognized as a rectangle and left as the reference (no default)"
+        );
+    }
+
+    /// A `/Page` leaf whose `/MediaBox` is a DIRECT array with an ELEMENT that is
+    /// an indirect reference to a number (`[0 0 612 4 0 R]`), with no ancestor
+    /// `/MediaBox`. qpdf's `isRectangle()` tests each item with `isNumber()`, which
+    /// dereferences the indirect element (verified on qpdf 11.9.0: the box is kept,
+    /// not defaulted), so `is_rectangle` must resolve each element too and leave the
+    /// leaf's `/MediaBox` untouched. Exercises `is_rectangle`'s per-element indirect
+    /// arm (codex review r3522482671 on PR #453).
+    fn pdf_with_indirect_element_mediabox_leaf() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 4 0 R] >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n792\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn indirect_element_mediabox_leaf_is_recognized_and_not_defaulted() {
+        let bytes = pdf_with_indirect_element_mediabox_leaf();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            leaf_dict.get("MediaBox"),
+            Some(&Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+                Object::Reference(ObjectRef::new(4, 0)),
+            ])),
+            "a /MediaBox array whose element is an indirect reference to a number \
+             is a valid rectangle (qpdf dereferences it) and must be left unchanged"
+        );
+    }
+
+    /// A `/Page` leaf whose `/MediaBox` is an indirect reference (4 0 R) to a
+    /// NON-rectangle (a three-element array `[0 0 300]`), no ancestor `/MediaBox`.
+    /// After resolving the reference the value is not a four-number array, so it is
+    /// not a rectangle and the default fires. Exercises `is_rectangle`'s
+    /// reference-resolves-to-a-non-rectangle arm.
+    fn pdf_with_reference_non_rectangle_mediabox_leaf() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox 4 0 R >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n[0 0 300]\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn reference_non_rectangle_mediabox_leaf_gets_default() {
+        let bytes = pdf_with_reference_non_rectangle_mediabox_leaf();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+
+        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        assert_eq!(
+            leaf_dict.get("MediaBox"),
+            Some(&Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+                Object::Integer(792),
+            ])),
+            "a /MediaBox that is an indirect reference to a non-rectangle must be \
+             replaced with the [0 0 612 792] default"
         );
     }
 
