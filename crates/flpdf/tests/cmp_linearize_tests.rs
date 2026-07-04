@@ -234,6 +234,14 @@ fn mistyped_page_tree_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("mistyped-page-tree.pdf", "mistyped-page-tree");
 }
 
+/// A /Page leaf with no /MediaBox and no ancestor /MediaBox. qpdf 11.9.0's
+/// getAllPagesInternal defaults it to letter/ANSI A [0 0 612 792]
+/// (QPDF_pages.cc:104-112) (flpdf-nd38 repair 3).
+#[test]
+fn missing_mediabox_leaf_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical("missing-mediabox-leaf.pdf", "missing-mediabox-leaf");
+}
+
 #[test]
 fn relinearize_one_page_is_byte_identical_to_qpdf() {
     // Re-linearizing an already-linearized input: the source's old /Linearized
