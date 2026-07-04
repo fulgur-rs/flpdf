@@ -113,9 +113,14 @@ each job grants only what it needs.
   on real releases, not on every merge). `has_releases=true` when:
   - `github.ref == refs/heads/main` AND (`workflow_dispatch` OR head commit
     subject matches `release-plz-\d{4}-\d{2}-\d{2}` OR any pushed commit subject
-    matches `^chore: release( v[0-9]| $)`).
-  - Verify the detection strings against release-plz's actual PR branch name and
-    release commit subject at implementation time.
+    matches `^chore: release( v[0-9]|$)`).
+  - Detection strings verified against sibling repos' real git history (release-plz
+    output): the Release PR branch is `release-plz-<ISO8601>` (→ the "Merge pull
+    request … from …release-plz-…" subject), and the release commit subject is
+    `chore: release vX.Y.Z` when all released packages share one version (fulgur,
+    version_group) or bare `chore: release` when versions differ (fulgur-chart,
+    decoupled). flpdf is lockstep single-version → versioned form; the regex
+    accepts both shapes and rejects `chore: release docs`-style false positives.
 - **`release-pr`** — App token → `release-plz/action` `command: release-pr`.
   Creates/updates the Release PR (version bump + Cargo.lock + CHANGELOG.md). **No
   aux-sync step** (unlike fulgur: commit-based changelog is native, and the

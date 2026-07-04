@@ -1,0 +1,42 @@
+# release-plz configuration: https://release-plz.dev/docs/config
+#
+# flpdf is a lockstep 2-crate workspace: flpdf (lib) and flpdf-cli both inherit
+# `[workspace.package].version` via `version.workspace = true`, so they always
+# release at the same version. release-plz bumps that single workspace version and
+# updates flpdf-cli's `flpdf = { path = "../flpdf", version = "..." }` requirement
+# automatically (verified with release-plz 0.3.159), so no `version_group` and no
+# per-crate version fields are needed.
+#
+# Version bumps use release-plz's conventional-commit default. At 0.x, SemVer 0.x
+# rules apply: `feat` and `fix` both bump patch, only breaking changes bump minor
+# — so flpdf stays on its 0.1.x cadence until an intentional breaking release.
+
+# A lockstep workspace wants ONE canonical `v{{version}}` tag/release, not
+# release-plz's default per-package tags (flpdf-v* / flpdf-cli-v*), which for a
+# shared version would emit two identical-SHA tags. Disable tags/releases at the
+# workspace level, then opt `flpdf` back in below as the canonical one.
+[workspace]
+git_tag_enable = false
+git_release_enable = false
+
+# flpdf owns the single root CHANGELOG.md (commit-based, git-cliff) and carries
+# the canonical version tag + GitHub Release for the whole lockstep workspace.
+# The Release body is generated from this changelog by `release-plz release`.
+[[package]]
+name = "flpdf"
+changelog_path = "CHANGELOG.md"
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+git_release_enable = true
+git_release_name = "v{{ version }}"
+
+# flpdf-cli is published (publish defaults to true) and version-locked to flpdf
+# via the shared workspace version, but it does NOT emit its own changelog
+# section: with a shared changelog_path a lockstep workspace would otherwise write
+# a duplicate `## [x]` header per crate (and a `flpdf-cli-v*` compare link that
+# 404s, since no per-crate tag is created). Trade-off: commits touching only
+# crates/flpdf-cli/ are absent from the changelog narrative — they still trigger
+# the release (the shared version bumps and flpdf-cli is published). See flpdf-l2ug.
+[[package]]
+name = "flpdf-cli"
+changelog_update = false
