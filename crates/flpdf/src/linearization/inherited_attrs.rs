@@ -242,7 +242,7 @@ fn push_internal<R: Read + Seek>(
 
 /// Partial mirror of qpdf 11.9.0 `getAllPagesInternal` (QPDF_pages.cc:77-138):
 /// walk the `/Kids` tree depth-first, repairing page-tree nodes in place so the
-/// subsequent inherited-attribute push sees a well-formed tree. Four repairs
+/// subsequent inherited-attribute push sees a well-formed tree. Five repairs
 /// from `getAllPagesInternal` are applied:
 ///
 /// - **Interior `/Type`** (:89-92): a node reached as an interior node (one with
@@ -252,8 +252,18 @@ fn push_internal<R: Read + Seek>(
 ///   from this node's own `/MediaBox` (:93-96) and threaded into the recursion.
 ///   A leaf that lacks a valid `/MediaBox` rectangle while `media_box` is false
 ///   has its `/MediaBox` set to a direct letter / ANSI A array `[0 0 612 792]`.
-///   Applied to the original leaf *before* the duplicate-clone decision (qpdf
-///   order :104-112 before :119-130), so a clone inherits the defaulted box.
+///   Applied to the original leaf *before* the direct-leaf and duplicate-clone
+///   decisions (qpdf order :104-112 before :113-130), so a minted object
+///   inherits the defaulted box.
+/// - **Direct leaf → indirect** (:113-118): a `/Kids` entry that is a direct
+///   (inline) `/Page` dict with no `/Kids` of its own is minted into a fresh
+///   indirect object (via the same running allocator as the clone below) and the
+///   entry is rewritten to that reference (qpdf's `makeIndirectObject`). The
+///   minted object carries NO synthesized `/Parent` (`makeIndirectObject` adds
+///   none). A direct *interior* node (a direct dict WITH `/Kids`) is out of
+///   scope: qpdf recurses into it in place (:101-102), which flpdf's
+///   reference-keyed walk cannot do, so it is left direct and untouched (no
+///   golden exists for this exotic shape).
 /// - **Duplicate leaf** (:119-130): the first occurrence of a `/Page` leaf is
 ///   recorded; each later occurrence is replaced, in the parent's `/Kids` array,
 ///   by a fresh shallow copy of the leaf dict (indirect sub-objects such as
@@ -272,9 +282,10 @@ fn push_internal<R: Read + Seek>(
 /// per clone (qpdf allocates from a running maximum rather than rescanning),
 /// which keeps cloning many duplicates linear rather than quadratic.
 ///
-/// The direct-kid → indirect repair (:113-118) `getAllPagesInternal` also
-/// performs is not mirrored here (direct `/Kids` entries are skipped, as the
-/// inherited-attribute push does).
+/// Direct `/Kids` entries: a direct *leaf* is mirrored (minted to indirect, the
+/// **Direct leaf → indirect** repair above); a direct *interior* node remains
+/// out of scope (qpdf's recurse-in-place at :101-102 is not mirrored). A direct
+/// non-dictionary entry is skipped, as the inherited-attribute push does.
 fn repair_page_tree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     node_ref: ObjectRef,
@@ -325,9 +336,44 @@ fn repair_page_tree<R: Read + Seek>(
     let media_box = media_box || is_rectangle(pdf, dict.get("MediaBox"))?;
 
     for kid in kids.iter_mut() {
-        let kid_ref = match &*kid {
-            Object::Reference(r) => *r,
-            _ => continue, // Direct (non-reference) /Kids entry: skip, as push does.
+        let kid_ref = if let Object::Reference(r) = &*kid {
+            *r
+        } else if let Object::Dictionary(d) = &*kid {
+            // A DIRECT (inline) /Kids entry. qpdf 11.9.0's getAllPagesInternal
+            // classifies interior-vs-leaf by `kid.hasKey("/Kids")` before any
+            // direct→indirect conversion (QPDF_pages.cc:100-118), so branch the
+            // same way here.
+            if d.get("Kids").is_some() {
+                // (1i) Direct *interior* node (a direct dict WITH /Kids). qpdf
+                // recurses into it in place (:101-102); flpdf's reference-keyed
+                // walk has no non-reference recursion path, so this is out of
+                // scope — leave the entry direct and untouched. No golden exists
+                // for this exotic shape.
+                continue;
+            }
+            // (1l) Direct *leaf* (no /Kids): mint it into a fresh indirect object
+            // and rewrite the /Kids entry to the new reference (makeIndirectObject,
+            // :113-118). Draw from the SAME running allocator the duplicate-clone
+            // arm uses so the object numbering matches qpdf. qpdf applies the
+            // /MediaBox default (:104-112) to the direct dict BEFORE
+            // makeIndirectObject (:113-118); minting first here and letting the
+            // existing leaf branch below apply the default to the now-indirect
+            // object yields the SAME object content and — since defaulting never
+            // mints — the SAME object numbers, so this reordering is byte-faithful.
+            let new_ref = *next_clone;
+            let next_num = new_ref
+                .number
+                .checked_add(1)
+                .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+            *next_clone = ObjectRef::new(next_num, 0);
+            // Move the inline dict out of the /Kids entry WITHOUT cloning; the
+            // moved dict carries no /Parent and makeIndirectObject adds none.
+            let owned = std::mem::replace(kid, Object::Reference(new_ref));
+            pdf.set_object(new_ref, owned);
+            changed = true;
+            new_ref
+        } else {
+            continue; // Direct (non-dictionary) /Kids entry: skip, as push does.
         };
         // Classify the kid (interior /Pages node vs leaf) and, for a leaf,
         // snapshot its own /MediaBox value — all in a scope that ends the
