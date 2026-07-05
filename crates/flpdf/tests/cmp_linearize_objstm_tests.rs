@@ -1128,6 +1128,28 @@ fn thumbnail_private_shared_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// thumb-firstpage-shared (flpdf-hn1g.16): a 2-page fixture where obj 5 (an image)
+// is BOTH page0's /Resources /XObject AND page1's /Thumb. qpdf gives it ou_page(0)
+// + ou_thumb(1), so thumbs>0 makes it lc_first_page_shared (part3) — placed after
+// the first-page-private content, not before it. Pins that the /Thumb signal feeds
+// the first-page private/shared split.
+#[test]
+fn thumb_firstpage_shared_objstm_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-thumb-firstpage-shared.pdf",
+        "objstm-lin-thumb-firstpage-shared",
+    );
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn thumb_firstpage_shared_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-thumb-firstpage-shared.pdf",
+        "objstm-lin-thumb-firstpage-shared",
+    );
+}
+
 // cap-boundary-199-bearing (flpdf-ihb.4): PRESERVE mode (qpdf
 // --object-streams=preserve) on an ObjStm-bearing input. qpdf's
 // preserveObjectStreams keeps the SOURCE document's ObjStm grouping rather than
