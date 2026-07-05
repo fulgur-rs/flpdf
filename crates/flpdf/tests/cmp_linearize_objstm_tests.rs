@@ -943,6 +943,48 @@ fn otherpage_others_two_container_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// otherpage-shared-docother (flpdf-w0vu): a drift-trigger fixture proving that
+// `route_objstm_containers` and `second_half_container_anchors` disagree on ONE
+// container's part WITHOUT any byte divergence from qpdf. Page 0 is fontless;
+// page 1 has 48 private fonts; page 2 has 53 fonts, whose FIRST font (B*) is also
+// referenced by a catalog custom key /Custom (a document-`others` reference that
+// sorts before /Pages, so the DFS visits B* early enough to co-locate it in the
+// first even-split container with the page-1 fonts). The container CX = {B*, the
+// /Pages tree node, 48 page-1 fonts} has union other_pages == {1, 2} (page-1
+// fonts reach page 1; B* reaches page 2), so `route_objstm_containers` categorizes
+// it lc_other_page_shared (part8, QPDF_linearization.cc:1130 — no `others` gate at
+// other_pages>=2). But `second_half_container_anchors` sees only pages == {1} (B*
+// and the /Pages node are in the rest set, not page-private) with rest == true, so
+// its `!rest` gate demotes CX to part9 (2,0). The two classifiers DRIFT part8 vs
+// part9. The fixture also carries a plain part8 XObject shared by pages 1&2 and a
+// plain part9 stream reached only by a catalog custom key /Zzz, so the buggy part9
+// anchor's rfind targets a real part9 object. Yet the output is byte-identical to
+// qpdf 11.9.0: `route` (correct, part8) drives the member numbering, and in
+// `place_objstm_members_per_half` a part9 plain object is always emitted
+// post-container while part8 is the last pre-container part, so the part9-mislabeled
+// container lands at the same terminal slot a part8 container would. This pins the
+// non-divergence as a regression guard: a future change to
+// `place_objstm_members_per_half` or either classifier that makes the drift
+// observable would break this golden. Distinct from otherpage-others-48-50 above,
+// which is the part7 (other-page-private) `others` gate; this is the part8
+// (other-page-shared) case where the drift is confirmed latent-but-invisible.
+#[test]
+fn otherpage_shared_docother_drift_objstm_structurally_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-otherpage-shared-docother.pdf",
+        "objstm-lin-otherpage-shared-docother",
+    );
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn otherpage_shared_docother_drift_objstm_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-otherpage-shared-docother.pdf",
+        "objstm-lin-otherpage-shared-docother",
+    );
+}
+
 // outline-od-shared-stream: a /JS action stream reachable from BOTH the catalog's
 // /OpenAction subtree (in_open_document) AND an outline item's /A (in_outlines).
 // qpdf's canonical classification orders in_outlines ABOVE in_open_document

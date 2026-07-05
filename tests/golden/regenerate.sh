@@ -806,6 +806,21 @@ fi
 #                     => part7) ignored the `others` gate and diverged. Distinct from
 #                     the outlines-otherpage part8/part9 fixtures above: this is the
 #                     part7 (other-page-private) `others` gate.
+#  - otherpage-shared-docother (flpdf-w0vu): the part8 sibling of otherpage-others.
+#                     Page 0 fontless; page 1 has 48 private fonts; page 2 has 53,
+#                     whose first font B* is ALSO a catalog custom key /Custom (a
+#                     document-`others` ref sorting before /Pages so the DFS co-locates
+#                     it in the first even-split container with the page-1 fonts). The
+#                     container CX={B*, /Pages node, 48 page-1 fonts} has other_pages==
+#                     {1,2} => route_objstm_containers = lc_other_page_shared (part8),
+#                     but second_half_container_anchors sees pages=={1} + rest => part9
+#                     via its `!rest` gate: the two classifiers DRIFT part8 vs part9.
+#                     Plus a plain part8 XObject (shared by pages 1&2) and a plain part9
+#                     stream (catalog /Zzz) so the buggy part9 anchor targets a real
+#                     part9 object. Byte-identical to qpdf 11.9.0 anyway (route drives
+#                     numbering; part9 plain is post-container, part8 is the last
+#                     pre-container part, so the mislabeled container lands at the same
+#                     slot) — pins that the drift stays byte-invisible (regression guard).
 declare -A G6HB2_FIX=(
     [objstm-lin-sharedfonts-100]="gen_shared_fonts.py 100"
     [objstm-lin-cap-boundary-199]="gen_shared_fonts.py 199"
@@ -824,6 +839,7 @@ declare -A G6HB2_FIX=(
     [objstm-lin-outlines-otherpage-2-120-20]="gen_outlines_otherpage_shared.py 2 120 20"
     [objstm-lin-outlines-otherpage-0-120-20]="gen_outlines_otherpage_shared.py 0 120 20"
     [objstm-lin-otherpage-others-48-50]="gen_otherpage_others_private.py 48 50"
+    [objstm-lin-otherpage-shared-docother]="gen_otherpage_shared_docother.py 48 53 1 1"
     [objstm-lin-outline-od-shared-stream]="gen_outline_open_action_shared_stream.py"
     [objstm-lin-useoutline-od-shared-stream]="gen_outline_open_action_shared_stream.py --use-outlines"
     [objstm-lin-acroform-widget-page0-5-10]="gen_acroform_widget_page0.py 5 10"
@@ -1610,6 +1626,7 @@ for stem in objstm-lin-sharedfonts-100 objstm-lin-cap-boundary-199 \
             objstm-lin-outlines-otherpage-2-120-20 \
             objstm-lin-outlines-otherpage-0-120-20 \
             objstm-lin-otherpage-others-48-50 \
+            objstm-lin-otherpage-shared-docother \
             objstm-lin-outline-od-shared-stream \
             objstm-lin-useoutline-od-shared-stream \
             objstm-lin-acroform-widget-page0-5-10 \
