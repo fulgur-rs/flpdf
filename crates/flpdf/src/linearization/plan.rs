@@ -937,6 +937,45 @@ impl LinearizationPlan {
         }
 
         // ----------------------------------------------------------------
+        // Step 4b: thumb-set for the first-page private/shared split.
+        // ----------------------------------------------------------------
+        // qpdf gives a page's /Thumb target the separate `ou_thumb` user
+        // (QPDF_optimization.cc:317-324), sharing that page's ou_page `visited`. A
+        // first-page object that is also some page's /Thumb therefore has thumbs>0 and
+        // is lc_first_page_shared, not lc_first_page_private
+        // (QPDF_linearization.cc:1124-1127). compute_closure skips /Thumb, so neither
+        // shared_page_indices nor document_other_set captures this; recover the set
+        // here. Object-stream-mode independent, like open_document/outlines/others.
+        let thumb_page_tree = page_tree_node_refs(pdf)?;
+        let mut thumb_refs: Vec<(usize, ObjectRef)> = Vec::new();
+        for (page_idx, &page_ref) in page_refs.iter().enumerate() {
+            if let Object::Dictionary(d) = pdf.resolve_borrowed(page_ref)? {
+                if let Some(Object::Reference(r)) = d.get("Thumb") {
+                    thumb_refs.push((page_idx, *r));
+                }
+            }
+        }
+        let mut thumb_shared_set: BTreeSet<ObjectRef> = BTreeSet::new();
+        for (page_idx, thumb_ref) in thumb_refs {
+            let closure = closure_from_seeds(pdf, vec![(thumb_ref, false)], &thumb_page_tree)?;
+            // Subtract the same page's ou_page closure: qpdf traverses /Thumb AFTER the
+            // page's other ref-bearing keys (alphabetical getKeys order) with a shared
+            // `visited`, so an object already reached by that page's ou_page walk never
+            // also receives ou_thumb from the same page (verified against qpdf 11.9.0:
+            // a page0 self-thumb of its own resource stays lc_first_page_private).
+            let own_set: BTreeSet<ObjectRef> = if page_idx == 0 {
+                first_page_closure.iter().copied().collect()
+            } else {
+                other_page_closures[page_idx - 1].iter().copied().collect()
+            };
+            for r in closure {
+                if !own_set.contains(&r) {
+                    thumb_shared_set.insert(r);
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
         // Step 5: partition into Part 2 (exclusive) and Part 3 (shared)
         // ----------------------------------------------------------------
         // Maintain closure discovery order from first_page_closure for Part 2
@@ -982,13 +1021,16 @@ impl LinearizationPlan {
                 part2_objects.push(*obj_ref);
             } else if shared_page_indices.contains_key(obj_ref)
                 || document_other_set.contains(obj_ref)
+                || thumb_shared_set.contains(obj_ref)
             {
                 // lc_first_page_shared: in_first_page AND (other_pages>0 ||
-                // others>0). `shared_page_indices` supplies other_pages (another
-                // page's closure); `document_other_set` supplies others (a
-                // document-level reference such as a Catalog key). Either makes
-                // the object shared (QPDF_linearization.cc:1124-1127), so it
-                // sorts after the first-page-private objects in part 6.
+                // others>0 || thumbs>0). `shared_page_indices` supplies
+                // other_pages (another page's closure); `document_other_set`
+                // supplies others (a document-level reference such as a Catalog
+                // key); `thumb_shared_set` supplies thumbs (a page's /Thumb
+                // target). Any of these makes the object shared
+                // (QPDF_linearization.cc:1124-1127), so it sorts after the
+                // first-page-private objects in part 6.
                 part3_objects.push(*obj_ref);
             } else {
                 part2_objects.push(*obj_ref);
