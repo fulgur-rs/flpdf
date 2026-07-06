@@ -949,11 +949,16 @@ impl LinearizationPlan {
         let thumb_page_tree = page_tree_node_refs(pdf)?;
         let mut thumb_refs: Vec<(usize, ObjectRef)> = Vec::new();
         for (page_idx, &page_ref) in page_refs.iter().enumerate() {
-            if let Object::Dictionary(d) = pdf.resolve_borrowed(page_ref)? {
-                if let Some(Object::Reference(r)) = d.get("Thumb") {
-                    thumb_refs.push((page_idx, *r));
-                }
-            }
+            // Accessor chain (not a nested `if let`) so every line runs for a
+            // /Thumb-less page too. A direct inline /Thumb dict yields no
+            // ObjectRef (`as_ref_id` -> None) and is skipped, matching qpdf: only
+            // indirect objects become `ou_thumb` users (QPDF_optimization.cc:317-324).
+            let thumb = pdf
+                .resolve_borrowed(page_ref)?
+                .as_dict()
+                .and_then(|d| d.get("Thumb"))
+                .and_then(|o| o.as_ref_id());
+            thumb_refs.extend(thumb.map(|r| (page_idx, r)));
         }
         let mut thumb_shared_set: BTreeSet<ObjectRef> = BTreeSet::new();
         for (page_idx, thumb_ref) in thumb_refs {
