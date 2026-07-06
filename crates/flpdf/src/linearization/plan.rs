@@ -962,19 +962,27 @@ impl LinearizationPlan {
         }
         let mut thumb_shared_set: BTreeSet<ObjectRef> = BTreeSet::new();
         for (page_idx, thumb_ref) in thumb_refs {
-            let closure = closure_from_seeds(pdf, vec![(thumb_ref, false)], &thumb_page_tree)?;
+            // Reuse the `live` set computed once above: closure_from_seeds is called
+            // once per thumbnail, so recomputing pdf.live_object_refs() inside it
+            // would reintroduce the O(pages * objects) rescan the page-closure loop
+            // deliberately avoids for /Thumb-heavy documents.
+            let closure =
+                closure_from_seeds(pdf, vec![(thumb_ref, false)], &thumb_page_tree, &live)?;
             // Subtract the same page's ou_page closure: qpdf traverses /Thumb AFTER the
             // page's other ref-bearing keys (alphabetical getKeys order) with a shared
             // `visited`, so an object already reached by that page's ou_page walk never
             // also receives ou_thumb from the same page (verified against qpdf 11.9.0:
             // a page0 self-thumb of its own resource stays lc_first_page_private).
-            let own_set: BTreeSet<ObjectRef> = if page_idx == 0 {
-                first_page_closure.iter().copied().collect()
-            } else {
-                other_page_closures[page_idx - 1].iter().copied().collect()
-            };
+            // Membership is tested against the already-built `first_page_set` (page 0)
+            // or the page's closure Vec directly (small contiguous Copy slice), avoiding
+            // a fresh BTreeSet allocation per thumbnail.
             for r in closure {
-                if !own_set.contains(&r) {
+                let is_own = if page_idx == 0 {
+                    first_page_set.contains(&r)
+                } else {
+                    other_page_closures[page_idx - 1].contains(&r)
+                };
+                if !is_own {
                     thumb_shared_set.insert(r);
                 }
             }
@@ -2480,7 +2488,8 @@ fn open_document_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet
     }
 
     let page_tree = page_tree_node_refs(pdf)?;
-    closure_from_seeds(pdf, seeds, &page_tree)
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+    closure_from_seeds(pdf, seeds, &page_tree, &live)
 }
 
 /// Compute the set of objects qpdf categorizes with a non-zero `others` count:
@@ -2538,7 +2547,8 @@ fn document_other_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSe
     }
 
     let page_tree = page_tree_node_refs(pdf)?;
-    closure_from_seeds(pdf, seeds, &page_tree)
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+    closure_from_seeds(pdf, seeds, &page_tree, &live)
 }
 
 /// The inheritable page attributes (ISO 32000-1 Table 30) that qpdf's
@@ -2632,10 +2642,11 @@ fn closure_from_seeds<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     seeds: Vec<(ObjectRef, bool)>,
     page_tree: &BTreeSet<ObjectRef>,
+    live: &BTreeSet<ObjectRef>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
-    // Live set is built once upfront so the Object::Null guard below can
-    // distinguish xref-absent refs from real live null bodies.
-    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+    // `live` is supplied by the caller (computed once) so the Object::Null guard
+    // below can distinguish xref-absent refs from real live null bodies without
+    // rescanning the xref/cache on every call.
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut out: BTreeSet<ObjectRef> = BTreeSet::new();
     // Xref-absent nulls added tentatively to `out`; the post-BFS pass below
@@ -2746,7 +2757,8 @@ pub(crate) fn outlines_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BT
         }
     }
     let page_tree = page_tree_node_refs(pdf)?;
-    closure_from_seeds(pdf, seeds, &page_tree)
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+    closure_from_seeds(pdf, seeds, &page_tree, &live)
 }
 
 /// Returns `true` when the catalog specifies `/PageMode /UseOutlines` AND has
