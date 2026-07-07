@@ -937,6 +937,58 @@ impl LinearizationPlan {
         }
 
         // ----------------------------------------------------------------
+        // Step 4b: thumb-set for the first-page private/shared split.
+        // ----------------------------------------------------------------
+        // qpdf gives a page's /Thumb target the separate `ou_thumb` user
+        // (QPDF_optimization.cc:317-324), sharing that page's ou_page `visited`. A
+        // first-page object that is also some page's /Thumb therefore has thumbs>0 and
+        // is lc_first_page_shared, not lc_first_page_private
+        // (QPDF_linearization.cc:1124-1127). compute_closure skips /Thumb, so neither
+        // shared_page_indices nor document_other_set captures this; recover the set
+        // here. Object-stream-mode independent, like open_document/outlines/others.
+        let thumb_page_tree = page_tree_node_refs(pdf)?;
+        let mut thumb_refs: Vec<(usize, ObjectRef)> = Vec::new();
+        for (page_idx, &page_ref) in page_refs.iter().enumerate() {
+            // Accessor chain (not a nested `if let`) so every line runs for a
+            // /Thumb-less page too. A direct inline /Thumb dict yields no
+            // ObjectRef (`as_ref_id` -> None) and is skipped, matching qpdf: only
+            // indirect objects become `ou_thumb` users (QPDF_optimization.cc:317-324).
+            let thumb = pdf
+                .resolve_borrowed(page_ref)?
+                .as_dict()
+                .and_then(|d| d.get("Thumb"))
+                .and_then(|o| o.as_ref_id());
+            thumb_refs.extend(thumb.map(|r| (page_idx, r)));
+        }
+        let mut thumb_shared_set: BTreeSet<ObjectRef> = BTreeSet::new();
+        for (page_idx, thumb_ref) in thumb_refs {
+            // Reuse the `live` set computed once above: closure_from_seeds is called
+            // once per thumbnail, so recomputing pdf.live_object_refs() inside it
+            // would reintroduce the O(pages * objects) rescan the page-closure loop
+            // deliberately avoids for /Thumb-heavy documents.
+            let closure =
+                closure_from_seeds(pdf, vec![(thumb_ref, false)], &thumb_page_tree, &live)?;
+            // Subtract the same page's ou_page closure: qpdf traverses /Thumb AFTER the
+            // page's other ref-bearing keys (alphabetical getKeys order) with a shared
+            // `visited`, so an object already reached by that page's ou_page walk never
+            // also receives ou_thumb from the same page (verified against qpdf 11.9.0:
+            // a page0 self-thumb of its own resource stays lc_first_page_private).
+            // Membership is tested against the already-built `first_page_set` (page 0)
+            // or the page's closure Vec directly (small contiguous Copy slice), avoiding
+            // a fresh BTreeSet allocation per thumbnail.
+            for r in closure {
+                let is_own = if page_idx == 0 {
+                    first_page_set.contains(&r)
+                } else {
+                    other_page_closures[page_idx - 1].contains(&r)
+                };
+                if !is_own {
+                    thumb_shared_set.insert(r);
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
         // Step 5: partition into Part 2 (exclusive) and Part 3 (shared)
         // ----------------------------------------------------------------
         // Maintain closure discovery order from first_page_closure for Part 2
@@ -982,13 +1034,16 @@ impl LinearizationPlan {
                 part2_objects.push(*obj_ref);
             } else if shared_page_indices.contains_key(obj_ref)
                 || document_other_set.contains(obj_ref)
+                || thumb_shared_set.contains(obj_ref)
             {
                 // lc_first_page_shared: in_first_page AND (other_pages>0 ||
-                // others>0). `shared_page_indices` supplies other_pages (another
-                // page's closure); `document_other_set` supplies others (a
-                // document-level reference such as a Catalog key). Either makes
-                // the object shared (QPDF_linearization.cc:1124-1127), so it
-                // sorts after the first-page-private objects in part 6.
+                // others>0 || thumbs>0). `shared_page_indices` supplies
+                // other_pages (another page's closure); `document_other_set`
+                // supplies others (a document-level reference such as a Catalog
+                // key); `thumb_shared_set` supplies thumbs (a page's /Thumb
+                // target). Any of these makes the object shared
+                // (QPDF_linearization.cc:1124-1127), so it sorts after the
+                // first-page-private objects in part 6.
                 part3_objects.push(*obj_ref);
             } else {
                 part2_objects.push(*obj_ref);
@@ -2433,7 +2488,8 @@ fn open_document_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet
     }
 
     let page_tree = page_tree_node_refs(pdf)?;
-    closure_from_seeds(pdf, seeds, &page_tree)
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+    closure_from_seeds(pdf, seeds, &page_tree, &live)
 }
 
 /// Compute the set of objects qpdf categorizes with a non-zero `others` count:
@@ -2491,7 +2547,8 @@ fn document_other_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSe
     }
 
     let page_tree = page_tree_node_refs(pdf)?;
-    closure_from_seeds(pdf, seeds, &page_tree)
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+    closure_from_seeds(pdf, seeds, &page_tree, &live)
 }
 
 /// The inheritable page attributes (ISO 32000-1 Table 30) that qpdf's
@@ -2585,10 +2642,11 @@ fn closure_from_seeds<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     seeds: Vec<(ObjectRef, bool)>,
     page_tree: &BTreeSet<ObjectRef>,
+    live: &BTreeSet<ObjectRef>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
-    // Live set is built once upfront so the Object::Null guard below can
-    // distinguish xref-absent refs from real live null bodies.
-    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+    // `live` is supplied by the caller (computed once) so the Object::Null guard
+    // below can distinguish xref-absent refs from real live null bodies without
+    // rescanning the xref/cache on every call.
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut out: BTreeSet<ObjectRef> = BTreeSet::new();
     // Xref-absent nulls added tentatively to `out`; the post-BFS pass below
@@ -2699,7 +2757,8 @@ pub(crate) fn outlines_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BT
         }
     }
     let page_tree = page_tree_node_refs(pdf)?;
-    closure_from_seeds(pdf, seeds, &page_tree)
+    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+    closure_from_seeds(pdf, seeds, &page_tree, &live)
 }
 
 /// Returns `true` when the catalog specifies `/PageMode /UseOutlines` AND has
@@ -3358,6 +3417,151 @@ mod tests {
                 "first-page-private object {r:?} must be in Part 2"
             );
         }
+    }
+
+    /// Two-page PDF where obj 5 (an image XObject) is BOTH a first-page resource
+    /// (page0 `/Resources /XObject /Im0`) AND page1's `/Thumb` target. qpdf gives
+    /// obj 5 an `ou_page(0)` user and an `ou_thumb(1)` user, so `thumbs > 0`
+    /// classifies it as `lc_first_page_shared` (Part 3), not first-page-private.
+    /// Obj 5 is numbered below the page-0 content (obj 6) so private/shared
+    /// changes the emission ordering.
+    fn thumb_first_page_shared_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = [0u64; 8];
+        let mut push = |pdf: &mut Vec<u8>, n: usize, body: &str| {
+            offs[n] = pdf.len() as u64;
+            pdf.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+        };
+        push(&mut pdf, 1, "<< /Type /Catalog /Pages 2 0 R >>");
+        push(
+            &mut pdf,
+            2,
+            "<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>",
+        );
+        push(
+            &mut pdf,
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /XObject << /Im0 5 0 R >> >> /Contents 6 0 R >>",
+        );
+        push(
+            &mut pdf,
+            4,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Contents 7 0 R /Thumb 5 0 R >>",
+        );
+        push(
+            &mut pdf,
+            5,
+            "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 \
+             /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\nA\nendstream",
+        );
+        push(&mut pdf, 6, "<< /Length 2 >>\nstream\nBT\nendstream");
+        push(&mut pdf, 7, "<< /Length 2 >>\nstream\nBT\nendstream");
+        let xref_start = pdf.len() as u64;
+        let mut xref = String::from("xref\n0 8\n0000000000 65535 f \n");
+        for off in offs.iter().skip(1) {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    // Non-gated integration guard for the Step-4b thumb-set route: a first-page
+    // object (obj 5) that is also another page's /Thumb target has thumbs>0 and
+    // must land in Part 3 (lc_first_page_shared), NOT Part 2 (private). This pins
+    // the classification independently of the qpdf-zlib-compat byte tests.
+    #[test]
+    fn thumb_target_that_is_first_page_object_is_part3_shared() {
+        let mut pdf = Pdf::open(Cursor::new(thumb_first_page_shared_pdf_bytes())).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+        let x = ObjectRef::new(5, 0);
+        assert!(
+            plan.part3_objects.contains(&x),
+            "X (first-page object that is also page1's /Thumb) must be Part 3 \
+             (lc_first_page_shared); part2={:?} part3={:?}",
+            plan.part2_objects,
+            plan.part3_objects
+        );
+        assert!(
+            !plan.part2_objects.contains(&x),
+            "shared X must not also be Part 2"
+        );
+    }
+
+    /// Two-page PDF where obj 5 is page0's own `/Resources /XObject /Im0` AND
+    /// page0's OWN `/Thumb`; page1 has no `/Thumb`. qpdf traverses `/Thumb` after
+    /// the page's other ref-bearing keys with a shared `visited`, so obj 5 gets no
+    /// `ou_thumb` beyond its own `ou_page(0)` — thumbs stays 0 and it remains
+    /// `lc_first_page_private` (Part 2). Objects 1,2,5,6,7 match
+    /// [`thumb_first_page_shared_pdf_bytes`].
+    fn self_thumb_first_page_private_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = [0u64; 8];
+        let mut push = |pdf: &mut Vec<u8>, n: usize, body: &str| {
+            offs[n] = pdf.len() as u64;
+            pdf.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+        };
+        push(&mut pdf, 1, "<< /Type /Catalog /Pages 2 0 R >>");
+        push(
+            &mut pdf,
+            2,
+            "<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>",
+        );
+        push(
+            &mut pdf,
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /XObject << /Im0 5 0 R >> >> /Contents 6 0 R /Thumb 5 0 R >>",
+        );
+        push(
+            &mut pdf,
+            4,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 7 0 R >>",
+        );
+        push(
+            &mut pdf,
+            5,
+            "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 \
+             /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\nA\nendstream",
+        );
+        push(&mut pdf, 6, "<< /Length 2 >>\nstream\nBT\nendstream");
+        push(&mut pdf, 7, "<< /Length 2 >>\nstream\nBT\nendstream");
+        let xref_start = pdf.len() as u64;
+        let mut xref = String::from("xref\n0 8\n0000000000 65535 f \n");
+        for off in offs.iter().skip(1) {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    // Guard for the same-page self-thumb case: obj 5, reached by page0 both as a
+    // resource and as its own /Thumb, must STAY Part 2 (private) — a page never
+    // grants ou_thumb to an object already in its own ou_page closure.
+    #[test]
+    fn self_thumb_first_page_object_stays_part2_private() {
+        let mut pdf = Pdf::open(Cursor::new(self_thumb_first_page_private_pdf_bytes())).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+        let x = ObjectRef::new(5, 0);
+        assert!(
+            plan.part2_objects.contains(&x),
+            "self-thumb X must stay Part 2 (private)"
+        );
+        assert!(
+            !plan.part3_objects.contains(&x),
+            "self-thumb X must NOT be Part 3"
+        );
     }
 
     /// Build a two-page PDF where page 2's font (obj 6) is reached ONLY by page 2
