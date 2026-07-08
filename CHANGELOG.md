@@ -232,6 +232,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/fulgur-rs/flpdf/compare/v0.1.8...v0.1.9) - 2026-07-07
+
+### Fixed
+
+- *(linearize)* classify first-page /Thumb target as lc_first_page_shared (flpdf-hn1g.16)
+- *(linearize)* gate generate-mode part7 container routing on others (flpdf-pn7h)
+
+### Other
+
+- *(linearize)* reuse live set + drop per-thumb own_set alloc (flpdf-hn1g.16)
+- *(linearize)* thumb detection via accessor chain for patch-coverage (flpdf-hn1g.16)
+- *(linearize)* byte-identical generate-mode thumb-firstpage-shared vs qpdf (flpdf-hn1g.16)
+- *(linearize)* thumb-target-is-first-page-object classification tests (flpdf-hn1g.16)
+- *(linearize)* pin generate-mode byte golden for otherpage-shared docother drift (flpdf-w0vu)
+- Merge pull request #464 from fulgur-rs/fix/pn7h-generate-others-gate
+
 ## [0.1.8](https://github.com/fulgur-rs/flpdf/compare/v0.1.7...v0.1.8) - 2026-07-04
 
 ### Fixed
