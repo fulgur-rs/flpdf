@@ -556,6 +556,42 @@ pub fn effective_pdf_version<'a>(
     "1.2"
 }
 
+/// Compute the effective (PDF version, Adobe extension level) pair to write,
+/// applying qpdf's pairwise combined rule (`QPDFWriter::setMinimumPDFVersion`):
+///
+/// * `options.min_version` unset → take `(source, source_ext)`.
+/// * new version > current → take both from the new source. The extension
+///   level resets across a version bump; it does not carry across.
+/// * new version == current AND new ext > current → take ext only.
+/// * new version < current → ignore.
+///
+/// This is the pair-aware sibling of [`effective_pdf_version`] and delegates
+/// to it for the version half. The extension level is only meaningful when
+/// greater than zero; callers should injection-gate on that. `linearize` and
+/// `object_streams` are threaded through unchanged.
+pub fn effective_pdf_version_and_ext<'a>(
+    source: &'a str,
+    source_ext: i64,
+    options: &'a WriteOptions,
+    linearize: bool,
+    object_streams: bool,
+) -> (&'a str, i64) {
+    // Version half: delegate.
+    let ver = effective_pdf_version(source, options, linearize, object_streams);
+
+    // Extension level half: pairwise. options.min_ext contributes only when the
+    // effective version equals options.min_version (i.e. min_version won or
+    // tied); otherwise the source's ext wins.
+    let ext = match options.min_version.as_deref() {
+        Some(min_v) if min_v == ver => {
+            let cand = options.min_extension_level.unwrap_or(0);
+            source_ext.max(cand)
+        }
+        _ => source_ext,
+    };
+    (ver, ext)
+}
+
 /// Binary header marker emitted by qpdf on the second line of every output
 /// PDF (immediately after the `%PDF-x.y` version line).  The four bytes are
 /// all > 127, which signals to file-transfer tools that the file is binary,
@@ -6413,5 +6449,67 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(options.min_extension_level, Some(8));
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_no_bump_when_min_unset() {
+        // Source 1.7 ext 0, options empty → (1.7, 0).
+        let options = WriteOptions::default();
+        let (v, e) = effective_pdf_version_and_ext("1.7", 0, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_pairwise_min_version_bump_resets_ext_to_source() {
+        // Source (1.3, 0), min_version=1.7, min_ext=Some(0) is illegal but None is the
+        // typical case here → min wins by version → ext resets to source_ext (0).
+        let options = WriteOptions {
+            min_version: Some("1.7".into()),
+            min_extension_level: None,
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.3", 0, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_min_ext_wins_when_versions_equal() {
+        // Source (1.7, 0), min (1.7, 8) → tie on ver, min_ext wins → (1.7, 8).
+        let options = WriteOptions {
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 0, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 8);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_source_ver_higher_resets_min_ext() {
+        // Source (2.0, 0), min (1.7, 8) → source wins by ver → ext resets to source_ext (0).
+        let options = WriteOptions {
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("2.0", 0, &options, false, false);
+        assert_eq!(v, "2.0");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_source_ext_wins_when_versions_tie() {
+        // Source (1.7, 8), min (1.7, 0) → tie on ver, source_ext higher → (1.7, 8).
+        let options = WriteOptions {
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(0),
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 8);
     }
 }
