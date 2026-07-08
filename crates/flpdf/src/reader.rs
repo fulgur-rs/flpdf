@@ -777,6 +777,21 @@ impl<R: Read + Seek> Pdf<R> {
         &self.version
     }
 
+    /// Adobe extension level from the catalog's `/Extensions /ADBE
+    /// /ExtensionLevel`, resolving indirect references at each step. Returns
+    /// `None` when any link in that chain is absent or is not the expected
+    /// type. Only the `/ADBE` developer prefix is honoured, matching qpdf's
+    /// `--check` version banner and the extension level qpdf accumulates into
+    /// its `max_input_version`.
+    pub fn adobe_extension_level(&mut self) -> Option<i64> {
+        let root_ref = self.trailer().get_ref("Root")?;
+        let catalog = self.resolve(root_ref).ok()?;
+        let extensions = resolve_object_value(self, catalog.as_dict()?.get("Extensions")?.clone())?;
+        let adbe = resolve_object_value(self, extensions.as_dict()?.get("ADBE")?.clone())?;
+        let level = resolve_object_value(self, adbe.as_dict()?.get("ExtensionLevel")?.clone())?;
+        level.as_integer()
+    }
+
     /// The trailer dictionary (or the dictionary attached to the trailing xref stream
     /// for cross-reference-stream documents). This is where you'd reach for `/Root`,
     /// `/Info`, `/Size`, `/ID`, etc.
@@ -1512,6 +1527,15 @@ impl Pdf<Cursor<Vec<u8>>> {
         options: PdfOpenOptions,
     ) -> crate::Result<Self> {
         Self::open_with_options(Cursor::new(bytes), options)
+    }
+}
+
+// Resolve `value` one level: follow an `Object::Reference` through `pdf`,
+// or return a non-reference value unchanged.
+fn resolve_object_value<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Option<Object> {
+    match value {
+        Object::Reference(reference) => pdf.resolve(reference).ok(),
+        other => Some(other),
     }
 }
 
@@ -2519,5 +2543,51 @@ mod tests {
             err.to_string().contains("too deep"),
             "expected a depth error, got: {err}"
         );
+    }
+
+    /// `%PDF-1.7` document whose catalog reaches an Adobe extension level via
+    /// an *indirect* `/Extensions` reference (object 4), with an inline `/ADBE`
+    /// dictionary and an inline integer `/ExtensionLevel`.
+    fn extension_level_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        let off1 = pdf.len();
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 4 0 R >>\nendobj\n",
+        );
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let off4 = pdf.len();
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /ADBE << /BaseVersion /1.7 /ExtensionLevel 8 >> >>\nendobj\n",
+        );
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn adobe_extension_level_reads_indirect_extensions_chain() {
+        let mut pdf = Pdf::open_mem_owned(extension_level_pdf_bytes()).expect("open");
+        assert_eq!(pdf.adobe_extension_level(), Some(8));
+    }
+
+    #[test]
+    fn adobe_extension_level_absent_when_catalog_has_no_extensions() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        assert_eq!(pdf.adobe_extension_level(), None);
     }
 }
