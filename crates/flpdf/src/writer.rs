@@ -592,6 +592,64 @@ pub fn effective_pdf_version_and_ext<'a>(
     (ver, ext)
 }
 
+/// Ensure the destination Catalog carries
+/// `/Extensions << /ADBE << /BaseVersion /<version> /ExtensionLevel <lvl> >> >>`.
+///
+/// Mirrors qpdf's `QPDFWriter::addDeveloperExtension` handling
+/// (QPDFWriter.cc L1355-1450): if the Catalog has no `/Extensions`, create a
+/// direct dict carrying only `/ADBE`; if it has one (direct dict or indirect
+/// reference), resolve it to a Dictionary and overwrite the `/ADBE` entry
+/// only, leaving non-ADBE developer prefixes intact; write the resulting
+/// Extensions dict back onto the Catalog inline as a direct value.
+///
+/// Callers must only invoke this when the effective extension level is > 0.
+///
+/// # Errors
+///
+/// - [`crate::Error::Missing`] if the input has no `/Root` in its trailer.
+/// - Propagates [`Pdf::resolve`] errors when materialising the Catalog or an
+///   indirect `/Extensions` value.
+fn inject_adbe_extension<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    version: &str,
+    extension_level: i64,
+) -> Result<()> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Err(crate::Error::Missing("/Root"));
+    };
+
+    // resolve() returns an owned Object (cloned from the cache); into_dict
+    // moves the inner Dictionary out without a further clone. A non-Dict
+    // Catalog would fail every downstream write path, so bail rather than
+    // silently mutate nothing.
+    let catalog_obj = pdf.resolve(root_ref)?;
+    let Some(mut catalog) = catalog_obj.into_dict() else {
+        return Err(crate::Error::Unsupported(
+            "Catalog is not a dictionary".to_string(),
+        ));
+    };
+
+    // If Catalog had /Extensions, materialise it into an owned Dictionary
+    // regardless of whether it was a direct dict or an indirect reference —
+    // matching qpdf, which always inlines the resulting Extensions on the
+    // Catalog. remove() moves the value out so no extra clone is taken.
+    let mut extensions = match catalog.remove("Extensions") {
+        Some(Object::Dictionary(d)) => d,
+        Some(Object::Reference(r)) => pdf.resolve(r)?.into_dict().unwrap_or_default(),
+        _ => Dictionary::new(),
+    };
+
+    // Overwrite /ADBE wholesale, leaving any other developer prefix keys alone.
+    let mut adbe = Dictionary::new();
+    adbe.insert("BaseVersion", Object::Name(version.as_bytes().to_vec()));
+    adbe.insert("ExtensionLevel", Object::Integer(extension_level));
+    extensions.insert("ADBE", Object::Dictionary(adbe));
+
+    catalog.insert("Extensions", Object::Dictionary(extensions));
+    pdf.set_object(root_ref, Object::Dictionary(catalog));
+    Ok(())
+}
+
 /// Binary header marker emitted by qpdf on the second line of every output
 /// PDF (immediately after the `%PDF-x.y` version line).  The four bytes are
 /// all > 127, which signals to file-transfer tools that the file is binary,
@@ -2694,6 +2752,25 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     let Some(root_ref) = pdf.root_ref() else {
         return Err(crate::Error::Missing("/Root"));
     };
+
+    // flpdf-9hc.16.8: propagate the Adobe extension level into the destination
+    // Catalog before the renumber walk. When WriteOptions::min_extension_level
+    // requests an ext >= 1 (or the source Catalog already carries one that
+    // survives the pairwise rule) inject
+    //   /Extensions << /ADBE << /BaseVersion /<ver> /ExtensionLevel <lvl> >> >>
+    // so it becomes part of the Catalog the renumber walk sees. A source
+    // indirect /Extensions ref, if any, is inlined here and drops out of the
+    // reachable graph — mirroring qpdf's QPDFWriter behaviour.
+    {
+        let source_ver = pdf.version().to_string();
+        let source_ext = pdf.adobe_extension_level().unwrap_or(0);
+        let (eff_ver, eff_ext) =
+            effective_pdf_version_and_ext(&source_ver, source_ext, options, false, false);
+        if eff_ext > 0 {
+            let eff_ver = eff_ver.to_owned();
+            inject_adbe_extension(pdf, &eff_ver, eff_ext)?;
+        }
+    }
 
     // Catalog-first renumber (flpdf-9hc.32): assign output object numbers in
     // qpdf's `enqueueObjectsStandard` BFS order so that plain rewrite output is
@@ -6511,5 +6588,233 @@ mod tests {
         let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
         assert_eq!(v, "1.7");
         assert_eq!(e, 8);
+    }
+
+    // ── inject_adbe_extension / min_extension_level end-to-end ──────────────
+    //
+    // These exercise the full-rewrite mutation that injects the Catalog's
+    // /Extensions /ADBE dict when WriteOptions::min_extension_level requests
+    // it. They use static_id for a stable output and inspect the emitted
+    // bytes for the expected keys and header.
+
+    /// Build a minimal single-page-less classic 1.3 PDF with only a Catalog
+    /// and empty Pages tree — the shape shared with the existing
+    /// deterministic-id fixture builder.
+    fn build_ext_injection_source() -> Vec<u8> {
+        let mut src = b"%PDF-1.3\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let startxref = src.len();
+        let count = offsets.len() + 1;
+        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        src
+    }
+
+    fn write_full_rewrite_with(source: &[u8], options: &WriteOptions) -> Vec<u8> {
+        let mut pdf = crate::Pdf::open_mem(source).expect("fixture must open");
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out, options)
+            .expect("full-rewrite write must succeed");
+        out
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_injects_extensions_adbe_when_min_ext_gt_zero() {
+        // Source is 1.3 with no /Extensions. min_version=1.7 wins the version
+        // half; because eff_ver == options.min_version, the ext half is
+        // max(source_ext=0, min_ext=8) = 8, so injection fires.
+        let src = build_ext_injection_source();
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+
+        assert!(
+            out.starts_with(b"%PDF-1.7\n"),
+            "min_version=1.7 must raise the header; first 12 bytes: {:?}",
+            &out[..out.len().min(12)]
+        );
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("/Extensions"), "Catalog must carry /Extensions");
+        assert!(s.contains("/ADBE"), "Extensions must carry /ADBE");
+        assert!(
+            s.contains("/BaseVersion /1.7"),
+            "ADBE must carry /BaseVersion /1.7"
+        );
+        assert!(
+            s.contains("/ExtensionLevel 8"),
+            "ADBE must carry /ExtensionLevel 8"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_no_injection_when_min_ext_is_none() {
+        // Same version bump but no min_extension_level → header rises to 1.7
+        // but no /Extensions injection, matching qpdf's --min-version=1.7.
+        let src = build_ext_injection_source();
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: None,
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+
+        assert!(out.starts_with(b"%PDF-1.7\n"));
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            !s.contains("/Extensions"),
+            "no min_extension_level → no /Extensions injection"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_no_injection_when_min_ext_is_zero() {
+        // Effective extension level 0 must not trigger injection even when
+        // min_extension_level is explicitly Some(0).
+        let src = build_ext_injection_source();
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(0),
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+
+        assert!(out.starts_with(b"%PDF-1.7\n"));
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            !s.contains("/Extensions"),
+            "eff_ext == 0 → no /Extensions injection"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_ext_injection_preserves_non_adbe_developer_prefix() {
+        // Source has a direct /Extensions dict with a non-ADBE developer
+        // prefix. Injection must overwrite only /ADBE and leave the other
+        // prefix intact — mirroring qpdf's QPDFWriter behaviour.
+        let mut src = b"%PDF-1.3\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+              /Extensions << /XYZW << /BaseVersion /1.3 /ExtensionLevel 1 >> >> \
+              >>\nendobj\n",
+        );
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let startxref = src.len();
+        let count = offsets.len() + 1;
+        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("/ADBE"), "injected /ADBE must appear");
+        assert!(
+            s.contains("/BaseVersion /1.7"),
+            "new /ADBE must carry the effective /BaseVersion"
+        );
+        assert!(
+            s.contains("/ExtensionLevel 8"),
+            "new /ADBE must carry the effective /ExtensionLevel"
+        );
+        assert!(
+            s.contains("/XYZW"),
+            "non-ADBE developer prefix must survive: {s}"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_ext_injection_follows_indirect_extensions_ref() {
+        // Source /Extensions is an indirect reference to a dict that already
+        // has an ADBE at an older level plus a non-ADBE prefix. Injection
+        // must overwrite /ADBE with the new (BaseVersion, ExtensionLevel),
+        // preserve the other prefix, and inline the result on the Catalog.
+        let mut src = b"%PDF-1.3\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 3 0 R >>\nendobj\n",
+        );
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"3 0 obj\n<< /ADBE << /BaseVersion /1.7 /ExtensionLevel 3 >> \
+              /ACRO << /BaseVersion /1.7 /ExtensionLevel 1 >> >>\nendobj\n",
+        );
+        let startxref = src.len();
+        let count = offsets.len() + 1;
+        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("/ExtensionLevel 8"),
+            "/ADBE must have been overwritten with the new level: {s}"
+        );
+        assert!(
+            !s.contains("/ExtensionLevel 3"),
+            "old /ADBE /ExtensionLevel 3 must not survive: {s}"
+        );
+        assert!(
+            s.contains("/ACRO"),
+            "non-ADBE developer prefix must survive: {s}"
+        );
     }
 }
