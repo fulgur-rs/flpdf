@@ -1409,6 +1409,69 @@ mod byte_gate {
             );
         }
     }
+
+    #[test]
+    fn overlay_encrypted_source_extension_level_bytes() {
+        use std::fs;
+
+        let dest_bytes = fs::read(fixture_path("tests/fixtures/compat/three-page.pdf"))
+            .expect("read dest fixture");
+        let source_bytes = fs::read(fixture_path("tests/fixtures/compat/one-page-enc-u.pdf"))
+            .expect("read encrypted source fixture");
+        let golden = fs::read(fixture_path(
+            "tests/golden/references/overlay/three-page-overlay-encrypted-source.pdf",
+        ))
+        .expect("read encrypted-source golden");
+
+        let mut dest = Pdf::open(std::io::Cursor::new(dest_bytes)).expect("open dest");
+        let src_open_opts = crate::PdfOpenOptions {
+            password: b"u".to_vec(),
+            ..crate::PdfOpenOptions::default()
+        };
+        let mut src = Pdf::open_with_options(std::io::Cursor::new(source_bytes), src_open_opts)
+            .expect("open encrypted source");
+
+        // Mirror flpdf-cli accumulation manually: the CLI walks dest and
+        // every overlay/underlay source; here there is exactly one source.
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: None,
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).expect("apply overlay");
+
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            newline_before_endstream: NewlineBeforeEndstream::Never,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut dest, &mut out, &opts).expect("write");
+
+        if let Some(off) = first_diff(&out, &golden) {
+            let lo = off.saturating_sub(24);
+            let g = golden.get(off).copied().unwrap_or(0);
+            let f = out.get(off).copied().unwrap_or(0);
+            panic!(
+                "overlay output not byte-identical to qpdf golden \
+                 three-page-overlay-encrypted-source.pdf \
+                 (flpdf={} bytes, golden={} bytes)\n\
+                 first diff at offset {off} (golden=0x{g:02x} flpdf=0x{f:02x})\n\
+                 golden[{lo}..]: {:?}\nflpdf [{lo}..]: {:?}",
+                out.len(),
+                golden.len(),
+                String::from_utf8_lossy(&golden[lo..(off + 24).min(golden.len())]),
+                String::from_utf8_lossy(&out[lo..(off + 24).min(out.len())]),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
