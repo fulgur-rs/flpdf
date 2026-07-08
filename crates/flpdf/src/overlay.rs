@@ -1313,6 +1313,102 @@ mod byte_gate {
         let actual = write_static_id(&mut dest);
         assert_byte_identical(&actual, "swapped-box-r90-overlay-self.pdf");
     }
+
+    // ---- source version-floor propagation --------------------------------
+    //
+    // These gates prove the writer half of qpdf's cross-source version rule
+    // in isolation from the CLI. The CLI wires the same accumulation into
+    // its overlay/underlay pipeline; here the test mirrors it explicitly so
+    // WriteOptions.min_version / min_extension_level are the sole inputs
+    // exercised at the library boundary.
+    use std::io::{Read, Seek};
+
+    /// Return `(max_pdf_version, max_extension_level)` over two open PDFs
+    /// using qpdf's pairwise rule: the higher version wins outright, and a
+    /// higher version RESETS the extension level (only equal versions merge
+    /// via `max`). Mirrors what `flpdf rewrite` needs to accumulate across
+    /// dest + all overlay/underlay sources.
+    fn accumulate_max<R1: Read + Seek, R2: Read + Seek>(
+        a: &mut Pdf<R1>,
+        b: &mut Pdf<R2>,
+    ) -> ((u8, u8), i64) {
+        let va = crate::writer::parse_pdf_version(a.version()).unwrap_or((1, 0));
+        let vb = crate::writer::parse_pdf_version(b.version()).unwrap_or((1, 0));
+        let ea = a.adobe_extension_level().unwrap_or(0);
+        let eb = b.adobe_extension_level().unwrap_or(0);
+        match va.cmp(&vb) {
+            std::cmp::Ordering::Greater => (va, ea),
+            std::cmp::Ordering::Less => (vb, eb),
+            std::cmp::Ordering::Equal => (va, ea.max(eb)),
+        }
+    }
+
+    /// Resolve a workspace-relative path (from the repo root) to an absolute
+    /// path so `cargo test` works from any cwd. Matches the neighbouring
+    /// `fixture` / `golden` helpers' use of `CARGO_MANIFEST_DIR`.
+    fn fixture_path(rel: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel)
+    }
+
+    #[test]
+    fn overlay_pure_source_version_floor_bytes() {
+        use std::fs;
+
+        let dest_bytes = fs::read(fixture_path("tests/fixtures/compat/three-page.pdf"))
+            .expect("read dest fixture");
+        let source_bytes = fs::read(fixture_path("tests/fixtures/compat/one-page-v17.pdf"))
+            .expect("read source fixture");
+        let golden = fs::read(fixture_path(
+            "tests/golden/references/overlay/three-page-overlay-v17-source.pdf",
+        ))
+        .expect("read golden");
+
+        let mut dest = Pdf::open(std::io::Cursor::new(dest_bytes)).expect("open dest");
+        let mut src = Pdf::open(std::io::Cursor::new(source_bytes)).expect("open source");
+
+        // Mirror flpdf-cli accumulation manually: the CLI walks dest and
+        // every overlay/underlay source; here there is exactly one source.
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: None,
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).expect("apply overlay");
+
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            newline_before_endstream: NewlineBeforeEndstream::Never,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut dest, &mut out, &opts).expect("write");
+
+        if let Some(off) = first_diff(&out, &golden) {
+            let lo = off.saturating_sub(24);
+            let g = golden.get(off).copied().unwrap_or(0);
+            let f = out.get(off).copied().unwrap_or(0);
+            panic!(
+                "overlay output not byte-identical to qpdf golden \
+                 three-page-overlay-v17-source.pdf \
+                 (flpdf={} bytes, golden={} bytes)\n\
+                 first diff at offset {off} (golden=0x{g:02x} flpdf=0x{f:02x})\n\
+                 golden[{lo}..]: {:?}\nflpdf [{lo}..]: {:?}",
+                out.len(),
+                golden.len(),
+                String::from_utf8_lossy(&golden[lo..(off + 24).min(golden.len())]),
+                String::from_utf8_lossy(&out[lo..(off + 24).min(out.len())]),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
