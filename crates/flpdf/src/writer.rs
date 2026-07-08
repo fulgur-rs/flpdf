@@ -228,6 +228,22 @@ pub struct WriteOptions {
     /// Mirrors `qpdf --min-version`.
     pub min_version: Option<String>,
 
+    /// Enforce a minimum Adobe extension level in the output catalog's
+    /// `/Extensions /ADBE /ExtensionLevel`.
+    ///
+    /// Combined with [`Self::min_version`] via qpdf's pairwise rule: a higher
+    /// `min_version` **resets** the extension level (does not carry it across a
+    /// version bump). When the resulting effective level is greater than 0, the
+    /// writer injects
+    /// `/Extensions << /ADBE << /BaseVersion /<ver> /ExtensionLevel <lvl> >> >>`
+    /// into the Catalog on the full-rewrite path. When 0, no injection (existing
+    /// Catalog untouched).
+    ///
+    /// Mirrors qpdf's `--min-version <version>-<level>` (the level portion) and
+    /// the extension_level `QPDFJob` accumulates into `max_input_version` from
+    /// every opened input's Catalog.
+    pub min_extension_level: Option<i64>,
+
     /// Force the output PDF version header to exactly this value, ignoring the
     /// source version and the linearize floor.
     ///
@@ -6382,5 +6398,20 @@ mod tests {
             contains(&ct, b"/Crypt"),
             "the exempt /Metadata stream must be tagged with a /Crypt filter"
         );
+    }
+
+    #[test]
+    fn write_options_default_min_extension_level_is_none() {
+        let options = WriteOptions::default();
+        assert!(options.min_extension_level.is_none());
+    }
+
+    #[test]
+    fn write_options_min_extension_level_stores_and_returns_value() {
+        let options = WriteOptions {
+            min_extension_level: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(options.min_extension_level, Some(8));
     }
 }
