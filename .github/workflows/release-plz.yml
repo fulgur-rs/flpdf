@@ -41,16 +41,24 @@ jobs:
   check-releases:
     name: Detect a real release
     runs-on: ubuntu-latest
+    # `pull-requests: read` lets the detector call
+    # `repos/{repo}/commits/{sha}/pulls` to verify that a `chore: release …`
+    # commit actually came from a `release-plz-*` PR (see fallback path below).
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       has_releases: ${{ steps.check.outputs.has_releases }}
     steps:
       - name: Determine whether this push is an actual release
         id: check
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
           HEAD_MSG: ${{ github.event.head_commit.message }}
-          COMMIT_MSGS: ${{ toJSON(github.event.commits.*.message) }}
+          COMMITS: ${{ toJSON(github.event.commits) }}
         run: |
           set -euo pipefail
           emit() { echo "has_releases=$1" >> "$GITHUB_OUTPUT"; echo "has_releases=$1 ($2)"; }
@@ -71,25 +79,42 @@ jobs:
             emit true "release-plz merge commit"; exit 0
           fi
 
-          # Merge-method-agnostic path: release-plz always creates a
-          # `chore: release …` commit for a real release. It is in the push
-          # whether the Release PR was merge-committed (as an inner commit) or
-          # squash-merged (as the squash commit itself), so scan EVERY pushed
-          # commit subject.
+          # Merge-method-agnostic fallback: release-plz always emits a
+          # `chore: release …` commit for a real release. It reaches main whether
+          # the Release PR was merge-committed (as an inner commit) or
+          # squash-merged (as the squash commit itself), so scan every pushed
+          # commit's subject.
           #
-          # Subject shape depends on whether all released packages share one
-          # version: with a single common version release-plz emits
-          # `chore: release vX.Y.Z` (observed on the version_group sibling repo);
-          # with differing per-crate versions it emits a bare `chore: release`
-          # (observed on the decoupled sibling repo). flpdf is a lockstep
-          # single-version workspace, so it takes the versioned form — but accept
-          # BOTH shapes for robustness. Anchor to end-of-line or ` vN` so an
-          # ordinary subject like `chore: release docs` doesn't false-positive and
-          # pause an unrelated merge on the release approval.
-          if printf '%s' "$COMMIT_MSGS" | jq -r '.[]? | split("\n")[0]' \
-               | grep -qE '^chore: release( v[0-9]|$)'; then
-            emit true "chore: release commit in push"; exit 0
-          fi
+          # Subject shape depends on whether released packages share one version:
+          # with a single common version release-plz emits `chore: release vX.Y.Z`
+          # (single-version workspaces, like flpdf); with differing per-crate
+          # versions it emits a bare `chore: release`. Accept BOTH, anchored to
+          # end-of-line or ` vN` so an unrelated subject like `chore: release
+          # docs` cannot false-positive.
+          #
+          # Provenance guard: the subject test alone is spoofable — a PR from an
+          # unrelated branch can carry a `chore: release vX.Y.Z` commit, and the
+          # release-pr-approval gate (release-pr-approval-gate.yml) only fires
+          # for `release-plz-*` head refs. Verify the commit was made in a
+          # `release-plz-*` PR by resolving its associated PR via the API. Any
+          # API failure or missing/non-matching association is treated as
+          # "not a release" (fail-closed).
+          candidate_shas=$(printf '%s' "$COMMITS" | jq -r '
+            .[]?
+            | select((.message // "" | split("\n")[0])
+                     | test("^chore: release( v[0-9]|$)"))
+            | .id')
+          for sha in $candidate_shas; do
+            head_refs=$(gh api "repos/$REPO/commits/$sha/pulls" \
+              --jq '.[] | select(.merged_at != null) | .head.ref' 2>/dev/null || true)
+            for ref in $head_refs; do
+              case "$ref" in
+                release-plz-*)
+                  emit true "chore: release from release-plz-* PR ($sha)"; exit 0
+                  ;;
+              esac
+            done
+          done
 
           emit false "no release markers"
 
