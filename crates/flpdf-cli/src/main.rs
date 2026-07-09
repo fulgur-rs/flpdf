@@ -2906,9 +2906,6 @@ fn run_rewrite(
     verbose: bool,
     options: WriteOptions,
 ) -> CliResult<()> {
-    // Consumed by upcoming overlay-progress and "wrote file" diagnostics; kept
-    // silent here so this plumbing commit is byte-parity-neutral.
-    let _ = verbose;
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
 
@@ -3177,6 +3174,29 @@ fn run_rewrite(
             }
             options.min_version = Some(format!("{}.{}", max_ver.0, max_ver.1));
             options.min_extension_level = (max_ext > 0).then_some(max_ext);
+
+            // --verbose: emit the per-destination-page overlay/underlay plan
+            // to stderr before painting, matching qpdf's --verbose output
+            // ("processing underlay/overlay" header + `  page N` +
+            // `    <file> overlay|underlay <src>`). The report is computed
+            // via the flpdf::overlay_verbose_report inspection API so the
+            // ordering (underlays first, then overlays, in declaration
+            // order across specs) is source-shared with apply_overlay_specs.
+            if verbose {
+                let report = flpdf::overlay_verbose_report(&mut pdf, &mut built)?;
+                eprintln!("flpdf: processing underlay/overlay");
+                for page in &report {
+                    eprintln!("  page {}", page.dest_page);
+                    for src in &page.sources {
+                        let file = &overlay_specs[src.spec_index].file;
+                        let kind_str = match src.kind {
+                            flpdf::OverlayKind::Underlay => "underlay",
+                            flpdf::OverlayKind::Overlay => "overlay",
+                        };
+                        eprintln!("    {} {} {}", file, kind_str, src.src_page);
+                    }
+                }
+            }
 
             flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
         }
