@@ -614,20 +614,28 @@ fn inject_adbe_extension<R: Read + Seek>(
     version: &str,
     extension_level: i64,
 ) -> Result<()> {
+    // cov:ignore-start: defensive /Root guard. inject_adbe_extension is only
+    // called from write_pdf_full_rewrite AFTER its own root_ref check has
+    // already returned Missing("/Root"), so this branch is unreachable in the
+    // normal pipeline.
     let Some(root_ref) = pdf.root_ref() else {
         return Err(crate::Error::Missing("/Root"));
     };
+    // cov:ignore-end
 
     // resolve() returns an owned Object (cloned from the cache); into_dict
     // moves the inner Dictionary out without a further clone. A non-Dict
     // Catalog would fail every downstream write path, so bail rather than
     // silently mutate nothing.
     let catalog_obj = pdf.resolve(root_ref)?;
+    // cov:ignore-start: defensive non-Dict Catalog guard. Every downstream
+    // write path rejects a non-dict Catalog before reaching this helper.
     let Some(mut catalog) = catalog_obj.into_dict() else {
         return Err(crate::Error::Unsupported(
             "Catalog is not a dictionary".to_string(),
         ));
     };
+    // cov:ignore-end
 
     // If Catalog had /Extensions, materialise it into an owned Dictionary
     // regardless of whether it was a direct dict or an indirect reference —
@@ -6649,7 +6657,7 @@ mod tests {
         assert!(
             out.starts_with(b"%PDF-1.7\n"),
             "min_version=1.7 must raise the header; first 12 bytes: {:?}",
-            &out[..out.len().min(12)]
+            &out[..out.len().min(12)] // cov:ignore: diagnostic format arg only evaluated on assertion failure
         );
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("/Extensions"), "Catalog must carry /Extensions");
