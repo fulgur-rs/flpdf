@@ -2775,8 +2775,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         let (eff_ver, eff_ext) =
             effective_pdf_version_and_ext(&source_ver, source_ext, options, false, false);
         if eff_ext > 0 {
-            let eff_ver = eff_ver.to_owned();
-            inject_adbe_extension(pdf, &eff_ver, eff_ext)?;
+            inject_adbe_extension(pdf, eff_ver, eff_ext)?;
         }
     }
 
