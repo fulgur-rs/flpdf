@@ -699,25 +699,38 @@ fn inject_adbe_extension<R: Read + Seek>(
 /// - Propagates [`Pdf::resolve`] errors when materialising the Catalog or an
 ///   indirect `/Extensions` value.
 fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
+    // cov:ignore-start: defensive /Root guard. strip_adbe_extension is only
+    // reached after write_pdf_full_rewrite passes its own root_ref check on
+    // the same Pdf.
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(());
     };
+    // cov:ignore-end
     let catalog_obj = pdf.resolve(root_ref)?;
+    // cov:ignore-start: defensive non-Dict Catalog guard, mirroring
+    // inject_adbe_extension. Every downstream write path rejects a non-dict
+    // Catalog before reaching this helper.
     let Some(mut catalog) = catalog_obj.into_dict() else {
         return Ok(());
     };
+    // cov:ignore-end
     let mut extensions = match catalog.remove("Extensions") {
         Some(Object::Dictionary(d)) => d,
         Some(Object::Reference(r)) => pdf.resolve(r)?.into_dict().unwrap_or_default(),
+        // cov:ignore-start: unreachable when source_ext > 0.
+        // adobe_extension_level() returns Some(N) only after walking through a
+        // Dict-or-Ref /Extensions; the caller gates strip on source_ext > 0.
         _ => return Ok(()),
+        // cov:ignore-end
     };
     if extensions.remove("ADBE").is_none() {
-        // No ADBE was present. Put /Extensions back exactly as we found it
-        // (as an inlined direct dict, matching inject_adbe_extension's
-        // normalization) so downstream sees the same shape.
+        // cov:ignore-start: unreachable when source_ext > 0. adobe_extension_level()
+        // returns Some(N) only if /Extensions carries /ADBE with an integer
+        // /ExtensionLevel; the caller gates strip on source_ext > 0.
         catalog.insert("Extensions", Object::Dictionary(extensions));
         pdf.set_object(root_ref, Object::Dictionary(catalog));
         return Ok(());
+        // cov:ignore-end
     }
     if extensions.iter().next().is_some() {
         catalog.insert("Extensions", Object::Dictionary(extensions));
@@ -7065,6 +7078,97 @@ mod tests {
             None,
             "stale ADBE from source (BaseVersion 1.3) must not survive when the \
              ObjStm floor drops the effective ext to 0"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_generate_mode_strips_stale_adbe_via_indirect_ref_preserving_other_prefix(
+    ) {
+        // Sibling of *_on_floor_bump but exercising the two remaining
+        // strip_adbe_extension branches: (1) /Extensions is an *indirect*
+        // reference (line 711), and (2) the source /Extensions carries a
+        // non-ADBE developer prefix that must survive after /ADBE is
+        // removed (line 723). Same trigger: ObjStm floor bumps 1.3 → 1.5.
+        let mut src = b"%PDF-1.3\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 3 0 R >>\nendobj\n",
+        );
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"3 0 obj\n<< /ADBE << /BaseVersion /1.3 /ExtensionLevel 8 >> \
+              /XYZW << /BaseVersion /1.3 /ExtensionLevel 1 >> >>\nendobj\n",
+        );
+        let startxref = src.len();
+        let count = offsets.len() + 1;
+        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        {
+            let mut src_pdf = crate::Pdf::open_mem(&src).expect("source must open");
+            assert_eq!(
+                src_pdf.adobe_extension_level(),
+                Some(8),
+                "fixture must carry source ADBE ExtensionLevel 8 through an indirect ref"
+            );
+        }
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            object_streams: ObjectStreamMode::Generate,
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+        assert!(
+            out.starts_with(b"%PDF-1.5\n"),
+            "ObjStm floor must bump the header to 1.5"
+        );
+        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
+        assert_eq!(
+            reopened.adobe_extension_level(),
+            None,
+            "stale ADBE from source must be stripped when the ObjStm floor \
+             drops the effective ext to 0"
+        );
+        // The non-ADBE developer prefix must survive the strip. Walk the
+        // Catalog manually. strip_adbe_extension inlines the mutated
+        // /Extensions back as a direct Dictionary on the Catalog, so we can
+        // access it directly without an extra resolve step. Extract owned
+        // Catalog dict via resolve+into_dict so the mutable borrow on
+        // `reopened` used by resolve() is released before subsequent asserts.
+        let root_ref = reopened.trailer().get_ref("Root").expect("Root ref");
+        let catalog_dict = reopened
+            .resolve(root_ref)
+            .expect("resolve root")
+            .into_dict()
+            .expect("root is dict");
+        // strip_adbe_extension always inlines /Extensions as a direct
+        // Dictionary, so a non-Dict variant here would indicate a code bug —
+        // panic rather than silently pass. Using as_dict keeps the assertion
+        // failure informative if this invariant ever breaks.
+        let ext_dict = catalog_dict
+            .get("Extensions")
+            .expect("Extensions key survives strip")
+            .as_dict()
+            .expect("Extensions must be present as a direct dict after strip");
+        assert!(
+            ext_dict.get("ADBE").is_none(),
+            "ADBE must be gone: {ext_dict:?}"
+        );
+        assert!(
+            ext_dict.get("XYZW").is_some(),
+            "non-ADBE developer prefix must survive: {ext_dict:?}"
         );
     }
 
