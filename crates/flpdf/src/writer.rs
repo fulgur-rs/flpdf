@@ -2869,22 +2869,38 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     out: W,
     options: &WriteOptions,
 ) -> Result<()> {
-    // Snapshot the source Catalog BEFORE any ADBE injection / strip mutates
-    // it, so those output-only mutations do not leak into the caller's Pdf
-    // handle. Restored below regardless of whether the write succeeds — the
-    // Pdf handle is safe to reuse for subsequent writes (or for read APIs
-    // like page enumeration) after this call returns.
-    let catalog_snapshot = pdf
-        .root_ref()
-        .and_then(|r| pdf.resolve(r).ok().map(|catalog| (r, catalog)));
+    // Snapshot the source Catalog AND its dirty-flag state BEFORE any ADBE
+    // injection / strip mutates them, so those output-only mutations do not
+    // leak into the caller's Pdf handle. Restored below regardless of whether
+    // the write succeeds — the Pdf handle is safe to reuse for subsequent
+    // writes (or for read APIs like page enumeration) after this call
+    // returns. The dirty flag is captured too because `Pdf::set_object` used
+    // for the restore unconditionally marks its target dirty; without the
+    // dirty-flag restore a subsequent `write_pdf` incremental append would
+    // spuriously emit a Catalog delta.
+    let catalog_snapshot = pdf.root_ref().and_then(|r| {
+        let was_dirty = pdf.is_dirty(r);
+        pdf.resolve(r).ok().map(|catalog| (r, catalog, was_dirty))
+    });
 
     let result = write_pdf_full_rewrite_inner(pdf, out, options);
 
-    // Restore the original Catalog. Runs on success and on error alike so
-    // partial injection state cannot leak either.
-    if let Some((root_ref, original)) = catalog_snapshot {
+    // Restore the original Catalog and its pre-write dirty state. Runs on
+    // success and on error alike so partial injection state cannot leak
+    // either. `set_object` marks the ref dirty; if the ref was clean before
+    // this call, clear the dirty flag to leave the caller's Pdf byte-for-byte
+    // equivalent to its pre-call state.
+    // cov:ignore-start: outer if-let and inner-if closing braces are
+    // llvm-cov region artifacts; the interior is exercised by
+    // write_pdf_full_rewrite_does_not_leave_root_dirty_flag_set and
+    // write_pdf_full_rewrite_preserves_pre_existing_root_dirty_flag.
+    if let Some((root_ref, original, was_dirty)) = catalog_snapshot {
         pdf.set_object(root_ref, original);
+        if !was_dirty {
+            pdf.clear_dirty(root_ref);
+        }
     }
+    // cov:ignore-end
 
     result
 }
@@ -7516,6 +7532,71 @@ mod tests {
             reopened.adobe_extension_level(),
             Some(8),
             "output must carry the requested ADBE"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_does_not_leave_root_dirty_flag_set() {
+        // Codex round-4 P2 #1: even after restoring the pre-write Catalog,
+        // `Pdf::set_object` used for the restore unconditionally marks the
+        // ref dirty. A subsequent incremental `write_pdf` would then emit a
+        // no-op Catalog delta, breaking the signed-prefix-preserving no-op
+        // workflow. Verify the outer wrapper clears the dirty flag when the
+        // ref was clean before the write.
+        let src = build_ext_injection_source();
+        let mut pdf = crate::Pdf::open_mem_owned(src).expect("open");
+        let root_ref = pdf.root_ref().expect("Root");
+        // Baseline: Root must be clean before any write.
+        assert!(!pdf.is_dirty(root_ref), "Root must be clean pre-write");
+
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..WriteOptions::default()
+        };
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out, &options).expect("write");
+
+        // Root must remain clean after the write — the injection's mutation
+        // was fully rolled back (value + dirty flag).
+        assert!(
+            !pdf.is_dirty(root_ref),
+            "Root dirty flag must be cleared after the full-rewrite restore"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_preserves_pre_existing_root_dirty_flag() {
+        // Sibling of _does_not_leave_root_dirty_flag_set: if the caller had
+        // already marked Root dirty BEFORE the full-rewrite (e.g. via a prior
+        // set_object), the restore path must LEAVE the dirty flag set —
+        // clearing it would silently drop the caller's own mutation.
+        let src = build_ext_injection_source();
+        let mut pdf = crate::Pdf::open_mem_owned(src).expect("open");
+        let root_ref = pdf.root_ref().expect("Root");
+
+        // Caller-side mutation: mark Root dirty explicitly by re-storing its
+        // current value. set_object always dirties the ref regardless of
+        // whether the value actually changed.
+        let catalog = pdf.resolve(root_ref).expect("resolve root");
+        pdf.set_object(root_ref, catalog);
+        assert!(pdf.is_dirty(root_ref), "sanity: caller marked Root dirty");
+
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..WriteOptions::default()
+        };
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out, &options).expect("write");
+
+        assert!(
+            pdf.is_dirty(root_ref),
+            "pre-existing Root dirty flag must survive the full-rewrite restore"
         );
     }
 

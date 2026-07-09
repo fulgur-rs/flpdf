@@ -877,6 +877,24 @@ impl<R: Read + Seek> Pdf<R> {
         self.dirty_object_refs.iter().copied().collect()
     }
 
+    /// `true` when `object_ref` is currently marked dirty (i.e. has been
+    /// mutated via [`Self::set_object`] or [`Self::delete_object`] since the
+    /// Pdf was opened). Used by the full-rewrite writer to detect whether a
+    /// pre-existing dirty flag existed before an output-only Catalog mutation
+    /// so the flag can be preserved through a restore.
+    pub(crate) fn is_dirty(&self, object_ref: ObjectRef) -> bool {
+        self.dirty_object_refs.contains(&object_ref)
+    }
+
+    /// Remove `object_ref` from the dirty set without touching the cache
+    /// value. Used by the full-rewrite writer to undo a spurious dirty flag
+    /// after restoring the pre-write Catalog snapshot: `Self::set_object`
+    /// unconditionally marks its target dirty, so the restore path calls
+    /// `clear_dirty` when the caller's Pdf was clean prior to the write.
+    pub(crate) fn clear_dirty(&mut self, object_ref: ObjectRef) {
+        self.dirty_object_refs.remove(&object_ref);
+    }
+
     /// Every object reference known from the cross-reference table, including objects
     /// that have not yet been parsed.
     pub fn object_refs(&self) -> Vec<ObjectRef> {
