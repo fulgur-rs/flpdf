@@ -55,6 +55,29 @@ fn run_cli(stem: &str, extra: &[&str]) -> Vec<u8> {
     std::fs::read(&out).unwrap_or_else(|e| panic!("read flpdf output for {stem}: {e}"))
 }
 
+/// Run `flpdf rewrite --full-rewrite --static-id <fixture> <out>` through the
+/// actual binary and return the written bytes. Mirrors the library-level
+/// `cmp_diff_zero_tests` but goes through the CLI so a divergence in argv
+/// parsing, `WriteOptions` assembly, or defaults (e.g. `--newline-before-endstream`)
+/// is caught end-to-end.
+fn run_cli_full_rewrite_static_id(stem: &str) -> Vec<u8> {
+    let outdir = tempfile::tempdir().unwrap();
+    let out = outdir.path().join("out.pdf");
+    let input = fixture(stem);
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg("--full-rewrite")
+        .arg("--static-id")
+        .arg(&input)
+        .arg(&out)
+        .assert()
+        .success();
+
+    std::fs::read(&out).unwrap_or_else(|e| panic!("read flpdf output for {stem}: {e}"))
+}
+
 fn assert_byte_identical(stem: &str, kind: &str, extra: &[&str]) {
     let actual = run_cli(stem, extra);
     let expected = golden(stem, kind);
@@ -121,4 +144,48 @@ fn cli_two_page_linearize_byte_identical() {
 #[test]
 fn cli_three_page_linearize_byte_identical() {
     assert_byte_identical("three-page", "linearize", &[]);
+}
+
+// ── Plain full rewrite + static-id (no linearize) ─────────────────────────────
+//
+// These cover the plain full-rewrite path, which uses the CLI's default
+// `--newline-before-endstream=never` framing to match qpdf. The linearize tests
+// above force `Never` internally regardless of the CLI default, so only these
+// rows would regress if the CLI default were flipped back to `y`.
+
+fn assert_full_rewrite_static_id_byte_identical(stem: &str) {
+    let actual = run_cli_full_rewrite_static_id(stem);
+    let expected = golden(stem, "static-id");
+    if actual == expected {
+        return;
+    }
+    let common = actual.len().min(expected.len());
+    let off = (0..common)
+        .find(|&i| actual[i] != expected[i])
+        .unwrap_or(common);
+    let lo = off.saturating_sub(24);
+    panic!(
+        "{stem} (static-id via full-rewrite): CLI output diverged from qpdf golden \
+         (flpdf={} bytes, golden={} bytes, first diff at byte {off})\n\
+         flpdf : {:?}\ngolden: {:?}",
+        actual.len(),
+        expected.len(),
+        String::from_utf8_lossy(&actual[lo..(off + 24).min(actual.len())]),
+        String::from_utf8_lossy(&expected[lo..(off + 24).min(expected.len())]),
+    );
+}
+
+#[test]
+fn cli_one_page_full_rewrite_static_id_byte_identical() {
+    assert_full_rewrite_static_id_byte_identical("one-page");
+}
+
+#[test]
+fn cli_two_page_full_rewrite_static_id_byte_identical() {
+    assert_full_rewrite_static_id_byte_identical("two-page");
+}
+
+#[test]
+fn cli_three_page_full_rewrite_static_id_byte_identical() {
+    assert_full_rewrite_static_id_byte_identical("three-page");
 }

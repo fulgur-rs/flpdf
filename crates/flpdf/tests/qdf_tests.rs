@@ -200,9 +200,9 @@ fn qdf_mode_strips_filter_from_flate_stream() {
         "qdf=true: stream data must be the decoded (human-readable) bytes"
     );
     // The holder body must equal the ON-DISK stream byte count that
-    // flpdf::fix_qdf recomputes: the payload plus the single EOL byte the
-    // default NewlineBeforeEndstream::Yes framing inserts before `endstream`
-    // (the raw payload here does not end with a newline).
+    // flpdf::fix_qdf recomputes. QDF mode forces `NewlineBeforeEndstream::Yes`
+    // (qpdf --qdf parity), so a single EOL is inserted before `endstream`
+    // when the payload does not already end with one.
     assert_eq!(
         read_length_holder(&output, s.length_holder),
         raw.len() as i64 + 1,
@@ -244,8 +244,9 @@ fn qdf_mode_keeps_dct_stream_verbatim() {
         fake_jpeg,
         "qdf=true: DCTDecode image data must be bit-for-bit unchanged"
     );
-    // Holder body equals the on-disk byte count (verbatim payload + the
-    // single EOL the Yes framing inserts; fake_jpeg does not end in EOL).
+    // Holder body equals the on-disk byte count. QDF mode forces
+    // `NewlineBeforeEndstream::Yes`, so a single EOL is inserted before
+    // `endstream` (the verbatim payload does not end in EOL).
     assert_eq!(
         read_length_holder(&output, s.length_holder),
         fake_jpeg.len() as i64 + 1,
@@ -276,8 +277,9 @@ fn qdf_mode_length_matches_decoded_bytes() {
     // bare-integer holder object — qpdf 11.9.0 --qdf + flpdf::fix_qdf parity.
     let s = parse_qdf_stream(&output, metadata_stream_number(&output));
 
-    // The holder body must equal the ON-DISK byte count fix_qdf recomputes
-    // (payload + the single EOL the Yes framing adds; raw has no trailing EOL).
+    // The holder body must equal the ON-DISK byte count fix_qdf recomputes.
+    // QDF mode forces `NewlineBeforeEndstream::Yes`, so a single EOL is
+    // inserted before `endstream` (the raw payload has no trailing EOL).
     let holder_value = read_length_holder(&output, s.length_holder);
     assert_eq!(
         holder_value,
@@ -444,6 +446,8 @@ fn qdf_mode_strips_filter_from_lzw_stream() {
         expected_plain,
         "qdf=true: LZWDecode stream data must be the decoded bytes"
     );
+    // QDF mode forces `NewlineBeforeEndstream::Yes`, so a single EOL is
+    // inserted before `endstream` (the decoded payload has no trailing EOL).
     assert_eq!(
         read_length_holder(&output, s.length_holder),
         expected_plain.len() as i64 + 1,

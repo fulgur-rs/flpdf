@@ -119,12 +119,15 @@ fn id_words(bytes: &[u8]) -> (String, String) {
 // stream (was `/W [1 8 4]`, no predictor, container-above-max). Both change the
 // container/xref bytes and therefore this content-derived /ID + SHA-256. The new
 // output is qpdf --check clean (verified manually on the fixture).
+// Re-blessed again when the library default for `NewlineBeforeEndstream` flipped
+// from `Yes` to `Never` (qpdf-parity default). Bodies no longer carry a `\n`
+// before each `endstream`, so the digest over the write output shifts.
 #[cfg(not(feature = "qpdf-zlib-compat"))]
-const GOLDEN_SHA256: &str = "c52eae32856edaa0dba4654be7c82fea0d7c9d0ca30b9d9b223db7c63b926080";
+const GOLDEN_SHA256: &str = "a348ebd012621cc7c5700c2a4c335da27c70d5b7734e7e382a999a2bb6967a0d";
 #[cfg(not(feature = "qpdf-zlib-compat"))]
-const GOLDEN_ID0: &str = "1b4312b11114463904503773ef543ad9";
+const GOLDEN_ID0: &str = "4b2f80f3a45e4d60d2731eb7604f831d";
 #[cfg(not(feature = "qpdf-zlib-compat"))]
-const GOLDEN_ID1: &str = "1b4312b11114463904503773ef543ad9";
+const GOLDEN_ID1: &str = "4b2f80f3a45e4d60d2731eb7604f831d";
 
 #[test]
 fn xref_stream_deterministic_id_has_no_zero_placeholder() {

@@ -17,8 +17,8 @@
 //! End-to-end / CLI matrix tests are the responsibility of flpdf-9hc.12.8.
 
 use flpdf::{
-    write_pdf_with_options, write_stream_to_buf, Dictionary, NewlineBeforeEndstream, Object, Pdf,
-    Stream, WriteOptions,
+    write_pdf_with_options, write_qdf, write_stream_to_buf, Dictionary, NewlineBeforeEndstream,
+    Object, Pdf, Stream, WriteOptions,
 };
 use std::io::Cursor;
 
@@ -354,7 +354,13 @@ fn round_trip_never_mode() {
 /// and the dict carries an indirect `/Length`. (Re-opening QDF + `Never` output
 /// is a separate code path and is not covered here.)
 #[test]
-fn qdf_never_emits_adjacent_endstream() {
+fn qdf_forces_yes_framing_regardless_of_caller_policy() {
+    // QDF form is designed for human editing and requires `endstream` on its own
+    // line so `flpdf::fix_qdf` (like qpdf's `fix-qdf`) can find it. The writer
+    // therefore promotes `Never`/`No` to `Yes` internally when `options.qdf` is
+    // true, mirroring `qpdf --qdf --newline-before-endstream=n` (qpdf keeps the
+    // QDF EOL regardless of the flag). The caller's `Never` request is honoured
+    // to the extent the format allows: it does not corrupt the output.
     let raw: &[u8] = b"qdf never-mode payload";
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
@@ -368,11 +374,11 @@ fn qdf_never_emits_adjacent_endstream() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    // Never = no EOL: the payload is immediately followed by `endstream`.
-    let adjacent = b"qdf never-mode payloadendstream";
+    // Yes framing: the payload is followed by `\nendstream`, NOT adjacent.
+    let yes_framed = b"qdf never-mode payload\nendstream";
     assert!(
-        output.windows(adjacent.len()).any(|w| w == adjacent),
-        "qdf + Never must emit the payload adjacent to endstream (no EOL inserted)"
+        output.windows(yes_framed.len()).any(|w| w == yes_framed),
+        "qdf must promote Never to Yes internally and emit `\\nendstream`"
     );
     // QDF splits /Length into an indirect length-holder: `/Length <N> 0 R`.
     // Match that exact shape so an unrelated `N 0 R` (e.g. `/Root 1 0 R`) can't
@@ -428,25 +434,46 @@ fn round_trip_qdf_never_mode() {
     );
 }
 
-/// Characterization test for the EOL-ending `Never` ambiguity.
-///
-/// A `Never` payload that ENDS in `\n` is written as `..\nendstream`: the
-/// `endstream` is line-anchored (preceded by the payload's own `\n`), so it
-/// takes the parser's endstream-scan path, which strips one framing EOL. The
-/// holder (raw length, EOL included) then equals the syntactic window, so the
-/// reader cannot tell this apart from a `Yes`-mode payload of "abc" plus the
-/// mandatory framing EOL — both emit byte-identical `abc\nendstream` with
-/// holder 4. The trailing `\n` therefore collapses into the framing EOL. This
-/// asserts the CURRENT (lossy) behavior and that re-open does NOT error (it does
-/// not reach the adjacent-endstream path). Disambiguating these is out of scope.
+/// Regression guard: the [`write_qdf`] convenience wrapper must go through
+/// the same `write_pdf_with_options` promotion that upgrades `Never` to `Yes`
+/// for QDF form. If a future refactor gives `write_qdf` its own emission path
+/// that bypasses the promotion, the output would carry adjacent `endstream`
+/// framing and `flpdf::fix_qdf` / qpdf's `fix-qdf` would fail on hand edits.
+/// The library default `NewlineBeforeEndstream::Never` makes this the exact
+/// state the caller reaches with `WriteOptions::default()`.
 #[test]
-fn round_trip_qdf_never_mode_eol_ending_payload_is_ambiguous() {
+fn write_qdf_wrapper_respects_yes_promotion_via_public_api() {
+    let raw: &[u8] = b"write_qdf wrapper payload";
+    let source = build_minimal_pdf(raw);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut output = Vec::new();
+    write_qdf(&mut pdf, &mut output).unwrap();
+
+    let yes_framed = b"write_qdf wrapper payload\nendstream";
+    assert!(
+        output.windows(yes_framed.len()).any(|w| w == yes_framed),
+        "write_qdf must emit `\\nendstream` framing regardless of the library \
+         default (`Never`) — the QDF Yes-promotion applies to all public entry points"
+    );
+}
+
+/// QDF form auto-promotes the caller's `Never` to `Yes` (see
+/// `qdf_forces_yes_framing_regardless_of_caller_policy` above), so an
+/// EOL-ending payload takes the standard `Yes`-mode framing path: the writer
+/// inserts a framing `\n` and sets the indirect `/Length` to `payload + 1`,
+/// and the reader strips the framing `\n` back off on re-open, so the
+/// original bytes are recovered exactly. This is stricter than the pre-Never
+/// characterization test that lived here (which asserted the trailing `\n`
+/// collapsed lossily into the framing EOL).
+#[test]
+fn round_trip_qdf_eol_ending_payload_round_trips_via_yes_promotion() {
     let raw: &[u8] = b"abc\n";
     assert_eq!(
         round_trip_qdf(raw, NewlineBeforeEndstream::Never).as_slice(),
-        b"abc",
-        "EOL-ending Never payload: trailing \\n collapses into the framing EOL \
-         (known ambiguity; must still re-open without error)"
+        raw,
+        "QDF auto-promotes Never to Yes, so an EOL-ending payload round-trips \
+         exactly via the Yes framing path (framing `\\n` stripped on re-open)"
     );
 }
 

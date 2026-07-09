@@ -22,8 +22,10 @@ with `/ID` elided.
 ## Byte-identity (feature-gated)
 
 The `byte-equal` column reflects the **default Pure-Rust build** (miniz_oxide
-deflate, `NewlineBeforeEndstream::Yes`), and is `diverge` for every row — the
-default build deliberately does **not** chase byte-identity (see
+deflate) with the CLI's default `--newline-before-endstream=never` framing.
+Framing now matches qpdf, but miniz's DEFLATE bytes still differ from qpdf's
+zlib bytes, so every row whose output carries a deflate stream stays `diverge`
+in the default build — it deliberately does **not** chase byte-identity (see
 `tests/golden/README.md`).
 
 Byte-for-byte identity with `qpdf --static-id` **is** achievable, but only as an
@@ -53,18 +55,18 @@ Update via: `BLESS=1 cargo test --test compat_matrix_baseline`
 
 | fixture | flag | flpdf-sha | byte-equal | qpdf-json | structural |
 |---|---|---|---|---|---|
-| one-page.pdf | plain | ac8ca6312f2a918e | diverge | diverge | diverge |
-| one-page.pdf | static-id | ac8ca6312f2a918e | diverge | diverge | match |
+| one-page.pdf | plain | 5b99c65b6e6a01b7 | diverge | diverge | diverge |
+| one-page.pdf | static-id | 5b99c65b6e6a01b7 | diverge | diverge | match |
 | one-page.pdf | linearize | f85d24b9e1ea4aec | diverge | diverge | diverge |
-| two-page.pdf | plain | bad1dc13c53a93f8 | diverge | diverge | diverge |
-| two-page.pdf | static-id | bad1dc13c53a93f8 | diverge | diverge | match |
+| two-page.pdf | plain | 129242f3cdfe6d59 | diverge | diverge | diverge |
+| two-page.pdf | static-id | 129242f3cdfe6d59 | diverge | diverge | match |
 | two-page.pdf | linearize | e61172249cfa3cac | diverge | diverge | diverge |
-| three-page.pdf | plain | 261c0e31280434aa | diverge | diverge | diverge |
-| three-page.pdf | static-id | 261c0e31280434aa | diverge | diverge | match |
+| three-page.pdf | plain | 38d1f54a9966f6d9 | diverge | diverge | diverge |
+| three-page.pdf | static-id | 38d1f54a9966f6d9 | diverge | diverge | match |
 | three-page.pdf | linearize | cc4903e1dc9b2372 | diverge | diverge | diverge |
-| linearized-one-page.pdf | plain | 21c145333c95ee8a | diverge | diverge | diverge |
-| attachment-two-page.pdf | plain | 17c1f26ffd1f808f | diverge | diverge | diverge |
-| attachment-two-page.pdf | static-id | 17c1f26ffd1f808f | diverge | match | match |
-| one-page.pdf | stream-data-uncompress | 2459b51d8e02a0ee | diverge | diverge | diverge |
-| two-page.pdf | stream-data-uncompress | 62b2ffa29d429247 | diverge | diverge | diverge |
-| three-page.pdf | stream-data-uncompress | 316464990dd79893 | diverge | diverge | diverge |
+| linearized-one-page.pdf | plain | 3b88c6941c9fee5c | match | diverge | diverge |
+| attachment-two-page.pdf | plain | e86234b11402469c | diverge | diverge | diverge |
+| attachment-two-page.pdf | static-id | e86234b11402469c | diverge | match | match |
+| one-page.pdf | stream-data-uncompress | 2eb818c086236c7b | match | diverge | diverge |
+| two-page.pdf | stream-data-uncompress | 1d82d83ecb1e890d | match | diverge | diverge |
+| three-page.pdf | stream-data-uncompress | 6956eea7856c790d | match | diverge | diverge |
