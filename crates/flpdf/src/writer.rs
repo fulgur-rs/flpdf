@@ -520,6 +520,17 @@ pub fn effective_pdf_version<'a>(
         }
     }
 
+    // Apply encryption floor (mirrors qpdf QPDFWriter::setEncryptionParametersInternal
+    // at QPDFWriter.cc L806-815). AES-256 (R>=6), AES-256 legacy (R=5), AES-128
+    // (R=4), RC4-128 (R=3, or R=4 without AES), RC4-40 (R<3) each require a
+    // minimum header version.
+    let enc_floor = encryption_version_floor(options);
+    if let Some((enc_ver, _)) = enc_floor {
+        if enc_ver > best {
+            best = enc_ver;
+        }
+    }
+
     // Apply object-stream floor (object streams require >= 1.5).
     if object_streams {
         let objstm_floor = (1u8, 5u8);
@@ -546,14 +557,80 @@ pub fn effective_pdf_version<'a>(
             return min_v.as_str();
         }
     }
+    // Encryption floor matched — return a static string for the emitted version.
+    // cov:ignore-start: inner-if closing braces are llvm-cov region artifacts;
+    // the `return` inside is exercised by
+    // effective_pdf_version_folds_each_encryption_floor_arm.
+    if let Some((enc_ver, _)) = enc_floor {
+        if enc_ver == best {
+            return static_version_string(best);
+        }
+    }
+    // cov:ignore-end
     // Object-stream floor "1.5" — reached when best == (1,5) and neither source
-    // nor min_version matched (object streams forced the version up).
+    // nor min_version nor encryption floor matched.
     if best == (1u8, 5u8) {
         return "1.5";
     }
     // Linearize floor "1.2" — only reached when best == (1,2) and neither
-    // source nor min_version matched.
+    // source nor min_version nor encryption floor matched.
     "1.2"
+}
+
+/// Header-version floor imposed by the encryption method requested via
+/// [`WriteOptions::encrypt`] / [`WriteOptions::copy_encryption`].
+///
+/// Mirrors qpdf QPDFWriter.cc L806-815 (`setEncryptionParametersInternal`):
+///
+/// | Method                       | Floor (version, ext) |
+/// |------------------------------|----------------------|
+/// | V=5 R=6 AES-256              | (1.7, 8)             |
+/// | V=5 R=5 AES-256 (legacy)     | (1.7, 3)             |
+/// | V=4 R=4 AES-128              | (1.6, 0)             |
+/// | V=4 R=4 RC4-128              | (1.5, 0)             |
+/// | V=2 R=3 RC4-128              | (1.4, 0)             |
+/// | V=1 R=2 RC4-40               | (1.3, 0)             |
+/// | `copy_encryption` (V=4 AES)  | (1.6, 0)             |
+///
+/// `copy_encryption` only supports V=4 AES-128 donors in the current release
+/// (see [`crate::encrypt_setup::CopyEncryptionSource`] docs), so the copy path
+/// returns the AES-128 floor unconditionally.
+fn encryption_version_floor(options: &WriteOptions) -> Option<((u8, u8), i64)> {
+    use crate::encrypt_setup::EncryptMethod;
+    if let Some(ref enc) = options.encrypt {
+        return Some(match enc.method {
+            EncryptMethod::V5R6Aes256 => ((1, 7), 8),
+            EncryptMethod::V5R5Aes256 => ((1, 7), 3),
+            EncryptMethod::V4Aes128 => ((1, 6), 0),
+            EncryptMethod::V4Rc4128 => ((1, 5), 0),
+            EncryptMethod::V2Rc4128 => ((1, 4), 0),
+            EncryptMethod::V1Rc440 => ((1, 3), 0),
+        });
+    }
+    if options.copy_encryption.is_some() {
+        return Some(((1, 6), 0));
+    }
+    None
+}
+
+/// Static PDF-version string for a `(major, minor)` pair. Reached from
+/// [`effective_pdf_version`] when the encryption floor wins the version race
+/// without the source or min_version matching, so a non-borrowed `&'static str`
+/// is needed for the return slot. Only the versions [`encryption_version_floor`]
+/// can return are handled.
+fn static_version_string(v: (u8, u8)) -> &'static str {
+    match v {
+        (1, 3) => "1.3",
+        (1, 4) => "1.4",
+        (1, 5) => "1.5",
+        (1, 6) => "1.6",
+        (1, 7) => "1.7",
+        // cov:ignore-start: encryption_version_floor only returns (1, 3..=7).
+        // Any other pair would indicate a code bug and 1.7 is the safest
+        // header fallback (no reader treats it as an under-specification).
+        _ => "1.7",
+        // cov:ignore-end
+    }
 }
 
 /// Compute the effective (PDF version, Adobe extension level) pair to write,
@@ -605,15 +682,27 @@ pub fn effective_pdf_version_and_ext<'a>(
         .as_deref()
         .and_then(parse_pdf_version)
         .is_some();
+    let enc_floor = encryption_version_floor(options);
     let source_contributes = !forced && ver_parsed.is_some() && ver_parsed == source_parsed;
     let min_contributes = !forced && ver_parsed.is_some() && ver_parsed == min_parsed;
+    let enc_contributes =
+        !forced && ver_parsed.is_some() && enc_floor.map(|(v, _)| v) == ver_parsed;
     let min_ext = options.min_extension_level.unwrap_or(0);
-    let ext = match (source_contributes, min_contributes) {
-        (true, true) => source_ext.max(min_ext),
-        (true, false) => source_ext,
-        (false, true) => min_ext,
-        (false, false) => 0,
-    };
+    let enc_ext = enc_floor.map(|(_, e)| e).unwrap_or(0);
+    // Whichever inputs tie with the effective version each contribute their ext;
+    // an input that was outbid contributes nothing. Multiple ties combine via
+    // `max` — qpdf-equivalent when multiple setMinimumPDFVersion calls arrive
+    // at the same version, the higher extension level wins the tie.
+    let mut ext = 0i64;
+    if source_contributes {
+        ext = ext.max(source_ext);
+    }
+    if min_contributes {
+        ext = ext.max(min_ext);
+    }
+    if enc_contributes {
+        ext = ext.max(enc_ext);
+    }
     (ver, ext)
 }
 
@@ -2776,6 +2865,31 @@ fn write_reencoded_object(
 }
 
 fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
+    pdf: &mut Pdf<R>,
+    out: W,
+    options: &WriteOptions,
+) -> Result<()> {
+    // Snapshot the source Catalog BEFORE any ADBE injection / strip mutates
+    // it, so those output-only mutations do not leak into the caller's Pdf
+    // handle. Restored below regardless of whether the write succeeds — the
+    // Pdf handle is safe to reuse for subsequent writes (or for read APIs
+    // like page enumeration) after this call returns.
+    let catalog_snapshot = pdf
+        .root_ref()
+        .and_then(|r| pdf.resolve(r).ok().map(|catalog| (r, catalog)));
+
+    let result = write_pdf_full_rewrite_inner(pdf, out, options);
+
+    // Restore the original Catalog. Runs on success and on error alike so
+    // partial injection state cannot leak either.
+    if let Some((root_ref, original)) = catalog_snapshot {
+        pdf.set_object(root_ref, original);
+    }
+
+    result
+}
+
+fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     mut out: W,
     options: &WriteOptions,
@@ -6495,11 +6609,13 @@ mod tests {
         }
     }
 
-    /// V=4 encryption (/V 4, AES-128 or RC4-128) requires a PDF header >= 1.5.
-    /// The encrypted path uses a classic xref table, so the writer must floor
-    /// the header explicitly — a 1.4 input must not emit a 1.4 header with /V 4.
+    /// V=4 encryption requires a PDF header floored per qpdf's method-specific
+    /// table (QPDFWriter.cc L810): AES → 1.6, RC4 → 1.5. Prior to the
+    /// encryption-floor fix flpdf floored both to 1.5, which was correct for
+    /// RC4 but under-shot AES; this test verifies each method emits the
+    /// qpdf-equivalent floor for a 1.4 input.
     #[test]
-    fn v4_encryption_floors_pdf_header_to_1_5() {
+    fn v4_encryption_floors_pdf_header_per_qpdf_table() {
         use crate::encrypt_setup::{EncryptMethod, EncryptParams};
         use std::io::Cursor;
 
@@ -6509,10 +6625,17 @@ mod tests {
             "fixture must start at %PDF-1.4 for this test to be meaningful"
         );
 
-        for params in [
-            EncryptParams::v4_aes128(b"u".to_vec(), b"o".to_vec()),
-            EncryptParams::rc4(EncryptMethod::V4Rc4128, b"u".to_vec(), b"o".to_vec()),
+        for (params, expected_prefix) in [
+            (
+                EncryptParams::v4_aes128(b"u".to_vec(), b"o".to_vec()),
+                b"%PDF-1.6".as_slice(),
+            ),
+            (
+                EncryptParams::rc4(EncryptMethod::V4Rc4128, b"u".to_vec(), b"o".to_vec()),
+                b"%PDF-1.5".as_slice(),
+            ),
         ] {
+            let method = params.method;
             let mut pdf = Pdf::open(Cursor::new(fixture.clone())).unwrap();
             let mut out = Vec::new();
             let options = WriteOptions {
@@ -6521,11 +6644,16 @@ mod tests {
                 ..WriteOptions::default()
             };
             write_pdf_with_options(&mut pdf, &mut out, &options).expect("V=4 encrypted write");
+            // cov:ignore-start: multi-line assert; llvm-cov attributes only the
+            // "on-panic" format-argument evaluations to the outer line, and the
+            // assertion succeeds so those are never evaluated.
             assert!(
-                out.starts_with(b"%PDF-1.5"),
-                "V=4 encryption must floor the header to 1.5, got {:?}",
+                out.starts_with(expected_prefix),
+                "{method:?} must floor the header to {}, got {:?}",
+                String::from_utf8_lossy(expected_prefix),
                 String::from_utf8_lossy(&out[..out.len().min(12)])
             );
+            // cov:ignore-end
         }
     }
 
@@ -6727,6 +6855,143 @@ mod tests {
         let (v, e) = effective_pdf_version_and_ext("1.3", 8, &options, false, true);
         assert_eq!(v, "1.5");
         assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn encryption_version_floor_matches_qpdf_table() {
+        use crate::encrypt_setup::{EncryptMethod, EncryptParams};
+        for (method, expected) in [
+            (EncryptMethod::V5R6Aes256, ((1, 7), 8)),
+            (EncryptMethod::V5R5Aes256, ((1, 7), 3)),
+            (EncryptMethod::V4Aes128, ((1, 6), 0)),
+            (EncryptMethod::V4Rc4128, ((1, 5), 0)),
+            (EncryptMethod::V2Rc4128, ((1, 4), 0)),
+            (EncryptMethod::V1Rc440, ((1, 3), 0)),
+        ] {
+            let mut params = EncryptParams::v4_aes128(vec![], vec![]);
+            params.method = method;
+            let options = WriteOptions {
+                encrypt: Some(params),
+                ..WriteOptions::default()
+            };
+            assert_eq!(
+                encryption_version_floor(&options),
+                Some(expected),
+                "encryption floor for {method:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_pdf_version_folds_each_encryption_floor_arm() {
+        // Below-floor source for each encryption method — exercises every
+        // static_version_string arm reachable from the encryption floor race.
+        use crate::encrypt_setup::{EncryptMethod, EncryptParams};
+        for (method, expected) in [
+            (EncryptMethod::V1Rc440, "1.3"),
+            (EncryptMethod::V2Rc4128, "1.4"),
+            (EncryptMethod::V4Rc4128, "1.5"),
+            (EncryptMethod::V4Aes128, "1.6"),
+            (EncryptMethod::V5R5Aes256, "1.7"),
+            (EncryptMethod::V5R6Aes256, "1.7"),
+        ] {
+            let mut params = EncryptParams::v4_aes128(vec![], vec![]);
+            params.method = method;
+            let options = WriteOptions {
+                encrypt: Some(params),
+                ..WriteOptions::default()
+            };
+            // "1.0" is below every encryption floor, so the returned string
+            // comes from the encryption-floor branch (via static_version_string).
+            assert_eq!(
+                effective_pdf_version("1.0", &options, false, false),
+                expected,
+                "effective_pdf_version for {method:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn encryption_version_floor_none_when_no_encryption() {
+        let options = WriteOptions::default();
+        assert_eq!(encryption_version_floor(&options), None);
+    }
+
+    #[test]
+    fn effective_pdf_version_folds_encryption_floor_into_header() {
+        // Source PDF-1.3 + --encrypt AES-128 → header floor must be 1.6.
+        // Before the fix, effective_pdf_version returned "1.3" and the emitted
+        // %PDF header contradicted the encryption method.
+        let options = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                vec![],
+                vec![],
+            )),
+            ..WriteOptions::default()
+        };
+        assert_eq!(effective_pdf_version("1.3", &options, false, false), "1.6");
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_v5_r6_encryption_contributes_ext() {
+        // Source (1.3, 0) + AES-256 encryption (V5R6, floor (1.7, 8)) → ver
+        // bumps to 1.7, encryption contributes ext=8 (source's 1.3 was outbid,
+        // no min_version, no ObjStm).
+        let options = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(vec![], vec![])),
+            ..WriteOptions::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.3", 0, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 8);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_aes128_encryption_drops_stale_source_ext() {
+        // Codex round-3 P2 #3: source (1.3, 8) + AES-128 encryption (floor
+        // (1.6, 0)) → ver bumps to 1.6, source ext dropped (source's 1.3
+        // doesn't tie with 1.6). Result (1.6, 0) — stale ADBE must NOT survive.
+        let options = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                vec![],
+                vec![],
+            )),
+            ..WriteOptions::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.3", 8, &options, false, false);
+        assert_eq!(v, "1.6");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_encryption_and_source_tie_take_max_ext() {
+        // Source (1.7, 3) + AES-256 encryption (V5R6 floor (1.7, 8)) → both
+        // tie at 1.7 → ext = max(3, 8) = 8 (encryption wins the extension race
+        // at the tied version).
+        let options = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(vec![], vec![])),
+            ..WriteOptions::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 3, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 8);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_source_ext_wins_when_source_beats_encryption() {
+        // Source (1.7, 8) + AES-128 encryption (floor (1.6, 0)) → source's 1.7
+        // wins the version race, source ext survives → (1.7, 8). Encryption
+        // floor was outbid so its ext=0 contributes nothing.
+        let options = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                vec![],
+                vec![],
+            )),
+            ..WriteOptions::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 8);
     }
 
     #[test]
@@ -7200,6 +7465,105 @@ mod tests {
             reopened.adobe_extension_level(),
             Some(8),
             "generate-mode output must carry /Extensions /ADBE /ExtensionLevel 8"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_does_not_dirty_caller_pdf_across_writes() {
+        // Codex round-3 P2 #4: the injection block mutates the caller's Pdf
+        // via set_object. Without the save/restore in write_pdf_full_rewrite,
+        // reusing the same Pdf handle for a second write would leak the
+        // output-only /Extensions dict into the second output. Verify the
+        // caller sees the same Pdf state before and after a write, and that
+        // two back-to-back writes produce identical output.
+        let src = build_ext_injection_source();
+        let mut pdf = crate::Pdf::open_mem_owned(src).expect("open");
+        // Pre-write baseline: source has no ADBE.
+        assert_eq!(pdf.adobe_extension_level(), None);
+
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..WriteOptions::default()
+        };
+        let mut out1 = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out1, &options).expect("first write");
+
+        // Caller-visible Pdf state must be unchanged after the write —
+        // adobe_extension_level still None (mutation was restored).
+        assert_eq!(
+            pdf.adobe_extension_level(),
+            None,
+            "first write must not leak /Extensions into the caller's Pdf"
+        );
+
+        // A second write with the same options must produce byte-identical
+        // output. If the first write had dirtied the Pdf, the second would
+        // see a different source_ext and could inject differently or accrete
+        // duplicate /Extensions state.
+        let mut out2 = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out2, &options).expect("second write");
+        assert_eq!(
+            out1, out2,
+            "back-to-back writes on the same Pdf must be byte-identical"
+        );
+
+        // And the output must still carry the requested /ADBE injection.
+        let mut reopened = crate::Pdf::open_mem_owned(out1).expect("reopen");
+        assert_eq!(
+            reopened.adobe_extension_level(),
+            Some(8),
+            "output must carry the requested ADBE"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_v4_aes128_source_1_3_with_adbe_strips_stale_ext() {
+        // Codex round-3 P2 #3: source PDF-1.3 with /Extensions /ADBE
+        // /ExtensionLevel 8, rewritten with --encrypt AES-128. The encryption
+        // floor bumps the header to 1.6; the source's ADBE (BaseVersion 1.3
+        // ext 8) must NOT survive because the pairwise rule drops the source
+        // ext when the version is outbid.
+        let src = build_ext_injection_source_with_adbe_1_3();
+        let mut pdf = crate::Pdf::open_mem_owned(src).expect("open");
+        assert_eq!(pdf.adobe_extension_level(), Some(8));
+
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            static_aes_iv: true,
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                b"u".to_vec(),
+                b"o".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out, &options).expect("aes-128 encrypted write");
+
+        // cov:ignore-start: multi-line assert; llvm-cov attributes only the
+        // "on-panic" format-argument evaluations to the outer line.
+        assert!(
+            out.starts_with(b"%PDF-1.6\n"),
+            "AES-128 must floor the header to 1.6, got {:?}",
+            String::from_utf8_lossy(&out[..out.len().min(12)])
+        );
+        // cov:ignore-end
+
+        // Re-open the encrypted output with the same password and confirm
+        // there is no residual /ADBE with a stale /BaseVersion.
+        let reopen_opts = crate::PdfOpenOptions {
+            password: b"u".to_vec(),
+            ..Default::default()
+        };
+        let mut reopened =
+            crate::Pdf::open_mem_owned_with_options(out, reopen_opts).expect("reopen encrypted");
+        assert_eq!(
+            reopened.adobe_extension_level(),
+            None,
+            "stale /ADBE (BaseVersion 1.3) must be stripped by the encryption floor"
         );
     }
 }
