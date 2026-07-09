@@ -664,6 +664,99 @@ where
     apply_aggregated_sources(dest, group_sources_by_dest_page(&entries))
 }
 
+/// A single overlay/underlay source contributing to one destination page, as
+/// reported by [`overlay_verbose_report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlayVerboseSource {
+    /// Zero-based index of the source's spec in the `specs` slice passed to
+    /// [`overlay_verbose_report`].
+    pub spec_index: usize,
+    /// Whether the source is drawn beneath or above the destination content.
+    pub kind: OverlayKind,
+    /// One-based source page number contributing to this destination page.
+    pub src_page: u32,
+}
+
+/// One destination page's overlay/underlay plan, as reported by
+/// [`overlay_verbose_report`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayVerbosePage {
+    /// One-based destination page number.
+    pub dest_page: u32,
+    /// Sources drawn on this page, ordered underlays-first (declaration order
+    /// across specs) then overlays. Empty when no spec targets this page.
+    pub sources: Vec<OverlayVerboseSource>,
+}
+
+/// Return the per-destination-page overlay/underlay plan without importing any
+/// source page or mutating the destination graph.
+///
+/// The returned vector covers every destination page in ascending order
+/// (`1..=n_dest`). Per-page sources are ordered underlays first (in declaration
+/// order across `specs`), then overlays (also in declaration order), matching
+/// the order [`apply_overlay_specs`] uses to paint the same page. Destination
+/// pages that no spec targets appear in the result with an empty `sources`.
+///
+/// The source documents are taken by `&mut` because [`PageRange::resolve`]
+/// reads their page trees; the destination is taken by `&mut` for the same
+/// reason. Neither document's on-disk content is modified. Calling this before
+/// [`apply_overlay_specs`] on the same specs yields the paint plan that will be
+/// applied.
+///
+/// # Errors
+///
+/// - [`Error::Parse`] when a `--from`/`--to`/`--repeat` range references a
+///   page number outside its document (propagated from
+///   [`PageRange::resolve`]).
+/// - Any error propagated from [`pages::page_refs`](crate::pages::page_refs)
+///   — typically [`Error::Missing`] for a missing `/Root`/`/Pages`, or
+///   [`Error::Unsupported`] for a malformed page tree.
+pub fn overlay_verbose_report<RS, RT>(
+    dest: &mut Pdf<RT>,
+    specs: &mut [OverlaySpec<RS>],
+) -> Result<Vec<OverlayVerbosePage>>
+where
+    RS: Read + Seek,
+    RT: Read + Seek,
+{
+    let n_dest = u32_len(page_refs(dest)?.len());
+    // Flatten every spec's (dest_page, source) pairs in declaration order.
+    let mut flat: Vec<(u32, OverlayVerboseSource)> = Vec::new();
+    for (spec_index, spec) in specs.iter_mut().enumerate() {
+        let pairs = resolve_spec_pairs(
+            &mut spec.source,
+            &spec.from,
+            &spec.to,
+            spec.repeat.as_ref(),
+            n_dest,
+        )?;
+        for (dest_page, src_page) in pairs {
+            flat.push((
+                dest_page,
+                OverlayVerboseSource {
+                    spec_index,
+                    kind: spec.kind,
+                    src_page,
+                },
+            ));
+        }
+    }
+    // Group by destination page (ascending order via BTreeMap).
+    let mut by_page: BTreeMap<u32, Vec<OverlayVerboseSource>> = BTreeMap::new();
+    for (dest_page, src) in flat {
+        by_page.entry(dest_page).or_default().push(src);
+    }
+    // Emit one entry per dest page in 1..=n_dest, with underlays-then-overlays
+    // per page (shared with the paint path via kind_stable_partition).
+    let mut out = Vec::with_capacity(n_dest as usize);
+    for dest_page in 1..=n_dest {
+        let sources = by_page.remove(&dest_page).unwrap_or_default();
+        let sources = kind_stable_partition(sources, |s| s.kind);
+        out.push(OverlayVerbosePage { dest_page, sources });
+    }
+    Ok(out)
+}
+
 /// Convert a page-list length to `u32`, the width [`PageRange::resolve`] expects.
 ///
 /// A document with more than `u32::MAX` pages is not representable; clamp to
@@ -2920,5 +3013,186 @@ mod tests {
         }];
         let err = apply_overlay_specs(&mut dest, &mut specs);
         assert!(matches!(err, Err(Error::Parse { .. })));
+    }
+
+    // ---- overlay_verbose_report (public inspection API) -------------------
+
+    /// A minimally-valid N-page document (empty content streams; MediaBox
+    /// only). Object numbers: 1 = Catalog, 2 = Pages, 3..(2+n) = /Page dicts.
+    fn n_page_doc(n: u32) -> Vec<u8> {
+        assert!(n >= 1);
+        let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 3 + i)).collect();
+        let mut objects: Vec<(u32, String)> = Vec::new();
+        objects.push((1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()));
+        objects.push((
+            2,
+            format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids.join(" "), n),
+        ));
+        for i in 0..n {
+            objects.push((
+                3 + i,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> >>"
+                    .to_string(),
+            ));
+        }
+        let refs: Vec<(u32, &str)> = objects.iter().map(|(n, s)| (*n, s.as_str())).collect();
+        build_pdf(&refs, 1)
+    }
+
+    #[test]
+    fn overlay_verbose_report_orders_underlays_then_overlays_across_specs() {
+        // 4 specs on the same 3-page dest with 1-page sources, all targeting page 1
+        // via --to=1. Declaration order: overlay-A, overlay-B, underlay-C, underlay-D.
+        // Expected page-1 sources spec_index order: [2, 3, 0, 1] (underlays first).
+        let mut dest = open(n_page_doc(3));
+        let spec_a = OverlaySpec {
+            source: open(n_page_doc(1)),
+            kind: OverlayKind::Overlay,
+            from: PageRange::parse("").unwrap(),
+            to: PageRange::parse("1").unwrap(),
+            repeat: None,
+        };
+        let spec_b = OverlaySpec {
+            source: open(n_page_doc(1)),
+            kind: OverlayKind::Overlay,
+            from: PageRange::parse("").unwrap(),
+            to: PageRange::parse("1").unwrap(),
+            repeat: None,
+        };
+        let spec_c = OverlaySpec {
+            source: open(n_page_doc(1)),
+            kind: OverlayKind::Underlay,
+            from: PageRange::parse("").unwrap(),
+            to: PageRange::parse("1").unwrap(),
+            repeat: None,
+        };
+        let spec_d = OverlaySpec {
+            source: open(n_page_doc(1)),
+            kind: OverlayKind::Underlay,
+            from: PageRange::parse("").unwrap(),
+            to: PageRange::parse("1").unwrap(),
+            repeat: None,
+        };
+        let mut specs = [spec_a, spec_b, spec_c, spec_d];
+        let report = overlay_verbose_report(&mut dest, &mut specs).unwrap();
+        assert_eq!(report.len(), 3, "3-page dest -> 3 report entries");
+        assert_eq!(report[0].dest_page, 1);
+        let idx: Vec<usize> = report[0].sources.iter().map(|s| s.spec_index).collect();
+        assert_eq!(
+            idx,
+            vec![2, 3, 0, 1],
+            "underlays first (specs 2,3), then overlays (0,1)"
+        );
+        let kinds: Vec<OverlayKind> = report[0].sources.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                OverlayKind::Underlay,
+                OverlayKind::Underlay,
+                OverlayKind::Overlay,
+                OverlayKind::Overlay,
+            ],
+            "sources[0..2] must be underlays, [2..4] overlays"
+        );
+        let srcs: Vec<u32> = report[0].sources.iter().map(|s| s.src_page).collect();
+        assert_eq!(
+            srcs,
+            vec![1, 1, 1, 1],
+            "every spec targets --to=1, src=1 for a 1-page source"
+        );
+        // Pages 2 and 3 unaffected (--to=1 only).
+        assert!(report[1].sources.is_empty());
+        assert!(report[2].sources.is_empty());
+    }
+
+    #[test]
+    fn overlay_verbose_report_includes_dest_pages_with_no_sources() {
+        // 3-page dest, 2-page source, single --overlay --to=1-2:
+        //   page 1 <- src 1 (overlay), page 2 <- src 2 (overlay), page 3 empty.
+        let mut dest = open(n_page_doc(3));
+        let spec = OverlaySpec {
+            source: open(n_page_doc(2)),
+            kind: OverlayKind::Overlay,
+            from: PageRange::parse("").unwrap(),
+            to: PageRange::parse("1-2").unwrap(),
+            repeat: None,
+        };
+        let mut specs = [spec];
+        let report = overlay_verbose_report(&mut dest, &mut specs).unwrap();
+        assert_eq!(report.len(), 3);
+        assert_eq!(report[0].dest_page, 1);
+        assert_eq!(report[0].sources.len(), 1);
+        assert_eq!(report[0].sources[0].src_page, 1);
+        assert_eq!(report[1].dest_page, 2);
+        assert_eq!(report[1].sources.len(), 1);
+        assert_eq!(report[1].sources[0].src_page, 2);
+        assert_eq!(report[2].dest_page, 3);
+        assert!(report[2].sources.is_empty());
+    }
+
+    #[test]
+    fn overlay_verbose_report_pins_source_page_under_repeat() {
+        // 5-page dest, 2-page source, single --overlay --repeat=1-2:
+        //   from defaults to all source pages (1,2), applied to dest 1-2 in order.
+        //   Once from is exhausted, repeat=[1,2] cycles across the remaining dest
+        //   pages -> dest 3<-1, 4<-2, 5<-1.
+        let mut dest = open(n_page_doc(5));
+        let spec = OverlaySpec {
+            source: open(n_page_doc(2)),
+            kind: OverlayKind::Overlay,
+            from: PageRange::parse("").unwrap(),
+            to: PageRange::parse("").unwrap(),
+            repeat: Some(PageRange::parse("1-2").unwrap()),
+        };
+        let mut specs = [spec];
+        let report = overlay_verbose_report(&mut dest, &mut specs).unwrap();
+        let src_pages: Vec<u32> = report.iter().map(|p| p.sources[0].src_page).collect();
+        assert_eq!(src_pages, vec![1, 2, 1, 2, 1]);
+    }
+
+    #[test]
+    fn overlay_verbose_report_empty_to_yields_all_empty_entries() {
+        // 3-page dest, 2-page source, single spec with an explicitly empty --to:
+        // no dest pages are selected, so every report entry has empty sources.
+        let mut dest = open(n_page_doc(3));
+        let spec = OverlaySpec {
+            source: open(n_page_doc(2)),
+            kind: OverlayKind::Overlay,
+            from: PageRange::parse("").unwrap(),
+            to: PageRange::empty(),
+            repeat: None,
+        };
+        let mut specs = [spec];
+        let report = overlay_verbose_report(&mut dest, &mut specs).unwrap();
+        assert_eq!(report.len(), 3);
+        for (i, page) in report.iter().enumerate() {
+            assert_eq!(page.dest_page, (i + 1) as u32);
+            assert!(page.sources.is_empty());
+        }
+    }
+
+    #[test]
+    fn overlay_verbose_report_does_not_mutate_dest() {
+        // Read-only inspection: page refs stay identical, and each page's
+        // /Contents and /Resources references are unchanged after the call.
+        let mut dest = open(n_page_doc(3));
+        let page_refs_before = page_refs(&mut dest).unwrap();
+        assert_eq!(page_refs_before.len(), 3);
+        let page1_ref = page_refs_before[0];
+        let dict_before = page_dictionary(&mut dest, page1_ref).unwrap();
+        let spec = OverlaySpec {
+            source: open(n_page_doc(1)),
+            kind: OverlayKind::Overlay,
+            from: PageRange::parse("").unwrap(),
+            to: PageRange::parse("").unwrap(),
+            repeat: None,
+        };
+        let mut specs = [spec];
+        let _ = overlay_verbose_report(&mut dest, &mut specs).unwrap();
+        let page_refs_after = page_refs(&mut dest).unwrap();
+        assert_eq!(page_refs_before, page_refs_after);
+        let dict_after = page_dictionary(&mut dest, page1_ref).unwrap();
+        assert_eq!(dict_before.get("Contents"), dict_after.get("Contents"));
+        assert_eq!(dict_before.get("Resources"), dict_after.get("Resources"));
     }
 }
