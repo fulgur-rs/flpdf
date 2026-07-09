@@ -420,20 +420,9 @@ where
 {
     // Snapshot the source page list before mutating `dest`. The applied patches
     // change page dictionaries in place but never reorder or remove page
-    // objects, so the 1-based page numbers stay valid. `n_dest` is the
-    // destination page count, computed once by the caller (it does not change
-    // while sources are being mapped).
+    // objects, so the 1-based page numbers stay valid.
     let source_pages = page_refs(source)?;
-    let n_source = u32_len(source_pages.len());
-
-    let from_pages = from.resolve(n_source)?;
-    let to_pages = to.resolve(n_dest)?;
-    let repeat_pages = match repeat {
-        Some(pr) => pr.resolve(n_source)?,
-        None => Vec::new(),
-    };
-
-    let pairs = map_overlay_pages(&from_pages, &to_pages, &repeat_pages);
+    let pairs = resolve_spec_pairs(source, from, to, repeat, n_dest)?;
 
     // Collect the distinct source pages in first-use order, then import them all
     // in a SINGLE cross-document copy. One copy shares any indirect object used
@@ -468,6 +457,42 @@ where
             (dest_page, OverlaySource { kind, xobject_ref })
         })
         .collect())
+}
+
+/// Resolve a single overlay/underlay spec's `--from`/`--to`/`--repeat` ranges
+/// into `(dest_page, source_page)` pairs, without touching either document.
+///
+/// This is the range-math half of [`spec_page_sources`]: it snapshots the
+/// source page count, resolves the three ranges, and calls
+/// [`map_overlay_pages`] to produce the pairing. No pages are imported and no
+/// destination pages are modified; the caller decides what to do with the
+/// pairs (import + apply, or report). `n_dest` is the destination page count,
+/// computed once by the caller (it does not change while sources are being
+/// mapped).
+///
+/// # Errors
+///
+/// Any error propagated from [`page_refs`] or [`PageRange::resolve`].
+pub(crate) fn resolve_spec_pairs<RS>(
+    source: &mut Pdf<RS>,
+    from: &PageRange,
+    to: &PageRange,
+    repeat: Option<&PageRange>,
+    n_dest: u32,
+) -> Result<Vec<(u32, u32)>>
+where
+    RS: Read + Seek,
+{
+    let n_source = u32_len(page_refs(source)?.len());
+
+    let from_pages = from.resolve(n_source)?;
+    let to_pages = to.resolve(n_dest)?;
+    let repeat_pages = match repeat {
+        Some(pr) => pr.resolve(n_source)?,
+        None => Vec::new(),
+    };
+
+    Ok(map_overlay_pages(&from_pages, &to_pages, &repeat_pages))
 }
 
 /// Apply a single overlay/underlay spec to `dest`, mirroring qpdf's
