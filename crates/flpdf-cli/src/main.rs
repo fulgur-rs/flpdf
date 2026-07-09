@@ -3201,9 +3201,12 @@ fn run_rewrite(
             flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
         }
 
-        let mut out = File::create(output)?;
+        let mut out = File::create(&output)?;
         write_pdf_with_options(&mut pdf, &mut out, &options)?;
 
+        if verbose {
+            eprintln!("flpdf: wrote file {}", output.display());
+        }
         if remove_restrictions && was_encrypted {
             eprintln!("flpdf: removed restrictions (encryption and advisory permissions stripped)");
         }
