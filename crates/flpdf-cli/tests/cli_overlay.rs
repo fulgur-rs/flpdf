@@ -431,7 +431,7 @@ fn overlay_bumps_header_from_non_encrypted_higher_version_source() {
     assert!(
         bytes.starts_with(b"%PDF-1.7\n"),
         "expected header %PDF-1.7 after floor to 1.7 source, got {:?}",
-        &bytes.get(..12),
+        bytes.get(..12),
     );
 
     let mut opened =
@@ -457,7 +457,7 @@ fn overlay_bumps_header_and_injects_adbe_from_encrypted_source() {
     assert!(
         bytes.starts_with(b"%PDF-1.7\n"),
         "expected header %PDF-1.7 after floor to 1.7 source, got {:?}",
-        &bytes.get(..12),
+        bytes.get(..12),
     );
 
     let mut opened =
