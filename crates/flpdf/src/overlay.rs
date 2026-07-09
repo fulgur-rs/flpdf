@@ -863,10 +863,10 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 // `overlay_encrypted_source_extension_level_bytes` (below).
 //
 // Explicit deferrals (NOT covered here, by design):
-//   - CLI-level byte-identity: deferred to flpdf-9hc.33. The flpdf CLI emits
-//     NewlineBeforeEndstream::Yes and exposes no ::Never (qpdf's default), so
-//     every CLI-written stream diverges. These gates write through the library
-//     entry points with NewlineBeforeEndstream::Never instead.
+//   - CLI-level overlay byte-identity: these gates write through the library
+//     entry points with `NewlineBeforeEndstream::Never` to keep the byte
+//     comparison surgical. The CLI now also defaults to `Never` and can be
+//     wired up separately for CLI-level overlay byte-identity coverage.
 #[cfg(all(test, feature = "qpdf-zlib-compat"))]
 mod byte_gate {
     use super::{

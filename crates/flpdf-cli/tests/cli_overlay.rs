@@ -7,12 +7,11 @@
 //! outcomes (exit status, page count, presence of the overlay XObject markers).
 //!
 //! Byte-identity to qpdf is proven at the library layer (the `overlay::byte_gate`
-//! tests in `crates/flpdf/src/overlay.rs`, run with `qpdf-zlib-compat`). The CLI
-//! binary's default output is intentionally not byte-identical to qpdf — the CLI
-//! emits `NewlineBeforeEndstream::Yes` framing whereas qpdf's default is `Never`,
-//! a pre-existing project-wide divergence documented in
-//! `tests/golden/compat-matrix.md` (CLI byte-equal "diverge for every row").
-//! These tests therefore assert wiring behavior, not output bytes.
+//! tests in `crates/flpdf/src/overlay.rs`) and — for the plain full-rewrite path
+//! — at the CLI layer in `cli_byte_identical`, both run with `qpdf-zlib-compat`.
+//! The default Pure-Rust build's DEFLATE bytes still diverge from qpdf's zlib
+//! output (see `tests/golden/compat-matrix.md`), so these tests assert wiring
+//! behavior rather than exact output bytes.
 
 use std::path::{Path, PathBuf};
 
@@ -422,9 +421,9 @@ fn overlay_bumps_header_from_non_encrypted_higher_version_source() {
     // 1.7 PDF with no /Extensions/ADBE. The CLI accumulator (main.rs) must
     // set options.min_version to max(dest, all sources) so the output header
     // is bumped to %PDF-1.7, but the source has ext_level == 0 so no
-    // /Extensions/ADBE injection should occur. Structural, not byte-level
-    // (per the module doc, byte-parity vs qpdf is proven at the library layer;
-    // the CLI cannot emit NewlineBeforeEndstream::Never).
+    // /Extensions/ADBE injection should occur. Structural, not byte-level:
+    // deflate byte-parity vs qpdf requires `qpdf-zlib-compat` (see the module
+    // doc).
     let src = fixture("one-page-v17.pdf");
     let bytes = run_overlay_ok("three-page.pdf", &["--overlay", &src, "--"]);
 

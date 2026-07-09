@@ -290,6 +290,9 @@ fn qdf_fix_repairs_hand_edited_stream_length() {
 
     // Hand-edit the stream payload: grow "Hello PDF" -> "Hello PDF EDITED!!!"
     // The QDF indirect /Length holder still says the old length until fixed.
+    // QDF form always inserts a newline before `endstream` (qpdf --qdf
+    // parity), regardless of the caller's `newline_before_endstream` setting,
+    // so `endstream` sits on its own line.
     let original = std::fs::read(&qdf_out).unwrap();
     let edited_bytes = {
         let from = b"stream\nHello PDF\nendstream".as_slice();

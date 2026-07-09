@@ -133,26 +133,25 @@ pub(crate) fn effective_stream_policy(options: &WriteOptions) -> Option<Compress
 ///
 /// # Variants and qpdf equivalence
 ///
-/// - [`Yes`](Self::Yes) (the **flpdf default**) — always write exactly one
-///   `b'\n'`, satisfying the ISO 32000-1 §7.3.8.1 recommendation and easing
-///   hand-editing. Equivalent to qpdf run **with** `--newline-before-endstream`.
+/// - [`Never`](Self::Never) (the **flpdf default**) — never insert a newline;
+///   exactly the raw payload bytes sit between `stream` and `endstream`. This
+///   reproduces qpdf's **default** output (qpdf only inserts a newline when run
+///   with `--newline-before-endstream`), and is required for byte-identical
+///   `qpdf`-equivalent output.
+/// - [`Yes`](Self::Yes) — always write exactly one `b'\n'`, satisfying the ISO
+///   32000-1 §7.3.8.1 recommendation and easing hand-editing. Equivalent to
+///   qpdf run **with** `--newline-before-endstream`.
 /// - [`No`](Self::No) — write a single `b'\n'` only when the payload does not
 ///   already end with `\n`/`\r`; if it does, `endstream` is adjacent. This is a
 ///   flpdf-specific middle ground and matches neither of qpdf's two modes.
-/// - [`Never`](Self::Never) — never insert a newline; exactly the raw payload
-///   bytes sit between `stream` and `endstream`. This reproduces qpdf's
-///   **default** output (qpdf only inserts a newline when run with
-///   `--newline-before-endstream`), and is required for byte-identical
-///   `qpdf`-equivalent output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum NewlineBeforeEndstream {
-    /// Always write exactly one `b'\n'` before `endstream` (the flpdf default),
-    /// regardless of whether the payload already ends with a newline.
+    /// Always write exactly one `b'\n'` before `endstream`, regardless of
+    /// whether the payload already ends with a newline.
     ///
     /// Satisfies ISO 32000-1 §7.3.8.1 and matches qpdf run with
     /// `--newline-before-endstream`.
-    #[default]
     Yes,
     /// Write a single `b'\n'` before `endstream` only when the payload does not
     /// already end with `\n`/`\r`; otherwise `endstream` is adjacent.
@@ -162,10 +161,11 @@ pub enum NewlineBeforeEndstream {
     No,
     /// Never insert a newline: the raw payload is written verbatim and
     /// `endstream` follows immediately, so exactly `/Length` bytes sit between
-    /// `stream` and `endstream`.
+    /// `stream` and `endstream` (the **flpdf default**).
     ///
     /// Reproduces qpdf's default output and is required for byte-identical
     /// qpdf-equivalent rewrites.
+    #[default]
     Never,
 }
 
@@ -303,11 +303,15 @@ pub struct WriteOptions {
 
     /// Whether to insert a newline immediately before each `endstream` keyword.
     ///
-    /// ISO 32000-1 §7.3.8.1 requires an end-of-line marker before `endstream`.
-    /// [`NewlineBeforeEndstream::Yes`] (the default) always writes exactly one
-    /// `b'\n'` before `endstream`, matching qpdf's `--newline-before-endstream=y`
-    /// behaviour.  [`NewlineBeforeEndstream::No`] omits the extra newline when
-    /// the stream payload already ends with a newline character.
+    /// ISO 32000-1 §7.3.8.1 recommends an end-of-line marker before `endstream`.
+    /// [`NewlineBeforeEndstream::Never`] (the default) never inserts one, so
+    /// exactly `/Length` bytes sit between `stream` and `endstream` — matching
+    /// qpdf's default output and required for byte-identical qpdf-equivalent
+    /// rewrites. [`NewlineBeforeEndstream::Yes`] always writes exactly one
+    /// `b'\n'` before `endstream`, matching qpdf run with
+    /// `--newline-before-endstream`. [`NewlineBeforeEndstream::No`] omits the
+    /// extra newline when the stream payload already ends with a newline
+    /// character (a flpdf-specific middle ground).
     ///
     /// The `/Length` value in the stream dictionary is **not** affected by this
     /// setting — it always reflects the raw payload byte count only.
@@ -2882,6 +2886,25 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
         let was_dirty = pdf.is_dirty(r);
         pdf.resolve(r).ok().map(|catalog| (r, catalog, was_dirty))
     });
+
+    // QDF form (`qpdf --qdf`) is designed for human editing and requires a
+    // line-anchored `endstream`, so it always emits a newline before
+    // `endstream` regardless of the caller's `newline_before_endstream`
+    // setting; `flpdf::fix_qdf` mirrors qpdf's `fix-qdf` and only finds
+    // `endstream` at line start. Force `Yes` framing here so QDF output is
+    // valid even when the caller left `newline_before_endstream` at its
+    // qpdf-parity default (`Never`).
+    let effective;
+    let options = if options.qdf && options.newline_before_endstream != NewlineBeforeEndstream::Yes
+    {
+        effective = WriteOptions {
+            newline_before_endstream: NewlineBeforeEndstream::Yes,
+            ..options.clone()
+        };
+        &effective
+    } else {
+        options
+    };
 
     let result = write_pdf_full_rewrite_inner(pdf, out, options);
 

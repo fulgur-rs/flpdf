@@ -10,12 +10,11 @@
 //!
 //! Both invocations are byte-identical except for the added flag, so the `!=`
 //! assertion can only be explained by re-encoding the *raw encoded* bytes — not
-//! by framing differences. The CLI writer appends a single newline before
-//! `endstream` (its `--newline-before-endstream` modes never reproduce qpdf's
-//! `Never`), so the captured payload is normalized by stripping one trailing
-//! newline before comparison. The comparison stays on the raw encoded bytes
-//! (the only observable difference between preserve and recompress): decoding
-//! both would yield identical content and defeat the test.
+//! by framing differences. The CLI's default `--newline-before-endstream=never`
+//! matches qpdf: no newline is inserted between the payload and `endstream`, so
+//! the captured payload IS the raw encoded stream. The comparison stays on the
+//! raw encoded bytes (the only observable difference between preserve and
+//! recompress): decoding both would yield identical content and defeat the test.
 
 use assert_cmd::Command;
 use std::path::Path;
@@ -48,27 +47,12 @@ fn largest_stream_payload(data: &[u8]) -> Vec<u8> {
     best
 }
 
-/// Strip one trailing newline (`\n`, optionally preceded by `\r`) that the CLI
-/// writer appends before `endstream`. Applied ONLY to the writer's output, not
-/// to the source: the source fixture has no added newline before `endstream`, so
-/// stripping there could pop a real trailing byte of the compressed data if it
-/// happened to be `0x0a`, causing a false mismatch.
-fn strip_trailing_newline(mut v: Vec<u8>) -> Vec<u8> {
-    if v.last() == Some(&b'\n') {
-        v.pop();
-        if v.last() == Some(&b'\r') {
-            v.pop();
-        }
-    }
-    v
-}
-
 fn source_payload() -> Vec<u8> {
     largest_stream_payload(&std::fs::read(fixture_path()).unwrap())
 }
 
 fn output_payload(out: &[u8]) -> Vec<u8> {
-    strip_trailing_newline(largest_stream_payload(out))
+    largest_stream_payload(out)
 }
 
 /// Run `flpdf rewrite <base args> <extra> <in> <out>` and return the output PDF

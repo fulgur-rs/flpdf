@@ -1837,14 +1837,14 @@ fn rewrite_help_shows_remove_unreferenced_resources_default_auto() {
 }
 
 #[test]
-fn rewrite_help_shows_newline_before_endstream_default_y() {
+fn rewrite_help_shows_newline_before_endstream_default_never() {
     Command::cargo_bin("flpdf")
         .unwrap()
         .args(["rewrite", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("newline-before-endstream"))
-        .stdout(predicate::str::contains("default: y"));
+        .stdout(predicate::str::contains("default: never"));
 }
 
 // ── combination tests ─────────────────────────────────────────────────────────

@@ -525,8 +525,12 @@ fn render_markdown(rows: &[MatrixRow]) -> String {
     out.push_str("with `/ID` elided.\n\n");
     out.push_str("## Byte-identity (feature-gated)\n\n");
     out.push_str("The `byte-equal` column reflects the **default Pure-Rust build** (miniz_oxide\n");
-    out.push_str("deflate, `NewlineBeforeEndstream::Yes`), and is `diverge` for every row — the\n");
-    out.push_str("default build deliberately does **not** chase byte-identity (see\n");
+    out.push_str("deflate) with the CLI's default `--newline-before-endstream=never` framing.\n");
+    out.push_str("Framing now matches qpdf, but miniz's DEFLATE bytes still differ from qpdf's\n");
+    out.push_str(
+        "zlib bytes, so every row whose output carries a deflate stream stays `diverge`\n",
+    );
+    out.push_str("in the default build — it deliberately does **not** chase byte-identity (see\n");
     out.push_str("`tests/golden/README.md`).\n\n");
     out.push_str(
         "Byte-for-byte identity with `qpdf --static-id` **is** achievable, but only as an\n",

@@ -1058,17 +1058,21 @@ struct RewriteCommand {
     remove_unreferenced_resources: CliRemoveUnreferencedResources,
 
     /// Insert a newline before each `endstream` keyword
-    /// (qpdf --newline-before-endstream=y|n).
+    /// (qpdf --newline-before-endstream=y|n|never).
     ///
-    /// `y` (default): always write exactly one `\n` before `endstream`, matching
-    /// ISO 32000-1 §7.3.8.1 and qpdf's default behaviour.
+    /// `never` (default): never insert a newline, so exactly `/Length` bytes sit
+    /// between `stream` and `endstream`. Reproduces qpdf's default output and is
+    /// required for byte-identical qpdf-equivalent rewrites.
+    /// `y`: always write exactly one `\n` before `endstream`, matching
+    /// ISO 32000-1 §7.3.8.1 and qpdf run with `--newline-before-endstream`.
     /// `n`: omit the extra newline when the stream payload already ends with `\n`
-    /// or `\r`.
+    /// or `\r` (a flpdf-specific middle ground; matches neither of qpdf's modes).
     ///
     /// Only affects the full-rewrite path.
-    #[arg(long = "newline-before-endstream", value_enum, default_value_t = CliYesNo::Yes,
-          help = "Insert newline before endstream keyword (qpdf default: y)")]
-    newline_before_endstream: CliYesNo,
+    #[arg(long = "newline-before-endstream", value_enum,
+          default_value_t = CliNewlineBeforeEndstream::Never,
+          help = "Insert newline before endstream keyword (qpdf default: never)")]
+    newline_before_endstream: CliNewlineBeforeEndstream,
 
     /// Stream data mode (qpdf --stream-data={preserve,uncompress,compress}).
     ///
@@ -1247,7 +1251,7 @@ impl From<CliFlattenMode> for FlattenMode {
     }
 }
 
-/// y|n toggle used by --compress-streams, --normalize-content, --newline-before-endstream.
+/// y|n toggle used by --compress-streams, --normalize-content.
 /// Clap variant names are `y` and `n` (lowercase single letter, qpdf-compatible).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliYesNo {
@@ -1255,6 +1259,21 @@ enum CliYesNo {
     Yes,
     #[clap(name = "n")]
     No,
+}
+
+/// `--newline-before-endstream=y|n|never` (qpdf default: never).
+///
+/// Adds a third `never` variant on top of `y|n` so the CLI can request qpdf's
+/// default framing (no newline between the stream payload and `endstream`),
+/// which is required for byte-identical qpdf-equivalent output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliNewlineBeforeEndstream {
+    #[clap(name = "y")]
+    Yes,
+    #[clap(name = "n")]
+    No,
+    #[clap(name = "never")]
+    Never,
 }
 
 /// `--remove-unreferenced-resources=auto|yes|no` (qpdf-compatible).
@@ -2063,8 +2082,9 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 CliYesNo::No => CompressStreams::No,
             };
             options.newline_before_endstream = match cmd.newline_before_endstream {
-                CliYesNo::Yes => NewlineBeforeEndstream::Yes,
-                CliYesNo::No => NewlineBeforeEndstream::No,
+                CliNewlineBeforeEndstream::Yes => NewlineBeforeEndstream::Yes,
+                CliNewlineBeforeEndstream::No => NewlineBeforeEndstream::No,
+                CliNewlineBeforeEndstream::Never => NewlineBeforeEndstream::Never,
             };
             // --stream-data overrides --compress-streams when set. The
             // policy is only applied by the full-rewrite path; without this
