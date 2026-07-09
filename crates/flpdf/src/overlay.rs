@@ -3195,4 +3195,24 @@ mod tests {
         assert_eq!(dict_before.get("Contents"), dict_after.get("Contents"));
         assert_eq!(dict_before.get("Resources"), dict_after.get("Resources"));
     }
+
+    #[test]
+    fn overlay_verbose_report_propagates_spec_page_resolution_error() {
+        // Source has 1 page but --from=2 references a nonexistent source page,
+        // so PageRange::resolve inside resolve_spec_pairs returns Err. Verifies
+        // the `?` on the resolve_spec_pairs call propagates the error.
+        let mut dest = open(n_page_doc(2));
+        let mut specs = [OverlaySpec {
+            source: open(n_page_doc(1)),
+            kind: OverlayKind::Overlay,
+            from: PageRange::parse("2").unwrap(),
+            to: PageRange::parse("").unwrap(),
+            repeat: None,
+        }];
+        let result = overlay_verbose_report(&mut dest, &mut specs);
+        assert!(
+            matches!(result, Err(Error::Parse { .. })),
+            "out-of-range --from should propagate as Err(Parse), got {result:?}"
+        );
+    }
 }
