@@ -172,7 +172,7 @@ mod tests {
         // Literal 1 byte (header=0x00): 'W'
         // EOD
         let input = [0x01, b'X', b'Y', 0xFD, b'Z', 0x00, b'W', 0x80];
-        let expected: Vec<u8> = [b'X', b'Y', b'Z', b'Z', b'Z', b'Z', b'W'].to_vec();
+        let expected: Vec<u8> = b"XYZZZZW".to_vec();
         assert_eq!(decode(&input).unwrap(), expected);
     }
 

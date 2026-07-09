@@ -3097,6 +3097,52 @@ fn run_rewrite(
         // above.
         if !overlay_specs.is_empty() {
             let mut built = build_overlay_specs(overlay_specs, repair, password.allow_weak_crypto)?;
+
+            // flpdf-9hc.16.8: propagate max input header version + Adobe
+            // extension_level to the writer (mirrors qpdf QPDFJob.cc L1714
+            // accumulator + L2913 setMinimumPDFVersion). Executed only when
+            // overlay/underlay is in play; a full CLI-wide input-version
+            // accumulator across other paths is out of scope here (documented
+            // as non-scope in the bd design).
+            let mut max_ver: (u8, u8) = parse_pdf_version(pdf.version()).unwrap_or((1, 0));
+            let mut max_ext: i64 = pdf.adobe_extension_level().unwrap_or(0);
+            for spec in built.iter_mut() {
+                let sv = parse_pdf_version(spec.source.version()).unwrap_or((1, 0));
+                let se = spec.source.adobe_extension_level().unwrap_or(0);
+                match sv.cmp(&max_ver) {
+                    std::cmp::Ordering::Greater => {
+                        max_ver = sv;
+                        max_ext = se;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if se > max_ext {
+                            max_ext = se;
+                        }
+                    }
+                    std::cmp::Ordering::Less => {}
+                }
+            }
+            // Preserve any pre-existing --min-version / --min-extension-level
+            // CLI arg by taking pairwise max with the accumulated floor.
+            if let Some(ref current) = options.min_version {
+                let cur = parse_pdf_version(current).unwrap_or((1, 0));
+                let cur_ext = options.min_extension_level.unwrap_or(0);
+                match cur.cmp(&max_ver) {
+                    std::cmp::Ordering::Greater => {
+                        max_ver = cur;
+                        max_ext = cur_ext;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if cur_ext > max_ext {
+                            max_ext = cur_ext;
+                        }
+                    }
+                    std::cmp::Ordering::Less => {}
+                }
+            }
+            options.min_version = Some(format!("{}.{}", max_ver.0, max_ver.1));
+            options.min_extension_level = (max_ext > 0).then_some(max_ext);
+
             flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
         }
 

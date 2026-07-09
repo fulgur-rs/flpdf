@@ -220,7 +220,7 @@ fn check_reader_inner_with_options<R: Read + Seek>(
         version: pdf.version().to_string(),
         encrypted: pdf.is_encrypted(),
         linearized,
-        extension_level: adobe_extension_level(&mut pdf),
+        extension_level: pdf.adobe_extension_level(),
     };
 
     Ok(CheckReport {
@@ -232,28 +232,6 @@ fn check_reader_inner_with_options<R: Read + Seek>(
 
 fn is_linearized_pdf<R: Read + Seek>(reader: &mut Pdf<R>) -> crate::Result<bool> {
     reader.linearized_hint_ref().map(|hint| hint.is_some())
-}
-
-/// Read the Adobe extension level from the catalog's `/Extensions /ADBE
-/// /ExtensionLevel`, resolving indirect references at each step. Returns `None`
-/// when any link in that chain is absent or not the expected type. qpdf only
-/// honours the `/ADBE` developer prefix for its `--check` version banner.
-fn adobe_extension_level<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<i64> {
-    let root_ref = pdf.trailer().get_ref("Root")?;
-    let catalog = pdf.resolve(root_ref).ok()?;
-    let extensions = resolve_value(pdf, catalog.as_dict()?.get("Extensions")?.clone())?;
-    let adbe = resolve_value(pdf, extensions.as_dict()?.get("ADBE")?.clone())?;
-    let level = resolve_value(pdf, adbe.as_dict()?.get("ExtensionLevel")?.clone())?;
-    level.as_integer()
-}
-
-/// Resolve `value` one level: follow an [`Object::Reference`] through `pdf`,
-/// or return a non-reference value unchanged.
-fn resolve_value<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Option<Object> {
-    match value {
-        Object::Reference(reference) => pdf.resolve(reference).ok(),
-        other => Some(other),
-    }
 }
 
 /// The generalized filters flpdf fully decodes. A decode failure on a stream

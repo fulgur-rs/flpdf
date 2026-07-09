@@ -1634,10 +1634,9 @@ fn parse_pdf_date(bytes: &[u8]) -> Option<String> {
         "Z".to_string()
     } else if let Some(rest) = tz_str.strip_prefix('+') {
         parse_tz_offset('+', rest)?
-    } else if let Some(rest) = tz_str.strip_prefix('-') {
-        parse_tz_offset('-', rest)?
     } else {
-        return None;
+        let rest = tz_str.strip_prefix('-')?;
+        parse_tz_offset('-', rest)?
     };
 
     Some(format!("{year}-{month}-{day}T{hour}:{minute}:{second}{tz}"))

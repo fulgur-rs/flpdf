@@ -192,7 +192,7 @@ fn parse_previous_xref_offset(trailer: &Dictionary) -> Option<u64> {
     trailer
         .get("Prev")
         .and_then(|offset| parse_non_negative_u64(offset, "/Prev").ok())
-        .and_then(|offset| if offset == 0 { None } else { Some(offset) })
+        .filter(|&offset| offset != 0)
 }
 
 fn recover_xref_from_linear_scan(

@@ -1265,10 +1265,13 @@ fn rewrite_subcommand_copy_encryption_from_succeeds() {
 }
 
 /// `--copy-encryption-from` (a V=4 AES-128 donor) applied to a low-version
-/// input must floor the output PDF header to 1.5 — the output carries /V 4, so
-/// a 1.3 header would be a spec violation. (one-page.pdf is %PDF-1.3.)
+/// input must floor the output PDF header to 1.6 per qpdf QPDFWriter.cc L810:
+/// V=4 with AES needs at least 1.6 (AES-128 CBC arrived in PDF 1.6). Prior to
+/// the encryption-floor fix flpdf floored to 1.5, matching what RC4 needs but
+/// under-shooting AES; the donor here is AES-128 (see `make_donor_pdf`).
+/// (one-page.pdf is %PDF-1.3.)
 #[test]
-fn copy_encryption_floors_pdf_header_to_1_5() {
+fn copy_encryption_floors_pdf_header_to_1_6() {
     let tmp = tempfile::tempdir().unwrap();
     let donor = make_donor_pdf(&tmp, "user-pw", "owner-pw");
     let out = tmp.path().join("copied.pdf");
@@ -1283,8 +1286,8 @@ fn copy_encryption_floors_pdf_header_to_1_5() {
         .success();
     let bytes = std::fs::read(&out).unwrap();
     assert!(
-        bytes.starts_with(b"%PDF-1.5"),
-        "copy-encryption (V=4 donor) must floor the header to 1.5, got {:?}",
+        bytes.starts_with(b"%PDF-1.6"),
+        "copy-encryption (V=4 AES-128 donor) must floor the header to 1.6, got {:?}",
         String::from_utf8_lossy(&bytes[..bytes.len().min(12)])
     );
 }

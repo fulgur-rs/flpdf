@@ -228,6 +228,22 @@ pub struct WriteOptions {
     /// Mirrors `qpdf --min-version`.
     pub min_version: Option<String>,
 
+    /// Enforce a minimum Adobe extension level in the output catalog's
+    /// `/Extensions /ADBE /ExtensionLevel`.
+    ///
+    /// Combined with [`Self::min_version`] via qpdf's pairwise rule: a higher
+    /// `min_version` **resets** the extension level (does not carry it across a
+    /// version bump). When the resulting effective level is greater than 0, the
+    /// writer injects
+    /// `/Extensions << /ADBE << /BaseVersion /<ver> /ExtensionLevel <lvl> >> >>`
+    /// into the Catalog on the full-rewrite path. When 0, no injection (existing
+    /// Catalog untouched).
+    ///
+    /// Mirrors qpdf's `--min-version <version>-<level>` (the level portion) and
+    /// the extension_level `QPDFJob` accumulates into `max_input_version` from
+    /// every opened input's Catalog.
+    pub min_extension_level: Option<i64>,
+
     /// Force the output PDF version header to exactly this value, ignoring the
     /// source version and the linearize floor.
     ///
@@ -504,6 +520,17 @@ pub fn effective_pdf_version<'a>(
         }
     }
 
+    // Apply encryption floor (mirrors qpdf QPDFWriter::setEncryptionParametersInternal
+    // at QPDFWriter.cc L806-815). AES-256 (R>=6), AES-256 legacy (R=5), AES-128
+    // (R=4), RC4-128 (R=3, or R=4 without AES), RC4-40 (R<3) each require a
+    // minimum header version.
+    let enc_floor = encryption_version_floor(options);
+    if let Some((enc_ver, _)) = enc_floor {
+        if enc_ver > best {
+            best = enc_ver;
+        }
+    }
+
     // Apply object-stream floor (object streams require >= 1.5).
     if object_streams {
         let objstm_floor = (1u8, 5u8);
@@ -530,14 +557,275 @@ pub fn effective_pdf_version<'a>(
             return min_v.as_str();
         }
     }
+    // Encryption floor matched — return a static string for the emitted version.
+    // cov:ignore-start: inner-if closing braces are llvm-cov region artifacts;
+    // the `return` inside is exercised by
+    // effective_pdf_version_folds_each_encryption_floor_arm.
+    if let Some((enc_ver, _)) = enc_floor {
+        if enc_ver == best {
+            return static_version_string(best);
+        }
+    }
+    // cov:ignore-end
     // Object-stream floor "1.5" — reached when best == (1,5) and neither source
-    // nor min_version matched (object streams forced the version up).
+    // nor min_version nor encryption floor matched.
     if best == (1u8, 5u8) {
         return "1.5";
     }
     // Linearize floor "1.2" — only reached when best == (1,2) and neither
-    // source nor min_version matched.
+    // source nor min_version nor encryption floor matched.
     "1.2"
+}
+
+/// Header-version floor imposed by the encryption method requested via
+/// [`WriteOptions::encrypt`] / [`WriteOptions::copy_encryption`].
+///
+/// Mirrors qpdf QPDFWriter.cc L806-815 (`setEncryptionParametersInternal`):
+///
+/// | Method                       | Floor (version, ext) |
+/// |------------------------------|----------------------|
+/// | V=5 R=6 AES-256              | (1.7, 8)             |
+/// | V=5 R=5 AES-256 (legacy)     | (1.7, 3)             |
+/// | V=4 R=4 AES-128              | (1.6, 0)             |
+/// | V=4 R=4 RC4-128              | (1.5, 0)             |
+/// | V=2 R=3 RC4-128              | (1.4, 0)             |
+/// | V=1 R=2 RC4-40               | (1.3, 0)             |
+/// | `copy_encryption` (V=4 AES)  | (1.6, 0)             |
+///
+/// `copy_encryption` only supports V=4 AES-128 donors in the current release
+/// (see [`crate::encrypt_setup::CopyEncryptionSource`] docs), so the copy path
+/// returns the AES-128 floor unconditionally.
+fn encryption_version_floor(options: &WriteOptions) -> Option<((u8, u8), i64)> {
+    use crate::encrypt_setup::EncryptMethod;
+    if let Some(ref enc) = options.encrypt {
+        return Some(match enc.method {
+            EncryptMethod::V5R6Aes256 => ((1, 7), 8),
+            EncryptMethod::V5R5Aes256 => ((1, 7), 3),
+            EncryptMethod::V4Aes128 => ((1, 6), 0),
+            EncryptMethod::V4Rc4128 => ((1, 5), 0),
+            EncryptMethod::V2Rc4128 => ((1, 4), 0),
+            EncryptMethod::V1Rc440 => ((1, 3), 0),
+        });
+    }
+    if options.copy_encryption.is_some() {
+        return Some(((1, 6), 0));
+    }
+    None
+}
+
+/// Static PDF-version string for a `(major, minor)` pair. Reached from
+/// [`effective_pdf_version`] when the encryption floor wins the version race
+/// without the source or min_version matching, so a non-borrowed `&'static str`
+/// is needed for the return slot. Only the versions [`encryption_version_floor`]
+/// can return are handled.
+fn static_version_string(v: (u8, u8)) -> &'static str {
+    match v {
+        (1, 3) => "1.3",
+        (1, 4) => "1.4",
+        (1, 5) => "1.5",
+        (1, 6) => "1.6",
+        (1, 7) => "1.7",
+        // cov:ignore-start: encryption_version_floor only returns (1, 3..=7).
+        // Any other pair would indicate a code bug and 1.7 is the safest
+        // header fallback (no reader treats it as an under-specification).
+        _ => "1.7",
+        // cov:ignore-end
+    }
+}
+
+/// Compute the effective (PDF version, Adobe extension level) pair to write,
+/// applying qpdf's pairwise combined rule (`QPDFWriter::setMinimumPDFVersion`):
+///
+/// * `options.min_version` unset → take `(source, source_ext)`.
+/// * new version > current → take both from the new source. The extension
+///   level resets across a version bump; it does not carry across.
+/// * new version == current AND new ext > current → take ext only.
+/// * new version < current → ignore.
+///
+/// This is the pair-aware sibling of [`effective_pdf_version`] and delegates
+/// to it for the version half. The extension level is only meaningful when
+/// greater than zero; callers should injection-gate on that. `linearize` and
+/// `object_streams` are threaded through unchanged.
+pub fn effective_pdf_version_and_ext<'a>(
+    source: &'a str,
+    source_ext: i64,
+    options: &'a WriteOptions,
+    linearize: bool,
+    object_streams: bool,
+) -> (&'a str, i64) {
+    // Version half: delegate.
+    let ver = effective_pdf_version(source, options, linearize, object_streams);
+
+    // Extension level half: pairwise. An input's extension level survives only
+    // when that input's version *equals* the effective version — i.e. that
+    // input won or tied on the version race. A bumped input (whose version was
+    // outbid, including a min_version that beat the source outright) drops its
+    // extension level; the pairwise rule does not carry ext across a version
+    // bump. When only one side ties, its ext wins alone; when both tie
+    // (source_ver == min_ver == ver) the higher of the two ext values wins.
+    // When neither ties (e.g. the object-stream floor 1.5 or linearize floor
+    // 1.2 bumped past both) the effective ext is 0.
+    let ver_parsed = parse_pdf_version(ver);
+    let source_parsed = parse_pdf_version(source);
+    let min_parsed = options.min_version.as_deref().and_then(parse_pdf_version);
+    // `--force-version` returns the forced value verbatim from
+    // `effective_pdf_version`. qpdf treats a valid `--force-version` as an
+    // exact version with extension level 0: neither the source nor the
+    // caller-supplied `--min-extension-level` should propagate an ext to
+    // the header, even when the forced major/minor happens to equal source
+    // or min_v. Gate both contributions on the forced flag so a forced
+    // version zeroes the extension regardless of the tie. (Explicit
+    // per-force extension specification is not part of the current API;
+    // if introduced, this is where the exception would go.)
+    let forced = options
+        .force_version
+        .as_deref()
+        .and_then(parse_pdf_version)
+        .is_some();
+    let enc_floor = encryption_version_floor(options);
+    let source_contributes = !forced && ver_parsed.is_some() && ver_parsed == source_parsed;
+    let min_contributes = !forced && ver_parsed.is_some() && ver_parsed == min_parsed;
+    let enc_contributes =
+        !forced && ver_parsed.is_some() && enc_floor.map(|(v, _)| v) == ver_parsed;
+    let min_ext = options.min_extension_level.unwrap_or(0);
+    let enc_ext = enc_floor.map(|(_, e)| e).unwrap_or(0);
+    // Whichever inputs tie with the effective version each contribute their ext;
+    // an input that was outbid contributes nothing. Multiple ties combine via
+    // `max` — qpdf-equivalent when multiple setMinimumPDFVersion calls arrive
+    // at the same version, the higher extension level wins the tie.
+    let mut ext = 0i64;
+    if source_contributes {
+        ext = ext.max(source_ext);
+    }
+    if min_contributes {
+        ext = ext.max(min_ext);
+    }
+    if enc_contributes {
+        ext = ext.max(enc_ext);
+    }
+    (ver, ext)
+}
+
+/// Ensure the destination Catalog carries
+/// `/Extensions << /ADBE << /BaseVersion /<version> /ExtensionLevel <lvl> >> >>`.
+///
+/// Mirrors qpdf's `QPDFWriter::addDeveloperExtension` handling
+/// (QPDFWriter.cc L1355-1450): if the Catalog has no `/Extensions`, create a
+/// direct dict carrying only `/ADBE`; if it has one (direct dict or indirect
+/// reference), resolve it to a Dictionary and overwrite the `/ADBE` entry
+/// only, leaving non-ADBE developer prefixes intact; write the resulting
+/// Extensions dict back onto the Catalog inline as a direct value.
+///
+/// Callers must only invoke this when the effective extension level is > 0.
+///
+/// # Errors
+///
+/// - [`crate::Error::Missing`] if the input has no `/Root` in its trailer.
+/// - Propagates [`Pdf::resolve`] errors when materialising the Catalog or an
+///   indirect `/Extensions` value.
+fn inject_adbe_extension<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    version: &str,
+    extension_level: i64,
+) -> Result<()> {
+    // cov:ignore-start: defensive /Root guard. inject_adbe_extension is only
+    // called from write_pdf_full_rewrite AFTER its own root_ref check has
+    // already returned Missing("/Root"), so this branch is unreachable in the
+    // normal pipeline.
+    let Some(root_ref) = pdf.root_ref() else {
+        return Err(crate::Error::Missing("/Root"));
+    };
+    // cov:ignore-end
+
+    // resolve() returns an owned Object (cloned from the cache); into_dict
+    // moves the inner Dictionary out without a further clone. A non-Dict
+    // Catalog would fail every downstream write path, so bail rather than
+    // silently mutate nothing.
+    let catalog_obj = pdf.resolve(root_ref)?;
+    // cov:ignore-start: defensive non-Dict Catalog guard. Every downstream
+    // write path rejects a non-dict Catalog before reaching this helper.
+    let Some(mut catalog) = catalog_obj.into_dict() else {
+        return Err(crate::Error::Unsupported(
+            "Catalog is not a dictionary".to_string(),
+        ));
+    };
+    // cov:ignore-end
+
+    // If Catalog had /Extensions, materialise it into an owned Dictionary
+    // regardless of whether it was a direct dict or an indirect reference —
+    // matching qpdf, which always inlines the resulting Extensions on the
+    // Catalog. remove() moves the value out so no extra clone is taken.
+    let mut extensions = match catalog.remove("Extensions") {
+        Some(Object::Dictionary(d)) => d,
+        Some(Object::Reference(r)) => pdf.resolve(r)?.into_dict().unwrap_or_default(),
+        _ => Dictionary::new(),
+    };
+
+    // Overwrite /ADBE wholesale, leaving any other developer prefix keys alone.
+    let mut adbe = Dictionary::new();
+    adbe.insert("BaseVersion", Object::Name(version.as_bytes().to_vec()));
+    adbe.insert("ExtensionLevel", Object::Integer(extension_level));
+    extensions.insert("ADBE", Object::Dictionary(adbe));
+
+    catalog.insert("Extensions", Object::Dictionary(extensions));
+    pdf.set_object(root_ref, Object::Dictionary(catalog));
+    Ok(())
+}
+
+/// Strip `/Extensions /ADBE` from the destination Catalog when the effective
+/// extension level is 0. This complements [`inject_adbe_extension`]: when a
+/// version race (min_version bump or ObjStm floor) drops the pairwise ext to
+/// 0 but the source Catalog carries a stale `/ADBE` entry, that stale entry
+/// would otherwise survive the renumber walk and produce an output whose
+/// Catalog `/BaseVersion` contradicts the emitted header version.
+///
+/// Only touches `/ADBE`; any other developer-prefix keys under `/Extensions`
+/// are preserved (matching qpdf's per-prefix handling). Drops `/Extensions`
+/// itself when it becomes empty after ADBE removal.
+///
+/// # Errors
+///
+/// - Propagates [`Pdf::resolve`] errors when materialising the Catalog or an
+///   indirect `/Extensions` value.
+fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
+    // cov:ignore-start: defensive /Root guard. strip_adbe_extension is only
+    // reached after write_pdf_full_rewrite passes its own root_ref check on
+    // the same Pdf.
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(());
+    };
+    // cov:ignore-end
+    let catalog_obj = pdf.resolve(root_ref)?;
+    // cov:ignore-start: defensive non-Dict Catalog guard, mirroring
+    // inject_adbe_extension. Every downstream write path rejects a non-dict
+    // Catalog before reaching this helper.
+    let Some(mut catalog) = catalog_obj.into_dict() else {
+        return Ok(());
+    };
+    // cov:ignore-end
+    let mut extensions = match catalog.remove("Extensions") {
+        Some(Object::Dictionary(d)) => d,
+        Some(Object::Reference(r)) => pdf.resolve(r)?.into_dict().unwrap_or_default(),
+        // cov:ignore-start: unreachable when source_ext > 0.
+        // adobe_extension_level() returns Some(N) only after walking through a
+        // Dict-or-Ref /Extensions; the caller gates strip on source_ext > 0.
+        _ => return Ok(()),
+        // cov:ignore-end
+    };
+    if extensions.remove("ADBE").is_none() {
+        // cov:ignore-start: unreachable when source_ext > 0. adobe_extension_level()
+        // returns Some(N) only if /Extensions carries /ADBE with an integer
+        // /ExtensionLevel; the caller gates strip on source_ext > 0.
+        catalog.insert("Extensions", Object::Dictionary(extensions));
+        pdf.set_object(root_ref, Object::Dictionary(catalog));
+        return Ok(());
+        // cov:ignore-end
+    }
+    if extensions.iter().next().is_some() {
+        catalog.insert("Extensions", Object::Dictionary(extensions));
+    }
+    pdf.set_object(root_ref, Object::Dictionary(catalog));
+    Ok(())
 }
 
 /// Binary header marker emitted by qpdf on the second line of every output
@@ -2578,6 +2866,47 @@ fn write_reencoded_object(
 
 fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
+    out: W,
+    options: &WriteOptions,
+) -> Result<()> {
+    // Snapshot the source Catalog AND its dirty-flag state BEFORE any ADBE
+    // injection / strip mutates them, so those output-only mutations do not
+    // leak into the caller's Pdf handle. Restored below regardless of whether
+    // the write succeeds — the Pdf handle is safe to reuse for subsequent
+    // writes (or for read APIs like page enumeration) after this call
+    // returns. The dirty flag is captured too because `Pdf::set_object` used
+    // for the restore unconditionally marks its target dirty; without the
+    // dirty-flag restore a subsequent `write_pdf` incremental append would
+    // spuriously emit a Catalog delta.
+    let catalog_snapshot = pdf.root_ref().and_then(|r| {
+        let was_dirty = pdf.is_dirty(r);
+        pdf.resolve(r).ok().map(|catalog| (r, catalog, was_dirty))
+    });
+
+    let result = write_pdf_full_rewrite_inner(pdf, out, options);
+
+    // Restore the original Catalog and its pre-write dirty state. Runs on
+    // success and on error alike so partial injection state cannot leak
+    // either. `set_object` marks the ref dirty; if the ref was clean before
+    // this call, clear the dirty flag to leave the caller's Pdf byte-for-byte
+    // equivalent to its pre-call state.
+    // cov:ignore-start: outer if-let and inner-if closing braces are
+    // llvm-cov region artifacts; the interior is exercised by
+    // write_pdf_full_rewrite_does_not_leave_root_dirty_flag_set and
+    // write_pdf_full_rewrite_preserves_pre_existing_root_dirty_flag.
+    if let Some((root_ref, original, was_dirty)) = catalog_snapshot {
+        pdf.set_object(root_ref, original);
+        if !was_dirty {
+            pdf.clear_dirty(root_ref);
+        }
+    }
+    // cov:ignore-end
+
+    result
+}
+
+fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
+    pdf: &mut Pdf<R>,
     mut out: W,
     options: &WriteOptions,
 ) -> Result<()> {
@@ -2621,6 +2950,49 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     // 6. xref: for Stream form, insert Compressed entries for members.
     //    For Table form with non-empty batches: return Err (5.7 guard).
     // ─────────────────────────────────────────────────────────────────────────
+
+    // flpdf-9hc.16.8: propagate the Adobe extension level into the destination
+    // Catalog BEFORE any downstream dispatch (e.g. the generate emitter below),
+    // so every path within write_pdf_full_rewrite sees the injected Catalog.
+    // When WriteOptions::min_extension_level requests an ext >= 1 (or the
+    // source Catalog already carries one that survives the pairwise rule)
+    // inject
+    //   /Extensions << /ADBE << /BaseVersion /<ver> /ExtensionLevel <lvl> >> >>
+    // so it becomes part of the Catalog the renumber walk / generate emitter
+    // sees. A source indirect /Extensions ref, if any, is inlined here and
+    // drops out of the reachable graph — mirroring qpdf's QPDFWriter behaviour.
+    {
+        let source_ver = pdf.version().to_string();
+        let source_ext = pdf.adobe_extension_level().unwrap_or(0);
+        // Predict whether the header floor will bump to PDF 1.5 due to
+        // ObjStm emission, so the pairwise pairwise-contribution logic in
+        // `effective_pdf_version_and_ext` sees the same version race that
+        // the header writer will apply. Generate mode always emits ObjStm
+        // (via the Generate dispatch below or, when it falls through due to
+        // encrypt / copy_encryption, via the full-rewrite planner). `--qdf`
+        // forces ObjStm off. `Preserve` and `Disable` skip the floor here;
+        // Preserve+source-has-ObjStm remains a latent edge case (walking
+        // the source for eligibility would be expensive).
+        let will_emit_objstm =
+            !options.qdf && matches!(options.object_streams, ObjectStreamMode::Generate);
+        let (eff_ver, eff_ext) = effective_pdf_version_and_ext(
+            &source_ver,
+            source_ext,
+            options,
+            false,
+            will_emit_objstm,
+        );
+        if eff_ext > 0 {
+            inject_adbe_extension(pdf, eff_ver, eff_ext)?;
+        } else if source_ext > 0 {
+            // Source carried an ADBE extension level that did not survive the
+            // pairwise version race (min_version bump or ObjStm floor drops
+            // it to 0). Removing the stale /ADBE entry from the destination
+            // Catalog keeps `/BaseVersion` from contradicting the emitted
+            // header version.
+            strip_adbe_extension(pdf)?;
+        }
+    }
 
     // Non-linearized --object-streams=generate is byte-identical to qpdf only
     // with qpdf's generate-mode numbering (container numbered immediately before
@@ -6253,11 +6625,13 @@ mod tests {
         }
     }
 
-    /// V=4 encryption (/V 4, AES-128 or RC4-128) requires a PDF header >= 1.5.
-    /// The encrypted path uses a classic xref table, so the writer must floor
-    /// the header explicitly — a 1.4 input must not emit a 1.4 header with /V 4.
+    /// V=4 encryption requires a PDF header floored per qpdf's method-specific
+    /// table (QPDFWriter.cc L810): AES → 1.6, RC4 → 1.5. Prior to the
+    /// encryption-floor fix flpdf floored both to 1.5, which was correct for
+    /// RC4 but under-shot AES; this test verifies each method emits the
+    /// qpdf-equivalent floor for a 1.4 input.
     #[test]
-    fn v4_encryption_floors_pdf_header_to_1_5() {
+    fn v4_encryption_floors_pdf_header_per_qpdf_table() {
         use crate::encrypt_setup::{EncryptMethod, EncryptParams};
         use std::io::Cursor;
 
@@ -6267,10 +6641,17 @@ mod tests {
             "fixture must start at %PDF-1.4 for this test to be meaningful"
         );
 
-        for params in [
-            EncryptParams::v4_aes128(b"u".to_vec(), b"o".to_vec()),
-            EncryptParams::rc4(EncryptMethod::V4Rc4128, b"u".to_vec(), b"o".to_vec()),
+        for (params, expected_prefix) in [
+            (
+                EncryptParams::v4_aes128(b"u".to_vec(), b"o".to_vec()),
+                b"%PDF-1.6".as_slice(),
+            ),
+            (
+                EncryptParams::rc4(EncryptMethod::V4Rc4128, b"u".to_vec(), b"o".to_vec()),
+                b"%PDF-1.5".as_slice(),
+            ),
         ] {
+            let method = params.method;
             let mut pdf = Pdf::open(Cursor::new(fixture.clone())).unwrap();
             let mut out = Vec::new();
             let options = WriteOptions {
@@ -6279,11 +6660,16 @@ mod tests {
                 ..WriteOptions::default()
             };
             write_pdf_with_options(&mut pdf, &mut out, &options).expect("V=4 encrypted write");
+            // cov:ignore-start: multi-line assert; llvm-cov attributes only the
+            // "on-panic" format-argument evaluations to the outer line, and the
+            // assertion succeeds so those are never evaluated.
             assert!(
-                out.starts_with(b"%PDF-1.5"),
-                "V=4 encryption must floor the header to 1.5, got {:?}",
+                out.starts_with(expected_prefix),
+                "{method:?} must floor the header to {}, got {:?}",
+                String::from_utf8_lossy(expected_prefix),
                 String::from_utf8_lossy(&out[..out.len().min(12)])
             );
+            // cov:ignore-end
         }
     }
 
@@ -6381,6 +6767,884 @@ mod tests {
         assert!(
             contains(&ct, b"/Crypt"),
             "the exempt /Metadata stream must be tagged with a /Crypt filter"
+        );
+    }
+
+    #[test]
+    fn write_options_default_min_extension_level_is_none() {
+        let options = WriteOptions::default();
+        assert!(options.min_extension_level.is_none());
+    }
+
+    #[test]
+    fn write_options_min_extension_level_stores_and_returns_value() {
+        let options = WriteOptions {
+            min_extension_level: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(options.min_extension_level, Some(8));
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_no_bump_when_min_unset() {
+        // Source 1.7 ext 0, options empty → (1.7, 0).
+        let options = WriteOptions::default();
+        let (v, e) = effective_pdf_version_and_ext("1.7", 0, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_pairwise_min_version_bump_resets_ext_to_source() {
+        // Source (1.3, 0), min_version=1.7, min_ext=Some(0) is illegal but None is the
+        // typical case here → min wins by version → ext resets to source_ext (0).
+        let options = WriteOptions {
+            min_version: Some("1.7".into()),
+            min_extension_level: None,
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.3", 0, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_min_ext_wins_when_versions_equal() {
+        // Source (1.7, 0), min (1.7, 8) → tie on ver, min_ext wins → (1.7, 8).
+        let options = WriteOptions {
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 0, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 8);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_source_ver_higher_resets_min_ext() {
+        // Source (2.0, 0), min (1.7, 8) → source wins by ver → ext resets to source_ext (0).
+        let options = WriteOptions {
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("2.0", 0, &options, false, false);
+        assert_eq!(v, "2.0");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_min_ver_bump_drops_source_ext() {
+        // Source (1.7, 8), min (2.0, None) → min wins by ver → source_ext must
+        // be dropped (pairwise rule: ext does not carry across a version bump).
+        // Expected: (2.0, 0), NOT (2.0, 8).
+        let options = WriteOptions {
+            min_version: Some("2.0".into()),
+            min_extension_level: None,
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
+        assert_eq!(v, "2.0");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_min_ver_bump_replaces_source_ext_with_min_ext() {
+        // Source (1.7, 8), min (2.0, Some(3)) → min wins by ver → source_ext
+        // drops, min_ext carries → (2.0, 3).
+        let options = WriteOptions {
+            min_version: Some("2.0".into()),
+            min_extension_level: Some(3),
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
+        assert_eq!(v, "2.0");
+        assert_eq!(e, 3);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_floor_bump_drops_both_ext() {
+        // Source (1.3, 8), min unset, object_streams bumps to 1.5 → neither
+        // source nor min contributes → ext = 0.
+        let options = WriteOptions::default();
+        let (v, e) = effective_pdf_version_and_ext("1.3", 8, &options, false, true);
+        assert_eq!(v, "1.5");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn encryption_version_floor_matches_qpdf_table() {
+        use crate::encrypt_setup::{EncryptMethod, EncryptParams};
+        for (method, expected) in [
+            (EncryptMethod::V5R6Aes256, ((1, 7), 8)),
+            (EncryptMethod::V5R5Aes256, ((1, 7), 3)),
+            (EncryptMethod::V4Aes128, ((1, 6), 0)),
+            (EncryptMethod::V4Rc4128, ((1, 5), 0)),
+            (EncryptMethod::V2Rc4128, ((1, 4), 0)),
+            (EncryptMethod::V1Rc440, ((1, 3), 0)),
+        ] {
+            let mut params = EncryptParams::v4_aes128(vec![], vec![]);
+            params.method = method;
+            let options = WriteOptions {
+                encrypt: Some(params),
+                ..WriteOptions::default()
+            };
+            assert_eq!(
+                encryption_version_floor(&options),
+                Some(expected),
+                "encryption floor for {method:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_pdf_version_folds_each_encryption_floor_arm() {
+        // Below-floor source for each encryption method — exercises every
+        // static_version_string arm reachable from the encryption floor race.
+        use crate::encrypt_setup::{EncryptMethod, EncryptParams};
+        for (method, expected) in [
+            (EncryptMethod::V1Rc440, "1.3"),
+            (EncryptMethod::V2Rc4128, "1.4"),
+            (EncryptMethod::V4Rc4128, "1.5"),
+            (EncryptMethod::V4Aes128, "1.6"),
+            (EncryptMethod::V5R5Aes256, "1.7"),
+            (EncryptMethod::V5R6Aes256, "1.7"),
+        ] {
+            let mut params = EncryptParams::v4_aes128(vec![], vec![]);
+            params.method = method;
+            let options = WriteOptions {
+                encrypt: Some(params),
+                ..WriteOptions::default()
+            };
+            // "1.0" is below every encryption floor, so the returned string
+            // comes from the encryption-floor branch (via static_version_string).
+            assert_eq!(
+                effective_pdf_version("1.0", &options, false, false),
+                expected,
+                "effective_pdf_version for {method:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn encryption_version_floor_none_when_no_encryption() {
+        let options = WriteOptions::default();
+        assert_eq!(encryption_version_floor(&options), None);
+    }
+
+    #[test]
+    fn effective_pdf_version_folds_encryption_floor_into_header() {
+        // Source PDF-1.3 + --encrypt AES-128 → header floor must be 1.6.
+        // Before the fix, effective_pdf_version returned "1.3" and the emitted
+        // %PDF header contradicted the encryption method.
+        let options = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                vec![],
+                vec![],
+            )),
+            ..WriteOptions::default()
+        };
+        assert_eq!(effective_pdf_version("1.3", &options, false, false), "1.6");
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_v5_r6_encryption_contributes_ext() {
+        // Source (1.3, 0) + AES-256 encryption (V5R6, floor (1.7, 8)) → ver
+        // bumps to 1.7, encryption contributes ext=8 (source's 1.3 was outbid,
+        // no min_version, no ObjStm).
+        let options = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(vec![], vec![])),
+            ..WriteOptions::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.3", 0, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 8);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_aes128_encryption_drops_stale_source_ext() {
+        // Codex round-3 P2 #3: source (1.3, 8) + AES-128 encryption (floor
+        // (1.6, 0)) → ver bumps to 1.6, source ext dropped (source's 1.3
+        // doesn't tie with 1.6). Result (1.6, 0) — stale ADBE must NOT survive.
+        let options = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                vec![],
+                vec![],
+            )),
+            ..WriteOptions::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.3", 8, &options, false, false);
+        assert_eq!(v, "1.6");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_encryption_and_source_tie_take_max_ext() {
+        // Source (1.7, 3) + AES-256 encryption (V5R6 floor (1.7, 8)) → both
+        // tie at 1.7 → ext = max(3, 8) = 8 (encryption wins the extension race
+        // at the tied version).
+        let options = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(vec![], vec![])),
+            ..WriteOptions::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 3, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 8);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_source_ext_wins_when_source_beats_encryption() {
+        // Source (1.7, 8) + AES-128 encryption (floor (1.6, 0)) → source's 1.7
+        // wins the version race, source ext survives → (1.7, 8). Encryption
+        // floor was outbid so its ext=0 contributes nothing.
+        let options = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                vec![],
+                vec![],
+            )),
+            ..WriteOptions::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 8);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_force_version_drops_source_ext() {
+        // --force-version=1.7 on a (1.7, 8) source → qpdf semantics: forced
+        // header is exact, extension level is 0 unless explicitly specified.
+        // Currently there is no explicit force-extension knob, so the source
+        // ext must not slip through just because the forced major/minor
+        // happens to equal the source version.
+        let options = WriteOptions {
+            force_version: Some("1.7".into()),
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_force_version_drops_min_ext() {
+        // --force-version=1.7 + --min-version=1.7 --min-extension-level=8
+        // → forced value is exact, so min_ext must not survive the tie.
+        let options = WriteOptions {
+            force_version: Some("1.7".into()),
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 0, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_invalid_force_version_is_ignored() {
+        // An unparseable --force-version is silently ignored by
+        // effective_pdf_version (mirrors the existing behavior); the pairwise
+        // helper must therefore fall back to normal contribution semantics
+        // rather than treating any garbage-force as "forced=true".
+        let options = WriteOptions {
+            force_version: Some("not-a-version".into()),
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 8);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_source_ext_wins_when_versions_tie() {
+        // Source (1.7, 8), min (1.7, 0) → tie on ver, source_ext higher → (1.7, 8).
+        let options = WriteOptions {
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(0),
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 8);
+    }
+
+    // ── inject_adbe_extension / min_extension_level end-to-end ──────────────
+    //
+    // These exercise the full-rewrite mutation that injects the Catalog's
+    // /Extensions /ADBE dict when WriteOptions::min_extension_level requests
+    // it. They use static_id for a stable output and inspect the emitted
+    // bytes for the expected keys and header.
+
+    /// Build a minimal single-page-less classic 1.3 PDF with only a Catalog
+    /// and empty Pages tree — the shape shared with the existing
+    /// deterministic-id fixture builder.
+    fn build_ext_injection_source() -> Vec<u8> {
+        let mut src = b"%PDF-1.3\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let startxref = src.len();
+        let count = offsets.len() + 1;
+        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        src
+    }
+
+    fn write_full_rewrite_with(source: &[u8], options: &WriteOptions) -> Vec<u8> {
+        let mut pdf = crate::Pdf::open_mem(source).expect("fixture must open");
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out, options)
+            .expect("full-rewrite write must succeed");
+        out
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_injects_extensions_adbe_when_min_ext_gt_zero() {
+        // Source is 1.3 with no /Extensions. min_version=1.7 wins the version
+        // half; because eff_ver == options.min_version, the ext half is
+        // max(source_ext=0, min_ext=8) = 8, so injection fires.
+        let src = build_ext_injection_source();
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+
+        assert!(
+            out.starts_with(b"%PDF-1.7\n"),
+            "min_version=1.7 must raise the header; first 12 bytes: {:?}",
+            &out[..out.len().min(12)] // cov:ignore: diagnostic format arg only evaluated on assertion failure
+        );
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("/Extensions"), "Catalog must carry /Extensions");
+        assert!(s.contains("/ADBE"), "Extensions must carry /ADBE");
+        assert!(
+            s.contains("/BaseVersion /1.7"),
+            "ADBE must carry /BaseVersion /1.7"
+        );
+        assert!(
+            s.contains("/ExtensionLevel 8"),
+            "ADBE must carry /ExtensionLevel 8"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_no_injection_when_min_ext_is_none() {
+        // Same version bump but no min_extension_level → header rises to 1.7
+        // but no /Extensions injection, matching qpdf's --min-version=1.7.
+        let src = build_ext_injection_source();
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: None,
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+
+        assert!(out.starts_with(b"%PDF-1.7\n"));
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            !s.contains("/Extensions"),
+            "no min_extension_level → no /Extensions injection"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_no_injection_when_min_ext_is_zero() {
+        // Effective extension level 0 must not trigger injection even when
+        // min_extension_level is explicitly Some(0).
+        let src = build_ext_injection_source();
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(0),
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+
+        assert!(out.starts_with(b"%PDF-1.7\n"));
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            !s.contains("/Extensions"),
+            "eff_ext == 0 → no /Extensions injection"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_ext_injection_preserves_non_adbe_developer_prefix() {
+        // Source has a direct /Extensions dict with a non-ADBE developer
+        // prefix. Injection must overwrite only /ADBE and leave the other
+        // prefix intact — mirroring qpdf's QPDFWriter behaviour.
+        let mut src = b"%PDF-1.3\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+              /Extensions << /XYZW << /BaseVersion /1.3 /ExtensionLevel 1 >> >> \
+              >>\nendobj\n",
+        );
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let startxref = src.len();
+        let count = offsets.len() + 1;
+        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("/ADBE"), "injected /ADBE must appear");
+        assert!(
+            s.contains("/BaseVersion /1.7"),
+            "new /ADBE must carry the effective /BaseVersion"
+        );
+        assert!(
+            s.contains("/ExtensionLevel 8"),
+            "new /ADBE must carry the effective /ExtensionLevel"
+        );
+        assert!(
+            s.contains("/XYZW"),
+            "non-ADBE developer prefix must survive: {s}"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_ext_injection_follows_indirect_extensions_ref() {
+        // Source /Extensions is an indirect reference to a dict that already
+        // has an ADBE at an older level plus a non-ADBE prefix. Injection
+        // must overwrite /ADBE with the new (BaseVersion, ExtensionLevel),
+        // preserve the other prefix, and inline the result on the Catalog.
+        let mut src = b"%PDF-1.3\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 3 0 R >>\nendobj\n",
+        );
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"3 0 obj\n<< /ADBE << /BaseVersion /1.7 /ExtensionLevel 3 >> \
+              /ACRO << /BaseVersion /1.7 /ExtensionLevel 1 >> >>\nendobj\n",
+        );
+        let startxref = src.len();
+        let count = offsets.len() + 1;
+        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("/ExtensionLevel 8"),
+            "/ADBE must have been overwritten with the new level: {s}"
+        );
+        assert!(
+            !s.contains("/ExtensionLevel 3"),
+            "old /ADBE /ExtensionLevel 3 must not survive: {s}"
+        );
+        assert!(
+            s.contains("/ACRO"),
+            "non-ADBE developer prefix must survive: {s}"
+        );
+    }
+
+    /// PDF-1.3 source that already carries `/Extensions /ADBE /ExtensionLevel N`.
+    /// Used by the ObjStm-floor regression tests below.
+    fn build_ext_injection_source_with_adbe_1_3() -> Vec<u8> {
+        let mut src = b"%PDF-1.3\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+              /Extensions << /ADBE << /BaseVersion /1.3 /ExtensionLevel 8 >> >> \
+              >>\nendobj\n",
+        );
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let startxref = src.len();
+        let count = offsets.len() + 1;
+        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        src
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_generate_mode_strips_stale_adbe_on_floor_bump() {
+        // Codex round-2 P2: source PDF-1.3 with /Extensions /ADBE /ExtensionLevel 8
+        // rewritten with --object-streams=generate. The ObjStm floor bumps the
+        // header to %PDF-1.5, so the source's ADBE (BaseVersion /1.3) must NOT
+        // survive — otherwise the emitted Catalog contradicts the header.
+        let src = build_ext_injection_source_with_adbe_1_3();
+        // Sanity: baseline reader sees the source ext.
+        {
+            let mut src_pdf = crate::Pdf::open_mem(&src).expect("source must open");
+            assert_eq!(
+                src_pdf.adobe_extension_level(),
+                Some(8),
+                "fixture must carry source ADBE ExtensionLevel 8"
+            );
+        }
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            object_streams: ObjectStreamMode::Generate,
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+        assert!(
+            out.starts_with(b"%PDF-1.5\n"),
+            "ObjStm floor must bump the header to 1.5"
+        );
+        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
+        assert_eq!(
+            reopened.adobe_extension_level(),
+            None,
+            "stale ADBE from source (BaseVersion 1.3) must not survive when the \
+             ObjStm floor drops the effective ext to 0"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_generate_mode_strips_stale_adbe_via_indirect_ref_preserving_other_prefix(
+    ) {
+        // Sibling of *_on_floor_bump but exercising the two remaining
+        // strip_adbe_extension branches: (1) /Extensions is an *indirect*
+        // reference (line 711), and (2) the source /Extensions carries a
+        // non-ADBE developer prefix that must survive after /ADBE is
+        // removed (line 723). Same trigger: ObjStm floor bumps 1.3 → 1.5.
+        let mut src = b"%PDF-1.3\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 3 0 R >>\nendobj\n",
+        );
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"3 0 obj\n<< /ADBE << /BaseVersion /1.3 /ExtensionLevel 8 >> \
+              /XYZW << /BaseVersion /1.3 /ExtensionLevel 1 >> >>\nendobj\n",
+        );
+        let startxref = src.len();
+        let count = offsets.len() + 1;
+        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        {
+            let mut src_pdf = crate::Pdf::open_mem(&src).expect("source must open");
+            assert_eq!(
+                src_pdf.adobe_extension_level(),
+                Some(8),
+                "fixture must carry source ADBE ExtensionLevel 8 through an indirect ref"
+            );
+        }
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            object_streams: ObjectStreamMode::Generate,
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+        assert!(
+            out.starts_with(b"%PDF-1.5\n"),
+            "ObjStm floor must bump the header to 1.5"
+        );
+        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
+        assert_eq!(
+            reopened.adobe_extension_level(),
+            None,
+            "stale ADBE from source must be stripped when the ObjStm floor \
+             drops the effective ext to 0"
+        );
+        // The non-ADBE developer prefix must survive the strip. Walk the
+        // Catalog manually. strip_adbe_extension inlines the mutated
+        // /Extensions back as a direct Dictionary on the Catalog, so we can
+        // access it directly without an extra resolve step. Extract owned
+        // Catalog dict via resolve+into_dict so the mutable borrow on
+        // `reopened` used by resolve() is released before subsequent asserts.
+        let root_ref = reopened.trailer().get_ref("Root").expect("Root ref");
+        let catalog_dict = reopened
+            .resolve(root_ref)
+            .expect("resolve root")
+            .into_dict()
+            .expect("root is dict");
+        // strip_adbe_extension always inlines /Extensions as a direct
+        // Dictionary, so a non-Dict variant here would indicate a code bug —
+        // panic rather than silently pass. Using as_dict keeps the assertion
+        // failure informative if this invariant ever breaks.
+        let ext_dict = catalog_dict
+            .get("Extensions")
+            .expect("Extensions key survives strip")
+            .as_dict()
+            .expect("Extensions must be present as a direct dict after strip");
+        assert!(
+            ext_dict.get("ADBE").is_none(),
+            "ADBE must be gone: {ext_dict:?}"
+        );
+        assert!(
+            ext_dict.get("XYZW").is_some(),
+            "non-ADBE developer prefix must survive: {ext_dict:?}"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_generate_mode_still_injects_extensions_adbe() {
+        // Regression for the write_pdf_generate dispatch race: the generate
+        // emitter (--object-streams=generate on an unencrypted, non-QDF full
+        // rewrite) branches out of write_pdf_full_rewrite before the Catalog
+        // renumber walk. The ADBE injection must fire BEFORE the dispatch so
+        // that the generate emitter sees the mutated Catalog. Without this the
+        // /Extensions dictionary would be silently missing from generate-mode
+        // output. Generate mode packs the Catalog into a FlateDecoded object
+        // stream, so we verify structurally by re-opening the output and
+        // asking for adobe_extension_level() rather than grepping raw bytes.
+        let src = build_ext_injection_source();
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            object_streams: ObjectStreamMode::Generate,
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+
+        assert!(out.starts_with(b"%PDF-1.7\n"), "header must raise to 1.7");
+        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
+        assert_eq!(
+            reopened.adobe_extension_level(),
+            Some(8),
+            "generate-mode output must carry /Extensions /ADBE /ExtensionLevel 8"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_does_not_dirty_caller_pdf_across_writes() {
+        // Codex round-3 P2 #4: the injection block mutates the caller's Pdf
+        // via set_object. Without the save/restore in write_pdf_full_rewrite,
+        // reusing the same Pdf handle for a second write would leak the
+        // output-only /Extensions dict into the second output. Verify the
+        // caller sees the same Pdf state before and after a write, and that
+        // two back-to-back writes produce identical output.
+        let src = build_ext_injection_source();
+        let mut pdf = crate::Pdf::open_mem_owned(src).expect("open");
+        // Pre-write baseline: source has no ADBE.
+        assert_eq!(pdf.adobe_extension_level(), None);
+
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..WriteOptions::default()
+        };
+        let mut out1 = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out1, &options).expect("first write");
+
+        // Caller-visible Pdf state must be unchanged after the write —
+        // adobe_extension_level still None (mutation was restored).
+        assert_eq!(
+            pdf.adobe_extension_level(),
+            None,
+            "first write must not leak /Extensions into the caller's Pdf"
+        );
+
+        // A second write with the same options must produce byte-identical
+        // output. If the first write had dirtied the Pdf, the second would
+        // see a different source_ext and could inject differently or accrete
+        // duplicate /Extensions state.
+        let mut out2 = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out2, &options).expect("second write");
+        assert_eq!(
+            out1, out2,
+            "back-to-back writes on the same Pdf must be byte-identical"
+        );
+
+        // And the output must still carry the requested /ADBE injection.
+        let mut reopened = crate::Pdf::open_mem_owned(out1).expect("reopen");
+        assert_eq!(
+            reopened.adobe_extension_level(),
+            Some(8),
+            "output must carry the requested ADBE"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_does_not_leave_root_dirty_flag_set() {
+        // Codex round-4 P2 #1: even after restoring the pre-write Catalog,
+        // `Pdf::set_object` used for the restore unconditionally marks the
+        // ref dirty. A subsequent incremental `write_pdf` would then emit a
+        // no-op Catalog delta, breaking the signed-prefix-preserving no-op
+        // workflow. Verify the outer wrapper clears the dirty flag when the
+        // ref was clean before the write.
+        let src = build_ext_injection_source();
+        let mut pdf = crate::Pdf::open_mem_owned(src).expect("open");
+        let root_ref = pdf.root_ref().expect("Root");
+        // Baseline: Root must be clean before any write.
+        assert!(!pdf.is_dirty(root_ref), "Root must be clean pre-write");
+
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..WriteOptions::default()
+        };
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out, &options).expect("write");
+
+        // Root must remain clean after the write — the injection's mutation
+        // was fully rolled back (value + dirty flag).
+        assert!(
+            !pdf.is_dirty(root_ref),
+            "Root dirty flag must be cleared after the full-rewrite restore"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_preserves_pre_existing_root_dirty_flag() {
+        // Sibling of _does_not_leave_root_dirty_flag_set: if the caller had
+        // already marked Root dirty BEFORE the full-rewrite (e.g. via a prior
+        // set_object), the restore path must LEAVE the dirty flag set —
+        // clearing it would silently drop the caller's own mutation.
+        let src = build_ext_injection_source();
+        let mut pdf = crate::Pdf::open_mem_owned(src).expect("open");
+        let root_ref = pdf.root_ref().expect("Root");
+
+        // Caller-side mutation: mark Root dirty explicitly by re-storing its
+        // current value. set_object always dirties the ref regardless of
+        // whether the value actually changed.
+        let catalog = pdf.resolve(root_ref).expect("resolve root");
+        pdf.set_object(root_ref, catalog);
+        assert!(pdf.is_dirty(root_ref), "sanity: caller marked Root dirty");
+
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..WriteOptions::default()
+        };
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out, &options).expect("write");
+
+        assert!(
+            pdf.is_dirty(root_ref),
+            "pre-existing Root dirty flag must survive the full-rewrite restore"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_v4_aes128_source_1_3_with_adbe_strips_stale_ext() {
+        // Codex round-3 P2 #3: source PDF-1.3 with /Extensions /ADBE
+        // /ExtensionLevel 8, rewritten with --encrypt AES-128. The encryption
+        // floor bumps the header to 1.6; the source's ADBE (BaseVersion 1.3
+        // ext 8) must NOT survive because the pairwise rule drops the source
+        // ext when the version is outbid.
+        let src = build_ext_injection_source_with_adbe_1_3();
+        let mut pdf = crate::Pdf::open_mem_owned(src).expect("open");
+        assert_eq!(pdf.adobe_extension_level(), Some(8));
+
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            static_aes_iv: true,
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                b"u".to_vec(),
+                b"o".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out, &options).expect("aes-128 encrypted write");
+
+        // cov:ignore-start: multi-line assert; llvm-cov attributes only the
+        // "on-panic" format-argument evaluations to the outer line.
+        assert!(
+            out.starts_with(b"%PDF-1.6\n"),
+            "AES-128 must floor the header to 1.6, got {:?}",
+            String::from_utf8_lossy(&out[..out.len().min(12)])
+        );
+        // cov:ignore-end
+
+        // Re-open the encrypted output with the same password and confirm
+        // there is no residual /ADBE with a stale /BaseVersion.
+        let reopen_opts = crate::PdfOpenOptions {
+            password: b"u".to_vec(),
+            ..Default::default()
+        };
+        let mut reopened =
+            crate::Pdf::open_mem_owned_with_options(out, reopen_opts).expect("reopen encrypted");
+        assert_eq!(
+            reopened.adobe_extension_level(),
+            None,
+            "stale /ADBE (BaseVersion 1.3) must be stripped by the encryption floor"
         );
     }
 }

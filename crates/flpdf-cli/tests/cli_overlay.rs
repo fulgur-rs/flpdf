@@ -415,3 +415,56 @@ fn overlay_on_top_level_inspection_is_rejected() {
             "can only be used with rewrite output",
         ));
 }
+
+#[test]
+fn overlay_bumps_header_from_non_encrypted_higher_version_source() {
+    // Dest is 1.3 (three-page.pdf) and the overlay source is a non-encrypted
+    // 1.7 PDF with no /Extensions/ADBE. The CLI accumulator (main.rs) must
+    // set options.min_version to max(dest, all sources) so the output header
+    // is bumped to %PDF-1.7, but the source has ext_level == 0 so no
+    // /Extensions/ADBE injection should occur. Structural, not byte-level
+    // (per the module doc, byte-parity vs qpdf is proven at the library layer;
+    // the CLI cannot emit NewlineBeforeEndstream::Never).
+    let src = fixture("one-page-v17.pdf");
+    let bytes = run_overlay_ok("three-page.pdf", &["--overlay", &src, "--"]);
+
+    assert!(
+        bytes.starts_with(b"%PDF-1.7\n"),
+        "expected header %PDF-1.7 after floor to 1.7 source, got {:?}",
+        bytes.get(..12),
+    );
+
+    let mut opened =
+        flpdf::Pdf::open(std::io::Cursor::new(bytes)).expect("output reopens as a valid PDF");
+    assert_eq!(
+        opened.adobe_extension_level(),
+        None,
+        "no /Extensions/ADBE must be injected when every source has ext_level == 0",
+    );
+}
+
+#[test]
+fn overlay_bumps_header_and_injects_adbe_from_encrypted_source() {
+    // Dest is 1.3 (three-page.pdf) and the overlay source is an AES-256
+    // encrypted 1.7 PDF whose Catalog carries /Extensions /ADBE
+    // /ExtensionLevel 8 (the standard marker for the AES-256 crypto handler).
+    // The CLI accumulator must (1) floor min_version to 1.7 and (2) propagate
+    // ext_level 8 so the writer injects /Extensions /ADBE into the output
+    // Catalog. Structural, not byte-level (see the module doc).
+    let src = fixture("one-page-enc-u.pdf");
+    let bytes = run_overlay_ok("three-page.pdf", &["--overlay", &src, "--password=u", "--"]);
+
+    assert!(
+        bytes.starts_with(b"%PDF-1.7\n"),
+        "expected header %PDF-1.7 after floor to 1.7 source, got {:?}",
+        bytes.get(..12),
+    );
+
+    let mut opened =
+        flpdf::Pdf::open(std::io::Cursor::new(bytes)).expect("output reopens as a valid PDF");
+    assert_eq!(
+        opened.adobe_extension_level(),
+        Some(8),
+        "expected /Extensions/ADBE/ExtensionLevel 8 propagated from AES-256 source",
+    );
+}
