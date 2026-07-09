@@ -579,15 +579,26 @@ pub fn effective_pdf_version_and_ext<'a>(
     // Version half: delegate.
     let ver = effective_pdf_version(source, options, linearize, object_streams);
 
-    // Extension level half: pairwise. options.min_ext contributes only when the
-    // effective version equals options.min_version (i.e. min_version won or
-    // tied); otherwise the source's ext wins.
-    let ext = match options.min_version.as_deref() {
-        Some(min_v) if min_v == ver => {
-            let cand = options.min_extension_level.unwrap_or(0);
-            source_ext.max(cand)
-        }
-        _ => source_ext,
+    // Extension level half: pairwise. An input's extension level survives only
+    // when that input's version *equals* the effective version — i.e. that
+    // input won or tied on the version race. A bumped input (whose version was
+    // outbid, including a min_version that beat the source outright) drops its
+    // extension level; the pairwise rule does not carry ext across a version
+    // bump. When only one side ties, its ext wins alone; when both tie
+    // (source_ver == min_ver == ver) the higher of the two ext values wins.
+    // When neither ties (e.g. the object-stream floor 1.5 or linearize floor
+    // 1.2 bumped past both) the effective ext is 0.
+    let ver_parsed = parse_pdf_version(ver);
+    let source_parsed = parse_pdf_version(source);
+    let min_parsed = options.min_version.as_deref().and_then(parse_pdf_version);
+    let source_contributes = ver_parsed.is_some() && ver_parsed == source_parsed;
+    let min_contributes = ver_parsed.is_some() && ver_parsed == min_parsed;
+    let min_ext = options.min_extension_level.unwrap_or(0);
+    let ext = match (source_contributes, min_contributes) {
+        (true, true) => source_ext.max(min_ext),
+        (true, false) => source_ext,
+        (false, true) => min_ext,
+        (false, false) => 0,
     };
     (ver, ext)
 }
@@ -2740,6 +2751,26 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     //    For Table form with non-empty batches: return Err (5.7 guard).
     // ─────────────────────────────────────────────────────────────────────────
 
+    // flpdf-9hc.16.8: propagate the Adobe extension level into the destination
+    // Catalog BEFORE any downstream dispatch (e.g. the generate emitter below),
+    // so every path within write_pdf_full_rewrite sees the injected Catalog.
+    // When WriteOptions::min_extension_level requests an ext >= 1 (or the
+    // source Catalog already carries one that survives the pairwise rule)
+    // inject
+    //   /Extensions << /ADBE << /BaseVersion /<ver> /ExtensionLevel <lvl> >> >>
+    // so it becomes part of the Catalog the renumber walk / generate emitter
+    // sees. A source indirect /Extensions ref, if any, is inlined here and
+    // drops out of the reachable graph — mirroring qpdf's QPDFWriter behaviour.
+    {
+        let source_ver = pdf.version().to_string();
+        let source_ext = pdf.adobe_extension_level().unwrap_or(0);
+        let (eff_ver, eff_ext) =
+            effective_pdf_version_and_ext(&source_ver, source_ext, options, false, false);
+        if eff_ext > 0 {
+            inject_adbe_extension(pdf, eff_ver, eff_ext)?;
+        }
+    }
+
     // Non-linearized --object-streams=generate is byte-identical to qpdf only
     // with qpdf's generate-mode numbering (container numbered immediately before
     // its members, members ascending-source, even split into ceil(n/100)
@@ -2760,24 +2791,6 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     let Some(root_ref) = pdf.root_ref() else {
         return Err(crate::Error::Missing("/Root"));
     };
-
-    // flpdf-9hc.16.8: propagate the Adobe extension level into the destination
-    // Catalog before the renumber walk. When WriteOptions::min_extension_level
-    // requests an ext >= 1 (or the source Catalog already carries one that
-    // survives the pairwise rule) inject
-    //   /Extensions << /ADBE << /BaseVersion /<ver> /ExtensionLevel <lvl> >> >>
-    // so it becomes part of the Catalog the renumber walk sees. A source
-    // indirect /Extensions ref, if any, is inlined here and drops out of the
-    // reachable graph — mirroring qpdf's QPDFWriter behaviour.
-    {
-        let source_ver = pdf.version().to_string();
-        let source_ext = pdf.adobe_extension_level().unwrap_or(0);
-        let (eff_ver, eff_ext) =
-            effective_pdf_version_and_ext(&source_ver, source_ext, options, false, false);
-        if eff_ext > 0 {
-            inject_adbe_extension(pdf, eff_ver, eff_ext)?;
-        }
-    }
 
     // Catalog-first renumber (flpdf-9hc.32): assign output object numbers in
     // qpdf's `enqueueObjectsStandard` BFS order so that plain rewrite output is
@@ -6585,6 +6598,45 @@ mod tests {
     }
 
     #[test]
+    fn effective_pdf_version_and_ext_min_ver_bump_drops_source_ext() {
+        // Source (1.7, 8), min (2.0, None) → min wins by ver → source_ext must
+        // be dropped (pairwise rule: ext does not carry across a version bump).
+        // Expected: (2.0, 0), NOT (2.0, 8).
+        let options = WriteOptions {
+            min_version: Some("2.0".into()),
+            min_extension_level: None,
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
+        assert_eq!(v, "2.0");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_min_ver_bump_replaces_source_ext_with_min_ext() {
+        // Source (1.7, 8), min (2.0, Some(3)) → min wins by ver → source_ext
+        // drops, min_ext carries → (2.0, 3).
+        let options = WriteOptions {
+            min_version: Some("2.0".into()),
+            min_extension_level: Some(3),
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
+        assert_eq!(v, "2.0");
+        assert_eq!(e, 3);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_floor_bump_drops_both_ext() {
+        // Source (1.3, 8), min unset, object_streams bumps to 1.5 → neither
+        // source nor min contributes → ext = 0.
+        let options = WriteOptions::default();
+        let (v, e) = effective_pdf_version_and_ext("1.3", 8, &options, false, true);
+        assert_eq!(v, "1.5");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
     fn effective_pdf_version_and_ext_source_ext_wins_when_versions_tie() {
         // Source (1.7, 8), min (1.7, 0) → tie on ver, source_ext higher → (1.7, 8).
         let options = WriteOptions {
@@ -6822,6 +6874,37 @@ mod tests {
         assert!(
             s.contains("/ACRO"),
             "non-ADBE developer prefix must survive: {s}"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_generate_mode_still_injects_extensions_adbe() {
+        // Regression for the write_pdf_generate dispatch race: the generate
+        // emitter (--object-streams=generate on an unencrypted, non-QDF full
+        // rewrite) branches out of write_pdf_full_rewrite before the Catalog
+        // renumber walk. The ADBE injection must fire BEFORE the dispatch so
+        // that the generate emitter sees the mutated Catalog. Without this the
+        // /Extensions dictionary would be silently missing from generate-mode
+        // output. Generate mode packs the Catalog into a FlateDecoded object
+        // stream, so we verify structurally by re-opening the output and
+        // asking for adobe_extension_level() rather than grepping raw bytes.
+        let src = build_ext_injection_source();
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            object_streams: ObjectStreamMode::Generate,
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+
+        assert!(out.starts_with(b"%PDF-1.7\n"), "header must raise to 1.7");
+        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
+        assert_eq!(
+            reopened.adobe_extension_level(),
+            Some(8),
+            "generate-mode output must carry /Extensions /ADBE /ExtensionLevel 8"
         );
     }
 }
