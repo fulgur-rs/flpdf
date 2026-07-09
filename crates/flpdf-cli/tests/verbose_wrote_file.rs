@@ -39,6 +39,34 @@ fn verbose_prints_wrote_file_line() {
 }
 
 #[test]
+fn verbose_prints_wrote_file_line_after_linearized_rewrite() {
+    // rewrite --linearize takes a separate write path (write_linearized +
+    // std::fs::write) that would otherwise skip the wrote-file completion
+    // line; regression-guard the branch keeps parity with qpdf --verbose.
+    let input = fixture("one-page.pdf");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = tmp.path().join("out.pdf");
+    let out_path = out.to_str().unwrap().to_string();
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args([
+            "rewrite",
+            "--static-id",
+            "--linearize",
+            "--verbose",
+            &input,
+            &out_path,
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "flpdf: wrote file {}\n",
+            out_path
+        )));
+}
+
+#[test]
 fn no_verbose_does_not_print_wrote_file() {
     let input = fixture("one-page.pdf");
     let tmp = tempfile::tempdir().expect("tempdir");

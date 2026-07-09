@@ -2980,6 +2980,9 @@ fn run_rewrite(
         doc.back_patch()?;
 
         std::fs::write(&output, &doc.bytes)?;
+        if verbose {
+            eprintln!("flpdf: wrote file {}", output.display());
+        }
         if had_signatures {
             eprintln!("flpdf: warning: removed signatures; signatures are now invalidated");
         }
