@@ -857,12 +857,12 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 // .16.10 source fixtures are pinned to PDF 1.3 (== the three-page dest) so the
 // orthogonal source version-floor limitation does not perturb the bytes.
 //
+// Source version-floor + Adobe extension_level propagation (pure header
+// bump AND AES-256 /Extensions/ADBE injection) is now covered here by
+// `overlay_pure_source_version_floor_bytes` and
+// `overlay_encrypted_source_extension_level_bytes` (below).
+//
 // Explicit deferrals (NOT covered here, by design):
-//   - Encrypted-source --password byte-identity: deferred to flpdf-9hc.16.8
-//     (source version-floor propagation). qpdf raises the output version to
-//     max(dest, sources) for AES-256 sources; flpdf keeps the dest version, so
-//     those bytes diverge. The behavioral --password path is covered in
-//     crates/flpdf-cli/tests/cli_overlay.rs.
 //   - CLI-level byte-identity: deferred to flpdf-9hc.33. The flpdf CLI emits
 //     NewlineBeforeEndstream::Yes and exposes no ::Never (qpdf's default), so
 //     every CLI-written stream diverges. These gates write through the library
