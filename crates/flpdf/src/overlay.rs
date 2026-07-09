@@ -238,6 +238,11 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     sources: &[OverlaySource],
 ) -> Result<()> {
     // qpdf orders sources underlays-then-overlays for BOTH naming and drawing.
+    // Build the two typed Vecs in a single pass over `sources` in encounter
+    // order — each kind is appended independently, so relative order within a
+    // kind is preserved. The paint order (underlays first, then overlays) is
+    // enforced below when we consume `underlays` before `overlays` while
+    // building the /Fx1.. names and the new content stream.
     let mut underlays: Vec<ObjectRef> = Vec::new();
     let mut overlays: Vec<ObjectRef> = Vec::new();
     for src in sources {
@@ -562,6 +567,25 @@ fn group_sources_by_dest_page(
         by_page.entry(dest_page).or_default().push(source);
     }
     by_page
+}
+
+/// Stable-partition `entries` into (underlays first, overlays second),
+/// preserving each source's original relative order within its kind.
+///
+/// qpdf orders overlay/underlay sources this way for both painting
+/// (see [`apply_overlays_to_page`]) and `--verbose` progress reporting.
+/// Sharing one implementation here prevents drift between painting and
+/// progress reporting.
+pub(crate) fn kind_stable_partition<T, F>(entries: Vec<T>, kind_of: F) -> Vec<T>
+where
+    F: Fn(&T) -> OverlayKind,
+{
+    let (underlays, overlays): (Vec<T>, Vec<T>) = entries
+        .into_iter()
+        .partition(|e| matches!(kind_of(e), OverlayKind::Underlay));
+    let mut out = underlays;
+    out.extend(overlays);
+    out
 }
 
 /// Apply already-grouped overlay/underlay sources to `dest`, calling
@@ -2654,6 +2678,75 @@ mod tests {
     #[test]
     fn group_sources_empty_is_empty() {
         assert!(group_sources_by_dest_page(&[]).is_empty());
+    }
+
+    // ---- kind_stable_partition (pure) -------------------------------------
+
+    #[test]
+    fn kind_stable_partition_underlays_first_stable_within_group() {
+        #[derive(Debug, PartialEq)]
+        struct E(u32, OverlayKind);
+        let out = kind_stable_partition(
+            vec![
+                E(1, OverlayKind::Overlay),
+                E(2, OverlayKind::Underlay),
+                E(3, OverlayKind::Overlay),
+                E(4, OverlayKind::Underlay),
+            ],
+            |e| e.1,
+        );
+        assert_eq!(
+            out,
+            vec![
+                E(2, OverlayKind::Underlay),
+                E(4, OverlayKind::Underlay),
+                E(1, OverlayKind::Overlay),
+                E(3, OverlayKind::Overlay),
+            ],
+            "underlays first (order preserved), then overlays (order preserved)"
+        );
+
+        // Empty input → empty output.
+        let empty: Vec<E> = kind_stable_partition(Vec::new(), |e| e.1);
+        assert!(empty.is_empty(), "empty input yields empty output");
+
+        // All-underlays input → identity (order preserved).
+        let all_u = kind_stable_partition(
+            vec![
+                E(10, OverlayKind::Underlay),
+                E(11, OverlayKind::Underlay),
+                E(12, OverlayKind::Underlay),
+            ],
+            |e| e.1,
+        );
+        assert_eq!(
+            all_u,
+            vec![
+                E(10, OverlayKind::Underlay),
+                E(11, OverlayKind::Underlay),
+                E(12, OverlayKind::Underlay),
+            ],
+            "all-underlays input preserves order (identity)"
+        );
+
+        // All-overlays input → identity (order preserved).
+        let all_o = kind_stable_partition(
+            vec![
+                E(20, OverlayKind::Overlay),
+                E(21, OverlayKind::Overlay),
+                E(22, OverlayKind::Overlay),
+            ],
+            |e| e.1,
+        );
+        assert_eq!(
+            all_o,
+            vec![
+                E(20, OverlayKind::Overlay),
+                E(21, OverlayKind::Overlay),
+                E(22, OverlayKind::Overlay),
+            ],
+            "all-overlays input preserves order (identity)"
+        );
     }
 
     // ---- apply_overlay_specs (multi-spec driver, end-to-end in memory) ----
