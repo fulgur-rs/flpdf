@@ -591,8 +591,22 @@ pub fn effective_pdf_version_and_ext<'a>(
     let ver_parsed = parse_pdf_version(ver);
     let source_parsed = parse_pdf_version(source);
     let min_parsed = options.min_version.as_deref().and_then(parse_pdf_version);
-    let source_contributes = ver_parsed.is_some() && ver_parsed == source_parsed;
-    let min_contributes = ver_parsed.is_some() && ver_parsed == min_parsed;
+    // `--force-version` returns the forced value verbatim from
+    // `effective_pdf_version`. qpdf treats a valid `--force-version` as an
+    // exact version with extension level 0: neither the source nor the
+    // caller-supplied `--min-extension-level` should propagate an ext to
+    // the header, even when the forced major/minor happens to equal source
+    // or min_v. Gate both contributions on the forced flag so a forced
+    // version zeroes the extension regardless of the tie. (Explicit
+    // per-force extension specification is not part of the current API;
+    // if introduced, this is where the exception would go.)
+    let forced = options
+        .force_version
+        .as_deref()
+        .and_then(parse_pdf_version)
+        .is_some();
+    let source_contributes = !forced && ver_parsed.is_some() && ver_parsed == source_parsed;
+    let min_contributes = !forced && ver_parsed.is_some() && ver_parsed == min_parsed;
     let min_ext = options.min_extension_level.unwrap_or(0);
     let ext = match (source_contributes, min_contributes) {
         (true, true) => source_ext.max(min_ext),
@@ -665,6 +679,49 @@ fn inject_adbe_extension<R: Read + Seek>(
     extensions.insert("ADBE", Object::Dictionary(adbe));
 
     catalog.insert("Extensions", Object::Dictionary(extensions));
+    pdf.set_object(root_ref, Object::Dictionary(catalog));
+    Ok(())
+}
+
+/// Strip `/Extensions /ADBE` from the destination Catalog when the effective
+/// extension level is 0. This complements [`inject_adbe_extension`]: when a
+/// version race (min_version bump or ObjStm floor) drops the pairwise ext to
+/// 0 but the source Catalog carries a stale `/ADBE` entry, that stale entry
+/// would otherwise survive the renumber walk and produce an output whose
+/// Catalog `/BaseVersion` contradicts the emitted header version.
+///
+/// Only touches `/ADBE`; any other developer-prefix keys under `/Extensions`
+/// are preserved (matching qpdf's per-prefix handling). Drops `/Extensions`
+/// itself when it becomes empty after ADBE removal.
+///
+/// # Errors
+///
+/// - Propagates [`Pdf::resolve`] errors when materialising the Catalog or an
+///   indirect `/Extensions` value.
+fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(());
+    };
+    let catalog_obj = pdf.resolve(root_ref)?;
+    let Some(mut catalog) = catalog_obj.into_dict() else {
+        return Ok(());
+    };
+    let mut extensions = match catalog.remove("Extensions") {
+        Some(Object::Dictionary(d)) => d,
+        Some(Object::Reference(r)) => pdf.resolve(r)?.into_dict().unwrap_or_default(),
+        _ => return Ok(()),
+    };
+    if extensions.remove("ADBE").is_none() {
+        // No ADBE was present. Put /Extensions back exactly as we found it
+        // (as an inlined direct dict, matching inject_adbe_extension's
+        // normalization) so downstream sees the same shape.
+        catalog.insert("Extensions", Object::Dictionary(extensions));
+        pdf.set_object(root_ref, Object::Dictionary(catalog));
+        return Ok(());
+    }
+    if extensions.iter().next().is_some() {
+        catalog.insert("Extensions", Object::Dictionary(extensions));
+    }
     pdf.set_object(root_ref, Object::Dictionary(catalog));
     Ok(())
 }
@@ -2764,10 +2821,33 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     {
         let source_ver = pdf.version().to_string();
         let source_ext = pdf.adobe_extension_level().unwrap_or(0);
-        let (eff_ver, eff_ext) =
-            effective_pdf_version_and_ext(&source_ver, source_ext, options, false, false);
+        // Predict whether the header floor will bump to PDF 1.5 due to
+        // ObjStm emission, so the pairwise pairwise-contribution logic in
+        // `effective_pdf_version_and_ext` sees the same version race that
+        // the header writer will apply. Generate mode always emits ObjStm
+        // (via the Generate dispatch below or, when it falls through due to
+        // encrypt / copy_encryption, via the full-rewrite planner). `--qdf`
+        // forces ObjStm off. `Preserve` and `Disable` skip the floor here;
+        // Preserve+source-has-ObjStm remains a latent edge case (walking
+        // the source for eligibility would be expensive).
+        let will_emit_objstm =
+            !options.qdf && matches!(options.object_streams, ObjectStreamMode::Generate);
+        let (eff_ver, eff_ext) = effective_pdf_version_and_ext(
+            &source_ver,
+            source_ext,
+            options,
+            false,
+            will_emit_objstm,
+        );
         if eff_ext > 0 {
             inject_adbe_extension(pdf, eff_ver, eff_ext)?;
+        } else if source_ext > 0 {
+            // Source carried an ADBE extension level that did not survive the
+            // pairwise version race (min_version bump or ObjStm floor drops
+            // it to 0). Removing the stale /ADBE entry from the destination
+            // Catalog keeps `/BaseVersion` from contradicting the emitted
+            // header version.
+            strip_adbe_extension(pdf)?;
         }
     }
 
@@ -6637,6 +6717,52 @@ mod tests {
     }
 
     #[test]
+    fn effective_pdf_version_and_ext_force_version_drops_source_ext() {
+        // --force-version=1.7 on a (1.7, 8) source → qpdf semantics: forced
+        // header is exact, extension level is 0 unless explicitly specified.
+        // Currently there is no explicit force-extension knob, so the source
+        // ext must not slip through just because the forced major/minor
+        // happens to equal the source version.
+        let options = WriteOptions {
+            force_version: Some("1.7".into()),
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_force_version_drops_min_ext() {
+        // --force-version=1.7 + --min-version=1.7 --min-extension-level=8
+        // → forced value is exact, so min_ext must not survive the tie.
+        let options = WriteOptions {
+            force_version: Some("1.7".into()),
+            min_version: Some("1.7".into()),
+            min_extension_level: Some(8),
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 0, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 0);
+    }
+
+    #[test]
+    fn effective_pdf_version_and_ext_invalid_force_version_is_ignored() {
+        // An unparseable --force-version is silently ignored by
+        // effective_pdf_version (mirrors the existing behavior); the pairwise
+        // helper must therefore fall back to normal contribution semantics
+        // rather than treating any garbage-force as "forced=true".
+        let options = WriteOptions {
+            force_version: Some("not-a-version".into()),
+            ..Default::default()
+        };
+        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
+        assert_eq!(v, "1.7");
+        assert_eq!(e, 8);
+    }
+
+    #[test]
     fn effective_pdf_version_and_ext_source_ext_wins_when_versions_tie() {
         // Source (1.7, 8), min (1.7, 0) → tie on ver, source_ext higher → (1.7, 8).
         let options = WriteOptions {
@@ -6874,6 +7000,71 @@ mod tests {
         assert!(
             s.contains("/ACRO"),
             "non-ADBE developer prefix must survive: {s}"
+        );
+    }
+
+    /// PDF-1.3 source that already carries `/Extensions /ADBE /ExtensionLevel N`.
+    /// Used by the ObjStm-floor regression tests below.
+    fn build_ext_injection_source_with_adbe_1_3() -> Vec<u8> {
+        let mut src = b"%PDF-1.3\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+              /Extensions << /ADBE << /BaseVersion /1.3 /ExtensionLevel 8 >> >> \
+              >>\nendobj\n",
+        );
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let startxref = src.len();
+        let count = offsets.len() + 1;
+        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        src
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_generate_mode_strips_stale_adbe_on_floor_bump() {
+        // Codex round-2 P2: source PDF-1.3 with /Extensions /ADBE /ExtensionLevel 8
+        // rewritten with --object-streams=generate. The ObjStm floor bumps the
+        // header to %PDF-1.5, so the source's ADBE (BaseVersion /1.3) must NOT
+        // survive — otherwise the emitted Catalog contradicts the header.
+        let src = build_ext_injection_source_with_adbe_1_3();
+        // Sanity: baseline reader sees the source ext.
+        {
+            let mut src_pdf = crate::Pdf::open_mem(&src).expect("source must open");
+            assert_eq!(
+                src_pdf.adobe_extension_level(),
+                Some(8),
+                "fixture must carry source ADBE ExtensionLevel 8"
+            );
+        }
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            object_streams: ObjectStreamMode::Generate,
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+        assert!(
+            out.starts_with(b"%PDF-1.5\n"),
+            "ObjStm floor must bump the header to 1.5"
+        );
+        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
+        assert_eq!(
+            reopened.adobe_extension_level(),
+            None,
+            "stale ADBE from source (BaseVersion 1.3) must not survive when the \
+             ObjStm floor drops the effective ext to 0"
         );
     }
 
