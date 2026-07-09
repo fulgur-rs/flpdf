@@ -53,6 +53,33 @@ fn verbose_overlay_prints_processing_header_and_per_page_mapping() {
 }
 
 #[test]
+fn verbose_underlay_prints_underlay_kind_string() {
+    let dest = fixture("one-page.pdf");
+    let src = fixture("one-page.pdf");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = tmp.path().join("out.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args([
+            "rewrite",
+            "--static-id",
+            "--verbose",
+            &dest,
+            out.to_str().unwrap(),
+            "--underlay",
+            &src,
+            "--",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "    {} underlay 1\n",
+            src
+        )));
+}
+
+#[test]
 fn verbose_without_overlay_does_not_print_processing_header() {
     let input = fixture("one-page.pdf");
     let tmp = tempfile::tempdir().expect("tempdir");
