@@ -1186,6 +1186,14 @@ struct RewriteCommand {
                 repeatable, terminate each group with --"
     )]
     underlay: Vec<String>,
+
+    /// Print verbose progress and diagnostic messages (mirrors qpdf --verbose).
+    #[arg(
+        long = "verbose",
+        help = "Print verbose progress and diagnostic messages \
+                (mirrors qpdf --verbose)"
+    )]
+    verbose: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -1607,6 +1615,7 @@ fn main() {
             None,                               // flatten_annotations (not on top-level surface)
             false,                              // flatten_rotation (not on top-level surface)
             &overlay_specs,
+            args.verbose,
             options,
         );
         if result.is_ok() {
@@ -1768,6 +1777,7 @@ fn main() {
             None,                               // flatten_annotations (not on top-level surface)
             false,                              // flatten_rotation (not on top-level surface)
             &overlay_specs,
+            args.verbose,
             options,
         )
     };
@@ -2247,6 +2257,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 cmd.flatten_annotations,
                 cmd.flatten_rotation,
                 overlay_specs,
+                cmd.verbose,
                 options,
             )
         }
@@ -2892,8 +2903,12 @@ fn run_rewrite(
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
     overlay_specs: &[OverlaySpec],
+    verbose: bool,
     options: WriteOptions,
 ) -> CliResult<()> {
+    // Consumed by upcoming overlay-progress and "wrote file" diagnostics; kept
+    // silent here so this plumbing commit is byte-parity-neutral.
+    let _ = verbose;
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
 
