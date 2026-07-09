@@ -447,11 +447,11 @@ struct Cli {
     )]
     list_attachments: bool,
 
-    /// Print verbose listing for --list-attachments (mirrors qpdf --verbose).
+    /// Print verbose progress and diagnostic messages (mirrors qpdf --verbose).
     #[arg(
         long = "verbose",
-        requires = "list_attachments",
-        help = "Print verbose listing when used with --list-attachments"
+        help = "Print verbose progress and diagnostic messages \
+                (mirrors qpdf --verbose)"
     )]
     verbose: bool,
 
