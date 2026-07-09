@@ -427,7 +427,8 @@ where
     // change page dictionaries in place but never reorder or remove page
     // objects, so the 1-based page numbers stay valid.
     let source_pages = page_refs(source)?;
-    let pairs = resolve_spec_pairs(source, from, to, repeat, n_dest)?;
+    let n_source = u32_len(source_pages.len());
+    let pairs = resolve_spec_pairs(n_source, from, to, repeat, n_dest)?;
 
     // Collect the distinct source pages in first-use order, then import them all
     // in a SINGLE cross-document copy. One copy shares any indirect object used
@@ -467,29 +468,23 @@ where
 /// Resolve a single overlay/underlay spec's `--from`/`--to`/`--repeat` ranges
 /// into `(dest_page, source_page)` pairs, without touching either document.
 ///
-/// This is the range-math half of [`spec_page_sources`]: it snapshots the
-/// source page count, resolves the three ranges, and calls
+/// This is the range-math half of [`spec_page_sources`]: it resolves the three
+/// ranges against the caller-supplied page counts and calls
 /// [`map_overlay_pages`] to produce the pairing. No pages are imported and no
 /// destination pages are modified; the caller decides what to do with the
-/// pairs (import + apply, or report). `n_dest` is the destination page count,
-/// computed once by the caller (it does not change while sources are being
-/// mapped).
+/// pairs (import + apply, or report). `n_source` and `n_dest` are the source
+/// and destination page counts, computed once by the caller.
 ///
 /// # Errors
 ///
-/// Any error propagated from [`page_refs`] or [`PageRange::resolve`].
-pub(crate) fn resolve_spec_pairs<RS>(
-    source: &mut Pdf<RS>,
+/// Any error propagated from [`PageRange::resolve`].
+pub(crate) fn resolve_spec_pairs(
+    n_source: u32,
     from: &PageRange,
     to: &PageRange,
     repeat: Option<&PageRange>,
     n_dest: u32,
-) -> Result<Vec<(u32, u32)>>
-where
-    RS: Read + Seek,
-{
-    let n_source = u32_len(page_refs(source)?.len());
-
+) -> Result<Vec<(u32, u32)>> {
     let from_pages = from.resolve(n_source)?;
     let to_pages = to.resolve(n_dest)?;
     let repeat_pages = match repeat {
@@ -723,13 +718,9 @@ where
     // Flatten every spec's (dest_page, source) pairs in declaration order.
     let mut flat: Vec<(u32, OverlayVerboseSource)> = Vec::new();
     for (spec_index, spec) in specs.iter_mut().enumerate() {
-        let pairs = resolve_spec_pairs(
-            &mut spec.source,
-            &spec.from,
-            &spec.to,
-            spec.repeat.as_ref(),
-            n_dest,
-        )?;
+        let n_source = u32_len(page_refs(&mut spec.source)?.len());
+        let pairs =
+            resolve_spec_pairs(n_source, &spec.from, &spec.to, spec.repeat.as_ref(), n_dest)?;
         for (dest_page, src_page) in pairs {
             flat.push((
                 dest_page,
