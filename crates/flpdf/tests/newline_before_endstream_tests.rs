@@ -17,8 +17,8 @@
 //! End-to-end / CLI matrix tests are the responsibility of flpdf-9hc.12.8.
 
 use flpdf::{
-    write_pdf_with_options, write_stream_to_buf, Dictionary, NewlineBeforeEndstream, Object, Pdf,
-    Stream, WriteOptions,
+    write_pdf_with_options, write_qdf, write_stream_to_buf, Dictionary, NewlineBeforeEndstream,
+    Object, Pdf, Stream, WriteOptions,
 };
 use std::io::Cursor;
 
@@ -431,6 +431,30 @@ fn round_trip_qdf_never_mode() {
         round_trip_qdf(raw, NewlineBeforeEndstream::Never).as_slice(),
         raw,
         "qdf+Never must re-open with the original payload intact"
+    );
+}
+
+/// Regression guard: the [`write_qdf`] convenience wrapper must go through
+/// the same `write_pdf_with_options` promotion that upgrades `Never` to `Yes`
+/// for QDF form. If a future refactor gives `write_qdf` its own emission path
+/// that bypasses the promotion, the output would carry adjacent `endstream`
+/// framing and `flpdf::fix_qdf` / qpdf's `fix-qdf` would fail on hand edits.
+/// The library default `NewlineBeforeEndstream::Never` makes this the exact
+/// state the caller reaches with `WriteOptions::default()`.
+#[test]
+fn write_qdf_wrapper_respects_yes_promotion_via_public_api() {
+    let raw: &[u8] = b"write_qdf wrapper payload";
+    let source = build_minimal_pdf(raw);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut output = Vec::new();
+    write_qdf(&mut pdf, &mut output).unwrap();
+
+    let yes_framed = b"write_qdf wrapper payload\nendstream";
+    assert!(
+        output.windows(yes_framed.len()).any(|w| w == yes_framed),
+        "write_qdf must emit `\\nendstream` framing regardless of the library \
+         default (`Never`) — the QDF Yes-promotion applies to all public entry points"
     );
 }
 
