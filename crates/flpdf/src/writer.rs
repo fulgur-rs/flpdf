@@ -3403,6 +3403,13 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     // via `old_ref`). These markers ride ahead of "%% Original object ID:" and
     // are NOT suppressed by no_original_object_ids — qpdf keeps them even under
     // `--no-original-object-ids`. Mirrors qpdf 11.9.0 QPDFWriter.cc:1774-1785.
+    //
+    // Small local enum: describe the /Contents shape without cloning the
+    // resolved Object graph (Stream bodies, direct dict/array subtrees).
+    enum ContentsForSeq {
+        Indirect(ObjectRef),
+        DirectRefArray(Vec<ObjectRef>),
+    }
     let (page_seq, contents_seq): (HashMap<ObjectRef, u32>, HashMap<ObjectRef, u32>) =
         if options.qdf {
             let mut page_seq: HashMap<ObjectRef, u32> = HashMap::new();
@@ -3411,36 +3418,53 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             for (idx, page_ref) in page_refs.iter().enumerate() {
                 let seq = (idx as u32).saturating_add(1);
                 page_seq.insert(*page_ref, seq);
-                // Extract /Contents (may itself be indirect). We first grab the
-                // raw dict entry cloned out so we can drop the borrow, then
-                // resolve any indirect wrapper to get the concrete value.
-                let contents_raw = match pdf.resolve_borrowed(*page_ref)? {
-                    Object::Dictionary(d) => d.get("Contents").cloned(),
+                // Extract /Contents while cloning only the reference structure
+                // we actually need (a single ObjectRef, or a Vec of ObjectRefs).
+                // Never clone an Object::Stream body or non-Reference Array
+                // elements — an inline /Contents Stream can be arbitrarily large
+                // and dropping its data on the floor is fine here because we
+                // only tag INDIRECT streams (a direct/inline Stream has no
+                // ObjectRef to insert into contents_seq).
+                let contents_kind: Option<ContentsForSeq> = match pdf.resolve_borrowed(*page_ref)? {
+                    Object::Dictionary(d) => match d.get("Contents") {
+                        Some(Object::Reference(r)) => Some(ContentsForSeq::Indirect(*r)),
+                        Some(Object::Array(items)) => Some(ContentsForSeq::DirectRefArray(
+                            items
+                                .iter()
+                                .filter_map(|it| match it {
+                                    Object::Reference(r) => Some(*r),
+                                    _ => None,
+                                })
+                                .collect(),
+                        )),
+                        _ => None,
+                    },
                     _ => None, // cov:ignore: page_refs() only returns refs to Page dicts by construction, so a non-Dictionary resolution is unreachable in valid PDFs; retained as a defensive fallthrough.
                 };
-                let contents_resolved = match contents_raw {
-                    Some(Object::Reference(r)) => Some((Some(r), pdf.resolve(r)?)),
-                    Some(other) => Some((None, other)),
-                    None => None,
-                };
-                if let Some((outer_ref, contents)) = contents_resolved {
-                    match contents {
+                match contents_kind {
+                    // Indirect /Contents: resolve the ref borrowed. If it lands
+                    // on an Array, iterate its Reference elements; otherwise
+                    // (Stream / etc.) the outer ref IS the content stream.
+                    Some(ContentsForSeq::Indirect(outer)) => match pdf.resolve_borrowed(outer)? {
                         Object::Array(items) => {
                             for item in items {
                                 if let Object::Reference(r) = item {
-                                    contents_seq.insert(r, seq);
+                                    contents_seq.insert(*r, seq);
                                 }
                             }
                         }
-                        // Single indirect content stream (the resolved value is
-                        // whatever `outer_ref` pointed at; the key is that outer
-                        // reference).
                         _ => {
-                            if let Some(r) = outer_ref {
-                                contents_seq.insert(r, seq);
-                            }
+                            contents_seq.insert(outer, seq);
+                        }
+                    },
+                    // Direct /Contents Array — refs were already extracted
+                    // above (Copy semantics; no Object clone).
+                    Some(ContentsForSeq::DirectRefArray(refs)) => {
+                        for r in refs {
+                            contents_seq.insert(r, seq);
                         }
                     }
+                    None => {}
                 }
             }
             (page_seq, contents_seq)

@@ -2083,6 +2083,122 @@ fn write_qdf_handles_page_without_contents_key() {
     );
 }
 
+/// A page whose `/Contents` is an INDIRECT reference resolving to an ARRAY
+/// of stream refs must tag each array element with the page's sequence
+/// number in the QDF pre-scan (`%% Contents for page N` before every content
+/// stream). Exercises the `Indirect → resolve → Array` arm of the pre-scan.
+#[test]
+fn write_qdf_handles_indirect_contents_ref_resolving_to_array_of_refs() {
+    // Minimal 1.4 PDF: Page's /Contents is `4 0 R`; object 4 is an ARRAY
+    // holding two content-stream refs `5 0 R` and `6 0 R`.
+    let stream_a = b"BT /F1 12 Tf ET";
+    let stream_b = b"0 0 m 10 10 l S";
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let off1 = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n");
+    let off3 = bytes.len();
+    // /Contents references object 4 (which is an Array).
+    bytes.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+    );
+    let off4 = bytes.len();
+    bytes.extend_from_slice(b"4 0 obj\n[5 0 R 6 0 R]\nendobj\n");
+    let off5 = bytes.len();
+    bytes.extend_from_slice(
+        format!("5 0 obj\n<< /Length {} >>\nstream\n", stream_a.len()).as_bytes(),
+    );
+    bytes.extend_from_slice(stream_a);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    let off6 = bytes.len();
+    bytes.extend_from_slice(
+        format!("6 0 obj\n<< /Length {} >>\nstream\n", stream_b.len()).as_bytes(),
+    );
+    bytes.extend_from_slice(stream_b);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for off in [off1, off2, off3, off4, off5, off6] {
+        bytes.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let mut output = Vec::new();
+    write_qdf(&mut pdf, &mut output).unwrap();
+
+    // qpdf's pre-scan tags EVERY element of the Array with the page's seq,
+    // so we expect TWO `%% Contents for page 1` comments (one before each
+    // stream object). Count them.
+    let needle = b"%% Contents for page 1\n";
+    let count = output
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count();
+    assert_eq!(
+        count, 2,
+        "QDF pre-scan must tag both array-element streams with `%% Contents for page 1` (found {count})"
+    );
+}
+
+/// A page whose `/Contents` is a DIRECT Array containing a mix of Reference
+/// and non-Reference elements (e.g. a stray `null`) must still tag the
+/// Reference elements. Exercises the `_ => None` filter_map arm that skips
+/// non-Reference direct-Array elements.
+#[test]
+fn write_qdf_direct_contents_array_skips_non_reference_elements() {
+    // Minimal 1.4 PDF where /Contents is `[ 5 0 R null ]` (mixed direct
+    // array). Only the Reference element must appear in the pre-scan
+    // tagging.
+    let stream_a = b"BT /F1 12 Tf ET";
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let off1 = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n");
+    let off3 = bytes.len();
+    bytes.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [5 0 R null] >>\nendobj\n",
+    );
+    let off5 = bytes.len();
+    bytes.extend_from_slice(
+        format!("5 0 obj\n<< /Length {} >>\nstream\n", stream_a.len()).as_bytes(),
+    );
+    bytes.extend_from_slice(stream_a);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+    // Object 4 is unused / free.
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{off5:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let mut output = Vec::new();
+    write_qdf(&mut pdf, &mut output).unwrap();
+
+    // Exactly one `%% Contents for page 1` — from the Reference element
+    // `5 0 R`. The `null` element is skipped by the filter_map.
+    let needle = b"%% Contents for page 1\n";
+    let count = output
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count();
+    assert_eq!(
+        count, 1,
+        "QDF pre-scan must tag exactly one content stream when the direct \
+         /Contents Array mixes a Reference with a non-Reference (found {count})"
+    );
+}
+
 /// QDF stream dict serialization must pull `/Length` to the last position
 /// (right before `>>`), matching qpdf's non-QDF `/Length`-last convention
 /// applied in the multi-line QDF layout. A stream dict with alphabetically-
