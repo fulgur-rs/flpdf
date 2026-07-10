@@ -232,6 +232,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/fulgur-rs/flpdf/compare/v0.1.9...v0.1.10) - 2026-07-10
+
+### Added
+
+- *(flpdf)* add overlay_verbose_report inspection API
+- *(flpdf-cli)* default to newline-before-endstream=never (qpdf parity)
+- *(flpdf)* inject Catalog /Extensions /ADBE when effective ext > 0
+- *(flpdf)* add effective_pdf_version_and_ext pairwise helper
+- *(flpdf)* add WriteOptions::min_extension_level
+- *(flpdf)* promote adobe_extension_level to pub Pdf method
+
+### Fixed
+
+- *(flpdf)* restore Catalog dirty flag + resolve preexisting clippy
+- *(flpdf)* fold encryption floor into version race + snapshot Catalog
+- *(flpdf)* honor ObjStm floor + force_version in pairwise ext rule
+- *(flpdf)* honor pairwise ext rule + inject ADBE before generate dispatch
+
+### Other
+
+- *(flpdf)* pass n_source into resolve_spec_pairs to avoid double page_refs walk
+- *(flpdf)* cover overlay_verbose_report error propagation
+- *(flpdf)* extract kind_stable_partition helper
+- *(flpdf)* split resolve_spec_pairs out of spec_page_sources
+- *(flpdf)* guard write_qdf public wrapper against Never-framing regression
+- *(flpdf)* cover strip_adbe_extension edge cases + mark defensive branches
+- *(flpdf)* drop redundant to_owned() on eff_ver in inject call site
+- *(flpdf)* mark defensive branches in inject_adbe_extension cov:ignore
+- *(flpdf)* drop stale flpdf-9hc.16.8 defer note in overlay byte_gate
+- *(flpdf)* library byte gate for encrypted-source overlay ext_level
+- *(flpdf)* library byte gate for pure version-floor overlay
+
 ## [0.1.9](https://github.com/fulgur-rs/flpdf/compare/v0.1.8...v0.1.9) - 2026-07-07
 
 ### Fixed
