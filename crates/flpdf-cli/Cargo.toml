@@ -28,11 +28,11 @@ qpdf-zlib-compat = ["flpdf/qpdf-zlib-compat"]
 
 [dependencies]
 clap.workspace = true
-flpdf = { path = "../flpdf", version = "0.1.9" }
+flpdf = { path = "../flpdf", version = "0.1.10" }
 
 [dev-dependencies]
 assert_cmd.workspace = true
-flpdf = { path = "../flpdf", version = "0.1.9" }
+flpdf = { path = "../flpdf", version = "0.1.10" }
 predicates.workspace = true
 regex.workspace = true
 serde_json = { workspace = true }
