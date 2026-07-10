@@ -70,3 +70,21 @@ Total: **13 reference files**.
 **Each reference file must be smaller than 100 KB.**  The `regenerate.sh`
 script enforces this limit and exits with an error if any file exceeds it.
 Current sizes are all well below 3 KB.
+
+## Overlay / underlay QDF variants (flpdf-9hc.16.13)
+
+The following 3 goldens exercise the `--qdf --no-original-object-ids` writer
+path in combination with `--overlay` / `--underlay`. They act as regression
+catchers for the library-layer QDF+NoOID+overlay parity. Exact byte parity
+against qpdf's `uo-1..uo-8` runtest suite is *not* covered here; that is
+validated by `flpdf-qtest`'s `compare-files` runtest steps, which live in a
+separate repository to isolate the qtest framework's Artistic 2.0 license
+from this tree.
+
+| Golden                                            | Scenario                                                |
+|---------------------------------------------------|---------------------------------------------------------|
+| `overlay/three-page-overlay-one-page-qdf.pdf`     | single overlay onto page 1 (smallest QDF+overlay)       |
+| `overlay/three-page-overlay-and-underlay-qdf.pdf` | overlay + underlay on the same dest pages               |
+| `overlay/three-page-two-overlays-qdf.pdf`         | two `--overlay` flags composed left-to-right            |
+
+qpdf command (all three): `qpdf --static-id --qdf --no-original-object-ids ...`.
