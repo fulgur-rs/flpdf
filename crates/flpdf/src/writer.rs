@@ -154,10 +154,12 @@ pub enum NewlineBeforeEndstream {
     /// `--newline-before-endstream`.
     Yes,
     /// Write a single `b'\n'` before `endstream` only when the payload does not
-    /// already end with `\n`/`\r`; otherwise `endstream` is adjacent.
+    /// already end with `\n`; otherwise `endstream` is adjacent. Payloads
+    /// ending with bare `\r` or `\r\n` still receive an added `\n`.
     ///
-    /// A flpdf-specific parseability-preserving middle ground (it matches
-    /// neither of qpdf's two modes).
+    /// Matches qpdf's `(last_char != '\n')` check in QPDFWriter.cc:1560,
+    /// which is what QDF form falls back to when the caller does not set
+    /// [`NewlineBeforeEndstream::Yes`] explicitly.
     No,
     /// Never insert a newline: the raw payload is written verbatim and
     /// `endstream` follows immediately, so exactly `/Length` bytes sit between
@@ -310,8 +312,9 @@ pub struct WriteOptions {
     /// rewrites. [`NewlineBeforeEndstream::Yes`] always writes exactly one
     /// `b'\n'` before `endstream`, matching qpdf run with
     /// `--newline-before-endstream`. [`NewlineBeforeEndstream::No`] omits the
-    /// extra newline when the stream payload already ends with a newline
-    /// character (a flpdf-specific middle ground).
+    /// extra newline only when the stream payload already ends with exactly
+    /// `\n` (matches qpdf's `(last_char != '\n')` check; bare `\r` or `\r\n`
+    /// endings still receive an added `\n`).
     ///
     /// The `/Length` value in the stream dictionary is **not** affected by this
     /// setting — it always reflects the raw payload byte count only.
@@ -1550,7 +1553,7 @@ fn allocate_incremental_objstm_container(
 /// consult `options.newline_before_endstream`. The `incremental_generate_qpdf_check`
 /// cross-check confirms `qpdf --check` reports no delta under the default
 /// `NewlineBeforeEndstream::Yes`; a divergence is only possible under
-/// `NewlineBeforeEndstream::No` with a payload ending in `\n`/`\r`.
+/// `NewlineBeforeEndstream::No` with a payload ending in `\n`.
 ///
 /// Wired into the incremental write path by `write_pdf_incremental`.
 fn write_incremental_objstm<R: Read + Seek>(
@@ -2888,23 +2891,28 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     });
 
     // QDF form (`qpdf --qdf`) is designed for human editing and requires a
-    // line-anchored `endstream`, so it must emit a newline before `endstream`
-    // regardless of the caller's `newline_before_endstream` setting;
-    // `flpdf::fix_qdf` mirrors qpdf's `fix-qdf` and only finds `endstream`
-    // at line start. Force `No` framing here: `No` writes a newline only when
-    // the payload does not already end with one, matching qpdf's --qdf
-    // behaviour (a content stream ending in `Q\n` is followed directly by
-    // `endstream`, not by `\n\nendstream`).
+    // line-anchored `endstream`, so the caller's `Never` policy — which
+    // would place `endstream` immediately after the raw payload byte —
+    // is incompatible with QDF. Promote `Never` to `No` here (qpdf's `No`
+    // still emits a newline unless the payload's last byte is exactly
+    // `\n`). Explicit `Yes` and `No` pass through unchanged so callers can
+    // request the exact qpdf semantics via WriteOptions or the CLI
+    // `--newline-before-endstream` flag.
+    //
+    // Mirrors qpdf QPDFWriter.cc:1560:
+    //     `if (newline_before_endstream || (qdf_mode && last_char != '\n'))`
+    // i.e. Yes → always add; QDF + non-'\n' end → add.
     let effective;
-    let options = if options.qdf && options.newline_before_endstream != NewlineBeforeEndstream::No {
-        effective = WriteOptions {
-            newline_before_endstream: NewlineBeforeEndstream::No,
-            ..options.clone()
+    let options =
+        if options.qdf && options.newline_before_endstream == NewlineBeforeEndstream::Never {
+            effective = WriteOptions {
+                newline_before_endstream: NewlineBeforeEndstream::No,
+                ..options.clone()
+            };
+            &effective
+        } else {
+            options
         };
-        &effective
-    } else {
-        options
-    };
 
     let result = write_pdf_full_rewrite_inner(pdf, out, options);
 
@@ -4608,8 +4616,10 @@ pub(crate) fn is_lone_flate(filter: Option<&Object>) -> bool {
 ///
 /// where `<EOL>` is:
 /// - `NewlineBeforeEndstream::Yes`: always `b'\n'` (one byte, unconditionally).
-/// - `NewlineBeforeEndstream::No`: empty when payload ends with `\n` or `\r`;
-///   otherwise `b'\n'` (one byte, for ISO 32000-1 parseability).
+/// - `NewlineBeforeEndstream::No`: empty when payload ends with exactly `\n`;
+///   otherwise `b'\n'` (one byte, for ISO 32000-1 parseability). Bare `\r`
+///   or `\r\n` endings still receive an added `\n`, matching qpdf's
+///   `(last_char != '\n')` check.
 ///
 /// # /Length invariant
 ///
@@ -4682,12 +4692,12 @@ fn write_stream_payload(buf: &mut Vec<u8>, data: &[u8], policy: NewlineBeforeEnd
             buf.push(b'\n');
         }
         NewlineBeforeEndstream::No => {
-            // Only write a newline when the payload does not already end with one.
-            let ends_with_eol = data
-                .last()
-                .map(|&b| b == b'\n' || b == b'\r')
-                .unwrap_or(false);
-            if !ends_with_eol {
+            // Write a newline when the payload does not already end with
+            // exactly `\n`. Matches qpdf's `(last_char != '\n')` in
+            // QPDFWriter.cc:1560 — bare-`\r` or `\r\n`-terminated payloads
+            // still receive an added `\n` before `endstream`.
+            let ends_with_nl = data.last().map(|&b| b == b'\n').unwrap_or(false);
+            if !ends_with_nl {
                 buf.push(b'\n');
             }
         }
@@ -4715,11 +4725,11 @@ fn on_disk_stream_len(data: &[u8], policy: NewlineBeforeEndstream) -> usize {
     match policy {
         NewlineBeforeEndstream::Yes => n + 1,
         NewlineBeforeEndstream::No => {
-            let ends_with_eol = data
-                .last()
-                .map(|&b| b == b'\n' || b == b'\r')
-                .unwrap_or(false);
-            if ends_with_eol {
+            // Add one byte unless the payload already ends with exactly `\n`
+            // (matches the check in write_stream_payload, which mirrors qpdf's
+            // `(last_char != '\n')` in QPDFWriter.cc:1560).
+            let ends_with_nl = data.last().map(|&b| b == b'\n').unwrap_or(false);
+            if ends_with_nl {
                 n
             } else {
                 n + 1

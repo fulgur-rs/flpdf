@@ -1046,9 +1046,10 @@ mod byte_gate {
     }
 
     /// Write `dest` through the `flpdf rewrite --static-id --qdf --no-original-object-ids`
-    /// recipe. QDF mode uses No-promotion (adds `\n` before `endstream` only if
-    /// the stream payload does not already end with an EOL), so we rely on the
-    /// QDF-internal handling and do not set `newline_before_endstream` explicitly.
+    /// recipe. QDF uses the caller's `newline_before_endstream` policy but
+    /// promotes only `Never` to `No` internally (so `endstream` stays
+    /// line-anchored) — we leave `newline_before_endstream` at its default
+    /// (`Never`) and rely on that promotion.
     fn write_qdf_nooid<R: std::io::Read + std::io::Seek>(dest: &mut Pdf<R>) -> Vec<u8> {
         let opts = WriteOptions {
             full_rewrite: true,

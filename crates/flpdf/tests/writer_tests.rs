@@ -2214,13 +2214,18 @@ fn write_qdf_stream_dict_pulls_length_to_end() {
     // followed by an indirect ref (`N 0 R`) and then `\n` + optional spaces +
     // `>>` — the QDF stream dict pulls /Length last. Search for the pattern
     // `/Length N 0 R\n` followed by any leading whitespace and `>>`.
+    //
+    // Materialize `lines()` once so the follow-up `next` lookup is O(1)
+    // rather than O(N) (the previous `text.lines().nth(i + 1)` re-walked
+    // the whole string every iteration).
     let mut found_length_last = false;
     let text = String::from_utf8_lossy(&output);
-    for (i, line) in text.lines().enumerate() {
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("/Length ") && trimmed.ends_with(" 0 R") {
             // The next non-blank line must be `>>` (dict close).
-            let next = text.lines().nth(i + 1).unwrap_or("").trim();
+            let next = lines.get(i + 1).copied().unwrap_or("").trim();
             if next == ">>" {
                 found_length_last = true;
                 break;
