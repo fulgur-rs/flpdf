@@ -447,11 +447,11 @@ struct Cli {
     )]
     list_attachments: bool,
 
-    /// Print verbose listing for --list-attachments (mirrors qpdf --verbose).
+    /// Print verbose progress and diagnostic messages (mirrors qpdf --verbose).
     #[arg(
         long = "verbose",
-        requires = "list_attachments",
-        help = "Print verbose listing when used with --list-attachments"
+        help = "Print verbose progress and diagnostic messages \
+                (mirrors qpdf --verbose)"
     )]
     verbose: bool,
 
@@ -1186,6 +1186,14 @@ struct RewriteCommand {
                 repeatable, terminate each group with --"
     )]
     underlay: Vec<String>,
+
+    /// Print verbose progress and diagnostic messages (mirrors qpdf --verbose).
+    #[arg(
+        long = "verbose",
+        help = "Print verbose progress and diagnostic messages \
+                (mirrors qpdf --verbose)"
+    )]
+    verbose: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -1607,6 +1615,7 @@ fn main() {
             None,                               // flatten_annotations (not on top-level surface)
             false,                              // flatten_rotation (not on top-level surface)
             &overlay_specs,
+            args.verbose,
             options,
         );
         if result.is_ok() {
@@ -1768,6 +1777,7 @@ fn main() {
             None,                               // flatten_annotations (not on top-level surface)
             false,                              // flatten_rotation (not on top-level surface)
             &overlay_specs,
+            args.verbose,
             options,
         )
     };
@@ -2247,6 +2257,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 cmd.flatten_annotations,
                 cmd.flatten_rotation,
                 overlay_specs,
+                cmd.verbose,
                 options,
             )
         }
@@ -2892,6 +2903,7 @@ fn run_rewrite(
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
     overlay_specs: &[OverlaySpec],
+    verbose: bool,
     options: WriteOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
@@ -2968,6 +2980,9 @@ fn run_rewrite(
         doc.back_patch()?;
 
         std::fs::write(&output, &doc.bytes)?;
+        if verbose {
+            eprintln!("flpdf: wrote file {}", output.display());
+        }
         if had_signatures {
             eprintln!("flpdf: warning: removed signatures; signatures are now invalidated");
         }
@@ -3163,12 +3178,38 @@ fn run_rewrite(
             options.min_version = Some(format!("{}.{}", max_ver.0, max_ver.1));
             options.min_extension_level = (max_ext > 0).then_some(max_ext);
 
+            // --verbose: emit the per-destination-page overlay/underlay plan
+            // to stderr before painting, matching qpdf's --verbose output
+            // ("processing underlay/overlay" header + `  page N` +
+            // `    <file> overlay|underlay <src>`). The report is computed
+            // via the flpdf::overlay_verbose_report inspection API so the
+            // ordering (underlays first, then overlays, in declaration
+            // order across specs) is source-shared with apply_overlay_specs.
+            if verbose {
+                let report = flpdf::overlay_verbose_report(&mut pdf, &mut built)?;
+                eprintln!("flpdf: processing underlay/overlay");
+                for page in &report {
+                    eprintln!("  page {}", page.dest_page);
+                    for src in &page.sources {
+                        let file = &overlay_specs[src.spec_index].file;
+                        let kind_str = match src.kind {
+                            flpdf::OverlayKind::Underlay => "underlay",
+                            flpdf::OverlayKind::Overlay => "overlay",
+                        };
+                        eprintln!("    {} {} {}", file, kind_str, src.src_page);
+                    }
+                }
+            }
+
             flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
         }
 
-        let mut out = File::create(output)?;
+        let mut out = File::create(&output)?;
         write_pdf_with_options(&mut pdf, &mut out, &options)?;
 
+        if verbose {
+            eprintln!("flpdf: wrote file {}", output.display());
+        }
         if remove_restrictions && was_encrypted {
             eprintln!("flpdf: removed restrictions (encryption and advisory permissions stripped)");
         }
