@@ -1162,6 +1162,24 @@ mod byte_gate {
     }
 
     #[test]
+    fn three_page_two_overlays_qdf_is_byte_identical() {
+        // QDF recipe of two_overlays_compose_byte_identical:
+        // `qpdf --overlay one-page.pdf -- --overlay two-page.pdf --`. Two
+        // overlays compose left-to-right in declaration order (Fx0/Fx1 for the
+        // first spec, Fx2 for the second on page 1; Fx0/Fx1 on page 2; page 3
+        // untouched). Verifies the Fx0/Fx1 declaration-order convention under
+        // QDF.
+        let mut dest = fixture("three-page.pdf");
+        let mut specs = vec![
+            spec("one-page.pdf", OverlayKind::Overlay),
+            spec("two-page.pdf", OverlayKind::Overlay),
+        ];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_qdf_nooid(&mut dest);
+        assert_byte_identical(&actual, "three-page-two-overlays-qdf.pdf");
+    }
+
+    #[test]
     fn three_page_overlay_and_underlay_qdf_is_byte_identical() {
         // QDF recipe of overlay_and_underlay_compose_byte_identical:
         // `qpdf --overlay one-page.pdf -- --underlay two-page.pdf --`, which
