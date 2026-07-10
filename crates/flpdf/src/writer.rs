@@ -2888,17 +2888,17 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     });
 
     // QDF form (`qpdf --qdf`) is designed for human editing and requires a
-    // line-anchored `endstream`, so it always emits a newline before
-    // `endstream` regardless of the caller's `newline_before_endstream`
-    // setting; `flpdf::fix_qdf` mirrors qpdf's `fix-qdf` and only finds
-    // `endstream` at line start. Force `Yes` framing here so QDF output is
-    // valid even when the caller left `newline_before_endstream` at its
-    // qpdf-parity default (`Never`).
+    // line-anchored `endstream`, so it must emit a newline before `endstream`
+    // regardless of the caller's `newline_before_endstream` setting;
+    // `flpdf::fix_qdf` mirrors qpdf's `fix-qdf` and only finds `endstream`
+    // at line start. Force `No` framing here: `No` writes a newline only when
+    // the payload does not already end with one, matching qpdf's --qdf
+    // behaviour (a content stream ending in `Q\n` is followed directly by
+    // `endstream`, not by `\n\nendstream`).
     let effective;
-    let options = if options.qdf && options.newline_before_endstream != NewlineBeforeEndstream::Yes
-    {
+    let options = if options.qdf && options.newline_before_endstream != NewlineBeforeEndstream::No {
         effective = WriteOptions {
-            newline_before_endstream: NewlineBeforeEndstream::Yes,
+            newline_before_endstream: NewlineBeforeEndstream::No,
             ..options.clone()
         };
         &effective
@@ -3389,6 +3389,65 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         }
     }
 
+    // ── QDF page/contents marker pre-scan ─────────────────────────────────────
+    // qpdf --qdf emits two page-context comments to help human readers:
+    //   • "%% Page N\n"              — immediately before each Page dict's
+    //                                   "M G obj" line (N is 1-based page order)
+    //   • "%% Contents for page N\n" — immediately before each content stream's
+    //                                   "M G obj" line (N is the owning page's
+    //                                   1-based order); a page's /Contents may
+    //                                   be a lone reference or an array of
+    //                                   references, and every element shares the
+    //                                   same page number.
+    // Maps are keyed on ORIGINAL ObjectRefs (matching how the emit loop compares
+    // via `old_ref`). These markers ride ahead of "%% Original object ID:" and
+    // are NOT suppressed by no_original_object_ids — qpdf keeps them even under
+    // `--no-original-object-ids`. Mirrors qpdf 11.9.0 QPDFWriter.cc:1774-1785.
+    let (page_seq, contents_seq): (HashMap<ObjectRef, u32>, HashMap<ObjectRef, u32>) =
+        if options.qdf {
+            let mut page_seq: HashMap<ObjectRef, u32> = HashMap::new();
+            let mut contents_seq: HashMap<ObjectRef, u32> = HashMap::new();
+            let page_refs = crate::pages::page_refs(pdf)?;
+            for (idx, page_ref) in page_refs.iter().enumerate() {
+                let seq = (idx as u32).saturating_add(1);
+                page_seq.insert(*page_ref, seq);
+                // Extract /Contents (may itself be indirect). We first grab the
+                // raw dict entry cloned out so we can drop the borrow, then
+                // resolve any indirect wrapper to get the concrete value.
+                let contents_raw = match pdf.resolve_borrowed(*page_ref)? {
+                    Object::Dictionary(d) => d.get("Contents").cloned(),
+                    _ => None, // cov:ignore: page_refs() only returns refs to Page dicts by construction, so a non-Dictionary resolution is unreachable in valid PDFs; retained as a defensive fallthrough.
+                };
+                let contents_resolved = match contents_raw {
+                    Some(Object::Reference(r)) => Some((Some(r), pdf.resolve(r)?)),
+                    Some(other) => Some((None, other)),
+                    None => None,
+                };
+                if let Some((outer_ref, contents)) = contents_resolved {
+                    match contents {
+                        Object::Array(items) => {
+                            for item in items {
+                                if let Object::Reference(r) = item {
+                                    contents_seq.insert(r, seq);
+                                }
+                            }
+                        }
+                        // Single indirect content stream (the resolved value is
+                        // whatever `outer_ref` pointed at; the key is that outer
+                        // reference).
+                        _ => {
+                            if let Some(r) = outer_ref {
+                                contents_seq.insert(r, seq);
+                            }
+                        }
+                    }
+                }
+            }
+            (page_seq, contents_seq)
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
+
     // In QDF mode, /Root's ref in the trailer is in emission-space; rebind
     // new_root from the qdf_emission_renumber map so remap_trailer_refs and the
     // explicit trailer.insert("Root", ...) both use the same emission number.
@@ -3505,6 +3564,18 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                 emit_ref.number
             )));
             // cov:ignore-end
+        }
+
+        // QDF page/contents markers ride ahead of "%% Original object ID:" and
+        // remain even under no_original_object_ids. Mirrors qpdf 11.9.0
+        // QPDFWriter.cc:1774-1785. Keyed on original refs (old_ref).
+        if options.qdf {
+            if let Some(&seq) = page_seq.get(old_ref) {
+                bytes.extend_from_slice(format!("%% Page {seq}\n").as_bytes());
+            }
+            if let Some(&seq) = contents_seq.get(old_ref) {
+                bytes.extend_from_slice(format!("%% Contents for page {seq}\n").as_bytes());
+            }
         }
 
         // QDF per-object comment: "%% Original object ID: N G"
@@ -4646,7 +4717,10 @@ fn write_stream_to_buf_qdf(
     stream: &crate::Stream,
     policy: NewlineBeforeEndstream,
 ) {
-    stream.dict.write_pdf_qdf(buf, 0);
+    // qpdf --qdf pulls /Length past every other (alphabetically-sorted) key so
+    // the length indirect reference sits immediately before `>>`; use the
+    // /Length-last QDF serializer here (mirrors non-QDF write_pdf_stream).
+    stream.dict.write_pdf_stream_qdf(buf, 0);
     // Stream framing + newline-before-endstream policy is identical to the
     // compact path; only the dict serialization differs in qdf mode.
     write_stream_payload(buf, &stream.data, policy);
