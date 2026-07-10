@@ -784,6 +784,37 @@ impl Dictionary {
         push_spaces(out, indent);
         out.extend_from_slice(b">>");
     }
+
+    /// Serialize this stream dictionary in qpdf `--qdf` layout (see
+    /// [`write_pdf_qdf`](Self::write_pdf_qdf)), but with `/Length` pulled to the
+    /// end so it appears immediately before `>>`. Mirrors qpdf's non-QDF
+    /// [`write_pdf_stream`](Self::write_pdf_stream) special-case in the QDF
+    /// multi-line form: every other key stays alphabetical, `/Length` moves
+    /// last. Absent `/Length` renders as plain alphabetical order.
+    pub(crate) fn write_pdf_stream_qdf(&self, out: &mut Vec<u8>, indent: usize) {
+        out.extend_from_slice(b"<<\n");
+        let mut length_value: Option<&Object> = None;
+        for (key, value) in self.iter() {
+            if key == b"Length" {
+                length_value = Some(value);
+                continue;
+            }
+            push_spaces(out, indent + 2);
+            out.push(b'/');
+            write_name_escaped(out, key);
+            out.push(b' ');
+            value.write_pdf_qdf(out, indent + 2);
+            out.push(b'\n');
+        }
+        if let Some(length) = length_value {
+            push_spaces(out, indent + 2);
+            out.extend_from_slice(b"/Length ");
+            length.write_pdf_qdf(out, indent + 2);
+            out.push(b'\n');
+        }
+        push_spaces(out, indent);
+        out.extend_from_slice(b">>");
+    }
 }
 
 /// PDF content stream: a dictionary plus an opaque byte payload.

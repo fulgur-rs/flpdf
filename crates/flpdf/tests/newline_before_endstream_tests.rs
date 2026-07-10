@@ -11,9 +11,16 @@
 //!   (d) Both modes: write a minimal PDF, re-open it, and verify stream data
 //!       round-trips correctly.
 //!   (e) ObjStm container and xref stream paths also apply Yes-mode consistently.
+//!   (f) QDF: the writer promotes only `Never` to `No` internally so
+//!       `endstream` is line-anchored; explicit `Yes` and `No` pass through
+//!       unchanged. `No` skips the added `\n` only when the payload ends in
+//!       exactly `\n` (matches qpdf's `(last_char != '\n')` check in
+//!       QPDFWriter.cc:1560 — bare-`\r` and `\r\n` endings still receive an
+//!       added `\n`, and explicit `Yes` always adds one regardless of the
+//!       payload's last byte).
 //!
 //! Unit tests (a–c) exercise `write_stream_to_buf` directly so they need no
-//! on-disk fixture.  Integration tests (d–e) use `write_pdf_with_options`.
+//! on-disk fixture.  Integration tests (d–f) use `write_pdf_with_options`.
 //! End-to-end / CLI matrix tests are the responsibility of flpdf-9hc.12.8.
 
 use flpdf::{
@@ -208,7 +215,11 @@ fn no_does_not_insert_newline_when_payload_ends_with_lf() {
 }
 
 #[test]
-fn no_does_not_insert_newline_when_payload_ends_with_cr() {
+fn no_inserts_newline_when_payload_ends_with_bare_cr() {
+    // qpdf's --qdf logic (`QPDFWriter.cc:1560`) only skips the added `\n`
+    // when the payload's last byte is exactly `\n`. Bare `\r` (and `\r\n`)
+    // endings still receive an added `\n` before `endstream`, so
+    // `endstream` remains line-anchored.
     let payload = b"payload ends with cr\r".to_vec();
     let stream = make_stream(None, payload.clone());
 
@@ -216,11 +227,19 @@ fn no_does_not_insert_newline_when_payload_ends_with_cr() {
     write_stream_to_buf(&mut buf, &stream, NewlineBeforeEndstream::No);
 
     let es_pos = rfind(&buf, b"endstream").expect("endstream not found");
-    // No mode + CR tail: endstream immediately follows the \r.
+    // No mode + bare-CR tail: an added `\n` sits between the payload and
+    // `endstream`, so byte before `endstream` is `\n` and the previous
+    // byte is the payload's `\r`.
     assert_eq!(
         buf[es_pos - 1],
+        b'\n',
+        "No mode (bare-CR tail): flpdf must insert `\\n` before `endstream` \
+         (qpdf `(last_char != '\\n')` in QPDFWriter.cc:1560)"
+    );
+    assert_eq!(
+        buf[es_pos - 2],
         b'\r',
-        "No mode (CR tail): endstream must immediately follow payload's trailing \\r"
+        "No mode (bare-CR tail): the payload's trailing `\\r` sits before the added `\\n`"
     );
 }
 
@@ -347,20 +366,27 @@ fn round_trip_never_mode() {
     run_round_trip_test(NewlineBeforeEndstream::Never);
 }
 
-/// qdf + `Never`: in QDF mode each stream's `/Length` becomes an indirect
-/// length-holder whose body is `on_disk_stream_len`, which for `Never` adds no
-/// EOL (holder == raw payload length). This asserts the *emitted* bytes: the
-/// payload is written verbatim with `endstream` immediately adjacent (no EOL),
-/// and the dict carries an indirect `/Length`. (Re-opening QDF + `Never` output
-/// is a separate code path and is not covered here.)
+/// qdf keeps `endstream` line-anchored regardless of the caller's
+/// `newline_before_endstream` policy. QDF form is designed for human editing
+/// and requires `endstream` on its own line so `flpdf::fix_qdf` (and qpdf's
+/// `fix-qdf`) can locate it; the writer therefore promotes `Never` to `No`
+/// internally when `options.qdf` is true. Under `No`, a payload that does not
+/// end in EOL gets exactly one framing `\n` before `endstream`; a payload
+/// that already ends in EOL takes no additional byte. This asserts the
+/// *emitted* bytes for a non-EOL payload: exactly one `\n` sits between the
+/// payload and `endstream`, and the dict carries an indirect `/Length`.
+/// (Re-opening QDF + `Never` output is a separate code path and is not
+/// covered here.)
 #[test]
-fn qdf_forces_yes_framing_regardless_of_caller_policy() {
+fn qdf_wraps_endstream_on_own_line_regardless_of_caller_policy() {
     // QDF form is designed for human editing and requires `endstream` on its own
     // line so `flpdf::fix_qdf` (like qpdf's `fix-qdf`) can find it. The writer
-    // therefore promotes `Never`/`No` to `Yes` internally when `options.qdf` is
-    // true, mirroring `qpdf --qdf --newline-before-endstream=n` (qpdf keeps the
-    // QDF EOL regardless of the flag). The caller's `Never` request is honoured
-    // to the extent the format allows: it does not corrupt the output.
+    // therefore promotes `Never` to `No` internally when `options.qdf` is true,
+    // matching qpdf --qdf: a payload that does not end in EOL gets exactly one
+    // framing `\n` before `endstream`, so the endstream keyword is line-anchored.
+    // Payloads that already end in EOL take no additional byte. The caller's
+    // `Never` request is honoured to the extent the format allows: the output
+    // is not corrupted.
     let raw: &[u8] = b"qdf never-mode payload";
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
@@ -374,11 +400,15 @@ fn qdf_forces_yes_framing_regardless_of_caller_policy() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    // Yes framing: the payload is followed by `\nendstream`, NOT adjacent.
-    let yes_framed = b"qdf never-mode payload\nendstream";
+    // Line-anchored endstream: the payload is followed by `\nendstream`, NOT
+    // adjacent to the payload. Under No-promotion for this non-EOL payload the
+    // writer inserts exactly one framing `\n`.
+    let newline_framed = b"qdf never-mode payload\nendstream";
     assert!(
-        output.windows(yes_framed.len()).any(|w| w == yes_framed),
-        "qdf must promote Never to Yes internally and emit `\\nendstream`"
+        output
+            .windows(newline_framed.len())
+            .any(|w| w == newline_framed),
+        "qdf keeps `\\nendstream` framing (line-anchored endstream)"
     );
     // QDF splits /Length into an indirect length-holder: `/Length <N> 0 R`.
     // Match that exact shape so an unrelated `N 0 R` (e.g. `/Root 1 0 R`) can't
@@ -435,14 +465,16 @@ fn round_trip_qdf_never_mode() {
 }
 
 /// Regression guard: the [`write_qdf`] convenience wrapper must go through
-/// the same `write_pdf_with_options` promotion that upgrades `Never` to `Yes`
+/// the same `write_pdf_with_options` promotion that upgrades `Never` to `No`
 /// for QDF form. If a future refactor gives `write_qdf` its own emission path
 /// that bypasses the promotion, the output would carry adjacent `endstream`
-/// framing and `flpdf::fix_qdf` / qpdf's `fix-qdf` would fail on hand edits.
-/// The library default `NewlineBeforeEndstream::Never` makes this the exact
-/// state the caller reaches with `WriteOptions::default()`.
+/// framing for non-EOL-ending payloads and `flpdf::fix_qdf` / qpdf's `fix-qdf`
+/// would fail on hand edits. The library default `NewlineBeforeEndstream::Never`
+/// makes this the exact state the caller reaches with `WriteOptions::default()`.
+/// The payload deliberately does not end in `\n`, so under `No` the writer
+/// still inserts exactly one framing `\n` before `endstream`.
 #[test]
-fn write_qdf_wrapper_respects_yes_promotion_via_public_api() {
+fn write_qdf_wrapper_respects_no_promotion_via_public_api() {
     let raw: &[u8] = b"write_qdf wrapper payload";
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
@@ -450,30 +482,92 @@ fn write_qdf_wrapper_respects_yes_promotion_via_public_api() {
     let mut output = Vec::new();
     write_qdf(&mut pdf, &mut output).unwrap();
 
-    let yes_framed = b"write_qdf wrapper payload\nendstream";
+    let framed = b"write_qdf wrapper payload\nendstream";
     assert!(
-        output.windows(yes_framed.len()).any(|w| w == yes_framed),
-        "write_qdf must emit `\\nendstream` framing regardless of the library \
-         default (`Never`) — the QDF Yes-promotion applies to all public entry points"
+        output.windows(framed.len()).any(|w| w == framed),
+        "write_qdf must emit `\\nendstream` framing (single `\\n`) regardless of \
+         the library default (`Never`) — the QDF No-promotion applies to all \
+         public entry points"
     );
 }
 
-/// QDF form auto-promotes the caller's `Never` to `Yes` (see
-/// `qdf_forces_yes_framing_regardless_of_caller_policy` above), so an
-/// EOL-ending payload takes the standard `Yes`-mode framing path: the writer
-/// inserts a framing `\n` and sets the indirect `/Length` to `payload + 1`,
-/// and the reader strips the framing `\n` back off on re-open, so the
-/// original bytes are recovered exactly. This is stricter than the pre-Never
-/// characterization test that lived here (which asserted the trailing `\n`
-/// collapsed lossily into the framing EOL).
+/// QDF form promotes the caller's `Never` to `No` (see
+/// `qdf_wraps_endstream_on_own_line_regardless_of_caller_policy` above),
+/// matching
+/// qpdf's `--qdf` behaviour: when the payload already ends with `\n`/`\r`,
+/// no additional framing byte is inserted, and `/Length` equals the raw
+/// payload length. Round-trip characterization: for a payload ending in EOL,
+/// the on-disk bytes `abc\nendstream` are ambiguous — they could come from
+/// payload `abc` (No policy adds framing `\n`) OR from payload `abc\n` (No
+/// policy adds nothing). The reader resolves this ambiguity in QDF mode by
+/// keeping the parser's endstream-scan value (strips one framing EOL), so
+/// the trailing byte is dropped on re-open. This mirrors qpdf's --qdf
+/// re-read behaviour and preserves the pinned QDF idempotence invariant.
 #[test]
-fn round_trip_qdf_eol_ending_payload_round_trips_via_yes_promotion() {
+fn round_trip_qdf_eol_ending_payload_drops_trailing_eol_via_no_promotion() {
     let raw: &[u8] = b"abc\n";
     assert_eq!(
         round_trip_qdf(raw, NewlineBeforeEndstream::Never).as_slice(),
-        raw,
-        "QDF auto-promotes Never to Yes, so an EOL-ending payload round-trips \
-         exactly via the Yes framing path (framing `\\n` stripped on re-open)"
+        b"abc",
+        "QDF promotes Never to No, so an EOL-ending payload loses its \
+         trailing EOL on re-open (the pre-endstream framing byte and the \
+         payload's trailing EOL are indistinguishable on disk); matches qpdf"
+    );
+}
+
+/// A payload ending in bare `\r` under QDF must receive an added framing
+/// `\n` before `endstream` — qpdf `--qdf` `(last_char != '\n')` covers only
+/// `\n`. Verified against the emitted bytes: the stream body ends
+/// `...\r\nendstream`, NOT `...\rendstream`.
+#[test]
+fn qdf_bare_cr_payload_gets_added_newline() {
+    let raw: &[u8] = b"payload with bare cr\r";
+    let source = build_minimal_pdf(raw);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = true;
+    options.compress_streams = flpdf::CompressStreams::No;
+    // Never → No promotion inside QDF; this exercises the No branch that
+    // adds `\n` when the payload does not end in exactly `\n`.
+    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let framed = b"payload with bare cr\r\nendstream";
+    assert!(
+        output.windows(framed.len()).any(|w| w == framed),
+        "QDF+No must add `\\n` after bare `\\r` payload — expected `...\\r\\nendstream`"
+    );
+}
+
+/// A caller who explicitly requests `Yes` under QDF must get the `Yes`
+/// framing — an added `\n` before `endstream` even when the payload already
+/// ends with `\n`. Verifies the override only promotes `Never`, never
+/// downgrading an explicit `Yes` to `No`.
+#[test]
+fn qdf_honors_explicit_newline_before_endstream_yes() {
+    // Payload already ends with `\n`; `Yes` forces an ADDITIONAL `\n`.
+    let raw: &[u8] = b"already lf-ending payload\n";
+    let source = build_minimal_pdf(raw);
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.qdf = true;
+    options.compress_streams = flpdf::CompressStreams::No;
+    options.newline_before_endstream = NewlineBeforeEndstream::Yes;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let framed = b"already lf-ending payload\n\nendstream";
+    assert!(
+        output.windows(framed.len()).any(|w| w == framed),
+        "QDF must honour explicit Yes: payload ends `\\n`, Yes adds a second \
+         `\\n`, so `...\\n\\nendstream` must appear in the output"
     );
 }
 

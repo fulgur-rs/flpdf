@@ -1962,6 +1962,283 @@ fn write_qdf_goes_through_canonical_qdf_serializers() {
     );
 }
 
+/// QDF output must carry qpdf's page-context comments — one `%% Page N` before
+/// each Page dict and one `%% Contents for page N` before each content stream —
+/// keyed by 1-based page order. Mirrors qpdf 11.9.0 QPDFWriter.cc:1774-1785.
+/// These markers are separate from `%% Original object ID:` and MUST remain
+/// even when `no_original_object_ids = true`.
+#[test]
+fn write_qdf_emits_page_and_contents_markers_per_page() {
+    let file = File::open("../../tests/fixtures/compat/three-page.pdf").unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    let mut output = Vec::new();
+    write_qdf(&mut pdf, &mut output).unwrap();
+
+    // One `%% Page N` marker per page (three-page fixture has 3 pages).
+    for n in 1..=3 {
+        let needle = format!("%% Page {n}\n");
+        assert!(
+            output.windows(needle.len()).any(|w| w == needle.as_bytes()),
+            "write_qdf must emit `%% Page {n}` marker before the Page dict"
+        );
+    }
+
+    // One `%% Contents for page N` marker per page (three-page.pdf pages
+    // each carry a single indirect /Contents stream).
+    for n in 1..=3 {
+        let needle = format!("%% Contents for page {n}\n");
+        assert!(
+            output.windows(needle.len()).any(|w| w == needle.as_bytes()),
+            "write_qdf must emit `%% Contents for page {n}` marker before the content stream"
+        );
+    }
+}
+
+/// Even under `no_original_object_ids = true` (qpdf's `--no-original-object-ids`),
+/// the QDF page/contents markers must still be emitted — qpdf keeps them
+/// regardless of that flag; only `%% Original object ID:` is suppressed.
+#[test]
+fn qdf_no_original_object_ids_still_emits_page_and_contents_markers() {
+    let file = File::open("../../tests/fixtures/compat/three-page.pdf").unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+
+    let mut opts = WriteOptions::default();
+    opts.full_rewrite = true;
+    opts.qdf = true;
+    opts.no_original_object_ids = true;
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &opts).unwrap();
+
+    // %% Original object ID: must be suppressed.
+    assert!(
+        !output
+            .windows(b"%% Original object ID:".len())
+            .any(|w| w == b"%% Original object ID:"),
+        "no_original_object_ids must suppress `%% Original object ID:` comments"
+    );
+
+    // But page/contents markers must remain (one per page, 3 pages).
+    for n in 1..=3 {
+        let page_needle = format!("%% Page {n}\n");
+        assert!(
+            output
+                .windows(page_needle.len())
+                .any(|w| w == page_needle.as_bytes()),
+            "no_original_object_ids must NOT suppress `%% Page {n}`"
+        );
+        let contents_needle = format!("%% Contents for page {n}\n");
+        assert!(
+            output
+                .windows(contents_needle.len())
+                .any(|w| w == contents_needle.as_bytes()),
+            "no_original_object_ids must NOT suppress `%% Contents for page {n}`"
+        );
+    }
+}
+
+/// Pages without a `/Contents` entry (legitimately blank pages) must not
+/// panic or skip the QDF page-marker emission. This exercises the
+/// `contents_raw = None` arm of the QDF page/contents pre-scan: `%% Page N`
+/// is still emitted for every page, but `%% Contents for page N` is only
+/// emitted for pages that actually have a content stream.
+#[test]
+fn write_qdf_handles_page_without_contents_key() {
+    // A minimal 1.4 PDF with one Page dict that has NO /Contents key.
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let off1 = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n");
+    let off3 = bytes.len();
+    // Page dict without /Contents — a blank page.
+    bytes.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    );
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let mut output = Vec::new();
+    write_qdf(&mut pdf, &mut output).unwrap();
+
+    // %% Page 1 must still be emitted (page seq is independent of /Contents).
+    assert!(
+        output
+            .windows(b"%% Page 1\n".len())
+            .any(|w| w == b"%% Page 1\n"),
+        "%% Page 1 must be emitted even when the page has no /Contents"
+    );
+    // %% Contents for page 1 must NOT be emitted — no content stream exists.
+    assert!(
+        !output
+            .windows(b"%% Contents for page 1".len())
+            .any(|w| w == b"%% Contents for page 1"),
+        "%% Contents for page N must not be emitted when the page has no /Contents"
+    );
+}
+
+/// A page whose `/Contents` is an INDIRECT reference resolving to an ARRAY
+/// of stream refs must tag each array element with the page's sequence
+/// number in the QDF pre-scan (`%% Contents for page N` before every content
+/// stream). Exercises the `Indirect → resolve → Array` arm of the pre-scan.
+#[test]
+fn write_qdf_handles_indirect_contents_ref_resolving_to_array_of_refs() {
+    // Minimal 1.4 PDF: Page's /Contents is `4 0 R`; object 4 is an ARRAY
+    // holding two content-stream refs `5 0 R` and `6 0 R`.
+    let stream_a = b"BT /F1 12 Tf ET";
+    let stream_b = b"0 0 m 10 10 l S";
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let off1 = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n");
+    let off3 = bytes.len();
+    // /Contents references object 4 (which is an Array).
+    bytes.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+    );
+    let off4 = bytes.len();
+    bytes.extend_from_slice(b"4 0 obj\n[5 0 R 6 0 R]\nendobj\n");
+    let off5 = bytes.len();
+    bytes.extend_from_slice(
+        format!("5 0 obj\n<< /Length {} >>\nstream\n", stream_a.len()).as_bytes(),
+    );
+    bytes.extend_from_slice(stream_a);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    let off6 = bytes.len();
+    bytes.extend_from_slice(
+        format!("6 0 obj\n<< /Length {} >>\nstream\n", stream_b.len()).as_bytes(),
+    );
+    bytes.extend_from_slice(stream_b);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for off in [off1, off2, off3, off4, off5, off6] {
+        bytes.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let mut output = Vec::new();
+    write_qdf(&mut pdf, &mut output).unwrap();
+
+    // qpdf's pre-scan tags EVERY element of the Array with the page's seq,
+    // so we expect TWO `%% Contents for page 1` comments (one before each
+    // stream object). Count them.
+    let needle = b"%% Contents for page 1\n";
+    let count = output
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count();
+    assert_eq!(
+        count, 2,
+        "QDF pre-scan must tag both array-element streams with `%% Contents for page 1` (found {count})"
+    );
+}
+
+/// A page whose `/Contents` is a DIRECT Array containing a mix of Reference
+/// and non-Reference elements (e.g. a stray `null`) must still tag the
+/// Reference elements. Exercises the `_ => None` filter_map arm that skips
+/// non-Reference direct-Array elements.
+#[test]
+fn write_qdf_direct_contents_array_skips_non_reference_elements() {
+    // Minimal 1.4 PDF where /Contents is `[ 5 0 R null ]` (mixed direct
+    // array). Only the Reference element must appear in the pre-scan
+    // tagging.
+    let stream_a = b"BT /F1 12 Tf ET";
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let off1 = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n");
+    let off3 = bytes.len();
+    bytes.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [5 0 R null] >>\nendobj\n",
+    );
+    let off5 = bytes.len();
+    bytes.extend_from_slice(
+        format!("5 0 obj\n<< /Length {} >>\nstream\n", stream_a.len()).as_bytes(),
+    );
+    bytes.extend_from_slice(stream_a);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+    // Object 4 is unused / free.
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{off5:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let mut output = Vec::new();
+    write_qdf(&mut pdf, &mut output).unwrap();
+
+    // Exactly one `%% Contents for page 1` — from the Reference element
+    // `5 0 R`. The `null` element is skipped by the filter_map.
+    let needle = b"%% Contents for page 1\n";
+    let count = output
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count();
+    assert_eq!(
+        count, 1,
+        "QDF pre-scan must tag exactly one content stream when the direct \
+         /Contents Array mixes a Reference with a non-Reference (found {count})"
+    );
+}
+
+/// QDF stream dict serialization must pull `/Length` to the last position
+/// (right before `>>`), matching qpdf's non-QDF `/Length`-last convention
+/// applied in the multi-line QDF layout. A stream dict with alphabetically-
+/// sorted keys must show `/Length` after every other key.
+#[test]
+fn write_qdf_stream_dict_pulls_length_to_end() {
+    let file = File::open("../../tests/fixtures/compat/three-page.pdf").unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    let mut output = Vec::new();
+    write_qdf(&mut pdf, &mut output).unwrap();
+
+    // Every occurrence of `/Length ` in a stream dict must be immediately
+    // followed by an indirect ref (`N 0 R`) and then `\n` + optional spaces +
+    // `>>` — the QDF stream dict pulls /Length last. Search for the pattern
+    // `/Length N 0 R\n` followed by any leading whitespace and `>>`.
+    //
+    // Materialize `lines()` once so the follow-up `next` lookup is O(1)
+    // rather than O(N) (the previous `text.lines().nth(i + 1)` re-walked
+    // the whole string every iteration).
+    let mut found_length_last = false;
+    let text = String::from_utf8_lossy(&output);
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("/Length ") && trimmed.ends_with(" 0 R") {
+            // The next non-blank line must be `>>` (dict close).
+            let next = lines.get(i + 1).copied().unwrap_or("").trim();
+            if next == ">>" {
+                found_length_last = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        found_length_last,
+        "write_qdf must emit `/Length N 0 R` as the last dict key immediately \
+         before `>>` in at least one stream dict"
+    );
+}
+
 fn count_substrings(haystack: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() {
         return 0;

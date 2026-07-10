@@ -1045,6 +1045,24 @@ mod byte_gate {
         out
     }
 
+    /// Write `dest` through the `flpdf rewrite --static-id --qdf --no-original-object-ids`
+    /// recipe. QDF uses the caller's `newline_before_endstream` policy but
+    /// promotes only `Never` to `No` internally (so `endstream` stays
+    /// line-anchored) — we leave `newline_before_endstream` at its default
+    /// (`Never`) and rely on that promotion.
+    fn write_qdf_nooid<R: std::io::Read + std::io::Seek>(dest: &mut Pdf<R>) -> Vec<u8> {
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        write_pdf_with_options(dest, &mut out, &opts).unwrap();
+        out
+    }
+
     /// Report the first differing byte offset for a readable failure message.
     fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
         if a == b {
@@ -1124,6 +1142,61 @@ mod byte_gate {
                 String::from_utf8_lossy(&actual[lo..(off + 24).min(actual.len())]),
             );
         }
+    }
+
+    #[test]
+    fn three_page_overlay_one_page_qdf_is_byte_identical() {
+        // Same as three_page_overlay_one_page_is_byte_identical but written
+        // through the QDF + --no-original-object-ids recipe.
+        let mut dest = fixture("three-page.pdf");
+        let mut source = fixture("one-page.pdf");
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr(""),
+            None,
+        )
+        .unwrap();
+        let actual = write_qdf_nooid(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-one-page-qdf.pdf");
+    }
+
+    #[test]
+    fn three_page_two_overlays_qdf_is_byte_identical() {
+        // QDF recipe of two_overlays_compose_byte_identical:
+        // `qpdf --overlay one-page.pdf -- --overlay two-page.pdf --`. Two
+        // overlays compose left-to-right in declaration order (Fx0/Fx1 for the
+        // first spec, Fx2 for the second on page 1; Fx0/Fx1 on page 2; page 3
+        // untouched). Verifies the Fx0/Fx1 declaration-order convention under
+        // QDF.
+        let mut dest = fixture("three-page.pdf");
+        let mut specs = vec![
+            spec("one-page.pdf", OverlayKind::Overlay),
+            spec("two-page.pdf", OverlayKind::Overlay),
+        ];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_qdf_nooid(&mut dest);
+        assert_byte_identical(&actual, "three-page-two-overlays-qdf.pdf");
+    }
+
+    #[test]
+    fn three_page_overlay_and_underlay_qdf_is_byte_identical() {
+        // QDF recipe of overlay_and_underlay_compose_byte_identical:
+        // `qpdf --overlay one-page.pdf -- --underlay two-page.pdf --`, which
+        // apply_overlay_specs batches together so Form XObject naming follows
+        // the under-then-over cross-spec convention (Fx0, Fx1, Fx2 on page 1;
+        // Fx0, Fx1 on page 2; page 3 untouched). Verifies Form XObject
+        // naming/order preservation under QDF.
+        let mut dest = fixture("three-page.pdf");
+        let mut specs = vec![
+            spec("one-page.pdf", OverlayKind::Overlay),
+            spec("two-page.pdf", OverlayKind::Underlay),
+        ];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_qdf_nooid(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-and-underlay-qdf.pdf");
     }
 
     #[test]
