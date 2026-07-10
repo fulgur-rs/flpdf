@@ -1884,6 +1884,36 @@ qpdf --static-id --warning-exit-0 \
     "$REF/overlay/swapped-box-r90-overlay-self.pdf"
 echo "overlay/swapped-box-r90-overlay-self.pdf"
 
+# ---------------------------------------------------------------------------
+# Phase 2b': QDF variants (flpdf-9hc.16.13)
+#
+# 3 representative overlay scenarios re-encoded with --qdf + --no-original-object-ids
+# to cover the QDF writer path (uncompressed streams, object-number relaying, xref
+# table form) in combination with overlay/underlay. Goldens serve as regression
+# catchers for library-layer QDF+NoOID+overlay parity; uo-1..uo-8 exact byte
+# parity is covered separately in flpdf-qtest (Artistic 2.0 isolation).
+# ---------------------------------------------------------------------------
+
+# QDF: three-page dest + one-page overlay (smallest QDF+overlay scenario).
+qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/one-page.pdf" -- \
+    "$REF/overlay/three-page-overlay-one-page-qdf.pdf"
+echo "overlay/three-page-overlay-one-page-qdf.pdf"
+
+# QDF: same page carries both overlay + underlay (order-preservation test).
+qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/one-page.pdf" -- \
+    --underlay "$FIX/two-page.pdf" -- \
+    "$REF/overlay/three-page-overlay-and-underlay-qdf.pdf"
+echo "overlay/three-page-overlay-and-underlay-qdf.pdf"
+
+# QDF: two --overlay flags compose left-to-right (Fx0/Fx1 declaration order).
+qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
+    "$FIX/three-page.pdf" --overlay "$FIX/one-page.pdf" -- \
+    --overlay "$FIX/two-page.pdf" -- \
+    "$REF/overlay/three-page-two-overlays-qdf.pdf"
+echo "overlay/three-page-two-overlays-qdf.pdf"
+
 
 echo ""
 
