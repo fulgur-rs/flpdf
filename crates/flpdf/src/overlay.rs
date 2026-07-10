@@ -1162,6 +1162,24 @@ mod byte_gate {
     }
 
     #[test]
+    fn three_page_overlay_and_underlay_qdf_is_byte_identical() {
+        // QDF recipe of overlay_and_underlay_compose_byte_identical:
+        // `qpdf --overlay one-page.pdf -- --underlay two-page.pdf --`, which
+        // apply_overlay_specs batches together so Form XObject naming follows
+        // the under-then-over cross-spec convention (Fx0, Fx1, Fx2 on page 1;
+        // Fx0, Fx1 on page 2; page 3 untouched). Verifies Form XObject
+        // naming/order preservation under QDF.
+        let mut dest = fixture("three-page.pdf");
+        let mut specs = vec![
+            spec("one-page.pdf", OverlayKind::Overlay),
+            spec("two-page.pdf", OverlayKind::Underlay),
+        ];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_qdf_nooid(&mut dest);
+        assert_byte_identical(&actual, "three-page-overlay-and-underlay-qdf.pdf");
+    }
+
+    #[test]
     fn overlay_two_page_default_is_byte_identical() {
         // dest=three-page, overlay source=two-page, defaults: p1<-s1, p2<-s2,
         // p3 untouched (source exhausted, no --repeat).
