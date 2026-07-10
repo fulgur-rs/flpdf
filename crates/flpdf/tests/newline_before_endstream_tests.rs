@@ -11,9 +11,13 @@
 //!   (d) Both modes: write a minimal PDF, re-open it, and verify stream data
 //!       round-trips correctly.
 //!   (e) ObjStm container and xref stream paths also apply Yes-mode consistently.
+//!   (f) QDF: the writer promotes `Never` to `No` internally so `endstream` is
+//!       line-anchored — a `\n` is inserted before `endstream` only when the
+//!       payload does not already end in EOL. Payloads ending in EOL take no
+//!       additional byte, matching qpdf `--qdf`.
 //!
 //! Unit tests (a–c) exercise `write_stream_to_buf` directly so they need no
-//! on-disk fixture.  Integration tests (d–e) use `write_pdf_with_options`.
+//! on-disk fixture.  Integration tests (d–f) use `write_pdf_with_options`.
 //! End-to-end / CLI matrix tests are the responsibility of flpdf-9hc.12.8.
 
 use flpdf::{
@@ -347,14 +351,19 @@ fn round_trip_never_mode() {
     run_round_trip_test(NewlineBeforeEndstream::Never);
 }
 
-/// qdf + `Never`: in QDF mode each stream's `/Length` becomes an indirect
-/// length-holder whose body is `on_disk_stream_len`, which for `Never` adds no
-/// EOL (holder == raw payload length). This asserts the *emitted* bytes: the
-/// payload is written verbatim with `endstream` immediately adjacent (no EOL),
-/// and the dict carries an indirect `/Length`. (Re-opening QDF + `Never` output
-/// is a separate code path and is not covered here.)
+/// qdf keeps `endstream` line-anchored regardless of the caller's
+/// `newline_before_endstream` policy. QDF form is designed for human editing
+/// and requires `endstream` on its own line so `flpdf::fix_qdf` (and qpdf's
+/// `fix-qdf`) can locate it; the writer therefore promotes `Never` to `No`
+/// internally when `options.qdf` is true. Under `No`, a payload that does not
+/// end in EOL gets exactly one framing `\n` before `endstream`; a payload
+/// that already ends in EOL takes no additional byte. This asserts the
+/// *emitted* bytes for a non-EOL payload: exactly one `\n` sits between the
+/// payload and `endstream`, and the dict carries an indirect `/Length`.
+/// (Re-opening QDF + `Never` output is a separate code path and is not
+/// covered here.)
 #[test]
-fn qdf_forces_yes_framing_regardless_of_caller_policy() {
+fn qdf_wraps_endstream_on_own_line_regardless_of_caller_policy() {
     // QDF form is designed for human editing and requires `endstream` on its own
     // line so `flpdf::fix_qdf` (like qpdf's `fix-qdf`) can find it. The writer
     // therefore promotes `Never` to `No` internally when `options.qdf` is true,
@@ -376,11 +385,15 @@ fn qdf_forces_yes_framing_regardless_of_caller_policy() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    // Yes framing: the payload is followed by `\nendstream`, NOT adjacent.
-    let yes_framed = b"qdf never-mode payload\nendstream";
+    // Line-anchored endstream: the payload is followed by `\nendstream`, NOT
+    // adjacent to the payload. Under No-promotion for this non-EOL payload the
+    // writer inserts exactly one framing `\n`.
+    let newline_framed = b"qdf never-mode payload\nendstream";
     assert!(
-        output.windows(yes_framed.len()).any(|w| w == yes_framed),
-        "qdf must promote Never to Yes internally and emit `\\nendstream`"
+        output
+            .windows(newline_framed.len())
+            .any(|w| w == newline_framed),
+        "qdf keeps `\\nendstream` framing (line-anchored endstream)"
     );
     // QDF splits /Length into an indirect length-holder: `/Length <N> 0 R`.
     // Match that exact shape so an unrelated `N 0 R` (e.g. `/Root 1 0 R`) can't
@@ -464,7 +477,8 @@ fn write_qdf_wrapper_respects_no_promotion_via_public_api() {
 }
 
 /// QDF form promotes the caller's `Never` to `No` (see
-/// `qdf_forces_yes_framing_regardless_of_caller_policy` above), matching
+/// `qdf_wraps_endstream_on_own_line_regardless_of_caller_policy` above),
+/// matching
 /// qpdf's `--qdf` behaviour: when the payload already ends with `\n`/`\r`,
 /// no additional framing byte is inserted, and `/Length` equals the raw
 /// payload length. Round-trip characterization: for a payload ending in EOL,
