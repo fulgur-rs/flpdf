@@ -467,3 +467,42 @@ fn overlay_bumps_header_and_injects_adbe_from_encrypted_source() {
         "expected /Extensions/ADBE/ExtensionLevel 8 propagated from AES-256 source",
     );
 }
+
+#[test]
+fn overlay_from_rc4_source_opens_without_allow_weak_crypto() {
+    // qpdf-parity for qtest form-xobject 31 (uo-7): an RC4-encrypted overlay
+    // source with correct --password must NOT require the top-level
+    // --allow-weak-crypto flag. The flag gates weak-crypto WRITES; opening
+    // an overlay source is a read-only inspection.
+    //
+    // The repo's RC4 fixture (`v2-rc4-128-r3.pdf`) has zero pages (by design
+    // of the encrypted-fixture generator, which starts from `minimal.pdf`),
+    // so this invocation still fails downstream with a page_count error.
+    // That failure shape is exactly what proves the RC4 open succeeded —
+    // before this fix, the same command failed earlier with a
+    // "encryption uses weak crypto (RC4)" error. Asserting the ABSENCE of
+    // that phrase (and the PRESENCE of the downstream error) is the
+    // observable regression check.
+    let dest = fixture("one-page.pdf");
+    let rc4_src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = tmp.path().join("overlay-out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg(&dest)
+        .arg(&out)
+        .arg("--overlay")
+        .arg(&rc4_src)
+        .arg("--password=user-v2")
+        .arg("--")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("weak crypto").not())
+        .stderr(predicate::str::contains("page_count"));
+}
