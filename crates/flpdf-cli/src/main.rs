@@ -5558,6 +5558,32 @@ mod tests {
     }
 
     #[test]
+    fn extract_leaves_trailing_top_level_flag_after_group_terminator() {
+        // qtest form-xobject uo-3 style: a top-level flag appears AFTER the
+        // overlay/underlay group's `--` terminator. The extractor must place
+        // that trailing flag verbatim into the residual argv so clap sees it.
+        // A regression here would reintroduce the flpdf-9hc.16.18 diagnosis
+        // trap ("blame the extractor when the top-level flag is missing from
+        // clap's schema").
+        let argv = strs(&[
+            "flpdf",
+            "in.pdf",
+            "out.pdf",
+            "--overlay",
+            "src.pdf",
+            "--",
+            "--coalesce-contents",
+        ]);
+        let (residual, specs) = extract_overlay_groups(argv).unwrap();
+        assert_eq!(
+            residual,
+            strs(&["flpdf", "in.pdf", "out.pdf", "--coalesce-contents"])
+        );
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].file, "src.pdf");
+    }
+
+    #[test]
     fn extract_unterminated_group_errors() {
         // No bare `--` after the file => qpdf requires the terminator.
         let argv = strs(&["--overlay", "over.pdf", "out.pdf"]);
