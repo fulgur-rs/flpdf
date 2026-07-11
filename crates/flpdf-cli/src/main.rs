@@ -195,7 +195,7 @@ struct Cli {
               "decrypt", "encrypt", "copy_encryption_from",
               "add_attachment", "remove_attachment", "list_attachments",
               "show_attachment", "copy_attachments_from",
-              "no_original_object_ids", "qdf",
+              "no_original_object_ids", "qdf", "coalesce_contents",
           ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
     json: Option<String>,
@@ -361,6 +361,25 @@ struct Cli {
     /// rewrite-mode positionals.
     #[arg(long = "qdf")]
     qdf: bool,
+
+    /// Coalesce multiple /Contents streams into a single stream per page
+    /// (top-level alias of `flpdf rewrite --coalesce-contents`; qpdf
+    /// `--coalesce-contents` equivalent). Requires a full rewrite of the
+    /// document. Rejected against inspection, attachment, `--linearize`,
+    /// and page-operation modes: the linearize branch of `run_rewrite`
+    /// and the page-op dispatch never read `args.coalesce_contents`, so
+    /// without these conflicts the flag would be silently dropped and the
+    /// user's requested coalescing would not appear in the output.
+    #[arg(long = "coalesce-contents",
+          conflicts_with_all = [
+              "check", "dump_object", "show_info", "show_catalog",
+              "show_metadata", "show_outline", "show_fonts",
+              "show_npages", "show_pages", "show_linearization",
+              "list_attachments", "show_attachment", "remove_attachment",
+              "add_attachment", "copy_attachments_from",
+              "linearize", "pages", "rotate", "split_pages", "empty",
+          ])]
+    coalesce_contents: bool,
 
     // ── Page-operation flags (flpdf-9hc.8.12) ─────────────────────────────
     // These mirror qpdf's page-selection / page-transformation surface.
@@ -1608,8 +1627,8 @@ fn main() {
             true,
             args.remove_restrictions,
             args.decrypt,
-            false,                              // normalize_content
-            false,                              // coalesce_contents
+            false, // normalize_content
+            args.coalesce_contents,
             CliRemoveUnreferencedResources::No, // remove_unreferenced (no-op for linearize path)
             false,                              // generate_appearances (not on top-level surface)
             None,                               // flatten_annotations (not on top-level surface)
@@ -1770,8 +1789,8 @@ fn main() {
             false,
             args.remove_restrictions,
             args.decrypt,
-            false,                              // normalize_content
-            false,                              // coalesce_contents
+            false, // normalize_content
+            args.coalesce_contents,
             CliRemoveUnreferencedResources::No, // remove_unreferenced (top-level alias is no-op)
             false,                              // generate_appearances (not on top-level surface)
             None,                               // flatten_annotations (not on top-level surface)
@@ -5555,6 +5574,32 @@ mod tests {
         assert_eq!(s.from.as_deref(), Some("1"));
         assert_eq!(s.to.as_deref(), Some("2-3"));
         assert_eq!(s.repeat.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn extract_leaves_trailing_top_level_flag_after_group_terminator() {
+        // qtest form-xobject uo-3 style: a top-level flag appears AFTER the
+        // overlay/underlay group's `--` terminator. The extractor must place
+        // that trailing flag verbatim into the residual argv so clap sees it.
+        // A regression here would reintroduce the flpdf-9hc.16.18 diagnosis
+        // trap ("blame the extractor when the top-level flag is missing from
+        // clap's schema").
+        let argv = strs(&[
+            "flpdf",
+            "in.pdf",
+            "out.pdf",
+            "--overlay",
+            "src.pdf",
+            "--",
+            "--coalesce-contents",
+        ]);
+        let (residual, specs) = extract_overlay_groups(argv).unwrap();
+        assert_eq!(
+            residual,
+            strs(&["flpdf", "in.pdf", "out.pdf", "--coalesce-contents"])
+        );
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].file, "src.pdf");
     }
 
     #[test]

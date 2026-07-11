@@ -1681,6 +1681,228 @@ fn rewrite_coalesce_contents_accepted_and_produces_valid_output() {
         .success();
 }
 
+#[test]
+fn top_level_coalesce_contents_accepted_and_produces_valid_output() {
+    // Top-level alias of `flpdf rewrite --coalesce-contents` (qpdf-shape).
+    // Mirrors rewrite_coalesce_contents_accepted_and_produces_valid_output,
+    // dropping only the "rewrite" argv token.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, two_page_pdf_with_multi_contents()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--coalesce-contents"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn top_level_coalesce_contents_conflicts_with_check() {
+    // A silent-ignore combination (--check would win the dispatch chain over
+    // any rewrite modifier) would produce wrong output. clap must surface it
+    // as a usage error, exit 2 (qpdf convention). Mirrors how --decrypt /
+    // --remove-restrictions are gated.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", "--coalesce-contents", "in.pdf"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_coalesce_contents_conflicts_with_add_attachment() {
+    // Silent-shadow guard: without a clap conflict, the add-attachment
+    // branch wins the dispatch chain and --coalesce-contents is dropped
+    // without diagnostic. Reject the combination at usage-error level
+    // (exit 2, qpdf convention).
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--coalesce-contents",
+            "--add-attachment",
+            "attach.pdf",
+            "--",
+            "in.pdf",
+            "out.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_coalesce_contents_conflicts_with_copy_attachments_from() {
+    // Silent-shadow guard, sibling of the add-attachment case.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--coalesce-contents",
+            "--copy-attachments-from",
+            "donor.pdf",
+            "in.pdf",
+            "out.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_coalesce_contents_conflicts_with_linearize() {
+    // Silent-shadow guard: --linearize is threaded to `run_rewrite`, whose
+    // linearize branch never reads `coalesce_contents`. Rejecting the
+    // combination up-front at clap level prevents the caller from getting a
+    // linearized output whose /Contents arrays are still unmerged.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--linearize", "--coalesce-contents", "in.pdf", "out.pdf"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_coalesce_contents_conflicts_with_pages() {
+    // Silent-shadow guard: the page-op dispatch branch owns the write via
+    // run_page_extraction / run_rewrite_with_page_ops, neither of which reads
+    // `args.coalesce_contents`. The `--encrypt` / `--overlay` combinations
+    // are already rejected inside that branch; mirror the same treatment for
+    // --coalesce-contents at the clap level.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--coalesce-contents",
+            "in.pdf",
+            "--pages",
+            ".",
+            "--",
+            "out.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_coalesce_contents_conflicts_with_rotate() {
+    // Sibling of the --pages case.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--coalesce-contents",
+            "--rotate",
+            "+90:1",
+            "in.pdf",
+            "out.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_coalesce_contents_conflicts_with_split_pages() {
+    // Sibling of the --pages case.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--coalesce-contents",
+            "--split-pages",
+            "1",
+            "in.pdf",
+            "out.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_coalesce_contents_accepts_collate_alone() {
+    // `--collate` alone (no `--pages`) is a documented no-op that does NOT
+    // activate `page_ops_active`; the default rewrite branch runs and honors
+    // `--coalesce-contents`. Regression net: keep `--collate` OUT of the
+    // conflicts_with_all list so qpdf-shaped callers that pass `--collate`
+    // unconditionally (with or without `--pages`) still coalesce correctly.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, two_page_pdf_with_multi_contents()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--coalesce-contents", "--collate=1"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+}
+
+#[test]
+fn top_level_coalesce_contents_conflicts_with_empty() {
+    // Sibling of the --pages case.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--coalesce-contents", "--empty", "in.pdf", "out.pdf"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_coalesce_contents_with_overlay_underlay_trailing_position() {
+    // The exact shape qtest form-xobject uo-3 emits (via the PATH-shim
+    // qpdf→flpdf): --coalesce-contents at the very end of argv, after
+    // TWO overlay/underlay groups each terminated by `--`. The parser
+    // must let the trailing top-level flag through to clap, and clap
+    // must accept it (see flpdf-9hc.16.18). We only assert exit 0 —
+    // byte-parity of the output is a separate concern.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let overlay = temp.path().join("over.pdf");
+    let underlay = temp.path().join("under.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, two_page_pdf_with_multi_contents()).unwrap();
+    std::fs::write(&overlay, two_page_pdf_with_multi_contents()).unwrap();
+    std::fs::write(&underlay, two_page_pdf_with_multi_contents()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args([
+            "--static-id",
+            "--qdf",
+            "--no-original-object-ids",
+            "--verbose",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .arg("--overlay")
+        .arg(&overlay)
+        .args(["--from=", "--repeat=r2,r1", "--"])
+        .arg("--underlay")
+        .arg(&underlay)
+        .args(["--from=z-1", "--", "--coalesce-contents"])
+        .assert()
+        .success();
+
+    assert!(output.exists());
+}
+
 // ── remove-unreferenced-resources ─────────────────────────────────────────────
 
 #[test]
