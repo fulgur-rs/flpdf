@@ -1759,6 +1759,46 @@ fn top_level_coalesce_contents_conflicts_with_copy_attachments_from() {
         .code(2);
 }
 
+#[test]
+fn top_level_coalesce_contents_with_overlay_underlay_trailing_position() {
+    // The exact shape qtest form-xobject uo-3 emits (via the PATH-shim
+    // qpdf→flpdf): --coalesce-contents at the very end of argv, after
+    // TWO overlay/underlay groups each terminated by `--`. The parser
+    // must let the trailing top-level flag through to clap, and clap
+    // must accept it (see flpdf-9hc.16.18). We only assert exit 0 —
+    // byte-parity of the output is a separate concern.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let overlay = temp.path().join("over.pdf");
+    let underlay = temp.path().join("under.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, two_page_pdf_with_multi_contents()).unwrap();
+    std::fs::write(&overlay, two_page_pdf_with_multi_contents()).unwrap();
+    std::fs::write(&underlay, two_page_pdf_with_multi_contents()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args([
+            "--static-id",
+            "--qdf",
+            "--no-original-object-ids",
+            "--verbose",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .arg("--overlay")
+        .arg(&overlay)
+        .args(["--from=", "--repeat=r2,r1", "--"])
+        .arg("--underlay")
+        .arg(&underlay)
+        .args(["--from=z-1", "--", "--coalesce-contents"])
+        .assert()
+        .success();
+
+    assert!(output.exists());
+}
+
 // ── remove-unreferenced-resources ─────────────────────────────────────────────
 
 #[test]
