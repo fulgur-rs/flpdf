@@ -3150,7 +3150,7 @@ fn run_rewrite(
         // here; the new objects only surface because full_rewrite was forced on
         // above.
         if !overlay_specs.is_empty() {
-            let mut built = build_overlay_specs(overlay_specs, repair, password.allow_weak_crypto)?;
+            let mut built = build_overlay_specs(overlay_specs, repair)?;
 
             // flpdf-9hc.16.8: propagate max input header version + Adobe
             // extension_level to the writer (mirrors qpdf QPDFJob.cc L1714
@@ -3702,9 +3702,11 @@ fn extract_overlay_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<Over
 /// opening each source PDF (with its per-segment `--password`).
 ///
 /// Source files are opened read-only; an authentication failure or unreadable
-/// file is surfaced as a CLI error. `allow_weak_crypto` is the top-level
-/// `--allow-weak-crypto` opt-in, threaded through so an RC4/R5-encrypted overlay
-/// source opens under the same gate as the primary input.
+/// file is surfaced as a CLI error. Weak-crypto sources (RC4, R=5) are accepted
+/// unconditionally: `--allow-weak-crypto` only gates weak-crypto *writes*, and
+/// an overlay source is a read-only inspection open. This mirrors qpdf's
+/// observable behavior and the same treatment the `--check` inspection open
+/// applies.
 ///
 /// Page-range defaults match qpdf: an **absent** `--from`/`--to` defaults to all
 /// source/destination pages. An **explicit empty** range is distinct from an
@@ -3722,15 +3724,19 @@ fn extract_overlay_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<Over
 fn build_overlay_specs(
     specs: &[OverlaySpec],
     repair: bool,
-    allow_weak_crypto: bool,
 ) -> CliResult<Vec<flpdf::OverlaySpec<BufReader<File>>>> {
     let mut built = Vec::with_capacity(specs.len());
     for spec in specs {
         let path = PathBuf::from(&spec.file);
         let file = File::open(&path).map_err(|error| error_with_file(&path, error.into()))?;
+        // Overlay sources are read-only; qpdf accepts weak-crypto opens
+        // unconditionally (the flag only gates weak-crypto WRITES). Match
+        // qpdf and unblock RC4 overlays — same pattern `run_check` uses
+        // for its inspection open (search for `options.allow_weak_crypto`
+        // in `run_check`).
         let options = PdfOpenOptions {
             repair,
-            allow_weak_crypto,
+            allow_weak_crypto: true,
             password: spec
                 .password
                 .as_ref()
@@ -5716,7 +5722,7 @@ mod tests {
             to: Some("1-2".into()),
             repeat: Some("1".into()),
         }];
-        let built = build_overlay_specs(&cli_specs, false, false).unwrap();
+        let built = build_overlay_specs(&cli_specs, false).unwrap();
         assert_eq!(built.len(), 1);
         assert_eq!(built[0].kind, flpdf::OverlayKind::Underlay);
         // repeat is Some when the segment supplied --repeat.
@@ -5735,7 +5741,7 @@ mod tests {
             to: None,
             repeat: None,
         }];
-        let built = build_overlay_specs(&cli_specs, false, false).unwrap();
+        let built = build_overlay_specs(&cli_specs, false).unwrap();
         assert_eq!(built[0].kind, flpdf::OverlayKind::Overlay);
         assert!(
             built[0].repeat.is_none(),
@@ -5755,7 +5761,7 @@ mod tests {
         }];
         // `flpdf::OverlaySpec` is not Debug (it holds a `Pdf`), so match the Ok
         // arm explicitly instead of `unwrap_err()`.
-        let err = match build_overlay_specs(&cli_specs, false, false) {
+        let err = match build_overlay_specs(&cli_specs, false) {
             Ok(_) => panic!("expected error for a missing source file"),
             Err(e) => e.to_string(),
         };
@@ -5791,13 +5797,13 @@ mod tests {
             }]
         };
 
-        let absent = build_overlay_specs(&spec(None), false, false).unwrap();
+        let absent = build_overlay_specs(&spec(None), false).unwrap();
         assert_eq!(absent[0].from.resolve(3).unwrap(), vec![1, 2, 3]);
 
-        let empty = build_overlay_specs(&spec(Some("")), false, false).unwrap();
+        let empty = build_overlay_specs(&spec(Some("")), false).unwrap();
         assert_eq!(empty[0].from.resolve(3).unwrap(), Vec::<u32>::new());
 
-        let explicit = build_overlay_specs(&spec(Some("2")), false, false).unwrap();
+        let explicit = build_overlay_specs(&spec(Some("2")), false).unwrap();
         assert_eq!(explicit[0].from.resolve(3).unwrap(), vec![2]);
     }
 
@@ -5818,13 +5824,13 @@ mod tests {
             }]
         };
 
-        let absent = build_overlay_specs(&spec(None), false, false).unwrap();
+        let absent = build_overlay_specs(&spec(None), false).unwrap();
         assert_eq!(absent[0].to.resolve(3).unwrap(), vec![1, 2, 3]);
 
-        let empty = build_overlay_specs(&spec(Some("")), false, false).unwrap();
+        let empty = build_overlay_specs(&spec(Some("")), false).unwrap();
         assert_eq!(empty[0].to.resolve(3).unwrap(), Vec::<u32>::new());
 
-        let explicit = build_overlay_specs(&spec(Some("2-3")), false, false).unwrap();
+        let explicit = build_overlay_specs(&spec(Some("2-3")), false).unwrap();
         assert_eq!(explicit[0].to.resolve(3).unwrap(), vec![2, 3]);
     }
 
@@ -5845,16 +5851,16 @@ mod tests {
             }]
         };
 
-        let absent = build_overlay_specs(&spec(None), false, false).unwrap();
+        let absent = build_overlay_specs(&spec(None), false).unwrap();
         assert!(absent[0].repeat.is_none(), "absent --repeat -> None");
 
-        let empty = build_overlay_specs(&spec(Some("")), false, false).unwrap();
+        let empty = build_overlay_specs(&spec(Some("")), false).unwrap();
         assert!(
             empty[0].repeat.is_none(),
             "explicit empty --repeat= -> None (no repeat), same as absent"
         );
 
-        let explicit = build_overlay_specs(&spec(Some("2")), false, false).unwrap();
+        let explicit = build_overlay_specs(&spec(Some("2")), false).unwrap();
         assert_eq!(
             explicit[0].repeat.as_ref().unwrap().resolve(3).unwrap(),
             vec![2]
@@ -5862,28 +5868,24 @@ mod tests {
     }
 
     #[test]
-    fn build_overlay_specs_threads_allow_weak_crypto_to_source() {
-        // An RC4 (weak) overlay source, opened with the CORRECT password, is
-        // refused unless `--allow-weak-crypto` was passed — the same gate the
-        // primary input honors.
-        let rc4_spec = || {
-            vec![OverlaySpec {
-                kind: OverlayKind::Overlay,
-                file: encrypted_fixture("v2-rc4-128-r3.pdf"),
-                password: Some("user-v2".into()),
-                from: None,
-                to: None,
-                repeat: None,
-            }]
-        };
+    fn build_overlay_specs_opens_rc4_source_without_allow_weak_crypto() {
+        // qpdf-parity: RC4 (weak-crypto) overlay sources open unconditionally,
+        // because the `--allow-weak-crypto` flag gates weak-crypto *writes*,
+        // not reads. `build_overlay_specs` is a read-only inspection open — the
+        // same category `run_check` handles — and matches qpdf's silent-accept
+        // behavior on RC4 sources (verified against qtest `form-xobject` test 31
+        // / uo-7).
+        let cli_specs = vec![OverlaySpec {
+            kind: OverlayKind::Overlay,
+            file: encrypted_fixture("v2-rc4-128-r3.pdf"),
+            password: Some("user-v2".into()),
+            from: None,
+            to: None,
+            repeat: None,
+        }];
 
-        let denied = match build_overlay_specs(&rc4_spec(), false, false) {
-            Ok(_) => panic!("weak-crypto source must be refused without the opt-in"),
-            Err(e) => e.to_string(),
-        };
-        assert!(denied.contains("weak crypto"), "got: {denied}");
-
-        let allowed = build_overlay_specs(&rc4_spec(), false, true).unwrap();
-        assert_eq!(allowed.len(), 1);
+        let built = build_overlay_specs(&cli_specs, false).unwrap();
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].kind, flpdf::OverlayKind::Overlay);
     }
 }
