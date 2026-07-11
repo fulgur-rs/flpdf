@@ -1681,6 +1681,32 @@ fn rewrite_coalesce_contents_accepted_and_produces_valid_output() {
         .success();
 }
 
+#[test]
+fn top_level_coalesce_contents_accepted_and_produces_valid_output() {
+    // Top-level alias of `flpdf rewrite --coalesce-contents` (qpdf-shape).
+    // Mirrors rewrite_coalesce_contents_accepted_and_produces_valid_output,
+    // dropping only the "rewrite" argv token.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, two_page_pdf_with_multi_contents()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--coalesce-contents"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
 // ── remove-unreferenced-resources ─────────────────────────────────────────────
 
 #[test]

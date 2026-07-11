@@ -195,7 +195,7 @@ struct Cli {
               "decrypt", "encrypt", "copy_encryption_from",
               "add_attachment", "remove_attachment", "list_attachments",
               "show_attachment", "copy_attachments_from",
-              "no_original_object_ids", "qdf",
+              "no_original_object_ids", "qdf", "coalesce_contents",
           ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
     json: Option<String>,
@@ -361,6 +361,20 @@ struct Cli {
     /// rewrite-mode positionals.
     #[arg(long = "qdf")]
     qdf: bool,
+
+    /// Coalesce multiple /Contents streams into a single stream per page
+    /// (top-level alias of `flpdf rewrite --coalesce-contents`; qpdf
+    /// `--coalesce-contents` equivalent). Requires a full rewrite of the
+    /// document. Rejected against inspection / attachment modes so a
+    /// silently-ignored flag surfaces as a usage error instead.
+    #[arg(long = "coalesce-contents",
+          conflicts_with_all = [
+              "check", "dump_object", "show_info", "show_catalog",
+              "show_metadata", "show_outline", "show_fonts",
+              "show_npages", "show_pages", "show_linearization",
+              "list_attachments", "show_attachment", "remove_attachment",
+          ])]
+    coalesce_contents: bool,
 
     // ── Page-operation flags (flpdf-9hc.8.12) ─────────────────────────────
     // These mirror qpdf's page-selection / page-transformation surface.
@@ -1608,8 +1622,8 @@ fn main() {
             true,
             args.remove_restrictions,
             args.decrypt,
-            false,                              // normalize_content
-            false,                              // coalesce_contents
+            false, // normalize_content
+            args.coalesce_contents,
             CliRemoveUnreferencedResources::No, // remove_unreferenced (no-op for linearize path)
             false,                              // generate_appearances (not on top-level surface)
             None,                               // flatten_annotations (not on top-level surface)
@@ -1770,8 +1784,8 @@ fn main() {
             false,
             args.remove_restrictions,
             args.decrypt,
-            false,                              // normalize_content
-            false,                              // coalesce_contents
+            false, // normalize_content
+            args.coalesce_contents,
             CliRemoveUnreferencedResources::No, // remove_unreferenced (top-level alias is no-op)
             false,                              // generate_appearances (not on top-level surface)
             None,                               // flatten_annotations (not on top-level surface)
