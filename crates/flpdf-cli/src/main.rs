@@ -365,8 +365,11 @@ struct Cli {
     /// Coalesce multiple /Contents streams into a single stream per page
     /// (top-level alias of `flpdf rewrite --coalesce-contents`; qpdf
     /// `--coalesce-contents` equivalent). Requires a full rewrite of the
-    /// document. Rejected against inspection / attachment modes so a
-    /// silently-ignored flag surfaces as a usage error instead.
+    /// document. Rejected against inspection, attachment, `--linearize`,
+    /// and page-operation modes: the linearize branch of `run_rewrite`
+    /// and the page-op dispatch never read `args.coalesce_contents`, so
+    /// without these conflicts the flag would be silently dropped and the
+    /// user's requested coalescing would not appear in the output.
     #[arg(long = "coalesce-contents",
           conflicts_with_all = [
               "check", "dump_object", "show_info", "show_catalog",
@@ -374,6 +377,7 @@ struct Cli {
               "show_npages", "show_pages", "show_linearization",
               "list_attachments", "show_attachment", "remove_attachment",
               "add_attachment", "copy_attachments_from",
+              "linearize", "pages", "rotate", "split_pages", "collate", "empty",
           ])]
     coalesce_contents: bool,
 

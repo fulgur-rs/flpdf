@@ -1760,6 +1760,98 @@ fn top_level_coalesce_contents_conflicts_with_copy_attachments_from() {
 }
 
 #[test]
+fn top_level_coalesce_contents_conflicts_with_linearize() {
+    // Silent-shadow guard: --linearize is threaded to `run_rewrite`, whose
+    // linearize branch never reads `coalesce_contents`. Rejecting the
+    // combination up-front at clap level prevents the caller from getting a
+    // linearized output whose /Contents arrays are still unmerged.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--linearize", "--coalesce-contents", "in.pdf", "out.pdf"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_coalesce_contents_conflicts_with_pages() {
+    // Silent-shadow guard: the page-op dispatch branch owns the write via
+    // run_page_extraction / run_rewrite_with_page_ops, neither of which reads
+    // `args.coalesce_contents`. The `--encrypt` / `--overlay` combinations
+    // are already rejected inside that branch; mirror the same treatment for
+    // --coalesce-contents at the clap level.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--coalesce-contents",
+            "in.pdf",
+            "--pages",
+            ".",
+            "--",
+            "out.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_coalesce_contents_conflicts_with_rotate() {
+    // Sibling of the --pages case.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--coalesce-contents",
+            "--rotate",
+            "+90:1",
+            "in.pdf",
+            "out.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_coalesce_contents_conflicts_with_split_pages() {
+    // Sibling of the --pages case.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--coalesce-contents",
+            "--split-pages",
+            "1",
+            "in.pdf",
+            "out.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_coalesce_contents_conflicts_with_collate() {
+    // Sibling of the --pages case.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--coalesce-contents", "--collate", "1", "in.pdf", "out.pdf"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_coalesce_contents_conflicts_with_empty() {
+    // Sibling of the --pages case.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--coalesce-contents", "--empty", "in.pdf", "out.pdf"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
 fn top_level_coalesce_contents_with_overlay_underlay_trailing_position() {
     // The exact shape qtest form-xobject uo-3 emits (via the PATH-shim
     // qpdf→flpdf): --coalesce-contents at the very end of argv, after
