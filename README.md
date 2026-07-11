@@ -51,6 +51,19 @@ flpdf  = "..."
 flate2 = { version = "1", features = ["zlib"] }
 ```
 
+> [!TIP]
+> Because `flate2` here is a Cargo-feature knob rather than a crate you
+> actually `use`, tools like `cargo-machete` and `cargo-udeps` will flag it as
+> an unused dependency. Ignore it in your `Cargo.toml`:
+>
+> ```toml
+> [package.metadata.cargo-machete]
+> ignored = ["flate2"]
+>
+> [package.metadata.cargo-udeps.ignore]
+> normal = ["flate2"]
+> ```
+
 ### `qpdf-zlib-compat` (internal parity feature)
 
 The optional `qpdf-zlib-compat` feature on the `flpdf` crate pins flate2's
