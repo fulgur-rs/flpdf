@@ -1708,6 +1708,20 @@ fn top_level_coalesce_contents_accepted_and_produces_valid_output() {
 }
 
 #[test]
+fn top_level_coalesce_contents_conflicts_with_check() {
+    // A silent-ignore combination (--check would win the dispatch chain over
+    // any rewrite modifier) would produce wrong output. clap must surface it
+    // as a usage error, exit 2 (qpdf convention). Mirrors how --decrypt /
+    // --remove-restrictions are gated.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", "--coalesce-contents", "in.pdf"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
 fn top_level_coalesce_contents_conflicts_with_add_attachment() {
     // Silent-shadow guard: without a clap conflict, the add-attachment
     // branch wins the dispatch chain and --coalesce-contents is dropped
