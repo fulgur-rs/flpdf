@@ -1830,14 +1830,26 @@ fn top_level_coalesce_contents_conflicts_with_split_pages() {
 }
 
 #[test]
-fn top_level_coalesce_contents_conflicts_with_collate() {
-    // Sibling of the --pages case.
+fn top_level_coalesce_contents_accepts_collate_alone() {
+    // `--collate` alone (no `--pages`) is a documented no-op that does NOT
+    // activate `page_ops_active`; the default rewrite branch runs and honors
+    // `--coalesce-contents`. Regression net: keep `--collate` OUT of the
+    // conflicts_with_all list so qpdf-shaped callers that pass `--collate`
+    // unconditionally (with or without `--pages`) still coalesce correctly.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, two_page_pdf_with_multi_contents()).unwrap();
+
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--coalesce-contents", "--collate", "1", "in.pdf", "out.pdf"])
+        .args(["--coalesce-contents", "--collate=1"])
+        .arg(&input)
+        .arg(&output)
         .assert()
-        .failure()
-        .code(2);
+        .success();
+
+    assert!(output.exists());
 }
 
 #[test]
