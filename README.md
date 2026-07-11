@@ -23,10 +23,53 @@ cargo build --workspace
 cargo test  --workspace
 ```
 
-The default build is Pure Rust. The optional `qpdf-zlib-compat` feature links
-classic libz via `libz-sys` so flate2's deflate output matches qpdf's
-`compress2()` byte-for-byte; it is used by bytes-identical tests only and is
-not required for production builds.
+The default build is Pure Rust; flpdf depends on `flate2` without pinning a
+backend, so `cargo build` resolves to flate2's default (`miniz_oxide`).
+
+### Choosing a DEFLATE backend (downstream consumers)
+
+flpdf does **not** re-export flate2's backend features (`zlib-rs`, `zlib`,
+`zlib-ng`, …) as its own features. A downstream crate that wants a specific
+backend adds `flate2` as a direct dependency and enables the feature there;
+Cargo's feature unification applies it to flpdf's copy of `flate2` too. This
+follows the pattern that
+[krilla PR #390](https://github.com/LaurenzV/krilla/pull/390) settled on —
+keeping the backend choice with the consumer avoids forcing a single
+implementation on every downstream build.
+
+```toml
+# Pure Rust, faster than miniz_oxide, WASM-friendly.
+[dependencies]
+flpdf  = "..."
+flate2 = { version = "1", features = ["zlib-rs"] }
+```
+
+```toml
+# System libz — matches qpdf's compress2() byte-for-byte.
+[dependencies]
+flpdf  = "..."
+flate2 = { version = "1", features = ["zlib"] }
+```
+
+> [!TIP]
+> Because `flate2` here is a Cargo-feature knob rather than a crate you
+> actually `use`, tools like `cargo-machete` and `cargo-udeps` will flag it as
+> an unused dependency. Ignore it in your `Cargo.toml`:
+>
+> ```toml
+> [package.metadata.cargo-machete]
+> ignored = ["flate2"]
+>
+> [package.metadata.cargo-udeps.ignore]
+> normal = ["flate2"]
+> ```
+
+### `qpdf-zlib-compat` (internal parity feature)
+
+The optional `qpdf-zlib-compat` feature on the `flpdf` crate pins flate2's
+backend to classic libz (via `libz-sys`) for flpdf's own bytes-identical test
+suite. It is used by the parity CI job only and is not intended for production
+consumers — pick a backend via the pattern above instead.
 
 ```bash
 cargo test -p flpdf --features qpdf-zlib-compat
