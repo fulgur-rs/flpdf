@@ -373,6 +373,7 @@ struct Cli {
               "show_metadata", "show_outline", "show_fonts",
               "show_npages", "show_pages", "show_linearization",
               "list_attachments", "show_attachment", "remove_attachment",
+              "add_attachment", "copy_attachments_from",
           ])]
     coalesce_contents: bool,
 

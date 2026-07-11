@@ -1707,6 +1707,44 @@ fn top_level_coalesce_contents_accepted_and_produces_valid_output() {
         .success();
 }
 
+#[test]
+fn top_level_coalesce_contents_conflicts_with_add_attachment() {
+    // Silent-shadow guard: without a clap conflict, the add-attachment
+    // branch wins the dispatch chain and --coalesce-contents is dropped
+    // without diagnostic. Reject the combination at usage-error level
+    // (exit 2, qpdf convention).
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--coalesce-contents",
+            "--add-attachment",
+            "attach.pdf",
+            "--",
+            "in.pdf",
+            "out.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_coalesce_contents_conflicts_with_copy_attachments_from() {
+    // Silent-shadow guard, sibling of the add-attachment case.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--coalesce-contents",
+            "--copy-attachments-from",
+            "donor.pdf",
+            "in.pdf",
+            "out.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
 // ── remove-unreferenced-resources ─────────────────────────────────────────────
 
 #[test]
