@@ -4071,13 +4071,17 @@ fn run_page_extraction(
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        split_pages(&bytes, n, output, options.deterministic_id)?;
+        let written = split_pages(&bytes, n, output, options.deterministic_id)?;
+        if verbose {
+            for path in &written {
+                eprintln!("flpdf: wrote file {}", path.display());
+            }
+        }
     } else {
         std::fs::write(output, &bytes)?;
-    }
-
-    if verbose {
-        eprintln!("flpdf: wrote file {}", output.display());
+        if verbose {
+            eprintln!("flpdf: wrote file {}", output.display());
+        }
     }
     Ok(())
 }
@@ -4160,13 +4164,17 @@ fn run_rewrite_with_page_ops(
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        split_pages(&bytes, n, output, options.deterministic_id)?;
+        let written = split_pages(&bytes, n, output, options.deterministic_id)?;
+        if verbose {
+            for path in &written {
+                eprintln!("flpdf: wrote file {}", path.display());
+            }
+        }
     } else {
         std::fs::write(output, &bytes)?;
-    }
-
-    if verbose {
-        eprintln!("flpdf: wrote file {}", output.display());
+        if verbose {
+            eprintln!("flpdf: wrote file {}", output.display());
+        }
     }
     Ok(())
 }
