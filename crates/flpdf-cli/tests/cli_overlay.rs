@@ -214,7 +214,11 @@ fn single_underlay_succeeds() {
 }
 
 #[test]
-fn overlay_with_pages_is_rejected() {
+fn overlay_with_pages_composes_page_selection_then_overlay() {
+    // qpdf runs page-selection FIRST, then applies overlays on the reduced
+    // page set (mirror `libqpdf/QPDFJob.cc`). `--pages . 1-2` extracts pages
+    // 1-2 of three-page.pdf; the overlay's `--to`/`--from` (default 1-z)
+    // then references the two extracted pages, not the original three.
     let one = fixture("one-page.pdf");
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("o.pdf");
@@ -226,8 +230,35 @@ fn overlay_with_pages_is_rejected() {
         .args(["--pages", ".", "1-2", "--"])
         .arg(out.to_str().unwrap())
         .assert()
+        .success();
+    let bytes = std::fs::read(&out).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("/Fx0"),
+        "overlay leaves /Fx0 marker on each page"
+    );
+}
+
+#[test]
+fn overlay_with_rotate_alone_still_rejected() {
+    // --rotate/--split-pages without --pages goes through
+    // `run_rewrite_with_page_ops`, which does not run overlay stacking;
+    // reject the combination loudly instead of dropping the overlays.
+    let one = fixture("one-page.pdf");
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("o.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg(fixture("three-page.pdf"))
+        .args(["--overlay", &one, "--"])
+        .args(["--rotate=+90:1"])
+        .arg(out.to_str().unwrap())
+        .assert()
         .failure()
-        .stderr(predicate::str::contains("overlay/--underlay"));
+        .stderr(predicate::str::contains(
+            "--rotate/--split-pages alone (no --pages)",
+        ));
 }
 
 #[test]
@@ -265,8 +296,9 @@ fn unterminated_overlay_group_is_rejected() {
 }
 
 #[test]
-fn top_level_overlay_with_pages_is_rejected() {
-    // The top-level (subcommand-less) page-op path also rejects overlay.
+fn top_level_overlay_with_pages_composes() {
+    // Top-level (subcommand-less) qpdf-shaped invocation must also compose
+    // page-selection with overlay (same ordering as the `rewrite` surface).
     let one = fixture("one-page.pdf");
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("o.pdf");
@@ -277,8 +309,13 @@ fn top_level_overlay_with_pages_is_rejected() {
         .args(["--pages", ".", "1-2", "--"])
         .arg(out.to_str().unwrap())
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("overlay/--underlay"));
+        .success();
+    let bytes = std::fs::read(&out).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("/Fx0"),
+        "overlay leaves /Fx0 marker on each page"
+    );
 }
 
 #[test]

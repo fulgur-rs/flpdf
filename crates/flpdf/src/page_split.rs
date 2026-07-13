@@ -107,6 +107,11 @@ use std::path::{Path, PathBuf};
 /// --deterministic-id`, which applies the deterministic-ID policy to every split
 /// output); otherwise each chunk is written as an incremental update.
 ///
+/// Returns the list of chunk output paths in write order. Callers that want to
+/// mirror qpdf's `--verbose --split-pages` `wrote file <chunk>` emission can
+/// iterate this list; qpdf 11.9.0 emits one such line per chunk inside its
+/// split loop (`libqpdf/QPDFJob.cc doSplitPages`).
+///
 /// # Errors
 ///
 /// - [`Error::Missing`] if the source PDF has no `/Root` or no pages.
@@ -117,7 +122,7 @@ pub fn split_pages(
     chunk_size: usize,
     output_template: &Path,
     deterministic_id: bool,
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     if chunk_size == 0 {
         return Err(Error::Unsupported(
             "split_pages: chunk_size must be >= 1".to_string(),
@@ -148,6 +153,7 @@ pub fn split_pages(
     let width = digit_width(total_pages as u32);
 
     // Iterate over chunks (0-indexed chunk index).
+    let mut written = Vec::new();
     let mut chunk_start = 0usize; // 0-based index into all_page_refs
     while chunk_start < total_pages {
         let chunk_end = (chunk_start + chunk_size).min(total_pages); // exclusive
@@ -171,10 +177,11 @@ pub fn split_pages(
             deterministic_id,
         )?;
 
+        written.push(out_path);
         chunk_start = chunk_end;
     }
 
-    Ok(())
+    Ok(written)
 }
 
 /// Compute the **range-form** output path (`{stem}-{first}-{last}{ext}`) for a

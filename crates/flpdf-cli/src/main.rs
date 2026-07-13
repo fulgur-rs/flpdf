@@ -1682,17 +1682,6 @@ fn main() {
             );
             std::process::exit(1);
         }
-        // The page-op pipeline owns the write through a separate path that does
-        // not run the overlay/underlay page-stacking step; reject the
-        // combination rather than silently dropping the overlays.
-        if !overlay_specs.is_empty() {
-            eprintln!(
-                "flpdf: --overlay/--underlay is not applied in the \
-                 --pages/--rotate/--split-pages/--collate pipeline; \
-                 rerun without the page operation"
-            );
-            std::process::exit(1);
-        }
         let mut options = WriteOptions::default();
         options.static_id = args.static_id;
         options.deterministic_id = args.deterministic_id;
@@ -1716,10 +1705,20 @@ fn main() {
                     args.repair,
                     &args.password,
                     &args.page_ops,
+                    &overlay_specs,
                     CliRemoveUnreferencedResources::Auto,
                     options.clone(),
+                    args.verbose,
                 )
             } else {
+                if !overlay_specs.is_empty() {
+                    eprintln!(
+                        "flpdf: --overlay/--underlay is not applied with \
+                         --rotate/--split-pages alone (no --pages); \
+                         rerun with --pages or without the overlay"
+                    );
+                    std::process::exit(1);
+                }
                 run_rewrite_with_page_ops(
                     &input,
                     &output,
@@ -1727,6 +1726,7 @@ fn main() {
                     &args.password,
                     &args.page_ops,
                     options.clone(),
+                    args.verbose,
                 )
             }
         };
@@ -2181,14 +2181,13 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     );
                     std::process::exit(1);
                 }
-                // The page-op pipeline owns the write through a separate path
-                // that does not run the overlay/underlay page-stacking step;
-                // reject the combination rather than silently dropping it.
-                if !overlay_specs.is_empty() {
+                // The --rotate/--split-pages-only path does not run overlay
+                // stacking; only --pages does (via run_page_extraction below).
+                if cmd.page_ops.pages.is_empty() && !overlay_specs.is_empty() {
                     eprintln!(
-                        "flpdf: --overlay/--underlay is not applied in the \
-                         --pages/--rotate/--split-pages/--collate pipeline; \
-                         rerun without the page operation"
+                        "flpdf: --overlay/--underlay is not applied with \
+                         --rotate/--split-pages alone (no --pages); \
+                         rerun with --pages or without the overlay"
                     );
                     std::process::exit(1);
                 }
@@ -2246,8 +2245,10 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         cmd.repair,
                         &cmd.password,
                         &cmd.page_ops,
+                        overlay_specs,
                         remove_unref,
                         options,
+                        cmd.verbose,
                     )
                 } else {
                     run_rewrite_with_page_ops(
@@ -2257,6 +2258,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         &cmd.password,
                         &cmd.page_ops,
                         options,
+                        cmd.verbose,
                     )
                 };
             }
@@ -3808,6 +3810,14 @@ fn parse_collate_n(raw: &str) -> CliResult<usize> {
     Ok(n)
 }
 
+/// Basename of `p` for `--verbose --pages` progress lines (qpdf uses the
+/// bare file name — e.g. `fxo-red.pdf`, not the absolute path or `.`).
+fn pages_progress_filename(p: &std::path::Path) -> String {
+    p.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
 /// Run the `--pages` extraction pipeline.
 ///
 /// Pipeline order is fixed as follows:
@@ -3837,8 +3847,10 @@ fn run_page_extraction(
     repair: bool,
     password: &PasswordArgs,
     page_ops: &PageOpArgs,
+    overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     options: WriteOptions,
+    verbose: bool,
 ) -> CliResult<()> {
     if page_ops.empty {
         // qpdf accepts `--empty`; ignoring it would silently change which
@@ -3899,11 +3911,41 @@ fn run_page_extraction(
         .into());
     }
 
+    // --verbose: emit qpdf-parity `--pages` progress. Order matches
+    // libqpdf/QPDFJob.cc: process_all() emits the shared-resource scan
+    // per input file (L2250/L2312), then the top-level pipeline emits
+    // "removing unreferenced pages from primary input" (L2539) once, then
+    // "adding pages from <file>" per Selection (L2594) inside the copy loop.
+    //
+    // flpdf does not implement qpdf's shared-resource scan (heuristic for
+    // whether resource pruning is worth it); we always emit the negative
+    // branch. Similarly, flpdf has no auto keep-open-files subsystem; we
+    // emit "y" unconditionally when the block fires. Both are documented
+    // parity divergences.
+    if verbose {
+        eprintln!("flpdf: selecting --keep-open-files=y");
+        for path in &distinct {
+            let fname = pages_progress_filename(path);
+            eprintln!("flpdf: {fname}: checking for shared resources");
+            eprintln!("flpdf: no shared resources found");
+        }
+    }
+
     // CombinedPlan::from_specs opens each file itself; its per-input
     // PagePlans carry source ObjectRefs that are stable across a re-open of
     // identical bytes. We use it only for selection/collation planning, then
     // open the (single) resolved source ourselves for the rebuild passes.
     let plan = CombinedPlan::from_specs(inputs.clone())?;
+
+    if verbose {
+        eprintln!("flpdf: removing unreferenced pages from primary input");
+        for spec in &inputs {
+            eprintln!(
+                "flpdf: adding pages from {}",
+                pages_progress_filename(&spec.path)
+            );
+        }
+    }
 
     let combined_pages = match page_ops.collate.as_deref() {
         Some(raw) => {
@@ -3970,17 +4012,76 @@ fn run_page_extraction(
     // any Unsupported it returns is propagated, not swallowed.
     prune_acroform_after_subset(&mut pdf, &result)?;
 
-    // Step 9: serialize. Extraction always implies a full document rewrite.
+    // Step 8.5: overlay/underlay page stacking. qpdf runs page-selection
+    // first, then applies overlays on the reduced page set — so the
+    // `--to`/`--from`/`--repeat` indices reference the extracted page
+    // count. Mirror that ordering by applying overlays here, after the
+    // page tree has been rebuilt and pruned.
     let mut options = options;
     options.full_rewrite = true;
+    if !overlay_specs.is_empty() {
+        let mut built = build_overlay_specs(overlay_specs, repair)?;
+
+        // Propagate max input header version + Adobe extension_level
+        // from overlay sources (mirrors run_rewrite's overlay branch and
+        // qpdf QPDFJob.cc L1714/L2913).
+        let mut max_ver: (u8, u8) = parse_pdf_version(pdf.version()).unwrap_or((1, 0));
+        let mut max_ext: i64 = pdf.adobe_extension_level().unwrap_or(0);
+        for spec in built.iter_mut() {
+            let sv = parse_pdf_version(spec.source.version()).unwrap_or((1, 0));
+            let se = spec.source.adobe_extension_level().unwrap_or(0);
+            if (sv, se) > (max_ver, max_ext) {
+                max_ver = sv;
+                max_ext = se;
+            }
+        }
+        if let Some(ref current) = options.min_version {
+            let cur = parse_pdf_version(current).unwrap_or((1, 0));
+            let cur_ext = options.min_extension_level.unwrap_or(0);
+            if (cur, cur_ext) > (max_ver, max_ext) {
+                max_ver = cur;
+                max_ext = cur_ext;
+            }
+        }
+        options.min_version = Some(format!("{}.{}", max_ver.0, max_ver.1));
+        options.min_extension_level = (max_ext > 0).then_some(max_ext);
+
+        if verbose {
+            let report = flpdf::overlay_verbose_report(&mut pdf, &mut built)?;
+            eprintln!("flpdf: processing underlay/overlay");
+            for page in &report {
+                eprintln!("  page {}", page.dest_page);
+                for src in &page.sources {
+                    let file = &overlay_specs[src.spec_index].file;
+                    let kind_str = match src.kind {
+                        flpdf::OverlayKind::Underlay => "underlay",
+                        flpdf::OverlayKind::Overlay => "overlay",
+                    };
+                    eprintln!("    {} {} {}", file, kind_str, src.src_page);
+                }
+            }
+        }
+
+        flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
+    }
+
+    // Step 9: serialize. Extraction always implies a full document rewrite.
     let mut bytes: Vec<u8> = Vec::new();
     write_pdf_with_options(&mut pdf, &mut bytes, &options)?;
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        split_pages(&bytes, n, output, options.deterministic_id)?;
+        let written = split_pages(&bytes, n, output, options.deterministic_id)?;
+        if verbose {
+            for path in &written {
+                eprintln!("flpdf: wrote file {}", path.display());
+            }
+        }
     } else {
         std::fs::write(output, &bytes)?;
+        if verbose {
+            eprintln!("flpdf: wrote file {}", output.display());
+        }
     }
     Ok(())
 }
@@ -4037,6 +4138,7 @@ fn run_rewrite_with_page_ops(
     password: &PasswordArgs,
     page_ops: &PageOpArgs,
     options: WriteOptions,
+    verbose: bool,
 ) -> CliResult<()> {
     if page_ops.empty {
         return Err(
@@ -4062,9 +4164,17 @@ fn run_rewrite_with_page_ops(
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        split_pages(&bytes, n, output, options.deterministic_id)?;
+        let written = split_pages(&bytes, n, output, options.deterministic_id)?;
+        if verbose {
+            for path in &written {
+                eprintln!("flpdf: wrote file {}", path.display());
+            }
+        }
     } else {
         std::fs::write(output, &bytes)?;
+        if verbose {
+            eprintln!("flpdf: wrote file {}", output.display());
+        }
     }
     Ok(())
 }
