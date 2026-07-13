@@ -3810,6 +3810,14 @@ fn parse_collate_n(raw: &str) -> CliResult<usize> {
     Ok(n)
 }
 
+/// Basename of `p` for `--verbose --pages` progress lines (qpdf uses the
+/// bare file name — e.g. `fxo-red.pdf`, not the absolute path or `.`).
+fn pages_progress_filename(p: &std::path::Path) -> String {
+    p.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
 /// Run the `--pages` extraction pipeline.
 ///
 /// Pipeline order is fixed as follows:
@@ -3833,14 +3841,6 @@ fn parse_collate_n(raw: &str) -> CliResult<usize> {
 /// actionable [`Error::Unsupported`] instead of silently producing wrong
 /// output or swallowing the limitation.
 #[allow(clippy::too_many_arguments)]
-/// Basename of `p` for `--verbose --pages` progress lines (qpdf uses the
-/// bare file name — e.g. `fxo-red.pdf`, not the absolute path or `.`).
-fn pages_progress_filename(p: &std::path::Path) -> String {
-    p.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.display().to_string())
-}
-
 fn run_page_extraction(
     primary_input: &std::path::Path,
     output: &std::path::Path,
@@ -3924,17 +3924,10 @@ fn run_page_extraction(
     // parity divergences.
     if verbose {
         eprintln!("flpdf: selecting --keep-open-files=y");
-        let mut seen_display: Vec<String> = Vec::new();
-        for spec in &inputs {
-            let key = std::fs::canonicalize(&spec.path)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| spec.path.display().to_string());
-            if !seen_display.contains(&key) {
-                seen_display.push(key);
-                let fname = pages_progress_filename(&spec.path);
-                eprintln!("flpdf: {fname}: checking for shared resources");
-                eprintln!("flpdf: no shared resources found");
-            }
+        for path in &distinct {
+            let fname = pages_progress_filename(path);
+            eprintln!("flpdf: {fname}: checking for shared resources");
+            eprintln!("flpdf: no shared resources found");
         }
     }
 
@@ -4037,33 +4030,17 @@ fn run_page_extraction(
         for spec in built.iter_mut() {
             let sv = parse_pdf_version(spec.source.version()).unwrap_or((1, 0));
             let se = spec.source.adobe_extension_level().unwrap_or(0);
-            match sv.cmp(&max_ver) {
-                std::cmp::Ordering::Greater => {
-                    max_ver = sv;
-                    max_ext = se;
-                }
-                std::cmp::Ordering::Equal => {
-                    if se > max_ext {
-                        max_ext = se;
-                    }
-                }
-                std::cmp::Ordering::Less => {}
+            if (sv, se) > (max_ver, max_ext) {
+                max_ver = sv;
+                max_ext = se;
             }
         }
         if let Some(ref current) = options.min_version {
             let cur = parse_pdf_version(current).unwrap_or((1, 0));
             let cur_ext = options.min_extension_level.unwrap_or(0);
-            match cur.cmp(&max_ver) {
-                std::cmp::Ordering::Greater => {
-                    max_ver = cur;
-                    max_ext = cur_ext;
-                }
-                std::cmp::Ordering::Equal => {
-                    if cur_ext > max_ext {
-                        max_ext = cur_ext;
-                    }
-                }
-                std::cmp::Ordering::Less => {}
+            if (cur, cur_ext) > (max_ver, max_ext) {
+                max_ver = cur;
+                max_ext = cur_ext;
             }
         }
         options.min_version = Some(format!("{}.{}", max_ver.0, max_ver.1));
