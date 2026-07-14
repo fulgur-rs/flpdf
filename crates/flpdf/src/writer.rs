@@ -7778,4 +7778,59 @@ mod tests {
             "stale /ADBE (BaseVersion 1.3) must be stripped by the encryption floor"
         );
     }
+
+    #[test]
+    fn write_pdf_full_rewrite_strips_stale_adbe_when_source_has_no_extension_level() {
+        // qpdf QPDFWriter.cc L1387/L1408 (whole /Extensions removed) parity:
+        // source /Extensions /ADBE dict has no /ExtensionLevel (or non-integer).
+        // adobe_extension_level() returns None → source_ext = 0. The pre-broadening
+        // trigger (`source_ext > 0`) would skip strip and let /ADBE pass through;
+        // the broadened trigger (`catalog_has_extensions_adbe`) fires and drops
+        // /Extensions entirely because /ADBE is the only key.
+        let mut src = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+              /Extensions << /ADBE << /BaseVersion /1.4 >> >> >>\nendobj\n",
+        );
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let startxref = src.len();
+        let count = offsets.len() + 1;
+        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        // Sanity: adobe_extension_level() returns None because /ExtensionLevel is absent.
+        {
+            let mut src_pdf = crate::Pdf::open_mem(&src).expect("source must open");
+            assert_eq!(src_pdf.adobe_extension_level(), None);
+        }
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
+        // The whole /Extensions dict must be gone from the output Catalog.
+        let root_ref = reopened.trailer().get_ref("Root").expect("Root ref");
+        let catalog = reopened
+            .resolve(root_ref)
+            .expect("resolve root")
+            .into_dict()
+            .expect("root is dict");
+        assert!(
+            catalog.get("Extensions").is_none(),
+            "stale /ADBE without /ExtensionLevel must trigger whole-/Extensions removal: {catalog:?}"
+        );
+    }
 }
