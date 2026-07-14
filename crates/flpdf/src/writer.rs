@@ -7833,4 +7833,67 @@ mod tests {
             "stale /ADBE without /ExtensionLevel must trigger whole-/Extensions removal: {catalog:?}"
         );
     }
+
+    #[test]
+    fn write_pdf_full_rewrite_strips_stale_adbe_no_ext_level_preserving_vendor_prefix() {
+        // qpdf QPDFWriter.cc L1432 (removeKey /ADBE, keep other extensions) parity:
+        // source /Extensions has /ADBE without /ExtensionLevel AND a non-ADBE
+        // developer prefix (/XYZW). Broadened trigger must fire and strip /ADBE
+        // only, leaving /XYZW intact.
+        let mut src = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+              /Extensions << /ADBE << /BaseVersion /1.4 >> \
+              /XYZW << /BaseVersion /1.4 /ExtensionLevel 1 >> >> >>\nendobj\n",
+        );
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let startxref = src.len();
+        let count = offsets.len() + 1;
+        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        // Sanity: adobe_extension_level() returns None (source /ExtensionLevel absent).
+        {
+            let mut src_pdf = crate::Pdf::open_mem(&src).expect("source must open");
+            assert_eq!(src_pdf.adobe_extension_level(), None);
+        }
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
+        let root_ref = reopened.trailer().get_ref("Root").expect("Root ref");
+        let catalog = reopened
+            .resolve(root_ref)
+            .expect("resolve root")
+            .into_dict()
+            .expect("root is dict");
+        // /Extensions must still be present, containing only /XYZW.
+        let ext_dict = catalog
+            .get("Extensions")
+            .expect("/Extensions must survive because /XYZW is present")
+            .as_dict()
+            .expect("/Extensions must be a direct dict after strip");
+        assert!(
+            ext_dict.get("ADBE").is_none(),
+            "stale /ADBE without /ExtensionLevel must be stripped: {ext_dict:?}"
+        );
+        assert!(
+            ext_dict.get("XYZW").is_some(),
+            "non-ADBE developer prefix must survive: {ext_dict:?}"
+        );
+    }
 }
