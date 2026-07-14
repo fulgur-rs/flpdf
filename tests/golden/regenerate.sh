@@ -1192,6 +1192,76 @@ else
     echo "Skipping no-stream-one-page.pdf (already exists)"
 fi
 
+# --- flpdf-9hc.16.15: /Extensions /ADBE removal parity fixtures ---
+# Hand-crafted source PDFs with malformed /ADBE (no /ExtensionLevel) so the
+# strip trigger fires on plain rewrite. qpdf's CLI cannot inject an ADBE dict
+# without a valid /ExtensionLevel, so we build the raw bytes directly.
+# Content-stream-free → deflate-independent (no --features qpdf-zlib-compat
+# needed to verify byte parity).
+
+if [[ ! -f "$FIX/one-page-stale-adbe-no-ext.pdf" ]]; then
+    echo "Generating one-page-stale-adbe-no-ext.pdf ..."
+    python3 - "$FIX/one-page-stale-adbe-no-ext.pdf" <<'PY'
+import sys
+out_path = sys.argv[1]
+body = bytearray(b"%PDF-1.4\n%\xbf\xf7\xa2\xfe\n")
+objs = [
+    b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+    b"/Extensions << /ADBE << /BaseVersion /1.4 >> >> >>\nendobj\n",
+    b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+    b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> >>\nendobj\n",
+]
+offsets = []
+for o in objs:
+    offsets.append(len(body))
+    body.extend(o)
+startxref = len(body)
+size = len(objs) + 1
+body.extend(f"xref\n0 {size}\n0000000000 65535 f \n".encode())
+for off in offsets:
+    body.extend(f"{off:010} 00000 n \n".encode())
+body.extend(
+    f"trailer\n<< /Size {size} /Root 1 0 R >>\n"
+    f"startxref\n{startxref}\n%%EOF\n".encode()
+)
+open(out_path, "wb").write(bytes(body))
+PY
+else
+    echo "Skipping one-page-stale-adbe-no-ext.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/one-page-stale-adbe-no-ext-vendor.pdf" ]]; then
+    echo "Generating one-page-stale-adbe-no-ext-vendor.pdf ..."
+    python3 - "$FIX/one-page-stale-adbe-no-ext-vendor.pdf" <<'PY'
+import sys
+out_path = sys.argv[1]
+body = bytearray(b"%PDF-1.4\n%\xbf\xf7\xa2\xfe\n")
+objs = [
+    b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+    b"/Extensions << /ADBE << /BaseVersion /1.4 >> "
+    b"/XYZW << /BaseVersion /1.4 /ExtensionLevel 1 >> >> >>\nendobj\n",
+    b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+    b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> >>\nendobj\n",
+]
+offsets = []
+for o in objs:
+    offsets.append(len(body))
+    body.extend(o)
+startxref = len(body)
+size = len(objs) + 1
+body.extend(f"xref\n0 {size}\n0000000000 65535 f \n".encode())
+for off in offsets:
+    body.extend(f"{off:010} 00000 n \n".encode())
+body.extend(
+    f"trailer\n<< /Size {size} /Root 1 0 R >>\n"
+    f"startxref\n{startxref}\n%%EOF\n".encode()
+)
+open(out_path, "wb").write(bytes(body))
+PY
+else
+    echo "Skipping one-page-stale-adbe-no-ext-vendor.pdf (already exists)"
+fi
+
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -1765,6 +1835,14 @@ for stem in perms-docmdp-one-page acroform-sig-field-only acroform-sig-widget \
     qpdf --remove-restrictions --static-id --warning-exit-0 \
         "$FIX/$stem.pdf" "$REF/$stem/remove-restrictions.pdf"
     echo "$stem/remove-restrictions.pdf"
+done
+
+# --- flpdf-9hc.16.15: qpdf oracle for /Extensions /ADBE removal branches ---
+for stem in one-page-stale-adbe-no-ext one-page-stale-adbe-no-ext-vendor; do
+    mkdir -p "$REF/$stem"
+    qpdf --static-id --newline-before-endstream=no --warning-exit-0 \
+        "$FIX/$stem.pdf" "$REF/$stem/adbe-strip.pdf"
+    echo "$stem/adbe-strip.pdf"
 done
 
 echo ""

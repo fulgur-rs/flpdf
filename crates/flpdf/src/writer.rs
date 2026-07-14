@@ -780,11 +780,15 @@ fn inject_adbe_extension<R: Read + Seek>(
 }
 
 /// Strip `/Extensions /ADBE` from the destination Catalog when the effective
-/// extension level is 0. This complements [`inject_adbe_extension`]: when a
-/// version race (min_version bump or ObjStm floor) drops the pairwise ext to
-/// 0 but the source Catalog carries a stale `/ADBE` entry, that stale entry
-/// would otherwise survive the renumber walk and produce an output whose
-/// Catalog `/BaseVersion` contradicts the emitted header version.
+/// extension level is 0. This complements [`inject_adbe_extension`] and
+/// mirrors qpdf's removal branches (QPDFWriter.cc L1408 whole-`/Extensions`
+/// removal and L1432 `/ADBE`-only removal). Fires for two related cases:
+/// (1) a version race (min_version bump or ObjStm floor) drops the pairwise
+/// ext to 0 but the source Catalog carries an `/ADBE` entry that would
+/// otherwise survive; (2) the source Catalog carries a stale / malformed
+/// `/ADBE` (no `/ExtensionLevel` or non-integer) even without a race — qpdf
+/// removes it based on key existence, not `/ExtensionLevel` validity, so
+/// flpdf must match to preserve byte parity.
 ///
 /// Only touches `/ADBE`; any other developer-prefix keys under `/Extensions`
 /// are preserved (matching qpdf's per-prefix handling). Drops `/Extensions`
@@ -813,16 +817,16 @@ fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
     let mut extensions = match catalog.remove("Extensions") {
         Some(Object::Dictionary(d)) => d,
         Some(Object::Reference(r)) => pdf.resolve(r)?.into_dict().unwrap_or_default(),
-        // cov:ignore-start: unreachable when source_ext > 0.
-        // adobe_extension_level() returns Some(N) only after walking through a
-        // Dict-or-Ref /Extensions; the caller gates strip on source_ext > 0.
+        // cov:ignore-start: unreachable — catalog_has_extensions_adbe (the sole
+        // caller-side gate) already verified /Extensions resolves to a
+        // Dictionary and pdf is not mutated between the check and this match.
         _ => return Ok(()),
         // cov:ignore-end
     };
     if extensions.remove("ADBE").is_none() {
-        // cov:ignore-start: unreachable when source_ext > 0. adobe_extension_level()
-        // returns Some(N) only if /Extensions carries /ADBE with an integer
-        // /ExtensionLevel; the caller gates strip on source_ext > 0.
+        // cov:ignore-start: unreachable — catalog_has_extensions_adbe verified
+        // /ADBE was present in the resolved /Extensions dict and pdf is not
+        // mutated between the check and this remove().
         catalog.insert("Extensions", Object::Dictionary(extensions));
         pdf.set_object(root_ref, Object::Dictionary(catalog));
         return Ok(());
@@ -833,6 +837,55 @@ fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
     }
     pdf.set_object(root_ref, Object::Dictionary(catalog));
     Ok(())
+}
+
+/// Detect whether the destination Catalog carries `/Extensions /ADBE` in any
+/// form (dict-valued or via indirect reference; regardless of `/ExtensionLevel`
+/// presence or value).
+///
+/// Mirrors qpdf's `have_extensions_adbe = keys.count("/ADBE") > 0` check
+/// (QPDFWriter.cc L1387). Used as the strip trigger for `eff_ext == 0`: when
+/// the effective extension level is zero, qpdf removes stale `/ADBE` whether
+/// or not the source dict carried a valid `/ExtensionLevel`; the previous
+/// `adobe_extension_level() > 0` gate only fired for positive integer
+/// `/ExtensionLevel` and silently passed through malformed / partial /ADBE
+/// entries.
+///
+/// # Errors
+///
+/// - Propagates [`Pdf::resolve_borrowed`] errors when materialising the Catalog
+///   or an indirect `/Extensions` value.
+fn catalog_has_extensions_adbe<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
+    // cov:ignore-start: defensive /Root guard. catalog_has_extensions_adbe is
+    // only reached after write_pdf_full_rewrite passes its own root_ref check
+    // on the same Pdf.
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(false);
+    };
+    // cov:ignore-end
+    let extensions_ref = {
+        let catalog = pdf.resolve_borrowed(root_ref)?;
+        // cov:ignore-start: defensive non-Dict Catalog guard, mirroring
+        // strip_adbe_extension. Every downstream write path rejects a non-dict
+        // Catalog before reaching this helper.
+        let Some(catalog_dict) = catalog.as_dict() else {
+            return Ok(false);
+        };
+        // cov:ignore-end
+        match catalog_dict.get("Extensions") {
+            Some(Object::Dictionary(d)) => return Ok(d.get("ADBE").is_some()),
+            Some(Object::Reference(r)) => *r,
+            None => return Ok(false),
+            // cov:ignore-start: /Extensions present but neither Dict nor Ref is
+            // structurally malformed input; no test-fixture path produces it.
+            Some(_) => return Ok(false),
+            // cov:ignore-end
+        }
+    };
+    let extensions = pdf.resolve_borrowed(extensions_ref)?;
+    Ok(extensions
+        .as_dict()
+        .is_some_and(|d| d.get("ADBE").is_some()))
 }
 
 /// Binary header marker emitted by qpdf on the second line of every output
@@ -3015,12 +3068,15 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         );
         if eff_ext > 0 {
             inject_adbe_extension(pdf, eff_ver, eff_ext)?;
-        } else if source_ext > 0 {
-            // Source carried an ADBE extension level that did not survive the
-            // pairwise version race (min_version bump or ObjStm floor drops
-            // it to 0). Removing the stale /ADBE entry from the destination
-            // Catalog keeps `/BaseVersion` from contradicting the emitted
-            // header version.
+        } else if catalog_has_extensions_adbe(pdf)? {
+            // qpdf QPDFWriter.cc L1387/L1408/L1432: when the effective extension
+            // level is 0, any `/Extensions /ADBE` key must be removed —
+            // whether from a prior injection that lost the pairwise version race
+            // (min_version bump / ObjStm floor drops the ext to 0) or from a
+            // stale/malformed source /ADBE without a valid /ExtensionLevel.
+            // strip_adbe_extension handles both branches: it drops /Extensions
+            // when nothing else remains, otherwise keeps it with the non-ADBE
+            // developer prefixes intact.
             strip_adbe_extension(pdf)?;
         }
     }
@@ -7776,6 +7832,192 @@ mod tests {
             reopened.adobe_extension_level(),
             None,
             "stale /ADBE (BaseVersion 1.3) must be stripped by the encryption floor"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_strips_stale_adbe_when_source_has_no_extension_level() {
+        // qpdf QPDFWriter.cc L1387/L1408 (whole /Extensions removed) parity:
+        // source /Extensions /ADBE dict has no /ExtensionLevel (or non-integer).
+        // adobe_extension_level() returns None → source_ext = 0. The pre-broadening
+        // trigger (`source_ext > 0`) would skip strip and let /ADBE pass through;
+        // the broadened trigger (`catalog_has_extensions_adbe`) fires and drops
+        // /Extensions entirely because /ADBE is the only key.
+        let mut src = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+              /Extensions << /ADBE << /BaseVersion /1.4 >> >> >>\nendobj\n",
+        );
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let startxref = src.len();
+        let count = offsets.len() + 1;
+        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        // Sanity: adobe_extension_level() returns None because /ExtensionLevel is absent.
+        {
+            let mut src_pdf = crate::Pdf::open_mem(&src).expect("source must open");
+            assert_eq!(src_pdf.adobe_extension_level(), None);
+        }
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
+        // The whole /Extensions dict must be gone from the output Catalog.
+        let root_ref = reopened.trailer().get_ref("Root").expect("Root ref");
+        let catalog = reopened
+            .resolve(root_ref)
+            .expect("resolve root")
+            .into_dict()
+            .expect("root is dict");
+        assert!(
+            catalog.get("Extensions").is_none(),
+            "stale /ADBE without /ExtensionLevel must trigger whole-/Extensions removal: {catalog:?}"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_strips_stale_adbe_no_ext_level_preserving_vendor_prefix() {
+        // qpdf QPDFWriter.cc L1432 (removeKey /ADBE, keep other extensions) parity:
+        // source /Extensions has /ADBE without /ExtensionLevel AND a non-ADBE
+        // developer prefix (/XYZW). Broadened trigger must fire and strip /ADBE
+        // only, leaving /XYZW intact.
+        let mut src = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+              /Extensions << /ADBE << /BaseVersion /1.4 >> \
+              /XYZW << /BaseVersion /1.4 /ExtensionLevel 1 >> >> >>\nendobj\n",
+        );
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let startxref = src.len();
+        let count = offsets.len() + 1;
+        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        // Sanity: adobe_extension_level() returns None (source /ExtensionLevel absent).
+        {
+            let mut src_pdf = crate::Pdf::open_mem(&src).expect("source must open");
+            assert_eq!(src_pdf.adobe_extension_level(), None);
+        }
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
+        let root_ref = reopened.trailer().get_ref("Root").expect("Root ref");
+        let catalog = reopened
+            .resolve(root_ref)
+            .expect("resolve root")
+            .into_dict()
+            .expect("root is dict");
+        // /Extensions must still be present, containing only /XYZW.
+        let ext_dict = catalog
+            .get("Extensions")
+            .expect("/Extensions must survive because /XYZW is present")
+            .as_dict()
+            .expect("/Extensions must be a direct dict after strip");
+        assert!(
+            ext_dict.get("ADBE").is_none(),
+            "stale /ADBE without /ExtensionLevel must be stripped: {ext_dict:?}"
+        );
+        assert!(
+            ext_dict.get("XYZW").is_some(),
+            "non-ADBE developer prefix must survive: {ext_dict:?}"
+        );
+    }
+
+    #[test]
+    fn write_pdf_full_rewrite_strips_stale_adbe_via_indirect_extensions_no_ext_level() {
+        // qpdf QPDFWriter.cc L1387 parity: `/Extensions` may arrive as an indirect
+        // reference. The broadened trigger must resolve the ref before checking
+        // for /ADBE key existence, and strip must inline the resolved dict then
+        // remove /ADBE. Covers the `Object::Reference` arm of
+        // `catalog_has_extensions_adbe` that inline-`/Extensions` fixtures skip.
+        let mut src = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 3 0 R >>\nendobj\n",
+        );
+        offsets.push(src.len());
+        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        offsets.push(src.len());
+        src.extend_from_slice(
+            b"3 0 obj\n<< /ADBE << /BaseVersion /1.4 >> \
+              /XYZW << /BaseVersion /1.4 /ExtensionLevel 1 >> >>\nendobj\n",
+        );
+        let startxref = src.len();
+        let count = offsets.len() + 1;
+        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
+        for off in &offsets {
+            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        src.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        // Sanity: adobe_extension_level returns None (source /ExtensionLevel absent
+        // even after resolving the indirect /Extensions ref).
+        {
+            let mut src_pdf = crate::Pdf::open_mem(&src).expect("source must open");
+            assert_eq!(src_pdf.adobe_extension_level(), None);
+        }
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            ..WriteOptions::default()
+        };
+        let out = write_full_rewrite_with(&src, &options);
+        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
+        let root_ref = reopened.trailer().get_ref("Root").expect("Root ref");
+        let catalog = reopened
+            .resolve(root_ref)
+            .expect("resolve root")
+            .into_dict()
+            .expect("root is dict");
+        // strip inlines /Extensions as a direct dict; /ADBE gone, /XYZW survives.
+        let ext_dict = catalog
+            .get("Extensions")
+            .expect("/Extensions must survive because /XYZW is present")
+            .as_dict()
+            .expect("/Extensions must be inlined as a direct dict after strip");
+        assert!(
+            ext_dict.get("ADBE").is_none(),
+            "stale /ADBE from indirect /Extensions must be stripped: {ext_dict:?}"
+        );
+        assert!(
+            ext_dict.get("XYZW").is_some(),
+            "non-ADBE developer prefix from indirect /Extensions must survive: {ext_dict:?}"
         );
     }
 }
