@@ -780,11 +780,15 @@ fn inject_adbe_extension<R: Read + Seek>(
 }
 
 /// Strip `/Extensions /ADBE` from the destination Catalog when the effective
-/// extension level is 0. This complements [`inject_adbe_extension`]: when a
-/// version race (min_version bump or ObjStm floor) drops the pairwise ext to
-/// 0 but the source Catalog carries a stale `/ADBE` entry, that stale entry
-/// would otherwise survive the renumber walk and produce an output whose
-/// Catalog `/BaseVersion` contradicts the emitted header version.
+/// extension level is 0. This complements [`inject_adbe_extension`] and
+/// mirrors qpdf's removal branches (QPDFWriter.cc L1408 whole-`/Extensions`
+/// removal and L1432 `/ADBE`-only removal). Fires for two related cases:
+/// (1) a version race (min_version bump or ObjStm floor) drops the pairwise
+/// ext to 0 but the source Catalog carries an `/ADBE` entry that would
+/// otherwise survive; (2) the source Catalog carries a stale / malformed
+/// `/ADBE` (no `/ExtensionLevel` or non-integer) even without a race — qpdf
+/// removes it based on key existence, not `/ExtensionLevel` validity, so
+/// flpdf must match to preserve byte parity.
 ///
 /// Only touches `/ADBE`; any other developer-prefix keys under `/Extensions`
 /// are preserved (matching qpdf's per-prefix handling). Drops `/Extensions`
@@ -813,16 +817,16 @@ fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
     let mut extensions = match catalog.remove("Extensions") {
         Some(Object::Dictionary(d)) => d,
         Some(Object::Reference(r)) => pdf.resolve(r)?.into_dict().unwrap_or_default(),
-        // cov:ignore-start: unreachable when source_ext > 0.
-        // adobe_extension_level() returns Some(N) only after walking through a
-        // Dict-or-Ref /Extensions; the caller gates strip on source_ext > 0.
+        // cov:ignore-start: unreachable — catalog_has_extensions_adbe (the sole
+        // caller-side gate) already verified /Extensions resolves to a
+        // Dictionary and pdf is not mutated between the check and this match.
         _ => return Ok(()),
         // cov:ignore-end
     };
     if extensions.remove("ADBE").is_none() {
-        // cov:ignore-start: unreachable when source_ext > 0. adobe_extension_level()
-        // returns Some(N) only if /Extensions carries /ADBE with an integer
-        // /ExtensionLevel; the caller gates strip on source_ext > 0.
+        // cov:ignore-start: unreachable — catalog_has_extensions_adbe verified
+        // /ADBE was present in the resolved /Extensions dict and pdf is not
+        // mutated between the check and this remove().
         catalog.insert("Extensions", Object::Dictionary(extensions));
         pdf.set_object(root_ref, Object::Dictionary(catalog));
         return Ok(());
@@ -833,6 +837,44 @@ fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
     }
     pdf.set_object(root_ref, Object::Dictionary(catalog));
     Ok(())
+}
+
+/// Detect whether the destination Catalog carries `/Extensions /ADBE` in any
+/// form (dict-valued or via indirect reference; regardless of `/ExtensionLevel`
+/// presence or value).
+///
+/// Mirrors qpdf's `have_extensions_adbe = keys.count("/ADBE") > 0` check
+/// (QPDFWriter.cc L1387). Used as the strip trigger for `eff_ext == 0`: when
+/// the effective extension level is zero, qpdf removes stale `/ADBE` whether
+/// or not the source dict carried a valid `/ExtensionLevel`; the previous
+/// `adobe_extension_level() > 0` gate only fired for positive integer
+/// `/ExtensionLevel` and silently passed through malformed / partial /ADBE
+/// entries.
+///
+/// # Errors
+///
+/// - Propagates [`Pdf::resolve`] errors when materialising the Catalog or an
+///   indirect `/Extensions` value.
+fn catalog_has_extensions_adbe<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(false);
+    };
+    let catalog = pdf.resolve(root_ref)?;
+    let Some(catalog_dict) = catalog.as_dict() else {
+        return Ok(false);
+    };
+    let Some(extensions_val) = catalog_dict.get("Extensions").cloned() else {
+        return Ok(false);
+    };
+    let extensions = match extensions_val {
+        Object::Dictionary(d) => d,
+        Object::Reference(r) => match pdf.resolve(r)?.into_dict() {
+            Some(d) => d,
+            None => return Ok(false),
+        },
+        _ => return Ok(false),
+    };
+    Ok(extensions.get("ADBE").is_some())
 }
 
 /// Binary header marker emitted by qpdf on the second line of every output
@@ -3015,12 +3057,15 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         );
         if eff_ext > 0 {
             inject_adbe_extension(pdf, eff_ver, eff_ext)?;
-        } else if source_ext > 0 {
-            // Source carried an ADBE extension level that did not survive the
-            // pairwise version race (min_version bump or ObjStm floor drops
-            // it to 0). Removing the stale /ADBE entry from the destination
-            // Catalog keeps `/BaseVersion` from contradicting the emitted
-            // header version.
+        } else if catalog_has_extensions_adbe(pdf)? {
+            // qpdf QPDFWriter.cc L1387/L1408/L1432: when the effective extension
+            // level is 0, any `/Extensions /ADBE` key must be removed —
+            // whether from a prior injection that lost the pairwise version race
+            // (min_version bump / ObjStm floor drops the ext to 0) or from a
+            // stale/malformed source /ADBE without a valid /ExtensionLevel.
+            // strip_adbe_extension handles both branches: it drops /Extensions
+            // when nothing else remains, otherwise keeps it with the non-ADBE
+            // developer prefixes intact.
             strip_adbe_extension(pdf)?;
         }
     }
