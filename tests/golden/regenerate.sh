@@ -1262,6 +1262,89 @@ else
     echo "Skipping one-page-stale-adbe-no-ext-vendor.pdf (already exists)"
 fi
 
+# ---------------------------------------------------------------------------
+# /ADBE INJECT source fixtures (flpdf-9hc.16.16)
+# ---------------------------------------------------------------------------
+# Three hand-crafted classic-1.3 PDFs exercising `inject_adbe_extension` (the
+# WriteOptions::min_extension_level path, mirroring qpdf --min-version=1.7.8):
+#   - one-page-no-ext.pdf:       Catalog has no /Extensions → fresh injection.
+#   - one-page-xyzw-only.pdf:    /Extensions << /XYZW >> (direct) → /ADBE added
+#                                before /XYZW (alphabetical), /XYZW preserved.
+#   - one-page-ext-indirect.pdf: /Extensions 3 0 R, obj 3 = << /ADBE weak /ACRO >>
+#                                → inlined onto Catalog, /ADBE overwritten,
+#                                /ACRO preserved; obj 3 removed from body.
+# `%%%%EOF` in the Python trailer literal is the correct escape for `%`-format
+# (matches other `%`-format sites in this file); a bare `%%EOF` collapses to
+# `%EOF` and produces a non-standard trailer marker.
+
+if [[ ! -f "$FIX/one-page-no-ext.pdf" ]]; then
+    echo "Generating one-page-no-ext.pdf ..."
+    python3 - "$FIX/one-page-no-ext.pdf" <<'PY'
+import sys
+src = b"%PDF-1.3\n"
+offs = []
+offs.append(len(src))
+src += b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+offs.append(len(src))
+src += b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n"
+xr = len(src)
+src += b"xref\n0 3\n0000000000 65535 f \n"
+for o in offs:
+    src += ("%010d 00000 n \n" % o).encode()
+src += ("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % xr).encode()
+open(sys.argv[1], "wb").write(src)
+PY
+else
+    echo "Skipping one-page-no-ext.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/one-page-xyzw-only.pdf" ]]; then
+    echo "Generating one-page-xyzw-only.pdf ..."
+    python3 - "$FIX/one-page-xyzw-only.pdf" <<'PY'
+import sys
+src = b"%PDF-1.3\n"
+offs = []
+offs.append(len(src))
+src += (b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+        b"/Extensions << /XYZW << /BaseVersion /1.3 /ExtensionLevel 1 >> >> "
+        b">>\nendobj\n")
+offs.append(len(src))
+src += b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n"
+xr = len(src)
+src += b"xref\n0 3\n0000000000 65535 f \n"
+for o in offs:
+    src += ("%010d 00000 n \n" % o).encode()
+src += ("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % xr).encode()
+open(sys.argv[1], "wb").write(src)
+PY
+else
+    echo "Skipping one-page-xyzw-only.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/one-page-ext-indirect.pdf" ]]; then
+    echo "Generating one-page-ext-indirect.pdf ..."
+    python3 - "$FIX/one-page-ext-indirect.pdf" <<'PY'
+import sys
+src = b"%PDF-1.3\n"
+offs = []
+offs.append(len(src))
+src += b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 3 0 R >>\nendobj\n"
+offs.append(len(src))
+src += b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n"
+offs.append(len(src))
+src += (b"3 0 obj\n<< /ADBE << /BaseVersion /1.7 /ExtensionLevel 3 >> "
+        b"/ACRO << /BaseVersion /1.7 /ExtensionLevel 1 >> >>\nendobj\n")
+xr = len(src)
+src += b"xref\n0 4\n0000000000 65535 f \n"
+for o in offs:
+    src += ("%010d 00000 n \n" % o).encode()
+src += ("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % xr).encode()
+open(sys.argv[1], "wb").write(src)
+PY
+else
+    echo "Skipping one-page-ext-indirect.pdf (already exists)"
+fi
+
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -1845,6 +1928,14 @@ for stem in one-page-stale-adbe-no-ext one-page-stale-adbe-no-ext-vendor; do
     echo "$stem/adbe-strip.pdf"
 done
 
+# --- flpdf-9hc.16.16: qpdf oracle for /Extensions /ADBE injection branches ---
+for stem in one-page-no-ext one-page-xyzw-only one-page-ext-indirect; do
+    mkdir -p "$REF/$stem"
+    qpdf --min-version=1.7.8 --static-id --warning-exit-0 \
+        "$FIX/$stem.pdf" "$REF/$stem/adbe-inject.pdf"
+    echo "$stem/adbe-inject.pdf"
+done
+
 echo ""
 echo "=== All references generated ==="
 
@@ -1994,113 +2085,6 @@ echo "overlay/three-page-two-overlays-qdf.pdf"
 
 
 echo ""
-
-# ---------------------------------------------------------------------------
-# /ADBE INJECT fixtures + goldens (flpdf-9hc.16.16)
-# ---------------------------------------------------------------------------
-# Three hand-crafted classic-1.3 PDFs exercising `inject_adbe_extension` (the
-# WriteOptions::min_extension_level path, mirroring qpdf --min-version=1.7.8):
-#   - one-page-no-ext.pdf:       Catalog has no /Extensions → fresh injection.
-#   - one-page-xyzw-only.pdf:    /Extensions << /XYZW >> (direct) → /ADBE added
-#                                before /XYZW (alphabetical), /XYZW preserved.
-#   - one-page-ext-indirect.pdf: /Extensions 3 0 R, obj 3 = << /ADBE weak /ACRO >>
-#                                → inlined onto Catalog, /ADBE overwritten,
-#                                /ACRO preserved; obj 3 removed from body.
-
-if [[ ! -f "$FIX/one-page-no-ext.pdf" ]]; then
-    echo "Generating one-page-no-ext.pdf ..."
-    python3 - "$FIX/one-page-no-ext.pdf" <<'PY'
-import sys
-src = b"%PDF-1.3\n"
-offs = []
-offs.append(len(src))
-src += b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
-offs.append(len(src))
-src += b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n"
-xr = len(src)
-src += b"xref\n0 3\n0000000000 65535 f \n"
-for o in offs:
-    src += ("%010d 00000 n \n" % o).encode()
-src += ("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n%d\n%%EOF\n" % xr).encode()
-open(sys.argv[1], "wb").write(src)
-PY
-else
-    echo "Skipping one-page-no-ext.pdf (already exists)"
-fi
-
-if [[ ! -f "$REF/one-page-no-ext/adbe-inject.pdf" ]]; then
-    echo "Generating one-page-no-ext/adbe-inject.pdf golden ..."
-    mkdir -p "$REF/one-page-no-ext"
-    qpdf --min-version=1.7.8 --static-id --warning-exit-0 \
-        "$FIX/one-page-no-ext.pdf" "$REF/one-page-no-ext/adbe-inject.pdf"
-else
-    echo "Skipping one-page-no-ext/adbe-inject.pdf golden (already exists)"
-fi
-
-if [[ ! -f "$FIX/one-page-xyzw-only.pdf" ]]; then
-    echo "Generating one-page-xyzw-only.pdf ..."
-    python3 - "$FIX/one-page-xyzw-only.pdf" <<'PY'
-import sys
-src = b"%PDF-1.3\n"
-offs = []
-offs.append(len(src))
-src += (b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
-        b"/Extensions << /XYZW << /BaseVersion /1.3 /ExtensionLevel 1 >> >> "
-        b">>\nendobj\n")
-offs.append(len(src))
-src += b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n"
-xr = len(src)
-src += b"xref\n0 3\n0000000000 65535 f \n"
-for o in offs:
-    src += ("%010d 00000 n \n" % o).encode()
-src += ("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n%d\n%%EOF\n" % xr).encode()
-open(sys.argv[1], "wb").write(src)
-PY
-else
-    echo "Skipping one-page-xyzw-only.pdf (already exists)"
-fi
-
-if [[ ! -f "$REF/one-page-xyzw-only/adbe-inject.pdf" ]]; then
-    echo "Generating one-page-xyzw-only/adbe-inject.pdf golden ..."
-    mkdir -p "$REF/one-page-xyzw-only"
-    qpdf --min-version=1.7.8 --static-id --warning-exit-0 \
-        "$FIX/one-page-xyzw-only.pdf" "$REF/one-page-xyzw-only/adbe-inject.pdf"
-else
-    echo "Skipping one-page-xyzw-only/adbe-inject.pdf golden (already exists)"
-fi
-
-if [[ ! -f "$FIX/one-page-ext-indirect.pdf" ]]; then
-    echo "Generating one-page-ext-indirect.pdf ..."
-    python3 - "$FIX/one-page-ext-indirect.pdf" <<'PY'
-import sys
-src = b"%PDF-1.3\n"
-offs = []
-offs.append(len(src))
-src += b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 3 0 R >>\nendobj\n"
-offs.append(len(src))
-src += b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n"
-offs.append(len(src))
-src += (b"3 0 obj\n<< /ADBE << /BaseVersion /1.7 /ExtensionLevel 3 >> "
-        b"/ACRO << /BaseVersion /1.7 /ExtensionLevel 1 >> >>\nendobj\n")
-xr = len(src)
-src += b"xref\n0 4\n0000000000 65535 f \n"
-for o in offs:
-    src += ("%010d 00000 n \n" % o).encode()
-src += ("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n%d\n%%EOF\n" % xr).encode()
-open(sys.argv[1], "wb").write(src)
-PY
-else
-    echo "Skipping one-page-ext-indirect.pdf (already exists)"
-fi
-
-if [[ ! -f "$REF/one-page-ext-indirect/adbe-inject.pdf" ]]; then
-    echo "Generating one-page-ext-indirect/adbe-inject.pdf golden ..."
-    mkdir -p "$REF/one-page-ext-indirect"
-    qpdf --min-version=1.7.8 --static-id --warning-exit-0 \
-        "$FIX/one-page-ext-indirect.pdf" "$REF/one-page-ext-indirect/adbe-inject.pdf"
-else
-    echo "Skipping one-page-ext-indirect/adbe-inject.pdf golden (already exists)"
-fi
 
 # ---------------------------------------------------------------------------
 # Phase 3: Size check (fail if any reference exceeds 100 KB)
