@@ -337,15 +337,22 @@ mod tests {
     }
 
     #[test]
-    fn deduplication_is_preserved() {
-        // "1,3,1" → [1, 3] (second 1 dropped by PageRange::resolve)
+    fn duplicates_preserved() {
+        // "1,3,1" → [1, 3, 1] (qpdf-parity: PageRange::resolve preserves
+        // duplicates). Verified against qpdf 11.9.0 with
+        // `qpdf --pages in 1,3,1 --` which emits 3 pages.
         let mut pdf = open(build_n_page_pdf(5));
         let range = PageRange::parse("1,3,1").unwrap();
         let plan = PagePlan::build(&mut pdf, &range).unwrap();
 
-        assert_eq!(plan.len(), 2);
+        assert_eq!(plan.len(), 3);
         assert_eq!(plan.pages()[0].index_1based, 1);
         assert_eq!(plan.pages()[1].index_1based, 3);
+        assert_eq!(plan.pages()[2].index_1based, 1);
+        // Same page_ref for both occurrences of page 1: downstream writer
+        // (rebuild_page_tree / extract_pages) shallow-clones the leaf so each
+        // slot gets its own /Parent, matching qpdf's duplicate-page output.
+        assert_eq!(plan.pages()[0].page_ref, plan.pages()[2].page_ref);
     }
 
     #[test]
