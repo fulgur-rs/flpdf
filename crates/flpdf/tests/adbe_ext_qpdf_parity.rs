@@ -1,15 +1,17 @@
 //! Byte-identity: flpdf plain full-rewrite emits qpdf's Catalog /Extensions
-//! /ADBE mutations byte-for-byte.
+//! /ADBE mutations (removal AND injection) byte-for-byte.
 //!
-//! Currently covers REMOVAL (QPDFWriter.cc L1408 whole /Extensions removal,
-//! L1432 /ADBE-only removal): proves `catalog_has_extensions_adbe` broadened
-//! trigger matches qpdf's `have_extensions_adbe = keys.count("/ADBE") > 0`
-//! (L1387) on inputs whose source /ADBE dict lacks a valid `/ExtensionLevel`.
+//! REMOVAL (QPDFWriter.cc L1408 whole /Extensions removal, L1432 /ADBE-only
+//! removal): proves `catalog_has_extensions_adbe` broadened trigger matches
+//! qpdf's `have_extensions_adbe = keys.count("/ADBE") > 0` (L1387) on inputs
+//! whose source /ADBE dict lacks a valid `/ExtensionLevel`.
 //!
-//! This file will also host INJECTION cases (`inject_adbe_extension` fired by
-//! `WriteOptions::min_extension_level`, qpdf `--min-version=<v>.<ext>`); the
-//! parametrised helpers below (`strip_options`, `inject_options`,
-//! `write_qpdf_equivalent`, `assert_parity`) are shared between the two.
+//! INJECTION (`inject_adbe_extension` fired by `WriteOptions::min_extension_level`,
+//! qpdf `--min-version=<v>.<ext>`) covers three shapes: (1) fresh /Extensions
+//! creation when the source Catalog has none, (2) direct /Extensions with a
+//! non-ADBE developer prefix (/XYZW) preserved, (3) indirect /Extensions
+//! reference with existing /ADBE weak + /ACRO — inlined onto the Catalog,
+//! /ADBE overwritten, /ACRO preserved.
 //!
 //! Fixtures are content-stream-free, so byte-identity is independent of the
 //! deflate backend — this file is NOT gated on `qpdf-zlib-compat`.
