@@ -32,7 +32,6 @@ fn strip_options() -> WriteOptions {
 
 /// INJECT-side WriteOptions: strip_options() + min-version 1.7 with extension
 /// level 8 (mirrors `qpdf --min-version=1.7.8`).
-#[allow(dead_code)] // wired up by follow-up INJECT tests
 fn inject_options() -> WriteOptions {
     let mut opts = strip_options();
     opts.min_version = Some("1.7".into());
@@ -114,5 +113,40 @@ fn non_adbe_prefix_preserved_when_source_adbe_lacks_extension_level_byte_identic
         "one-page-stale-adbe-no-ext-vendor.pdf",
         "adbe-strip.pdf",
         &strip_options(),
+    );
+}
+
+#[test]
+fn fresh_extensions_adbe_injected_when_source_has_none_byte_identical_to_qpdf() {
+    // qpdf --min-version=1.7.8 on a Catalog with no /Extensions must emit
+    // a fresh /Extensions << /ADBE << /BaseVersion /1.7 /ExtensionLevel 8 >> >>.
+    // Verifies inject_adbe_extension's fresh-creation branch byte-for-byte.
+    assert_parity("one-page-no-ext.pdf", "adbe-inject.pdf", &inject_options());
+}
+
+#[test]
+fn non_adbe_prefix_preserved_when_source_lacks_adbe_and_min_ext_requests_injection_byte_identical_to_qpdf(
+) {
+    // qpdf --min-version=1.7.8 on a Catalog with /Extensions << /XYZW … >>
+    // must add /ADBE before /XYZW (alphabetical) and preserve /XYZW verbatim.
+    // The issue-focus case: non-ADBE developer prefix survives injection.
+    assert_parity(
+        "one-page-xyzw-only.pdf",
+        "adbe-inject.pdf",
+        &inject_options(),
+    );
+}
+
+#[test]
+fn indirect_extensions_inlined_and_adbe_overwritten_preserving_non_adbe_prefix_byte_identical_to_qpdf(
+) {
+    // qpdf --min-version=1.7.8 on a Catalog whose /Extensions is an indirect
+    // reference (obj 3 = /ADBE weak + /ACRO) must inline obj 3 onto the
+    // Catalog, overwrite /ADBE with (1.7, 8), and preserve /ACRO. Result key
+    // order is alphabetical: /ACRO before /ADBE. obj 3 is dropped from the body.
+    assert_parity(
+        "one-page-ext-indirect.pdf",
+        "adbe-inject.pdf",
+        &inject_options(),
     );
 }
