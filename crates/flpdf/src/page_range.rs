@@ -21,14 +21,10 @@
 //!   yields 3 pages, not the 4 a page-number reading would give). Do not "fix"
 //!   this to filter by `p % 2` — that would diverge from qpdf.
 //! - An empty string means "all pages" and is resolved to `1..=page_count`.
-//! - Multiple entries are concatenated; the final resolved list is deduplicated
-//!   (first-occurrence wins) while preserving order.
-//!
-//! # Divergence from qpdf
-//!
-//! qpdf does **not** deduplicate — `1,1,2` in qpdf produces page 1 twice. This
-//! implementation **does** deduplicate. The syntax parser and resolve error
-//! conditions are otherwise qpdf-compatible.
+//! - Multiple entries are concatenated; the final resolved list preserves
+//!   duplicates in declaration order (qpdf-parity: `1,3,1` yields `[1,3,1]`,
+//!   verified against qpdf 11.9.0 with `qpdf --pages in 1,3,1 --`). Callers
+//!   that want a deduplicated set can build one from the returned vector.
 
 use crate::{Error, Result};
 
@@ -120,8 +116,10 @@ impl PageRange {
     /// Resolve the parsed expression against `page_count` (the number of pages
     /// in the document, ≥ 1).
     ///
-    /// Returns an ordered, deduplicated (first-occurrence-wins) `Vec<u32>` of
-    /// 1-based page numbers.
+    /// Returns a `Vec<u32>` of 1-based page numbers in declaration order,
+    /// preserving duplicates (qpdf-parity: `1,3,1` yields `[1,3,1]`, not
+    /// `[1,3]`). Callers that need a deduplicated set can build one from the
+    /// returned vector.
     ///
     /// # Errors
     ///
@@ -139,15 +137,8 @@ impl PageRange {
         };
 
         let mut result: Vec<u32> = Vec::new();
-        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-
         for entry in entries {
-            let expanded = resolve_entry(entry, page_count)?;
-            for p in expanded {
-                if seen.insert(p) {
-                    result.push(p);
-                }
-            }
+            result.extend(resolve_entry(entry, page_count)?);
         }
         Ok(result)
     }
@@ -653,9 +644,19 @@ mod tests {
     }
 
     #[test]
-    fn deduplication_preserves_order() {
-        // '1,3,5,3' → [1,3,5] (first occurrence wins; second '3' dropped)
-        assert_eq!(resolve("1,3,5,3", 10), vec![1, 3, 5]);
+    fn duplicates_preserved_in_declaration_order() {
+        // '1,3,5,3' → [1,3,5,3] (qpdf-parity: no dedup).
+        // Verified against qpdf 11.9.0: `qpdf --pages in 1,3,5,3 --` emits 4 pages.
+        assert_eq!(resolve("1,3,5,3", 10), vec![1, 3, 5, 3]);
+    }
+
+    #[test]
+    fn repeated_slot_preserved() {
+        // '1,1,1,1' → [1,1,1,1] (qpdf-parity: no dedup).
+        // This is the case that unblocks overlay --to=1,1,1,1 --from=1-4:
+        // the four repeated slots must reach map_overlay_pages so it can pair
+        // each slot with the i-th --from source page.
+        assert_eq!(resolve("1,1,1,1", 5), vec![1, 1, 1, 1]);
     }
 
     #[test]

@@ -2540,6 +2540,22 @@ mod tests {
         );
     }
 
+    // ---- resolve_spec_pairs (composed with PageRange::resolve) ------------
+
+    #[test]
+    fn spec_pairs_repeated_to_slots_yield_one_pair_per_slot() {
+        // uo-6 pattern: `--overlay --to=1,1,1,1 --from=1-4` on a 1-page dest
+        // and a 4-page source. PageRange::resolve preserves the four repeated
+        // 1s (qpdf-parity), so map_overlay_pages pairs each slot with the
+        // i-th --from source page. The bug this pins (flpdf-9x9o): dedup on
+        // --to collapsed the four slots to `[1]` and only one overlay was
+        // applied.
+        let from = pr("1-4");
+        let to = pr("1,1,1,1");
+        let pairs = resolve_spec_pairs(4, &from, &to, None, 1).unwrap();
+        assert_eq!(pairs, vec![(1, 1), (1, 2), (1, 3), (1, 4)]);
+    }
+
     // ---- apply_overlay_spec (driving function, end-to-end in memory) ------
 
     /// Build a `count`-page document. Every page is object `2 + i` (page 1 is
@@ -3212,6 +3228,29 @@ mod tests {
         let report = overlay_verbose_report(&mut dest, &mut specs).unwrap();
         let src_pages: Vec<u32> = report.iter().map(|p| p.sources[0].src_page).collect();
         assert_eq!(src_pages, vec![1, 2, 1, 2, 1]);
+    }
+
+    #[test]
+    fn overlay_verbose_report_repeated_to_slot_yields_one_source_per_slot() {
+        // uo-6 pattern: 1-page dest, 4-page source, single --overlay with
+        // --to=1,1,1,1 and --from=1-4. The four repeated dest-slots each pair
+        // with a distinct source page (from 1..4), so dest page 1 accumulates
+        // four sources — matching qpdf's uo-6 golden which emits
+        // `fxo-blue.pdf overlay 1..4` on page 1.
+        let mut dest = open(n_page_doc(1));
+        let spec = OverlaySpec {
+            source: open(n_page_doc(4)),
+            kind: OverlayKind::Overlay,
+            from: PageRange::parse("1-4").unwrap(),
+            to: PageRange::parse("1,1,1,1").unwrap(),
+            repeat: None,
+        };
+        let mut specs = [spec];
+        let report = overlay_verbose_report(&mut dest, &mut specs).unwrap();
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].dest_page, 1);
+        let src_pages: Vec<u32> = report[0].sources.iter().map(|s| s.src_page).collect();
+        assert_eq!(src_pages, vec![1, 2, 3, 4]);
     }
 
     #[test]
