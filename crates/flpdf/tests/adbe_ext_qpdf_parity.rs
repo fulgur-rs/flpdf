@@ -1,18 +1,15 @@
 //! Byte-identity: flpdf plain full-rewrite emits qpdf's Catalog /Extensions
-//! /ADBE mutations (removal AND injection) byte-for-byte.
+//! /ADBE mutations byte-for-byte.
 //!
-//! REMOVAL (QPDFWriter.cc L1408 whole /Extensions removal, L1432 /ADBE-only
-//! removal): proves `catalog_has_extensions_adbe` broadened trigger matches
-//! qpdf's `have_extensions_adbe = keys.count("/ADBE") > 0` (L1387) on inputs
-//! whose source /ADBE dict lacks a valid `/ExtensionLevel`.
+//! Currently covers REMOVAL (QPDFWriter.cc L1408 whole /Extensions removal,
+//! L1432 /ADBE-only removal): proves `catalog_has_extensions_adbe` broadened
+//! trigger matches qpdf's `have_extensions_adbe = keys.count("/ADBE") > 0`
+//! (L1387) on inputs whose source /ADBE dict lacks a valid `/ExtensionLevel`.
 //!
-//! INJECTION (`inject_adbe_extension` fired by `WriteOptions::min_extension_level`,
-//! qpdf `--min-version=<v>.<ext>`): proves flpdf's injection reproduces qpdf's
-//! Catalog /Extensions dict byte-for-byte across three shapes: (1) fresh
-//! creation when source has no /Extensions, (2) direct /Extensions with a
-//! non-ADBE developer prefix (/XYZW) preserved, (3) indirect /Extensions
-//! reference with existing /ADBE weak + /ACRO — inlined onto the Catalog,
-//! /ADBE overwritten, /ACRO preserved.
+//! This file will also host INJECTION cases (`inject_adbe_extension` fired by
+//! `WriteOptions::min_extension_level`, qpdf `--min-version=<v>.<ext>`); the
+//! parametrised helpers below (`strip_options`, `inject_options`,
+//! `write_qpdf_equivalent`, `assert_parity`) are shared between the two.
 //!
 //! Fixtures are content-stream-free, so byte-identity is independent of the
 //! deflate backend — this file is NOT gated on `qpdf-zlib-compat`.
@@ -78,7 +75,10 @@ fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
     Some(common)
 }
 
-fn assert_parity(fixture: &str, stem: &str, golden_name: &str, options: &WriteOptions) {
+fn assert_parity(fixture: &str, golden_name: &str, options: &WriteOptions) {
+    let stem = fixture
+        .strip_suffix(".pdf")
+        .expect("fixture must end in .pdf");
     let actual = write_qpdf_equivalent(fixture, options);
     let expected = golden(stem, golden_name);
     if let Some(off) = first_diff(&actual, &expected) {
@@ -101,7 +101,6 @@ fn whole_extensions_removed_when_source_adbe_lacks_extension_level_byte_identica
     // whole /Extensions from Catalog.
     assert_parity(
         "one-page-stale-adbe-no-ext.pdf",
-        "one-page-stale-adbe-no-ext",
         "adbe-strip.pdf",
         &strip_options(),
     );
@@ -113,7 +112,6 @@ fn non_adbe_prefix_preserved_when_source_adbe_lacks_extension_level_byte_identic
     // /ADBE → remove /ADBE key only, keep /Extensions with other keys.
     assert_parity(
         "one-page-stale-adbe-no-ext-vendor.pdf",
-        "one-page-stale-adbe-no-ext-vendor",
         "adbe-strip.pdf",
         &strip_options(),
     );
