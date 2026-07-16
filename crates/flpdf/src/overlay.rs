@@ -1515,6 +1515,38 @@ mod byte_gate {
         assert_byte_identical(&actual, "overlay-copy-annotations.pdf");
     }
 
+    /// Overlay a source whose `/AcroForm/DR` is stored inline as a direct
+    /// dictionary (rather than the usual indirect ref). Exercises
+    /// `read_source_acroform_defaults`' direct-`/DR` materialize path
+    /// (allocate a fresh source-doc indirect object, register the direct
+    /// dict on it, and return that ref for downstream copy).
+    #[test]
+    fn overlay_copy_annotations_source_direct_dr_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src = fixture("form-fields-and-annotations-direct-dr.pdf");
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            ..Default::default()
+        };
+        let mut actual = Vec::new();
+        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        assert_byte_identical(&actual, "overlay-source-direct-dr.pdf");
+    }
+
     /// Overlay `form-fields-and-annotations.pdf` onto a dest that already
     /// carries an `/AcroForm` with a pre-existing `/Fields` entry named
     /// "Text Box 1" — the same partial name as one of the source's
