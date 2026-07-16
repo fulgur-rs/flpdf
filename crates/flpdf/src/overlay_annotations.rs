@@ -923,16 +923,22 @@ pub(crate) fn add_and_rename_form_fields<R: Read + Seek>(
         None => return Ok(()),
     };
 
-    // Get or create /AcroForm (with a /Fields array). ensure_dest_acroform_dr
-    // is called by apply_placement before this point when any placement had a
-    // top-level field; if we get here with no /AcroForm, no field was ever
-    // added — which means new_top_fields is empty and we returned above.
+    // Get or create /AcroForm. When apply_placement's `ensure_dest_acroform_dr`
+    // ran (source had /DR), it already promoted the AcroForm to indirect and
+    // this branch just uses that ref. When it did NOT run (source has no /DR),
+    // we may still see a direct AcroForm here — promote it in place preserving
+    // its existing contents (/Fields, /DA, /Q, /NeedAppearances, ...). Only
+    // a truly missing/non-dict AcroForm gets a fresh empty one.
     let acroform_ref = match catalog.get("AcroForm").cloned() {
         Some(Object::Reference(r)) => r,
-        Some(Object::Dictionary(_)) | Some(Object::Null) | None | Some(_) => {
-            // Defensive: mint a fresh /AcroForm without /DR (the DR path is
-            // handled in ensure_dest_acroform_dr; if we're here without one,
-            // the placement carried no /DR — non-standard but non-fatal).
+        Some(Object::Dictionary(existing)) => {
+            let r = allocate_next_ref(dest)?;
+            dest.set_object(r, Object::Dictionary(existing));
+            catalog.insert("AcroForm", Object::Reference(r));
+            dest.set_object(root_ref, Object::Dictionary(catalog));
+            r
+        }
+        _ => {
             let mut dict = crate::Dictionary::new();
             dict.insert("Fields", Object::Array(Vec::new()));
             let r = allocate_next_ref(dest)?;
@@ -1038,19 +1044,37 @@ pub(crate) fn add_and_rename_form_fields<R: Read + Seek>(
     }
 
     // Finally append the new top-level fields to /AcroForm/Fields (they may
-    // now have renamed /T).
+    // now have renamed /T). /Fields may be a direct array or an indirect ref
+    // to one; preserve the existing entries in either shape.
     let Some(mut acroform_dict) = dest.resolve(acroform_ref)?.into_dict() else {
         return Ok(());
     };
-    let mut fields = match acroform_dict.get("Fields").cloned() {
-        Some(Object::Array(arr)) => arr,
-        _ => Vec::new(),
-    };
-    for r in new_top_fields {
-        fields.push(Object::Reference(r));
+    match acroform_dict.get("Fields").cloned() {
+        Some(Object::Reference(fields_ref)) => {
+            // Indirect /Fields: update the array in place so any other
+            // references to it (there shouldn't be any, but be conservative)
+            // stay valid.
+            let mut fields = match dest.resolve(fields_ref)? {
+                Object::Array(arr) => arr,
+                _ => Vec::new(),
+            };
+            for r in new_top_fields {
+                fields.push(Object::Reference(r));
+            }
+            dest.set_object(fields_ref, Object::Array(fields));
+        }
+        other => {
+            let mut fields = match other {
+                Some(Object::Array(arr)) => arr,
+                _ => Vec::new(),
+            };
+            for r in new_top_fields {
+                fields.push(Object::Reference(r));
+            }
+            acroform_dict.insert("Fields", Object::Array(fields));
+            dest.set_object(acroform_ref, Object::Dictionary(acroform_dict));
+        }
     }
-    acroform_dict.insert("Fields", Object::Array(fields));
-    dest.set_object(acroform_ref, Object::Dictionary(acroform_dict));
     Ok(())
 }
 
