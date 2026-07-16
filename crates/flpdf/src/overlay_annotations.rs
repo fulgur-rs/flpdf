@@ -802,11 +802,19 @@ fn ensure_dest_acroform_dr<R: Read + Seek>(
     let acroform_val = catalog.get("AcroForm").cloned();
     let acroform_ref = match acroform_val {
         Some(Object::Reference(r)) => r,
+        Some(Object::Dictionary(existing)) => {
+            // Direct /AcroForm: promote to indirect while preserving the
+            // existing contents (/Fields, /DA, /Q, /NeedAppearances, ...).
+            // A prior implementation discarded the direct dict entirely,
+            // which silently dropped any pre-existing form data.
+            let af_ref = allocate_next_ref(dest)?;
+            dest.set_object(af_ref, Object::Dictionary(existing));
+            catalog.insert("AcroForm", Object::Reference(af_ref));
+            dest.set_object(root_ref, Object::Dictionary(catalog));
+            af_ref
+        }
         _ => {
-            // No existing /AcroForm (or a direct one — replace with an
-            // indirect empty dict). The direct-case fallback would silently
-            // drop the pre-existing direct /AcroForm; for pre-v1.0 we treat
-            // "no /AcroForm" as the sole supported starting point (fxo-red).
+            // No /AcroForm (or a non-dict value): install a fresh empty one.
             let mut af = crate::Dictionary::new();
             af.insert("Fields", Object::Array(Vec::new()));
             let af_ref = allocate_next_ref(dest)?;
@@ -945,9 +953,12 @@ pub(crate) fn add_and_rename_form_fields<R: Read + Seek>(
     }
 
     // BFS the new top fields, renaming /T on FQN collision (`+N` suffix).
-    // `renames` maps an OLD fully-qualified name to the suffix to append —
-    // reuse across all fields in the same rename group (qpdf line 84-95).
-    let mut renames: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    // Every field re-runs the collision check against the live `existing_fqns`
+    // set (which is updated per-field below), so two independently-copied
+    // fields that happen to share the same source FQN each pick a distinct
+    // suffix instead of colliding in the dest AcroForm. A cache keyed by
+    // old_fqn would produce the same suffix for both and re-introduce the
+    // collision.
     let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut queue: std::collections::VecDeque<ObjectRef> = new_top_fields.iter().copied().collect();
     while let Some(field_ref) = queue.pop_front() {
@@ -970,9 +981,7 @@ pub(crate) fn add_and_rename_form_fields<R: Read + Seek>(
         };
         if has_t {
             let old_fqn = fully_qualified_name_of(dest, field_ref)?;
-            let append = if let Some(existing) = renames.get(&old_fqn) {
-                existing.clone()
-            } else {
+            let append = {
                 let mut candidate_fqn = old_fqn.clone();
                 let mut suffix = 0u32;
                 let mut append = Vec::new();
@@ -984,7 +993,6 @@ pub(crate) fn add_and_rename_form_fields<R: Read + Seek>(
                     candidate_fqn = old_fqn.clone();
                     candidate_fqn.extend_from_slice(&append);
                 }
-                renames.insert(old_fqn.clone(), append.clone());
                 append
             };
             if !append.is_empty() {
