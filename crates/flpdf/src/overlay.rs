@@ -1515,6 +1515,41 @@ mod byte_gate {
         assert_byte_identical(&actual, "overlay-copy-annotations.pdf");
     }
 
+    /// Underlay counterpart of the primary copy-annotations byte gate.
+    /// Same fixture (fxo-red + form-fields-and-annotations, --repeat=1),
+    /// same expected annotation copy behaviour (qpdf's
+    /// `doUnderOverlayForPage` shares the codepath for both kinds and
+    /// differs only in the content-stream placement order), but exercises
+    /// [`apply_overlay_specs`]'s underlay branch and the accompanying
+    /// [`apply_placement`] call inside it — the mirror of the overlay
+    /// branch already covered above.
+    #[test]
+    fn underlay_copy_annotations_fxo_red_repeat1_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src = fixture("form-fields-and-annotations.pdf");
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Underlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            ..Default::default()
+        };
+        let mut actual = Vec::new();
+        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        assert_byte_identical(&actual, "underlay-copy-annotations.pdf");
+    }
+
     fn overlay_one_page_to1_3_repeat1_is_byte_identical() {
         // dest=three-page, overlay source=one-page, --to=1-3 --repeat=1: every
         // dest page is selected and the single source page cycles via --repeat,
