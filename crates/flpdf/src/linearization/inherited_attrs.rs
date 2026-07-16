@@ -551,10 +551,18 @@ fn is_rectangle<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<&Object>) -> Res
             Object::Reference(r) => {
                 let terminal = terminal_ref_of_chain(pdf, *r)?;
                 let resolved = pdf.resolve_borrowed(terminal)?;
+                // cov:ignore-start: rustfmt reflow of the `matches!` macro
+                // parks the opening `matches!(` on its own line, and llvm-cov
+                // instruments the invocation head separately from its arms;
+                // the arms record hits (DA:555+, exercised by
+                // `indirect_real_literal_mediabox_elem_is_recognized_...`)
+                // but the head line always shows zero. Same behavior in
+                // similar multi-line `matches!` sites across the crate.
                 matches!(
                     resolved,
                     Object::Integer(_) | Object::Real(_) | Object::RealLiteral { .. }
                 )
+                // cov:ignore-end
             }
             _ => false,
         };
@@ -3382,7 +3390,7 @@ mod tests {
         assert!(
             matches!(items.get(3), Some(Object::Reference(_))),
             "expected /MediaBox[3] to remain an indirect reference, got {:?}",
-            items.get(3)
+            items.get(3) // cov:ignore: format arg only evaluated on assert failure
         );
     }
 

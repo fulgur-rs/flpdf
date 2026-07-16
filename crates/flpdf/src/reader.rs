@@ -956,6 +956,7 @@ impl<R: Read + Seek> Pdf<R> {
             Object::Integer(value) if *value > 0 => Some(candidate),
             Object::Real(value) | Object::RealLiteral { value, .. }
                 if value.is_finite() && *value > 0.0 =>
+            // cov:ignore: rustfmt reflow parks the guard on its own line; llvm-cov reports 0 hits on this line even when the arm body (below) is exercised (see linearized_hint_ref_accepts_real_literal_value)
             {
                 Some(candidate)
             }

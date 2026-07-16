@@ -516,7 +516,10 @@ fn real_literal_is_safe(literal: &[u8], value: f64) -> bool {
         return false;
     }
     let Ok(text) = std::str::from_utf8(literal) else {
-        return false;
+        return false; // cov:ignore: unreachable — the charset check above
+                      // accepts only ASCII digits, `.`, `+`, `-`, `e`, `E`,
+                      // all of which are single-byte UTF-8, so any literal
+                      // that passes the charset check is valid UTF-8.
     };
     match text.parse::<f64>() {
         Ok(parsed) => parsed.to_bits() == value.to_bits(),
@@ -1005,6 +1008,16 @@ mod real_literal_tests {
         assert!(real_literal_is_safe(b"1.", 1.0));
         assert!(real_literal_is_safe(b"+.25", 0.25));
         assert!(real_literal_is_safe(b"1e3", 1000.0));
+    }
+
+    /// A byte sequence that passes the charset check but does NOT parse to a
+    /// valid f64 (`b"e"` is a lone exponent marker) must fall through to
+    /// the `Err(_) => false` arm.
+    #[test]
+    fn is_safe_rejects_charset_ok_but_unparseable() {
+        assert!(!real_literal_is_safe(b"e", 0.0));
+        assert!(!real_literal_is_safe(b"1e", 0.0));
+        assert!(!real_literal_is_safe(b"-.", 0.0));
     }
 }
 

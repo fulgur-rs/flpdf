@@ -910,14 +910,12 @@ mod tests {
     #[test]
     fn check_linearization_accepts_real_literal_linearized_value() {
         let pdf = linearization_like_pdf_with_real_literal_linearized();
-        let result = check_linearization_bytes(&pdf);
-        match result {
-            Err(LinearizationCheckError::NotLinearized) => {
-                panic!("RealLiteral /Linearized must not be rejected as NotLinearized");
-            }
-            Err(_) => { /* expected: downstream check fails on the stub fixture */ }
-            Ok(()) => panic!("stub fixture cannot satisfy a full linearization check"),
-        }
+        let err = check_linearization_bytes(&pdf)
+            .expect_err("stub fixture cannot satisfy a full linearization check"); // cov:ignore: expect_err panic branch only fires on unexpected Ok
+        assert!(
+            !matches!(err, LinearizationCheckError::NotLinearized),
+            "RealLiteral /Linearized must not be rejected as NotLinearized (got {err:?})" // cov:ignore: format arg only evaluated on assert failure
+        );
     }
 
     // -----------------------------------------------------------------------
