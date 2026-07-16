@@ -954,12 +954,13 @@ impl<R: Read + Seek> Pdf<R> {
 
         Ok(match linearized {
             Object::Integer(value) if *value > 0 => Some(candidate),
+            // cov:ignore-start: rustfmt parks the match-arm guard on its own line, and llvm-cov instruments the guard head separately from the arm body — the body IS exercised (see linearized_hint_ref_accepts_real_literal_value) but the guard-only line always shows zero hits.
             Object::Real(value) | Object::RealLiteral { value, .. }
                 if value.is_finite() && *value > 0.0 =>
-            // cov:ignore: rustfmt reflow parks the guard on its own line; llvm-cov reports 0 hits on this line even when the arm body (below) is exercised (see linearized_hint_ref_accepts_real_literal_value)
             {
                 Some(candidate)
             }
+            // cov:ignore-end
             Object::Boolean(value) if *value => Some(candidate),
             _ => None,
         })
