@@ -22,8 +22,9 @@
 #                  Stacked PRs pass the parent branch.
 #   --lcov <path>  Reuse an existing lcov report instead of running coverage
 #                  (skips the slow instrumented rebuild). Without it, the script
-#                  runs `cargo llvm-cov --workspace --lcov`. The report MUST come
-#                  from the current commit; a stale report can mismeasure.
+#                  runs `cargo llvm-cov --workspace --features qpdf-zlib-compat
+#                  --ignore-run-fail --lcov`. The report MUST come from the
+#                  current commit; a stale report can mismeasure.
 #   --allow-dirty  Proceed on a dirty working tree (default: error). Coverage
 #                  measures the tree but the gate diffs HEAD, so a dirty tree can
 #                  produce a false pass — only override when you know it aligns.
@@ -77,10 +78,23 @@ if [[ -z "$LCOV" ]]; then
   # Fresh, whole-workspace measurement: a gated file absent from the report is
   # genuinely non-executable. A user-supplied --lcov may be stale, so that case
   # is checked (see LCOV_MODE below).
+  #
+  # We enable `qpdf-zlib-compat` because the byte-identical byte_gate tests are
+  # gated on that feature; without it, most of the byte-parity plumbing (e.g.
+  # `overlay::byte_gate`, `overlay_annotations`) is exercised by nothing that
+  # runs under `cargo test`, and coverage under-reports catastrophically
+  # (600+ false-positive uncovered lines on flpdf-9hc.34).
+  #
+  # We pass `--ignore-run-fail` so a single pre-existing baseline miss (e.g.
+  # `flpdf-hdsz`: `compat_baseline_static_id::static_id_baseline` on
+  # `attachment-two-page.pdf`) does not block the whole coverage run — the
+  # gate is the changed-line diff, not the overall test outcome, and other
+  # workflows already run the full test suite with a proper pass/fail gate.
   LCOV_MODE="fresh"
   LCOV="target/patch-cov.lcov"
-  echo "[patch-coverage] running 'cargo llvm-cov --workspace' (slow; pass --lcov <path> to reuse a report)..." >&2
-  cargo llvm-cov --workspace --lcov --output-path "$LCOV" >&2
+  echo "[patch-coverage] running 'cargo llvm-cov --workspace --features qpdf-zlib-compat --ignore-run-fail' (slow; pass --lcov <path> to reuse a report)..." >&2
+  cargo llvm-cov --workspace --features qpdf-zlib-compat --ignore-run-fail \
+    --lcov --output-path "$LCOV" >&2
 else
   LCOV_MODE="reused"
   # Line-level staleness of an arbitrary report cannot be detected from lcov
