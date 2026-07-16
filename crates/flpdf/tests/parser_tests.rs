@@ -35,16 +35,24 @@ fn parses_real_numbers() {
         panic!("expected array")
     };
 
+    // Non-canonical source literals (leading dot, trailing dot, explicit `+`,
+    // scientific notation) round-trip through [`Object::RealLiteral`] which
+    // preserves the source bytes verbatim; canonical forms (`595.28`,
+    // `841.89`, `-0.5`, `-1.5`) stay as [`Object::Real`].
+    let lit = |v: f64, s: &[u8]| Object::RealLiteral {
+        value: v,
+        literal: s.to_vec(),
+    };
     assert_eq!(values[0], Object::Integer(0));
     assert_eq!(values[1], Object::Integer(0));
     assert_eq!(values[2], Object::Real(595.28));
     assert_eq!(values[3], Object::Real(841.89));
     assert_eq!(values[4], Object::Real(-0.5));
-    assert_eq!(values[5], Object::Real(0.75));
-    assert_eq!(values[6], Object::Real(1.0));
-    assert_eq!(values[7], Object::Real(0.25));
+    assert_eq!(values[5], lit(0.75, b".75"));
+    assert_eq!(values[6], lit(1.0, b"1."));
+    assert_eq!(values[7], lit(0.25, b"+.25"));
     assert_eq!(values[8], Object::Real(-1.5));
-    assert_eq!(values[9], Object::Real(1000.0));
+    assert_eq!(values[9], lit(1000.0, b"1e3"));
 }
 
 #[test]

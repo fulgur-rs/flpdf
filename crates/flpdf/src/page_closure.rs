@@ -171,6 +171,7 @@ fn collect_refs_in_object(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) 
         | Object::Boolean(_)
         | Object::Integer(_)
         | Object::Real(_)
+        | Object::RealLiteral { .. }
         | Object::Name(_)
         | Object::String(_) => {}
     }

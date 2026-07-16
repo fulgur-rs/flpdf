@@ -736,7 +736,7 @@ fn parse_rect_array(arr: &[Object], key: &[u8]) -> Result<PageBox> {
     for (i, elem) in arr.iter().take(4).enumerate() {
         coords[i] = match elem {
             Object::Integer(n) => *n as f64,
-            Object::Real(r) => *r,
+            Object::Real(r) | Object::RealLiteral { value: r, .. } => *r,
             other => {
                 return Err(Error::Unsupported(format!(
                     "/{} rectangle element {i} has type {} (expected number)",
@@ -754,7 +754,7 @@ fn object_type_name(obj: &Object) -> &'static str {
         Object::Null => "null",
         Object::Boolean(_) => "boolean",
         Object::Integer(_) => "integer",
-        Object::Real(_) => "real",
+        Object::Real(_) | Object::RealLiteral { .. } => "real",
         Object::Name(_) => "name",
         Object::String(_) => "string",
         Object::Array(_) => "array",

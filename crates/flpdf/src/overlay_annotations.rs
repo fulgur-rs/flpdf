@@ -198,11 +198,10 @@ fn top_level_field_for_annot<R: Read + Seek>(
         };
         let is_widget = matches!(
             dict.get("Subtype"),
-            Some(Object::Name(name)) if name.as_slice() == b"Widget"
+            Some(Object::Name(name)) if name == b"Widget"
         );
-        let is_field = dict.get("T").is_some()
-            || dict.get("FT").is_some()
-            || dict.get("Kids").is_some();
+        let is_field =
+            dict.get("T").is_some() || dict.get("FT").is_some() || dict.get("Kids").is_some();
         let parent_ref = dict.get_ref("Parent");
         (is_widget, is_field, parent_ref)
     };
@@ -360,17 +359,13 @@ pub(crate) fn apply_placement<R: Read + Seek>(
 
     for (dest_annot_ref, dest_top_field) in &template.annots {
         // 1. Duplicate the field tree (top → kids) into per-placement copies,
-        //    patching /Parent back-pointers. If the widget IS the field (self-
-        //    field), the annot ref equals the top-level ref, so this call also
-        //    dups the annot as a side effect.
+        //    patching /Parent back-pointers and resetting field /DR (top and
+        //    every kid, matching qpdf's per-BFS-iteration line 928-930). If
+        //    the widget IS the field (self-field), the annot ref equals the
+        //    top-level ref, so this call also dups the annot as a side effect.
         let new_top_field_ref = if let Some(top_ref) = dest_top_field {
-            let new_top = duplicate_field_tree(dest, *top_ref, &mut per_placement_dup)?;
-            // Reset field-level /DR to the dest AcroForm /DR (foreign case
-            // only — qpdf transformAnnotations line 928). If dest has no /DR
-            // (e.g. source also had none), leave the field's /DR alone.
-            if let Some(dr) = *dest_acroform_dr {
-                clear_or_set_field_dr(dest, new_top, dr, &per_placement_dup)?;
-            }
+            let new_top =
+                duplicate_field_tree(dest, *top_ref, &mut per_placement_dup, *dest_acroform_dr)?;
             if added_top_field_set.insert(new_top) {
                 new_top_fields.push(new_top);
             }
@@ -445,10 +440,17 @@ fn allocate_next_ref<R: Read + Seek>(dest: &Pdf<R>) -> Result<ObjectRef> {
 /// The dup of `top_ref` is added to `per_placement_dup` first, then kids are
 /// discovered by reading each dup's `/Kids`; any kid that is not yet in the
 /// map is dup'd and enqueued.
+///
+/// If `dest_dr` is `Some`, every field visited in the BFS has its `/DR` reset
+/// to that ref (qpdf transformAnnotations line 928-930 — inside the BFS, so
+/// both the top-level field and every kid receive the reset). Radio button
+/// kids are self-field annotations and each carry an inline `/DR` in the
+/// source, so kid-level reset is required for parity.
 fn duplicate_field_tree<R: Read + Seek>(
     dest: &mut Pdf<R>,
     top_ref: ObjectRef,
     per_placement_dup: &mut BTreeMap<ObjectRef, ObjectRef>,
+    dest_dr: Option<ObjectRef>,
 ) -> Result<ObjectRef> {
     let new_top = match per_placement_dup.get(&top_ref) {
         Some(&existing) => return Ok(existing),
@@ -518,30 +520,21 @@ fn duplicate_field_tree<R: Read + Seek>(
             }
         }
 
+        // Reset field-level /DR to the dest /AcroForm/DR ref (qpdf
+        // transformAnnotations line 928-930). Runs for every visited node
+        // (top-level field and every kid), matching qpdf's per-iteration BFS
+        // reset — required for radio button kids that carry inline /DR in the
+        // source.
+        if let Some(dr) = dest_dr {
+            if dict.get("DR").is_some() {
+                dict.insert("DR", Object::Reference(dr));
+            }
+        }
+
         dest.set_object(dup_ref, Object::Dictionary(dict));
     }
 
     Ok(new_top)
-}
-
-/// If the field at `field_ref` has a `/DR` entry, replace it with a reference
-/// to the destination `/AcroForm/DR` (qpdf transformAnnotations line 928-930).
-/// A field without `/DR` is left untouched.
-fn clear_or_set_field_dr<R: Read + Seek>(
-    dest: &mut Pdf<R>,
-    field_ref: ObjectRef,
-    dest_dr: ObjectRef,
-    _per_placement_dup: &BTreeMap<ObjectRef, ObjectRef>,
-) -> Result<()> {
-    let Some(mut dict) = dest.resolve(field_ref)?.into_dict() else {
-        return Ok(());
-    };
-    if dict.get("DR").is_none() {
-        return Ok(());
-    }
-    dict.insert("DR", Object::Reference(dest_dr));
-    dest.set_object(field_ref, Object::Dictionary(dict));
-    Ok(())
 }
 
 /// Duplicate each `/AP` appearance stream referenced from the annot at
@@ -582,11 +575,11 @@ fn transform_annot_ap_streams<R: Read + Seek>(
                 let mut sub = sub;
                 let sub_keys: Vec<Vec<u8>> = sub.iter().map(|(k, _)| k.to_vec()).collect();
                 for sub_key in sub_keys {
-                    let Some(sub_val) = sub.get(&sub_key).cloned() else { continue };
+                    let Some(sub_val) = sub.get(&sub_key).cloned() else {
+                        continue;
+                    };
                     if let Object::Reference(stream_ref) = sub_val {
-                        if let Some(new_ref) =
-                            dup_and_transform_ap_stream(dest, stream_ref, cm)?
-                        {
+                        if let Some(new_ref) = dup_and_transform_ap_stream(dest, stream_ref, cm)? {
                             sub.insert(&sub_key, Object::Reference(new_ref));
                         }
                     }
@@ -641,7 +634,7 @@ fn read_matrix_array(dict: &crate::Dictionary, key: &[u8]) -> Option<[f64; 6]> {
     for (i, item) in arr.iter().enumerate() {
         out[i] = match item {
             Object::Integer(n) => *n as f64,
-            Object::Real(x) => *x,
+            Object::Real(x) | Object::RealLiteral { value: x, .. } => *x,
             _ => return None,
         };
     }
@@ -667,13 +660,12 @@ fn matrix_to_object(m: [f64; 6]) -> Object {
 /// `%.6f + strip` is by construction for values expressible in ≤6 decimal
 /// places), the writer's later `f64::to_string` returns the same bytes.
 fn qpdf_real(v: f64) -> Object {
-    let mut s = format!("{v:.6}");
-    // Normalize "-0.000000" (and any trim path leading to "-0") to "0".
-    if s == "-0.000000" {
-        s = "0".to_string();
-    }
-    let trimmed = s.trim_end_matches('0').trim_end_matches('.').to_string();
-    // Fall back to 0 for pathological parse failure (unreachable for %.6f).
+    let s = format!("{v:.6}");
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    // Preserve signed-zero: qpdf's QUtil::double_to_string(-0.0, 6, true)
+    // yields "-0" (via `printf %.6f` → "-0.000000" → trim → "-0"). Rust's
+    // f64::to_string on -0.0 also yields "-0", so a round-trip through parse
+    // preserves the sign bit and the writer emits the same "-0" byte.
     let rounded: f64 = trimmed.parse().unwrap_or(0.0);
     Object::Real(rounded)
 }
@@ -798,17 +790,22 @@ fn append_page_annots<R: Read + Seek>(
 }
 
 /// Lazy-initialize the destination `/AcroForm/DR`. If dest has no `/AcroForm`,
-/// create one; the new `/DR` is set to point at the (already dest-space)
-/// `source_dr` copied by the batch cross-doc copy. Returns the ref of the
-/// dest `/DR` (whether newly-created or previously present).
+/// create one; the new `/DR` is a FRESH indirect object whose contents are
+/// merged from the (already dest-space) `source_dr` via [`merge_resources_shallow`].
+/// Returns the ref of the dest `/DR` (whether newly-created or previously
+/// present).
 ///
-/// For the primary target (fxo-red has no /AcroForm), this creates:
-///   dest_acroform = { /Fields [] /DR <source_dr_ref> }
+/// This matches qpdf transformAnnotations line 780-800 (init_dr_map): dest
+/// `/AcroForm/DR` is a new object, and `source_dr` is preserved as a SEPARATE
+/// object reachable via appearance-stream `/Resources` references — so the
+/// dest ends up with two byte-identical `/DR`-shaped objects (dest_dr for
+/// `/AcroForm/DR`, source_dr for AP stream `/Resources`). See qpdf golden
+/// `overlay-copy-annotations.pdf` obj 4 (dest_dr) and obj 344 (source_dr copy).
 ///
-/// For a dest that already has an /AcroForm, `/DR` merge conflicts are NOT
-/// resolved here — that's the `dr_map` path (adjustAppearanceStream, dormant
-/// for the primary target). A future extension when a real fixture requires
-/// it will add the merge.
+/// For a dest that already has an /AcroForm and /DR, this is a first-wins
+/// no-op — a full merge with conflict remapping (`dr_map` +
+/// `adjustAppearanceStream`) is dormant for the primary target and out of
+/// scope until a fixture exercises it.
 fn ensure_dest_acroform_dr<R: Read + Seek>(
     dest: &mut Pdf<R>,
     source_dr: ObjectRef,
@@ -831,21 +828,15 @@ fn ensure_dest_acroform_dr<R: Read + Seek>(
             // indirect empty dict). The direct-case fallback would silently
             // drop the pre-existing direct /AcroForm; for pre-v1.0 we treat
             // "no /AcroForm" as the sole supported starting point (fxo-red).
-            let mut dict = crate::Dictionary::new();
-            dict.insert("Fields", Object::Array(Vec::new()));
-            dict.insert("DR", Object::Reference(source_dr));
-            let new_ref = allocate_next_ref(dest)?;
-            dest.set_object(new_ref, Object::Dictionary(dict));
-            catalog.insert("AcroForm", Object::Reference(new_ref));
+            let mut af = crate::Dictionary::new();
+            af.insert("Fields", Object::Array(Vec::new()));
+            let af_ref = allocate_next_ref(dest)?;
+            dest.set_object(af_ref, Object::Dictionary(af));
+            catalog.insert("AcroForm", Object::Reference(af_ref));
             dest.set_object(root_ref, Object::Dictionary(catalog));
-            return Ok(source_dr);
+            af_ref
         }
     };
-    // Existing /AcroForm: ensure /DR is present. Merging into a pre-existing
-    // /DR is out of scope for the primary target (dormant per advisor #3);
-    // if /DR is absent, install source_dr; if present, leave it (the caller
-    // won't call this unless template.source_dr is Some, but two specs might
-    // race — first wins).
     let mut acroform_dict = match dest.resolve(acroform_ref)?.into_dict() {
         Some(d) => d,
         None => {
@@ -854,16 +845,76 @@ fn ensure_dest_acroform_dr<R: Read + Seek>(
             ))
         }
     };
-    let existing_dr = acroform_dict.get_ref("DR");
-    let dr_ref = match existing_dr {
-        Some(r) => r,
-        None => {
-            acroform_dict.insert("DR", Object::Reference(source_dr));
-            dest.set_object(acroform_ref, Object::Dictionary(acroform_dict));
-            source_dr
-        }
-    };
+    if let Some(existing) = acroform_dict.get_ref("DR") {
+        return Ok(existing);
+    }
+    // Allocate a fresh /DR object, merge source_dr's contents into it, and
+    // wire dest /AcroForm to point at it.
+    let dr_ref = allocate_next_ref(dest)?;
+    dest.set_object(dr_ref, Object::Dictionary(crate::Dictionary::new()));
+    merge_resources_shallow(dest, dr_ref, source_dr)?;
+    acroform_dict.insert("DR", Object::Reference(dr_ref));
+    dest.set_object(acroform_ref, Object::Dictionary(acroform_dict));
     Ok(dr_ref)
+}
+
+/// Merge `source_dr`'s resource entries into the (existing, initially-empty)
+/// dict at `dest_dr`. Mirrors qpdf's `QPDFObjectHandle::mergeResources` for
+/// the "dest starts empty" path (the only path exercised by the primary
+/// target fxo-red, which has no /AcroForm).
+///
+/// For each top-level key (resource type: /Font, /XObject, /ColorSpace, ...),
+/// the source's sub-dictionary is copied into a NEW direct dict in dest so
+/// dest_dr and source_dr do not share mutable sub-dict state. Individual
+/// resource entries (e.g. `/F1 8 0 R`) are shallow-cloned — they are typically
+/// refs, so the clone is cheap and the dest and source paths continue to
+/// share the underlying font/xobject objects (as qpdf does).
+///
+/// Conflict handling (dest already has a key with a different ref) is NOT
+/// implemented — that's the `dr_map` path that would drive
+/// `adjustAppearanceStream`. Dormant for the primary target; extend when a
+/// fixture requires it.
+fn merge_resources_shallow<R: Read + Seek>(
+    dest: &mut Pdf<R>,
+    dest_dr: ObjectRef,
+    source_dr: ObjectRef,
+) -> Result<()> {
+    let Some(src_dict) = dest.resolve(source_dr)?.into_dict() else {
+        return Ok(());
+    };
+    let Some(mut dest_dict) = dest.resolve(dest_dr)?.into_dict() else {
+        return Ok(());
+    };
+    for (type_key, src_type_val) in src_dict.iter() {
+        // Resolve the resource-type entry (e.g. /Font). It's typically a
+        // direct sub-dict in a /DR, but PDF also permits an indirect ref.
+        let src_type_dict = match src_type_val {
+            Object::Dictionary(d) => d.clone(),
+            Object::Reference(r) => match dest.resolve(*r)? {
+                Object::Dictionary(d) => d,
+                // Non-dictionary /Font, /XObject, etc. — leave as-is by
+                // ref-copy; qpdf's mergeResources would also skip such
+                // malformed entries.
+                other => {
+                    dest_dict.insert(type_key, other);
+                    continue;
+                }
+            },
+            other => {
+                dest_dict.insert(type_key, other.clone());
+                continue;
+            }
+        };
+        // Copy each resource entry into a fresh direct sub-dict so dest_dr's
+        // sub-dict is independent of source_dr's sub-dict.
+        let mut new_type_dict = crate::Dictionary::new();
+        for (name, val) in src_type_dict.iter() {
+            new_type_dict.insert(name, val.clone());
+        }
+        dest_dict.insert(type_key, Object::Dictionary(new_type_dict));
+    }
+    dest.set_object(dest_dr, Object::Dictionary(dest_dict));
+    Ok(())
 }
 
 /// After every placement on a destination page has been applied, add the
@@ -958,7 +1009,9 @@ pub(crate) fn add_and_rename_form_fields<R: Read + Seek>(
                 append
             };
             if !append.is_empty() {
-                let Some(mut dict) = dest.resolve(field_ref)?.into_dict() else { continue };
+                let Some(mut dict) = dest.resolve(field_ref)?.into_dict() else {
+                    continue;
+                };
                 let old_t = match dict.get("T").cloned() {
                     Some(Object::String(s)) => s,
                     Some(_) => Vec::new(),

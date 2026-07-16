@@ -143,6 +143,21 @@ pub enum Object {
     Boolean(bool),
     Integer(i64),
     Real(f64),
+    /// A real parsed from the source whose original literal bytes cannot be
+    /// reproduced by `value.to_string()` alone — for example, `.4` (leading
+    /// zero dropped) or `0.400` (trailing zeros). Preserving the literal is
+    /// required for qpdf byte-identical parity, because qpdf's `QPDF_Real`
+    /// stores the source string and re-emits it verbatim; flpdf must do the
+    /// same for objects it rebuilds through the Object model. Objects that
+    /// flpdf *computes* (e.g. matrices via `qpdf_real`) use plain `Real(f64)`
+    /// and are formatted by `f64::to_string`.
+    ///
+    /// Invariant: `literal.parse::<f64>() == Ok(value)` and
+    /// `literal != value.to_string()` (otherwise `Real(value)` is used).
+    RealLiteral {
+        value: f64,
+        literal: Vec<u8>,
+    },
     Name(Vec<u8>),
     String(Vec<u8>),
     Array(Vec<Object>),
@@ -229,10 +244,11 @@ impl Object {
         }
     }
 
-    /// Return this object as a real number, if it is [`Object::Real`].
+    /// Return this object as a real number, if it is [`Object::Real`] or
+    /// [`Object::RealLiteral`].
     pub fn as_real(&self) -> Option<f64> {
         match self {
-            Object::Real(value) => Some(*value),
+            Object::Real(value) | Object::RealLiteral { value, .. } => Some(*value),
             _ => None,
         }
     }
@@ -369,6 +385,7 @@ impl Object {
             }
             Object::Integer(value) => out.extend_from_slice(value.to_string().as_bytes()),
             Object::Real(value) => out.extend_from_slice(value.to_string().as_bytes()),
+            Object::RealLiteral { literal, .. } => out.extend_from_slice(literal),
             Object::Name(name) => {
                 out.push(b'/');
                 write_name_escaped(out, name);
@@ -478,11 +495,14 @@ fn push_spaces(out: &mut Vec<u8>, n: usize) {
 /// `Object::Name` always holds *decoded* bytes (the parser unescapes
 /// `#XX` on read — see `Parser::name`), so escaping on write keeps the
 /// read/write pair symmetric: `Name(b"application/pdf")` serializes to
-/// `/application#2Fpdf` and round-trips back to `application/pdf`.
+/// `/application#2fpdf` and round-trips back to `application/pdf`.
 /// Conventional names (`Type`, `Page`, `FlateDecode`, …) contain no
 /// escapable bytes, so their output is byte-identical to before.
 pub(crate) fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    // Lowercase hex to match qpdf's `QUtil::hex_encode_char`
+    // (libqpdf/include/qpdf/QUtil.hh:540, `"0123456789abcdef"`), which is used
+    // by `QPDF_Name::normalizeName` (libqpdf/QPDF_Name.cc:43).
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     for &b in raw {
         let needs_escape = !(0x21..=0x7E).contains(&b)
             || matches!(
@@ -852,7 +872,7 @@ mod qdf_key_escape_tests {
         d.write_pdf_qdf(&mut out, 0);
         let s = String::from_utf8(out).unwrap();
         assert!(
-            s.contains("/A#20B#23C#2FD#80E 1"),
+            s.contains("/A#20B#23C#2fD#80E 1"),
             "key not escaped in QDF output: {s:?}"
         );
         // No raw delimiter/space leaked into the name token.

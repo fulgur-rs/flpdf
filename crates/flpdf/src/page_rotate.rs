@@ -387,7 +387,7 @@ fn object_to_pagebox(obj: &Object) -> Option<PageBox> {
     for (i, e) in a.iter().enumerate() {
         v[i] = match e {
             Object::Integer(n) => *n as f64,
-            Object::Real(r) => *r,
+            Object::Real(r) | Object::RealLiteral { value: r, .. } => *r,
             _ => return None,
         };
     }

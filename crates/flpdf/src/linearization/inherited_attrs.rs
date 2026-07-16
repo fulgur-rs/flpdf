@@ -547,11 +547,14 @@ fn is_rectangle<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<&Object>) -> Res
     // — so each element's indirect chain is resolved here as well.
     for e in &items {
         let is_num = match e {
-            Object::Integer(_) | Object::Real(_) => true,
+            Object::Integer(_) | Object::Real(_) | Object::RealLiteral { .. } => true,
             Object::Reference(r) => {
                 let terminal = terminal_ref_of_chain(pdf, *r)?;
                 let resolved = pdf.resolve_borrowed(terminal)?;
-                matches!(resolved, Object::Integer(_) | Object::Real(_))
+                matches!(
+                    resolved,
+                    Object::Integer(_) | Object::Real(_) | Object::RealLiteral { .. }
+                )
             }
             _ => false,
         };
@@ -3305,13 +3308,20 @@ mod tests {
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
+        // Fixture bytes are "0.0"/"612.0"/"792.0" — non-canonical for f64
+        // (Rust's shortest-roundtrip yields "0", "612", "792") — so the parser
+        // preserves the source literal via [`Object::RealLiteral`].
+        let real_lit = |v: f64, s: &[u8]| Object::RealLiteral {
+            value: v,
+            literal: s.to_vec(),
+        };
         assert_eq!(
             leaf_dict.get("MediaBox"),
             Some(&Object::Array(vec![
-                Object::Real(0.0),
-                Object::Real(0.0),
-                Object::Real(612.0),
-                Object::Real(792.0),
+                real_lit(0.0, b"0.0"),
+                real_lit(0.0, b"0.0"),
+                real_lit(612.0, b"612.0"),
+                real_lit(792.0, b"792.0"),
             ])),
             "a /MediaBox of four Real values is a valid rectangle and must be left \
              unchanged (no default)"

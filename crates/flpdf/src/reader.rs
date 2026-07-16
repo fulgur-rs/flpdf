@@ -954,7 +954,11 @@ impl<R: Read + Seek> Pdf<R> {
 
         Ok(match linearized {
             Object::Integer(value) if *value > 0 => Some(candidate),
-            Object::Real(value) if value.is_finite() && *value > 0.0 => Some(candidate),
+            Object::Real(value) | Object::RealLiteral { value, .. }
+                if value.is_finite() && *value > 0.0 =>
+            {
+                Some(candidate)
+            }
             Object::Boolean(value) if *value => Some(candidate),
             _ => None,
         })

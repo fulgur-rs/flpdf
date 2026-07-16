@@ -1485,6 +1485,7 @@ fn decrypt_strings_in_value(
         | Object::Boolean(_)
         | Object::Integer(_)
         | Object::Real(_)
+        | Object::RealLiteral { .. }
         | Object::Name(_)
         | Object::Reference(_) => Ok(()),
     }
@@ -1741,6 +1742,7 @@ where
         | Object::Boolean(_)
         | Object::Integer(_)
         | Object::Real(_)
+        | Object::RealLiteral { .. }
         | Object::Name(_)
         | Object::Reference(_) => Ok(()),
     }

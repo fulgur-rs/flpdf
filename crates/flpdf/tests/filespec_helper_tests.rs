@@ -854,7 +854,7 @@ fn builder_params_date_format_is_pdf_date() {
 ///
 /// This guards the serializer's name-escaping: `Object::Name` holds
 /// decoded bytes, so `application/pdf` must be written as
-/// `/application#2Fpdf` and decoded back on read. Without escaping the
+/// `/application#2fpdf` and decoded back on read. Without escaping the
 /// `/` would split the name token and corrupt `/Subtype`.
 #[test]
 fn builder_mimetype_with_slash_round_trips_through_pdf_serialization() {
@@ -872,10 +872,10 @@ fn builder_mimetype_with_slash_round_trips_through_pdf_serialization() {
 
     // The escaped name must appear literally in the byte stream, and the
     // unescaped form must NOT (which would mean the `/` split the token).
-    let needle = b"/application#2Fpdf";
+    let needle = b"/application#2fpdf";
     assert!(
         serialized.windows(needle.len()).any(|w| w == needle),
-        "serialized PDF must contain escaped /Subtype name /application#2Fpdf"
+        "serialized PDF must contain escaped /Subtype name /application#2fpdf"
     );
 
     // Reopen the serialized bytes and read /Subtype back.

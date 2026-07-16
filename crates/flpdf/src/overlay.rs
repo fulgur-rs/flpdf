@@ -26,9 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
-use crate::page_form_xobject::{
-    page_to_form_xobject, read_page_transform, transformation_matrix,
-};
+use crate::page_form_xobject::{page_to_form_xobject, read_page_transform, transformation_matrix};
 use crate::page_object_helper::{PageBox, PageObjectHelper};
 use crate::page_range::PageRange;
 use crate::pages::page_refs;
@@ -533,8 +531,7 @@ where
     let mut surveys: Vec<Option<crate::overlay_annotations::AnnotationSurvey>> =
         Vec::with_capacity(source_refs.len());
     for &page_ref in &source_refs {
-        let xobject_ref =
-            crate::page_form_xobject::page_to_form_xobject(source, page_ref)?;
+        let xobject_ref = crate::page_form_xobject::page_to_form_xobject(source, page_ref)?;
         union.extend(crate::page_form_xobject::xobject_object_closure(
             source,
             xobject_ref,
@@ -559,24 +556,27 @@ where
             })
         })
         .collect::<Result<_>>()?;
-    let imported: BTreeMap<u32, (ObjectRef, Option<crate::overlay_annotations::AnnotationCopyTemplate>)> =
-        distinct_sources
-            .iter()
-            .copied()
-            .zip(
-                imported_xobject_refs
-                    .into_iter()
-                    .zip(surveys.into_iter())
-                    .map(|(xr, sv)| {
-                        (
-                            xr,
-                            sv.map(|s| {
-                                crate::overlay_annotations::template_from_survey(&s, &map)
-                            }),
-                        )
-                    }),
-            )
-            .collect();
+    let imported: BTreeMap<
+        u32,
+        (
+            ObjectRef,
+            Option<crate::overlay_annotations::AnnotationCopyTemplate>,
+        ),
+    > = distinct_sources
+        .iter()
+        .copied()
+        .zip(
+            imported_xobject_refs
+                .into_iter()
+                .zip(surveys.into_iter())
+                .map(|(xr, sv)| {
+                    (
+                        xr,
+                        sv.map(|s| crate::overlay_annotations::template_from_survey(&s, &map)),
+                    )
+                }),
+        )
+        .collect();
 
     Ok(pairs
         .iter()
@@ -1486,9 +1486,6 @@ mod byte_gate {
     // single source page is repeated onto every dest page, the +N rename path
     // fires from placement 2 onward (r1..r1+15, "Text Box 1"..+15, etc.).
     #[test]
-    #[ignore = "flpdf-9hc.34 work-in-progress; the annotation copy phase is\
-        being built up incrementally. Enable once the byte gate is expected\
-        to hold."]
     fn overlay_copy_annotations_fxo_red_repeat1_is_byte_identical_qdf() {
         let mut dest = fixture("fxo-red.pdf");
         let mut src = fixture("form-fields-and-annotations.pdf");

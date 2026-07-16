@@ -486,7 +486,7 @@ fn object_type_name(obj: &Object) -> &'static str {
         Object::Null => "null",
         Object::Boolean(_) => "boolean",
         Object::Integer(_) => "integer",
-        Object::Real(_) => "real",
+        Object::Real(_) | Object::RealLiteral { .. } => "real",
         Object::Name(_) => "name",
         Object::String(_) => "string",
         Object::Array(_) => "array",

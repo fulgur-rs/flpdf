@@ -361,7 +361,7 @@ fn rectangle_dimensions(arr: &[Object]) -> (f64, f64) {
     let n = |o: &Object| -> f64 {
         match o {
             Object::Integer(i) => *i as f64,
-            Object::Real(r) => *r,
+            Object::Real(r) | Object::RealLiteral { value: r, .. } => *r,
             _ => 0.0,
         }
     };
@@ -482,7 +482,7 @@ fn leaf_user_unit<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Resu
     match resolved {
         Object::Null => Ok((false, 1.0)),
         Object::Integer(n) => Ok((true, n as f64)),
-        Object::Real(r) => Ok((true, r)),
+        Object::Real(r) | Object::RealLiteral { value: r, .. } => Ok((true, r)),
         _ => Ok((true, 1.0)),
     }
 }
@@ -615,6 +615,7 @@ fn collect_object_refs(obj: &Object, out: &mut Vec<ObjectRef>) {
         | Object::Boolean(_)
         | Object::Integer(_)
         | Object::Real(_)
+        | Object::RealLiteral { .. }
         | Object::Name(_)
         | Object::String(_) => {}
     }

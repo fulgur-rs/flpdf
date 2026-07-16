@@ -599,7 +599,13 @@ fn compare_objects(
                 Err(format!("{path}: Integer({a}) vs Integer({b})"))
             }
         }
-        (Object::Real(a), Object::Real(b)) => {
+        // Two reals compare equal on value (either variant carries the value),
+        // ignoring source-literal preservation since compat comparisons already
+        // treat integers and reals independently on other keys.
+        (
+            Object::Real(a) | Object::RealLiteral { value: a, .. },
+            Object::Real(b) | Object::RealLiteral { value: b, .. },
+        ) => {
             if a == b {
                 Ok(())
             } else {
@@ -795,7 +801,7 @@ fn object_type_name(obj: &Object) -> &'static str {
         Object::Null => "Null",
         Object::Boolean(_) => "Boolean",
         Object::Integer(_) => "Integer",
-        Object::Real(_) => "Real",
+        Object::Real(_) | Object::RealLiteral { .. } => "Real",
         Object::Name(_) => "Name",
         Object::String(_) => "String",
         Object::Array(_) => "Array",

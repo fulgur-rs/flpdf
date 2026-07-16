@@ -484,7 +484,7 @@ fn read_xobj_bbox_and_matrix<R: Read + Seek>(
     for (i, elem) in bbox_arr.iter().take(4).enumerate() {
         bbox_vals[i] = match elem {
             Object::Integer(n) => *n as f64,
-            Object::Real(r) => *r,
+            Object::Real(r) | Object::RealLiteral { value: r, .. } => *r,
             _ => return Ok((None, identity)),
         };
     }
@@ -500,7 +500,7 @@ fn read_xobj_bbox_and_matrix<R: Read + Seek>(
             for (i, elem) in a.iter().take(6).enumerate() {
                 m[i] = match elem {
                     Object::Integer(n) => *n as f64,
-                    Object::Real(r) => *r,
+                    Object::Real(r) | Object::RealLiteral { value: r, .. } => *r,
                     _ => {
                         valid = false;
                         break;
@@ -520,7 +520,7 @@ fn read_xobj_bbox_and_matrix<R: Read + Seek>(
                 for (i, elem) in a.iter().take(6).enumerate() {
                     m[i] = match elem {
                         Object::Integer(n) => *n as f64,
-                        Object::Real(r) => *r,
+                        Object::Real(r) | Object::RealLiteral { value: r, .. } => *r,
                         _ => {
                             valid = false;
                             break;
