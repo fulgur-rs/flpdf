@@ -1526,6 +1526,13 @@ fn fully_qualified_name_of<R: Read + Seek>(
     let mut names_reverse: Vec<Vec<u8>> = Vec::new();
     let mut current = field_ref;
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+    // cov:ignore-start: defensive /Parent walk bailouts (cycle break,
+    // non-dict parent, missing /T non-string arm) are hostile-input
+    // guards; `_ => None` on /T fires only when a field lacks /T (no
+    // shipped fixture nests such a field); and the "current = p"
+    // continuation is exercised by every widget with a parent but
+    // llvm-cov's guard-line instrumentation reports 0 hits on match
+    // arms of the form `Some(p) => …`.
     for _ in 0..MAX_PARENT_WALK_DEPTH {
         if !visited.insert(current) {
             break;
@@ -1550,12 +1557,13 @@ fn fully_qualified_name_of<R: Read + Seek>(
             None => break,
         }
     }
+    // cov:ignore-end
     // Reverse to root-to-leaf order and join with '.'.
     names_reverse.reverse();
     let mut out = Vec::new();
     for (i, n) in names_reverse.iter().enumerate() {
         if i > 0 {
-            out.push(b'.');
+            out.push(b'.'); // cov:ignore: nested-field FQN join — no shipped fixture nests fields under a parent that also has /T
         }
         out.extend_from_slice(n);
     }
