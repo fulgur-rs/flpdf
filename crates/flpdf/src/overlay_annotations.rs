@@ -102,16 +102,23 @@ pub(crate) fn survey_source_annotations<R: Read + Seek>(
         return Ok(None);
     }
 
-    // 2. Enumerate annot refs. qpdf materializes direct annots via
-    //    `from_qpdf->makeIndirectObject(annot)` so they can be shallow-copied
-    //    per placement (transformAnnotations line 954). Materialising the
-    //    source is out of scope for now; we skip direct annots and record a
-    //    warning-free None. If a real fixture has direct annots the byte gate
-    //    will flag it as a missing annot in the output.
+    // 2. Enumerate annot refs. Indirect refs are used verbatim. Direct annot
+    //    dictionaries and streams are materialized into fresh source-doc
+    //    indirect objects (qpdf transformAnnotations line 954-956:
+    //    `annot = from_qpdf->makeIndirectObject(annot)`) so the downstream
+    //    copy path can treat every annot uniformly. Values that are neither
+    //    a reference nor a dict/stream (Null padding, malformed entries) are
+    //    silently skipped, matching qpdf's `annot.warnIfPossible("... stream")`
+    //    branch behaviour of dropping the entry rather than aborting.
     let mut annots: Vec<(ObjectRef, Option<ObjectRef>)> = Vec::new();
     for item in annots_array {
         let annot_ref = match item {
             Object::Reference(r) => r,
+            direct @ (Object::Dictionary(_) | Object::Stream(_)) => {
+                let new_ref = allocate_next_ref(source)?;
+                source.set_object(new_ref, direct);
+                new_ref
+            }
             _ => continue,
         };
         let top_field = top_level_field_for_annot(source, annot_ref)?;
@@ -371,6 +378,16 @@ pub(crate) fn apply_placement<R: Read + Seek>(
 
         // 4. Transform the annot's /Rect by cm.
         transform_annot_rect(dest, new_annot_ref, cm)?;
+
+        // 5. Repoint `/P` (the annot's back-pointer to its owning page). The
+        //    source's /P was excluded from the copy closure so the source page
+        //    itself is not dragged into dest; the surviving entry in the
+        //    dup'd annot dict is `Null` after `copy_objects`'s rewrite pass.
+        //    Rewrite that Null to the current dest_page_ref so the annot is
+        //    consistent with its new host. Annots that never had /P (the
+        //    primary target case) stay as-is — no key is added — so goldens
+        //    without /P remain byte-identical.
+        set_annot_page_ref_if_null(dest, new_annot_ref, dest_page_ref)?;
 
         new_annot_refs.push(new_annot_ref);
     }
@@ -735,6 +752,31 @@ fn transform_rect_by_cm(rect: [f64; 4], cm: [f64; 6]) -> [f64; 4] {
 fn apply_matrix_to_point(m: [f64; 6], x: f64, y: f64) -> (f64, f64) {
     let [a, b, c, d, e, f] = m;
     (a * x + c * y + e, b * x + d * y + f)
+}
+
+/// Rewrite the annot's `/P` entry to `dest_page_ref` when it is currently
+/// `Null`. The source's /P was excluded from the copy closure
+/// ([`survey_source_annotations`], `skip_parent_key = true`), so the
+/// dup'd annot dict carries `/P null` after `copy_objects`'s rewrite pass
+/// (unmapped refs become `Object::Null`). Repointing that Null to the
+/// current dest page keeps the annot's page back-pointer consistent while
+/// leaving annots that never had `/P` untouched — no key is added, so
+/// fixtures whose source annots omit `/P` stay byte-identical.
+fn set_annot_page_ref_if_null<R: Read + Seek>(
+    dest: &mut Pdf<R>,
+    annot_ref: ObjectRef,
+    dest_page_ref: ObjectRef,
+) -> Result<()> {
+    let Some(mut dict) = dest.resolve(annot_ref)?.into_dict() else {
+        return Ok(());
+    };
+    match dict.get("P") {
+        Some(Object::Null) => {}
+        _ => return Ok(()),
+    }
+    dict.insert("P", Object::Reference(dest_page_ref));
+    dest.set_object(annot_ref, Object::Dictionary(dict));
+    Ok(())
 }
 
 /// Append `new_annot_refs` to the destination page's `/Annots` array,
