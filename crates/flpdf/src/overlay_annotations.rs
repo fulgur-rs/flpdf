@@ -297,7 +297,21 @@ fn read_source_acroform_defaults<R: Read + Seek>(
         },
         _ => return Ok((None, None, None)),
     };
-    let dr = acroform_dict.get_ref("DR");
+    // /DR may be indirect (a Reference) or direct. Direct dicts get
+    // materialized into a fresh source-doc indirect object so downstream
+    // closure collection and `copy_objects` can treat every /DR uniformly
+    // (mirrors qpdf transformAnnotations line 750-752, which promotes
+    // from_dr with `from_qpdf->makeIndirectObject(from_dr)` before
+    // `copyForeignObject`).
+    let dr = match acroform_dict.get("DR").cloned() {
+        Some(Object::Reference(r)) => Some(r),
+        Some(dr_val @ (Object::Dictionary(_) | Object::Stream(_))) => {
+            let new_ref = allocate_next_ref(source)?;
+            source.set_object(new_ref, dr_val);
+            Some(new_ref)
+        }
+        _ => None,
+    };
     let da = match acroform_dict.get("DA") {
         Some(Object::String(s)) => Some(s.clone()),
         _ => None,
@@ -1392,7 +1406,12 @@ fn collect_fully_qualified_names<R: Read + Seek>(
             "AcroForm field tree exceeds maximum depth of {MAX_PARENT_WALK_DEPTH}"
         )));
     }
-    let (own_fqn, kids_refs) = {
+    // Reading /T and /Kids in two steps: /T uses a borrowed read, then /Kids
+    // may need to resolve an indirect array (which requires a mutable borrow
+    // and therefore drops the borrowed read first). Both direct-array and
+    // indirect-array forms of /Kids are valid per ISO 32000 and appear in
+    // real-world AcroForm docs.
+    let (own_fqn, kids_val) = {
         let obj = dest.resolve_borrowed(field_ref)?;
         let Some(dict) = obj.as_dict() else {
             return Ok(());
@@ -1408,17 +1427,27 @@ fn collect_fully_qualified_names<R: Read + Seek>(
             }
             _ => None,
         };
-        let kids: Vec<ObjectRef> = match dict.get("Kids") {
-            Some(Object::Array(arr)) => arr
-                .iter()
+        (own_fqn, dict.get("Kids").cloned())
+    };
+    let kids_refs: Vec<ObjectRef> = match kids_val {
+        Some(Object::Array(arr)) => arr
+            .iter()
+            .filter_map(|item| match item {
+                Object::Reference(r) => Some(*r),
+                _ => None,
+            })
+            .collect(),
+        Some(Object::Reference(r)) => match dest.resolve(r)? {
+            Object::Array(arr) => arr
+                .into_iter()
                 .filter_map(|item| match item {
-                    Object::Reference(r) => Some(*r),
+                    Object::Reference(r) => Some(r),
                     _ => None,
                 })
                 .collect(),
             _ => Vec::new(),
-        };
-        (own_fqn, kids)
+        },
+        _ => Vec::new(),
     };
     let recursion_fqn = own_fqn.clone().unwrap_or(parent_fqn);
     if let Some(fqn) = own_fqn {
