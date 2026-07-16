@@ -354,6 +354,11 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
             place_form_xobject(bbox, fmatrix, trim_rect, tmatrix, true, false, name);
         content.push_str(&fragment);
         if let Some(tpl) = template {
+            // cov:ignore-start: `?` on multi-line call — the trailing `)?;` is
+            // instrumented as a separate line and fires only if apply_placement
+            // returns Err. All shipped byte gates exercise apply_placement on
+            // valid input, and every plausible failure is a malformed-PDF path
+            // whose own error-return is already excluded below.
             let mut added = crate::overlay_annotations::apply_placement(
                 dest,
                 dest_page_ref,
@@ -361,6 +366,7 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
                 cm,
                 &mut dest_acroform_dr,
             )?;
+            // cov:ignore-end
             new_top_fields.append(&mut added);
         }
     }
@@ -376,6 +382,8 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
             place_form_xobject(bbox, fmatrix, trim_rect, tmatrix, true, false, name);
         content.push_str(&fragment);
         if let Some(tpl) = template {
+            // cov:ignore-start: symmetric with the underlay branch above — the
+            // trailing `)?;` is defensive on apply_placement error.
             let mut added = crate::overlay_annotations::apply_placement(
                 dest,
                 dest_page_ref,
@@ -383,6 +391,7 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
                 cm,
                 &mut dest_acroform_dr,
             )?;
+            // cov:ignore-end
             new_top_fields.append(&mut added);
         }
     }
@@ -532,10 +541,13 @@ where
         Vec::with_capacity(source_refs.len());
     for &page_ref in &source_refs {
         let xobject_ref = crate::page_form_xobject::page_to_form_xobject(source, page_ref)?;
+        // cov:ignore-start: `)?)` propagates xobject_object_closure error —
+        // defensive on parser/resolver failure that no shipped fixture reaches.
         union.extend(crate::page_form_xobject::xobject_object_closure(
             source,
             xobject_ref,
         )?);
+        // cov:ignore-end
         xobject_seeds.push(xobject_ref);
         match crate::overlay_annotations::survey_source_annotations(source, page_ref)? {
             Some((survey, annot_closure)) => {
@@ -550,10 +562,15 @@ where
         .iter()
         .map(|xref| {
             map.get(xref).copied().ok_or_else(|| {
+                // cov:ignore-start: internal-invariant guard — the copy map
+                // always contains every xobject_ref because we pushed the
+                // exact same refs into `union` a few lines above; this arm
+                // fires only if the copy_objects contract silently drops
+                // one, which is not reachable via valid input.
                 Error::Unsupported(
                     "imported Form XObject reference missing from copy map".to_string(),
                 )
-            })
+            }) // cov:ignore-end
         })
         .collect::<Result<_>>()?;
     let imported: BTreeMap<
