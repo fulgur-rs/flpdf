@@ -40,6 +40,21 @@ use crate::{Error, Object, ObjectRef, Pdf, Result};
 /// graph traversals must have a depth cap against hostile input).
 const MAX_PARENT_WALK_DEPTH: usize = 100;
 
+/// Per-placement inherited-field override plan derived from the source and
+/// dest `/AcroForm`'s `/DA` and `/Q` defaults, consumed by
+/// [`adjust_inherited_field`] during the field-tree BFS. See qpdf
+/// `transformAnnotations` line 737-767 (flag computation) and
+/// `adjustInheritedFields` (`libqpdf/QPDFAcroFormDocumentHelper.cc:442-484`).
+///
+/// When `override_da` is false, `/DA` is left untouched on every field even
+/// if `from_default_da` is set; same for `/Q`.
+struct InheritedOverrides {
+    override_da: bool,
+    from_default_da: Vec<u8>,
+    override_q: bool,
+    from_default_q: i64,
+}
+
 /// Survey of a source page's annotation graph, in SOURCE object space,
 /// computed BEFORE the cross-document copy.
 #[derive(Debug, Default)]
@@ -50,6 +65,11 @@ pub(crate) struct AnnotationSurvey {
     pub annots: Vec<(ObjectRef, Option<ObjectRef>)>,
     /// Source `/AcroForm/DR` ref, if present.
     pub source_dr: Option<ObjectRef>,
+    /// Source `/AcroForm/DA` (raw string bytes) — feeds
+    /// `adjustInheritedFields` on the dest side.
+    pub source_default_da: Option<Vec<u8>>,
+    /// Source `/AcroForm/Q` integer — same as above.
+    pub source_default_q: Option<i64>,
 }
 
 /// Dest-space refs derived from an [`AnnotationSurvey`] after cross-doc copy;
@@ -60,6 +80,10 @@ pub(crate) struct AnnotationCopyTemplate {
     pub annots: Vec<(ObjectRef, Option<ObjectRef>)>,
     /// Dest-space source `/DR` ref, if the source had one.
     pub source_dr: Option<ObjectRef>,
+    /// Source `/AcroForm/DA` bytes (verbatim from the source).
+    pub source_default_da: Option<Vec<u8>>,
+    /// Source `/AcroForm/Q` integer.
+    pub source_default_q: Option<i64>,
 }
 
 /// Walk a source page's `/Annots` and return:
@@ -128,13 +152,14 @@ pub(crate) fn survey_source_annotations<R: Read + Seek>(
         return Ok(None);
     }
 
-    // 3. Read the source /AcroForm/DR ref (added to the copy set below).
-    //    Source /AcroForm /DA and /Q would feed `adjustInheritedFields`
-    //    (qpdf QPDFAcroFormDocumentHelper.cc:442-484), but the primary target
-    //    (fxo-red + form-fields-and-annotations) has neither key, so
-    //    override_da/override_q are always false and the path is dormant —
-    //    implementing it lands with a separate follow-up.
-    let source_dr = read_source_acroform_dr(source)?;
+    // 3. Read the source /AcroForm/DR ref (added to the copy set below) and
+    //    the inherited /DA / /Q defaults, used by `adjust_inherited_fields`
+    //    on the dest side (qpdf QPDFAcroFormDocumentHelper.cc:442-484,
+    //    called from transformAnnotations line 914-917). For the primary
+    //    target (fxo-red + form-fields-and-annotations) the source /AcroForm
+    //    has neither /DA nor /Q, so both defaults are `None` and the dest-side
+    //    override is a no-op — the byte gate is unaffected.
+    let (source_dr, source_default_da, source_default_q) = read_source_acroform_defaults(source)?;
 
     // 4. Build the reachable-ref closure to feed the batch copy_objects call.
     //    Every annot ref is seeded (with /P skipped, since a widget's /P is a
@@ -165,7 +190,15 @@ pub(crate) fn survey_source_annotations<R: Read + Seek>(
         )?;
     }
 
-    Ok(Some((AnnotationSurvey { annots, source_dr }, closure)))
+    Ok(Some((
+        AnnotationSurvey {
+            annots,
+            source_dr,
+            source_default_da,
+            source_default_q,
+        },
+        closure,
+    )))
 }
 
 /// Walk `annot_ref`'s `/Parent` chain in source space to find its top-level
@@ -232,37 +265,48 @@ fn top_level_field_for_annot<R: Read + Seek>(
     )))
 }
 
-/// Read source `/AcroForm/DR` for later use by `apply_placement`. Returns
-/// `None` when the source has no `/AcroForm` or when `/DR` is absent.
+/// Read source `/AcroForm`'s `/DR` ref plus the inherited `/DA` and `/Q`
+/// defaults. Returns `(None, None, None)` when the source has no
+/// `/AcroForm`; missing individual keys stay `None`.
 ///
-/// Source `/AcroForm` `/DA` and `/Q` (needed for qpdf's
-/// `adjustInheritedFields` overrides — see
-/// `QPDFAcroFormDocumentHelper.cc:442-484` and its call site at
-/// line 914-917) are not read: the primary target
-/// (fxo-red + form-fields-and-annotations) has neither key, so
-/// `override_da`/`override_q` are always false and the path is dormant. A
-/// separate follow-up implements the overrides once a fixture exercises them.
-fn read_source_acroform_dr<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Option<ObjectRef>> {
+/// The defaults feed `adjust_inherited_fields` (qpdf
+/// `QPDFAcroFormDocumentHelper::adjustInheritedFields`,
+/// `libqpdf/QPDFAcroFormDocumentHelper.cc:442-484`, called from
+/// `transformAnnotations` line 914-917) so a copied field that inherits
+/// `/DA` or `/Q` from the source doc keeps rendering the same way when
+/// the destination doc's defaults differ.
+fn read_source_acroform_defaults<R: Read + Seek>(
+    source: &mut Pdf<R>,
+) -> Result<(Option<ObjectRef>, Option<Vec<u8>>, Option<i64>)> {
     let Some(root_ref) = source.root_ref() else {
-        return Ok(None);
+        return Ok((None, None, None));
     };
     let acroform_val = {
         let obj = source.resolve_borrowed(root_ref)?;
         let Some(dict) = obj.as_dict() else {
-            return Ok(None);
+            return Ok((None, None, None));
         };
         dict.get("AcroForm").cloned()
     };
     let acroform_dict = match acroform_val {
-        None | Some(Object::Null) => return Ok(None),
+        None | Some(Object::Null) => return Ok((None, None, None)),
         Some(Object::Dictionary(d)) => d,
         Some(Object::Reference(r)) => match source.resolve(r)? {
             Object::Dictionary(d) => d,
-            _ => return Ok(None),
+            _ => return Ok((None, None, None)),
         },
-        _ => return Ok(None),
+        _ => return Ok((None, None, None)),
     };
-    Ok(acroform_dict.get_ref("DR"))
+    let dr = acroform_dict.get_ref("DR");
+    let da = match acroform_dict.get("DA") {
+        Some(Object::String(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let q = match acroform_dict.get("Q") {
+        Some(Object::Integer(n)) => Some(*n),
+        _ => None,
+    };
+    Ok((dr, da, q))
 }
 
 /// Materialize an [`AnnotationSurvey`]'s source-space refs into dest-space
@@ -291,6 +335,8 @@ pub(crate) fn template_from_survey(
     AnnotationCopyTemplate {
         annots,
         source_dr: survey.source_dr.and_then(|r| copy_map.get(&r).copied()),
+        source_default_da: survey.source_default_da.clone(),
+        source_default_q: survey.source_default_q,
     }
 }
 
@@ -339,6 +385,16 @@ pub(crate) fn apply_placement<R: Read + Seek>(
         }
     }
 
+    // Compute the inherited-field overrides (qpdf transformAnnotations
+    // line 737-767): when the source /AcroForm's /DA or /Q differs from the
+    // dest's, each foreign-copied field that inherits its value from the
+    // source /AcroForm must be pinned to the source value so it does not
+    // silently inherit the (different) dest default. For the primary target
+    // (fxo-red + form-fields-and-annotations) neither doc has /DA or /Q, so
+    // both flags come out false and the BFS reset is a no-op — the byte
+    // gate is unaffected.
+    let overrides = compute_inherited_overrides(dest, template)?;
+
     let mut new_top_fields: Vec<ObjectRef> = Vec::new();
     let mut added_top_field_set: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut new_annot_refs: Vec<ObjectRef> = Vec::new();
@@ -350,8 +406,13 @@ pub(crate) fn apply_placement<R: Read + Seek>(
         //    the widget IS the field (self-field), the annot ref equals the
         //    top-level ref, so this call also dups the annot as a side effect.
         let new_top_field_ref = if let Some(top_ref) = dest_top_field {
-            let new_top =
-                duplicate_field_tree(dest, *top_ref, &mut per_placement_dup, *dest_acroform_dr)?;
+            let new_top = duplicate_field_tree(
+                dest,
+                *top_ref,
+                &mut per_placement_dup,
+                *dest_acroform_dr,
+                overrides.as_ref(),
+            )?;
             if added_top_field_set.insert(new_top) {
                 new_top_fields.push(new_top);
             }
@@ -447,6 +508,7 @@ fn duplicate_field_tree<R: Read + Seek>(
     top_ref: ObjectRef,
     per_placement_dup: &mut BTreeMap<ObjectRef, ObjectRef>,
     dest_dr: Option<ObjectRef>,
+    overrides: Option<&InheritedOverrides>,
 ) -> Result<ObjectRef> {
     let new_top = match per_placement_dup.get(&top_ref) {
         Some(&existing) => return Ok(existing),
@@ -525,6 +587,19 @@ fn duplicate_field_tree<R: Read + Seek>(
             if dict.get("DR").is_some() {
                 dict.insert("DR", Object::Reference(dr));
             }
+        }
+
+        // Override inherited /DA and /Q on this field when the source doc's
+        // defaults differ from the dest's (qpdf transformAnnotations
+        // line 914-917 → adjustInheritedFields at line 442-484). Only pin the
+        // value when this field does not already carry an explicit /DA or /Q
+        // (either on itself or on an ancestor visited earlier in the BFS —
+        // parents come before kids), and only when the field's currently
+        // inherited value would differ from `from_default`. `dict` at this
+        // point already has its /Parent rewritten to the dup, so the walk
+        // stays inside `per_placement_dup`.
+        if let Some(ov) = overrides {
+            adjust_inherited_field(dest, dup_ref, &mut dict, ov, per_placement_dup)?;
         }
 
         dest.set_object(dup_ref, Object::Dictionary(dict));
@@ -754,6 +829,149 @@ fn apply_matrix_to_point(m: [f64; 6], x: f64, y: f64) -> (f64, f64) {
     (a * x + c * y + e, b * x + d * y + f)
 }
 
+/// Read the destination `/AcroForm`'s `/DA` and `/Q` defaults and compare
+/// with `template.source_default_da / _q`. Returns `Some(InheritedOverrides)`
+/// only when at least one differs — matching qpdf's `override_da || override_q`
+/// gate (transformAnnotations line 736-767). Missing values default to `""`
+/// / `0` per qpdf.
+fn compute_inherited_overrides<R: Read + Seek>(
+    dest: &mut Pdf<R>,
+    template: &AnnotationCopyTemplate,
+) -> Result<Option<InheritedOverrides>> {
+    let (dest_da, dest_q) = read_dest_acroform_defaults(dest)?;
+    let from_da = template
+        .source_default_da
+        .as_deref()
+        .unwrap_or(b"")
+        .to_vec();
+    let from_q = template.source_default_q.unwrap_or(0);
+    let override_da = from_da != dest_da;
+    let override_q = from_q != dest_q;
+    if !override_da && !override_q {
+        return Ok(None);
+    }
+    Ok(Some(InheritedOverrides {
+        override_da,
+        from_default_da: from_da,
+        override_q,
+        from_default_q: from_q,
+    }))
+}
+
+/// Read `/AcroForm/DA` (as bytes; empty when absent) and `/AcroForm/Q`
+/// (integer; 0 when absent) from the destination doc's catalog.
+fn read_dest_acroform_defaults<R: Read + Seek>(dest: &mut Pdf<R>) -> Result<(Vec<u8>, i64)> {
+    let Some(root_ref) = dest.root_ref() else {
+        return Ok((Vec::new(), 0));
+    };
+    let acroform_val = {
+        let obj = dest.resolve_borrowed(root_ref)?;
+        let Some(dict) = obj.as_dict() else {
+            return Ok((Vec::new(), 0));
+        };
+        dict.get("AcroForm").cloned()
+    };
+    let acroform_dict = match acroform_val {
+        None | Some(Object::Null) => return Ok((Vec::new(), 0)),
+        Some(Object::Dictionary(d)) => d,
+        Some(Object::Reference(r)) => match dest.resolve(r)? {
+            Object::Dictionary(d) => d,
+            _ => return Ok((Vec::new(), 0)),
+        },
+        _ => return Ok((Vec::new(), 0)),
+    };
+    let da = match acroform_dict.get("DA") {
+        Some(Object::String(s)) => s.clone(),
+        _ => Vec::new(),
+    };
+    let q = match acroform_dict.get("Q") {
+        Some(Object::Integer(n)) => *n,
+        _ => 0,
+    };
+    Ok((da, q))
+}
+
+/// Apply `overrides` to a single field's dup during the BFS. Mirrors qpdf
+/// `adjustInheritedFields` (`libqpdf/QPDFAcroFormDocumentHelper.cc:442-484`).
+///
+/// For each of /DA and /Q: if `override_*` is set AND the field does not
+/// carry an explicit value on itself OR any ancestor visited earlier in this
+/// placement (both flpdf's per_placement_dup and qpdf's `orig_to_copy` visit
+/// parents before kids, so ancestors are already dup'd), pin the field to
+/// the source's default so the (different) dest default is not silently
+/// inherited.
+fn adjust_inherited_field<R: Read + Seek>(
+    dest: &mut Pdf<R>,
+    field_ref: ObjectRef,
+    field_dict: &mut crate::Dictionary,
+    overrides: &InheritedOverrides,
+    per_placement_dup: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<()> {
+    // /FT gate: qpdf's `adjustInheritedFields` also proceeds unconditionally
+    // (the comment at line 449-455 explains it may write to non-field
+    // annots, and that's harmless), so we do too.
+    if overrides.override_da
+        && field_dict.get("DA").is_none()
+        && !ancestor_has_key(dest, field_ref, b"DA", per_placement_dup)?
+    {
+        field_dict.insert("DA", Object::String(overrides.from_default_da.clone()));
+    }
+    if overrides.override_q
+        && field_dict.get("Q").is_none()
+        && !ancestor_has_key(dest, field_ref, b"Q", per_placement_dup)?
+    {
+        field_dict.insert("Q", Object::Integer(overrides.from_default_q));
+    }
+    Ok(())
+}
+
+/// True when any ancestor of `field_ref` (via `/Parent`) already carries an
+/// explicit `key`. Follows the *dup* graph via `per_placement_dup` because
+/// the BFS rewrites `/Parent` to point at the placement's dup before the
+/// field is written back. Bounded by `MAX_PARENT_WALK_DEPTH`.
+fn ancestor_has_key<R: Read + Seek>(
+    dest: &mut Pdf<R>,
+    field_ref: ObjectRef,
+    key: &[u8],
+    per_placement_dup: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<bool> {
+    let mut current = field_ref;
+    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+    for _ in 0..MAX_PARENT_WALK_DEPTH {
+        if !visited.insert(current) {
+            return Ok(false);
+        }
+        let parent = {
+            let obj = dest.resolve_borrowed(current)?;
+            let Some(dict) = obj.as_dict() else {
+                return Ok(false);
+            };
+            dict.get_ref("Parent")
+        };
+        let Some(parent_ref) = parent else {
+            return Ok(false);
+        };
+        // The BFS may have already rewritten /Parent to the dup; if not, map
+        // via per_placement_dup so we walk within this placement's clones.
+        let ancestor_ref = per_placement_dup
+            .get(&parent_ref)
+            .copied()
+            .unwrap_or(parent_ref);
+        let has = {
+            let obj = dest.resolve_borrowed(ancestor_ref)?;
+            match obj.as_dict() {
+                Some(dict) => dict.get(key).is_some(),
+                None => false,
+            }
+        };
+        if has {
+            return Ok(true);
+        }
+        current = ancestor_ref;
+    }
+    Ok(false)
+}
+
 /// Rewrite the annot's `/P` entry to `dest_page_ref` when it is currently
 /// `Null`. The source's /P was excluded from the copy closure
 /// ([`survey_source_annotations`], `skip_parent_key = true`), so the
@@ -874,11 +1092,25 @@ fn ensure_dest_acroform_dr<R: Read + Seek>(
             ))
         }
     };
-    if let Some(existing) = acroform_dict.get_ref("DR") {
-        return Ok(existing);
+    // Existing /DR may be indirect (a ref) or a direct dict; preserve either
+    // shape. First-wins semantics: a fully-implemented merge with conflict
+    // remapping (`dr_map` + `adjustAppearanceStream`) is dormant for the
+    // primary target and left for a follow-up.
+    match acroform_dict.get("DR").cloned() {
+        Some(Object::Reference(existing)) => return Ok(existing),
+        Some(Object::Dictionary(existing)) => {
+            // Promote direct /DR to indirect, keeping its contents intact so
+            // existing dest form fields' resources are not lost.
+            let dr_ref = allocate_next_ref(dest)?;
+            dest.set_object(dr_ref, Object::Dictionary(existing));
+            acroform_dict.insert("DR", Object::Reference(dr_ref));
+            dest.set_object(acroform_ref, Object::Dictionary(acroform_dict));
+            return Ok(dr_ref);
+        }
+        _ => {}
     }
-    // Allocate a fresh /DR object, merge source_dr's contents into it, and
-    // wire dest /AcroForm to point at it.
+    // No existing /DR: allocate a fresh one, merge source_dr's contents into
+    // it, and wire dest /AcroForm to point at it.
     let dr_ref = allocate_next_ref(dest)?;
     dest.set_object(dr_ref, Object::Dictionary(crate::Dictionary::new()));
     merge_resources_shallow(dest, dr_ref, source_dr)?;

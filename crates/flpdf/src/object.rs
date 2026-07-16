@@ -385,7 +385,19 @@ impl Object {
             }
             Object::Integer(value) => out.extend_from_slice(value.to_string().as_bytes()),
             Object::Real(value) => out.extend_from_slice(value.to_string().as_bytes()),
-            Object::RealLiteral { literal, .. } => out.extend_from_slice(literal),
+            Object::RealLiteral { value, literal } => {
+                if real_literal_is_safe(literal, *value) {
+                    out.extend_from_slice(literal);
+                } else {
+                    // Fall back to the canonical shortest-decimal form when
+                    // the literal contains bytes outside PDF real syntax or
+                    // does not round-trip to `value` — prevents a caller that
+                    // hand-built a `RealLiteral` with attacker-controlled
+                    // bytes from injecting whitespace / delimiters / object
+                    // syntax into a numeric position of the emitted PDF.
+                    out.extend_from_slice(value.to_string().as_bytes());
+                }
+            }
             Object::Name(name) => {
                 out.push(b'/');
                 write_name_escaped(out, name);
@@ -484,6 +496,32 @@ impl Object {
 /// Append `n` ASCII space bytes to `out`.
 fn push_spaces(out: &mut Vec<u8>, n: usize) {
     out.resize(out.len() + n, b' ');
+}
+
+/// True when `literal` is a safe pass-through for [`Object::RealLiteral`]:
+/// every byte is in the PDF real-token character set (ASCII digits, one of
+/// `.`, `+`, `-`, `e`, `E`) AND `literal` parses back to `value` bit-for-bit.
+/// Fails closed if a caller constructs a `RealLiteral` with arbitrary bytes
+/// (whitespace, `/`, `<<`, string parentheses, …) — the writer's caller
+/// falls back to the canonical shortest-decimal form so nothing outside a
+/// numeric token can slip into the emitted PDF at a real's position.
+fn real_literal_is_safe(literal: &[u8], value: f64) -> bool {
+    if literal.is_empty() {
+        return false;
+    }
+    if !literal
+        .iter()
+        .all(|b| matches!(*b, b'0'..=b'9' | b'.' | b'+' | b'-' | b'e' | b'E'))
+    {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(literal) else {
+        return false;
+    };
+    match text.parse::<f64>() {
+        Ok(parsed) => parsed.to_bits() == value.to_bits(),
+        Err(_) => false,
+    }
 }
 
 /// Escape a name's raw (logical) bytes into PDF name-token syntax per
