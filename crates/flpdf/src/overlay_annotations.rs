@@ -1162,24 +1162,19 @@ fn merge_resources_shallow<R: Read + Seek>(
         return Ok(());
     };
     for (type_key, src_type_val) in src_dict.iter() {
-        // Resolve the resource-type entry (e.g. /Font). It's typically a
-        // direct sub-dict in a /DR, but PDF also permits an indirect ref.
-        let src_type_dict = match src_type_val {
-            Object::Dictionary(d) => d.clone(),
-            Object::Reference(r) => match dest.resolve(*r)? {
-                Object::Dictionary(d) => d,
-                // Non-dictionary /Font, /XObject, etc. — leave as-is by
-                // ref-copy; qpdf's mergeResources would also skip such
-                // malformed entries.
-                other => {
-                    dest_dict.insert(type_key, other);
-                    continue;
-                }
-            },
-            other => {
-                dest_dict.insert(type_key, other.clone());
-                continue;
-            }
+        // Resource-type entry (e.g. /Font) is expected to be a direct
+        // sub-dict, matching the primary target and every qpdf golden we
+        // currently oracle. PDF also permits `/Font <ref>` (indirect
+        // sub-dict), but replicating qpdf's mergeResources semantics for
+        // that shape needs an oracle golden that no shipped fixture
+        // supplies — deferred to flpdf-4r6l, which lands alongside
+        // dr_map + adjustAppearanceStream once a real fixture exercises
+        // the merge-conflict path. Until then, non-dict resource-type
+        // values are copied verbatim (works correctly for the empty-dest
+        // /DR case that fxo-red exercises).
+        let Some(src_type_dict) = src_type_val.as_dict() else {
+            dest_dict.insert(type_key, src_type_val.clone());
+            continue;
         };
         // Copy each resource entry into a fresh direct sub-dict so dest_dr's
         // sub-dict is independent of source_dr's sub-dict.

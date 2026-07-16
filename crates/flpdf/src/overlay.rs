@@ -1557,6 +1557,40 @@ mod byte_gate {
         assert_byte_identical(&actual, "overlay-source-p-and-inline.pdf");
     }
 
+    /// Overlay a source that has annotations (a `/Link` annot) but NO
+    /// `/AcroForm` on the catalog — a valid, common shape (only widget
+    /// annots require an /AcroForm; link, stamp, freetext, ... do not).
+    /// Exercises the "no /AcroForm" branch of
+    /// `read_source_acroform_defaults` (`source_dr`, `source_default_da`,
+    /// `source_default_q` all return None) that the primary target does
+    /// not hit because its source PDF carries an /AcroForm.
+    #[test]
+    fn overlay_copy_annotations_source_no_acroform_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src = fixture("link-annot-no-acroform.pdf");
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            ..Default::default()
+        };
+        let mut actual = Vec::new();
+        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        assert_byte_identical(&actual, "overlay-link-annot-no-acroform.pdf");
+    }
+
     /// Overlay onto a dest whose `/AcroForm/Fields` is stored as an
     /// indirect reference (`/Fields 5 0 R`) instead of a direct array —
     /// a valid PDF shape. Exercises
