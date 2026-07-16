@@ -1515,6 +1515,48 @@ mod byte_gate {
         assert_byte_identical(&actual, "overlay-copy-annotations.pdf");
     }
 
+    /// Overlay `form-fields-and-annotations.pdf` onto a dest that already
+    /// carries an `/AcroForm` with a pre-existing `/Fields` entry named
+    /// "Text Box 1" — the same partial name as one of the source's
+    /// top-level fields, so the +N collision rename must fire once for
+    /// every placement (the source page is repeated onto all 16 dest
+    /// pages, so the rename runs 16 times: "Text Box 1+1", "Text Box 1+2",
+    /// ...). Also exercises `ensure_dest_acroform_dr`'s existing-`/DR`
+    /// short-circuit, `add_and_rename_form_fields`'s reference-`/AcroForm`
+    /// / reference-`/Fields` paths, `collect_fully_qualified_names` over
+    /// the pre-existing field, and the tail of `duplicate_field_tree` that
+    /// leaves an existing dest `/DR` untouched.
+    ///
+    /// Fixture: `fxo-red-with-existing-acroform.pdf` is fxo-red with a
+    /// small hand-added `/AcroForm { /DR ... /Fields [<field>] }` whose
+    /// field has `/T (Text Box 1)`.
+    #[test]
+    fn overlay_copy_annotations_onto_existing_acroform_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red-with-existing-acroform.pdf");
+        let mut src = fixture("form-fields-and-annotations.pdf");
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            ..Default::default()
+        };
+        let mut actual = Vec::new();
+        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        assert_byte_identical(&actual, "overlay-onto-existing-acroform.pdf");
+    }
+
     /// Overlay a source whose `/AcroForm` supplies `/DA` and `/Q` defaults
     /// onto a dest with no `/AcroForm`. Exercises qpdf's
     /// `adjustInheritedFields` (line 442-484, called from
