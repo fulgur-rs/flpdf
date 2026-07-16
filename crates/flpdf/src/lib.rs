@@ -70,6 +70,7 @@ pub mod outline;
 pub mod outline_dest_remap;
 pub mod outline_document_helper;
 pub(crate) mod overlay;
+pub(crate) mod overlay_annotations;
 pub mod page_annotation_enum;
 pub mod page_annotation_flatten;
 pub mod page_closure;
