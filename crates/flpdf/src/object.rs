@@ -929,6 +929,86 @@ mod qdf_key_escape_tests {
 }
 
 #[cfg(test)]
+mod real_literal_tests {
+    use super::*;
+
+    /// A safe `RealLiteral` (bytes are in the PDF real charset AND round-trip
+    /// to `value` bit-for-bit) is emitted verbatim, preserving qpdf-parity
+    /// source literals like `.4`, `1.`, `+.25` that would otherwise be
+    /// re-canonicalised by `f64::to_string`.
+    #[test]
+    fn write_pdf_emits_safe_literal_verbatim() {
+        let mut out = Vec::new();
+        Object::RealLiteral {
+            value: 0.75,
+            literal: b".75".to_vec(),
+        }
+        .write_pdf(&mut out);
+        assert_eq!(out, b".75");
+    }
+
+    /// An unsafe `RealLiteral` (bytes contain characters outside the PDF real
+    /// charset, e.g. a space or `/`) falls back to the canonical
+    /// `value.to_string()` form so the injected bytes cannot slip into a
+    /// numeric position of the emitted PDF.
+    #[test]
+    fn write_pdf_falls_back_when_literal_has_bad_bytes() {
+        let mut out = Vec::new();
+        Object::RealLiteral {
+            value: 0.75,
+            literal: b"0.75 /Type /Malicious".to_vec(),
+        }
+        .write_pdf(&mut out);
+        assert_eq!(out, b"0.75");
+    }
+
+    /// An unsafe `RealLiteral` (bytes are numeric-only but do not parse back
+    /// to `value`) falls back to the canonical form. Guards against a hand-
+    /// built RealLiteral whose stored `value` disagrees with its literal.
+    #[test]
+    fn write_pdf_falls_back_when_literal_does_not_round_trip() {
+        let mut out = Vec::new();
+        Object::RealLiteral {
+            value: 0.5,
+            literal: b"0.75".to_vec(),
+        }
+        .write_pdf(&mut out);
+        assert_eq!(out, b"0.5");
+    }
+
+    #[test]
+    fn is_safe_rejects_empty_literal() {
+        assert!(!real_literal_is_safe(b"", 0.0));
+    }
+
+    #[test]
+    fn is_safe_rejects_disallowed_char() {
+        // Space is not in the PDF real charset — must be rejected even though
+        // stripping it would round-trip.
+        assert!(!real_literal_is_safe(b"0.5 ", 0.5));
+    }
+
+    #[test]
+    fn is_safe_rejects_non_utf8() {
+        assert!(!real_literal_is_safe(b"\xff\xfe", 0.0));
+    }
+
+    #[test]
+    fn is_safe_rejects_value_mismatch() {
+        // Digits round-trip cleanly, but to a different value.
+        assert!(!real_literal_is_safe(b"0.75", 0.5));
+    }
+
+    #[test]
+    fn is_safe_accepts_canonical_literal() {
+        assert!(real_literal_is_safe(b".75", 0.75));
+        assert!(real_literal_is_safe(b"1.", 1.0));
+        assert!(real_literal_is_safe(b"+.25", 0.25));
+        assert!(real_literal_is_safe(b"1e3", 1000.0));
+    }
+}
+
+#[cfg(test)]
 mod stream_dict_order_tests {
     use super::*;
 

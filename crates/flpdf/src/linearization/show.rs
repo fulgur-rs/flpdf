@@ -1642,6 +1642,41 @@ mod tests {
         ));
     }
 
+    /// `param_u64` recognizes a whole-number `/DA` parameter stored as
+    /// [`Object::RealLiteral`] (source literal like `5.0` that Rust's
+    /// shortest round-trip would render as `5`). Guards the RealLiteral
+    /// arm added for byte-identical parity.
+    #[test]
+    fn param_u64_accepts_real_literal_whole_number() {
+        let mut d = crate::Dictionary::new();
+        d.insert(
+            "N",
+            Object::RealLiteral {
+                value: 5.0,
+                literal: b"5.0".to_vec(),
+            },
+        );
+        assert_eq!(param_u64(&d, "N").expect("must succeed"), 5);
+    }
+
+    /// A fractional `RealLiteral` (e.g. `1.5`) is still rejected — the
+    /// `.fract() == 0.0` guard applies to both real variants.
+    #[test]
+    fn param_u64_rejects_fractional_real_literal() {
+        let mut d = crate::Dictionary::new();
+        d.insert(
+            "N",
+            Object::RealLiteral {
+                value: 1.5,
+                literal: b"1.5".to_vec(),
+            },
+        );
+        assert!(matches!(
+            param_u64(&d, "N"),
+            Err(ShowLinearizationError::Malformed { .. })
+        ));
+    }
+
     #[test]
     fn parse_obj_header_basic() {
         assert_eq!(

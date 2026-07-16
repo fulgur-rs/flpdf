@@ -843,6 +843,83 @@ mod tests {
         assert_eq!(as_u64(&exact, "N").unwrap(), 42, "Real(42.0) is exact");
     }
 
+    /// `as_u64` accepts an integer-valued `RealLiteral` (source literal
+    /// preserved through the parser but still equal to the whole-number
+    /// value). Covers the `RealLiteral` arm added for byte-identical
+    /// parity.
+    #[test]
+    fn as_u64_accepts_integer_valued_real_literal() {
+        let lit = Object::RealLiteral {
+            value: 42.0,
+            literal: b"42.0".to_vec(),
+        };
+        assert_eq!(as_u64(&lit, "N").unwrap(), 42);
+    }
+
+    /// A fractional `RealLiteral` (source literal `.9`) is rejected via the
+    /// same `.fract() == 0.0` guard that applies to `Object::Real`.
+    #[test]
+    fn as_u64_rejects_fractional_real_literal() {
+        let lit = Object::RealLiteral {
+            value: 0.9,
+            literal: b".9".to_vec(),
+        };
+        assert!(matches!(
+            as_u64(&lit, "N"),
+            Err(LinearizationCheckError::InvalidParam { .. })
+        ));
+    }
+
+    /// Build a PDF whose object `(1, 0)` is a "linearization dictionary"
+    /// whose `/Linearized` value is a non-canonical real literal (`.9`,
+    /// stored as [`Object::RealLiteral`]). The dictionary is intentionally
+    /// missing the rest of the required keys (`/L`, `/H`, `/O`, `/E`, `/N`,
+    /// `/T`), so downstream checks will fail — but the `RealLiteral` arm at
+    /// the /Linearized recognition point (check.rs:185-187) is what we care
+    /// about for coverage.
+    fn linearization_like_pdf_with_real_literal_linearized() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Linearized .9 >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n");
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 2 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// `check_linearization` recognizes `/Linearized` when its value is an
+    /// [`Object::RealLiteral`] (source literal like `.9`) and proceeds past
+    /// the `NotLinearized` early-return into the downstream checks — where
+    /// the intentionally-incomplete fixture then fails. If the RealLiteral
+    /// arm were missing, the failure would be `NotLinearized`.
+    #[test]
+    fn check_linearization_accepts_real_literal_linearized_value() {
+        let pdf = linearization_like_pdf_with_real_literal_linearized();
+        let result = check_linearization_bytes(&pdf);
+        match result {
+            Err(LinearizationCheckError::NotLinearized) => {
+                panic!("RealLiteral /Linearized must not be rejected as NotLinearized");
+            }
+            Err(_) => { /* expected: downstream check fails on the stub fixture */ }
+            Ok(()) => panic!("stub fixture cannot satisfy a full linearization check"),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // parse_obj_header_at: full N G obj parser
     // -----------------------------------------------------------------------

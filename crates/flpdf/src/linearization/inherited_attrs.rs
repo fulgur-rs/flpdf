@@ -3328,6 +3328,64 @@ mod tests {
         );
     }
 
+    /// A `/Page` leaf whose `/MediaBox` mixes direct integers with one
+    /// **indirect** element that resolves to an [`Object::RealLiteral`]
+    /// (source literal `792.0`, which the parser preserves because Rust's
+    /// shortest form of `792.0f64` is `"792"`). Exercises `is_rectangle`'s
+    /// `Reference → RealLiteral` arm at line 550-560.
+    fn pdf_with_indirect_real_literal_mediabox_elem() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 4 0 R] >>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(b"4 0 obj\n792.0\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// A `/MediaBox` whose last element is an indirect ref to a
+    /// [`Object::RealLiteral`] terminal is a valid rectangle and must NOT be
+    /// overwritten with the `[0 0 612 792]` default. Guards the
+    /// `matches!(resolved, ... | Object::RealLiteral { .. })` arm added
+    /// alongside the RealLiteral variant.
+    #[test]
+    fn indirect_real_literal_mediabox_elem_is_recognized_and_not_defaulted() {
+        let bytes = pdf_with_indirect_real_literal_mediabox_elem();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let Object::Dictionary(leaf_dict) = leaf else {
+            panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
+        };
+        let mb = leaf_dict.get("MediaBox").expect("MediaBox must be present");
+        let Object::Array(items) = mb else {
+            panic!("MediaBox must be an array, got {mb:?}"); // cov:ignore: unreachable — fixture always uses an array
+        };
+        // Fourth element must still be the indirect reference; the default
+        // rectangle would have replaced it with an Integer(792).
+        assert!(
+            matches!(items.get(3), Some(Object::Reference(_))),
+            "expected /MediaBox[3] to remain an indirect reference, got {:?}",
+            items.get(3)
+        );
+    }
+
     /// The root `/Pages` node's single `/Kids` entry is a DIRECT (inline) `/Page`
     /// dictionary, NOT an indirect reference. The inline leaf carries its own
     /// valid `/MediaBox` and correct `/Type /Page`, so ONLY the direct → indirect

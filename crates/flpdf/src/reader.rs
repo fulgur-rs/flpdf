@@ -2361,6 +2361,47 @@ mod tests {
         pdf
     }
 
+    /// Build a minimal PDF whose object `(1, 0)` is a linearization
+    /// parameter dictionary with `/Linearized` written as `.9` — a
+    /// non-canonical literal that the parser stores as
+    /// [`Object::RealLiteral`]. Exercises `linearized_hint_ref`'s
+    /// `RealLiteral` arm.
+    fn linearized_like_pdf_bytes_real_literal() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Linearized .9 >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n");
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 5 /Root 2 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// `linearized_hint_ref` recognizes a `/Linearized` value stored as
+    /// [`Object::RealLiteral`] (non-canonical source literal like `.9`) and
+    /// returns `Some((1, 0))`. Regression guard for the
+    /// `Object::Real | Object::RealLiteral` arm.
+    #[test]
+    fn linearized_hint_ref_accepts_real_literal_value() {
+        let bytes = linearized_like_pdf_bytes_real_literal();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open should succeed");
+        let hint = pdf.linearized_hint_ref().expect("must succeed");
+        assert_eq!(hint, Some(ObjectRef::new(1, 0)));
+    }
+
     // ------------------------------------------------------------------
     // Acceptance (1): open_mem_owned(Vec<u8>) opens an in-memory PDF
     // ------------------------------------------------------------------

@@ -763,3 +763,22 @@ fn object_type_name(obj: &Object) -> &'static str {
         Object::Reference(_) => "reference",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `object_type_name` collapses both real variants to `"real"` — both
+    /// forms should produce the same diagnostic string.
+    #[test]
+    fn object_type_name_collapses_real_and_real_literal() {
+        assert_eq!(object_type_name(&Object::Real(1.5)), "real");
+        assert_eq!(
+            object_type_name(&Object::RealLiteral {
+                value: 1.5,
+                literal: b"1.5".to_vec(),
+            }),
+            "real"
+        );
+    }
+}
