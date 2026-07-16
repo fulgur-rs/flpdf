@@ -563,7 +563,7 @@ fn page_group<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<O
 /// Compute the transitive reachable object closure of the Form XObject at
 /// `xobject_ref` (the XObject itself plus every object reachable through its
 /// references). Bounded DFS with a visited set (cycle guard) and a depth limit.
-fn xobject_object_closure<R: Read + Seek>(
+pub(crate) fn xobject_object_closure<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     xobject_ref: ObjectRef,
 ) -> Result<BTreeSet<ObjectRef>> {
