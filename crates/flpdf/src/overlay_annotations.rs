@@ -454,15 +454,13 @@ pub(crate) fn apply_placement<R: Read + Seek>(
         // 4. Transform the annot's /Rect by cm.
         transform_annot_rect(dest, new_annot_ref, cm)?;
 
-        // 5. Repoint `/P` (the annot's back-pointer to its owning page). The
-        //    source's /P was excluded from the copy closure so the source page
-        //    itself is not dragged into dest; the surviving entry in the
-        //    dup'd annot dict is `Null` after `copy_objects`'s rewrite pass.
-        //    Rewrite that Null to the current dest_page_ref so the annot is
-        //    consistent with its new host. Annots that never had /P (the
-        //    primary target case) stay as-is — no key is added — so goldens
-        //    without /P remain byte-identical.
-        set_annot_page_ref_if_null(dest, new_annot_ref, dest_page_ref)?;
+        // 5. Drop the annot's `/P` back-pointer when it is `Null` after copy.
+        //    survey excluded `/P` from the copy closure (so the source page is
+        //    not dragged into dest), which leaves `/P null` for annots that
+        //    had one; qpdf's oracle removes the key entirely rather than
+        //    repointing at dest_page_ref. Annots that never had /P (the
+        //    primary target) are untouched.
+        set_annot_page_ref_if_null(dest, new_annot_ref)?;
 
         new_annot_refs.push(new_annot_ref);
     }
@@ -986,18 +984,21 @@ fn ancestor_has_key<R: Read + Seek>(
     Ok(false)
 }
 
-/// Rewrite the annot's `/P` entry to `dest_page_ref` when it is currently
-/// `Null`. The source's /P was excluded from the copy closure
+/// Remove the annot's `/P` entry when it is currently `Null`.
+///
+/// The source's `/P` was excluded from the copy closure
 /// ([`survey_source_annotations`], `skip_parent_key = true`), so the
 /// dup'd annot dict carries `/P null` after `copy_objects`'s rewrite pass
-/// (unmapped refs become `Object::Null`). Repointing that Null to the
-/// current dest page keeps the annot's page back-pointer consistent while
-/// leaving annots that never had `/P` untouched — no key is added, so
-/// fixtures whose source annots omit `/P` stay byte-identical.
+/// (unmapped refs become `Object::Null`). qpdf's oracle drops `/P` from
+/// the copied annot entirely (verified against the
+/// `overlay-source-p-and-inline.pdf` golden) — the page back-pointer is
+/// re-established at read time by whatever consumer needs it. Removing
+/// the key here rather than re-pointing it at `dest_page_ref` matches
+/// that behavior; annots that never had `/P` (the primary target) are
+/// unaffected since the key isn't present to remove.
 fn set_annot_page_ref_if_null<R: Read + Seek>(
     dest: &mut Pdf<R>,
     annot_ref: ObjectRef,
-    dest_page_ref: ObjectRef,
 ) -> Result<()> {
     let Some(mut dict) = dest.resolve(annot_ref)?.into_dict() else {
         return Ok(());
@@ -1006,7 +1007,7 @@ fn set_annot_page_ref_if_null<R: Read + Seek>(
         Some(Object::Null) => {}
         _ => return Ok(()),
     }
-    dict.insert("P", Object::Reference(dest_page_ref));
+    dict.remove("P");
     dest.set_object(annot_ref, Object::Dictionary(dict));
     Ok(())
 }

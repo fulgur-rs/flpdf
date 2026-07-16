@@ -1515,6 +1515,48 @@ mod byte_gate {
         assert_byte_identical(&actual, "overlay-copy-annotations.pdf");
     }
 
+    /// Overlay a source that mixes two edge shapes into its page's
+    /// `/Annots` array:
+    /// - one widget (obj 3, "Text Box 1") carries an explicit `/P`
+    ///   pointing at the source page — after copy that ref goes stale
+    ///   and gets Null'd by rewrite_refs, so `apply_placement`'s
+    ///   `set_annot_page_ref_if_null` must repoint it at dest_page_ref;
+    /// - one entry is a DIRECT annot dictionary (an inline
+    ///   `<< /Subtype /FreeText ... >>` where an indirect ref would
+    ///   normally live) — `survey_source_annotations` must materialize
+    ///   it into a fresh source-doc indirect object (qpdf
+    ///   transformAnnotations line 954-956).
+    ///
+    /// Fixture: `form-fields-and-annotations-p-and-inline.pdf` is the
+    /// primary source with `/P 17 0 R` added to Text Box 1 and one
+    /// FreeText annot inlined into the page's `/Annots`.
+    #[test]
+    fn overlay_copy_annotations_source_p_and_inline_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src = fixture("form-fields-and-annotations-p-and-inline.pdf");
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            ..Default::default()
+        };
+        let mut actual = Vec::new();
+        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        assert_byte_identical(&actual, "overlay-source-p-and-inline.pdf");
+    }
+
     /// Overlay a source whose `/AcroForm/DR` is stored inline as a direct
     /// dictionary (rather than the usual indirect ref). Exercises
     /// `read_source_acroform_defaults`' direct-`/DR` materialize path
