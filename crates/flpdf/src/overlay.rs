@@ -1515,6 +1515,47 @@ mod byte_gate {
         assert_byte_identical(&actual, "overlay-copy-annotations.pdf");
     }
 
+    /// Overlay a source whose `/AcroForm` supplies `/DA` and `/Q` defaults
+    /// onto a dest with no `/AcroForm`. Exercises qpdf's
+    /// `adjustInheritedFields` (line 442-484, called from
+    /// transformAnnotations line 914-917) — a copied field that inherits
+    /// its default appearance / quadding from the source `/AcroForm` gets
+    /// the value pinned on the field itself so the (different / absent)
+    /// dest default is not silently inherited.
+    ///
+    /// Fixture: `form-fields-and-annotations-with-defaults.pdf` is
+    /// `form-fields-and-annotations.pdf` with `/DA (/ZaDi 0 Tf 0 g)` and
+    /// `/Q 1` added at the `/AcroForm` level (nothing else changed). Dest
+    /// remains fxo-red (no `/AcroForm`), so `override_da` and
+    /// `override_q` both fire and every copied field runs through
+    /// `adjust_inherited_field` + `ancestor_has_key`.
+    #[test]
+    fn overlay_copy_annotations_with_da_q_defaults_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src = fixture("form-fields-and-annotations-with-defaults.pdf");
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            ..Default::default()
+        };
+        let mut actual = Vec::new();
+        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        assert_byte_identical(&actual, "overlay-copy-annotations-with-defaults.pdf");
+    }
+
     /// Underlay counterpart of the primary copy-annotations byte gate.
     /// Same fixture (fxo-red + form-fields-and-annotations, --repeat=1),
     /// same expected annotation copy behaviour (qpdf's
