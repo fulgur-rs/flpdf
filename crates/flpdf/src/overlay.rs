@@ -192,8 +192,11 @@ fn matrix_for_form_xobject_placement(
 /// (qpdf 11.9.0). A degenerate placement matrix collapses to the identity, as in
 /// qpdf.
 ///
-/// The fragment is exactly `"q\n" + cm + " cm\n/" + name + " Do\nQ\n"`, where `cm`
-/// is the six components formatted by [`matrix_unparse`].
+/// Returns `(fragment, cm)`: the fragment is exactly
+/// `"q\n" + cm + " cm\n/" + name + " Do\nQ\n"` (with `cm` formatted by
+/// [`matrix_unparse`]); `cm` is the same six-component matrix used to place the
+/// XObject. Callers that transform per-placement annotations (qpdf's
+/// `copyAnnotations(from_page, cm, …)`) use the returned `cm` unchanged.
 fn place_form_xobject(
     fo_bbox: [f64; 4],
     fo_matrix: [f64; 6],
@@ -202,7 +205,7 @@ fn place_form_xobject(
     allow_shrink: bool,
     allow_expand: bool,
     name: &str,
-) -> String {
+) -> (String, [f64; 6]) {
     let cm = matrix_for_form_xobject_placement(
         fo_bbox,
         fo_matrix,
@@ -212,7 +215,8 @@ fn place_form_xobject(
         allow_expand,
     )
     .unwrap_or(IDENTITY_MATRIX);
-    format!("q\n{} cm\n/{} Do\nQ\n", matrix_unparse(cm), name)
+    let fragment = format!("q\n{} cm\n/{} Do\nQ\n", matrix_unparse(cm), name);
+    (fragment, cm)
 }
 
 /// Apply an ordered list of overlay/underlay `sources` to the destination page
@@ -314,21 +318,21 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     let mut content = String::new();
     for (name, xref) in &underlay_names {
         let (bbox, fmatrix) = fo_bbox_and_matrix(dest, *xref)?;
-        content.push_str(&place_form_xobject(
-            bbox, fmatrix, trim_rect, tmatrix, true, false, name,
-        ));
+        let (fragment, _cm) =
+            place_form_xobject(bbox, fmatrix, trim_rect, tmatrix, true, false, name);
+        content.push_str(&fragment);
     }
     {
         let (bbox, fmatrix) = fo_bbox_and_matrix(dest, fx0_ref)?;
-        content.push_str(&place_form_xobject(
-            bbox, fmatrix, media_rect, tmatrix, false, false, "Fx0",
-        ));
+        let (fragment, _cm) =
+            place_form_xobject(bbox, fmatrix, media_rect, tmatrix, false, false, "Fx0");
+        content.push_str(&fragment);
     }
     for (name, xref) in &overlay_names {
         let (bbox, fmatrix) = fo_bbox_and_matrix(dest, *xref)?;
-        content.push_str(&place_form_xobject(
-            bbox, fmatrix, trim_rect, tmatrix, true, false, name,
-        ));
+        let (fragment, _cm) =
+            place_form_xobject(bbox, fmatrix, trim_rect, tmatrix, true, false, name);
+        content.push_str(&fragment);
     }
 
     // 4. Allocate the new /Contents stream (uncompressed, no /Filter; the writer
@@ -1738,7 +1742,7 @@ mod tests {
     #[test]
     fn place_identity_when_same_size() {
         // BBox == rect (612x792 at origin), no fo/dest transform -> identity, centred.
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 612.0, 792.0],
             ID,
             [0.0, 0.0, 612.0, 792.0],
@@ -1754,7 +1758,7 @@ mod tests {
     fn place_centers_smaller_bbox_without_scaling() {
         // 300x144 source into 612x792 dest: no scale-up; centred at
         // tx = 306 - 150 = 156, ty = 396 - 72 = 324.
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 300.0, 144.0],
             ID,
             [0.0, 0.0, 612.0, 792.0],
@@ -1770,7 +1774,7 @@ mod tests {
     fn place_shrinks_larger_bbox_to_fit() {
         // 612x792 source into 300x144 dest with allow_shrink: scale = min(300/612,
         // 144/792) = 0.18182 (5dp). tx -> "94.36364", ty -> "0".
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 612.0, 792.0],
             ID,
             [0.0, 0.0, 300.0, 144.0],
@@ -1787,7 +1791,7 @@ mod tests {
         // Same oversize source, but allow_shrink=false (the /Fx0 flags): the
         // would-be <1 scale is clamped to 1 and the bbox is centred unscaled.
         // scale 1; t_cx=306, t_cy=396; r_cx=150, r_cy=72; tx=-156, ty=-324.
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 612.0, 792.0],
             ID,
             [0.0, 0.0, 300.0, 144.0],
@@ -1803,7 +1807,7 @@ mod tests {
     fn place_fractional_center() {
         // 301x145 source into 612x792 dest: no scale; tx = 306 - 150.5 = 155.5,
         // ty = 396 - 72.5 = 323.5.
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 301.0, 145.0],
             ID,
             [0.0, 0.0, 612.0, 792.0],
@@ -1820,7 +1824,7 @@ mod tests {
         // A degenerate /BBox (zero width) gives qpdf a degenerate transformed
         // rectangle, so getMatrixForFormXObjectPlacement returns the identity
         // (NOT a centred scale-1 placement). Mirrors qpdf 11.9.0.
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 0.0, 100.0],
             ID,
             [0.0, 0.0, 200.0, 200.0],
@@ -1837,7 +1841,7 @@ mod tests {
         // /BBox origin is non-zero: centre uses (llx+urx)/2, (lly+ury)/2.
         // BBox [10 10 510 610] -> w=500 h=600 into rect [0 0 612 792].
         // scale = min(612/500, 792/600) -> clamped to 1; tx=46, ty=86.
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [10.0, 10.0, 510.0, 610.0],
             ID,
             [0.0, 0.0, 612.0, 792.0],
@@ -1859,7 +1863,7 @@ mod tests {
         // (impossible for the old axis-aligned placement) prove the dest inverse
         // transform is folded in.
         let tmatrix = [0.0, 1.0, -1.0, 0.0, 792.0, 0.0];
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 612.0, 792.0],
             [0.0, -1.0, 1.0, 0.0, 0.0, 612.0],
             [0.0, 0.0, 612.0, 792.0],
@@ -2416,7 +2420,7 @@ mod tests {
         //   0.77273 0 0 0.77273 0 159.54545
         // The fo /Matrix affects scale/translation but does NOT appear in the cm
         // (the PDF interpreter applies it automatically), so b/c stay 0.
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 612.0, 792.0],
             [0.0, -1.0, 1.0, 0.0, 0.0, 612.0],
             [0.0, 0.0, 612.0, 792.0],
