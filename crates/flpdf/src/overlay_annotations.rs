@@ -13,8 +13,8 @@
 //! 1. [`survey_source_annotations`] — walk the source page's `/Annots` in
 //!    source space and return the reachable-ref closure to add to the batch
 //!    [`copy_objects`](crate::object_copy::copy_objects) call, alongside a
-//!    survey describing the per-annot top-level field and the source
-//!    `/AcroForm` inherited entries.
+//!    survey describing the per-annot top-level field and (when present) the
+//!    source `/AcroForm/DR` ref.
 //! 2. [`template_from_survey`] — after the batch copy returns its map, remap
 //!    the survey's source-space refs into dest-space refs.
 //! 3. [`apply_placement`] — per placement, shallow-duplicate each annotation
@@ -50,10 +50,6 @@ pub(crate) struct AnnotationSurvey {
     pub annots: Vec<(ObjectRef, Option<ObjectRef>)>,
     /// Source `/AcroForm/DR` ref, if present.
     pub source_dr: Option<ObjectRef>,
-    /// Source `/AcroForm/DA` value (verbatim), if present.
-    pub source_default_da: Option<Vec<u8>>,
-    /// Source `/AcroForm/Q` integer, if present.
-    pub source_default_q: Option<i64>,
 }
 
 /// Dest-space refs derived from an [`AnnotationSurvey`] after cross-doc copy;
@@ -64,11 +60,6 @@ pub(crate) struct AnnotationCopyTemplate {
     pub annots: Vec<(ObjectRef, Option<ObjectRef>)>,
     /// Dest-space source `/DR` ref, if the source had one.
     pub source_dr: Option<ObjectRef>,
-    /// Source `/AcroForm/DA` value (verbatim); used by `adjustInheritedFields`
-    /// when it differs from the dest's default.
-    pub source_default_da: Option<Vec<u8>>,
-    /// Source `/AcroForm/Q` integer; same as above.
-    pub source_default_q: Option<i64>,
 }
 
 /// Walk a source page's `/Annots` and return:
@@ -130,10 +121,13 @@ pub(crate) fn survey_source_annotations<R: Read + Seek>(
         return Ok(None);
     }
 
-    // 3. Read source /AcroForm inherited entries. /DA and /Q are the ones
-    //    qpdf's transformAnnotations reads for override_da/override_q
-    //    (QPDFAcroFormDocumentHelper.cc:737-745). /DR is added to the copy set.
-    let (source_dr, source_default_da, source_default_q) = read_source_acroform_defaults(source)?;
+    // 3. Read the source /AcroForm/DR ref (added to the copy set below).
+    //    Source /AcroForm /DA and /Q would feed `adjustInheritedFields`
+    //    (qpdf QPDFAcroFormDocumentHelper.cc:442-484), but the primary target
+    //    (fxo-red + form-fields-and-annotations) has neither key, so
+    //    override_da/override_q are always false and the path is dormant —
+    //    implementing it lands with a separate follow-up.
+    let source_dr = read_source_acroform_dr(source)?;
 
     // 4. Build the reachable-ref closure to feed the batch copy_objects call.
     //    Every annot ref is seeded (with /P skipped, since a widget's /P is a
@@ -164,15 +158,7 @@ pub(crate) fn survey_source_annotations<R: Read + Seek>(
         )?;
     }
 
-    Ok(Some((
-        AnnotationSurvey {
-            annots,
-            source_dr,
-            source_default_da,
-            source_default_q,
-        },
-        closure,
-    )))
+    Ok(Some((AnnotationSurvey { annots, source_dr }, closure)))
 }
 
 /// Walk `annot_ref`'s `/Parent` chain in source space to find its top-level
@@ -239,42 +225,37 @@ fn top_level_field_for_annot<R: Read + Seek>(
     )))
 }
 
-/// Read source `/AcroForm/DR`, `/DA`, `/Q` for later use by `apply_placement`
-/// (adjustInheritedFields overrides /DA and /Q on each copied field when they
-/// differ from the destination's defaults). Returns default (None, None,
-/// None) when the source has no `/AcroForm`.
-fn read_source_acroform_defaults<R: Read + Seek>(
-    source: &mut Pdf<R>,
-) -> Result<(Option<ObjectRef>, Option<Vec<u8>>, Option<i64>)> {
+/// Read source `/AcroForm/DR` for later use by `apply_placement`. Returns
+/// `None` when the source has no `/AcroForm` or when `/DR` is absent.
+///
+/// Source `/AcroForm` `/DA` and `/Q` (needed for qpdf's
+/// `adjustInheritedFields` overrides — see
+/// `QPDFAcroFormDocumentHelper.cc:442-484` and its call site at
+/// line 914-917) are not read: the primary target
+/// (fxo-red + form-fields-and-annotations) has neither key, so
+/// `override_da`/`override_q` are always false and the path is dormant. A
+/// separate follow-up implements the overrides once a fixture exercises them.
+fn read_source_acroform_dr<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Option<ObjectRef>> {
     let Some(root_ref) = source.root_ref() else {
-        return Ok((None, None, None));
+        return Ok(None);
     };
     let acroform_val = {
         let obj = source.resolve_borrowed(root_ref)?;
         let Some(dict) = obj.as_dict() else {
-            return Ok((None, None, None));
+            return Ok(None);
         };
         dict.get("AcroForm").cloned()
     };
     let acroform_dict = match acroform_val {
-        None | Some(Object::Null) => return Ok((None, None, None)),
+        None | Some(Object::Null) => return Ok(None),
         Some(Object::Dictionary(d)) => d,
         Some(Object::Reference(r)) => match source.resolve(r)? {
             Object::Dictionary(d) => d,
-            _ => return Ok((None, None, None)),
+            _ => return Ok(None),
         },
-        _ => return Ok((None, None, None)),
+        _ => return Ok(None),
     };
-    let dr = acroform_dict.get_ref("DR");
-    let da = match acroform_dict.get("DA") {
-        Some(Object::String(s)) => Some(s.clone()),
-        _ => None,
-    };
-    let q = match acroform_dict.get("Q") {
-        Some(Object::Integer(n)) => Some(*n),
-        _ => None,
-    };
-    Ok((dr, da, q))
+    Ok(acroform_dict.get_ref("DR"))
 }
 
 /// Materialize an [`AnnotationSurvey`]'s source-space refs into dest-space
@@ -303,8 +284,6 @@ pub(crate) fn template_from_survey(
     AnnotationCopyTemplate {
         annots,
         source_dr: survey.source_dr.and_then(|r| copy_map.get(&r).copied()),
-        source_default_da: survey.source_default_da.clone(),
-        source_default_q: survey.source_default_q,
     }
 }
 
@@ -710,7 +689,7 @@ fn transform_annot_rect<R: Read + Seek>(
     for (i, item) in rect.iter().enumerate() {
         nums[i] = match item {
             Object::Integer(n) => *n as f64,
-            Object::Real(x) => *x,
+            Object::Real(x) | Object::RealLiteral { value: x, .. } => *x,
             _ => return Ok(()),
         };
     }
@@ -1189,22 +1168,4 @@ fn fully_qualified_name_of<R: Read + Seek>(
         out.extend_from_slice(n);
     }
     Ok(out)
-}
-
-// Suppress dead-code warnings for the future field access; every helper here
-// is called from `crate::overlay` once the wiring is in place.
-#[allow(dead_code)]
-fn _touch_survey_fields(s: &AnnotationSurvey, t: &AnnotationCopyTemplate) -> Option<Vec<u8>> {
-    let _ = (
-        &s.annots,
-        s.source_dr,
-        &s.source_default_da,
-        s.source_default_q,
-        &t.annots,
-        t.source_dr,
-        &t.source_default_da,
-        t.source_default_q,
-    );
-    let _: Result<()> = Err(Error::Unsupported("dead-code sink".into()));
-    None
 }

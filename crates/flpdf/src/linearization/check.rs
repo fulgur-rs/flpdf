@@ -108,7 +108,11 @@ macro_rules! fail {
 fn as_u64(obj: &Object, key: &str) -> std::result::Result<u64, LinearizationCheckError> {
     match obj {
         Object::Integer(n) if *n >= 0 => Ok(*n as u64),
-        Object::Real(r) if r.is_finite() && *r >= 0.0 && r.fract() == 0.0 => Ok(*r as u64),
+        Object::Real(r) | Object::RealLiteral { value: r, .. }
+            if r.is_finite() && *r >= 0.0 && r.fract() == 0.0 =>
+        {
+            Ok(*r as u64)
+        }
         other => Err(LinearizationCheckError::InvalidParam {
             message: format!(
                 "/{key} is not a non-negative integer (got {})",
@@ -182,7 +186,7 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     };
     match linearized_val {
         Object::Integer(n) if *n > 0 => {}
-        Object::Real(r) if r.is_finite() && *r > 0.0 => {}
+        Object::Real(r) | Object::RealLiteral { value: r, .. } if r.is_finite() && *r > 0.0 => {}
         _ => return Err(LinearizationCheckError::NotLinearized),
     }
 

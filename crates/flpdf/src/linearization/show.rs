@@ -591,7 +591,11 @@ fn dump_generic(out: &mut String, p: &LinParameters, t: &HGeneric) {
 fn param_u64(dict: &crate::Dictionary, key: &'static str) -> ShowResult<u64> {
     match dict.get(key) {
         Some(Object::Integer(n)) if *n >= 0 => Ok(*n as u64),
-        Some(Object::Real(r)) if r.is_finite() && *r >= 0.0 && r.fract() == 0.0 => Ok(*r as u64),
+        Some(Object::Real(r)) | Some(Object::RealLiteral { value: r, .. })
+            if r.is_finite() && *r >= 0.0 && r.fract() == 0.0 =>
+        {
+            Ok(*r as u64)
+        }
         _ => Err(malformed!(
             "/{key} is missing or not a non-negative integer in the linearization dictionary"
         )),
@@ -606,7 +610,9 @@ fn param_u64(dict: &crate::Dictionary, key: &'static str) -> ShowResult<u64> {
 fn is_linearized(dict: &crate::Dictionary, file_size: u64) -> bool {
     let linearized_ok = match dict.get("Linearized") {
         Some(Object::Integer(n)) => *n == 1,
-        Some(Object::Real(r)) => r.is_finite() && r.floor() == 1.0,
+        Some(Object::Real(r)) | Some(Object::RealLiteral { value: r, .. }) => {
+            r.is_finite() && r.floor() == 1.0
+        }
         _ => false,
     };
     if !linearized_ok {
