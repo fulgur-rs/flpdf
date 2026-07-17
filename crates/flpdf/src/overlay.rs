@@ -477,7 +477,8 @@ fn map_overlay_pages(
 /// selected pages are paired by [`map_overlay_pages`].
 ///
 /// The distinct source pages used by the mapping are imported into `dest` in a
-/// single cross-document copy via [`import_pages_as_form_xobjects`] (so an object
+/// single cross-document copy via
+/// [`import_pages_as_form_xobjects`](crate::page_form_xobject::import_pages_as_form_xobjects) (so an object
 /// shared by several source pages is copied once), and the imported Form XObject
 /// reference is shared across every destination page that uses that source page
 /// (qpdf imports each source page once and reuses the object). The result is a
@@ -491,7 +492,8 @@ fn map_overlay_pages(
 /// - [`Error::Unsupported`] when a resolved page number falls outside `dest` or
 ///   `source` (the page lists and counts are read once up front, so this only
 ///   triggers on an internally inconsistent mapping), or any error propagated
-///   from [`PageRange::resolve`] or [`import_pages_as_form_xobjects`].
+///   from [`PageRange::resolve`] or
+///   [`import_pages_as_form_xobjects`](crate::page_form_xobject::import_pages_as_form_xobjects).
 fn spec_page_sources<RS, RT>(
     dest: &mut Pdf<RT>,
     source: &mut Pdf<RS>,
