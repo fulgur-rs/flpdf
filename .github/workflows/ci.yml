@@ -214,8 +214,17 @@ jobs:
 
       # Output to target/ (gitignored) so the working tree stays clean for the
       # patch-coverage gate's dirty-tree check.
+      #
+      # `--features qpdf-zlib-compat` mirrors scripts/patch-coverage.sh's fresh-
+      # mode default: the byte-identical `overlay::byte_gate` tests are gated on
+      # that feature, and without it coverage under-reports catastrophically
+      # (600+ false-positive uncovered lines on flpdf-9hc.34). `--ignore-run-fail`
+      # lets a single pre-existing baseline miss (flpdf-hdsz on
+      # attachment-two-page.pdf) not block the coverage gate — the gate is the
+      # changed-line diff, and the `test` matrix job runs the full suite with a
+      # proper pass/fail gate separately.
       - name: Run tests with coverage
-        run: cargo llvm-cov --workspace --lcov --output-path target/patch-cov.lcov
+        run: cargo llvm-cov --workspace --features qpdf-zlib-compat --ignore-run-fail --lcov --output-path target/patch-cov.lcov
 
       # Authoritative changed-line coverage gate: 100% for crates/flpdf/src/,
       # report-only for crates/flpdf-cli/src/.  Understands // cov:ignore markers
