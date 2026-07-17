@@ -585,7 +585,7 @@ where
         .zip(
             imported_xobject_refs
                 .into_iter()
-                .zip(surveys.into_iter())
+                .zip(surveys)
                 .map(|(xr, sv)| {
                     (
                         xr,
@@ -1492,7 +1492,6 @@ mod byte_gate {
         assert_byte_identical(&actual, "three-page-overlay-rotated.pdf");
     }
 
-    #[test]
     // ---- copy-annotations parity (flpdf-9hc.34) -------------------------
     //
     // Primary target for the overlay/underlay copyAnnotations parity work:
@@ -1798,6 +1797,7 @@ mod byte_gate {
         assert_byte_identical(&actual, "underlay-copy-annotations.pdf");
     }
 
+    #[test]
     fn overlay_one_page_to1_3_repeat1_is_byte_identical() {
         // dest=three-page, overlay source=one-page, --to=1-3 --repeat=1: every
         // dest page is selected and the single source page cycles via --repeat,

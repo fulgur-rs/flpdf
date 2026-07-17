@@ -292,6 +292,7 @@ fn top_level_field_for_annot<R: Read + Seek>(
 /// `transformAnnotations` line 914-917) so a copied field that inherits
 /// `/DA` or `/Q` from the source doc keeps rendering the same way when
 /// the destination doc's defaults differ.
+#[allow(clippy::type_complexity)]
 fn read_source_acroform_defaults<R: Read + Seek>(
     source: &mut Pdf<R>,
 ) -> Result<(Option<ObjectRef>, Option<Vec<u8>>, Option<i64>)> {
