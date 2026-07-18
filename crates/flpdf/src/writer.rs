@@ -6082,16 +6082,19 @@ mod tests {
 
         // The compact shape places `[` immediately before `<` (no space).
         // The generic array serializer would emit `[ <` — the regression.
+        // Materialize the diagnostic on the covered path so the assert-message
+        // arm is not a coverage hole.
+        let out_str = String::from_utf8_lossy(&out).into_owned();
         assert!(
             out.windows(6).any(|w| w == b"/ID [<"),
             "xref-stream trailer /ID must be compact `/ID [<...` (qpdf shape); \
-             found neither: {}",
-            String::from_utf8_lossy(&out).into_owned()
+             got: {out_str}"
         );
         assert!(
             !out.windows(7).any(|w| w == b"/ID [ <"),
             "xref-stream trailer /ID must NOT drift to `/ID [ <...` (that is \
-             the generic array serializer, which regresses qpdf parity)"
+             the generic array serializer, which regresses qpdf parity); \
+             got: {out_str}"
         );
     }
 
