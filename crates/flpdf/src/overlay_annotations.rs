@@ -483,15 +483,33 @@ pub(crate) fn apply_placement<R: Read + Seek>(
     // don't share mutated /Rect / /Parent / AP /Matrix state.
     let mut per_placement_dup: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
 
-    // If ANY annot in this placement carries a top-level field and the source
-    // supplied a /DR, ensure the destination /AcroForm/DR exists. This is
-    // lazy: fxo-red (the primary target) has no /AcroForm, so `dest_acroform_dr`
-    // is None on the first placement and is filled here.
+    // If ANY annot in this placement carries a top-level field, run the
+    // source /DR merge for THIS placement — even when `dest_acroform_dr` is
+    // already Some. The merge repopulates `dr_map.by_name` with just this
+    // source's mappings, so a subsequent placement's field-tree walk (which
+    // reads `dr_map.by_name` via [`adjust_default_appearance`]) sees THIS
+    // source's renames rather than a prior source's stale entries. The
+    // `dest_acroform_dr` cache stays: the ref itself does not change once
+    // installed. When the placement has fields but NO source /DR (a valid
+    // shape: source has annotations without an /AcroForm), no merge fires,
+    // so `dr_map.by_name` is cleared explicitly to prevent a stale rename
+    // from leaking into this placement's /DA rewrites.
     let has_any_top_field = template.annots.iter().any(|(_, tf)| tf.is_some());
-    if has_any_top_field && dest_acroform_dr.is_none() {
-        if let Some(source_dr) = template.source_dr {
-            *dest_acroform_dr = Some(ensure_dest_acroform_dr(dest, source_dr, dr_map)?);
-        } // cov:ignore: control-flow marker — llvm-cov instrumentation artifact
+    if has_any_top_field {
+        match template.source_dr {
+            Some(source_dr) => {
+                let dr_ref = ensure_dest_acroform_dr(dest, source_dr, dr_map)?;
+                if dest_acroform_dr.is_none() {
+                    *dest_acroform_dr = Some(dr_ref);
+                }
+            }
+            // cov:ignore-start: source has fields but no /DR — the shipped
+            // link-annot-no-acroform fixture is source-without-fields, so
+            // this arm needs a source-with-fields-but-no-/DR fixture to
+            // reach.
+            None => dr_map.by_name.clear(),
+            // cov:ignore-end
+        }
     }
 
     // Compute the inherited-field overrides (qpdf transformAnnotations
@@ -916,9 +934,17 @@ fn adjust_default_appearance(
                 if let Some(new_name) = renamed {
                     let present = font_resources.get(name.as_slice()).is_some();
                     if present {
+                        // Escape the replacement bytes so a name containing
+                        // delimiters or non-printable bytes serializes back
+                        // to a valid PDF name token (e.g. decoded `F A_1`
+                        // must emit as `/F#20A_1`, not `/F A_1` which the
+                        // parser would tokenize as `/F` followed by an
+                        // operand run). qpdf routes every name write
+                        // through `QPDF_Name::normalizeName` for the same
+                        // reason.
                         let mut replacement = Vec::with_capacity(new_name.len() + 1);
                         replacement.push(b'/');
-                        replacement.extend_from_slice(new_name);
+                        crate::object::write_name_escaped(&mut replacement, new_name);
                         out.splice(out_start..out_end, replacement);
                     }
                 }
@@ -2575,6 +2601,29 @@ mod tests {
         assert_eq!(
             adjust_default_appearance(da, &dr_map, &resources),
             da.to_vec()
+        );
+    }
+
+    /// A renamed name containing delimiter bytes must be serialized with
+    /// PDF name escaping (`#XX` for delimiters and non-printables), not
+    /// spliced in raw. Concretely: a dest key `F A_1` (decoded bytes with
+    /// a space) must emit as `/F#20A_1`, not `/F A_1` — the raw form
+    /// tokenizes as `/F` followed by an operand run and breaks the /DA.
+    #[test]
+    fn adjust_default_appearance_escapes_name_bytes_needing_hex_escape() {
+        let mut font = BTreeMap::new();
+        // Decoded (in-memory) key = "F A_1" — the parser would have decoded
+        // "F#20A_1" back to these bytes; the writer must re-escape on emit.
+        font.insert(b"F1".to_vec(), b"F A_1".to_vec());
+        let mut dr_map = DrMap::new();
+        dr_map.by_name.insert(b"Font".to_vec(), font);
+        // The dest /Font sub-dict lookup uses the ORIGINAL colliding name
+        // ("F1"); the escape only affects the SERIALIZED output.
+        let resources = font_resources_dict(&["F1"]);
+        let da: &[u8] = b"/F1 18 Tf";
+        assert_eq!(
+            adjust_default_appearance(da, &dr_map, &resources),
+            b"/F#20A_1 18 Tf".to_vec()
         );
     }
 
