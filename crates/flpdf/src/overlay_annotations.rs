@@ -1674,3 +1674,290 @@ fn fully_qualified_name_of<R: Read + Seek>(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Minimal single-object (`/Type /Catalog`, no `/AcroForm`) PDF, just
+    /// enough for [`Pdf::open`] to accept. Tests layer additional objects
+    /// onto it via [`Pdf::set_object`] at object numbers beyond the xref
+    /// table — the same pattern `allocate_next_ref` relies on elsewhere in
+    /// this crate (a `set_object` at a fresh number is accepted and shows up
+    /// in `object_refs()`/is resolvable immediately).
+    fn minimal_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!("xref\n0 2\n0000000000 65535 f \n{off1:010} 00000 n \n").as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    fn open_minimal() -> Pdf<Cursor<Vec<u8>>> {
+        Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("minimal pdf should parse")
+    }
+
+    /// Set object `n` (generation 0) to a dictionary built from `entries` and
+    /// return its ref.
+    fn set_dict<R: Read + Seek>(pdf: &mut Pdf<R>, n: u32, entries: &[(&str, Object)]) -> ObjectRef {
+        let mut d = crate::Dictionary::new();
+        for (k, v) in entries {
+            d.insert(*k, v.clone());
+        }
+        let r = ObjectRef::new(n, 0);
+        pdf.set_object(r, Object::Dictionary(d));
+        r
+    }
+
+    /// Build a one-category `/Font << name ref, ... >>` resource dict object.
+    fn set_font_dr<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        n: u32,
+        entries: &[(&str, ObjectRef)],
+    ) -> ObjectRef {
+        let mut font = crate::Dictionary::new();
+        for (name, r) in entries {
+            font.insert(*name, Object::Reference(*r));
+        }
+        set_dict(pdf, n, &[("Font", Object::Dictionary(font))])
+    }
+
+    fn font_dict<R: Read + Seek>(pdf: &mut Pdf<R>, dr_ref: ObjectRef) -> crate::Dictionary {
+        let dr = pdf.resolve(dr_ref).unwrap().into_dict().unwrap();
+        dr.get("Font").and_then(Object::as_dict).unwrap().clone()
+    }
+
+    // ---- merge_resources_shallow ------------------------------------------
+
+    #[test]
+    fn merge_resources_shallow_dest_empty_is_verbatim_insert() {
+        let mut pdf = open_minimal();
+        let font_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let dest_dr = set_dict(&mut pdf, 2, &[]);
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", font_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+
+        assert!(dr_map.is_empty());
+        let font = font_dict(&mut pdf, dest_dr);
+        assert_eq!(font.get_ref("F1"), Some(font_ref));
+    }
+
+    #[test]
+    fn merge_resources_shallow_renames_on_collision_with_different_ref() {
+        let mut pdf = open_minimal();
+        let helv_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let courier_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("BaseFont", Object::Name(b"Courier".to_vec()))],
+        );
+        let dest_dr = set_font_dr(&mut pdf, 2, &[("F1", helv_ref)]);
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", courier_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+
+        assert_eq!(
+            dr_map
+                .get(b"Font".as_slice())
+                .and_then(|m| m.get(b"F1".as_slice())),
+            Some(&b"F1_1".to_vec())
+        );
+        let font = font_dict(&mut pdf, dest_dr);
+        assert_eq!(font.get_ref("F1"), Some(helv_ref));
+        assert_eq!(font.get_ref("F1_1"), Some(courier_ref));
+    }
+
+    #[test]
+    fn merge_resources_shallow_same_ref_collision_is_noop() {
+        let mut pdf = open_minimal();
+        let font_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let dest_dr = set_font_dr(&mut pdf, 2, &[("F1", font_ref)]);
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", font_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+
+        assert!(dr_map.is_empty());
+        let font = font_dict(&mut pdf, dest_dr);
+        assert_eq!(font.get_ref("F1"), Some(font_ref));
+        assert!(font.get("F1_1").is_none());
+    }
+
+    #[test]
+    fn merge_resources_shallow_scans_past_taken_suffix_to_next_n() {
+        let mut pdf = open_minimal();
+        let helv_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let other_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("BaseFont", Object::Name(b"TimesRoman".to_vec()))],
+        );
+        let courier_ref = set_dict(
+            &mut pdf,
+            12,
+            &[("BaseFont", Object::Name(b"Courier".to_vec()))],
+        );
+        // Pre-seed dest with BOTH F1 (which will collide with source) and
+        // F1_1 (an unrelated pre-existing entry that already occupies the
+        // first rename candidate), forcing the suffix scan to skip to F1_2.
+        let dest_dr = set_font_dr(&mut pdf, 2, &[("F1", helv_ref), ("F1_1", other_ref)]);
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", courier_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+
+        assert_eq!(
+            dr_map
+                .get(b"Font".as_slice())
+                .and_then(|m| m.get(b"F1".as_slice())),
+            Some(&b"F1_2".to_vec())
+        );
+        let font = font_dict(&mut pdf, dest_dr);
+        assert_eq!(font.get_ref("F1"), Some(helv_ref));
+        assert_eq!(font.get_ref("F1_1"), Some(other_ref));
+        assert_eq!(font.get_ref("F1_2"), Some(courier_ref));
+    }
+
+    // ---- ensure_dest_acroform_dr -------------------------------------------
+
+    #[test]
+    fn ensure_dest_acroform_dr_creates_fresh_dr_when_dest_has_no_acroform() {
+        let mut pdf = open_minimal();
+        let font_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", font_ref)]);
+
+        let mut dr_map = DrMap::new();
+        let dr_ref = ensure_dest_acroform_dr(&mut pdf, source_dr, &mut dr_map).unwrap();
+
+        assert!(dr_map.is_empty());
+        let font = font_dict(&mut pdf, dr_ref);
+        assert_eq!(font.get_ref("F1"), Some(font_ref));
+    }
+
+    /// Simulates two placements onto two different pages of the SAME
+    /// destination document: the first call creates a fresh `/AcroForm/DR`
+    /// (`dr_map1` stays empty — verbatim insert); the second call finds the
+    /// `/AcroForm/DR` already installed as an indirect reference (the
+    /// `Some(Object::Reference(existing))` branch) and must reuse it. This is
+    /// the invariant this layer must not break: `source_dr` did not change
+    /// between calls, so the second call's `F1` collides with dest's `F1`
+    /// under the *same* object — a same-ref no-op, not a rename. Every
+    /// multi-page overlay byte gate with a form-field source relies on this:
+    /// after the first placement establishes the dest `/DR`, every
+    /// subsequent placement's `ensure_dest_acroform_dr` call must leave it
+    /// untouched rather than minting spurious `F1_1`, `F1_2`, ... entries.
+    #[test]
+    fn ensure_dest_acroform_dr_reuses_existing_dr_across_repeated_calls_without_rename() {
+        let mut pdf = open_minimal();
+        let font_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", font_ref)]);
+
+        let mut dr_map1 = DrMap::new();
+        let dr_ref1 = ensure_dest_acroform_dr(&mut pdf, source_dr, &mut dr_map1).unwrap();
+        assert!(dr_map1.is_empty());
+
+        let mut dr_map2 = DrMap::new();
+        let dr_ref2 = ensure_dest_acroform_dr(&mut pdf, source_dr, &mut dr_map2).unwrap();
+
+        assert_eq!(dr_ref1, dr_ref2, "the same /DR object must be reused");
+        assert!(dr_map2.is_empty(), "same source ref must not be re-renamed");
+        let font = font_dict(&mut pdf, dr_ref2);
+        assert_eq!(font.get_ref("F1"), Some(font_ref));
+        assert!(font.get("F1_1").is_none());
+    }
+
+    // ---- end-to-end (structural, not byte-identical) -----------------------
+
+    /// Full `apply_overlay_specs` pipeline over the Layer-1 fixtures used by
+    /// the (still-`#[ignore]`d) byte gate in `overlay.rs`, asserting
+    /// structure rather than exact bytes so this runs without the
+    /// `qpdf-zlib-compat` feature. Restricted to destination page 1 only
+    /// (`to: "1"`) so it drives exactly one merge call — the multi-page
+    /// repeat-placement reuse gap documented on `merge_resources_shallow` is
+    /// out of scope here.
+    #[test]
+    fn overlay_pipeline_renames_colliding_dr_font_end_to_end() {
+        use crate::overlay::{apply_overlay_specs, OverlayKind, OverlaySpec};
+        use crate::page_range::PageRange;
+        use std::path::Path;
+
+        fn fixture(name: &str) -> Pdf<std::io::BufReader<std::fs::File>> {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/compat")
+                .join(name);
+            let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+            Pdf::open(std::io::BufReader::new(file)).unwrap()
+        }
+        fn pr(input: &str) -> PageRange {
+            PageRange::parse(input).unwrap_or_else(|e| panic!("parse {input:?}: {e}"))
+        }
+
+        let mut dest = fixture("fxo-red-with-existing-acroform-dr.pdf");
+        let src = fixture("form-fields-and-annotations.pdf");
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr("1"),
+            repeat: None,
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+
+        let root_ref = dest.root_ref().unwrap();
+        let catalog = dest.resolve(root_ref).unwrap().into_dict().unwrap();
+        let acroform_ref = catalog.get_ref("AcroForm").unwrap();
+        let acroform = dest.resolve(acroform_ref).unwrap().into_dict().unwrap();
+        let dr_ref = acroform.get_ref("DR").unwrap();
+        let font = font_dict(&mut dest, dr_ref);
+        let f1_ref = font.get_ref("F1").expect("original /F1 preserved");
+        let f1_1_ref = font.get_ref("F1_1").expect("collision renamed to /F1_1");
+        assert_ne!(f1_ref, f1_1_ref);
+
+        let f1_font = dest.resolve(f1_ref).unwrap().into_dict().unwrap();
+        assert_eq!(
+            f1_font.get("BaseFont"),
+            Some(&Object::Name(b"Helvetica".to_vec()))
+        );
+        let f1_1_font = dest.resolve(f1_1_ref).unwrap().into_dict().unwrap();
+        assert_eq!(
+            f1_1_font.get("BaseFont"),
+            Some(&Object::Name(b"Courier".to_vec()))
+        );
+    }
+}
