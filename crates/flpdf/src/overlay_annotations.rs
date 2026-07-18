@@ -380,23 +380,67 @@ pub(crate) fn template_from_survey(
     }
 }
 
-/// Per-destination-page record of resource-name renames, populated by
+/// Per-destination record of resource-name renames, populated by
 /// [`merge_resources_shallow`] when a source `/DR` sub-dictionary key
 /// collides with an existing dest entry of the same name that resolves to a
-/// *different* object. Outer key is the resource category (`Font`,
-/// `XObject`, ...); inner map is `old_name -> new_name` — the source's
-/// original key mapped to the name it was actually inserted under in dest.
+/// *different* object.
+///
+/// Holds two internally-consistent views:
+///
+/// - `by_name`: outer key is the resource category (`Font`, `XObject`, ...);
+///   inner map is `old_source_name -> new_dest_name`. Consumed by
+///   [`adjust_default_appearance`] to rewrite the copied field's `/DA`
+///   string (name-indexed because `/DA` operators reference names).
+///   Overwritten across multi-source merges — reflects the most recent
+///   merge's mappings (which is precisely what the current placement's
+///   field-tree walk needs, because that walk immediately follows the
+///   merge that populated the map).
+///
+/// - `by_source_ref`: (category, source `ObjectRef`) -> new dest name.
+///   Stable across every merge into the same destination. Consulted by
+///   [`merge_resources_shallow`]'s collision branch to reuse an existing
+///   rename when the SAME source object recurs (across pages or across
+///   overlay specs), even if `by_name` was overwritten by an intervening
+///   merge with a different source that collided under the same old name.
 ///
 /// Mirrors qpdf's per-destination `dr_map`, populated by
 /// `QPDFObjectHandle::mergeResources`'s `conflicts` out-parameter and driven
 /// by `QPDFAcroFormDocumentHelper::init_dr_map`
 /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:775-800`, called from
-/// `transformAnnotations`). qpdf consumes the map via
-/// `adjustDefaultAppearances` / `adjustAppearanceStream` to rewrite each
-/// copied field's `/DA` string and AP-stream content operators from the old
-/// name to the new one; that rewrite is not implemented yet — this map is
-/// only built and threaded so a later change has the data it needs.
-pub(crate) type DrMap = BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>;
+/// `transformAnnotations`). qpdf's reuse logic is source-object-identity
+/// based, matching `by_source_ref` here.
+#[derive(Debug, Default)]
+pub(crate) struct DrMap {
+    /// old source name -> new dest name, per resource category. Overwritten
+    /// across merges of different sources that collide under the same name;
+    /// consumers must use it before the next merge is called on the same
+    /// destination.
+    by_name: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>,
+    /// (category, source `ObjectRef`) -> dest name. Stable across every
+    /// merge into the same destination; used to reuse a rename when the
+    /// same source object recurs.
+    by_source_ref: BTreeMap<(Vec<u8>, ObjectRef), Vec<u8>>,
+}
+
+impl DrMap {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` when no rename has been recorded — the fast-path
+    /// gate every consumer uses to skip work entirely.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+
+    /// The `old_name -> new_name` map for the given resource category, as
+    /// populated by the most recent merge. Returned as a reference so
+    /// callers (notably [`adjust_default_appearance`]) can look names up
+    /// without needing internal mutation.
+    pub(crate) fn category(&self, category: &[u8]) -> Option<&BTreeMap<Vec<u8>, Vec<u8>>> {
+        self.by_name.get(category)
+    }
+}
 
 /// Per-placement annotation application:
 /// - shallow-dup each templated annot (new indirect object) and any
@@ -590,23 +634,42 @@ fn duplicate_field_tree<R: Read + Seek>(
         }
     };
 
-    // Pre-resolve the dest `/DR` dict ONCE (rather than per visited field)
-    // when there is a rename to apply. Every field visited by this BFS that
-    // still carries a `/DR` key gets it reset to `dest_dr` below, and a field
-    // without one inherits `/AcroForm/DR` (also `dest_dr`) — so `dest_dr`'s
-    // resolved dict is the correct `/DA` resource-lookup surface for every
-    // node in this walk. `dr_map` is only ever populated inside
-    // `ensure_dest_acroform_dr` (via `merge_resources_shallow`), which always
-    // sets the caller's `dest_acroform_dr` to `Some` before returning, so
-    // `dr_map` non-empty implies `dest_dr` is `Some` here; the `None` arm is
-    // a defensive fallback for that invariant, not a path any shipped
-    // fixture reaches.
-    let da_resources: Option<crate::Dictionary> = if dr_map.is_empty() {
+    // Pre-resolve the dest `/DR/Font` sub-dict ONCE (rather than per visited
+    // field) when there is a rename to apply. Every field visited by this
+    // BFS that still carries a `/DR` key gets it reset to `dest_dr` below,
+    // and a field without one inherits `/AcroForm/DR` (also `dest_dr`) —
+    // so `dest_dr`'s Font sub-dict is the correct `/DA` resource-lookup
+    // surface for every node in this walk. `dr_map` is only ever populated
+    // inside `ensure_dest_acroform_dr` (via `merge_resources_shallow`),
+    // which always sets the caller's `dest_acroform_dr` to `Some` before
+    // returning, so `dr_map` non-empty implies `dest_dr` is `Some` here;
+    // the `None` arm is a defensive fallback for that invariant, not a
+    // path any shipped fixture reaches.
+    //
+    // The `/Font` entry may itself be indirect (`/DR << /Font 4 0 R >>`)
+    // — a PDF-permitted shape that `merge_resources_shallow` supports and
+    // therefore this lookup must handle. Directly matching only
+    // `Object::Dictionary` here would silently drop the rewrite and leave
+    // `/F1` in place while `/DR/Font` was actually renamed to `/F1_1`.
+    let font_resources: Option<crate::Dictionary> = if dr_map.is_empty() {
         None
     } else {
-        match dest_dr {
+        // cov:ignore-start: dr_map non-empty implies dest_dr Some (see
+        // comment above) and its resolve returns a dict. The Some/Some
+        // arm is exercised by every rename byte-gate; the None arms are
+        // defensive fallbacks the invariant precludes.
+        let dr_dict = match dest_dr {
             Some(dr_ref) => dest.resolve(dr_ref)?.into_dict(),
-            None => None, // cov:ignore: dr_map non-empty implies dest_dr is Some (see comment above); defensive only
+            None => None,
+        };
+        // cov:ignore-end
+        match dr_dict.as_ref().and_then(|d| d.get("Font").cloned()) {
+            Some(Object::Dictionary(font)) => Some(font),
+            Some(Object::Reference(font_ref)) => dest.resolve(font_ref)?.into_dict(),
+            // cov:ignore-start: /DR without /Font or with a non-dict/-ref
+            // /Font value — no shipped fixture supplies this shape.
+            _ => None,
+            // cov:ignore-end
         }
     };
 
@@ -702,10 +765,10 @@ fn duplicate_field_tree<R: Read + Seek>(
         // is also covered. `remove` (not `get().cloned()`) moves the string
         // out since `dict` is owned here — see pdf-rust-review-patterns.md
         // rule 1.
-        if let Some(resources) = da_resources.as_ref() {
+        if let Some(font_res) = font_resources.as_ref() {
             match dict.remove("DA") {
                 Some(Object::String(da)) => {
-                    let new_da = adjust_default_appearance(&da, dr_map, resources);
+                    let new_da = adjust_default_appearance(&da, dr_map, font_res);
                     dict.insert("DA", Object::String(new_da));
                 }
                 // cov:ignore-start: malformed /DA (non-string) — no shipped
@@ -739,12 +802,17 @@ fn duplicate_field_tree<R: Read + Seek>(
 /// - `dr_map` records a rename for that name under the `Font` category
 ///   (populated by [`merge_resources_shallow`] when the source `/DR/Font`
 ///   entry collided with an existing dest entry under the same name), AND
-/// - `resources`'s `/Font` sub-dictionary still carries that ORIGINAL name
-///   as a key — a defensive guard against renaming a name that happens to
-///   collide with a `dr_map` key from an unrelated context. In practice this
-///   is a no-op superset check: `merge_resources_shallow` always keeps the
+/// - `font_resources` still carries that ORIGINAL name as a key — a
+///   defensive guard against renaming a name that happens to collide with
+///   a `dr_map` key from an unrelated context. In practice this is a
+///   no-op superset check: `merge_resources_shallow` always keeps the
 ///   original colliding name in the merged dest `/DR/Font` alongside the
 ///   `{name}_N` rename, so any name recorded in `dr_map` is always present.
+///
+/// `font_resources` is the resolved `/DR/Font` sub-dict (indirect refs
+/// pre-resolved by the caller); passing the resolved sub-dict lets this
+/// function stay free of `&mut Pdf<R>` while still handling the PDF-permitted
+/// `/DR << /Font <ref> >>` shape.
 ///
 /// Every other byte — whitespace, unrelated names, other operators, string
 /// and numeric operands — is copied through unchanged, so the result is
@@ -757,12 +825,15 @@ fn duplicate_field_tree<R: Read + Seek>(
 ///
 /// Returns `da.to_vec()` verbatim, without scanning, when `dr_map` is empty
 /// (the common case: no placement recorded a rename on this dest page).
-fn adjust_default_appearance(da: &[u8], dr_map: &DrMap, resources: &crate::Dictionary) -> Vec<u8> {
+fn adjust_default_appearance(
+    da: &[u8],
+    dr_map: &DrMap,
+    font_resources: &crate::Dictionary,
+) -> Vec<u8> {
     if dr_map.is_empty() {
         return da.to_vec();
     }
-    let font_renames = dr_map.get(b"Font".as_slice());
-    let font_resources = resources.get("Font").and_then(Object::as_dict);
+    let font_renames = dr_map.category(b"Font");
 
     let mut out: Vec<u8> = Vec::with_capacity(da.len());
     // Byte span of the most recently seen name token WITHIN `out` (not
@@ -843,7 +914,7 @@ fn adjust_default_appearance(da: &[u8], dr_map: &DrMap, resources: &crate::Dicti
             if let Some((out_start, out_end, name)) = last_name.take() {
                 let renamed = font_renames.and_then(|m| m.get(name.as_slice()));
                 if let Some(new_name) = renamed {
-                    let present = font_resources.is_some_and(|d| d.get(name.as_slice()).is_some());
+                    let present = font_resources.get(name.as_slice()).is_some();
                     if present {
                         let mut replacement = Vec::with_capacity(new_name.len() + 1);
                         replacement.push(b'/');
@@ -1498,34 +1569,49 @@ fn merge_resources_shallow<R: Read + Seek>(
                     if same_object {
                         continue;
                     }
-                    // If this source object was already renamed on a prior
-                    // merge call against the same dest `/DR` (dr_map recorded
-                    // the mapping, and the mapped dest name still holds this
-                    // same source ref), reuse that name instead of minting a
-                    // fresh `_N`. Mirrors qpdf's dest-scoped
-                    // `QPDFObjGen -> name` reuse map: byte parity across
-                    // repeated placements onto the same dest depends on the
-                    // colliding source object producing the same renamed
-                    // name every time.
-                    let existing_rename = dr_map
-                        .get(type_key.as_slice())
-                        .and_then(|m| m.get(name))
+                    // If THIS source object was already renamed on a prior
+                    // merge call against the same dest `/DR`, reuse that
+                    // rename instead of minting a fresh `_N`. Mirrors
+                    // qpdf's dest-scoped `QPDFObjGen -> name` reuse map:
+                    // byte parity across repeated placements onto the same
+                    // dest depends on the colliding source object producing
+                    // the same renamed name every time.
+                    //
+                    // Reuse is keyed by SOURCE `ObjectRef`, not by source
+                    // NAME — two different source objects that both collide
+                    // under `/F1` (e.g. two OverlaySpecs whose sources both
+                    // use `/F1`) must produce distinct dest names
+                    // (`/F1_1`, `/F1_2`), and a name-keyed reuse would let
+                    // the second overwrite the first and mis-reuse on a
+                    // later placement.
+                    let reuse_key = val.as_ref_id().map(|r| (type_key.to_vec(), r));
+                    let reuse = reuse_key
+                        .as_ref()
+                        .and_then(|k| dr_map.by_source_ref.get(k))
                         .cloned();
-                    if let Some(mapped) = existing_rename {
-                        let mapped_holds_same_source = matches!(
-                            (new_type_dict.get(&mapped), val),
-                            (Some(Object::Reference(d)), Object::Reference(s)) if d == s
-                        );
-                        if mapped_holds_same_source {
-                            continue;
-                        }
+                    if let Some(existing_new_name) = reuse {
+                        // Refresh `by_name` for this call's placement so
+                        // `adjust_default_appearance` sees the reused
+                        // rename under this source's name. Skip the
+                        // dest-dict insert (already carries the same ref
+                        // under `existing_new_name`).
+                        dr_map
+                            .by_name
+                            .entry(type_key.to_vec())
+                            .or_default()
+                            .insert(name.to_vec(), existing_new_name);
+                        continue;
                     }
                     let new_name = unique_dr_name(name, &new_type_dict)?;
                     new_type_dict.insert(&new_name, val.clone());
                     dr_map
+                        .by_name
                         .entry(type_key.to_vec())
                         .or_default()
-                        .insert(name.to_vec(), new_name);
+                        .insert(name.to_vec(), new_name.clone());
+                    if let Some(key) = reuse_key {
+                        dr_map.by_source_ref.insert(key, new_name);
+                    }
                 }
             }
         }
@@ -2013,7 +2099,7 @@ mod tests {
 
         assert_eq!(
             dr_map
-                .get(b"Font".as_slice())
+                .category(b"Font")
                 .and_then(|m| m.get(b"F1".as_slice())),
             Some(&b"F1_1".to_vec())
         );
@@ -2071,7 +2157,7 @@ mod tests {
 
         assert_eq!(
             dr_map
-                .get(b"Font".as_slice())
+                .category(b"Font")
                 .and_then(|m| m.get(b"F1".as_slice())),
             Some(&b"F1_2".to_vec())
         );
@@ -2179,6 +2265,70 @@ mod tests {
         assert_eq!(merged.get_ref("F1"), Some(courier_ref));
     }
 
+    /// Reuse must be keyed by SOURCE `ObjectRef`, not by source name. If
+    /// two different sources both collide with dest's `/F1` under the same
+    /// old name (e.g. two `OverlaySpec` merges against the same dest), each
+    /// must get its own dest name — and a later re-placement of source A
+    /// must reuse A's original rename, not follow whatever `by_name`
+    /// currently holds (which the intervening B merge overwrote).
+    #[test]
+    fn merge_resources_shallow_reuse_is_keyed_by_source_ref_not_by_name() {
+        let mut pdf = open_minimal();
+        let times_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Times-Roman".to_vec()))],
+        );
+        let helv_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let courier_ref = set_dict(
+            &mut pdf,
+            12,
+            &[("BaseFont", Object::Name(b"Courier".to_vec()))],
+        );
+        let dest_dr = set_font_dr(&mut pdf, 2, &[("F1", times_ref)]);
+        // Two distinct source /DR dicts both using /F1 for different fonts.
+        let source_a = set_font_dr(&mut pdf, 3, &[("F1", helv_ref)]);
+        let source_b = set_font_dr(&mut pdf, 4, &[("F1", courier_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_a, &mut dr_map).unwrap();
+        merge_resources_shallow(&mut pdf, dest_dr, source_b, &mut dr_map).unwrap();
+        // After A then B: dest has {F1: Times, F1_1: Helv, F1_2: Courier}.
+        // by_name["Font"]["F1"] is F1_2 (B's rename, overwrote A's F1_1).
+        assert_eq!(
+            dr_map
+                .category(b"Font")
+                .and_then(|m| m.get(b"F1".as_slice())),
+            Some(&b"F1_2".to_vec()),
+        );
+        let font_after_ab = font_dict(&mut pdf, dest_dr);
+        assert_eq!(font_after_ab.get_ref("F1"), Some(times_ref));
+        assert_eq!(font_after_ab.get_ref("F1_1"), Some(helv_ref));
+        assert_eq!(font_after_ab.get_ref("F1_2"), Some(courier_ref));
+
+        // Re-merge A: the source_ref-keyed reuse map must recognize helv_ref
+        // and reuse its original F1_1, NOT mint an F1_3.
+        merge_resources_shallow(&mut pdf, dest_dr, source_a, &mut dr_map).unwrap();
+        assert_eq!(
+            dr_map
+                .category(b"Font")
+                .and_then(|m| m.get(b"F1".as_slice())),
+            Some(&b"F1_1".to_vec()),
+            "re-merging source A must refresh by_name back to F1_1 (the ref-keyed reuse)",
+        );
+        let font_after_aba = font_dict(&mut pdf, dest_dr);
+        assert!(
+            font_after_aba.get("F1_3").is_none(),
+            "must NOT mint F1_3; must reuse F1_1 keyed by helv_ref",
+        );
+        assert_eq!(font_after_aba.get_ref("F1_1"), Some(helv_ref));
+        assert_eq!(font_after_aba.get_ref("F1_2"), Some(courier_ref));
+    }
+
     /// Two `merge_resources_shallow` calls against the SAME dest `/DR` with
     /// the SAME conflicting source: the first call renames `F1` → `F1_1`
     /// and records the mapping in `dr_map`; the second call must reuse
@@ -2208,7 +2358,7 @@ mod tests {
         // First call: F1 collision renamed to F1_1.
         assert_eq!(
             dr_map
-                .get(b"Font".as_slice())
+                .category(b"Font")
                 .and_then(|m| m.get(b"F1".as_slice())),
             Some(&b"F1_1".to_vec())
         );
@@ -2217,7 +2367,7 @@ mod tests {
         // Second call: reuse F1_1 (do NOT mint F1_2).
         assert_eq!(
             dr_map
-                .get(b"Font".as_slice())
+                .category(b"Font")
                 .and_then(|m| m.get(b"F1".as_slice())),
             Some(&b"F1_1".to_vec())
         );
@@ -2291,14 +2441,16 @@ mod tests {
     /// Build a `/DR`-shaped dict `<< /Font << name1 100 0 R, ... >> >>`.
     /// `adjust_default_appearance` only checks name *presence* in the Font
     /// sub-dict, so the target refs are arbitrary placeholders.
+    /// Build a `/Font` sub-dict (the shape now expected directly by
+    /// `adjust_default_appearance`, since `duplicate_field_tree` pre-resolves
+    /// `/DR/Font` before calling — including when the sub-dict is stored as
+    /// an indirect reference).
     fn font_resources_dict(names: &[&str]) -> crate::Dictionary {
         let mut font = crate::Dictionary::new();
         for (i, name) in names.iter().enumerate() {
             font.insert(*name, Object::Reference(ObjectRef::new(100 + i as u32, 0)));
         }
-        let mut dr = crate::Dictionary::new();
-        dr.insert("Font", Object::Dictionary(font));
-        dr
+        font
     }
 
     /// Build a `DrMap` with a single `Font` category from `(old, new)` pairs.
@@ -2308,7 +2460,7 @@ mod tests {
             font.insert(old.as_bytes().to_vec(), new.as_bytes().to_vec());
         }
         let mut dr_map = DrMap::new();
-        dr_map.insert(b"Font".to_vec(), font);
+        dr_map.by_name.insert(b"Font".to_vec(), font);
         dr_map
     }
 
@@ -2430,7 +2582,7 @@ mod tests {
         // collisions were recorded) — the Tf-pattern lookup must miss
         // cleanly rather than panic.
         let mut dr_map = DrMap::new();
-        dr_map.insert(b"XObject".to_vec(), BTreeMap::new());
+        dr_map.by_name.insert(b"XObject".to_vec(), BTreeMap::new());
         let resources = font_resources_dict(&["F1"]);
         let da: &[u8] = b"/F1 18 Tf";
         assert_eq!(
