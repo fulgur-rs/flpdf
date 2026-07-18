@@ -486,7 +486,7 @@ fn object_type_name(obj: &Object) -> &'static str {
         Object::Null => "null",
         Object::Boolean(_) => "boolean",
         Object::Integer(_) => "integer",
-        Object::Real(_) => "real",
+        Object::Real(_) | Object::RealLiteral { .. } => "real",
         Object::Name(_) => "name",
         Object::String(_) => "string",
         Object::Array(_) => "array",
@@ -744,6 +744,21 @@ mod tests {
     use crate::filters::encode_stream_data;
     use crate::Dictionary;
     use std::io::Cursor;
+
+    /// `object_type_name` collapses both real variants to `"real"` so that
+    /// diagnostics do not leak the implementation detail that one form
+    /// preserves the source literal and the other does not.
+    #[test]
+    fn object_type_name_collapses_real_and_real_literal() {
+        assert_eq!(object_type_name(&Object::Real(1.5)), "real");
+        assert_eq!(
+            object_type_name(&Object::RealLiteral {
+                value: 1.5,
+                literal: b"1.5".to_vec(),
+            }),
+            "real"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Minimal PDF builder helpers

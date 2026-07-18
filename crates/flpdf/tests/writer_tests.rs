@@ -1705,21 +1705,28 @@ fn rewrites_pdf_with_real_number_fixture() {
     let Object::Dictionary(page_dict) = page else {
         panic!("expected page dictionary")
     };
+    // Fixture literals preserved verbatim by [`Object::RealLiteral`] when the
+    // source string is not Rust's shortest round-trip for the value
+    // (`1e3` vs `1000`, `.75` vs `0.75`, `1.` vs `1`, `+.25` vs `0.25`).
+    let lit = |v: f64, s: &[u8]| Object::RealLiteral {
+        value: v,
+        literal: s.to_vec(),
+    };
     assert_eq!(
         page_dict.get("MediaBox"),
         Some(&Object::Array(vec![
             Object::Integer(0),
             Object::Integer(0),
-            Object::Real(1000.0),
-            Object::Real(0.75),
+            lit(1000.0, b"1e3"),
+            lit(0.75, b".75"),
         ]))
     );
     assert_eq!(
         page_dict.get("TrimBox"),
         Some(&Object::Array(vec![
-            Object::Real(1.0),
+            lit(1.0, b"1."),
             Object::Real(-0.25),
-            Object::Real(0.25),
+            lit(0.25, b"+.25"),
             Object::Real(-1.5),
         ]))
     );

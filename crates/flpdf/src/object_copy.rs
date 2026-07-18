@@ -144,6 +144,7 @@ pub(crate) fn rewrite_refs(
         | Object::Boolean(_)
         | Object::Integer(_)
         | Object::Real(_)
+        | Object::RealLiteral { .. }
         | Object::Name(_)
         | Object::String(_) => {}
     }

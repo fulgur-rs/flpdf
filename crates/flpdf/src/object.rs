@@ -143,6 +143,21 @@ pub enum Object {
     Boolean(bool),
     Integer(i64),
     Real(f64),
+    /// A real parsed from the source whose original literal bytes cannot be
+    /// reproduced by `value.to_string()` alone — for example, `.4` (leading
+    /// zero dropped) or `0.400` (trailing zeros). Preserving the literal is
+    /// required for qpdf byte-identical parity, because qpdf's `QPDF_Real`
+    /// stores the source string and re-emits it verbatim; flpdf must do the
+    /// same for objects it rebuilds through the Object model. Objects that
+    /// flpdf *computes* (e.g. matrices via `qpdf_real`) use plain `Real(f64)`
+    /// and are formatted by `f64::to_string`.
+    ///
+    /// Invariant: `literal.parse::<f64>() == Ok(value)` and
+    /// `literal != value.to_string()` (otherwise `Real(value)` is used).
+    RealLiteral {
+        value: f64,
+        literal: Vec<u8>,
+    },
     Name(Vec<u8>),
     String(Vec<u8>),
     Array(Vec<Object>),
@@ -229,10 +244,11 @@ impl Object {
         }
     }
 
-    /// Return this object as a real number, if it is [`Object::Real`].
+    /// Return this object as a real number, if it is [`Object::Real`] or
+    /// [`Object::RealLiteral`].
     pub fn as_real(&self) -> Option<f64> {
         match self {
-            Object::Real(value) => Some(*value),
+            Object::Real(value) | Object::RealLiteral { value, .. } => Some(*value),
             _ => None,
         }
     }
@@ -369,6 +385,19 @@ impl Object {
             }
             Object::Integer(value) => out.extend_from_slice(value.to_string().as_bytes()),
             Object::Real(value) => out.extend_from_slice(value.to_string().as_bytes()),
+            Object::RealLiteral { value, literal } => {
+                if real_literal_is_safe(literal, *value) {
+                    out.extend_from_slice(literal);
+                } else {
+                    // Fall back to the canonical shortest-decimal form when
+                    // the literal contains bytes outside PDF real syntax or
+                    // does not round-trip to `value` — prevents a caller that
+                    // hand-built a `RealLiteral` with attacker-controlled
+                    // bytes from injecting whitespace / delimiters / object
+                    // syntax into a numeric position of the emitted PDF.
+                    out.extend_from_slice(value.to_string().as_bytes());
+                }
+            }
             Object::Name(name) => {
                 out.push(b'/');
                 write_name_escaped(out, name);
@@ -469,6 +498,35 @@ fn push_spaces(out: &mut Vec<u8>, n: usize) {
     out.resize(out.len() + n, b' ');
 }
 
+/// True when `literal` is a safe pass-through for [`Object::RealLiteral`]:
+/// every byte is in the PDF real-token character set (ASCII digits, one of
+/// `.`, `+`, `-`, `e`, `E`) AND `literal` parses back to `value` bit-for-bit.
+/// Fails closed if a caller constructs a `RealLiteral` with arbitrary bytes
+/// (whitespace, `/`, `<<`, string parentheses, …) — the writer's caller
+/// falls back to the canonical shortest-decimal form so nothing outside a
+/// numeric token can slip into the emitted PDF at a real's position.
+fn real_literal_is_safe(literal: &[u8], value: f64) -> bool {
+    if literal.is_empty() {
+        return false;
+    }
+    if !literal
+        .iter()
+        .all(|b| matches!(*b, b'0'..=b'9' | b'.' | b'+' | b'-' | b'e' | b'E'))
+    {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(literal) else {
+        return false; // cov:ignore: unreachable — the charset check above
+                      // accepts only ASCII digits, `.`, `+`, `-`, `e`, `E`,
+                      // all of which are single-byte UTF-8, so any literal
+                      // that passes the charset check is valid UTF-8.
+    };
+    match text.parse::<f64>() {
+        Ok(parsed) => parsed.to_bits() == value.to_bits(),
+        Err(_) => false,
+    }
+}
+
 /// Escape a name's raw (logical) bytes into PDF name-token syntax per
 /// ISO 32000-1 §7.3.5: any byte outside the printable ASCII range
 /// `0x21..=0x7E`, any PDF delimiter (`( ) < > [ ] { } / %`), and `#`
@@ -478,11 +536,14 @@ fn push_spaces(out: &mut Vec<u8>, n: usize) {
 /// `Object::Name` always holds *decoded* bytes (the parser unescapes
 /// `#XX` on read — see `Parser::name`), so escaping on write keeps the
 /// read/write pair symmetric: `Name(b"application/pdf")` serializes to
-/// `/application#2Fpdf` and round-trips back to `application/pdf`.
+/// `/application#2fpdf` and round-trips back to `application/pdf`.
 /// Conventional names (`Type`, `Page`, `FlateDecode`, …) contain no
 /// escapable bytes, so their output is byte-identical to before.
 pub(crate) fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    // Lowercase hex to match qpdf's `QUtil::hex_encode_char`
+    // (libqpdf/include/qpdf/QUtil.hh:540, `"0123456789abcdef"`), which is used
+    // by `QPDF_Name::normalizeName` (libqpdf/QPDF_Name.cc:43).
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     for &b in raw {
         let needs_escape = !(0x21..=0x7E).contains(&b)
             || matches!(
@@ -852,7 +913,7 @@ mod qdf_key_escape_tests {
         d.write_pdf_qdf(&mut out, 0);
         let s = String::from_utf8(out).unwrap();
         assert!(
-            s.contains("/A#20B#23C#2FD#80E 1"),
+            s.contains("/A#20B#23C#2fD#80E 1"),
             "key not escaped in QDF output: {s:?}"
         );
         // No raw delimiter/space leaked into the name token.
@@ -867,6 +928,96 @@ mod qdf_key_escape_tests {
         let mut out = Vec::new();
         d.write_pdf_qdf(&mut out, 0);
         assert_eq!(out, b"<<\n  /Type /Catalog\n>>");
+    }
+}
+
+#[cfg(test)]
+mod real_literal_tests {
+    use super::*;
+
+    /// A safe `RealLiteral` (bytes are in the PDF real charset AND round-trip
+    /// to `value` bit-for-bit) is emitted verbatim, preserving qpdf-parity
+    /// source literals like `.4`, `1.`, `+.25` that would otherwise be
+    /// re-canonicalised by `f64::to_string`.
+    #[test]
+    fn write_pdf_emits_safe_literal_verbatim() {
+        let mut out = Vec::new();
+        Object::RealLiteral {
+            value: 0.75,
+            literal: b".75".to_vec(),
+        }
+        .write_pdf(&mut out);
+        assert_eq!(out, b".75");
+    }
+
+    /// An unsafe `RealLiteral` (bytes contain characters outside the PDF real
+    /// charset, e.g. a space or `/`) falls back to the canonical
+    /// `value.to_string()` form so the injected bytes cannot slip into a
+    /// numeric position of the emitted PDF.
+    #[test]
+    fn write_pdf_falls_back_when_literal_has_bad_bytes() {
+        let mut out = Vec::new();
+        Object::RealLiteral {
+            value: 0.75,
+            literal: b"0.75 /Type /Malicious".to_vec(),
+        }
+        .write_pdf(&mut out);
+        assert_eq!(out, b"0.75");
+    }
+
+    /// An unsafe `RealLiteral` (bytes are numeric-only but do not parse back
+    /// to `value`) falls back to the canonical form. Guards against a hand-
+    /// built RealLiteral whose stored `value` disagrees with its literal.
+    #[test]
+    fn write_pdf_falls_back_when_literal_does_not_round_trip() {
+        let mut out = Vec::new();
+        Object::RealLiteral {
+            value: 0.5,
+            literal: b"0.75".to_vec(),
+        }
+        .write_pdf(&mut out);
+        assert_eq!(out, b"0.5");
+    }
+
+    #[test]
+    fn is_safe_rejects_empty_literal() {
+        assert!(!real_literal_is_safe(b"", 0.0));
+    }
+
+    #[test]
+    fn is_safe_rejects_disallowed_char() {
+        // Space is not in the PDF real charset — must be rejected even though
+        // stripping it would round-trip.
+        assert!(!real_literal_is_safe(b"0.5 ", 0.5));
+    }
+
+    #[test]
+    fn is_safe_rejects_non_utf8() {
+        assert!(!real_literal_is_safe(b"\xff\xfe", 0.0));
+    }
+
+    #[test]
+    fn is_safe_rejects_value_mismatch() {
+        // Digits round-trip cleanly, but to a different value.
+        assert!(!real_literal_is_safe(b"0.75", 0.5));
+    }
+
+    #[test]
+    fn is_safe_accepts_canonical_literal() {
+        assert!(real_literal_is_safe(b".75", 0.75));
+        assert!(real_literal_is_safe(b"1.", 1.0));
+        assert!(real_literal_is_safe(b"+.25", 0.25));
+        assert!(real_literal_is_safe(b"1e3", 1000.0));
+    }
+
+    /// A byte sequence that passes the charset check but does NOT parse to a
+    /// valid f64 (`b"e"` is a lone exponent marker) must fall through to
+    /// the `Err(_) => false` arm.
+    #[test]
+    fn is_safe_rejects_charset_ok_but_unparseable() {
+        assert!(!real_literal_is_safe(b"e", 0.0));
+        assert!(!real_literal_is_safe(b"1e", 0.0));
+        assert!(!real_literal_is_safe(b"-.", 0.0));
     }
 }
 

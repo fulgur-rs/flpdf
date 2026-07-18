@@ -1323,7 +1323,7 @@ fn resolve_rect<R: Read + Seek>(
     let nums: Vec<f64> = arr
         .iter()
         .map(|o| match o {
-            Object::Real(f) => Some(*f),
+            Object::Real(f) | Object::RealLiteral { value: f, .. } => Some(*f),
             Object::Integer(i) => Some(*i as f64),
             _ => None,
         })

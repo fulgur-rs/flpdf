@@ -819,6 +819,7 @@ pub(crate) fn collect_refs_in_object<R: Read + Seek>(
         | Object::Boolean(_)
         | Object::Integer(_)
         | Object::Real(_)
+        | Object::RealLiteral { .. }
         | Object::Name(_)
         | Object::String(_) => Ok(()),
     }
@@ -932,6 +933,7 @@ pub(crate) fn remap_refs_in_object(obj: Object, map: &BTreeMap<ObjectRef, Object
         | Object::Boolean(_)
         | Object::Integer(_)
         | Object::Real(_)
+        | Object::RealLiteral { .. }
         | Object::Name(_)
         | Object::String(_) => obj,
     }

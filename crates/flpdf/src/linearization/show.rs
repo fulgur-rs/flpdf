@@ -591,7 +591,11 @@ fn dump_generic(out: &mut String, p: &LinParameters, t: &HGeneric) {
 fn param_u64(dict: &crate::Dictionary, key: &'static str) -> ShowResult<u64> {
     match dict.get(key) {
         Some(Object::Integer(n)) if *n >= 0 => Ok(*n as u64),
-        Some(Object::Real(r)) if r.is_finite() && *r >= 0.0 && r.fract() == 0.0 => Ok(*r as u64),
+        Some(Object::Real(r)) | Some(Object::RealLiteral { value: r, .. })
+            if r.is_finite() && *r >= 0.0 && r.fract() == 0.0 =>
+        {
+            Ok(*r as u64)
+        }
         _ => Err(malformed!(
             "/{key} is missing or not a non-negative integer in the linearization dictionary"
         )),
@@ -606,7 +610,9 @@ fn param_u64(dict: &crate::Dictionary, key: &'static str) -> ShowResult<u64> {
 fn is_linearized(dict: &crate::Dictionary, file_size: u64) -> bool {
     let linearized_ok = match dict.get("Linearized") {
         Some(Object::Integer(n)) => *n == 1,
-        Some(Object::Real(r)) => r.is_finite() && r.floor() == 1.0,
+        Some(Object::Real(r)) | Some(Object::RealLiteral { value: r, .. }) => {
+            r.is_finite() && r.floor() == 1.0
+        }
         _ => false,
     };
     if !linearized_ok {
@@ -1630,6 +1636,41 @@ mod tests {
     fn param_u64_rejects_fractional() {
         let mut d = crate::Dictionary::new();
         d.insert("N", Object::Real(1.5));
+        assert!(matches!(
+            param_u64(&d, "N"),
+            Err(ShowLinearizationError::Malformed { .. })
+        ));
+    }
+
+    /// `param_u64` recognizes a whole-number `/DA` parameter stored as
+    /// [`Object::RealLiteral`] (source literal like `5.0` that Rust's
+    /// shortest round-trip would render as `5`). Guards the RealLiteral
+    /// arm added for byte-identical parity.
+    #[test]
+    fn param_u64_accepts_real_literal_whole_number() {
+        let mut d = crate::Dictionary::new();
+        d.insert(
+            "N",
+            Object::RealLiteral {
+                value: 5.0,
+                literal: b"5.0".to_vec(),
+            },
+        );
+        assert_eq!(param_u64(&d, "N").expect("must succeed"), 5);
+    }
+
+    /// A fractional `RealLiteral` (e.g. `1.5`) is still rejected — the
+    /// `.fract() == 0.0` guard applies to both real variants.
+    #[test]
+    fn param_u64_rejects_fractional_real_literal() {
+        let mut d = crate::Dictionary::new();
+        d.insert(
+            "N",
+            Object::RealLiteral {
+                value: 1.5,
+                literal: b"1.5".to_vec(),
+            },
+        );
         assert!(matches!(
             param_u64(&d, "N"),
             Err(ShowLinearizationError::Malformed { .. })

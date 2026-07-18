@@ -26,9 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
-use crate::page_form_xobject::{
-    import_pages_as_form_xobjects, page_to_form_xobject, read_page_transform, transformation_matrix,
-};
+use crate::page_form_xobject::{page_to_form_xobject, read_page_transform, transformation_matrix};
 use crate::page_object_helper::{PageBox, PageObjectHelper};
 use crate::page_range::PageRange;
 use crate::pages::page_refs;
@@ -45,13 +43,21 @@ pub enum OverlayKind {
 }
 
 /// A single overlay/underlay source: a Form XObject already imported into the
-/// destination document, plus whether it is an overlay or an underlay.
-#[derive(Debug, Clone, Copy)]
+/// destination document, plus whether it is an overlay or an underlay and an
+/// optional `AnnotationCopyTemplate` that names the dest-side annotation refs
+/// to duplicate at placement time (populated only when the source page has
+/// `/Annots`; `None` otherwise so annotation-less sources cost nothing).
+#[derive(Debug, Clone)]
 pub(crate) struct OverlaySource {
     /// The source's kind (overlay or underlay).
     pub kind: OverlayKind,
     /// Reference to the imported Form XObject in the destination document.
     pub xobject_ref: ObjectRef,
+    /// Template refs for per-placement annotation duplication (qpdf's
+    /// `dest_page.copyAnnotations(from_page, cm, ...)` step). `None` when the
+    /// source page has no `/Annots` and the placement should skip the
+    /// annotation phase entirely.
+    pub annot_template: Option<crate::overlay_annotations::AnnotationCopyTemplate>,
 }
 
 /// Format `v` like qpdf's `QUtil::double_to_string` with five decimal places:
@@ -192,8 +198,11 @@ fn matrix_for_form_xobject_placement(
 /// (qpdf 11.9.0). A degenerate placement matrix collapses to the identity, as in
 /// qpdf.
 ///
-/// The fragment is exactly `"q\n" + cm + " cm\n/" + name + " Do\nQ\n"`, where `cm`
-/// is the six components formatted by [`matrix_unparse`].
+/// Returns `(fragment, cm)`: the fragment is exactly
+/// `"q\n" + cm + " cm\n/" + name + " Do\nQ\n"` (with `cm` formatted by
+/// [`matrix_unparse`]); `cm` is the same six-component matrix used to place the
+/// XObject. Callers that transform per-placement annotations (qpdf's
+/// `copyAnnotations(from_page, cm, …)`) use the returned `cm` unchanged.
 fn place_form_xobject(
     fo_bbox: [f64; 4],
     fo_matrix: [f64; 6],
@@ -202,7 +211,7 @@ fn place_form_xobject(
     allow_shrink: bool,
     allow_expand: bool,
     name: &str,
-) -> String {
+) -> (String, [f64; 6]) {
     let cm = matrix_for_form_xobject_placement(
         fo_bbox,
         fo_matrix,
@@ -212,7 +221,8 @@ fn place_form_xobject(
         allow_expand,
     )
     .unwrap_or(IDENTITY_MATRIX);
-    format!("q\n{} cm\n/{} Do\nQ\n", matrix_unparse(cm), name)
+    let fragment = format!("q\n{} cm\n/{} Do\nQ\n", matrix_unparse(cm), name);
+    (fragment, cm)
 }
 
 /// Apply an ordered list of overlay/underlay `sources` to the destination page
@@ -243,12 +253,24 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     // kind is preserved. The paint order (underlays first, then overlays) is
     // enforced below when we consume `underlays` before `overlays` while
     // building the /Fx1.. names and the new content stream.
-    let mut underlays: Vec<ObjectRef> = Vec::new();
-    let mut overlays: Vec<ObjectRef> = Vec::new();
+    //
+    // Each entry carries the source's `annot_template` alongside the imported
+    // XObject ref so that per placement we can call
+    // `overlay_annotations::apply_placement(dest, dest_page_ref, template, cm, dr)`
+    // right after `place_form_xobject` returns `cm`, mirroring qpdf's
+    // `dest_page.copyAnnotations(from_page, cm, dest_afdh, from_afdh)` call at
+    // `QPDFJob::doUnderOverlayForPage` line 1899.
+    type PlacementEntry = (
+        ObjectRef,
+        Option<crate::overlay_annotations::AnnotationCopyTemplate>,
+    );
+    let mut underlays: Vec<PlacementEntry> = Vec::new();
+    let mut overlays: Vec<PlacementEntry> = Vec::new();
     for src in sources {
+        let entry = (src.xobject_ref, src.annot_template.clone());
         match src.kind {
-            OverlayKind::Underlay => underlays.push(src.xobject_ref),
-            OverlayKind::Overlay => overlays.push(src.xobject_ref),
+            OverlayKind::Underlay => underlays.push(entry),
+            OverlayKind::Overlay => overlays.push(entry),
         }
     }
 
@@ -287,18 +309,23 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     let mut xobject_dict = Dictionary::new();
     xobject_dict.insert("Fx0", Object::Reference(fx0_ref));
     let mut next_index = 1u32;
-    let mut underlay_names: Vec<(String, ObjectRef)> = Vec::new();
-    let mut overlay_names: Vec<(String, ObjectRef)> = Vec::new();
-    for xref in &underlays {
+    type NamedPlacement = (
+        String,
+        ObjectRef,
+        Option<crate::overlay_annotations::AnnotationCopyTemplate>,
+    );
+    let mut underlay_names: Vec<NamedPlacement> = Vec::new();
+    let mut overlay_names: Vec<NamedPlacement> = Vec::new();
+    for (xref, template) in &underlays {
         let name = format!("Fx{next_index}");
         xobject_dict.insert(name.as_bytes(), Object::Reference(*xref));
-        underlay_names.push((name, *xref));
+        underlay_names.push((name, *xref, template.clone()));
         next_index += 1;
     }
-    for xref in &overlays {
+    for (xref, template) in &overlays {
         let name = format!("Fx{next_index}");
         xobject_dict.insert(name.as_bytes(), Object::Reference(*xref));
-        overlay_names.push((name, *xref));
+        overlay_names.push((name, *xref, template.clone()));
         next_index += 1;
     }
 
@@ -306,29 +333,67 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     //    overlays. Underlays/overlays place into the page /TrimBox with
     //    allow_shrink=true; /Fx0 places into the page /MediaBox with
     //    allow_shrink=false (qpdf's doUnderOverlayForPage flag split). Every
-    //    placement folds in the dest inverse transform `tmatrix`.
+    //    placement folds in the dest inverse transform `tmatrix`. Immediately
+    //    after each source placement returns `cm`, the source's annotation
+    //    template (if any) is applied through
+    //    [`crate::overlay_annotations::apply_placement`], mirroring qpdf's
+    //    `dest_page.copyAnnotations(from_page, cm, dest_afdh, from_afdh)` at
+    //    `QPDFJob::doUnderOverlayForPage` line 1899. New top-level fields
+    //    accumulate across placements and are appended to /AcroForm/Fields
+    //    (with +N rename on FQN collision) once at the end.
     // Placement rects mirror qpdf's getTrimBox()/getMediaBox().getArrayAsRectangle()
     // in doUnderOverlayForPage: corners normalized before scaling/centring.
     let trim_rect = normalize_rectangle(page_box_array(&trim_box));
     let media_rect = normalize_rectangle(page_box_array(&media_box));
     let mut content = String::new();
-    for (name, xref) in &underlay_names {
+    let mut new_top_fields: Vec<ObjectRef> = Vec::new();
+    let mut dest_acroform_dr: Option<ObjectRef> = None;
+    for (name, xref, template) in &underlay_names {
         let (bbox, fmatrix) = fo_bbox_and_matrix(dest, *xref)?;
-        content.push_str(&place_form_xobject(
-            bbox, fmatrix, trim_rect, tmatrix, true, false, name,
-        ));
+        let (fragment, cm) =
+            place_form_xobject(bbox, fmatrix, trim_rect, tmatrix, true, false, name);
+        content.push_str(&fragment);
+        if let Some(tpl) = template {
+            // cov:ignore-start: `?` on multi-line call — the trailing `)?;` is
+            // instrumented as a separate line and fires only if apply_placement
+            // returns Err. All shipped byte gates exercise apply_placement on
+            // valid input, and every plausible failure is a malformed-PDF path
+            // whose own error-return is already excluded below.
+            let mut added = crate::overlay_annotations::apply_placement(
+                dest,
+                dest_page_ref,
+                tpl,
+                cm,
+                &mut dest_acroform_dr,
+            )?;
+            // cov:ignore-end
+            new_top_fields.append(&mut added);
+        }
     }
     {
         let (bbox, fmatrix) = fo_bbox_and_matrix(dest, fx0_ref)?;
-        content.push_str(&place_form_xobject(
-            bbox, fmatrix, media_rect, tmatrix, false, false, "Fx0",
-        ));
+        let (fragment, _cm) =
+            place_form_xobject(bbox, fmatrix, media_rect, tmatrix, false, false, "Fx0");
+        content.push_str(&fragment);
     }
-    for (name, xref) in &overlay_names {
+    for (name, xref, template) in &overlay_names {
         let (bbox, fmatrix) = fo_bbox_and_matrix(dest, *xref)?;
-        content.push_str(&place_form_xobject(
-            bbox, fmatrix, trim_rect, tmatrix, true, false, name,
-        ));
+        let (fragment, cm) =
+            place_form_xobject(bbox, fmatrix, trim_rect, tmatrix, true, false, name);
+        content.push_str(&fragment);
+        if let Some(tpl) = template {
+            // cov:ignore-start: symmetric with the underlay branch above — the
+            // trailing `)?;` is defensive on apply_placement error.
+            let mut added = crate::overlay_annotations::apply_placement(
+                dest,
+                dest_page_ref,
+                tpl,
+                cm,
+                &mut dest_acroform_dr,
+            )?;
+            // cov:ignore-end
+            new_top_fields.append(&mut added);
+        }
     }
 
     // 4. Allocate the new /Contents stream (uncompressed, no /Filter; the writer
@@ -338,13 +403,30 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     dest.set_object(contents_ref, Object::Stream(contents_stream));
 
     // 5. Rewrite the page dictionary: replace /Resources and /Contents, keep all
-    //    other keys.
+    //    other keys (in particular, /Annots — which apply_placement above may
+    //    have already extended in place — must survive this step).
     let mut page_dict = page_dictionary(dest, dest_page_ref)?;
+    // Fetch the /Annots value we just installed (if any) so it is carried onto
+    // the rewritten page dict below (apply_placement wrote to the pre-rewrite
+    // dict). If page_dictionary returns a fresh clone that already includes
+    // /Annots, this is a no-op; if it does not, we re-install it.
+    let live_annots = {
+        let obj = dest.resolve_borrowed(dest_page_ref)?;
+        obj.as_dict().and_then(|d| d.get("Annots").cloned())
+    };
     let mut resources = Dictionary::new();
     resources.insert("XObject", Object::Dictionary(xobject_dict));
     page_dict.insert("Resources", Object::Dictionary(resources));
     page_dict.insert("Contents", Object::Reference(contents_ref));
+    if let Some(annots) = live_annots {
+        page_dict.insert("Annots", annots);
+    }
     dest.set_object(dest_page_ref, Object::Dictionary(page_dict));
+
+    // 6. Finalize: append the accumulated new top-level fields to
+    //    /AcroForm/Fields, renaming /T on FQN collision with existing dest
+    //    fields (qpdf's addAndRenameFormFields).
+    crate::overlay_annotations::add_and_rename_form_fields(dest, new_top_fields)?;
 
     Ok(())
 }
@@ -395,7 +477,8 @@ fn map_overlay_pages(
 /// selected pages are paired by [`map_overlay_pages`].
 ///
 /// The distinct source pages used by the mapping are imported into `dest` in a
-/// single cross-document copy via [`import_pages_as_form_xobjects`] (so an object
+/// single cross-document copy via
+/// [`import_pages_as_form_xobjects`](crate::page_form_xobject::import_pages_as_form_xobjects) (so an object
 /// shared by several source pages is copied once), and the imported Form XObject
 /// reference is shared across every destination page that uses that source page
 /// (qpdf imports each source page once and reuses the object). The result is a
@@ -409,7 +492,8 @@ fn map_overlay_pages(
 /// - [`Error::Unsupported`] when a resolved page number falls outside `dest` or
 ///   `source` (the page lists and counts are read once up front, so this only
 ///   triggers on an internally inconsistent mapping), or any error propagated
-///   from [`PageRange::resolve`] or [`import_pages_as_form_xobjects`].
+///   from [`PageRange::resolve`] or
+///   [`import_pages_as_form_xobjects`](crate::page_form_xobject::import_pages_as_form_xobjects).
 fn spec_page_sources<RS, RT>(
     dest: &mut Pdf<RT>,
     source: &mut Pdf<RS>,
@@ -447,11 +531,70 @@ where
         .iter()
         .map(|&p| page_ref_for(&source_pages, p, "source"))
         .collect::<Result<_>>()?;
-    let imported_refs = import_pages_as_form_xobjects(dest, source, &source_refs)?;
-    let imported: BTreeMap<u32, ObjectRef> = distinct_sources
+
+    // Inline the two-phase import so the annotation closure (annots + fields
+    // + AP streams + /DR fonts) is unioned into the SAME copy_objects call as
+    // the Form XObject closure — advisor #2: one shared foreign→local map per
+    // source document, so a font used by both page /Resources and a widget's
+    // /AP is copied exactly once.
+    let mut xobject_seeds: Vec<ObjectRef> = Vec::with_capacity(source_refs.len());
+    let mut union: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut surveys: Vec<Option<crate::overlay_annotations::AnnotationSurvey>> =
+        Vec::with_capacity(source_refs.len());
+    for &page_ref in &source_refs {
+        let xobject_ref = crate::page_form_xobject::page_to_form_xobject(source, page_ref)?;
+        // cov:ignore-start: `)?)` propagates xobject_object_closure error —
+        // defensive on parser/resolver failure that no shipped fixture reaches.
+        union.extend(crate::page_form_xobject::xobject_object_closure(
+            source,
+            xobject_ref,
+        )?);
+        // cov:ignore-end
+        xobject_seeds.push(xobject_ref);
+        match crate::overlay_annotations::survey_source_annotations(source, page_ref)? {
+            Some((survey, annot_closure)) => {
+                union.extend(annot_closure);
+                surveys.push(Some(survey));
+            }
+            None => surveys.push(None),
+        }
+    }
+    let map = crate::object_copy::copy_objects(source, dest, &union)?;
+    let imported_xobject_refs: Vec<ObjectRef> = xobject_seeds
+        .iter()
+        .map(|xref| {
+            map.get(xref).copied().ok_or_else(|| {
+                // cov:ignore-start: internal-invariant guard — the copy map
+                // always contains every xobject_ref because we pushed the
+                // exact same refs into `union` a few lines above; this arm
+                // fires only if the copy_objects contract silently drops
+                // one, which is not reachable via valid input.
+                Error::Unsupported(
+                    "imported Form XObject reference missing from copy map".to_string(),
+                )
+            }) // cov:ignore-end
+        })
+        .collect::<Result<_>>()?;
+    let imported: BTreeMap<
+        u32,
+        (
+            ObjectRef,
+            Option<crate::overlay_annotations::AnnotationCopyTemplate>,
+        ),
+    > = distinct_sources
         .iter()
         .copied()
-        .zip(imported_refs)
+        .zip(
+            imported_xobject_refs
+                .into_iter()
+                .zip(surveys)
+                .map(|(xr, sv)| {
+                    (
+                        xr,
+                        sv.map(|s| crate::overlay_annotations::template_from_survey(&s, &map)),
+                    )
+                }),
+        )
         .collect();
 
     Ok(pairs
@@ -459,8 +602,15 @@ where
         .map(|&(dest_page, source_page)| {
             // `source_page` came from `pairs`, so it is one of `distinct_sources`
             // and is always present in the map; index directly.
-            let xobject_ref = imported[&source_page];
-            (dest_page, OverlaySource { kind, xobject_ref })
+            let (xobject_ref, template) = imported[&source_page].clone();
+            (
+                dest_page,
+                OverlaySource {
+                    kind,
+                    xobject_ref,
+                    annot_template: template,
+                },
+            )
         })
         .collect())
 }
@@ -558,8 +708,8 @@ fn group_sources_by_dest_page(
     entries: &[(u32, OverlaySource)],
 ) -> BTreeMap<u32, Vec<OverlaySource>> {
     let mut by_page: BTreeMap<u32, Vec<OverlaySource>> = BTreeMap::new();
-    for &(dest_page, source) in entries {
-        by_page.entry(dest_page).or_default().push(source);
+    for (dest_page, source) in entries {
+        by_page.entry(*dest_page).or_default().push(source.clone());
     }
     by_page
 }
@@ -1111,6 +1261,7 @@ mod byte_gate {
             &[OverlaySource {
                 kind: OverlayKind::Overlay,
                 xobject_ref: imported,
+                annot_template: None,
             }],
         )
         .unwrap();
@@ -1341,6 +1492,311 @@ mod byte_gate {
         .unwrap();
         let actual = write_static_id(&mut dest);
         assert_byte_identical(&actual, "three-page-overlay-rotated.pdf");
+    }
+
+    // ---- copy-annotations parity (flpdf-9hc.34) -------------------------
+    //
+    // Primary target for the overlay/underlay copyAnnotations parity work:
+    // qpdf 11.9.0's `qpdf/qtest/copy-annotations.test` line 19-28.
+    // fxo-red.pdf (16-page dest, no /AcroForm) --overlay
+    // form-fields-and-annotations.pdf --repeat=1 (1-page source with 5 widget
+    // annots over 3 top-level fields including a radio group). Because the
+    // single source page is repeated onto every dest page, the +N rename path
+    // fires from placement 2 onward (r1..r1+15, "Text Box 1"..+15, etc.).
+    #[test]
+    fn overlay_copy_annotations_fxo_red_repeat1_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src = fixture("form-fields-and-annotations.pdf");
+        // qpdf floors the output at max(dest, all sources) — form-fields-and-
+        // annotations.pdf is PDF 1.6, fxo-red.pdf is PDF 1.3, so the output
+        // header must be 1.6.
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            ..Default::default()
+        };
+        let mut actual = Vec::new();
+        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        assert_byte_identical(&actual, "overlay-copy-annotations.pdf");
+    }
+
+    /// Overlay a source that mixes two edge shapes into its page's
+    /// `/Annots` array:
+    /// - one widget (obj 3, "Text Box 1") carries an explicit `/P`
+    ///   pointing at the source page — after copy that ref goes stale
+    ///   and gets Null'd by rewrite_refs, so `apply_placement`'s
+    ///   `set_annot_page_ref_if_null` must repoint it at dest_page_ref;
+    /// - one entry is a DIRECT annot dictionary (an inline
+    ///   `<< /Subtype /FreeText ... >>` where an indirect ref would
+    ///   normally live) — `survey_source_annotations` must materialize
+    ///   it into a fresh source-doc indirect object (qpdf
+    ///   transformAnnotations line 954-956).
+    ///
+    /// Fixture: `form-fields-and-annotations-p-and-inline.pdf` is the
+    /// primary source with `/P 17 0 R` added to Text Box 1 and one
+    /// FreeText annot inlined into the page's `/Annots`.
+    #[test]
+    fn overlay_copy_annotations_source_p_and_inline_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src = fixture("form-fields-and-annotations-p-and-inline.pdf");
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            ..Default::default()
+        };
+        let mut actual = Vec::new();
+        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        assert_byte_identical(&actual, "overlay-source-p-and-inline.pdf");
+    }
+
+    /// Overlay a source that has annotations (a `/Link` annot) but NO
+    /// `/AcroForm` on the catalog — a valid, common shape (only widget
+    /// annots require an /AcroForm; link, stamp, freetext, ... do not).
+    /// Exercises the "no /AcroForm" branch of
+    /// `read_source_acroform_defaults` (`source_dr`, `source_default_da`,
+    /// `source_default_q` all return None) that the primary target does
+    /// not hit because its source PDF carries an /AcroForm.
+    #[test]
+    fn overlay_copy_annotations_source_no_acroform_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src = fixture("link-annot-no-acroform.pdf");
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            ..Default::default()
+        };
+        let mut actual = Vec::new();
+        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        assert_byte_identical(&actual, "overlay-link-annot-no-acroform.pdf");
+    }
+
+    /// Overlay onto a dest whose `/AcroForm/Fields` is stored as an
+    /// indirect reference (`/Fields 5 0 R`) instead of a direct array —
+    /// a valid PDF shape. Exercises
+    /// `read_existing_top_field_refs`'s Reference branch,
+    /// `collect_fully_qualified_names`'s indirect-`/Kids` handling on
+    /// the same axis, and `add_and_rename_form_fields`'s indirect-Fields
+    /// append (updates the array object in place rather than storing a
+    /// new direct array on the AcroForm).
+    ///
+    /// Fixture: `fxo-red-indirect-fields.pdf` is fxo-red with a hand-added
+    /// `/AcroForm { /Fields <ref> }` whose Fields ref points at a
+    /// standalone array object containing one widget "Text Box 1"; the
+    /// source's Text Box 1 must therefore rename to +N on every placement.
+    #[test]
+    fn overlay_copy_annotations_onto_indirect_fields_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red-indirect-fields.pdf");
+        let mut src = fixture("form-fields-and-annotations.pdf");
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            ..Default::default()
+        };
+        let mut actual = Vec::new();
+        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        assert_byte_identical(&actual, "overlay-onto-indirect-fields.pdf");
+    }
+
+    /// Overlay a source whose `/AcroForm/DR` is stored inline as a direct
+    /// dictionary (rather than the usual indirect ref). Exercises
+    /// `read_source_acroform_defaults`' direct-`/DR` materialize path
+    /// (allocate a fresh source-doc indirect object, register the direct
+    /// dict on it, and return that ref for downstream copy).
+    #[test]
+    fn overlay_copy_annotations_source_direct_dr_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src = fixture("form-fields-and-annotations-direct-dr.pdf");
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            ..Default::default()
+        };
+        let mut actual = Vec::new();
+        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        assert_byte_identical(&actual, "overlay-source-direct-dr.pdf");
+    }
+
+    /// Overlay `form-fields-and-annotations.pdf` onto a dest that already
+    /// carries an `/AcroForm` with a pre-existing `/Fields` entry named
+    /// "Text Box 1" — the same partial name as one of the source's
+    /// top-level fields, so the +N collision rename must fire once for
+    /// every placement (the source page is repeated onto all 16 dest
+    /// pages, so the rename runs 16 times: "Text Box 1+1", "Text Box 1+2",
+    /// ...). Also exercises `ensure_dest_acroform_dr`'s existing-`/DR`
+    /// short-circuit, `add_and_rename_form_fields`'s reference-`/AcroForm`
+    /// / reference-`/Fields` paths, `collect_fully_qualified_names` over
+    /// the pre-existing field, and the tail of `duplicate_field_tree` that
+    /// leaves an existing dest `/DR` untouched.
+    ///
+    /// Fixture: `fxo-red-with-existing-acroform.pdf` is fxo-red with a
+    /// small hand-added `/AcroForm { /DR ... /Fields [<field>] }` whose
+    /// field has `/T (Text Box 1)`.
+    #[test]
+    fn overlay_copy_annotations_onto_existing_acroform_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red-with-existing-acroform.pdf");
+        let mut src = fixture("form-fields-and-annotations.pdf");
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            ..Default::default()
+        };
+        let mut actual = Vec::new();
+        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        assert_byte_identical(&actual, "overlay-onto-existing-acroform.pdf");
+    }
+
+    /// Overlay a source whose `/AcroForm` supplies `/DA` and `/Q` defaults
+    /// onto a dest with no `/AcroForm`. Exercises qpdf's
+    /// `adjustInheritedFields` (line 442-484, called from
+    /// transformAnnotations line 914-917) — a copied field that inherits
+    /// its default appearance / quadding from the source `/AcroForm` gets
+    /// the value pinned on the field itself so the (different / absent)
+    /// dest default is not silently inherited.
+    ///
+    /// Fixture: `form-fields-and-annotations-with-defaults.pdf` is
+    /// `form-fields-and-annotations.pdf` with `/DA (/ZaDi 0 Tf 0 g)` and
+    /// `/Q 1` added at the `/AcroForm` level (nothing else changed). Dest
+    /// remains fxo-red (no `/AcroForm`), so `override_da` and
+    /// `override_q` both fire and every copied field runs through
+    /// `adjust_inherited_field` + `ancestor_has_key`.
+    #[test]
+    fn overlay_copy_annotations_with_da_q_defaults_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src = fixture("form-fields-and-annotations-with-defaults.pdf");
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            ..Default::default()
+        };
+        let mut actual = Vec::new();
+        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        assert_byte_identical(&actual, "overlay-copy-annotations-with-defaults.pdf");
+    }
+
+    /// Underlay counterpart of the primary copy-annotations byte gate.
+    /// Same fixture (fxo-red + form-fields-and-annotations, --repeat=1),
+    /// same expected annotation copy behaviour (qpdf's
+    /// `doUnderOverlayForPage` shares the codepath for both kinds and
+    /// differs only in the content-stream placement order), but exercises
+    /// [`apply_overlay_specs`]'s underlay branch and the accompanying
+    /// [`apply_placement`] call inside it — the mirror of the overlay
+    /// branch already covered above.
+    #[test]
+    fn underlay_copy_annotations_fxo_red_repeat1_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src = fixture("form-fields-and-annotations.pdf");
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Underlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            ..Default::default()
+        };
+        let mut actual = Vec::new();
+        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        assert_byte_identical(&actual, "underlay-copy-annotations.pdf");
     }
 
     #[test]
@@ -1738,7 +2194,7 @@ mod tests {
     #[test]
     fn place_identity_when_same_size() {
         // BBox == rect (612x792 at origin), no fo/dest transform -> identity, centred.
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 612.0, 792.0],
             ID,
             [0.0, 0.0, 612.0, 792.0],
@@ -1754,7 +2210,7 @@ mod tests {
     fn place_centers_smaller_bbox_without_scaling() {
         // 300x144 source into 612x792 dest: no scale-up; centred at
         // tx = 306 - 150 = 156, ty = 396 - 72 = 324.
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 300.0, 144.0],
             ID,
             [0.0, 0.0, 612.0, 792.0],
@@ -1770,7 +2226,7 @@ mod tests {
     fn place_shrinks_larger_bbox_to_fit() {
         // 612x792 source into 300x144 dest with allow_shrink: scale = min(300/612,
         // 144/792) = 0.18182 (5dp). tx -> "94.36364", ty -> "0".
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 612.0, 792.0],
             ID,
             [0.0, 0.0, 300.0, 144.0],
@@ -1787,7 +2243,7 @@ mod tests {
         // Same oversize source, but allow_shrink=false (the /Fx0 flags): the
         // would-be <1 scale is clamped to 1 and the bbox is centred unscaled.
         // scale 1; t_cx=306, t_cy=396; r_cx=150, r_cy=72; tx=-156, ty=-324.
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 612.0, 792.0],
             ID,
             [0.0, 0.0, 300.0, 144.0],
@@ -1803,7 +2259,7 @@ mod tests {
     fn place_fractional_center() {
         // 301x145 source into 612x792 dest: no scale; tx = 306 - 150.5 = 155.5,
         // ty = 396 - 72.5 = 323.5.
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 301.0, 145.0],
             ID,
             [0.0, 0.0, 612.0, 792.0],
@@ -1820,7 +2276,7 @@ mod tests {
         // A degenerate /BBox (zero width) gives qpdf a degenerate transformed
         // rectangle, so getMatrixForFormXObjectPlacement returns the identity
         // (NOT a centred scale-1 placement). Mirrors qpdf 11.9.0.
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 0.0, 100.0],
             ID,
             [0.0, 0.0, 200.0, 200.0],
@@ -1837,7 +2293,7 @@ mod tests {
         // /BBox origin is non-zero: centre uses (llx+urx)/2, (lly+ury)/2.
         // BBox [10 10 510 610] -> w=500 h=600 into rect [0 0 612 792].
         // scale = min(612/500, 792/600) -> clamped to 1; tx=46, ty=86.
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [10.0, 10.0, 510.0, 610.0],
             ID,
             [0.0, 0.0, 612.0, 792.0],
@@ -1859,7 +2315,7 @@ mod tests {
         // (impossible for the old axis-aligned placement) prove the dest inverse
         // transform is folded in.
         let tmatrix = [0.0, 1.0, -1.0, 0.0, 792.0, 0.0];
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 612.0, 792.0],
             [0.0, -1.0, 1.0, 0.0, 0.0, 612.0],
             [0.0, 0.0, 612.0, 792.0],
@@ -1976,6 +2432,7 @@ mod tests {
             &[OverlaySource {
                 kind: OverlayKind::Overlay,
                 xobject_ref: overlay,
+                annot_template: None,
             }],
         )
         .unwrap();
@@ -2050,10 +2507,12 @@ mod tests {
                 OverlaySource {
                     kind: OverlayKind::Overlay,
                     xobject_ref: overlay,
+                    annot_template: None,
                 },
                 OverlaySource {
                     kind: OverlayKind::Underlay,
                     xobject_ref: underlay,
+                    annot_template: None,
                 },
             ],
         )
@@ -2128,6 +2587,7 @@ mod tests {
             &[OverlaySource {
                 kind: OverlayKind::Overlay,
                 xobject_ref: src,
+                annot_template: None,
             }],
         )
         .unwrap();
@@ -2175,6 +2635,7 @@ mod tests {
             &[OverlaySource {
                 kind: OverlayKind::Overlay,
                 xobject_ref: src,
+                annot_template: None,
             }],
         )
         .unwrap();
@@ -2416,7 +2877,7 @@ mod tests {
         //   0.77273 0 0 0.77273 0 159.54545
         // The fo /Matrix affects scale/translation but does NOT appear in the cm
         // (the PDF interpreter applies it automatically), so b/c stay 0.
-        let frag = place_form_xobject(
+        let (frag, _cm) = place_form_xobject(
             [0.0, 0.0, 612.0, 792.0],
             [0.0, -1.0, 1.0, 0.0, 0.0, 612.0],
             [0.0, 0.0, 612.0, 792.0],
@@ -2810,6 +3271,7 @@ mod tests {
         OverlaySource {
             kind,
             xobject_ref: ObjectRef::new(n, 0),
+            annot_template: None,
         }
     }
 

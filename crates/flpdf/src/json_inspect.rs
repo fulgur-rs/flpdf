@@ -354,7 +354,7 @@ pub fn pdf_object_to_json(obj: &Object) -> Result<JsonValue, ConvertError> {
         Object::Null => Ok(JsonValue::Null),
         Object::Boolean(b) => Ok(JsonValue::Bool(*b)),
         Object::Integer(n) => Ok(JsonValue::Integer(*n)),
-        Object::Real(f) => {
+        Object::Real(f) | Object::RealLiteral { value: f, .. } => {
             if !f.is_finite() {
                 return Err(ConvertError::NonFiniteFloat);
             }

@@ -430,11 +430,25 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let text = std::str::from_utf8(&self.input[start..self.pos])
-            .map_err(|_| Error::parse(start, "real is not utf-8"))?;
-        text.parse::<f64>()
-            .map(Object::Real)
-            .map_err(|_| Error::parse(start, "invalid real"))
+        let bytes = &self.input[start..self.pos];
+        let text =
+            std::str::from_utf8(bytes).map_err(|_| Error::parse(start, "real is not utf-8"))?;
+        let value = text
+            .parse::<f64>()
+            .map_err(|_| Error::parse(start, "invalid real"))?;
+        // Preserve the source literal when `value.to_string()` cannot
+        // reproduce it byte-for-byte (e.g. `.4`, `0.400`, `1.0`) — required
+        // for byte-identical parity with qpdf's QPDF_Real (which re-emits the
+        // parsed string verbatim). When the literal already matches Rust's
+        // shortest round-trip, the plain `Real(f64)` is smaller and equivalent.
+        if value.to_string().as_bytes() == bytes {
+            Ok(Object::Real(value))
+        } else {
+            Ok(Object::RealLiteral {
+                value,
+                literal: bytes.to_vec(),
+            })
+        }
     }
 
     fn integer(&mut self) -> Result<i64> {

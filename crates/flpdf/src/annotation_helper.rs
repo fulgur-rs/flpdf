@@ -734,7 +734,7 @@ fn parse_rect_array(arr: &[Object], key: &[u8]) -> Result<PageBox> {
     for (i, elem) in arr.iter().take(4).enumerate() {
         coords[i] = match elem {
             Object::Integer(n) => *n as f64,
-            Object::Real(r) => *r,
+            Object::Real(r) | Object::RealLiteral { value: r, .. } => *r,
             other => {
                 return Err(Error::Unsupported(format!(
                     "/{} rectangle element {i} has unexpected type {:?}",

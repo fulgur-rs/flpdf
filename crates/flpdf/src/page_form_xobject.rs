@@ -361,7 +361,7 @@ fn rectangle_dimensions(arr: &[Object]) -> (f64, f64) {
     let n = |o: &Object| -> f64 {
         match o {
             Object::Integer(i) => *i as f64,
-            Object::Real(r) => *r,
+            Object::Real(r) | Object::RealLiteral { value: r, .. } => *r,
             _ => 0.0,
         }
     };
@@ -482,7 +482,7 @@ fn leaf_user_unit<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Resu
     match resolved {
         Object::Null => Ok((false, 1.0)),
         Object::Integer(n) => Ok((true, n as f64)),
-        Object::Real(r) => Ok((true, r)),
+        Object::Real(r) | Object::RealLiteral { value: r, .. } => Ok((true, r)),
         _ => Ok((true, 1.0)),
     }
 }
@@ -563,7 +563,7 @@ fn page_group<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<O
 /// Compute the transitive reachable object closure of the Form XObject at
 /// `xobject_ref` (the XObject itself plus every object reachable through its
 /// references). Bounded DFS with a visited set (cycle guard) and a depth limit.
-fn xobject_object_closure<R: Read + Seek>(
+pub(crate) fn xobject_object_closure<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     xobject_ref: ObjectRef,
 ) -> Result<BTreeSet<ObjectRef>> {
@@ -615,6 +615,7 @@ fn collect_object_refs(obj: &Object, out: &mut Vec<ObjectRef>) {
         | Object::Boolean(_)
         | Object::Integer(_)
         | Object::Real(_)
+        | Object::RealLiteral { .. }
         | Object::Name(_)
         | Object::String(_) => {}
     }
