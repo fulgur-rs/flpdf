@@ -185,3 +185,97 @@ fn cli_three_page_overlay_two_page_from_empty_repeat2_is_byte_identical() {
     );
     assert_bytes(&bytes, "three-page-overlay-two-page-from-empty-repeat2.pdf");
 }
+
+#[test]
+fn cli_three_page_underlay_two_page_is_byte_identical() {
+    let src = fixture("two-page.pdf");
+    let bytes = run_cli(
+        &[],
+        "three-page.pdf",
+        &["--underlay", src.to_str().unwrap(), "--"],
+    );
+    assert_bytes(&bytes, "three-page-underlay-two-page.pdf");
+}
+
+#[test]
+fn cli_three_page_overlay_rotated_source_is_byte_identical() {
+    let src = fixture("one-page-r90.pdf");
+    let bytes = run_cli(
+        &[],
+        "three-page.pdf",
+        &["--overlay", src.to_str().unwrap(), "--"],
+    );
+    assert_bytes(&bytes, "three-page-overlay-rotated.pdf");
+}
+
+#[test]
+fn cli_three_page_overlay_to_1_3_repeat1_is_byte_identical() {
+    let src = fixture("one-page.pdf");
+    let bytes = run_cli(
+        &[],
+        "three-page.pdf",
+        &[
+            "--overlay",
+            src.to_str().unwrap(),
+            "--to=1-3",
+            "--repeat=1",
+            "--",
+        ],
+    );
+    assert_bytes(&bytes, "three-page-overlay-to-repeat.pdf");
+}
+
+#[test]
+fn cli_three_page_overlay_multi_stream_source_is_byte_identical() {
+    let src = fixture("multi-stream-one-page.pdf");
+    let bytes = run_cli(
+        &[],
+        "three-page.pdf",
+        &["--overlay", src.to_str().unwrap(), "--"],
+    );
+    assert_bytes(&bytes, "three-page-overlay-multi-stream.pdf");
+}
+
+#[test]
+fn cli_r90_dest_overlay_one_page_is_byte_identical() {
+    let src = fixture("one-page.pdf");
+    let bytes = run_cli(
+        &[],
+        "one-page-r90.pdf",
+        &["--overlay", src.to_str().unwrap(), "--"],
+    );
+    assert_bytes(&bytes, "r90-dest-overlay-one-page.pdf");
+}
+
+#[test]
+fn cli_three_page_overlay_userunit_source_is_byte_identical() {
+    let src = fixture("userunit-one-page.pdf");
+    let bytes = run_cli(
+        &[],
+        "three-page.pdf",
+        &["--overlay", src.to_str().unwrap(), "--"],
+    );
+    assert_bytes(&bytes, "three-page-overlay-userunit.pdf");
+}
+
+#[test]
+fn cli_swapped_box_overlay_one_page_is_byte_identical() {
+    let src = fixture("one-page.pdf");
+    let bytes = run_cli(
+        &[],
+        "swapped-box-one-page.pdf",
+        &["--overlay", src.to_str().unwrap(), "--"],
+    );
+    assert_bytes(&bytes, "swapped-box-overlay-one-page.pdf");
+}
+
+#[test]
+fn cli_swapped_box_r90_overlay_self_is_byte_identical() {
+    let src = fixture("swapped-box-r90-one-page.pdf");
+    let bytes = run_cli(
+        &[],
+        "swapped-box-r90-one-page.pdf",
+        &["--overlay", src.to_str().unwrap(), "--"],
+    );
+    assert_bytes(&bytes, "swapped-box-r90-overlay-self.pdf");
+}
