@@ -543,3 +543,183 @@ fn overlay_from_rc4_source_opens_without_allow_weak_crypto() {
         .stderr(predicate::str::contains("weak crypto").not())
         .stderr(predicate::str::contains("page_count"));
 }
+
+// ── Overlay/underlay source repair-warning propagation ────────────────────
+//
+// qpdf 11.9.0 empirical: when `--overlay`/`--underlay` is given a source PDF
+// whose open triggers `Pdf::repair_diagnostics()` (e.g. a corrupt xref), qpdf
+// prints each warning to stderr in the shape
+// `WARNING: <path>[ (offset N)]: <message>` and STILL exits 0 for
+// "clean-primary + warning-bearing overlay/underlay source" — qpdf does not
+// add overlay/underlay source warnings to its exit-code accumulator; the
+// "operation succeeded with warnings" summary is not printed either. The
+// tests below assert that flpdf mirrors that observability (stderr) and exit
+// (0) shape.
+
+/// Return bytes for a 1-page PDF whose `xref` keyword is corrupted so that
+/// `open_with_repair` runs the reconstruction path and records warning
+/// diagnostics. Duplicated from the private helper in `cli_tests.rs` to keep
+/// this test file self-contained (a shared `mod common` is a follow-up).
+fn corrupt_xref_with_info_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Info 5 0 R >>\nendobj\n".to_vec();
+    let obj2 = b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec();
+    let obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R >>\nendobj\n".to_vec();
+    let obj4 = b"4 0 obj\n<< /Length 0 >>\nstream\nendstream\nendobj\n".to_vec();
+    let obj5 = b"5 0 obj\n<< /Title (Corrupt fixture) /Creator (flpdf) >>\nendobj\n".to_vec();
+
+    let mut offsets = Vec::new();
+    for object in [&obj1, &obj2, &obj3, &obj4, &obj5] {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f\n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R /Info 5 0 R >>\nstartxref\n{start_xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+
+    let mut corrupted = bytes;
+    let Some(pos) = corrupted.windows(4).position(|window| window == b"xref") else {
+        unreachable!("fixture should contain xref token")
+    };
+    if let Some(byte) = corrupted.get_mut(pos + 2) {
+        *byte = b'z';
+    }
+
+    corrupted
+}
+
+/// Write [`corrupt_xref_with_info_pdf`] into `dir` and return the resulting
+/// path. Named so the test's intent — "here is a source PDF whose open will
+/// warn" — reads clearly at the call site.
+fn write_corrupt_fixture(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, corrupt_xref_with_info_pdf()).unwrap();
+    path
+}
+
+#[test]
+fn overlay_corrupt_source_emits_source_warnings_and_exits_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corrupt = write_corrupt_fixture(tmp.path(), "corrupt-overlay.pdf");
+    let out = tmp.path().join("out.pdf");
+    let dest = fixture("one-page.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg("--repair")
+        .arg(&dest)
+        .arg("--overlay")
+        .arg(&corrupt)
+        .arg("--")
+        .arg(&out)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {}: file is damaged",
+            corrupt.display()
+        )))
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {} (offset ",
+            corrupt.display()
+        )))
+        .stderr(predicate::str::contains(
+            "Attempting to reconstruct cross-reference table",
+        ));
+}
+
+#[test]
+fn underlay_corrupt_source_emits_source_warnings_and_exits_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corrupt = write_corrupt_fixture(tmp.path(), "corrupt-underlay.pdf");
+    let out = tmp.path().join("out.pdf");
+    let dest = fixture("one-page.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg("--repair")
+        .arg(&dest)
+        .arg("--underlay")
+        .arg(&corrupt)
+        .arg("--")
+        .arg(&out)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {}: file is damaged",
+            corrupt.display()
+        )));
+}
+
+/// Regression guard: an overlay source with no `repair_diagnostics` must not
+/// add any `WARNING:` line — the emit helper must stay silent on a clean
+/// source. Also verifies that a re-parseable, warning-free source path does
+/// not accidentally acquire a WARNING through some other channel.
+#[test]
+fn overlay_clean_source_emits_no_open_warnings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out.pdf");
+    let dest = fixture("one-page.pdf");
+    let clean_source = fixture("one-page.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg(&dest)
+        .arg("--overlay")
+        .arg(&clean_source)
+        .arg("--")
+        .arg(&out)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("WARNING:").not());
+}
+
+/// Two corrupt overlay sources → each source's warnings are emitted
+/// independently (three warning lines per source; assert the "file is
+/// damaged" line names each source path).
+#[test]
+fn two_corrupt_overlay_sources_each_emit_warnings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = write_corrupt_fixture(tmp.path(), "corrupt-a.pdf");
+    let b = write_corrupt_fixture(tmp.path(), "corrupt-b.pdf");
+    let out = tmp.path().join("out.pdf");
+    let dest = fixture("one-page.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg("--repair")
+        .arg(&dest)
+        .arg("--overlay")
+        .arg(&a)
+        .arg("--")
+        .arg("--overlay")
+        .arg(&b)
+        .arg("--")
+        .arg(&out)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {}: file is damaged",
+            a.display()
+        )))
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {}: file is damaged",
+            b.display()
+        )));
+}
