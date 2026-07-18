@@ -1250,31 +1250,58 @@ fn merge_resources_shallow<R: Read + Seek>(
     let Some(mut dest_dict) = dest.resolve(dest_dr)?.into_dict() else {
         return Ok(()); // cov:ignore: defensive early return
     };
+    // Collect (type_key, resolved source sub-dict, verbatim-fallback value) so
+    // the mutable-borrow of `dest` inside `resolve(...)` doesn't collide with
+    // the immutable borrow of `src_dict` needed by the for-loop. PDF permits
+    // `/Font <ref>` (indirect resource-type sub-dict) as well as the direct-
+    // dict shape; qpdf's `QPDFObjectHandle::mergeResources` operates on
+    // resolved QPDFObjectHandle values, so both shapes must merge — losing an
+    // indirect source sub-dict would drop the referenced fonts entirely.
+    let mut src_types: Vec<(Vec<u8>, Option<crate::Dictionary>, Option<Object>)> = Vec::new();
     for (type_key, src_type_val) in src_dict.iter() {
-        // Resource-type entry (e.g. /Font) is expected to be a direct
-        // sub-dict, matching the primary target and every qpdf golden we
-        // currently oracle. PDF also permits `/Font <ref>` (indirect
-        // sub-dict), but replicating qpdf's mergeResources semantics for
-        // that shape needs an oracle golden that no shipped fixture
-        // supplies.
-        let Some(src_type_dict) = src_type_val.as_dict() else {
-            // cov:ignore-start: verbatim-copy for non-dict resource-type —
-            // no shipped fixture supplies this shape (every source /DR
-            // sub-dict value we currently oracle is a direct dict).
-            if dest_dict.get(type_key).is_none() {
-                dest_dict.insert(type_key, src_type_val.clone());
+        let entry = match src_type_val {
+            Object::Reference(r) => match dest.resolve(*r)?.into_dict() {
+                Some(d) => (type_key.to_vec(), Some(d), None),
+                None => (type_key.to_vec(), None, Some(src_type_val.clone())), // cov:ignore: source resource-type ref does not resolve to a dict — verbatim fallback per qpdf. No shipped fixture supplies this shape.
+            },
+            _ => match src_type_val.as_dict() {
+                Some(d) => (type_key.to_vec(), Some(d.clone()), None),
+                None => (type_key.to_vec(), None, Some(src_type_val.clone())), // cov:ignore: non-dict, non-reference resource-type value — no shipped fixture supplies this shape.
+            },
+        };
+        src_types.push(entry);
+    }
+
+    for (type_key, src_type_dict, verbatim) in src_types {
+        let Some(src_type_dict) = src_type_dict else {
+            // cov:ignore-start: verbatim-copy path — non-dict resource-type
+            // value from an unusual source /DR shape (see collection above).
+            if let Some(v) = verbatim {
+                if dest_dict.get(&type_key).is_none() {
+                    dest_dict.insert(&type_key, v);
+                }
             }
             continue;
             // cov:ignore-end
         };
 
-        // Start from dest's existing sub-dict for this type (if any) so a
+        // Resolve dest's existing sub-dict for this type (if any) so a
         // pre-existing dest `/DR` category is preserved rather than
-        // replaced; a type dest has never seen starts from an empty dict
-        // (matching the previous "dest starts empty" behavior verbatim).
-        let mut new_type_dict = match dest_dict.get(type_key) {
-            Some(Object::Dictionary(existing)) => existing.clone(),
-            _ => crate::Dictionary::new(),
+        // replaced. `/Font <ref>` (indirect) is preserved as-is: we resolve
+        // to get the underlying dict, mutate it in place, and leave the
+        // reference in dest_dict untouched — matching qpdf's behavior of
+        // preserving indirect resource-type refs.
+        let (mut new_type_dict, indirect_target) = match dest_dict.get(&type_key).cloned() {
+            Some(Object::Dictionary(existing)) => (existing, None),
+            Some(Object::Reference(r)) => match dest.resolve(r)?.into_dict() {
+                Some(d) => (d, Some(r)),
+                // cov:ignore-start: dest resource-type ref does not resolve
+                // to a dict — degrade to a fresh dict and replace inline.
+                // No shipped fixture supplies this malformed shape.
+                None => (crate::Dictionary::new(), None),
+                // cov:ignore-end
+            },
+            _ => (crate::Dictionary::new(), None),
         };
 
         for (name, val) in src_type_dict.iter() {
@@ -1297,14 +1324,20 @@ fn merge_resources_shallow<R: Read + Seek>(
                     let new_name = unique_dr_name(name, &new_type_dict)?;
                     new_type_dict.insert(&new_name, val.clone());
                     dr_map
-                        .entry(type_key.to_vec())
+                        .entry(type_key.clone())
                         .or_default()
                         .insert(name.to_vec(), new_name);
                 }
             }
         }
 
-        dest_dict.insert(type_key, Object::Dictionary(new_type_dict));
+        if let Some(target_ref) = indirect_target {
+            // Preserve indirect-ness: mutate the referenced object; dest_dict
+            // still holds `Object::Reference(target_ref)`, so no insert.
+            dest.set_object(target_ref, Object::Dictionary(new_type_dict));
+        } else {
+            dest_dict.insert(&type_key, Object::Dictionary(new_type_dict));
+        }
     }
     dest.set_object(dest_dr, Object::Dictionary(dest_dict));
     Ok(())
@@ -1844,6 +1877,92 @@ mod tests {
         assert_eq!(font.get_ref("F1"), Some(helv_ref));
         assert_eq!(font.get_ref("F1_1"), Some(other_ref));
         assert_eq!(font.get_ref("F1_2"), Some(courier_ref));
+    }
+
+    /// Source `/DR/Font` is stored as an indirect reference (not a direct
+    /// sub-dict). qpdf's `mergeResources` resolves the reference and merges
+    /// the underlying dict; a naive implementation that only matched
+    /// `Object::Dictionary` would drop the fonts entirely.
+    #[test]
+    fn merge_resources_shallow_resolves_indirect_source_resource_type_dict() {
+        let mut pdf = open_minimal();
+        let font_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        // Indirect /Font sub-dict on the source side: /Font 4 0 R where 4 0 R
+        // resolves to << /F1 10 0 R >>.
+        let font_subdict_ref = ObjectRef::new(4, 0);
+        let mut font_sub = crate::Dictionary::new();
+        font_sub.insert("F1", Object::Reference(font_ref));
+        pdf.set_object(font_subdict_ref, Object::Dictionary(font_sub));
+        let source_dr = set_dict(
+            &mut pdf,
+            3,
+            &[("Font", Object::Reference(font_subdict_ref))],
+        );
+        let dest_dr = set_dict(&mut pdf, 2, &[]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+
+        assert!(dr_map.is_empty());
+        let font = font_dict(&mut pdf, dest_dr);
+        assert_eq!(font.get_ref("F1"), Some(font_ref));
+    }
+
+    /// Dest `/DR/Font` is stored as an indirect reference. qpdf's
+    /// `mergeResources` preserves the indirect-ness by mutating the
+    /// referenced object in place; a naive implementation that only matched
+    /// `Object::Dictionary` would replace the entire ref with a fresh direct
+    /// dict on the dest, dropping any other holders of that font-subdict.
+    #[test]
+    fn merge_resources_shallow_preserves_indirect_dest_resource_type_dict() {
+        let mut pdf = open_minimal();
+        let helv_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let courier_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("BaseFont", Object::Name(b"Courier".to_vec()))],
+        );
+        // Indirect /Font sub-dict on the dest side: /Font 4 0 R where 4 0 R
+        // resolves to << /F0 10 0 R >> (F0 = Helvetica).
+        let dest_font_subdict_ref = ObjectRef::new(4, 0);
+        let mut dest_font_sub = crate::Dictionary::new();
+        dest_font_sub.insert("F0", Object::Reference(helv_ref));
+        pdf.set_object(dest_font_subdict_ref, Object::Dictionary(dest_font_sub));
+        let dest_dr = set_dict(
+            &mut pdf,
+            2,
+            &[("Font", Object::Reference(dest_font_subdict_ref))],
+        );
+        // Direct /Font sub-dict on the source side, adding a fresh F1.
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", courier_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+
+        assert!(dr_map.is_empty(), "no name collision, no rename");
+        // Indirect-ness preserved on dest_dr itself.
+        let dest_dict = pdf.resolve(dest_dr).unwrap().into_dict().unwrap();
+        assert_eq!(
+            dest_dict.get_ref("Font"),
+            Some(dest_font_subdict_ref),
+            "/Font indirect ref preserved (not replaced with direct dict)",
+        );
+        // Referenced object mutated in place: still has F0, now also has F1.
+        let mutated = pdf
+            .resolve(dest_font_subdict_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
+        assert_eq!(mutated.get_ref("F0"), Some(helv_ref));
+        assert_eq!(mutated.get_ref("F1"), Some(courier_ref));
     }
 
     // ---- ensure_dest_acroform_dr -------------------------------------------
