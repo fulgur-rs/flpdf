@@ -2211,6 +2211,153 @@ mod tests {
         assert!(font.get("F1_1").is_none());
     }
 
+    // ---- adjust_default_appearance ------------------------------------------
+
+    /// Build a `/DR`-shaped dict `<< /Font << name1 100 0 R, ... >> >>`.
+    /// `adjust_default_appearance` only checks name *presence* in the Font
+    /// sub-dict, so the target refs are arbitrary placeholders.
+    fn font_resources_dict(names: &[&str]) -> crate::Dictionary {
+        let mut font = crate::Dictionary::new();
+        for (i, name) in names.iter().enumerate() {
+            font.insert(*name, Object::Reference(ObjectRef::new(100 + i as u32, 0)));
+        }
+        let mut dr = crate::Dictionary::new();
+        dr.insert("Font", Object::Dictionary(font));
+        dr
+    }
+
+    /// Build a `DrMap` with a single `Font` category from `(old, new)` pairs.
+    fn font_dr_map(entries: &[(&str, &str)]) -> DrMap {
+        let mut font = BTreeMap::new();
+        for (old, new) in entries {
+            font.insert(old.as_bytes().to_vec(), new.as_bytes().to_vec());
+        }
+        let mut dr_map = DrMap::new();
+        dr_map.insert(b"Font".to_vec(), font);
+        dr_map
+    }
+
+    #[test]
+    fn adjust_default_appearance_empty_dr_map_is_identity() {
+        let dr_map = DrMap::new();
+        let resources = crate::Dictionary::new();
+        let da: &[u8] = b"0 0.4 0 rg /F1 18 Tf";
+        assert_eq!(
+            adjust_default_appearance(da, &dr_map, &resources),
+            da.to_vec()
+        );
+    }
+
+    /// The canonical case exercised by the (still-ignored) Layer 1 byte
+    /// gate: `form-fields-and-annotations.pdf`'s `/DA (0 0.4 0 rg /F1 18
+    /// Tf)` merged onto a dest whose `/DR/Font/F1` already existed, renaming
+    /// the source's colliding `/F1` to `/F1_1`.
+    #[test]
+    fn adjust_default_appearance_rewrites_matched_font_name() {
+        let dr_map = font_dr_map(&[("F1", "F1_1")]);
+        let resources = font_resources_dict(&["F1", "F1_1"]);
+        let da: &[u8] = b"0 0.4 0 rg /F1 18 Tf";
+        assert_eq!(
+            adjust_default_appearance(da, &dr_map, &resources),
+            b"0 0.4 0 rg /F1_1 18 Tf".to_vec()
+        );
+    }
+
+    #[test]
+    fn adjust_default_appearance_name_not_in_dr_map_is_verbatim() {
+        // /ZaDi never collided during the merge (only /F1 did), so it has no
+        // dr_map entry and must be left untouched — matching the qpdf golden
+        // (`overlay-onto-existing-acroform-dr.pdf`), where every `/ZaDi`
+        // `/DA` stays verbatim alongside the renamed `/F1_1` ones.
+        let dr_map = font_dr_map(&[("F1", "F1_1")]);
+        let resources = font_resources_dict(&["ZaDi"]);
+        let da: &[u8] = b"0.18039 0.20392 0.21176 rg /ZaDi 0 Tf";
+        assert_eq!(
+            adjust_default_appearance(da, &dr_map, &resources),
+            da.to_vec()
+        );
+    }
+
+    #[test]
+    fn adjust_default_appearance_name_absent_from_resources_is_verbatim() {
+        // dr_map has a rename for "F1", but the resources dict's /Font
+        // sub-dict does not carry "F1" as a key at all (only an unrelated
+        // name) — the safety guard must leave /DA untouched rather than
+        // rewrite a name that isn't actually backed by this resources dict.
+        let dr_map = font_dr_map(&[("F1", "F1_1")]);
+        let resources = font_resources_dict(&["SomeOtherName"]);
+        let da: &[u8] = b"0 0.4 0 rg /F1 18 Tf";
+        assert_eq!(
+            adjust_default_appearance(da, &dr_map, &resources),
+            da.to_vec()
+        );
+    }
+
+    #[test]
+    fn adjust_default_appearance_name_inside_string_literal_is_verbatim() {
+        // `(F1)` is a STRING operand, not a name token, even though its
+        // content matches a dr_map key — must not be mistaken for the font
+        // name preceding `Tf`.
+        let dr_map = font_dr_map(&[("F1", "F1_1")]);
+        let resources = font_resources_dict(&["F1"]);
+        let da: &[u8] = b"(F1) 18 Tf";
+        assert_eq!(
+            adjust_default_appearance(da, &dr_map, &resources),
+            da.to_vec()
+        );
+    }
+
+    #[test]
+    fn adjust_default_appearance_skips_comment_verbatim() {
+        let dr_map = font_dr_map(&[("F1", "F1_1")]);
+        let resources = font_resources_dict(&["F1", "F1_1"]);
+        let da: &[u8] = b"% a comment\n/F1 18 Tf";
+        assert_eq!(
+            adjust_default_appearance(da, &dr_map, &resources),
+            b"% a comment\n/F1_1 18 Tf".to_vec()
+        );
+    }
+
+    #[test]
+    fn adjust_default_appearance_recovers_from_malformed_operand() {
+        // A stray `)` with no matching `(` is not a valid operand start; the
+        // scanner must copy it verbatim and keep scanning rather than
+        // aborting, so the `/F1` rename after it still applies.
+        let dr_map = font_dr_map(&[("F1", "F1_1")]);
+        let resources = font_resources_dict(&["F1", "F1_1"]);
+        let da: &[u8] = b") /F1 18 Tf";
+        assert_eq!(
+            adjust_default_appearance(da, &dr_map, &resources),
+            b") /F1_1 18 Tf".to_vec()
+        );
+    }
+
+    #[test]
+    fn adjust_default_appearance_no_font_category_in_dr_map_is_verbatim() {
+        // dr_map is non-empty but has no "Font" entry (e.g. only /XObject
+        // collisions were recorded) — the Tf-pattern lookup must miss
+        // cleanly rather than panic.
+        let mut dr_map = DrMap::new();
+        dr_map.insert(b"XObject".to_vec(), BTreeMap::new());
+        let resources = font_resources_dict(&["F1"]);
+        let da: &[u8] = b"/F1 18 Tf";
+        assert_eq!(
+            adjust_default_appearance(da, &dr_map, &resources),
+            da.to_vec()
+        );
+    }
+
+    #[test]
+    fn adjust_default_appearance_no_font_category_in_resources_is_verbatim() {
+        let dr_map = font_dr_map(&[("F1", "F1_1")]);
+        let resources = crate::Dictionary::new();
+        let da: &[u8] = b"/F1 18 Tf";
+        assert_eq!(
+            adjust_default_appearance(da, &dr_map, &resources),
+            da.to_vec()
+        );
+    }
+
     // ---- end-to-end (structural, not byte-identical) -----------------------
 
     /// Full `apply_overlay_specs` pipeline over the Layer-1 fixtures used by
@@ -2267,6 +2414,30 @@ mod tests {
         assert_eq!(
             f1_1_font.get("BaseFont"),
             Some(&Object::Name(b"Courier".to_vec()))
+        );
+
+        // Layer 3: at least one copied field's /DA must have been rewritten
+        // from the collision-renamed /F1 to /F1_1 (adjust_default_appearance,
+        // called from duplicate_field_tree). form-fields-and-annotations.pdf
+        // supplies `/DA (0 0.4 0 rg /F1 18 Tf)` on its text-box widgets.
+        let fields = acroform.get("Fields").and_then(Object::as_array).unwrap();
+        let mut saw_rewritten_da = false;
+        for field in fields {
+            let Object::Reference(field_ref) = field else {
+                continue;
+            };
+            let Some(field_dict) = dest.resolve(*field_ref).unwrap().into_dict() else {
+                continue;
+            };
+            if let Some(Object::String(da)) = field_dict.get("DA") {
+                if da.as_slice() == b"0 0.4 0 rg /F1_1 18 Tf" {
+                    saw_rewritten_da = true;
+                }
+            }
+        }
+        assert!(
+            saw_rewritten_da,
+            "expected at least one copied field's /DA rewritten to /F1_1"
         );
     }
 }
