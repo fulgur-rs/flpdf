@@ -1162,7 +1162,8 @@ struct RewriteCommand {
     // ── Overlay / underlay flags (flpdf-9hc.16) ───────────────────────────
     // qpdf --overlay / --underlay impose pages from another file on top of
     // (overlay) or beneath (underlay) the destination pages. Both are
-    // REPEATABLE and each group is terminated by a bare `--`:
+    // REPEATABLE and each group is terminated by a bare `--`. Within a group
+    // the file token and sub-options may appear in any order:
     //   {--overlay|--underlay} [--file=]f [--password=p] [--to=R] [--from=R]
     //                          [--repeat=R] --
     //
@@ -1176,8 +1177,9 @@ struct RewriteCommand {
     /// `--overlay`). Repeatable; terminate each group with `--`.
     ///
     /// Syntax: `--overlay [--file=]FILE [--password=PW] [--to=R] [--from=R]
-    ///          [--repeat=R] --`. Pages are stacked in order of appearance:
-    /// first underlays, then the original page, then overlays.
+    ///          [--repeat=R] --`. Within a group the file token and sub-options
+    /// may appear in any order. Pages are stacked in order of appearance: first
+    /// underlays, then the original page, then overlays.
     #[arg(
         long = "overlay",
         num_args = 1..,
@@ -1193,8 +1195,9 @@ struct RewriteCommand {
     /// `--underlay`). Repeatable; terminate each group with `--`.
     ///
     /// Syntax: `--underlay [--file=]FILE [--password=PW] [--to=R] [--from=R]
-    ///          [--repeat=R] --`. Pages are stacked in order of appearance:
-    /// first underlays, then the original page, then overlays.
+    ///          [--repeat=R] --`. Within a group the file token and sub-options
+    /// may appear in any order. Pages are stacked in order of appearance: first
+    /// underlays, then the original page, then overlays.
     #[arg(
         long = "underlay",
         num_args = 1..,
@@ -3479,7 +3482,9 @@ struct OverlaySpec {
 
 /// Parse the raw token slice captured between `--overlay`/`--underlay` and `--`.
 ///
-/// Grammar: `[--file=]FILE [--password=PW] [--to=R] [--from=R] [--repeat=R]`
+/// Grammar: `FILE and sub-options in any order`. `FILE` is either bare or `--file=PATH`;
+/// `--password=`, `--to=`, `--from=`, `--repeat=` may appear before or after it,
+/// mirroring qpdf's UO segment parser (no positional ordering constraint).
 ///
 /// - `FILE` is mandatory (exactly one, either via `--file=PATH` or bare).
 /// - `--password=`, `--to=`, `--from=`, `--repeat=` are each optional; duplicates error.
@@ -3515,12 +3520,6 @@ fn parse_overlay_segment(kind: OverlayKind, tokens: &[String]) -> CliResult<Over
             continue;
         }
         if let Some(pw) = tok.strip_prefix("--password=") {
-            if file.is_none() {
-                return Err(format!(
-                    "{flag}: --password= must follow the source file in the segment"
-                )
-                .into());
-            }
             if password.is_some() {
                 return Err(format!("{flag}: duplicate --password= in segment").into());
             }
@@ -3528,11 +3527,6 @@ fn parse_overlay_segment(kind: OverlayKind, tokens: &[String]) -> CliResult<Over
             continue;
         }
         if let Some(r) = tok.strip_prefix("--to=") {
-            if file.is_none() {
-                return Err(
-                    format!("{flag}: --to= must follow the source file in the segment").into(),
-                );
-            }
             if to.is_some() {
                 return Err(format!("{flag}: duplicate --to= in segment").into());
             }
@@ -3542,11 +3536,6 @@ fn parse_overlay_segment(kind: OverlayKind, tokens: &[String]) -> CliResult<Over
             continue;
         }
         if let Some(r) = tok.strip_prefix("--from=") {
-            if file.is_none() {
-                return Err(
-                    format!("{flag}: --from= must follow the source file in the segment").into(),
-                );
-            }
             if from.is_some() {
                 return Err(format!("{flag}: duplicate --from= in segment").into());
             }
@@ -3556,12 +3545,6 @@ fn parse_overlay_segment(kind: OverlayKind, tokens: &[String]) -> CliResult<Over
             continue;
         }
         if let Some(r) = tok.strip_prefix("--repeat=") {
-            if file.is_none() {
-                return Err(format!(
-                    "{flag}: --repeat= must follow the source file in the segment"
-                )
-                .into());
-            }
             if repeat.is_some() {
                 return Err(format!("{flag}: duplicate --repeat= in segment").into());
             }
@@ -5455,13 +5438,15 @@ mod tests {
     }
 
     #[test]
-    fn overlay_missing_file_with_password_error() {
-        // --password= before any file token
+    fn overlay_missing_file_with_only_sub_options_error() {
+        // Sub-options present but no file token at all: fails with a missing-file
+        // error (order-independent parsing means --password= alone no longer
+        // triggers a "must follow" positional check).
         let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["--password=pw"]))
             .unwrap_err()
             .to_string();
         assert!(err.contains("--overlay"), "got: {err}");
-        assert!(err.contains("must follow"), "got: {err}");
+        assert!(err.contains("no source file"), "got: {err}");
     }
 
     #[test]
@@ -5566,27 +5551,97 @@ mod tests {
     }
 
     #[test]
-    fn overlay_option_before_file_to_error() {
-        let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["--to=1", "src.pdf"]))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("must follow"), "got: {err}");
+    fn overlay_option_before_file_to_ok() {
+        // qpdf accepts sub-options before the file token within a UO segment.
+        let spec =
+            parse_overlay_segment(OverlayKind::Overlay, &strs(&["--to=1", "src.pdf"])).unwrap();
+        assert_eq!(spec.file, "src.pdf");
+        assert_eq!(spec.to, Some("1".into()));
+        assert_eq!(spec.from, None);
+        assert_eq!(spec.repeat, None);
+        assert_eq!(spec.password, None);
     }
 
     #[test]
-    fn overlay_option_before_file_from_error() {
-        let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["--from=1", "src.pdf"]))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("must follow"), "got: {err}");
+    fn overlay_option_before_file_from_ok() {
+        let spec =
+            parse_overlay_segment(OverlayKind::Overlay, &strs(&["--from=1", "src.pdf"])).unwrap();
+        assert_eq!(spec.file, "src.pdf");
+        assert_eq!(spec.from, Some("1".into()));
     }
 
     #[test]
-    fn overlay_option_before_file_repeat_error() {
-        let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["--repeat=1", "src.pdf"]))
+    fn overlay_option_before_file_repeat_ok() {
+        let spec =
+            parse_overlay_segment(OverlayKind::Overlay, &strs(&["--repeat=1", "src.pdf"])).unwrap();
+        assert_eq!(spec.file, "src.pdf");
+        assert_eq!(spec.repeat, Some("1".into()));
+    }
+
+    #[test]
+    fn overlay_option_before_file_password_ok() {
+        let spec =
+            parse_overlay_segment(OverlayKind::Overlay, &strs(&["--password=pw", "src.pdf"]))
+                .unwrap();
+        assert_eq!(spec.file, "src.pdf");
+        assert_eq!(spec.password, Some("pw".into()));
+    }
+
+    #[test]
+    fn overlay_options_mixed_around_file_ok() {
+        // Sub-options both before and after the file token, mirroring qpdf's
+        // free-order UO segment parsing.
+        let spec = parse_overlay_segment(
+            OverlayKind::Overlay,
+            &strs(&[
+                "--password=pw",
+                "--from=1",
+                "src.pdf",
+                "--to=2",
+                "--repeat=z",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(spec.file, "src.pdf");
+        assert_eq!(spec.password, Some("pw".into()));
+        assert_eq!(spec.from, Some("1".into()));
+        assert_eq!(spec.to, Some("2".into()));
+        assert_eq!(spec.repeat, Some("z".into()));
+    }
+
+    #[test]
+    fn underlay_option_before_file_ok() {
+        let spec = parse_overlay_segment(
+            OverlayKind::Underlay,
+            &strs(&["--to=1", "--from=2", "under.pdf"]),
+        )
+        .unwrap();
+        assert_eq!(spec.kind, OverlayKind::Underlay);
+        assert_eq!(spec.file, "under.pdf");
+        assert_eq!(spec.to, Some("1".into()));
+        assert_eq!(spec.from, Some("2".into()));
+    }
+
+    #[test]
+    fn overlay_duplicate_to_before_file_error() {
+        // Duplicate detection stays effective even when duplicates straddle
+        // the file token.
+        let err = parse_overlay_segment(
+            OverlayKind::Overlay,
+            &strs(&["--to=1", "src.pdf", "--to=2"]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate --to="), "got: {err}");
+    }
+
+    #[test]
+    fn overlay_invalid_range_before_file_error() {
+        // Range validation runs regardless of where the sub-option appears.
+        let err = parse_overlay_segment(OverlayKind::Overlay, &strs(&["--to=abc!", "src.pdf"]))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("must follow"), "got: {err}");
+        assert!(err.contains("invalid --to="), "got: {err}");
     }
 
     #[test]
@@ -5732,6 +5787,50 @@ mod tests {
         let argv = strs(&["--overlay", "over.pdf", "--to=abc!", "--"]);
         let err = extract_overlay_groups(argv).unwrap_err().to_string();
         assert!(err.contains("invalid --to="), "got: {err}");
+    }
+
+    #[test]
+    fn extract_sub_options_before_file_within_group() {
+        // qpdf accepts sub-options in any order within a UO segment, so the raw
+        // argv `--overlay --to=1 src.pdf --` must parse to a single overlay
+        // group with `to=1` and `file=src.pdf`. Mirrors the repro in the issue:
+        // `flpdf rewrite in.pdf --overlay --to=1 src.pdf -- out.pdf`.
+        let argv = strs(&[
+            "flpdf",
+            "rewrite",
+            "in.pdf",
+            "--overlay",
+            "--to=1",
+            "src.pdf",
+            "--",
+            "out.pdf",
+        ]);
+        let (residual, specs) = extract_overlay_groups(argv).unwrap();
+        assert_eq!(residual, strs(&["flpdf", "rewrite", "in.pdf", "out.pdf"]));
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].kind, OverlayKind::Overlay);
+        assert_eq!(specs[0].file, "src.pdf");
+        assert_eq!(specs[0].to.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn extract_overlay_equals_form_rejected() {
+        // The `--overlay=FILE` attached-value form must stay rejected even
+        // after the segment parser was loosened to accept sub-options in any
+        // order; qpdf rejects the equals form (the flag itself is not an
+        // `=`-valued option, only its inner `--file=FILE` sub-option is).
+        let argv = strs(&["flpdf", "--overlay=src.pdf", "--"]);
+        let err = extract_overlay_groups(argv).unwrap_err().to_string();
+        assert!(err.contains("--overlay"), "got: {err}");
+        assert!(err.contains("not supported"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_underlay_equals_form_rejected() {
+        let argv = strs(&["flpdf", "--underlay=src.pdf", "--"]);
+        let err = extract_overlay_groups(argv).unwrap_err().to_string();
+        assert!(err.contains("--underlay"), "got: {err}");
+        assert!(err.contains("not supported"), "got: {err}");
     }
 
     #[test]
