@@ -2322,16 +2322,33 @@ mod tests {
     }
 
     #[test]
-    fn adjust_default_appearance_recovers_from_malformed_operand() {
-        // A stray `)` with no matching `(` is not a valid operand start; the
-        // scanner must copy it verbatim and keep scanning rather than
-        // aborting, so the `/F1` rename after it still applies.
+    fn adjust_default_appearance_recovers_from_stray_delimiter() {
+        // A stray `)` with no matching `(` does not start any recognised
+        // operand (it isn't `/(<[+-.0-9`); the scanner must copy it verbatim
+        // and keep scanning rather than aborting, so the `/F1` rename after
+        // it still applies.
         let dr_map = font_dr_map(&[("F1", "F1_1")]);
         let resources = font_resources_dict(&["F1", "F1_1"]);
         let da: &[u8] = b") /F1 18 Tf";
         assert_eq!(
             adjust_default_appearance(da, &dr_map, &resources),
             b") /F1_1 18 Tf".to_vec()
+        );
+    }
+
+    #[test]
+    fn adjust_default_appearance_recovers_from_operand_parse_error() {
+        // An unterminated string literal (opens `(` but never closes) IS a
+        // recognised operand start and reaches the shared object lexer,
+        // which returns `Err` on EOF. The scanner must copy only the single
+        // `(` byte and resume rather than losing the rest of the string, so
+        // the `/F1` rename after it still applies.
+        let dr_map = font_dr_map(&[("F1", "F1_1")]);
+        let resources = font_resources_dict(&["F1", "F1_1"]);
+        let da: &[u8] = b"(bad /F1 18 Tf";
+        assert_eq!(
+            adjust_default_appearance(da, &dr_map, &resources),
+            b"(bad /F1_1 18 Tf".to_vec()
         );
     }
 
@@ -2426,12 +2443,12 @@ mod tests {
         let fields = acroform.get("Fields").and_then(Object::as_array).unwrap();
         let mut saw_rewritten_da = false;
         for field in fields {
-            let Object::Reference(field_ref) = field else {
-                continue;
-            };
-            let Some(field_dict) = dest.resolve(*field_ref).unwrap().into_dict() else {
-                continue;
-            };
+            // Every /AcroForm/Fields entry in this fixture is an indirect
+            // reference resolving to a dict — unwrap rather than a
+            // defensive continue, since a malformed shape here is a test
+            // setup bug, not an input to tolerate.
+            let field_ref = field.as_ref_id().unwrap();
+            let field_dict = dest.resolve(field_ref).unwrap().into_dict().unwrap();
             if let Some(Object::String(da)) = field_dict.get("DA") {
                 if da.as_slice() == b"0 0.4 0 rg /F1_1 18 Tf" {
                     saw_rewritten_da = true;
