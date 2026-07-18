@@ -232,6 +232,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/fulgur-rs/flpdf/compare/v0.1.10...v0.2.0) - 2026-07-18
+
+### Added
+
+- *(flpdf-9hc.34)* overlay copy-annotations byte-identical parity
+- *(flpdf-9hc.34)* wire annotation copy through overlay pipeline
+- *(flpdf-9hc.34)* survey_source_annotations + template_from_survey
+- *(flpdf)* broaden /ADBE strip trigger to any /ADBE key (qpdf L1387 parity)
+
+### Fixed
+
+- *(flpdf-hdsz)* route incremental xref-stream trailer /ID through compact writer
+- *(flpdf-hdsz)* route xref-stream trailer /ID through compact writer + review touch-ups
+- *(flpdf-hdsz)* route incremental trailer /ID through qpdf-compact writer
+- *(flpdf-hdsz)* drop array token-boundary rule; hand-roll trailer /ID like qpdf
+- *(flpdf)* repair broken intra-doc links in spec_page_sources
+- *(flpdf)* clippy fixes for CI Quality gate
+- *(flpdf-9hc.34)* roborev review 2133 findings
+- *(flpdf-9hc.34)* roborev review 2132 findings
+- *(flpdf-9hc.34)* roborev review 2131 findings
+- *(flpdf-9hc.34)* roborev review 2130 findings
+- *(flpdf-9hc.34)* roborev review 2129 findings
+- *(flpdf-9hc.34)* roborev review 2128 findings
+- *(flpdf)* PageRange::resolve preserves duplicates (qpdf-parity)
+- *(flpdf-cli)* emit `wrote file` per split chunk, not the never-written template
+- *(flpdf)* preserve explicit newline_before_endstream=Yes under QDF; narrow No's EOL check to '\n' (PR #473 review)
+- *(flpdf)* reduce clones in QDF /Contents pre-scan (PR #473 review)
+- *(flpdf)* emit QDF %% Page N and %% Contents for page N markers (flpdf-9hc.16.13)
+
+### Other
+
+- *(flpdf)* tighten CLI byte-gate forward-pointer scope
+- *(flpdf)* update overlay.rs deferral comment to point at CLI byte gate
+- *(flpdf-hdsz)* materialize xref-stream regression assert message for patch-coverage
+- *(flpdf-hdsz)* materialize assert-message renderings for patch-coverage
+- *(flpdf-9hc.34)* cov:ignore-block for fully_qualified_name_of /Parent walk
+- *(flpdf-9hc.34)* cov:ignore for defensive / malformed-input / llvm-cov artifact branches
+- *(flpdf-9hc.34)* fixture for source with annots but no /AcroForm + simplify merge_resources_shallow
+- *(flpdf-9hc.34)* copy-annotations byte gate for dest with indirect /Fields
+- *(flpdf-9hc.34)* copy-annotations byte gate for source /P + inline annot
+- *(flpdf-9hc.34)* copy-annotations byte gate for source /AcroForm with direct /DR
+- *(flpdf-9hc.34)* copy-annotations byte gate for dest with existing /AcroForm
+- *(flpdf-9hc.34)* copy-annotations byte gate for source /AcroForm /DA + /Q defaults
+- *(flpdf-9hc.34)* underlay copy-annotations byte gate
+- *(flpdf-9hc.34)* cov:ignore-block reader.rs linearized_hint_ref match guard
+- *(flpdf-9hc.34)* cover remaining RealLiteral gaps and cov:ignore llvm-cov artifacts
+- *(flpdf-9hc.34)* unit-test Object::RealLiteral match arms
+- *(flpdf-9hc.34)* overlay_annotations module skeleton
+- *(flpdf-9hc.34)* fixtures/goldens + place_form_xobject returns cm
+- *(flpdf)* update adbe_ext_qpdf_parity module doc — INJECTION cases are now present
+- *(flpdf)* byte-gate for /ADBE inject parity vs qpdf 11.9.0 (3 shapes)
+- *(flpdf)* scope module doc to REMOVAL and drop redundant stem arg in assert_parity
+- *(flpdf)* rename adbe_removal_qpdf_parity → adbe_ext_qpdf_parity + parametrise helpers
+- *(flpdf)* byte-gate for /ADBE removal parity vs qpdf 11.9.0
+- *(flpdf)* catalog_has_extensions_adbe uses resolve_borrowed + indirect-ref test
+- *(flpdf)* failing test for /ADBE strip preserving non-ADBE prefix
+- *(flpdf)* failing test for /ADBE strip when source lacks /ExtensionLevel
+- warn about cargo-machete / cargo-udeps false positives
+- document DEFLATE backend consumer-choice policy in README
+- *(flpdf)* update stale QDF newline-promotion references (flpdf-9hc.16.13)
+- *(flpdf)* overlay+QDF byte-gate for two-overlay declaration order (flpdf-9hc.16.13)
+- *(flpdf)* overlay+underlay+QDF byte-gate same-page composition (flpdf-9hc.16.13)
+- *(flpdf)* overlay+QDF byte-gate for single-page overlay (flpdf-9hc.16.13)
+
 ## [0.1.10](https://github.com/fulgur-rs/flpdf/compare/v0.1.9...v0.1.10) - 2026-07-10
 
 ### Added
