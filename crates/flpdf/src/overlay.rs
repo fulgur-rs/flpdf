@@ -1145,11 +1145,13 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 // `overlay_pure_source_version_floor_bytes` and
 // `overlay_encrypted_source_extension_level_bytes` (below).
 //
-// Explicit deferrals (NOT covered here, by design):
-//   - CLI-level overlay byte-identity: these gates write through the library
-//     entry points with `NewlineBeforeEndstream::Never` to keep the byte
-//     comparison surgical. The CLI now also defaults to `Never` and can be
-//     wired up separately for CLI-level overlay byte-identity coverage.
+// CLI-level overlay byte-identity coverage lives in
+// `crates/flpdf-cli/tests/cli_byte_identical_overlay.rs` (gated on
+// `qpdf-zlib-compat`, same policy as the linearize `cli_byte_identical`
+// gate). Those tests run the actual `flpdf` binary with `--static-id`
+// [`--qdf --no-original-object-ids`] against the same overlay goldens
+// used here, catching CLI-layer wiring divergences (argv parsing,
+// `WriteOptions` assembly, defaults) that library-only gates cannot see.
 #[cfg(all(test, feature = "qpdf-zlib-compat"))]
 mod byte_gate {
     use super::{
