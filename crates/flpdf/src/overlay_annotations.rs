@@ -379,6 +379,24 @@ pub(crate) fn template_from_survey(
     }
 }
 
+/// Per-destination-page record of resource-name renames, populated by
+/// [`merge_resources_shallow`] when a source `/DR` sub-dictionary key
+/// collides with an existing dest entry of the same name that resolves to a
+/// *different* object. Outer key is the resource category (`Font`,
+/// `XObject`, ...); inner map is `old_name -> new_name` — the source's
+/// original key mapped to the name it was actually inserted under in dest.
+///
+/// Mirrors qpdf's per-destination `dr_map`, populated by
+/// `QPDFObjectHandle::mergeResources`'s `conflicts` out-parameter and driven
+/// by `QPDFAcroFormDocumentHelper::init_dr_map`
+/// (`libqpdf/QPDFAcroFormDocumentHelper.cc:775-800`, called from
+/// `transformAnnotations`). qpdf consumes the map via
+/// `adjustDefaultAppearances` / `adjustAppearanceStream` to rewrite each
+/// copied field's `/DA` string and AP-stream content operators from the old
+/// name to the new one; that rewrite is not implemented yet — this map is
+/// only built and threaded so a later change has the data it needs.
+pub(crate) type DrMap = BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>;
+
 /// Per-placement annotation application:
 /// - shallow-dup each templated annot (new indirect object) and any
 ///   associated top-level field / kid path (so repeated placements of the
@@ -387,8 +405,14 @@ pub(crate) fn template_from_survey(
 ///   (identity when the stream had no /Matrix);
 /// - transform the annot's `/Rect` by `cm`;
 /// - if the source top-level field had a `/DR`, replace it with the
-///   destination AcroForm `/DR` (lazy-initialized on first placement);
+///   destination AcroForm `/DR` (lazy-initialized on first placement, merging
+///   into a pre-existing dest `/DR` with conflict renaming recorded into
+///   `dr_map`);
 /// - append the dup'd annots to the destination page `/Annots`.
+///
+/// `dr_map` accumulates resource-name renames across every placement on this
+/// destination page (one map per dest page, created by the caller alongside
+/// `dest_acroform_dr`); see [`DrMap`].
 ///
 /// Returns the newly-added top-level field dest refs (one per distinct top
 /// field observed in this placement), to be collected across all placements
@@ -401,6 +425,7 @@ pub(crate) fn apply_placement<R: Read + Seek>(
     template: &AnnotationCopyTemplate,
     cm: [f64; 6],
     dest_acroform_dr: &mut Option<ObjectRef>,
+    dr_map: &mut DrMap,
 ) -> Result<Vec<ObjectRef>> {
     if template.annots.is_empty() {
         return Ok(Vec::new()); // cov:ignore: defensive early return
@@ -420,7 +445,7 @@ pub(crate) fn apply_placement<R: Read + Seek>(
     let has_any_top_field = template.annots.iter().any(|(_, tf)| tf.is_some());
     if has_any_top_field && dest_acroform_dr.is_none() {
         if let Some(source_dr) = template.source_dr {
-            *dest_acroform_dr = Some(ensure_dest_acroform_dr(dest, source_dr)?);
+            *dest_acroform_dr = Some(ensure_dest_acroform_dr(dest, source_dr, dr_map)?);
         } // cov:ignore: control-flow marker — llvm-cov instrumentation artifact
     }
 
@@ -1076,10 +1101,10 @@ fn append_page_annots<R: Read + Seek>(
 }
 
 /// Lazy-initialize the destination `/AcroForm/DR`. If dest has no `/AcroForm`,
-/// create one; the new `/DR` is a FRESH indirect object whose contents are
-/// merged from the (already dest-space) `source_dr` via [`merge_resources_shallow`].
-/// Returns the ref of the dest `/DR` (whether newly-created or previously
-/// present).
+/// create one; the `/DR` (fresh or pre-existing) has `source_dr`'s (already
+/// dest-space) contents merged into it via [`merge_resources_shallow`], which
+/// records any conflict rename it performs into `dr_map`. Returns the ref of
+/// the dest `/DR` (whether newly-created or previously present).
 ///
 /// This matches qpdf transformAnnotations line 780-800 (init_dr_map): dest
 /// `/AcroForm/DR` is a new object, and `source_dr` is preserved as a SEPARATE
@@ -1088,13 +1113,16 @@ fn append_page_annots<R: Read + Seek>(
 /// `/AcroForm/DR`, source_dr for AP stream `/Resources`). See qpdf golden
 /// `overlay-copy-annotations.pdf` obj 4 (dest_dr) and obj 344 (source_dr copy).
 ///
-/// For a dest that already has an /AcroForm and /DR, this is a first-wins
-/// no-op — a full merge with conflict remapping (`dr_map` +
-/// `adjustAppearanceStream`) is dormant for the primary target and out of
-/// scope until a fixture exercises it.
+/// For a dest that already has an `/AcroForm` and `/DR`, the pre-existing
+/// `/DR` object is reused (not replaced) and `source_dr`'s entries are merged
+/// into it with conflict renaming. Downstream consumption of `dr_map` to
+/// rewrite copied fields' `/DA` and AP-stream content (qpdf's
+/// `adjustDefaultAppearances` / `adjustAppearanceStream`) is not implemented
+/// yet — left for a later change.
 fn ensure_dest_acroform_dr<R: Read + Seek>(
     dest: &mut Pdf<R>,
     source_dr: ObjectRef,
+    dr_map: &mut DrMap,
 ) -> Result<ObjectRef> {
     // cov:ignore-start: defensive early returns on catalog-shape guards.
     let Some(root_ref) = dest.root_ref() else {
@@ -1146,11 +1174,12 @@ fn ensure_dest_acroform_dr<R: Read + Seek>(
         }
     };
     // Existing /DR may be indirect (a ref) or a direct dict; preserve either
-    // shape. First-wins semantics: a fully-implemented merge with conflict
-    // remapping (`dr_map` + `adjustAppearanceStream`) is dormant for the
-    // primary target and left for a follow-up.
+    // shape and merge `source_dr`'s entries into it either way.
     match acroform_dict.get("DR").cloned() {
-        Some(Object::Reference(existing)) => return Ok(existing),
+        Some(Object::Reference(existing)) => {
+            merge_resources_shallow(dest, existing, source_dr, dr_map)?;
+            return Ok(existing);
+        }
         // cov:ignore-start: direct-/DR promotion in the existing-AcroForm
         // path — analogous to the direct-/AcroForm case above. qpdf
         // normalizes /DR to indirect on write, so no shipped fixture
@@ -1160,6 +1189,7 @@ fn ensure_dest_acroform_dr<R: Read + Seek>(
             dest.set_object(dr_ref, Object::Dictionary(existing));
             acroform_dict.insert("DR", Object::Reference(dr_ref));
             dest.set_object(acroform_ref, Object::Dictionary(acroform_dict));
+            merge_resources_shallow(dest, dr_ref, source_dr, dr_map)?;
             return Ok(dr_ref);
         }
         // cov:ignore-end
@@ -1169,32 +1199,50 @@ fn ensure_dest_acroform_dr<R: Read + Seek>(
     // it, and wire dest /AcroForm to point at it.
     let dr_ref = allocate_next_ref(dest)?;
     dest.set_object(dr_ref, Object::Dictionary(crate::Dictionary::new()));
-    merge_resources_shallow(dest, dr_ref, source_dr)?;
+    merge_resources_shallow(dest, dr_ref, source_dr, dr_map)?;
     acroform_dict.insert("DR", Object::Reference(dr_ref));
     dest.set_object(acroform_ref, Object::Dictionary(acroform_dict));
     Ok(dr_ref)
 }
 
-/// Merge `source_dr`'s resource entries into the (existing, initially-empty)
-/// dict at `dest_dr`. Mirrors qpdf's `QPDFObjectHandle::mergeResources` for
-/// the "dest starts empty" path (the only path exercised by the primary
-/// target fxo-red, which has no /AcroForm).
+/// Merge `source_dr`'s resource entries into the dict at `dest_dr`, which may
+/// already carry entries of its own (e.g. a pre-existing dest `/AcroForm/DR`).
+/// Mirrors qpdf's `QPDFObjectHandle::mergeResources`.
 ///
-/// For each top-level key (resource type: /Font, /XObject, /ColorSpace, ...),
-/// the source's sub-dictionary is copied into a NEW direct dict in dest so
-/// dest_dr and source_dr do not share mutable sub-dict state. Individual
-/// resource entries (e.g. `/F1 8 0 R`) are shallow-cloned — they are typically
-/// refs, so the clone is cheap and the dest and source paths continue to
-/// share the underlying font/xobject objects (as qpdf does).
+/// For each top-level key (resource type: `/Font`, `/XObject`, `/ColorSpace`,
+/// ...), source's per-name entries are merged into a dest-owned copy of that
+/// category's sub-dict, so `dest_dr` and `source_dr` never share mutable
+/// sub-dict state:
+/// - a source name absent from dest's sub-dict is inserted verbatim;
+/// - a source name present in dest's sub-dict pointing at the SAME object
+///   (by [`ObjectRef`] identity, not deep equality — matches qpdf's
+///   `QPDFObjGen`-based check) is a no-op;
+/// - a source name present in dest's sub-dict pointing at a DIFFERENT object
+///   is a genuine conflict: the source's entry is inserted under the
+///   smallest unused `{name}_N` (`N` starting at 1, scanned against the dest
+///   sub-dict as it grows during this call — qpdf's `getUniqueResourceName`),
+///   and `(name, {name}_N)` is recorded into `dr_map[type]`.
 ///
-/// Conflict handling (dest already has a key with a different ref) is NOT
-/// implemented — that's the `dr_map` path that would drive
-/// `adjustAppearanceStream`. Dormant for the primary target; extend when a
-/// fixture requires it.
+/// Individual resource entries (e.g. `/F1 8 0 R`) are shallow-cloned — they
+/// are typically refs, so the clone is cheap and the dest and source paths
+/// continue to share the underlying font/xobject objects (as qpdf does).
+///
+/// Known gap: qpdf additionally reuses an existing dest name whenever the
+/// SAME source object recurs under a colliding name across repeated calls
+/// (its dest-scoped `QPDFObjGen -> name` map, populated once and consulted
+/// on every subsequent `mergeResources` call against that same dest dict).
+/// This function only checks the single colliding name within one call, so a
+/// dest whose pre-existing `/DR` already has a genuine conflict would mint a
+/// new `_N` suffix on every repeat placement instead of reusing the first
+/// one. No shipped fixture drives repeated placements onto a
+/// pre-conflicting dest `/DR` yet; revisit alongside `adjustDefaultAppearances`
+/// / `adjustAppearanceStream`, which need the reused name to stay stable
+/// across placements to rewrite every copy consistently.
 fn merge_resources_shallow<R: Read + Seek>(
     dest: &mut Pdf<R>,
     dest_dr: ObjectRef,
     source_dr: ObjectRef,
+    dr_map: &mut DrMap,
 ) -> Result<()> {
     let Some(src_dict) = dest.resolve(source_dr)?.into_dict() else {
         return Ok(()); // cov:ignore: defensive early return
@@ -1208,25 +1256,81 @@ fn merge_resources_shallow<R: Read + Seek>(
         // currently oracle. PDF also permits `/Font <ref>` (indirect
         // sub-dict), but replicating qpdf's mergeResources semantics for
         // that shape needs an oracle golden that no shipped fixture
-        // supplies — deferred to flpdf-4r6l, which lands alongside
-        // dr_map + adjustAppearanceStream once a real fixture exercises
-        // the merge-conflict path. Until then, non-dict resource-type
-        // values are copied verbatim (works correctly for the empty-dest
-        // /DR case that fxo-red exercises).
+        // supplies.
         let Some(src_type_dict) = src_type_val.as_dict() else {
-            dest_dict.insert(type_key, src_type_val.clone()); // cov:ignore: verbatim-copy for non-dict resource-type — deferred to flpdf-4r6l
-            continue; // cov:ignore: verbatim-copy for non-dict resource-type — deferred to flpdf-4r6l
+            // cov:ignore-start: verbatim-copy for non-dict resource-type —
+            // no shipped fixture supplies this shape (every source /DR
+            // sub-dict value we currently oracle is a direct dict).
+            if dest_dict.get(type_key).is_none() {
+                dest_dict.insert(type_key, src_type_val.clone());
+            }
+            continue;
+            // cov:ignore-end
         };
-        // Copy each resource entry into a fresh direct sub-dict so dest_dr's
-        // sub-dict is independent of source_dr's sub-dict.
-        let mut new_type_dict = crate::Dictionary::new();
+
+        // Start from dest's existing sub-dict for this type (if any) so a
+        // pre-existing dest `/DR` category is preserved rather than
+        // replaced; a type dest has never seen starts from an empty dict
+        // (matching the previous "dest starts empty" behavior verbatim).
+        let mut new_type_dict = match dest_dict.get(type_key) {
+            Some(Object::Dictionary(existing)) => existing.clone(),
+            _ => crate::Dictionary::new(),
+        };
+
         for (name, val) in src_type_dict.iter() {
-            new_type_dict.insert(name, val.clone());
+            match new_type_dict.get(name) {
+                None => {
+                    new_type_dict.insert(name, val.clone());
+                }
+                Some(existing_val) => {
+                    // Same-name collision. qpdf's short-circuit is object
+                    // identity (QPDFObjGen), not deep equality — a direct
+                    // (non-reference) value can never match here even if
+                    // structurally equal, matching mergeResources.
+                    let same_object = matches!(
+                        (existing_val, val),
+                        (Object::Reference(d), Object::Reference(s)) if d == s
+                    );
+                    if same_object {
+                        continue;
+                    }
+                    let new_name = unique_dr_name(name, &new_type_dict)?;
+                    new_type_dict.insert(&new_name, val.clone());
+                    dr_map
+                        .entry(type_key.to_vec())
+                        .or_default()
+                        .insert(name.to_vec(), new_name);
+                }
+            }
         }
+
         dest_dict.insert(type_key, Object::Dictionary(new_type_dict));
     }
     dest.set_object(dest_dr, Object::Dictionary(dest_dict));
     Ok(())
+}
+
+/// Smallest `{base}_N` (`N` starting at 1) absent from `dict`, scanning
+/// `dict` as it stands at call time — so repeated calls within the same
+/// [`merge_resources_shallow`] pass see names inserted by earlier collisions
+/// in that pass and do not reissue them. Mirrors qpdf's
+/// `getUniqueResourceName`.
+///
+/// # Errors
+///
+/// [`Error::Unsupported`] if `u32` wraps before an unused suffix is found
+/// (would require billions of colliding names under one base).
+fn unique_dr_name(base: &[u8], dict: &crate::Dictionary) -> Result<Vec<u8>> {
+    let mut n: u32 = 1;
+    loop {
+        let candidate = [base, b"_", n.to_string().as_bytes()].concat();
+        if dict.get(&candidate).is_none() {
+            return Ok(candidate);
+        }
+        n = n
+            .checked_add(1)
+            .ok_or_else(|| Error::Unsupported("DR resource-name suffix space exhausted".into()))?;
+    }
 }
 
 /// After every placement on a destination page has been applied, add the
