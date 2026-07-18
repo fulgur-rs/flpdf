@@ -1826,8 +1826,21 @@ fn write_incremental_xref_stream(
         })?),
     );
 
-    let xref_stream = Object::Stream(crate::Stream::new(stream_dict, stream_data));
-    write_object(bytes, ObjectRef::new(xref_object_number, 0), &xref_stream)?;
+    // The incremental xref-stream inherits `/ID` from the source trailer
+    // (via the `trailer.clone()` above). Render the stream via the
+    // `_with_id_writer(None)` variant so the stored `/ID` array goes through
+    // `write_id_style_value` and emits qpdf's compact `[<hex1><hex2>]` shape
+    // — a direct `Object::Stream::write_pdf` would route the array through
+    // the generic serializer (now unconditional spaces after this branch's
+    // earlier array-writer parity fix) and produce `/ID [ <hex1> <hex2> ]`,
+    // regressing from qpdf's writeTrailer / linearization
+    // `xref_stream::write_object` compact shape. Framing matches
+    // `Object::Stream::write_pdf` exactly: `NewlineBeforeEndstream::Yes`
+    // reproduces its unconditional `\n` before `endstream`.
+    let xref_stream = crate::Stream::new(stream_dict, stream_data);
+    bytes.extend_from_slice(format!("{xref_object_number} 0 obj\n").as_bytes());
+    write_stream_to_buf_with_id_writer(bytes, &xref_stream, NewlineBeforeEndstream::Yes, None);
+    bytes.extend_from_slice(b"\nendobj\n");
 
     Ok(xref_offset)
 }
@@ -6130,6 +6143,59 @@ mod tests {
             "xref-stream /ID[1] must match the two-level reconstruction"
         );
         assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
+    }
+
+    /// Regression: the incremental xref-stream writer preserves `/ID` from
+    /// the source trailer and must render it in qpdf's compact
+    /// `[<hex1><hex2>]` shape — the incremental xref-stream is exactly the
+    /// reader-visible trailer, and qpdf's `writeTrailer` /
+    /// `xref_stream::write_object` both emit compact `/ID`. Before this
+    /// fix, `write_incremental_xref_stream` serialized the stream via a
+    /// plain `Object::Stream` — after the branch's array-writer parity
+    /// commit that path emits `/ID [ <hex0> <hex1> ]` (space-separated),
+    /// silently regressing qpdf parity for every incremental update over
+    /// an xref-stream input with an `/ID`.
+    #[test]
+    fn write_incremental_xref_stream_emits_qpdf_compact_id_shape() {
+        // Build a trailer carrying an `/ID`; xref-stream layouts inherit
+        // `/ID` from the trailer at `stream_dict = trailer.clone()`.
+        let mut trailer = Dictionary::new();
+        trailer.insert(
+            "ID",
+            Object::Array(vec![
+                Object::String(vec![0xABu8; 16]),
+                Object::String(vec![0xCDu8; 16]),
+            ]),
+        );
+        let source_offsets = BTreeMap::new();
+        let root_ref = ObjectRef::new(1, 0);
+
+        let mut bytes = Vec::new();
+        write_incremental_xref_stream(
+            &mut bytes,
+            &trailer,
+            &source_offsets,
+            &root_ref,
+            /* xref_object_number */ 2,
+            /* object_count */ 3,
+            /* previous_xref_offset */ 0,
+        )
+        .expect("write_incremental_xref_stream must succeed");
+
+        // The compact shape places `[` immediately before `<` (no space).
+        // Materialize the diagnostic on the covered path so the assert
+        // message arms are not a coverage hole.
+        let out_str = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(
+            bytes.windows(6).any(|w| w == b"/ID [<"),
+            "incremental xref-stream /ID must be compact `/ID [<...` \
+             (qpdf shape); got: {out_str}"
+        );
+        assert!(
+            !bytes.windows(7).any(|w| w == b"/ID [ <"),
+            "incremental xref-stream /ID must NOT drift to `/ID [ <...` \
+             (that is the generic array serializer); got: {out_str}"
+        );
     }
 
     #[test]
