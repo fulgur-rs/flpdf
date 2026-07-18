@@ -1149,9 +1149,11 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 // `crates/flpdf-cli/tests/cli_byte_identical_overlay.rs` (gated on
 // `qpdf-zlib-compat`, same policy as the linearize `cli_byte_identical`
 // gate). Those tests run the actual `flpdf` binary with `--static-id`
-// [`--qdf --no-original-object-ids`] against the same overlay goldens
-// used here, catching CLI-layer wiring divergences (argv parsing,
-// `WriteOptions` assembly, defaults) that library-only gates cannot see.
+// [`--qdf --no-original-object-ids`] against a subset of the overlay
+// goldens used here (the version-floor / encrypted-source / annotation-
+// copy families remain library-only for now), catching CLI-layer wiring
+// divergences (argv parsing, `WriteOptions` assembly, defaults) that
+// library-only gates cannot see.
 #[cfg(all(test, feature = "qpdf-zlib-compat"))]
 mod byte_gate {
     use super::{
