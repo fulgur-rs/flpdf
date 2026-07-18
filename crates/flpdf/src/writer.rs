@@ -4865,7 +4865,7 @@ fn write_qdf_trailer(
         bytes.extend_from_slice(b"  /ID ");
         match id_writer {
             Some(write_id) => write_id(bytes),
-            None => value.write_pdf(bytes),
+            None => crate::object::write_id_style_value(bytes, value),
         }
         bytes.push(b'\n');
     }
@@ -5533,10 +5533,15 @@ mod tests {
     }
 
     #[test]
-    fn write_pdf_with_id_writer_none_matches_write_pdf() {
-        // With `id_writer = None`, the serializer must be byte-identical to the
-        // plain `write_pdf` even when `/ID` is present — covering the fallback
-        // arm that production (always `Some`) never exercises.
+    fn write_pdf_with_id_writer_none_emits_qpdf_trailer_id_shape() {
+        // With `id_writer = None`, the fallback routes the stored `/ID` value
+        // through `write_id_style_value` to reproduce qpdf's `writeTrailer`
+        // compact `[<hex1><hex2>]` (no separating spaces). Plain `write_pdf`
+        // goes through the generic array serializer, which now — matching
+        // qpdf's `unparseObject` — inserts spaces on both sides of every
+        // element (`[ <hex1> <hex2> ]`). Pin both shapes: /ID via the None
+        // fallback stays qpdf-trailer-compact; other keys agree byte-for-byte
+        // with plain `write_pdf`.
         let mut dict = Dictionary::new();
         dict.insert("Size", Object::Integer(4));
         dict.insert("Root", Object::reference(ObjectRef::new(1, 0)));
@@ -5548,22 +5553,62 @@ mod tests {
             ]),
         );
 
+        let mut via_none = Vec::new();
+        dict.write_pdf_with_id_writer(&mut via_none, None);
+        // The compact shape puts `[` immediately before `<`, no separator.
+        assert!(
+            via_none.windows(6).any(|w| w == b"/ID [<"),
+            "None fallback must emit compact `/ID [<...` without space between `[` and `<`; got: {}",
+            String::from_utf8_lossy(&via_none)
+        );
+        assert!(
+            !via_none.windows(8).any(|w| w == b"/ID [ <"),
+            "None fallback must NOT emit `/ID [ <...` (that is the generic array serializer); got: {}",
+            String::from_utf8_lossy(&via_none)
+        );
+
+        // Plain `write_pdf` now goes through the generic array serializer, so
+        // its /ID output is space-separated. Prove the two paths intentionally
+        // diverge on the /ID value (they must not silently drift back to the
+        // pre-fix "both use write_pdf" behavior).
+        let mut plain = Vec::new();
+        dict.write_pdf(&mut plain);
+        assert!(
+            plain.windows(7).any(|w| w == b"/ID [ <"),
+            "plain write_pdf must emit the generic `/ID [ <...` shape; got: {}",
+            String::from_utf8_lossy(&plain)
+        );
+        assert_ne!(
+            via_none, plain,
+            "None fallback (qpdf-trailer /ID shape) must differ from plain write_pdf (generic array /ID shape)"
+        );
+    }
+
+    #[test]
+    fn write_pdf_with_id_writer_none_matches_write_pdf_without_id() {
+        // Without an `/ID` key, the None fallback has no ID-value substitution
+        // to perform, so it must remain byte-identical to plain `write_pdf`.
+        let mut dict = Dictionary::new();
+        dict.insert("Size", Object::Integer(4));
+        dict.insert("Root", Object::reference(ObjectRef::new(1, 0)));
+
         let mut plain = Vec::new();
         dict.write_pdf(&mut plain);
         let mut via_none = Vec::new();
         dict.write_pdf_with_id_writer(&mut via_none, None);
         assert_eq!(
             via_none, plain,
-            "write_pdf_with_id_writer(None) must equal write_pdf byte-for-byte"
+            "write_pdf_with_id_writer(None) must equal write_pdf when no /ID is present"
         );
     }
 
     #[test]
-    fn write_stream_to_buf_with_id_writer_none_matches_write_stream_to_buf() {
-        // The xref-stream helper documents byte-identity with `write_stream_to_buf`
-        // when `id_writer = None`; production only ever passes `Some`, so this pins
-        // the documented `None` contract across both the dictionary and the payload
-        // framing (the helper is otherwise unreachable with `None`).
+    fn write_stream_to_buf_with_id_writer_none_emits_qpdf_trailer_id_shape() {
+        // The xref-stream helper's `None` fallback likewise routes stored `/ID`
+        // through `write_id_style_value`, so the payload framing agrees with
+        // `write_stream_to_buf` on everything except the /ID value shape. Only
+        // production paths passing `Some` are used in practice, but pin the
+        // `None` contract: /ID is compact, other bytes match the plain helper.
         let mut dict = Dictionary::new();
         dict.insert("Length", Object::Integer(3));
         dict.insert(
@@ -5575,13 +5620,34 @@ mod tests {
         );
         let stream = crate::Stream::new(dict, b"abc".to_vec());
 
+        let mut actual = Vec::new();
+        write_stream_to_buf_with_id_writer(&mut actual, &stream, NewlineBeforeEndstream::Yes, None);
+        assert!(
+            actual.windows(6).any(|w| w == b"/ID [<"),
+            "None fallback must emit compact `/ID [<...` (no space); got: {}",
+            String::from_utf8_lossy(&actual)
+        );
+        assert!(
+            !actual.windows(7).any(|w| w == b"/ID [ <"),
+            "None fallback must not emit the generic space-separated `/ID [ <...`"
+        );
+    }
+
+    #[test]
+    fn write_stream_to_buf_with_id_writer_none_matches_helper_without_id() {
+        // Without `/ID` in the dictionary, the xref-stream helper's `None`
+        // fallback is byte-identical to `write_stream_to_buf`.
+        let mut dict = Dictionary::new();
+        dict.insert("Length", Object::Integer(3));
+        let stream = crate::Stream::new(dict, b"abc".to_vec());
+
         let mut expected = Vec::new();
         write_stream_to_buf(&mut expected, &stream, NewlineBeforeEndstream::Yes);
         let mut actual = Vec::new();
         write_stream_to_buf_with_id_writer(&mut actual, &stream, NewlineBeforeEndstream::Yes, None);
         assert_eq!(
             actual, expected,
-            "write_stream_to_buf_with_id_writer(None) must equal write_stream_to_buf"
+            "None fallback must equal write_stream_to_buf when no /ID is present"
         );
     }
 

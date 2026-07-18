@@ -329,8 +329,14 @@ impl Object {
     /// assert_eq!(out, b"7 0 R");
     /// ```
     ///
-    /// Array whitespace follows the qpdf token-boundary convention: a space is
-    /// inserted between adjacent tokens unless both sides are PDF delimiters.
+    /// Array serialization mirrors qpdf `QPDFWriter::unparseObject` (the array
+    /// branch): a single space follows `[`, a single space follows each element,
+    /// and a single space precedes `]`. There is no token-boundary optimization —
+    /// the space is emitted unconditionally, even when adjacent tokens are PDF
+    /// delimiters (`<hex>`, `(str)`, `<<dict>>`, nested `[array]`). The trailer
+    /// `/ID` array (`[<hex1><hex2>]`, no spaces) is qpdf's own special case
+    /// hand-rolled in `writeTrailer` and does not go through this serializer;
+    /// see [`Dictionary::write_pdf_trailer`] and [`write_id_style_value`].
     ///
     /// ```
     /// use flpdf::Object;
@@ -346,14 +352,14 @@ impl Object {
     /// nums.write_pdf(&mut out);
     /// assert_eq!(out, b"[ 0 0 612 792 ]");
     ///
-    /// // Hex-string array (/ID): both elements are delimiters, so no spaces.
-    /// let id_array = Object::Array(vec![
+    /// // Adjacent-delimiter elements still get separating spaces.
+    /// let hex_strings = Object::Array(vec![
     ///     Object::String(vec![0xabu8, 0xcdu8]),
     ///     Object::String(vec![0xefu8, 0x01u8]),
     /// ]);
     /// let mut out = Vec::new();
-    /// id_array.write_pdf(&mut out);
-    /// assert_eq!(out, b"[<abcd><ef01>]");
+    /// hex_strings.write_pdf(&mut out);
+    /// assert_eq!(out, b"[ <abcd> <ef01> ]");
     ///
     /// // Empty array.
     /// let empty = Object::Array(vec![]);
@@ -361,16 +367,13 @@ impl Object {
     /// empty.write_pdf(&mut out);
     /// assert_eq!(out, b"[ ]");
     ///
-    /// // Stream followed by a number: the stream's serialized form ends with
-    /// // the `endstream` keyword (a letter, not a delimiter), so a separating
-    /// // space must precede the next token.
+    /// // Stream followed by a number: qpdf writes a space after every element
+    /// // regardless of what precedes it.
     /// use flpdf::object::{Dictionary, Stream};
     /// let stream = Object::Stream(Stream::new(Dictionary::new(), vec![]));
     /// let mixed = Object::Array(vec![stream, Object::Integer(7)]);
     /// let mut out = Vec::new();
     /// mixed.write_pdf(&mut out);
-    /// // The exact stream bytes vary; what matters is that a space appears
-    /// // between `endstream` and `7`.
     /// assert!(
     ///     out.windows(b"endstream 7".len()).any(|w| w == b"endstream 7"),
     ///     "got: {:?}",
@@ -410,32 +413,22 @@ impl Object {
                 }
             }
             Object::Array(values) => {
-                if values.is_empty() {
-                    out.extend_from_slice(b"[ ]");
-                    return;
-                }
+                // qpdf `QPDFWriter::unparseObject` (libqpdf/QPDFWriter.cc:1334-
+                // 1345) writes `[` then per element `writeString(indent)` (indent
+                // is a single space in non-QDF mode) + `unparseChild(item, ...)`
+                // + a final `writeString(indent)` before `]`. There is no
+                // token-boundary rule: the separating space is emitted even when
+                // both adjacent tokens are PDF delimiters. The trailer `/ID`
+                // array's compact `[<hex1><hex2>]` shape (goldens produced by
+                // `qpdf --static-id`) comes from qpdf's own hand-rolled
+                // `writeTrailer` (libqpdf/QPDFWriter.cc:1194-1222), not this
+                // path; see [`write_id_style_value`].
                 out.push(b'[');
-                // qpdf token-boundary rule: insert a space between adjacent tokens
-                // unless both sides are PDF delimiters (`<`, `(`, `[`, `/`, `>`, `)`, `]`).
-                // `[` itself counts as a delimiter on the left.
-                // qpdf rule: omit the space only when BOTH sides are delimiters.
-                // `[` is treated as a delimiter on the left for the first element.
-                let mut prev_ends_with_delim = true; // treat `[` as delimiter
                 for value in values.iter() {
-                    // Insert a space unless both the previous token end AND the
-                    // current token start are PDF delimiters.
-                    if !(prev_ends_with_delim && starts_with_delim(value)) {
-                        out.push(b' ');
-                    }
-                    value.write_pdf(out);
-                    prev_ends_with_delim = ends_with_delim(value);
-                }
-                // Add trailing space before `]` unless the last token ends with a delimiter.
-                // (`]` is also a delimiter, so we only omit if prev is also delimiter.)
-                if !prev_ends_with_delim {
                     out.push(b' ');
+                    value.write_pdf(out);
                 }
-                out.push(b']');
+                out.extend_from_slice(b" ]");
             }
             Object::Dictionary(dict) => dict.write_pdf(out),
             Object::Stream(stream) => {
@@ -560,34 +553,37 @@ pub(crate) fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
     }
 }
 
-/// Returns `true` when the serialized form of `o` starts with a self-separating
-/// PDF delimiter byte (`<`, `(`, `[`, `<<`). Used by [`Object::write_pdf`] to
-/// decide whether to insert a space before this token inside an array.
+/// Serialize a stored trailer `/ID` value in qpdf's `writeTrailer` shape:
+/// `[<hex1><hex2>]` with no spaces.
 ///
-/// Note: [`Object::Name`] starts with `/` — technically a delimiter byte — but
-/// qpdf inserts a space before names anyway (`[ /PDF /Text ]` rather than
-/// `[/PDF /Text]`), so names are deliberately excluded from this set to match
-/// qpdf's array-writer convention.
-fn starts_with_delim(o: &Object) -> bool {
-    matches!(
-        o,
-        Object::String(_) | Object::Array(_) | Object::Dictionary(_) | Object::Stream(_)
-    )
-}
-
-/// Returns `true` when the serialized form of `o` ends with a PDF delimiter byte
-/// (`>`, `)`, `]`). Used by [`Object::write_pdf`] to decide whether to insert
-/// a space after this token inside an array.
+/// qpdf's `writeTrailer` (libqpdf/QPDFWriter.cc:1194-1222) hand-rolls the
+/// trailer's `/ID` array — it emits `[`, then the two identifier strings
+/// via `QPDF_String::unparse(true)` (which produces `<hex...>`), then `]`
+/// with no separators. This bypasses the generic `unparseObject` array
+/// serializer, which would otherwise insert spaces on both sides of every
+/// element (see [`Object::write_pdf`]).
 ///
-/// Excluded types end with a letter (`Name` → arbitrary letter from the name;
-/// `Stream` → the `endstream` keyword), so a following token in an array would
-/// run together without a separating space if these were treated as
-/// delimiter-terminated.
-fn ends_with_delim(o: &Object) -> bool {
-    matches!(
-        o,
-        Object::String(_) | Object::Array(_) | Object::Dictionary(_)
-    )
+/// `obj` is the trailer's stored `/ID` value. In practice this is always
+/// `Array([String, String])` — either the source PDF's own `/ID`, the
+/// all-zero placeholder `--static-id` puts there, or the deterministic-`/ID`
+/// placeholder later patched inline. If the shape is anything else (empty
+/// array, wrong arity, non-string elements), we fall back to
+/// [`Object::write_pdf`] rather than silently truncate: this keeps the
+/// fallback observable in tests / goldens while still handling the
+/// production-path shape byte-identically to qpdf.
+pub(crate) fn write_id_style_value(out: &mut Vec<u8>, obj: &Object) {
+    if let Object::Array(values) = obj {
+        if values.len() == 2 {
+            if let (Object::String(id0), Object::String(id1)) = (&values[0], &values[1]) {
+                out.push(b'[');
+                write_hex_string(out, id0);
+                write_hex_string(out, id1);
+                out.push(b']');
+                return;
+            }
+        }
+    }
+    obj.write_pdf(out);
 }
 
 /// Returns `true` when `value` can be emitted as a single-line literal string
@@ -706,15 +702,17 @@ impl Dictionary {
     /// the `/ID` *value* from that closure instead of serializing the stored
     /// value (the ` /ID ` key token is still emitted at its sorted position).
     ///
-    /// Every other key — and the `/ID` key itself when `id_writer` is `None` —
-    /// is written byte-for-byte identically to [`write_pdf`](Self::write_pdf),
-    /// so the two serializers agree except for the substituted `/ID` value.
-    /// This lets the caller compute the `/ID` directly from the bytes written so
-    /// far — used by the deterministic-`/ID` writer to emit a content-derived
-    /// identifier inline rather than via a placeholder-then-patch step. Unlike
-    /// the trailer, the cross-reference *stream* dictionary keeps `/ID` at its
-    /// lexicographic position (it is not forced last), so the closure runs
-    /// mid-iteration when the `/ID` key is reached.
+    /// Every other key is written byte-for-byte identically to
+    /// [`write_pdf`](Self::write_pdf). When `id_writer` is `Some`, the closure
+    /// substitutes for the `/ID` value — used by the deterministic-`/ID` writer
+    /// to emit a content-derived identifier inline rather than via a
+    /// placeholder-then-patch step. When `id_writer` is `None`, the stored
+    /// `/ID` value is routed through [`write_id_style_value`] to match qpdf's
+    /// `writeTrailer` compact `[<hex1><hex2>]` shape (qpdf special-cases the
+    /// `/ID` output; it never passes through the generic array serializer).
+    /// Unlike the trailer, the cross-reference *stream* dictionary keeps `/ID`
+    /// at its lexicographic position (it is not forced last), so the closure
+    /// runs mid-iteration when the `/ID` key is reached.
     pub(crate) fn write_pdf_with_id_writer(
         &self,
         out: &mut Vec<u8>,
@@ -728,6 +726,7 @@ impl Dictionary {
             out.push(b' ');
             match (key == b"ID", id_writer.as_mut()) {
                 (true, Some(write_id)) => write_id(out),
+                (true, None) => write_id_style_value(out, value),
                 _ => value.write_pdf(out),
             }
         }
@@ -796,8 +795,13 @@ impl Dictionary {
     /// dictionary's stored `/ID` value. This lets the caller compute the `/ID`
     /// directly from the bytes written so far — used by the deterministic-`/ID`
     /// writer to emit qpdf's content-derived identifier inline rather than via a
-    /// placeholder-then-patch step. The closure runs only when the `/ID` key is
-    /// present in the dictionary; if it is absent, `id_writer` is ignored.
+    /// placeholder-then-patch step. When `id_writer` is `None`, the stored
+    /// `/ID` value is routed through [`write_id_style_value`] to reproduce
+    /// qpdf's `writeTrailer` compact `[<hex1><hex2>]` shape without spaces
+    /// (qpdf's trailer hand-rolls `/ID`; the generic array serializer would
+    /// otherwise insert separating spaces). The closure runs only when the
+    /// `/ID` key is present in the dictionary; if it is absent, `id_writer`
+    /// is ignored.
     pub(crate) fn write_pdf_trailer(&self, out: &mut Vec<u8>, id_writer: Option<TrailerIdWriter>) {
         out.extend_from_slice(b"<<");
         let mut id_value: Option<&Object> = None;
@@ -815,7 +819,7 @@ impl Dictionary {
             out.extend_from_slice(b" /ID ");
             match id_writer {
                 Some(write_id) => write_id(out),
-                None => value.write_pdf(out),
+                None => write_id_style_value(out, value),
             }
         }
         out.extend_from_slice(b" >>");
@@ -928,6 +932,130 @@ mod qdf_key_escape_tests {
         let mut out = Vec::new();
         d.write_pdf_qdf(&mut out, 0);
         assert_eq!(out, b"<<\n  /Type /Catalog\n>>");
+    }
+}
+
+/// Oracle tests: pin `Object::Array::write_pdf` to qpdf's
+/// `QPDFWriter::unparseObject` array-branch shape (unconditional space after
+/// `[`, between every element, and before `]`), and pin
+/// `write_id_style_value` to qpdf's `writeTrailer` compact `[<hex1><hex2>]`
+/// shape.
+#[cfg(test)]
+mod array_writer_qpdf_parity_tests {
+    use super::*;
+
+    /// Adjacent string elements after `[`: qpdf still inserts spaces.
+    /// (This is exactly the shape the compat baseline's
+    /// `attachment-two-page.pdf` fixture exercises via
+    /// `/Names [ (attachment.txt) 5 0 R ]`.)
+    #[test]
+    fn array_writer_inserts_space_after_open_bracket_before_string() {
+        let arr = Object::Array(vec![
+            Object::String(b"attachment.txt".to_vec()),
+            Object::reference(ObjectRef::new(5, 0)),
+        ]);
+        let mut out = Vec::new();
+        arr.write_pdf(&mut out);
+        assert_eq!(out, b"[ (attachment.txt) 5 0 R ]");
+    }
+
+    /// Adjacent hex strings: no boundary optimization — qpdf emits spaces
+    /// between them. (`write_id_style_value` handles the trailer `/ID`
+    /// special case.)
+    #[test]
+    fn array_writer_inserts_space_between_adjacent_hex_strings() {
+        let arr = Object::Array(vec![
+            Object::String(vec![0xabu8, 0xcdu8]),
+            Object::String(vec![0xefu8, 0x01u8]),
+        ]);
+        let mut out = Vec::new();
+        arr.write_pdf(&mut out);
+        assert_eq!(out, b"[ <abcd> <ef01> ]");
+    }
+
+    /// Nested arrays: spaces around every element, including the nested
+    /// `[...]` tokens.
+    #[test]
+    fn array_writer_inserts_space_around_nested_arrays() {
+        let arr = Object::Array(vec![
+            Object::Array(vec![Object::Integer(1)]),
+            Object::Array(vec![Object::Integer(2)]),
+        ]);
+        let mut out = Vec::new();
+        arr.write_pdf(&mut out);
+        assert_eq!(out, b"[ [ 1 ] [ 2 ] ]");
+    }
+
+    /// Adjacent dictionaries: spaces around each `<<...>>`.
+    #[test]
+    fn array_writer_inserts_space_between_adjacent_dictionaries() {
+        let mut a = Dictionary::new();
+        a.insert(b"A", Object::Integer(1));
+        let mut b = Dictionary::new();
+        b.insert(b"B", Object::Integer(2));
+        let arr = Object::Array(vec![Object::Dictionary(a), Object::Dictionary(b)]);
+        let mut out = Vec::new();
+        arr.write_pdf(&mut out);
+        assert_eq!(out, b"[ << /A 1 >> << /B 2 >> ]");
+    }
+
+    /// Empty array stays `[ ]` (one space).
+    #[test]
+    fn array_writer_empty_is_single_space() {
+        let arr = Object::Array(vec![]);
+        let mut out = Vec::new();
+        arr.write_pdf(&mut out);
+        assert_eq!(out, b"[ ]");
+    }
+
+    /// Single-element array: opening space, element, trailing space.
+    #[test]
+    fn array_writer_single_element() {
+        let arr = Object::Array(vec![Object::Integer(42)]);
+        let mut out = Vec::new();
+        arr.write_pdf(&mut out);
+        assert_eq!(out, b"[ 42 ]");
+    }
+
+    /// `write_id_style_value` produces qpdf's `writeTrailer` compact shape.
+    #[test]
+    fn write_id_style_value_emits_compact_hex_pair() {
+        let id = Object::Array(vec![
+            Object::String(vec![0xabu8, 0xcdu8, 0xefu8]),
+            Object::String(vec![0x12u8, 0x34u8, 0x56u8]),
+        ]);
+        let mut out = Vec::new();
+        write_id_style_value(&mut out, &id);
+        assert_eq!(out, b"[<abcdef><123456>]");
+    }
+
+    /// Off-spec `/ID` values (wrong arity, wrong element types) fall back to
+    /// the generic array serializer rather than silently truncating.
+    #[test]
+    fn write_id_style_value_falls_back_for_unexpected_shapes() {
+        // Wrong arity → generic serializer (spaces). Use bytes that fall
+        // outside the printable-literal range so the serializer picks the
+        // hex form and the expected output is predictable.
+        let three = Object::Array(vec![
+            Object::String(vec![0x00u8]),
+            Object::String(vec![0x11u8]),
+            Object::String(vec![0x8fu8]),
+        ]);
+        let mut out = Vec::new();
+        write_id_style_value(&mut out, &three);
+        assert_eq!(out, b"[ <00> <11> <8f> ]");
+
+        // Wrong element type → generic serializer.
+        let non_string = Object::Array(vec![Object::Integer(1), Object::String(vec![0x8fu8])]);
+        let mut out = Vec::new();
+        write_id_style_value(&mut out, &non_string);
+        assert_eq!(out, b"[ 1 <8f> ]");
+
+        // Not an array at all → delegated to write_pdf verbatim.
+        let scalar = Object::Integer(7);
+        let mut out = Vec::new();
+        write_id_style_value(&mut out, &scalar);
+        assert_eq!(out, b"7");
     }
 }
 

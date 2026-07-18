@@ -10,6 +10,6 @@ baseline test, so silent drift is caught.
 | one-page.pdf | 861b0bbfeee8368a | 1192 | 1189 | diverge | length mismatch (flpdf=1192 golden=1189) |
 | two-page.pdf | 52022d9ba6e99359 | 1585 | 1579 | diverge | length mismatch (flpdf=1585 golden=1579) |
 | three-page.pdf | 198eee6c8c5c12ff | 1979 | 1970 | diverge | length mismatch (flpdf=1979 golden=1970) |
-| attachment-two-page.pdf | 55219fb715b7733c | 2152 | 2153 | diverge | length mismatch (flpdf=2152 golden=2153) |
+| attachment-two-page.pdf | 41dc413b58e1e668 | 2153 | 2153 | match | - |
 | linearized-one-page.pdf | - | - | - | skip | no golden for --static-id |
 | encrypted-r4-three-page.pdf | - | - | - | skip | no golden for --static-id |

@@ -769,10 +769,14 @@ fn write_part1_xref_and_trailer(
         // pass), produce the `/ID` value from the closure — qpdf's content-
         // derived identifier in the fixed-width hex form — instead of the
         // stored placeholder. The closure emits exactly the same byte width as
-        // the placeholder, so every downstream offset is unchanged.
+        // the placeholder, so every downstream offset is unchanged. When
+        // `id_writer` is `None`, the stored value is routed through
+        // `write_id_style_value` so the trailer's `/ID` output is compact
+        // `[<hex1><hex2>]` (matches qpdf's hand-rolled `writeTrailer`; the
+        // generic array serializer would otherwise insert separating spaces).
         match id_writer {
             Some(write_id) => write_id(bytes),
-            None => id_obj.write_pdf(bytes),
+            None => crate::object::write_id_style_value(bytes, id_obj),
         }
     }
 
@@ -900,10 +904,12 @@ fn write_main_xref_and_trailer(
         // See `write_part1_xref_and_trailer`: the classic deterministic-`/ID`
         // final pass supplies a closure that emits qpdf's content-derived
         // identifier (same fixed-width hex form as the placeholder), so the
-        // main trailer carries the same `/ID` as the Part-1 trailer.
+        // main trailer carries the same `/ID` as the Part-1 trailer. On the
+        // `None` fallback, route the stored value through
+        // `write_id_style_value` for the compact `[<hex1><hex2>]` shape.
         match id_writer {
             Some(write_id) => write_id(bytes),
-            None => id_obj.write_pdf(bytes),
+            None => crate::object::write_id_style_value(bytes, id_obj),
         }
         bytes.extend_from_slice(b" ");
     }
@@ -5024,9 +5030,12 @@ mod tests {
             .get("ID")
             .expect("main trailer must carry /ID after linearize --deterministic-id");
         // Serialize the resolved trailer /ID and confirm it matches the
-        // byte-for-byte /ID array found in the file.
+        // byte-for-byte /ID array found in the file. The trailer serializer
+        // routes the /ID value through `write_id_style_value` (qpdf's
+        // hand-rolled compact `[<hex1><hex2>]` shape) rather than the generic
+        // array serializer, so compare against that helper.
         let mut serialized = Vec::new();
-        trailer_id.write_pdf(&mut serialized);
+        crate::object::write_id_style_value(&mut serialized, trailer_id);
         assert_eq!(
             serialized.as_slice(),
             first.as_slice(),
