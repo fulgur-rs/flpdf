@@ -5555,16 +5555,18 @@ mod tests {
 
         let mut via_none = Vec::new();
         dict.write_pdf_with_id_writer(&mut via_none, None);
+        // Render once so the diagnostic bytes appear on the covered path too;
+        // avoids a coverage hole in the assert-message arm that only runs on
+        // failure.
+        let via_none_str = String::from_utf8_lossy(&via_none).into_owned();
         // The compact shape puts `[` immediately before `<`, no separator.
         assert!(
             via_none.windows(6).any(|w| w == b"/ID [<"),
-            "None fallback must emit compact `/ID [<...` without space between `[` and `<`; got: {}",
-            String::from_utf8_lossy(&via_none)
+            "None fallback must emit compact `/ID [<...` without space between `[` and `<`; got: {via_none_str}"
         );
         assert!(
             !via_none.windows(8).any(|w| w == b"/ID [ <"),
-            "None fallback must NOT emit `/ID [ <...` (that is the generic array serializer); got: {}",
-            String::from_utf8_lossy(&via_none)
+            "None fallback must NOT emit `/ID [ <...` (that is the generic array serializer); got: {via_none_str}"
         );
 
         // Plain `write_pdf` now goes through the generic array serializer, so
@@ -5573,10 +5575,10 @@ mod tests {
         // pre-fix "both use write_pdf" behavior).
         let mut plain = Vec::new();
         dict.write_pdf(&mut plain);
+        let plain_str = String::from_utf8_lossy(&plain).into_owned();
         assert!(
             plain.windows(7).any(|w| w == b"/ID [ <"),
-            "plain write_pdf must emit the generic `/ID [ <...` shape; got: {}",
-            String::from_utf8_lossy(&plain)
+            "plain write_pdf must emit the generic `/ID [ <...` shape; got: {plain_str}"
         );
         assert_ne!(
             via_none, plain,
@@ -5622,14 +5624,14 @@ mod tests {
 
         let mut actual = Vec::new();
         write_stream_to_buf_with_id_writer(&mut actual, &stream, NewlineBeforeEndstream::Yes, None);
+        let actual_str = String::from_utf8_lossy(&actual).into_owned();
         assert!(
             actual.windows(6).any(|w| w == b"/ID [<"),
-            "None fallback must emit compact `/ID [<...` (no space); got: {}",
-            String::from_utf8_lossy(&actual)
+            "None fallback must emit compact `/ID [<...` (no space); got: {actual_str}"
         );
         assert!(
             !actual.windows(7).any(|w| w == b"/ID [ <"),
-            "None fallback must not emit the generic space-separated `/ID [ <...`"
+            "None fallback must not emit the generic space-separated `/ID [ <...`; got: {actual_str}"
         );
     }
 
