@@ -168,6 +168,10 @@ jobs:
           # Gated behind qpdf-zlib-compat, so it is compiled out of the default
           # test workflow and must be run explicitly here.
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_byte_identical
+          # Pins the CLI binary's overlay/underlay output byte-identity vs qpdf
+          # goldens end-to-end (raw-argv pre-split -> WriteOptions -> write path).
+          # Gated behind qpdf-zlib-compat; must be run explicitly here.
+          cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_byte_identical_overlay
 
       - name: Compat matrix baselines (Linux amd64)
         if: ${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}
