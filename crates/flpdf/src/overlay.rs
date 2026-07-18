@@ -1727,6 +1727,69 @@ mod byte_gate {
         assert_byte_identical(&actual, "overlay-onto-existing-acroform.pdf");
     }
 
+    /// Overlay onto a dest whose `/AcroForm/DR` is already populated with a
+    /// `/Font /F1` that collides with the source's own `/DR/Font/F1` (dest
+    /// `/F1` is Helvetica, source `/F1` is Courier — different refs).
+    /// Exercises four qpdf helpers not reached by
+    /// `overlay_copy_annotations_onto_existing_acroform_is_byte_identical_qdf`
+    /// (whose dest `/AcroForm` has no `/DR` at all):
+    ///   1. `QPDFObjectHandle::mergeResources` — rename source `/F1` to
+    ///      `/F1_1` on merge into the existing dest `/DR/Font`.
+    ///   2. `init_dr_map` — populate `dr_map = {Font: {F1: F1_1}}`.
+    ///   3. `adjustDefaultAppearances` — rewrite each copied field's `/DA`
+    ///      to reference `/F1_1` instead of `/F1`.
+    ///   4. `adjustAppearanceStream` (`ResourceReplacer`) — rewrite the
+    ///      `/F1` operand inside each copied field's AP stream content to
+    ///      `/F1_1`.
+    ///
+    /// Fixture: `fxo-red-with-existing-acroform-dr.pdf` is
+    /// `fxo-red-with-existing-acroform.pdf` with an indirect `/AcroForm/DR`
+    /// added (`/Font << /F1 <ref-to-Helvetica> >>`).
+    ///
+    /// Golden generated with (qpdf 11.9.0):
+    /// ```text
+    /// qpdf --qdf --static-id --no-original-object-ids --min-version=1.6 \
+    ///   tests/fixtures/compat/fxo-red-with-existing-acroform-dr.pdf \
+    ///   --overlay tests/fixtures/compat/form-fields-and-annotations.pdf --repeat=1 \
+    ///   -- tests/golden/references/overlay/overlay-onto-existing-acroform-dr.pdf
+    /// ```
+    ///
+    /// Golden inspection confirms all three of:
+    ///   - dest `/AcroForm/DR/Font` has both `/F1 -> Helvetica` and
+    ///     `/F1_1 -> Courier`.
+    ///   - every copied field `/DA` string reads `/F1_1 ... Tf`.
+    ///   - at least one copied AP stream content is
+    ///     `/Tx BMC q BT /F1_1 18 Tf ... ET Q EMC` with its own
+    ///     `/Resources/Font/F1_1` pointing at the Courier font — proving
+    ///     `ResourceReplacer` fired on the stream, not just the `/DA` string.
+    #[test]
+    #[ignore = "flpdf-4r6l Layer 4: enables when adjustAppearanceStream lands"]
+    fn overlay_copy_annotations_onto_existing_acroform_dr_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red-with-existing-acroform-dr.pdf");
+        let mut src = fixture("form-fields-and-annotations.pdf");
+        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            qdf: true,
+            no_original_object_ids: true,
+            min_version: Some(format!("{maj}.{min}")),
+            min_extension_level: (max_ext > 0).then_some(max_ext),
+            ..Default::default()
+        };
+        let mut actual = Vec::new();
+        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        assert_byte_identical(&actual, "overlay-onto-existing-acroform-dr.pdf");
+    }
+
     /// Overlay a source whose `/AcroForm` supplies `/DA` and `/Q` defaults
     /// onto a dest with no `/AcroForm`. Exercises qpdf's
     /// `adjustInheritedFields` (line 442-484, called from
