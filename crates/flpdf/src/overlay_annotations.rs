@@ -708,9 +708,12 @@ fn duplicate_field_tree<R: Read + Seek>(
                     let new_da = adjust_default_appearance(&da, dr_map, resources);
                     dict.insert("DA", Object::String(new_da));
                 }
+                // cov:ignore-start: malformed /DA (non-string) — no shipped
+                // fixture supplies this shape.
                 Some(other) => {
-                    dict.insert("DA", other); // cov:ignore: malformed /DA (non-string) — no shipped fixture supplies this shape
+                    dict.insert("DA", other);
                 }
+                // cov:ignore-end
                 None => {}
             }
         }
