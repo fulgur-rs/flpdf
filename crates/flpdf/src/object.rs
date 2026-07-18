@@ -336,7 +336,8 @@ impl Object {
     /// delimiters (`<hex>`, `(str)`, `<<dict>>`, nested `[array]`). The trailer
     /// `/ID` array (`[<hex1><hex2>]`, no spaces) is qpdf's own special case
     /// hand-rolled in `writeTrailer` and does not go through this serializer;
-    /// see [`Dictionary::write_pdf_trailer`] and [`write_id_style_value`].
+    /// the crate's trailer writers special-case the stored `/ID` value to
+    /// reproduce that compact shape.
     ///
     /// ```
     /// use flpdf::Object;
@@ -573,14 +574,12 @@ pub(crate) fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
 /// production-path shape byte-identically to qpdf.
 pub(crate) fn write_id_style_value(out: &mut Vec<u8>, obj: &Object) {
     if let Object::Array(values) = obj {
-        if values.len() == 2 {
-            if let (Object::String(id0), Object::String(id1)) = (&values[0], &values[1]) {
-                out.push(b'[');
-                write_hex_string(out, id0);
-                write_hex_string(out, id1);
-                out.push(b']');
-                return;
-            }
+        if let [Object::String(id0), Object::String(id1)] = values.as_slice() {
+            out.push(b'[');
+            write_hex_string(out, id0);
+            write_hex_string(out, id1);
+            out.push(b']');
+            return;
         }
     }
     obj.write_pdf(out);

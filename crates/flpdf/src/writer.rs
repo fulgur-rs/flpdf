@@ -4171,7 +4171,20 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     Some(&mut id_writer),
                 );
             } else {
-                write_stream_to_buf(&mut bytes, &xref_stream, options.newline_before_endstream);
+                // Route through the _with_id_writer variant with `None` so any
+                // stored `/ID` in the xref-stream dict is rendered via
+                // `write_id_style_value` (qpdf-trailer compact `[<hex><hex>]`).
+                // Plain `write_stream_to_buf` would use the generic
+                // `Dictionary::write_pdf`, whose array serializer now inserts
+                // separating spaces and would emit `/ID [ <hex> <hex> ]` — the
+                // shape the linearization `xref_stream::write_object` and the
+                // classic/QDF trailers all avoid.
+                write_stream_to_buf_with_id_writer(
+                    &mut bytes,
+                    &xref_stream,
+                    options.newline_before_endstream,
+                    None,
+                );
             }
             bytes.extend_from_slice(b"\nendobj\n");
             bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
@@ -6038,6 +6051,48 @@ mod tests {
             "xref-stream /ID[1] must match the two-level reconstruction"
         );
         assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
+    }
+
+    /// Regression: the xref-stream trailer's `/ID` must use qpdf's compact
+    /// `[<hex1><hex2>]` shape (no separating spaces) even when the run is
+    /// **non-deterministic** — e.g. `--static-id` combined with a
+    /// generate-mode plan that upgrades to xref-stream form. Before the
+    /// `write_stream_to_buf_with_id_writer(_, None)` routing, this branch
+    /// serialized the xref-stream dict via plain `write_stream_to_buf`,
+    /// which now goes through the generic array serializer and would emit
+    /// `/ID [ <hex1> <hex2> ]` (space-separated). qpdf's own hand-rolled
+    /// trailer / linearization `xref_stream::write_object` path always
+    /// emits the compact shape, so drifting to spaces would be a silent
+    /// parity regression.
+    #[test]
+    fn static_id_xref_stream_emits_qpdf_compact_id_shape() {
+        let fixture = build_partition_fixture();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            // Force ObjStm batches → XrefForm::Stream → the `else` branch of
+            // the xref-stream writer (`deterministic_id` is off, `static_id`
+            // is on) is the one Codex flagged.
+            object_streams: ObjectStreamMode::Generate,
+            ..WriteOptions::default()
+        };
+        let mut pdf = crate::Pdf::open_mem(&fixture).expect("fixture must open");
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out, &opts).expect("write");
+
+        // The compact shape places `[` immediately before `<` (no space).
+        // The generic array serializer would emit `[ <` — the regression.
+        assert!(
+            out.windows(6).any(|w| w == b"/ID [<"),
+            "xref-stream trailer /ID must be compact `/ID [<...` (qpdf shape); \
+             found neither: {}",
+            String::from_utf8_lossy(&out).into_owned()
+        );
+        assert!(
+            !out.windows(7).any(|w| w == b"/ID [ <"),
+            "xref-stream trailer /ID must NOT drift to `/ID [ <...` (that is \
+             the generic array serializer, which regresses qpdf parity)"
+        );
     }
 
     #[test]
