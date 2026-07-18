@@ -3731,6 +3731,11 @@ fn build_overlay_specs(
         };
         let source = Pdf::open_with_options(BufReader::new(file), options)
             .map_err(|error| error_with_file(&path, actionable_password_error(error)))?;
+        // Print qpdf-style WARNING lines for any repair diagnostics the
+        // source triggered (matches qpdf 11.9.0's stderr output for
+        // `--overlay`/`--underlay`; qpdf does not add these warnings to
+        // its exit-code accumulator, so exit code is unchanged).
+        emit_open_warnings(&path, &source);
 
         let kind = match spec.kind {
             OverlayKind::Overlay => flpdf::OverlayKind::Overlay,
@@ -4896,10 +4901,7 @@ fn open_pdf_impl(
     let pdf = Pdf::open_with_options(BufReader::new(file), options)
         .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
 
-    for diagnostic in pdf.repair_diagnostics().entries() {
-        let location = diagnostic_location(input, diagnostic.offset);
-        eprintln!("WARNING: {location}: {}", diagnostic.message);
-    }
+    emit_open_warnings(input, &pdf);
     // Skip the weak-crypto warning on the forced (inspection) path: the user
     // supplied no `--allow-weak-crypto` flag to acknowledge, and qpdf emits no
     // such warning for `--show-encryption[-key]`. On the normal path a weak
@@ -4963,6 +4965,18 @@ fn diagnostic_location(input: &Path, offset: Option<u64>) -> String {
     match offset {
         Some(offset) => format!("{} (offset {offset})", input.display()),
         None => input.display().to_string(),
+    }
+}
+
+/// Emit each entry from `pdf.repair_diagnostics()` to stderr in qpdf's
+/// `WARNING: <file>[ (offset N)]: <message>` shape. Shared between the
+/// primary-input open (`open_pdf_impl`) and the overlay/underlay source
+/// open (`build_overlay_specs`) so both surfaces print open-time warnings
+/// identically.
+fn emit_open_warnings<R: Read + Seek>(path: &Path, pdf: &Pdf<R>) {
+    for diagnostic in pdf.repair_diagnostics().entries() {
+        let location = diagnostic_location(path, diagnostic.offset);
+        eprintln!("WARNING: {location}: {}", diagnostic.message);
     }
 }
 
