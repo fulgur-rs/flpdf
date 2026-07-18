@@ -86,3 +86,102 @@ fn cli_three_page_overlay_one_page_is_byte_identical() {
     );
     assert_bytes(&bytes, "three-page-overlay-one-page.pdf");
 }
+
+#[test]
+fn cli_three_page_overlay_two_page_is_byte_identical() {
+    let src = fixture("two-page.pdf");
+    let bytes = run_cli(
+        &[],
+        "three-page.pdf",
+        &["--overlay", src.to_str().unwrap(), "--"],
+    );
+    assert_bytes(&bytes, "three-page-overlay-two-page.pdf");
+}
+
+#[test]
+fn cli_three_page_overlay_one_page_repeat1_is_byte_identical() {
+    let src = fixture("one-page.pdf");
+    let bytes = run_cli(
+        &[],
+        "three-page.pdf",
+        &["--overlay", src.to_str().unwrap(), "--repeat=1", "--"],
+    );
+    assert_bytes(&bytes, "three-page-overlay-one-page-repeat1.pdf");
+}
+
+#[test]
+fn cli_three_page_overlay_two_page_to_2_3_is_byte_identical() {
+    let src = fixture("two-page.pdf");
+    let bytes = run_cli(
+        &[],
+        "three-page.pdf",
+        &["--overlay", src.to_str().unwrap(), "--to=2-3", "--"],
+    );
+    assert_bytes(&bytes, "three-page-overlay-two-page-to2-3.pdf");
+}
+
+#[test]
+fn cli_three_page_two_overlays_compose_is_byte_identical() {
+    let a = fixture("one-page.pdf");
+    let b = fixture("two-page.pdf");
+    let bytes = run_cli(
+        &[],
+        "three-page.pdf",
+        &[
+            "--overlay",
+            a.to_str().unwrap(),
+            "--",
+            "--overlay",
+            b.to_str().unwrap(),
+            "--",
+        ],
+    );
+    assert_bytes(&bytes, "three-page-two-overlays.pdf");
+}
+
+#[test]
+fn cli_three_page_overlay_and_underlay_compose_is_byte_identical() {
+    let a = fixture("one-page.pdf");
+    let b = fixture("two-page.pdf");
+    let bytes = run_cli(
+        &[],
+        "three-page.pdf",
+        &[
+            "--overlay",
+            a.to_str().unwrap(),
+            "--",
+            "--underlay",
+            b.to_str().unwrap(),
+            "--",
+        ],
+    );
+    assert_bytes(&bytes, "three-page-overlay-and-underlay.pdf");
+}
+
+#[test]
+fn cli_three_page_overlay_two_page_from2_is_byte_identical() {
+    let src = fixture("two-page.pdf");
+    let bytes = run_cli(
+        &[],
+        "three-page.pdf",
+        &["--overlay", src.to_str().unwrap(), "--from=2", "--"],
+    );
+    assert_bytes(&bytes, "three-page-overlay-two-page-from2.pdf");
+}
+
+#[test]
+fn cli_three_page_overlay_two_page_from_empty_repeat2_is_byte_identical() {
+    let src = fixture("two-page.pdf");
+    let bytes = run_cli(
+        &[],
+        "three-page.pdf",
+        &[
+            "--overlay",
+            src.to_str().unwrap(),
+            "--from=",
+            "--repeat=2",
+            "--",
+        ],
+    );
+    assert_bytes(&bytes, "three-page-overlay-two-page-from-empty-repeat2.pdf");
+}
