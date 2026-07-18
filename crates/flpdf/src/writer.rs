@@ -1826,8 +1826,21 @@ fn write_incremental_xref_stream(
         })?),
     );
 
-    let xref_stream = Object::Stream(crate::Stream::new(stream_dict, stream_data));
-    write_object(bytes, ObjectRef::new(xref_object_number, 0), &xref_stream)?;
+    // The incremental xref-stream inherits `/ID` from the source trailer
+    // (via the `trailer.clone()` above). Render the stream via the
+    // `_with_id_writer(None)` variant so the stored `/ID` array goes through
+    // `write_id_style_value` and emits qpdf's compact `[<hex1><hex2>]` shape
+    // — a direct `Object::Stream::write_pdf` would route the array through
+    // the generic serializer (now unconditional spaces after this branch's
+    // earlier array-writer parity fix) and produce `/ID [ <hex1> <hex2> ]`,
+    // regressing from qpdf's writeTrailer / linearization
+    // `xref_stream::write_object` compact shape. Framing matches
+    // `Object::Stream::write_pdf` exactly: `NewlineBeforeEndstream::Yes`
+    // reproduces its unconditional `\n` before `endstream`.
+    let xref_stream = crate::Stream::new(stream_dict, stream_data);
+    bytes.extend_from_slice(format!("{xref_object_number} 0 obj\n").as_bytes());
+    write_stream_to_buf_with_id_writer(bytes, &xref_stream, NewlineBeforeEndstream::Yes, None);
+    bytes.extend_from_slice(b"\nendobj\n");
 
     Ok(xref_offset)
 }
@@ -1901,7 +1914,13 @@ fn write_incremental_trailer<R: Read + Seek>(
     }
 
     bytes.extend_from_slice(b"trailer\n");
-    trailer.write_pdf(bytes);
+    // Route the stored `/ID` value through the qpdf-trailer compact writer so
+    // the emitted `/ID` stays `[<hex1><hex2>]` (matching qpdf's hand-rolled
+    // `writeTrailer` shape). Keys still iterate in the dictionary's natural
+    // alphabetical order — this call keeps that ordering and only substitutes
+    // the /ID value shape, so every non-/ID byte remains identical to plain
+    // `Dictionary::write_pdf`.
+    trailer.write_pdf_with_id_writer(bytes, None);
     bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
     Ok(())
 }
@@ -4165,7 +4184,20 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     Some(&mut id_writer),
                 );
             } else {
-                write_stream_to_buf(&mut bytes, &xref_stream, options.newline_before_endstream);
+                // Route through the _with_id_writer variant with `None` so any
+                // stored `/ID` in the xref-stream dict is rendered via
+                // `write_id_style_value` (qpdf-trailer compact `[<hex><hex>]`).
+                // Plain `write_stream_to_buf` would use the generic
+                // `Dictionary::write_pdf`, whose array serializer now inserts
+                // separating spaces and would emit `/ID [ <hex> <hex> ]` — the
+                // shape the linearization `xref_stream::write_object` and the
+                // classic/QDF trailers all avoid.
+                write_stream_to_buf_with_id_writer(
+                    &mut bytes,
+                    &xref_stream,
+                    options.newline_before_endstream,
+                    None,
+                );
             }
             bytes.extend_from_slice(b"\nendobj\n");
             bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
@@ -4865,7 +4897,7 @@ fn write_qdf_trailer(
         bytes.extend_from_slice(b"  /ID ");
         match id_writer {
             Some(write_id) => write_id(bytes),
-            None => value.write_pdf(bytes),
+            None => crate::object::write_id_style_value(bytes, value),
         }
         bytes.push(b'\n');
     }
@@ -5533,10 +5565,15 @@ mod tests {
     }
 
     #[test]
-    fn write_pdf_with_id_writer_none_matches_write_pdf() {
-        // With `id_writer = None`, the serializer must be byte-identical to the
-        // plain `write_pdf` even when `/ID` is present — covering the fallback
-        // arm that production (always `Some`) never exercises.
+    fn write_pdf_with_id_writer_none_emits_qpdf_trailer_id_shape() {
+        // With `id_writer = None`, the fallback routes the stored `/ID` value
+        // through `write_id_style_value` to reproduce qpdf's `writeTrailer`
+        // compact `[<hex1><hex2>]` (no separating spaces). Plain `write_pdf`
+        // goes through the generic array serializer, which now — matching
+        // qpdf's `unparseObject` — inserts spaces on both sides of every
+        // element (`[ <hex1> <hex2> ]`). Pin both shapes: /ID via the None
+        // fallback stays qpdf-trailer-compact; other keys agree byte-for-byte
+        // with plain `write_pdf`.
         let mut dict = Dictionary::new();
         dict.insert("Size", Object::Integer(4));
         dict.insert("Root", Object::reference(ObjectRef::new(1, 0)));
@@ -5548,22 +5585,64 @@ mod tests {
             ]),
         );
 
+        let mut via_none = Vec::new();
+        dict.write_pdf_with_id_writer(&mut via_none, None);
+        // Render once so the diagnostic bytes appear on the covered path too;
+        // avoids a coverage hole in the assert-message arm that only runs on
+        // failure.
+        let via_none_str = String::from_utf8_lossy(&via_none).into_owned();
+        // The compact shape puts `[` immediately before `<`, no separator.
+        assert!(
+            via_none.windows(6).any(|w| w == b"/ID [<"),
+            "None fallback must emit compact `/ID [<...` without space between `[` and `<`; got: {via_none_str}"
+        );
+        assert!(
+            !via_none.windows(8).any(|w| w == b"/ID [ <"),
+            "None fallback must NOT emit `/ID [ <...` (that is the generic array serializer); got: {via_none_str}"
+        );
+
+        // Plain `write_pdf` now goes through the generic array serializer, so
+        // its /ID output is space-separated. Prove the two paths intentionally
+        // diverge on the /ID value (they must not silently drift back to the
+        // pre-fix "both use write_pdf" behavior).
+        let mut plain = Vec::new();
+        dict.write_pdf(&mut plain);
+        let plain_str = String::from_utf8_lossy(&plain).into_owned();
+        assert!(
+            plain.windows(7).any(|w| w == b"/ID [ <"),
+            "plain write_pdf must emit the generic `/ID [ <...` shape; got: {plain_str}"
+        );
+        assert_ne!(
+            via_none, plain,
+            "None fallback (qpdf-trailer /ID shape) must differ from plain write_pdf (generic array /ID shape)"
+        );
+    }
+
+    #[test]
+    fn write_pdf_with_id_writer_none_matches_write_pdf_without_id() {
+        // Without an `/ID` key, the None fallback has no ID-value substitution
+        // to perform, so it must remain byte-identical to plain `write_pdf`.
+        let mut dict = Dictionary::new();
+        dict.insert("Size", Object::Integer(4));
+        dict.insert("Root", Object::reference(ObjectRef::new(1, 0)));
+
         let mut plain = Vec::new();
         dict.write_pdf(&mut plain);
         let mut via_none = Vec::new();
         dict.write_pdf_with_id_writer(&mut via_none, None);
         assert_eq!(
             via_none, plain,
-            "write_pdf_with_id_writer(None) must equal write_pdf byte-for-byte"
+            "write_pdf_with_id_writer(None) must equal write_pdf when no /ID is present"
         );
     }
 
     #[test]
-    fn write_stream_to_buf_with_id_writer_none_matches_write_stream_to_buf() {
-        // The xref-stream helper documents byte-identity with `write_stream_to_buf`
-        // when `id_writer = None`; production only ever passes `Some`, so this pins
-        // the documented `None` contract across both the dictionary and the payload
-        // framing (the helper is otherwise unreachable with `None`).
+    fn write_stream_to_buf_with_id_writer_none_emits_qpdf_trailer_id_shape() {
+        // The xref-stream helper's `None` fallback likewise routes stored `/ID`
+        // through `write_id_style_value`, so the payload framing agrees with
+        // `write_stream_to_buf` on everything except the /ID value shape. Only
+        // production paths passing `Some` are used in practice, but pin the
+        // `None` contract: /ID is compact, other bytes match the plain helper.
         let mut dict = Dictionary::new();
         dict.insert("Length", Object::Integer(3));
         dict.insert(
@@ -5575,13 +5654,34 @@ mod tests {
         );
         let stream = crate::Stream::new(dict, b"abc".to_vec());
 
+        let mut actual = Vec::new();
+        write_stream_to_buf_with_id_writer(&mut actual, &stream, NewlineBeforeEndstream::Yes, None);
+        let actual_str = String::from_utf8_lossy(&actual).into_owned();
+        assert!(
+            actual.windows(6).any(|w| w == b"/ID [<"),
+            "None fallback must emit compact `/ID [<...` (no space); got: {actual_str}"
+        );
+        assert!(
+            !actual.windows(7).any(|w| w == b"/ID [ <"),
+            "None fallback must not emit the generic space-separated `/ID [ <...`; got: {actual_str}"
+        );
+    }
+
+    #[test]
+    fn write_stream_to_buf_with_id_writer_none_matches_helper_without_id() {
+        // Without `/ID` in the dictionary, the xref-stream helper's `None`
+        // fallback is byte-identical to `write_stream_to_buf`.
+        let mut dict = Dictionary::new();
+        dict.insert("Length", Object::Integer(3));
+        let stream = crate::Stream::new(dict, b"abc".to_vec());
+
         let mut expected = Vec::new();
         write_stream_to_buf(&mut expected, &stream, NewlineBeforeEndstream::Yes);
         let mut actual = Vec::new();
         write_stream_to_buf_with_id_writer(&mut actual, &stream, NewlineBeforeEndstream::Yes, None);
         assert_eq!(
             actual, expected,
-            "write_stream_to_buf_with_id_writer(None) must equal write_stream_to_buf"
+            "None fallback must equal write_stream_to_buf when no /ID is present"
         );
     }
 
@@ -5966,6 +6066,51 @@ mod tests {
         assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
     }
 
+    /// Regression: the xref-stream trailer's `/ID` must use qpdf's compact
+    /// `[<hex1><hex2>]` shape (no separating spaces) even when the run is
+    /// **non-deterministic** — e.g. `--static-id` combined with a
+    /// generate-mode plan that upgrades to xref-stream form. Before the
+    /// `write_stream_to_buf_with_id_writer(_, None)` routing, this branch
+    /// serialized the xref-stream dict via plain `write_stream_to_buf`,
+    /// which now goes through the generic array serializer and would emit
+    /// `/ID [ <hex1> <hex2> ]` (space-separated). qpdf's own hand-rolled
+    /// trailer / linearization `xref_stream::write_object` path always
+    /// emits the compact shape, so drifting to spaces would be a silent
+    /// parity regression.
+    #[test]
+    fn static_id_xref_stream_emits_qpdf_compact_id_shape() {
+        let fixture = build_partition_fixture();
+        let opts = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            // Force ObjStm batches → XrefForm::Stream → the `else` branch of
+            // the xref-stream writer (`deterministic_id` is off, `static_id`
+            // is on) is the one Codex flagged.
+            object_streams: ObjectStreamMode::Generate,
+            ..WriteOptions::default()
+        };
+        let mut pdf = crate::Pdf::open_mem(&fixture).expect("fixture must open");
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out, &opts).expect("write");
+
+        // The compact shape places `[` immediately before `<` (no space).
+        // The generic array serializer would emit `[ <` — the regression.
+        // Materialize the diagnostic on the covered path so the assert-message
+        // arm is not a coverage hole.
+        let out_str = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            out.windows(6).any(|w| w == b"/ID [<"),
+            "xref-stream trailer /ID must be compact `/ID [<...` (qpdf shape); \
+             got: {out_str}"
+        );
+        assert!(
+            !out.windows(7).any(|w| w == b"/ID [ <"),
+            "xref-stream trailer /ID must NOT drift to `/ID [ <...` (that is \
+             the generic array serializer, which regresses qpdf parity); \
+             got: {out_str}"
+        );
+    }
+
     #[test]
     fn deterministic_id_preserve_xref_stream_form_is_self_stable() {
         // A cross-reference-stream INPUT written with --object-streams=preserve
@@ -5998,6 +6143,59 @@ mod tests {
             "xref-stream /ID[1] must match the two-level reconstruction"
         );
         assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
+    }
+
+    /// Regression: the incremental xref-stream writer preserves `/ID` from
+    /// the source trailer and must render it in qpdf's compact
+    /// `[<hex1><hex2>]` shape — the incremental xref-stream is exactly the
+    /// reader-visible trailer, and qpdf's `writeTrailer` /
+    /// `xref_stream::write_object` both emit compact `/ID`. Before this
+    /// fix, `write_incremental_xref_stream` serialized the stream via a
+    /// plain `Object::Stream` — after the branch's array-writer parity
+    /// commit that path emits `/ID [ <hex0> <hex1> ]` (space-separated),
+    /// silently regressing qpdf parity for every incremental update over
+    /// an xref-stream input with an `/ID`.
+    #[test]
+    fn write_incremental_xref_stream_emits_qpdf_compact_id_shape() {
+        // Build a trailer carrying an `/ID`; xref-stream layouts inherit
+        // `/ID` from the trailer at `stream_dict = trailer.clone()`.
+        let mut trailer = Dictionary::new();
+        trailer.insert(
+            "ID",
+            Object::Array(vec![
+                Object::String(vec![0xABu8; 16]),
+                Object::String(vec![0xCDu8; 16]),
+            ]),
+        );
+        let source_offsets = BTreeMap::new();
+        let root_ref = ObjectRef::new(1, 0);
+
+        let mut bytes = Vec::new();
+        write_incremental_xref_stream(
+            &mut bytes,
+            &trailer,
+            &source_offsets,
+            &root_ref,
+            /* xref_object_number */ 2,
+            /* object_count */ 3,
+            /* previous_xref_offset */ 0,
+        )
+        .expect("write_incremental_xref_stream must succeed");
+
+        // The compact shape places `[` immediately before `<` (no space).
+        // Materialize the diagnostic on the covered path so the assert
+        // message arms are not a coverage hole.
+        let out_str = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(
+            bytes.windows(6).any(|w| w == b"/ID [<"),
+            "incremental xref-stream /ID must be compact `/ID [<...` \
+             (qpdf shape); got: {out_str}"
+        );
+        assert!(
+            !bytes.windows(7).any(|w| w == b"/ID [ <"),
+            "incremental xref-stream /ID must NOT drift to `/ID [ <...` \
+             (that is the generic array serializer); got: {out_str}"
+        );
     }
 
     #[test]
