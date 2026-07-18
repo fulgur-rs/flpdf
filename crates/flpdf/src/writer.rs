@@ -1901,7 +1901,13 @@ fn write_incremental_trailer<R: Read + Seek>(
     }
 
     bytes.extend_from_slice(b"trailer\n");
-    trailer.write_pdf(bytes);
+    // Route the stored `/ID` value through the qpdf-trailer compact writer so
+    // the emitted `/ID` stays `[<hex1><hex2>]` (matching qpdf's hand-rolled
+    // `writeTrailer` shape). Keys still iterate in the dictionary's natural
+    // alphabetical order — this call keeps that ordering and only substitutes
+    // the /ID value shape, so every non-/ID byte remains identical to plain
+    // `Dictionary::write_pdf`.
+    trailer.write_pdf_with_id_writer(bytes, None);
     bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
     Ok(())
 }
