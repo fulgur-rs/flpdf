@@ -1412,17 +1412,16 @@ fn ensure_dest_acroform_dr<R: Read + Seek>(
 /// are typically refs, so the clone is cheap and the dest and source paths
 /// continue to share the underlying font/xobject objects (as qpdf does).
 ///
-/// Known gap: qpdf additionally reuses an existing dest name whenever the
-/// SAME source object recurs under a colliding name across repeated calls
-/// (its dest-scoped `QPDFObjGen -> name` map, populated once and consulted
-/// on every subsequent `mergeResources` call against that same dest dict).
-/// This function only checks the single colliding name within one call, so a
-/// dest whose pre-existing `/DR` already has a genuine conflict would mint a
-/// new `_N` suffix on every repeat placement instead of reusing the first
-/// one. No shipped fixture drives repeated placements onto a
-/// pre-conflicting dest `/DR` yet; revisit alongside `adjustDefaultAppearances`
-/// / `adjustAppearanceStream`, which need the reused name to stay stable
-/// across placements to rewrite every copy consistently.
+/// Dest-scoped rename reuse: qpdf's `mergeResources` maintains a
+/// `QPDFObjGen -> name` map on the dest `/DR` so the same colliding source
+/// object gets the same renamed dest name on every subsequent call. Callers
+/// therefore share a single `dr_map` across every merge into the same
+/// destination (see `apply_aggregated_sources` in `overlay.rs`); when a
+/// collision recurs and `dr_map` already records the rename and the mapped
+/// dest name still holds the same source ref, the rename is reused rather
+/// than minting a fresh `_N`. Byte parity across repeated placements onto a
+/// pre-conflicting dest `/DR` depends on this reuse — every field's `/DA` and
+/// every AP stream must reference the same renamed name across pages.
 fn merge_resources_shallow<R: Read + Seek>(
     dest: &mut Pdf<R>,
     dest_dr: ObjectRef,
@@ -1498,6 +1497,28 @@ fn merge_resources_shallow<R: Read + Seek>(
                     );
                     if same_object {
                         continue;
+                    }
+                    // If this source object was already renamed on a prior
+                    // merge call against the same dest `/DR` (dr_map recorded
+                    // the mapping, and the mapped dest name still holds this
+                    // same source ref), reuse that name instead of minting a
+                    // fresh `_N`. Mirrors qpdf's dest-scoped
+                    // `QPDFObjGen -> name` reuse map: byte parity across
+                    // repeated placements onto the same dest depends on the
+                    // colliding source object producing the same renamed
+                    // name every time.
+                    let existing_rename = dr_map
+                        .get(type_key.as_slice())
+                        .and_then(|m| m.get(name))
+                        .cloned();
+                    if let Some(mapped) = existing_rename {
+                        let mapped_holds_same_source = matches!(
+                            (new_type_dict.get(&mapped), val),
+                            (Some(Object::Reference(d)), Object::Reference(s)) if d == s
+                        );
+                        if mapped_holds_same_source {
+                            continue;
+                        }
                     }
                     let new_name = unique_dr_name(name, &new_type_dict)?;
                     new_type_dict.insert(&new_name, val.clone());
@@ -2158,6 +2179,57 @@ mod tests {
         assert_eq!(merged.get_ref("F1"), Some(courier_ref));
     }
 
+    /// Two `merge_resources_shallow` calls against the SAME dest `/DR` with
+    /// the SAME conflicting source: the first call renames `F1` → `F1_1`
+    /// and records the mapping in `dr_map`; the second call must reuse
+    /// `F1_1` (dr_map already carries the mapping and dest's `F1_1` still
+    /// holds the source ref) rather than minting `F1_2`. This is qpdf's
+    /// dest-scoped rename-reuse invariant; every field's `/DA` and every
+    /// AP stream needs the renamed name to stay stable across placements
+    /// or byte parity breaks.
+    #[test]
+    fn merge_resources_shallow_reuses_prior_rename_across_repeated_calls() {
+        let mut pdf = open_minimal();
+        let helv_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let courier_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("BaseFont", Object::Name(b"Courier".to_vec()))],
+        );
+        let dest_dr = set_font_dr(&mut pdf, 2, &[("F1", helv_ref)]);
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", courier_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+        // First call: F1 collision renamed to F1_1.
+        assert_eq!(
+            dr_map
+                .get(b"Font".as_slice())
+                .and_then(|m| m.get(b"F1".as_slice())),
+            Some(&b"F1_1".to_vec())
+        );
+
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+        // Second call: reuse F1_1 (do NOT mint F1_2).
+        assert_eq!(
+            dr_map
+                .get(b"Font".as_slice())
+                .and_then(|m| m.get(b"F1".as_slice())),
+            Some(&b"F1_1".to_vec())
+        );
+        let font = font_dict(&mut pdf, dest_dr);
+        assert_eq!(font.get_ref("F1"), Some(helv_ref));
+        assert_eq!(font.get_ref("F1_1"), Some(courier_ref));
+        assert!(
+            font.get("F1_2").is_none(),
+            "second call must reuse F1_1 rather than minting F1_2"
+        );
+    }
+
     // ---- ensure_dest_acroform_dr -------------------------------------------
 
     #[test]
@@ -2385,8 +2457,8 @@ mod tests {
     /// structure rather than exact bytes so this runs without the
     /// `qpdf-zlib-compat` feature. Restricted to destination page 1 only
     /// (`to: "1"`) so it drives exactly one merge call — the multi-page
-    /// repeat-placement reuse gap documented on `merge_resources_shallow` is
-    /// out of scope here.
+    /// repeated-placement reuse case is covered separately by
+    /// `overlay_pipeline_repeated_placements_reuse_dr_rename_end_to_end`.
     #[test]
     fn overlay_pipeline_renames_colliding_dr_font_end_to_end() {
         use crate::overlay::{apply_overlay_specs, OverlayKind, OverlaySpec};
@@ -2458,6 +2530,63 @@ mod tests {
         assert!(
             saw_rewritten_da,
             "expected at least one copied field's /DA rewritten to /F1_1"
+        );
+    }
+
+    /// Repeated placements onto multiple dest pages: after page 1 renames
+    /// the colliding /F1 → /F1_1, every subsequent page must reuse /F1_1
+    /// rather than mint /F1_2, /F1_3, ... . qpdf's byte gate expects a
+    /// single renamed entry regardless of page count; the dr_map lifetime
+    /// (per-dest, threaded through apply_aggregated_sources) and the
+    /// rename-reuse branch in merge_resources_shallow are what enforce this.
+    #[test]
+    fn overlay_pipeline_repeated_placements_reuse_dr_rename_end_to_end() {
+        use crate::overlay::{apply_overlay_specs, OverlayKind, OverlaySpec};
+        use crate::page_range::PageRange;
+        use std::path::Path;
+
+        fn fixture(name: &str) -> Pdf<std::io::BufReader<std::fs::File>> {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/compat")
+                .join(name);
+            let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+            Pdf::open(std::io::BufReader::new(file)).unwrap()
+        }
+        fn pr(input: &str) -> PageRange {
+            PageRange::parse(input).unwrap_or_else(|e| panic!("parse {input:?}: {e}"))
+        }
+
+        let mut dest = fixture("fxo-red-with-existing-acroform-dr.pdf");
+        let src = fixture("form-fields-and-annotations.pdf");
+        // Overlay the single source page onto three dest pages (--repeat=1
+        // cycles it). qpdf's mergeResources fires once per page against the
+        // shared dest /DR; without dest-scoped rename reuse this would mint
+        // F1_2 and F1_3 on pages 2 and 3.
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr("1-3"),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+
+        let root_ref = dest.root_ref().unwrap();
+        let catalog = dest.resolve(root_ref).unwrap().into_dict().unwrap();
+        let acroform_ref = catalog.get_ref("AcroForm").unwrap();
+        let acroform = dest.resolve(acroform_ref).unwrap().into_dict().unwrap();
+        let dr_ref = acroform.get_ref("DR").unwrap();
+        let font = font_dict(&mut dest, dr_ref);
+
+        assert!(font.get("F1").is_some(), "original /F1 preserved");
+        assert!(font.get("F1_1").is_some(), "collision renamed to /F1_1");
+        assert!(
+            font.get("F1_2").is_none(),
+            "second page must reuse /F1_1, not mint /F1_2"
+        );
+        assert!(
+            font.get("F1_3").is_none(),
+            "third page must reuse /F1_1, not mint /F1_3"
         );
     }
 }

@@ -246,6 +246,7 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     dest: &mut Pdf<R>,
     dest_page_ref: ObjectRef,
     sources: &[OverlaySource],
+    dr_map: &mut crate::overlay_annotations::DrMap,
 ) -> Result<()> {
     // qpdf orders sources underlays-then-overlays for BOTH naming and drawing.
     // Build the two typed Vecs in a single pass over `sources` in encounter
@@ -348,10 +349,12 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     let mut content = String::new();
     let mut new_top_fields: Vec<ObjectRef> = Vec::new();
     let mut dest_acroform_dr: Option<ObjectRef> = None;
-    // One `dr_map` per destination page, alongside `dest_acroform_dr` (same
-    // lifecycle: created fresh here, threaded through every placement on
-    // this page). See `overlay_annotations::DrMap`.
-    let mut dr_map = crate::overlay_annotations::DrMap::new();
+    // `dr_map` lifetime is per-destination (created by the caller,
+    // `apply_aggregated_sources`, and threaded through every page). qpdf's
+    // resource-name rename reuse is dest-scoped, not page-scoped: the same
+    // colliding source object must yield the same renamed dest name every
+    // time it lands on `dest_acroform_dr`, otherwise every page mints a
+    // fresh `_N` suffix and byte parity breaks.
     for (name, xref, template) in &underlay_names {
         let (bbox, fmatrix) = fo_bbox_and_matrix(dest, *xref)?;
         let (fragment, cm) =
@@ -369,7 +372,7 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
                 tpl,
                 cm,
                 &mut dest_acroform_dr,
-                &mut dr_map,
+                dr_map,
             )?;
             // cov:ignore-end
             new_top_fields.append(&mut added);
@@ -395,7 +398,7 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
                 tpl,
                 cm,
                 &mut dest_acroform_dr,
-                &mut dr_map,
+                dr_map,
             )?;
             // cov:ignore-end
             new_top_fields.append(&mut added);
@@ -755,9 +758,15 @@ fn apply_aggregated_sources<R: Read + Seek>(
     // Snapshot the dest page refs once; the patches mutate page dicts in place
     // but never reorder or remove page objects, so 1-based numbers stay valid.
     let dest_pages = page_refs(dest)?;
+    // One `dr_map` per destination document, threaded through every per-page
+    // call. Mirrors qpdf's dest-scoped resource-name reuse (see the invariant
+    // note on `merge_resources_shallow`): the same colliding source object
+    // must yield the same renamed dest name across every page it lands on,
+    // rather than growing a fresh `_N` suffix per page.
+    let mut dr_map = crate::overlay_annotations::DrMap::new();
     for (dest_page, sources) in by_page {
         let dest_ref = page_ref_for(&dest_pages, dest_page, "destination")?;
-        apply_overlays_to_page(dest, dest_ref, &sources)?;
+        apply_overlays_to_page(dest, dest_ref, &sources, &mut dr_map)?;
     }
     Ok(())
 }
@@ -1265,6 +1274,7 @@ mod byte_gate {
         // Import source page 1 into dest as a Form XObject, then apply it as a
         // single overlay onto dest page 1.
         let imported = import_page_as_form_xobject(&mut dest, &mut source, source_page).unwrap();
+        let mut dr_map = crate::overlay_annotations::DrMap::new();
         apply_overlays_to_page(
             &mut dest,
             dest_page,
@@ -1273,6 +1283,7 @@ mod byte_gate {
                 xobject_ref: imported,
                 annot_template: None,
             }],
+            &mut dr_map,
         )
         .unwrap();
 
@@ -2506,6 +2517,7 @@ mod tests {
         let page_ref = ObjectRef::new(3, 0);
         let overlay = insert_form_xobject(&mut pdf, [0, 0, 612, 792], b"overlay content");
 
+        let mut dr_map = crate::overlay_annotations::DrMap::new();
         apply_overlays_to_page(
             &mut pdf,
             page_ref,
@@ -2514,6 +2526,7 @@ mod tests {
                 xobject_ref: overlay,
                 annot_template: None,
             }],
+            &mut dr_map,
         )
         .unwrap();
 
@@ -2580,6 +2593,7 @@ mod tests {
         let overlay = insert_form_xobject(&mut pdf, [0, 0, 612, 792], b"over");
         let underlay = insert_form_xobject(&mut pdf, [0, 0, 612, 792], b"under");
 
+        let mut dr_map = crate::overlay_annotations::DrMap::new();
         apply_overlays_to_page(
             &mut pdf,
             page_ref,
@@ -2595,6 +2609,7 @@ mod tests {
                     annot_template: None,
                 },
             ],
+            &mut dr_map,
         )
         .unwrap();
 
@@ -2661,6 +2676,7 @@ mod tests {
         // Source XObject /BBox = the source page's TrimBox.
         let src = insert_form_xobject(&mut pdf, [20, 20, 220, 100], b"src");
 
+        let mut dr_map = crate::overlay_annotations::DrMap::new();
         apply_overlays_to_page(
             &mut pdf,
             page_ref,
@@ -2669,6 +2685,7 @@ mod tests {
                 xobject_ref: src,
                 annot_template: None,
             }],
+            &mut dr_map,
         )
         .unwrap();
 
@@ -2709,6 +2726,7 @@ mod tests {
         ));
         let page_ref = ObjectRef::new(3, 0);
         let src = insert_form_xobject(&mut pdf, [0, 0, 100, 100], b"src");
+        let mut dr_map = crate::overlay_annotations::DrMap::new();
         apply_overlays_to_page(
             &mut pdf,
             page_ref,
@@ -2717,6 +2735,7 @@ mod tests {
                 xobject_ref: src,
                 annot_template: None,
             }],
+            &mut dr_map,
         )
         .unwrap();
         let contents_ref = match pdf
@@ -2765,7 +2784,8 @@ mod tests {
     fn apply_rejects_non_page() {
         // Object 2 is /Type /Pages, not /Page -> /Fx0 conversion fails.
         let mut pdf = open(one_page_doc("x"));
-        let err = apply_overlays_to_page(&mut pdf, ObjectRef::new(2, 0), &[]);
+        let mut dr_map = crate::overlay_annotations::DrMap::new();
+        let err = apply_overlays_to_page(&mut pdf, ObjectRef::new(2, 0), &[], &mut dr_map);
         assert!(matches!(err, Err(Error::Unsupported(_))));
     }
 
