@@ -279,3 +279,61 @@ fn cli_swapped_box_r90_overlay_self_is_byte_identical() {
     );
     assert_bytes(&bytes, "swapped-box-r90-overlay-self.pdf");
 }
+
+// ── QDF variants: --qdf --no-original-object-ids ─────────────────────────────
+//
+// Mirrors the library `overlay::byte_gate::write_qdf_nooid` recipe. The
+// full-rewrite promotion still comes from overlay-presence; --qdf adds the
+// QDF writer path (uncompressed streams, object-number relaying, xref table
+// form) and --no-original-object-ids reissues object numbers sequentially.
+
+const QDF: &[&str] = &["--qdf", "--no-original-object-ids"];
+
+#[test]
+fn cli_three_page_overlay_one_page_qdf_is_byte_identical() {
+    let src = fixture("one-page.pdf");
+    let bytes = run_cli(
+        QDF,
+        "three-page.pdf",
+        &["--overlay", src.to_str().unwrap(), "--"],
+    );
+    assert_bytes(&bytes, "three-page-overlay-one-page-qdf.pdf");
+}
+
+#[test]
+fn cli_three_page_overlay_and_underlay_qdf_is_byte_identical() {
+    let a = fixture("one-page.pdf");
+    let b = fixture("two-page.pdf");
+    let bytes = run_cli(
+        QDF,
+        "three-page.pdf",
+        &[
+            "--overlay",
+            a.to_str().unwrap(),
+            "--",
+            "--underlay",
+            b.to_str().unwrap(),
+            "--",
+        ],
+    );
+    assert_bytes(&bytes, "three-page-overlay-and-underlay-qdf.pdf");
+}
+
+#[test]
+fn cli_three_page_two_overlays_qdf_is_byte_identical() {
+    let a = fixture("one-page.pdf");
+    let b = fixture("two-page.pdf");
+    let bytes = run_cli(
+        QDF,
+        "three-page.pdf",
+        &[
+            "--overlay",
+            a.to_str().unwrap(),
+            "--",
+            "--overlay",
+            b.to_str().unwrap(),
+            "--",
+        ],
+    );
+    assert_bytes(&bytes, "three-page-two-overlays-qdf.pdf");
+}
