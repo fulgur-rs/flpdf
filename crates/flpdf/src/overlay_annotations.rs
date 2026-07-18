@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 use crate::acroform_document_helper::{collect_reachable_refs, collect_refs_in_object};
+use crate::parser::{is_delimiter, is_ws, Parser};
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 
 /// Bound field-tree /Parent walks (widget → top-level field). Mirrors the
@@ -476,6 +477,7 @@ pub(crate) fn apply_placement<R: Read + Seek>(
                 &mut per_placement_dup,
                 *dest_acroform_dr,
                 overrides.as_ref(),
+                dr_map,
             )?; // cov:ignore: control-flow marker — llvm-cov instrumentation artifact
             if added_top_field_set.insert(new_top) {
                 new_top_fields.push(new_top);
@@ -565,12 +567,19 @@ fn allocate_next_ref<R: Read + Seek>(dest: &Pdf<R>) -> Result<ObjectRef> {
 /// both the top-level field and every kid receive the reset). Radio button
 /// kids are self-field annotations and each carry an inline `/DR` in the
 /// source, so kid-level reset is required for parity.
+///
+/// When `dr_map` is non-empty, every visited field's `/DA` (if present) is
+/// additionally rewritten via [`adjust_default_appearance`] (qpdf
+/// `adjustDefaultAppearances`, called from `transformAnnotations` line
+/// 932-934) so a `/DA` referencing a source `/DR/Font` name that collided
+/// during the merge points at the renamed dest name instead.
 fn duplicate_field_tree<R: Read + Seek>(
     dest: &mut Pdf<R>,
     top_ref: ObjectRef,
     per_placement_dup: &mut BTreeMap<ObjectRef, ObjectRef>,
     dest_dr: Option<ObjectRef>,
     overrides: Option<&InheritedOverrides>,
+    dr_map: &DrMap,
 ) -> Result<ObjectRef> {
     let new_top = match per_placement_dup.get(&top_ref) {
         Some(&existing) => return Ok(existing),
@@ -578,6 +587,26 @@ fn duplicate_field_tree<R: Read + Seek>(
             let new = shallow_dup_indirect(dest, top_ref)?;
             per_placement_dup.insert(top_ref, new);
             new
+        }
+    };
+
+    // Pre-resolve the dest `/DR` dict ONCE (rather than per visited field)
+    // when there is a rename to apply. Every field visited by this BFS that
+    // still carries a `/DR` key gets it reset to `dest_dr` below, and a field
+    // without one inherits `/AcroForm/DR` (also `dest_dr`) — so `dest_dr`'s
+    // resolved dict is the correct `/DA` resource-lookup surface for every
+    // node in this walk. `dr_map` is only ever populated inside
+    // `ensure_dest_acroform_dr` (via `merge_resources_shallow`), which always
+    // sets the caller's `dest_acroform_dr` to `Some` before returning, so
+    // `dr_map` non-empty implies `dest_dr` is `Some` here; the `None` arm is
+    // a defensive fallback for that invariant, not a path any shipped
+    // fixture reaches.
+    let da_resources: Option<crate::Dictionary> = if dr_map.is_empty() {
+        None
+    } else {
+        match dest_dr {
+            Some(dr_ref) => dest.resolve(dr_ref)?.into_dict(),
+            None => None, // cov:ignore: dr_map non-empty implies dest_dr is Some (see comment above); defensive only
         }
     };
 
@@ -666,10 +695,163 @@ fn duplicate_field_tree<R: Read + Seek>(
             adjust_inherited_field(dest, dup_ref, &mut dict, ov, per_placement_dup)?;
         }
 
+        // Rewrite this field's /DA to reference the renamed dest resource
+        // name (qpdf transformAnnotations line 932-934 →
+        // adjustDefaultAppearances). Runs after adjust_inherited_field so a
+        // /DA that was just pinned from the source /AcroForm default above
+        // is also covered. `remove` (not `get().cloned()`) moves the string
+        // out since `dict` is owned here — see pdf-rust-review-patterns.md
+        // rule 1.
+        if let Some(resources) = da_resources.as_ref() {
+            match dict.remove("DA") {
+                Some(Object::String(da)) => {
+                    let new_da = adjust_default_appearance(&da, dr_map, resources);
+                    dict.insert("DA", Object::String(new_da));
+                }
+                Some(other) => {
+                    dict.insert("DA", other); // cov:ignore: malformed /DA (non-string) — no shipped fixture supplies this shape
+                }
+                None => {}
+            }
+        }
+
         dest.set_object(dup_ref, Object::Dictionary(dict));
     }
 
     Ok(new_top)
+}
+
+/// Rewrite the Font-resource name in a `/DA` string according to `dr_map`,
+/// matching qpdf `QPDFAcroFormDocumentHelper::adjustDefaultAppearances`
+/// (`libqpdf/QPDFAcroFormDocumentHelper.cc`, called from
+/// `transformAnnotations` line 932-934).
+///
+/// `/DA` is a content-stream fragment restricted to colour-setting operators
+/// and `Tf` (ISO 32000-2 12.7.3.3), e.g. `0 0.4 0 rg /F1 18 Tf`. This scans
+/// the fragment for the name token most recently seen before each `Tf`
+/// operator (mirroring qpdf's `ResourceFinder`, which tracks a single
+/// `last_name` overwritten by every name token and consulted whenever an
+/// operator maps to a resource type) and rewrites that name's bytes to
+/// `dr_map["Font"][name]` when BOTH:
+/// - `dr_map` records a rename for that name under the `Font` category
+///   (populated by [`merge_resources_shallow`] when the source `/DR/Font`
+///   entry collided with an existing dest entry under the same name), AND
+/// - `resources`'s `/Font` sub-dictionary still carries that ORIGINAL name
+///   as a key — a defensive guard against renaming a name that happens to
+///   collide with a `dr_map` key from an unrelated context. In practice this
+///   is a no-op superset check: `merge_resources_shallow` always keeps the
+///   original colliding name in the merged dest `/DR/Font` alongside the
+///   `{name}_N` rename, so any name recorded in `dr_map` is always present.
+///
+/// Every other byte — whitespace, unrelated names, other operators, string
+/// and numeric operands — is copied through unchanged, so the result is
+/// byte-identical to `da` except at the rewritten name's exact span.
+///
+/// This is an inline tokenizer scoped to the `/DA` subset (delegates operand
+/// lexing to the shared [`Parser`] but does not use the general
+/// [`crate::content_stream::ContentStreamParser`], which does not track
+/// per-token byte offsets).
+///
+/// Returns `da.to_vec()` verbatim, without scanning, when `dr_map` is empty
+/// (the common case: no placement recorded a rename on this dest page).
+fn adjust_default_appearance(da: &[u8], dr_map: &DrMap, resources: &crate::Dictionary) -> Vec<u8> {
+    if dr_map.is_empty() {
+        return da.to_vec();
+    }
+    let font_renames = dr_map.get(b"Font".as_slice());
+    let font_resources = resources.get("Font").and_then(Object::as_dict);
+
+    let mut out: Vec<u8> = Vec::with_capacity(da.len());
+    // Byte span of the most recently seen name token WITHIN `out` (not
+    // `da` — needed so `Vec::splice` can replace it in place) plus its
+    // decoded value. Overwritten by every subsequent name token; consumed
+    // (reset to `None`) only when a `Tf` operator actually applies it, so a
+    // later stray `Tf` cannot re-splice an already-rewritten span.
+    let mut last_name: Option<(usize, usize, Vec<u8>)> = None;
+    let mut pos = 0usize;
+    while pos < da.len() {
+        let byte = da[pos];
+        if is_ws(byte) {
+            let start = pos;
+            while pos < da.len() && is_ws(da[pos]) {
+                pos += 1;
+            }
+            out.extend_from_slice(&da[start..pos]);
+            continue;
+        }
+        if byte == b'%' {
+            // `%` comment: copied verbatim to end of line. `/DA` fragments
+            // rarely carry comments, but the token grammar permits them
+            // (ISO 32000-2 7.8.2).
+            let start = pos;
+            while pos < da.len() && !matches!(da[pos], b'\n' | b'\r') {
+                pos += 1;
+            }
+            out.extend_from_slice(&da[start..pos]);
+            continue;
+        }
+        if byte == b'/'
+            || byte == b'('
+            || byte == b'<'
+            || byte == b'['
+            || matches!(byte, b'+' | b'-' | b'.' | b'0'..=b'9')
+        {
+            // Operand: delegate to the shared object lexer (numbers,
+            // strings, names, arrays, dictionaries) that
+            // `crate::content_stream` also reuses verbatim, so name/string
+            // escaping matches the rest of the crate exactly rather than
+            // reimplementing it here.
+            let mut parser = Parser::new_no_reference(&da[pos..]);
+            match parser.parse_one_object() {
+                Ok(obj) => {
+                    let end = pos + parser.position();
+                    let out_start = out.len();
+                    out.extend_from_slice(&da[pos..end]);
+                    if let Object::Name(name) = obj {
+                        last_name = Some((out_start, out.len(), name));
+                    }
+                    pos = end;
+                }
+                Err(_) => {
+                    // Malformed operand: copy one byte verbatim and resume
+                    // (tolerant scanning — mirrors `/DA` parsing elsewhere in
+                    // the crate, which also recovers from bad tokens rather
+                    // than aborting the whole string).
+                    out.push(byte);
+                    pos += 1;
+                }
+            }
+            continue;
+        }
+        // Operator keyword: bytes up to the next whitespace/delimiter.
+        let start = pos;
+        while pos < da.len() && !is_ws(da[pos]) && !is_delimiter(da[pos]) {
+            pos += 1;
+        }
+        if pos == start {
+            // Stray delimiter that did not start a recognised operand (e.g.
+            // an unmatched `)`); copy the single byte verbatim and resume.
+            out.push(da[pos]);
+            pos += 1;
+            continue;
+        }
+        out.extend_from_slice(&da[start..pos]);
+        if &da[start..pos] == b"Tf" {
+            if let Some((out_start, out_end, name)) = last_name.take() {
+                let renamed = font_renames.and_then(|m| m.get(name.as_slice()));
+                if let Some(new_name) = renamed {
+                    let present = font_resources.is_some_and(|d| d.get(name.as_slice()).is_some());
+                    if present {
+                        let mut replacement = Vec::with_capacity(new_name.len() + 1);
+                        replacement.push(b'/');
+                        replacement.extend_from_slice(new_name);
+                        out.splice(out_start..out_end, replacement);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Duplicate each `/AP` appearance stream referenced from the annot at
