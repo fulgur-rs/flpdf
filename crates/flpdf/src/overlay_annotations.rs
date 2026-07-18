@@ -665,7 +665,7 @@ fn duplicate_field_tree<R: Read + Seek>(
         // cov:ignore-end
         match dr_dict.as_ref().and_then(|d| d.get("Font").cloned()) {
             Some(Object::Dictionary(font)) => Some(font),
-            Some(Object::Reference(font_ref)) => dest.resolve(font_ref)?.into_dict(),
+            Some(Object::Reference(font_ref)) => dest.resolve(font_ref)?.into_dict(), // cov:ignore: indirect /DR/Font — no shipped byte-gate fixture supplies this shape (Layer 1 fixture uses direct /Font), kept for robustness matching merge_resources_shallow's indirect handling.
             // cov:ignore-start: /DR without /Font or with a non-dict/-ref
             // /Font value — no shipped fixture supplies this shape.
             _ => None,
@@ -1505,6 +1505,15 @@ fn merge_resources_shallow<R: Read + Seek>(
     let Some(mut dest_dict) = dest.resolve(dest_dr)?.into_dict() else {
         return Ok(()); // cov:ignore: defensive early return
     };
+    // Reset the placement-scoped name map to the identity mappings this
+    // merge is about to establish. `by_source_ref` is dest-scoped and
+    // persists (that is how repeated collisions from the same source object
+    // reuse a prior rename); `by_name` describes only THIS placement's
+    // fields' /DA rewrite plan, so a stale entry from a prior merge of a
+    // different source must NOT leak into
+    // `adjust_default_appearance`'s lookup during the field-tree walk that
+    // follows this merge.
+    dr_map.by_name.clear();
     // PDF permits `/Font <ref>` (indirect resource-type sub-dict) as well as
     // the direct-dict shape; qpdf's `QPDFObjectHandle::mergeResources`
     // operates on resolved QPDFObjectHandle values, so both shapes must
@@ -2263,6 +2272,55 @@ mod tests {
         let merged = pdf.resolve(new_font_ref).unwrap().into_dict().unwrap();
         assert_eq!(merged.get_ref("F0"), Some(helv_ref));
         assert_eq!(merged.get_ref("F1"), Some(courier_ref));
+    }
+
+    /// A stale `by_name` entry from a prior merge must NOT leak into the
+    /// next placement. Concretely: source A collides and records
+    /// `by_name[Font][F1] = F1_1`; source B's `/F1` is a same-object no-op
+    /// (its Font equals dest's `F1`), so this merge records nothing new.
+    /// `by_name` after B's merge must be empty (not still {F1: F1_1}), so
+    /// `adjust_default_appearance` running on B's fields does not rewrite
+    /// B's `/F1` to `/F1_1` — which would be catastrophic, since dest's
+    /// `/F1_1` is actually A's font.
+    #[test]
+    fn merge_resources_shallow_clears_stale_by_name_between_source_merges() {
+        let mut pdf = open_minimal();
+        let times_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Times-Roman".to_vec()))],
+        );
+        let helv_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let dest_dr = set_font_dr(&mut pdf, 2, &[("F1", times_ref)]);
+        let source_a = set_font_dr(&mut pdf, 3, &[("F1", helv_ref)]);
+        // Source B's /F1 points at times_ref, the SAME object dest already
+        // holds under /F1 → same_object short-circuit fires, no rename.
+        let source_b = set_font_dr(&mut pdf, 4, &[("F1", times_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_a, &mut dr_map).unwrap();
+        assert_eq!(
+            dr_map
+                .category(b"Font")
+                .and_then(|m| m.get(b"F1".as_slice())),
+            Some(&b"F1_1".to_vec()),
+        );
+
+        merge_resources_shallow(&mut pdf, dest_dr, source_b, &mut dr_map).unwrap();
+        assert!(
+            dr_map.is_empty(),
+            "by_name must clear at merge start so B's fields don't inherit A's F1→F1_1 mapping"
+        );
+        // by_source_ref (dest-scoped) must still remember A's rename.
+        assert_eq!(
+            dr_map.by_source_ref.get(&(b"Font".to_vec(), helv_ref)),
+            Some(&b"F1_1".to_vec()),
+            "by_source_ref must persist across merges (dest-scoped reuse map)",
+        );
     }
 
     /// Reuse must be keyed by SOURCE `ObjectRef`, not by source name. If
