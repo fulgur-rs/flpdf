@@ -1762,6 +1762,12 @@ mod byte_gate {
     ///     `/Tx BMC q BT /F1_1 18 Tf ... ET Q EMC` with its own
     ///     `/Resources/Font/F1_1` pointing at the Courier font — proving
     ///     `ResourceReplacer` fired on the stream, not just the `/DA` string.
+    // cov:ignore-start: the test body is instrumented by llvm-cov but never
+    // executes on this branch because it is `#[ignore]`d until Layer 4 wires
+    // up `adjust_appearance_stream`. The body IS exercised (and byte-identical
+    // against the qpdf 11.9.0 golden) on the top of the stack; keeping it
+    // here means the golden and its test doc-comment land alongside the
+    // fixture that defines them, rather than being deferred to a later PR.
     #[test]
     #[ignore = "flpdf-4r6l Layer 4: enables when adjustAppearanceStream lands"]
     fn overlay_copy_annotations_onto_existing_acroform_dr_is_byte_identical_qdf() {
@@ -1789,6 +1795,7 @@ mod byte_gate {
         write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
         assert_byte_identical(&actual, "overlay-onto-existing-acroform-dr.pdf");
     }
+    // cov:ignore-end
 
     /// Overlay a source whose `/AcroForm` supplies `/DA` and `/Q` defaults
     /// onto a dest with no `/AcroForm`. Exercises qpdf's
