@@ -186,7 +186,7 @@ pub(crate) fn resource_replacer(content: &[u8], dr_map: &DrMap, resources: &Dict
                         out.splice(out_start..out_end, replacement);
                     }
                 }
-            }
+            } // cov:ignore: control-flow marker — llvm-cov instrumentation artifact
         }
     }
     out
