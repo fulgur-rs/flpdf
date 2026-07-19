@@ -1453,6 +1453,68 @@ mod tests {
     }
 
     #[test]
+    fn adjust_appearance_stream_undecodable_filter_keeps_resources_rename_but_leaves_content_stale()
+    {
+        // Unlike the CCITT test above, this stream's own /Resources/Font
+        // DOES have "F1" — a REAL collision, so the /Resources rename
+        // (steps 1-4) is not a no-op this time. The content still cannot
+        // be decoded (same CCITTFaxDecode passthrough codec), so step 5's
+        // content rewrite cannot run at all. This asserts flpdf's ACTUAL
+        // (verified) qpdf-matching behavior: qpdf performs the /Resources
+        // rename BEFORE its own try/catch'd tokenize step
+        // (`libqpdf/QPDFAcroFormDocumentHelper.cc:791-807` runs before
+        // `:824-849`), and does NOT roll the rename back when the
+        // subsequent tokenize fails — confirmed by fetching qpdf's actual
+        // source for roborev PR #490 iter-3 finding 3, which proposed a
+        // rollback; a rollback would have been the qpdf DIVERGENCE, so it
+        // was declined and this test instead documents the verified,
+        // matching (if internally inconsistent-looking) result: the dict
+        // says "F1_1", the content still says "F1" — exactly like qpdf.
+        let mut pdf = open_minimal();
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F1", Object::Integer(1));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", Object::Dictionary(font_dict));
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[
+                ("Resources", Object::Dictionary(resources)),
+                ("Filter", Object::Name(b"CCITTFaxDecode".to_vec())),
+            ],
+            b"\x00\x01/F1 opaque-ccitt-bytes",
+        );
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+
+        let result = adjust_appearance_stream(&mut pdf, ap_ref, &dr_map);
+        assert!(
+            result.is_ok(),
+            "an undecodable AP stream content must not fail the whole call"
+        );
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(
+            stream.data, b"\x00\x01/F1 opaque-ccitt-bytes",
+            "content bytes must be left exactly as read — qpdf does not roll \
+             back a rename it already applied to /Resources just because the \
+             later tokenize step failed"
+        );
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        assert_eq!(
+            font.get("F1_1"),
+            Some(&Object::Integer(1)),
+            "the /Resources dict rename (steps 1-4) still applies even though \
+             the content (step 5) could not be rewritten"
+        );
+        assert!(font.get("F1").is_none());
+    }
+
+    #[test]
     fn adjust_appearance_stream_rename_chain_matches_qpdf_verified_result() {
         // dr_map records a CHAIN within one category: F1->F1_1 AND,
         // independently, F1_1->F1_1_1 (both entries genuinely present in
