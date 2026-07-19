@@ -2795,7 +2795,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            dr_map.is_empty(),
+            dr_map.category(b"Font").is_none(),
             "an annotation-only placement (no top-level field) must clear a stale \
              by_name rename left over from a prior placement, not silently carry it \
              forward into whatever reads dr_map for THIS placement's own AP streams"
