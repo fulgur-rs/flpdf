@@ -440,6 +440,35 @@ impl DrMap {
     pub(crate) fn category(&self, category: &[u8]) -> Option<&BTreeMap<Vec<u8>, Vec<u8>>> {
         self.by_name.get(category)
     }
+
+    /// Every resource-type category with at least one recorded rename, as
+    /// populated by the most recent merge. Mirrors qpdf iterating `dr_map`'s
+    /// top-level keys in `AcroForm::adjustAppearanceStream`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:770-777`) to force each
+    /// category's sub-dictionary to exist (unshared) in an appearance
+    /// stream's own `/Resources` before renaming; see
+    /// [`crate::overlay_appearance_stream::adjust_appearance_stream`].
+    pub(crate) fn categories(&self) -> impl Iterator<Item = &Vec<u8>> {
+        self.by_name.keys()
+    }
+}
+
+#[cfg(test)]
+impl DrMap {
+    /// Test-only constructor: a `DrMap` with exactly one category
+    /// containing one `old -> new` rename, for unit tests elsewhere in the
+    /// crate (notably `overlay_appearance_stream`'s `resource_replacer`
+    /// tests) that need a populated map without driving a full
+    /// [`merge_resources_shallow`] call through a real `Pdf`. `by_name` is
+    /// otherwise private to this module.
+    pub(crate) fn for_test(category: &[u8], old: &[u8], new: &[u8]) -> Self {
+        let mut map = Self::new();
+        map.by_name
+            .entry(category.to_vec())
+            .or_default()
+            .insert(old.to_vec(), new.to_vec());
+        map
+    }
 }
 
 /// Per-placement annotation application:
@@ -580,7 +609,7 @@ pub(crate) fn apply_placement<R: Read + Seek>(
         // 3. Duplicate and cm-transform each /AP appearance stream. Streams
         //    are shared across placements otherwise, so a cm concat here would
         //    accumulate across placements. Per-annot dup guarantees isolation.
-        transform_annot_ap_streams(dest, new_annot_ref, cm)?;
+        transform_annot_ap_streams(dest, new_annot_ref, cm, dr_map)?;
 
         // 4. Transform the annot's /Rect by cm.
         transform_annot_rect(dest, new_annot_ref, cm)?;
@@ -1056,10 +1085,19 @@ fn da_operator_category(op: &[u8]) -> Option<&'static [u8]> {
 /// transformAnnotations line 992-1010), and rewrite the annot's `/AP` entries
 /// to point at the dup'd streams. Only walked at `/AP/{N,R,D}` and one nested
 /// dictionary level, matching qpdf's `apdict` traversal.
+///
+/// When `dr_map` is non-empty, each dup'd stream is additionally passed to
+/// [`crate::overlay_appearance_stream::adjust_appearance_stream`] (qpdf
+/// `AcroForm::adjustAppearanceStream`, called from `transformAnnotations`
+/// line 1156-1161) so a `/Resources` name that collided during the `/DR`
+/// merge is privatized, renamed, and rewritten in the stream's own content —
+/// every nested per-state stream (`/N/1`, `/N/Off`, ...) is adjusted
+/// independently, matching qpdf's per-stream loop at the same call site.
 fn transform_annot_ap_streams<R: Read + Seek>(
     dest: &mut Pdf<R>,
     annot_ref: ObjectRef,
     cm: [f64; 6],
+    dr_map: &DrMap,
 ) -> Result<()> {
     let Some(mut annot_dict) = dest.resolve(annot_ref)?.into_dict() else {
         return Ok(()); // cov:ignore: defensive early return
@@ -1081,6 +1119,11 @@ fn transform_annot_ap_streams<R: Read + Seek>(
         match val {
             Object::Reference(stream_ref) => {
                 if let Some(new_ref) = dup_and_transform_ap_stream(dest, stream_ref, cm)? {
+                    if !dr_map.is_empty() {
+                        crate::overlay_appearance_stream::adjust_appearance_stream(
+                            dest, new_ref, dr_map,
+                        )?;
+                    }
                     apdict.insert(&key, Object::Reference(new_ref));
                 }
             }
@@ -1094,6 +1137,11 @@ fn transform_annot_ap_streams<R: Read + Seek>(
                     };
                     if let Object::Reference(stream_ref) = sub_val {
                         if let Some(new_ref) = dup_and_transform_ap_stream(dest, stream_ref, cm)? {
+                            if !dr_map.is_empty() {
+                                crate::overlay_appearance_stream::adjust_appearance_stream(
+                                    dest, new_ref, dr_map,
+                                )?;
+                            }
                             sub.insert(&sub_key, Object::Reference(new_ref));
                         }
                     } // cov:ignore: control-flow marker — llvm-cov instrumentation artifact
