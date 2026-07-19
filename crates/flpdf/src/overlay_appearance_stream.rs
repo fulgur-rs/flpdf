@@ -423,19 +423,35 @@ fn ei_lookahead_passes(rest: &[u8]) -> bool {
 ///    per-call rename map from step 3 — the membership guard must see the
 ///    original names, since step 3 already renamed (removed) them from the
 ///    copy being written back. Steps 1–4 (the `/Resources` dictionary
-///    rewrite) always run; step 5 is best-effort: if the stream's content
-///    cannot be decoded or re-encoded (most commonly an unsupported
+///    rewrite) always run; step 5 is best-effort in one direction only: if
+///    the content **cannot be decoded** at all (most commonly an unsupported
 ///    `/Filter`), the content bytes are left exactly as read and only the
 ///    dictionary-level rename from steps 1–4 applies — matching qpdf's own
-///    `try`/`catch` around the equivalent step
+///    `try`/`catch` around its equivalent tokenize step
 ///    (`libqpdf/QPDFAcroFormDocumentHelper.cc:829-849`), which turns a
-///    content-parse failure into a warning rather than aborting.
+///    content-parse failure into a warning without rolling back the rename
+///    already made to `/Resources`. If the content **decodes** but the
+///    rewritten bytes cannot be **re-encoded under the original `/Filter`**
+///    (e.g. `/LZWDecode`, which flpdf can decode but not re-encode — see
+///    `crate::filters::apply_single_filter_encode`, decision
+///    flpdf-9hc.7.2), the rewritten content is instead re-encoded as
+///    `FlateDecode` and `/Filter`/`/DecodeParms` are replaced accordingly, so
+///    the dictionary rename and the content tokens never disagree about a
+///    resource's name. qpdf never needs this fallback: it installs
+///    `ResourceReplacer` as a token filter once the content tokenizes, and
+///    its writer re-serializes under its own default output filter
+///    (`FlateDecode`, since qpdf has no LZW encoder either) rather than
+///    reproducing the original filter's bytes — the Flate fallback here
+///    mirrors that write-time re-serialization.
 ///
 /// # Errors
 ///
-/// Propagates any error from [`Pdf::resolve`]. A content decode/re-encode
-/// failure is not one of them (see step 5 above) — it is swallowed and
-/// treated as "leave this stream's content unchanged", matching qpdf.
+/// Propagates any error from [`Pdf::resolve`]. A content decode or
+/// re-encode failure is not one of them (see step 5 above) — a decode
+/// failure is swallowed and leaves the content unchanged, matching qpdf; a
+/// re-encode failure is swallowed and instead re-encodes the rewritten
+/// content as `FlateDecode` so it stays consistent with the `/Resources`
+/// rename.
 pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
     dest: &mut Pdf<R>,
     ap_stream_ref: ObjectRef,
@@ -535,19 +551,49 @@ pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
         resources.remove(&key);
     }
 
-    // Best-effort content rewrite (step 5, see doc comment above): a
-    // decode/re-encode failure here — most commonly an unsupported
-    // `/Filter` chain (e.g. an image codec on an AP stream that also has a
-    // `/Resources` collision) — must NOT propagate. qpdf wraps its
-    // equivalent step in a `try`/`catch` that turns exactly this failure
-    // into a warning rather than aborting; propagating an `Err` here would
-    // fail the WHOLE overlay call chain over one unrelated AP stream, which
-    // real qpdf does not do. On failure, `stream.data` is simply left as
-    // read — only the `/Resources` dictionary rename above still applies.
+    // Best-effort content rewrite (step 5, see doc comment above): a decode
+    // failure here — most commonly an unsupported `/Filter` chain (e.g. an
+    // image codec on an AP stream that also has a `/Resources` collision) —
+    // must NOT propagate. qpdf wraps its equivalent tokenize step in a
+    // `try`/`catch` that turns exactly this failure into a warning rather
+    // than aborting; propagating an `Err` here would fail the WHOLE overlay
+    // call chain over one unrelated AP stream, which real qpdf does not do.
+    // On decode failure, `stream.data` is simply left as read — only the
+    // `/Resources` dictionary rename above still applies (matching qpdf,
+    // which does not roll back the rename either).
     if let Ok(decoded) = crate::filters::decode_stream_data(&stream.dict, &stream.data) {
         let new_decoded = resource_replacer(&decoded, &local_dr_map, &pre_rename_resources);
-        if let Ok(encoded) = crate::filters::encode_stream_data(&stream.dict, &new_decoded) {
-            stream.data = encoded;
+        match crate::filters::encode_stream_data(&stream.dict, &new_decoded) {
+            Ok(encoded) => stream.data = encoded,
+            Err(_) => {
+                // Re-encoding under the ORIGINAL `/Filter` failed — decodable
+                // but not re-encodable filters are exactly `/LZWDecode`
+                // (`crate::filters::apply_single_filter_encode`, decision
+                // flpdf-9hc.7.2: "flpdf writes stream compression as
+                // FlateDecode only ... qpdf has no LZW encoder either").
+                // Leaving `stream.data` untouched here (the pre-fix
+                // behavior) would strand the content on the OLD resource
+                // names while `/Resources` above already has the NEW ones —
+                // an inconsistent stream. Re-encode the rewritten content as
+                // `FlateDecode` instead, mirroring how qpdf's writer would
+                // re-serialize this same token-filtered content under its
+                // own default output filter rather than reproducing LZW.
+                // In-memory FlateDecode of already-decoded bytes does not
+                // fail in practice, so no further fallback is attempted.
+                let mut flate_dict = Dictionary::new();
+                flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+                if let Ok(encoded) = crate::filters::encode_stream_data(&flate_dict, &new_decoded) {
+                    stream.dict.remove("DecodeParms");
+                    stream
+                        .dict
+                        .insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+                    stream.dict.insert(
+                        "Length",
+                        Object::Integer(i64::try_from(encoded.len()).unwrap_or(i64::MAX)),
+                    );
+                    stream.data = encoded;
+                }
+            }
         }
     }
 
@@ -1364,5 +1410,102 @@ mod tests {
         );
         assert!(font.get("F1").is_none());
         assert!(font.get("F1_1").is_none());
+    }
+
+    /// Pack literal bytes as a minimal `/LZWDecode` stream: each byte is its
+    /// own literal code (codes 0-255 are always literal single-byte table
+    /// entries per PDF §7.4.4), followed by EOD (257). Every code stays 9
+    /// bits wide because so few codes are emitted the table never reaches
+    /// the first width-bump threshold (511 entries under the default
+    /// EarlyChange). flpdf has no LZW encoder (decision flpdf-9hc.7.2), so a
+    /// test needing LZW-encoded *input* must synthesize it directly —
+    /// mirrors `filters::tests::pack_lzw_9bit`, which cannot be reused here
+    /// since it is private to that module.
+    fn pack_lzw_9bit_literal(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf: u32 = 0;
+        let mut bits: u32 = 0;
+        let mut codes: Vec<u16> = bytes.iter().map(|&b| u16::from(b)).collect();
+        codes.push(257); // EOD
+        for code in codes {
+            buf = (buf << 9) | u32::from(code);
+            bits += 9;
+            while bits >= 8 {
+                bits -= 8;
+                out.push((buf >> bits) as u8);
+            }
+        }
+        if bits > 0 {
+            out.push((buf << (8 - bits)) as u8);
+        }
+        out
+    }
+
+    #[test]
+    fn adjust_appearance_stream_lzw_reencode_failure_falls_back_to_flate() {
+        // `/LZWDecode` is the one filter flpdf can decode but not re-encode
+        // (crate::filters::apply_single_filter_encode, decision
+        // flpdf-9hc.7.2). Unlike the CCITT test above, this stream's own
+        // /Resources/Font DOES have "F1", so dr_map's F1->F1_1 rename is a
+        // REAL rename, not a no-op. Before this fix, the /Resources rename
+        // still applied but the content-rewrite step silently discarded the
+        // token-replaced bytes on re-encode failure, leaving the content on
+        // the stale "/F1" name while /Resources only had "F1_1" — an
+        // inconsistent stream. This asserts the two stay consistent.
+        let mut pdf = open_minimal();
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F1", Object::Integer(1));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", Object::Dictionary(font_dict));
+
+        let lzw_bytes = pack_lzw_9bit_literal(b"/F1 18 Tf");
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[
+                ("Resources", Object::Dictionary(resources)),
+                ("Filter", Object::Name(b"LZWDecode".to_vec())),
+            ],
+            &lzw_bytes,
+        );
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+
+        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+
+        // Dict-level rename (steps 1-4) applied, as always.
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        assert_eq!(font.get("F1_1"), Some(&Object::Integer(1)));
+        assert!(font.get("F1").is_none());
+
+        // The content must agree: re-encoded as FlateDecode (flpdf cannot
+        // re-encode LZW), with the resource token renamed to match.
+        assert_eq!(
+            stream.dict.get("Filter"),
+            Some(&Object::Name(b"FlateDecode".to_vec())),
+            "un-re-encodable /LZWDecode must fall back to /FlateDecode"
+        );
+        assert!(
+            stream.dict.get("DecodeParms").is_none(),
+            "stale LZW /DecodeParms must not survive the filter swap"
+        );
+        let decoded_content =
+            crate::filters::decode_stream_data(&stream.dict, &stream.data).unwrap();
+        assert_eq!(
+            decoded_content, b"/F1_1 18 Tf",
+            "content must reference the RENAMED name, consistent with /Resources"
+        );
+        let expected_length = i64::try_from(stream.data.len()).unwrap();
+        assert_eq!(
+            stream.dict.get("Length"),
+            Some(&Object::Integer(expected_length)),
+            "/Length must match the newly re-encoded bytes"
+        );
     }
 }
