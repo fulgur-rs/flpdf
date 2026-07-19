@@ -98,16 +98,18 @@ fn resource_type_for_operator(op: &[u8]) -> Option<&'static [u8]> {
 /// `ResourceReplacer`) never re-lexes (`libqpdf/QPDFTokenizer.cc`'s
 /// `expectInlineImage`/`findEI`, called from
 /// `QPDFObjectHandle::parseContentStream_data` on every `ID` operator):
-/// once the `ID` operator is seen, everything up to the next
-/// delimiter-bounded `EI` is copied through byte-for-byte without being fed
-/// to the operand/operator lexer, so binary image data that happens to
-/// contain a byte sequence resembling a resource-name operand (e.g. `/F1 18
-/// Tf`) is never mistaken for one. This implements qpdf's primary
-/// delimiter-bounded-`EI` search only, not its secondary ten-token lookahead
-/// heuristic for disambiguating an `EI` byte sequence that occurs *inside*
-/// the image data itself — no shipped fixture needs that refinement, and
-/// the per-byte malformed-operand recovery above still guarantees
-/// termination even if a real file needed it.
+/// once the `ID` operator is seen, everything up to the terminating `EI` is
+/// copied through byte-for-byte without being fed to the operand/operator
+/// lexer, so binary image data that happens to contain a byte sequence
+/// resembling a resource-name operand (e.g. `/F1 18 Tf`) is never mistaken
+/// for one.
+///
+/// Locating that terminating `EI` is itself two-stage, matching qpdf's
+/// `Tokenizer::findEI`: a delimiter-bounded `EI` is found first
+/// ([`next_delimiter_bounded_ei`]), then [`ei_lookahead_passes`] reads up to
+/// the next 10 tokens (or EOF) to check the candidate isn't itself binary
+/// image data that happens to look like a delimiter-bounded `EI`. See
+/// [`find_inline_image_ei`] for the full search/fallback order.
 ///
 /// Returns `content.to_vec()` verbatim, without scanning, when `dr_map` is
 /// empty (the common case: no placement recorded a rename on this dest
@@ -205,26 +207,7 @@ pub(crate) fn resource_replacer(content: &[u8], dr_map: &DrMap, resources: &Dict
                 pos += 1;
             }
             let data_start = pos;
-            let mut ei_pos = content.len();
-            let mut i = data_start;
-            while i + 1 < content.len() {
-                if content[i] == b'E'
-                    && content[i + 1] == b'I'
-                    && (i == data_start || is_ws(content[i - 1]))
-                    && (i + 2 >= content.len()
-                        || is_ws(content[i + 2])
-                        || is_delimiter(content[i + 2]))
-                {
-                    ei_pos = i;
-                    break;
-                }
-                i += 1;
-            }
-            // `ei_pos` falls back to `content.len()` (copy everything to
-            // EOF as opaque data) when no delimiter-bounded `EI` is found —
-            // a truncated/malformed stream, handled the same tolerant way
-            // as every other recovery path in this scanner: never panic or
-            // hang.
+            let ei_pos = find_inline_image_ei(content, data_start);
             out.extend_from_slice(&content[data_start..ei_pos]);
             pos = ei_pos;
             continue;
@@ -248,6 +231,138 @@ pub(crate) fn resource_replacer(content: &[u8], dr_map: &DrMap, resources: &Dict
         }
     }
     out
+}
+
+/// Locate the `EI` that terminates inline image data starting at
+/// `data_start`, matching qpdf's `Tokenizer::findEI`
+/// (`libqpdf/QPDFTokenizer.cc`): a naive first-match search is wrong
+/// because binary image data can itself contain a byte sequence that looks
+/// exactly like a delimiter-bounded `EI`.
+///
+/// For every candidate found by [`next_delimiter_bounded_ei`],
+/// [`ei_lookahead_passes`] reads up to the next 10 tokens (or EOF) and
+/// rejects the candidate if any of them looks like it is still part of
+/// image data rather than real content — qpdf's assumption is that at
+/// least 10 tokens always separate one inline image's `EI` from the next
+/// `BI`/`ID`, since `/W`, `/H`, `/BPC`, `/CS`, `BI`, and `ID` are all
+/// required in between. The first candidate that passes wins. If every
+/// candidate found is rejected, the LAST one found is used anyway — qpdf's
+/// own fallback ("If we get to the end without finding one, return the
+/// last EI we found"), which is why a rejected candidate can still end up
+/// as the boundary and hand the bytes after it back to normal content
+/// scanning. If no delimiter-bounded `EI` exists at all, everything to EOF
+/// is treated as opaque data — a truncated/malformed stream, handled the
+/// same tolerant way as every other recovery path in this scanner: never
+/// panic or hang.
+fn find_inline_image_ei(content: &[u8], data_start: usize) -> usize {
+    let mut last_candidate: Option<usize> = None;
+    let mut search_pos = data_start;
+    while let Some(i) = next_delimiter_bounded_ei(content, data_start, search_pos) {
+        last_candidate = Some(i);
+        if ei_lookahead_passes(&content[i + 2..]) {
+            return i;
+        }
+        search_pos = i + 2;
+    }
+    last_candidate.unwrap_or(content.len())
+}
+
+/// Find the next `EI` at or after `from` that is bounded by whitespace (or
+/// the start of the inline image data, `data_start`) before it, and by
+/// whitespace, a delimiter, or EOF after it. Returns the byte offset of the
+/// `E`, or `None` if no such `EI` exists anywhere in the rest of `content`.
+fn next_delimiter_bounded_ei(content: &[u8], data_start: usize, from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < content.len() {
+        if content[i] == b'E'
+            && content[i + 1] == b'I'
+            && (i == data_start || is_ws(content[i - 1]))
+            && (i + 2 >= content.len() || is_ws(content[i + 2]) || is_delimiter(content[i + 2]))
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// qpdf's secondary disambiguation heuristic for [`find_inline_image_ei`]:
+/// read up to 10 tokens (or EOF) from `rest` — the bytes immediately after a
+/// candidate `EI` — matching `Tokenizer::findEI`'s inner lookahead loop
+/// (`libqpdf/QPDFTokenizer.cc`). Whitespace between tokens is free (does not
+/// consume a slot); a `%` comment consumes one slot but is never itself
+/// "bad" (matching qpdf's own tokenizer, which does not flag comments).
+///
+/// A candidate is rejected (this function returns `false`) as soon as any
+/// lookahead token is:
+/// - a malformed operand (an unterminated string, an invalid array/dict, …)
+///   — the shared object lexer's `Err` case, or
+/// - a stray delimiter that does not start a recognised operand (qpdf's
+///   `tt_bad`), or
+/// - a bare "word" (an operator-like keyword, or any other run of
+///   non-whitespace, non-delimiter bytes) containing a byte outside the
+///   printable 7-bit range (compared as a SIGNED byte, matching qpdf, so any
+///   byte `>= 0x80` counts, not just ASCII control codes), or mixing an
+///   alphabetic/`*` character with any other character — both patterns are
+///   qpdf's signal that this "word" is more likely raw image bytes than a
+///   real content-stream keyword.
+///
+/// Hitting EOF before 10 tokens, or getting through all 10 without
+/// triggering either condition, means the candidate is accepted.
+fn ei_lookahead_passes(rest: &[u8]) -> bool {
+    let mut pos = 0usize;
+    for _ in 0..10 {
+        while pos < rest.len() && is_ws(rest[pos]) {
+            pos += 1;
+        }
+        if pos >= rest.len() {
+            return true;
+        }
+        let byte = rest[pos];
+        if byte == b'%' {
+            while pos < rest.len() && !matches!(rest[pos], b'\n' | b'\r') {
+                pos += 1;
+            }
+            continue;
+        }
+        if byte == b'/'
+            || byte == b'('
+            || byte == b'<'
+            || byte == b'['
+            || matches!(byte, b'+' | b'-' | b'.' | b'0'..=b'9')
+        {
+            let mut parser = Parser::new_no_reference(&rest[pos..]);
+            match parser.parse_one_object() {
+                Ok(_) => {
+                    pos += parser.position();
+                    continue;
+                }
+                Err(_) => return false,
+            }
+        }
+        if is_delimiter(byte) {
+            return false;
+        }
+        let start = pos;
+        while pos < rest.len() && !is_ws(rest[pos]) && !is_delimiter(rest[pos]) {
+            pos += 1;
+        }
+        let mut found_alpha = false;
+        let mut found_other = false;
+        for &ch in &rest[start..pos] {
+            if ch.is_ascii_alphabetic() || ch == b'*' {
+                found_alpha = true;
+            } else if (ch as i8) < 32 {
+                return false;
+            } else {
+                found_other = true;
+            }
+        }
+        if found_alpha && found_other {
+            return false;
+        }
+    }
+    true
 }
 
 /// Privatize and rewrite an appearance stream's `/Resources` dictionary and
@@ -691,6 +806,118 @@ mod tests {
         let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content: &[u8] = b"BI /W 1 ID \x01/F1 18 Tf\x02";
         assert_eq!(resource_replacer(content, &dr_map, &resources), content);
+    }
+
+    #[test]
+    fn resource_replacer_inline_image_rejects_fake_ei_via_lookahead() {
+        // A delimiter-bounded "EI" sits INSIDE the image data, immediately
+        // followed by a byte (0xFF) that is not valid 7-bit content —
+        // qpdf's lookahead heuristic must reject it as still being part of
+        // the image, and keep scanning for a LATER, real `EI`. A naive
+        // first-match search (the pre-fix behaviour) would stop the image
+        // right at the fake `EI` and hand the rest — including the
+        // `/F1 18 Tf` lookalike operand embedded in the image data — to the
+        // normal token scanner, wrongly renaming it. With the lookahead,
+        // the embedded `/F1 18 Tf` must stay untouched, and only the real
+        // tokens before `BI` and after the genuine `EI` are renamed.
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        let resources = dict_with_subdict(b"Font", &[b"F1"]);
+        let content: &[u8] = b"/F1 18 Tf BI /W 1 /H 1 /BPC 8 /CS /G ID \x01\x02 EI \xFFzzzz /F1 18 Tf \x05\x06 EI /F1 18 Tf";
+        assert_eq!(
+            resource_replacer(content, &dr_map, &resources),
+            b"/F1_1 18 Tf BI /W 1 /H 1 /BPC 8 /CS /G ID \x01\x02 EI \xFFzzzz /F1 18 Tf \x05\x06 EI /F1_1 18 Tf".to_vec()
+        );
+    }
+
+    #[test]
+    fn resource_replacer_inline_image_rejects_fake_ei_mixed_alpha_and_other_word() {
+        // The lookahead token right after the fake `EI` is `ab1`: it mixes
+        // alphabetic characters (`a`, `b`) with a non-alphabetic one (`1`),
+        // which qpdf's heuristic treats as suspicious (real operators are
+        // pure alphabetic runs, e.g. `Tf`, `cm`, `Do`) and rejects.
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        let resources = dict_with_subdict(b"Font", &[b"F1"]);
+        let content: &[u8] = b"BI ID \x01 EI ab1 more /F1 18 Tf \x02 EI /F1 18 Tf";
+        assert_eq!(
+            resource_replacer(content, &dr_map, &resources),
+            b"BI ID \x01 EI ab1 more /F1 18 Tf \x02 EI /F1_1 18 Tf".to_vec()
+        );
+    }
+
+    #[test]
+    fn resource_replacer_inline_image_rejects_fake_ei_stray_delimiter() {
+        // The lookahead token right after the fake `EI` is a lone `)` — a
+        // delimiter that does not start any recognised operand — which is
+        // qpdf's `tt_bad` case and rejects the candidate.
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        let resources = dict_with_subdict(b"Font", &[b"F1"]);
+        let content: &[u8] = b"BI ID \x01 EI ) /F1 18 Tf \x02 EI /F1 18 Tf";
+        assert_eq!(
+            resource_replacer(content, &dr_map, &resources),
+            b"BI ID \x01 EI ) /F1 18 Tf \x02 EI /F1_1 18 Tf".to_vec()
+        );
+    }
+
+    #[test]
+    fn resource_replacer_inline_image_rejects_fake_ei_malformed_operand() {
+        // The lookahead token right after the fake `EI` starts an operand
+        // (`(`) but never terminates it before EOF — the shared object
+        // lexer's `Err` case, which also rejects the candidate.
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        let resources = dict_with_subdict(b"Font", &[b"F1"]);
+        let content: &[u8] = b"BI ID \x01 EI (unterminated /F1 18 Tf \x02 EI /F1 18 Tf";
+        assert_eq!(
+            resource_replacer(content, &dr_map, &resources),
+            b"BI ID \x01 EI (unterminated /F1 18 Tf \x02 EI /F1_1 18 Tf".to_vec()
+        );
+    }
+
+    #[test]
+    fn resource_replacer_inline_image_lookahead_treats_comment_as_one_token() {
+        // A `%` comment right after a candidate `EI` is neither "bad" nor a
+        // suspicious "word" — it consumes one of the 10 lookahead slots and
+        // the candidate is still accepted once EOF follows.
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        let resources = dict_with_subdict(b"Font", &[b"F1"]);
+        let content: &[u8] = b"BI ID \x01 EI %trailing comment";
+        assert_eq!(resource_replacer(content, &dr_map, &resources), content);
+    }
+
+    #[test]
+    fn resource_replacer_inline_image_lookahead_ten_clean_tokens_accepts() {
+        // Ten consecutive well-formed, non-EOF tokens after a candidate
+        // `EI` (never hitting the early EOF success check) must still
+        // accept the candidate once the fixed lookahead budget is
+        // exhausted without ever finding a bad or suspicious token.
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        let resources = dict_with_subdict(b"Font", &[b"F1"]);
+        let content: &[u8] = b"BI ID \x01 EI 1 2 3 4 5 6 7 8 9 10 /F1 18 Tf";
+        assert_eq!(
+            resource_replacer(content, &dr_map, &resources),
+            b"BI ID \x01 EI 1 2 3 4 5 6 7 8 9 10 /F1_1 18 Tf".to_vec()
+        );
+    }
+
+    #[test]
+    fn resource_replacer_inline_image_falls_back_to_last_rejected_candidate() {
+        // Exactly one delimiter-bounded `EI` exists in the image data, and
+        // it is REJECTED by the lookahead (the very next byte, 0xFF, is
+        // non-printable). No further "EI" occurs anywhere afterward, so the
+        // outer search exhausts without ever finding a passing candidate —
+        // qpdf's own fallback ("If we get to the end without finding one,
+        // return the last EI we found") means this rejected candidate is
+        // STILL used as the boundary, handing everything from it onward
+        // back to normal content scanning. That is observable here: the
+        // `/F1 18 Tf` sitting AFTER the rejected `EI` gets renamed, proving
+        // the fallback is the rejected candidate's position and not a
+        // blanket "copy everything to EOF".
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        let resources = dict_with_subdict(b"Font", &[b"F1"]);
+        let content: &[u8] = b"BI ID \x01 EI \xFFbad /F1 18 Tf";
+        assert_eq!(
+            resource_replacer(content, &dr_map, &resources),
+            b"BI ID \x01 EI \xFFbad /F1_1 18 Tf".to_vec()
+        );
     }
 
     // ---- adjust_appearance_stream -------------------------------------------
