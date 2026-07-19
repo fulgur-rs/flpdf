@@ -418,7 +418,7 @@ fn ei_lookahead_passes(rest: &[u8]) -> bool {
 ///      conflicts algorithm). A staged value whose slot phase 1 already
 ///      vacated re-lands under its own original name, no conflict. A
 ///      GENUINE new conflict (the slot is occupied by something else) is
-///      resolved the same way [`crate::overlay_annotations::merge_resources_shallow`]
+///      resolved the same way `crate::overlay_annotations::merge_resources_shallow`
 ///      resolves the top-level `/DR` merge conflict: reuse a key that
 ///      already names the SAME object elsewhere in the sub-dictionary (by
 ///      [`ObjectRef`] identity — qpdf's `QPDFObjGen`-keyed `og_to_name`), or
