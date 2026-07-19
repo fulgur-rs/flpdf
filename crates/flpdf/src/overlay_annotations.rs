@@ -410,7 +410,7 @@ pub(crate) fn template_from_survey(
 /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:775-800`, called from
 /// `transformAnnotations`). qpdf's reuse logic is source-object-identity
 /// based, matching `by_source_ref` here.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct DrMap {
     /// old source name -> new dest name, per resource category. Overwritten
     /// across merges of different sources that collide under the same name;
@@ -451,6 +451,24 @@ impl DrMap {
     /// [`crate::overlay_appearance_stream::adjust_appearance_stream`].
     pub(crate) fn categories(&self) -> impl Iterator<Item = &Vec<u8>> {
         self.by_name.keys()
+    }
+
+    /// Record an additional `old -> new` rename under `category`, alongside
+    /// whatever that category already holds. Used by
+    /// [`crate::overlay_appearance_stream::adjust_appearance_stream`] to
+    /// extend a **per-call, cloned** copy of this map (never the shared one
+    /// threaded through every placement on a destination page) with the
+    /// extra rename produced when privatizing one appearance stream's own
+    /// `/Resources` uncovers a second-order name collision — mirroring
+    /// qpdf's `dr_map` parameter to `AcroForm::adjustAppearanceStream` being
+    /// passed **by value** (`libqpdf/QPDFAcroFormDocumentHelper.cc:752`), so
+    /// mutations for one stream never leak into another placement's shared
+    /// [`DrMap`].
+    pub(crate) fn insert_rename(&mut self, category: &[u8], old: Vec<u8>, new: Vec<u8>) {
+        self.by_name
+            .entry(category.to_vec())
+            .or_default()
+            .insert(old, new);
     }
 }
 
@@ -1845,11 +1863,18 @@ fn merge_resources_shallow<R: Read + Seek>(
 /// in that pass and do not reissue them. Mirrors qpdf's
 /// `getUniqueResourceName`.
 ///
+/// Also reused by
+/// [`crate::overlay_appearance_stream::adjust_appearance_stream`] to mint a
+/// stream-local unique name for the rare case where an appearance stream's
+/// own (private) `/Resources` already has a *different* entry under a
+/// `DrMap` rename's target name (`libqpdf/QPDFAcroFormDocumentHelper.cc:791-807`'s
+/// `merge_with` re-merge).
+///
 /// # Errors
 ///
 /// [`Error::Unsupported`] if `u32` wraps before an unused suffix is found
 /// (would require billions of colliding names under one base).
-fn unique_dr_name(base: &[u8], dict: &crate::Dictionary) -> Result<Vec<u8>> {
+pub(crate) fn unique_dr_name(base: &[u8], dict: &crate::Dictionary) -> Result<Vec<u8>> {
     let mut n: u32 = 1;
     loop {
         let candidate = [base, b"_", n.to_string().as_bytes()].concat();

@@ -67,10 +67,14 @@ fn resource_type_for_operator(op: &[u8]) -> Option<&'static [u8]> {
 /// - `resources[category]` — the appearance stream's own, **pre-rename**
 ///   `/Resources` sub-dictionary, snapshotted by the caller before
 ///   [`adjust_appearance_stream`]'s in-place rename — still carries that
-///   name as a key. Real qpdf's `ResourceReplacer` has no such guard (its
-///   `to_replace` map is built solely from `dr_map` crossed with the
-///   content scan); this is an flpdf-local defensive check mirroring the
-///   one `crate::overlay_annotations::adjust_default_appearance` applies to
+///   name as a key. The caller resolves an indirect (`/Font <ref>`-style)
+///   category sub-dictionary before taking this snapshot, so the guard sees
+///   the same names regardless of whether the AP stream's own `/Resources`
+///   nested that category directly or through a reference. Real qpdf's
+///   `ResourceReplacer` has no such guard (its `to_replace` map is built
+///   solely from `dr_map` crossed with the content scan); this is an
+///   flpdf-local defensive check mirroring the one
+///   `crate::overlay_annotations::adjust_default_appearance` applies to
 ///   `/DA` strings, and is a no-op superset check in practice: every name
 ///   `merge_resources_shallow` records a rename for was, by construction,
 ///   present in the source `/DR` that this stream's `/Resources` was copied
@@ -273,28 +277,37 @@ pub(crate) fn resource_replacer(content: &[u8], dr_map: &DrMap, resources: &Dict
 ///    `/AcroForm/DR` object the copy started out pointing at — matching
 ///    qpdf's unconditional `resources.shallowCopy()`.
 /// 2. For every resource-type category [`DrMap::categories`] recorded a
-///    rename for: ensure that category's sub-dictionary exists in the
-///    private `/Resources` copy (inserting an empty one if absent — mirrors
-///    merging in qpdf's per-category empty `merge_with` dict, whose only
-///    effect at this stage is to force the sub-dictionary to exist and be
-///    unshared), then rename every `old_key` present in that sub-dictionary
-///    to `dr_map`'s `new_key`, keeping the same value.
-/// 3. Drop any sub-dictionary left empty by step 2 (qpdf: "remove empty
+///    rename for: resolve that category's sub-dictionary (an indirect
+///    `/Font <ref>`-style sub-dictionary is resolved the same as a direct
+///    one — an appearance stream's own `/Resources` can name either shape),
+///    inserting an empty one if absent — mirrors merging in qpdf's
+///    per-category empty `merge_with` dict, whose only effect at this stage
+///    is to force the sub-dictionary to exist and be unshared. A copy of
+///    the *resolved* (never `Object::Reference`) sub-dictionary, as it
+///    stands before any rename, is recorded into the snapshot step 4 reads
+///    — see that step for why an unresolved snapshot would silently defeat
+///    the membership guard.
+/// 3. Rename every `old_key` present in that sub-dictionary to `dr_map`'s
+///    `new_key`, keeping the same value. When `new_key` already names a
+///    *different* resource in this stream's own private copy (same-object
+///    references are a no-op, matching qpdf's `QPDFObjGen` identity check),
+///    the displaced value is not lost: it is reinserted under a freshly
+///    minted stream-local unique name ([`crate::overlay_annotations::unique_dr_name`],
+///    based on `new_key`), and that extra rename is recorded into a
+///    **per-call, cloned** copy of `dr_map` ([`DrMap::insert_rename`]) so
+///    step 5's content rewrite also redirects any token that already said
+///    `new_key` — mirroring qpdf's `merge_with` side table and re-merge
+///    (`libqpdf/QPDFAcroFormDocumentHelper.cc:791-807`). qpdf's `dr_map`
+///    parameter to this function is itself passed **by value**
+///    (`:752`), which is exactly why growing a local copy here cannot leak
+///    into another placement's shared [`DrMap`].
+/// 4. Drop any sub-dictionary left empty by step 3 (qpdf: "remove empty
 ///    subdictionaries").
-/// 4. Rewrite the stream's decoded content via [`resource_replacer`], using
-///    the **pre-rename** `/Resources` snapshot taken in step 1 — the
-///    membership guard must see the original names, since step 2 already
-///    renamed (removed) them from the copy being written back.
-///
-/// The rare double-conflict case qpdf handles by re-merging with a
-/// `merge_with` side table and growing its (per-call, by-value) copy of
-/// `dr_map` — reached only when the private `/Resources` copy already has
-/// an entry under the *renamed* name that differs from what step 2 is
-/// moving into it — is not implemented: no shipped qpdf-oracle golden
-/// exercises it, and `dr_map` here is an immutable map shared across every
-/// placement on this destination page, so growing it locally would leak a
-/// stream-specific rename across placements. See
-/// `libqpdf/QPDFAcroFormDocumentHelper.cc:806-816`.
+/// 5. Rewrite the stream's decoded content via [`resource_replacer`], using
+///    the **pre-rename** `/Resources` snapshot taken in steps 1–2 and the
+///    per-call rename map from step 3 — the membership guard must see the
+///    original names, since step 3 already renamed (removed) them from the
+///    copy being written back.
 ///
 /// # Errors
 ///
@@ -326,8 +339,21 @@ pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
     // Snapshot BEFORE any rename: `resource_replacer`'s membership guard
     // must see the ORIGINAL names — the rename loop below removes them from
     // `resources` (the copy that gets written back), so consulting the
-    // post-rename copy would make every match fail.
-    let pre_rename_resources = resources.clone();
+    // post-rename copy would make every match fail. Seeded here from the
+    // top-level clone; the loop below overwrites each touched category with
+    // a RESOLVED (never `Object::Reference`) sub-dictionary, since
+    // `resource_replacer`'s guard uses `Object::as_dict`, which does not
+    // itself resolve references.
+    let mut pre_rename_resources = resources.clone();
+
+    // Per-call, owned copy of `dr_map` — mirrors qpdf's `dr_map` parameter
+    // to `AcroForm::adjustAppearanceStream` being passed BY VALUE
+    // (`libqpdf/QPDFAcroFormDocumentHelper.cc:752`). The double-conflict
+    // branch below extends this LOCAL copy only, via
+    // [`DrMap::insert_rename`], so an extra rename discovered while
+    // privatizing one stream's `/Resources` never leaks into another
+    // placement's shared `DrMap`.
+    let mut local_dr_map = dr_map.clone();
 
     for category in dr_map.categories() {
         let Some(renames) = dr_map.category(category) else {
@@ -336,12 +362,39 @@ pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
         let existing = resources.get(category).cloned();
         let mut subdict = match existing {
             Some(Object::Dictionary(d)) => d,
-            Some(Object::Reference(r)) => dest.resolve(r)?.into_dict().unwrap_or_default(), // cov:ignore: indirect resource-type sub-dict inside an AP stream's own /Resources — no shipped fixture supplies this shape.
+            Some(Object::Reference(r)) => dest.resolve(r)?.into_dict().unwrap_or_default(),
             _ => Dictionary::new(),
         };
+        // Refresh this category's entry in the pre-rename snapshot with the
+        // RESOLVED sub-dictionary, before any mutation below.
+        pre_rename_resources.insert(category, Object::Dictionary(subdict.clone()));
+
         for (old_key, new_key) in renames {
-            if let Some(val) = subdict.remove(old_key) {
-                subdict.insert(new_key, val);
+            let Some(old_val) = subdict.remove(old_key) else {
+                // This stream's own /Resources never had `old_key` under
+                // this category; nothing to move, and — matching qpdf's
+                // `QPDFObjGen` identity no-op for an unmodified slot —
+                // nothing to displace either.
+                continue;
+            };
+            let old_val_ref_id = old_val.as_ref_id();
+            let existing_new = subdict.get(new_key).cloned();
+            subdict.insert(new_key, old_val);
+            if let Some(existing_new_val) = existing_new {
+                let same_object = existing_new_val
+                    .as_ref_id()
+                    .is_some_and(|r| Some(r) == old_val_ref_id);
+                if !same_object {
+                    // Double conflict: `new_key` already named a DIFFERENT
+                    // resource in this stream's own (private) `/Resources`.
+                    // Mint a fresh stream-local name for the displaced
+                    // value and extend the per-call rename map so a
+                    // content token that already said `new_key` gets
+                    // redirected to it too.
+                    let fresh_name = crate::overlay_annotations::unique_dr_name(new_key, &subdict)?;
+                    subdict.insert(fresh_name.clone(), existing_new_val);
+                    local_dr_map.insert_rename(category, new_key.clone(), fresh_name);
+                }
             }
         }
         resources.insert(category, Object::Dictionary(subdict));
@@ -360,7 +413,7 @@ pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
     }
 
     let decoded = crate::filters::decode_stream_data(&stream.dict, &stream.data)?;
-    let new_decoded = resource_replacer(&decoded, dr_map, &pre_rename_resources);
+    let new_decoded = resource_replacer(&decoded, &local_dr_map, &pre_rename_resources);
     stream.data = crate::filters::encode_stream_data(&stream.dict, &new_decoded)?;
 
     if was_indirect {
@@ -852,5 +905,143 @@ mod tests {
         // subdictionary of the resulting /Resources, not just the ones
         // `dr_map` touched.
         assert!(resources.get("Font").is_none());
+    }
+
+    #[test]
+    fn adjust_appearance_stream_rewrites_content_when_category_subdict_is_indirect() {
+        // The AP stream's own `/Resources` is direct, but ITS `/Font` entry
+        // is itself an indirect reference (`/Font 6 0 R`) — a shape PDF
+        // permits and `merge_resources_shallow` already resolves on the
+        // /DR-merge side. Before the fix, the pre-rename snapshot the
+        // membership guard consults still held the un-resolved
+        // `Object::Reference`, `Object::as_dict` cannot see through it, and
+        // the guard silently blocked the rewrite even though `/F1` really
+        // was present under that indirect sub-dict.
+        let mut pdf = open_minimal();
+        let font_ref = ObjectRef::new(5, 0);
+        pdf.set_object(font_ref, Object::Dictionary(Dictionary::new()));
+        let font_dict_ref = ObjectRef::new(6, 0);
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F1", Object::Reference(font_ref));
+        pdf.set_object(font_dict_ref, Object::Dictionary(font_dict));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", Object::Reference(font_dict_ref));
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[("Resources", Object::Dictionary(resources))],
+            b"/F1 18 Tf",
+        );
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+
+        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(stream.data, b"/F1_1 18 Tf");
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        assert_eq!(font.get_ref("F1_1"), Some(font_ref));
+        assert!(font.get("F1").is_none());
+    }
+
+    #[test]
+    fn adjust_appearance_stream_double_conflict_mints_fresh_local_name() {
+        // The AP stream's own /Resources/Font already has BOTH `F1` and
+        // `F1_1` as two DIFFERENT font objects. Renaming `F1` -> `F1_1`
+        // (per dr_map) would silently clobber the pre-existing, unrelated
+        // `F1_1` font if the collision were not detected. qpdf handles this
+        // by minting a fresh name for the displaced value
+        // (`libqpdf/QPDFAcroFormDocumentHelper.cc:791-807`) and extending
+        // its local `dr_map` so content that already said `/F1_1` follows
+        // it there too. The fresh name is `getUniqueResourceName("F1_1_",
+        // ...)`'s first free suffix, `F1_1_1` — NOT `F1_2`, since the
+        // minted-name base is the RENAME TARGET (`F1_1`), not the original
+        // source name (`F1`).
+        let mut pdf = open_minimal();
+        let f1_font_ref = ObjectRef::new(5, 0);
+        pdf.set_object(f1_font_ref, Object::Dictionary(Dictionary::new()));
+        let f1_1_font_ref = ObjectRef::new(6, 0);
+        pdf.set_object(f1_1_font_ref, Object::Dictionary(Dictionary::new()));
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F1", Object::Reference(f1_font_ref));
+        font_dict.insert("F1_1", Object::Reference(f1_1_font_ref));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", Object::Dictionary(font_dict));
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[("Resources", Object::Dictionary(resources))],
+            b"/F1 18 Tf /F1_1 18 Tf",
+        );
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+
+        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(stream.data, b"/F1_1 18 Tf /F1_1_1 18 Tf");
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        assert!(font.get("F1").is_none());
+        assert_eq!(
+            font.get_ref("F1_1"),
+            Some(f1_font_ref),
+            "the renamed slot now holds F1's original value"
+        );
+        assert_eq!(
+            font.get_ref("F1_1_1"),
+            Some(f1_1_font_ref),
+            "the displaced original F1_1 value moved to the freshly minted name"
+        );
+    }
+
+    #[test]
+    fn adjust_appearance_stream_double_conflict_same_object_is_noop() {
+        // /Resources/Font already has BOTH `F1` and `F1_1` pointing at the
+        // SAME underlying font object — qpdf's `QPDFObjGen` identity check
+        // treats this as already-resolved (the renamed slot would hold the
+        // exact same object either way) and mints no fresh name at all.
+        let mut pdf = open_minimal();
+        let shared_font_ref = ObjectRef::new(5, 0);
+        pdf.set_object(shared_font_ref, Object::Dictionary(Dictionary::new()));
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F1", Object::Reference(shared_font_ref));
+        font_dict.insert("F1_1", Object::Reference(shared_font_ref));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", Object::Dictionary(font_dict));
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[("Resources", Object::Dictionary(resources))],
+            b"/F1 18 Tf /F1_1 18 Tf",
+        );
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+
+        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        // `/F1` is renamed to `/F1_1`; the second `/F1_1` token is untouched
+        // (no local rename was ever recorded for it), so both tokens end up
+        // saying `/F1_1`.
+        assert_eq!(stream.data, b"/F1_1 18 Tf /F1_1 18 Tf");
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        assert!(font.get("F1").is_none());
+        assert!(
+            font.get("F1_1_1").is_none(),
+            "no fresh name should be minted for a same-object collision"
+        );
+        assert_eq!(font.get_ref("F1_1"), Some(shared_font_ref));
     }
 }
