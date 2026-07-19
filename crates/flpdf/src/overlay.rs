@@ -1786,7 +1786,6 @@ mod byte_gate {
     // here means the golden and its test doc-comment land alongside the
     // fixture that defines them, rather than being deferred to a later PR.
     #[test]
-    #[ignore = "flpdf-4r6l Layer 4: enables when adjustAppearanceStream lands"]
     fn overlay_copy_annotations_onto_existing_acroform_dr_is_byte_identical_qdf() {
         let mut dest = fixture("fxo-red-with-existing-acroform-dr.pdf");
         let mut src = fixture("form-fields-and-annotations.pdf");

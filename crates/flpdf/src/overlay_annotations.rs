@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 use crate::acroform_document_helper::{collect_reachable_refs, collect_refs_in_object};
+use crate::overlay_appearance_stream::adjust_appearance_stream;
 use crate::parser::{is_delimiter, is_ws, Parser};
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 
@@ -409,7 +410,7 @@ pub(crate) fn template_from_survey(
 /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:775-800`, called from
 /// `transformAnnotations`). qpdf's reuse logic is source-object-identity
 /// based, matching `by_source_ref` here.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct DrMap {
     /// old source name -> new dest name, per resource category. Overwritten
     /// across merges of different sources that collide under the same name;
@@ -440,6 +441,53 @@ impl DrMap {
     pub(crate) fn category(&self, category: &[u8]) -> Option<&BTreeMap<Vec<u8>, Vec<u8>>> {
         self.by_name.get(category)
     }
+
+    /// Every resource-type category with at least one recorded rename, as
+    /// populated by the most recent merge. Mirrors qpdf iterating `dr_map`'s
+    /// top-level keys in `AcroForm::adjustAppearanceStream`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:770-777`) to force each
+    /// category's sub-dictionary to exist (unshared) in an appearance
+    /// stream's own `/Resources` before renaming; see
+    /// [`crate::overlay_appearance_stream::adjust_appearance_stream`].
+    pub(crate) fn categories(&self) -> impl Iterator<Item = &Vec<u8>> {
+        self.by_name.keys()
+    }
+
+    /// Record an additional `old -> new` rename under `category`, alongside
+    /// whatever that category already holds. Used by
+    /// [`crate::overlay_appearance_stream::adjust_appearance_stream`] to
+    /// extend a **per-call, cloned** copy of this map (never the shared one
+    /// threaded through every placement on a destination page) with the
+    /// extra rename produced when privatizing one appearance stream's own
+    /// `/Resources` uncovers a second-order name collision — mirroring
+    /// qpdf's `dr_map` parameter to `AcroForm::adjustAppearanceStream` being
+    /// passed **by value** (`libqpdf/QPDFAcroFormDocumentHelper.cc:752`), so
+    /// mutations for one stream never leak into another placement's shared
+    /// [`DrMap`].
+    pub(crate) fn insert_rename(&mut self, category: &[u8], old: Vec<u8>, new: Vec<u8>) {
+        self.by_name
+            .entry(category.to_vec())
+            .or_default()
+            .insert(old, new);
+    }
+}
+
+#[cfg(test)]
+impl DrMap {
+    /// Test-only constructor: a `DrMap` with exactly one category
+    /// containing one `old -> new` rename, for unit tests elsewhere in the
+    /// crate (notably `overlay_appearance_stream`'s `resource_replacer`
+    /// tests) that need a populated map without driving a full
+    /// [`merge_resources_shallow`] call through a real `Pdf`. `by_name` is
+    /// otherwise private to this module.
+    pub(crate) fn for_test(category: &[u8], old: &[u8], new: &[u8]) -> Self {
+        let mut map = Self::new();
+        map.by_name
+            .entry(category.to_vec())
+            .or_default()
+            .insert(old.to_vec(), new.to_vec());
+        map
+    }
 }
 
 /// Per-placement annotation application:
@@ -450,14 +498,20 @@ impl DrMap {
 ///   (identity when the stream had no /Matrix);
 /// - transform the annot's `/Rect` by `cm`;
 /// - if the source top-level field had a `/DR`, replace it with the
-///   destination AcroForm `/DR` (lazy-initialized on first placement, merging
-///   into a pre-existing dest `/DR` with conflict renaming recorded into
-///   `dr_map`);
+///   destination AcroForm `/DR` (lazy-initialized on the first placement AND
+///   the first field-bearing annot within a placement, merging into a
+///   pre-existing dest `/DR` with conflict renaming recorded into `dr_map`);
 /// - append the dup'd annots to the destination page `/Annots`.
 ///
-/// `dr_map` accumulates resource-name renames across every placement on this
-/// destination page (one map per dest page, created by the caller alongside
-/// `dest_acroform_dr`); see [`DrMap`].
+/// `dr_map` is document-scoped: ONE map created by the caller
+/// (`apply_aggregated_sources` in `overlay.rs`) and threaded by `&mut`
+/// through every placement on every destination page, so [`DrMap`]'s
+/// `by_source_ref` cache can keep reusing the same renamed name for a
+/// recurring source object across pages. Its `by_name` table, by contrast,
+/// is reset at the top of every call to this function and repopulated only
+/// for THIS placement — see the reset at the top of the function body.
+/// `dest_acroform_dr`, unlike `dr_map`, is page-scoped: a fresh `None`
+/// created by the caller for each destination page.
 ///
 /// Returns the newly-added top-level field dest refs (one per distinct top
 /// field observed in this placement), to be collected across all placements
@@ -483,34 +537,57 @@ pub(crate) fn apply_placement<R: Read + Seek>(
     // don't share mutated /Rect / /Parent / AP /Matrix state.
     let mut per_placement_dup: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
 
-    // If ANY annot in this placement carries a top-level field, run the
-    // source /DR merge for THIS placement — even when `dest_acroform_dr` is
-    // already Some. The merge repopulates `dr_map.by_name` with just this
-    // source's mappings, so a subsequent placement's field-tree walk (which
-    // reads `dr_map.by_name` via [`adjust_default_appearance`]) sees THIS
-    // source's renames rather than a prior source's stale entries. The
-    // `dest_acroform_dr` cache stays: the ref itself does not change once
-    // installed. When the placement has fields but NO source /DR (a valid
-    // shape: source has annotations without an /AcroForm), no merge fires,
-    // so `dr_map.by_name` is cleared explicitly to prevent a stale rename
-    // from leaking into this placement's /DA rewrites.
-    let has_any_top_field = template.annots.iter().any(|(_, tf)| tf.is_some());
-    if has_any_top_field {
-        match template.source_dr {
-            Some(source_dr) => {
-                let dr_ref = ensure_dest_acroform_dr(dest, source_dr, dr_map)?;
-                if dest_acroform_dr.is_none() {
-                    *dest_acroform_dr = Some(dr_ref);
-                }
-            }
-            // cov:ignore-start: source has fields but no /DR — the shipped
-            // link-annot-no-acroform fixture is source-without-fields, so
-            // this arm needs a source-with-fields-but-no-/DR fixture to
-            // reach.
-            None => dr_map.by_name.clear(),
-            // cov:ignore-end
-        }
-    }
+    // `dr_map.by_name` is reset UNCONDITIONALLY at the top of every
+    // placement, before deciding whether to repopulate it — mirrors qpdf's
+    // `dr_map` being a local variable freshly created at the top of every
+    // `AcroForm::transformAnnotations` call (verified via deepwiki against
+    // `libqpdf/QPDFAcroFormDocumentHelper.cc`), never persisted across
+    // calls. flpdf threads the SAME `DrMap` by `&mut` through every
+    // placement on the whole destination document so `by_source_ref` (a
+    // genuinely dest-scoped cache — see [`DrMap`]) can keep reusing the same
+    // rename for a recurring source object, but `by_name` — the per-call
+    // rename table [`adjust_default_appearance`] and
+    // `crate::overlay_appearance_stream::adjust_appearance_stream` consult
+    // for THIS placement's fields/AP streams — must not leak from a prior
+    // placement into one that never repopulates it below. An
+    // annotation-only placement (no top-level field at all, so the
+    // first-field trigger inside the per-annot loop below never fires)
+    // previously left a PRIOR placement's `by_name` renames in place,
+    // wrongly applied to this placement's AP streams (roborev PR #490
+    // iter-3 finding 2).
+    dr_map.by_name.clear();
+
+    // Trigger the source /DR merge for THIS placement the first time the
+    // per-annot loop below (step 1) encounters an annot with a top-level
+    // field — even when `dest_acroform_dr` is already Some. The merge
+    // repopulates `dr_map.by_name` with just this source's mappings, so a
+    // subsequent placement's field-tree walk (which reads `dr_map.by_name`
+    // via [`adjust_default_appearance`]) sees THIS source's renames rather
+    // than a prior source's stale entries. The `dest_acroform_dr` cache
+    // stays: the ref itself does not change once installed. When the
+    // placement has fields but NO source /DR (a valid shape: source has
+    // annotations without an /AcroForm), no merge ever fires, so `by_name`
+    // simply stays cleared (from above) — there is nothing to repopulate it
+    // with.
+    //
+    // MUST be lazy (triggered per-annot, not once before the loop): qpdf's
+    // `dr_map` starts EMPTY for the whole `transformAnnotations` call and is
+    // populated only inside `traverse_field` via `init_dr_map` (an
+    // `if (!dr)`-guarded, run-once closure) — which fires ONLY for
+    // field-bearing annots, and only once the per-annot loop actually
+    // reaches the FIRST one. An annot with NO field that precedes the first
+    // field-bearing annot in `/Annots` order therefore sees `dr_map` still
+    // empty when ITS `adjustAppearanceStream` call runs a few lines later
+    // (guarded by `!dr_map.empty()` at
+    // `libqpdf/QPDFAcroFormDocumentHelper.cc` in `transformAnnotations`,
+    // fetched and verified against the live source for roborev PR #490
+    // iter-4 finding 2) — its AP stream is left untouched. Populating
+    // `dr_map` unconditionally before the loop (the prior version of this
+    // function) gave every annot in the placement, including ones ordered
+    // before the first field, the fully-populated map: a source/dest /DR
+    // collision could then rewrite an AP stream qpdf leaves alone,
+    // producing non-qpdf-matching bytes.
+    let mut dr_map_ready = false;
 
     // Compute the inherited-field overrides (qpdf transformAnnotations
     // line 737-767): when the source /AcroForm's /DA or /Q differs from the
@@ -527,6 +604,26 @@ pub(crate) fn apply_placement<R: Read + Seek>(
     let mut new_annot_refs: Vec<ObjectRef> = Vec::new();
 
     for (dest_annot_ref, dest_top_field) in &template.annots {
+        // 0. Lazily trigger the source /DR merge (see the doc comment
+        //    above `dr_map_ready`) on the FIRST field-bearing annot this
+        //    loop reaches — mirrors qpdf's `init_dr_map()` call at the top
+        //    of `traverse_field`'s per-node loop, which only ever executes
+        //    (its body, past the `if (!dr)` guard) on that same first
+        //    field. Runs BEFORE step 1's `duplicate_field_tree` so that
+        //    call's own `/DA` rewrite (mirroring qpdf's
+        //    `adjustDefaultAppearances`, called right after
+        //    `init_dr_map()` inside the SAME per-node loop) sees the
+        //    freshly-populated map when THIS annot is itself the trigger.
+        if dest_top_field.is_some() && !dr_map_ready {
+            dr_map_ready = true;
+            if let Some(source_dr) = template.source_dr {
+                let dr_ref = ensure_dest_acroform_dr(dest, source_dr, dr_map)?;
+                if dest_acroform_dr.is_none() {
+                    *dest_acroform_dr = Some(dr_ref);
+                }
+            } // cov:ignore: control-flow marker — llvm-cov instrumentation artifact; the body above is exercised by every field+/DR fixture (e.g. overlay_pipeline_renames_colliding_dr_font_end_to_end)
+        }
+
         // 1. Duplicate the field tree (top → kids) into per-placement copies,
         //    patching /Parent back-pointers and resetting field /DR (top and
         //    every kid, matching qpdf's per-BFS-iteration line 928-930). If
@@ -563,7 +660,7 @@ pub(crate) fn apply_placement<R: Read + Seek>(
         // 3. Duplicate and cm-transform each /AP appearance stream. Streams
         //    are shared across placements otherwise, so a cm concat here would
         //    accumulate across placements. Per-annot dup guarantees isolation.
-        transform_annot_ap_streams(dest, new_annot_ref, cm)?;
+        transform_annot_ap_streams(dest, new_annot_ref, cm, dr_map)?;
 
         // 4. Transform the annot's /Rect by cm.
         transform_annot_rect(dest, new_annot_ref, cm)?;
@@ -1039,10 +1136,19 @@ fn da_operator_category(op: &[u8]) -> Option<&'static [u8]> {
 /// transformAnnotations line 992-1010), and rewrite the annot's `/AP` entries
 /// to point at the dup'd streams. Only walked at `/AP/{N,R,D}` and one nested
 /// dictionary level, matching qpdf's `apdict` traversal.
+///
+/// When `dr_map` is non-empty, each dup'd stream is additionally passed to
+/// [`crate::overlay_appearance_stream::adjust_appearance_stream`] (qpdf
+/// `AcroForm::adjustAppearanceStream`, called from `transformAnnotations`
+/// line 1156-1161) so a `/Resources` name that collided during the `/DR`
+/// merge is privatized, renamed, and rewritten in the stream's own content —
+/// every nested per-state stream (`/N/1`, `/N/Off`, ...) is adjusted
+/// independently, matching qpdf's per-stream loop at the same call site.
 fn transform_annot_ap_streams<R: Read + Seek>(
     dest: &mut Pdf<R>,
     annot_ref: ObjectRef,
     cm: [f64; 6],
+    dr_map: &DrMap,
 ) -> Result<()> {
     let Some(mut annot_dict) = dest.resolve(annot_ref)?.into_dict() else {
         return Ok(()); // cov:ignore: defensive early return
@@ -1064,6 +1170,9 @@ fn transform_annot_ap_streams<R: Read + Seek>(
         match val {
             Object::Reference(stream_ref) => {
                 if let Some(new_ref) = dup_and_transform_ap_stream(dest, stream_ref, cm)? {
+                    if !dr_map.is_empty() {
+                        adjust_appearance_stream(dest, new_ref, dr_map)?;
+                    }
                     apdict.insert(&key, Object::Reference(new_ref));
                 }
             }
@@ -1077,6 +1186,9 @@ fn transform_annot_ap_streams<R: Read + Seek>(
                     };
                     if let Object::Reference(stream_ref) = sub_val {
                         if let Some(new_ref) = dup_and_transform_ap_stream(dest, stream_ref, cm)? {
+                            if !dr_map.is_empty() {
+                                adjust_appearance_stream(dest, new_ref, dr_map)?;
+                            }
                             sub.insert(&sub_key, Object::Reference(new_ref));
                         }
                     } // cov:ignore: control-flow marker — llvm-cov instrumentation artifact
@@ -1783,11 +1895,18 @@ fn merge_resources_shallow<R: Read + Seek>(
 /// in that pass and do not reissue them. Mirrors qpdf's
 /// `getUniqueResourceName`.
 ///
+/// Also reused by
+/// [`crate::overlay_appearance_stream::adjust_appearance_stream`] to mint a
+/// stream-local unique name for the rare case where an appearance stream's
+/// own (private) `/Resources` already has a *different* entry under a
+/// `DrMap` rename's target name (`libqpdf/QPDFAcroFormDocumentHelper.cc:791-807`'s
+/// `merge_with` re-merge).
+///
 /// # Errors
 ///
 /// [`Error::Unsupported`] if `u32` wraps before an unused suffix is found
 /// (would require billions of colliding names under one base).
-fn unique_dr_name(base: &[u8], dict: &crate::Dictionary) -> Result<Vec<u8>> {
+pub(crate) fn unique_dr_name(base: &[u8], dict: &crate::Dictionary) -> Result<Vec<u8>> {
     let mut n: u32 = 1;
     loop {
         let candidate = [base, b"_", n.to_string().as_bytes()].concat();
@@ -2716,6 +2835,242 @@ mod tests {
         let font = font_dict(&mut pdf, dr_ref2);
         assert_eq!(font.get_ref("F1"), Some(font_ref));
         assert!(font.get("F1_1").is_none());
+    }
+
+    // ---- apply_placement ----------------------------------------------------
+
+    /// A prior placement on this destination page installed a real DR-level
+    /// rename into `dr_map.by_name` (here stood in for directly via
+    /// `merge_resources_shallow`, the exact call `apply_placement`'s
+    /// per-annot, first-field-triggered merge makes for any placement with a
+    /// top-level field). A SECOND placement on the SAME page that carries
+    /// annotations but NO top-level field at all (so the trigger condition
+    /// never fires) must not see that stale rename: before this fix, neither
+    /// arm of the (then pre-loop, unconditional) merge check ran for an
+    /// annotation-only placement, so `dr_map.by_name` was left exactly as
+    /// the first placement's merge left it — a rename table describing a
+    /// DIFFERENT source's fonts, silently available to whatever later reads
+    /// `dr_map.by_name` for this placement's own AP streams (roborev PR #490
+    /// iter-3 finding 2).
+    #[test]
+    fn apply_placement_clears_stale_by_name_for_annotation_only_placement() {
+        let mut pdf = open_minimal();
+        let times_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Times-Roman".to_vec()))],
+        );
+        let helv_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let dest_dr = set_font_dr(&mut pdf, 2, &[("F1", times_ref)]);
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", helv_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+        assert_eq!(
+            dr_map
+                .category(b"Font")
+                .and_then(|m| m.get(b"F1".as_slice())),
+            Some(&b"F1_1".to_vec()),
+            "sanity: the setup step actually populated a stale rename"
+        );
+
+        let page_ref = set_dict(&mut pdf, 20, &[]);
+        let annot_ref = set_dict(&mut pdf, 21, &[]);
+        let template = AnnotationCopyTemplate {
+            annots: vec![(annot_ref, None)], // annotation-only: no top-level field
+            source_dr: None,
+            ..Default::default()
+        };
+        let mut dest_acroform_dr: Option<ObjectRef> = None;
+
+        apply_placement(
+            &mut pdf,
+            page_ref,
+            &template,
+            IDENTITY,
+            &mut dest_acroform_dr,
+            &mut dr_map,
+        )
+        .unwrap();
+
+        assert!(
+            dr_map.category(b"Font").is_none(),
+            "an annotation-only placement (no top-level field) must clear a stale \
+             by_name rename left over from a prior placement, not silently carry it \
+             forward into whatever reads dr_map for THIS placement's own AP streams"
+        );
+    }
+
+    /// roborev PR #490 iter-4 finding 2: a non-field annot that precedes the
+    /// placement's first field-bearing annot in `/Annots` order must see an
+    /// EMPTY `dr_map` when its own AP stream is processed — qpdf's `dr_map`
+    /// starts empty for the whole `transformAnnotations` call and is
+    /// populated only inside `traverse_field`'s `init_dr_map()`, which fires
+    /// exclusively for field-bearing annots
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc` v11.9.0, `transformAnnotations`,
+    /// fetched and verified against the live source: `init_dr_map()` is
+    /// called at line ~920, inside `traverse_field`, called only from
+    /// `transform_annotation`'s field branch; `adjustAppearanceStream` is
+    /// gated by `!dr_map.empty()` at line ~1007, evaluated fresh for EACH
+    /// annot in loop order). A prior version of `apply_placement` computed
+    /// `has_any_top_field` and ran the merge ONCE, unconditionally, before
+    /// the per-annot loop — so every annot in the placement, including one
+    /// ordered before the first field, saw the fully-populated map.
+    ///
+    /// This test places a non-field annot with an AP stream FIRST and a
+    /// (self-field) widget SECOND. The destination already has an
+    /// `/AcroForm/DR/Font/F1` that collides with the source `/DR/Font/F1`
+    /// the widget brings in, so the merge is a REAL, observable rename
+    /// (Font: F1 -> F1_1) — not a vacuous no-op. The non-field annot's own
+    /// AP stream also happens to use the name `/F1` locally; if `dr_map`
+    /// were (incorrectly) already populated when it is processed, its
+    /// `/Resources/Font/F1` entry and its `/F1` content token would both get
+    /// renamed to `/F1_1`, exactly like the field-triggered collision. This
+    /// must NOT happen — the AP stream must come out byte-for-byte
+    /// unchanged (aside from the unrelated cm-Matrix dup every AP stream
+    /// gets in step 3, which is identity here).
+    #[test]
+    fn apply_placement_leading_non_field_annot_sees_empty_dr_map() {
+        let mut pdf = open_minimal();
+        let dest_font_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Times-Roman".to_vec()))],
+        );
+        let source_font_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let local_font_ref = set_dict(
+            &mut pdf,
+            12,
+            &[("BaseFont", Object::Name(b"Courier".to_vec()))],
+        );
+        let dest_dr = set_font_dr(&mut pdf, 2, &[("F1", dest_font_ref)]);
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", source_font_ref)]);
+
+        // Install a destination /AcroForm/DR up front (mirrors
+        // `fxo-red-with-existing-acroform-dr.pdf`'s shape) so
+        // `ensure_dest_acroform_dr` merges into it — rather than creating a
+        // fresh, empty one — and the F1 collision is real.
+        let mut acroform = crate::Dictionary::new();
+        acroform.insert("Fields", Object::Array(Vec::new()));
+        acroform.insert("DR", Object::Reference(dest_dr));
+        let acroform_ref = ObjectRef::new(30, 0);
+        pdf.set_object(acroform_ref, Object::Dictionary(acroform));
+        let mut catalog = crate::Dictionary::new();
+        catalog.insert("Type", Object::Name(b"Catalog".to_vec()));
+        catalog.insert("AcroForm", Object::Reference(acroform_ref));
+        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+        let page_ref = set_dict(&mut pdf, 20, &[]);
+
+        // Non-field annot: an /AP /N stream with its own local /Resources
+        // that ALSO happens to use the name F1 — the name the merge below
+        // renames — plus a content token spelling it out, so a wrongly
+        // non-empty dr_map at the time this annot is processed would be
+        // directly observable.
+        let mut ap_font = crate::Dictionary::new();
+        ap_font.insert("F1", Object::Reference(local_font_ref));
+        let mut ap_resources = crate::Dictionary::new();
+        ap_resources.insert("Font", Object::Dictionary(ap_font));
+        let ap_stream_ref = ObjectRef::new(22, 0);
+        let mut ap_stream_dict = crate::Dictionary::new();
+        ap_stream_dict.insert("Resources", Object::Dictionary(ap_resources));
+        pdf.set_object(
+            ap_stream_ref,
+            Object::Stream(crate::Stream::new(ap_stream_dict, b"/F1 10 Tf".to_vec())),
+        );
+        let mut ap_dict = crate::Dictionary::new();
+        ap_dict.insert("N", Object::Reference(ap_stream_ref));
+        let non_field_annot_ref = set_dict(&mut pdf, 21, &[("AP", Object::Dictionary(ap_dict))]);
+
+        // Field-bearing annot (self-field widget): appears SECOND in
+        // /Annots order, so it is the one that lazily triggers the /DR
+        // merge — AFTER the non-field annot above has already been
+        // processed by the per-annot loop.
+        let field_annot_ref = set_dict(&mut pdf, 23, &[]);
+
+        let template = AnnotationCopyTemplate {
+            annots: vec![
+                (non_field_annot_ref, None),
+                (field_annot_ref, Some(field_annot_ref)),
+            ],
+            source_dr: Some(source_dr),
+            ..Default::default()
+        };
+        let mut dr_map = DrMap::new();
+        let mut dest_acroform_dr: Option<ObjectRef> = None;
+
+        apply_placement(
+            &mut pdf,
+            page_ref,
+            &template,
+            IDENTITY,
+            &mut dest_acroform_dr,
+            &mut dr_map,
+        )
+        .unwrap();
+
+        // Sanity: the setup did produce a REAL, non-vacuous F1 collision —
+        // otherwise this test would pass trivially regardless of the fix.
+        assert_eq!(
+            dr_map
+                .category(b"Font")
+                .and_then(|m| m.get(b"F1".as_slice())),
+            Some(&b"F1_1".to_vec()),
+            "sanity: the widget's field-tree walk must have triggered a real \
+             F1 -> F1_1 collision rename"
+        );
+
+        let page = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+        let annots_arr = page.get("Annots").and_then(Object::as_array).unwrap();
+        assert_eq!(annots_arr.len(), 2);
+        let new_non_field_annot_ref = annots_arr[0].as_ref_id().unwrap();
+
+        let new_annot = pdf
+            .resolve(new_non_field_annot_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
+        let new_ap_stream_ref = new_annot
+            .get("AP")
+            .and_then(Object::as_dict)
+            .and_then(|ap| ap.get_ref("N"))
+            .expect("dup'd AP /N stream ref");
+        let new_ap_stream = pdf
+            .resolve(new_ap_stream_ref)
+            .unwrap()
+            .into_stream()
+            .unwrap();
+        assert_eq!(
+            new_ap_stream.data, b"/F1 10 Tf",
+            "the leading non-field annot's AP content must be untouched — \
+             dr_map was still empty when it was processed"
+        );
+        let new_ap_font = new_ap_stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .and_then(|r| r.get("Font"))
+            .and_then(Object::as_dict)
+            .expect("AP stream /Resources/Font");
+        assert_eq!(
+            new_ap_font.get_ref("F1"),
+            Some(local_font_ref),
+            "the leading non-field annot's own /Resources/Font/F1 must be \
+             untouched — no rename applied while dr_map was still empty"
+        );
+        assert!(
+            new_ap_font.get("F1_1").is_none(),
+            "no F1_1 entry should have been minted on the non-field annot's \
+             AP stream — adjustAppearanceStream must not have run at all"
+        );
     }
 
     // ---- adjust_default_appearance ------------------------------------------
