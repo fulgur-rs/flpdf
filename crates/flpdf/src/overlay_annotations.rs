@@ -1277,14 +1277,17 @@ fn merge_resources_shallow<R: Read + Seek>(
 
         // Resolve dest's existing sub-dict for this type (if any) so a
         // pre-existing dest `/DR` category is preserved rather than
-        // replaced. `/Font <ref>` (indirect) is preserved as-is: we resolve
-        // to get the underlying dict, mutate it in place, and leave the
-        // reference in dest_dict untouched — matching qpdf's behavior of
-        // preserving indirect resource-type refs.
-        let (mut new_type_dict, indirect_target) = match dest_dict.get(type_key).cloned() {
+        // replaced. When the dest sub-dict is INDIRECT, allocate a NEW
+        // indirect object holding a shallow copy of the referenced dict
+        // and re-point `dest_dict[type_key]` at it — mirroring qpdf's
+        // `this_val = replaceKeyAndGetNew(rtype, this_val.shallowCopy())`
+        // in `QPDFObjectHandle::mergeResources`. Mutating the ORIGINAL
+        // referenced object in place would leak the merge (and any
+        // subsequent `_N` renames) into every other holder of that ref.
+        let (mut new_type_dict, new_indirect_target) = match dest_dict.get(type_key).cloned() {
             Some(Object::Dictionary(existing)) => (existing, None),
             Some(Object::Reference(r)) => match dest.resolve(r)?.into_dict() {
-                Some(d) => (d, Some(r)),
+                Some(d) => (d, Some(allocate_next_ref(dest)?)),
                 // cov:ignore-start: dest resource-type ref does not resolve
                 // to a dict — degrade to a fresh dict and replace inline.
                 // No shipped fixture supplies this malformed shape.
@@ -1321,10 +1324,13 @@ fn merge_resources_shallow<R: Read + Seek>(
             }
         }
 
-        if let Some(target_ref) = indirect_target {
-            // Preserve indirect-ness: mutate the referenced object; dest_dict
-            // still holds `Object::Reference(target_ref)`, so no insert.
-            dest.set_object(target_ref, Object::Dictionary(new_type_dict));
+        if let Some(new_ref) = new_indirect_target {
+            // qpdf-parity: dest sub-dict was indirect, so install the merged
+            // dict into a freshly-allocated indirect object and re-point
+            // dest_dict at it. The ORIGINAL indirect object is untouched —
+            // other holders of the same ref are not affected.
+            dest.set_object(new_ref, Object::Dictionary(new_type_dict));
+            dest_dict.insert(type_key, Object::Reference(new_ref));
         } else {
             dest_dict.insert(type_key, Object::Dictionary(new_type_dict));
         }
@@ -1902,13 +1908,18 @@ mod tests {
         assert_eq!(font.get_ref("F1"), Some(font_ref));
     }
 
-    /// Dest `/DR/Font` is stored as an indirect reference. qpdf's
-    /// `mergeResources` preserves the indirect-ness by mutating the
-    /// referenced object in place; a naive implementation that only matched
-    /// `Object::Dictionary` would replace the entire ref with a fresh direct
-    /// dict on the dest, dropping any other holders of that font-subdict.
+    /// Dest `/DR/Font` is stored as an indirect reference potentially
+    /// shared with other holders. qpdf's `mergeResources` shallow-copies
+    /// the referenced dict into a FRESH indirect object and re-points
+    /// dest's `/Font` at the new ref
+    /// (`this_val = replaceKeyAndGetNew(rtype, this_val.shallowCopy())` in
+    /// `QPDFObjectHandle::mergeResources`); the ORIGINAL indirect object
+    /// stays untouched so unrelated holders keep their original content.
+    /// A naive implementation that mutated the original object in place
+    /// would leak the merge (and any subsequent `_N` renames) into every
+    /// other holder of that ref.
     #[test]
-    fn merge_resources_shallow_preserves_indirect_dest_resource_type_dict() {
+    fn merge_resources_shallow_copies_indirect_dest_sub_dict_into_fresh_ref() {
         let mut pdf = open_minimal();
         let helv_ref = set_dict(
             &mut pdf,
@@ -1938,21 +1949,28 @@ mod tests {
         merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
 
         assert!(dr_map.is_empty(), "no name collision, no rename");
-        // Indirect-ness preserved on dest_dr itself.
+        // dest's /Font now points at a NEW indirect object (not the original).
         let dest_dict = pdf.resolve(dest_dr).unwrap().into_dict().unwrap();
-        assert_eq!(
-            dest_dict.get_ref("Font"),
-            Some(dest_font_subdict_ref),
-            "/Font indirect ref preserved (not replaced with direct dict)",
+        let new_font_ref = dest_dict.get_ref("Font").expect("Font must be indirect");
+        assert_ne!(
+            new_font_ref, dest_font_subdict_ref,
+            "qpdf shallow-copies indirect sub-dicts into a fresh ref",
         );
-        // Referenced object mutated in place: still has F0, now also has F1.
-        let mutated = pdf
+        // The ORIGINAL indirect object is untouched — still only carries F0.
+        let original = pdf
             .resolve(dest_font_subdict_ref)
             .unwrap()
             .into_dict()
             .unwrap();
-        assert_eq!(mutated.get_ref("F0"), Some(helv_ref));
-        assert_eq!(mutated.get_ref("F1"), Some(courier_ref));
+        assert_eq!(original.get_ref("F0"), Some(helv_ref));
+        assert!(
+            original.get("F1").is_none(),
+            "original indirect object must not be mutated (other holders would see F1 leak)",
+        );
+        // The NEW indirect object carries the shallow-copied F0 plus F1.
+        let merged = pdf.resolve(new_font_ref).unwrap().into_dict().unwrap();
+        assert_eq!(merged.get_ref("F0"), Some(helv_ref));
+        assert_eq!(merged.get_ref("F1"), Some(courier_ref));
     }
 
     // ---- ensure_dest_acroform_dr -------------------------------------------
