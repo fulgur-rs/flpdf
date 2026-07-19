@@ -379,6 +379,24 @@ pub(crate) fn template_from_survey(
     }
 }
 
+/// Per-destination-page record of resource-name renames, populated by
+/// [`merge_resources_shallow`] when a source `/DR` sub-dictionary key
+/// collides with an existing dest entry of the same name that resolves to a
+/// *different* object. Outer key is the resource category (`Font`,
+/// `XObject`, ...); inner map is `old_name -> new_name` — the source's
+/// original key mapped to the name it was actually inserted under in dest.
+///
+/// Mirrors qpdf's per-destination `dr_map`, populated by
+/// `QPDFObjectHandle::mergeResources`'s `conflicts` out-parameter and driven
+/// by `QPDFAcroFormDocumentHelper::init_dr_map`
+/// (`libqpdf/QPDFAcroFormDocumentHelper.cc:775-800`, called from
+/// `transformAnnotations`). qpdf consumes the map via
+/// `adjustDefaultAppearances` / `adjustAppearanceStream` to rewrite each
+/// copied field's `/DA` string and AP-stream content operators from the old
+/// name to the new one; that rewrite is not implemented yet — this map is
+/// only built and threaded so a later change has the data it needs.
+pub(crate) type DrMap = BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>;
+
 /// Per-placement annotation application:
 /// - shallow-dup each templated annot (new indirect object) and any
 ///   associated top-level field / kid path (so repeated placements of the
@@ -387,8 +405,14 @@ pub(crate) fn template_from_survey(
 ///   (identity when the stream had no /Matrix);
 /// - transform the annot's `/Rect` by `cm`;
 /// - if the source top-level field had a `/DR`, replace it with the
-///   destination AcroForm `/DR` (lazy-initialized on first placement);
+///   destination AcroForm `/DR` (lazy-initialized on first placement, merging
+///   into a pre-existing dest `/DR` with conflict renaming recorded into
+///   `dr_map`);
 /// - append the dup'd annots to the destination page `/Annots`.
+///
+/// `dr_map` accumulates resource-name renames across every placement on this
+/// destination page (one map per dest page, created by the caller alongside
+/// `dest_acroform_dr`); see [`DrMap`].
 ///
 /// Returns the newly-added top-level field dest refs (one per distinct top
 /// field observed in this placement), to be collected across all placements
@@ -401,6 +425,7 @@ pub(crate) fn apply_placement<R: Read + Seek>(
     template: &AnnotationCopyTemplate,
     cm: [f64; 6],
     dest_acroform_dr: &mut Option<ObjectRef>,
+    dr_map: &mut DrMap,
 ) -> Result<Vec<ObjectRef>> {
     if template.annots.is_empty() {
         return Ok(Vec::new()); // cov:ignore: defensive early return
@@ -420,7 +445,7 @@ pub(crate) fn apply_placement<R: Read + Seek>(
     let has_any_top_field = template.annots.iter().any(|(_, tf)| tf.is_some());
     if has_any_top_field && dest_acroform_dr.is_none() {
         if let Some(source_dr) = template.source_dr {
-            *dest_acroform_dr = Some(ensure_dest_acroform_dr(dest, source_dr)?);
+            *dest_acroform_dr = Some(ensure_dest_acroform_dr(dest, source_dr, dr_map)?);
         } // cov:ignore: control-flow marker — llvm-cov instrumentation artifact
     }
 
@@ -1076,10 +1101,10 @@ fn append_page_annots<R: Read + Seek>(
 }
 
 /// Lazy-initialize the destination `/AcroForm/DR`. If dest has no `/AcroForm`,
-/// create one; the new `/DR` is a FRESH indirect object whose contents are
-/// merged from the (already dest-space) `source_dr` via [`merge_resources_shallow`].
-/// Returns the ref of the dest `/DR` (whether newly-created or previously
-/// present).
+/// create one; the `/DR` (fresh or pre-existing) has `source_dr`'s (already
+/// dest-space) contents merged into it via [`merge_resources_shallow`], which
+/// records any conflict rename it performs into `dr_map`. Returns the ref of
+/// the dest `/DR` (whether newly-created or previously present).
 ///
 /// This matches qpdf transformAnnotations line 780-800 (init_dr_map): dest
 /// `/AcroForm/DR` is a new object, and `source_dr` is preserved as a SEPARATE
@@ -1088,13 +1113,16 @@ fn append_page_annots<R: Read + Seek>(
 /// `/AcroForm/DR`, source_dr for AP stream `/Resources`). See qpdf golden
 /// `overlay-copy-annotations.pdf` obj 4 (dest_dr) and obj 344 (source_dr copy).
 ///
-/// For a dest that already has an /AcroForm and /DR, this is a first-wins
-/// no-op — a full merge with conflict remapping (`dr_map` +
-/// `adjustAppearanceStream`) is dormant for the primary target and out of
-/// scope until a fixture exercises it.
+/// For a dest that already has an `/AcroForm` and `/DR`, the pre-existing
+/// `/DR` object is reused (not replaced) and `source_dr`'s entries are merged
+/// into it with conflict renaming. Downstream consumption of `dr_map` to
+/// rewrite copied fields' `/DA` and AP-stream content (qpdf's
+/// `adjustDefaultAppearances` / `adjustAppearanceStream`) is not implemented
+/// yet — left for a later change.
 fn ensure_dest_acroform_dr<R: Read + Seek>(
     dest: &mut Pdf<R>,
     source_dr: ObjectRef,
+    dr_map: &mut DrMap,
 ) -> Result<ObjectRef> {
     // cov:ignore-start: defensive early returns on catalog-shape guards.
     let Some(root_ref) = dest.root_ref() else {
@@ -1146,11 +1174,12 @@ fn ensure_dest_acroform_dr<R: Read + Seek>(
         }
     };
     // Existing /DR may be indirect (a ref) or a direct dict; preserve either
-    // shape. First-wins semantics: a fully-implemented merge with conflict
-    // remapping (`dr_map` + `adjustAppearanceStream`) is dormant for the
-    // primary target and left for a follow-up.
+    // shape and merge `source_dr`'s entries into it either way.
     match acroform_dict.get("DR").cloned() {
-        Some(Object::Reference(existing)) => return Ok(existing),
+        Some(Object::Reference(existing)) => {
+            merge_resources_shallow(dest, existing, source_dr, dr_map)?;
+            return Ok(existing);
+        }
         // cov:ignore-start: direct-/DR promotion in the existing-AcroForm
         // path — analogous to the direct-/AcroForm case above. qpdf
         // normalizes /DR to indirect on write, so no shipped fixture
@@ -1160,6 +1189,7 @@ fn ensure_dest_acroform_dr<R: Read + Seek>(
             dest.set_object(dr_ref, Object::Dictionary(existing));
             acroform_dict.insert("DR", Object::Reference(dr_ref));
             dest.set_object(acroform_ref, Object::Dictionary(acroform_dict));
+            merge_resources_shallow(dest, dr_ref, source_dr, dr_map)?;
             return Ok(dr_ref);
         }
         // cov:ignore-end
@@ -1169,32 +1199,50 @@ fn ensure_dest_acroform_dr<R: Read + Seek>(
     // it, and wire dest /AcroForm to point at it.
     let dr_ref = allocate_next_ref(dest)?;
     dest.set_object(dr_ref, Object::Dictionary(crate::Dictionary::new()));
-    merge_resources_shallow(dest, dr_ref, source_dr)?;
+    merge_resources_shallow(dest, dr_ref, source_dr, dr_map)?;
     acroform_dict.insert("DR", Object::Reference(dr_ref));
     dest.set_object(acroform_ref, Object::Dictionary(acroform_dict));
     Ok(dr_ref)
 }
 
-/// Merge `source_dr`'s resource entries into the (existing, initially-empty)
-/// dict at `dest_dr`. Mirrors qpdf's `QPDFObjectHandle::mergeResources` for
-/// the "dest starts empty" path (the only path exercised by the primary
-/// target fxo-red, which has no /AcroForm).
+/// Merge `source_dr`'s resource entries into the dict at `dest_dr`, which may
+/// already carry entries of its own (e.g. a pre-existing dest `/AcroForm/DR`).
+/// Mirrors qpdf's `QPDFObjectHandle::mergeResources`.
 ///
-/// For each top-level key (resource type: /Font, /XObject, /ColorSpace, ...),
-/// the source's sub-dictionary is copied into a NEW direct dict in dest so
-/// dest_dr and source_dr do not share mutable sub-dict state. Individual
-/// resource entries (e.g. `/F1 8 0 R`) are shallow-cloned — they are typically
-/// refs, so the clone is cheap and the dest and source paths continue to
-/// share the underlying font/xobject objects (as qpdf does).
+/// For each top-level key (resource type: `/Font`, `/XObject`, `/ColorSpace`,
+/// ...), source's per-name entries are merged into a dest-owned copy of that
+/// category's sub-dict, so `dest_dr` and `source_dr` never share mutable
+/// sub-dict state:
+/// - a source name absent from dest's sub-dict is inserted verbatim;
+/// - a source name present in dest's sub-dict pointing at the SAME object
+///   (by [`ObjectRef`] identity, not deep equality — matches qpdf's
+///   `QPDFObjGen`-based check) is a no-op;
+/// - a source name present in dest's sub-dict pointing at a DIFFERENT object
+///   is a genuine conflict: the source's entry is inserted under the
+///   smallest unused `{name}_N` (`N` starting at 1, scanned against the dest
+///   sub-dict as it grows during this call — qpdf's `getUniqueResourceName`),
+///   and `(name, {name}_N)` is recorded into `dr_map[type]`.
 ///
-/// Conflict handling (dest already has a key with a different ref) is NOT
-/// implemented — that's the `dr_map` path that would drive
-/// `adjustAppearanceStream`. Dormant for the primary target; extend when a
-/// fixture requires it.
+/// Individual resource entries (e.g. `/F1 8 0 R`) are shallow-cloned — they
+/// are typically refs, so the clone is cheap and the dest and source paths
+/// continue to share the underlying font/xobject objects (as qpdf does).
+///
+/// Known gap: qpdf additionally reuses an existing dest name whenever the
+/// SAME source object recurs under a colliding name across repeated calls
+/// (its dest-scoped `QPDFObjGen -> name` map, populated once and consulted
+/// on every subsequent `mergeResources` call against that same dest dict).
+/// This function only checks the single colliding name within one call, so a
+/// dest whose pre-existing `/DR` already has a genuine conflict would mint a
+/// new `_N` suffix on every repeat placement instead of reusing the first
+/// one. No shipped fixture drives repeated placements onto a
+/// pre-conflicting dest `/DR` yet; revisit alongside `adjustDefaultAppearances`
+/// / `adjustAppearanceStream`, which need the reused name to stay stable
+/// across placements to rewrite every copy consistently.
 fn merge_resources_shallow<R: Read + Seek>(
     dest: &mut Pdf<R>,
     dest_dr: ObjectRef,
     source_dr: ObjectRef,
+    dr_map: &mut DrMap,
 ) -> Result<()> {
     let Some(src_dict) = dest.resolve(source_dr)?.into_dict() else {
         return Ok(()); // cov:ignore: defensive early return
@@ -1202,31 +1250,116 @@ fn merge_resources_shallow<R: Read + Seek>(
     let Some(mut dest_dict) = dest.resolve(dest_dr)?.into_dict() else {
         return Ok(()); // cov:ignore: defensive early return
     };
+    // PDF permits `/Font <ref>` (indirect resource-type sub-dict) as well as
+    // the direct-dict shape; qpdf's `QPDFObjectHandle::mergeResources`
+    // operates on resolved QPDFObjectHandle values, so both shapes must
+    // merge — losing an indirect source sub-dict would drop the referenced
+    // fonts entirely. `src_dict` is owned (from `into_dict`), so the loop's
+    // borrow of it does not collide with `dest.resolve(...)` on the mutable
+    // `dest` — both borrows are of separate variables.
     for (type_key, src_type_val) in src_dict.iter() {
-        // Resource-type entry (e.g. /Font) is expected to be a direct
-        // sub-dict, matching the primary target and every qpdf golden we
-        // currently oracle. PDF also permits `/Font <ref>` (indirect
-        // sub-dict), but replicating qpdf's mergeResources semantics for
-        // that shape needs an oracle golden that no shipped fixture
-        // supplies — deferred to flpdf-4r6l, which lands alongside
-        // dr_map + adjustAppearanceStream once a real fixture exercises
-        // the merge-conflict path. Until then, non-dict resource-type
-        // values are copied verbatim (works correctly for the empty-dest
-        // /DR case that fxo-red exercises).
-        let Some(src_type_dict) = src_type_val.as_dict() else {
-            dest_dict.insert(type_key, src_type_val.clone()); // cov:ignore: verbatim-copy for non-dict resource-type — deferred to flpdf-4r6l
-            continue; // cov:ignore: verbatim-copy for non-dict resource-type — deferred to flpdf-4r6l
+        let src_type_dict = match src_type_val {
+            Object::Reference(r) => dest.resolve(*r)?.into_dict(),
+            _ => src_type_val.as_dict().cloned(),
         };
-        // Copy each resource entry into a fresh direct sub-dict so dest_dr's
-        // sub-dict is independent of source_dr's sub-dict.
-        let mut new_type_dict = crate::Dictionary::new();
+
+        let Some(src_type_dict) = src_type_dict else {
+            // cov:ignore-start: verbatim-copy path — non-dict resource-type
+            // value from an unusual source /DR shape (either a non-dict/-ref
+            // direct value, or an indirect ref that does not resolve to a
+            // dict). No shipped fixture supplies this shape.
+            if dest_dict.get(type_key).is_none() {
+                dest_dict.insert(type_key, src_type_val.clone());
+            }
+            continue;
+            // cov:ignore-end
+        };
+
+        // Resolve dest's existing sub-dict for this type (if any) so a
+        // pre-existing dest `/DR` category is preserved rather than
+        // replaced. When the dest sub-dict is INDIRECT, allocate a NEW
+        // indirect object holding a shallow copy of the referenced dict
+        // and re-point `dest_dict[type_key]` at it — mirroring qpdf's
+        // `this_val = replaceKeyAndGetNew(rtype, this_val.shallowCopy())`
+        // in `QPDFObjectHandle::mergeResources`. Mutating the ORIGINAL
+        // referenced object in place would leak the merge (and any
+        // subsequent `_N` renames) into every other holder of that ref.
+        let (mut new_type_dict, new_indirect_target) = match dest_dict.get(type_key).cloned() {
+            Some(Object::Dictionary(existing)) => (existing, None),
+            Some(Object::Reference(r)) => match dest.resolve(r)?.into_dict() {
+                Some(d) => (d, Some(allocate_next_ref(dest)?)),
+                // cov:ignore-start: dest resource-type ref does not resolve
+                // to a dict — degrade to a fresh dict and replace inline.
+                // No shipped fixture supplies this malformed shape.
+                None => (crate::Dictionary::new(), None),
+                // cov:ignore-end
+            },
+            _ => (crate::Dictionary::new(), None),
+        };
+
         for (name, val) in src_type_dict.iter() {
-            new_type_dict.insert(name, val.clone());
+            match new_type_dict.get(name) {
+                None => {
+                    new_type_dict.insert(name, val.clone());
+                }
+                Some(existing_val) => {
+                    // Same-name collision. qpdf's short-circuit is object
+                    // identity (QPDFObjGen), not deep equality — a direct
+                    // (non-reference) value can never match here even if
+                    // structurally equal, matching mergeResources.
+                    let same_object = matches!(
+                        (existing_val, val),
+                        (Object::Reference(d), Object::Reference(s)) if d == s
+                    );
+                    if same_object {
+                        continue;
+                    }
+                    let new_name = unique_dr_name(name, &new_type_dict)?;
+                    new_type_dict.insert(&new_name, val.clone());
+                    dr_map
+                        .entry(type_key.to_vec())
+                        .or_default()
+                        .insert(name.to_vec(), new_name);
+                }
+            }
         }
-        dest_dict.insert(type_key, Object::Dictionary(new_type_dict));
+
+        if let Some(new_ref) = new_indirect_target {
+            // qpdf-parity: dest sub-dict was indirect, so install the merged
+            // dict into a freshly-allocated indirect object and re-point
+            // dest_dict at it. The ORIGINAL indirect object is untouched —
+            // other holders of the same ref are not affected.
+            dest.set_object(new_ref, Object::Dictionary(new_type_dict));
+            dest_dict.insert(type_key, Object::Reference(new_ref));
+        } else {
+            dest_dict.insert(type_key, Object::Dictionary(new_type_dict));
+        }
     }
     dest.set_object(dest_dr, Object::Dictionary(dest_dict));
     Ok(())
+}
+
+/// Smallest `{base}_N` (`N` starting at 1) absent from `dict`, scanning
+/// `dict` as it stands at call time — so repeated calls within the same
+/// [`merge_resources_shallow`] pass see names inserted by earlier collisions
+/// in that pass and do not reissue them. Mirrors qpdf's
+/// `getUniqueResourceName`.
+///
+/// # Errors
+///
+/// [`Error::Unsupported`] if `u32` wraps before an unused suffix is found
+/// (would require billions of colliding names under one base).
+fn unique_dr_name(base: &[u8], dict: &crate::Dictionary) -> Result<Vec<u8>> {
+    let mut n: u32 = 1;
+    loop {
+        let candidate = [base, b"_", n.to_string().as_bytes()].concat();
+        if dict.get(&candidate).is_none() {
+            return Ok(candidate);
+        }
+        n = n
+            .checked_add(1)
+            .ok_or_else(|| Error::Unsupported("DR resource-name suffix space exhausted".into()))?;
+    }
 }
 
 /// After every placement on a destination page has been applied, add the
@@ -1569,4 +1702,389 @@ fn fully_qualified_name_of<R: Read + Seek>(
         out.extend_from_slice(n);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Minimal single-object (`/Type /Catalog`, no `/AcroForm`) PDF, just
+    /// enough for [`Pdf::open`] to accept. Tests layer additional objects
+    /// onto it via [`Pdf::set_object`] at object numbers beyond the xref
+    /// table — the same pattern `allocate_next_ref` relies on elsewhere in
+    /// this crate (a `set_object` at a fresh number is accepted and shows up
+    /// in `object_refs()`/is resolvable immediately).
+    fn minimal_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!("xref\n0 2\n0000000000 65535 f \n{off1:010} 00000 n \n").as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    fn open_minimal() -> Pdf<Cursor<Vec<u8>>> {
+        Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("minimal pdf should parse")
+    }
+
+    /// Set object `n` (generation 0) to a dictionary built from `entries` and
+    /// return its ref.
+    fn set_dict<R: Read + Seek>(pdf: &mut Pdf<R>, n: u32, entries: &[(&str, Object)]) -> ObjectRef {
+        let mut d = crate::Dictionary::new();
+        for (k, v) in entries {
+            d.insert(*k, v.clone());
+        }
+        let r = ObjectRef::new(n, 0);
+        pdf.set_object(r, Object::Dictionary(d));
+        r
+    }
+
+    /// Build a one-category `/Font << name ref, ... >>` resource dict object.
+    fn set_font_dr<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        n: u32,
+        entries: &[(&str, ObjectRef)],
+    ) -> ObjectRef {
+        let mut font = crate::Dictionary::new();
+        for (name, r) in entries {
+            font.insert(*name, Object::Reference(*r));
+        }
+        set_dict(pdf, n, &[("Font", Object::Dictionary(font))])
+    }
+
+    fn font_dict<R: Read + Seek>(pdf: &mut Pdf<R>, dr_ref: ObjectRef) -> crate::Dictionary {
+        let dr = pdf.resolve(dr_ref).unwrap().into_dict().unwrap();
+        dr.get("Font").and_then(Object::as_dict).unwrap().clone()
+    }
+
+    // ---- merge_resources_shallow ------------------------------------------
+
+    #[test]
+    fn merge_resources_shallow_dest_empty_is_verbatim_insert() {
+        let mut pdf = open_minimal();
+        let font_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let dest_dr = set_dict(&mut pdf, 2, &[]);
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", font_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+
+        assert!(dr_map.is_empty());
+        let font = font_dict(&mut pdf, dest_dr);
+        assert_eq!(font.get_ref("F1"), Some(font_ref));
+    }
+
+    #[test]
+    fn merge_resources_shallow_renames_on_collision_with_different_ref() {
+        let mut pdf = open_minimal();
+        let helv_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let courier_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("BaseFont", Object::Name(b"Courier".to_vec()))],
+        );
+        let dest_dr = set_font_dr(&mut pdf, 2, &[("F1", helv_ref)]);
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", courier_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+
+        assert_eq!(
+            dr_map
+                .get(b"Font".as_slice())
+                .and_then(|m| m.get(b"F1".as_slice())),
+            Some(&b"F1_1".to_vec())
+        );
+        let font = font_dict(&mut pdf, dest_dr);
+        assert_eq!(font.get_ref("F1"), Some(helv_ref));
+        assert_eq!(font.get_ref("F1_1"), Some(courier_ref));
+    }
+
+    #[test]
+    fn merge_resources_shallow_same_ref_collision_is_noop() {
+        let mut pdf = open_minimal();
+        let font_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let dest_dr = set_font_dr(&mut pdf, 2, &[("F1", font_ref)]);
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", font_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+
+        assert!(dr_map.is_empty());
+        let font = font_dict(&mut pdf, dest_dr);
+        assert_eq!(font.get_ref("F1"), Some(font_ref));
+        assert!(font.get("F1_1").is_none());
+    }
+
+    #[test]
+    fn merge_resources_shallow_scans_past_taken_suffix_to_next_n() {
+        let mut pdf = open_minimal();
+        let helv_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let other_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("BaseFont", Object::Name(b"TimesRoman".to_vec()))],
+        );
+        let courier_ref = set_dict(
+            &mut pdf,
+            12,
+            &[("BaseFont", Object::Name(b"Courier".to_vec()))],
+        );
+        // Pre-seed dest with BOTH F1 (which will collide with source) and
+        // F1_1 (an unrelated pre-existing entry that already occupies the
+        // first rename candidate), forcing the suffix scan to skip to F1_2.
+        let dest_dr = set_font_dr(&mut pdf, 2, &[("F1", helv_ref), ("F1_1", other_ref)]);
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", courier_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+
+        assert_eq!(
+            dr_map
+                .get(b"Font".as_slice())
+                .and_then(|m| m.get(b"F1".as_slice())),
+            Some(&b"F1_2".to_vec())
+        );
+        let font = font_dict(&mut pdf, dest_dr);
+        assert_eq!(font.get_ref("F1"), Some(helv_ref));
+        assert_eq!(font.get_ref("F1_1"), Some(other_ref));
+        assert_eq!(font.get_ref("F1_2"), Some(courier_ref));
+    }
+
+    /// Source `/DR/Font` is stored as an indirect reference (not a direct
+    /// sub-dict). qpdf's `mergeResources` resolves the reference and merges
+    /// the underlying dict; a naive implementation that only matched
+    /// `Object::Dictionary` would drop the fonts entirely.
+    #[test]
+    fn merge_resources_shallow_resolves_indirect_source_resource_type_dict() {
+        let mut pdf = open_minimal();
+        let font_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        // Indirect /Font sub-dict on the source side: /Font 4 0 R where 4 0 R
+        // resolves to << /F1 10 0 R >>.
+        let font_subdict_ref = ObjectRef::new(4, 0);
+        let mut font_sub = crate::Dictionary::new();
+        font_sub.insert("F1", Object::Reference(font_ref));
+        pdf.set_object(font_subdict_ref, Object::Dictionary(font_sub));
+        let source_dr = set_dict(
+            &mut pdf,
+            3,
+            &[("Font", Object::Reference(font_subdict_ref))],
+        );
+        let dest_dr = set_dict(&mut pdf, 2, &[]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+
+        assert!(dr_map.is_empty());
+        let font = font_dict(&mut pdf, dest_dr);
+        assert_eq!(font.get_ref("F1"), Some(font_ref));
+    }
+
+    /// Dest `/DR/Font` is stored as an indirect reference potentially
+    /// shared with other holders. qpdf's `mergeResources` shallow-copies
+    /// the referenced dict into a FRESH indirect object and re-points
+    /// dest's `/Font` at the new ref
+    /// (`this_val = replaceKeyAndGetNew(rtype, this_val.shallowCopy())` in
+    /// `QPDFObjectHandle::mergeResources`); the ORIGINAL indirect object
+    /// stays untouched so unrelated holders keep their original content.
+    /// A naive implementation that mutated the original object in place
+    /// would leak the merge (and any subsequent `_N` renames) into every
+    /// other holder of that ref.
+    #[test]
+    fn merge_resources_shallow_copies_indirect_dest_sub_dict_into_fresh_ref() {
+        let mut pdf = open_minimal();
+        let helv_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let courier_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("BaseFont", Object::Name(b"Courier".to_vec()))],
+        );
+        // Indirect /Font sub-dict on the dest side: /Font 4 0 R where 4 0 R
+        // resolves to << /F0 10 0 R >> (F0 = Helvetica).
+        let dest_font_subdict_ref = ObjectRef::new(4, 0);
+        let mut dest_font_sub = crate::Dictionary::new();
+        dest_font_sub.insert("F0", Object::Reference(helv_ref));
+        pdf.set_object(dest_font_subdict_ref, Object::Dictionary(dest_font_sub));
+        let dest_dr = set_dict(
+            &mut pdf,
+            2,
+            &[("Font", Object::Reference(dest_font_subdict_ref))],
+        );
+        // Direct /Font sub-dict on the source side, adding a fresh F1.
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", courier_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+
+        assert!(dr_map.is_empty(), "no name collision, no rename");
+        // dest's /Font now points at a NEW indirect object (not the original).
+        let dest_dict = pdf.resolve(dest_dr).unwrap().into_dict().unwrap();
+        let new_font_ref = dest_dict.get_ref("Font").expect("Font must be indirect");
+        assert_ne!(
+            new_font_ref, dest_font_subdict_ref,
+            "qpdf shallow-copies indirect sub-dicts into a fresh ref",
+        );
+        // The ORIGINAL indirect object is untouched — still only carries F0.
+        let original = pdf
+            .resolve(dest_font_subdict_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
+        assert_eq!(original.get_ref("F0"), Some(helv_ref));
+        assert!(
+            original.get("F1").is_none(),
+            "original indirect object must not be mutated (other holders would see F1 leak)",
+        );
+        // The NEW indirect object carries the shallow-copied F0 plus F1.
+        let merged = pdf.resolve(new_font_ref).unwrap().into_dict().unwrap();
+        assert_eq!(merged.get_ref("F0"), Some(helv_ref));
+        assert_eq!(merged.get_ref("F1"), Some(courier_ref));
+    }
+
+    // ---- ensure_dest_acroform_dr -------------------------------------------
+
+    #[test]
+    fn ensure_dest_acroform_dr_creates_fresh_dr_when_dest_has_no_acroform() {
+        let mut pdf = open_minimal();
+        let font_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", font_ref)]);
+
+        let mut dr_map = DrMap::new();
+        let dr_ref = ensure_dest_acroform_dr(&mut pdf, source_dr, &mut dr_map).unwrap();
+
+        assert!(dr_map.is_empty());
+        let font = font_dict(&mut pdf, dr_ref);
+        assert_eq!(font.get_ref("F1"), Some(font_ref));
+    }
+
+    /// Simulates two placements onto two different pages of the SAME
+    /// destination document: the first call creates a fresh `/AcroForm/DR`
+    /// (`dr_map1` stays empty — verbatim insert); the second call finds the
+    /// `/AcroForm/DR` already installed as an indirect reference (the
+    /// `Some(Object::Reference(existing))` branch) and must reuse it. This is
+    /// the invariant this layer must not break: `source_dr` did not change
+    /// between calls, so the second call's `F1` collides with dest's `F1`
+    /// under the *same* object — a same-ref no-op, not a rename. Every
+    /// multi-page overlay byte gate with a form-field source relies on this:
+    /// after the first placement establishes the dest `/DR`, every
+    /// subsequent placement's `ensure_dest_acroform_dr` call must leave it
+    /// untouched rather than minting spurious `F1_1`, `F1_2`, ... entries.
+    #[test]
+    fn ensure_dest_acroform_dr_reuses_existing_dr_across_repeated_calls_without_rename() {
+        let mut pdf = open_minimal();
+        let font_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", font_ref)]);
+
+        let mut dr_map1 = DrMap::new();
+        let dr_ref1 = ensure_dest_acroform_dr(&mut pdf, source_dr, &mut dr_map1).unwrap();
+        assert!(dr_map1.is_empty());
+
+        let mut dr_map2 = DrMap::new();
+        let dr_ref2 = ensure_dest_acroform_dr(&mut pdf, source_dr, &mut dr_map2).unwrap();
+
+        assert_eq!(dr_ref1, dr_ref2, "the same /DR object must be reused");
+        assert!(dr_map2.is_empty(), "same source ref must not be re-renamed");
+        let font = font_dict(&mut pdf, dr_ref2);
+        assert_eq!(font.get_ref("F1"), Some(font_ref));
+        assert!(font.get("F1_1").is_none());
+    }
+
+    // ---- end-to-end (structural, not byte-identical) -----------------------
+
+    /// Full `apply_overlay_specs` pipeline over the Layer-1 fixtures used by
+    /// the (still-`#[ignore]`d) byte gate in `overlay.rs`, asserting
+    /// structure rather than exact bytes so this runs without the
+    /// `qpdf-zlib-compat` feature. Restricted to destination page 1 only
+    /// (`to: "1"`) so it drives exactly one merge call — the multi-page
+    /// repeat-placement reuse gap documented on `merge_resources_shallow` is
+    /// out of scope here.
+    #[test]
+    fn overlay_pipeline_renames_colliding_dr_font_end_to_end() {
+        use crate::overlay::{apply_overlay_specs, OverlayKind, OverlaySpec};
+        use crate::page_range::PageRange;
+        use std::path::Path;
+
+        fn fixture(name: &str) -> Pdf<std::io::BufReader<std::fs::File>> {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/compat")
+                .join(name);
+            let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+            Pdf::open(std::io::BufReader::new(file)).unwrap()
+        }
+        fn pr(input: &str) -> PageRange {
+            PageRange::parse(input).unwrap_or_else(|e| panic!("parse {input:?}: {e}"))
+        }
+
+        let mut dest = fixture("fxo-red-with-existing-acroform-dr.pdf");
+        let src = fixture("form-fields-and-annotations.pdf");
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr("1"),
+            repeat: None,
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+
+        let root_ref = dest.root_ref().unwrap();
+        let catalog = dest.resolve(root_ref).unwrap().into_dict().unwrap();
+        let acroform_ref = catalog.get_ref("AcroForm").unwrap();
+        let acroform = dest.resolve(acroform_ref).unwrap().into_dict().unwrap();
+        let dr_ref = acroform.get_ref("DR").unwrap();
+        let font = font_dict(&mut dest, dr_ref);
+        let f1_ref = font.get_ref("F1").expect("original /F1 preserved");
+        let f1_1_ref = font.get_ref("F1_1").expect("collision renamed to /F1_1");
+        assert_ne!(f1_ref, f1_1_ref);
+
+        let f1_font = dest.resolve(f1_ref).unwrap().into_dict().unwrap();
+        assert_eq!(
+            f1_font.get("BaseFont"),
+            Some(&Object::Name(b"Helvetica".to_vec()))
+        );
+        let f1_1_font = dest.resolve(f1_1_ref).unwrap().into_dict().unwrap();
+        assert_eq!(
+            f1_1_font.get("BaseFont"),
+            Some(&Object::Name(b"Courier".to_vec()))
+        );
+    }
 }

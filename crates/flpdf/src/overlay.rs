@@ -348,6 +348,10 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     let mut content = String::new();
     let mut new_top_fields: Vec<ObjectRef> = Vec::new();
     let mut dest_acroform_dr: Option<ObjectRef> = None;
+    // One `dr_map` per destination page, alongside `dest_acroform_dr` (same
+    // lifecycle: created fresh here, threaded through every placement on
+    // this page). See `overlay_annotations::DrMap`.
+    let mut dr_map = crate::overlay_annotations::DrMap::new();
     for (name, xref, template) in &underlay_names {
         let (bbox, fmatrix) = fo_bbox_and_matrix(dest, *xref)?;
         let (fragment, cm) =
@@ -365,6 +369,7 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
                 tpl,
                 cm,
                 &mut dest_acroform_dr,
+                &mut dr_map,
             )?;
             // cov:ignore-end
             new_top_fields.append(&mut added);
@@ -390,6 +395,7 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
                 tpl,
                 cm,
                 &mut dest_acroform_dr,
+                &mut dr_map,
             )?;
             // cov:ignore-end
             new_top_fields.append(&mut added);
