@@ -526,7 +526,7 @@ pub(crate) fn apply_placement<R: Read + Seek>(
             if dest_acroform_dr.is_none() {
                 *dest_acroform_dr = Some(dr_ref);
             }
-        }
+        } // cov:ignore: control-flow marker — llvm-cov instrumentation artifact; the body above is exercised by every field+/DR fixture (e.g. overlay_pipeline_renames_colliding_dr_font_end_to_end)
     }
 
     // Compute the inherited-field overrides (qpdf transformAnnotations
