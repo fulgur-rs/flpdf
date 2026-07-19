@@ -422,12 +422,20 @@ fn ei_lookahead_passes(rest: &[u8]) -> bool {
 ///    the **pre-rename** `/Resources` snapshot taken in steps 1–2 and the
 ///    per-call rename map from step 3 — the membership guard must see the
 ///    original names, since step 3 already renamed (removed) them from the
-///    copy being written back.
+///    copy being written back. Steps 1–4 (the `/Resources` dictionary
+///    rewrite) always run; step 5 is best-effort: if the stream's content
+///    cannot be decoded or re-encoded (most commonly an unsupported
+///    `/Filter`), the content bytes are left exactly as read and only the
+///    dictionary-level rename from steps 1–4 applies — matching qpdf's own
+///    `try`/`catch` around the equivalent step
+///    (`libqpdf/QPDFAcroFormDocumentHelper.cc:829-849`), which turns a
+///    content-parse failure into a warning rather than aborting.
 ///
 /// # Errors
 ///
-/// Propagates any error from [`Pdf::resolve`], or from decoding/re-encoding
-/// the stream's content (an unsupported or malformed `/Filter` chain).
+/// Propagates any error from [`Pdf::resolve`]. A content decode/re-encode
+/// failure is not one of them (see step 5 above) — it is swallowed and
+/// treated as "leave this stream's content unchanged", matching qpdf.
 pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
     dest: &mut Pdf<R>,
     ap_stream_ref: ObjectRef,
@@ -527,9 +535,21 @@ pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
         resources.remove(&key);
     }
 
-    let decoded = crate::filters::decode_stream_data(&stream.dict, &stream.data)?;
-    let new_decoded = resource_replacer(&decoded, &local_dr_map, &pre_rename_resources);
-    stream.data = crate::filters::encode_stream_data(&stream.dict, &new_decoded)?;
+    // Best-effort content rewrite (step 5, see doc comment above): a
+    // decode/re-encode failure here — most commonly an unsupported
+    // `/Filter` chain (e.g. an image codec on an AP stream that also has a
+    // `/Resources` collision) — must NOT propagate. qpdf wraps its
+    // equivalent step in a `try`/`catch` that turns exactly this failure
+    // into a warning rather than aborting; propagating an `Err` here would
+    // fail the WHOLE overlay call chain over one unrelated AP stream, which
+    // real qpdf does not do. On failure, `stream.data` is simply left as
+    // read — only the `/Resources` dictionary rename above still applies.
+    if let Ok(decoded) = crate::filters::decode_stream_data(&stream.dict, &stream.data) {
+        let new_decoded = resource_replacer(&decoded, &local_dr_map, &pre_rename_resources);
+        if let Ok(encoded) = crate::filters::encode_stream_data(&stream.dict, &new_decoded) {
+            stream.data = encoded;
+        }
+    }
 
     if was_indirect {
         // A fresh indirect object, never the original ref: the original
@@ -1285,5 +1305,64 @@ mod tests {
             "no fresh name should be minted for a same-object collision"
         );
         assert_eq!(font.get_ref("F1_1"), Some(shared_font_ref));
+    }
+
+    #[test]
+    fn adjust_appearance_stream_unsupported_filter_is_non_fatal_noop() {
+        // The AP stream's own /Resources/Font has "F2", never "F1" — a rename
+        // recorded under dr_map for F1->F1_1 could never have matched this
+        // stream's content even if it decoded successfully. Its content uses
+        // CCITTFaxDecode: a real ISO 32000 stream filter, but one flpdf
+        // intentionally never decodes (crate::filters::passthrough_codec_label
+        // — an image/binary passthrough codec, preserved verbatim). Real
+        // qpdf's AcroForm::adjustAppearanceStream wraps the equivalent
+        // content-parse step in a try/catch that turns exactly this kind of
+        // failure into a warning, not a hard error, so it must not propagate
+        // here either and kill the whole overlay call chain over one
+        // unrelated AP stream. The /Resources dict rename step still runs
+        // (matching qpdf, which renames before its own try/catch), but since
+        // there was nothing to rename, it is a no-op; the content bytes must
+        // be left byte-for-byte exactly as read since flpdf cannot decode
+        // them at all.
+        let mut pdf = open_minimal();
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F2", Object::Integer(1));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", Object::Dictionary(font_dict));
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[
+                ("Resources", Object::Dictionary(resources)),
+                ("Filter", Object::Name(b"CCITTFaxDecode".to_vec())),
+            ],
+            b"\x00\x01opaque-ccitt-bytes",
+        );
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+
+        let result = adjust_appearance_stream(&mut pdf, ap_ref, &dr_map);
+        assert!(
+            result.is_ok(),
+            "an undecodable AP stream content must not fail the whole call"
+        );
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(
+            stream.data, b"\x00\x01opaque-ccitt-bytes",
+            "content bytes must be left exactly as read when they cannot be decoded"
+        );
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        assert_eq!(
+            font.get("F2"),
+            Some(&Object::Integer(1)),
+            "unrelated existing key is untouched"
+        );
+        assert!(font.get("F1").is_none());
+        assert!(font.get("F1_1").is_none());
     }
 }
