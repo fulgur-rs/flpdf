@@ -59,26 +59,24 @@ fn resource_type_for_operator(op: &[u8]) -> Option<&'static [u8]> {
 /// what gets matched: the first name (the tag, `/Span`) is overwritten by
 /// the second before the operator is reached.
 ///
-/// A match requires BOTH:
-/// - `dr_map` records a rename for that name under the operator's resource
-///   category (populated by `merge_resources_shallow` when the source
-///   `/DR`'s entry collided with an existing destination entry under the
-///   same name), AND
-/// - `resources[category]` — the appearance stream's own, **pre-rename**
-///   `/Resources` sub-dictionary, snapshotted by the caller before
-///   [`adjust_appearance_stream`]'s in-place rename — still carries that
-///   name as a key. The caller resolves an indirect (`/Font <ref>`-style)
-///   category sub-dictionary before taking this snapshot, so the guard sees
-///   the same names regardless of whether the AP stream's own `/Resources`
-///   nested that category directly or through a reference. Real qpdf's
-///   `ResourceReplacer` has no such guard (its `to_replace` map is built
-///   solely from `dr_map` crossed with the content scan); this is an
-///   flpdf-local defensive check mirroring the one
-///   `crate::overlay_annotations::adjust_default_appearance` applies to
-///   `/DA` strings, and is a no-op superset check in practice: every name
-///   `merge_resources_shallow` records a rename for was, by construction,
-///   present in the source `/DR` that this stream's `/Resources` was copied
-///   from.
+/// A match requires only that `dr_map` records a rename for that name under
+/// the operator's resource category (populated by `merge_resources_shallow`
+/// when the source `/DR`'s entry collided with an existing destination
+/// entry under the same name) — there is NO additional check that the name
+/// is actually present in this stream's own (local) `/Resources`
+/// sub-dictionary. An earlier version of this function added such a
+/// presence guard as a defensive measure, mirroring the one
+/// `crate::overlay_annotations::adjust_default_appearance` applies to `/DA`
+/// strings; it was removed (roborev PR #490 iter-3 finding 4) after fetching
+/// qpdf's actual `ResourceReplacer`/`ResourceFinder` source
+/// (`libqpdf/QPDFAcroFormDocumentHelper.cc`, `libqpdf/ResourceFinder.cc`)
+/// and confirming qpdf's `ResourceReplacer::handleToken` rewrites purely
+/// from its precomputed `to_replace` map (`dr_map` crossed with the
+/// content-stream scan) with no check against the stream's local
+/// `/Resources` at all. The guard was not a no-op: an appearance stream can
+/// reference a name that resolves only through the INHERITED
+/// `/AcroForm/DR` (no local `/Resources` entry for it at all), and qpdf
+/// still rewrites that token — the guard was blocking exactly that case.
 ///
 /// When matched, the name token's exact byte span is replaced with the
 /// renamed name (escaped via [`crate::object::write_name_escaped`], the
@@ -114,7 +112,7 @@ fn resource_type_for_operator(op: &[u8]) -> Option<&'static [u8]> {
 /// Returns `content.to_vec()` verbatim, without scanning, when `dr_map` is
 /// empty (the common case: no placement recorded a rename on this dest
 /// page).
-pub(crate) fn resource_replacer(content: &[u8], dr_map: &DrMap, resources: &Dictionary) -> Vec<u8> {
+pub(crate) fn resource_replacer(content: &[u8], dr_map: &DrMap) -> Vec<u8> {
     if dr_map.is_empty() {
         return content.to_vec();
     }
@@ -216,16 +214,10 @@ pub(crate) fn resource_replacer(content: &[u8], dr_map: &DrMap, resources: &Dict
             if let Some((out_start, out_end, name)) = last_name.take() {
                 let renamed = dr_map.category(rtype).and_then(|m| m.get(name.as_slice()));
                 if let Some(new_name) = renamed {
-                    let present = resources
-                        .get(rtype)
-                        .and_then(Object::as_dict)
-                        .is_some_and(|d| d.get(name.as_slice()).is_some());
-                    if present {
-                        let mut replacement = Vec::with_capacity(new_name.len() + 1);
-                        replacement.push(b'/');
-                        crate::object::write_name_escaped(&mut replacement, new_name);
-                        out.splice(out_start..out_end, replacement);
-                    }
+                    let mut replacement = Vec::with_capacity(new_name.len() + 1);
+                    replacement.push(b'/');
+                    crate::object::write_name_escaped(&mut replacement, new_name);
+                    out.splice(out_start..out_end, replacement);
                 }
             } // cov:ignore: control-flow marker — llvm-cov instrumentation artifact
         }
@@ -397,42 +389,67 @@ fn ei_lookahead_passes(rest: &[u8]) -> bool {
 ///    one — an appearance stream's own `/Resources` can name either shape),
 ///    inserting an empty one if absent — mirrors merging in qpdf's
 ///    per-category empty `merge_with` dict, whose only effect at this stage
-///    is to force the sub-dictionary to exist and be unshared. A copy of
-///    the *resolved* (never `Object::Reference`) sub-dictionary, as it
-///    stands before any rename, is recorded into the snapshot step 4 reads
-///    — see that step for why an unresolved snapshot would silently defeat
-///    the membership guard.
+///    is to force the sub-dictionary to exist and be unshared.
 /// 3. Rename every `old_key` present in that sub-dictionary to `dr_map`'s
-///    `new_key`, keeping the same value. When `new_key` already names a
-///    *different* resource in this stream's own private copy (same-object
-///    references are a no-op, matching qpdf's `QPDFObjGen` identity check),
-///    the displaced value is not lost: it is reinserted under a freshly
-///    minted stream-local unique name ([`crate::overlay_annotations::unique_dr_name`],
-///    based on `new_key`), and that extra rename is recorded into a
-///    **per-call, cloned** copy of `dr_map` ([`DrMap::insert_rename`]) so
-///    step 5's content rewrite also redirects any token that already said
-///    `new_key` — mirroring qpdf's `merge_with` side table and re-merge
-///    (`libqpdf/QPDFAcroFormDocumentHelper.cc:791-807`). qpdf's `dr_map`
-///    parameter to this function is itself passed **by value**
-///    (`:752`), which is exactly why growing a local copy here cannot leak
-///    into another placement's shared [`DrMap`].
+///    `new_key`, keeping the same value, matching qpdf's rename loop
+///    verbatim (`libqpdf/QPDFAcroFormDocumentHelper.cc:781-803`, fetched and
+///    read line-by-line for this port — roborev PR #490 iter-3 finding 1).
+///    This is a TWO-PHASE algorithm, not a single pass:
+///    - **Phase 1** mutates the sub-dictionary key-by-key, IN PLACE, reading
+///      `existing_new`/`old_val` from the LIVE, currently-mutating
+///      sub-dictionary — exactly like qpdf. A `new_key` that already names a
+///      value gets that value staged into a local `merge_with` dict (NOT
+///      immediately renamed) before `old_key`'s value moves into `new_key`.
+///      Because phase 1 reads live state, a LATER rename entry in the same
+///      category CAN observe an EARLIER entry's freshly-written key — e.g.
+///      `dr_map` recording both `F1->F1_1` and `F1_1->F1_1_1` for the same
+///      category means the second entry's `old_key` lookup (`F1_1`) finds
+///      the value phase 1 JUST moved there from `F1`, not the sub-dict's
+///      true original `F1_1` occupant. This matches qpdf bug-for-bug: a
+///      snapshot-based rewrite that avoided this "reprocessing" would
+///      itself be the byte-identical divergence (see the
+///      `adjust_appearance_stream_rename_chain_*` tests below, which encode
+///      the resulting cross-wired names as the correct, qpdf-verified
+///      output).
+///    - **Phase 2** re-merges the staged `merge_with` dict back into the
+///      (now phase-1-mutated) sub-dictionary, matching qpdf's
+///      `resources.mergeResources(merge_with, &dr_map)` (`:807`, itself
+///      `QPDFObjectHandle::mergeResources`'s generic dict-merge-with-
+///      conflicts algorithm). A staged value whose slot phase 1 already
+///      vacated re-lands under its own original name, no conflict. A
+///      GENUINE new conflict (the slot is occupied by something else) is
+///      resolved the same way [`crate::overlay_annotations::merge_resources_shallow`]
+///      resolves the top-level `/DR` merge conflict: reuse a key that
+///      already names the SAME object elsewhere in the sub-dictionary (by
+///      [`ObjectRef`] identity — qpdf's `QPDFObjGen`-keyed `og_to_name`), or
+///      else mint a fresh name via
+///      [`crate::overlay_annotations::unique_dr_name`] and extend a
+///      **per-call, cloned** copy of `dr_map` ([`DrMap::insert_rename`]) so
+///      step 5's content rewrite also redirects any token that already said
+///      the staged key. qpdf's `dr_map` parameter to this function is
+///      itself passed **by value** (`:752`), which is exactly why growing a
+///      local copy here cannot leak into another placement's shared
+///      [`DrMap`].
 /// 4. Drop any sub-dictionary left empty by step 3 (qpdf: "remove empty
 ///    subdictionaries").
 /// 5. Rewrite the stream's decoded content via [`resource_replacer`], using
-///    the **pre-rename** `/Resources` snapshot taken in steps 1–2 and the
-///    per-call rename map from step 3 — the membership guard must see the
-///    original names, since step 3 already renamed (removed) them from the
-///    copy being written back. Steps 1–4 (the `/Resources` dictionary
-///    rewrite) always run; step 5 is best-effort in one direction only: if
-///    the content **cannot be decoded** at all (most commonly an unsupported
-///    `/Filter`), the content bytes are left exactly as read and only the
-///    dictionary-level rename from steps 1–4 applies — matching qpdf's own
-///    `try`/`catch` around its equivalent tokenize step
-///    (`libqpdf/QPDFAcroFormDocumentHelper.cc:829-849`), which turns a
-///    content-parse failure into a warning without rolling back the rename
-///    already made to `/Resources`. If the content **decodes** but the
-///    rewritten bytes cannot be **re-encoded under the original `/Filter`**
-///    (e.g. `/LZWDecode`, which flpdf can decode but not re-encode — see
+///    the per-call rename map extended by step 3. Steps 1–4 (the
+///    `/Resources` dictionary rewrite) always run; step 5 is best-effort in
+///    one direction only: if the content **cannot be decoded** at all (most
+///    commonly an unsupported `/Filter`), the content bytes are left
+///    exactly as read and only the dictionary-level rename from steps 1–4
+///    applies. This was verified directly against qpdf's source
+///    (`libqpdf/QPDFAcroFormDocumentHelper.cc`, fetched and read for
+///    roborev PR #490 iter-3 finding 3): the `/Resources` rename (steps 1–4
+///    of this function) runs unconditionally BEFORE qpdf's equivalent
+///    tokenize step, which is wrapped in its OWN `try`/`catch`
+///    (`:824-849`) that turns a content-parse failure into a warning
+///    without rolling back the rename already made to `/Resources` — qpdf
+///    genuinely leaves the stream in this state (renamed dict, stale
+///    content) rather than reverting it, so flpdf matches rather than
+///    "fixing" it. If the content **decodes** but the rewritten bytes
+///    cannot be **re-encoded under the original `/Filter`** (e.g.
+///    `/LZWDecode`, which flpdf can decode but not re-encode — see
 ///    `crate::filters::apply_single_filter_encode`, decision
 ///    flpdf-9hc.7.2), the rewritten content is instead re-encoded as
 ///    `FlateDecode` and `/Filter`/`/DecodeParms` are replaced accordingly, so
@@ -448,7 +465,8 @@ fn ei_lookahead_passes(rest: &[u8]) -> bool {
 ///
 /// Propagates any error from [`Pdf::resolve`]. A content decode or
 /// re-encode failure is not one of them (see step 5 above) — a decode
-/// failure is swallowed and leaves the content unchanged, matching qpdf; a
+/// failure is swallowed and leaves the content unchanged, matching qpdf
+/// (verified against source, not just observed behavior — see step 5); a
 /// re-encode failure is swallowed and instead re-encodes the rewritten
 /// content as `FlateDecode` so it stays consistent with the `/Resources`
 /// rename.
@@ -475,23 +493,12 @@ pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
         _ => return Ok(()), // cov:ignore: /Resources neither dict nor reference — malformed input
     };
 
-    // Snapshot BEFORE any rename: `resource_replacer`'s membership guard
-    // must see the ORIGINAL names — the rename loop below removes them from
-    // `resources` (the copy that gets written back), so consulting the
-    // post-rename copy would make every match fail. Seeded here from the
-    // top-level clone; the loop below overwrites each touched category with
-    // a RESOLVED (never `Object::Reference`) sub-dictionary, since
-    // `resource_replacer`'s guard uses `Object::as_dict`, which does not
-    // itself resolve references.
-    let mut pre_rename_resources = resources.clone();
-
     // Per-call, owned copy of `dr_map` — mirrors qpdf's `dr_map` parameter
     // to `AcroForm::adjustAppearanceStream` being passed BY VALUE
-    // (`libqpdf/QPDFAcroFormDocumentHelper.cc:752`). The double-conflict
-    // branch below extends this LOCAL copy only, via
-    // [`DrMap::insert_rename`], so an extra rename discovered while
-    // privatizing one stream's `/Resources` never leaks into another
-    // placement's shared `DrMap`.
+    // (`libqpdf/QPDFAcroFormDocumentHelper.cc:752`). Phase 2 below extends
+    // this LOCAL copy only, via [`DrMap::insert_rename`], so an extra
+    // rename discovered while privatizing one stream's `/Resources` never
+    // leaks into another placement's shared `DrMap`.
     let mut local_dr_map = dr_map.clone();
 
     for category in dr_map.categories() {
@@ -504,38 +511,71 @@ pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
             Some(Object::Reference(r)) => dest.resolve(r)?.into_dict().unwrap_or_default(),
             _ => Dictionary::new(),
         };
-        // Refresh this category's entry in the pre-rename snapshot with the
-        // RESOLVED sub-dictionary, before any mutation below.
-        pre_rename_resources.insert(category, Object::Dictionary(subdict.clone()));
 
+        // PHASE 1 (qpdf `libqpdf/QPDFAcroFormDocumentHelper.cc:781-803`):
+        // mutate `subdict` key-by-key, IN PLACE — `existing_new`/`old_val`
+        // are read from the LIVE, currently-mutating `subdict`, matching
+        // qpdf's `subdict.getKey(new_key)` / `subdict.getKey(old_key)`
+        // exactly (both consult `subdict` at the moment of THIS iteration,
+        // not a pre-loop snapshot). Any value a rename would otherwise
+        // silently clobber is staged into `merge_with` (qpdf's own local of
+        // that name) rather than lost outright.
+        let mut merge_with = Dictionary::new();
         for (old_key, new_key) in renames {
-            let Some(old_val) = subdict.remove(old_key) else {
-                // This stream's own /Resources never had `old_key` under
-                // this category; nothing to move, and — matching qpdf's
-                // `QPDFObjGen` identity no-op for an unmodified slot —
-                // nothing to displace either.
-                continue;
-            };
-            let old_val_ref_id = old_val.as_ref_id();
-            let existing_new = subdict.get(new_key).cloned();
-            subdict.insert(new_key, old_val);
-            if let Some(existing_new_val) = existing_new {
-                let same_object = existing_new_val
-                    .as_ref_id()
-                    .is_some_and(|r| Some(r) == old_val_ref_id);
-                if !same_object {
-                    // Double conflict: `new_key` already named a DIFFERENT
-                    // resource in this stream's own (private) `/Resources`.
-                    // Mint a fresh stream-local name for the displaced
-                    // value and extend the per-call rename map so a
-                    // content token that already said `new_key` gets
-                    // redirected to it too.
-                    let fresh_name = crate::overlay_annotations::unique_dr_name(new_key, &subdict)?;
-                    subdict.insert(fresh_name.clone(), existing_new_val);
-                    local_dr_map.insert_rename(category, new_key.clone(), fresh_name);
+            if let Some(existing_new) = subdict.get(new_key.as_slice()).cloned() {
+                merge_with.insert(new_key.clone(), existing_new);
+            }
+            if let Some(existing_old) = subdict.remove(old_key) {
+                subdict.insert(new_key.clone(), existing_old);
+            }
+        }
+
+        // PHASE 2 (qpdf `:805-807`'s `resources.mergeResources(merge_with,
+        // &dr_map)`): re-merge every staged, displaced value back in. Not a
+        // simple re-insert — `QPDFObjectHandle::mergeResources`'s
+        // conflicts-map algorithm applies again here, so a slot phase 1
+        // left vacant re-lands its staged value verbatim, while a slot
+        // phase 1 left OCCUPIED by something else is a genuine new
+        // conflict, resolved exactly like the top-level `/DR` merge
+        // conflict in `merge_resources_shallow`: reuse a key that already
+        // names the SAME object elsewhere in `subdict` (an `ObjectRef`
+        // identity scan, qpdf's `og_to_name`), else mint a fresh name.
+        if merge_with.iter().next().is_some() {
+            let mut ref_to_key: std::collections::HashMap<ObjectRef, Vec<u8>> =
+                std::collections::HashMap::new();
+            for (k, v) in subdict.iter() {
+                if let Some(r) = v.as_ref_id() {
+                    ref_to_key.insert(r, k.to_vec());
+                }
+            }
+            let staged: Vec<(Vec<u8>, Object)> = merge_with
+                .iter()
+                .map(|(k, v)| (k.to_vec(), v.clone()))
+                .collect();
+            for (key, rval) in staged {
+                if subdict.get(key.as_slice()).is_none() {
+                    // The slot this value was staged under is free again
+                    // (phase 1 vacated it) — no conflict, reinstate verbatim.
+                    subdict.insert(key, rval);
+                    continue;
+                }
+                let reused = rval.as_ref_id().and_then(|r| ref_to_key.get(&r).cloned());
+                if let Some(existing_key) = reused {
+                    // `existing_key == key` (no rename needed — the
+                    // displaced value already sits under its own staged
+                    // name) matches qpdf's `if (new_key != key)` guard
+                    // around its `conflicts[rtype][key] = new_key` write.
+                    if existing_key != key {
+                        local_dr_map.insert_rename(category, key, existing_key);
+                    }
+                } else {
+                    let fresh_name = crate::overlay_annotations::unique_dr_name(&key, &subdict)?;
+                    subdict.insert(fresh_name.clone(), rval);
+                    local_dr_map.insert_rename(category, key, fresh_name);
                 }
             }
         }
+
         resources.insert(category, Object::Dictionary(subdict));
     }
 
@@ -562,7 +602,7 @@ pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
     // `/Resources` dictionary rename above still applies (matching qpdf,
     // which does not roll back the rename either).
     if let Ok(decoded) = crate::filters::decode_stream_data(&stream.dict, &stream.data) {
-        let new_decoded = resource_replacer(&decoded, &local_dr_map, &pre_rename_resources);
+        let new_decoded = resource_replacer(&decoded, &local_dr_map);
         match crate::filters::encode_stream_data(&stream.dict, &new_decoded) {
             Ok(encoded) => {
                 // Keep `/Length` consistent with the rewritten body — the
@@ -658,53 +698,44 @@ mod tests {
         crate::overlay_annotations::DrMap::for_test(category, old, new)
     }
 
-    fn dict_with_subdict(category: &[u8], keys: &[&[u8]]) -> Dictionary {
-        let mut sub = Dictionary::new();
-        for k in keys {
-            sub.insert(*k, Object::Integer(1));
-        }
-        let mut d = Dictionary::new();
-        d.insert(category, Object::Dictionary(sub));
-        d
-    }
-
     // ---- resource_replacer -------------------------------------------------
 
     #[test]
     fn resource_replacer_empty_dr_map_is_identity() {
         let dr_map = DrMap::new();
-        let resources = Dictionary::new();
         let content = b"/F1 18 Tf (hi) Tj";
-        assert_eq!(resource_replacer(content, &dr_map, &resources), content);
+        assert_eq!(resource_replacer(content, &dr_map), content);
     }
 
     #[test]
     fn resource_replacer_rewrites_tf_font_name() {
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content = b"/F1 18 Tf";
-        assert_eq!(
-            resource_replacer(content, &dr_map, &resources),
-            b"/F1_1 18 Tf"
-        );
+        assert_eq!(resource_replacer(content, &dr_map), b"/F1_1 18 Tf");
     }
 
     #[test]
     fn resource_replacer_name_not_in_dr_map_is_verbatim() {
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F2"]);
         let content = b"/F2 18 Tf";
-        assert_eq!(resource_replacer(content, &dr_map, &resources), content);
+        assert_eq!(resource_replacer(content, &dr_map), content);
     }
 
     #[test]
-    fn resource_replacer_name_absent_from_resources_is_verbatim() {
-        // dr_map has a rename, but this stream's own /Resources never had
-        // the old name — the membership guard must block the rewrite.
+    fn resource_replacer_rewrites_even_when_name_absent_from_local_resources() {
+        // dr_map has a rename, but this stream's own (local) /Resources
+        // never had the old name at all — e.g. the AP stream relies on the
+        // name resolving through the INHERITED /AcroForm/DR rather than its
+        // own /Resources. qpdf's `ResourceReplacer::handleToken` rewrites
+        // purely from its precomputed `to_replace` map (verified against
+        // `libqpdf/ResourceFinder.cc` source — roborev PR #490 iter-3
+        // finding 4); it has NO check against the stream's local
+        // /Resources, so this must still rewrite. An earlier version of
+        // this function added exactly such a presence guard and wrongly
+        // left this token untouched.
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = Dictionary::new();
         let content = b"/F1 18 Tf";
-        assert_eq!(resource_replacer(content, &dr_map, &resources), content);
+        assert_eq!(resource_replacer(content, &dr_map), b"/F1_1 18 Tf".to_vec());
     }
 
     #[test]
@@ -712,18 +743,16 @@ mod tests {
         // `(F1)` is a STRING, not a Name — `Tj` is not in the operator
         // table either, so nothing here can match regardless.
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content = b"(F1) Tj";
-        assert_eq!(resource_replacer(content, &dr_map, &resources), content);
+        assert_eq!(resource_replacer(content, &dr_map), content);
     }
 
     #[test]
     fn resource_replacer_preserves_whitespace_and_comments() {
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content: &[u8] = b"  % a comment\n /F1   18  Tf  ";
         assert_eq!(
-            resource_replacer(content, &dr_map, &resources),
+            resource_replacer(content, &dr_map),
             b"  % a comment\n /F1_1   18  Tf  ".to_vec()
         );
     }
@@ -736,10 +765,9 @@ mod tests {
         // `crate::overlay_annotations::adjust_default_appearance`'s own
         // malformed-token recovery test).
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content: &[u8] = b"/F1 18 Tf ) /F1 18 Tf";
         assert_eq!(
-            resource_replacer(content, &dr_map, &resources),
+            resource_replacer(content, &dr_map),
             b"/F1_1 18 Tf ) /F1_1 18 Tf".to_vec()
         );
     }
@@ -756,10 +784,9 @@ mod tests {
         // `crate::overlay_annotations::adjust_default_appearance`'s own
         // operand-parse-error recovery test).
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content: &[u8] = b"(bad /F1 18 Tf";
         assert_eq!(
-            resource_replacer(content, &dr_map, &resources),
+            resource_replacer(content, &dr_map),
             b"(bad /F1_1 18 Tf".to_vec()
         );
     }
@@ -767,9 +794,8 @@ mod tests {
     #[test]
     fn resource_replacer_do_xobject() {
         let dr_map = dr_map_with(b"XObject", b"Fx1", b"Fx1_1");
-        let resources = dict_with_subdict(b"XObject", &[b"Fx1"]);
         assert_eq!(
-            resource_replacer(b"q /Fx1 Do Q", &dr_map, &resources),
+            resource_replacer(b"q /Fx1 Do Q", &dr_map),
             b"q /Fx1_1 Do Q".to_vec()
         );
     }
@@ -777,9 +803,8 @@ mod tests {
     #[test]
     fn resource_replacer_gs_extgstate() {
         let dr_map = dr_map_with(b"ExtGState", b"GS1", b"GS1_1");
-        let resources = dict_with_subdict(b"ExtGState", &[b"GS1"]);
         assert_eq!(
-            resource_replacer(b"/GS1 gs", &dr_map, &resources),
+            resource_replacer(b"/GS1 gs", &dr_map),
             b"/GS1_1 gs".to_vec()
         );
     }
@@ -787,9 +812,8 @@ mod tests {
     #[test]
     fn resource_replacer_sh_shading() {
         let dr_map = dr_map_with(b"Shading", b"Sh1", b"Sh1_1");
-        let resources = dict_with_subdict(b"Shading", &[b"Sh1"]);
         assert_eq!(
-            resource_replacer(b"/Sh1 sh", &dr_map, &resources),
+            resource_replacer(b"/Sh1 sh", &dr_map),
             b"/Sh1_1 sh".to_vec()
         );
     }
@@ -797,13 +821,12 @@ mod tests {
     #[test]
     fn resource_replacer_cs_and_lowercase_cs_colorspace() {
         let dr_map = dr_map_with(b"ColorSpace", b"CS1", b"CS1_1");
-        let resources = dict_with_subdict(b"ColorSpace", &[b"CS1"]);
         assert_eq!(
-            resource_replacer(b"/CS1 CS", &dr_map, &resources),
+            resource_replacer(b"/CS1 CS", &dr_map),
             b"/CS1_1 CS".to_vec()
         );
         assert_eq!(
-            resource_replacer(b"/CS1 cs", &dr_map, &resources),
+            resource_replacer(b"/CS1 cs", &dr_map),
             b"/CS1_1 cs".to_vec()
         );
     }
@@ -811,13 +834,12 @@ mod tests {
     #[test]
     fn resource_replacer_scn_and_lowercase_scn_pattern() {
         let dr_map = dr_map_with(b"Pattern", b"P1", b"P1_1");
-        let resources = dict_with_subdict(b"Pattern", &[b"P1"]);
         assert_eq!(
-            resource_replacer(b"1 0 0 /P1 SCN", &dr_map, &resources),
+            resource_replacer(b"1 0 0 /P1 SCN", &dr_map),
             b"1 0 0 /P1_1 SCN".to_vec()
         );
         assert_eq!(
-            resource_replacer(b"1 0 0 /P1 scn", &dr_map, &resources),
+            resource_replacer(b"1 0 0 /P1 scn", &dr_map),
             b"1 0 0 /P1_1 scn".to_vec()
         );
     }
@@ -830,13 +852,12 @@ mod tests {
         // operator is reached, so only it is eligible for renaming; the
         // first (`/Span`) is never looked up at all.
         let dr_map = dr_map_with(b"Properties", b"P1", b"P1_1");
-        let resources = dict_with_subdict(b"Properties", &[b"P1"]);
         assert_eq!(
-            resource_replacer(b"/Span /P1 BDC", &dr_map, &resources),
+            resource_replacer(b"/Span /P1 BDC", &dr_map),
             b"/Span /P1_1 BDC".to_vec()
         );
         assert_eq!(
-            resource_replacer(b"/Span /P1 DP", &dr_map, &resources),
+            resource_replacer(b"/Span /P1 DP", &dr_map),
             b"/Span /P1_1 DP".to_vec()
         );
     }
@@ -849,11 +870,10 @@ mod tests {
         // content tokens before `BI` and after `EI` are eligible for
         // renaming.
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content: &[u8] =
             b"/F1 18 Tf BI /W 1 /H 1 /BPC 8 /CS /G ID \x01/F1 18 Tf\x02 EI /F1 18 Tf";
         assert_eq!(
-            resource_replacer(content, &dr_map, &resources),
+            resource_replacer(content, &dr_map),
             b"/F1_1 18 Tf BI /W 1 /H 1 /BPC 8 /CS /G ID \x01/F1 18 Tf\x02 EI /F1_1 18 Tf".to_vec()
         );
     }
@@ -865,10 +885,9 @@ mod tests {
         // "after" check accepts EITHER whitespace OR a delimiter, matching
         // qpdf's own delimiter-bounded `EI` search.
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content: &[u8] = b"BI /W 1 ID \x01/F1 18 Tf\x02 EI/F1 18 Tf";
         assert_eq!(
-            resource_replacer(content, &dr_map, &resources),
+            resource_replacer(content, &dr_map),
             b"BI /W 1 ID \x01/F1 18 Tf\x02 EI/F1_1 18 Tf".to_vec()
         );
     }
@@ -880,9 +899,8 @@ mod tests {
         // of `content` as opaque data rather than losing bytes or hanging,
         // and must NOT rewrite the `/F1` pattern embedded in it.
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content: &[u8] = b"BI /W 1 ID \x01/F1 18 Tf\x02";
-        assert_eq!(resource_replacer(content, &dr_map, &resources), content);
+        assert_eq!(resource_replacer(content, &dr_map), content);
     }
 
     #[test]
@@ -898,10 +916,9 @@ mod tests {
         // the embedded `/F1 18 Tf` must stay untouched, and only the real
         // tokens before `BI` and after the genuine `EI` are renamed.
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content: &[u8] = b"/F1 18 Tf BI /W 1 /H 1 /BPC 8 /CS /G ID \x01\x02 EI \xFFzzzz /F1 18 Tf \x05\x06 EI /F1 18 Tf";
         assert_eq!(
-            resource_replacer(content, &dr_map, &resources),
+            resource_replacer(content, &dr_map),
             b"/F1_1 18 Tf BI /W 1 /H 1 /BPC 8 /CS /G ID \x01\x02 EI \xFFzzzz /F1 18 Tf \x05\x06 EI /F1_1 18 Tf".to_vec()
         );
     }
@@ -913,10 +930,9 @@ mod tests {
         // which qpdf's heuristic treats as suspicious (real operators are
         // pure alphabetic runs, e.g. `Tf`, `cm`, `Do`) and rejects.
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content: &[u8] = b"BI ID \x01 EI ab1 more /F1 18 Tf \x02 EI /F1 18 Tf";
         assert_eq!(
-            resource_replacer(content, &dr_map, &resources),
+            resource_replacer(content, &dr_map),
             b"BI ID \x01 EI ab1 more /F1 18 Tf \x02 EI /F1_1 18 Tf".to_vec()
         );
     }
@@ -927,10 +943,9 @@ mod tests {
         // delimiter that does not start any recognised operand — which is
         // qpdf's `tt_bad` case and rejects the candidate.
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content: &[u8] = b"BI ID \x01 EI ) /F1 18 Tf \x02 EI /F1 18 Tf";
         assert_eq!(
-            resource_replacer(content, &dr_map, &resources),
+            resource_replacer(content, &dr_map),
             b"BI ID \x01 EI ) /F1 18 Tf \x02 EI /F1_1 18 Tf".to_vec()
         );
     }
@@ -941,10 +956,9 @@ mod tests {
         // (`(`) but never terminates it before EOF — the shared object
         // lexer's `Err` case, which also rejects the candidate.
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content: &[u8] = b"BI ID \x01 EI (unterminated /F1 18 Tf \x02 EI /F1 18 Tf";
         assert_eq!(
-            resource_replacer(content, &dr_map, &resources),
+            resource_replacer(content, &dr_map),
             b"BI ID \x01 EI (unterminated /F1 18 Tf \x02 EI /F1_1 18 Tf".to_vec()
         );
     }
@@ -955,9 +969,8 @@ mod tests {
         // suspicious "word" — it consumes one of the 10 lookahead slots and
         // the candidate is still accepted once EOF follows.
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content: &[u8] = b"BI ID \x01 EI %trailing comment";
-        assert_eq!(resource_replacer(content, &dr_map, &resources), content);
+        assert_eq!(resource_replacer(content, &dr_map), content);
     }
 
     #[test]
@@ -967,10 +980,9 @@ mod tests {
         // accept the candidate once the fixed lookahead budget is
         // exhausted without ever finding a bad or suspicious token.
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content: &[u8] = b"BI ID \x01 EI 1 2 3 4 5 6 7 8 9 10 /F1 18 Tf";
         assert_eq!(
-            resource_replacer(content, &dr_map, &resources),
+            resource_replacer(content, &dr_map),
             b"BI ID \x01 EI 1 2 3 4 5 6 7 8 9 10 /F1_1 18 Tf".to_vec()
         );
     }
@@ -989,11 +1001,28 @@ mod tests {
         // the fallback is the rejected candidate's position and not a
         // blanket "copy everything to EOF".
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
-        let resources = dict_with_subdict(b"Font", &[b"F1"]);
         let content: &[u8] = b"BI ID \x01 EI \xFFbad /F1 18 Tf";
         assert_eq!(
-            resource_replacer(content, &dr_map, &resources),
+            resource_replacer(content, &dr_map),
             b"BI ID \x01 EI \xFFbad /F1_1 18 Tf".to_vec()
+        );
+    }
+
+    #[test]
+    fn resource_replacer_rewrites_a_rename_chain_independently_of_dict_state() {
+        // `resource_replacer` only ever rewrites content tokens FROM
+        // `dr_map` — it has no dependency on how `adjust_appearance_stream`
+        // resolved any `/Resources` dictionary collisions along the way
+        // (roborev PR #490 iter-3 finding 1's dict-side "reprocessing" is a
+        // property of `adjust_appearance_stream`'s rename loop, not of this
+        // function). A chained dr_map (`F1->F1_1`, `F1_1->F1_1_1`) simply
+        // rewrites every matching token independently, left to right.
+        let mut dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        dr_map.insert_rename(b"Font", b"F1_1".to_vec(), b"F1_1_1".to_vec());
+        let content: &[u8] = b"/F1 18 Tf /F1_1 18 Tf";
+        assert_eq!(
+            resource_replacer(content, &dr_map),
+            b"/F1_1 18 Tf /F1_1_1 18 Tf".to_vec()
         );
     }
 
@@ -1421,6 +1450,128 @@ mod tests {
         );
         assert!(font.get("F1").is_none());
         assert!(font.get("F1_1").is_none());
+    }
+
+    #[test]
+    fn adjust_appearance_stream_rename_chain_matches_qpdf_verified_result() {
+        // dr_map records a CHAIN within one category: F1->F1_1 AND,
+        // independently, F1_1->F1_1_1 (both entries genuinely present in
+        // dr_map at once — plausible when the top-level /DR merge assigns
+        // F1_1 to a renamed F1 while a DIFFERENT source object separately
+        // collides under the destination's own pre-existing F1_1). This
+        // stream's own /Resources/Font has both F1 and F1_1 locally.
+        //
+        // qpdf's rename loop (`libqpdf/QPDFAcroFormDocumentHelper.cc:781-803`,
+        // fetched and read for roborev PR #490 iter-3 finding 1) mutates the
+        // sub-dictionary IN PLACE: processing F1->F1_1 first (dr_map is
+        // sorted, "F1" < "F1_1") moves F1's value into the F1_1 slot,
+        // displacing the true original F1_1 value into a `merge_with`
+        // side-map. Processing F1_1->F1_1_1 next then reads the ALREADY-
+        // overwritten F1_1 slot (now holding F1's value, not the true
+        // original) and moves THAT into F1_1_1. The re-merge step
+        // (`:805-807`) then re-lands the side-mapped, true original F1_1
+        // value back into ITS OWN name, F1_1 — which is free again, since
+        // phase 1 vacated it. The two resources end up CROSS-WIRED between
+        // the dict and content: this is qpdf's actual, verified output for
+        // this input, not a bug flpdf introduced — a "cleaner" pre-snapshot
+        // rewrite would be the byte-identical divergence here.
+        let mut pdf = open_minimal();
+        let f1_font_ref = ObjectRef::new(5, 0);
+        pdf.set_object(f1_font_ref, Object::Dictionary(Dictionary::new()));
+        let f1_1_font_ref = ObjectRef::new(6, 0);
+        pdf.set_object(f1_1_font_ref, Object::Dictionary(Dictionary::new()));
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F1", Object::Reference(f1_font_ref));
+        font_dict.insert("F1_1", Object::Reference(f1_1_font_ref));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", Object::Dictionary(font_dict));
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[("Resources", Object::Dictionary(resources))],
+            b"/F1 18 Tf /F1_1 18 Tf",
+        );
+        let mut dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        dr_map.insert_rename(b"Font", b"F1_1".to_vec(), b"F1_1_1".to_vec());
+
+        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(stream.data, b"/F1_1 18 Tf /F1_1_1 18 Tf");
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        assert!(font.get("F1").is_none());
+        assert_eq!(
+            font.get_ref("F1_1"),
+            Some(f1_1_font_ref),
+            "the true original F1_1 value re-lands under its OWN name via the re-merge"
+        );
+        assert_eq!(
+            font.get_ref("F1_1_1"),
+            Some(f1_font_ref),
+            "F1's value ends up under F1_1_1, having been reprocessed by the second rename entry"
+        );
+    }
+
+    #[test]
+    fn adjust_appearance_stream_reuses_existing_key_for_same_object_on_new_conflict() {
+        // Phase 2's conflict resolution (`libqpdf/QPDFAcroFormDocumentHelper.cc:805-807`'s
+        // `resources.mergeResources(merge_with, &dr_map)`, `QPDFObjectHandle::mergeResources`'s
+        // `og_to_name` reuse) is exercised here: /Resources/Font has F1 and
+        // F2 BOTH pointing at the SAME object, plus F3 at a different
+        // object. dr_map renames F3->F2. Phase 1 moves F3's value into F2
+        // (displacing F2's original occupant — which is the SAME object as
+        // F1 — into `merge_with`). Phase 2 then finds F2 occupied (by F3's
+        // moved-in value) and, instead of minting a fresh name for the
+        // displaced value, notices it already lives under F1 (by
+        // `ObjectRef` identity) and records an EXTRA dr_map redirect
+        // (F2->F1) instead — no fresh name minted at all.
+        let mut pdf = open_minimal();
+        let shared_ref = ObjectRef::new(5, 0);
+        pdf.set_object(shared_ref, Object::Dictionary(Dictionary::new()));
+        let other_ref = ObjectRef::new(6, 0);
+        pdf.set_object(other_ref, Object::Dictionary(Dictionary::new()));
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F1", Object::Reference(shared_ref));
+        font_dict.insert("F2", Object::Reference(shared_ref));
+        font_dict.insert("F3", Object::Reference(other_ref));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", Object::Dictionary(font_dict));
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[("Resources", Object::Dictionary(resources))],
+            b"/F3 18 Tf /F2 18 Tf",
+        );
+        let dr_map = dr_map_with(b"Font", b"F3", b"F2");
+
+        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(
+            stream.data, b"/F2 18 Tf /F1 18 Tf",
+            "F3 (now under F2) rewrites to /F2; the original /F2 token must \
+             follow its displaced value to wherever it actually ended up (F1), \
+             not stay pointing at F2 (now a different object) or lose the rename"
+        );
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        assert_eq!(font.get_ref("F1"), Some(shared_ref));
+        assert_eq!(font.get_ref("F2"), Some(other_ref));
+        assert!(font.get("F3").is_none());
+        assert!(
+            font.get("F2_1").is_none(),
+            "no fresh name should be minted — the displaced value is REUSED \
+             under its existing F1 name, not aliased under a new one"
+        );
     }
 
     /// Pack literal bytes as a minimal `/LZWDecode` stream: each byte is its
