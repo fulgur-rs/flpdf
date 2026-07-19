@@ -455,9 +455,15 @@ impl DrMap {
 ///   `dr_map`);
 /// - append the dup'd annots to the destination page `/Annots`.
 ///
-/// `dr_map` accumulates resource-name renames across every placement on this
-/// destination page (one map per dest page, created by the caller alongside
-/// `dest_acroform_dr`); see [`DrMap`].
+/// `dr_map` is document-scoped: ONE map created by the caller
+/// (`apply_aggregated_sources` in `overlay.rs`) and threaded by `&mut`
+/// through every placement on every destination page, so [`DrMap`]'s
+/// `by_source_ref` cache can keep reusing the same renamed name for a
+/// recurring source object across pages. Its `by_name` table, by contrast,
+/// is reset at the top of every call to this function and repopulated only
+/// for THIS placement — see the reset at the top of the function body.
+/// `dest_acroform_dr`, unlike `dr_map`, is page-scoped: a fresh `None`
+/// created by the caller for each destination page.
 ///
 /// Returns the newly-added top-level field dest refs (one per distinct top
 /// field observed in this placement), to be collected across all placements
@@ -483,6 +489,25 @@ pub(crate) fn apply_placement<R: Read + Seek>(
     // don't share mutated /Rect / /Parent / AP /Matrix state.
     let mut per_placement_dup: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
 
+    // `dr_map.by_name` is reset UNCONDITIONALLY at the top of every
+    // placement, before deciding whether to repopulate it — mirrors qpdf's
+    // `dr_map` being a local variable freshly created at the top of every
+    // `AcroForm::transformAnnotations` call (verified via deepwiki against
+    // `libqpdf/QPDFAcroFormDocumentHelper.cc`), never persisted across
+    // calls. flpdf threads the SAME `DrMap` by `&mut` through every
+    // placement on the whole destination document so `by_source_ref` (a
+    // genuinely dest-scoped cache — see [`DrMap`]) can keep reusing the same
+    // rename for a recurring source object, but `by_name` — the per-call
+    // rename table [`adjust_default_appearance`] and
+    // `crate::overlay_appearance_stream::adjust_appearance_stream` consult
+    // for THIS placement's fields/AP streams — must not leak from a prior
+    // placement into one that never repopulates it below. An
+    // annotation-only placement (no top-level field at all, so neither
+    // branch below runs) previously left a PRIOR placement's `by_name`
+    // renames in place, wrongly applied to this placement's AP streams
+    // (roborev PR #490 iter-3 finding 2).
+    dr_map.by_name.clear();
+
     // If ANY annot in this placement carries a top-level field, run the
     // source /DR merge for THIS placement — even when `dest_acroform_dr` is
     // already Some. The merge repopulates `dr_map.by_name` with just this
@@ -492,23 +517,15 @@ pub(crate) fn apply_placement<R: Read + Seek>(
     // `dest_acroform_dr` cache stays: the ref itself does not change once
     // installed. When the placement has fields but NO source /DR (a valid
     // shape: source has annotations without an /AcroForm), no merge fires,
-    // so `dr_map.by_name` is cleared explicitly to prevent a stale rename
-    // from leaking into this placement's /DA rewrites.
+    // so `by_name` simply stays cleared (from above) — there is nothing to
+    // repopulate it with.
     let has_any_top_field = template.annots.iter().any(|(_, tf)| tf.is_some());
     if has_any_top_field {
-        match template.source_dr {
-            Some(source_dr) => {
-                let dr_ref = ensure_dest_acroform_dr(dest, source_dr, dr_map)?;
-                if dest_acroform_dr.is_none() {
-                    *dest_acroform_dr = Some(dr_ref);
-                }
+        if let Some(source_dr) = template.source_dr {
+            let dr_ref = ensure_dest_acroform_dr(dest, source_dr, dr_map)?;
+            if dest_acroform_dr.is_none() {
+                *dest_acroform_dr = Some(dr_ref);
             }
-            // cov:ignore-start: source has fields but no /DR — the shipped
-            // link-annot-no-acroform fixture is source-without-fields, so
-            // this arm needs a source-with-fields-but-no-/DR fixture to
-            // reach.
-            None => dr_map.by_name.clear(),
-            // cov:ignore-end
         }
     }
 
@@ -2716,6 +2733,73 @@ mod tests {
         let font = font_dict(&mut pdf, dr_ref2);
         assert_eq!(font.get_ref("F1"), Some(font_ref));
         assert!(font.get("F1_1").is_none());
+    }
+
+    // ---- apply_placement ----------------------------------------------------
+
+    /// A prior placement on this destination page installed a real DR-level
+    /// rename into `dr_map.by_name` (here stood in for directly via
+    /// `merge_resources_shallow`, the exact call `apply_placement`'s own
+    /// `has_any_top_field` branch makes for any placement with a top-level
+    /// field). A SECOND placement on the SAME page that carries annotations
+    /// but NO top-level field at all (`has_any_top_field == false`) must not
+    /// see that stale rename: before this fix, neither arm of the
+    /// `has_any_top_field` check ran for an annotation-only placement, so
+    /// `dr_map.by_name` was left exactly as the first placement's merge left
+    /// it — a rename table describing a DIFFERENT source's fonts, silently
+    /// available to whatever later reads `dr_map.by_name` for this
+    /// placement's own AP streams (roborev PR #490 iter-3 finding 2).
+    #[test]
+    fn apply_placement_clears_stale_by_name_for_annotation_only_placement() {
+        let mut pdf = open_minimal();
+        let times_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Times-Roman".to_vec()))],
+        );
+        let helv_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let dest_dr = set_font_dr(&mut pdf, 2, &[("F1", times_ref)]);
+        let source_dr = set_font_dr(&mut pdf, 3, &[("F1", helv_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+        assert_eq!(
+            dr_map
+                .category(b"Font")
+                .and_then(|m| m.get(b"F1".as_slice())),
+            Some(&b"F1_1".to_vec()),
+            "sanity: the setup step actually populated a stale rename"
+        );
+
+        let page_ref = set_dict(&mut pdf, 20, &[]);
+        let annot_ref = set_dict(&mut pdf, 21, &[]);
+        let template = AnnotationCopyTemplate {
+            annots: vec![(annot_ref, None)], // annotation-only: no top-level field
+            source_dr: None,
+            ..Default::default()
+        };
+        let mut dest_acroform_dr: Option<ObjectRef> = None;
+
+        apply_placement(
+            &mut pdf,
+            page_ref,
+            &template,
+            IDENTITY,
+            &mut dest_acroform_dr,
+            &mut dr_map,
+        )
+        .unwrap();
+
+        assert!(
+            dr_map.is_empty(),
+            "an annotation-only placement (no top-level field) must clear a stale \
+             by_name rename left over from a prior placement, not silently carry it \
+             forward into whatever reads dr_map for THIS placement's own AP streams"
+        );
     }
 
     // ---- adjust_default_appearance ------------------------------------------
