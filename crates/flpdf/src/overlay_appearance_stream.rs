@@ -540,26 +540,61 @@ pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
         // conflict in `merge_resources_shallow`: reuse a key that already
         // names the SAME object elsewhere in `subdict` (an `ObjectRef`
         // identity scan, qpdf's `og_to_name`), else mint a fresh name.
+        //
+        // `og_to_name`'s lazy-init-then-FROZEN lifecycle (qpdf
+        // `libqpdf/QPDFObjectHandle.cc`, `mergeResources`, the
+        // `initialized_maps` guard around `make_og_to_name`, verified
+        // against the live source — line numbers below are from qpdf
+        // `main` as fetched, not the finding's cited
+        // `QPDFAcroFormDocumentHelper.cc:791-816`, which was for a
+        // different, older qpdf revision):
+        //   - `og_to_name` is built EXACTLY ONCE, lazily, the first time a
+        //     staged key collides with an occupied `subdict` slot (a
+        //     genuine conflict, not a phase-1-vacated slot) — so it DOES
+        //     see any vacated-slot reinstates that happened EARLIER in
+        //     THIS SAME staged loop (they already mutated `subdict`/
+        //     `this_val` by then).
+        //   - Once built, it is NEVER updated again for the rest of this
+        //     resource-type's staged loop — neither by a LATER vacated-slot
+        //     reinstate, nor by a freshly-minted alias from a LATER genuine
+        //     conflict (`this_val.replaceKey(new_key, rval)` in qpdf's
+        //     `else` branch does not touch `og_to_name`).
+        // Concretely: two genuine conflicts on the SAME object each mint
+        // their OWN fresh alias (no reuse between them) — reuse only
+        // happens when one of the two colliding values was already visible
+        // to `subdict` (either pre-existing, or reinstated verbatim earlier
+        // in this loop) at the moment `og_to_name` was snapshotted.
         if merge_with.iter().next().is_some() {
-            let mut ref_to_key: std::collections::HashMap<ObjectRef, Vec<u8>> =
-                std::collections::HashMap::new();
-            for (k, v) in subdict.iter() {
-                if let Some(r) = v.as_ref_id() {
-                    ref_to_key.insert(r, k.to_vec());
-                }
-            }
             let staged: Vec<(Vec<u8>, Object)> = merge_with
                 .iter()
                 .map(|(k, v)| (k.to_vec(), v.clone()))
                 .collect();
+            let mut ref_to_key: Option<std::collections::HashMap<ObjectRef, Vec<u8>>> = None;
             for (key, rval) in staged {
                 if subdict.get(key.as_slice()).is_none() {
                     // The slot this value was staged under is free again
                     // (phase 1 vacated it) — no conflict, reinstate verbatim.
+                    // Deliberately does NOT touch `ref_to_key`: once it has
+                    // been snapshotted below, qpdf's `og_to_name` stays
+                    // frozen even across later vacated-slot reinstates.
                     subdict.insert(key, rval);
                     continue;
                 }
-                let reused = rval.as_ref_id().and_then(|r| ref_to_key.get(&r).cloned());
+                // Genuine conflict — snapshot `subdict` into `ref_to_key`
+                // lazily, on the FIRST such conflict only (`og_to_name`'s
+                // `initialized_maps` guard). This snapshot legitimately
+                // includes any vacated-slot reinstates already applied
+                // above in this same loop.
+                let snapshot = ref_to_key.get_or_insert_with(|| {
+                    let mut m = std::collections::HashMap::new();
+                    for (k, v) in subdict.iter() {
+                        if let Some(r) = v.as_ref_id() {
+                            m.insert(r, k.to_vec());
+                        }
+                    }
+                    m
+                });
+                let reused = rval.as_ref_id().and_then(|r| snapshot.get(&r).cloned());
                 if let Some(existing_key) = reused {
                     // `existing_key == key` (no rename needed — the
                     // displaced value already sits under its own staged
@@ -1633,6 +1668,113 @@ mod tests {
             font.get("F2_1").is_none(),
             "no fresh name should be minted — the displaced value is REUSED \
              under its existing F1 name, not aliased under a new one"
+        );
+    }
+
+    #[test]
+    fn adjust_appearance_stream_reuses_slot_vacated_earlier_in_same_merge() {
+        // roborev PR #490 iter-4 finding 1: an earlier version of phase 2's
+        // "reuse a key that already names the same object" lookup snapshot
+        // `subdict` into `ref_to_key` ONCE, EAGERLY, before the staged loop
+        // began. That missed a value that becomes visible to `subdict` only
+        // DURING the loop — specifically, a slot phase 1 vacated and phase
+        // 2's OWN verbatim-reinstate step (an earlier staged entry, in key
+        // order) just refilled with the SAME object a LATER staged entry is
+        // about to collide on.
+        //
+        // Ground truth (fetched from qpdf `main`,
+        // `libqpdf/QPDFObjectHandle.cc`, `mergeResources`, since deepwiki's
+        // summary of this was internally inconsistent): `og_to_name` is
+        // built lazily — ONCE, on the FIRST genuine conflict — via the
+        // `initialized_maps` guard around `make_og_to_name(this_val, ...)`.
+        // Because that snapshot is taken mid-loop, it legitimately captures
+        // any vacated-slot reinstate that ran earlier in the SAME
+        // `other_val` loop (those already mutated `this_val` in place via
+        // `this_val.replaceKey`). It is then FROZEN — untouched by anything
+        // that happens afterward, including a fresh alias minted for a
+        // later conflict (this is why the *previous* test above,
+        // `..._double_conflict_mints_fresh_local_name`, still mints two
+        // separate aliases for two conflicts that are BOTH genuine — that
+        // qpdf behavior is unchanged by this fix). This test isolates the
+        // one case the eager snapshot missed: reuse sourced from an
+        // in-loop verbatim reinstate.
+        //
+        // Chain (three rename entries under Font, sorted by old_key so
+        // phase 1 processes them F1, F1_1, F2 in that order):
+        //   F1 -> F1_1: displaces F1_1's ORIGINAL value (shared_ref) into
+        //               merge_with["F1_1"]; F1's value (temp_ref) moves in.
+        //   F1_1 -> F3: displaces nothing (F3 was empty); F1_1's CURRENT
+        //               value (temp_ref) moves to F3, vacating F1_1.
+        //   F2 -> F4:   displaces F4's ORIGINAL value (shared_ref, the SAME
+        //               object as above) into merge_with["F4"]; F2's value
+        //               (other_ref) moves in.
+        // After phase 1: subdict = {F3: temp_ref, F4: other_ref}; no key
+        // names shared_ref any more. merge_with = {F1_1: shared_ref,
+        // F4: shared_ref} — both entries name the SAME object.
+        //
+        // Phase 2 processes merge_with in key order: "F1_1" < "F4".
+        //   F1_1: vacated (subdict has no F1_1) -> reinstated verbatim,
+        //         subdict["F1_1"] = shared_ref. THIS is the in-loop
+        //         mutation the eager snapshot could not see.
+        //   F4:   occupied (by other_ref) -> genuine conflict, the FIRST
+        //         one this loop hits. The lazily-built snapshot now
+        //         includes the just-reinstated F1_1 -> shared_ref, so F4's
+        //         displaced value (shared_ref) reuses F1_1 instead of
+        //         minting a fresh alias (e.g. the wrong "F4_1").
+        let mut pdf = open_minimal();
+        let shared_ref = ObjectRef::new(5, 0);
+        pdf.set_object(shared_ref, Object::Dictionary(Dictionary::new()));
+        let temp_ref = ObjectRef::new(6, 0);
+        pdf.set_object(temp_ref, Object::Dictionary(Dictionary::new()));
+        let other_ref = ObjectRef::new(7, 0);
+        pdf.set_object(other_ref, Object::Dictionary(Dictionary::new()));
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F1", Object::Reference(temp_ref));
+        font_dict.insert("F1_1", Object::Reference(shared_ref));
+        font_dict.insert("F2", Object::Reference(other_ref));
+        font_dict.insert("F4", Object::Reference(shared_ref));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", Object::Dictionary(font_dict));
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[("Resources", Object::Dictionary(resources))],
+            b"/F4 12 Tf",
+        );
+        let mut dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        dr_map.insert_rename(b"Font", b"F1_1".to_vec(), b"F3".to_vec());
+        dr_map.insert_rename(b"Font", b"F2".to_vec(), b"F4".to_vec());
+
+        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(
+            stream.data, b"/F1_1 12 Tf",
+            "the /F4 token must follow shared_ref to wherever it actually \
+             ended up (F1_1, reused from the in-loop reinstate), not a \
+             freshly minted alias"
+        );
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        assert_eq!(
+            font.get_ref("F1_1"),
+            Some(shared_ref),
+            "the vacated slot's own verbatim reinstate"
+        );
+        assert_eq!(
+            font.get_ref("F4"),
+            Some(other_ref),
+            "F4's occupant is untouched — the reuse branch never mutates \
+             subdict, unlike the fresh-mint branch"
+        );
+        assert!(
+            font.get("F4_1").is_none(),
+            "no fresh alias minted for F4 — it reuses F1_1 by ObjectRef \
+             identity instead"
         );
     }
 
