@@ -232,6 +232,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/fulgur-rs/flpdf/compare/v0.2.0...v0.2.1) - 2026-07-19
+
+### Added
+
+- *(flpdf-4r6l.4)* port qpdf ResourceReplacer / adjustAppearanceStream
+- *(flpdf-4r6l.3)* adjustDefaultAppearances (/DA Font-name rewrite)
+- *(flpdf-4r6l.2)* mergeResources conflict rename + dr_map threading
+
+### Fixed
+
+- *(flpdf-4r6l.4)* lazily trigger the source /DR merge on the first field-bearing annot
+- *(flpdf-4r6l.4)* freeze og_to_name snapshot lazily, not eagerly, in AP-stream re-merge
+- *(flpdf-4r6l.4)* fix broken intra-doc link to a private sibling function
+- *(flpdf-4r6l.4)* port qpdf's two-phase AP-stream rename + drop presence guard
+- *(flpdf-4r6l.4)* update stream /Length on successful re-encode
+- *(flpdf-4r6l.4)* fall back to FlateDecode when AP-stream re-encode fails
+- *(flpdf-4r6l.4)* make AP-stream content decode/re-encode non-fatal
+- *(flpdf-4r6l.4)* port qpdf's findEI 10-token lookahead for inline images
+- *(flpdf-4r6l.4)* resolve indirect category sub-dicts + implement AP double-conflict rename
+- *(flpdf-4r6l.4)* treat BI/ID/EI inline image data as opaque in resource_replacer
+- *(flpdf-4r6l.4)* cov:ignore the last if-let closing brace
+- *(flpdf-4r6l.4)* close patch-coverage gaps in the new AP-stream port
+- *(flpdf-4r6l.3)* mark closing-brace instrumentation artifact as cov:ignore
+- *(flpdf-4r6l.3)* clear stale DR renames before annotation-only placements
+- *(flpdf-4r6l.3)* rewrite /Properties in /DA + reuse verbatim inserts
+- *(flpdf-4r6l.3)* handle indirect /DA and rewrite non-Font operators
+- *(flpdf-4r6l.3)* per-placement merge + escape /DA rename bytes
+- *(flpdf-4r6l.3)* clear by_name at each merge start (stale-map leak)
+- *(flpdf-4r6l.3)* source-ref-keyed dr_map reuse + resolve indirect /DR/Font
+- *(flpdf-4r6l.3)* dest-scoped dr_map + reuse prior rename across placements
+- *(flpdf-4r6l.3)* silence coverage on malformed-/DA match arm
+- *(flpdf-4r6l.2)* shallow-copy indirect dest sub-dict into fresh ref
+- *(flpdf-4r6l.2)* resolve indirect /DR resource-type refs in merge_resources_shallow
+
+### Other
+
+- *(flpdf-4r6l.4)* cover the qpdf-verified undecodable-filter+collision case
+- *(flpdf-4r6l.4)* cover EI-followed-by-delimiter branch in inline-image scan
+- *(flpdf-4r6l.4)* unignore existing-/DR overlay byte gate
+- *(flpdf-4r6l.3)* assert on category() presence, not is_empty()
+- *(flpdf-4r6l.3)* cover /DA operand-parse-error branch, tidy fixture loop
+- *(flpdf-4r6l.3)* unit tests for adjust_default_appearance
+- *(flpdf-4r6l.2)* drop intermediate src_types Vec in merge_resources_shallow
+- *(flpdf-4r6l.2)* unit tests for DR merge conflict rename
+- *(flpdf-4r6l.1)* cov:ignore the #[ignore]d Layer 4 byte gate body
+- *(flpdf-4r6l.1)* ignored byte gate for AcroForm /DR merge collision
+
 ## [0.2.0](https://github.com/fulgur-rs/flpdf/compare/v0.1.10...v0.2.0) - 2026-07-18
 
 ### Added
