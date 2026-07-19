@@ -667,6 +667,21 @@ mod tests {
     }
 
     #[test]
+    fn resource_replacer_inline_image_ei_followed_by_delimiter_not_whitespace() {
+        // `EI` immediately followed by a delimiter (`/`, no intervening
+        // whitespace) must still be recognised as the terminator — the
+        // "after" check accepts EITHER whitespace OR a delimiter, matching
+        // qpdf's own delimiter-bounded `EI` search.
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        let resources = dict_with_subdict(b"Font", &[b"F1"]);
+        let content: &[u8] = b"BI /W 1 ID \x01/F1 18 Tf\x02 EI/F1 18 Tf";
+        assert_eq!(
+            resource_replacer(content, &dr_map, &resources),
+            b"BI /W 1 ID \x01/F1 18 Tf\x02 EI/F1_1 18 Tf".to_vec()
+        );
+    }
+
+    #[test]
     fn resource_replacer_inline_image_without_ei_copies_to_eof() {
         // A truncated/malformed inline image with no delimiter-bounded `EI`
         // at all: the fallback must treat everything from `ID` to the end
