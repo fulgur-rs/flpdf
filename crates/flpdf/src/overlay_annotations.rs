@@ -1250,36 +1250,26 @@ fn merge_resources_shallow<R: Read + Seek>(
     let Some(mut dest_dict) = dest.resolve(dest_dr)?.into_dict() else {
         return Ok(()); // cov:ignore: defensive early return
     };
-    // Collect (type_key, resolved source sub-dict, verbatim-fallback value) so
-    // the mutable-borrow of `dest` inside `resolve(...)` doesn't collide with
-    // the immutable borrow of `src_dict` needed by the for-loop. PDF permits
-    // `/Font <ref>` (indirect resource-type sub-dict) as well as the direct-
-    // dict shape; qpdf's `QPDFObjectHandle::mergeResources` operates on
-    // resolved QPDFObjectHandle values, so both shapes must merge — losing an
-    // indirect source sub-dict would drop the referenced fonts entirely.
-    let mut src_types: Vec<(Vec<u8>, Option<crate::Dictionary>, Option<Object>)> = Vec::new();
+    // PDF permits `/Font <ref>` (indirect resource-type sub-dict) as well as
+    // the direct-dict shape; qpdf's `QPDFObjectHandle::mergeResources`
+    // operates on resolved QPDFObjectHandle values, so both shapes must
+    // merge — losing an indirect source sub-dict would drop the referenced
+    // fonts entirely. `src_dict` is owned (from `into_dict`), so the loop's
+    // borrow of it does not collide with `dest.resolve(...)` on the mutable
+    // `dest` — both borrows are of separate variables.
     for (type_key, src_type_val) in src_dict.iter() {
-        let entry = match src_type_val {
-            Object::Reference(r) => match dest.resolve(*r)?.into_dict() {
-                Some(d) => (type_key.to_vec(), Some(d), None),
-                None => (type_key.to_vec(), None, Some(src_type_val.clone())), // cov:ignore: source resource-type ref does not resolve to a dict — verbatim fallback per qpdf. No shipped fixture supplies this shape.
-            },
-            _ => match src_type_val.as_dict() {
-                Some(d) => (type_key.to_vec(), Some(d.clone()), None),
-                None => (type_key.to_vec(), None, Some(src_type_val.clone())), // cov:ignore: non-dict, non-reference resource-type value — no shipped fixture supplies this shape.
-            },
+        let src_type_dict = match src_type_val {
+            Object::Reference(r) => dest.resolve(*r)?.into_dict(),
+            _ => src_type_val.as_dict().cloned(),
         };
-        src_types.push(entry);
-    }
 
-    for (type_key, src_type_dict, verbatim) in src_types {
         let Some(src_type_dict) = src_type_dict else {
             // cov:ignore-start: verbatim-copy path — non-dict resource-type
-            // value from an unusual source /DR shape (see collection above).
-            if let Some(v) = verbatim {
-                if dest_dict.get(&type_key).is_none() {
-                    dest_dict.insert(&type_key, v);
-                }
+            // value from an unusual source /DR shape (either a non-dict/-ref
+            // direct value, or an indirect ref that does not resolve to a
+            // dict). No shipped fixture supplies this shape.
+            if dest_dict.get(type_key).is_none() {
+                dest_dict.insert(type_key, src_type_val.clone());
             }
             continue;
             // cov:ignore-end
@@ -1291,7 +1281,7 @@ fn merge_resources_shallow<R: Read + Seek>(
         // to get the underlying dict, mutate it in place, and leave the
         // reference in dest_dict untouched — matching qpdf's behavior of
         // preserving indirect resource-type refs.
-        let (mut new_type_dict, indirect_target) = match dest_dict.get(&type_key).cloned() {
+        let (mut new_type_dict, indirect_target) = match dest_dict.get(type_key).cloned() {
             Some(Object::Dictionary(existing)) => (existing, None),
             Some(Object::Reference(r)) => match dest.resolve(r)?.into_dict() {
                 Some(d) => (d, Some(r)),
@@ -1324,7 +1314,7 @@ fn merge_resources_shallow<R: Read + Seek>(
                     let new_name = unique_dr_name(name, &new_type_dict)?;
                     new_type_dict.insert(&new_name, val.clone());
                     dr_map
-                        .entry(type_key.clone())
+                        .entry(type_key.to_vec())
                         .or_default()
                         .insert(name.to_vec(), new_name);
                 }
@@ -1336,7 +1326,7 @@ fn merge_resources_shallow<R: Read + Seek>(
             // still holds `Object::Reference(target_ref)`, so no insert.
             dest.set_object(target_ref, Object::Dictionary(new_type_dict));
         } else {
-            dest_dict.insert(&type_key, Object::Dictionary(new_type_dict));
+            dest_dict.insert(type_key, Object::Dictionary(new_type_dict));
         }
     }
     dest.set_object(dest_dr, Object::Dictionary(dest_dict));
