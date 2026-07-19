@@ -86,11 +86,24 @@ fn resource_type_for_operator(op: &[u8]) -> Option<&'static [u8]> {
 /// A malformed operand is copied through verbatim, one byte at a time,
 /// resuming the scan just past it (the same tolerant recovery
 /// `adjust_default_appearance` uses) rather than aborting the whole
-/// rewrite. Inline images (`BI`...`ID`...`EI`) are not recognized
-/// specially: an appearance stream generated for form-field text or icons
-/// never contains one, and this same per-byte recovery still guarantees
-/// termination — never a panic or a hang — if binary inline-image data is
-/// present and happens to confuse the operand lexer.
+/// rewrite.
+///
+/// Inline images (`BI`...`ID`...`EI`) ARE recognized specially, matching
+/// qpdf's tokenizer, which emits the whole `ID`-to-`EI` span as a single
+/// opaque `tt_inline_image` token that a `TokenFilter` (such as
+/// `ResourceReplacer`) never re-lexes (`libqpdf/QPDFTokenizer.cc`'s
+/// `expectInlineImage`/`findEI`, called from
+/// `QPDFObjectHandle::parseContentStream_data` on every `ID` operator):
+/// once the `ID` operator is seen, everything up to the next
+/// delimiter-bounded `EI` is copied through byte-for-byte without being fed
+/// to the operand/operator lexer, so binary image data that happens to
+/// contain a byte sequence resembling a resource-name operand (e.g. `/F1 18
+/// Tf`) is never mistaken for one. This implements qpdf's primary
+/// delimiter-bounded-`EI` search only, not its secondary ten-token lookahead
+/// heuristic for disambiguating an `EI` byte sequence that occurs *inside*
+/// the image data itself — no shipped fixture needs that refinement, and
+/// the per-byte malformed-operand recovery above still guarantees
+/// termination even if a real file needed it.
 ///
 /// Returns `content.to_vec()` verbatim, without scanning, when `dr_map` is
 /// empty (the common case: no placement recorded a rename on this dest
@@ -171,6 +184,47 @@ pub(crate) fn resource_replacer(content: &[u8], dr_map: &DrMap, resources: &Dict
         }
         let op = &content[start..pos];
         out.extend_from_slice(op);
+        if op == b"ID" {
+            // Inline image data: per the doc comment above, everything from
+            // here to the next delimiter-bounded `EI` is opaque and must be
+            // copied through verbatim, never fed to the name/operator
+            // lexer. `last_name` is deliberately left untouched — an inline
+            // image is a single token to qpdf's tokenizer too, so it can
+            // neither set nor consume it.
+            //
+            // The single mandatory separator byte right after `ID` (ISO
+            // 32000-2 8.9.7.2) is itself part of the opaque span, but is
+            // copied separately here so the search below starts exactly at
+            // the first real data byte.
+            if pos < content.len() {
+                out.push(content[pos]);
+                pos += 1;
+            }
+            let data_start = pos;
+            let mut ei_pos = content.len();
+            let mut i = data_start;
+            while i + 1 < content.len() {
+                if content[i] == b'E'
+                    && content[i + 1] == b'I'
+                    && (i == data_start || is_ws(content[i - 1]))
+                    && (i + 2 >= content.len()
+                        || is_ws(content[i + 2])
+                        || is_delimiter(content[i + 2]))
+                {
+                    ei_pos = i;
+                    break;
+                }
+                i += 1;
+            }
+            // `ei_pos` falls back to `content.len()` (copy everything to
+            // EOF as opaque data) when no delimiter-bounded `EI` is found —
+            // a truncated/malformed stream, handled the same tolerant way
+            // as every other recovery path in this scanner: never panic or
+            // hang.
+            out.extend_from_slice(&content[data_start..ei_pos]);
+            pos = ei_pos;
+            continue;
+        }
         if let Some(rtype) = resource_type_for_operator(op) {
             if let Some((out_start, out_end, name)) = last_name.take() {
                 let renamed = dr_map.category(rtype).and_then(|m| m.get(name.as_slice()));
@@ -540,6 +594,35 @@ mod tests {
             resource_replacer(b"/Span /P1 DP", &dr_map, &resources),
             b"/Span /P1_1 DP".to_vec()
         );
+    }
+
+    #[test]
+    fn resource_replacer_inline_image_data_is_opaque() {
+        // A byte sequence that looks exactly like a renameable operand
+        // (`/F1 18 Tf`) sits INSIDE the inline image's binary data, between
+        // `ID` and `EI`. It must be copied through verbatim — only the real
+        // content tokens before `BI` and after `EI` are eligible for
+        // renaming.
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        let resources = dict_with_subdict(b"Font", &[b"F1"]);
+        let content: &[u8] =
+            b"/F1 18 Tf BI /W 1 /H 1 /BPC 8 /CS /G ID \x01/F1 18 Tf\x02 EI /F1 18 Tf";
+        assert_eq!(
+            resource_replacer(content, &dr_map, &resources),
+            b"/F1_1 18 Tf BI /W 1 /H 1 /BPC 8 /CS /G ID \x01/F1 18 Tf\x02 EI /F1_1 18 Tf".to_vec()
+        );
+    }
+
+    #[test]
+    fn resource_replacer_inline_image_without_ei_copies_to_eof() {
+        // A truncated/malformed inline image with no delimiter-bounded `EI`
+        // at all: the fallback must treat everything from `ID` to the end
+        // of `content` as opaque data rather than losing bytes or hanging,
+        // and must NOT rewrite the `/F1` pattern embedded in it.
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        let resources = dict_with_subdict(b"Font", &[b"F1"]);
+        let content: &[u8] = b"BI /W 1 ID \x01/F1 18 Tf\x02";
+        assert_eq!(resource_replacer(content, &dr_map, &resources), content);
     }
 
     // ---- adjust_appearance_stream -------------------------------------------
