@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 use crate::acroform_document_helper::{collect_reachable_refs, collect_refs_in_object};
+use crate::overlay_appearance_stream::adjust_appearance_stream;
 use crate::parser::{is_delimiter, is_ws, Parser};
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 
@@ -1120,9 +1121,7 @@ fn transform_annot_ap_streams<R: Read + Seek>(
             Object::Reference(stream_ref) => {
                 if let Some(new_ref) = dup_and_transform_ap_stream(dest, stream_ref, cm)? {
                     if !dr_map.is_empty() {
-                        crate::overlay_appearance_stream::adjust_appearance_stream(
-                            dest, new_ref, dr_map,
-                        )?;
+                        adjust_appearance_stream(dest, new_ref, dr_map)?;
                     }
                     apdict.insert(&key, Object::Reference(new_ref));
                 }
@@ -1138,9 +1137,7 @@ fn transform_annot_ap_streams<R: Read + Seek>(
                     if let Object::Reference(stream_ref) = sub_val {
                         if let Some(new_ref) = dup_and_transform_ap_stream(dest, stream_ref, cm)? {
                             if !dr_map.is_empty() {
-                                crate::overlay_appearance_stream::adjust_appearance_stream(
-                                    dest, new_ref, dr_map,
-                                )?;
+                                adjust_appearance_stream(dest, new_ref, dr_map)?;
                             }
                             sub.insert(&sub_key, Object::Reference(new_ref));
                         }

@@ -446,6 +446,26 @@ mod tests {
     }
 
     #[test]
+    fn resource_replacer_recovers_from_operand_parse_error() {
+        // An unterminated string literal (opens `(` but never closes) IS a
+        // recognised operand start and reaches the shared object lexer,
+        // which returns `Err` on EOF — distinct from the stray-delimiter
+        // path above, which never reaches the lexer at all. The scanner
+        // must copy only the single `(` byte and resume rather than losing
+        // the rest of the stream, so the `/F1` rename after it still
+        // applies (mirrors
+        // `crate::overlay_annotations::adjust_default_appearance`'s own
+        // operand-parse-error recovery test).
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        let resources = dict_with_subdict(b"Font", &[b"F1"]);
+        let content: &[u8] = b"(bad /F1 18 Tf";
+        assert_eq!(
+            resource_replacer(content, &dr_map, &resources),
+            b"(bad /F1_1 18 Tf".to_vec()
+        );
+    }
+
+    #[test]
     fn resource_replacer_do_xobject() {
         let dr_map = dr_map_with(b"XObject", b"Fx1", b"Fx1_1");
         let resources = dict_with_subdict(b"XObject", &[b"Fx1"]);
@@ -595,9 +615,7 @@ mod tests {
 
         adjust_appearance_stream(&mut pdf, ap_ref, &DrMap::new()).unwrap();
 
-        let Object::Stream(stream) = pdf.resolve(ap_ref).unwrap() else {
-            panic!("expected stream");
-        };
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1 18 Tf");
         assert_eq!(
             stream.dict.get("Resources"),
@@ -613,9 +631,7 @@ mod tests {
 
         adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let Object::Stream(stream) = pdf.resolve(ap_ref).unwrap() else {
-            panic!("expected stream");
-        };
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1 18 Tf");
         assert!(stream.dict.get("Resources").is_none());
     }
@@ -647,9 +663,7 @@ mod tests {
 
         adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let Object::Stream(stream) = pdf.resolve(ap_ref).unwrap() else {
-            panic!("expected stream");
-        };
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 18 Tf");
         let new_resources_ref = stream
             .dict
@@ -706,13 +720,13 @@ mod tests {
 
         adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let Object::Stream(stream) = pdf.resolve(ap_ref).unwrap() else {
-            panic!("expected stream");
-        };
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 18 Tf");
-        let Some(Object::Dictionary(resources)) = stream.dict.get("Resources") else {
-            panic!("Resources should stay a direct (embedded) dictionary");
-        };
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
         let font = resources.get("Font").and_then(Object::as_dict).unwrap();
         assert_eq!(font.get("F1_1"), Some(&Object::Reference(font_ref)));
     }
@@ -737,12 +751,12 @@ mod tests {
 
         adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let Object::Stream(stream) = pdf.resolve(ap_ref).unwrap() else {
-            panic!("expected stream");
-        };
-        let Some(Object::Dictionary(resources)) = stream.dict.get("Resources") else {
-            panic!("expected direct Resources dict");
-        };
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("expected direct Resources dict");
         assert!(
             resources.get("ExtGState").is_none(),
             "empty /ExtGState sub-dict must be dropped, not left behind"
