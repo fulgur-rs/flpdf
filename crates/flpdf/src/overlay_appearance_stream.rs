@@ -564,7 +564,18 @@ pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
     if let Ok(decoded) = crate::filters::decode_stream_data(&stream.dict, &stream.data) {
         let new_decoded = resource_replacer(&decoded, &local_dr_map, &pre_rename_resources);
         match crate::filters::encode_stream_data(&stream.dict, &new_decoded) {
-            Ok(encoded) => stream.data = encoded,
+            Ok(encoded) => {
+                // Keep `/Length` consistent with the rewritten body — the
+                // rename may shrink or grow the compressed payload, and a
+                // stale dict `/Length` here would leave the stream
+                // structurally inconsistent (symmetric with the FlateDecode
+                // fallback below, which already updates it).
+                stream.dict.insert(
+                    "Length",
+                    Object::Integer(i64::try_from(encoded.len()).unwrap_or(i64::MAX)),
+                );
+                stream.data = encoded;
+            }
             Err(_) => {
                 // Re-encoding under the ORIGINAL `/Filter` failed — decodable
                 // but not re-encodable filters are exactly `/LZWDecode`
