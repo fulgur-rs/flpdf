@@ -24,7 +24,7 @@
 //! ```
 
 use crate::name_number_tree::read_name_tree;
-use crate::{Object, ObjectRef, Pdf, Result};
+use crate::{Diagnostic, Diagnostics, Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
@@ -324,6 +324,41 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         }
     }
 
+    /// Read every entry of the catalog's legacy `/Dests` dictionary (ISO
+    /// 32000-1 §7.11.4; the PDF 1.1 named-destination dictionary, superseded
+    /// — but not replaced — by the `/Names /Dests` name tree added in PDF
+    /// 1.2). `/Dests` may be an indirect reference or a direct dictionary on
+    /// the catalog; both forms are read via the same resolution [`Pdf::outline`]
+    /// uses for named-destination lookup.
+    ///
+    /// Entries come back in the dictionary's lexicographic key order
+    /// (matching [`crate::Dictionary::iter`], which is not necessarily the
+    /// order the entries were declared in the source file). A value that
+    /// cannot be resolved to an explicit destination array (for example a
+    /// malformed non-array, non-reference value) yields `None` for that
+    /// entry rather than dropping the name, so a caller can still see every
+    /// declared name.
+    ///
+    /// Only the legacy dictionary is enumerated here; the `/Names /Dests`
+    /// name tree is a separate structure with its own accessor.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from resolving the catalog or the `/Dests`
+    /// dictionary/value objects (for example I/O or parse failures surfaced
+    /// by [`Pdf::resolve`]).
+    pub fn legacy_dests(&mut self) -> Result<Vec<(Vec<u8>, Option<Dest>)>> {
+        let Some(Object::Dictionary(dests)) = self.catalog_value("Dests")? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for (name, value) in dests.iter() {
+            let dest = self.dest_from_value(value, MAX_DEST_RESOLVE_DEPTH)?;
+            out.push((name.to_vec(), dest));
+        }
+        Ok(out)
+    }
+
     /// Pre-order iterator over every materialized node (owned). Each yielded
     /// node has its `children` cleared — the flattened view is linear and
     /// `depth` conveys structure; use [`get_root`](Self::get_root) or
@@ -367,6 +402,70 @@ impl<R: Read + Seek> Pdf<R> {
     pub fn outline(&mut self) -> OutlineDocumentHelper<'_, R> {
         OutlineDocumentHelper::new(self)
     }
+}
+
+/// Validate the catalog's legacy `/Dests` dictionary
+/// ([`OutlineDocumentHelper::legacy_dests`]): push a warning [`Diagnostic`]
+/// for every entry whose destination's target page reference is not a page
+/// currently reachable from the document's `/Pages` tree — a dangling
+/// reference, a reference to a non-`/Page` object, or a page a prior edit
+/// removed. A missing target is reported, not treated as document
+/// corruption: it never turns into an `Err` on its own.
+///
+/// # Errors
+///
+/// Propagates any error from resolving the catalog or the `/Dests`
+/// dictionary/value objects. A failure to enumerate the document's page tree
+/// (for example a missing `/Pages` entry) is downgraded to a warning
+/// [`Diagnostic`] instead, so the caller still receives a report.
+///
+/// # Examples
+///
+/// ```no_run
+/// use flpdf::{check_legacy_dests, Pdf};
+/// use std::fs::File;
+/// use std::io::BufReader;
+///
+/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
+/// for diagnostic in check_legacy_dests(&mut pdf)?.entries() {
+///     println!("{diagnostic:?}");
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn check_legacy_dests<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Diagnostics> {
+    let entries = OutlineDocumentHelper::new(pdf).legacy_dests()?;
+    let mut diagnostics = Diagnostics::default();
+    if entries.is_empty() {
+        return Ok(diagnostics);
+    }
+
+    let live_pages: BTreeSet<ObjectRef> = match crate::pages::page_refs(pdf) {
+        Ok(refs) => refs.into_iter().collect(),
+        Err(error) => {
+            diagnostics.push(Diagnostic::warning(
+                format!("could not enumerate pages to validate /Dests targets: {error}"),
+                None,
+            ));
+            return Ok(diagnostics);
+        }
+    };
+
+    for (name, dest) in entries {
+        let Some(dest) = dest else { continue };
+        let Some(page_ref) = dest.page() else {
+            continue;
+        };
+        if !live_pages.contains(&page_ref) {
+            diagnostics.push(Diagnostic::warning(
+                format!(
+                    "named destination \"{}\" targets {page_ref}, which is not a page in the document",
+                    String::from_utf8_lossy(&name)
+                ),
+                None,
+            ));
+        }
+    }
+    Ok(diagnostics)
 }
 
 /// Decode an outline `/Title`, resolving one level of indirection (review rule 2).

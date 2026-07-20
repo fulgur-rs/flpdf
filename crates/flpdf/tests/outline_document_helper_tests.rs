@@ -1,6 +1,6 @@
 //! Integration tests for [`flpdf::OutlineDocumentHelper`].
 
-use flpdf::{ObjectRef, Pdf};
+use flpdf::{check_legacy_dests, write_pdf, ObjectRef, Pdf, Severity};
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
@@ -464,4 +464,226 @@ fn title_resolves_indirect_reference() {
     let mut pdf = Pdf::open(Cursor::new(indirect_title_pdf())).unwrap();
     let roots = pdf.outline().get_root().unwrap();
     assert_eq!(roots[0].title, "RealTitle");
+}
+
+// -----------------------------------------------------------------------
+// flpdf-9hc.14.1: catalog-level legacy /Dests dictionary read/diagnostics
+// -----------------------------------------------------------------------
+
+/// Catalog whose legacy `/Dests` is an INLINE (direct) dictionary on the
+/// catalog with three entries, two distinct target pages.
+fn legacy_dests_inline_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Dests << /alpha [3 0 R /Fit] \
+                 /beta [4 0 R /XYZ 0 792 0] /gamma [3 0 R /FitH 792] >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn legacy_dests_reads_inline_dictionary_entries_sorted_by_name() {
+    let mut pdf = Pdf::open(Cursor::new(legacy_dests_inline_pdf())).unwrap();
+    let entries = pdf.outline().legacy_dests().unwrap();
+
+    // Dictionary::iter() yields lexicographic key order.
+    let names: Vec<Vec<u8>> = entries.iter().map(|(n, _)| n.clone()).collect();
+    assert_eq!(
+        names,
+        vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]
+    );
+
+    let alpha = entries[0].1.as_ref().expect("alpha dest should resolve");
+    assert_eq!(alpha.page(), Some(ObjectRef::new(3, 0)));
+    let beta = entries[1].1.as_ref().expect("beta dest should resolve");
+    assert_eq!(beta.page(), Some(ObjectRef::new(4, 0)));
+    let gamma = entries[2].1.as_ref().expect("gamma dest should resolve");
+    assert_eq!(gamma.page(), Some(ObjectRef::new(3, 0)));
+}
+
+/// Catalog whose legacy `/Dests` is an INDIRECT reference (object 8) to the
+/// dictionary — the other form permitted by the spec.
+fn legacy_dests_indirect_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (8, "<< /solo [3 0 R /Fit] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn legacy_dests_reads_indirect_dictionary() {
+    let mut pdf = Pdf::open(Cursor::new(legacy_dests_indirect_pdf())).unwrap();
+    let entries = pdf.outline().legacy_dests().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, b"solo");
+    assert_eq!(
+        entries[0].1.as_ref().unwrap().page(),
+        Some(ObjectRef::new(3, 0))
+    );
+}
+
+#[test]
+fn legacy_dests_absent_yields_empty_vec() {
+    let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
+    assert!(pdf.outline().legacy_dests().unwrap().is_empty());
+}
+
+/// Round-trip acceptance: opening a document with a legacy `/Dests`
+/// dictionary and rewriting it via [`write_pdf`] (no page operations, no
+/// mutation) must preserve every entry unchanged.
+#[test]
+fn legacy_dests_round_trip_through_write_pdf_unmodified() {
+    let mut pdf = Pdf::open(Cursor::new(legacy_dests_indirect_pdf())).unwrap();
+    let before = pdf.outline().legacy_dests().unwrap();
+    assert_eq!(before.len(), 1, "sanity: fixture has one dest entry");
+
+    let mut out = Vec::new();
+    write_pdf(&mut pdf, &mut out).unwrap();
+
+    let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
+    let after = reopened.outline().legacy_dests().unwrap();
+    assert_eq!(before, after, "/Dests entries must round-trip unmodified");
+}
+
+#[test]
+fn check_legacy_dests_no_diagnostics_when_all_targets_exist() {
+    let mut pdf = Pdf::open(Cursor::new(legacy_dests_inline_pdf())).unwrap();
+    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
+    assert!(diagnostics.entries().is_empty());
+}
+
+/// A `/Dests` entry ("gone") targets object `99 0 R`, which is never defined
+/// in this document — a dangling reference. Acceptance: this must produce a
+/// diagnostic, not fail the call.
+fn legacy_dests_missing_target_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (8, "<< /gone [99 0 R /Fit] /here [3 0 R /Fit] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn check_legacy_dests_missing_target_is_warning_not_error() {
+    let mut pdf = Pdf::open(Cursor::new(legacy_dests_missing_target_pdf())).unwrap();
+    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
+    let entries = diagnostics.entries();
+    assert_eq!(
+        entries.len(),
+        1,
+        "only the dangling entry should be flagged"
+    );
+    assert_eq!(entries[0].severity, Severity::Warning);
+    assert!(entries[0].message.contains("gone"));
+    assert!(entries[0].message.contains("99 0 R"));
+}
+
+/// A `/Dests` entry targets object `2 0 R`, which exists but is the `/Pages`
+/// root, not a `/Page` leaf — also a "missing target page".
+fn legacy_dests_non_page_target_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (8, "<< /wrong [2 0 R /Fit] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn check_legacy_dests_target_not_a_page_is_warning() {
+    let mut pdf = Pdf::open(Cursor::new(legacy_dests_non_page_target_pdf())).unwrap();
+    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
+    assert_eq!(diagnostics.entries().len(), 1);
+    assert_eq!(diagnostics.entries()[0].severity, Severity::Warning);
+}
+
+/// `check_legacy_dests` must not fail even when the document has no `/Pages`
+/// tree at all to enumerate (downgraded to a warning, matching `check.rs`'s
+/// own page-enumeration-failure posture).
+#[test]
+fn check_legacy_dests_missing_page_tree_downgrades_to_warning() {
+    let mut pdf = Pdf::open(Cursor::new(build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Dests 8 0 R >>"),
+            (8, "<< /gone [99 0 R /Fit] >>"),
+        ],
+        1,
+    )))
+    .unwrap();
+    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
+    assert!(diagnostics.entries().iter().any(
+        |d| d.severity == Severity::Warning && d.message.contains("could not enumerate pages")
+    ));
+}
+
+/// Acceptance: after a page-tree rebuild (e.g. `--pages` subset selection)
+/// renumbers pages, a surviving-page legacy `/Dests` entry must read back
+/// remapped to its new ref, and a removed-page entry (left verbatim,
+/// resolving to the nulled-out page) must be flagged by
+/// [`check_legacy_dests`].
+#[test]
+fn legacy_dests_reflects_remap_after_page_tree_rebuild() {
+    let mut pdf = Pdf::open(Cursor::new(build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (8, "<< /keep [3 0 R /Fit] /drop [4 0 R /Fit] >>"),
+        ],
+        1,
+    )))
+    .unwrap();
+
+    let result = flpdf::rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+    let new_p1 = result.ref_map[&ObjectRef::new(3, 0)][0];
+    flpdf::remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+    let entries = pdf.outline().legacy_dests().unwrap();
+    let keep = entries
+        .iter()
+        .find(|(n, _)| n == b"keep")
+        .expect("keep entry present");
+    assert_eq!(
+        keep.1.as_ref().unwrap().page(),
+        Some(new_p1),
+        "surviving page's dest should read back remapped to its new ref"
+    );
+
+    let drop = entries
+        .iter()
+        .find(|(n, _)| n == b"drop")
+        .expect("drop entry present (qpdf null-out parity: never dropped)");
+    assert_eq!(
+        drop.1.as_ref().unwrap().page(),
+        Some(ObjectRef::new(4, 0)),
+        "removed page's dest is left verbatim, now resolving to a nulled object"
+    );
+
+    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
+    assert_eq!(
+        diagnostics.entries().len(),
+        1,
+        "the nulled removed-page dest should be the only flagged entry"
+    );
+    assert!(diagnostics.entries()[0].message.contains("drop"));
 }
