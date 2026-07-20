@@ -474,8 +474,10 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
 
     /// Install `entries` as the catalog's `/PageLabels`: a direct
     /// (non-indirect) `<< /Nums [...] >>` dictionary — never a balanced
-    /// number tree — with each entry's label dictionary built via
-    /// [`LabelRange::to_reconstructed_dict`].
+    /// number tree — with each entry's label dictionary built in the same
+    /// shape qpdf's `getLabelForPage` reconstruction uses (`/S` iff the style
+    /// is not [`LabelStyle::None`], `/P` iff the prefix is non-empty, `/St`
+    /// always present).
     ///
     /// This is the shape qpdf produces when reconstructing labels for a page
     /// subset or split (`QPDFJob::handlePageSpecs`, `QPDFJob::doSplitPages`):
