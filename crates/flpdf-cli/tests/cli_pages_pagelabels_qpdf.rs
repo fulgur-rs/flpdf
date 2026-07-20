@@ -193,6 +193,10 @@ fn cli_pages_without_source_labels_has_none() {
         std::fs::File::open(&flpdf_out).unwrap(),
     ))
     .unwrap();
+    // This test guards the CLI wrapper specifically: sister tests cover the
+    // library API (page_extract_tests: extract_pages) and the split path
+    // (page_merge_tests: merge with no labels). Kept per-layer so a bug
+    // scoped to the CLI wiring cannot slip through by regressing only here.
     assert!(
         !pdf.page_labels().has_page_labels().unwrap(),
         "a source with no /PageLabels must not gain one"

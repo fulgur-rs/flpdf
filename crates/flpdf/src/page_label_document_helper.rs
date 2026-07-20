@@ -451,6 +451,13 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         end_idx: i64,
         new_start_idx: i64,
     ) -> Result<Vec<(i64, LabelRange)>> {
+        // debug_assert catches an inverted span (a caller bug per the doc
+        // contract) in dev/tests. Release keeps the graceful empty-span
+        // behavior documented above.
+        debug_assert!(
+            start_idx <= end_idx,
+            "labels_for_page_range: inverted span (start={start_idx}, end={end_idx})",
+        );
         let ranges = self.ranges()?;
         // Set of explicit source indices, for hasIndex().
         let explicit: std::collections::BTreeSet<i64> = ranges.iter().map(|(i, _)| *i).collect();

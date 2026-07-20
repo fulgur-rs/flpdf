@@ -386,14 +386,16 @@ fn write_chunk(
         if labels.has_page_labels()? {
             // `chunk_start`/`chunk_end` are half-open `[start, end)`; a
             // valid chunk always has at least one page, so the caller-side
-            // invariant is `chunk_end > chunk_start`. `checked_sub(1)` on
-            // `chunk_end` guards against a 0 slipping through (which would
-            // wrap `chunk_end - 1` to usize::MAX).
+            // invariant is `chunk_end > chunk_start`. debug_assert enforces
+            // it in dev/tests; the checked_sub fallback keeps release
+            // safety even if the invariant is ever violated (the empty
+            // labels vector below is a benign no-op).
+            debug_assert!(
+                chunk_end > chunk_start,
+                "write_chunk: empty chunk (start={chunk_start}, end={chunk_end})",
+            );
             let start = chunk_start as i64;
-            let end_inclusive = chunk_end
-                .checked_sub(1)
-                .expect("write_chunk: chunk_end > 0 (empty chunk is caller bug)")
-                as i64;
+            let end_inclusive = chunk_end.checked_sub(1).unwrap_or(chunk_start) as i64;
             let entries = labels.labels_for_page_range(start, end_inclusive, 0)?;
             labels.write_reconstructed_labels(&entries)?;
         }
