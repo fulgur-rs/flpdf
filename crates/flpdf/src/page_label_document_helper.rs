@@ -663,10 +663,17 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
                     start: r.start.saturating_add(offset),
                 }
             }
+            // No explicit range covers `removed_end`: those pages were
+            // showing the PDF default label sequence (decimal starting at
+            // 1). After removal the page at output index `at` was previously
+            // source page `removed_end`, whose default label was
+            // `removed_end + 1`; preserve that decimal sequence rather than
+            // fabricating a LabelStyle::None entry that would render every
+            // surviving page's label as an empty string.
             None => LabelRange {
-                style: LabelStyle::None,
+                style: LabelStyle::Decimal,
                 prefix: String::new(),
-                start: at.saturating_add(1),
+                start: removed_end.saturating_add(1),
             },
         };
         result.push((at, tail_first_label));
@@ -1551,29 +1558,36 @@ mod tests {
         assert_eq!(h.ranges().unwrap(), vec![(0, dec(1))]);
     }
 
-    /// Cover the `None => LabelStyle::None` fallback in remove_pages: when
-    /// `removed_end` is BEFORE the first explicit range, no entry satisfies
-    /// `entry.0 <= removed_end`, so `effective_at_removed_end` stays None and
-    /// the tail gets the fabricated default label.
+    /// Covers the `None` arm of the `effective_at_removed_end` match in
+    /// remove_pages: when `removed_end` is BEFORE the first explicit range,
+    /// the surviving pages must keep the PDF-default decimal label sequence
+    /// they had before removal (starting at `removed_end + 1`), NOT get a
+    /// LabelStyle::None entry that would render every label as an empty
+    /// string.
     #[test]
-    fn remove_pages_before_first_range_fabricates_none_style_label() {
-        // Ranges start at index 5 (roman), leaving 0..5 with no explicit label.
+    fn remove_pages_before_first_range_preserves_default_decimal_sequence() {
+        // Ranges start at index 5 (roman), leaving 0..5 with the PDF
+        // default label sequence "1"…"5".
         let mut pdf = pdf_with_pagelabels(vec![Object::Integer(5), label_dict("r", Some(1), None)]);
         // Remove pages 0..2 — removed_end=2, before the first range at index 5.
+        // Old source page 2 (previously "3") now becomes output page 0.
         {
             let mut h = pdf.page_labels();
             h.remove_pages(0, 2).unwrap();
         }
         let mut h = pdf.page_labels();
         let ranges = h.ranges().unwrap();
-        // Two entries survive: the fabricated None-style entry at index 0
-        // (the shifted tail's first label), and the original roman range now
-        // at index 3 (5 - 2 shift).
+        // Two entries survive: an explicit decimal range starting at 3 (so
+        // new page 0 renders as "3", matching source page 2), and the
+        // original roman range now at index 3 (5 - 2 shift).
         assert_eq!(ranges.len(), 2, "got {ranges:?}");
         assert_eq!(ranges[0].0, 0);
-        assert_eq!(ranges[0].1.style, LabelStyle::None);
+        assert_eq!(ranges[0].1.style, LabelStyle::Decimal);
+        assert_eq!(ranges[0].1.start, 3);
         assert_eq!(ranges[1].0, 3);
         assert_eq!(ranges[1].1.style, LabelStyle::RomanLower);
+        // End-to-end: the rendered label for new page 0 must be "3".
+        assert_eq!(h.label_string_for_page(0).unwrap(), "3");
     }
 
     /// Cover the trailing shift-loop `if *idx > removed_end` in remove_pages:
