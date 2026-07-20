@@ -61,6 +61,13 @@ pub struct OutlineNode {
     /// Resolved explicit destination (`/Dest`, or a `/A` GoTo action's `/D`),
     /// or `None` when absent or a still-unresolved named destination.
     pub dest: Option<Dest>,
+    /// The `/SE` (structure-element) link: an indirect reference to a node in
+    /// the document's structure tree (ISO 32000-2 section 12.3.3, table 151),
+    /// or `None` when `/SE` is absent. Per spec `/SE` shall be an indirect
+    /// reference; a direct (non-reference) `/SE` value is malformed and is
+    /// also read as `None`, matching how [`Self::dest`] and the other fields
+    /// on this type treat a non-conforming value as absent.
+    pub se: Option<ObjectRef>,
     /// Child nodes in `/First`->`/Next` order.
     pub children: Vec<OutlineNode>,
 }
@@ -179,6 +186,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             // rejects it. A later task adds `dest_src`/`action_src` here.
             let first = dict.get_ref("First");
             let next = dict.get_ref("Next");
+            let se = dict.get_ref("SE");
             let title_src = dict.get("Title").cloned();
             let count_src = dict.get("Count").cloned();
             let dest_src = dict.get("Dest").cloned();
@@ -203,6 +211,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 count,
                 parent,
                 dest,
+                se,
                 children,
             });
             current = next;
@@ -476,6 +485,44 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         }
         Ok(())
     }
+
+    /// Drop dangling outline `/SE` links using [`DEFAULT_MAX_OUTLINE_DEPTH`].
+    /// See [`prune_outline_se`] (the free-function form of this method, which
+    /// most callers should prefer) for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
+    /// [`DEFAULT_MAX_OUTLINE_DEPTH`]. Propagates any error from resolving outline
+    /// objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
+    pub fn prune_se(&mut self, live_struct_elem_refs: &BTreeSet<ObjectRef>) -> Result<usize> {
+        self.prune_se_with_max_depth(live_struct_elem_refs, DEFAULT_MAX_OUTLINE_DEPTH)
+    }
+
+    /// Like [`Self::prune_se`] but with a caller-supplied recursion limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
+    /// `max_depth`. Propagates any error from resolving outline objects.
+    pub fn prune_se_with_max_depth(
+        &mut self,
+        live_struct_elem_refs: &BTreeSet<ObjectRef>,
+        max_depth: usize,
+    ) -> Result<usize> {
+        let Some(first) = self.outline_root_first()? else {
+            return Ok(0);
+        };
+        let mut visited = BTreeSet::new();
+        walk_outline_se(
+            self.pdf,
+            first,
+            0,
+            &mut visited,
+            live_struct_elem_refs,
+            max_depth,
+        )
+    }
 }
 
 impl<R: Read + Seek> Pdf<R> {
@@ -662,6 +709,68 @@ pub fn check_name_tree_dests<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Diagnos
     Ok(diagnostics)
 }
 
+/// Drop dangling outline `/SE` (structure-element) links.
+///
+/// Walks the document's `/Outlines` tree (`/First`/`/Next`/`/First` order,
+/// same as [`OutlineDocumentHelper::get_root`]) and removes the `/SE` key
+/// from every outline item dictionary whose `/SE` target is not a member of
+/// `live_struct_elem_refs`. An outline item with no `/SE`, or whose `/SE` is
+/// not a (spec-mandated) indirect reference, is left untouched — matching
+/// how [`OutlineNode::se`] reads a non-conforming `/SE` value.
+///
+/// This function does not compute `live_struct_elem_refs` itself: pass in the
+/// set of structure element refs that remain reachable from
+/// `/StructTreeRoot` after the structure tree has been dropped or rebuilt.
+/// When the structure tree is left intact, `/SE` links need no pruning —
+/// leaving a document's `/Outlines` tree and `/StructTreeRoot` unmodified
+/// (an ordinary read-then-[`crate::write_pdf`] round trip) already preserves
+/// every `/SE` entry verbatim, the same as any other outline dictionary key.
+///
+/// Returns the number of `/SE` entries removed, for diagnostics.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
+/// [`DEFAULT_MAX_OUTLINE_DEPTH`]. Propagates any error from resolving outline
+/// objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
+///
+/// # Examples
+///
+/// ```no_run
+/// use flpdf::{prune_outline_se, ObjectRef, Pdf};
+/// use std::collections::BTreeSet;
+/// use std::fs::File;
+/// use std::io::BufReader;
+///
+/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
+/// // Structure elements that remain reachable from /StructTreeRoot after a
+/// // rebuild; an empty set prunes every outline /SE link.
+/// let live: BTreeSet<ObjectRef> = BTreeSet::new();
+/// let dropped = prune_outline_se(&mut pdf, &live)?;
+/// println!("dropped {dropped} dangling /SE link(s)");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn prune_outline_se<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    live_struct_elem_refs: &BTreeSet<ObjectRef>,
+) -> Result<usize> {
+    OutlineDocumentHelper::new(pdf).prune_se(live_struct_elem_refs)
+}
+
+/// Like [`prune_outline_se`] but with a caller-supplied recursion limit.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
+/// `max_depth`. Propagates any error from resolving outline objects.
+pub fn prune_outline_se_with_max_depth<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    live_struct_elem_refs: &BTreeSet<ObjectRef>,
+    max_depth: usize,
+) -> Result<usize> {
+    OutlineDocumentHelper::new(pdf).prune_se_with_max_depth(live_struct_elem_refs, max_depth)
+}
+
 /// Decode an outline `/Title`, resolving one level of indirection (review rule 2).
 /// qpdf yields an empty string when absent or not a (resolved) string.
 fn resolve_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<String> {
@@ -723,4 +832,59 @@ fn resolve_page_ref_through_holders<R: Read + Seek>(
         }
     }
     current
+}
+
+/// Walk one `/First`->`/Next` sibling chain (and recurse into `/First`
+/// grandchildren), dropping any `/SE` not present in `live`. Returns the
+/// number of `/SE` entries removed along this chain and its descendants.
+///
+/// Mirrors [`OutlineDocumentHelper::build_siblings`]'s traversal shape
+/// (same cycle-safe `visited` set, same depth cap) but mutates in place via
+/// [`Pdf::set_object`] instead of materializing [`OutlineNode`]s.
+fn walk_outline_se<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    start: ObjectRef,
+    depth: usize,
+    visited: &mut BTreeSet<ObjectRef>,
+    live: &BTreeSet<ObjectRef>,
+    max_depth: usize,
+) -> Result<usize> {
+    if depth >= max_depth {
+        return Err(crate::Error::Unsupported(format!(
+            "outline depth exceeds maximum of {max_depth} at {start}"
+        )));
+    }
+
+    let mut pruned = 0;
+    let mut current = Some(start);
+    while let Some(current_ref) = current {
+        if !visited.insert(current_ref) {
+            break; // cycle - stop this chain
+        }
+
+        // `resolve()` returns an owned `Object` (review rule 1): moved directly
+        // into `dict` rather than cloned again, since the dictionary may need
+        // mutating below.
+        let Object::Dictionary(mut dict) = pdf.resolve(current_ref)? else {
+            break;
+        };
+        let first = dict.get_ref("First");
+        let next = dict.get_ref("Next");
+
+        if let Some(se_ref) = dict.get_ref("SE") {
+            if !live.contains(&se_ref) {
+                dict.remove("SE");
+                pdf.set_object(current_ref, Object::Dictionary(dict));
+                pruned += 1;
+            }
+        }
+
+        if let Some(first) = first {
+            pruned += walk_outline_se(pdf, first, depth + 1, visited, live, max_depth)?;
+        }
+
+        current = next;
+    }
+
+    Ok(pruned)
 }

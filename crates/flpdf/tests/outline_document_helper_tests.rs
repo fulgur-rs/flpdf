@@ -1,7 +1,10 @@
 //! Integration tests for [`flpdf::OutlineDocumentHelper`].
 
-use flpdf::{check_legacy_dests, check_name_tree_dests, write_pdf, ObjectRef, Pdf, Severity};
-use std::collections::BTreeMap;
+use flpdf::{
+    check_legacy_dests, check_name_tree_dests, prune_outline_se, prune_outline_se_with_max_depth,
+    write_pdf, ObjectRef, Pdf, Severity,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
 /// Build a minimal cross-reffed PDF from `(objnum, body)` pairs.
@@ -1255,4 +1258,224 @@ fn check_name_tree_dests_follows_page_ref_through_holder() {
         "the holder-chain page ref resolves to a live page, no diagnostic: {:?}",
         diagnostics.entries()
     );
+}
+// -----------------------------------------------------------------------
+// /SE (structure-element link) tests
+// -----------------------------------------------------------------------
+
+/// Catalog + pages + `/StructTreeRoot` (10, `/K` holding struct elements 20
+/// and 21) + a two-item outline: A(5)'s `/SE` points at struct elem 20; B(7)
+/// has no `/SE` at all.
+fn outline_se_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /StructTreeRoot 10 0 R >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 7 0 R /Count 2 >>"),
+            (5, "<< /Title (A) /Parent 4 0 R /Next 7 0 R /SE 20 0 R >>"),
+            (7, "<< /Title (B) /Parent 4 0 R /Prev 5 0 R >>"),
+            (10, "<< /Type /StructTreeRoot /K [20 0 R 21 0 R] >>"),
+            (20, "<< /Type /StructElem /S /P /P 10 0 R /Pg 3 0 R >>"),
+            (21, "<< /Type /StructElem /S /P /P 10 0 R /Pg 3 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn outline_se_reads_indirect_reference_and_none_when_absent() {
+    let mut pdf = Pdf::open(Cursor::new(outline_se_pdf())).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    assert_eq!(roots.len(), 2);
+    assert_eq!(
+        roots[0].se,
+        Some(ObjectRef::new(20, 0)),
+        "A's indirect /SE must resolve to the struct elem ref"
+    );
+    assert_eq!(roots[1].se, None, "B has no /SE");
+}
+
+/// `/SE` stored as a *direct* dictionary (not an indirect reference) is
+/// malformed per ISO 32000-2 section 12.3.3 table 151 ("shall be an
+/// indirect reference"); it is read as absent, the same as every other
+/// non-conforming outline value in this module.
+fn outline_se_direct_dict_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (A) /Parent 4 0 R /SE << /Type /StructElem /S /P >> >>",
+            ),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn outline_se_direct_dictionary_value_is_malformed_and_ignored() {
+    let mut pdf = Pdf::open(Cursor::new(outline_se_direct_dict_pdf())).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    assert_eq!(roots[0].se, None);
+}
+
+/// Round-trip acceptance: opening a document whose `/StructTreeRoot` is left
+/// intact and rewriting it via [`write_pdf`] (no page operations, no
+/// mutation) must preserve every outline `/SE` link unchanged, the same as
+/// [`legacy_dests_round_trip_through_write_pdf_unmodified`] does for
+/// `/Dests`.
+#[test]
+fn outline_se_round_trip_through_write_pdf_unmodified() {
+    let mut pdf = Pdf::open(Cursor::new(outline_se_pdf())).unwrap();
+    let before: Vec<Option<ObjectRef>> = pdf
+        .outline()
+        .get_root()
+        .unwrap()
+        .iter()
+        .map(|n| n.se)
+        .collect();
+    assert_eq!(
+        before,
+        vec![Some(ObjectRef::new(20, 0)), None],
+        "sanity: fixture has one /SE entry"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut pdf, &mut out).unwrap();
+
+    let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
+    let after: Vec<Option<ObjectRef>> = reopened
+        .outline()
+        .get_root()
+        .unwrap()
+        .iter()
+        .map(|n| n.se)
+        .collect();
+    assert_eq!(
+        before, after,
+        "/SE links must round-trip unmodified when /StructTreeRoot is left intact"
+    );
+}
+
+#[test]
+fn prune_outline_se_drops_entries_not_in_live_set() {
+    let mut pdf = Pdf::open(Cursor::new(outline_se_pdf())).unwrap();
+    let live: BTreeSet<ObjectRef> = BTreeSet::new(); // struct elem 20 is not live
+    let dropped = prune_outline_se(&mut pdf, &live).unwrap();
+    assert_eq!(dropped, 1);
+
+    let roots = pdf.outline().get_root().unwrap();
+    assert_eq!(roots[0].se, None, "dangling /SE must be dropped");
+    assert_eq!(
+        roots[0].title, "A",
+        "the rest of the outline item must be untouched"
+    );
+    assert_eq!(roots[1].se, None, "B never had /SE");
+}
+
+#[test]
+fn prune_outline_se_keeps_entries_in_live_set() {
+    let mut pdf = Pdf::open(Cursor::new(outline_se_pdf())).unwrap();
+    let mut live = BTreeSet::new();
+    live.insert(ObjectRef::new(20, 0));
+    let dropped = prune_outline_se(&mut pdf, &live).unwrap();
+    assert_eq!(dropped, 0);
+
+    let roots = pdf.outline().get_root().unwrap();
+    assert_eq!(
+        roots[0].se,
+        Some(ObjectRef::new(20, 0)),
+        "a live /SE target must be kept"
+    );
+}
+
+/// Three siblings A(/SE -> 20, dropped), B(/SE -> 21, kept), C(no /SE).
+/// Exercises that pruning is entry-by-entry: only the dangling link is
+/// removed, and the `/First`/`/Next` sibling chain still walks afterward.
+fn outline_se_three_siblings_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /StructTreeRoot 10 0 R >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 8 0 R /Count 3 >>"),
+            (5, "<< /Title (A) /Parent 4 0 R /Next 6 0 R /SE 20 0 R >>"),
+            (
+                6,
+                "<< /Title (B) /Parent 4 0 R /Prev 5 0 R /Next 8 0 R /SE 21 0 R >>",
+            ),
+            (8, "<< /Title (C) /Parent 4 0 R /Prev 6 0 R >>"),
+            (10, "<< /Type /StructTreeRoot /K [20 0 R 21 0 R] >>"),
+            (20, "<< /Type /StructElem /S /P /P 10 0 R /Pg 3 0 R >>"),
+            (21, "<< /Type /StructElem /S /P /P 10 0 R /Pg 3 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn prune_outline_se_mixed_siblings_only_drops_dangling() {
+    let mut pdf = Pdf::open(Cursor::new(outline_se_three_siblings_pdf())).unwrap();
+    let mut live = BTreeSet::new();
+    live.insert(ObjectRef::new(21, 0)); // only B's target survives
+
+    let dropped = prune_outline_se(&mut pdf, &live).unwrap();
+    assert_eq!(dropped, 1);
+
+    let roots = pdf.outline().get_root().unwrap();
+    assert_eq!(
+        roots.len(),
+        3,
+        "the sibling chain must survive pruning intact"
+    );
+    assert_eq!(roots[0].title, "A");
+    assert_eq!(roots[0].se, None, "A's dangling /SE must be dropped");
+    assert_eq!(roots[1].title, "B");
+    assert_eq!(
+        roots[1].se,
+        Some(ObjectRef::new(21, 0)),
+        "B's live /SE must be kept"
+    );
+    assert_eq!(roots[2].title, "C");
+    assert_eq!(roots[2].se, None, "C never had /SE");
+}
+
+#[test]
+fn prune_outline_se_no_outlines_is_noop() {
+    let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
+    let live = BTreeSet::new();
+    let dropped = prune_outline_se(&mut pdf, &live).unwrap();
+    assert_eq!(dropped, 0);
+}
+
+/// Reuses the `/Next`-cycle fixture from [`cyclic_outline_terminates`]: no
+/// item in it has `/SE`, so pruning must terminate (not hang) and report
+/// zero drops.
+#[test]
+fn prune_outline_se_cycle_terminates() {
+    let mut pdf = Pdf::open(Cursor::new(cyclic_outline_pdf())).unwrap();
+    let live = BTreeSet::new();
+    let dropped = prune_outline_se(&mut pdf, &live).unwrap();
+    assert_eq!(dropped, 0, "fixture has no /SE entries to drop");
+}
+
+/// Deep `/First`-nested outline (10 levels): pruning with a max depth of 5
+/// must surface `Error::Unsupported`, mirroring `depth_cap_is_enforced` for
+/// `get_root_with_max_depth`.
+#[test]
+fn prune_outline_se_depth_cap_is_enforced() {
+    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(10))).unwrap();
+    let live = BTreeSet::new();
+    let err = prune_outline_se_with_max_depth(&mut pdf, &live, 5);
+    assert!(err.is_err(), "expected depth-cap error, got {err:?}");
 }
