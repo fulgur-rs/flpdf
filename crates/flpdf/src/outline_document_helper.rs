@@ -431,6 +431,18 @@ impl<R: Read + Seek> Pdf<R> {
 /// (for example a missing `/Pages` entry) is downgraded to a warning
 /// [`Diagnostic`] instead, so the caller still receives a report.
 ///
+/// # Known limitation
+///
+/// The live-page set comes from [`crate::pages::page_refs`], which walks
+/// `/Kids` entries but does not currently follow a `/Kids` entry that is
+/// itself a bare indirect reference chain (e.g. `/Kids [30 0 R]` where
+/// `30 0 obj` is `3 0 R` and `3 0 obj` is the actual `/Page`). In that
+/// corner case a legacy destination pointing at the terminal page is
+/// falsely flagged as dangling. Documents produced by mainstream writers
+/// (qpdf, Acrobat, common libraries) do not use bare-ref holders in
+/// `/Kids`, so this is a hostile/hand-authored input concern rather than
+/// a round-trip regression.
+///
 /// # Examples
 ///
 /// ```no_run
