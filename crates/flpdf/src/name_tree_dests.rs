@@ -199,14 +199,17 @@ fn rebuild_name_tree_dests<R: Read + Seek>(
                     .map(|d| (Some(terminal_ref.unwrap_or(*r)), d))
             }
             Some(Object::Dictionary(d)) => Some((None, d.clone())),
-            // cov:ignore: unreachable via the public writer API. `entries` can
-            // only be empty here when `delete_name_tree_dest` actually found
-            // and removed an entry, which requires `collect_name_tree_dests_raw`
-            // to have matched this same (unmutated) `/Names` value as either
-            // `Reference` or `Dictionary` moments earlier in the same call —
-            // this wildcard can only fire for some other type or absence.
-            _ => None,
+            // `entries` can only be empty here when `delete_name_tree_dest`
+            // actually found and removed an entry, which requires
+            // `collect_name_tree_dests_raw` to have matched this same
+            // (unmutated) `/Names` value as either `Reference` or
+            // `Dictionary` moments earlier in the same call — this wildcard
+            // can only fire for some other type or absence.
+            _ => None, // cov:ignore: unreachable via the public writer API (see comment above)
         };
+        // `names_dict_opt` is always `Some` in practice for the same reason
+        // the wildcard above is unreachable; the `if let` is retained (rather
+        // than an `unwrap`) purely for defensive symmetry with the read path.
         if let Some((names_ref_opt, mut names_dict)) = names_dict_opt {
             names_dict.remove("Dests");
             if names_dict.iter().next().is_none() {
@@ -232,7 +235,7 @@ fn rebuild_name_tree_dests<R: Read + Seek>(
                     }
                 }
             }
-        }
+        } // cov:ignore: the `None` (skip) arm of this `if let` is unreachable; see above
         return Ok(());
     }
 

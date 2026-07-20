@@ -418,13 +418,8 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Some(dests_root) = names.remove("Dests") else {
             return Ok(Vec::new());
         };
-        let decode_verbatim = |_pdf: &mut Pdf<R>, value: Object| Ok(Some(value));
-        let raw = read_name_tree(
-            self.pdf,
-            dests_root,
-            decode_verbatim,
-            DEFAULT_MAX_OUTLINE_DEPTH,
-        )?;
+        let decode = |_pdf: &mut Pdf<R>, value: Object| Ok(Some(value));
+        let raw = read_name_tree(self.pdf, dests_root, decode, DEFAULT_MAX_OUTLINE_DEPTH)?;
         let mut out = Vec::with_capacity(raw.len());
         for (name, value) in raw {
             let dest = self.dest_from_value(&value, MAX_DEST_RESOLVE_DEPTH)?;
