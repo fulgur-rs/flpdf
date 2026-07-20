@@ -2,7 +2,7 @@
 
 use flpdf::{
     check_legacy_dests, check_name_tree_dests, prune_outline_se, prune_outline_se_with_max_depth,
-    write_pdf, ObjectRef, Pdf, Severity,
+    write_pdf, Object, ObjectRef, Pdf, Severity,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
@@ -1362,6 +1362,23 @@ fn outline_se_round_trip_through_write_pdf_unmodified() {
         before, after,
         "/SE links must round-trip unmodified when /StructTreeRoot is left intact"
     );
+
+    // The link must still *resolve*, not merely have the same ref value: the
+    // structure element it targets must have survived as a real /StructElem
+    // dictionary (a writer that GC'd it while leaving the /SE ref dangling
+    // would still pass the `before == after` check above, so that check
+    // alone is not sufficient).
+    let se_ref = after[0].expect("A's /SE must still be present");
+    match reopened.resolve(se_ref).unwrap() {
+        Object::Dictionary(dict) => {
+            assert_eq!(
+                dict.get("Type"),
+                Some(&Object::Name(b"StructElem".to_vec())),
+                "the /SE target must still be a /StructElem dictionary"
+            );
+        }
+        other => panic!("/SE target must resolve to a dictionary, got {other:?}"),
+    }
 }
 
 #[test]
