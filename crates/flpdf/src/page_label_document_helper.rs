@@ -416,6 +416,11 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// `/PageLabels` for a new page range (pair with
     /// [`PageLabelDocumentHelper::write_reconstructed_labels`]).
     ///
+    /// `start_idx` must be `<= end_idx`. An inverted span (`start_idx >
+    /// end_idx`) is a caller bug: this returns only the first-page label
+    /// with no explicit-range entries, matching an empty-span read; it does
+    /// not panic. `start_idx == end_idx` denotes a single-page span.
+    ///
     /// Unlike qpdf's accumulating signature, this is a single self-contained
     /// call: the leading entry is always emitted (the result vector starts
     /// empty, so there is no prior entry to be redundant against). A later

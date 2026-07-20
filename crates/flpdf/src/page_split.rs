@@ -356,9 +356,10 @@ pub fn digit_width(n: u32) -> usize {
 ///
 /// Re-opens `src_bytes` as a fresh `Pdf`, mutates the `/Pages` root so that
 /// only the `chunk_refs` pages remain, then appends an incremental update via
-/// [`write_pdf`]. `chunk_start`/`chunk_end` are the chunk's 0-based
-/// `[start, end)` span in the *source* document, used to reconstruct
-/// `/PageLabels` for the chunk (qpdf `--split-pages` parity).
+/// [`write_pdf`]. `chunk_start` (inclusive) and `chunk_end` (exclusive) are
+/// the chunk's 0-based half-open `[chunk_start, chunk_end)` span in the
+/// *source* document, used to reconstruct `/PageLabels` for the chunk
+/// (qpdf `--split-pages` parity).
 fn write_chunk(
     src_bytes: &[u8],
     pages_root_ref: ObjectRef,

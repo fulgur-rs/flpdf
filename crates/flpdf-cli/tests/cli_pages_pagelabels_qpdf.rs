@@ -85,7 +85,7 @@ fn read_ranges(path: &Path) -> Vec<(i64, flpdf::LabelRange)> {
 #[test]
 fn cli_pages_subset_reconstructs_labels_like_qpdf() {
     if !qpdf_available() {
-        eprintln!("skipping: {QPDF} (11.9.0) not available");
+        eprintln!("[SKIP cli_pages_pagelabels_qpdf] {} 11.9.0 not on PATH — set QPDF env or install to run", QPDF);
         return;
     }
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -150,7 +150,7 @@ fn cli_pages_subset_reconstructs_labels_like_qpdf() {
 #[test]
 fn cli_pages_without_source_labels_has_none() {
     if !qpdf_available() {
-        eprintln!("skipping: {QPDF} (11.9.0) not available");
+        eprintln!("[SKIP cli_pages_pagelabels_qpdf] {} 11.9.0 not on PATH — set QPDF env or install to run", QPDF);
         return;
     }
     let tmp = tempfile::tempdir().expect("tempdir");

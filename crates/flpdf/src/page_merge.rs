@@ -1741,7 +1741,11 @@ pub fn merge_documents<R: Read + Seek>(
     // `getLabelsForPageRange` once per selected page regardless of which
     // source file it came from, gating only the final `/PageLabels` install
     // on whether ANY input's own tree carried real labels.
-    let mut label_entries: Vec<(i64, LabelRange)> = Vec::new();
+    // One entry per selected page across all inputs, upper-bounded by the
+    // total selection count; pre-allocate to avoid repeated regrowth on
+    // large merges.
+    let total_selected: usize = inputs.iter().map(|i| i.pages.len()).sum();
+    let mut label_entries: Vec<(i64, LabelRange)> = Vec::with_capacity(total_selected);
     let mut any_page_labels = false;
     let mut out_pageno: i64 = 0;
 
