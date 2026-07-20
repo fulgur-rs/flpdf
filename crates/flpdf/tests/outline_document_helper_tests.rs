@@ -877,3 +877,36 @@ fn check_legacy_dests_holder_chain_depth_cap_terminates() {
         diagnostics.entries()
     );
 }
+
+/// Codex round-3: alias resolution inside a chained-through `/Dests` dict.
+/// `/Dests 10 0 R` → obj 10 = `11 0 R` → obj 11 = `<< /alias /target /target [3 0 R /Fit] >>`.
+/// The `alias` entry is a name pointing at `target`. Before the fix,
+/// legacy_dests followed the chain (sub-1) but resolve_named_dest still
+/// used the single-hop catalog_value, so the alias silently resolved to
+/// None and check_legacy_dests skipped the entry entirely.
+#[test]
+fn legacy_dests_resolves_alias_through_chained_dests_dict() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 10 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            // Multi-hop holder chain to the dict.
+            (10, "11 0 R"),
+            (11, "<< /alias /target /target [3 0 R /Fit] >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let entries = pdf.outline().legacy_dests().unwrap();
+    // Two entries; both must resolve to the same page (alias → target →
+    // page 3), not None for alias.
+    assert_eq!(entries.len(), 2, "got {entries:?}");
+    for (name, dest) in &entries {
+        assert!(
+            dest.as_ref().and_then(|d| d.page()).is_some(),
+            "entry {:?} must resolve to a page (alias must chase target through chained /Dests)",
+            std::str::from_utf8(name).unwrap_or("?")
+        );
+    }
+}

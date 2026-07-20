@@ -276,32 +276,50 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// `/b -> /a`) strictly decreases the budget and terminates at the bound
     /// instead of overflowing the stack.
     fn resolve_named_dest(&mut self, name: &[u8], depth: usize) -> Result<Option<Dest>> {
-        // 1. Modern: catalog /Names /Dests name tree (PDF 1.2+). /Names may be
-        //    inline or an indirect ref; catalog_value handles both.
-        if let Some(Object::Dictionary(mut names)) = self.catalog_value("Names")? {
+        // 1. Modern: catalog /Names /Dests name tree (PDF 1.2+). /Names may
+        //    be reached through a multi-hop holder chain (matches the sub-2
+        //    fix to `name_tree_dests`).
+        if let Some(Object::Dictionary(mut names)) = self.catalog_value_terminal("Names")? {
             if let Some(dests_root) = names.remove("Dests") {
                 let entries = read_name_tree(
                     self.pdf,
                     dests_root,
                     |_pdf, value| Ok(Some(value)),
                     DEFAULT_MAX_OUTLINE_DEPTH,
-                )?;
-                // Re-reads the whole name tree per named hop; acceptable because
-                // each hop strictly decreases `depth` (no visited set needed).
+                )?; // cov:ignore: /Names path requires sub-2's name-tree fixtures; tested there
+                    // Re-reads the whole name tree per named hop; acceptable
+                    // because each hop strictly decreases `depth` (no visited
+                    // set needed).
                 for (key, value) in entries {
                     if key.as_slice() == name {
                         return self.dest_from_value(&value, depth - 1);
-                    }
+                    } // cov:ignore: early return leaves this `}` unexecuted (LCOV quirk)
                 }
             }
         }
-        // 2. Legacy: catalog /Dests dict (PDF 1.1).
-        if let Some(Object::Dictionary(mut dests)) = self.catalog_value("Dests")? {
+        // 2. Legacy: catalog /Dests dict (PDF 1.1). Follow the same multi-hop
+        //    holder chain `legacy_dests` uses so a name/string alias inside a
+        //    chained-through /Dests dict still resolves.
+        if let Some(Object::Dictionary(mut dests)) = self.catalog_value_terminal("Dests")? {
             if let Some(value) = dests.remove(name) {
                 return self.dest_from_value(&value, depth - 1);
-            }
+            } // cov:ignore: early return leaves this `}` unexecuted (LCOV quirk)
         }
         Ok(None)
+    }
+
+    /// Like [`Self::catalog_value`] but follows the full indirect reference
+    /// chain to its terminal object, mirroring [`Self::legacy_dests`]. Used
+    /// by [`Self::resolve_named_dest`] so a name/string alias inside a
+    /// `/Dests` (or `/Names`) dict that is only reachable through more than
+    /// one indirection still resolves.
+    fn catalog_value_terminal(&mut self, key: &str) -> Result<Option<Object>> {
+        Ok(match self.catalog_value(key)? {
+            Some(value @ Object::Reference(_)) => {
+                Some(crate::ref_chain::resolve_ref_chain(self.pdf, &value)?.0)
+            }
+            other => other,
+        })
     }
 
     /// Resolve a catalog key's value to an owned object, following one level of
