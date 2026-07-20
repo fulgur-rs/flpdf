@@ -813,3 +813,67 @@ fn check_legacy_dests_follows_page_ref_through_holder() {
         diagnostics.entries()
     );
 }
+
+/// Malformed catalog: `/Dests` is present but resolves to a non-dictionary
+/// value (an integer here). Covers the `let Object::Dictionary(dests) = ..
+/// else { return Ok(Vec::new()); }` fallback added alongside the multi-hop
+/// holder-chain resolve — matches the sibling `/Names` fallback on sub-2.
+#[test]
+fn legacy_dests_returns_empty_when_dests_is_not_a_dictionary() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 10 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            // /Dests resolves to a plain integer — spec-nonconforming.
+            (10, "42"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let entries = pdf.outline().legacy_dests().unwrap();
+    assert!(entries.is_empty(), "non-dict /Dests must read as empty");
+}
+
+/// Cover the depth-cap fallback in `resolve_page_ref_through_holders`: a
+/// destination whose page operand is an unbounded ref chain must terminate
+/// (returning the last ref we managed to walk to) instead of looping
+/// forever. Uses a chain that exceeds MAX_DEST_RESOLVE_DEPTH via reused
+/// object numbers.
+#[test]
+fn check_legacy_dests_holder_chain_depth_cap_terminates() {
+    // Build a 70-object bare-ref chain 100 → 101 → 102 → … → 169 → 3 0 R
+    // (page 3). MAX_DEST_RESOLVE_DEPTH is 64, so the walker gives up at
+    // hop 64 and returns object 164, which is NOT in live_pages, so this
+    // legitimately-if-pathologically-deep target reads as dangling. The
+    // point of this test is that it terminates (no infinite loop) and
+    // emits a diagnostic instead.
+    let mut objs: Vec<(u32, String)> = vec![
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>".to_string(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+        ),
+        (8, "<< /deep [100 0 R /Fit] >>".to_string()),
+    ];
+    for i in 100..169 {
+        objs.push((i, format!("{} 0 R", i + 1)));
+    }
+    objs.push((169, "3 0 R".to_string()));
+    let refs: Vec<(u32, &str)> = objs.iter().map(|(n, s)| (*n, s.as_str())).collect();
+    let pdf_bytes = build_pdf(&refs, 1);
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
+    // Test succeeded by not looping forever; the depth-capped ref is not
+    // in the page tree, so one warning is emitted.
+    assert_eq!(
+        diagnostics.entries().len(),
+        1,
+        "got {:?}",
+        diagnostics.entries()
+    );
+}
