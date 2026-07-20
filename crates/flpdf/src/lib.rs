@@ -36,6 +36,34 @@
 //! Errors flow through the unified [`Error`] enum and the crate-level [`Result`] alias,
 //! except for the small [`object::ParseObjectRefError`] returned by
 //! [`ObjectRef::parse`].
+//!
+//! # Known limitations
+//!
+//! - **Outline and page-label preservation.** [`OutlineDocumentHelper`] and
+//!   [`PageLabelDocumentHelper`] round-trip through [`write_pdf`] and survive
+//!   page operations ([`extract_pages`], [`rebuild_page_tree`],
+//!   [`merge_documents`]) for: deeply nested outlines (no practical depth
+//!   limit; walks are iterative, not recursive); both destination sources —
+//!   the legacy catalog `/Dests` dictionary and the modern `/Names /Dests`
+//!   name tree (ISO 32000-2 §7.9.6, §12.3.2.3) — present in the same
+//!   document; all five `/A` action subtypes (`GoTo`, `GoToR`, `URI`,
+//!   `Launch`, `Named`) plus their `/Next` chains (ISO 32000-2 §12.6.2); the
+//!   `/SE` structure-element link (ISO 32000-2 §14.7); and `/PageLabels`
+//!   number-tree ranges (ISO 32000-2 §7.9.7), including reconstruction across
+//!   `--pages`-style subset/merge operations.
+//! - **`/SE` is not pruned automatically.** Built-in page-operation helpers
+//!   only drop a structure element's now-dangling `/Pg` entry
+//!   ([`struct_tree_pg::drop_struct_elem_dangling_pg`]) — they never remove
+//!   the structure element itself, so an outline item's `/SE` reference is
+//!   never left dangling by them. [`prune_outline_se`] exists for callers
+//!   that perform their own structure-element removal and need to keep
+//!   outline `/SE` links consistent with it; no built-in page-operation
+//!   pipeline (extract, rebuild, split, merge) invokes it automatically.
+//! - **`flpdf --json`'s `outlines` and `pagelabels` sections** currently use
+//!   a different key layout than qpdf's own `--json=2` output for these two
+//!   sections specifically (other sections match). Both still faithfully
+//!   expose the document's outline tree and page-label ranges; only the JSON
+//!   field names and shape differ from qpdf's.
 
 // Mechanically enforce threat-model guarantee (a): no undefined behaviour. The
 // crate contains no `unsafe` blocks, so this attribute keeps it that way.
