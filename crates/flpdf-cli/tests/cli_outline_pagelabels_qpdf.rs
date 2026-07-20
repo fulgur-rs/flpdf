@@ -60,13 +60,10 @@ fn outline_and_dests_four_page_pdf() -> Vec<u8> {
         ),
         (
             2,
-            "<< /Type /Pages /Kids [3 0 R 4000 0 R 5 0 R 6 0 R] /Count 4 >>",
+            "<< /Type /Pages /Kids [3 0 R 7 0 R 5 0 R 6 0 R] /Count 4 >>",
         ),
         (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-        (
-            4000,
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
-        ),
+        (7, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
         (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
         (6, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
         (

@@ -61,7 +61,12 @@ fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
 /// A linear chain of `n` nested outline items (each is the sole child of the
 /// previous), each carrying a `/Dest` to the single page. Object numbers:
 /// catalog 1, pages 2, page 3, outlines root 4, items 5..5+n.
+///
+/// `n` must be `>= 1`: obj 4 (the outlines root) hard-codes `/First 5 0 R
+/// /Last 5 0 R`, so an empty chain would reference an object that isn't
+/// emitted. The tests below always call with n >= 150.
 fn deep_outline_with_dests_pdf(n: u32) -> Vec<u8> {
+    assert!(n >= 1, "deep_outline_with_dests_pdf: n must be >= 1");
     let mut objs: Vec<(u32, String)> = vec![
         (
             1,
