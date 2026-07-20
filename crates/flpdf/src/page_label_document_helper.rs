@@ -1561,4 +1561,71 @@ mod tests {
         let only = vec![(0, dec(1))];
         assert_eq!(merge_adjacent_ranges(only.clone()), only);
     }
+
+    #[test]
+    fn merge_adjacent_ranges_skips_merge_on_arithmetic_overflow() {
+        // Unsorted input (idx < prev_idx) → checked_sub underflows → no merge.
+        // The function is total: it must not panic and must preserve the entry.
+        let a = LabelRange {
+            style: LabelStyle::Decimal,
+            prefix: String::new(),
+            start: 1,
+        };
+        let b = a.clone();
+        let unsorted = vec![(10, a), (5, b)];
+        assert_eq!(
+            merge_adjacent_ranges(unsorted.clone()),
+            unsorted,
+            "underflow in gap arithmetic must fall through, not merge"
+        );
+
+        // Add-overflow branch: prev.start = i64::MAX with a positive gap
+        // saturates in the old code; checked_add now short-circuits.
+        let big = LabelRange {
+            style: LabelStyle::Decimal,
+            prefix: String::new(),
+            start: i64::MAX,
+        };
+        let follow = LabelRange {
+            style: LabelStyle::Decimal,
+            prefix: String::new(),
+            start: 0, // any value; the point is that checked_add must be None
+        };
+        let overflow = vec![(0, big), (1, follow)];
+        assert_eq!(
+            merge_adjacent_ranges(overflow.clone()),
+            overflow,
+            "add overflow must fall through, not merge"
+        );
+    }
+
+    #[test]
+    fn insert_pages_rejects_at_or_count_exceeding_i64_max() {
+        // Need a document with at least one range so we get past the
+        // early-return; usize::MAX > i64::MAX on any target with usize >= 64-bit.
+        // (On 32-bit targets usize::MAX < i64::MAX and try_from succeeds; those
+        // are not our supported targets for this behaviour.)
+        let mut pdf = pdf_with_pagelabels(vec![
+            Object::Integer(0),
+            Object::Dictionary(Dictionary::new()),
+        ]);
+        let mut helper = PageLabelDocumentHelper::new(&mut pdf);
+        let err = helper.insert_pages(usize::MAX, 1).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        let err = helper.insert_pages(0, usize::MAX).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn remove_pages_rejects_at_or_count_exceeding_i64_max() {
+        let mut pdf = pdf_with_pagelabels(vec![
+            Object::Integer(0),
+            Object::Dictionary(Dictionary::new()),
+        ]);
+        let mut helper = PageLabelDocumentHelper::new(&mut pdf);
+        let err = helper.remove_pages(usize::MAX, 1).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        let err = helper.remove_pages(0, usize::MAX).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
 }
