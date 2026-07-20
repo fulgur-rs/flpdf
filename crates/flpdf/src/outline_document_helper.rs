@@ -255,14 +255,8 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             // this point - owned values only from here on.
             let title = resolve_title(self.pdf, title_src)?;
             let count = resolve_int(self.pdf, count_src)?.unwrap_or(0);
-            // `action_src` feeds two independent read paths below (dest
-            // resolution and the typed `/A` field), so it is cloned once here
-            // rather than restructuring `resolve_node_dest` to borrow it -
-            // the action dict itself is small (never a stream/page tree), so
-            // this is not the deep/O(N) clone review rule 1 warns against.
-            let action_for_typed = action_src.clone();
-            let dest = self.resolve_node_dest(dest_src, action_src)?;
-            let action = match action_for_typed {
+            let dest = self.resolve_node_dest(dest_src.as_ref(), action_src.as_ref())?;
+            let action = match action_src {
                 Some(a) => parse_outline_action(self.pdf, a)?,
                 None => None,
             };
@@ -294,20 +288,24 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// Named/string destinations are resolved in a later task (return `None` here).
     fn resolve_node_dest(
         &mut self,
-        dest: Option<Object>,
-        action: Option<Object>,
+        dest: Option<&Object>,
+        action: Option<&Object>,
     ) -> Result<Option<Dest>> {
         if let Some(d) = dest {
-            if let Some(found) = self.dest_from_value(&d, MAX_DEST_RESOLVE_DEPTH)? {
+            if let Some(found) = self.dest_from_value(d, MAX_DEST_RESOLVE_DEPTH)? {
                 return Ok(Some(found));
             }
         }
         if let Some(a) = action {
-            let action_obj = match a {
-                Object::Reference(r) => self.pdf.resolve(r)?,
-                other => other,
+            let resolved_owned;
+            let adict = match a {
+                Object::Reference(r) => {
+                    resolved_owned = self.pdf.resolve(*r)?;
+                    resolved_owned.as_dict()
+                }
+                other => other.as_dict(),
             };
-            if let Some(adict) = action_obj.as_dict() {
+            if let Some(adict) = adict {
                 let is_goto = matches!(adict.get("S"), Some(Object::Name(n)) if n == b"GoTo");
                 if is_goto {
                     if let Some(d) = adict.get("D").cloned() {

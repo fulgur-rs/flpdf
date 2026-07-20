@@ -1553,7 +1553,7 @@ fn action_pdf(action_body: &str) -> Vec<u8> {
 }
 
 fn first_action(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Option<OutlineAction> {
-    pdf.outline().get_root().unwrap().remove(0).action
+    pdf.outline().get_root().unwrap()[0].action.clone()
 }
 
 // ── GoTo ───────────────────────────────────────────────────────────────────
