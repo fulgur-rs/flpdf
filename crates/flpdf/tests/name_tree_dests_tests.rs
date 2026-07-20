@@ -623,3 +623,173 @@ fn writer_preserves_dict_valued_dest_on_insert() {
         .expect("inserted key must be present");
     assert_eq!(added.1, dest_array(ObjectRef::new(4, 0)));
 }
+
+// ── Boundary: no /Root at all ─────────────────────────────────────────────────
+
+/// A trailer with no `/Root` at all: `root_ref()` is `None`, so both the raw
+/// collector and the rebuild step must no-op rather than panicking.
+fn build_no_root_pdf() -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let off1 = out.len() as u64;
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref_pos = out.len() as u64;
+    out.extend_from_slice(
+        format!(
+            "xref\n0 2\n0000000000 65535 f \n{off1:010} 00000 n \ntrailer\n<< /Size 2 >>\nstartxref\n{xref_pos}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn insert_is_noop_when_root_absent() {
+    let mut pdf = open(build_no_root_pdf());
+    // Must not panic or error; there is nowhere to attach the tree.
+    insert_name_tree_dest(&mut pdf, b"x", dest_array(ObjectRef::new(1, 0))).expect("insert");
+    assert!(pdf.root_ref().is_none(), "sanity: fixture has no /Root");
+}
+
+// ── Boundary: /Root resolves to a non-dictionary object ──────────────────────
+
+/// Catalog `/Root` resolves to an array, not a dictionary — both the raw
+/// collector and the rebuild step must treat this as a no-op.
+fn build_nondict_root_pdf() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut off: BTreeMap<u32, u64> = BTreeMap::new();
+    off.insert(1, out.len() as u64);
+    out.extend_from_slice(b"1 0 obj\n[ 1 2 3 ]\nendobj\n");
+    finish_pdf(&mut out, &off, 1, 1);
+    out
+}
+
+#[test]
+fn insert_is_noop_when_root_not_a_dict() {
+    let mut pdf = open(build_nondict_root_pdf());
+    insert_name_tree_dest(&mut pdf, b"x", dest_array(ObjectRef::new(1, 0))).expect("insert");
+    // Nothing to assert structurally (there is no dict to hold /Names); the
+    // contract under test is simply "does not error or panic".
+}
+
+// ── Boundary: catalog carries an INLINE (non-indirect) /Names dict ───────────
+
+/// Catalog `/Names` is a direct (inline) dictionary rather than an indirect
+/// reference, and has no pre-existing `/Dests` key. Insert must allocate a
+/// fresh indirect object for the rewritten `/Names` dict while preserving the
+/// pre-existing inline dict's other keys verbatim.
+fn build_inline_names_dict_pdf() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut off: BTreeMap<u32, u64> = BTreeMap::new();
+
+    off.insert(1, out.len() as u64);
+    out.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages 3 0 R \
+          /Names << /EmbeddedFiles 2 0 R >> >>\nendobj\n",
+    );
+
+    off.insert(2, out.len() as u64);
+    out.extend_from_slice(b"2 0 obj\n<< /Names [ (att.txt) 4 0 R ] >>\nendobj\n");
+
+    off.insert(3, out.len() as u64);
+    out.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Kids [ ] /Count 0 >>\nendobj\n");
+
+    off.insert(4, out.len() as u64);
+    out.extend_from_slice(b"4 0 obj\n<< /Type /Filespec /F (att.txt) >>\nendobj\n");
+
+    finish_pdf(&mut out, &off, 4, 1);
+    out
+}
+
+#[test]
+fn insert_into_inline_names_dict_allocates_ref_and_preserves_sibling() {
+    let mut pdf = open(build_inline_names_dict_pdf());
+
+    insert_name_tree_dest(&mut pdf, b"home", dest_array(ObjectRef::new(3, 0))).expect("insert");
+
+    // /Names must now be an INDIRECT reference (the writer always stores it
+    // that way once rewritten), and the pre-existing /EmbeddedFiles sibling
+    // key must be preserved verbatim.
+    let catalog_ref = pdf.root_ref().expect("root");
+    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref).expect("resolve catalog") else {
+        panic!("catalog not a dict");
+    };
+    let names_ref = catalog
+        .get_ref("Names")
+        .expect("/Names must be rewritten as an indirect reference");
+    let Object::Dictionary(names_dict) = pdf.resolve(names_ref).expect("resolve /Names") else {
+        panic!("/Names not a dict");
+    };
+    assert_eq!(
+        names_dict.get("EmbeddedFiles"),
+        Some(&Object::Reference(ObjectRef::new(2, 0))),
+        "pre-existing inline /Names dict's sibling key must survive verbatim"
+    );
+    assert!(names_dict.get("Dests").is_some());
+
+    let entries = collect_raw_dests_tree(&mut pdf);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, b"home");
+}
+
+// ── Boundary: delete-to-empty with inline /Names dict + surviving sibling ────
+
+/// Catalog `/Names` is a direct (inline) dictionary carrying both `/Dests`
+/// (with a single entry) and a sibling `/EmbeddedFiles` key. Deleting the
+/// sole `/Dests` entry must drop `/Dests` but keep `/Names` inline (not
+/// promoted to an indirect reference) since the sibling key keeps it
+/// non-empty.
+fn build_inline_names_dict_with_sibling_and_dest_pdf() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut off: BTreeMap<u32, u64> = BTreeMap::new();
+
+    off.insert(1, out.len() as u64);
+    out.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+          /Names << /EmbeddedFiles 3 0 R \
+                     /Dests << /Names [ (solo) [2 0 R /Fit] ] >> >> >>\nendobj\n",
+    );
+
+    off.insert(2, out.len() as u64);
+    out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [ ] /Count 0 >>\nendobj\n");
+
+    off.insert(3, out.len() as u64);
+    out.extend_from_slice(b"3 0 obj\n<< /Names [ (att.txt) 4 0 R ] >>\nendobj\n");
+
+    off.insert(4, out.len() as u64);
+    out.extend_from_slice(b"4 0 obj\n<< /Type /Filespec /F (att.txt) >>\nendobj\n");
+
+    finish_pdf(&mut out, &off, 4, 1);
+    out
+}
+
+#[test]
+fn delete_last_entry_from_inline_names_dict_keeps_names_inline_with_sibling() {
+    let mut pdf = open(build_inline_names_dict_with_sibling_and_dest_pdf());
+
+    let removed = delete_name_tree_dest(&mut pdf, b"solo").expect("delete");
+    assert!(removed, "the sole /Dests entry must be found and removed");
+
+    let catalog_ref = pdf.root_ref().expect("root");
+    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref).expect("resolve catalog") else {
+        panic!("catalog not a dict");
+    };
+    // /Names must still be a DIRECT (inline) dictionary — never promoted to a
+    // reference in this branch, since names_ref_opt was None going in.
+    let Some(Object::Dictionary(names_dict)) = catalog.get("Names").cloned() else {
+        panic!(
+            "/Names must remain an inline dictionary, got: {:?}",
+            catalog.get("Names")
+        );
+    };
+    assert!(
+        names_dict.get("Dests").is_none(),
+        "/Dests must be removed once its last entry is deleted"
+    );
+    assert_eq!(
+        names_dict.get("EmbeddedFiles"),
+        Some(&Object::Reference(ObjectRef::new(3, 0))),
+        "sibling /EmbeddedFiles key must survive"
+    );
+
+    assert!(collect_raw_dests_tree(&mut pdf).is_empty());
+}

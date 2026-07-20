@@ -199,6 +199,12 @@ fn rebuild_name_tree_dests<R: Read + Seek>(
                     .map(|d| (Some(terminal_ref.unwrap_or(*r)), d))
             }
             Some(Object::Dictionary(d)) => Some((None, d.clone())),
+            // cov:ignore: unreachable via the public writer API. `entries` can
+            // only be empty here when `delete_name_tree_dest` actually found
+            // and removed an entry, which requires `collect_name_tree_dests_raw`
+            // to have matched this same (unmutated) `/Names` value as either
+            // `Reference` or `Dictionary` moments earlier in the same call —
+            // this wildcard can only fire for some other type or absence.
             _ => None,
         };
         if let Some((names_ref_opt, mut names_dict)) = names_dict_opt {
