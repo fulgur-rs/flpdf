@@ -575,7 +575,39 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let count = i64::try_from(count).map_err(|_| {
             Error::Unsupported(format!("insert_pages: count={} exceeds i64::MAX", count))
         })?;
-        let shifted: Vec<(i64, LabelRange)> = ranges
+
+        // Compute the label that old source page `at` was showing — the
+        // first surviving page (which will end up at output index `at +
+        // count`) has to keep that label. Without this, an insertion inside
+        // an existing range (or inside the default-decimal prefix) shifts
+        // the effective numbering: `insert_pages(2, 1)` on a single decimal
+        // range at 0 makes old page 2 (previously "3") render as "4"
+        // instead of "3"; the same happens in the default prefix when
+        // no explicit range covers `at`.
+        let mut effective_at: Option<&(i64, LabelRange)> = None;
+        for entry in &ranges {
+            if entry.0 <= at {
+                effective_at = Some(entry);
+            } else {
+                break;
+            }
+        }
+        let preservation_label = match effective_at {
+            Some((first, r)) => LabelRange {
+                style: r.style,
+                prefix: r.prefix.clone(),
+                start: r.start.saturating_add(at.saturating_sub(*first)),
+            },
+            // Default-decimal prefix before the first explicit range: old
+            // source page `at` was rendering as decimal `at + 1`.
+            None => LabelRange {
+                style: LabelStyle::Decimal,
+                prefix: String::new(),
+                start: at.saturating_add(1),
+            },
+        };
+
+        let mut result: Vec<(i64, LabelRange)> = ranges
             .into_iter()
             .map(|(idx, range)| {
                 if idx >= at {
@@ -585,11 +617,16 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
                 }
             })
             .collect();
-        // Shifting can turn a pre-existing intentional jump (e.g. an explicit
-        // restart placed exactly `count` pages after its predecessor) into a
-        // same-sequence continuation once the gap is filled by the inserted
-        // pages; fold it away like `remove_pages` does.
-        let merged = merge_adjacent_ranges(shifted);
+        // Insert the preservation range at `at + count` so surviving pages
+        // keep their original labels. merge_adjacent_ranges below folds it
+        // away when it is redundant with a predecessor.
+        result.push((at.saturating_add(count), preservation_label));
+        result.sort_by_key(|(idx, _)| *idx);
+
+        // Shifting + preservation may leave neighbours that are structurally
+        // equivalent (e.g. the preservation range equals a shifted first
+        // range's continuation); fold them away like `remove_pages` does.
+        let merged = merge_adjacent_ranges(result);
         self.write_labels(&merged)
     }
 
@@ -606,10 +643,16 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// out to be redundant with its new predecessor (the common case when the
     /// removed pages sat inside a single, otherwise-uninterrupted range).
     ///
-    /// This helper does not know the document's total page count, so removing
-    /// pages up to (or past) the end of the labeled range can still produce a
-    /// trailing entry describing pages that no longer exist; that entry is
-    /// inert (never looked up) but is not pruned here.
+    /// This helper does not know the document's total page count, so
+    /// removing pages up to (or past) the end of the labeled range can
+    /// still produce a trailing entry describing pages that no longer
+    /// exist — e.g. `remove_pages(4, 1)` on a 5-page document writes an
+    /// explicit range at output index 4 even though the output has only
+    /// pages 0..3. That entry is inert for lookups
+    /// ([`Self::label_for_page`] never queries past the caller's page
+    /// count) but the on-disk `/PageLabels` tree carries a stale key.
+    /// Callers who care about a clean tree at output time should call
+    /// [`Self::write_labels`] afterwards with the trimmed range list.
     ///
     /// A no-op when `count == 0` or when the document has no `/PageLabels`.
     ///
@@ -1346,11 +1389,18 @@ mod tests {
         }
         let mut h = pdf.page_labels();
         let ranges = h.ranges().unwrap();
-        assert_eq!(ranges[0].0, 0, "range before the insertion point stays put");
-        assert_eq!(
-            ranges[1].0, 7,
-            "range at/after the insertion point shifts by count"
-        );
+        // Three ranges after insertion:
+        //   0: original roman start 1 (inserted pages 3, 4 render iv, v)
+        //   5: preservation roman start 4 (old page 3, now output page 5,
+        //      keeps its original "iv" label instead of drifting to "vi")
+        //   7: original decimal restart shifted from 5 by count
+        assert_eq!(ranges.len(), 3, "got {ranges:?}");
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges[1].0, 5);
+        assert_eq!(ranges[1].1.start, 4, "old source page 3's roman position");
+        assert_eq!(ranges[2].0, 7);
+        // End-to-end: old page 3's label survives at its new position.
+        assert_eq!(h.label_string_for_page(5).unwrap(), "iv");
     }
 
     #[test]
@@ -1368,13 +1418,41 @@ mod tests {
         assert_eq!(h.label_string_for_page(2).unwrap(), "1");
     }
 
+    /// Cover the `None` arm of insert_pages's preservation-label match:
+    /// when `at` sits BEFORE the first explicit range, no entry has
+    /// `entry.0 <= at`, so `effective_at` stays None and the fabricated
+    /// LabelStyle::Decimal-at-1 range at `at + count` runs.
     #[test]
-    fn insert_pages_merges_shift_that_closes_an_exact_gap() {
-        // (5, Decimal, start 8) is an intentional forward jump over (0,
-        // Decimal, start 1) -- numbers 6 and 7 are deliberately skipped.
-        // Inserting exactly 2 pages at position 2 shifts it to index 7, and
-        // 1 + 7 == 8: the gap the insertion fills is exactly the jump that
-        // made the second entry non-redundant, so it must now collapse.
+    fn insert_pages_before_first_range_fabricates_decimal_preservation() {
+        // First explicit range at index 5 (roman), leaving pages 0..4 with
+        // the PDF default decimal sequence "1".."5".
+        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(5), label_dict("r", Some(1), None)]);
+        {
+            let mut h = pdf.page_labels();
+            // Insert 2 pages at position 0 — inside the default prefix, no
+            // explicit range covers `at = 0`.
+            h.insert_pages(0, 2).unwrap();
+        }
+        let mut h = pdf.page_labels();
+        // Old page 0 (previously "1") moves to output index 2 and must
+        // still render as "1"; the fabricated Decimal-start-1 preservation
+        // range at index 2 encodes that.
+        assert_eq!(h.label_string_for_page(2).unwrap(), "1");
+        // Old page 4 (previously "5") moves to output index 6, still "5".
+        assert_eq!(h.label_string_for_page(6).unwrap(), "5");
+        // Roman range shifted from 5 to 7.
+        assert_eq!(h.label_string_for_page(7).unwrap(), "i");
+    }
+
+    #[test]
+    fn insert_pages_preserves_old_page_labels_across_gap_close() {
+        // (5, Decimal, start 8) is an intentional forward jump over
+        // (0, Decimal, start 1) — numbers 6 and 7 are deliberately skipped.
+        // Insert 2 pages at position 2. The pre-fix version dropped the
+        // preservation range and merged everything into a single (0, dec 1)
+        // sequence, breaking old page 2's original "3" → it showed "5"
+        // instead after insertion. The correct behaviour keeps old pages'
+        // labels stable: old page 2 stays "3" at its new position 4.
         let mut pdf = pdf_with_pagelabels(vec![
             Object::Integer(0),
             label_dict("D", Some(1), None),
@@ -1386,7 +1464,12 @@ mod tests {
             h.insert_pages(2, 2).unwrap();
         }
         let mut h = pdf.page_labels();
-        assert_eq!(h.ranges().unwrap(), vec![(0, dec(1))]);
+        // Old page 2 (label "3") now sits at output page 4 and must still
+        // render as "3", not drift to "5".
+        assert_eq!(h.label_string_for_page(4).unwrap(), "3");
+        // Old page 5 (the deliberate restart to "8") now sits at output
+        // page 7 and must still render as "8".
+        assert_eq!(h.label_string_for_page(7).unwrap(), "8");
     }
 
     #[test]
@@ -1397,7 +1480,16 @@ mod tests {
             h.insert_pages(10, 3).unwrap(); // append pages well past the only range
         }
         let mut h = pdf.page_labels();
-        assert_eq!(h.ranges().unwrap(), vec![(0, dec(1))]);
+        // Inserted pages 10-12 continue the decimal-1 sequence (labels
+        // "11","12","13"); old page 10 moves to position 13 but its label
+        // was already "11" under the (0, dec 1) range, so it must still
+        // render as "11" — the preservation range at index 13 with start
+        // 11 encodes this invariant even though it looks redundant to a
+        // naïve reader.
+        assert_eq!(h.label_string_for_page(13).unwrap(), "11");
+        // Pages before the insertion point are untouched.
+        assert_eq!(h.label_string_for_page(0).unwrap(), "1");
+        assert_eq!(h.label_string_for_page(9).unwrap(), "10");
     }
 
     #[test]
