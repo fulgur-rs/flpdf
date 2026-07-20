@@ -616,6 +616,17 @@ pub fn check_name_tree_dests<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Diagnos
         return Ok(diagnostics);
     }
 
+    // Mirror `check_legacy_dests`: if no entry has a resolvable page ref, the
+    // page-tree walk below can flag nothing. Skip it — otherwise a document
+    // with only malformed/unresolvable name-tree destinations plus a broken
+    // /Pages tree would emit a spurious "could not enumerate pages" warning.
+    let has_resolvable_page_ref = entries
+        .iter()
+        .any(|(_, dest)| dest.as_ref().and_then(|d| d.page()).is_some());
+    if !has_resolvable_page_ref {
+        return Ok(diagnostics);
+    }
+
     let live_pages: BTreeSet<ObjectRef> = match crate::pages::page_refs(pdf) {
         Ok(refs) => refs.into_iter().collect(),
         Err(error) => {
