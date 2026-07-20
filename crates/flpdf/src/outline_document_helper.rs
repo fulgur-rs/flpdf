@@ -262,12 +262,15 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             // this point - owned values only from here on.
             let title = resolve_title(self.pdf, title_src)?;
             let count = resolve_int(self.pdf, count_src)?.unwrap_or(0);
-            // action_src is BORROWED here for the dest fallback, then MOVED
-            // into parse_outline_action below — no double-use, no clone.
+            // action_src is BORROWED here (as Option<&Object>) for the dest
+            // fallback, then the owned value is MOVED into
+            // parse_outline_action only in the Some branch — no double-use,
+            // no clone. The None branch skips the call entirely.
             let dest = self.resolve_node_dest(dest_src.as_ref(), action_src.as_ref())?;
-            let action = match action_src {
-                Some(a) => parse_outline_action(self.pdf, a)?,
-                None => None,
+            let action = if let Some(a) = action_src {
+                parse_outline_action(self.pdf, a)?
+            } else {
+                None
             };
 
             let children = match first {
@@ -322,8 +325,9 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 // adict borrow, so we can resolve /S via &mut self.pdf.
                 let s_src = adict.get("S").cloned();
                 let d_src = adict.get("D").cloned();
-                // Review rule 2: `/S` may be stored as an indirect reference;
-                // matching Object::Reference directly would silently miss GoTo.
+                // `/S` may be stored as an indirect reference; matching
+                // Object::Name against a raw Object::Reference silently
+                // misses the GoTo path. Resolve one level before matching.
                 let s = resolve_one_level(self.pdf, s_src)?;
                 let is_goto = matches!(s, Some(Object::Name(ref n)) if n == b"GoTo");
                 if is_goto {
@@ -970,6 +974,8 @@ fn resolve_page_ref_through_holders<R: Read + Seek>(
         }
     }
     current
+}
+
 /// Resolve one level of indirection on an optional value (review rule 2).
 /// Returns `None` only when `value` itself is `None`.
 fn resolve_one_level<R: Read + Seek>(

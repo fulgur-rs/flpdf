@@ -1597,7 +1597,8 @@ fn action_goto_missing_d_is_unknown() {
     }
 }
 
-/// GoTo action whose `/D` is an INDIRECT reference (obj 8) to the dest array.
+/// GoTo action whose `/D` is an INDIRECT reference (obj 8, using the ≥6
+/// reserved range documented on `action_pdf`) to the dest array.
 fn action_goto_indirect_d_pdf() -> Vec<u8> {
     build_pdf(
         &[
