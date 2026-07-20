@@ -725,3 +725,35 @@ fn check_legacy_dests_skips_entries_without_resolvable_page_ref() {
     let diagnostics = check_legacy_dests(&mut pdf).unwrap();
     assert!(diagnostics.entries().is_empty());
 }
+
+/// Mixed /Dests: one entry has a resolvable page ref (so the early-return
+/// short-circuit does NOT fire), a second entry has no resolvable page ref
+/// (so the validation loop below must `continue` past it without adding a
+/// diagnostic). This covers the in-loop skip for `dest.page().is_none()`.
+fn legacy_dests_mixed_page_ref_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (8, "<< /good [3 0 R /Fit] /odd [/NotAPageRef /Fit] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn check_legacy_dests_continues_past_entry_without_page_ref_when_others_have_one() {
+    let mut pdf = Pdf::open(Cursor::new(legacy_dests_mixed_page_ref_pdf())).unwrap();
+    // Sanity: one entry resolves to page 3, the other resolves to None.
+    let entries = pdf.outline().legacy_dests().unwrap();
+    assert_eq!(entries.len(), 2);
+    // Both targets are live/malformed but present in a live document → no
+    // diagnostics: the `good` entry hits page 3, the `odd` entry hits the
+    // `continue` in the validation loop.
+    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
+    assert!(
+        diagnostics.entries().is_empty(),
+        "no page is missing and the odd entry has no page ref to validate"
+    );
+}
