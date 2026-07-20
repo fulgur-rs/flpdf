@@ -1479,3 +1479,30 @@ fn prune_outline_se_depth_cap_is_enforced() {
     let err = prune_outline_se_with_max_depth(&mut pdf, &live, 5);
     assert!(err.is_err(), "expected depth-cap error, got {err:?}");
 }
+
+/// The outline root's `/First` resolves to a non-dictionary object (a stray
+/// integer): the walk must break out of that chain gracefully instead of
+/// panicking or erroring.
+fn outline_se_first_not_a_dict_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "42"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn prune_outline_se_non_dict_item_breaks_walk_gracefully() {
+    let mut pdf = Pdf::open(Cursor::new(outline_se_first_not_a_dict_pdf())).unwrap();
+    let live = BTreeSet::new();
+    let dropped = prune_outline_se(&mut pdf, &live).unwrap();
+    assert_eq!(
+        dropped, 0,
+        "a non-dictionary outline item must be skipped, not pruned"
+    );
+}
