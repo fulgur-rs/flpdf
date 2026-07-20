@@ -409,8 +409,9 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
     assert_eq!(depth, 19, "20-level deep chain must survive intact");
 
     // -- All five action subtypes preserved, in sibling order --
-    let actions: Vec<Option<OutlineAction>> =
-        roots[1..=5].iter().map(|n| n.action.clone()).collect();
+    // Borrow each item's `.action` — `.iter()` yields `&OutlineNode`, and
+    // OutlineNode's manual Drop blocks partial moves but not borrows.
+    let actions: Vec<&Option<OutlineAction>> = roots[1..=5].iter().map(|n| &n.action).collect();
     match actions[0].as_ref().unwrap() {
         OutlineAction::GoTo { d } => assert_eq!(
             d.as_array().unwrap()[0],
@@ -744,10 +745,14 @@ fn page_labels_round_trip_through_extract_then_remerge() {
 
     // "Split": extract each page into its own single-page document, exactly
     // as flpdf's split_pages does per chunk (one entry per selected page,
-    // reconstructed against that page's own source index).
+    // reconstructed against that page's own source index). Borrow src_bytes
+    // per iteration via a slice cursor — the source is read-only, so no
+    // per-iteration Vec clone is needed. extract_pages still returns a
+    // fresh owned Pdf<Cursor<Vec<u8>>>, so `singles` stays owned.
+    let src_slice: &[u8] = &src_bytes;
     let mut singles: Vec<Pdf<Cursor<Vec<u8>>>> = Vec::new();
     for (idx, want) in expected.iter().enumerate() {
-        let mut src = Pdf::open(Cursor::new(src_bytes.clone())).unwrap();
+        let mut src = Pdf::open(Cursor::new(src_slice)).unwrap();
         let mut extracted = flpdf::extract_pages(&mut src, &[idx]).unwrap();
         assert_eq!(
             extracted.page_labels().label_string_for_page(0).unwrap(),
