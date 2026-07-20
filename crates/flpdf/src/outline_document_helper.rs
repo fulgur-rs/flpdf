@@ -998,8 +998,12 @@ fn parse_outline_action<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: Object,
 ) -> Result<Option<OutlineAction>> {
+    // Follow the full holder chain — /A may be `/A 8 0 R` where obj 8 is
+    // `9 0 R` and obj 9 is the action dict. Single-hop resolve would return
+    // `Object::Reference(9)` and drop the action on the floor at
+    // `.into_dict()` below.
     let resolved = match value {
-        Object::Reference(r) => pdf.resolve(r)?,
+        Object::Reference(_) => crate::ref_chain::resolve_ref_chain(pdf, &value)?.0,
         other => other,
     };
     match resolved.into_dict() {
@@ -1023,29 +1027,63 @@ fn action_from_dict<R: Read + Seek>(
     let subtype = resolve_one_level(pdf, dict.get("S").cloned())?.and_then(Object::into_name);
 
     Ok(match subtype.as_deref() {
-        Some(b"GoTo") => match resolve_one_level(pdf, dict.get("D").cloned())? {
-            Some(d) => OutlineAction::GoTo { d },
-            None => OutlineAction::Unknown(dict),
-        },
-        Some(b"GoToR") => match resolve_one_level(pdf, dict.get("F").cloned())? {
-            Some(f) => {
-                let d = resolve_one_level(pdf, dict.get("D").cloned())?;
-                OutlineAction::GoToR { f, d }
+        Some(b"GoTo") => {
+            // Accept /D or /SD (structure destination, ISO 32000-2 §12.6.4.3);
+            // /SD takes precedence when both are present. A resolved /D that
+            // turns out to be Null (`/D null`, or an unresolvable ref that
+            // normalises to null) is treated as absent — Null is not a usable
+            // destination even though it is a legal Object.
+            let sd = resolve_one_level_non_null(pdf, dict.get("SD").cloned())?;
+            let d_only = resolve_one_level_non_null(pdf, dict.get("D").cloned())?;
+            match sd.or(d_only) {
+                Some(d) => OutlineAction::GoTo { d },
+                None => OutlineAction::Unknown(dict),
             }
-            None => OutlineAction::Unknown(dict),
-        },
+        }
+        Some(b"GoToR") => {
+            // ISO 32000-1 §12.6.4.3: /F must be a file specification (string
+            // path or /Type /Filespec dict). Anything else (e.g. `/F 42`)
+            // makes the action malformed → fall through to Unknown.
+            match resolve_one_level_non_null(pdf, dict.get("F").cloned())?.filter(is_file_spec) {
+                Some(f) => {
+                    let d = resolve_one_level_non_null(pdf, dict.get("D").cloned())?;
+                    OutlineAction::GoToR { f, d }
+                }
+                None => OutlineAction::Unknown(dict),
+            }
+        }
         Some(b"URI") => {
-            match resolve_one_level(pdf, dict.get("URI").cloned())?.and_then(Object::into_string) {
+            match resolve_one_level_non_null(pdf, dict.get("URI").cloned())?
+                .and_then(Object::into_string)
+            {
                 Some(uri) => OutlineAction::Uri { uri },
                 None => OutlineAction::Unknown(dict),
             }
         }
-        Some(b"Launch") => match resolve_one_level(pdf, dict.get("F").cloned())? {
-            Some(f) => OutlineAction::Launch { f },
-            None => OutlineAction::Unknown(dict),
-        },
+        Some(b"Launch") => {
+            // ISO 32000-1 §12.6.4.5: prefer /F; if absent, fall back to any
+            // of the platform-specific launch specs /Win, /Mac, /Unix. /F
+            // must be a file specification when present.
+            let f = resolve_one_level_non_null(pdf, dict.get("F").cloned())?.filter(is_file_spec);
+            let platform = f.or_else(|| {
+                for key in ["Win", "Mac", "Unix"] {
+                    if let Ok(Some(v)) = resolve_one_level_non_null(pdf, dict.get(key).cloned()) {
+                        if v.as_dict().is_some() {
+                            return Some(v);
+                        } // cov:ignore: closure early-return; LCOV misses closing brace region
+                    }
+                }
+                None
+            });
+            match platform {
+                Some(f) => OutlineAction::Launch { f },
+                None => OutlineAction::Unknown(dict),
+            }
+        }
         Some(b"Named") => {
-            match resolve_one_level(pdf, dict.get("N").cloned())?.and_then(Object::into_name) {
+            match resolve_one_level_non_null(pdf, dict.get("N").cloned())?
+                .and_then(Object::into_name)
+            {
                 Some(n) => OutlineAction::Named { n },
                 None => OutlineAction::Unknown(dict),
             }
@@ -1054,58 +1092,83 @@ fn action_from_dict<R: Read + Seek>(
     })
 }
 
+/// Like [`resolve_one_level`] but treats an explicit `/D null` (or a
+/// reference that normalises to null) as "absent" — required action fields
+/// with `Object::Null` are unusable in practice and would otherwise be
+/// classified as a typed action carrying a null field.
+fn resolve_one_level_non_null<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: Option<Object>,
+) -> Result<Option<Object>> {
+    Ok(resolve_one_level(pdf, value)?.filter(|o| !matches!(o, Object::Null)))
+}
+
+/// A PDF file specification (ISO 32000-1 §7.11) is either a text string
+/// (`String`/`HexString`, holding the file path) or a `/Type /Filespec`
+/// dictionary. Reject anything else so a caller-visible typed action does
+/// not silently carry an unusable file target.
+fn is_file_spec(o: &Object) -> bool {
+    matches!(o, Object::String(_) | Object::Dictionary(_))
+}
+
 /// Recursive step of [`OutlineDocumentHelper::action_chain_with_max_depth`]:
 /// classify `value` as an action (or an array of actions), append every
 /// action found to `out` in visitation order, then repeat for each action's
 /// own `/Next`.
 ///
-/// `depth` bounds the recursion (both `/Next` hops and array descent);
-/// `visited` records every indirect action object already processed so a
-/// self- or mutually-referencing `/Next` (or the same action object reached
-/// through more than one array element) is visited at most once — this is
-/// what makes the traversal safe against a hostile PDF: a shared `visited`
-/// set bounds total work by the document's distinct object count, not by
-/// `depth` raised to the branching factor of nested `/Next` arrays.
+/// `depth` bounds the `/Next` hop count only. Descending into a `/Next`
+/// array does NOT consume budget — the array is a single "next slot" whose
+/// entries are performed in order (ISO 32000-1 §12.6.2), so a chain like
+/// `/Next [11 0 R]` under a small `max_depth` should still surface obj 11.
+///
+/// `path` tracks the CURRENT descent path (added on entry, removed on
+/// return) so a genuine self- or mutually-referencing `/Next` terminates
+/// without also silencing a legitimate repeat of the same action inside a
+/// `/Next` array (e.g. `/Next [11 0 R 11 0 R]`, where a shared `visited`
+/// set would drop the second occurrence).
 fn collect_action_chain<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: Object,
-    visited: &mut BTreeSet<ObjectRef>,
+    path: &mut BTreeSet<ObjectRef>,
     depth: usize,
     out: &mut Vec<OutlineAction>,
 ) -> Result<()> {
     if depth == 0 {
         return Ok(()); // Chain depth exhausted (hostile/pathological /Next chain).
     }
-    let resolved = match value {
+    let (resolved, on_path) = match value {
         Object::Reference(r) => {
-            if !visited.insert(r) {
-                return Ok(()); // Cycle: this action object was already visited.
+            if !path.insert(r) {
+                return Ok(()); // Cycle: this action is already on the active descent path.
             }
-            pdf.resolve(r)?
+            (pdf.resolve(r)?, Some(r))
         }
-        other => other,
+        other => (other, None),
     };
-    match resolved {
+    let result = match resolved {
         Object::Array(arr) => {
+            // Array is a container; entries share the same /Next slot,
+            // performed in order. Descending into each element does NOT
+            // spend a `/Next` hop.
             for elem in arr {
-                collect_action_chain(pdf, elem, visited, depth - 1, out)?;
+                collect_action_chain(pdf, elem, path, depth, out)?;
             }
             Ok(())
         }
         Object::Dictionary(dict) => {
-            // `/Next` is read raw and forwarded to the recursive call, which
-            // resolves the `Object::Reference` case at its top (also feeding
-            // `visited` for cycle detection). Resolving here would duplicate
-            // that logic and split the cycle-check across two sites.
             let next = dict.get("Next").cloned();
             out.push(action_from_dict(pdf, dict)?);
             if let Some(next) = next {
-                collect_action_chain(pdf, next, visited, depth - 1, out)?;
+                collect_action_chain(pdf, next, path, depth - 1, out)?;
             }
             Ok(())
         }
         _ => Ok(()), // Not a conforming action dictionary or action array.
+    };
+    if let Some(r) = on_path {
+        path.remove(&r);
     }
+    result
 }
 
 /// Walk one `/First`->`/Next` sibling chain (and recurse into `/First`

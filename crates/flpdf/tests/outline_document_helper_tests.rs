@@ -2347,3 +2347,192 @@ fn action_chain_non_conforming_next_value_stops_chain() {
         "a non-dict/array /Next must stop the chain, not error"
     );
 }
+
+// ── Codex round-2 regressions on /A action typing (sub-5) ────────────────
+
+/// N6: multi-hop holder chain on outline `/A`. Previously `parse_outline_action`
+/// resolved one level and `.into_dict()` treated the intermediate
+/// `Object::Reference` as absent, silently dropping valid actions.
+#[test]
+fn outline_action_resolves_through_multi_hop_holder_chain() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (Act) /Parent 4 0 R /A 8 0 R >>"),
+            (8, "9 0 R"),
+            (9, "<< /S /GoTo /D [3 0 R /Fit] >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    assert!(
+        matches!(&roots[0].action, Some(flpdf::OutlineAction::GoTo { .. })),
+        "multi-hop /A must classify as GoTo, got {:?}",
+        roots[0].action
+    );
+}
+
+/// N7: `/S /Launch` with platform-specific `/Win` (or `/Mac`, `/Unix`) dict
+/// and no top-level `/F` must be recognised as Launch, not dropped to
+/// Unknown.
+#[test]
+fn outline_action_launch_recognises_platform_specific_win_dict() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (L) /Parent 4 0 R /A << /S /Launch /Win << /F (notepad.exe) >> >> >>",
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    assert!(
+        matches!(&roots[0].action, Some(flpdf::OutlineAction::Launch { .. })),
+        "platform-specific /Win Launch must classify as Launch, got {:?}",
+        roots[0].action
+    );
+}
+
+/// N8: `/Next` array descent must not consume the depth budget itself.
+#[test]
+fn outline_action_chain_next_array_does_not_consume_depth_budget() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (A) /Parent 4 0 R /A << /S /Named /N /NextPage /Next [11 0 R] >> >>",
+            ),
+            (11, "<< /S /Named /N /LastPage >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let root_action_ref = pdf.outline().get_root().unwrap()[0].object_ref;
+    let chain = pdf
+        .outline()
+        .action_chain_with_max_depth(root_action_ref, 2)
+        .unwrap();
+    // Depth-2 budget under the FIX allows the wrapping array to descend
+    // without spending, so we still reach obj 11 (root action + one /Next
+    // hop through the array). The old bug consumed the array's hop and
+    // silently truncated at the root.
+    assert_eq!(chain.len(), 2, "got {chain:?}");
+}
+
+/// N9: an action whose required field resolves to `Object::Null` (e.g.
+/// `/S /GoTo /D null`) must classify as Unknown, not GoTo{d:Null}.
+#[test]
+fn outline_action_null_required_field_classifies_as_unknown() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (N) /Parent 4 0 R /A << /S /GoTo /D null >> >>",
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    assert!(
+        matches!(&roots[0].action, Some(flpdf::OutlineAction::Unknown(_))),
+        "/D null must fall through to Unknown, got {:?}",
+        roots[0].action
+    );
+}
+
+/// N10: `/Next [11 0 R 11 0 R]` — legitimate repeats in an action array
+/// must both surface, not be silenced by a shared visited set.
+#[test]
+fn outline_action_chain_next_array_preserves_legitimate_repeats() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (R) /Parent 4 0 R /A << /S /Named /N /NextPage /Next [11 0 R 11 0 R] >> >>",
+            ),
+            (11, "<< /S /Named /N /LastPage >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let root_ref = pdf.outline().get_root().unwrap()[0].object_ref;
+    let chain = pdf.outline().action_chain(root_ref).unwrap();
+    // Root NextPage + LastPage + LastPage (obj 11 appears twice in the
+    // array; both executions must surface).
+    assert_eq!(chain.len(), 3, "got {chain:?}");
+}
+
+/// N11: `/S /GoToR` with a non-file-spec `/F` (e.g. integer) must fall
+/// through to Unknown, not carry an unusable typed action.
+#[test]
+fn outline_action_gotor_non_file_spec_f_classifies_as_unknown() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (R) /Parent 4 0 R /A << /S /GoToR /F 42 /D [0 /Fit] >> >>",
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    assert!(
+        matches!(&roots[0].action, Some(flpdf::OutlineAction::Unknown(_))),
+        "non-file-spec /F must fall through to Unknown, got {:?}",
+        roots[0].action
+    );
+}
+
+/// N12: `/S /GoTo /SD [...]` (structure destination alone, no /D) must
+/// classify as GoTo (with `d` filled from /SD), not fall through to Unknown.
+#[test]
+fn outline_action_goto_recognises_sd_as_destination() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (S) /Parent 4 0 R /A << /S /GoTo /SD [3 0 R /Fit] >> >>",
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    assert!(
+        matches!(&roots[0].action, Some(flpdf::OutlineAction::GoTo { .. })),
+        "/SD alone must classify as GoTo, got {:?}",
+        roots[0].action
+    );
+}
