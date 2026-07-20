@@ -196,15 +196,18 @@ pub fn merge_adjacent_ranges(ranges: Vec<(i64, LabelRange)>) -> Vec<(i64, LabelR
     let mut out: Vec<(i64, LabelRange)> = Vec::with_capacity(ranges.len());
     for (idx, range) in ranges {
         if let Some((prev_idx, prev_range)) = out.last() {
-            let expected_start = prev_range
-                .start
-                .saturating_add(idx.saturating_sub(*prev_idx));
-            if prev_range.style == range.style
-                && prev_range.prefix == range.prefix
-                && range.start == expected_start
-            {
-                continue; // redundant with the predecessor — drop the explicit entry
+            let expected_start = idx
+                .checked_sub(*prev_idx)
+                .and_then(|gap| prev_range.start.checked_add(gap));
+            if let Some(expected_start) = expected_start {
+                if prev_range.style == range.style
+                    && prev_range.prefix == range.prefix
+                    && range.start == expected_start
+                {
+                    continue; // redundant with the predecessor — drop the explicit entry
+                }
             }
+            // Overflow → err on the side of not merging (keep the explicit entry).
         }
         out.push((idx, range));
     }
@@ -563,8 +566,11 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         if ranges.is_empty() {
             return Ok(());
         }
-        let at = at as i64;
-        let count = count as i64;
+        let at = i64::try_from(at)
+            .map_err(|_| Error::Unsupported(format!("insert_pages: at={} exceeds i64::MAX", at)))?;
+        let count = i64::try_from(count).map_err(|_| {
+            Error::Unsupported(format!("insert_pages: count={} exceeds i64::MAX", count))
+        })?;
         let shifted: Vec<(i64, LabelRange)> = ranges
             .into_iter()
             .map(|(idx, range)| {
@@ -616,8 +622,11 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         if ranges.is_empty() {
             return Ok(());
         }
-        let at = at as i64;
-        let count = count as i64;
+        let at = i64::try_from(at)
+            .map_err(|_| Error::Unsupported(format!("remove_pages: at={} exceeds i64::MAX", at)))?;
+        let count = i64::try_from(count).map_err(|_| {
+            Error::Unsupported(format!("remove_pages: count={} exceeds i64::MAX", count))
+        })?;
         let removed_end = at.saturating_add(count);
 
         let mut result: Vec<(i64, LabelRange)> =
