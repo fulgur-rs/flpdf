@@ -374,9 +374,11 @@ fn write_chunk(
 
     // /PageLabels (qpdf `QPDFJob::doSplitPages` parity): reconstruct the
     // label range for this chunk's local page span, renumbered to start at
-    // 0, and install it as a direct `/Nums` dict. Reading/writing labels only
-    // touches the catalog's `/PageLabels` key — independent of the `/Pages`
-    // mutation below — so the order relative to it does not matter. A source
+    // 0, and install it as a direct `/Nums` dict. The write mutates the
+    // catalog's `/PageLabels` key only — it does not touch the `/Pages`
+    // subtree the mutation below rewrites. Both paths ultimately update
+    // the catalog dictionary via `set_object`, so running labels first
+    // avoids invalidating any borrow the /Pages rewrite acquires. A source
     // with no `/PageLabels` at all is left untouched, matching qpdf's fresh
     // `outpdf` (which never gains one either).
     {

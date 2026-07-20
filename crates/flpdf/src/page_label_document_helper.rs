@@ -460,13 +460,20 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
 
         let mut out = vec![(new_start_idx, first_label)];
         let idx_offset = new_start_idx.saturating_sub(start_idx);
-        // Iterate only the explicit indices within the span (the rest sequence
-        // implicitly from the prior entry), so the cost is O(log N + M) in the
-        // number of ranges rather than O(end_idx - start_idx) over the page span.
-        // Guarded on `start_idx < end_idx`: a single-page span (start_idx ==
-        // end_idx, the common case for --split-pages=1 or a range's last
-        // page) would otherwise build the inverted bound `(start_idx+1)..=end_idx`,
-        // which `BTreeSet::range` panics on rather than treating as empty.
+        // Iterate the explicit indices strictly BETWEEN start_idx and end_idx
+        // (start_idx's label is already emitted as first_label; every page
+        // between two explicit indices inherits from the prior entry). Cost
+        // is O(log N + M) in the number of ranges rather than
+        // O(end_idx - start_idx) over the page span.
+        //
+        // The `start_idx < end_idx` guard covers two shapes:
+        //   • start_idx == end_idx (single-page span, common under
+        //     --split-pages=1 or a range's last page): nothing lies strictly
+        //     between, so we skip the loop entirely.
+        //   • start_idx > end_idx (inverted span, a caller bug — see the
+        //     doc contract above): treated as empty rather than panicking.
+        // Without the guard, `(start_idx+1)..=end_idx` becomes an inverted
+        // bound that `BTreeSet::range` panics on rather than treating as empty.
         if start_idx < end_idx {
             for &i in explicit.range((start_idx + 1)..=end_idx) {
                 if let Some(lab) = self.label_for_page(i)? {

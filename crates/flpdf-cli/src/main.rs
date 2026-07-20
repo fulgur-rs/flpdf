@@ -3982,6 +3982,10 @@ fn run_page_extraction(
     {
         let mut labels = pdf.page_labels();
         if labels.has_page_labels()? {
+            // Each single-page labels_for_page_range call returns exactly one
+            // entry (the leading `first_label`; no explicit-range entries fit
+            // in a zero-width span). Capacity == selected-page count is
+            // therefore exact for this call shape.
             let mut entries: Vec<(i64, flpdf::LabelRange)> =
                 Vec::with_capacity(combined_pages.len());
             for (out_idx, cp) in combined_pages.iter().enumerate() {
