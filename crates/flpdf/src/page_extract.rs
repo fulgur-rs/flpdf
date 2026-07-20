@@ -59,7 +59,7 @@
 use crate::object_copy::{copy_objects, rewrite_refs};
 use crate::outline_dest_remap::dest_page_ref_resolved;
 use crate::page_closure::extend_page_object_closure;
-use crate::page_label_document_helper::{merge_adjacent_ranges, LabelRange};
+use crate::page_label_document_helper::merge_adjacent_ranges;
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
 use crate::page_tree_rebuild::resolve_inherited_raw;
 use crate::pages::{
@@ -238,12 +238,8 @@ pub fn extract_pages<R: Read + Seek>(
     {
         let mut source_labels = source.page_labels();
         if source_labels.has_page_labels()? {
-            let mut entries: Vec<(i64, LabelRange)> = Vec::with_capacity(page_indices.len());
-            for (out_idx, &src_idx) in page_indices.iter().enumerate() {
-                let src_idx = src_idx as i64;
-                let out_idx = out_idx as i64;
-                entries.extend(source_labels.labels_for_page_range(src_idx, src_idx, out_idx)?);
-            }
+            let src_indices: Vec<i64> = page_indices.iter().map(|&i| i as i64).collect();
+            let entries = source_labels.labels_for_selection(&src_indices, 0)?;
             let folded = merge_adjacent_ranges(entries);
             target.page_labels().write_reconstructed_labels(&folded)?;
         }

@@ -1774,12 +1774,9 @@ pub fn merge_documents<R: Read + Seek>(
             if src_labels.has_page_labels()? {
                 any_page_labels = true;
             }
-            for &idx in &input.pages {
-                let src_idx = idx as i64;
-                label_entries
-                    .extend(src_labels.labels_for_page_range(src_idx, src_idx, out_pageno)?);
-                out_pageno += 1;
-            }
+            let src_indices: Vec<i64> = input.pages.iter().map(|&i| i as i64).collect();
+            label_entries.extend(src_labels.labels_for_selection(&src_indices, out_pageno)?);
+            out_pageno = out_pageno.saturating_add(input.pages.len() as i64);
         }
 
         let doc_level = if is_primary {

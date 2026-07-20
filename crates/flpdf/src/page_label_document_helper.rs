@@ -209,6 +209,65 @@ fn resolve_entry<R: Read + Seek>(
 /// let merged = merge_adjacent_ranges(vec![(0, a), (5, b)]);
 /// assert_eq!(merged.len(), 1);
 /// ```
+/// Pure implementation of [`PageLabelDocumentHelper::labels_for_page_range`]
+/// against a pre-fetched, ascending `ranges` slice. Same fabricated-first-
+/// label rule (LabelStyle::None with `/St = new_start_idx + 1`); same
+/// "strictly between start_idx and end_idx" explicit-entry emission.
+fn labels_for_page_range_from_ranges(
+    ranges: &[(i64, LabelRange)],
+    start_idx: i64,
+    end_idx: i64,
+    new_start_idx: i64,
+) -> Vec<(i64, LabelRange)> {
+    let first_label = label_from_ranges(ranges, start_idx).unwrap_or_else(|| LabelRange {
+        style: LabelStyle::None,
+        prefix: String::new(),
+        start: new_start_idx.saturating_add(1),
+    });
+    let mut out = vec![(new_start_idx, first_label)];
+    let idx_offset = new_start_idx.saturating_sub(start_idx);
+    // Emit each ranges entry that lies strictly BETWEEN start_idx and
+    // end_idx (start_idx's label is already emitted as first_label). The
+    // guard also folds away single-page (start==end) and inverted
+    // (start>end) spans without special-casing them.
+    if start_idx < end_idx {
+        for (i, lab) in ranges {
+            if *i > start_idx && *i <= end_idx {
+                out.push((i.saturating_add(idx_offset), lab.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Effective label for `page_idx` given a pre-fetched, ascending `ranges`.
+///
+/// Pure function used by [`PageLabelDocumentHelper::label_for_page`] and the
+/// selection-batch API — sharing the lookup lets callers fetch `/PageLabels`
+/// once and reuse it instead of paying per-page tree walks.
+pub(crate) fn label_from_ranges(ranges: &[(i64, LabelRange)], page_idx: i64) -> Option<LabelRange> {
+    // ranges is ascending; take the last with first_index <= page_idx.
+    let mut chosen: Option<&(i64, LabelRange)> = None;
+    for entry in ranges {
+        if entry.0 <= page_idx {
+            chosen = Some(entry);
+        } else {
+            break;
+        }
+    }
+    chosen.map(|(first, r)| {
+        // Saturating arithmetic: `first <= page_idx` so the offset is
+        // non-negative, but a hostile `/St` near i64::MAX could otherwise
+        // overflow the start (panic in debug, wrap in release).
+        let offset = page_idx.saturating_sub(*first);
+        LabelRange {
+            style: r.style,
+            prefix: r.prefix.clone(),
+            start: r.start.saturating_add(offset),
+        }
+    })
+}
+
 pub fn merge_adjacent_ranges(ranges: Vec<(i64, LabelRange)>) -> Vec<(i64, LabelRange)> {
     let mut out: Vec<(i64, LabelRange)> = Vec::with_capacity(ranges.len());
     for (idx, range) in ranges {
@@ -374,26 +433,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// - Any error from [`Pdf::resolve`].
     pub fn label_for_page(&mut self, page_idx: i64) -> Result<Option<LabelRange>> {
         let ranges = self.ranges()?;
-        // ranges is ascending; take the last with first_index <= page_idx.
-        let mut chosen: Option<&(i64, LabelRange)> = None;
-        for entry in &ranges {
-            if entry.0 <= page_idx {
-                chosen = Some(entry);
-            } else {
-                break;
-            }
-        }
-        Ok(chosen.map(|(first, r)| {
-            // Saturating arithmetic: `first <= page_idx` so the offset is
-            // non-negative, but a hostile `/St` near i64::MAX could otherwise
-            // overflow the start (panic in debug, wrap in release).
-            let offset = page_idx.saturating_sub(*first);
-            LabelRange {
-                style: r.style,
-                prefix: r.prefix.clone(),
-                start: r.start.saturating_add(offset),
-            }
-        }))
+        Ok(label_from_ranges(&ranges, page_idx))
     }
 
     /// The rendered display string for a 0-based page index. Falls back to
@@ -459,45 +499,42 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             "labels_for_page_range: inverted span (start={start_idx}, end={end_idx})",
         );
         let ranges = self.ranges()?;
-        // Set of explicit source indices, for hasIndex().
-        let explicit: std::collections::BTreeSet<i64> = ranges.iter().map(|(i, _)| *i).collect();
+        Ok(labels_for_page_range_from_ranges(
+            &ranges,
+            start_idx,
+            end_idx,
+            new_start_idx,
+        ))
+    }
 
-        // First page label, or a fabricated default when start_idx precedes
-        // every explicit range: qpdf's own fabricated dict (`getLabelForPage`
-        // returning null) carries only `/St`, no `/S` — i.e. LabelStyle::None,
-        // NOT Decimal (verified against qpdf 11.9.0: `qpdf --split-pages=1`
-        // on an unlabeled leading page emits `<< /St 1 >>`, no `/S /D`).
-        let first_label = match self.label_for_page(start_idx)? {
-            Some(r) => r,
-            None => LabelRange {
+    /// Batch variant of [`Self::labels_for_page_range`] for
+    /// page-selection/split/merge callers that would otherwise re-parse the
+    /// `/PageLabels` tree once per selected page. Fetches `ranges()` ONCE and
+    /// emits one entry per input index (in input order); each entry's output
+    /// index is `out_start_idx + i`, so multi-input mergers can pass a
+    /// running base. Pair with [`merge_adjacent_ranges`] to fold away
+    /// redundant tail entries before writing.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
+    ///   exceeded while reading the existing tree.
+    /// - Any error from [`Pdf::resolve`].
+    pub fn labels_for_selection(
+        &mut self,
+        src_indices: &[i64],
+        out_start_idx: i64,
+    ) -> Result<Vec<(i64, LabelRange)>> {
+        let ranges = self.ranges()?;
+        let mut out = Vec::with_capacity(src_indices.len());
+        for (i, &src_idx) in src_indices.iter().enumerate() {
+            let out_idx = out_start_idx.saturating_add(i as i64);
+            let label = label_from_ranges(&ranges, src_idx).unwrap_or_else(|| LabelRange {
                 style: LabelStyle::None,
                 prefix: String::new(),
-                start: new_start_idx.saturating_add(1),
-            },
-        };
-
-        let mut out = vec![(new_start_idx, first_label)];
-        let idx_offset = new_start_idx.saturating_sub(start_idx);
-        // Iterate the explicit indices strictly BETWEEN start_idx and end_idx
-        // (start_idx's label is already emitted as first_label; every page
-        // between two explicit indices inherits from the prior entry). Cost
-        // is O(log N + M) in the number of ranges rather than
-        // O(end_idx - start_idx) over the page span.
-        //
-        // The `start_idx < end_idx` guard covers two shapes:
-        //   • start_idx == end_idx (single-page span, common under
-        //     --split-pages=1 or a range's last page): nothing lies strictly
-        //     between, so we skip the loop entirely.
-        //   • start_idx > end_idx (inverted span, a caller bug — see the
-        //     doc contract above): treated as empty rather than panicking.
-        // Without the guard, `(start_idx+1)..=end_idx` becomes an inverted
-        // bound that `BTreeSet::range` panics on rather than treating as empty.
-        if start_idx < end_idx {
-            for &i in explicit.range((start_idx + 1)..=end_idx) {
-                if let Some(lab) = self.label_for_page(i)? {
-                    out.push((i.saturating_add(idx_offset), lab));
-                }
-            }
+                start: out_idx.saturating_add(1),
+            });
+            out.push((out_idx, label));
         }
         Ok(out)
     }

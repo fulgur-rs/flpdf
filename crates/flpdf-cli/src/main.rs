@@ -3982,18 +3982,14 @@ fn run_page_extraction(
     {
         let mut labels = pdf.page_labels();
         if labels.has_page_labels()? {
-            // Each call returns exactly one entry (the leading `first_label`;
-            // no explicit-range entries fit in a zero-width span), so
-            // capacity matches the selected-page count before folding —
-            // `merge_adjacent_ranges` below can only shrink `entries`, never
-            // grow it, so pre-allocating this upper bound avoids regrowth.
-            let mut entries: Vec<(i64, flpdf::LabelRange)> =
-                Vec::with_capacity(combined_pages.len());
-            for (out_idx, cp) in combined_pages.iter().enumerate() {
-                let src_idx = i64::from(cp.page.index_1based) - 1;
-                let out_idx = out_idx as i64;
-                entries.extend(labels.labels_for_page_range(src_idx, src_idx, out_idx)?);
-            }
+            // `labels_for_selection` fetches /PageLabels once and computes
+            // one entry per selected page — O(N + M) vs the prior
+            // per-page `labels_for_page_range` loop's O(N × M).
+            let src_indices: Vec<i64> = combined_pages
+                .iter()
+                .map(|cp| i64::from(cp.page.index_1based) - 1)
+                .collect();
+            let entries = labels.labels_for_selection(&src_indices, 0)?;
             let folded = flpdf::merge_adjacent_ranges(entries);
             labels.write_reconstructed_labels(&folded)?;
         }
