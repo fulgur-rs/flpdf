@@ -757,3 +757,59 @@ fn check_legacy_dests_continues_past_entry_without_page_ref_when_others_have_one
         "no page is missing and the odd entry has no page ref to validate"
     );
 }
+
+/// B1 regression: catalog `/Dests` reached through a multi-hop holder chain
+/// (catalog `/Dests 10 0 R`, obj 10 → obj 11 → dict) must still be read.
+/// The prior reader stopped after a single hop and returned Vec::new(),
+/// silently missing every named destination — and, by extension, every
+/// dangling-target warning `check_legacy_dests` would have emitted for
+/// them.
+#[test]
+fn legacy_dests_reads_through_multi_hop_holder_chain() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 10 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            // 2-hop holder chain into the /Dests dict.
+            (10, "11 0 R"),
+            (11, "<< /only [3 0 R /Fit] >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let entries = pdf.outline().legacy_dests().unwrap();
+    assert_eq!(entries.len(), 1, "multi-hop /Dests must still resolve");
+    assert_eq!(entries[0].0, b"only");
+    assert_eq!(
+        entries[0].1.as_ref().expect("dest resolves").page(),
+        Some(ObjectRef::new(3, 0)),
+    );
+}
+
+/// B2 regression: a destination whose page operand is stored behind a
+/// holder (`/h [30 0 R /Fit]` where `30 0 obj 3 0 R`) points at a live
+/// page — `check_legacy_dests` must normalise through the holder chain
+/// before comparing against `page_refs`, or it emits a false-positive
+/// "not a page" warning.
+#[test]
+fn check_legacy_dests_follows_page_ref_through_holder() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            // /Dests -> /h [30 0 R /Fit], and obj 30 is a bare ref to page 3.
+            (8, "<< /h [30 0 R /Fit] >>"),
+            (30, "3 0 R"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
+    assert!(
+        diagnostics.entries().is_empty(),
+        "the holder-chain page ref resolves to a live page, no diagnostic: got {:?}",
+        diagnostics.entries()
+    );
+}

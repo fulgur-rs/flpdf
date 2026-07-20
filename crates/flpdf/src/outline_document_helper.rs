@@ -348,7 +348,19 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// dictionary/value objects (for example I/O or parse failures surfaced
     /// by [`Pdf::resolve`]).
     pub fn legacy_dests(&mut self) -> Result<Vec<(Vec<u8>, Option<Dest>)>> {
-        let Some(Object::Dictionary(dests)) = self.catalog_value("Dests")? else {
+        // `catalog_value` resolves a single level of indirection but stops
+        // short of a multi-hop holder chain (catalog /Dests -> r1 -> r2 ->
+        // dict — a legal shape). Without this follow-through the reader
+        // silently returns empty, and `check_legacy_dests` misses every
+        // dangling target it is supposed to flag.
+        let dests_obj = match self.catalog_value("Dests")? {
+            Some(value @ Object::Reference(_)) => {
+                crate::ref_chain::resolve_ref_chain(self.pdf, &value)?.0
+            }
+            Some(other) => other,
+            None => return Ok(Vec::new()),
+        };
+        let Object::Dictionary(dests) = dests_obj else {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
@@ -463,9 +475,14 @@ pub fn check_legacy_dests<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Diagnostic
 
     for (name, dest) in entries {
         let Some(dest) = dest else { continue };
-        let Some(page_ref) = dest.page() else {
+        let Some(page_ref_raw) = dest.page() else {
             continue;
         };
+        // Normalise through any holder chain: `/h [30 0 R /Fit]` with
+        // `30 0 obj 3 0 R` should compare against the terminal page ref
+        // `3 0 R`, not the intermediate `30 0 R`, otherwise a legitimately
+        // live target is falsely flagged as dangling.
+        let page_ref = resolve_page_ref_through_holders(pdf, page_ref_raw);
         if !live_pages.contains(&page_ref) {
             diagnostics.push(Diagnostic::warning(
                 format!(
@@ -516,4 +533,28 @@ fn resolve_int<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Resul
         Some(other) => Ok(other.as_integer()),
         None => Ok(None),
     }
+}
+
+/// Walk an object reference through any indirect-holder chain (obj N is a
+/// bare `Reference(M)`, obj M is a `Reference(K)`, …) and return the
+/// terminal ObjectRef. Stops at the first non-`Reference` value or after
+/// [`MAX_DEST_RESOLVE_DEPTH`] hops (cycle/deep-chain safety).
+///
+/// Used by `check_legacy_dests` and `check_name_tree_dests` to compare a
+/// destination's page against the live page set: the destination's own
+/// array element may be `ref → ref → page`, but `page_refs` returns only
+/// terminals, so a naive `==` check would false-flag a live target as
+/// dangling.
+fn resolve_page_ref_through_holders<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    start: ObjectRef,
+) -> ObjectRef {
+    let mut current = start;
+    for _ in 0..MAX_DEST_RESOLVE_DEPTH {
+        match pdf.resolve(current) {
+            Ok(Object::Reference(next)) if next != current => current = next,
+            _ => return current,
+        }
+    }
+    current
 }
