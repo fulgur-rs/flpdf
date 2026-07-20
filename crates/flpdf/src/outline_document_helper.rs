@@ -640,9 +640,15 @@ pub fn check_name_tree_dests<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Diagnos
 
     for (name, dest) in entries {
         let Some(dest) = dest else { continue };
-        let Some(page_ref) = dest.page() else {
+        let Some(page_ref_raw) = dest.page() else {
             continue;
         };
+        // Normalise through any holder chain — mirrors the sub-1 fix on
+        // `check_legacy_dests`: a destination whose page operand is stored
+        // behind a holder (`/target [30 0 R /Fit]` with `30 0 obj 3 0 R`)
+        // points at a live page, but a naïve `==` against page_refs
+        // would false-flag it as dangling.
+        let page_ref = resolve_page_ref_through_holders(pdf, page_ref_raw);
         if !live_pages.contains(&page_ref) {
             diagnostics.push(Diagnostic::warning(
                 format!(

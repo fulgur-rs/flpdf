@@ -1231,3 +1231,28 @@ fn check_name_tree_dests_continues_past_entry_without_page_ref_when_others_have_
         diagnostics.entries()
     );
 }
+
+/// N2 regression: sibling of the sub-1 `check_legacy_dests_follows_page_ref_through_holder`
+/// fix — a `/Names /Dests` entry whose page operand goes through a holder
+/// must not be flagged as dangling.
+#[test]
+fn check_name_tree_dests_follows_page_ref_through_holder() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (8, "<< /Dests 9 0 R >>"),
+            (9, "<< /Names [(target) [30 0 R /Fit]] >>"),
+            (30, "3 0 R"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
+    assert!(
+        diagnostics.entries().is_empty(),
+        "the holder-chain page ref resolves to a live page, no diagnostic: {:?}",
+        diagnostics.entries()
+    );
+}
