@@ -1043,6 +1043,27 @@ fn name_tree_dests_reads_through_multi_hop_names_chain() {
     );
 }
 
+/// Malformed catalog: `/Names` is present but resolves to a non-dictionary
+/// value (an integer here). The reader must not panic and must return an
+/// empty result, matching the "absent" behavior of `/Names /Dests`. Covers
+/// the `let Object::Dictionary(mut names) = names_obj else { .. }` fallback.
+#[test]
+fn name_tree_dests_returns_empty_when_names_is_not_a_dictionary() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Names 10 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            // /Names resolves to a plain integer — spec-nonconforming.
+            (10, "42"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let entries = pdf.outline().name_tree_dests().unwrap();
+    assert!(entries.is_empty(), "non-dict /Names must read as empty");
+}
+
 /// Round-trip acceptance: opening a document with a `/Names /Dests` name
 /// tree and rewriting it via [`write_pdf`] (no page operations, no mutation)
 /// must preserve every entry, in the same order, unchanged.
