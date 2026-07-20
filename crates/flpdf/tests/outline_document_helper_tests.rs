@@ -687,3 +687,41 @@ fn legacy_dests_reflects_remap_after_page_tree_rebuild() {
     );
     assert!(diagnostics.entries()[0].message.contains("drop"));
 }
+
+/// `check_legacy_dests` must short-circuit before enumerating the page tree
+/// when the catalog carries no legacy `/Dests` dictionary at all.
+#[test]
+fn check_legacy_dests_returns_empty_when_no_dests_dict() {
+    let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
+    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
+    assert!(diagnostics.entries().is_empty());
+}
+
+/// A `/Dests` entry whose value is an array with no resolvable page
+/// reference (first element is a name, not an indirect reference). This is a
+/// malformed destination, not a "missing target page": `Dest::page()`
+/// returns `None`, so no diagnostic is produced for it.
+fn legacy_dests_no_page_ref_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (8, "<< /odd [/NotAPageRef /Fit] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn check_legacy_dests_skips_entries_without_resolvable_page_ref() {
+    let mut pdf = Pdf::open(Cursor::new(legacy_dests_no_page_ref_pdf())).unwrap();
+    // The value parses as a Dest (it is an array), but has no page ref.
+    let entries = pdf.outline().legacy_dests().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].1.as_ref().unwrap().page().is_none());
+
+    // check_legacy_dests must not flag it (nothing to validate) and must not error.
+    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
+    assert!(diagnostics.entries().is_empty());
+}
