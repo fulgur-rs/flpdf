@@ -148,7 +148,7 @@ impl LabelRange {
     ///
     /// Use this (via
     /// [`PageLabelDocumentHelper::write_reconstructed_labels`]) for entries
-    /// coming from [`Self::labels_for_page_range`] / a page-subset or -split
+    /// coming from [`PageLabelDocumentHelper::labels_for_page_range`] / a page-subset or -split
     /// operation; use [`Self::to_dict`] for a directly authored range (qpdf's
     /// `--set-page-labels` shape), where the default `/St 1` is omitted for
     /// brevity.
