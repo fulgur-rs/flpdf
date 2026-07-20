@@ -262,6 +262,8 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             // this point - owned values only from here on.
             let title = resolve_title(self.pdf, title_src)?;
             let count = resolve_int(self.pdf, count_src)?.unwrap_or(0);
+            // action_src is BORROWED here for the dest fallback, then MOVED
+            // into parse_outline_action below — no double-use, no clone.
             let dest = self.resolve_node_dest(dest_src.as_ref(), action_src.as_ref())?;
             let action = match action_src {
                 Some(a) => parse_outline_action(self.pdf, a)?,
@@ -304,6 +306,9 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             }
         }
         if let Some(a) = action {
+            // Hold the resolved-owned Object on the stack so `adict` (a
+            // borrow into it) satisfies the borrow checker for the rest
+            // of this block.
             let resolved_owned;
             let adict = match a {
                 Object::Reference(r) => {

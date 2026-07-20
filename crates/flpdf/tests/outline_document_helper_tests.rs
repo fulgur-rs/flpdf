@@ -1540,8 +1540,10 @@ fn prune_outline_se_non_dict_item_breaks_walk_gracefully() {
 /// This helper reserves object numbers 1–5. If a test needs to embed
 /// additional indirect objects (an indirect `/A` dict, an indirect `/D`
 /// destination array, and so on), call `build_pdf` directly with obj
-/// numbers ≥ 6 to avoid colliding with the fixed layout above — the
-/// `action_goto_indirect_*_pdf` helpers below follow this convention.
+/// numbers ≥ 6 to avoid colliding with the fixed layout above. Existing
+/// `action_goto_indirect_*_pdf` helpers pick obj 8/9 with 6-7 skipped
+/// so the helper's own layout has room to grow before renumbering the
+/// tests, but any free number ≥ 6 works.
 fn action_pdf(action_body: &str) -> Vec<u8> {
     build_pdf(
         &[
