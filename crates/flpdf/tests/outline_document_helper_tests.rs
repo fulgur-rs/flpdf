@@ -1536,6 +1536,12 @@ fn prune_outline_se_non_dict_item_breaks_walk_gracefully() {
 
 /// Build a single-item outline whose lone item's `/A` is the literal
 /// `action_body` (already wrapped in `<< ... >>` or a bare reference).
+///
+/// This helper reserves object numbers 1–5. If a test needs to embed
+/// additional indirect objects (an indirect `/A` dict, an indirect `/D`
+/// destination array, and so on), call `build_pdf` directly with obj
+/// numbers ≥ 6 to avoid colliding with the fixed layout above — the
+/// `action_goto_indirect_*_pdf` helpers below follow this convention.
 fn action_pdf(action_body: &str) -> Vec<u8> {
     build_pdf(
         &[
@@ -1649,6 +1655,37 @@ fn action_resolves_indirect_a_reference() {
         ),
         other => panic!("expected GoTo, got {other:?}"),
     }
+}
+
+/// Regression: `/A /S` stored as an INDIRECT reference (obj 8) to a Name.
+/// Prior to the resolve_one_level fix, `resolve_node_dest` matched
+/// `Some(Object::Name(..))` directly and treated the item's `dest` as
+/// missing (Object::Reference didn't match), even though `parse_outline_action`
+/// resolved it correctly. The dest fallback path must see through the ref too.
+#[test]
+fn resolve_node_dest_follows_indirect_s_name() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (Act) /Parent 4 0 R /A << /S 8 0 R /D [3 0 R /Fit] >> >>",
+            ),
+            (8, "/GoTo"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let root = pdf.outline().get_root().unwrap();
+    let dest = root[0].dest.as_ref().expect("dest resolved from GoTo /D");
+    assert_eq!(
+        dest.array[0],
+        Object::Reference(ObjectRef::new(3, 0)),
+        "GoTo /D must be picked up even when /S is an indirect ref"
+    );
 }
 
 /// `/A` resolves to a non-dictionary value (a bare string): malformed, so

@@ -313,9 +313,16 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 other => other.as_dict(),
             };
             if let Some(adict) = adict {
-                let is_goto = matches!(adict.get("S"), Some(Object::Name(n)) if n == b"GoTo");
+                // Extract both /S and /D as owned values before ending the
+                // adict borrow, so we can resolve /S via &mut self.pdf.
+                let s_src = adict.get("S").cloned();
+                let d_src = adict.get("D").cloned();
+                // Review rule 2: `/S` may be stored as an indirect reference;
+                // matching Object::Reference directly would silently miss GoTo.
+                let s = resolve_one_level(self.pdf, s_src)?;
+                let is_goto = matches!(s, Some(Object::Name(ref n)) if n == b"GoTo");
                 if is_goto {
-                    if let Some(d) = adict.get("D").cloned() {
+                    if let Some(d) = d_src {
                         if let Some(found) = self.dest_from_value(&d, MAX_DEST_RESOLVE_DEPTH)? {
                             return Ok(Some(found));
                         }
