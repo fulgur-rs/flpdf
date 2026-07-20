@@ -19,17 +19,17 @@ use flpdf::{pages, ObjectRef, Pdf};
 use std::path::Path;
 use std::process::Command as Shell;
 
-/// `qpdf` binary path (the project's pinned truth source).
-const QPDF: &str = "/usr/bin/qpdf";
-
 /// The qpdf release this parity test's expected behaviour was derived from.
 const EXPECTED_QPDF_VERSION: &str = "11.9.0";
 
+/// Resolves the qpdf binary: `QPDF` env var if set, else plain `qpdf` so it
+/// picks up `$PATH` (macOS Homebrew, non-Debian layouts, custom builds).
+fn qpdf_command() -> String {
+    std::env::var("QPDF").unwrap_or_else(|_| "qpdf".to_string())
+}
+
 fn qpdf_available() -> bool {
-    if !Path::new(QPDF).exists() {
-        return false;
-    }
-    match Shell::new(QPDF).arg("--version").output() {
+    match Shell::new(qpdf_command()).arg("--version").output() {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             stdout.lines().next().map(str::trim)
@@ -143,7 +143,7 @@ fn open(path: &Path) -> Pdf<std::io::BufReader<std::fs::File>> {
 fn cli_pages_subset_outline_and_named_dest_page_positions_match_qpdf() {
     if !qpdf_available() {
         eprintln!(
-            "[SKIP cli_outline_pagelabels_qpdf] {QPDF} {EXPECTED_QPDF_VERSION} not on PATH — set QPDF env or install to run"
+            "[SKIP cli_outline_pagelabels_qpdf] qpdf {EXPECTED_QPDF_VERSION} not on PATH — set QPDF env or install to run"
         );
         return;
     }
@@ -154,7 +154,7 @@ fn cli_pages_subset_outline_and_named_dest_page_positions_match_qpdf() {
     // Select 1-based pages 1 and 3 (0-based 0, 2) — both destination targets
     // survive, landing at output indices 0 and 1 respectively.
     let qpdf_out = tmp.path().join("qpdf_out.pdf");
-    let status = Shell::new(QPDF)
+    let status = Shell::new(qpdf_command())
         .args([
             src.to_str().unwrap(),
             "--pages",
@@ -230,7 +230,8 @@ fn cli_json_outlines_and_pagelabels_sections_are_populated() {
     assert!(item.get("dest").is_some_and(|v| v.is_array()));
     assert!(item
         .get("kids")
-        .is_some_and(|v| v.as_array().unwrap().is_empty()));
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| a.is_empty()));
 
     // "pagelabels": two ranges (roman from 0, decimal from 2), today's
     // {index, label: {first, prefix, style}} shape.
