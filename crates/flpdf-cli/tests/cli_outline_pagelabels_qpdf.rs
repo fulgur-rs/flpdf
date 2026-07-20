@@ -15,7 +15,7 @@
 //! the pattern `cli_pages_pagelabels_qpdf.rs` already uses for `/PageLabels`.
 
 use assert_cmd::Command;
-use flpdf::{pages, Pdf};
+use flpdf::{pages, ObjectRef, Pdf};
 use std::path::Path;
 use std::process::Command as Shell;
 
@@ -99,6 +99,17 @@ fn outline_and_dests_four_page_pdf() -> Vec<u8> {
     out
 }
 
+/// 0-based index of `target` within `pdf`'s own page order. Extracted from
+/// both `outline_dest_page_index` and `named_dest_page_index` since only the
+/// accessor (get_root vs name_tree_dests) differs — the position lookup is
+/// identical.
+fn page_index_of(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>, target: ObjectRef) -> usize {
+    let refs = pages::page_refs(pdf).unwrap();
+    refs.iter()
+        .position(|&r| r == target)
+        .expect("dest target must be one of the output's own pages")
+}
+
 /// 0-based index, within `pdf`'s own page order, of the page an outline
 /// item's explicit `/Dest` array targets. Panics if there is no outline
 /// item, or its `/Dest` does not resolve to a page in this document — a
@@ -112,10 +123,7 @@ fn outline_dest_page_index(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>) -> 
         .expect("outline item must keep its /Dest")
         .page()
         .expect("dest must resolve to a page ref");
-    let refs = pages::page_refs(pdf).unwrap();
-    refs.iter()
-        .position(|&r| r == target)
-        .expect("dest target must be one of the output's own pages")
+    page_index_of(pdf, target)
 }
 
 /// 0-based index, within `pdf`'s own page order, of the page the modern
@@ -127,10 +135,7 @@ fn named_dest_page_index(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>) -> us
         .find(|(name, _)| name == b"target")
         .expect("\"target\" entry must survive");
     let target = dest.as_ref().expect("dest must resolve").page().unwrap();
-    let refs = pages::page_refs(pdf).unwrap();
-    refs.iter()
-        .position(|&r| r == target)
-        .expect("named dest target must be one of the output's own pages")
+    page_index_of(pdf, target)
 }
 
 fn open(path: &Path) -> Pdf<std::io::BufReader<std::fs::File>> {
