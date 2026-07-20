@@ -157,7 +157,7 @@ pub use outline::OutlineItem;
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
 pub use outline_document_helper::{
     check_legacy_dests, check_name_tree_dests, prune_outline_se, prune_outline_se_with_max_depth,
-    Dest, OutlineDocumentHelper, OutlineNode,
+    Dest, OutlineAction, OutlineDocumentHelper, OutlineNode, DEFAULT_MAX_ACTION_CHAIN_DEPTH,
 };
 pub use overlay::{
     apply_overlay_specs, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,

@@ -2,7 +2,7 @@
 
 use flpdf::{
     check_legacy_dests, check_name_tree_dests, prune_outline_se, prune_outline_se_with_max_depth,
-    write_pdf, Object, ObjectRef, Pdf, Severity,
+    write_pdf, Object, ObjectRef, OutlineAction, Pdf, Severity,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
@@ -1521,5 +1521,784 @@ fn prune_outline_se_non_dict_item_breaks_walk_gracefully() {
     assert_eq!(
         dropped, 0,
         "a non-dictionary outline item must be skipped, not pruned"
+    );
+}
+
+// -----------------------------------------------------------------------
+// flpdf-9hc.14.5: outline `/A` action coverage (GoTo/GoToR/URI/Launch/Named)
+// -----------------------------------------------------------------------
+//
+// `remap_outline_and_dests` already remaps a `/A /GoTo /D` destination (see
+// `outline_dest_remap.rs`, `remap_item_dest`) from earlier work on this
+// epic; this subtask adds the typed `OutlineAction` reader and the
+// regression coverage below (including the surviving-page GoTo remap case,
+// which no prior test exercised), rather than changing the remapper itself.
+
+/// Build a single-item outline whose lone item's `/A` is the literal
+/// `action_body` (already wrapped in `<< ... >>` or a bare reference).
+fn action_pdf(action_body: &str) -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                &format!("<< /Title (Act) /Parent 4 0 R /A {action_body} >>"),
+            ),
+        ],
+        1,
+    )
+}
+
+fn first_action(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Option<OutlineAction> {
+    pdf.outline().get_root().unwrap().remove(0).action
+}
+
+// ── GoTo ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn action_goto_typed_from_direct_d() {
+    let mut pdf = Pdf::open(Cursor::new(action_pdf("<< /S /GoTo /D [3 0 R /Fit] >>"))).unwrap();
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::GoTo { d } => assert_eq!(
+            d,
+            Object::Array(vec![
+                Object::Reference(ObjectRef::new(3, 0)),
+                Object::Name(b"Fit".to_vec()),
+            ])
+        ),
+        other => panic!("expected GoTo, got {other:?}"),
+    }
+}
+
+#[test]
+fn action_goto_missing_d_is_unknown() {
+    let mut pdf = Pdf::open(Cursor::new(action_pdf("<< /S /GoTo >>"))).unwrap();
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::Unknown(dict) => {
+            assert_eq!(dict.get("S"), Some(&Object::Name(b"GoTo".to_vec())));
+        }
+        other => panic!("expected Unknown fallback for a malformed GoTo, got {other:?}"),
+    }
+}
+
+/// GoTo action whose `/D` is an INDIRECT reference (obj 8) to the dest array.
+fn action_goto_indirect_d_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (Act) /Parent 4 0 R /A << /S /GoTo /D 8 0 R >> >>",
+            ),
+            (8, "[3 0 R /Fit]"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn action_goto_resolves_indirect_d() {
+    let mut pdf = Pdf::open(Cursor::new(action_goto_indirect_d_pdf())).unwrap();
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::GoTo { d } => assert_eq!(
+            d,
+            Object::Array(vec![
+                Object::Reference(ObjectRef::new(3, 0)),
+                Object::Name(b"Fit".to_vec()),
+            ]),
+            "an indirect /D must resolve one level, review rule 2"
+        ),
+        other => panic!("expected GoTo, got {other:?}"),
+    }
+}
+
+/// The outline item's `/A` itself is an INDIRECT reference (obj 9) to the
+/// action dictionary, per review rule 2 ("/A は間接参照で来うる").
+fn action_indirect_a_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (Act) /Parent 4 0 R /A 9 0 R >>"),
+            (9, "<< /S /GoTo /D [3 0 R /Fit] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn action_resolves_indirect_a_reference() {
+    let mut pdf = Pdf::open(Cursor::new(action_indirect_a_pdf())).unwrap();
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::GoTo { d } => assert_eq!(
+            d.as_array().unwrap()[0],
+            Object::Reference(ObjectRef::new(3, 0))
+        ),
+        other => panic!("expected GoTo, got {other:?}"),
+    }
+}
+
+/// `/A` resolves to a non-dictionary value (a bare string): malformed, so
+/// the item's typed action is `None`, the same as an absent `/A`.
+#[test]
+fn action_non_dict_value_is_none() {
+    let mut pdf = Pdf::open(Cursor::new(action_pdf("(not a dict)"))).unwrap();
+    assert!(first_action(&mut pdf).is_none());
+}
+
+#[test]
+fn action_absent_when_no_a() {
+    let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    assert!(roots[1].action.is_none(), "item B has no /A");
+}
+
+// ── GoToR ────────────────────────────────────────────────────────────────
+
+#[test]
+fn action_gotor_typed_from_f_and_d() {
+    let mut pdf = Pdf::open(Cursor::new(action_pdf(
+        "<< /S /GoToR /F (other.pdf) /D [0 /Fit] >>",
+    )))
+    .unwrap();
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::GoToR { f, d } => {
+            assert_eq!(f, Object::String(b"other.pdf".to_vec()));
+            assert_eq!(
+                d,
+                Some(Object::Array(vec![
+                    Object::Integer(0),
+                    Object::Name(b"Fit".to_vec()),
+                ]))
+            );
+        }
+        other => panic!("expected GoToR, got {other:?}"),
+    }
+}
+
+#[test]
+fn action_gotor_no_d_is_none_field() {
+    let mut pdf = Pdf::open(Cursor::new(action_pdf("<< /S /GoToR /F (other.pdf) >>"))).unwrap();
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::GoToR { f, d } => {
+            assert_eq!(f, Object::String(b"other.pdf".to_vec()));
+            assert!(d.is_none(), "/D is optional on GoToR");
+        }
+        other => panic!("expected GoToR, got {other:?}"),
+    }
+}
+
+#[test]
+fn action_gotor_missing_f_is_unknown() {
+    let mut pdf = Pdf::open(Cursor::new(action_pdf("<< /S /GoToR /D [0 /Fit] >>"))).unwrap();
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::Unknown(dict) => {
+            assert_eq!(dict.get("S"), Some(&Object::Name(b"GoToR".to_vec())));
+        }
+        other => panic!("expected Unknown fallback for a malformed GoToR, got {other:?}"),
+    }
+}
+
+// ── URI ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn action_uri_typed_from_uri_string() {
+    let mut pdf = Pdf::open(Cursor::new(action_pdf(
+        "<< /S /URI /URI (https://example.com/page) >>",
+    )))
+    .unwrap();
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::Uri { uri } => assert_eq!(uri, b"https://example.com/page"),
+        other => panic!("expected Uri, got {other:?}"),
+    }
+}
+
+#[test]
+fn action_uri_missing_uri_is_unknown() {
+    let mut pdf = Pdf::open(Cursor::new(action_pdf("<< /S /URI >>"))).unwrap();
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::Unknown(dict) => {
+            assert_eq!(dict.get("S"), Some(&Object::Name(b"URI".to_vec())));
+        }
+        other => panic!("expected Unknown fallback for a malformed URI action, got {other:?}"),
+    }
+}
+
+// ── Launch ───────────────────────────────────────────────────────────────
+
+#[test]
+fn action_launch_typed_from_f() {
+    let mut pdf = Pdf::open(Cursor::new(action_pdf("<< /S /Launch /F (app.exe) >>"))).unwrap();
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::Launch { f } => assert_eq!(f, Object::String(b"app.exe".to_vec())),
+        other => panic!("expected Launch, got {other:?}"),
+    }
+}
+
+#[test]
+fn action_launch_missing_f_is_unknown() {
+    let mut pdf = Pdf::open(Cursor::new(action_pdf("<< /S /Launch >>"))).unwrap();
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::Unknown(dict) => {
+            assert_eq!(dict.get("S"), Some(&Object::Name(b"Launch".to_vec())));
+        }
+        other => panic!("expected Unknown fallback for a malformed Launch, got {other:?}"),
+    }
+}
+
+// ── Named ────────────────────────────────────────────────────────────────
+
+#[test]
+fn action_named_typed_from_n() {
+    let mut pdf = Pdf::open(Cursor::new(action_pdf("<< /S /Named /N /NextPage >>"))).unwrap();
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::Named { n } => assert_eq!(n, b"NextPage"),
+        other => panic!("expected Named, got {other:?}"),
+    }
+}
+
+#[test]
+fn action_named_missing_n_is_unknown() {
+    let mut pdf = Pdf::open(Cursor::new(action_pdf("<< /S /Named >>"))).unwrap();
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::Unknown(dict) => {
+            assert_eq!(dict.get("S"), Some(&Object::Name(b"Named".to_vec())));
+        }
+        other => panic!("expected Unknown fallback for a malformed Named action, got {other:?}"),
+    }
+}
+
+// ── Unknown subtype ──────────────────────────────────────────────────────
+
+/// A non-standard action subtype (`/SubmitForm`) with arbitrary keys,
+/// including an indirect `/F` pointing at an unrelated dictionary.
+fn action_unknown_subtype_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (Act) /Parent 4 0 R /A << /S /SubmitForm /F 9 0 R /Flags 4 >> >>",
+            ),
+            (9, "<< /FS /URL /F (https://example.com/submit) >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn action_unknown_subtype_preserved_verbatim() {
+    let mut pdf = Pdf::open(Cursor::new(action_unknown_subtype_pdf())).unwrap();
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::Unknown(dict) => {
+            assert_eq!(dict.get("S"), Some(&Object::Name(b"SubmitForm".to_vec())));
+            assert_eq!(dict.get("Flags"), Some(&Object::Integer(4)));
+            assert_eq!(dict.get_ref("F"), Some(ObjectRef::new(9, 0)));
+        }
+        other => panic!("expected Unknown, got {other:?}"),
+    }
+}
+
+#[test]
+fn action_missing_s_is_unknown() {
+    let mut pdf = Pdf::open(Cursor::new(action_pdf("<< /D [3 0 R /Fit] >>"))).unwrap();
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::Unknown(dict) => {
+            assert!(dict.get("S").is_none());
+            assert!(dict.get("D").is_some());
+        }
+        other => panic!("expected Unknown fallback for a missing /S, got {other:?}"),
+    }
+}
+
+// ── Round-trip ───────────────────────────────────────────────────────────
+
+/// Five-item outline, one item per action subtype (GoTo/GoToR/URI/Launch/Named).
+fn multi_action_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 9 0 R /Count 5 >>"),
+            (
+                5,
+                "<< /Title (GoTo) /Parent 4 0 R /Next 6 0 R \
+                 /A << /S /GoTo /D [3 0 R /Fit] >> >>",
+            ),
+            (
+                6,
+                "<< /Title (GoToR) /Parent 4 0 R /Prev 5 0 R /Next 7 0 R \
+                 /A << /S /GoToR /F (other.pdf) /D [0 /Fit] >> >>",
+            ),
+            (
+                7,
+                "<< /Title (URI) /Parent 4 0 R /Prev 6 0 R /Next 8 0 R \
+                 /A << /S /URI /URI (https://example.com) >> >>",
+            ),
+            (
+                8,
+                "<< /Title (Launch) /Parent 4 0 R /Prev 7 0 R /Next 9 0 R \
+                 /A << /S /Launch /F (app.exe) >> >>",
+            ),
+            (
+                9,
+                "<< /Title (Named) /Parent 4 0 R /Prev 8 0 R \
+                 /A << /S /Named /N /NextPage >> >>",
+            ),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn action_round_trip_through_write_pdf_unmodified() {
+    let mut pdf = Pdf::open(Cursor::new(multi_action_pdf())).unwrap();
+    let before: Vec<Option<OutlineAction>> = pdf
+        .outline()
+        .get_root()
+        .unwrap()
+        .into_iter()
+        .map(|n| n.action)
+        .collect();
+    assert_eq!(before.len(), 5, "sanity: fixture has 5 outline items");
+    assert!(
+        before.iter().all(Option::is_some),
+        "sanity: every item should have a typed action before the round trip"
+    );
+
+    let mut out = Vec::new();
+    write_pdf(&mut pdf, &mut out).unwrap();
+
+    let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
+    let after: Vec<Option<OutlineAction>> = reopened
+        .outline()
+        .get_root()
+        .unwrap()
+        .into_iter()
+        .map(|n| n.action)
+        .collect();
+    assert_eq!(
+        before, after,
+        "every action subtype must round-trip unmodified through write_pdf"
+    );
+}
+
+// ── GoTo remap on page renumber ──────────────────────────────────────────
+
+/// Two-page document; the outline item's `/A /GoTo /D` targets the SECOND
+/// page (obj 30) explicitly by reference.
+fn action_goto_two_page_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 30 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                30,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (Act) /Parent 4 0 R /A << /S /GoTo /D [30 0 R /Fit] >> >>",
+            ),
+        ],
+        1,
+    )
+}
+
+/// Selecting a page more than once (e.g. `qpdf --pages . 1,1`) clones the
+/// second-and-later occurrences to fresh object numbers, while the first
+/// occurrence keeps the source page's original ref (see
+/// `page_tree_rebuild.rs`'s "First occurrence: mutate the existing object in
+/// place" branch — [`crate`]-level `rebuild_page_tree` never renumbers a
+/// singly-selected page). Selecting page 30 twice below is what makes this
+/// test meaningful: it proves a GoTo action's `/D` is remapped to the FIRST
+/// occurrence, not silently left pointing at (or accidentally rewritten to)
+/// the second, unrelated clone — the same property
+/// `duplicate_selection_uses_first_new_ref` in `outline_dest_remap.rs`
+/// verifies for a plain `/Dest`.
+#[test]
+fn action_goto_dest_remapped_to_first_occurrence_of_duplicated_page() {
+    let mut pdf = Pdf::open(Cursor::new(action_goto_two_page_pdf())).unwrap();
+    let result = flpdf::rebuild_page_tree(
+        &mut pdf,
+        &[
+            ObjectRef::new(3, 0),
+            ObjectRef::new(30, 0),
+            ObjectRef::new(30, 0),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        result.ref_map[&ObjectRef::new(30, 0)].len(),
+        2,
+        "sanity: page 30 was selected twice"
+    );
+    let first_new = result.ref_map[&ObjectRef::new(30, 0)][0];
+    flpdf::remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::GoTo { d } => {
+            assert_eq!(
+                d.as_array().unwrap()[0],
+                Object::Reference(first_new),
+                "a GoTo action /D must remap to the first occurrence of a duplicated page"
+            );
+        }
+        other => panic!("expected GoTo, got {other:?}"),
+    }
+}
+
+/// Same two-page shape, but the GoTo action's `/D` is a NAMED destination
+/// (a string naming an entry in the `/Names /Dests` tree) rather than an
+/// explicit array.
+fn action_goto_named_dest_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names 8 0 R >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 30 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                30,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (Act) /Parent 4 0 R /A << /S /GoTo /D (mydest) >> >>",
+            ),
+            (8, "<< /Dests 9 0 R >>"),
+            (9, "<< /Names [(mydest) [30 0 R /Fit]] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn action_goto_named_dest_kept_verbatim_while_name_tree_remaps() {
+    let mut pdf = Pdf::open(Cursor::new(action_goto_named_dest_pdf())).unwrap();
+    let result = flpdf::rebuild_page_tree(&mut pdf, &[ObjectRef::new(30, 0)]).unwrap();
+    let new_p2 = result.ref_map[&ObjectRef::new(30, 0)][0];
+    flpdf::remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+    // The outline item never stores a page ref for a named destination, so
+    // its /A /GoTo /D stays the literal name, unchanged.
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::GoTo { d } => {
+            assert_eq!(d, Object::String(b"mydest".to_vec()));
+        }
+        other => panic!("expected GoTo, got {other:?}"),
+    }
+
+    // The name tree's own "mydest" entry is what gets remapped.
+    let entries = pdf.outline().name_tree_dests().unwrap();
+    let (_, dest) = entries
+        .iter()
+        .find(|(n, _)| n == b"mydest")
+        .expect("mydest entry present");
+    assert_eq!(dest.as_ref().unwrap().page(), Some(new_p2));
+}
+
+/// GoToR's `/D` looks like a local page reference (`30 0 R`), but a remote
+/// destination must never be remapped even when that ref happens to also be
+/// a page in THIS document that survives the rebuild.
+fn action_gotor_two_page_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 30 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                30,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (Act) /Parent 4 0 R \
+                 /A << /S /GoToR /F (other.pdf) /D [30 0 R /Fit] >> >>",
+            ),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn action_gotor_dest_left_unchanged_after_page_rebuild() {
+    let mut pdf = Pdf::open(Cursor::new(action_gotor_two_page_pdf())).unwrap();
+    let result = flpdf::rebuild_page_tree(&mut pdf, &[ObjectRef::new(30, 0)]).unwrap();
+    flpdf::remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::GoToR { f, d } => {
+            assert_eq!(f, Object::String(b"other.pdf".to_vec()));
+            assert_eq!(
+                d.unwrap().as_array().unwrap()[0],
+                Object::Reference(ObjectRef::new(30, 0)),
+                "a GoToR /D is never a local destination and must be left verbatim"
+            );
+        }
+        other => panic!("expected GoToR, got {other:?}"),
+    }
+}
+
+/// A URI action's target must be preserved byte-for-byte across a page
+/// rebuild — it never carries a page reference at all.
+#[test]
+fn action_uri_left_unchanged_after_page_rebuild() {
+    let mut pdf = Pdf::open(Cursor::new(action_pdf(
+        "<< /S /URI /URI (https://example.com/x) >>",
+    )))
+    .unwrap();
+    let result = flpdf::rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+    flpdf::remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::Uri { uri } => assert_eq!(uri, b"https://example.com/x"),
+        other => panic!("expected Uri, got {other:?}"),
+    }
+}
+
+/// An unknown-subtype action's fields (including an indirect `/F` to an
+/// unrelated dictionary) must never be touched by the page-rebuild remap.
+#[test]
+fn action_unknown_subtype_unchanged_after_page_rebuild() {
+    let mut pdf = Pdf::open(Cursor::new(action_unknown_subtype_pdf())).unwrap();
+    let result = flpdf::rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+    flpdf::remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+    match first_action(&mut pdf).expect("action present") {
+        OutlineAction::Unknown(dict) => {
+            assert_eq!(dict.get_ref("F"), Some(ObjectRef::new(9, 0)));
+        }
+        other => panic!("expected Unknown, got {other:?}"),
+    }
+}
+
+// -----------------------------------------------------------------------
+// `/Next` action-chain walk (OutlineDocumentHelper::action_chain)
+// -----------------------------------------------------------------------
+
+/// The outline item's `/A` (obj 10) chains a single further action via
+/// `/Next` (obj 11).
+fn action_chain_single_next_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (Act) /Parent 4 0 R /A 10 0 R >>"),
+            (10, "<< /S /Named /N /NextPage /Next 11 0 R >>"),
+            (11, "<< /S /Named /N /PrevPage >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn action_chain_follows_single_next_dict() {
+    let mut pdf = Pdf::open(Cursor::new(action_chain_single_next_pdf())).unwrap();
+    let chain = pdf.outline().action_chain(ObjectRef::new(5, 0)).unwrap();
+    assert_eq!(chain.len(), 2);
+    assert!(matches!(&chain[0], OutlineAction::Named { n } if n == b"NextPage"));
+    assert!(matches!(&chain[1], OutlineAction::Named { n } if n == b"PrevPage"));
+}
+
+/// `/Next` is an ARRAY of two further actions (ISO 32000-1 section 12.6.2:
+/// "a single action dictionary or an array of action dictionaries").
+fn action_chain_next_array_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (Act) /Parent 4 0 R /A 10 0 R >>"),
+            (10, "<< /S /Named /N /FirstPage /Next [11 0 R 12 0 R] >>"),
+            (11, "<< /S /Named /N /NextPage >>"),
+            (12, "<< /S /Named /N /LastPage >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn action_chain_follows_next_array_of_actions() {
+    let mut pdf = Pdf::open(Cursor::new(action_chain_next_array_pdf())).unwrap();
+    let chain = pdf.outline().action_chain(ObjectRef::new(5, 0)).unwrap();
+    assert_eq!(chain.len(), 3);
+    assert!(matches!(&chain[0], OutlineAction::Named { n } if n == b"FirstPage"));
+    assert!(matches!(&chain[1], OutlineAction::Named { n } if n == b"NextPage"));
+    assert!(matches!(&chain[2], OutlineAction::Named { n } if n == b"LastPage"));
+}
+
+/// Build a linear `/Next` chain of `n` distinct action objects (object
+/// numbers `100..100+n`), each `<< /S /Named /N (Step) /Next <next> 0 R >>`
+/// except the last (no `/Next`). The outline item's `/A` points at the first.
+fn action_chain_long_pdf(n: u32) -> Vec<u8> {
+    let mut objs: Vec<(u32, String)> = vec![
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>".to_string(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+        ),
+        (
+            4,
+            "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>".to_string(),
+        ),
+        (5, "<< /Title (Act) /Parent 4 0 R /A 100 0 R >>".to_string()),
+    ];
+    for i in 0..n {
+        let num = 100 + i;
+        let mut body = "<< /S /Named /N (Step)".to_string();
+        if i + 1 < n {
+            body.push_str(&format!(" /Next {} 0 R", num + 1));
+        }
+        body.push_str(" >>");
+        objs.push((num, body));
+    }
+    let refs: Vec<(u32, &str)> = objs.iter().map(|(n, s)| (*n, s.as_str())).collect();
+    build_pdf(&refs, 1)
+}
+
+#[test]
+fn action_chain_depth_cap_terminates_long_chain() {
+    let mut pdf = Pdf::open(Cursor::new(action_chain_long_pdf(150))).unwrap();
+    let chain = pdf.outline().action_chain(ObjectRef::new(5, 0)).unwrap();
+    assert_eq!(
+        chain.len(),
+        flpdf::DEFAULT_MAX_ACTION_CHAIN_DEPTH,
+        "a 150-action chain must be truncated at the default depth cap, not OOM"
+    );
+}
+
+/// `/Next` points back at the SAME action object (obj 10 -> itself).
+fn action_chain_self_cycle_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (Act) /Parent 4 0 R /A 10 0 R >>"),
+            (10, "<< /S /Named /N /NextPage /Next 10 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn action_chain_self_cycle_terminates() {
+    let mut pdf = Pdf::open(Cursor::new(action_chain_self_cycle_pdf())).unwrap();
+    let chain = pdf.outline().action_chain(ObjectRef::new(5, 0)).unwrap();
+    assert_eq!(
+        chain.len(),
+        1,
+        "a self-referencing /Next must stop after the first action, not loop forever"
+    );
+}
+
+/// Two actions whose `/Next` point at each other (obj 10 <-> obj 11).
+fn action_chain_mutual_cycle_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (Act) /Parent 4 0 R /A 10 0 R >>"),
+            (10, "<< /S /Named /N /Alpha /Next 11 0 R >>"),
+            (11, "<< /S /Named /N /Beta /Next 10 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn action_chain_mutual_cycle_terminates() {
+    let mut pdf = Pdf::open(Cursor::new(action_chain_mutual_cycle_pdf())).unwrap();
+    let chain = pdf.outline().action_chain(ObjectRef::new(5, 0)).unwrap();
+    assert_eq!(
+        chain.len(),
+        2,
+        "a 2-node mutual /Next cycle must visit each action exactly once"
+    );
+}
+
+#[test]
+fn action_chain_empty_when_no_a() {
+    let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
+    let chain = pdf.outline().action_chain(ObjectRef::new(7, 0)).unwrap(); // item B has no /A
+    assert!(chain.is_empty());
+}
+
+/// `item_ref` (obj 5) resolves to a non-dictionary object.
+fn action_chain_item_ref_not_dict_pdf() -> Vec<u8> {
+    build_pdf(&[(1, "<< /Type /Catalog >>"), (5, "42")], 1)
+}
+
+#[test]
+fn action_chain_item_ref_not_a_dict_yields_empty() {
+    let mut pdf = Pdf::open(Cursor::new(action_chain_item_ref_not_dict_pdf())).unwrap();
+    let chain = pdf.outline().action_chain(ObjectRef::new(5, 0)).unwrap();
+    assert!(chain.is_empty());
+}
+
+#[test]
+fn action_chain_zero_max_depth_yields_empty() {
+    let mut pdf = Pdf::open(Cursor::new(action_pdf("<< /S /Named /N /NextPage >>"))).unwrap();
+    let chain = pdf
+        .outline()
+        .action_chain_with_max_depth(ObjectRef::new(5, 0), 0)
+        .unwrap();
+    assert!(chain.is_empty());
+}
+
+/// `/Next` resolves to neither a dictionary nor an array (a stray integer).
+fn action_chain_next_not_conforming_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (Act) /Parent 4 0 R /A << /S /Named /N /NextPage /Next 42 >> >>",
+            ),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn action_chain_non_conforming_next_value_stops_chain() {
+    let mut pdf = Pdf::open(Cursor::new(action_chain_next_not_conforming_pdf())).unwrap();
+    let chain = pdf.outline().action_chain(ObjectRef::new(5, 0)).unwrap();
+    assert_eq!(
+        chain.len(),
+        1,
+        "a non-dict/array /Next must stop the chain, not error"
     );
 }
