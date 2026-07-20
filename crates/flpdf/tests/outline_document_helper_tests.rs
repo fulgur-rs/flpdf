@@ -130,17 +130,7 @@ fn get_root_empty_when_no_outline() {
 #[test]
 fn iter_yields_preorder() {
     let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
-    // `.clone()` is structurally required, not a review-rule-1 slip:
-    // `OutlineNode` has a manual `Drop` (iterative teardown of `children`),
-    // so partial field moves like `let s = n.title` fail with E0509
-    // ("cannot move out of type ..., which implements the `Drop` trait").
-    // Same rationale at every `n.title.clone()` / `n.action.clone()` below.
-    let titles: Vec<String> = pdf
-        .outline()
-        .iter()
-        .unwrap()
-        .map(|n| n.title.clone())
-        .collect();
+    let titles: Vec<String> = pdf.outline().iter().unwrap().map(|n| n.title).collect();
     assert_eq!(titles, vec!["A", "A1", "B"]); // pre-order: A, its child A1, then B
 
     // iter() yields a flattened view: every node has its children cleared.
@@ -263,13 +253,15 @@ fn deep_outline_walks_1000_levels_with_default_depth() {
     assert_eq!(visits, n as usize);
 }
 
-/// A far deeper chain (tens of thousands of levels) proves `get_root`/`iter`/
-/// `walk` are genuinely iterative, not just under the old 100-level cap:
-/// native recursion one call frame per level would overflow the stack long
-/// before this depth, on any reasonably-sized thread stack.
+/// A 3,000-level chain (comfortably above the epic acceptance criterion of
+/// 1,000 and well within the `MAX_OUTLINE_WALK_DEPTH` = 5,000 cap) proves
+/// `get_root`/`iter`/`walk` scale past the old 100-level cap without
+/// overflowing on their iterative walk, and that the returned tree can then
+/// be inspected, dropped, and re-materialised without recursive-Clone or
+/// recursive-Drop pain.
 #[test]
-fn deep_outline_iterative_walk_survives_tens_of_thousands_of_levels() {
-    let n = 20_000u32;
+fn deep_outline_iterative_walk_survives_three_thousand_levels() {
+    let n = 3_000u32;
 
     let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
     let roots = pdf.outline().get_root().unwrap();
@@ -325,12 +317,7 @@ fn cyclic_outline_pdf() -> Vec<u8> {
 #[test]
 fn cyclic_outline_terminates() {
     let mut pdf = Pdf::open(Cursor::new(cyclic_outline_pdf())).unwrap();
-    let titles: Vec<String> = pdf
-        .outline()
-        .iter()
-        .unwrap()
-        .map(|n| n.title.clone())
-        .collect();
+    let titles: Vec<String> = pdf.outline().iter().unwrap().map(|n| n.title).collect();
     // Visits X and Y once each, then the cycle back to 5 is cut by `visited`.
     assert_eq!(titles, vec!["X", "Y"]);
 }
@@ -2020,7 +2007,7 @@ fn action_round_trip_through_write_pdf_unmodified() {
         .get_root()
         .unwrap()
         .into_iter()
-        .map(|n| n.action.clone())
+        .map(|n| n.action)
         .collect();
     assert_eq!(before.len(), 5, "sanity: fixture has 5 outline items");
     assert!(
@@ -2037,7 +2024,7 @@ fn action_round_trip_through_write_pdf_unmodified() {
         .get_root()
         .unwrap()
         .into_iter()
-        .map(|n| n.action.clone())
+        .map(|n| n.action)
         .collect();
     assert_eq!(
         before, after,

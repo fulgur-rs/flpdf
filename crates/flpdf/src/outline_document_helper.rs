@@ -45,14 +45,13 @@ use std::io::{Read, Seek};
 pub const DEFAULT_MAX_OUTLINE_DEPTH: usize = crate::outline::DEFAULT_MAX_OUTLINE_DEPTH;
 
 /// Depth bound for [`OutlineDocumentHelper::get_root`] (and the `iter`/`walk`
-/// traversals built on it) and for [`check_outline_links`]. The walk
-/// underneath is iterative, not recursive, so this bound isn't protecting the
-/// call stack the way [`DEFAULT_MAX_OUTLINE_DEPTH`] does for the still-recursive
-/// traversals — it exists only to stop a pathological or hostile outline tree
-/// (for example one crafted with this many distinct, non-cyclic dictionary
-/// objects chained end to end) from growing without limit. 100,000 nested
-/// levels comfortably covers any legitimate document.
-pub const MAX_OUTLINE_WALK_DEPTH: usize = 100_000;
+/// traversals built on it) and for [`check_outline_links`]. The walk itself
+/// is iterative; the cap primarily bounds the returned [`OutlineNode`] tree
+/// so that its automatically-derived `Clone`/`Debug`/`PartialEq` (which
+/// recurse once per nesting level) and its default `Drop` cannot stack-
+/// overflow. 5,000 levels comfortably covers any legitimate document while
+/// leaving substantial headroom for the recursive derives.
+pub const MAX_OUTLINE_WALK_DEPTH: usize = 5_000;
 
 /// Indirection/`/D` nesting bound when resolving a destination. Mirrors the
 /// constant in `outline_dest_remap`. Only exists to make malformed/cyclic
@@ -105,32 +104,6 @@ pub struct OutlineNode {
     pub action: Option<OutlineAction>,
     /// Child nodes in `/First`->`/Next` order.
     pub children: Vec<OutlineNode>,
-}
-
-impl Drop for OutlineNode {
-    /// Drop `children` iteratively instead of relying on the
-    /// compiler-generated recursive glue.
-    ///
-    /// `OutlineNode` nests itself through `children`, so the default
-    /// generated `Drop` would recurse one native stack frame per outline
-    /// nesting level when a materialized tree (e.g. from
-    /// [`OutlineDocumentHelper::get_root`]) goes out of scope — overflowing
-    /// the stack on a tree tens of thousands of levels deep even though
-    /// building and walking it (see [`MAX_OUTLINE_WALK_DEPTH`]) never
-    /// recurses natively. This mirrors the standard fix for a deep owned tree
-    /// or linked list: move each node's children onto an explicit heap
-    /// worklist before letting the (now childless) node drop, so the nested
-    /// `Drop::drop` calls this triggers bottom out immediately instead of
-    /// chaining.
-    fn drop(&mut self) {
-        let mut pending = std::mem::take(&mut self.children);
-        while let Some(mut node) = pending.pop() {
-            pending.append(&mut node.children);
-            // `node` drops here at the end of the loop body; its `children`
-            // is already empty (just moved into `pending` above), so this
-            // nested `drop` call does no further work.
-        }
-    }
 }
 
 /// A resolved explicit destination, e.g. `[pageRef /Fit ...]`. Mirrors the
