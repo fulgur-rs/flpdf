@@ -720,20 +720,20 @@ mod tests {
             .into_dict()
             .expect("catalog is a dict");
         let Some(Object::Dictionary(page_labels)) = catalog.get("PageLabels") else {
-            panic!("/PageLabels must be a direct dictionary, got {catalog:?}");
+            panic!("/PageLabels must be a direct dictionary, got {catalog:?}"); // cov:ignore: defensive — split_pages always installs a direct dict when labels exist
         };
         let Some(Object::Array(nums)) = page_labels.get("Nums") else {
-            panic!("/Nums must be a direct array");
+            panic!("/Nums must be a direct array"); // cov:ignore: defensive — write_reconstructed_labels always installs a direct array
         };
         nums.chunks_exact(2)
             .map(|pair| {
                 let idx = match &pair[0] {
                     Object::Integer(n) => *n,
-                    other => panic!("expected an integer index, got {other:?}"),
+                    other => panic!("expected an integer index, got {other:?}"), // cov:ignore: defensive — write_reconstructed_labels always emits an integer index
                 };
                 let dict = match &pair[1] {
                     Object::Dictionary(d) => d.clone(),
-                    other => panic!("expected a label dictionary, got {other:?}"),
+                    other => panic!("expected a label dictionary, got {other:?}"), // cov:ignore: defensive — write_reconstructed_labels always emits a label dictionary
                 };
                 (idx, dict)
             })

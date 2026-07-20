@@ -1519,10 +1519,10 @@ mod tests {
             .unwrap()
             .clone();
         let Some(Object::Dictionary(page_labels)) = catalog.get("PageLabels") else {
-            panic!("/PageLabels must be a direct dictionary, got {catalog:?}");
+            panic!("/PageLabels must be a direct dictionary, got {catalog:?}"); // cov:ignore: defensive — write_reconstructed_labels always installs a direct dict
         };
         let Some(Object::Array(nums)) = page_labels.get("Nums") else {
-            panic!("/Nums must be a direct array");
+            panic!("/Nums must be a direct array"); // cov:ignore: defensive — write_reconstructed_labels always installs a direct array
         };
         assert_eq!(nums.len(), 4, "2 entries * (index, dict)");
         assert_eq!(nums[0], Object::Integer(0));
