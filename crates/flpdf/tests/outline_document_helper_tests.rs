@@ -1200,3 +1200,34 @@ fn check_name_tree_dests_skips_entries_without_resolvable_page_ref() {
     let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
     assert!(diagnostics.entries().is_empty());
 }
+
+/// Cover the in-loop `continue` on `dest.page().is_none()` in
+/// `check_name_tree_dests`: at least one entry must have a resolvable page
+/// ref (so the sub-2 short-circuit does NOT fire), plus at least one
+/// malformed entry whose page ref resolves to None (so the loop actually
+/// runs and hits `continue`). Same shape as
+/// `check_legacy_dests_continues_past_entry_without_page_ref_when_others_have_one`
+/// on sub-1, for the modern `/Names /Dests` sibling.
+#[test]
+fn check_name_tree_dests_continues_past_entry_without_page_ref_when_others_have_one() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (8, "<< /Dests 9 0 R >>"),
+            (
+                9,
+                "<< /Names [(good) [3 0 R /Fit] (odd) [/NotAPageRef /Fit]] >>",
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
+    assert!(
+        diagnostics.entries().is_empty(),
+        "no page is missing and the odd entry has no page ref to validate: {:?}",
+        diagnostics.entries()
+    );
+}
