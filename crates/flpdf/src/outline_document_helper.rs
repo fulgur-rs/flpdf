@@ -123,19 +123,26 @@ pub enum OutlineAction {
     },
     /// `/S /GoToR`: a destination in a remote (external) PDF document.
     GoToR {
-        /// The remote file, as a file specification (ISO 32000-1 section 7.11).
+        /// The remote file, as a file specification (ISO 32000-1 section 7.11):
+        /// either a `Object::String`/`Object::HexString` file path or an
+        /// `Object::Dictionary` with `/Type /Filespec`.
         f: Object,
-        /// The destination within the remote file, if present.
+        /// The destination within the remote file. Absent when the action
+        /// simply opens the file at its default view (per ISO 32000-1 section
+        /// 12.6.4.3, the destination is optional).
         d: Option<Object>,
     },
     /// `/S /URI`: resolve a uniform resource identifier.
     Uri {
-        /// The URI, as the raw bytes of `/URI`.
+        /// The URI, as the raw bytes of `/URI`. Preserved verbatim — this
+        /// crate does not attempt URL parsing or normalization.
         uri: Vec<u8>,
     },
     /// `/S /Launch`: launch an application, typically to open a target file.
     Launch {
-        /// The application/file to launch, as a file specification.
+        /// The application/file to launch, as a file specification (same
+        /// shape as [`Self::GoToR::f`]: string path or `/Type /Filespec`
+        /// dictionary).
         f: Object,
     },
     /// `/S /Named`: execute a predefined, viewer-specific action such as
@@ -1068,6 +1075,10 @@ fn collect_action_chain<R: Read + Seek>(
             Ok(())
         }
         Object::Dictionary(dict) => {
+            // `/Next` is read raw and forwarded to the recursive call, which
+            // resolves the `Object::Reference` case at its top (also feeding
+            // `visited` for cycle detection). Resolving here would duplicate
+            // that logic and split the cycle-check across two sites.
             let next = dict.get("Next").cloned();
             out.push(action_from_dict(pdf, dict)?);
             if let Some(next) = next {
