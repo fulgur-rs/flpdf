@@ -224,7 +224,12 @@ pub fn merge_adjacent_ranges(ranges: Vec<(i64, LabelRange)>) -> Vec<(i64, LabelR
                     continue; // redundant with the predecessor — drop the explicit entry
                 }
             }
-            // Overflow → err on the side of not merging (keep the explicit entry).
+            // Overflow signals either an unsorted input (checked_sub
+            // underflow) or a pathological i64::MAX-adjacent start (checked_add
+            // overflow); adversarial input or a caller bug. Safety first —
+            // keep the explicit entry rather than trust a synthetic
+            // "expected_start" that could accidentally match. Redundant
+            // entries never break correctness, only compactness.
         }
         out.push((idx, range));
     }
@@ -420,6 +425,12 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// end_idx`) is a caller bug: this returns only the first-page label
     /// with no explicit-range entries, matching an empty-span read; it does
     /// not panic. `start_idx == end_idx` denotes a single-page span.
+    ///
+    /// `new_start_idx` is expected to be a valid page-index-shaped value
+    /// (typically `0..page_count`). Pathological inputs near `i64::MAX`
+    /// saturate on internal `+1`/`+idx_offset` arithmetic — no panic, but
+    /// the resulting `/St` and output indices are clamped to `i64::MAX`;
+    /// the caller is responsible for supplying realistic page indices.
     ///
     /// Unlike qpdf's accumulating signature, this is a single self-contained
     /// call: the leading entry is always emitted (the result vector starts

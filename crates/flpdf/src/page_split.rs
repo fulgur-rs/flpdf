@@ -384,9 +384,17 @@ fn write_chunk(
     {
         let mut labels = pdf.page_labels();
         if labels.has_page_labels()? {
+            // `chunk_start`/`chunk_end` are half-open `[start, end)`; a
+            // valid chunk always has at least one page, so the caller-side
+            // invariant is `chunk_end > chunk_start`. `checked_sub(1)` on
+            // `chunk_end` guards against a 0 slipping through (which would
+            // wrap `chunk_end - 1` to usize::MAX).
             let start = chunk_start as i64;
-            let end = (chunk_end - 1) as i64;
-            let entries = labels.labels_for_page_range(start, end, 0)?;
+            let end_inclusive = chunk_end
+                .checked_sub(1)
+                .expect("write_chunk: chunk_end > 0 (empty chunk is caller bug)")
+                as i64;
+            let entries = labels.labels_for_page_range(start, end_inclusive, 0)?;
             labels.write_reconstructed_labels(&entries)?;
         }
     }
