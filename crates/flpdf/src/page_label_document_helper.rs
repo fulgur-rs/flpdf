@@ -1551,6 +1551,59 @@ mod tests {
         assert_eq!(h.ranges().unwrap(), vec![(0, dec(1))]);
     }
 
+    /// Cover the `None => LabelStyle::None` fallback in remove_pages: when
+    /// `removed_end` is BEFORE the first explicit range, no entry satisfies
+    /// `entry.0 <= removed_end`, so `effective_at_removed_end` stays None and
+    /// the tail gets the fabricated default label.
+    #[test]
+    fn remove_pages_before_first_range_fabricates_none_style_label() {
+        // Ranges start at index 5 (roman), leaving 0..5 with no explicit label.
+        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(5), label_dict("r", Some(1), None)]);
+        // Remove pages 0..2 — removed_end=2, before the first range at index 5.
+        {
+            let mut h = pdf.page_labels();
+            h.remove_pages(0, 2).unwrap();
+        }
+        let mut h = pdf.page_labels();
+        let ranges = h.ranges().unwrap();
+        // Two entries survive: the fabricated None-style entry at index 0
+        // (the shifted tail's first label), and the original roman range now
+        // at index 3 (5 - 2 shift).
+        assert_eq!(ranges.len(), 2, "got {ranges:?}");
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges[0].1.style, LabelStyle::None);
+        assert_eq!(ranges[1].0, 3);
+        assert_eq!(ranges[1].1.style, LabelStyle::RomanLower);
+    }
+
+    /// Cover the trailing shift-loop `if *idx > removed_end` in remove_pages:
+    /// deletion touches only the first range, so a downstream range must
+    /// survive with its output index shifted left.
+    #[test]
+    fn remove_pages_shifts_trailing_range_past_removed_span() {
+        // Two ranges: roman starting at 0, decimal restart at 4. Remove
+        // one page at index 0, so the trailing range must shift to index 3.
+        let mut pdf = pdf_with_pagelabels(vec![
+            Object::Integer(0),
+            label_dict("r", Some(1), None),
+            Object::Integer(4),
+            label_dict("D", Some(1), None),
+        ]);
+        {
+            let mut h = pdf.page_labels();
+            h.remove_pages(0, 1).unwrap();
+        }
+        let mut h = pdf.page_labels();
+        let ranges = h.ranges().unwrap();
+        // Trailing decimal range slides from index 4 to 3.
+        assert!(
+            ranges
+                .iter()
+                .any(|(idx, r)| *idx == 3 && r.style == LabelStyle::Decimal),
+            "trailing range must survive at shifted index 3: {ranges:?}"
+        );
+    }
+
     // ── merge_adjacent_ranges ─────────────────────────────────────────────
 
     #[test]
