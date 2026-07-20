@@ -99,10 +99,9 @@ fn outline_and_dests_four_page_pdf() -> Vec<u8> {
     out
 }
 
-/// 0-based index of `target` within `pdf`'s own page order. Extracted from
-/// both `outline_dest_page_index` and `named_dest_page_index` since only the
-/// accessor (get_root vs name_tree_dests) differs — the position lookup is
-/// identical.
+/// Returns the 0-based index of `target` within `pdf`'s page order. Panics
+/// if `target` is not among the document's pages (a test-harness bug the
+/// callers deliberately do not tolerate silently).
 fn page_index_of(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>, target: ObjectRef) -> usize {
     let refs = pages::page_refs(pdf).unwrap();
     refs.iter()

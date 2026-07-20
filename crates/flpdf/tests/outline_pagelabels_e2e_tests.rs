@@ -19,21 +19,16 @@ use flpdf::{
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
-/// Build a minimal cross-reffed PDF from `(objnum, body)` pairs (same
-/// convention as `outline_document_helper_tests.rs`'s `build_pdf`).
+/// Build a minimal cross-reffed PDF from `(objnum, body)` pairs.
 ///
-/// Intentionally NOT `crates/flpdf/tests/common/mod.rs`'s `build_pdf`:
+/// Intentionally NOT the same as `crates/flpdf/tests/common/mod.rs`'s
+/// `build_pdf`:
 /// * that variant emits a `%PDF-1.5` header and takes `&[(u32, String)]`,
 ///   forcing every literal object body to be owned;
 /// * this variant emits `%PDF-1.7` (the version the tests below target for
 ///   `/Names /Dests`, `/A` action subtypes, and `/StructTreeRoot`) and takes
 ///   `&[(u32, &str)]`, so a `&refs` slice built from `Vec<(u32, &str)>` and
 ///   inline literal-array calls compose without an owned-string round trip.
-///
-/// Consolidating with `common::build_pdf` would require changing every
-/// call site here to `.into()` per element and accepting the 1.5 header
-/// (or widening `common`'s signature and header, which is out of this
-/// subtask's scope).
 fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
     let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
     let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
