@@ -1,8 +1,8 @@
 //! Integration tests for [`flpdf::OutlineDocumentHelper`].
 
 use flpdf::{
-    check_legacy_dests, check_name_tree_dests, prune_outline_se, prune_outline_se_with_max_depth,
-    write_pdf, Object, ObjectRef, OutlineAction, Pdf, Severity,
+    check_legacy_dests, check_name_tree_dests, check_outline_links, prune_outline_se,
+    prune_outline_se_with_max_depth, write_pdf, Object, ObjectRef, OutlineAction, Pdf, Severity,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
@@ -130,7 +130,12 @@ fn get_root_empty_when_no_outline() {
 #[test]
 fn iter_yields_preorder() {
     let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
-    let titles: Vec<String> = pdf.outline().iter().unwrap().map(|n| n.title).collect();
+    let titles: Vec<String> = pdf
+        .outline()
+        .iter()
+        .unwrap()
+        .map(|n| n.title.clone())
+        .collect();
     assert_eq!(titles, vec!["A", "A1", "B"]); // pre-order: A, its child A1, then B
 
     // iter() yields a flattened view: every node has its children cleared.
@@ -217,6 +222,86 @@ fn depth_cap_is_enforced() {
     assert!(err.is_err(), "expected depth-cap error, got {err:?}");
 }
 
+#[test]
+fn get_root_with_max_depth_zero_rejects_even_top_level() {
+    // Covers the depth check at the very top of `build_siblings` (before any
+    // sibling is processed), distinct from the child-frame check that
+    // `depth_cap_is_enforced` exercises.
+    let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
+    let err = pdf.outline().get_root_with_max_depth(0);
+    assert!(err.is_err(), "expected depth-cap error, got {err:?}");
+}
+
+/// A 1000-level-deep outline (a straight chain, one child per level) walks to
+/// completion through the default (no explicit `max_depth`) API: `get_root`,
+/// `iter`, and `walk` all succeed and see every level.
+#[test]
+fn deep_outline_walks_1000_levels_with_default_depth() {
+    let n = 1000u32;
+    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    assert_eq!(roots.len(), 1);
+
+    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
+    let depths: Vec<usize> = pdf
+        .outline()
+        .iter()
+        .unwrap()
+        .map(|node| node.depth)
+        .collect();
+    assert_eq!(depths.len(), n as usize);
+    assert_eq!(*depths.last().unwrap(), (n - 1) as usize);
+
+    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
+    let mut visits = 0usize;
+    pdf.outline().walk(|_node, _depth| visits += 1).unwrap();
+    assert_eq!(visits, n as usize);
+}
+
+/// A far deeper chain (tens of thousands of levels) proves `get_root`/`iter`/
+/// `walk` are genuinely iterative, not just under the old 100-level cap:
+/// native recursion one call frame per level would overflow the stack long
+/// before this depth, on any reasonably-sized thread stack.
+#[test]
+fn deep_outline_iterative_walk_survives_tens_of_thousands_of_levels() {
+    let n = 20_000u32;
+
+    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    assert_eq!(roots.len(), 1);
+    // Walk down the single child chain to confirm the tree was built to the
+    // full depth (not silently truncated).
+    let mut depth = 0;
+    let mut node = &roots[0];
+    loop {
+        assert_eq!(node.depth, depth);
+        match node.children.first() {
+            Some(child) => {
+                node = child;
+                depth += 1;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(depth, (n - 1) as usize);
+
+    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
+    let count = pdf.outline().iter().unwrap().count();
+    assert_eq!(count, n as usize);
+
+    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
+    let mut visits = 0usize;
+    let mut max_seen_depth = 0usize;
+    pdf.outline()
+        .walk(|_node, depth| {
+            visits += 1;
+            max_seen_depth = max_seen_depth.max(depth);
+        })
+        .unwrap();
+    assert_eq!(visits, n as usize);
+    assert_eq!(max_seen_depth, (n - 1) as usize);
+}
+
 /// Outline with a /Next cycle: 5 -> Next 6 -> Next 5 ...
 fn cyclic_outline_pdf() -> Vec<u8> {
     build_pdf(
@@ -235,7 +320,12 @@ fn cyclic_outline_pdf() -> Vec<u8> {
 #[test]
 fn cyclic_outline_terminates() {
     let mut pdf = Pdf::open(Cursor::new(cyclic_outline_pdf())).unwrap();
-    let titles: Vec<String> = pdf.outline().iter().unwrap().map(|n| n.title).collect();
+    let titles: Vec<String> = pdf
+        .outline()
+        .iter()
+        .unwrap()
+        .map(|n| n.title.clone())
+        .collect();
     // Visits X and Y once each, then the cycle back to 5 is cut by `visited`.
     assert_eq!(titles, vec!["X", "Y"]);
 }
@@ -1566,7 +1656,7 @@ fn first_action(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Option<OutlineAction> {
         .unwrap()
         .into_iter()
         .next()
-        .and_then(|n| n.action)
+        .and_then(|n| n.action.clone())
 }
 
 // ── GoTo ───────────────────────────────────────────────────────────────────
@@ -1915,7 +2005,7 @@ fn action_round_trip_through_write_pdf_unmodified() {
         .get_root()
         .unwrap()
         .into_iter()
-        .map(|n| n.action)
+        .map(|n| n.action.clone())
         .collect();
     assert_eq!(before.len(), 5, "sanity: fixture has 5 outline items");
     assert!(
@@ -1932,7 +2022,7 @@ fn action_round_trip_through_write_pdf_unmodified() {
         .get_root()
         .unwrap()
         .into_iter()
-        .map(|n| n.action)
+        .map(|n| n.action.clone())
         .collect();
     assert_eq!(
         before, after,
@@ -2403,6 +2493,165 @@ fn outline_action_launch_recognises_platform_specific_win_dict() {
     );
 }
 
+// --- check_outline_links: /Parent, /Prev, and cycle diagnostics ---
+
+#[test]
+fn check_outline_links_returns_empty_when_no_outline() {
+    let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
+    assert!(check_outline_links(&mut pdf).unwrap().entries().is_empty());
+}
+
+#[test]
+fn check_outline_links_no_diagnostics_for_well_formed_outline() {
+    // `outline_pdf()`'s /Parent and /Prev entries are all internally
+    // consistent with its /First-/Next chain (checked by hand against the
+    // fixture): no diagnostics should be raised.
+    let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
+    let diagnostics = check_outline_links(&mut pdf).unwrap();
+    assert!(
+        diagnostics.entries().is_empty(),
+        "expected no diagnostics, got {:?}",
+        diagnostics.entries()
+    );
+}
+
+/// Two top-level siblings A(5)->Next->B(7); B's `/Prev` wrongly names the
+/// `/Outlines` dict (4) instead of A (5).
+fn wrong_prev_ref_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 7 0 R /Count 2 >>"),
+            (5, "<< /Title (A) /Parent 4 0 R /Next 7 0 R >>"),
+            (7, "<< /Title (B) /Parent 4 0 R /Prev 4 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn check_outline_links_flags_wrong_prev_ref() {
+    let mut pdf = Pdf::open(Cursor::new(wrong_prev_ref_pdf())).unwrap();
+    let diagnostics = check_outline_links(&mut pdf).unwrap();
+    let entries = diagnostics.entries();
+    assert_eq!(entries.len(), 1, "got {entries:?}");
+    assert_eq!(entries[0].severity, Severity::Warning);
+    assert!(entries[0].message.contains("7 0 R"));
+    assert!(entries[0].message.contains("/Prev"));
+    assert!(entries[0].message.contains("4 0 R"));
+    assert!(entries[0].message.contains("expected 5 0 R"));
+}
+
+/// Two top-level siblings A(5)->Next->B(7); B has no `/Prev` at all even
+/// though it isn't the first sibling.
+fn missing_prev_on_non_first_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 7 0 R /Count 2 >>"),
+            (5, "<< /Title (A) /Parent 4 0 R /Next 7 0 R >>"),
+            (7, "<< /Title (B) /Parent 4 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn check_outline_links_flags_missing_prev_on_non_first_sibling() {
+    let mut pdf = Pdf::open(Cursor::new(missing_prev_on_non_first_pdf())).unwrap();
+    let diagnostics = check_outline_links(&mut pdf).unwrap();
+    let entries = diagnostics.entries();
+    assert_eq!(entries.len(), 1, "got {entries:?}");
+    assert!(entries[0].message.contains("7 0 R"));
+    assert!(entries[0].message.contains("/Prev is none"));
+    assert!(entries[0].message.contains("expected 5 0 R"));
+}
+
+/// Two top-level siblings A(5)->Next->B(7); A (the first sibling) has a
+/// stray `/Prev` pointing at B, even though a first sibling shouldn't have
+/// one at all.
+fn stray_prev_on_first_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 7 0 R /Count 2 >>"),
+            (5, "<< /Title (A) /Parent 4 0 R /Prev 7 0 R /Next 7 0 R >>"),
+            (7, "<< /Title (B) /Parent 4 0 R /Prev 5 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn check_outline_links_flags_stray_prev_on_first_sibling() {
+    let mut pdf = Pdf::open(Cursor::new(stray_prev_on_first_pdf())).unwrap();
+    let diagnostics = check_outline_links(&mut pdf).unwrap();
+    let entries = diagnostics.entries();
+    assert_eq!(entries.len(), 1, "got {entries:?}");
+    assert!(entries[0].message.contains("5 0 R"));
+    assert!(entries[0].message.contains("/Prev is 7 0 R"));
+    assert!(entries[0].message.contains("expected none"));
+}
+
+/// Two top-level siblings A(5)->Next->B(7); B's `/Parent` wrongly names A (5)
+/// instead of the `/Outlines` dict (4).
+fn wrong_parent_ref_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 7 0 R /Count 2 >>"),
+            (5, "<< /Title (A) /Parent 4 0 R /Next 7 0 R >>"),
+            (7, "<< /Title (B) /Parent 5 0 R /Prev 5 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn check_outline_links_flags_wrong_parent_ref() {
+    let mut pdf = Pdf::open(Cursor::new(wrong_parent_ref_pdf())).unwrap();
+    let diagnostics = check_outline_links(&mut pdf).unwrap();
+    let entries = diagnostics.entries();
+    assert_eq!(entries.len(), 1, "got {entries:?}");
+    assert!(entries[0].message.contains("7 0 R"));
+    assert!(entries[0].message.contains("/Parent is 5 0 R"));
+    assert!(entries[0].message.contains("expected 4 0 R"));
+}
+
+/// Two top-level siblings A(5)->Next->B(7); B has no `/Parent` entry at all.
+fn missing_parent_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 7 0 R /Count 2 >>"),
+            (5, "<< /Title (A) /Parent 4 0 R /Next 7 0 R >>"),
+            (7, "<< /Title (B) /Prev 5 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn check_outline_links_flags_missing_parent() {
+    let mut pdf = Pdf::open(Cursor::new(missing_parent_pdf())).unwrap();
+    let diagnostics = check_outline_links(&mut pdf).unwrap();
+    let entries = diagnostics.entries();
+    assert_eq!(entries.len(), 1, "got {entries:?}");
+    assert!(entries[0].message.contains("7 0 R"));
+    assert!(entries[0].message.contains("/Parent is none"));
+    assert!(entries[0].message.contains("expected 4 0 R"));
+}
+
 /// N8: `/Next` array descent must not consume the depth budget itself.
 #[test]
 fn outline_action_chain_next_array_does_not_consume_depth_budget() {
@@ -2426,11 +2675,31 @@ fn outline_action_chain_next_array_does_not_consume_depth_budget() {
         .outline()
         .action_chain_with_max_depth(root_action_ref, 2)
         .unwrap();
-    // Depth-2 budget under the FIX allows the wrapping array to descend
-    // without spending, so we still reach obj 11 (root action + one /Next
-    // hop through the array). The old bug consumed the array's hop and
-    // silently truncated at the root.
     assert_eq!(chain.len(), 2, "got {chain:?}");
+}
+
+/// A(5)'s `/First` loops back to itself.
+fn self_cycle_first_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (A) /Parent 4 0 R /First 5 0 R /Last 5 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn check_outline_links_self_cycle_produces_diagnostic_and_bails() {
+    let mut pdf = Pdf::open(Cursor::new(self_cycle_first_pdf())).unwrap();
+    let diagnostics = check_outline_links(&mut pdf).unwrap();
+    let entries = diagnostics.entries();
+    assert_eq!(entries.len(), 1, "got {entries:?}");
+    assert!(entries[0].message.contains("5 0 R"));
+    assert!(entries[0].message.contains("cycle"));
 }
 
 /// N9: an action whose required field resolves to `Object::Null` (e.g.
@@ -2535,4 +2804,36 @@ fn outline_action_goto_recognises_sd_as_destination() {
         "/SD alone must classify as GoTo, got {:?}",
         roots[0].action
     );
+}
+
+/// A(5)'s `/First` is B(6); B(6)'s `/First` loops back to A(5).
+fn mutual_cycle_first_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (A) /Parent 4 0 R /First 6 0 R /Last 6 0 R >>"),
+            (6, "<< /Title (B) /Parent 5 0 R /First 5 0 R /Last 5 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn check_outline_links_mutual_cycle_produces_diagnostic_and_bails() {
+    let mut pdf = Pdf::open(Cursor::new(mutual_cycle_first_pdf())).unwrap();
+    let diagnostics = check_outline_links(&mut pdf).unwrap();
+    let entries = diagnostics.entries();
+    assert_eq!(entries.len(), 1, "got {entries:?}");
+    assert!(entries[0].message.contains("5 0 R"));
+    assert!(entries[0].message.contains("cycle"));
+}
+
+#[test]
+fn check_outline_links_depth_cap_is_enforced() {
+    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(10))).unwrap();
+    let err = pdf.outline().check_links_with_max_depth(5);
+    assert!(err.is_err(), "expected depth-cap error, got {err:?}");
 }

@@ -6,6 +6,14 @@
 //! [`OutlineNode`]s; navigation (`children`, `parent`, `count`, `dest`) lives on
 //! each node, mirroring `QPDFOutlineObjectHelper`.
 //!
+//! [`OutlineDocumentHelper::get_root`] and the traversals built on it
+//! ([`OutlineDocumentHelper::iter`], [`OutlineDocumentHelper::walk`]) walk the
+//! `/First`/`/Next` chain iteratively rather than by native recursion, so a
+//! document with tens of thousands of nested outline levels cannot overflow
+//! the call stack; a shared visited set still cuts short any `/Next` or
+//! `/First` cycle. [`check_outline_links`] separately validates that every
+//! item's `/Parent` and `/Prev` actually match the tree that chain describes.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -28,10 +36,23 @@ use crate::{Diagnostic, Diagnostics, Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
-/// Default recursion limit for outline materialization. Matches
-/// [`crate::outline::DEFAULT_MAX_OUTLINE_DEPTH`]. True unbounded/iterative deep
-/// walking (1000+ levels, cycle diagnostics) is not currently supported.
+/// Depth bound shared by [`OutlineDocumentHelper::prune_se`] and the
+/// `/Names`/`Dests` name-tree readers ([`OutlineDocumentHelper::name_tree_dests`]).
+/// Matches [`crate::outline::DEFAULT_MAX_OUTLINE_DEPTH`]. Those traversals
+/// still recurse natively, so this bound is kept modest to protect the call
+/// stack. [`OutlineDocumentHelper::get_root`] and the traversals built on it
+/// walk iteratively instead and use the much larger [`MAX_OUTLINE_WALK_DEPTH`].
 pub const DEFAULT_MAX_OUTLINE_DEPTH: usize = crate::outline::DEFAULT_MAX_OUTLINE_DEPTH;
+
+/// Depth bound for [`OutlineDocumentHelper::get_root`] (and the `iter`/`walk`
+/// traversals built on it) and for [`check_outline_links`]. The walk
+/// underneath is iterative, not recursive, so this bound isn't protecting the
+/// call stack the way [`DEFAULT_MAX_OUTLINE_DEPTH`] does for the still-recursive
+/// traversals — it exists only to stop a pathological or hostile outline tree
+/// (for example one crafted with this many distinct, non-cyclic dictionary
+/// objects chained end to end) from growing without limit. 100,000 nested
+/// levels comfortably covers any legitimate document.
+pub const MAX_OUTLINE_WALK_DEPTH: usize = 100_000;
 
 /// Indirection/`/D` nesting bound when resolving a destination. Mirrors the
 /// constant in `outline_dest_remap`. Only exists to make malformed/cyclic
@@ -84,6 +105,32 @@ pub struct OutlineNode {
     pub action: Option<OutlineAction>,
     /// Child nodes in `/First`->`/Next` order.
     pub children: Vec<OutlineNode>,
+}
+
+impl Drop for OutlineNode {
+    /// Drop `children` iteratively instead of relying on the
+    /// compiler-generated recursive glue.
+    ///
+    /// `OutlineNode` nests itself through `children`, so the default
+    /// generated `Drop` would recurse one native stack frame per outline
+    /// nesting level when a materialized tree (e.g. from
+    /// [`OutlineDocumentHelper::get_root`]) goes out of scope — overflowing
+    /// the stack on a tree tens of thousands of levels deep even though
+    /// building and walking it (see [`MAX_OUTLINE_WALK_DEPTH`]) never
+    /// recurses natively. This mirrors the standard fix for a deep owned tree
+    /// or linked list: move each node's children onto an explicit heap
+    /// worklist before letting the (now childless) node drop, so the nested
+    /// `Drop::drop` calls this triggers bottom out immediately instead of
+    /// chaining.
+    fn drop(&mut self) {
+        let mut pending = std::mem::take(&mut self.children);
+        while let Some(mut node) = pending.pop() {
+            pending.append(&mut node.children);
+            // `node` drops here at the end of the loop body; its `children`
+            // is already empty (just moved into `pending` above), so this
+            // nested `drop` call does no further work.
+        }
+    }
 }
 
 /// A resolved explicit destination, e.g. `[pageRef /Fit ...]`. Mirrors the
@@ -178,8 +225,13 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         Ok(self.outline_root_first()?.is_some())
     }
 
-    /// Resolve the catalog `/Outlines` dict's `/First` child ref, if any.
-    fn outline_root_first(&mut self) -> Result<Option<ObjectRef>> {
+    /// Resolve the catalog `/Outlines` dict's own ref together with its
+    /// `/First` child ref, if both are present. The outline dictionary's own
+    /// ref is what a top-level item's `/Parent` should name (ISO 32000-1
+    /// section 12.3.3: "The parent of a top-level item is the outline
+    /// dictionary itself"), which [`Self::outline_root_first`] alone can't
+    /// answer.
+    fn outline_root(&mut self) -> Result<Option<(ObjectRef, ObjectRef)>> {
         let Some(catalog_ref) = self.pdf.root_ref() else {
             return Ok(None);
         };
@@ -192,7 +244,15 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Object::Dictionary(root) = self.pdf.resolve_borrowed(outlines_ref)? else {
             return Ok(None);
         };
-        Ok(root.get_ref("First"))
+        let Some(first) = root.get_ref("First") else {
+            return Ok(None);
+        };
+        Ok(Some((outlines_ref, first)))
+    }
+
+    /// Resolve the catalog `/Outlines` dict's `/First` child ref, if any.
+    fn outline_root_first(&mut self) -> Result<Option<ObjectRef>> {
+        Ok(self.outline_root()?.map(|(_outlines_ref, first)| first))
     }
 
     /// Materialize and return the top-level outline nodes (qpdf
@@ -202,10 +262,10 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// # Errors
     ///
     /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
-    /// [`DEFAULT_MAX_OUTLINE_DEPTH`]. Propagates any error from resolving outline
+    /// [`MAX_OUTLINE_WALK_DEPTH`]. Propagates any error from resolving outline
     /// objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
     pub fn get_root(&mut self) -> Result<Vec<OutlineNode>> {
-        self.get_root_with_max_depth(DEFAULT_MAX_OUTLINE_DEPTH)
+        self.get_root_with_max_depth(MAX_OUTLINE_WALK_DEPTH)
     }
 
     /// Like [`get_root`](Self::get_root) with a caller-supplied recursion limit.
@@ -223,7 +283,16 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         self.build_siblings(first, 0, None, &mut visited, max_depth)
     }
 
-    /// Build a `/First`->`/Next` sibling chain into owned nodes.
+    /// Build a `/First`->`/Next` sibling chain into owned nodes, descending
+    /// into each item's own `/First` children.
+    ///
+    /// Implemented as an explicit work stack rather than by native recursion:
+    /// `current` is the sibling chain currently being extended and
+    /// `ancestors` holds every enclosing chain waiting for it (or one of its
+    /// descendants) to finish. This is what lets [`Self::get_root`] use a
+    /// depth bound as large as [`MAX_OUTLINE_WALK_DEPTH`] without risking a
+    /// stack overflow on a deeply (or maliciously) nested outline — a
+    /// recursive walk would consume one native stack frame per nesting level.
     fn build_siblings(
         &mut self,
         start: ObjectRef,
@@ -233,18 +302,57 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         max_depth: usize,
     ) -> Result<Vec<OutlineNode>> {
         if depth >= max_depth {
-            return Err(crate::Error::Unsupported(format!(
-                "outline depth exceeds maximum of {max_depth} at {start}"
-            )));
+            return Err(too_deep(max_depth, start));
         }
-        let mut nodes = Vec::new();
-        let mut current = Some(start);
-        while let Some(current_ref) = current {
+
+        /// One `/First`->`/Next` sibling chain awaiting completion. `next` is
+        /// the ref of the next sibling to resolve (`None` once the chain runs
+        /// out); `nodes` accumulates that chain's completed siblings, each
+        /// pushed with an empty `children` that is filled in once the frame
+        /// for its own `/First` descendants — pushed onto `ancestors` right
+        /// after — is folded back in.
+        struct Frame {
+            next: Option<ObjectRef>,
+            parent: Option<ObjectRef>,
+            depth: usize,
+            nodes: Vec<OutlineNode>,
+        }
+
+        let mut current = Frame {
+            next: Some(start),
+            parent,
+            depth,
+            nodes: Vec::new(),
+        };
+        let mut ancestors: Vec<Frame> = Vec::new();
+
+        loop {
+            let Some(current_ref) = current.next else {
+                // `current`'s chain is exhausted: fold its nodes into the
+                // item that owns it, or return them if this was the top level.
+                let Some(mut parent_frame) = ancestors.pop() else {
+                    return Ok(current.nodes);
+                };
+                // Invariant: a frame is only pushed onto `ancestors` right
+                // after its owning node is pushed onto that (about to become
+                // `parent_frame`) frame's `nodes` below, so `nodes` is never
+                // empty here.
+                let owner = parent_frame
+                    .nodes
+                    .last_mut()
+                    .expect("ancestors frame always has an owner node for its child frame");
+                owner.children = std::mem::take(&mut current.nodes);
+                current = parent_frame;
+                continue;
+            };
+
             if !visited.insert(current_ref) {
-                break; // cycle - stop this chain
+                current.next = None; // cycle - stop this chain
+                continue;
             }
             let Object::Dictionary(dict) = self.pdf.resolve_borrowed(current_ref)? else {
-                break;
+                current.next = None; // non-dict item - stop this chain
+                continue;
             };
             // IMPORTANT (borrow order): `dict` borrows `self.pdf` (it is a
             // `resolve_borrowed` reference). Extract EVERY value we need into
@@ -273,27 +381,35 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 None
             };
 
-            let children = match first {
-                Some(first) => {
-                    self.build_siblings(first, depth + 1, Some(current_ref), visited, max_depth)?
-                }
-                None => Vec::new(),
-            };
-
-            nodes.push(OutlineNode {
+            current.next = next;
+            current.nodes.push(OutlineNode {
                 object_ref: current_ref,
-                depth,
+                depth: current.depth,
                 title,
                 count,
-                parent,
+                parent: current.parent,
                 dest,
                 se,
                 action,
-                children,
+                children: Vec::new(),
             });
-            current = next;
+
+            if let Some(first) = first {
+                let child_depth = current.depth + 1;
+                if child_depth >= max_depth {
+                    return Err(too_deep(max_depth, first));
+                }
+                ancestors.push(std::mem::replace(
+                    &mut current,
+                    Frame {
+                        next: Some(first),
+                        parent: Some(current_ref),
+                        depth: child_depth,
+                        nodes: Vec::new(),
+                    },
+                ));
+            }
         }
-        Ok(nodes)
     }
 
     /// Resolve a node's destination from `/Dest`, else a `/A` GoTo action's `/D`.
@@ -549,15 +665,11 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// # Errors
     ///
     /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
-    /// [`DEFAULT_MAX_OUTLINE_DEPTH`]. Propagates any error from resolving outline
+    /// [`MAX_OUTLINE_WALK_DEPTH`]. Propagates any error from resolving outline
     /// objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
     pub fn iter(&mut self) -> Result<impl Iterator<Item = OutlineNode>> {
         let roots = self.get_root()?;
-        let mut flat = Vec::new();
-        for node in roots {
-            flatten_preorder(node, &mut flat);
-        }
-        Ok(flat.into_iter())
+        Ok(flatten_preorder(roots).into_iter())
     }
 
     /// Visit every node pre-order, passing `(node, depth)` to `visitor`. The
@@ -568,13 +680,11 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// # Errors
     ///
     /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
-    /// [`DEFAULT_MAX_OUTLINE_DEPTH`]. Propagates any error from resolving outline
+    /// [`MAX_OUTLINE_WALK_DEPTH`]. Propagates any error from resolving outline
     /// objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
     pub fn walk<F: FnMut(&OutlineNode, usize)>(&mut self, mut visitor: F) -> Result<()> {
         let roots = self.get_root()?;
-        for node in &roots {
-            walk_node(node, &mut visitor);
-        }
+        walk_nodes(&roots, &mut visitor);
         Ok(())
     }
 
@@ -664,6 +774,57 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let mut out = Vec::new();
         collect_action_chain(self.pdf, a_value, &mut visited, max_depth, &mut out)?;
         Ok(out)
+    }
+
+    /// Validate `/Parent`/`/Prev` linkage across the outline tree using
+    /// [`MAX_OUTLINE_WALK_DEPTH`]. See
+    /// [`Self::check_links_with_max_depth`] for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Unsupported`] if the outline nesting depth
+    /// exceeds [`MAX_OUTLINE_WALK_DEPTH`]. Propagates any error from
+    /// resolving outline objects.
+    pub fn check_links(&mut self) -> Result<Diagnostics> {
+        self.check_links_with_max_depth(MAX_OUTLINE_WALK_DEPTH)
+    }
+
+    /// Like [`Self::check_links`] but with a caller-supplied recursion limit.
+    ///
+    /// Validates every outline item's `/Parent` and `/Prev` against the
+    /// `/First`->`/Next` chain the tree actually follows (ISO 32000-1 section
+    /// 12.3.3): a non-first sibling's `/Prev` should name the preceding
+    /// sibling, the first sibling in a chain should have no `/Prev`, and
+    /// every item's `/Parent` should name its containing item (or the
+    /// `/Outlines` dictionary itself, for a top-level item). Each link that
+    /// doesn't match pushes one warning [`Diagnostic`]. A `/Next` or `/First`
+    /// cycle also pushes one warning and cuts that chain short right there —
+    /// the same point [`Self::get_root`] bails out of a cyclic chain instead
+    /// of looping forever — so a hostile or malformed outline can't cause an
+    /// infinite loop or unbounded memory growth.
+    ///
+    /// Returns an empty [`Diagnostics`] when the document has no outline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Unsupported`] if the outline nesting depth
+    /// exceeds `max_depth`. Propagates any error from resolving outline
+    /// objects (for example I/O or parse failures surfaced by [`Pdf::resolve_borrowed`]).
+    pub fn check_links_with_max_depth(&mut self, max_depth: usize) -> Result<Diagnostics> {
+        let Some((outlines_ref, first)) = self.outline_root()? else {
+            return Ok(Diagnostics::default());
+        };
+        let mut visited = BTreeSet::new();
+        let mut diagnostics = Diagnostics::default();
+        walk_outline_links(
+            self.pdf,
+            first,
+            outlines_ref,
+            &mut visited,
+            max_depth,
+            &mut diagnostics,
+        )?;
+        Ok(diagnostics)
     }
 }
 
@@ -851,6 +1012,38 @@ pub fn check_name_tree_dests<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Diagnos
     Ok(diagnostics)
 }
 
+/// Validate `/Parent`/`/Prev` linkage across the document's outline tree
+/// ([`OutlineDocumentHelper::check_links`]): push a warning [`Diagnostic`]
+/// for every outline item whose `/Parent` or `/Prev` doesn't match the
+/// `/First`->`/Next` chain the tree actually follows, and for every `/Next`
+/// or `/First` cycle encountered (the chain is then cut short there, exactly
+/// as [`OutlineDocumentHelper::get_root`] does, rather than looping forever).
+/// A missing or dangling link is reported, not treated as document
+/// corruption: it never turns into an `Err` on its own.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
+/// [`MAX_OUTLINE_WALK_DEPTH`]. Propagates any error from resolving outline
+/// objects (for example I/O or parse failures surfaced by [`Pdf::resolve_borrowed`]).
+///
+/// # Examples
+///
+/// ```no_run
+/// use flpdf::{check_outline_links, Pdf};
+/// use std::fs::File;
+/// use std::io::BufReader;
+///
+/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
+/// for diagnostic in check_outline_links(&mut pdf)?.entries() {
+///     println!("{diagnostic:?}");
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn check_outline_links<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Diagnostics> {
+    OutlineDocumentHelper::new(pdf).check_links()
+}
+
 /// Drop dangling outline `/SE` (structure-element) links.
 ///
 /// Walks the document's `/Outlines` tree (`/First`/`/Next`/`/First` order,
@@ -926,21 +1119,184 @@ fn resolve_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Res
     })
 }
 
-/// Push `node` (with `children` taken/emptied) then its descendants, pre-order.
-fn flatten_preorder(mut node: OutlineNode, out: &mut Vec<OutlineNode>) {
-    let children = std::mem::take(&mut node.children);
-    out.push(node);
-    for child in children {
-        flatten_preorder(child, out);
+/// Flatten `roots` and every descendant into a single `Vec`, pre-order, with
+/// each node's `children` taken/emptied (see [`OutlineDocumentHelper::iter`]).
+///
+/// Iterative — an explicit stack of sibling iterators — rather than
+/// recursive, so a tree materialized tens of thousands of levels deep (see
+/// [`MAX_OUTLINE_WALK_DEPTH`]) can't overflow the call stack the way
+/// recursing once per level would.
+fn flatten_preorder(roots: Vec<OutlineNode>) -> Vec<OutlineNode> {
+    let mut out = Vec::new();
+    let mut stack: Vec<std::vec::IntoIter<OutlineNode>> = vec![roots.into_iter()];
+    while let Some(level) = stack.last_mut() {
+        match level.next() {
+            None => {
+                stack.pop();
+            }
+            Some(mut node) => {
+                let children = std::mem::take(&mut node.children);
+                out.push(node);
+                if !children.is_empty() {
+                    stack.push(children.into_iter());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Invoke `visitor(node, node.depth)` for `roots` and every descendant,
+/// pre-order.
+///
+/// Iterative for the same reason as [`flatten_preorder`]: an explicit stack
+/// of sibling iterators in place of one native call frame per nesting level.
+fn walk_nodes<F: FnMut(&OutlineNode, usize)>(roots: &[OutlineNode], visitor: &mut F) {
+    let mut stack: Vec<std::slice::Iter<'_, OutlineNode>> = vec![roots.iter()];
+    while let Some(level) = stack.last_mut() {
+        match level.next() {
+            None => {
+                stack.pop();
+            }
+            Some(node) => {
+                visitor(node, node.depth);
+                if !node.children.is_empty() {
+                    stack.push(node.children.iter());
+                }
+            }
+        }
     }
 }
 
-/// Invoke `visitor(node, node.depth)` then recurse into children, pre-order.
-fn walk_node<F: FnMut(&OutlineNode, usize)>(node: &OutlineNode, visitor: &mut F) {
-    visitor(node, node.depth);
-    for child in &node.children {
-        walk_node(child, visitor);
+/// Build the "outline depth exceeds maximum" [`crate::Error::Unsupported`]
+/// used by [`OutlineDocumentHelper::build_siblings`] and
+/// [`walk_outline_links`].
+fn too_deep(max_depth: usize, at: ObjectRef) -> crate::Error {
+    crate::Error::Unsupported(format!(
+        "outline depth exceeds maximum of {max_depth} at {at}"
+    ))
+}
+
+/// Iterative worklist backing [`OutlineDocumentHelper::check_links_with_max_depth`].
+///
+/// Unlike [`OutlineDocumentHelper::build_siblings`], no node tree is
+/// materialized here, so frames don't need to be folded back into a parent
+/// on completion — each frame stands alone and is simply discarded once its
+/// `next` runs out. A frame is still pushed for a node's `/First` children
+/// right after (so it pops, and is fully processed, before the node's own
+/// `/Next` continuation) to match the depth-first order
+/// [`OutlineDocumentHelper::get_root`]'s recursion would visit items in,
+/// which keeps diagnostics in document order.
+fn walk_outline_links<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    first: ObjectRef,
+    outlines_ref: ObjectRef,
+    visited: &mut BTreeSet<ObjectRef>,
+    max_depth: usize,
+    diagnostics: &mut Diagnostics,
+) -> Result<()> {
+    /// One pending sibling-chain continuation: `next` is the item to
+    /// process (`None` once the chain this frame belongs to is exhausted),
+    /// `expected_parent`/`expected_prev` are what that item's `/Parent` and
+    /// `/Prev` should be per the `/First`->`/Next` chain.
+    struct Frame {
+        next: Option<ObjectRef>,
+        expected_parent: ObjectRef,
+        expected_prev: Option<ObjectRef>,
+        depth: usize,
     }
+
+    let mut stack = vec![Frame {
+        next: Some(first),
+        expected_parent: outlines_ref,
+        expected_prev: None,
+        depth: 0,
+    }];
+
+    while let Some(frame) = stack.pop() {
+        let Some(current_ref) = frame.next else {
+            continue; // this frame's chain already ran out
+        };
+        if frame.depth >= max_depth {
+            return Err(too_deep(max_depth, current_ref));
+        }
+        if !visited.insert(current_ref) {
+            diagnostics.push(Diagnostic::warning(
+                format!(
+                    "outline item {current_ref} was already visited via a /Next or /First cycle"
+                ),
+                None,
+            ));
+            continue; // cycle - bail this chain
+        }
+        let Object::Dictionary(dict) = pdf.resolve_borrowed(current_ref)? else {
+            continue; // non-dict item - stop this chain
+        };
+        let actual_parent = dict.get_ref("Parent");
+        let actual_prev = dict.get_ref("Prev");
+        let first_child = dict.get_ref("First");
+        let next_sibling = dict.get_ref("Next");
+
+        check_ref_link(
+            diagnostics,
+            current_ref,
+            "Parent",
+            actual_parent,
+            Some(frame.expected_parent),
+        );
+        check_ref_link(
+            diagnostics,
+            current_ref,
+            "Prev",
+            actual_prev,
+            frame.expected_prev,
+        );
+
+        // Push the sibling continuation first so the `/First` descent
+        // (pushed next) pops — and is fully processed — first, matching
+        // `/First`-before-`/Next` recursion order.
+        stack.push(Frame {
+            next: next_sibling,
+            expected_parent: frame.expected_parent,
+            expected_prev: Some(current_ref),
+            depth: frame.depth,
+        });
+        if let Some(first_child) = first_child {
+            stack.push(Frame {
+                next: Some(first_child),
+                expected_parent: current_ref,
+                expected_prev: None,
+                depth: frame.depth + 1,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Compare an outline item's actual `/Parent` or `/Prev` ref (already read
+/// via [`crate::Dictionary::get_ref`], so `None` also covers a value stored
+/// as anything other than a direct reference) against what the
+/// `/First`->`/Next` chain implies it should be, pushing one warning
+/// [`Diagnostic`] when they differ.
+fn check_ref_link(
+    diagnostics: &mut Diagnostics,
+    item_ref: ObjectRef,
+    field: &str,
+    actual: Option<ObjectRef>,
+    expected: Option<ObjectRef>,
+) {
+    if actual == expected {
+        return;
+    }
+    let describe = |r: Option<ObjectRef>| r.map_or_else(|| "none".to_string(), |r| r.to_string());
+    diagnostics.push(Diagnostic::warning(
+        format!(
+            "outline item {item_ref}: /{field} is {}, expected {} to match the /First-/Next chain",
+            describe(actual),
+            describe(expected)
+        ),
+        None,
+    ));
 }
 
 /// Resolve one level of indirection and read an integer (review rule 2/3).
