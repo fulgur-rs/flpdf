@@ -16,7 +16,7 @@
 //! commonly an inline destination array (`[page /Fit ...]`) or a `<< /D
 //! array >>` dictionary, though an indirect reference to either is also
 //! valid (ISO 32000-2 §12.3.2.3). Consequently the writer here accepts an
-//! arbitrary [`Object`] value rather than requiring an [`ObjectRef`].
+//! arbitrary [`Object`] value rather than requiring an [`crate::ObjectRef`].
 //!
 //! # Reader
 //!
