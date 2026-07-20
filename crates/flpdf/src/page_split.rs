@@ -31,6 +31,14 @@
 //! - The split is at the **last** `.` in the filename portion of the path
 //!   (confirmed with `two.dots.pdf` → `two.dots-1-2.pdf`).
 //!
+//! # Page labels
+//!
+//! When the source carries a `/PageLabels` number tree, each chunk gets its
+//! own reconstructed `/PageLabels` covering just that chunk's page span,
+//! renumbered to start at 0 — matching qpdf's `--split-pages`, which
+//! rebuilds the label array per chunk rather than copying the source tree
+//! verbatim. A source with no `/PageLabels` leaves every chunk without one.
+//!
 //! # Page extraction strategy
 //!
 //! Since a full page-tree rebuild pass is not yet available,
@@ -173,6 +181,8 @@ pub fn split_pages(
             src_bytes,
             pages_root_ref,
             &chunk_refs,
+            chunk_start,
+            chunk_end,
             &out_path,
             deterministic_id,
         )?;
@@ -346,16 +356,37 @@ pub fn digit_width(n: u32) -> usize {
 ///
 /// Re-opens `src_bytes` as a fresh `Pdf`, mutates the `/Pages` root so that
 /// only the `chunk_refs` pages remain, then appends an incremental update via
-/// [`write_pdf`].
+/// [`write_pdf`]. `chunk_start`/`chunk_end` are the chunk's 0-based
+/// `[start, end)` span in the *source* document, used to reconstruct
+/// `/PageLabels` for the chunk (qpdf `--split-pages` parity).
 fn write_chunk(
     src_bytes: &[u8],
     pages_root_ref: ObjectRef,
     chunk_refs: &[ObjectRef],
+    chunk_start: usize,
+    chunk_end: usize,
     out_path: &Path,
     deterministic_id: bool,
 ) -> Result<()> {
     // Re-open the source bytes so each chunk starts from the pristine state.
     let mut pdf = Pdf::open(Cursor::new(src_bytes))?;
+
+    // /PageLabels (qpdf `QPDFJob::doSplitPages` parity): reconstruct the
+    // label range for this chunk's local page span, renumbered to start at
+    // 0, and install it as a direct `/Nums` dict. Reading/writing labels only
+    // touches the catalog's `/PageLabels` key — independent of the `/Pages`
+    // mutation below — so the order relative to it does not matter. A source
+    // with no `/PageLabels` at all is left untouched, matching qpdf's fresh
+    // `outpdf` (which never gains one either).
+    {
+        let mut labels = pdf.page_labels();
+        if labels.has_page_labels()? {
+            let start = chunk_start as i64;
+            let end = (chunk_end - 1) as i64;
+            let entries = labels.labels_for_page_range(start, end, 0)?;
+            labels.write_reconstructed_labels(&entries)?;
+        }
+    }
 
     // Read the current /Pages root dictionary.
     let pages_obj = pdf.resolve_borrowed(pages_root_ref)?;
@@ -628,6 +659,87 @@ mod tests {
         pdf
     }
 
+    /// Like [`build_n_page_pdf`] but the catalog also carries
+    /// `/PageLabels << /Nums {nums_body} >>` (an inline, direct dict — the
+    /// same shape [`super::write_reconstructed_labels`] itself installs).
+    fn build_n_page_pdf_with_pagelabels(n: u32, nums_body: &str) -> Vec<u8> {
+        assert!(n >= 1);
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums {nums_body} >> >>\nendobj\n"
+            )
+            .as_bytes(),
+        );
+
+        let off2 = pdf.len() as u64;
+        let kids: String = (3u32..=2 + n).map(|i| format!("{i} 0 R ")).collect();
+        pdf.extend_from_slice(
+            format!("2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {n} >>\nendobj\n").as_bytes(),
+        );
+
+        let mut page_offsets: Vec<u64> = Vec::new();
+        for i in 3u32..=2 + n {
+            let off = pdf.len() as u64;
+            page_offsets.push(off);
+            pdf.extend_from_slice(
+                format!(
+                    "{i} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n"
+                )
+                .as_bytes(),
+            );
+        }
+
+        let xref_start = pdf.len() as u64;
+        let total = 2 + n as usize + 1;
+        let mut xref = format!("xref\n0 {total}\n0000000000 65535 f \n");
+        xref.push_str(&format!("{:010} 00000 n \n", off1));
+        xref.push_str(&format!("{:010} 00000 n \n", off2));
+        for off in &page_offsets {
+            xref.push_str(&format!("{:010} 00000 n \n", off));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+
+        let trailer =
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Read the catalog's `/PageLabels /Nums` entries as `(index, Dictionary)`
+    /// pairs, for asserting the exact reconstructed shape of a chunk's labels.
+    fn read_nums(bytes: &[u8]) -> Vec<(i64, crate::Dictionary)> {
+        let mut pdf = Pdf::open(Cursor::new(bytes.to_vec())).expect("should parse");
+        let catalog_ref = pdf.root_ref().expect("/Root");
+        let catalog = pdf
+            .resolve(catalog_ref)
+            .expect("resolve catalog")
+            .into_dict()
+            .expect("catalog is a dict");
+        let Some(Object::Dictionary(page_labels)) = catalog.get("PageLabels") else {
+            panic!("/PageLabels must be a direct dictionary, got {catalog:?}");
+        };
+        let Some(Object::Array(nums)) = page_labels.get("Nums") else {
+            panic!("/Nums must be a direct array");
+        };
+        nums.chunks_exact(2)
+            .map(|pair| {
+                let idx = match &pair[0] {
+                    Object::Integer(n) => *n,
+                    other => panic!("expected an integer index, got {other:?}"),
+                };
+                let dict = match &pair[1] {
+                    Object::Dictionary(d) => d.clone(),
+                    other => panic!("expected a label dictionary, got {other:?}"),
+                };
+                (idx, dict)
+            })
+            .collect()
+    }
+
     // -----------------------------------------------------------------------
     // Integration tests: split_pages
     // -----------------------------------------------------------------------
@@ -766,5 +878,65 @@ mod tests {
         let template = tmpdir.path().join("out.pdf");
         let result = split_pages(&src, 0, &template, false);
         assert!(result.is_err(), "chunk_size=0 should return an error");
+    }
+
+    #[test]
+    fn split_pages_reconstructs_page_labels_per_chunk() {
+        // 5-page source: roman lowercase from page 0, decimal (restart at 1)
+        // from page 3. split=2 → chunks [0,1], [2,3], [4,4]. Expected shape
+        // verified byte-for-byte against qpdf 11.9.0 `--split-pages=2`.
+        let src = build_n_page_pdf_with_pagelabels(5, "[0 << /S /r >> 3 << /S /D /St 1 >>]");
+        let tmpdir = tempfile::tempdir().expect("tmpdir");
+        let template = tmpdir.path().join("out.pdf");
+
+        split_pages(&src, 2, &template, false).expect("split should succeed");
+
+        let chunk1 = std::fs::read(tmpdir.path().join("out-1-2.pdf")).unwrap();
+        let chunk2 = std::fs::read(tmpdir.path().join("out-3-4.pdf")).unwrap();
+        let chunk3 = std::fs::read(tmpdir.path().join("out-5-5.pdf")).unwrap();
+
+        let s = |name: &str| Object::Name(name.as_bytes().to_vec());
+
+        let nums1 = read_nums(&chunk1);
+        assert_eq!(nums1.len(), 1);
+        assert_eq!(nums1[0].0, 0);
+        assert_eq!(nums1[0].1.get("S"), Some(&s("r")));
+        assert_eq!(nums1[0].1.get("St"), Some(&Object::Integer(1)));
+
+        let nums2 = read_nums(&chunk2);
+        assert_eq!(nums2.len(), 2, "roman continuation + decimal restart");
+        assert_eq!(nums2[0].0, 0);
+        assert_eq!(nums2[0].1.get("S"), Some(&s("r")));
+        assert_eq!(nums2[0].1.get("St"), Some(&Object::Integer(3)));
+        assert_eq!(nums2[1].0, 1);
+        assert_eq!(nums2[1].1.get("S"), Some(&s("D")));
+        assert_eq!(nums2[1].1.get("St"), Some(&Object::Integer(1)));
+
+        let nums3 = read_nums(&chunk3);
+        assert_eq!(nums3.len(), 1);
+        assert_eq!(nums3[0].0, 0);
+        assert_eq!(nums3[0].1.get("S"), Some(&s("D")));
+        assert_eq!(nums3[0].1.get("St"), Some(&Object::Integer(2)));
+    }
+
+    #[test]
+    fn split_pages_without_page_labels_omits_pagelabels_key() {
+        let src = build_n_page_pdf(3);
+        let tmpdir = tempfile::tempdir().expect("tmpdir");
+        let template = tmpdir.path().join("out.pdf");
+        split_pages(&src, 1, &template, false).expect("split should succeed");
+
+        let chunk = std::fs::read(tmpdir.path().join("out-1.pdf")).unwrap();
+        let mut pdf = Pdf::open(Cursor::new(chunk)).expect("should parse");
+        let catalog_ref = pdf.root_ref().unwrap();
+        let catalog = pdf
+            .resolve(catalog_ref)
+            .unwrap()
+            .into_dict()
+            .expect("catalog is a dict");
+        assert!(
+            catalog.get("PageLabels").is_none(),
+            "a source with no /PageLabels must not gain one"
+        );
     }
 }
