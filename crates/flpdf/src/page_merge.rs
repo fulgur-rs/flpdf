@@ -6,6 +6,18 @@
 //! inputs contribute pages and form fields only. Shared resources within one
 //! input are de-duplicated; form-field name collisions are resolved by qpdf's
 //! `<name>+<N>` renaming rule.
+//!
+//! `/PageLabels` is the one document-level structure that is **not**
+//! primary-only: it is reconstructed from every input's own labels, one entry
+//! per selected page in output order, matching qpdf's `handlePageSpecs`
+//! (which calls `getLabelsForPageRange` for each selected page regardless of
+//! which input file it came from). No input's named destinations or outline
+//! items are copied at all beyond the primary — those structures are not
+//! part of any page's object closure, and qpdf's own page-copy mechanism
+//! (`addPage` / `copyForeignObject`) never reaches a source document's
+//! catalog-level `/Names /Dests`, legacy `/Dests`, or `/Outlines`.
+//! Consequently no named-destination "collision" between inputs is possible
+//! here (there is nothing from a secondary input to collide with).
 
 use crate::acroform_document_helper::{collect_refs_in_object, remap_refs_in_object};
 use crate::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
@@ -18,6 +30,7 @@ use crate::page_extract::{
     append_selection_kids, materialize_leaf, minimal_target_bytes, resolve_dict,
     sd_target_page_ref, target_pages_root, InheritedAttrs,
 };
+use crate::page_label_document_helper::{merge_adjacent_ranges, LabelRange};
 use crate::pages::{page_refs, DEFAULT_MAX_PAGE_TREE_DEPTH};
 use crate::ref_chain::resolve_ref_chain;
 use crate::subset_prune::sweep_unreachable_objects;
@@ -1722,6 +1735,16 @@ pub fn merge_documents<R: Read + Seek>(
     let mut primary_acroform = PrimaryAcroForm::default();
     let mut primary_map: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
 
+    // /PageLabels merge state (qpdf `handlePageSpecs` parity). Unlike outlines
+    // and named destinations, which are inherited from the primary input
+    // only, page labels accumulate across EVERY input: qpdf calls
+    // `getLabelsForPageRange` once per selected page regardless of which
+    // source file it came from, gating only the final `/PageLabels` install
+    // on whether ANY input's own tree carried real labels.
+    let mut label_entries: Vec<(i64, LabelRange)> = Vec::new();
+    let mut any_page_labels = false;
+    let mut out_pageno: i64 = 0;
+
     let depth = DEFAULT_MAX_PAGE_TREE_DEPTH;
     for (input_index, input) in inputs.iter_mut().enumerate() {
         // Document-level structures (outlines, named dests, /OpenAction) are
@@ -1736,6 +1759,23 @@ pub fn merge_documents<R: Read + Seek>(
         // state even when it contributes no pages of its own.
         if !is_primary && input.pages.is_empty() {
             continue;
+        }
+
+        // Reconstruct this input's page-label contribution, one entry per
+        // selected page (in selection order, duplicates included), before any
+        // other per-input processing — purely a `/PageLabels`-tree read,
+        // independent of the page-copy/dest/AcroForm machinery below.
+        {
+            let mut src_labels = input.source.page_labels();
+            if src_labels.has_page_labels()? {
+                any_page_labels = true;
+            }
+            for &idx in &input.pages {
+                let src_idx = idx as i64;
+                label_entries
+                    .extend(src_labels.labels_for_page_range(src_idx, src_idx, out_pageno)?);
+                out_pageno += 1;
+            }
         }
 
         let doc_level = if is_primary {
@@ -1985,6 +2025,16 @@ pub fn merge_documents<R: Read + Seek>(
     // qpdf's `+N` rule. Done BEFORE the sweep so the `/DR` fonts (reachable only
     // through `/AcroForm`) are not garbage-collected.
     build_merged_acroform(&mut target, &primary_acroform, &kept_fields, &primary_map)?;
+
+    // Install the merged `/PageLabels`, folding away entries that turn out
+    // redundant with the running sequence (qpdf's own accumulating
+    // `getLabelsForPageRange` redundancy check). A no-op when no input ever
+    // carried real page labels — the target then keeps its fresh, label-less
+    // catalog, matching qpdf's `emptyPDF()`-based output.
+    if any_page_labels {
+        let folded = merge_adjacent_ranges(label_entries);
+        target.page_labels().write_reconstructed_labels(&folded)?;
+    }
 
     // Drop the copied ancestor /Pages node(s) and any objects only they
     // referenced: they are unreachable now that each leaf /Parent points at the
