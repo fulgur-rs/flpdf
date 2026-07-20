@@ -535,10 +535,14 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             .iter()
             .map(|(idx, range)| (*idx, Object::Dictionary(range.to_dict())))
             .collect();
-        // build_number_tree requires pre-sorted input; callers (merge_adjacent_ranges,
-        // shifted insert/remove lists) already preserve ascending order, but sort
-        // defensively since this is a public entry point.
+        // build_number_tree requires pre-sorted UNIQUE input; callers
+        // (merge_adjacent_ranges, shifted insert/remove lists) already preserve
+        // ascending order and normally uniqueness, but this is a public entry
+        // point, so sort defensively and dedup by key. ISO 32000-1 §7.9.7
+        // requires number-tree keys to be unique; a duplicate would produce
+        // a malformed PDF.
         entries.sort_by_key(|(idx, _)| *idx);
+        entries.dedup_by(|a, b| a.0 == b.0);
         self.rebuild(entries)
     }
 
@@ -629,10 +633,52 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         })?;
         let removed_end = at.saturating_add(count);
 
-        let mut result: Vec<(i64, LabelRange)> =
-            ranges.into_iter().filter(|(idx, _)| *idx < at).collect();
-        let tail = self.labels_for_page_range(removed_end, i64::MAX, at)?;
-        result.extend(tail);
+        // Everything before `at` is unchanged.
+        let mut result: Vec<(i64, LabelRange)> = ranges
+            .iter()
+            .filter(|(idx, _)| *idx < at)
+            .cloned()
+            .collect();
+
+        // Fabricate the tail's first-label entry from the range effective at
+        // `removed_end` (or a LabelStyle::None default if no range applies) —
+        // both use `at` as the new base index in the output. This mirrors what
+        // the previous `labels_for_page_range` call did, but reuses `ranges`
+        // already in scope: O(N) in-memory pass instead of an O(M × N) tree
+        // re-parse per surviving explicit index.
+        let mut effective_at_removed_end: Option<&(i64, LabelRange)> = None;
+        for entry in &ranges {
+            if entry.0 <= removed_end {
+                effective_at_removed_end = Some(entry);
+            } else {
+                break;
+            }
+        }
+        let tail_first_label = match effective_at_removed_end {
+            Some((first, r)) => {
+                let offset = removed_end.saturating_sub(*first);
+                LabelRange {
+                    style: r.style,
+                    prefix: r.prefix.clone(),
+                    start: r.start.saturating_add(offset),
+                }
+            }
+            None => LabelRange {
+                style: LabelStyle::None,
+                prefix: String::new(),
+                start: at.saturating_add(1),
+            },
+        };
+        result.push((at, tail_first_label));
+
+        // Every explicit entry past `removed_end` survives, shifted left by
+        // `count` so its output index accounts for the removed span.
+        let idx_offset = at.saturating_sub(removed_end);
+        for (idx, range) in &ranges {
+            if *idx > removed_end {
+                result.push((idx.saturating_add(idx_offset), range.clone()));
+            }
+        }
 
         let merged = merge_adjacent_ranges(result);
         self.write_labels(&merged)
