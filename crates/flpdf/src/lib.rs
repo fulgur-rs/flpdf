@@ -63,6 +63,7 @@ pub mod json;
 pub mod json_inspect;
 pub mod linearization;
 pub mod name_number_tree;
+pub mod name_tree_dests;
 pub mod object;
 pub mod object_copy;
 pub mod objr_obj_annot_p;
@@ -146,12 +147,17 @@ pub use name_number_tree::{
     build_name_tree, build_number_tree, read_name_tree, read_number_tree, DEFAULT_MAX_TREE_DEPTH,
     LEAF_MAX,
 };
+pub use name_tree_dests::{
+    delete_name_tree_dest, insert_name_tree_dest, DEFAULT_MAX_NAME_TREE_DESTS_DEPTH,
+};
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use object_copy::copy_objects;
 pub use objr_obj_annot_p::drop_objr_obj_annot_dangling_p;
 pub use outline::OutlineItem;
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
-pub use outline_document_helper::{check_legacy_dests, Dest, OutlineDocumentHelper, OutlineNode};
+pub use outline_document_helper::{
+    check_legacy_dests, check_name_tree_dests, Dest, OutlineDocumentHelper, OutlineNode,
+};
 pub use overlay::{
     apply_overlay_specs, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
     OverlayVerboseSource,

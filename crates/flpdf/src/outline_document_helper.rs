@@ -389,6 +389,49 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         Ok(out)
     }
 
+    /// Read every entry of the catalog's `/Names /Dests` name tree (ISO
+    /// 32000-2 §7.9.6 + §12.3.2.3): the PDF 1.2+ modern named-destination
+    /// structure, which supersedes — but does not replace, both may coexist
+    /// — the legacy `/Catalog /Dests` dictionary read by
+    /// [`Self::legacy_dests`]. The tree shape (`/Kids`/`/Names` nodes with
+    /// `/Limits`) is identical to `/Names /EmbeddedFiles`; see
+    /// [`crate::name_tree_dests`] for the writer.
+    ///
+    /// Entries come back in the tree's depth-first, key-ascending order (the
+    /// order the spec requires the tree be sorted in — see
+    /// [`crate::name_number_tree::read_name_tree`]). A value that cannot be
+    /// resolved to an explicit destination array (for example a malformed
+    /// non-array, non-reference, non-`/D`-bearing value) yields `None` for
+    /// that entry rather than dropping the name, so a caller can still see
+    /// every declared name.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from resolving the catalog, `/Names`, or the
+    /// `/Dests` name-tree nodes. Returns [`crate::Error::Unsupported`] if a
+    /// `/Kids` chain exceeds [`DEFAULT_MAX_OUTLINE_DEPTH`] (guards against
+    /// cyclic or maliciously deep trees).
+    pub fn name_tree_dests(&mut self) -> Result<Vec<(Vec<u8>, Option<Dest>)>> {
+        let Some(Object::Dictionary(mut names)) = self.catalog_value("Names")? else {
+            return Ok(Vec::new());
+        };
+        let Some(dests_root) = names.remove("Dests") else {
+            return Ok(Vec::new());
+        };
+        let raw = read_name_tree(
+            self.pdf,
+            dests_root,
+            |_pdf, value| Ok(Some(value)),
+            DEFAULT_MAX_OUTLINE_DEPTH,
+        )?;
+        let mut out = Vec::with_capacity(raw.len());
+        for (name, value) in raw {
+            let dest = self.dest_from_value(&value, MAX_DEST_RESOLVE_DEPTH)?;
+            out.push((name, dest));
+        }
+        Ok(out)
+    }
+
     /// Pre-order iterator over every materialized node (owned). Each yielded
     /// node has its `children` cleared — the flattened view is linear and
     /// `depth` conveys structure; use [`get_root`](Self::get_root) or
@@ -517,6 +560,74 @@ pub fn check_legacy_dests<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Diagnostic
             diagnostics.push(Diagnostic::warning(
                 format!(
                     "named destination \"{}\" targets {page_ref}, which is not a page in the document",
+                    String::from_utf8_lossy(&name)
+                ),
+                None,
+            ));
+        }
+    }
+    Ok(diagnostics)
+}
+
+/// Validate the catalog's `/Names /Dests` name tree
+/// ([`OutlineDocumentHelper::name_tree_dests`]): push a warning [`Diagnostic`]
+/// for every entry whose destination's target page reference is not a page
+/// currently reachable from the document's `/Pages` tree — a dangling
+/// reference, a reference to a non-`/Page` object, or a page a prior edit
+/// removed. A missing target is reported, not treated as document
+/// corruption: it never turns into an `Err` on its own.
+///
+/// See [`check_legacy_dests`] for the equivalent check over the legacy
+/// `/Catalog /Dests` dictionary; the two structures are validated
+/// independently since a document may carry either or both.
+///
+/// # Errors
+///
+/// Propagates any error from resolving the catalog or the `/Names /Dests`
+/// name-tree nodes. A failure to enumerate the document's page tree (for
+/// example a missing `/Pages` entry) is downgraded to a warning
+/// [`Diagnostic`] instead, so the caller still receives a report.
+///
+/// # Examples
+///
+/// ```no_run
+/// use flpdf::{check_name_tree_dests, Pdf};
+/// use std::fs::File;
+/// use std::io::BufReader;
+///
+/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
+/// for diagnostic in check_name_tree_dests(&mut pdf)?.entries() {
+///     println!("{diagnostic:?}");
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn check_name_tree_dests<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Diagnostics> {
+    let entries = OutlineDocumentHelper::new(pdf).name_tree_dests()?;
+    let mut diagnostics = Diagnostics::default();
+    if entries.is_empty() {
+        return Ok(diagnostics);
+    }
+
+    let live_pages: BTreeSet<ObjectRef> = match crate::pages::page_refs(pdf) {
+        Ok(refs) => refs.into_iter().collect(),
+        Err(error) => {
+            diagnostics.push(Diagnostic::warning(
+                format!("could not enumerate pages to validate /Names /Dests targets: {error}"),
+                None,
+            ));
+            return Ok(diagnostics);
+        }
+    };
+
+    for (name, dest) in entries {
+        let Some(dest) = dest else { continue };
+        let Some(page_ref) = dest.page() else {
+            continue;
+        };
+        if !live_pages.contains(&page_ref) {
+            diagnostics.push(Diagnostic::warning(
+                format!(
+                    "named destination \"{}\" (in /Names /Dests) targets {page_ref}, which is not a page in the document",
                     String::from_utf8_lossy(&name)
                 ),
                 None,

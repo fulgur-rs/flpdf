@@ -1,6 +1,6 @@
 //! Integration tests for [`flpdf::OutlineDocumentHelper`].
 
-use flpdf::{check_legacy_dests, write_pdf, ObjectRef, Pdf, Severity};
+use flpdf::{check_legacy_dests, check_name_tree_dests, write_pdf, ObjectRef, Pdf, Severity};
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
@@ -909,4 +909,244 @@ fn legacy_dests_resolves_alias_through_chained_dests_dict() {
             std::str::from_utf8(name).unwrap_or("?")
         );
     }
+}
+
+// ── /Names /Dests name tree (modern, PDF 1.2+) ────────────────────────────────
+//
+// Reader ([`OutlineDocumentHelper::name_tree_dests`]) and diagnostic
+// ([`check_name_tree_dests`]) coverage. Mirrors the legacy_dests tests above;
+// the writer (insert/delete/rebuild) is covered separately in
+// `name_tree_dests_tests.rs`.
+
+/// A flat `/Names /Dests` leaf with two entries, one holding a dict value
+/// (`<< /D array >>`) instead of a bare array (both forms are valid per ISO
+/// 32000-2 §12.3.2.3).
+fn name_tree_dests_single_level_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (8, "<< /Dests 9 0 R >>"),
+            (
+                9,
+                "<< /Names [(alpha) [3 0 R /Fit] (beta) << /D [4 0 R /XYZ 0 792 0] >>] >>",
+            ),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn name_tree_dests_reads_flat_leaf_entries_in_key_order() {
+    let mut pdf = Pdf::open(Cursor::new(name_tree_dests_single_level_pdf())).unwrap();
+    let entries = pdf.outline().name_tree_dests().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].0, b"alpha");
+    assert_eq!(
+        entries[0].1.as_ref().expect("alpha resolves").page(),
+        Some(ObjectRef::new(3, 0))
+    );
+    assert_eq!(entries[1].0, b"beta");
+    assert_eq!(
+        entries[1].1.as_ref().expect("beta resolves").page(),
+        Some(ObjectRef::new(4, 0)),
+        "a << /D array >> dict value must resolve just like a bare array"
+    );
+}
+
+/// A `/Names /Dests` tree nested 5 levels deep via `/Kids` chains, with the
+/// sole entry at the deepest leaf. Verifies the reader's depth-first walk
+/// reaches entries well past a shallow tree (acceptance: "round-trip
+/// preserves ordering and depth").
+///
+/// Object layout: 10 -> Kids[11] -> Kids[12] -> Kids[13] -> Kids[14] -> leaf
+/// (/Names [(deep) [3 0 R /Fit]]).
+fn name_tree_dests_deep_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (8, "<< /Dests 10 0 R >>"),
+            (10, "<< /Kids [11 0 R] >>"),
+            (11, "<< /Kids [12 0 R] >>"),
+            (12, "<< /Kids [13 0 R] >>"),
+            (13, "<< /Kids [14 0 R] >>"),
+            (14, "<< /Names [(deep) [3 0 R /Fit]] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn name_tree_dests_reads_through_five_level_deep_kids_chain() {
+    let mut pdf = Pdf::open(Cursor::new(name_tree_dests_deep_pdf())).unwrap();
+    let entries = pdf.outline().name_tree_dests().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, b"deep");
+    assert_eq!(
+        entries[0].1.as_ref().expect("deep entry resolves").page(),
+        Some(ObjectRef::new(3, 0))
+    );
+}
+
+#[test]
+fn name_tree_dests_absent_names_key_yields_empty_vec() {
+    let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
+    assert!(pdf.outline().name_tree_dests().unwrap().is_empty());
+}
+
+#[test]
+fn name_tree_dests_names_present_but_no_dests_key_yields_empty_vec() {
+    // /Names dict exists (e.g. for /EmbeddedFiles) but has no /Dests entry.
+    let mut pdf = Pdf::open(Cursor::new(build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [] /Count 0 >>"),
+            (8, "<< /EmbeddedFiles 9 0 R >>"),
+            (9, "<< /Names [] >>"),
+        ],
+        1,
+    )))
+    .unwrap();
+    assert!(pdf.outline().name_tree_dests().unwrap().is_empty());
+}
+
+/// Round-trip acceptance: opening a document with a `/Names /Dests` name
+/// tree and rewriting it via [`write_pdf`] (no page operations, no mutation)
+/// must preserve every entry, in the same order, unchanged.
+#[test]
+fn name_tree_dests_round_trip_through_write_pdf_unmodified() {
+    let mut pdf = Pdf::open(Cursor::new(name_tree_dests_deep_pdf())).unwrap();
+    let before = pdf.outline().name_tree_dests().unwrap();
+    assert_eq!(before.len(), 1, "sanity: fixture has one dest entry");
+
+    let mut out = Vec::new();
+    write_pdf(&mut pdf, &mut out).unwrap();
+
+    let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
+    let after = reopened.outline().name_tree_dests().unwrap();
+    assert_eq!(
+        before, after,
+        "/Names /Dests entries must round-trip unmodified"
+    );
+}
+
+#[test]
+fn check_name_tree_dests_no_diagnostics_when_all_targets_exist() {
+    let mut pdf = Pdf::open(Cursor::new(name_tree_dests_single_level_pdf())).unwrap();
+    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
+    assert!(diagnostics.entries().is_empty());
+}
+
+/// A `/Names /Dests` entry ("gone") targets object `99 0 R`, which is never
+/// defined in this document — a dangling reference. Acceptance: this must
+/// produce a diagnostic, not fail the call.
+fn name_tree_dests_missing_target_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (8, "<< /Dests 9 0 R >>"),
+            (9, "<< /Names [(gone) [99 0 R /Fit] (here) [3 0 R /Fit]] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn check_name_tree_dests_missing_target_is_warning_not_error() {
+    let mut pdf = Pdf::open(Cursor::new(name_tree_dests_missing_target_pdf())).unwrap();
+    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
+    let entries = diagnostics.entries();
+    assert_eq!(
+        entries.len(),
+        1,
+        "only the dangling entry should be flagged"
+    );
+    assert_eq!(entries[0].severity, Severity::Warning);
+    assert!(entries[0].message.contains("gone"));
+    assert!(entries[0].message.contains("99 0 R"));
+}
+
+/// A `/Names /Dests` entry targets object `2 0 R`, which exists but is the
+/// `/Pages` root, not a `/Page` leaf — also a "missing target page".
+fn name_tree_dests_non_page_target_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (8, "<< /Dests 9 0 R >>"),
+            (9, "<< /Names [(wrong) [2 0 R /Fit]] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn check_name_tree_dests_target_not_a_page_is_warning() {
+    let mut pdf = Pdf::open(Cursor::new(name_tree_dests_non_page_target_pdf())).unwrap();
+    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
+    assert_eq!(diagnostics.entries().len(), 1);
+    assert_eq!(diagnostics.entries()[0].severity, Severity::Warning);
+}
+
+/// `check_name_tree_dests` must not fail even when the document has no
+/// `/Pages` tree at all to enumerate (downgraded to a warning).
+#[test]
+fn check_name_tree_dests_missing_page_tree_downgrades_to_warning() {
+    let mut pdf = Pdf::open(Cursor::new(build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Names 8 0 R >>"),
+            (8, "<< /Dests 9 0 R >>"),
+            (9, "<< /Names [(gone) [99 0 R /Fit]] >>"),
+        ],
+        1,
+    )))
+    .unwrap();
+    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
+    assert!(diagnostics.entries().iter().any(
+        |d| d.severity == Severity::Warning && d.message.contains("could not enumerate pages")
+    ));
+}
+
+/// `check_name_tree_dests` must short-circuit before enumerating the page
+/// tree when the catalog carries no `/Names /Dests` name tree at all.
+#[test]
+fn check_name_tree_dests_returns_empty_when_no_dests_tree() {
+    let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
+    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
+    assert!(diagnostics.entries().is_empty());
+}
+
+/// A `/Names /Dests` entry whose value is an array with no resolvable page
+/// reference (first element is a name, not an indirect reference). This is a
+/// malformed destination, not a "missing target page": `Dest::page()`
+/// returns `None`, so no diagnostic is produced for it.
+fn name_tree_dests_no_page_ref_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (8, "<< /Dests 9 0 R >>"),
+            (9, "<< /Names [(odd) [/NotAPageRef /Fit]] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn check_name_tree_dests_skips_entries_without_resolvable_page_ref() {
+    let mut pdf = Pdf::open(Cursor::new(name_tree_dests_no_page_ref_pdf())).unwrap();
+    let entries = pdf.outline().name_tree_dests().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].1.as_ref().unwrap().page().is_none());
+
+    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
+    assert!(diagnostics.entries().is_empty());
 }
