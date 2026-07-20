@@ -127,13 +127,25 @@ impl LabelRange {
     /// Build a label dictionary mirroring qpdf `pageLabelDict`: `/S` name when
     /// the style is not [`LabelStyle::None`]; `/P` only when non-empty; `/St`
     /// only when `!= 1`.
+    ///
+    /// Non-ASCII prefixes are emitted as a PDF UTF-16BE text string (BOM +
+    /// UTF-16BE bytes, ISO 32000-1 §7.9.2.2). Emitting the Rust `String`'s
+    /// raw UTF-8 bytes verbatim would be misread by PDFDocEncoding-only
+    /// readers — a source `§` (`c2 a7`) would come back as `Â§`. Pure ASCII
+    /// prefixes are emitted as-is since ASCII 32-127 is identical between
+    /// PDFDocEncoding and UTF-8/UTF-16.
     pub fn to_dict(&self) -> Dictionary {
         let mut d = Dictionary::new();
         if let Some(name) = self.style.to_name() {
             d.insert("S", Object::Name(name.into()));
         }
         if !self.prefix.is_empty() {
-            d.insert("P", Object::String(self.prefix.clone().into_bytes()));
+            let bytes = if self.prefix.is_ascii() {
+                self.prefix.clone().into_bytes()
+            } else {
+                crate::filespec_helper::encode_utf16be(&self.prefix)
+            };
+            d.insert("P", Object::String(bytes));
         }
         if self.start != 1 {
             d.insert("St", Object::Integer(self.start));
@@ -1306,6 +1318,44 @@ mod tests {
         let mut d = Dictionary::new();
         d.insert("S", Object::Integer(0)); // /S not a Name -> LabelStyle::None
         assert_eq!(LabelRange::from_dict(&d).style, LabelStyle::None);
+    }
+
+    /// Non-ASCII prefix must survive a to_dict → from_dict round trip. Emitting
+    /// the raw UTF-8 bytes verbatim (as this code originally did) would be
+    /// misread by PDFDocEncoding readers — a source `§` (`c2 a7`) came back
+    /// as `Â§`. UTF-16BE with BOM survives both interpretations.
+    #[test]
+    fn to_dict_non_ascii_prefix_round_trips_through_pdf_text_string() {
+        let r = LabelRange {
+            style: LabelStyle::Decimal,
+            prefix: "§ Foo—Bar".into(),
+            start: 1,
+        };
+        let d = r.to_dict();
+        let re_read = LabelRange::from_dict(&d);
+        assert_eq!(re_read.prefix, r.prefix, "round-trip must preserve prefix");
+        // The serialised /P must be UTF-16BE-with-BOM (starts with 0xFE 0xFF),
+        // NOT raw UTF-8 (which for `§` would be 0xC2 0xA7).
+        let Object::String(bytes) = d.get("P").expect("/P present") else {
+            panic!("/P must be a string");
+        };
+        assert_eq!(&bytes[..2], &[0xFE, 0xFF], "must have UTF-16BE BOM");
+    }
+
+    /// ASCII-only prefixes stay verbatim (avoiding a needless UTF-16BE
+    /// re-encoding when ASCII is safe under both PDFDocEncoding and UTF-8).
+    #[test]
+    fn to_dict_ascii_prefix_stays_verbatim() {
+        let r = LabelRange {
+            style: LabelStyle::Decimal,
+            prefix: "App-".into(),
+            start: 1,
+        };
+        let d = r.to_dict();
+        let Object::String(bytes) = d.get("P").expect("/P present") else {
+            panic!("/P must be a string");
+        };
+        assert_eq!(bytes, b"App-", "pure ASCII must stay verbatim");
     }
 
     #[test]

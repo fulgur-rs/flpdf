@@ -1769,7 +1769,12 @@ pub fn merge_documents<R: Read + Seek>(
         // selected page (in selection order, duplicates included), before any
         // other per-input processing — purely a `/PageLabels`-tree read,
         // independent of the page-copy/dest/AcroForm machinery below.
-        {
+        // An input that contributes no pages contributes no labels either —
+        // otherwise a primary carrying /PageLabels but pages: vec![] would
+        // set `any_page_labels` (and thereby install fabricated labels for
+        // every later input's pages) even though none of its own pages are
+        // in the output.
+        if !input.pages.is_empty() {
             let mut src_labels = input.source.page_labels();
             if src_labels.has_page_labels()? {
                 any_page_labels = true;
