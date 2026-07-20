@@ -123,7 +123,10 @@ pub fn insert_name_tree_dest<R: Read + Seek>(
         existing.1 = value;
     } else {
         entries.push((key.to_vec(), value));
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        // Keys are unique after the insert-or-replace merge above, so no
+        // stability guarantee is needed — unstable sort avoids the extra
+        // allocation stable sort otherwise reserves.
+        entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     }
 
     rebuild_name_tree_dests(pdf, entries)

@@ -1014,6 +1014,35 @@ fn name_tree_dests_names_present_but_no_dests_key_yields_empty_vec() {
     assert!(pdf.outline().name_tree_dests().unwrap().is_empty());
 }
 
+/// Regression: `/Names` reached via a 2-hop indirect holder chain (catalog
+/// /Names -> ref -> ref -> dict) must not silently return empty. The writer
+/// already uses `resolve_ref_chain` for this; before this fix the reader
+/// stopped after a single hop and matched the intermediate Reference
+/// against Object::Dictionary, dropping every entry on the floor.
+#[test]
+fn name_tree_dests_reads_through_multi_hop_names_chain() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Names 10 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            // 2-hop holder chain into the /Names dict.
+            (10, "11 0 R"),
+            (11, "<< /Dests 12 0 R >>"),
+            (12, "<< /Names [(only) [3 0 R /Fit]] >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    let entries = pdf.outline().name_tree_dests().unwrap();
+    assert_eq!(entries.len(), 1, "multi-hop /Names must still resolve");
+    assert_eq!(entries[0].0, b"only");
+    assert_eq!(
+        entries[0].1.as_ref().expect("dest resolves").page(),
+        Some(ObjectRef::new(3, 0)),
+    );
+}
+
 /// Round-trip acceptance: opening a document with a `/Names /Dests` name
 /// tree and rewriting it via [`write_pdf`] (no page operations, no mutation)
 /// must preserve every entry, in the same order, unchanged.

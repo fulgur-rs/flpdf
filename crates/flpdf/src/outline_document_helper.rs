@@ -412,7 +412,19 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// `/Kids` chain exceeds [`DEFAULT_MAX_OUTLINE_DEPTH`] (guards against
     /// cyclic or maliciously deep trees).
     pub fn name_tree_dests(&mut self) -> Result<Vec<(Vec<u8>, Option<Dest>)>> {
-        let Some(Object::Dictionary(mut names)) = self.catalog_value("Names")? else {
+        // `catalog_value` resolves a single level of indirection but stops
+        // short of a multi-hop holder chain (catalog /Names -> r1 -> r2 ->
+        // dict). The writer (name_tree_dests module) uses `resolve_ref_chain`
+        // for this; the reader must too or it silently returns empty when
+        // a document keeps its /Names dictionary behind more than one ref.
+        let names_obj = match self.catalog_value("Names")? {
+            Some(value @ Object::Reference(_)) => {
+                crate::ref_chain::resolve_ref_chain(self.pdf, &value)?.0
+            }
+            Some(other) => other,
+            None => return Ok(Vec::new()),
+        };
+        let Object::Dictionary(mut names) = names_obj else {
             return Ok(Vec::new());
         };
         let Some(dests_root) = names.remove("Dests") else {
