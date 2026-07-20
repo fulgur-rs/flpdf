@@ -141,6 +141,23 @@ impl LabelRange {
         d
     }
 
+    /// Build a label dictionary in the shape qpdf's
+    /// `QPDFPageLabelDocumentHelper::getLabelForPage` reconstruction produces:
+    /// `/S` and `/P` are included on the same terms as [`Self::to_dict`], but
+    /// `/St` is **always** present — never omitted for the default value `1`.
+    ///
+    /// Use this (via
+    /// [`PageLabelDocumentHelper::write_reconstructed_labels`]) for entries
+    /// coming from [`Self::labels_for_page_range`] / a page-subset or -split
+    /// operation; use [`Self::to_dict`] for a directly authored range (qpdf's
+    /// `--set-page-labels` shape), where the default `/St 1` is omitted for
+    /// brevity.
+    pub(crate) fn to_reconstructed_dict(&self) -> Dictionary {
+        let mut d = self.to_dict();
+        d.insert("St", Object::Integer(self.start));
+        d
+    }
+
     /// Render the display label for `value` (§12.4.2): `prefix` followed by the
     /// style-formatted number. [`LabelStyle::None`] and non-positive numeric
     /// values contribute no numeric portion.
@@ -395,7 +412,9 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// renumbered to begin at `new_start_idx`. Returns `(new_index, LabelRange)`
     /// pairs (the first entry plus every explicit entry in the source range),
     /// renumbered by `new_start_idx - start_idx`. Read-only; intended for
-    /// page-extraction wiring (.14.4).
+    /// page-extraction/subsetting call sites that reconstruct a document's
+    /// `/PageLabels` for a new page range (pair with
+    /// [`PageLabelDocumentHelper::write_reconstructed_labels`]).
     ///
     /// Unlike qpdf's accumulating signature, this is a single self-contained
     /// call: the leading entry is always emitted (the result vector starts
@@ -420,11 +439,15 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         // Set of explicit source indices, for hasIndex().
         let explicit: std::collections::BTreeSet<i64> = ranges.iter().map(|(i, _)| *i).collect();
 
-        // First page label (or fabricated default decimal start = 1 + new_start).
+        // First page label, or a fabricated default when start_idx precedes
+        // every explicit range: qpdf's own fabricated dict (`getLabelForPage`
+        // returning null) carries only `/St`, no `/S` — i.e. LabelStyle::None,
+        // NOT Decimal (verified against qpdf 11.9.0: `qpdf --split-pages=1`
+        // on an unlabeled leading page emits `<< /St 1 >>`, no `/S /D`).
         let first_label = match self.label_for_page(start_idx)? {
             Some(r) => r,
             None => LabelRange {
-                style: LabelStyle::Decimal,
+                style: LabelStyle::None,
                 prefix: String::new(),
                 start: new_start_idx.saturating_add(1),
             },
@@ -435,12 +458,58 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         // Iterate only the explicit indices within the span (the rest sequence
         // implicitly from the prior entry), so the cost is O(log N + M) in the
         // number of ranges rather than O(end_idx - start_idx) over the page span.
-        for &i in explicit.range((start_idx + 1)..=end_idx) {
-            if let Some(lab) = self.label_for_page(i)? {
-                out.push((i.saturating_add(idx_offset), lab));
+        // Guarded on `start_idx < end_idx`: a single-page span (start_idx ==
+        // end_idx, the common case for --split-pages=1 or a range's last
+        // page) would otherwise build the inverted bound `(start_idx+1)..=end_idx`,
+        // which `BTreeSet::range` panics on rather than treating as empty.
+        if start_idx < end_idx {
+            for &i in explicit.range((start_idx + 1)..=end_idx) {
+                if let Some(lab) = self.label_for_page(i)? {
+                    out.push((i.saturating_add(idx_offset), lab));
+                }
             }
         }
         Ok(out)
+    }
+
+    /// Install `entries` as the catalog's `/PageLabels`: a direct
+    /// (non-indirect) `<< /Nums [...] >>` dictionary — never a balanced
+    /// number tree — with each entry's label dictionary built via
+    /// [`LabelRange::to_reconstructed_dict`].
+    ///
+    /// This is the shape qpdf produces when reconstructing labels for a page
+    /// subset or split (`QPDFJob::handlePageSpecs`, `QPDFJob::doSplitPages`):
+    /// it always unconditionally replaces the catalog's `/PageLabels` with a
+    /// freshly built flat array — never merging with, or preserving the
+    /// shape of, any prior value. Pair with [`Self::labels_for_page_range`] /
+    /// [`Self::label_for_page`], which produce the `entries` this expects.
+    /// Contrast with [`Self::write_labels`], which instead rebuilds a
+    /// balanced number tree (the shape used for directly authored ranges).
+    ///
+    /// A no-op when the document has no catalog, or the catalog is not a
+    /// dictionary.
+    ///
+    /// # Errors
+    ///
+    /// Any error from [`Pdf::resolve`].
+    pub fn write_reconstructed_labels(&mut self, entries: &[(i64, LabelRange)]) -> Result<()> {
+        let Some(catalog_ref) = self.pdf.root_ref() else {
+            return Ok(());
+        };
+        let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
+            return Ok(());
+        };
+        let mut nums = Vec::with_capacity(entries.len() * 2);
+        for (idx, range) in entries {
+            nums.push(Object::Integer(*idx));
+            nums.push(Object::Dictionary(range.to_reconstructed_dict()));
+        }
+        let mut page_labels = Dictionary::new();
+        page_labels.insert("Nums", Object::Array(nums));
+        catalog.insert("PageLabels", Object::Dictionary(page_labels));
+        self.pdf
+            .set_object(catalog_ref, Object::Dictionary(catalog));
+        Ok(())
     }
 
     /// Collect the raw `(index, value Object)` entries of the `/PageLabels` tree
@@ -1223,12 +1292,26 @@ mod tests {
         let mut pdf = pdf_with_pagelabels(vec![Object::Integer(5), label_dict("D", Some(1), None)]);
         let mut h = pdf.page_labels();
         let out = h.labels_for_page_range(0, 6, 0).unwrap();
-        // First entry fabricated: Decimal, start = new_start(0) + 1 = 1.
+        // First entry fabricated: no /S (LabelStyle::None), start = new_start(0) + 1 = 1.
+        // Matches qpdf 11.9.0's own fabricated dict (`getLabelForPage` returning
+        // null): `<< /St 1 >>`, no `/S /D`.
         assert_eq!(out[0].0, 0);
-        assert_eq!(out[0].1.style, LabelStyle::Decimal);
+        assert_eq!(out[0].1.style, LabelStyle::None);
         assert_eq!(out[0].1.start, 1);
         // The explicit range at 5 is copied (renumbered to 5).
         assert!(out.iter().any(|(idx, _)| *idx == 5));
+    }
+
+    #[test]
+    fn labels_for_page_range_single_page_span_does_not_panic() {
+        // start_idx == end_idx (a single-page span, the common case for
+        // --split-pages=1 or a chunk's last page) must not panic: the
+        // internal `explicit.range((start_idx+1)..=end_idx)` bound would
+        // otherwise be inverted, which `BTreeSet::range` panics on.
+        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
+        let mut h = pdf.page_labels();
+        let out = h.labels_for_page_range(4, 4, 0).unwrap();
+        assert_eq!(out, vec![(0, dec(5))], "St 1 + offset 4 = 5");
     }
 
     #[test]
@@ -1289,6 +1372,16 @@ mod tests {
     fn dec(start: i64) -> LabelRange {
         LabelRange {
             style: LabelStyle::Decimal,
+            prefix: String::new(),
+            start,
+        }
+    }
+
+    /// Shorthand for a style-less range (no `/S`), no prefix, starting at
+    /// `start` — the shape of qpdf's fabricated "unlabeled page" default.
+    fn none_range(start: i64) -> LabelRange {
+        LabelRange {
+            style: LabelStyle::None,
             prefix: String::new(),
             start,
         }
@@ -1369,6 +1462,148 @@ mod tests {
             .write_labels(&[(-1, dec(1))])
             .expect_err("negative first_page_idx must be rejected");
         assert!(matches!(err, Error::Unsupported(_)));
+    }
+
+    // ── write_reconstructed_labels / to_reconstructed_dict ────────────────
+
+    #[test]
+    fn to_reconstructed_dict_always_includes_st() {
+        // Unlike to_dict, /St is present even at the default value 1 — qpdf's
+        // getLabelForPage-reconstructed dicts always carry an explicit /St.
+        let bare = LabelRange {
+            style: LabelStyle::None,
+            prefix: String::new(),
+            start: 1,
+        };
+        let dict = bare.to_reconstructed_dict();
+        assert_eq!(dict.get("St"), Some(&Object::Integer(1)));
+        assert_eq!(dict.get("S"), None, "None style => no /S key");
+        assert_eq!(dict.get("P"), None, "empty prefix => no /P key");
+
+        let full = LabelRange {
+            style: LabelStyle::Decimal,
+            prefix: "A-".into(),
+            start: 5,
+        };
+        let dict2 = full.to_reconstructed_dict();
+        assert_eq!(dict2.get("S"), Some(&Object::Name("D".into())));
+        assert_eq!(dict2.get("P"), Some(&Object::String(b"A-".to_vec())));
+        assert_eq!(dict2.get("St"), Some(&Object::Integer(5)));
+    }
+
+    #[test]
+    fn write_reconstructed_labels_installs_direct_nums_dict() {
+        // Installed as a direct dict — not an indirect number tree — and
+        // every entry's /St is explicit (qpdf --split-pages/--pages parity).
+        let mut pdf = bare_one_page_pdf();
+        {
+            let mut h = pdf.page_labels();
+            h.write_reconstructed_labels(&[
+                (0, none_range(1)),
+                (
+                    3,
+                    LabelRange {
+                        style: LabelStyle::Decimal,
+                        prefix: String::new(),
+                        start: 1,
+                    },
+                ),
+            ])
+            .unwrap();
+        }
+        let catalog_ref = pdf.root_ref().unwrap();
+        let catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        let Some(Object::Dictionary(page_labels)) = catalog.get("PageLabels") else {
+            panic!("/PageLabels must be a direct dictionary, got {catalog:?}");
+        };
+        let Some(Object::Array(nums)) = page_labels.get("Nums") else {
+            panic!("/Nums must be a direct array");
+        };
+        assert_eq!(nums.len(), 4, "2 entries * (index, dict)");
+        assert_eq!(nums[0], Object::Integer(0));
+        assert_eq!(
+            nums[1],
+            Object::Dictionary({
+                let mut d = Dictionary::new();
+                d.insert("St", Object::Integer(1));
+                d
+            }),
+            "no /S for a None-style fabricated entry"
+        );
+        assert_eq!(nums[2], Object::Integer(3));
+        assert_eq!(
+            nums[3],
+            Object::Dictionary({
+                let mut d = Dictionary::new();
+                d.insert("S", Object::Name("D".into()));
+                d.insert("St", Object::Integer(1));
+                d
+            }),
+            "/St 1 stays explicit, unlike to_dict"
+        );
+
+        // The high-level reader round-trips the installed entries too.
+        let mut h = pdf.page_labels();
+        let ranges = h.ranges().unwrap();
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges[1].0, 3);
+    }
+
+    #[test]
+    fn write_reconstructed_labels_replaces_existing_indirect_tree() {
+        // A pre-existing indirect /PageLabels root is unconditionally replaced
+        // by a fresh direct dict (qpdf never merges).
+        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("R", Some(1), None)]);
+        {
+            let mut h = pdf.page_labels();
+            h.write_reconstructed_labels(&[(0, none_range(1))]).unwrap();
+        }
+        let catalog_ref = pdf.root_ref().unwrap();
+        let catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        assert!(
+            matches!(catalog.get("PageLabels"), Some(Object::Dictionary(_))),
+            "/PageLabels must now be a direct dict, not the old indirect ref"
+        );
+    }
+
+    #[test]
+    fn write_reconstructed_labels_noop_without_root() {
+        // A trailer without /Root must degrade gracefully, matching the same
+        // tolerant style as rebuild()/set_range() elsewhere in this file.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.7\n");
+        let off1 = bytes.len() as u64;
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{off1:010} 00000 n \ntrailer\n<< /Size 2 >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("rootless trailer still opens");
+        let mut h = pdf.page_labels();
+        h.write_reconstructed_labels(&[(0, none_range(1))]).unwrap();
+    }
+
+    #[test]
+    fn write_reconstructed_labels_noop_on_non_dict_catalog() {
+        let mut pdf = bare_one_page_pdf();
+        let catalog_ref = pdf.root_ref().unwrap();
+        pdf.set_object(catalog_ref, Object::Integer(0)); // catalog no longer a dict
+        let mut h = pdf.page_labels();
+        h.write_reconstructed_labels(&[(0, none_range(1))]).unwrap();
     }
 
     // ── insert_pages ──────────────────────────────────────────────────────
