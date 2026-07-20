@@ -130,6 +130,11 @@ fn get_root_empty_when_no_outline() {
 #[test]
 fn iter_yields_preorder() {
     let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
+    // `.clone()` is structurally required, not a review-rule-1 slip:
+    // `OutlineNode` has a manual `Drop` (iterative teardown of `children`),
+    // so partial field moves like `let s = n.title` fail with E0509
+    // ("cannot move out of type ..., which implements the `Drop` trait").
+    // Same rationale at every `n.title.clone()` / `n.action.clone()` below.
     let titles: Vec<String> = pdf
         .outline()
         .iter()
