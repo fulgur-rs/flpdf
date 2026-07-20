@@ -862,20 +862,25 @@ fn walk_outline_se<R: Read + Seek>(
             break; // cycle - stop this chain
         }
 
-        // `resolve()` returns an owned `Object` (review rule 1): moved directly
-        // into `dict` rather than cloned again, since the dictionary may need
-        // mutating below.
-        let Object::Dictionary(mut dict) = pdf.resolve(current_ref)? else {
+        // Peek via a borrow first (pruning is the rare case). We only
+        // materialize an owned mutable dict + `set_object` when there is
+        // actually a dangling `/SE` to drop; the common no-op path avoids
+        // the deep dict clone entirely.
+        let Object::Dictionary(dict) = pdf.resolve_borrowed(current_ref)? else {
             break;
         };
         let first = dict.get_ref("First");
         let next = dict.get_ref("Next");
+        let se = dict.get_ref("SE");
 
-        if let Some(se_ref) = dict.get_ref("SE") {
+        if let Some(se_ref) = se {
             if !live.contains(&se_ref) {
-                dict.remove("SE");
-                pdf.set_object(current_ref, Object::Dictionary(dict));
-                pruned += 1;
+                // Now we need to mutate — take an owned dict via resolve().
+                if let Object::Dictionary(mut dict) = pdf.resolve(current_ref)? {
+                    dict.remove("SE");
+                    pdf.set_object(current_ref, Object::Dictionary(dict));
+                    pruned += 1;
+                }
             }
         }
 
