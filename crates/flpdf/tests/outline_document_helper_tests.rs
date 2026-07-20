@@ -1614,6 +1614,16 @@ fn prune_outline_se_non_dict_item_breaks_walk_gracefully() {
     );
 }
 
+#[test]
+fn get_root_non_dict_first_item_breaks_walk_gracefully() {
+    let mut pdf = Pdf::open(Cursor::new(outline_se_first_not_a_dict_pdf())).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    assert!(
+        roots.is_empty(),
+        "a non-dictionary outline item must be skipped, not produce a node"
+    );
+}
+
 // -----------------------------------------------------------------------
 // flpdf-9hc.14.5: outline `/A` action coverage (GoTo/GoToR/URI/Launch/Named)
 // -----------------------------------------------------------------------
@@ -2836,4 +2846,15 @@ fn check_outline_links_depth_cap_is_enforced() {
     let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(10))).unwrap();
     let err = pdf.outline().check_links_with_max_depth(5);
     assert!(err.is_err(), "expected depth-cap error, got {err:?}");
+}
+
+#[test]
+fn check_outline_links_non_dict_item_breaks_walk_gracefully() {
+    let mut pdf = Pdf::open(Cursor::new(outline_se_first_not_a_dict_pdf())).unwrap();
+    let diagnostics = check_outline_links(&mut pdf).unwrap();
+    assert!(
+        diagnostics.entries().is_empty(),
+        "a non-dictionary outline item must be skipped, not diagnosed: {:?}",
+        diagnostics.entries()
+    );
 }
