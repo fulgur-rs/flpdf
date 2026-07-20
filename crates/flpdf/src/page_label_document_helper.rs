@@ -543,6 +543,9 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// `count` pages inserted at 0-based position `at`. Ranges before `at` are
     /// left untouched, so pages inserted in the middle of an existing range's
     /// span inherit that range's numbering (no new explicit entry is needed).
+    /// [`merge_adjacent_ranges`] then folds away a shifted range that the
+    /// insertion happened to turn into a redundant continuation of its
+    /// predecessor (an intentional gap of exactly `count` pages closes up).
     ///
     /// A no-op when `count == 0` or when the document has no `/PageLabels`
     /// (this never fabricates a tree where none existed).
@@ -572,7 +575,12 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
                 }
             })
             .collect();
-        self.write_labels(&shifted)
+        // Shifting can turn a pre-existing intentional jump (e.g. an explicit
+        // restart placed exactly `count` pages after its predecessor) into a
+        // same-sequence continuation once the gap is filled by the inserted
+        // pages; fold it away like `remove_pages` does.
+        let merged = merge_adjacent_ranges(shifted);
+        self.write_labels(&merged)
     }
 
     /// Update label ranges for `count` pages removed at 0-based position
@@ -1296,6 +1304,27 @@ mod tests {
         // back to the plain 1-based default rather than inheriting page 2's "1".
         assert_eq!(h.label_string_for_page(0).unwrap(), "1");
         assert_eq!(h.label_string_for_page(2).unwrap(), "1");
+    }
+
+    #[test]
+    fn insert_pages_merges_shift_that_closes_an_exact_gap() {
+        // (5, Decimal, start 8) is an intentional forward jump over (0,
+        // Decimal, start 1) -- numbers 6 and 7 are deliberately skipped.
+        // Inserting exactly 2 pages at position 2 shifts it to index 7, and
+        // 1 + 7 == 8: the gap the insertion fills is exactly the jump that
+        // made the second entry non-redundant, so it must now collapse.
+        let mut pdf = pdf_with_pagelabels(vec![
+            Object::Integer(0),
+            label_dict("D", Some(1), None),
+            Object::Integer(5),
+            label_dict("D", Some(8), None),
+        ]);
+        {
+            let mut h = pdf.page_labels();
+            h.insert_pages(2, 2).unwrap();
+        }
+        let mut h = pdf.page_labels();
+        assert_eq!(h.ranges().unwrap(), vec![(0, dec(1))]);
     }
 
     #[test]
