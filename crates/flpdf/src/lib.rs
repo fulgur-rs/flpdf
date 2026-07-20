@@ -39,18 +39,26 @@
 //!
 //! # Known limitations
 //!
-//! - **Outline and page-label preservation.** [`OutlineDocumentHelper`] and
-//!   [`PageLabelDocumentHelper`] round-trip through [`write_pdf`] and survive
-//!   page operations ([`extract_pages`], [`rebuild_page_tree`],
-//!   [`merge_documents`]) for: deeply nested outlines (no practical depth
-//!   limit; walks are iterative, not recursive); both destination sources —
-//!   the legacy catalog `/Dests` dictionary and the modern `/Names /Dests`
-//!   name tree (ISO 32000-2 §7.9.6, §12.3.2.3) — present in the same
-//!   document; all five `/A` action subtypes (`GoTo`, `GoToR`, `URI`,
-//!   `Launch`, `Named`) plus their `/Next` chains (ISO 32000-2 §12.6.2); the
-//!   `/SE` structure-element link (ISO 32000-2 §14.7); and `/PageLabels`
-//!   number-tree ranges (ISO 32000-2 §7.9.7), including reconstruction across
-//!   `--pages`-style subset/merge operations.
+//! - **Outline and page-label preservation.** Support scope varies by
+//!   operation:
+//!
+//!   - [`write_pdf`] and [`rebuild_page_tree`] preserve both destination
+//!     sources — the legacy catalog `/Dests` dictionary and the modern
+//!     `/Names /Dests` name tree (ISO 32000-2 §7.9.6, §12.3.2.3); deeply
+//!     nested outlines (walks are iterative); all five `/A` action subtypes
+//!     (`GoTo`, `GoToR`, `URI`, `Launch`, `Named`) plus their `/Next`
+//!     chains (ISO 32000-2 §12.6.2); the `/SE` structure-element link
+//!     (ISO 32000-2 §14.7); and the `/PageLabels` number-tree ranges
+//!     (ISO 32000-2 §7.9.7).
+//!   - [`merge_documents`] preserves the same for the PRIMARY input only
+//!     (matching qpdf `--pages`), and reconstructs `/PageLabels` across
+//!     every input's selected pages.
+//!   - [`extract_pages`] returns a *minimal* new document that intentionally
+//!     omits catalog-level navigation — `/Outlines`, catalog `/Dests`, and
+//!     `/Names /Dests` are all dropped. Only `/PageLabels` is reconstructed
+//!     for the selection. Callers who need outlines/dests preserved should
+//!     stay on the source document with [`rebuild_page_tree`] or use
+//!     [`merge_documents`] with a single input.
 //! - **`/SE` is not pruned automatically.** Built-in page-operation helpers
 //!   only drop a structure element's now-dangling `/Pg` entry
 //!   ([`struct_tree_pg::drop_struct_elem_dangling_pg`]) — they never remove
