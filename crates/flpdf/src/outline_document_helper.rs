@@ -439,6 +439,17 @@ pub fn check_legacy_dests<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Diagnostic
         return Ok(diagnostics);
     }
 
+    // Every `/Dests` entry with a resolvable page ref is what the page-tree
+    // walk below is validating; if not a single entry has one (all values
+    // are named/string/unresolved), the walk cannot possibly flag anything
+    // — skip the O(N) `page_refs(pdf)` traversal entirely.
+    let has_resolvable_page_ref = entries
+        .iter()
+        .any(|(_, dest)| dest.as_ref().and_then(|d| d.page()).is_some());
+    if !has_resolvable_page_ref {
+        return Ok(diagnostics);
+    }
+
     let live_pages: BTreeSet<ObjectRef> = match crate::pages::page_refs(pdf) {
         Ok(refs) => refs.into_iter().collect(),
         Err(error) => {
