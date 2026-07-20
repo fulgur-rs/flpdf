@@ -42,7 +42,7 @@
 //! - **Outline and page-label preservation.** Support scope varies by
 //!   operation:
 //!
-//!   - [`write_pdf`] and [`rebuild_page_tree`] preserve both destination
+//!   - [`write_pdf`] (with no page selection) preserves both destination
 //!     sources — the legacy catalog `/Dests` dictionary and the modern
 //!     `/Names /Dests` name tree (ISO 32000-2 §7.9.6, §12.3.2.3); deeply
 //!     nested outlines (walks are iterative); all five `/A` action subtypes
@@ -50,15 +50,25 @@
 //!     chains (ISO 32000-2 §12.6.2); the `/SE` structure-element link
 //!     (ISO 32000-2 §14.7); and the `/PageLabels` number-tree ranges
 //!     (ISO 32000-2 §7.9.7).
-//!   - [`merge_documents`] preserves the same for the PRIMARY input only
-//!     (matching qpdf `--pages`), and reconstructs `/PageLabels` across
-//!     every input's selected pages.
+//!   - [`rebuild_page_tree`] alone only rewrites the `/Pages` tree; it
+//!     does NOT remap outline `/Dest` refs, does NOT drop `/Dests`
+//!     entries whose targets went away, and does NOT reconstruct
+//!     `/PageLabels`. Serializing only `rebuild_page_tree`'s output
+//!     leaves stale destinations and label ranges pointing at pages no
+//!     longer in the tree. Pair it with
+//!     [`remap_outline_and_dests`] and (when labels matter)
+//!     [`PageLabelDocumentHelper::labels_for_selection`] +
+//!     [`PageLabelDocumentHelper::write_reconstructed_labels`] — the
+//!     [`extract_pages`] and [`merge_documents`] pipelines assemble
+//!     that combination for you.
+//!   - [`merge_documents`] preserves outlines and both dest sources for
+//!     the PRIMARY input only (matching qpdf `--pages`), and reconstructs
+//!     `/PageLabels` across every input's selected pages.
 //!   - [`extract_pages`] returns a *minimal* new document that intentionally
 //!     omits catalog-level navigation — `/Outlines`, catalog `/Dests`, and
 //!     `/Names /Dests` are all dropped. Only `/PageLabels` is reconstructed
 //!     for the selection. Callers who need outlines/dests preserved should
-//!     stay on the source document with [`rebuild_page_tree`] or use
-//!     [`merge_documents`] with a single input.
+//!     use [`merge_documents`] with a single input.
 //! - **`/SE` is not pruned automatically.** Built-in page-operation helpers
 //!   only drop a structure element's now-dangling `/Pg` entry
 //!   ([`struct_tree_pg::drop_struct_elem_dangling_pg`]) — they never remove
