@@ -1337,7 +1337,7 @@ mod tests {
         // The serialised /P must be UTF-16BE-with-BOM (starts with 0xFE 0xFF),
         // NOT raw UTF-8 (which for `§` would be 0xC2 0xA7).
         let Object::String(bytes) = d.get("P").expect("/P present") else {
-            panic!("/P must be a string");
+            panic!("/P must be a string"); // cov:ignore: test-shape guard, unreachable given to_dict emits Object::String
         };
         assert_eq!(&bytes[..2], &[0xFE, 0xFF], "must have UTF-16BE BOM");
     }
@@ -1353,7 +1353,7 @@ mod tests {
         };
         let d = r.to_dict();
         let Object::String(bytes) = d.get("P").expect("/P present") else {
-            panic!("/P must be a string");
+            panic!("/P must be a string"); // cov:ignore: test-shape guard, unreachable given to_dict emits Object::String
         };
         assert_eq!(bytes, b"App-", "pure ASCII must stay verbatim");
     }
