@@ -288,14 +288,19 @@ const MAX_INLINE_DEST_DEPTH: usize = 64;
 /// reached and remapped regardless of how the destination is shaped:
 /// - an `[page /Fit …]` array → its leading page ref is remapped;
 /// - a `<< /D <dest> >>` destination dictionary → its `/D` is remapped (recursed);
-/// - an indirect reference to either → resolved (against `source`) then remapped,
-///   so the un-copied intermediate holder is sidestepped (the catalog is never
-///   copied, so an indirect holder named only from it is absent from the output);
+/// - an indirect destination wrapper → resolved against `source` so its concrete
+///   array/dictionary can be rebuilt;
 /// - any other shape (a name/string named destination) is returned unchanged.
 ///
-/// A page absent from `map` (the destination's target was removed) keeps its
-/// source reference, which has been copied as a placeholder and nulled — so it
-/// resolves to `null` in the output, matching the indirect-carrier null-out.
+/// Before this runs, the direct catalog carrier is folded through the generic
+/// object closure. Every indirect holder reachable from it, and every page
+/// boundary reached through those holders, is therefore present in `map`.
+/// Remapping preserves that reference structure: for example, a destination
+/// array whose leading ref names a page holder points at the copied holder, which
+/// in turn points at the copied page. If that copied page was not selected, the
+/// later page-boundary null-out replaces its body with `Null` while leaving the
+/// carrier chain intact.
+///
 /// Inline `/D` nesting is bounded by [`MAX_INLINE_DEST_DEPTH`] and reference
 /// indirection by [`resolve_ref_chain`].
 fn remap_inline_dest<R: Read + Seek>(

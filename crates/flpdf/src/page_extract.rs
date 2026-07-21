@@ -45,7 +45,6 @@ use crate::page_tree_rebuild::resolve_inherited_raw;
 use crate::pages::{
     page_refs, resolve_inherited_resources_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH,
 };
-use crate::ref_chain::resolve_ref_chain;
 use crate::subset_prune::sweep_unreachable_objects;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -379,53 +378,6 @@ pub(crate) fn append_selection_kids(
         kids.push(kid);
     }
     Ok(())
-}
-
-/// Resolve a GoTo `/SD` structure destination to its target page reference, or
-/// `None` when it carries no in-document page ref.
-///
-/// An `/SD` value is `[structElemRef /Fit ...]` (or an indirect ref to one);
-/// the first element is a *structure element*, whose `/Pg` is the target page
-/// (ISO 32000-2 §12.6.4.3). Named structure destinations (a name/string,
-/// resolved via the structure tree) carry no in-document page ref and return
-/// `None`. A missing / unresolvable / non-Page `/Pg` also returns `None`. Each
-/// level may be indirect; [`resolve_ref_chain`] bounds the indirection.
-///
-/// Shared with page merging so structure destinations use the same
-/// StructElem -> `/Pg` resolution.
-pub(crate) fn sd_target_page_ref<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    sd: &Object,
-) -> Result<Option<ObjectRef>> {
-    let (concrete, _) = resolve_ref_chain(pdf, sd)?;
-    let Object::Array(arr) = concrete else {
-        return Ok(None); // named structure destination or malformed
-    };
-    let Some(struct_elem) = arr.into_iter().next() else {
-        return Ok(None);
-    };
-    let (se, _) = resolve_ref_chain(pdf, &struct_elem)?;
-    let Some(se_dict) = se.into_dict() else {
-        return Ok(None);
-    };
-    let Some(pg) = se_dict.get("Pg").cloned() else {
-        return Ok(None);
-    };
-    let (pg_concrete, pg_ref) = resolve_ref_chain(pdf, &pg)?;
-    // `/SD` reaches the page through a StructElem -> `/Pg` hop, so confirm the
-    // resolved `/Pg` target is actually a `/Type /Page` before treating it as a
-    // page destination.
-    Ok(match pg_ref {
-        Some(r) if is_page_dict(&pg_concrete) => Some(r),
-        _ => None,
-    })
-}
-
-/// `true` when `obj` is a `<< /Type /Page ... >>` dictionary.
-fn is_page_dict(obj: &Object) -> bool {
-    obj.as_dict()
-        .and_then(|d| d.get("Type"))
-        .is_some_and(|t| matches!(t, Object::Name(n) if n == b"Page"))
 }
 
 /// Minimal valid target: Catalog(1) + empty Pages(2). No placeholder page (so
