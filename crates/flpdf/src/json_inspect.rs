@@ -2878,6 +2878,10 @@ mod tests {
             qpdf_utf8_value(&[0xfe, 0xff, 0x54, 0x0d, 0x52, 0x4d]),
             "名前"
         );
+        assert_eq!(
+            qpdf_utf8_value(&[0xff, 0xfe, 0x0d, 0x54, 0x4d, 0x52]),
+            "名前"
+        );
         assert_eq!(qpdf_utf8_value(&[0x95]), "Ł");
     }
 
