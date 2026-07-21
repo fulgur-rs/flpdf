@@ -297,9 +297,9 @@ const MAX_INLINE_DEST_DEPTH: usize = 64;
 /// boundary reached through those holders, is therefore present in `map`.
 /// Remapping preserves that reference structure: for example, a destination
 /// array whose leading ref names a page holder points at the copied holder, which
-/// in turn points at the copied page. If that copied page was not selected, the
-/// later page-boundary null-out replaces its body with `Null` while leaving the
-/// carrier chain intact.
+/// in turn points at the copied page. Catalog wiring happens after the
+/// page-boundary null-out, so when that page was not selected, its `map` target
+/// already has a `Null` body while the holder/carrier chain remains intact.
 ///
 /// Inline `/D` nesting is bounded by [`MAX_INLINE_DEST_DEPTH`] and reference
 /// indirection by [`resolve_ref_chain`].
@@ -320,18 +320,19 @@ fn remap_inline_dest_depth<R: Read + Seek>(
     if depth == 0 {
         return Ok(dest.clone()); // cov:ignore: inline /D nesting deeper than MAX_INLINE_DEST_DEPTH (DoS bound)
     }
-    // Resolve an indirect holder to its concrete array/dict form (the holder
-    // itself is named only from the never-copied catalog, so inlining the
-    // resolved value is what reaches the page ref present in `map`).
+    // Resolve a destination wrapper to its concrete array/dict shape so the
+    // inline catalog carrier can be reconstructed. The generic closure has
+    // already copied the wrapper and everything it reaches; references embedded
+    // in the concrete value are remapped through `map` below, preserving holder
+    // chains within that rebuilt carrier.
     let (concrete, _) = resolve_ref_chain(source, dest)?;
     match concrete {
         Object::Array(mut arr) => {
             // The leading page ref may be a holder chain (`r → r2 → page`); the
-            // copy map keys pages by their TERMINAL ref. The common case is a
-            // direct ref already present in `map`, so match it first and only fall
-            // back to a terminal-normalizing chain resolve (a `pdf.resolve`) when
-            // the direct lookup misses — otherwise a doubled-indirect dest ref
-            // would be emitted as the (uncopied) source holder ref.
+            // generic closure normally puts the leading holder itself in `map`,
+            // so prefer that direct mapping and preserve the copied chain. The
+            // terminal-normalizing fallback handles a map that contains only the
+            // terminal page, avoiding an unremapped source-space reference.
             let first_ref = match arr.first() {
                 Some(Object::Reference(r)) => Some(*r),
                 _ => None,
