@@ -21,14 +21,11 @@
 
 use crate::acroform_document_helper::{collect_refs_in_object, remap_refs_in_object};
 use crate::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
-use crate::name_number_tree::{read_name_tree, DEFAULT_MAX_TREE_DEPTH};
 use crate::object_copy::copy_objects;
-use crate::outline::DEFAULT_MAX_OUTLINE_DEPTH;
-use crate::outline_dest_remap::dest_page_ref_resolved;
-use crate::page_closure::extend_page_object_closure;
+use crate::page_closure::{extend_object_closure, extend_page_object_closure};
 use crate::page_extract::{
-    append_selection_kids, materialize_leaf, minimal_target_bytes, resolve_dict,
-    sd_target_page_ref, target_pages_root, InheritedAttrs,
+    append_selection_kids, materialize_leaf, minimal_target_bytes, null_copied_removed_pages,
+    resolve_dict, target_pages_root, InheritedAttrs,
 };
 use crate::page_label_document_helper::{merge_adjacent_ranges, LabelRange};
 use crate::pages::{page_refs, DEFAULT_MAX_PAGE_TREE_DEPTH};
@@ -45,298 +42,6 @@ pub struct MergeInput<'a, R: Read + Seek> {
     pub source: &'a mut Pdf<R>,
     /// 0-based page indices to copy, in output order.
     pub pages: Vec<usize>,
-}
-
-/// Inline-`/Next`-nesting bound for action-chain traversal, mirroring extract's
-/// `MAX_ACTION_CHAIN_DEPTH` so a cyclic or pathologically deep inline `/Next`
-/// chain terminates. Indirect `/Next` cycles are additionally bounded by a
-/// per-walk `visited` set.
-const MAX_ACTION_CHAIN_DEPTH: usize = 64;
-
-/// Collect the source page references reachable from `page_ref` through the
-/// *destination* family of carriers, keeping only targets that are *not* in
-/// `selected` (the input's chosen pages). Those are the removed pages a
-/// destination still points at; for qpdf `--pages` null-out parity they are
-/// copied as placeholders and then replaced with `null`, so the reference
-/// survives but resolves to a null page object.
-///
-/// The destination carriers, per page, are:
-/// - each `/Annots` annotation's `/Dest` and `/A` action chain;
-/// - each annotation's `/AA` additional actions and the page's own `/AA`.
-///
-/// Within each action chain, both `/GoTo /D` page destinations and `/GoTo /SD`
-/// structure destinations are followed, as are `/Next` continuations (single
-/// action or array form).
-///
-/// Scope note — this covers the *destination* family only, which is the family
-/// qpdf `--pages` null-outs. It deliberately does NOT walk a thread bead's `/P`
-/// or a structure element's `/Pg` reached from an unselected page: those belong
-/// to a drop-and-garbage-collect family (qpdf removes the page entirely rather
-/// than leaving a null in its place), so nulling them would be the wrong shape.
-/// Such pages are not pruned here; see [`merge_documents`] for the resulting
-/// constraint.
-///
-/// Indirect references are resolved throughout via [`resolve_ref_chain`] /
-/// [`dest_page_ref_resolved`] / [`sd_target_page_ref`], which bound the
-/// indirection. Named/string/external destinations carry no in-document page
-/// reference and contribute nothing.
-fn collect_removed_dest_targets<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    page_ref: ObjectRef,
-    selected: &BTreeSet<ObjectRef>,
-    removed: &mut BTreeSet<ObjectRef>,
-) -> Result<()> {
-    // Detach the values that need a `&mut source` resolve before mutating the
-    // borrow: the raw /Annots value and the page's own /AA value.
-    let (annots_val, page_aa): (Option<Object>, Option<Object>) = {
-        let page_obj = source.resolve_borrowed(page_ref)?;
-        let Some(page_dict) = page_obj.as_dict() else {
-            return Ok(()); // cov:ignore: malformed input — a page ref always resolves to a dictionary
-        };
-        (
-            page_dict.get("Annots").cloned(),
-            page_dict.get("AA").cloned(),
-        )
-    };
-
-    // /Annots may be an inline array or an indirect reference to one (mirrors
-    // neutralize_absent_dests). Each array element is either an indirect
-    // reference to an annotation dict OR a direct (inline) annotation dict; both
-    // carry destinations and must be scanned (an inline annot whose /Dest points
-    // at a removed page is otherwise missed, leaving a live orphan instead of a
-    // null target).
-    let annot_elems: Vec<Object> = match annots_val {
-        Some(Object::Array(arr)) => arr,
-        // /Annots may be reached through a multi-hop indirect chain (a ref to a
-        // ref to the array); follow the whole chain via resolve_ref_chain so the
-        // terminal array is reached (a one-level resolve would stop on an
-        // intermediate Reference and miss the annotations). resolve_ref_chain
-        // returns an owned Object, so no clone is needed.
-        Some(r @ Object::Reference(_)) => match resolve_ref_chain(source, &r)?.0 {
-            Object::Array(arr) => arr,
-            _ => Vec::new(),
-        },
-        _ => Vec::new(),
-    };
-    for elem in annot_elems {
-        // Resolve an indirect element to its annotation dict (releasing the
-        // source borrow via `.cloned()`); an inline dict is scanned directly,
-        // borrowing the owned array element rather than `source`.
-        match elem {
-            Object::Reference(annot_ref) => {
-                // The element may be a reference to a reference to the annotation;
-                // follow the whole chain so a multi-hop annotation is scanned (a
-                // one-hop resolve would stop on an intermediate Reference and miss
-                // its removed-page destinations).
-                let (concrete, _) = resolve_ref_chain(source, &Object::Reference(annot_ref))?;
-                let Some(annot) = concrete.into_dict() else {
-                    continue;
-                };
-                scan_annotation(source, &annot, selected, removed)?;
-            }
-            Object::Dictionary(annot) => {
-                scan_annotation(source, &annot, selected, removed)?;
-            }
-            // A non-ref, non-dict /Annots element is malformed; skip it.
-            _ => {} // cov:ignore: malformed /Annots element (neither reference nor dict)
-        }
-    }
-
-    // Page-level /AA: each entry (/O, /C, …) is an action chain.
-    if let Some(aa_val) = page_aa {
-        collect_aa_dest_targets(source, &aa_val, selected, removed)?;
-    }
-
-    Ok(())
-}
-
-/// Scan one annotation dictionary's destination carriers (`/Dest`, the `/A`
-/// action chain, and the annotation-level `/AA`) for targets pointing at a
-/// removed page. Shared by the indirect-reference and inline (direct) `/Annots`
-/// element paths so both kinds of annotation are null-out'd identically.
-fn scan_annotation<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    annot: &Dictionary,
-    selected: &BTreeSet<ObjectRef>,
-    removed: &mut BTreeSet<ObjectRef>,
-) -> Result<()> {
-    // /Dest — explicit array/dict destination (mirrors
-    // neutralize_annot_if_absent's /Dest arm).
-    if let Some(dest) = annot.get("Dest") {
-        collect_dest_target(source, dest, selected, removed)?;
-    }
-    // /A — an action chain (mirrors the /A arm via neutralize_action_chain).
-    if let Some(a_val) = annot.get("A") {
-        let mut visited = BTreeSet::new();
-        collect_action_chain_targets(
-            source,
-            a_val,
-            selected,
-            removed,
-            &mut visited,
-            MAX_ACTION_CHAIN_DEPTH,
-        )?; // cov:ignore: `?` Err arm — resolve cannot fail on already-opened action objects
-    }
-    // Annotation-level /AA (e.g. a widget's /E enter, /X exit actions);
-    // each entry is an action chain.
-    if let Some(aa_val) = annot.get("AA") {
-        collect_aa_dest_targets(source, aa_val, selected, removed)?;
-    }
-    Ok(())
-}
-
-/// Scan every entry of an additional-actions (`/AA`) value for destinations
-/// targeting a removed page. The value may be an inline dict or an indirect
-/// reference to one ([`resolve_ref_chain`] bounds the indirection). Mirrors
-/// extract's `neutralize_aa_if_absent` (collect-only).
-fn collect_aa_dest_targets<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    aa_value: &Object,
-    selected: &BTreeSet<ObjectRef>,
-    removed: &mut BTreeSet<ObjectRef>,
-) -> Result<()> {
-    let (concrete, _) = resolve_ref_chain(source, aa_value)?;
-    // A non-dictionary /AA is malformed; nothing to scan.
-    if let Some(aa) = concrete.into_dict() {
-        for (_key, sub) in aa.iter() {
-            // Each subaction is an independent chain; reset `visited` per entry,
-            // matching neutralize_aa_if_absent.
-            let mut visited = BTreeSet::new();
-            collect_action_chain_targets(
-                source,
-                sub,
-                selected,
-                removed,
-                &mut visited,
-                MAX_ACTION_CHAIN_DEPTH,
-            )?; // cov:ignore: `?` Err arm — resolve cannot fail on already-opened action objects
-        }
-    }
-    Ok(())
-}
-
-/// Resolve `dest` to its target page reference and record it in `removed` when
-/// it is not in `selected`.
-fn collect_dest_target<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    dest: &Object,
-    selected: &BTreeSet<ObjectRef>,
-    removed: &mut BTreeSet<ObjectRef>,
-) -> Result<()> {
-    if let Some(target) = dest_page_ref_resolved(source, dest)? {
-        // `dest_page_ref_resolved` returns the dest array's LEADING ref as-is; that
-        // ref may be a holder chain (a ref to a ref to the page). `selected` holds
-        // terminal page refs (from `page_refs`), and the copy map keys pages by
-        // their terminal, so normalize the leading ref to its terminal before the
-        // membership check and before recording it — otherwise a holder ref to a
-        // SELECTED page is wrongly treated as removed (and nulled).
-        let target = resolve_ref_chain(source, &Object::Reference(target))?
-            .1
-            .unwrap_or(target);
-        if !selected.contains(&target) {
-            removed.insert(target);
-        }
-    }
-    Ok(())
-}
-
-/// Walk an action value (`/A`, an `/AA` subaction, or a `/Next` element),
-/// recording the target page of every `/GoTo /D` and `/GoTo /SD` whose
-/// destination is a removed page, and following `/Next` continuations (single
-/// action or array). Mirrors extract's `neutralize_action_chain` /
-/// `neutralize_action_array` (collect-only): indirect cycles are bounded by
-/// `visited`, inline `/Next` nesting by `depth`.
-fn collect_action_chain_targets<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    action_value: &Object,
-    selected: &BTreeSet<ObjectRef>,
-    removed: &mut BTreeSet<ObjectRef>,
-    visited: &mut BTreeSet<ObjectRef>,
-    depth: usize,
-) -> Result<()> {
-    if depth == 0 {
-        return Ok(()); // cov:ignore: inline /Next nesting deeper than MAX_ACTION_CHAIN_DEPTH (DoS bound)
-    }
-
-    let (concrete, terminal_ref) = resolve_ref_chain(source, action_value)?;
-    // Indirect-cycle guard: stop if we have already entered this action object.
-    if let Some(r) = terminal_ref {
-        if !visited.insert(r) {
-            return Ok(());
-        }
-    }
-
-    // An action value may be an ARRAY of actions (ISO 32000-1 §12.6.3: `/Next`
-    // may be a single action or an array). Handle it before the dict path so an
-    // array stored as a separate object is not silently skipped.
-    if let Object::Array(elems) = concrete {
-        for elem in &elems {
-            collect_action_chain_targets(source, elem, selected, removed, visited, depth - 1)?;
-        }
-        return Ok(());
-    }
-
-    let Some(action) = concrete.into_dict() else {
-        return Ok(());
-    };
-    let is_goto = matches!(action.get("S"), Some(Object::Name(n)) if n == b"GoTo");
-    if is_goto {
-        if let Some(d_val) = action.get("D") {
-            collect_dest_target(source, d_val, selected, removed)?;
-        }
-        if let Some(sd_val) = action.get("SD") {
-            collect_sd_target(source, sd_val, selected, removed)?;
-        }
-    }
-
-    // /Next — a single action or an array of actions. Recurse into each.
-    if let Some(next_val) = action.get("Next") {
-        match next_val {
-            Object::Array(elems) => {
-                // Each array element is an independent action chain, recursed at
-                // `depth - 1` (matching extract's neutralize_action_array so the
-                // inline-nesting bound stays identical across the two paths).
-                for elem in elems {
-                    collect_action_chain_targets(
-                        source,
-                        elem,
-                        selected,
-                        removed,
-                        visited,
-                        depth - 1,
-                    )?; // cov:ignore: `?` Err arm — resolve cannot fail on already-opened action objects
-                }
-            }
-            single => {
-                collect_action_chain_targets(
-                    source,
-                    single,
-                    selected,
-                    removed,
-                    visited,
-                    depth - 1,
-                )?; // cov:ignore: `?` Err arm — resolve cannot fail on already-opened action objects
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Resolve a `/GoTo /SD` structure destination to its target page (via the
-/// StructElem `/Pg` hop) and record it in `removed` when not in `selected`.
-/// Shares [`sd_target_page_ref`] with extract.
-fn collect_sd_target<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    sd: &Object,
-    selected: &BTreeSet<ObjectRef>,
-    removed: &mut BTreeSet<ObjectRef>,
-) -> Result<()> {
-    if let Some(target) = sd_target_page_ref(source, sd)? {
-        if !selected.contains(&target) {
-            removed.insert(target);
-        }
-    }
-    Ok(())
 }
 
 /// Primary-only document-level structures discovered on `inputs[0]`'s catalog,
@@ -448,10 +153,9 @@ fn discover_primary_doc_level<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Pri
     Ok(doc)
 }
 
-/// Fold every indirect document-level carrier of `doc` into `closure` via the
-/// complete transitive [`page_object_closure`](crate::page_closure::page_object_closure)
-/// (which stops at `Page`/`Catalog`
-/// dicts, collecting a destination page as a leaf reference without descending).
+/// Fold every document-level carrier of `doc` into `closure` via the generic
+/// object-root traversal (which stops at `Page`/`Catalog` dictionaries,
+/// collecting a destination page as a leaf reference without descending).
 /// This makes the primary's single `copy_objects` pass copy the whole outline /
 /// name-tree / action graph and remap every destination in one rewrite — no
 /// separate post-copy remap pass is needed (or wanted).
@@ -472,368 +176,37 @@ fn fold_doc_level_closure<R: Read + Seek>(
         // Thread one `visited` set (the accumulating `closure`) through every
         // doc-level root so a subtree reachable from several roots (e.g. a page
         // referenced by both an outline item and the `/OpenAction`) is walked
-        // once for the union. Behaviour-preserving: the shared-visited union
-        // equals the independent union (start refs are force-traversed; non-start
-        // `Page`/`Catalog` leaves stop in both walks). None of these roots is a
-        // `Page`/`Catalog`, so force-traversal never expands a sibling page.
-        extend_page_object_closure(source, root, closure)?;
+        // once for the union. Start from the root as a generic reference so a
+        // malformed root that is itself a `/Page` or `/Catalog` remains a copied
+        // boundary leaf instead of being force-expanded like a selected page.
+        extend_object_closure(source, &Object::Reference(root), closure)?;
     }
-    // An INLINE (on-catalog) `/OpenAction` is not an indirect root, so its
-    // operand objects (e.g. a `/JavaScript` action's `/JS` string) are not pulled
-    // in by the loop above. Fold them explicitly — the indirect `open_action_ref`
-    // path got them for free via page_object_closure.
+    // Inline-on-catalog values are not indirect roots, so extend the generic
+    // object closure from each direct value. This follows every referenced
+    // holder without imposing carrier-specific depth limits while retaining the
+    // shared Page/Catalog boundary guard and the inline-object nesting limit.
     if let Some(inline) = &doc.open_action_inline {
-        fold_inline_action_operands(source, inline, closure, MAX_ACTION_CHAIN_DEPTH)?;
+        extend_object_closure(source, inline, closure)?;
     }
-    // An INLINE (on-catalog) `/Names /Dests` name-tree root is likewise not an
-    // indirect root. When such a root is a `/Kids` node (ISO 32000-2 §7.9.6: a
-    // name-tree root may carry `/Kids` instead of `/Names`), its sub-leaf
-    // objects are not pulled in by the loop above. Fold each kid ref through the
-    // transitive closure so the sub-leaves (and their destinations) are copied,
-    // mirroring what the indirect `names_dests` root gets for free.
     if let Some(inline) = &doc.names_dests_inline {
-        if let Some(Object::Array(kids)) = inline.get("Kids") {
-            // `kids` borrows `doc`, disjoint from the `&mut source` the fold
-            // needs, so iterate the filter-mapped refs directly — no intermediate
-            // `Vec`.
-            for kid in kids.iter().filter_map(Object::as_ref_id) {
-                extend_page_object_closure(source, kid, closure)?;
-            }
-        }
+        extend_object_closure(source, &Object::Dictionary(inline.clone()), closure)?;
     }
-    // An INLINE (on-catalog) `/Outlines` root is likewise not an indirect root;
-    // fold its item chain through the `/First` and `/Last` child refs so the
-    // outline items (and their destination pages) are copied, mirroring what the
-    // indirect `outlines` root gets for free.
+    if let Some(inline) = &doc.legacy_dests_inline {
+        extend_object_closure(source, &Object::Dictionary(inline.clone()), closure)?;
+    }
     if let Some(inline) = &doc.outlines_inline {
-        // `inline` borrows `doc`, disjoint from the `&mut source` the fold needs,
-        // so iterate the resolved child refs directly — no intermediate `Vec`.
-        for child in ["First", "Last"]
-            .into_iter()
-            .filter_map(|key| inline.get_ref(key))
-        {
-            extend_page_object_closure(source, child, closure)?;
-        }
-    }
-    Ok(())
-}
-
-/// Action-operand keys that carry a *destination* (or a structural/back-pointer)
-/// rather than a plain operand object. These are owned by the destination
-/// null-out machinery ([`collect_doc_level_removed_targets`] /
-/// [`remap_inline_action`]) and by the `/Next`-chain walk, so the operand fold
-/// below must NOT descend them — descending `/D` would pull a destination page's
-/// content (and, via `/Parent`, its siblings) into the primary closure.
-const ACTION_DEST_KEYS: [&[u8]; 5] = [b"D", b"SD", b"Dest", b"Next", b"Parent"];
-
-/// Fold every indirect *operand* object reachable from an inline action graph
-/// (the action dict plus its `/Next` continuation chain) into `closure`, so a
-/// non-destination operand such as a `/JavaScript` action's `/JS` string is
-/// copied into the output. Destination/structural keys ([`ACTION_DEST_KEYS`]) are
-/// skipped — their pages are handled by the destination null-out path, mirroring
-/// what the indirect-`/OpenAction` root gets for free from
-/// [`page_object_closure`](crate::page_closure::page_object_closure)
-/// (which stops at `Page`/`Catalog` boundaries). Bounded by `depth` (inline
-/// `/Next` nesting) and [`resolve_ref_chain`] (reference indirection); the
-/// `collect_refs_in_object` operand walk is itself depth- and cycle-bounded.
-fn fold_inline_action_operands<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    action: &Object,
-    closure: &mut BTreeSet<ObjectRef>,
-    depth: usize,
-) -> Result<()> {
-    if depth == 0 {
-        return Ok(()); // cov:ignore: inline /Next nesting deeper than MAX_ACTION_CHAIN_DEPTH (DoS bound)
-    }
-    let (concrete, _) = resolve_ref_chain(source, action)?;
-    let Some(dict) = concrete.into_dict() else {
-        return Ok(()); // cov:ignore: a bare-dest array /OpenAction has no operand objects to fold
-    };
-    // An action's `/D` is a *local* page destination (owned by the null-out path)
-    // only for a bare-dest dict (no `/S`) or `/S /GoTo`. For an opaque action
-    // (`/S` present and != GoTo, e.g. `/GoToR`, `/URI`), `/D` is a remote/named
-    // destination operand object that must be folded like any other operand, so it
-    // is copied and the remapper (`remap_inline_action_depth`, opaque arm) can wire
-    // its refs instead of dropping the unmapped ref to `Null`. Mirror the
-    // remapper's `dest_bearing` predicate exactly so fold and remap agree on `/D`.
-    let dest_bearing = !matches!(dict.get("S"), Some(Object::Name(n)) if n != b"GoTo");
-    // Fold each non-destination operand's indirect refs into the closure. `/SD`,
-    // `/Dest`, `/Next`, `/Parent` are always skipped (see ACTION_DEST_KEYS); `/D`
-    // is skipped only when it is a local/GoTo destination (`dest_bearing`).
-    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    for (key, value) in dict.iter() {
-        let skip_key = if key == b"D" {
-            dest_bearing
-        } else {
-            ACTION_DEST_KEYS.contains(&key)
-        };
-        if skip_key {
-            continue;
-        }
-        // `skip_parent_key: true` so a `/P` operand (if any) is treated as a
-        // back-pointer, matching the field-tree closure discipline.
-        collect_refs_in_object(source, value, closure, &mut seen, 0, 0, true)?;
-    }
-    // Follow the `/Next` continuation chain so a continuation's operands are
-    // folded too. `/Next` may be a single action, an array of actions, or an
-    // indirect ref to either; resolve the chain first so an indirect `/Next`
-    // resolving to an array is folded as actions (each element recursed), not
-    // skipped as a bare-dest array (which would hit the `into_dict()` early
-    // return). Mirrors remap_next_continuation on the remap side.
-    if let Some(next_val) = dict.get("Next") {
-        let (concrete, _) = resolve_ref_chain(source, next_val)?;
-        match concrete {
-            Object::Array(elems) => {
-                for elem in &elems {
-                    fold_inline_action_operands(source, elem, closure, depth - 1)?;
-                }
-            }
-            single => fold_inline_action_operands(source, &single, closure, depth - 1)?,
-        }
-    }
-    Ok(())
-}
-
-/// Collect every removed-page destination target reachable from the primary's
-/// document-level carriers (outline tree, `/Names /Dests` name tree, legacy
-/// `/Catalog /Dests`, and `/OpenAction`), adding them to `removed`. A removed
-/// target is a destination page that is not in `selected`; folding it into the
-/// closure and nulling its copied body reproduces qpdf's `--pages` null-out
-/// (the destination keeps its reference, which resolves to `null`). Reuses the
-/// Task 3 leaf collectors ([`collect_dest_target`] / [`collect_action_chain_targets`]).
-fn collect_doc_level_removed_targets<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    doc: &PrimaryDocLevel,
-    selected: &BTreeSet<ObjectRef>,
-    removed: &mut BTreeSet<ObjectRef>,
-) -> Result<()> {
-    collect_outline_doc_dests(source, doc, selected, removed)?;
-
-    // /Names /Dests name tree — its root is an indirect ref or a direct dict;
-    // read_name_tree accepts either as its `root: Object`, enumerating leaf and
-    // /Kids dests so removed targets (incl. those carried by an inline root) are
-    // collected for null-out.
-    let names_root = match (doc.names_dests, &doc.names_dests_inline) {
-        (Some(r), _) => Some(Object::Reference(r)),
-        (None, Some(d)) => Some(Object::Dictionary(d.clone())),
-        (None, None) => None,
-    };
-    if let Some(root) = names_root {
-        collect_name_tree_removed_targets(source, root, selected, removed)?;
-    }
-
-    // Legacy /Dests: each value is a destination; reached as an indirect dict or
-    // an inline dict on the catalog.
-    let legacy = match (doc.legacy_dests_ref, &doc.legacy_dests_inline) {
-        // The legacy /Dests carrier may sit behind a holder chain (a ref to a ref
-        // to the dict); follow it so its entries are scanned for removed targets.
-        (Some(r), _) => resolve_ref_chain(source, &Object::Reference(r))?
-            .0
-            .into_dict(),
-        (None, Some(d)) => Some(d.clone()),
-        (None, None) => None,
-    };
-    if let Some(dests) = legacy {
-        for (_key, dest) in dests.iter() {
-            collect_dest_target(source, dest, selected, removed)?;
-        }
-    }
-
-    // /OpenAction: an action chain (indirect or inline) or a bare dest array.
-    // The indirect form is walked through its ref; the inline form is borrowed
-    // from `doc` (no clone) and walked in place.
-    let open_action_owned = doc.open_action_ref.map(Object::Reference);
-    if let Some(oa) = open_action_owned
-        .as_ref()
-        .or(doc.open_action_inline.as_ref())
-    {
-        let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-        collect_action_chain_targets(
-            source,
-            oa,
-            selected,
-            removed,
-            &mut visited,
-            MAX_ACTION_CHAIN_DEPTH,
-        )?; // cov:ignore: `?` Err arm — action walk cannot fail on an already-opened source
-            // Beyond the `/S /GoTo` action chain above, an /OpenAction may itself
-            // be a BARE destination: a `[page /Fit]` array, or a `<< /D … >>`
-            // destination dictionary with no `/S` (or `/S /GoTo`). Resolve the
-            // concrete shape and collect such a removed-page `/D`/array target so
-            // its placeholder is nulled. An action dict with `/S` present AND
-            // != GoTo (e.g. `/GoToR`, `/URI`) is opaque — its `/D` is a remote/named
-            // destination, not a local page ref — so it is left alone, mirroring
-            // outline_dest_remap::remap_or_null_action_dest. (Residual: a non-GoTo
-            // /D with a local ref is malformed remote-dest input; page_object_closure
-            // still folds that page as a copied orphan rather than nulling it. Not
-            // fixed here — touching the shared page_object_closure primitive is out
-            // of scope.)
-        let (concrete, _) = resolve_ref_chain(source, oa)?;
-        match concrete {
-            // A bare `[page /Fit]` destination array.
-            Object::Array(_) => collect_dest_target(source, oa, selected, removed)?,
-            // A no-/S (or /S /GoTo) `<< /D … >>` destination dictionary: its `/D`
-            // is a bare destination. (`/S /GoTo`'s /D was already collected by the
-            // action-chain walk above; re-collecting an already-recorded removed
-            // target is idempotent.)
-            // A no-/S (or /S /GoTo) dict's /D is a bare destination; an opaque
-            // action dict (`/S` present and != GoTo) has no /D. `get("D")` yields
-            // `&Object::Null` for the latter, which carries no page ref, so
-            // collecting it unconditionally is correct and avoids an uncovered
-            // `if let` else-arm.
-            Object::Dictionary(ref d) if !matches!(d.get("S"), Some(Object::Name(n)) if n != b"GoTo") =>
-            {
-                let d_val = d.get("D").unwrap_or(&Object::Null);
-                collect_dest_target(source, d_val, selected, removed)?; // cov:ignore: `?` Err arm — collect cannot fail on an already-opened source
-            }
-            // A bare-name /OpenAction, or an opaque action dict (`/S` present and
-            // != GoTo) — no local-page bare destination to collect.
-            _ => {}
-        }
-    }
-
-    Ok(())
-}
-
-/// Collect the primary outline tree's removed-page destination targets, if the
-/// primary has an `/Outlines` root with a `/First` item. A thin wrapper that
-/// locates the first item then delegates to [`collect_outline_removed_targets`].
-fn collect_outline_doc_dests<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    doc: &PrimaryDocLevel,
-    selected: &BTreeSet<ObjectRef>,
-    removed: &mut BTreeSet<ObjectRef>,
-) -> Result<()> {
-    let first = match (doc.outlines, &doc.outlines_inline) {
-        (Some(outlines_ref), _) => {
-            // The /Outlines root may sit behind a holder chain (a ref to a ref to
-            // the root dict); follow the whole chain (not a one-hop resolve) so the
-            // root's /First is read and its removed-page dests are collected. The
-            // captured first-hop ref is kept verbatim for closure-folding; only this
-            // scan-side deref chains to the terminal.
-            let (root, _) = resolve_ref_chain(source, &Object::Reference(outlines_ref))?;
-            root.as_dict().and_then(|d| d.get_ref("First"))
-        }
-        // A direct (inline) root holds its `/First` item ref inline on the catalog.
-        (None, Some(inline)) => inline.get_ref("First"),
-        (None, None) => return Ok(()),
-    };
-    let Some(first) = first else {
-        // An /Outlines root with no /First is an empty outline tree — nothing to
-        // collect (mirrors crate::outline_dest_remap's empty-root handling).
-        return Ok(());
-    };
-    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-    collect_outline_removed_targets(
-        source,
-        first,
-        selected,
-        removed,
-        &mut visited,
-        DEFAULT_MAX_OUTLINE_DEPTH,
-    )
-}
-
-/// Walk the outline sibling chain from `first`, descending `/First` children,
-/// recording every removed-page target reached via an item's `/Dest` or
-/// `/A /GoTo /D`. Bounded by `depth` and a shared `visited` set (outline trees
-/// can be cyclic or deeply nested), mirroring
-/// [`crate::outline_dest_remap`]'s traversal structure but collect-only.
-///
-/// On depth exhaustion the walk stops conservatively (matching the inline
-/// `/Next`-chain bound in [`collect_action_chain_targets`]): a destination below
-/// the nesting bound is simply not collected, rather than rejecting the whole
-/// merge. The deepest such targets stay copied-but-not-nulled, the same tolerant
-/// outcome already accepted for pathological input elsewhere in this module.
-fn collect_outline_removed_targets<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    first: ObjectRef,
-    selected: &BTreeSet<ObjectRef>,
-    removed: &mut BTreeSet<ObjectRef>,
-    visited: &mut BTreeSet<ObjectRef>,
-    depth: usize,
-) -> Result<()> {
-    if depth == 0 {
-        return Ok(()); // cov:ignore: outline nesting deeper than DEFAULT_MAX_OUTLINE_DEPTH (DoS bound)
-    }
-    let mut current = Some(first);
-    while let Some(item_ref) = current {
-        // /First and /Next may point through holder chains (a ref to a ref to the
-        // item); resolve to the terminal item and key the cycle guard on the
-        // terminal ref so a destination below a holder is still reached.
-        let (item_obj, terminal) = resolve_ref_chain(source, &Object::Reference(item_ref))?;
-        if !visited.insert(terminal.unwrap_or(item_ref)) {
-            break; // Cycle guard (/Next or /First back-edge).
-        }
-        let (dest_val, action_val, next_ref, first_child) = {
-            let Some(item) = item_obj.as_dict() else {
-                break; // Malformed — stop this chain.
-            };
-            (
-                item.get("Dest").cloned(),
-                item.get("A").cloned(),
-                item.get_ref("Next"),
-                item.get_ref("First"),
-            )
-        };
-        if let Some(dest) = dest_val {
-            collect_dest_target(source, &dest, selected, removed)?;
-        }
-        if let Some(action) = action_val {
-            let mut a_visited: BTreeSet<ObjectRef> = BTreeSet::new();
-            collect_action_chain_targets(
-                source,
-                &action,
-                selected,
-                removed,
-                &mut a_visited,
-                MAX_ACTION_CHAIN_DEPTH,
-            )?; // cov:ignore: `?` Err arm — resolve cannot fail on already-opened outline action objects
-        }
-        if let Some(child) = first_child {
-            collect_outline_removed_targets(source, child, selected, removed, visited, depth - 1)?;
-        }
-        current = next_ref;
-    }
-    Ok(())
-}
-
-/// Record every removed-page target carried by a `/Names /Dests` name tree.
-/// `root` is the name-tree root — an `Object::Reference` to an indirect root or
-/// an `Object::Dictionary` for a direct (inline) root; [`read_name_tree`]
-/// accepts either. Uses it (depth- and cycle-bounded) to enumerate the verbatim
-/// dest value of each entry, then resolves it through [`collect_dest_target`].
-fn collect_name_tree_removed_targets<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    root: Object,
-    selected: &BTreeSet<ObjectRef>,
-    removed: &mut BTreeSet<ObjectRef>,
-) -> Result<()> {
-    // The name-tree root may sit behind a holder chain (a ref to a ref to the root
-    // node); resolve it so read_name_tree walks the concrete root rather than
-    // stopping on an intermediate Reference and enumerating nothing.
-    let (root, _) = resolve_ref_chain(source, &root)?;
-    let entries = read_name_tree(
-        source,
-        root,
-        |_pdf, value| Ok(Some(value)),
-        DEFAULT_MAX_TREE_DEPTH,
-    )?; // cov:ignore: `?` Err arm — name-tree depth-limit / resolve failure not reachable from these fixtures
-    for (_name, dest) in entries {
-        collect_dest_target(source, &dest, selected, removed)?;
+        extend_object_closure(source, &Object::Dictionary(inline.clone()), closure)?;
     }
     Ok(())
 }
 
 /// Wire the primary's inherited document-level structures onto the fresh output
 /// catalog after the primary copy. Indirect roots are wired to their copied ref
-/// via the renumber `map`; inline-on-catalog `/OpenAction` and legacy `/Dests`
-/// (never copied because the primary catalog is not copied) are reconstructed
-/// from `map`. `copy_objects` already remapped every destination *inside* the
-/// copied objects, so this only sets catalog keys — it does not re-walk or
-/// re-remap any destination (avoiding a double remap).
-fn wire_doc_level<RSrc: Read + Seek, RTgt: Read + Seek>(
-    source: &mut Pdf<RSrc>,
+/// via the renumber `map`; inline-on-catalog direct objects (never copied because
+/// the primary catalog is not copied) are reconstructed from `map`.
+/// `copy_objects` already remapped every reference inside copied objects, so
+/// this only sets catalog keys — it does not re-walk copied objects.
+fn wire_doc_level<RTgt: Read + Seek>(
     target: &mut Pdf<RTgt>,
     doc: &PrimaryDocLevel,
     map: &BTreeMap<ObjectRef, ObjectRef>,
@@ -860,10 +233,11 @@ fn wire_doc_level<RSrc: Read + Seek, RTgt: Read + Seek>(
         );
     }
     // /Names /Dests: indirect root → wire copied ref; inline root → reconstruct
-    // it from the renumber map (the catalog is never copied, so an inline root's
-    // dest page refs and `/Kids` sub-leaf refs are remapped here, like inline
-    // legacy /Dests). Either way a minimal /Names holder carries only the
-    // inherited /Dests name tree (sibling name trees are not merged).
+    // it from the renumber map (the catalog is never copied). Remap the direct
+    // carrier as one generic object so every source ref becomes its copied ref
+    // without resolving or flattening indirect destination holders. Either way
+    // a minimal /Names holder carries only the inherited /Dests name tree
+    // (sibling name trees are not merged).
     if let Some(dests) = doc.names_dests {
         if let Some(&new_ref) = map.get(&dests) {
             let mut names = Dictionary::new();
@@ -871,23 +245,24 @@ fn wire_doc_level<RSrc: Read + Seek, RTgt: Read + Seek>(
             catalog.insert("Names", Object::Dictionary(names));
         }
     } else if let Some(inline) = &doc.names_dests_inline {
-        let rebuilt = remap_inline_name_tree_root(source, inline, map)?;
         let mut names = Dictionary::new();
-        names.insert("Dests", Object::Dictionary(rebuilt));
+        names.insert(
+            "Dests",
+            remap_refs_in_object(Object::Dictionary(inline.clone()), map),
+        );
         catalog.insert("Names", Object::Dictionary(names));
     }
-    // Legacy /Catalog /Dests: indirect → wire copied ref; inline → reconstruct
-    // each entry's destination from the renumber map.
+    // Legacy /Catalog /Dests: indirect → wire copied ref; inline → remap the
+    // complete direct carrier once, preserving any indirect holder structure.
     if let Some(legacy) = doc.legacy_dests_ref {
         if let Some(&new_ref) = map.get(&legacy) {
             catalog.insert("Dests", Object::Reference(new_ref));
         }
     } else if let Some(inline) = &doc.legacy_dests_inline {
-        let mut rebuilt = Dictionary::new();
-        for (key, dest) in inline.iter() {
-            rebuilt.insert(key, remap_inline_dest(source, dest, map)?);
-        }
-        catalog.insert("Dests", Object::Dictionary(rebuilt));
+        catalog.insert(
+            "Dests",
+            remap_refs_in_object(Object::Dictionary(inline.clone()), map),
+        );
     }
     // /OpenAction: indirect → wire copied ref; inline → reconstruct from the map.
     if let Some(oa_ref) = doc.open_action_ref {
@@ -895,280 +270,11 @@ fn wire_doc_level<RSrc: Read + Seek, RTgt: Read + Seek>(
             catalog.insert("OpenAction", Object::Reference(new_ref));
         }
     } else if let Some(inline) = &doc.open_action_inline {
-        catalog.insert("OpenAction", remap_inline_action(source, inline, map)?);
+        catalog.insert("OpenAction", remap_refs_in_object(inline.clone(), map));
     }
 
     target.set_object(catalog_ref, Object::Dictionary(catalog));
     Ok(())
-}
-
-/// Inline-destination nesting bound: how deep an inline `/Dests` value's
-/// `/D` chain (dict → `/D` → dict → …) is followed before stopping. Mirrors
-/// [`MAX_ACTION_CHAIN_DEPTH`] so a pathological inline structure terminates;
-/// [`resolve_ref_chain`] independently bounds *reference* chains.
-const MAX_INLINE_DEST_DEPTH: usize = 64;
-
-/// Remap an inline (on-catalog) destination value to the copied page refs in
-/// `map`, resolving any indirect holder first so the leading page reference is
-/// reached and remapped regardless of how the destination is shaped:
-/// - an `[page /Fit …]` array → its leading page ref is remapped;
-/// - a `<< /D <dest> >>` destination dictionary → its `/D` is remapped (recursed);
-/// - an indirect reference to either → resolved (against `source`) then remapped,
-///   so the un-copied intermediate holder is sidestepped (the catalog is never
-///   copied, so an indirect holder named only from it is absent from the output);
-/// - any other shape (a name/string named destination) is returned unchanged.
-///
-/// A page absent from `map` (the destination's target was removed) keeps its
-/// source reference, which has been copied as a placeholder and nulled — so it
-/// resolves to `null` in the output, matching the indirect-carrier null-out.
-/// Inline `/D` nesting is bounded by [`MAX_INLINE_DEST_DEPTH`] and reference
-/// indirection by [`resolve_ref_chain`].
-fn remap_inline_dest<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    dest: &Object,
-    map: &BTreeMap<ObjectRef, ObjectRef>,
-) -> Result<Object> {
-    remap_inline_dest_depth(source, dest, map, MAX_INLINE_DEST_DEPTH)
-}
-
-fn remap_inline_dest_depth<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    dest: &Object,
-    map: &BTreeMap<ObjectRef, ObjectRef>,
-    depth: usize,
-) -> Result<Object> {
-    if depth == 0 {
-        return Ok(dest.clone()); // cov:ignore: inline /D nesting deeper than MAX_INLINE_DEST_DEPTH (DoS bound)
-    }
-    // Resolve an indirect holder to its concrete array/dict form (the holder
-    // itself is named only from the never-copied catalog, so inlining the
-    // resolved value is what reaches the page ref present in `map`).
-    let (concrete, _) = resolve_ref_chain(source, dest)?;
-    match concrete {
-        Object::Array(mut arr) => {
-            // The leading page ref may be a holder chain (`r → r2 → page`); the
-            // copy map keys pages by their TERMINAL ref. The common case is a
-            // direct ref already present in `map`, so match it first and only fall
-            // back to a terminal-normalizing chain resolve (a `pdf.resolve`) when
-            // the direct lookup misses — otherwise a doubled-indirect dest ref
-            // would be emitted as the (uncopied) source holder ref.
-            let first_ref = match arr.first() {
-                Some(Object::Reference(r)) => Some(*r),
-                _ => None,
-            };
-            if let Some(r) = first_ref {
-                if let Some(&new_ref) = map.get(&r) {
-                    arr[0] = Object::Reference(new_ref);
-                } else if let Some(terminal) = resolve_ref_chain(source, &Object::Reference(r))?.1 {
-                    if let Some(&new_ref) = map.get(&terminal) {
-                        arr[0] = Object::Reference(new_ref);
-                    }
-                }
-            }
-            Ok(Object::Array(arr))
-        }
-        // `<< /D <dest> >>` destination dictionary: remap its `/D` and keep the
-        // rest of the dict verbatim.
-        Object::Dictionary(mut d) => {
-            if let Some(d_val) = d.remove("D") {
-                let remapped = remap_inline_dest_depth(source, &d_val, map, depth - 1)?;
-                d.insert("D", remapped);
-            }
-            Ok(Object::Dictionary(d))
-        }
-        other => Ok(other),
-    }
-}
-
-/// Reconstruct an inline (direct-dictionary) `/Names /Dests` name-tree root,
-/// remapping each destination in its `/Names` `[(key) dest (key) dest …]` array
-/// (the dests are the odd-indexed elements) through `map` via
-/// [`remap_inline_dest`], and remapping each `/Kids` sub-leaf reference through
-/// `map` to its copied object. Other keys (`/Limits`) are kept verbatim.
-///
-/// Per ISO 32000-2 §7.9.6 a name-tree root may carry `/Names`, `/Kids`, or both.
-/// A `/Kids` root is the normal shape once there are more entries than fit one
-/// leaf; whether the root is inline-on-catalog or indirect is purely a
-/// serialization choice. The kid sub-leaves are folded into the copy closure (so
-/// they are copied) by [`fold_doc_level_closure`], and `copy_objects` remaps the
-/// destinations *inside* each copied leaf; this function only rewrites the top
-/// `/Kids` refs to point at those copies. A kid absent from `map` keeps its
-/// source ref (which was copied as a placeholder and nulled), matching the
-/// destination null-out. Removed targets carried anywhere in the tree are nulled
-/// — [`collect_name_tree_removed_targets`] enumerates leaf and `/Kids` dests when
-/// collecting the null-out set.
-fn remap_inline_name_tree_root<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    leaf: &Dictionary,
-    map: &BTreeMap<ObjectRef, ObjectRef>,
-) -> Result<Dictionary> {
-    let mut out = leaf.clone();
-    // A leaf root: remap its own `/Names` array dests (the odd-indexed elements).
-    if let Some(Object::Array(names)) = leaf.get("Names") {
-        let mut rebuilt = names.clone();
-        let mut i = 1;
-        while i < rebuilt.len() {
-            rebuilt[i] = remap_inline_dest(source, &rebuilt[i], map)?;
-            i += 2;
-        }
-        out.insert("Names", Object::Array(rebuilt));
-    }
-    // A `/Kids` root: remap each sub-leaf ref to its copied object (mirroring the
-    // `arr[0]` page-ref remap in remap_inline_dest_depth). Every kid ref was
-    // folded into the copy closure by fold_doc_level_closure, so it is always
-    // present in `map`; an unmapped ref (or a malformed non-ref element) is left
-    // verbatim by falling back to its current value.
-    if let Some(Object::Array(kids)) = leaf.get("Kids") {
-        let mut rebuilt = kids.clone();
-        for kid in &mut rebuilt {
-            if let Object::Reference(r) = kid {
-                *kid = Object::Reference(map.get(r).copied().unwrap_or(*r));
-            }
-        }
-        out.insert("Kids", Object::Array(rebuilt));
-    }
-    Ok(out)
-}
-
-/// Remap an inline `/OpenAction` value: a bare `[page /Fit]` destination array
-/// (via [`remap_inline_dest`]) or a `/S /GoTo` action dict whose `/D` is such an
-/// array, following the `/Next` continuation chain (a single action or an array
-/// of actions) so every `/GoTo /D` along the chain is remapped — matching the
-/// destinations [`collect_action_chain_targets`] walks. A non-GoTo action dict's
-/// own `/D` is returned unchanged (its `/D` is not a local page destination), but
-/// its `/Next` is still followed. An indirect action holder (the `/OpenAction`
-/// itself or an indirect `/Next`) is resolved via [`resolve_ref_chain`] before
-/// classification, so its concrete destinations are reached. The primary catalog
-/// is never copied, so this is the only place an inline `/OpenAction`'s
-/// destinations are remapped (not a re-pass over a copied object). Inline `/Next`
-/// nesting is bounded by [`MAX_ACTION_CHAIN_DEPTH`]. A local `/GoTo`'s `/SD`
-/// (structure destination) is dropped: page-merge copies no structure tree, so
-/// its StructElem ref cannot resolve, and `/SD` would otherwise take precedence
-/// over the `/D` fallback (ISO 32000-2 §12.3.2.3). An opaque `/GoToR`/`/GoToE`
-/// action's `/SD` targets the remote/embedded document and is preserved verbatim
-/// like its `/D`.
-fn remap_inline_action<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    action: &Object,
-    map: &BTreeMap<ObjectRef, ObjectRef>,
-) -> Result<Object> {
-    remap_inline_action_depth(source, action, map, MAX_ACTION_CHAIN_DEPTH)
-}
-
-fn remap_inline_action_depth<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    action: &Object,
-    map: &BTreeMap<ObjectRef, ObjectRef>,
-    depth: usize,
-) -> Result<Object> {
-    if depth == 0 {
-        return Ok(action.clone()); // cov:ignore: inline /Next nesting deeper than MAX_ACTION_CHAIN_DEPTH (DoS bound)
-    }
-    // Resolve an indirect action holder (the whole `/OpenAction` or an indirect
-    // `/Next` continuation) so its concrete shape is reached and remapped, like
-    // collect_action_chain_targets. The catalog is never copied, so an indirect
-    // holder named only from it would otherwise dangle unremapped in the output.
-    let (concrete, _) = resolve_ref_chain(source, action)?;
-    match concrete {
-        Object::Array(arr) => remap_inline_dest(source, &Object::Array(arr), map),
-        Object::Dictionary(mut out) => {
-            // Detach the two keys whose values need dest-aware / recursive
-            // remapping (`/D`, `/Next`) before remapping the remaining operands, so
-            // a page ref under `/D` is never remapped twice.
-            let dest = out.remove("D");
-            let next = out.remove("Next");
-
-            // A dict is an opaque non-destination action ONLY when `/S` is present
-            // AND != GoTo (e.g. `/GoToR`, `/URI`, `/JavaScript`); its `/D`, when
-            // present, is a remote/named destination, not a local page ref. A dict
-            // with no `/S` (a bare `<< /D … >>` destination dictionary) or `/S
-            // /GoTo` has a local-page `/D` to remap. Mirrors
-            // outline_dest_remap::remap_or_null_action_dest. Classified on the
-            // un-remapped `/S` (a Name, unaffected by the operand remap below) so
-            // it also gates the `/SD` drop that precedes that remap.
-            let dest_bearing = !matches!(out.get("S"), Some(Object::Name(n)) if n != b"GoTo");
-
-            // Drop a local `/GoTo`'s (or bare-dest dict's) `/SD` structure
-            // destination. It references a StructElem in the primary's structure
-            // tree, which page-merge never copies, so the ref is unmapped: left in
-            // place it would dangle (or be nulled by remap_refs_in_object below)
-            // AND — `/SD` takes precedence over `/D` for structure-aware viewers
-            // (ISO 32000-2 §12.3.2.3) — suppress the still-valid `/D` fallback.
-            // Removing it degrades the action to its explicit `/D`. Dropped
-            // regardless of whether the `/SD` target page is selected (merge copies
-            // no structure tree, so `/SD` is invalid either way), but ONLY for a
-            // local-dest action: an opaque `/GoToR`/`/GoToE` carries an `/SD` into
-            // the *remote/embedded* document, preserved verbatim like its `/D`.
-            // The collector (collect_action_chain_targets) and extract's
-            // neutralize_action_chain gate `/SD` on `/GoTo` the same way; the fold
-            // side already skips `/SD` (ACTION_DEST_KEYS), keeping remap symmetric.
-            if dest_bearing {
-                out.remove("SD");
-            }
-
-            // Remap every other indirect operand (e.g. a `/JavaScript` action's
-            // `/JS` string ref) through the copy map. The catalog is never copied,
-            // so an inline action's operand objects (folded into the primary
-            // closure by fold_inline_action_operands) are remapped only here.
-            out = match remap_refs_in_object(Object::Dictionary(out), map) {
-                Object::Dictionary(d) => d,
-                other => return Ok(other), // cov:ignore: remap_refs_in_object preserves the Dictionary variant
-            };
-
-            if let Some(dest) = dest {
-                let remapped = if dest_bearing {
-                    // A local-page destination: remap its leading page ref.
-                    remap_inline_dest(source, &dest, map)?
-                } else {
-                    // An opaque action's /D (remote/named): remap any indirect
-                    // holder/operand refs but do not treat it as a local page dest.
-                    remap_refs_in_object(dest, map)
-                };
-                out.insert("D", remapped);
-            }
-            // /Next — a single action, an array of actions, or an indirect ref to
-            // either. Recurse into each at `depth - 1` so a continuation's /D is
-            // remapped too. An indirect ref that resolves to an array is an array
-            // OF ACTIONS (not a destination array), so resolve the chain first and
-            // route an array through the per-element action recursion — mirroring
-            // collect_action_chain_targets / the inline-array arm. (The top-level
-            // Object::Array arm above is for a bare-dest `/OpenAction` array, which
-            // `/Next` is never.)
-            if let Some(next) = next {
-                let remapped_next = remap_next_continuation(source, &next, map, depth)?;
-                out.insert("Next", remapped_next);
-            }
-            Ok(Object::Dictionary(out))
-        }
-        other => Ok(other),
-    }
-}
-
-/// Remap a `/Next` continuation value: a single action, an array of actions, or
-/// an indirect reference resolving to either. The chain is resolved via
-/// [`resolve_ref_chain`] so an indirect `/Next` is reached; if it resolves to an
-/// array, the array is treated as a list of actions (each element recursed as an
-/// action through [`remap_inline_action_depth`]) — NOT as a destination array,
-/// since a `/Next` continuation always carries actions (ISO 32000-2 §12.6.3). A
-/// non-array continuation is recursed directly. Bounded by `depth` (inline
-/// nesting) and [`resolve_ref_chain`] (reference indirection).
-fn remap_next_continuation<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    next: &Object,
-    map: &BTreeMap<ObjectRef, ObjectRef>,
-    depth: usize,
-) -> Result<Object> {
-    let (concrete, _) = resolve_ref_chain(source, next)?;
-    match concrete {
-        Object::Array(elems) => {
-            let mut rebuilt = Vec::with_capacity(elems.len());
-            for elem in &elems {
-                rebuilt.push(remap_inline_action_depth(source, elem, map, depth - 1)?);
-            }
-            Ok(Object::Array(rebuilt))
-        }
-        single => remap_inline_action_depth(source, &single, map, depth - 1),
-    }
 }
 
 /// Resolve qpdf's `--pages` form-field name collision: return `base` when it is
@@ -1439,8 +545,7 @@ fn collect_retained_widget_refs<R: Read + Seek>(
         let Some(annots_val) = annots_val else {
             continue;
         };
-        // /Annots: an inline array or an indirect reference to one (mirrors
-        // collect_removed_dest_targets's /Annots resolution).
+        // /Annots: an inline array or an indirect reference to one.
         let (concrete, _) = resolve_ref_chain(source, &annots_val)?;
         let Object::Array(elems) = concrete else {
             continue; // cov:ignore: a non-array /Annots is malformed
@@ -1861,40 +966,10 @@ pub fn merge_documents<R: Read + Seek>(
             closure.extend(primary_acroform.closure_seed.iter().copied());
         }
 
-        // qpdf `--pages` null-out parity: a destination (annotation `/Dest`,
-        // `/A /GoTo /D`, or page `/AA`) targeting a page NOT selected from this
-        // input keeps its reference but resolves to `null`. Collect those
-        // removed targets, fold them into the closure so `copy_objects`'s single
-        // rewrite pass remaps each destination to the removed page's NEW ref
-        // (instead of inline-`null`-ing the array element), then null the copied
-        // placeholder body below. Folding the remap into the copy pass — rather
-        // than a separate post-copy remap — keeps a destination shared by
-        // several carriers from being rewritten twice. (page_object_closure
-        // already pulls these pages in via the same `/Annots`/`/AA` traversal;
-        // adding them explicitly keeps the remap correct independent of that
-        // traversal's reach and names the removed set for the null-out.)
-        let unique_set: BTreeSet<ObjectRef> = unique.iter().copied().collect();
-        let mut removed_targets: BTreeSet<ObjectRef> = BTreeSet::new();
-        for &page_ref in &unique {
-            // cov:ignore-start: the `?` error path propagates a resolve failure not reachable from a well-formed source page
-            collect_removed_dest_targets(
-                input.source,
-                page_ref,
-                &unique_set,
-                &mut removed_targets,
-            )?;
-            // cov:ignore-end
-        }
-        // Primary document-level dests targeting an unselected page are removed
-        // targets too: collect them so their copied placeholder is nulled (same
-        // null-out mechanism). A no-op for secondary inputs.
-        collect_doc_level_removed_targets(
-            input.source,
-            &doc_level,
-            &unique_set,
-            &mut removed_targets,
-        )?; // cov:ignore: `?` Err arm — doc-level collect cannot fail on an already-opened source
-        closure.extend(removed_targets.iter().copied());
+        // qpdf `--pages` null-out parity is page-tree driven: after every closure
+        // root has been folded, the selected page set determines which copied
+        // source pages are retained. No destination/action subtype analysis is
+        // needed, and pages outside the closure are never copied as placeholders.
         // Renumbering-disjointness invariant: copy_objects allocates fresh
         // target object numbers starting one past the current maximum, so the
         // refs it returns never collide with objects already surviving in the
@@ -1909,17 +984,7 @@ pub fn merge_documents<R: Read + Seek>(
              (renumbering-disjointness invariant; guards against shared-destination double-remap)"
         );
 
-        // Null the copied placeholder body of each removed destination target.
-        // These pages are referenced only by a surviving destination, never
-        // appear in /Kids, and are not materialized as leaves; replacing the
-        // body with `null` makes the kept destination resolve to a null page
-        // (qpdf `--pages` parity). sweep_unreachable_objects later GCs any
-        // placeholder no surviving destination still references.
-        for src_ref in &removed_targets {
-            if let Some(&new_ref) = map.get(src_ref) {
-                target.set_object(new_ref, Object::Null);
-            }
-        }
+        null_copied_removed_pages(&mut target, &all, &seen, &map);
 
         // Wire the primary's inherited document-level structures onto the output
         // catalog (obj 1, distinct from the /Pages root obj 2 rebuilt below).
@@ -1927,7 +992,7 @@ pub fn merge_documents<R: Read + Seek>(
         // outline / name-tree / action objects, so this only sets catalog keys.
         // A no-op for secondary inputs (empty doc_level).
         if is_primary {
-            wire_doc_level(input.source, &mut target, &doc_level, &map)?;
+            wire_doc_level(&mut target, &doc_level, &map)?;
         }
 
         // Record this input's kept top-level fields (those whose source ref was
@@ -1953,7 +1018,7 @@ pub fn merge_documents<R: Read + Seek>(
         // Build that retained-widget set once per input from the selected pages'
         // `/Annots`, in source space, so a `/P`-less selected-page widget is kept.
         let mut retained_widgets: BTreeSet<ObjectRef> = BTreeSet::new();
-        collect_retained_widget_refs(input.source, &unique_set, &mut retained_widgets)?;
+        collect_retained_widget_refs(input.source, &seen, &mut retained_widgets)?;
         for (src_field_ref, partial_name) in source_fields {
             if let Some(&target_ref) = map.get(&src_field_ref) {
                 let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
@@ -1961,7 +1026,7 @@ pub fn merge_documents<R: Read + Seek>(
                     input.source,
                     &mut target,
                     src_field_ref,
-                    &unique_set,
+                    &seen,
                     &retained_widgets,
                     &map,
                     &mut orphan_pages,
@@ -2052,8 +1117,42 @@ pub fn merge_documents<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::unique_field_name;
-    use std::collections::BTreeSet;
+    use super::{
+        discover_primary_doc_level, fold_doc_level_closure, merge_documents, unique_field_name,
+        MergeInput,
+    };
+    use crate::page_closure::extend_page_object_closure;
+    use crate::{Object, ObjectRef, Pdf};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
+        let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+        let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
+        let max = objects.iter().map(|(number, _)| *number).max().unwrap_or(0);
+        for (number, body) in objects {
+            offsets.insert(*number, out.len() as u64);
+            out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref_start = out.len() as u64;
+        let size = max + 1;
+        out.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for number in 1..=max {
+            match offsets.get(&number) {
+                Some(offset) => {
+                    out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes())
+                }
+                None => out.extend_from_slice(b"0000000000 65535 f \n"),
+            }
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {size} /Root {root} 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        out
+    }
 
     fn used(names: &[&[u8]]) -> BTreeSet<Vec<u8>> {
         names.iter().map(|n| n.to_vec()).collect()
@@ -2092,6 +1191,58 @@ mod tests {
         assert_eq!(
             unique_field_name(b"name+1", &used(&[b"name", b"name+1"])),
             b"name+1+1".to_vec()
+        );
+    }
+
+    /// A malformed indirect document-level root may itself be an unselected
+    /// page. It is still copied so the catalog carrier can point at a null page
+    /// boundary, but generic root traversal must stop there rather than pulling
+    /// the page's `/Contents` into the copy closure.
+    #[test]
+    fn doc_level_page_root_is_null_boundary_without_contents_in_closure() {
+        let bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /OpenAction 4 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (
+                    4,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 10 0 R >>",
+                ),
+                (10, "<< /Length 4 >>\nstream\nDROP\nendstream"),
+            ],
+            1,
+        );
+
+        let mut merge_source = Pdf::open_mem_owned(bytes.clone()).unwrap();
+        let mut inputs = [MergeInput {
+            source: &mut merge_source,
+            pages: vec![0],
+        }];
+        let mut merged = merge_documents(&mut inputs).unwrap();
+        let catalog_ref = merged.root_ref().unwrap();
+        let catalog = merged.resolve(catalog_ref).unwrap().into_dict().unwrap();
+        let open_action_ref = catalog
+            .get_ref("OpenAction")
+            .expect("indirect /OpenAction carrier is retained");
+        assert_eq!(
+            merged.resolve(open_action_ref).unwrap(),
+            Object::Null,
+            "the unselected page root is copied and nulled"
+        );
+
+        let mut source = Pdf::open_mem_owned(bytes).unwrap();
+        let doc_level = discover_primary_doc_level(&mut source).unwrap();
+        let mut closure = BTreeSet::new();
+        extend_page_object_closure(&mut source, ObjectRef::new(3, 0), &mut closure).unwrap();
+        fold_doc_level_closure(&mut source, &doc_level, &mut closure).unwrap();
+        assert!(
+            closure.contains(&ObjectRef::new(4, 0)),
+            "the indirect /OpenAction page root must enter the copy map"
+        );
+        assert!(
+            !closure.contains(&ObjectRef::new(10, 0)),
+            "the boundary page's /Contents must not enter the copy map"
         );
     }
 }
