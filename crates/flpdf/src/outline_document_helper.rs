@@ -87,9 +87,8 @@ pub struct OutlineNode {
     pub count: i64,
     /// Parent item ref; `None` for top-level items.
     pub parent: Option<ObjectRef>,
-    /// Resolved explicit destination (`/Dest`, or a `/A` GoTo action's `/D`),
-    /// or `None` when absent or a still-unresolved named destination.
-    pub dest: Option<Dest>,
+    /// qpdf `getDest()` result; `Object::Null` means no resolved destination.
+    pub dest: Object,
     /// The `/SE` (structure-element) link: an indirect reference to a node in
     /// the document's structure tree (ISO 32000-2 section 12.3.3, table 151),
     /// or `None` when `/SE` is absent. Per spec `/SE` shall be an indirect
@@ -104,6 +103,16 @@ pub struct OutlineNode {
     pub action: Option<OutlineAction>,
     /// Child nodes in `/First`->`/Next` order.
     pub children: Vec<OutlineNode>,
+}
+
+impl OutlineNode {
+    /// Mirror qpdf `getDestPage()` without resolving the page operand.
+    pub fn dest_page(&self) -> Object {
+        match &self.dest {
+            Object::Array(items) if !items.is_empty() => items[0].clone(),
+            _ => Object::Null,
+        }
+    }
 }
 
 /// A resolved explicit destination, e.g. `[pageRef /Fit ...]`. Mirrors the
@@ -386,49 +395,77 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     }
 
     /// Resolve a node's destination from `/Dest`, else a `/A` GoTo action's `/D`.
-    /// Named/string destinations are resolved in a later task (return `None` here).
     fn resolve_node_dest(
         &mut self,
         dest: Option<&Object>,
         action: Option<&Object>,
-    ) -> Result<Option<Dest>> {
-        if let Some(d) = dest {
-            if let Some(found) = self.dest_from_value(d, MAX_DEST_RESOLVE_DEPTH)? {
-                return Ok(Some(found));
+    ) -> Result<Object> {
+        let candidate = if let Some(dest) = dest {
+            Some(dest.clone())
+        } else {
+            self.goto_action_dest(action)?
+        };
+        match candidate {
+            Some(value) => self.resolve_node_dest_value(value),
+            None => Ok(Object::Null),
+        }
+    }
+
+    fn goto_action_dest(&mut self, action: Option<&Object>) -> Result<Option<Object>> {
+        let Some(action) = action else {
+            return Ok(None);
+        };
+        let Object::Dictionary(dict) = resolve_terminal_object(self.pdf, action.clone())? else {
+            return Ok(None);
+        };
+        let Some(subtype) = dict.get("S").cloned() else {
+            return Ok(None);
+        };
+        let subtype = resolve_terminal_object(self.pdf, subtype)?;
+        if !matches!(subtype, Object::Name(ref name) if name == b"GoTo") {
+            return Ok(None);
+        }
+        Ok(dict.get("D").cloned())
+    }
+
+    fn resolve_node_dest_value(&mut self, value: Object) -> Result<Object> {
+        match resolve_terminal_object(self.pdf, value)? {
+            Object::Name(name) => self.resolve_legacy_node_dest(&name),
+            Object::String(bytes) => self.resolve_name_tree_node_dest(&bytes),
+            other => Ok(other),
+        }
+    }
+
+    fn resolve_legacy_node_dest(&mut self, name: &[u8]) -> Result<Object> {
+        let Some(Object::Dictionary(dests)) = self.catalog_value_terminal("Dests")? else {
+            return Ok(Object::Null);
+        };
+        match dests.get(name).cloned() {
+            Some(value) => resolve_terminal_object(self.pdf, value),
+            None => Ok(Object::Null),
+        }
+    }
+
+    fn resolve_name_tree_node_dest(&mut self, bytes: &[u8]) -> Result<Object> {
+        let lookup = crate::json_inspect::qpdf_utf8_value(bytes);
+        let Some(Object::Dictionary(mut names)) = self.catalog_value_terminal("Names")? else {
+            return Ok(Object::Null);
+        };
+        let Some(dests_root) = names.remove("Dests") else {
+            return Ok(Object::Null);
+        };
+        let entries = read_name_tree(
+            self.pdf,
+            dests_root,
+            |_pdf, value| Ok(Some(value)),
+            DEFAULT_MAX_OUTLINE_DEPTH,
+        )?;
+        for (stored, value) in entries {
+            if crate::json_inspect::qpdf_utf8_value(&stored) == lookup {
+                return resolve_terminal_object(self.pdf, value);
             }
         }
-        if let Some(a) = action {
-            // Hold the resolved-owned Object on the stack so `adict` (a
-            // borrow into it) satisfies the borrow checker for the rest
-            // of this block.
-            let resolved_owned;
-            let adict = match a {
-                Object::Reference(r) => {
-                    resolved_owned = self.pdf.resolve(*r)?;
-                    resolved_owned.as_dict()
-                }
-                other => other.as_dict(),
-            };
-            if let Some(adict) = adict {
-                // Extract both /S and /D as owned values before ending the
-                // adict borrow, so we can resolve /S via &mut self.pdf.
-                let s_src = adict.get("S").cloned();
-                let d_src = adict.get("D").cloned();
-                // `/S` may be stored as an indirect reference; matching
-                // Object::Name against a raw Object::Reference silently
-                // misses the GoTo path. Resolve one level before matching.
-                let s = resolve_one_level(self.pdf, s_src)?;
-                let is_goto = matches!(s, Some(Object::Name(ref n)) if n == b"GoTo");
-                if is_goto {
-                    if let Some(d) = d_src {
-                        if let Some(found) = self.dest_from_value(&d, MAX_DEST_RESOLVE_DEPTH)? {
-                            return Ok(Some(found));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(None)
+        Ok(Object::Null)
     }
 
     /// Resolve a destination value (array / indirect / dict `/D`) to a [`Dest`].
@@ -1077,6 +1114,13 @@ pub fn prune_outline_se_with_max_depth<R: Read + Seek>(
     max_depth: usize,
 ) -> Result<usize> {
     OutlineDocumentHelper::new(pdf).prune_se_with_max_depth(live_struct_elem_refs, max_depth)
+}
+
+fn resolve_terminal_object<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<Object> {
+    match value {
+        value @ Object::Reference(_) => Ok(crate::ref_chain::resolve_ref_chain(pdf, &value)?.0),
+        other => Ok(other),
+    }
 }
 
 /// Decode an outline `/Title`, resolving one level of indirection (review rule 2).

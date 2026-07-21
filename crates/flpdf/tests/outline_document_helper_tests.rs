@@ -33,6 +33,13 @@ fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
     out
 }
 
+fn page_dest(page: u32) -> Object {
+    Object::Array(vec![
+        Object::Reference(ObjectRef::new(page, 0)),
+        Object::Name(b"Fit".to_vec()),
+    ])
+}
+
 /// Catalog + pages + a two-level outline:
 ///   root(4) -> First A(5)
 ///   A(5)    -> First A1(6); A1 has dest [3 0 R /Fit]
@@ -327,10 +334,10 @@ fn dest_from_explicit_dest_array() {
     let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
     let roots = pdf.outline().get_root().unwrap();
     let a1 = &roots[0].children[0]; // A1 has /Dest [3 0 R /Fit]
-    let dest = a1.dest.as_ref().expect("A1 should have a dest");
-    assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
-    // Nodes without a dest stay None.
-    assert!(roots[1].dest.is_none()); // B
+    assert_eq!(a1.dest, page_dest(3));
+    assert_eq!(a1.dest_page(), Object::Reference(ObjectRef::new(3, 0)));
+    // Nodes without a destination have qpdf's null sentinel.
+    assert_eq!(roots[1].dest, Object::Null); // B
 }
 
 /// Outline item whose destination is a GoTo action: /A << /S /GoTo /D [3 0 R /Fit] >>.
@@ -354,11 +361,11 @@ fn action_dest_pdf() -> Vec<u8> {
 fn dest_from_goto_action() {
     let mut pdf = Pdf::open(Cursor::new(action_dest_pdf())).unwrap();
     let roots = pdf.outline().get_root().unwrap();
-    let dest = roots[0]
-        .dest
-        .as_ref()
-        .expect("GoTo action should yield a dest");
-    assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
+    assert_eq!(roots[0].dest, page_dest(3));
+    assert_eq!(
+        roots[0].dest_page(),
+        Object::Reference(ObjectRef::new(3, 0))
+    );
 }
 
 /// Outline item whose /Dest is an INDIRECT ref (obj 8) to an explicit array.
@@ -380,15 +387,11 @@ fn indirect_dest_pdf() -> Vec<u8> {
 fn dest_from_indirect_dest_reference() {
     let mut pdf = Pdf::open(Cursor::new(indirect_dest_pdf())).unwrap();
     let roots = pdf.outline().get_root().unwrap();
-    let dest = roots[0]
-        .dest
-        .as_ref()
-        .expect("indirect /Dest should resolve");
-    assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
+    assert_eq!(roots[0].dest, page_dest(3));
 }
 
 /// Outline item whose /Dest points at a dict whose /D points back at itself:
-/// 8 0 obj << /D 8 0 R >>. Resolution must terminate (depth bound) -> None.
+/// 8 0 obj << /D 8 0 R >>. qpdf preserves the raw dictionary shape.
 fn cyclic_dest_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -404,11 +407,10 @@ fn cyclic_dest_pdf() -> Vec<u8> {
 }
 
 #[test]
-fn cyclic_dest_terminates_as_none() {
+fn cyclic_dest_preserves_dictionary_shape() {
     let mut pdf = Pdf::open(Cursor::new(cyclic_dest_pdf())).unwrap();
     let roots = pdf.outline().get_root().unwrap();
-    // The cyclic /D bottoms out at the depth bound and resolves to no dest.
-    assert!(roots[0].dest.is_none());
+    assert!(matches!(roots[0].dest, Object::Dictionary(_)));
 }
 
 /// Modern named dest: outline /Dest (string) resolved via catalog /Names /Dests
@@ -435,8 +437,7 @@ fn named_dest_nametree_pdf() -> Vec<u8> {
 fn dest_from_named_nametree() {
     let mut pdf = Pdf::open(Cursor::new(named_dest_nametree_pdf())).unwrap();
     let roots = pdf.outline().get_root().unwrap();
-    let dest = roots[0].dest.as_ref().expect("named dest should resolve");
-    assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
+    assert_eq!(roots[0].dest, page_dest(3));
 }
 
 /// Legacy named dest: /Dest is a Name (/mydest) resolved via catalog /Dests
@@ -462,15 +463,12 @@ fn named_dest_legacy_pdf() -> Vec<u8> {
 fn dest_from_named_legacy() {
     let mut pdf = Pdf::open(Cursor::new(named_dest_legacy_pdf())).unwrap();
     let roots = pdf.outline().get_root().unwrap();
-    let dest = roots[0]
-        .dest
-        .as_ref()
-        .expect("legacy named dest should resolve");
-    assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
+    assert!(matches!(roots[0].dest, Object::Dictionary(_)));
+    assert_eq!(roots[0].dest_page(), Object::Null);
 }
 
-/// Legacy /Dests with a NAME->NAME cycle: /a -> /b, /b -> /a. Resolution must
-/// terminate at the depth bound and yield no dest (not overflow the stack).
+/// Legacy /Dests with a NAME->NAME cycle: /a -> /b, /b -> /a. qpdf performs
+/// only one named lookup, so `/a` materializes as the raw alias `/b`.
 fn cyclic_named_dest_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -489,11 +487,10 @@ fn cyclic_named_dest_pdf() -> Vec<u8> {
 }
 
 #[test]
-fn cyclic_named_dest_terminates_as_none() {
+fn cyclic_named_dest_preserves_first_alias() {
     let mut pdf = Pdf::open(Cursor::new(cyclic_named_dest_pdf())).unwrap();
     let roots = pdf.outline().get_root().unwrap();
-    // The /a -> /b -> /a name cycle bottoms out at the depth bound -> no dest.
-    assert!(roots[0].dest.is_none());
+    assert_eq!(roots[0].dest, Object::Name(b"b".to_vec()));
 }
 
 /// The same dest name exists in BOTH the modern name tree and legacy /Dests.
@@ -521,12 +518,8 @@ fn named_dest_collision_pdf() -> Vec<u8> {
 fn named_dest_modern_wins_over_legacy() {
     let mut pdf = Pdf::open(Cursor::new(named_dest_collision_pdf())).unwrap();
     let roots = pdf.outline().get_root().unwrap();
-    let dest = roots[0]
-        .dest
-        .as_ref()
-        .expect("collision named dest should resolve");
     // Modern name-tree entry ([3 0 R ...]) wins over legacy /Dests ([2 0 R ...]).
-    assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
+    assert_eq!(roots[0].dest, page_dest(3));
 }
 
 /// Outline item whose /Title is an INDIRECT reference (obj 9) to a string.
@@ -1652,6 +1645,198 @@ fn action_pdf(action_body: &str) -> Vec<u8> {
     )
 }
 
+fn single_outline_with_catalog(
+    catalog_entries: &str,
+    item_entries: &str,
+    extra: &[(u32, &str)],
+) -> Vec<u8> {
+    let mut owned = vec![
+        (
+            1,
+            format!("<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R {catalog_entries} >>"),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+        ),
+        (
+            4,
+            "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>".to_string(),
+        ),
+        (
+            5,
+            format!("<< /Title (One) /Parent 4 0 R {item_entries} >>"),
+        ),
+    ];
+    owned.extend(
+        extra
+            .iter()
+            .map(|(number, body)| (*number, (*body).to_string())),
+    );
+    let borrowed: Vec<(u32, &str)> = owned
+        .iter()
+        .map(|(number, body)| (*number, body.as_str()))
+        .collect();
+    build_pdf(&borrowed, 1)
+}
+
+fn qpdf_destination_matrix_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 7 0 R /Count 3 >>"),
+            (5, "<< /Title (Array) /Parent 4 0 R /Next 6 0 R /A [10 0 R] >>"),
+            (6, "<< /Title (Integer) /Parent 4 0 R /Prev 5 0 R /Next 7 0 R /Dest 42 /A << /S /GoTo /D [3 0 R /Fit] >> >>"),
+            (7, "<< /Title (GoTo) /Parent 4 0 R /Prev 6 0 R /A << /S /GoTo /D [3 0 R /Fit] >> >>"),
+            (10, "<< /S /GoTo /D [3 0 R /Fit] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn qpdf_destination_matrix_matches_raw_objects() {
+    let mut pdf = Pdf::open(Cursor::new(qpdf_destination_matrix_pdf())).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    assert_eq!(roots[0].dest, Object::Null);
+    assert_eq!(roots[1].dest, Object::Integer(42));
+    assert_eq!(roots[2].dest, page_dest(3));
+}
+
+#[test]
+fn dest_key_presence_suppresses_valid_action_fallback() {
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (P) /Parent 4 0 R /Dest 42 /A << /S /GoTo /D [3 0 R /Fit] >> >>",
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    assert_eq!(
+        pdf.outline().get_root().unwrap()[0].dest,
+        Object::Integer(42)
+    );
+}
+
+#[test]
+fn root_action_array_is_not_an_action_dictionary() {
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (A) /Parent 4 0 R /A [10 0 R] >>"),
+            (10, "<< /S /GoTo /D [3 0 R /Fit] >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, Object::Null);
+}
+
+#[test]
+fn candidate_type_selects_only_qpdf_named_destination_store() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names 8 0 R /Dests 10 0 R >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 6 0 R /Count 2 >>"),
+            (
+                5,
+                "<< /Title (Name) /Parent 4 0 R /Next 6 0 R /Dest /dup >>",
+            ),
+            (
+                6,
+                "<< /Title (String) /Parent 4 0 R /Prev 5 0 R /Dest (dup) >>",
+            ),
+            (8, "<< /Dests 9 0 R >>"),
+            (9, "<< /Names [(dup) [3 0 R /Fit]] >>"),
+            (10, "<< /dup [2 0 R /Fit] >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let roots = pdf.outline().get_root().unwrap();
+    assert_eq!(roots[0].dest, page_dest(2));
+    assert_eq!(roots[1].dest, page_dest(3));
+}
+
+#[test]
+fn malformed_or_non_goto_actions_have_null_destination() {
+    for action in [
+        "<< /S /GoTo >>",
+        "<< /S 42 /D [3 0 R /Fit] >>",
+        "<< /S /URI /D [3 0 R /Fit] >>",
+        "<< /S /GoTo /D null >>",
+        "<< /S /GoTo /SD [3 0 R /Fit] >>",
+        "(not a dictionary)",
+    ] {
+        let mut pdf = Pdf::open(Cursor::new(action_pdf(action))).unwrap();
+        assert_eq!(pdf.outline().get_root().unwrap()[0].dest, Object::Null);
+    }
+}
+
+#[test]
+fn unresolved_dest_name_suppresses_action_fallback() {
+    let bytes = single_outline_with_catalog(
+        "/Dests << >>",
+        "/Dest /missing /A << /S /GoTo /D [3 0 R /Fit] >>",
+        &[],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, Object::Null);
+}
+
+#[test]
+fn utf16_string_key_uses_qpdf_utf8_value() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests 8 0 R >>",
+        "/Dest <FEFF540D524D>",
+        &[(8, "<< /Names [<FEFF540D524D> [3 0 R /Fit]] >>")],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, page_dest(3));
+}
+
+#[test]
+fn named_destination_preserves_dictionary_shape() {
+    let bytes = single_outline_with_catalog(
+        "/Dests << /dict << /D [3 0 R /Fit] >> >>",
+        "/Dest /dict",
+        &[],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let node = &pdf.outline().get_root().unwrap()[0];
+    assert!(matches!(node.dest, Object::Dictionary(_)));
+    assert_eq!(node.dest_page(), Object::Null);
+}
+
+#[test]
+fn named_destination_materializes_indirect_result_holder() {
+    let bytes = single_outline_with_catalog(
+        "/Dests << /held 8 0 R >>",
+        "/Dest /held",
+        &[(8, "[3 0 R /Fit]")],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, page_dest(3));
+}
+
 fn first_action(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Option<OutlineAction> {
     pdf.outline()
         .get_root()
@@ -1775,9 +1960,8 @@ fn resolve_node_dest_follows_indirect_s_name() {
     );
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
     let root = pdf.outline().get_root().unwrap();
-    let dest = root[0].dest.as_ref().expect("dest resolved from GoTo /D");
     assert_eq!(
-        dest.array[0],
+        root[0].dest_page(),
         Object::Reference(ObjectRef::new(3, 0)),
         "GoTo /D must be picked up even when /S is an indirect ref"
     );

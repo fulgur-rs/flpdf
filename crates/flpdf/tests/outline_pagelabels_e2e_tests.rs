@@ -125,11 +125,11 @@ fn deep_outline_round_trip_through_write_pdf() {
     loop {
         assert_eq!(node.depth, depth);
         assert_eq!(node.title, format!("L{depth}"));
-        let dest = node
-            .dest
-            .as_ref()
-            .unwrap_or_else(|| panic!("level {depth} must keep its /Dest after the round trip"));
-        assert_eq!(dest.page(), Some(ObjectRef::new(3, 0)));
+        assert_eq!(
+            node.dest_page(),
+            Object::Reference(ObjectRef::new(3, 0)),
+            "level {depth} must keep its /Dest after the round trip"
+        );
         match node.children.first() {
             Some(child) => {
                 node = child;
