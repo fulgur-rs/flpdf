@@ -1803,6 +1803,46 @@ fn unresolved_dest_name_suppresses_action_fallback() {
 }
 
 #[test]
+fn missing_named_candidate_store_paths_have_null_destination() {
+    let cases = [
+        (
+            "Name candidate with no legacy /Dests",
+            "/Names << /Dests 8 0 R >>",
+            "/Dest /onlymodern",
+            (8, "<< /Names [(onlymodern) [3 0 R /Fit]] >>"),
+        ),
+        (
+            "String candidate with no /Names",
+            "/Dests << /onlylegacy [3 0 R /Fit] >>",
+            "/Dest (onlylegacy)",
+            (8, "null"),
+        ),
+        (
+            "String candidate with /Names but no /Dests",
+            "/Names << /Other 8 0 R >> /Dests << /onlylegacy [3 0 R /Fit] >>",
+            "/Dest (onlylegacy)",
+            (8, "null"),
+        ),
+        (
+            "String candidate missing from the /Dests name tree",
+            "/Names << /Dests 8 0 R >>",
+            "/Dest (missing)",
+            (8, "<< /Names [(other) [3 0 R /Fit]] >>"),
+        ),
+    ];
+
+    for (label, catalog_entries, item_entries, extra) in cases {
+        let bytes = single_outline_with_catalog(catalog_entries, item_entries, &[extra]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(
+            pdf.outline().get_root().unwrap()[0].dest,
+            Object::Null,
+            "{label}"
+        );
+    }
+}
+
+#[test]
 fn utf16_string_key_uses_qpdf_utf8_value() {
     let bytes = single_outline_with_catalog(
         "/Names << /Dests 8 0 R >>",

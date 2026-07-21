@@ -93,8 +93,7 @@ pub struct OutlineNode {
     /// the document's structure tree (ISO 32000-2 section 12.3.3, table 151),
     /// or `None` when `/SE` is absent. Per spec `/SE` shall be an indirect
     /// reference; a direct (non-reference) `/SE` value is malformed and is
-    /// also read as `None`, matching how [`Self::dest`] and the other fields
-    /// on this type treat a non-conforming value as absent.
+    /// also read as `None`.
     pub se: Option<ObjectRef>,
     /// The item's own `/A` action (ISO 32000-1 section 12.6), typed by
     /// subtype, or `None` when `/A` is absent or does not resolve to a
