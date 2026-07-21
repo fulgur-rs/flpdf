@@ -619,10 +619,10 @@ pub use outline_document_helper::{
 Run:
 
 ```bash
-rg -n "OutlineAction|action_chain|DEFAULT_MAX_ACTION_CHAIN_DEPTH|\.action\b" crates/flpdf/src crates/flpdf/tests crates/flpdf-cli/src
+rg -n "OutlineAction|DEFAULT_MAX_ACTION_CHAIN_DEPTH|pub fn action_chain|pub fn action_chain_with_max_depth|OutlineNode::action|node\.action|roots\[[^]]+\]\.action" crates/flpdf/src crates/flpdf/tests crates/flpdf-cli/src
 ```
 
-Expected: no matches. `/Next` may still appear in raw fixture strings and page-extraction code; the search terms above must not.
+Expected: no matches. `/Next` and internal action-chain handling may still appear in raw fixture strings and page-extraction code.
 
 - [ ] **Step 6: Run focused, crate, and workspace tests**
 
