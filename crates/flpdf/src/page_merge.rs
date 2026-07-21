@@ -970,7 +970,6 @@ pub fn merge_documents<R: Read + Seek>(
         // root has been folded, the selected page set determines which copied
         // source pages are retained. No destination/action subtype analysis is
         // needed, and pages outside the closure are never copied as placeholders.
-        let selected_set: BTreeSet<ObjectRef> = unique.iter().copied().collect();
         // Renumbering-disjointness invariant: copy_objects allocates fresh
         // target object numbers starting one past the current maximum, so the
         // refs it returns never collide with objects already surviving in the
@@ -985,7 +984,7 @@ pub fn merge_documents<R: Read + Seek>(
              (renumbering-disjointness invariant; guards against shared-destination double-remap)"
         );
 
-        null_copied_removed_pages(&mut target, &all, &selected_set, &closure, &map);
+        null_copied_removed_pages(&mut target, &all, &seen, &map);
 
         // Wire the primary's inherited document-level structures onto the output
         // catalog (obj 1, distinct from the /Pages root obj 2 rebuilt below).
@@ -1019,7 +1018,7 @@ pub fn merge_documents<R: Read + Seek>(
         // Build that retained-widget set once per input from the selected pages'
         // `/Annots`, in source space, so a `/P`-less selected-page widget is kept.
         let mut retained_widgets: BTreeSet<ObjectRef> = BTreeSet::new();
-        collect_retained_widget_refs(input.source, &selected_set, &mut retained_widgets)?;
+        collect_retained_widget_refs(input.source, &seen, &mut retained_widgets)?;
         for (src_field_ref, partial_name) in source_fields {
             if let Some(&target_ref) = map.get(&src_field_ref) {
                 let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
@@ -1027,7 +1026,7 @@ pub fn merge_documents<R: Read + Seek>(
                     input.source,
                     &mut target,
                     src_field_ref,
-                    &selected_set,
+                    &seen,
                     &retained_widgets,
                     &map,
                     &mut orphan_pages,

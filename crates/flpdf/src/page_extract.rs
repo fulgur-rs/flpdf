@@ -177,8 +177,7 @@ pub fn extract_pages<R: Read + Seek>(
     }
     let mut target = Pdf::open_mem_owned(minimal_target_bytes())?;
     let map = copy_objects(source, &mut target, &closure)?;
-    let selected_set: BTreeSet<ObjectRef> = unique.iter().copied().collect();
-    null_copied_removed_pages(&mut target, &all_pages, &selected_set, &closure, &map);
+    null_copied_removed_pages(&mut target, &all_pages, &seen, &map);
     let pages_root_ref = target_pages_root(&mut target)?;
 
     // Materialize inherited attrs onto each copied leaf (remapping refs), then
@@ -244,17 +243,16 @@ pub fn extract_pages<R: Read + Seek>(
 /// Replace every copied but unselected source page with `null`.
 ///
 /// Page identity comes from the source page tree (`all_pages`), not from the
-/// semantics or `/Type` of the object carrying the reference. Pages outside
-/// `closure` were never copied and therefore require no placeholder object.
+/// semantics or `/Type` of the object carrying the reference. Pages absent
+/// from `map` were never copied and therefore require no placeholder object.
 pub(crate) fn null_copied_removed_pages<R: Read + Seek>(
     target: &mut Pdf<R>,
     all_pages: &[ObjectRef],
     selected: &BTreeSet<ObjectRef>,
-    closure: &BTreeSet<ObjectRef>,
     map: &BTreeMap<ObjectRef, ObjectRef>,
 ) {
     for source_page in all_pages {
-        if !selected.contains(source_page) && closure.contains(source_page) {
+        if !selected.contains(source_page) {
             if let Some(&copied_page) = map.get(source_page) {
                 target.set_object(copied_page, Object::Null);
             }
