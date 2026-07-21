@@ -37,7 +37,8 @@ The following separately tracked qpdf parity gaps are outside this scope:
 
 - `flpdf-7nu4`: add qpdf-compatible `get_outlines_for_page`;
 - `flpdf-x5yi`: accept direct outline dictionaries;
-- `flpdf-3g9k`: match qpdf's depth-50 silent truncation.
+- `flpdf-3g9k`: match qpdf's depth-50 silent truncation;
+- `flpdf-guru`: match qpdf title decoding and count clamping.
 
 ## Public API
 
