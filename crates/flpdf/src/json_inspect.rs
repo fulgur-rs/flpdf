@@ -120,6 +120,33 @@ const fn build_pdfdoc_table() -> [Option<char>; 256] {
     table
 }
 
+/// Match qpdf `QPDF_String::getUTF8Val`: UTF-16 BOM, explicit UTF-8 BOM,
+/// otherwise PDFDocEncoding with U+FFFD for undefined entries.
+///
+/// The return type preserves qpdf's `std::string` bytes: in particular, bytes
+/// after an explicit UTF-8 BOM are returned verbatim even when they are not
+/// valid UTF-8.
+pub(crate) fn qpdf_utf8_value(bytes: &[u8]) -> Vec<u8> {
+    if let Some(rest) = bytes.strip_prefix(&[0xfe, 0xff]) {
+        return lossy_utf16_to_utf8(rest, false).into_bytes();
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xff, 0xfe]) {
+        return lossy_utf16_to_utf8(rest, true).into_bytes();
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
+        return rest.to_vec();
+    }
+
+    bytes
+        .iter()
+        .map(|&byte| match byte {
+            0x7f | 0x9f | 0xad => '\u{fffd}',
+            _ => PDFDOC_ENCODING[byte as usize].unwrap_or(byte as char),
+        })
+        .collect::<String>()
+        .into_bytes()
+}
+
 /// Decode a PDF text string (ISO 32000-1 §7.9.2) into a Rust `String`.
 ///
 /// Returns `Some(text)` when the byte sequence is valid as a PDF text string
@@ -2847,6 +2874,37 @@ mod tests {
     }
 
     // ── 11. String conversion (text vs binary) ────────────────────────────────
+
+    #[test]
+    fn qpdf_utf8_value_decodes_all_qpdf_string_encodings() {
+        assert_eq!(qpdf_utf8_value(b"plain"), b"plain");
+        assert_eq!(
+            qpdf_utf8_value(&[0xef, 0xbb, 0xbf, 0xe5, 0x90, 0x8d]),
+            "名".as_bytes()
+        );
+        assert_eq!(
+            qpdf_utf8_value(&[0xfe, 0xff, 0x54, 0x0d, 0x52, 0x4d]),
+            "名前".as_bytes()
+        );
+        assert_eq!(
+            qpdf_utf8_value(&[0xff, 0xfe, 0x0d, 0x54, 0x4d, 0x52]),
+            "名前".as_bytes()
+        );
+        assert_eq!(qpdf_utf8_value(&[0x95]), "Ł".as_bytes());
+    }
+
+    #[test]
+    fn qpdf_utf8_value_replaces_undefined_pdfdoc_byte() {
+        assert_eq!(
+            qpdf_utf8_value(&[b'a', 0xad, b'b']),
+            "a\u{fffd}b".as_bytes()
+        );
+    }
+
+    #[test]
+    fn qpdf_utf8_value_preserves_invalid_explicit_utf8_bytes() {
+        assert_eq!(qpdf_utf8_value(&[0xef, 0xbb, 0xbf, 0xff]), &[0xff]);
+    }
 
     #[test]
     fn object_string_ascii_text_has_u_prefix() {

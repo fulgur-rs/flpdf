@@ -114,10 +114,8 @@ fn page_index_of(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>, target: Objec
 fn outline_dest_page_index(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>) -> usize {
     let roots = pdf.outline().get_root().unwrap();
     let target = roots[0]
-        .dest
-        .as_ref()
-        .expect("outline item must keep its /Dest")
-        .page()
+        .dest_page()
+        .as_ref_id()
         .expect("dest must resolve to a page ref");
     page_index_of(pdf, target)
 }
