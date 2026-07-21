@@ -598,8 +598,7 @@ fn merge_indirect_annots_nulls_removed_dest_and_ignores_pageless_dests() {
         "named destination must be retained as-is"
     );
 
-    // The URI action is not a GoTo: it contributes no removed target and is
-    // retained verbatim.
+    // The URI action contains no page reference and is retained verbatim.
     let uri = doc.resolve(annots[2]).unwrap().into_dict().unwrap();
     let action = match uri.get("A") {
         Some(Object::Dictionary(d)) => d.clone(),
@@ -617,9 +616,9 @@ fn merge_indirect_annots_nulls_removed_dest_and_ignores_pageless_dests() {
 }
 
 /// Five-page document whose page 0 reaches three distinct removed pages (2, 3,
-/// 4) through carriers that the one-level collector did NOT follow: a `/Next`
-/// action chain, an action array, and a `/SD` structure destination. Pages 0
-/// and 1 survive; 2/3/4 are removed when only `[0,1]` is selected.
+/// 4) through a `/Next` action chain, an action array, and a `/SD` structure
+/// destination. Pages 0 and 1 survive; 2/3/4 are removed when only `[0,1]` is
+/// selected.
 ///
 /// - obj 6 = annot `/A << /S /SetOCGState /Next << /S /GoTo /D [7 0 R] >> >>`
 ///   — the GoTo lives only on the `/Next` continuation; the head action is a
@@ -689,13 +688,10 @@ fn page_absent_from_kids(
         .any(|r| r == page_ref)
 }
 
-// A removed page reached ONLY through a /Next action chain, an action array, or
-// a /SD structure destination is nulled (qpdf --pages null-out parity), NOT left
-// as a live orphan. The merge collector must cover the SAME carriers extract's
-// neutralize family covers; before that fix these targets were pulled into the
-// copy closure but skipped by the one-level collector, surviving as full
-// un-nulled orphan pages reachable via a remapped reference. Each target uses a
-// distinct carrier so one assertion pins one carrier.
+// A removed page reached only through a /Next action chain, an action array, or
+// a /SD structure destination is nulled by source-page membership, not action
+// semantics. Each target uses a distinct carrier so one assertion pins the
+// generic closure and page-boundary behavior.
 #[test]
 fn merge_nulls_removed_page_via_next_array_and_sd() {
     let mut a = Pdf::open_mem_owned(five_page_next_array_sd_pdf()).unwrap();
@@ -818,18 +814,11 @@ fn three_page_bead_ring_pdf() -> Vec<u8> {
     )
 }
 
-// KNOWN LIMITATION (documents current behaviour). A page reached only through
-// an article-thread bead's `/P` from a selected page belongs to a
-// drop-and-garbage-collect family, NOT the destination null-out family. qpdf
-// `--pages` GCs such a page entirely rather than leaving a null placeholder, so
-// merge deliberately does not null it. Until merge implements the drop, the
-// page is pulled into the copy by the page closure (which follows the surviving
-// bead `/P`) and stays a LIVE object — outside the output page tree, but still
-// reachable through the bead ring. This test pins that current behaviour: the
-// bead `/P` target resolves to a live `/Type /Page` dict (NOT null) and is
-// absent from `/Kids`. A future drop-fix should flip the first assertion.
+// Page null-out is driven by membership in the source page tree, not by the
+// semantics of the carrier. A removed page copied through an article-thread
+// bead's `/P` therefore remains referenced but resolves to null.
 #[test]
-fn merge_bead_p_removed_page_currently_orphaned() {
+fn merge_bead_p_removed_page_is_nulled() {
     let mut a = Pdf::open_mem_owned(three_page_bead_ring_pdf()).unwrap();
     let mut inputs = [MergeInput {
         source: &mut a,
@@ -854,16 +843,9 @@ fn merge_bead_p_removed_page_currently_orphaned() {
     let bead1 = doc.resolve(bead1_ref).unwrap().into_dict().unwrap();
     let p_target = bead1.get("P").and_then(Object::as_ref_id).unwrap();
 
-    // Current behaviour: the bead /P target is NOT nulled — it remains a live
-    // `/Type /Page` object, distinct from the destination null-out family.
-    let resolved = doc.resolve(p_target).unwrap().into_dict();
     assert!(
-        resolved
-            .as_ref()
-            .and_then(|d| d.get("Type"))
-            .and_then(Object::as_name)
-            == Some(&b"Page"[..]),
-        "bead-/P-reached removed page is currently a live Page object (drop deferred)"
+        matches!(doc.resolve(p_target).unwrap(), Object::Null),
+        "bead-/P-reached removed page must resolve to null"
     );
     // ...but it is outside the output page tree (never appears in /Kids).
     assert!(
@@ -877,10 +859,8 @@ fn merge_bead_p_removed_page_currently_orphaned() {
 }
 
 /// Three-page document whose pages carry deliberately malformed or structurally
-/// varied destination carriers, exercising the collector's tolerant and
-/// chain-shape arms without any well-formed *removed* target. All three pages
-/// are selected, so nothing is nulled; the test only proves the collector walks
-/// these shapes without error.
+/// varied destination carriers. All three pages are selected, so nothing is
+/// nulled; the test proves generic closure/copy tolerates these shapes.
 ///
 /// page0 (obj 3) — malformed carriers:
 /// - page-level `/AA 9 0 R` resolves to a NON-dict (an array) → `/AA` arm.
@@ -892,19 +872,15 @@ fn merge_bead_p_removed_page_currently_orphaned() {
 /// page1 (obj 4) — `/Annots 14 0 R` resolves to a NON-array (a dict) → the
 ///   indirect-`/Annots`-not-an-array arm.
 ///
-/// page2 (obj 5) — action-chain shapes and `/SD` carriers targeting *kept*
-/// pages (so they are collected-but-not-removed, exercising the "target is
-/// selected" branch) and `/SD` shapes carrying no resolvable page ref:
-/// - obj 12 = annot whose `/A` head's `/Next` is an ARRAY of actions → the
-///   `/Next`-array arm.
+/// page2 (obj 5) — action-chain shapes and `/SD` carriers targeting kept pages,
+/// plus malformed `/SD` shapes:
+/// - obj 12 = annot whose `/A` head's `/Next` is an ARRAY of actions.
 /// - obj 13 = annot whose `/A 15 0 R` is an action whose `/Next 15 0 R` points
-///   back at itself → the indirect-cycle guard (the same action object is not
-///   re-entered).
+///   back at itself (an indirect cycle).
 /// - obj 17 = annot `/A /GoTo /SD` → StructElem (obj 18) whose `/Pg 4 0 R` is a
-///   SELECTED page (the `/SD` target is kept, not removed).
-/// - objs 21–24 = `/A /GoTo /SD` shapes that each yield no page ref (empty
-///   `/SD`, non-dict StructElem, StructElem without `/Pg`, `/Pg` → non-page),
-///   exercising the early-return arms of `sd_target_page_ref`.
+///   selected page.
+/// - objs 21–24 = malformed `/A /GoTo /SD` shapes (empty `/SD`, non-dict
+///   StructElem, StructElem without `/Pg`, `/Pg` → non-page).
 fn malformed_carriers_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -937,31 +913,27 @@ fn malformed_carriers_pdf() -> Vec<u8> {
             (8, "[6 0 R 7 0 R]"), // indirect /Annots array
             (9, "[1 2 3]"),       // /AA resolves to a non-dict (array)
             (11, "99"),           // /A resolves to a non-dict (integer)
-            // page2: /A head whose /Next is an ARRAY of actions (both non-GoTo,
-            // so no target is collected; this exercises the /Next-array walk).
+            // page2: /A head whose /Next is an ARRAY of actions.
             (
                 12,
                 "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] \
                  /A << /S /SetOCGState /Next [ << /S /SetOCGState >> << /S /SetOCGState >> ] >> >>",
             ),
-            // page2: /A is an indirect action whose /Next points back at itself,
-            // exercising the indirect-cycle guard (visited set).
+            // page2: /A is an indirect action whose /Next points back at itself.
             (
                 13,
                 "<< /Type /Annot /Subtype /Link /Rect [20 0 30 10] /A 15 0 R >>",
             ),
             (14, "<< /NotAnArray true >>"), // indirect /Annots resolves to a non-array
             (15, "<< /S /SetOCGState /Next 15 0 R >>"), // self-referential /Next
-            // page2: a /A /GoTo /SD whose target is a KEPT (selected) page —
-            // collected but not recorded as removed.
+            // page2: a /A /GoTo /SD whose target is a selected page.
             (
                 17,
                 "<< /Type /Annot /Subtype /Link /Rect [40 0 50 10] \
                  /A << /S /GoTo /SD [18 0 R /Fit] >> >>",
             ),
             (18, "<< /Type /StructElem /S /Sect /Pg 4 0 R >>"),
-            // page2: /SD shapes that carry no resolvable page ref (each returns
-            // None from sd_target_page_ref, exercising its early-return arms).
+            // page2: malformed /SD shapes.
             (
                 21,
                 "<< /Type /Annot /Subtype /Link /Rect [0 0 5 5] /A << /S /GoTo /SD [] >> >>",
@@ -992,9 +964,7 @@ fn malformed_carriers_pdf() -> Vec<u8> {
 // /Annots), structural action shapes (a /Next array, a self-referential
 // indirect /Next), a /A /GoTo /SD whose target is a KEPT page, and /SD shapes
 // carrying no resolvable page ref are all tolerated: the merge succeeds and all
-// selected pages survive. These shapes pass page_refs (which does not validate
-// these sub-objects), so the collector's tolerant arms are genuinely reachable
-// from an openable PDF.
+// selected pages survive.
 #[test]
 fn merge_tolerates_malformed_carrier_shapes() {
     let mut a = Pdf::open_mem_owned(malformed_carriers_pdf()).unwrap();
@@ -1074,6 +1044,26 @@ fn doc_level_dest_pdf() -> Vec<u8> {
 fn catalog_dict(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> flpdf::Dictionary {
     let catalog_ref = doc.root_ref().unwrap();
     doc.resolve(catalog_ref).unwrap().into_dict().unwrap()
+}
+
+/// Count how many live objects in `doc` carry the given /Type name.
+fn count_type(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, type_name: &[u8]) -> usize {
+    let mut n = 0;
+    for r in doc.live_object_refs() {
+        if let Ok(obj) = doc.resolve(r) {
+            let dict = match &obj {
+                Object::Dictionary(d) => Some(d.clone()),
+                Object::Stream(s) => Some(s.dict.clone()),
+                _ => None,
+            };
+            if let Some(d) = dict {
+                if d.get("Type").and_then(|o| o.as_name()) == Some(type_name) {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
 }
 
 /// Walk an `/Outlines` tree (`/First` → `/Next`, descending `/First`) and return
@@ -1400,9 +1390,8 @@ fn merge_inline_openaction_dest_array_remapped_and_nulled() {
 
 // An inline /OpenAction that is an OPAQUE action (/S != /GoTo, e.g. /GoToR) whose
 // /D is an indirect operand object (a remote/named destination, not a local page
-// ref) must have that /D object folded into the copy closure and remapped to the
-// copied object — not dropped to Null. The /D-skip in the operand fold applies
-// only to local GoTo / bare-dest actions.
+// ref) has that object folded into the generic closure and remapped to the copied
+// object rather than dropped to Null.
 #[test]
 fn merge_opaque_openaction_d_operand_is_copied_and_remapped() {
     let src = build_pdf(
@@ -1440,14 +1429,11 @@ fn merge_opaque_openaction_d_operand_is_copied_and_remapped() {
     );
 }
 
-// An inline-on-catalog /OpenAction of /S /GoTo carrying BOTH a /SD structure
-// destination and a /D explicit destination: merge never copies the structure
-// tree, so /SD (pointing at an uncopied StructElem) cannot resolve and — per
-// ISO 32000-2 §12.3.2.3, /SD takes precedence over /D for structure-aware
-// viewers — would suppress the working /D if left in place (nulled or dangling).
-// merge drops /SD and keeps /D, which is remapped to the copied page.
+// A direct /OpenAction is copied generically: /SD and /D are both retained and
+// every reference is remapped. The StructElem remains live, while its /Pg points
+// at the copied null boundary for the unselected source page.
 #[test]
-fn merge_inline_openaction_goto_sd_dropped_falls_back_to_d() {
+fn merge_inline_openaction_goto_sd_retained_with_removed_page_nulled() {
     let src = build_pdf(
         &[
             (
@@ -1475,11 +1461,20 @@ fn merge_inline_openaction_goto_sd_dropped_falls_back_to_d() {
         Some(Object::Dictionary(d)) => d.clone(),
         other => panic!("expected /OpenAction action dict, got {other:?}"),
     };
-    assert!(
-        oa.get("SD").is_none(),
-        "/SD must be dropped (structure tree not copied), got {:?}",
-        oa.get("SD")
-    );
+    let sd = oa
+        .get("SD")
+        .and_then(Object::as_array)
+        .expect("/SD carrier is retained");
+    let struct_ref = sd
+        .first()
+        .and_then(Object::as_ref_id)
+        .expect("/SD retains a StructElem reference");
+    let struct_elem = doc.resolve(struct_ref).unwrap().into_dict().unwrap();
+    let removed_page = struct_elem
+        .get("Pg")
+        .and_then(Object::as_ref_id)
+        .expect("StructElem /Pg is retained");
+    assert!(matches!(doc.resolve(removed_page).unwrap(), Object::Null));
     let d = match oa.get("D") {
         Some(Object::Array(arr)) => arr.clone(),
         other => panic!("expected /D array fallback, got {other:?}"),
@@ -1493,11 +1488,10 @@ fn merge_inline_openaction_goto_sd_dropped_falls_back_to_d() {
     assert!(Pdf::open_mem_owned(out).is_ok(), "merged doc round-trips");
 }
 
-// An inline /OpenAction /S /GoTo with ONLY /SD (no /D): dropping /SD leaves the
-// GoTo with no destination (a benign no-op action), retained like extract's
-// neutralize keeps the action and drops only the destination key.
+// An inline /OpenAction /S /GoTo with ONLY /SD retains the carrier and copied
+// StructElem, whose /Pg resolves to the null boundary for the removed page.
 #[test]
-fn merge_inline_openaction_goto_sd_only_yields_no_dest() {
+fn merge_inline_openaction_goto_sd_only_retains_null_page_boundary() {
     let src = build_pdf(
         &[
             (
@@ -1524,7 +1518,20 @@ fn merge_inline_openaction_goto_sd_only_yields_no_dest() {
         Some(Object::Dictionary(d)) => d.clone(),
         other => panic!("expected /OpenAction action dict, got {other:?}"),
     };
-    assert!(oa.get("SD").is_none(), "/SD dropped");
+    let sd = oa
+        .get("SD")
+        .and_then(Object::as_array)
+        .expect("/SD carrier is retained");
+    let struct_ref = sd
+        .first()
+        .and_then(Object::as_ref_id)
+        .expect("/SD retains a StructElem reference");
+    let struct_elem = doc.resolve(struct_ref).unwrap().into_dict().unwrap();
+    let removed_page = struct_elem
+        .get("Pg")
+        .and_then(Object::as_ref_id)
+        .expect("StructElem /Pg is retained");
+    assert!(matches!(doc.resolve(removed_page).unwrap(), Object::Null));
     assert!(oa.get("D").is_none(), "no /D fallback present");
     assert_eq!(
         oa.get("S").and_then(Object::as_name),
@@ -1537,14 +1544,10 @@ fn merge_inline_openaction_goto_sd_only_yields_no_dest() {
     assert!(Pdf::open_mem_owned(out).is_ok(), "merged doc round-trips");
 }
 
-// /SD is dropped UNCONDITIONALLY — even when its StructElem /Pg targets a KEPT
-// page. Unlike extract (which keeps a kept-page /SD because it retains the
-// structure tree), merge never copies the structure tree, so the StructElem ref
-// is uncopied regardless of whether the target page survives. This pins the
-// unconditional-drop discipline (guards against a copy of extract's
-// drop-only-when-absent condition).
+// When /SD reaches a selected page, both the StructElem and its /Pg carrier are
+// retained and remapped to the copied live page.
 #[test]
-fn merge_inline_openaction_goto_sd_dropped_even_when_target_kept() {
+fn merge_inline_openaction_goto_sd_retained_when_target_kept() {
     let src = build_pdf(
         &[
             (
@@ -1570,18 +1573,25 @@ fn merge_inline_openaction_goto_sd_dropped_even_when_target_kept() {
         Some(Object::Dictionary(d)) => d.clone(),
         other => panic!("expected /OpenAction action dict, got {other:?}"),
     };
-    assert!(
-        oa.get("SD").is_none(),
-        "/SD dropped even when its target page is kept (structure tree never copied)"
-    );
+    let sd = oa
+        .get("SD")
+        .and_then(Object::as_array)
+        .expect("/SD carrier is retained");
+    let struct_ref = sd
+        .first()
+        .and_then(Object::as_ref_id)
+        .expect("/SD retains a StructElem reference");
+    let struct_elem = doc.resolve(struct_ref).unwrap().into_dict().unwrap();
+    let page_ref = struct_elem
+        .get("Pg")
+        .and_then(Object::as_ref_id)
+        .expect("StructElem /Pg is retained");
+    assert_eq!(page_ref, pages::page_refs(&mut doc).unwrap()[0]);
+    assert!(!matches!(doc.resolve(page_ref).unwrap(), Object::Null));
 }
 
 // An inline /OpenAction that is an OPAQUE remote go-to (/S /GoToR) carrying its
-// own /SD: that /SD references a structure element in the *target* document, not
-// the primary's (absent) local structure tree, so — unlike a local /GoTo — merge
-// must preserve it verbatim alongside the remote /D. The /SD drop is gated on
-// local-dest actions, mirroring the /GoTo-only gating in the collector and in
-// extract's neutralize family. Regression guard for the GoTo-only scope.
+// own /SD preserves both direct arrays verbatim under generic remapping.
 #[test]
 fn merge_inline_openaction_gotor_sd_is_preserved() {
     let src = build_pdf(
@@ -1764,9 +1774,8 @@ fn merge_inherits_inline_doc_level_carriers() {
 }
 
 // A non-GoTo inline /OpenAction action dict, and an /OpenAction that is neither
-// an array nor a dict (a bare name), are both passed through verbatim — their
-// /D, if any, is not a local page destination, so no remap is attempted. This
-// exercises remap_inline_action's non-GoTo dict and "other" arms.
+// an array nor a dict (a bare name), are both preserved by generic reference
+// remapping.
 #[test]
 fn merge_inline_non_goto_open_action_passed_through() {
     let non_goto = build_pdf(
@@ -1824,8 +1833,7 @@ fn merge_inline_non_goto_open_action_passed_through() {
 
 /// Primary whose outline tree has a NESTED child item targeting a removed page,
 /// a cyclic `/Next` back-edge, and a `/First` pointing at a non-dict object,
-/// exercising the outline collector's child-descent, cycle-guard, and
-/// malformed-item arms.
+/// exercising generic closure traversal over cyclic and malformed shapes.
 ///
 /// - obj 20 "P0" → `/Dest [3 0 R /Fit]` (surviving page0), child 22, `/Next 21`.
 /// - obj 21 "P1" → `/Next 20` (cyclic back-edge to the already-visited 20).
@@ -2041,8 +2049,7 @@ fn check_name_tree_dests_flags_dest_nulled_by_merge() {
 
 // A primary whose /Outlines root is empty (/Type /Outlines /Count 0, no /First)
 // is a legitimate, reachable PDF shape: merge must tolerate it (no crash, no
-// dropped pages) and still inherit the (empty) /Outlines root. Exercises the
-// missing-/First early return in collect_outline_doc_dests.
+// dropped pages) and still inherit the (empty) /Outlines root.
 #[test]
 fn merge_tolerates_empty_outline_root() {
     let empty_outline = build_pdf(
@@ -2168,11 +2175,9 @@ fn merge_inline_legacy_dests_non_array_remapped() {
     assert!(d_nod.get("D").is_none(), "no-/D dict dest stays without /D");
 }
 
-// M3: an inline (on-catalog) dest array whose LEADING page ref is itself a
-// holder chain (`30 0 R → 3 0 R`, the page) must remap to the copied page. The
-// copy map keys pages by their terminal ref, so a one-hop match on the holder
-// `30 0 R` misses and emits the uncopied source holder (resolving to Null);
-// terminal normalization matches the page and remaps to the new page0.
+// M3: an inline (on-catalog) dest array whose leading ref is itself a holder
+// (`30 0 R → 3 0 R`, the page) preserves that structure: both the holder and
+// selected page are copied, and the holder is remapped to the copied page.
 #[test]
 fn merge_inline_dest_holder_chain_leading_ref_remapped() {
     let pdf = build_pdf(
@@ -2213,19 +2218,96 @@ fn merge_inline_dest_holder_chain_leading_ref_remapped() {
         other => panic!("expected /d_holder /D array, got {other:?}"),
     };
     let (first, is_null) = dest_array_first(&mut doc, &arr);
-    assert_eq!(first, page0, "holder-chain leading ref remaps to new page0");
-    assert!(
-        !is_null,
-        "surviving holder-chain dest must not resolve to null"
+    assert_ne!(first, page0, "the copied holder remains an explicit object");
+    assert!(!is_null, "surviving holder object must not resolve to null");
+    assert_eq!(
+        doc.resolve(first).unwrap(),
+        Object::Reference(page0),
+        "copied holder remaps to the copied selected page"
     );
 }
 
-// F2: an inline (on-catalog) /OpenAction GoTo action whose /Next continuation is
-// itself a GoTo to a different page must have BOTH /D destinations remapped. The
-// pre-fix `remap_inline_action` rewrote only the top-level /D and never recursed
-// /Next, so the /Next/D[0] kept its source ref and silently resolved to the WRONG
-// page. Both pages are selected (surviving); a correct fix maps /D[0] -> page0
-// and /Next/D[0] -> page1.
+fn long_indirect_open_action_array_pdf() -> Vec<u8> {
+    let mut owned: Vec<(u32, String)> = vec![
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /OpenAction << /S /URI /URI (https://example.test) /Next 10 0 R >> >>"
+                .into(),
+        ),
+        (
+            2,
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into(),
+        ),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+        ),
+        (
+            4,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>".into(),
+        ),
+    ];
+    for number in 10..80 {
+        owned.push((number, format!("[{} 0 R]", number + 1)));
+    }
+    owned.push((80, "[<< /S /GoTo /D [4 0 R /Fit] >>]".into()));
+    let borrowed: Vec<(u32, &str)> = owned
+        .iter()
+        .map(|(number, body)| (*number, body.as_str()))
+        .collect();
+    build_pdf(&borrowed, 1)
+}
+
+fn action_after_71_array_holders(
+    doc: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+    mut value: Object,
+) -> flpdf::Dictionary {
+    for _ in 0..=70 {
+        let concrete = match value {
+            Object::Reference(reference) => doc.resolve(reference).unwrap(),
+            direct => direct,
+        };
+        let mut items = concrete.into_array().expect("singleton action array");
+        assert_eq!(items.len(), 1);
+        value = items.remove(0);
+    }
+    value.into_dict().expect("terminal GoTo action")
+}
+
+#[test]
+fn merge_long_indirect_open_action_array_chain_nulls_removed_page() {
+    let mut source = Pdf::open_mem_owned(long_indirect_open_action_array_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut source,
+        pages: vec![0],
+    }];
+    let mut out = merge_documents(&mut inputs).unwrap();
+
+    assert_eq!(count_type(&mut out, b"Page"), 1);
+    let catalog = catalog_dict(&mut out);
+    let open_action = catalog
+        .get("OpenAction")
+        .and_then(Object::as_dict)
+        .expect("direct /OpenAction is preserved");
+    let terminal = action_after_71_array_holders(
+        &mut out,
+        open_action
+            .get("Next")
+            .cloned()
+            .expect("/OpenAction /Next is preserved"),
+    );
+    let removed_page = terminal
+        .get("D")
+        .and_then(Object::as_array)
+        .and_then(|items| items.first())
+        .and_then(Object::as_ref_id)
+        .unwrap();
+    assert!(matches!(out.resolve(removed_page).unwrap(), Object::Null));
+}
+
+// An inline (on-catalog) /OpenAction GoTo action whose /Next continuation is
+// itself a GoTo to a different page has both selected-page refs remapped by the
+// generic direct-object rewrite.
 #[test]
 fn merge_inline_open_action_next_chain_remapped() {
     let pdf = build_pdf(
@@ -2283,12 +2365,9 @@ fn merge_inline_open_action_next_chain_remapped() {
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
-// F2 (array /Next form): a /Next that is an ARRAY of actions — including an
-// INDIRECT action element — must have each element's /D remapped. This exercises
-// the /Next-array arm of remap_inline_action and the indirect-action resolution
-// (resolve_ref_chain) added for symmetry with collect_action_chain_targets. Three
-// pages are selected; /D → page0, /Next[0]/D → page1, /Next[1] (indirect) /D →
-// page2.
+// Array /Next form: every action reference, including an indirect action
+// element, is copied and remapped generically. Three pages are selected;
+// /D → page0, /Next[0]/D → page1, /Next[1] (indirect) /D → page2.
 #[test]
 fn merge_inline_open_action_next_array_remapped() {
     let pdf = build_pdf(
@@ -2371,14 +2450,11 @@ fn merge_inline_open_action_next_array_remapped() {
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
-// F5: an indirect /OpenAction that is a NON-GoTo action dict (here /S /GoToR, a
-// remote-go-to) whose /D is an array with a leading LOCAL page ref must NOT be
-// treated as a removed destination. The pre-fix `collect_doc_level_removed_targets`
-// called the bare-dest fallback unconditionally, so the /D[0] page was wrongly
-// added to the removed set and nulled. With the gate, the unselected page1 is not
-// nulled by this carrier, and /OpenAction /D[0] does not resolve to null.
+// Page null-out is independent of action subtype. Even a non-GoTo action that
+// carries a local reference to a copied unselected source page retains the
+// carrier while that page boundary resolves to null.
 #[test]
-fn merge_non_goto_open_action_d_not_treated_as_removed_dest() {
+fn merge_non_goto_open_action_d_retains_null_removed_page() {
     let pdf = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R /OpenAction 20 0 R >>"),
@@ -2390,8 +2466,7 @@ fn merge_non_goto_open_action_d_not_treated_as_removed_dest() {
         1,
     );
     let mut a = Pdf::open_mem_owned(pdf).unwrap();
-    // Select only page0; page1 (obj 4) is unselected. The /GoToR /D names a local
-    // ref to page1, but a non-GoTo action's /D must not drive the null-out.
+    // Select only page0; page1 (obj 4) is unselected but copied through /D.
     let mut inputs = [MergeInput {
         source: &mut a,
         pages: vec![0],
@@ -2399,7 +2474,7 @@ fn merge_non_goto_open_action_d_not_treated_as_removed_dest() {
     let mut doc = merge_documents(&mut inputs).unwrap();
     let cat = catalog_dict(&mut doc);
 
-    // /OpenAction is inherited (indirect, copied) and its /D[0] is NOT nulled.
+    // /OpenAction is inherited and its /D carrier points at the copied null page.
     let oa_ref = cat
         .get_ref("OpenAction")
         .expect("indirect /OpenAction inherited onto output catalog");
@@ -2409,10 +2484,7 @@ fn merge_non_goto_open_action_d_not_treated_as_removed_dest() {
         other => panic!("expected /OpenAction /D array, got {other:?}"),
     };
     let (_d_ref, d_null) = dest_array_first(&mut doc, &oa_d);
-    assert!(
-        !d_null,
-        "non-GoTo /OpenAction /D[0] must not be nulled (bare-dest fallback gated)"
-    );
+    assert!(d_null, "copied unselected /D[0] page must resolve to null");
 }
 
 // ---------------------------------------------------------------------------
