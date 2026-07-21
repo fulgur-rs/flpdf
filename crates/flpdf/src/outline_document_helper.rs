@@ -100,9 +100,12 @@ impl OutlineNode {
     }
 }
 
-/// A resolved explicit destination, e.g. `[pageRef /Fit ...]`. Mirrors the
-/// array form qpdf `getDest` yields after resolving `/Dest`, `/A /GoTo /D`, and
-/// named destinations.
+/// flpdf's normalized destination type returned by
+/// [`OutlineDocumentHelper::legacy_dests`] and
+/// [`OutlineDocumentHelper::name_tree_dests`].
+///
+/// This type is retained for those enumeration APIs; [`OutlineNode::dest`]
+/// exposes the raw resolved object instead.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dest {
     /// The explicit destination array. Element 0 is normally the page ref.
@@ -111,7 +114,6 @@ pub struct Dest {
 
 impl Dest {
     /// The destination page ref (array element 0), if it is an indirect ref.
-    /// Mirrors qpdf `getDestPage`.
     pub fn page(&self) -> Option<ObjectRef> {
         self.array.first().and_then(Object::as_ref_id)
     }
@@ -369,7 +371,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     }
 
     fn resolve_name_tree_node_dest(&mut self, bytes: &[u8]) -> Result<Object> {
-        let lookup = crate::json_inspect::qpdf_utf8_value(bytes);
+        let lookup = qpdf_new_unicode_utf8_value(&crate::json_inspect::qpdf_utf8_value(bytes));
         let Some(Object::Dictionary(mut names)) = self.catalog_value_terminal("Names")? else {
             return Ok(Object::Null);
         };
@@ -704,6 +706,68 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         )?;
         Ok(diagnostics)
     }
+}
+
+/// Match `newUnicodeString(utf8).getUTF8Value()` in qpdf 11.9.0.
+///
+/// qpdf accepts up to six-byte UTF-8 forms while decoding, consumes malformed
+/// sequences according to `QUtil::get_next_utf8_codepoint`, then writes U+FFFD
+/// for every decode error, surrogate, or code point above U+10FFFF.
+fn qpdf_new_unicode_utf8_value(utf8: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(utf8.len());
+    let mut pos = 0;
+    while pos < utf8.len() {
+        let original_pos = pos;
+        let mut byte = utf8[pos];
+        pos += 1;
+
+        if byte < 0x80 {
+            result.push(byte);
+            continue;
+        }
+
+        let mut bytes_needed = 0;
+        let mut bit_check = 0x40;
+        let mut to_clear = 0x80;
+        while byte & bit_check != 0 {
+            bytes_needed += 1;
+            to_clear |= bit_check;
+            bit_check >>= 1;
+        }
+
+        let mut error = !(1..=5).contains(&bytes_needed) || pos + bytes_needed > utf8.len();
+        let mut codepoint = 0xfffd;
+        if !error {
+            codepoint = u32::from(byte & !to_clear);
+            for _ in 0..bytes_needed {
+                byte = utf8[pos];
+                pos += 1;
+                if byte & 0xc0 != 0x80 {
+                    pos -= 1;
+                    error = true;
+                    break;
+                }
+                codepoint = (codepoint << 6) + u32::from(byte & 0x3f);
+            }
+
+            if !error {
+                let lower_bounds = [0, 0, 1 << 7, 1 << 11, 1 << 16, 1 << 12, 1 << 26];
+                let lower_bound = lower_bounds[pos - original_pos];
+                if lower_bound > 0 && codepoint < lower_bound {
+                    error = true;
+                }
+            }
+        }
+
+        let scalar = if error {
+            '\u{fffd}'
+        } else {
+            char::from_u32(codepoint).unwrap_or('\u{fffd}')
+        };
+        let mut encoded = [0; 4];
+        result.extend_from_slice(scalar.encode_utf8(&mut encoded).as_bytes());
+    }
+    result
 }
 
 impl<R: Read + Seek> Pdf<R> {
@@ -1275,4 +1339,35 @@ fn walk_outline_se<R: Read + Seek>(
     }
 
     Ok(pruned)
+}
+
+#[cfg(test)]
+mod qpdf_utf8_tests {
+    use super::qpdf_new_unicode_utf8_value;
+
+    #[test]
+    fn new_unicode_string_normalization_matches_qpdf_error_consumption() {
+        let replacement = "\u{fffd}".as_bytes();
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"ascii", b"ascii"),
+            (
+                &[0xc2, 0xa2, 0xf0, 0x9f, 0x92, 0xa9],
+                &[0xc2, 0xa2, 0xf0, 0x9f, 0x92, 0xa9],
+            ),
+            (&[0x80], replacement),
+            (&[0xff, b'a'], "\u{fffd}a".as_bytes()),
+            (&[0xe2, 0x82], "\u{fffd}\u{fffd}".as_bytes()),
+            (&[0xe2, b'(', 0xa1], "\u{fffd}(\u{fffd}".as_bytes()),
+            (&[0xe2, 0x82, b'('], "\u{fffd}(".as_bytes()),
+            (&[0xc0, 0xaf], replacement),
+            (&[0xed, 0xa0, 0x80], replacement),
+            (&[0xf4, 0x90, 0x80, 0x80], replacement),
+            (&[0xf8, 0x80, 0x80, 0x80, 0x80], replacement),
+            (&[0xf8, 0x80, 0x81, 0x80, 0x80], &[0xe1, 0x80, 0x80]),
+            (&[0xfc, 0x84, 0x80, 0x80, 0x80, 0x80], replacement),
+        ];
+        for &(input, expected) in cases {
+            assert_eq!(qpdf_new_unicode_utf8_value(input), expected, "{input:x?}");
+        }
+    }
 }

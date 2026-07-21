@@ -1891,6 +1891,52 @@ fn utf16_string_key_uses_qpdf_utf8_value() {
     assert_eq!(pdf.outline().get_root().unwrap()[0].dest, page_dest(3));
 }
 
+/// qpdf keeps bytes after an explicit UTF-8 BOM raw for both the outline
+/// candidate and stored name-tree key. Lookup normalizes only the candidate
+/// through `newUnicodeString`, so the two identical malformed byte strings do
+/// not compare equal (`U+FFFD` needle versus raw `0xff` stored key).
+fn malformed_explicit_utf8_named_dest_pdf() -> Vec<u8> {
+    single_outline_with_catalog(
+        "/Names << /Dests 8 0 R >>",
+        "/Dest <EFBBBFFF>",
+        &[(8, "<< /Names [<EFBBBFFF> [3 0 R /Fit]] >>")],
+    )
+}
+
+#[test]
+fn malformed_explicit_utf8_candidate_does_not_resolve_same_raw_key() {
+    let mut pdf = Pdf::open(Cursor::new(malformed_explicit_utf8_named_dest_pdf())).unwrap();
+    assert_eq!(
+        pdf.outline().get_root().unwrap()[0].dest,
+        Object::Null,
+        "candidate normalization must not create a match against the raw malformed stored key"
+    );
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 oracle"]
+fn qpdf_malformed_explicit_utf8_named_dest_oracle_is_null() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    input
+        .write_all(&malformed_explicit_utf8_named_dest_pdf())
+        .unwrap();
+    let output = Command::new("qpdf")
+        .args(["--json", "--json-key=outlines"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["outlines"][0]["dest"], serde_json::Value::Null);
+}
+
 #[test]
 fn named_destination_preserves_dictionary_shape() {
     let bytes = single_outline_with_catalog(
@@ -1901,6 +1947,15 @@ fn named_destination_preserves_dictionary_shape() {
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
     let node = &pdf.outline().get_root().unwrap()[0];
     assert!(matches!(node.dest, Object::Dictionary(_)));
+    assert_eq!(node.dest_page(), Object::Null);
+}
+
+#[test]
+fn empty_destination_array_has_null_dest_page() {
+    let bytes = single_outline_with_catalog("", "/Dest []", &[]);
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let node = &pdf.outline().get_root().unwrap()[0];
+    assert_eq!(node.dest, Object::Array(Vec::new()));
     assert_eq!(node.dest_page(), Object::Null);
 }
 
