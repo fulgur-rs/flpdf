@@ -1743,7 +1743,7 @@ fn merge_inherits_inline_doc_level_carriers() {
         },
     );
     assert!(lp2_null, "legacy_p2 (removed) nulled");
-    // Name-form dest: kept verbatim (remap_inline_dest non-array arm).
+    // Name-form dest: generic reference remapping leaves the scalar unchanged.
     assert_eq!(
         legacy.get("legacy_named").and_then(|o| o.as_name()),
         Some(&b"SomeName"[..]),
@@ -2092,7 +2092,7 @@ fn merge_tolerates_empty_outline_root() {
 // F1: an inline (on-catalog) legacy /Dests whose entries are NON-array dests —
 // a dictionary destination `<< /D [page /Fit] >>` and an INDIRECT reference to a
 // `[page /Fit]` array — must have their leading page ref remapped/resolved, just
-// like a bare array dest. The pre-fix `remap_inline_dest` rewrote only the array
+// like a bare array dest. The pre-fix specialized mapper rewrote only the array
 // shape (every other shape hit `other => other.clone()`), so:
 //   - the dict dest kept the SOURCE page ref (dangling in the output), and
 //   - the indirect-holder dest kept a source object number that was never copied
@@ -2224,6 +2224,141 @@ fn merge_inline_dest_holder_chain_leading_ref_remapped() {
         doc.resolve(first).unwrap(),
         Object::Reference(page0),
         "copied holder remaps to the copied selected page"
+    );
+}
+
+/// Direct catalog destination carriers keep indirect destination holders as
+/// indirect objects. The carrier reference itself is remapped to the copied
+/// holder, and `copy_objects` remaps the page reference inside that holder.
+#[test]
+fn merge_direct_dest_carriers_preserve_indirect_destination_holders() {
+    let pdf = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /Names << /Dests << /Names [(named) 30 0 R] >> >> \
+                 /Dests << /legacy 31 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (30, "[3 0 R /Fit]"),
+            (31, "<< /D [3 0 R /Fit] >>"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem_owned(pdf).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut source,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let page0 = pages::page_refs(&mut doc).unwrap()[0];
+    let catalog = catalog_dict(&mut doc);
+
+    let names = match catalog.get("Names") {
+        Some(Object::Dictionary(dict)) => dict.clone(),
+        other => panic!("expected direct /Names dictionary, got {other:?}"),
+    };
+    let name_tree = match names.get("Dests") {
+        Some(Object::Dictionary(dict)) => dict.clone(),
+        other => panic!("expected direct /Names /Dests root, got {other:?}"),
+    };
+    let pairs = match name_tree.get("Names") {
+        Some(Object::Array(items)) => items,
+        other => panic!("expected name-tree /Names array, got {other:?}"),
+    };
+    let named_holder_ref = match &pairs[1] {
+        Object::Reference(reference) => *reference,
+        other => panic!("named destination holder must stay indirect, got {other:?}"),
+    };
+    let named_dest = match doc.resolve(named_holder_ref).unwrap() {
+        Object::Array(array) => array,
+        other => panic!("named destination holder must resolve to an array, got {other:?}"),
+    };
+    let (named_page_ref, named_page_null) = dest_array_first(&mut doc, &named_dest);
+    assert_eq!(named_page_ref, page0);
+    assert!(!named_page_null);
+
+    let legacy = match catalog.get("Dests") {
+        Some(Object::Dictionary(dict)) => dict.clone(),
+        other => panic!("expected direct legacy /Dests dictionary, got {other:?}"),
+    };
+    let legacy_holder_ref = match legacy.get("legacy") {
+        Some(Object::Reference(reference)) => *reference,
+        other => panic!("legacy destination holder must stay indirect, got {other:?}"),
+    };
+    let legacy_dest = match doc.resolve(legacy_holder_ref).unwrap() {
+        Object::Dictionary(dict) => dict,
+        other => panic!("legacy destination holder must resolve to a dict, got {other:?}"),
+    };
+    let legacy_array = match legacy_dest.get("D") {
+        Some(Object::Array(array)) => array,
+        other => panic!("expected legacy holder /D array, got {other:?}"),
+    };
+    let (legacy_page_ref, legacy_page_null) = dest_array_first(&mut doc, legacy_array);
+    assert_eq!(legacy_page_ref, page0);
+    assert!(!legacy_page_null);
+}
+
+/// A direct legacy destination may nest `/D` dictionaries deeper than the old
+/// carrier-specific limit of 64 while remaining below the generic inline
+/// object limit. Its terminal removed-page reference must still be remapped to
+/// the copied null boundary, never left as a stale source-space reference.
+#[test]
+fn merge_deep_direct_legacy_dest_remaps_terminal_page_boundary() {
+    const DIRECT_D_DEPTH: usize = 70;
+
+    let mut destination = "[4 0 R /Fit]".to_owned();
+    for _ in 0..DIRECT_D_DEPTH {
+        destination = format!("<< /D {destination} >>");
+    }
+    let catalog = format!("<< /Type /Catalog /Pages 2 0 R /Dests << /deep {destination} >> >>");
+    let pdf = build_pdf(
+        &[
+            (1, catalog.as_str()),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem_owned(pdf).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut source,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let page0 = pages::page_refs(&mut doc).unwrap()[0];
+    let catalog = catalog_dict(&mut doc);
+    let legacy = match catalog.get("Dests") {
+        Some(Object::Dictionary(dict)) => dict,
+        other => panic!("expected direct legacy /Dests dictionary, got {other:?}"),
+    };
+    let mut current = legacy.get("deep").expect("deep destination");
+    for level in 0..DIRECT_D_DEPTH {
+        current = match current {
+            Object::Dictionary(dict) => dict
+                .get("D")
+                .unwrap_or_else(|| panic!("missing /D at direct nesting level {level}")),
+            other => panic!("expected dictionary at direct nesting level {level}, got {other:?}"),
+        };
+    }
+    let terminal = match current {
+        Object::Array(array) => array,
+        other => panic!("expected terminal destination array, got {other:?}"),
+    };
+    let (terminal_page_ref, terminal_page_null) = dest_array_first(&mut doc, terminal);
+    assert_ne!(
+        terminal_page_ref, page0,
+        "deep destination must not retain the source ref that aliases the selected output page"
+    );
+    assert!(
+        terminal_page_null,
+        "deep destination must resolve to the copied null removed-page boundary"
     );
 }
 
@@ -4470,7 +4605,8 @@ fn merge_inherits_inline_dests_kids_root() {
 /// Two-page primary whose inline `/OpenAction` GoTo action's `/Next` is an
 /// INDIRECT reference (obj 12) that resolves to an ARRAY of actions. The array
 /// element is itself a GoTo to the second selected page. Before the fix the
-/// indirect `/Next` resolving to an array was routed through `remap_inline_dest`
+/// indirect `/Next` resolving to an array was routed through a destination-only
+/// path
 /// (which only touches `arr[0]` as a page ref), so the array element's inner
 /// `/D` page ref was never remapped — leaving the survivor mispointed.
 fn inline_open_action_indirect_next_array_pdf() -> Vec<u8> {

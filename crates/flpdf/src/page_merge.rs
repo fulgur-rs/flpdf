@@ -153,10 +153,9 @@ fn discover_primary_doc_level<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Pri
     Ok(doc)
 }
 
-/// Fold every indirect document-level carrier of `doc` into `closure` via the
-/// complete transitive [`page_object_closure`](crate::page_closure::page_object_closure)
-/// (which stops at `Page`/`Catalog`
-/// dicts, collecting a destination page as a leaf reference without descending).
+/// Fold every document-level carrier of `doc` into `closure` via the generic
+/// object-root traversal (which stops at `Page`/`Catalog` dictionaries,
+/// collecting a destination page as a leaf reference without descending).
 /// This makes the primary's single `copy_objects` pass copy the whole outline /
 /// name-tree / action graph and remap every destination in one rewrite — no
 /// separate post-copy remap pass is needed (or wanted).
@@ -177,11 +176,10 @@ fn fold_doc_level_closure<R: Read + Seek>(
         // Thread one `visited` set (the accumulating `closure`) through every
         // doc-level root so a subtree reachable from several roots (e.g. a page
         // referenced by both an outline item and the `/OpenAction`) is walked
-        // once for the union. Behaviour-preserving: the shared-visited union
-        // equals the independent union (start refs are force-traversed; non-start
-        // `Page`/`Catalog` leaves stop in both walks). None of these roots is a
-        // `Page`/`Catalog`, so force-traversal never expands a sibling page.
-        extend_page_object_closure(source, root, closure)?;
+        // once for the union. Start from the root as a generic reference so a
+        // malformed root that is itself a `/Page` or `/Catalog` remains a copied
+        // boundary leaf instead of being force-expanded like a selected page.
+        extend_object_closure(source, &Object::Reference(root), closure)?;
     }
     // Inline-on-catalog values are not indirect roots, so extend the generic
     // object closure from each direct value. This follows every referenced
@@ -208,8 +206,7 @@ fn fold_doc_level_closure<R: Read + Seek>(
 /// the primary catalog is not copied) are reconstructed from `map`.
 /// `copy_objects` already remapped every reference inside copied objects, so
 /// this only sets catalog keys — it does not re-walk copied objects.
-fn wire_doc_level<RSrc: Read + Seek, RTgt: Read + Seek>(
-    source: &mut Pdf<RSrc>,
+fn wire_doc_level<RTgt: Read + Seek>(
     target: &mut Pdf<RTgt>,
     doc: &PrimaryDocLevel,
     map: &BTreeMap<ObjectRef, ObjectRef>,
@@ -236,10 +233,11 @@ fn wire_doc_level<RSrc: Read + Seek, RTgt: Read + Seek>(
         );
     }
     // /Names /Dests: indirect root → wire copied ref; inline root → reconstruct
-    // it from the renumber map (the catalog is never copied, so an inline root's
-    // dest page refs and `/Kids` sub-leaf refs are remapped here, like inline
-    // legacy /Dests). Either way a minimal /Names holder carries only the
-    // inherited /Dests name tree (sibling name trees are not merged).
+    // it from the renumber map (the catalog is never copied). Remap the direct
+    // carrier as one generic object so every source ref becomes its copied ref
+    // without resolving or flattening indirect destination holders. Either way
+    // a minimal /Names holder carries only the inherited /Dests name tree
+    // (sibling name trees are not merged).
     if let Some(dests) = doc.names_dests {
         if let Some(&new_ref) = map.get(&dests) {
             let mut names = Dictionary::new();
@@ -247,23 +245,24 @@ fn wire_doc_level<RSrc: Read + Seek, RTgt: Read + Seek>(
             catalog.insert("Names", Object::Dictionary(names));
         }
     } else if let Some(inline) = &doc.names_dests_inline {
-        let rebuilt = remap_inline_name_tree_root(source, inline, map)?;
         let mut names = Dictionary::new();
-        names.insert("Dests", Object::Dictionary(rebuilt));
+        names.insert(
+            "Dests",
+            remap_refs_in_object(Object::Dictionary(inline.clone()), map),
+        );
         catalog.insert("Names", Object::Dictionary(names));
     }
-    // Legacy /Catalog /Dests: indirect → wire copied ref; inline → reconstruct
-    // each entry's destination from the renumber map.
+    // Legacy /Catalog /Dests: indirect → wire copied ref; inline → remap the
+    // complete direct carrier once, preserving any indirect holder structure.
     if let Some(legacy) = doc.legacy_dests_ref {
         if let Some(&new_ref) = map.get(&legacy) {
             catalog.insert("Dests", Object::Reference(new_ref));
         }
     } else if let Some(inline) = &doc.legacy_dests_inline {
-        let mut rebuilt = Dictionary::new();
-        for (key, dest) in inline.iter() {
-            rebuilt.insert(key, remap_inline_dest(source, dest, map)?);
-        }
-        catalog.insert("Dests", Object::Dictionary(rebuilt));
+        catalog.insert(
+            "Dests",
+            remap_refs_in_object(Object::Dictionary(inline.clone()), map),
+        );
     }
     // /OpenAction: indirect → wire copied ref; inline → reconstruct from the map.
     if let Some(oa_ref) = doc.open_action_ref {
@@ -276,137 +275,6 @@ fn wire_doc_level<RSrc: Read + Seek, RTgt: Read + Seek>(
 
     target.set_object(catalog_ref, Object::Dictionary(catalog));
     Ok(())
-}
-
-/// Inline-destination nesting bound: how deep an inline `/Dests` value's
-/// `/D` chain (dict → `/D` → dict → …) is followed before stopping.
-/// [`resolve_ref_chain`] independently bounds *reference* chains.
-const MAX_INLINE_DEST_DEPTH: usize = 64;
-
-/// Remap an inline (on-catalog) destination value to the copied page refs in
-/// `map`, resolving any indirect holder first so the leading page reference is
-/// reached and remapped regardless of how the destination is shaped:
-/// - an `[page /Fit …]` array → its leading page ref is remapped;
-/// - a `<< /D <dest> >>` destination dictionary → its `/D` is remapped (recursed);
-/// - an indirect destination wrapper → resolved against `source` so its concrete
-///   array/dictionary can be rebuilt;
-/// - any other shape (a name/string named destination) is returned unchanged.
-///
-/// Before this runs, the direct catalog carrier is folded through the generic
-/// object closure. Every indirect holder reachable from it, and every page
-/// boundary reached through those holders, is therefore present in `map`.
-/// Remapping preserves that reference structure: for example, a destination
-/// array whose leading ref names a page holder points at the copied holder, which
-/// in turn points at the copied page. Catalog wiring happens after the
-/// page-boundary null-out, so when that page was not selected, its `map` target
-/// already has a `Null` body while the holder/carrier chain remains intact.
-///
-/// Inline `/D` nesting is bounded by [`MAX_INLINE_DEST_DEPTH`] and reference
-/// indirection by [`resolve_ref_chain`].
-fn remap_inline_dest<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    dest: &Object,
-    map: &BTreeMap<ObjectRef, ObjectRef>,
-) -> Result<Object> {
-    remap_inline_dest_depth(source, dest, map, MAX_INLINE_DEST_DEPTH)
-}
-
-fn remap_inline_dest_depth<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    dest: &Object,
-    map: &BTreeMap<ObjectRef, ObjectRef>,
-    depth: usize,
-) -> Result<Object> {
-    if depth == 0 {
-        return Ok(dest.clone()); // cov:ignore: inline /D nesting deeper than MAX_INLINE_DEST_DEPTH (DoS bound)
-    }
-    // Resolve a destination wrapper to its concrete array/dict shape so the
-    // inline catalog carrier can be reconstructed. The generic closure has
-    // already copied the wrapper and everything it reaches; references embedded
-    // in the concrete value are remapped through `map` below, preserving holder
-    // chains within that rebuilt carrier.
-    let (concrete, _) = resolve_ref_chain(source, dest)?;
-    match concrete {
-        Object::Array(mut arr) => {
-            // The leading page ref may be a holder chain (`r → r2 → page`); the
-            // generic closure normally puts the leading holder itself in `map`,
-            // so prefer that direct mapping and preserve the copied chain. The
-            // terminal-normalizing fallback handles a map that contains only the
-            // terminal page, avoiding an unremapped source-space reference.
-            let first_ref = match arr.first() {
-                Some(Object::Reference(r)) => Some(*r),
-                _ => None,
-            };
-            if let Some(r) = first_ref {
-                if let Some(&new_ref) = map.get(&r) {
-                    arr[0] = Object::Reference(new_ref);
-                } else if let Some(terminal) = resolve_ref_chain(source, &Object::Reference(r))?.1 {
-                    if let Some(&new_ref) = map.get(&terminal) {
-                        arr[0] = Object::Reference(new_ref);
-                    }
-                }
-            }
-            Ok(Object::Array(arr))
-        }
-        // `<< /D <dest> >>` destination dictionary: remap its `/D` and keep the
-        // rest of the dict verbatim.
-        Object::Dictionary(mut d) => {
-            if let Some(d_val) = d.remove("D") {
-                let remapped = remap_inline_dest_depth(source, &d_val, map, depth - 1)?;
-                d.insert("D", remapped);
-            }
-            Ok(Object::Dictionary(d))
-        }
-        other => Ok(other),
-    }
-}
-
-/// Reconstruct an inline (direct-dictionary) `/Names /Dests` name-tree root,
-/// remapping each destination in its `/Names` `[(key) dest (key) dest …]` array
-/// (the dests are the odd-indexed elements) through `map` via
-/// [`remap_inline_dest`], and remapping each `/Kids` sub-leaf reference through
-/// `map` to its copied object. Other keys (`/Limits`) are kept verbatim.
-///
-/// Per ISO 32000-2 §7.9.6 a name-tree root may carry `/Names`, `/Kids`, or both.
-/// A `/Kids` root is the normal shape once there are more entries than fit one
-/// leaf; whether the root is inline-on-catalog or indirect is purely a
-/// serialization choice. The kid sub-leaves are folded into the copy closure (so
-/// they are copied) by [`fold_doc_level_closure`], and `copy_objects` remaps the
-/// destinations *inside* each copied leaf; this function only rewrites the top
-/// `/Kids` refs to point at those copies. A kid absent from `map` keeps its
-/// source ref. Copied unselected pages referenced anywhere in the tree are
-/// nulled by the shared page-boundary pass.
-fn remap_inline_name_tree_root<R: Read + Seek>(
-    source: &mut Pdf<R>,
-    leaf: &Dictionary,
-    map: &BTreeMap<ObjectRef, ObjectRef>,
-) -> Result<Dictionary> {
-    let mut out = leaf.clone();
-    // A leaf root: remap its own `/Names` array dests (the odd-indexed elements).
-    if let Some(Object::Array(names)) = leaf.get("Names") {
-        let mut rebuilt = names.clone();
-        let mut i = 1;
-        while i < rebuilt.len() {
-            rebuilt[i] = remap_inline_dest(source, &rebuilt[i], map)?;
-            i += 2;
-        }
-        out.insert("Names", Object::Array(rebuilt));
-    }
-    // A `/Kids` root: remap each sub-leaf ref to its copied object (mirroring the
-    // `arr[0]` page-ref remap in remap_inline_dest_depth). Every kid ref was
-    // folded into the copy closure by fold_doc_level_closure, so it is always
-    // present in `map`; an unmapped ref (or a malformed non-ref element) is left
-    // verbatim by falling back to its current value.
-    if let Some(Object::Array(kids)) = leaf.get("Kids") {
-        let mut rebuilt = kids.clone();
-        for kid in &mut rebuilt {
-            if let Object::Reference(r) = kid {
-                *kid = Object::Reference(map.get(r).copied().unwrap_or(*r));
-            }
-        }
-        out.insert("Kids", Object::Array(rebuilt));
-    }
-    Ok(out)
 }
 
 /// Resolve qpdf's `--pages` form-field name collision: return `base` when it is
@@ -1125,7 +993,7 @@ pub fn merge_documents<R: Read + Seek>(
         // outline / name-tree / action objects, so this only sets catalog keys.
         // A no-op for secondary inputs (empty doc_level).
         if is_primary {
-            wire_doc_level(input.source, &mut target, &doc_level, &map)?;
+            wire_doc_level(&mut target, &doc_level, &map)?;
         }
 
         // Record this input's kept top-level fields (those whose source ref was
@@ -1250,8 +1118,42 @@ pub fn merge_documents<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::unique_field_name;
-    use std::collections::BTreeSet;
+    use super::{
+        discover_primary_doc_level, fold_doc_level_closure, merge_documents, unique_field_name,
+        MergeInput,
+    };
+    use crate::page_closure::extend_page_object_closure;
+    use crate::{Object, ObjectRef, Pdf};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
+        let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+        let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
+        let max = objects.iter().map(|(number, _)| *number).max().unwrap_or(0);
+        for (number, body) in objects {
+            offsets.insert(*number, out.len() as u64);
+            out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref_start = out.len() as u64;
+        let size = max + 1;
+        out.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for number in 1..=max {
+            match offsets.get(&number) {
+                Some(offset) => {
+                    out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes())
+                }
+                None => out.extend_from_slice(b"0000000000 65535 f \n"),
+            }
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {size} /Root {root} 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        out
+    }
 
     fn used(names: &[&[u8]]) -> BTreeSet<Vec<u8>> {
         names.iter().map(|n| n.to_vec()).collect()
@@ -1290,6 +1192,58 @@ mod tests {
         assert_eq!(
             unique_field_name(b"name+1", &used(&[b"name", b"name+1"])),
             b"name+1+1".to_vec()
+        );
+    }
+
+    /// A malformed indirect document-level root may itself be an unselected
+    /// page. It is still copied so the catalog carrier can point at a null page
+    /// boundary, but generic root traversal must stop there rather than pulling
+    /// the page's `/Contents` into the copy closure.
+    #[test]
+    fn doc_level_page_root_is_null_boundary_without_contents_in_closure() {
+        let bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /OpenAction 4 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (
+                    4,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 10 0 R >>",
+                ),
+                (10, "<< /Length 4 >>\nstream\nDROP\nendstream"),
+            ],
+            1,
+        );
+
+        let mut merge_source = Pdf::open_mem_owned(bytes.clone()).unwrap();
+        let mut inputs = [MergeInput {
+            source: &mut merge_source,
+            pages: vec![0],
+        }];
+        let mut merged = merge_documents(&mut inputs).unwrap();
+        let catalog_ref = merged.root_ref().unwrap();
+        let catalog = merged.resolve(catalog_ref).unwrap().into_dict().unwrap();
+        let open_action_ref = catalog
+            .get_ref("OpenAction")
+            .expect("indirect /OpenAction carrier is retained");
+        assert_eq!(
+            merged.resolve(open_action_ref).unwrap(),
+            Object::Null,
+            "the unselected page root is copied and nulled"
+        );
+
+        let mut source = Pdf::open_mem_owned(bytes).unwrap();
+        let doc_level = discover_primary_doc_level(&mut source).unwrap();
+        let mut closure = BTreeSet::new();
+        extend_page_object_closure(&mut source, ObjectRef::new(3, 0), &mut closure).unwrap();
+        fold_doc_level_closure(&mut source, &doc_level, &mut closure).unwrap();
+        assert!(
+            closure.contains(&ObjectRef::new(4, 0)),
+            "the indirect /OpenAction page root must enter the copy map"
+        );
+        assert!(
+            !closure.contains(&ObjectRef::new(10, 0)),
+            "the boundary page's /Contents must not enter the copy map"
         );
     }
 }
