@@ -81,6 +81,50 @@ fn only_leaf(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> flpdf::Dictionary {
         .unwrap()
 }
 
+fn resolve_indirect_value(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, mut value: Object) -> Object {
+    while let Object::Reference(reference) = value {
+        value = doc.resolve(reference).unwrap();
+    }
+    value
+}
+
+fn destination_page_ref(
+    doc: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+    value: Object,
+) -> flpdf::ObjectRef {
+    resolve_indirect_value(doc, value)
+        .into_array()
+        .expect("destination array")
+        .into_iter()
+        .next()
+        .and_then(|value| value.as_ref_id())
+        .expect("destination page reference")
+}
+
+fn assert_destination_page_is_null(
+    doc: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+    value: Object,
+    context: &str,
+) {
+    let page_ref = destination_page_ref(doc, value);
+    assert!(
+        matches!(doc.resolve(page_ref).unwrap(), Object::Null),
+        "{context}"
+    );
+}
+
+fn assert_reference_target_is_null(
+    doc: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+    value: &Object,
+    context: &str,
+) {
+    let reference = value.as_ref_id().expect("page reference");
+    assert!(
+        matches!(doc.resolve(reference).unwrap(), Object::Null),
+        "{context}"
+    );
+}
+
 #[test]
 fn extracts_single_page_with_count_one() {
     let src = two_page_pdf();
@@ -560,10 +604,9 @@ fn cross_page_link_pdf() -> Vec<u8> {
 }
 
 #[test]
-fn cross_page_link_neutralized_no_sibling_leak() {
-    // flpdf-4924: an explicit cross-page /Dest is neutralized (dest removed,
-    // annotation kept). The sibling /Page stub + its ancestor /Pages node then
-    // become unreachable and are swept. qpdf-aligned.
+fn cross_page_link_keeps_dest_and_nulls_removed_page() {
+    // qpdf keeps the explicit cross-page /Dest carrier and replaces the copied
+    // unselected page object with null.
     let src = cross_page_link_pdf();
     let mut source = Pdf::open_mem(&src).unwrap();
 
@@ -572,15 +615,15 @@ fn cross_page_link_neutralized_no_sibling_leak() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "sibling page must be pruned after neutralizing its inbound /Dest"
+        "copied unselected page must be nulled"
     );
     assert_eq!(
         count_type(&mut out, b"Pages"),
         1,
-        "ancestor /Pages must be pruned once the sibling stub is gone"
+        "ancestor /Pages must be pruned once the copied sibling becomes null"
     );
 
-    // Annotation is RETAINED but its /Dest is removed (neutralized).
+    // Annotation and /Dest are retained; the referenced page resolves to null.
     let leaf_refs = pages::page_refs(&mut out).unwrap();
     assert_eq!(leaf_refs.len(), 1);
     let leaf = out
@@ -601,9 +644,10 @@ fn cross_page_link_neutralized_no_sibling_leak() {
         .as_dict()
         .cloned()
         .unwrap();
-    assert!(
-        annot.get("Dest").is_none(),
-        "/Dest must be neutralized (removed)"
+    assert_destination_page_is_null(
+        &mut out,
+        annot.get("Dest").cloned().expect("/Dest retained"),
+        "cross-page /Dest target must resolve to null",
     );
     assert_eq!(
         annot.get("Subtype").and_then(|o| o.as_name()),
@@ -639,7 +683,7 @@ fn cross_page_link_neutralized_no_sibling_leak() {
 
 #[test]
 fn self_page_link_is_preserved() {
-    // /Dest targets the extracted page itself -> kept, no neutralization.
+    // /Dest targets the extracted page itself, so it remains a live page ref.
     let src = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -734,7 +778,7 @@ fn named_dest_is_preserved_no_leak() {
 }
 
 #[test]
-fn action_goto_absent_page_is_neutralized() {
+fn action_goto_keeps_d_and_nulls_removed_page() {
     let src = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -750,7 +794,7 @@ fn action_goto_absent_page_is_neutralized() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "GoTo sibling must be pruned"
+        "copied unselected page must be nulled"
     );
     let leaf_refs = pages::page_refs(&mut out).unwrap();
     let leaf = out
@@ -769,7 +813,7 @@ fn action_goto_absent_page_is_neutralized() {
         .as_dict()
         .cloned()
         .unwrap();
-    // The /A action is RETAINED; only its dead /D is dropped (qpdf-aligned).
+    // The /A action and /D are retained; the referenced page is null.
     let action = annot
         .get("A")
         .and_then(|o| o.as_dict())
@@ -779,16 +823,17 @@ fn action_goto_absent_page_is_neutralized() {
         Some(&b"GoTo"[..]),
         "/A action is still a GoTo"
     );
-    assert!(
-        action.get("D").is_none(),
-        "cross-page /D must be dropped from the GoTo action"
+    assert_destination_page_is_null(
+        &mut out,
+        action.get("D").cloned().expect("/D retained"),
+        "cross-page /D target must resolve to null",
     );
 }
 
 #[test]
-fn annot_aa_goto_absent_page_is_neutralized() {
+fn annot_aa_goto_keeps_d_and_nulls_removed_page() {
     // Annotation /AA additional-actions dict: an /U subaction is a cross-page
-    // GoTo. Its /D must be dropped, /AA and /U retained.
+    // GoTo. Its /D, /AA, and /U remain while the copied page becomes null.
     let src = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -804,7 +849,7 @@ fn annot_aa_goto_absent_page_is_neutralized() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "/AA GoTo sibling must be pruned"
+        "copied unselected page must be nulled"
     );
     let leaf_refs = pages::page_refs(&mut out).unwrap();
     let leaf = out
@@ -836,16 +881,17 @@ fn annot_aa_goto_absent_page_is_neutralized() {
         Some(&b"GoTo"[..]),
         "/AA /U is still a GoTo"
     );
-    assert!(
-        u.get("D").is_none(),
-        "cross-page /D must be dropped from /AA /U"
+    assert_destination_page_is_null(
+        &mut out,
+        u.get("D").cloned().expect("/AA /U /D retained"),
+        "cross-page /AA /U /D target must resolve to null",
     );
 }
 
 #[test]
-fn action_next_chain_goto_is_neutralized() {
+fn action_next_chain_keeps_d_and_nulls_removed_page() {
     // /A is a /URI action whose /Next is a cross-page GoTo. The URI action is
-    // untouched; the chained GoTo's /D is dropped.
+    // untouched; the chained GoTo's /D remains and targets null.
     let src = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -861,7 +907,7 @@ fn action_next_chain_goto_is_neutralized() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "/Next GoTo sibling must be pruned"
+        "copied unselected page must be nulled"
     );
     let leaf_refs = pages::page_refs(&mut out).unwrap();
     let leaf = out
@@ -902,15 +948,16 @@ fn action_next_chain_goto_is_neutralized() {
         Some(&b"GoTo"[..]),
         "/Next action is still a GoTo"
     );
-    assert!(
-        next.get("D").is_none(),
-        "cross-page /D must be dropped from the /Next GoTo"
+    assert_destination_page_is_null(
+        &mut out,
+        next.get("D").cloned().expect("/Next /D retained"),
+        "cross-page /Next /D target must resolve to null",
     );
 }
 
 #[test]
-fn next_array_goto_is_neutralized() {
-    // /Next is an ARRAY of actions: [URI, GoTo]. Only the GoTo's /D is dropped.
+fn next_array_goto_keeps_d_and_nulls_removed_page() {
+    // /Next is an ARRAY of actions: [URI, GoTo]. The GoTo /D targets null.
     let src = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -926,7 +973,7 @@ fn next_array_goto_is_neutralized() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "/Next array GoTo sibling must be pruned"
+        "copied unselected page must be nulled"
     );
     let leaf_refs = pages::page_refs(&mut out).unwrap();
     let leaf = out
@@ -967,14 +1014,15 @@ fn next_array_goto_is_neutralized() {
         Some(&b"GoTo"[..]),
         "second /Next action is still a GoTo"
     );
-    assert!(
-        second.get("D").is_none(),
-        "cross-page /D must be dropped from the array GoTo"
+    assert_destination_page_is_null(
+        &mut out,
+        second.get("D").cloned().expect("array GoTo /D retained"),
+        "cross-page array GoTo /D target must resolve to null",
     );
 }
 
 #[test]
-fn page_level_aa_goto_is_neutralized() {
+fn page_level_aa_goto_keeps_d_and_nulls_removed_page() {
     // The extracted page leaf's OWN /AA (open action) is a cross-page GoTo.
     let src = build_pdf(
         &[
@@ -990,7 +1038,7 @@ fn page_level_aa_goto_is_neutralized() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "page /AA GoTo sibling must be pruned"
+        "copied unselected page must be nulled"
     );
     let leaf_refs = pages::page_refs(&mut out).unwrap();
     let leaf = out
@@ -1010,16 +1058,17 @@ fn page_level_aa_goto_is_neutralized() {
         Some(&b"GoTo"[..]),
         "page /AA /O is still a GoTo"
     );
-    assert!(
-        o.get("D").is_none(),
-        "cross-page /D must be dropped from page /AA /O"
+    assert_destination_page_is_null(
+        &mut out,
+        o.get("D").cloned().expect("page /AA /O /D retained"),
+        "cross-page page /AA /O /D target must resolve to null",
     );
 }
 
 #[test]
-fn indirect_action_goto_is_neutralized() {
-    // /A is an indirect reference to a GoTo action (obj 8). The walker must
-    // rewrite obj 8 in place (set_object on the terminal ref).
+fn indirect_action_goto_keeps_d_and_nulls_removed_page() {
+    // /A is an indirect reference to a GoTo action (obj 8). The action and /D
+    // remain indirect while the copied unselected page becomes null.
     let src = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -1042,7 +1091,7 @@ fn indirect_action_goto_is_neutralized() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "indirect-action GoTo sibling must be pruned"
+        "copied unselected page must be nulled"
     );
     let leaf_refs = pages::page_refs(&mut out).unwrap();
     let leaf = out
@@ -1061,7 +1110,7 @@ fn indirect_action_goto_is_neutralized() {
         .as_dict()
         .cloned()
         .unwrap();
-    // /A is still an indirect ref to the (now neutralized) action.
+    // /A remains an indirect ref to the unchanged action carrier.
     let action_ref = annot.get("A").and_then(Object::as_ref_id).expect("/A ref");
     let action = out
         .resolve_borrowed(action_ref)
@@ -1074,16 +1123,20 @@ fn indirect_action_goto_is_neutralized() {
         Some(&b"GoTo"[..]),
         "indirect action is still a GoTo"
     );
-    assert!(
-        action.get("D").is_none(),
-        "cross-page /D must be dropped from the indirect action"
+    assert_destination_page_is_null(
+        &mut out,
+        action
+            .get("D")
+            .cloned()
+            .expect("indirect action /D retained"),
+        "cross-page indirect action /D target must resolve to null",
     );
 }
 
 #[test]
-fn selflink_dest_kept_with_crosspage_action_neutralized() {
+fn selflink_dest_and_crosspage_action_carriers_are_preserved() {
     // Independence: a self-link /Dest (kept) coexists with a cross-page /A GoTo
-    // (neutralized). /Dest stays; the action's /D is dropped.
+    // to an unselected page. Both carriers stay; the latter target is null.
     let src = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -1099,7 +1152,7 @@ fn selflink_dest_kept_with_crosspage_action_neutralized() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "cross-page action sibling must be pruned"
+        "copied unselected page must be nulled"
     );
     let leaf_refs = pages::page_refs(&mut out).unwrap();
     let leaf = out
@@ -1126,9 +1179,10 @@ fn selflink_dest_kept_with_crosspage_action_neutralized() {
         .get("A")
         .and_then(|o| o.as_dict())
         .expect("/A action retained");
-    assert!(
-        action.get("D").is_none(),
-        "cross-page /A GoTo /D must be dropped"
+    assert_destination_page_is_null(
+        &mut out,
+        action.get("D").cloned().expect("cross-page /A /D retained"),
+        "cross-page /A GoTo /D target must resolve to null",
     );
 }
 
@@ -1167,7 +1221,7 @@ fn action_uri_is_preserved() {
 }
 
 #[test]
-fn indirect_dest_absent_page_is_neutralized() {
+fn indirect_dest_is_preserved_and_removed_page_is_null() {
     // /Dest is an indirect ref (8 0 R) to the [sibling /Fit] array.
     let src = build_pdf(
         &[
@@ -1191,7 +1245,7 @@ fn indirect_dest_absent_page_is_neutralized() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "indirect-dest sibling must be pruned"
+        "copied unselected page must be nulled"
     );
     let leaf_refs = pages::page_refs(&mut out).unwrap();
     let leaf = out
@@ -1210,16 +1264,17 @@ fn indirect_dest_absent_page_is_neutralized() {
         .as_dict()
         .cloned()
         .unwrap();
-    assert!(
-        annot.get("Dest").is_none(),
-        "indirect /Dest must be neutralized"
+    assert_destination_page_is_null(
+        &mut out,
+        annot.get("Dest").cloned().expect("indirect /Dest retained"),
+        "indirect /Dest target must resolve to null",
     );
 }
 
 #[test]
-fn indirect_aa_goto_is_neutralized() {
+fn indirect_aa_goto_keeps_d_and_nulls_removed_page() {
     // /AA is an indirect ref (9 0 R) to the additional-actions dict; its /U
-    // subaction is a cross-page GoTo. Exercises the indirect-/AA in-place arm.
+    // subaction is a cross-page GoTo. The carrier remains indirect.
     let src = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -1242,7 +1297,7 @@ fn indirect_aa_goto_is_neutralized() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "indirect-/AA GoTo sibling must be pruned"
+        "copied unselected page must be nulled"
     );
     let leaf_refs = pages::page_refs(&mut out).unwrap();
     let leaf = out
@@ -1261,13 +1316,12 @@ fn indirect_aa_goto_is_neutralized() {
         .as_dict()
         .cloned()
         .unwrap();
-    // /AA must stay an indirect reference: the indirect arm rewrites the
-    // referenced dict in place via set_object, it does not inline /AA.
+    // /AA stays an indirect reference.
     let aa_ref = match annot.get("AA") {
         Some(Object::Reference(r)) => *r,
         other => panic!("/AA must stay indirect, got {other:?}"),
     };
-    // Resolve the indirect /AA and confirm /U lost its /D.
+    // Resolve the indirect /AA and confirm /U kept a /D that targets null.
     let aa = out
         .resolve_borrowed(aa_ref)
         .unwrap()
@@ -1283,13 +1337,17 @@ fn indirect_aa_goto_is_neutralized() {
         Some(&b"GoTo"[..]),
         "action kept"
     );
-    assert!(u.get("D").is_none(), "indirect /AA /U /D must be dropped");
+    assert_destination_page_is_null(
+        &mut out,
+        u.get("D").cloned().expect("indirect /AA /U /D retained"),
+        "indirect /AA /U /D target must resolve to null",
+    );
 }
 
 #[test]
-fn indirect_next_array_goto_is_neutralized() {
+fn indirect_next_array_goto_keeps_d_and_nulls_removed_page() {
     // /A /Next is an indirect ref (10 0 R) to an ARRAY of actions; one is a
-    // cross-page GoTo. Without handling indirect-/Next-to-array it would leak.
+    // cross-page GoTo. The whole carrier chain remains intact.
     let src = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -1306,17 +1364,118 @@ fn indirect_next_array_goto_is_neutralized() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "indirect-/Next-array GoTo must be pruned"
+        "copied unselected page must be nulled"
+    );
+    let leaf = only_leaf(&mut out);
+    let annot_ref = leaf
+        .get("Annots")
+        .and_then(Object::as_array)
+        .and_then(|annots| annots.first())
+        .and_then(Object::as_ref_id)
+        .unwrap();
+    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let action = annot.get("A").and_then(Object::as_dict).unwrap();
+    let next = resolve_indirect_value(
+        &mut out,
+        action
+            .get("Next")
+            .cloned()
+            .expect("indirect /Next retained"),
+    )
+    .into_array()
+    .unwrap();
+    let goto = next[0].as_dict().unwrap();
+    assert_destination_page_is_null(
+        &mut out,
+        goto.get("D").cloned().expect("/Next GoTo /D retained"),
+        "indirect /Next array GoTo /D target must resolve to null",
     );
 }
 
-// --- Additional coverage: defensive/safety branches in the neutralize pass ---
+fn long_indirect_next_array_pdf() -> Vec<u8> {
+    let mut owned: Vec<(u32, String)> = vec![
+        (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+        (
+            2,
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into(),
+        ),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>"
+                .into(),
+        ),
+        (
+            4,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>".into(),
+        ),
+        (
+            5,
+            "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A << /S /URI /URI (https://example.test) /Next 10 0 R >> >>"
+                .into(),
+        ),
+    ];
+    for number in 10..80 {
+        owned.push((number, format!("[{} 0 R]", number + 1)));
+    }
+    owned.push((80, "[<< /S /GoTo /D [4 0 R /Fit] >>]".into()));
+    let borrowed: Vec<(u32, &str)> = owned
+        .iter()
+        .map(|(number, body)| (*number, body.as_str()))
+        .collect();
+    build_pdf(&borrowed, 1)
+}
+
+fn action_after_71_array_holders(
+    doc: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+    mut value: Object,
+) -> flpdf::Dictionary {
+    for _ in 0..=70 {
+        let concrete = match value {
+            Object::Reference(reference) => doc.resolve(reference).unwrap(),
+            direct => direct,
+        };
+        let mut items = concrete.into_array().expect("singleton action array");
+        assert_eq!(items.len(), 1);
+        value = items.remove(0);
+    }
+    value.into_dict().expect("terminal GoTo action")
+}
 
 #[test]
-fn indirect_annots_array_crosspage_dest_is_neutralized() {
-    // /Annots is an indirect ref (9 0 R) to the array — exercises the
-    // indirect-/Annots resolution arm. The annotation's cross-page /Dest is
-    // still neutralized and the sibling pruned.
+fn long_indirect_next_array_keeps_carrier_and_nulls_removed_page() {
+    let bytes = long_indirect_next_array_pdf();
+    let mut source = Pdf::open_mem(&bytes).unwrap();
+    let mut out = extract_page(&mut source, 0).unwrap();
+
+    assert_eq!(count_type(&mut out, b"Page"), 1);
+    let leaf = only_leaf(&mut out);
+    let annot_ref = leaf
+        .get("Annots")
+        .and_then(Object::as_array)
+        .and_then(|items| items.first())
+        .and_then(Object::as_ref_id)
+        .unwrap();
+    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let action = annot.get("A").and_then(Object::as_dict).unwrap();
+    let terminal = action_after_71_array_holders(
+        &mut out,
+        action.get("Next").cloned().expect("/Next is preserved"),
+    );
+    let removed_page = terminal
+        .get("D")
+        .and_then(Object::as_array)
+        .and_then(|items| items.first())
+        .and_then(Object::as_ref_id)
+        .unwrap();
+    assert!(matches!(out.resolve(removed_page).unwrap(), Object::Null));
+}
+
+// --- Additional coverage for indirect carrier shapes ---
+
+#[test]
+fn indirect_annots_array_keeps_dest_and_nulls_removed_page() {
+    // /Annots is an indirect ref (9 0 R) to the array. The annotation's
+    // cross-page /Dest remains and targets the nulled copied page.
     let src = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -1339,15 +1498,29 @@ fn indirect_annots_array_crosspage_dest_is_neutralized() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "indirect /Annots cross-page dest must be neutralized"
+        "copied unselected page must be nulled"
+    );
+    let leaf = only_leaf(&mut out);
+    let annots = resolve_indirect_value(
+        &mut out,
+        leaf.get("Annots")
+            .cloned()
+            .expect("indirect /Annots retained"),
+    )
+    .into_array()
+    .unwrap();
+    let annot_ref = annots[0].as_ref_id().unwrap();
+    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    assert_destination_page_is_null(
+        &mut out,
+        annot.get("Dest").cloned().expect("/Dest retained"),
+        "indirect /Annots /Dest target must resolve to null",
     );
 }
 
 #[test]
 fn aa_with_only_local_subaction_is_unchanged() {
-    // /AA carries a single non-GoTo (/URI) subaction: nothing is neutralized,
-    // exercising the "subaction unchanged -> re-insert" and "no change -> None"
-    // arms of neutralize_aa_if_absent. No sibling is pulled in.
+    // /AA carries a single non-GoTo (/URI) subaction and no page reference.
     let src = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -1394,10 +1567,10 @@ fn aa_with_only_local_subaction_is_unchanged() {
 }
 
 #[test]
-fn indirect_next_cycle_terminates_and_neutralizes() {
+fn indirect_next_cycle_is_preserved_and_removed_page_is_null() {
     // /A -> action 8 whose /Next is 9, and 9's /Next is 8 (an A<->B indirect
-    // cycle). Both are cross-page GoTos. The visited-set must terminate the walk
-    // (no hang / stack overflow) and still drop both /D, pruning the sibling.
+    // cycle). Both are cross-page GoTos. Generic closure traversal terminates
+    // via its visited set, and both /D carriers target the same nulled page.
     let src = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -1421,7 +1594,37 @@ fn indirect_next_cycle_terminates_and_neutralizes() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "cyclic indirect /Next chain must terminate and prune the sibling"
+        "copied unselected page must be nulled"
+    );
+    let leaf = only_leaf(&mut out);
+    let annot_ref = leaf
+        .get("Annots")
+        .and_then(Object::as_array)
+        .and_then(|annots| annots.first())
+        .and_then(Object::as_ref_id)
+        .unwrap();
+    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let first = resolve_indirect_value(
+        &mut out,
+        annot.get("A").cloned().expect("indirect /A retained"),
+    )
+    .into_dict()
+    .unwrap();
+    assert_destination_page_is_null(
+        &mut out,
+        first.get("D").cloned().expect("first /D retained"),
+        "first cyclic action /D target must resolve to null",
+    );
+    let second = resolve_indirect_value(
+        &mut out,
+        first.get("Next").cloned().expect("first /Next retained"),
+    )
+    .into_dict()
+    .unwrap();
+    assert_destination_page_is_null(
+        &mut out,
+        second.get("D").cloned().expect("second /D retained"),
+        "second cyclic action /D target must resolve to null",
     );
 }
 
@@ -1473,10 +1676,9 @@ fn action_goto_self_link_is_preserved() {
 }
 
 #[test]
-fn deep_inline_next_chain_terminates_at_depth_bound() {
-    // A /Next chain deeper than MAX_ACTION_CHAIN_DEPTH (64). All actions are
-    // /URI (no cross-page), so nothing leaks; the point is that the depth bound
-    // makes the walk terminate instead of recursing without limit.
+fn deep_inline_next_chain_is_preserved() {
+    // A deeply nested inline /Next chain of /URI actions carries no page ref,
+    // so extraction preserves it subject only to the generic inline-depth cap.
     let mut a = String::from("<< /S /URI /URI (http://leaf) >>");
     for _ in 0..70 {
         a = format!("<< /S /URI /URI (http://x) /Next {a} >>");
@@ -1500,8 +1702,8 @@ fn deep_inline_next_chain_terminates_at_depth_bound() {
     assert_eq!(count_type(&mut out, b"Page"), 1);
 }
 
-/// GoTo /SD -> StructElem(/Pg sibling) keeps the sibling reachable unless /SD is
-/// neutralized. (flpdf-2tmg, ISO 32000-2 §12.6.4.3.)
+/// GoTo /SD -> StructElem(/Pg sibling) keeps the carrier chain reachable while
+/// the copied sibling page itself becomes null. (ISO 32000-2 §12.6.4.3.)
 fn cross_page_sd_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -1517,18 +1719,18 @@ fn cross_page_sd_pdf() -> Vec<u8> {
 }
 
 #[test]
-fn action_goto_sd_absent_page_is_neutralized() {
+fn action_goto_sd_keeps_carrier_and_nulls_removed_page() {
     let mut src = Pdf::open(std::io::Cursor::new(cross_page_sd_pdf())).unwrap();
     let mut out = extract_page(&mut src, 0).unwrap();
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "GoTo /SD sibling must be pruned"
+        "copied unselected page must be nulled"
     );
     assert_eq!(
         count_type(&mut out, b"StructElem"),
-        0,
-        "StructElem reachable only via the neutralized /SD must be swept"
+        1,
+        "StructElem carrier reachable through /SD must be retained"
     );
     let leaf = only_leaf(&mut out);
     let annot_ref = match leaf.get("Annots") {
@@ -1542,9 +1744,13 @@ fn action_goto_sd_absent_page_is_neutralized() {
         Some(&flpdf::Object::Name(b"GoTo".to_vec())),
         "GoTo action retained"
     );
-    assert!(
-        action.get("SD").is_none(),
-        "/SD must be neutralized (removed)"
+    let struct_ref =
+        destination_page_ref(&mut out, action.get("SD").cloned().expect("/SD retained"));
+    let struct_elem = out.resolve(struct_ref).unwrap().into_dict().unwrap();
+    assert_reference_target_is_null(
+        &mut out,
+        struct_elem.get("Pg").expect("StructElem /Pg retained"),
+        "/SD StructElem /Pg target must resolve to null",
     );
 }
 
@@ -1606,9 +1812,9 @@ fn action_goto_sd_named_dest_is_preserved() {
 }
 
 #[test]
-fn annot_p_absent_page_is_neutralized() {
+fn annot_p_is_preserved_and_removed_page_is_null() {
     // A malformed annotation /P points at the SIBLING page (obj 4); the closure
-    // copies the sibling as a stub. Dropping /P makes it unreachable.
+    // copies the sibling, whose copied object is then replaced with null.
     let pdf = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -1630,7 +1836,7 @@ fn annot_p_absent_page_is_neutralized() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "sibling reached via annotation /P must be pruned"
+        "copied unselected page must be nulled"
     );
     let leaf = only_leaf(&mut out);
     let annot_ref = match leaf.get("Annots") {
@@ -1638,7 +1844,11 @@ fn annot_p_absent_page_is_neutralized() {
         other => panic!("expected /Annots array, got {other:?}"),
     };
     let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
-    assert!(annot.get("P").is_none(), "absent-page /P must be dropped");
+    assert_reference_target_is_null(
+        &mut out,
+        annot.get("P").expect("annotation /P retained"),
+        "annotation /P target must resolve to null",
+    );
 }
 
 #[test]
@@ -1672,7 +1882,7 @@ fn annot_p_self_page_is_preserved() {
 }
 
 #[test]
-fn bead_p_absent_page_is_neutralized() {
+fn bead_p_carrier_is_preserved_and_removed_page_is_null() {
     let pdf = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -1703,14 +1913,14 @@ fn bead_p_absent_page_is_neutralized() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "sibling reached via bead /P must be pruned"
+        "copied unselected page must be nulled"
     );
     // The kept page's /B is retained (qpdf keeps the ring).
     let leaf = only_leaf(&mut out);
     assert!(leaf.get("B").is_some(), "page /B must be retained");
 
     // The kept page's own bead (obj 10) targets the kept page, so its /P must
-    // survive neutralization and still resolve to a /Type /Page dictionary.
+    // stay live and still resolve to a /Type /Page dictionary.
     let bead_ref = match leaf.get("B") {
         Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
         other => panic!("expected /B array, got {other:?}"),
@@ -1725,6 +1935,16 @@ fn bead_p_absent_page_is_neutralized() {
         p_page.get("Type"),
         Some(&flpdf::Object::Name(b"Page".to_vec())),
         "preserved bead /P must resolve to a /Type /Page"
+    );
+
+    let sibling_bead =
+        resolve_indirect_value(&mut out, bead.get("N").cloned().expect("bead /N retained"))
+            .into_dict()
+            .unwrap();
+    assert_reference_target_is_null(
+        &mut out,
+        sibling_bead.get("P").expect("sibling bead /P retained"),
+        "sibling bead /P target must resolve to null",
     );
 }
 
@@ -1949,7 +2169,7 @@ fn three_page_linked_pdf() -> Vec<u8> {
 fn extract_pages_keeps_dest_between_selected_pages() {
     // A /Dest from one selected page to ANOTHER selected page is remapped and
     // kept (the target is present in the output); a /Dest to a NON-selected
-    // page is neutralized and its stub pruned.
+    // page is also kept, but its copied page target is null.
     let src = three_page_linked_pdf();
     let mut source = Pdf::open_mem(&src).unwrap();
 
@@ -1967,34 +2187,35 @@ fn extract_pages_keeps_dest_between_selected_pages() {
     assert_eq!(annot_refs.len(), 2, "both annotations retained");
 
     let mut kept = 0;
-    let mut neutralized = 0;
+    let mut nulled = 0;
     for annot_ref in annot_refs {
         let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
-        match annot.get("Dest") {
-            Some(Object::Array(arr)) => {
-                assert_eq!(
-                    arr.first(),
-                    Some(&Object::Reference(second_page_ref)),
-                    "kept /Dest must be remapped to the second output page"
-                );
-                kept += 1;
-            }
-            None => neutralized += 1,
-            other => panic!("unexpected /Dest shape: {other:?}"),
+        let target_ref = destination_page_ref(
+            &mut out,
+            annot.get("Dest").cloned().expect("/Dest retained"),
+        );
+        if target_ref == second_page_ref {
+            kept += 1;
+        } else {
+            assert!(
+                matches!(out.resolve(target_ref).unwrap(), Object::Null),
+                "non-selected /Dest target must resolve to null"
+            );
+            nulled += 1;
         }
     }
     assert_eq!(kept, 1, "the link to selected page 4 must survive");
     assert_eq!(
-        neutralized, 1,
-        "the link to non-selected page 5 must lose its /Dest"
+        nulled, 1,
+        "the link to non-selected page 5 must target null"
     );
 
-    // Page 5's copied stub becomes unreachable after neutralization and is
-    // swept: exactly the two selected pages remain.
+    // Page 5's copied object remains reachable but is null: exactly the two
+    // selected live /Page dictionaries remain.
     assert_eq!(
         count_type(&mut out, b"Page"),
         2,
-        "non-selected page stub must be pruned"
+        "non-selected copied page must be null"
     );
 }
 
@@ -2059,11 +2280,11 @@ fn extract_pages_materializes_inherited_attrs_per_parent() {
 }
 
 #[test]
-fn bead_p_absent_page_via_indirect_chain_is_neutralized() {
+fn bead_p_via_indirect_chain_is_preserved_and_removed_page_is_null() {
     // The sibling bead (obj 11) is reached from the on-page bead's /N through an
-    // indirect-reference chain (obj 13 is itself `11 0 R`). The ring walk must
-    // normalize the link to the terminal bead, else bead 11's /P 4 0 R is never
-    // inspected and the sibling page leaks.
+    // indirect-reference chain (obj 13 is itself `11 0 R`). Generic closure
+    // traversal follows the chain; bead 11's /P 4 0 R remains and resolves to
+    // the nulled copied page.
     let pdf = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -2096,10 +2317,28 @@ fn bead_p_absent_page_via_indirect_chain_is_neutralized() {
     assert_eq!(
         count_type(&mut out, b"Page"),
         1,
-        "sibling reached via an indirect bead chain must be pruned"
+        "copied unselected page must be nulled"
     );
     let leaf = only_leaf(&mut out);
     assert!(leaf.get("B").is_some(), "page /B must be retained");
+    let bead_ref = leaf
+        .get("B")
+        .and_then(Object::as_array)
+        .and_then(|beads| beads.first())
+        .and_then(Object::as_ref_id)
+        .unwrap();
+    let bead = out.resolve(bead_ref).unwrap().into_dict().unwrap();
+    let sibling_bead = resolve_indirect_value(
+        &mut out,
+        bead.get("N").cloned().expect("indirect bead /N retained"),
+    )
+    .into_dict()
+    .unwrap();
+    assert_reference_target_is_null(
+        &mut out,
+        sibling_bead.get("P").expect("sibling bead /P retained"),
+        "indirect sibling bead /P target must resolve to null",
+    );
 }
 
 // ---------------------------------------------------------------------------
