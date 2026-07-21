@@ -1998,6 +1998,47 @@ fn merge_inherits_inline_dests_root() {
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
+// `merge_documents` (qpdf `--pages` parity) never merges a secondary input's
+// own named destinations/outline into the target — only the primary's are
+// inherited, and a secondary's catalog-level `/Names /Dests` / `/Dests` /
+// `/Outlines` are not part of any page's object closure at all (qpdf's own
+// `addPage`/`copyForeignObject` never reaches them). So there is no
+// "overlapping named destination" scenario to collide in the first place.
+// What CAN happen — a primary named destination left pointing at a page the
+// merge dropped (nulled, as `d_b` above) — is exactly what the existing
+// `check_name_tree_dests` / `check_legacy_dests` diagnostics
+// (flpdf-9hc.14.1/.2) already detect, with no change needed here: they
+// operate on any `Pdf`, including a freshly merged one.
+#[test]
+fn check_name_tree_dests_flags_dest_nulled_by_merge() {
+    let mut a = Pdf::open_mem_owned(inline_dests_root_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![0],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let diagnostics = flpdf::check_name_tree_dests(&mut doc).unwrap();
+    let messages: Vec<&str> = diagnostics
+        .entries()
+        .iter()
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(
+        messages.len(),
+        1,
+        "exactly one named dest (d_b) targets a page the merge dropped, got {messages:?}"
+    );
+    assert!(
+        messages[0].contains("d_b"),
+        "the dangling-dest warning must name d_b, got {messages:?}"
+    );
+    assert!(
+        !messages[0].contains("d_a"),
+        "d_a survives (remapped, not nulled) and must not be flagged"
+    );
+}
+
 // A primary whose /Outlines root is empty (/Type /Outlines /Count 0, no /First)
 // is a legitimate, reachable PDF shape: merge must tolerate it (no crash, no
 // dropped pages) and still inherit the (empty) /Outlines root. Exercises the
@@ -4932,5 +4973,98 @@ fn merge_shared_visited_keeps_cross_referenced_pages_exclusive_resource() {
         leaf_base_font(&mut doc, 1),
         b"Courier".to_vec(),
         "page 1's exclusive /Resources font must be copied into the merged output"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// /PageLabels merge (accumulates across ALL inputs, unlike outlines/dests)
+// ---------------------------------------------------------------------------
+
+/// Two-page document whose catalog carries `/PageLabels` (roman lowercase
+/// from page 0).
+fn two_page_pdf_with_roman_labels() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0 << /S /r >>] >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+/// Plain two-page document with no `/PageLabels` at all.
+fn two_page_pdf_no_labels() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn merge_accumulates_page_labels_across_all_inputs() {
+    // Input A carries real page labels (roman); input B carries none, so its
+    // pages get qpdf's fabricated `<< /St n >>` default at their merged
+    // position. Verified byte-for-byte against qpdf 11.9.0 (`--empty --pages
+    // A.pdf 1,2 B.pdf 1,2 -- out.pdf`): folded /Nums is
+    // `[0 << /S /r /St 1 >> 2 << /St 3 >>]`.
+    let mut a = Pdf::open_mem_owned(two_page_pdf_with_roman_labels()).unwrap();
+    let mut b = Pdf::open_mem_owned(two_page_pdf_no_labels()).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut a,
+            pages: vec![0, 1],
+        },
+        MergeInput {
+            source: &mut b,
+            pages: vec![0, 1],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let mut h = doc.page_labels();
+    assert!(h.has_page_labels().unwrap());
+    let ranges = h.ranges().unwrap();
+    assert_eq!(ranges.len(), 2, "folds to 2 entries, got {ranges:?}");
+    assert_eq!(ranges[0].0, 0);
+    assert_eq!(ranges[0].1.style, flpdf::LabelStyle::RomanLower);
+    assert_eq!(ranges[0].1.start, 1);
+    assert_eq!(ranges[1].0, 2);
+    assert_eq!(ranges[1].1.style, flpdf::LabelStyle::None);
+    assert_eq!(ranges[1].1.start, 3);
+
+    assert_eq!(h.label_string_for_page(0).unwrap(), "i");
+    assert_eq!(h.label_string_for_page(1).unwrap(), "ii");
+}
+
+#[test]
+fn merge_without_any_input_labels_omits_pagelabels() {
+    let mut a = Pdf::open_mem_owned(two_page_pdf_no_labels()).unwrap();
+    let mut b = Pdf::open_mem_owned(two_page_pdf_no_labels()).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut a,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut b,
+            pages: vec![0],
+        },
+    ];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+
+    let mut h = doc.page_labels();
+    assert!(
+        !h.has_page_labels().unwrap(),
+        "no input ever carried real labels, so the merged catalog gets none"
     );
 }

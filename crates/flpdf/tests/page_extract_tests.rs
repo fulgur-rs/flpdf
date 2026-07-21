@@ -2101,3 +2101,87 @@ fn bead_p_absent_page_via_indirect_chain_is_neutralized() {
     let leaf = only_leaf(&mut out);
     assert!(leaf.get("B").is_some(), "page /B must be retained");
 }
+
+// ---------------------------------------------------------------------------
+// /PageLabels reconstruction
+// ---------------------------------------------------------------------------
+
+/// Four-page document with `/PageLabels`: roman lowercase for pages 0-1,
+/// decimal (restart at 1) for pages 2-3.
+fn four_page_pdf_with_labels() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /PageLabels \
+                 << /Nums [0 << /S /r >> 2 << /S /D /St 1 >>] >> >>",
+            ),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] /Count 4 >>",
+            ),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (6, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn extract_pages_reconstructs_labels_in_selection_order_with_duplicates() {
+    // Selection order 2,0,2 (0-based): src page2 (decimal "1"), src page0
+    // (roman "i"), src page2 again (duplicate -> decimal "1" again).
+    // Verified byte-for-byte against qpdf 11.9.0 (`--empty --pages src.pdf
+    // 3,1,3 -- out.pdf`), which reconstructs the identical 3-entry /Nums.
+    let src = four_page_pdf_with_labels();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_pages(&mut source, &[2, 0, 2]).unwrap();
+
+    let mut h = out.page_labels();
+    assert_eq!(h.label_string_for_page(0).unwrap(), "1");
+    assert_eq!(h.label_string_for_page(1).unwrap(), "i");
+    assert_eq!(h.label_string_for_page(2).unwrap(), "1");
+    let ranges = h.ranges().unwrap();
+    assert_eq!(ranges.len(), 3, "no fold: styles alternate, got {ranges:?}");
+}
+
+#[test]
+fn extract_pages_folds_redundant_sequential_labels() {
+    // Identity selection: labels continue exactly as in the source (roman i,
+    // ii, then decimal 1, 2), so the reconstructed tree folds down to the 2
+    // real range starts (0 and 2) rather than one entry per page. Verified
+    // against qpdf 11.9.0 (`--empty --pages src.pdf 1,2,3,4 -- out.pdf`).
+    let src = four_page_pdf_with_labels();
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_pages(&mut source, &[0, 1, 2, 3]).unwrap();
+
+    let mut h = out.page_labels();
+    let ranges = h.ranges().unwrap();
+    assert_eq!(
+        ranges.len(),
+        2,
+        "sequential/continuous entries fold to the 2 real range starts, got {ranges:?}"
+    );
+    assert_eq!(h.label_string_for_page(0).unwrap(), "i");
+    assert_eq!(h.label_string_for_page(1).unwrap(), "ii");
+    assert_eq!(h.label_string_for_page(2).unwrap(), "1");
+    assert_eq!(h.label_string_for_page(3).unwrap(), "2");
+}
+
+#[test]
+fn extract_pages_without_source_labels_has_none() {
+    let src = three_page_shared_font_pdf(); // no /PageLabels
+    let mut source = Pdf::open_mem(&src).unwrap();
+
+    let mut out = extract_pages(&mut source, &[0, 1]).unwrap();
+
+    let mut h = out.page_labels();
+    assert!(
+        !h.has_page_labels().unwrap(),
+        "a source with no /PageLabels must not gain one"
+    );
+}

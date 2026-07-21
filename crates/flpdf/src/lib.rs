@@ -36,6 +36,52 @@
 //! Errors flow through the unified [`Error`] enum and the crate-level [`Result`] alias,
 //! except for the small [`object::ParseObjectRefError`] returned by
 //! [`ObjectRef::parse`].
+//!
+//! # Known limitations
+//!
+//! - **Outline and page-label preservation.** Support scope varies by
+//!   operation:
+//!
+//!   - [`write_pdf`] (with no page selection) preserves both destination
+//!     sources — the legacy catalog `/Dests` dictionary and the modern
+//!     `/Names /Dests` name tree (ISO 32000-2 §7.9.6, §12.3.2.3); deeply
+//!     nested outlines (walks are iterative); all five `/A` action subtypes
+//!     (`GoTo`, `GoToR`, `URI`, `Launch`, `Named`) plus their `/Next`
+//!     chains (ISO 32000-2 §12.6.2); the `/SE` structure-element link
+//!     (ISO 32000-2 §14.7); and the `/PageLabels` number-tree ranges
+//!     (ISO 32000-2 §7.9.7).
+//!   - [`rebuild_page_tree`] alone only rewrites the `/Pages` tree; it
+//!     does NOT remap outline `/Dest` refs, does NOT drop `/Dests`
+//!     entries whose targets went away, and does NOT reconstruct
+//!     `/PageLabels`. Serializing only `rebuild_page_tree`'s output
+//!     leaves stale destinations and label ranges pointing at pages no
+//!     longer in the tree. Pair it with
+//!     [`remap_outline_and_dests`] and (when labels matter)
+//!     [`PageLabelDocumentHelper::labels_for_selection`] +
+//!     [`PageLabelDocumentHelper::write_reconstructed_labels`] — the
+//!     [`extract_pages`] and [`merge_documents`] pipelines assemble
+//!     that combination for you.
+//!   - [`merge_documents`] preserves outlines and both dest sources for
+//!     the PRIMARY input only (matching qpdf `--pages`), and reconstructs
+//!     `/PageLabels` across every input's selected pages.
+//!   - [`extract_pages`] returns a *minimal* new document that intentionally
+//!     omits catalog-level navigation — `/Outlines`, catalog `/Dests`, and
+//!     `/Names /Dests` are all dropped. Only `/PageLabels` is reconstructed
+//!     for the selection. Callers who need outlines/dests preserved should
+//!     use [`merge_documents`] with a single input.
+//! - **`/SE` is not pruned automatically.** Built-in page-operation helpers
+//!   only drop a structure element's now-dangling `/Pg` entry
+//!   ([`struct_tree_pg::drop_struct_elem_dangling_pg`]) — they never remove
+//!   the structure element itself, so an outline item's `/SE` reference is
+//!   never left dangling by them. [`prune_outline_se`] exists for callers
+//!   that perform their own structure-element removal and need to keep
+//!   outline `/SE` links consistent with it; no built-in page-operation
+//!   pipeline (extract, rebuild, split, merge) invokes it automatically.
+//! - **`flpdf --json`'s `outlines` and `pagelabels` sections** currently use
+//!   a different key layout than qpdf's own `--json=2` output for these two
+//!   sections specifically (other sections match). Both still faithfully
+//!   expose the document's outline tree and page-label ranges; only the JSON
+//!   field names and shape differ from qpdf's.
 
 // Mechanically enforce threat-model guarantee (a): no undefined behaviour. The
 // crate contains no `unsafe` blocks, so this attribute keeps it that way.
@@ -63,6 +109,7 @@ pub mod json;
 pub mod json_inspect;
 pub mod linearization;
 pub mod name_number_tree;
+pub mod name_tree_dests;
 pub mod object;
 pub mod object_copy;
 pub mod objr_obj_annot_p;
@@ -146,12 +193,19 @@ pub use name_number_tree::{
     build_name_tree, build_number_tree, read_name_tree, read_number_tree, DEFAULT_MAX_TREE_DEPTH,
     LEAF_MAX,
 };
+pub use name_tree_dests::{
+    delete_name_tree_dest, insert_name_tree_dest, DEFAULT_MAX_NAME_TREE_DESTS_DEPTH,
+};
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use object_copy::copy_objects;
 pub use objr_obj_annot_p::drop_objr_obj_annot_dangling_p;
 pub use outline::OutlineItem;
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
-pub use outline_document_helper::{Dest, OutlineDocumentHelper, OutlineNode};
+pub use outline_document_helper::{
+    check_legacy_dests, check_name_tree_dests, check_outline_links, prune_outline_se,
+    prune_outline_se_with_max_depth, Dest, OutlineAction, OutlineDocumentHelper, OutlineNode,
+    DEFAULT_MAX_ACTION_CHAIN_DEPTH, MAX_OUTLINE_WALK_DEPTH,
+};
 pub use overlay::{
     apply_overlay_specs, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
     OverlayVerboseSource,
@@ -164,7 +218,9 @@ pub use page_collate::collate;
 pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_document_helper::PageDocumentHelper;
 pub use page_extract::{extract_page, extract_pages};
-pub use page_label_document_helper::{LabelRange, LabelStyle, PageLabelDocumentHelper};
+pub use page_label_document_helper::{
+    merge_adjacent_ranges, LabelRange, LabelStyle, PageLabelDocumentHelper,
+};
 pub use page_merge::{merge_documents, MergeInput};
 pub use page_object_helper::{PageBox, PageObjectHelper};
 pub use page_plan::{PagePlan, SelectedPage};

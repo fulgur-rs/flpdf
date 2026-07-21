@@ -3812,6 +3812,8 @@ fn pages_progress_filename(p: &std::path::Path) -> String {
 ///   1. page_combine / page_collate → selected ObjectRef list
 ///   2. page_tree_rebuild::rebuild_page_tree → RebuildResult
 ///   3. apply_rotate_to_pages (on the rebuilt OUTPUT leaves; qpdf-observed)
+///      3.5. /PageLabels reconstruction (per selected page, qpdf
+///      `handlePageSpecs`-observed)
 ///   4. outline_dest_remap::remap_outline_and_dests
 ///   5. struct_tree_pg::drop_struct_elem_dangling_pg
 ///   6. thread_bead_p::drop_thread_bead_dangling_p
@@ -3972,6 +3974,26 @@ fn run_page_extraction(
     // mutates each leaf's /Rotate, never the /Outlines, /Names, /AcroForm,
     // or orphaned-resource graph that steps 4–6 operate on.
     apply_rotate_specs(&mut pdf, &page_ops.rotate, &result.new_kids)?;
+
+    // Step 3.5: /PageLabels reconstruction (qpdf `handlePageSpecs` parity).
+    // One entry per selected page, in output order (collate/duplicates
+    // included), folding away entries redundant with the running sequence.
+    // A no-op when the source has no `/PageLabels` at all.
+    {
+        let mut labels = pdf.page_labels();
+        if labels.has_page_labels()? {
+            // `labels_for_selection` fetches /PageLabels once and computes
+            // one entry per selected page — O(N + M) vs the prior
+            // per-page `labels_for_page_range` loop's O(N × M).
+            let src_indices: Vec<i64> = combined_pages
+                .iter()
+                .map(|cp| i64::from(cp.page.index_1based) - 1)
+                .collect();
+            let entries = labels.labels_for_selection(&src_indices, 0)?;
+            let folded = flpdf::merge_adjacent_ranges(entries);
+            labels.write_reconstructed_labels(&folded)?;
+        }
+    }
 
     // Step 4: outline / named-destination remap-or-drop (8.10).
     remap_outline_and_dests(&mut pdf, &result)?;

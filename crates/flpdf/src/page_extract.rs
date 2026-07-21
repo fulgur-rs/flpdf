@@ -17,6 +17,18 @@
 //! are copied in a single pass, so objects shared between them (fonts, images,
 //! content streams) are copied exactly once.
 //!
+//! # Page labels
+//!
+//! When `source` carries a `/PageLabels` number tree, the extracted document
+//! gets its own reconstructed `/PageLabels` reflecting the selected pages'
+//! renumbered positions (a page's label at its old position becomes its
+//! label at its new, 0-based output position). No catalog-level navigation
+//! structure is otherwise copied: named destinations (`/Names /Dests`, the
+//! legacy `/Catalog /Dests` dictionary) and the outline tree are not part of
+//! any page's object closure, so they are absent from the extracted
+//! document — matching qpdf's `addPage`-based copy, which brings over only
+//! each page's own reachable objects.
+//!
 //! # Cross-page annotation destinations
 //!
 //! Destinations on an extracted page that target another, now-absent page are
@@ -47,6 +59,7 @@
 use crate::object_copy::{copy_objects, rewrite_refs};
 use crate::outline_dest_remap::dest_page_ref_resolved;
 use crate::page_closure::extend_page_object_closure;
+use crate::page_label_document_helper::merge_adjacent_ranges;
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
 use crate::page_tree_rebuild::resolve_inherited_raw;
 use crate::pages::{
@@ -116,7 +129,8 @@ impl InheritedAttrs {
 ///
 /// `source` is not modified. See also [`extract_page`] for the single-page
 /// form, and the [module documentation](self) for how cross-page
-/// destinations on the extracted pages are neutralized.
+/// destinations on the extracted pages are neutralized, and how
+/// `/PageLabels` is reconstructed for the selection.
 ///
 /// # Examples
 ///
@@ -214,6 +228,21 @@ pub fn extract_pages<R: Read + Seek>(
     let keep: BTreeSet<ObjectRef> = copied_unique.iter().copied().collect();
     for &copied_page_ref in &copied_unique {
         neutralize_absent_dests(&mut target, copied_page_ref, &keep)?;
+    }
+
+    // /PageLabels (qpdf `addPage`-based reconstruction parity — the same
+    // per-page accumulation `QPDFJob::handlePageSpecs` performs while adding
+    // pages, generalized here to arbitrary/duplicate selection order). A
+    // source with no `/PageLabels` at all leaves the fresh target untouched
+    // (it never gains one), matching qpdf's `emptyPDF()`-based output.
+    {
+        let mut source_labels = source.page_labels();
+        if source_labels.has_page_labels()? {
+            let src_indices: Vec<i64> = page_indices.iter().map(|&i| i as i64).collect();
+            let entries = source_labels.labels_for_selection(&src_indices, 0)?;
+            let folded = merge_adjacent_ranges(entries);
+            target.page_labels().write_reconstructed_labels(&folded)?;
+        }
     }
 
     // Build /Kids in SELECTION order. The first occurrence of a source page
