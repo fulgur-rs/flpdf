@@ -58,15 +58,6 @@ pub const MAX_OUTLINE_WALK_DEPTH: usize = 5_000;
 /// `/D` structures terminate instead of overflowing the stack.
 const MAX_DEST_RESOLVE_DEPTH: usize = 64;
 
-/// Default recursion limit for walking an outline action's `/Next` chain via
-/// [`OutlineDocumentHelper::action_chain`]. ISO 32000-1 section 12.6.2:
-/// `/Next` chains an action to further actions performed in order afterward
-/// (a single action, or an array of actions). The bound exists to make a
-/// hostile or malformed `/Next` chain (a self-reference, a mutual reference,
-/// or an implausibly long chain) terminate instead of growing without bound
-/// or looping forever.
-pub const DEFAULT_MAX_ACTION_CHAIN_DEPTH: usize = 100;
-
 /// One materialized node of the outline tree (a bookmark).
 ///
 /// Mirrors qpdf's `QPDFOutlineObjectHelper`. `children` are the resolved
@@ -95,11 +86,6 @@ pub struct OutlineNode {
     /// reference; a direct (non-reference) `/SE` value is malformed and is
     /// also read as `None`.
     pub se: Option<ObjectRef>,
-    /// The item's own `/A` action (ISO 32000-1 section 12.6), typed by
-    /// subtype, or `None` when `/A` is absent or does not resolve to a
-    /// dictionary. A `/Next`-chained action is not included here — use
-    /// [`OutlineDocumentHelper::action_chain`] to walk the full chain.
-    pub action: Option<OutlineAction>,
     /// Child nodes in `/First`->`/Next` order.
     pub children: Vec<OutlineNode>,
 }
@@ -129,59 +115,6 @@ impl Dest {
     pub fn page(&self) -> Option<ObjectRef> {
         self.array.first().and_then(Object::as_ref_id)
     }
-}
-
-/// An outline item's `/A` action, classified by its `/S` subtype (ISO
-/// 32000-1 section 12.6.4). Every recognized variant resolves one level of
-/// indirection on its subtype-specific fields, so a value stored as an
-/// indirect reference reads the same as a direct one. A recognized subtype
-/// that is missing its required field, or any other subtype (including one
-/// with no `/S` at all), is preserved opaque as [`Self::Unknown`] — the
-/// whole action dictionary, untouched.
-#[derive(Debug, Clone, PartialEq)]
-pub enum OutlineAction {
-    /// `/S /GoTo`: a destination within this document. `d` is the action's
-    /// `/D` value (an array, a name/string naming a destination, or a
-    /// dictionary holding one of those under its own `/D`); see
-    /// [`OutlineNode::dest`] for the same destination already resolved to an
-    /// explicit page target.
-    GoTo {
-        /// The action's `/D` destination value.
-        d: Object,
-    },
-    /// `/S /GoToR`: a destination in a remote (external) PDF document.
-    GoToR {
-        /// The remote file, as a file specification (ISO 32000-1 section 7.11):
-        /// either a `Object::String`/`Object::HexString` file path or an
-        /// `Object::Dictionary` with `/Type /Filespec`.
-        f: Object,
-        /// The destination within the remote file. Absent when the action
-        /// simply opens the file at its default view (per ISO 32000-1 section
-        /// 12.6.4.3, the destination is optional).
-        d: Option<Object>,
-    },
-    /// `/S /URI`: resolve a uniform resource identifier.
-    Uri {
-        /// The URI, as the raw bytes of `/URI`. Preserved verbatim — this
-        /// crate does not attempt URL parsing or normalization.
-        uri: Vec<u8>,
-    },
-    /// `/S /Launch`: launch an application, typically to open a target file.
-    Launch {
-        /// The application/file to launch, as a file specification (same
-        /// shape as [`Self::GoToR::f`]: string path or `/Type /Filespec`
-        /// dictionary).
-        f: Object,
-    },
-    /// `/S /Named`: execute a predefined, viewer-specific action such as
-    /// `NextPage`, `PrevPage`, `FirstPage`, or `LastPage`.
-    Named {
-        /// The named action, as the raw bytes of `/N`.
-        n: Vec<u8>,
-    },
-    /// Any other action subtype, including a missing `/S`: the full action
-    /// dictionary, preserved exactly as read.
-    Unknown(crate::Dictionary),
 }
 
 /// High-level outline helper for a document. See module docs.
@@ -351,16 +284,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             // this point - owned values only from here on.
             let title = resolve_title(self.pdf, title_src)?;
             let count = resolve_int(self.pdf, count_src)?.unwrap_or(0);
-            // action_src is BORROWED here (as Option<&Object>) for the dest
-            // fallback, then the owned value is MOVED into
-            // parse_outline_action only in the Some branch — no double-use,
-            // no clone. The None branch skips the call entirely.
             let dest = self.resolve_node_dest(dest_src.as_ref(), action_src.as_ref())?;
-            let action = if let Some(a) = action_src {
-                parse_outline_action(self.pdf, a)?
-            } else {
-                None
-            };
 
             current.next = next;
             current.nodes.push(OutlineNode {
@@ -371,7 +295,6 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 parent: current.parent,
                 dest,
                 se,
-                action,
                 children: Vec::new(),
             });
 
@@ -453,12 +376,8 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Some(dests_root) = names.remove("Dests") else {
             return Ok(Object::Null);
         };
-        let entries = read_name_tree(
-            self.pdf,
-            dests_root,
-            |_pdf, value| Ok(Some(value)),
-            DEFAULT_MAX_OUTLINE_DEPTH,
-        )?;
+        let decode = |_pdf: &mut Pdf<R>, value| Ok(Some(value));
+        let entries = read_name_tree(self.pdf, dests_root, decode, DEFAULT_MAX_OUTLINE_DEPTH)?;
         for (stored, value) in entries {
             if crate::json_inspect::qpdf_utf8_value(&stored) == lookup {
                 return resolve_terminal_object(self.pdf, value);
@@ -733,56 +652,6 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             live_struct_elem_refs,
             max_depth,
         )
-    }
-
-    /// Walk an outline item's `/A` action and its `/Next` chain, using
-    /// [`DEFAULT_MAX_ACTION_CHAIN_DEPTH`]. See
-    /// [`Self::action_chain_with_max_depth`] for the full contract.
-    ///
-    /// # Errors
-    ///
-    /// Propagates any error from resolving the item or its action objects
-    /// (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
-    pub fn action_chain(&mut self, item_ref: ObjectRef) -> Result<Vec<OutlineAction>> {
-        self.action_chain_with_max_depth(item_ref, DEFAULT_MAX_ACTION_CHAIN_DEPTH)
-    }
-
-    /// Like [`Self::action_chain`] but with a caller-supplied recursion limit.
-    ///
-    /// Returns every action reachable from `item_ref`'s `/A`, in visitation
-    /// order: the item's own action first, then each action chained after it
-    /// via `/Next` (a single action, or an array of actions performed in
-    /// order after the action they extend — ISO 32000-1 section 12.6.2).
-    /// Returns an empty `Vec` when `item_ref` has no `/A`, or when `/A` does
-    /// not resolve to a dictionary.
-    ///
-    /// Bounded by `max_depth` and a cycle guard on indirect action objects,
-    /// so a hostile or malformed `/Next` chain (a self-reference, a mutual
-    /// reference, or an implausibly long chain) terminates instead of
-    /// growing without bound or looping forever.
-    ///
-    /// # Errors
-    ///
-    /// Propagates any error from resolving the item or its action objects
-    /// (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
-    pub fn action_chain_with_max_depth(
-        &mut self,
-        item_ref: ObjectRef,
-        max_depth: usize,
-    ) -> Result<Vec<OutlineAction>> {
-        let a_value = {
-            let Object::Dictionary(dict) = self.pdf.resolve_borrowed(item_ref)? else {
-                return Ok(Vec::new());
-            };
-            dict.get("A").cloned()
-        };
-        let Some(a_value) = a_value else {
-            return Ok(Vec::new());
-        };
-        let mut visited = BTreeSet::new();
-        let mut out = Vec::new();
-        collect_action_chain(self.pdf, a_value, &mut visited, max_depth, &mut out)?;
-        Ok(out)
     }
 
     /// Validate `/Parent`/`/Prev` linkage across the outline tree using
@@ -1346,201 +1215,6 @@ fn resolve_page_ref_through_holders<R: Read + Seek>(
         }
     }
     current
-}
-
-/// Resolve one level of indirection on an optional value (review rule 2).
-/// Returns `None` only when `value` itself is `None`.
-fn resolve_one_level<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    value: Option<Object>,
-) -> Result<Option<Object>> {
-    Ok(match value {
-        Some(Object::Reference(r)) => Some(pdf.resolve(r)?),
-        other => other,
-    })
-}
-
-/// Parse an outline item's raw, unresolved `/A` value into a typed
-/// [`OutlineAction`] — this item's own action only; a chained `/Next` action
-/// is not followed (see [`OutlineDocumentHelper::action_chain`] for that).
-/// Resolves one level of indirection on the action value itself (review rule
-/// 2 — `/A` may be stored as an indirect reference). Returns `None` when the
-/// resolved value is not a dictionary.
-fn parse_outline_action<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    value: Object,
-) -> Result<Option<OutlineAction>> {
-    // Follow the full holder chain — /A may be `/A 8 0 R` where obj 8 is
-    // `9 0 R` and obj 9 is the action dict. Single-hop resolve would return
-    // `Object::Reference(9)` and drop the action on the floor at
-    // `.into_dict()` below.
-    let resolved = match value {
-        Object::Reference(_) => crate::ref_chain::resolve_ref_chain(pdf, &value)?.0,
-        other => other,
-    };
-    match resolved.into_dict() {
-        Some(dict) => action_from_dict(pdf, dict).map(Some),
-        None => Ok(None),
-    }
-}
-
-/// Build an [`OutlineAction`] from an already-resolved action dictionary,
-/// classifying it by its `/S` subtype (ISO 32000-1 section 12.6.4). Each
-/// subtype-specific field is resolved one level of indirection (review rule
-/// 2); a recognized subtype missing its required field, or any other
-/// subtype (including an absent `/S`), is preserved opaque as
-/// [`OutlineAction::Unknown`] — the whole dictionary, untouched (`dict` is
-/// moved into that variant rather than cloned, since every branch above it
-/// only clones the individual field it inspects).
-fn action_from_dict<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    dict: crate::Dictionary,
-) -> Result<OutlineAction> {
-    let subtype = resolve_one_level(pdf, dict.get("S").cloned())?.and_then(Object::into_name);
-
-    Ok(match subtype.as_deref() {
-        Some(b"GoTo") => {
-            // Accept /D or /SD (structure destination, ISO 32000-2 §12.6.4.3);
-            // /SD takes precedence when both are present. A resolved /D that
-            // turns out to be Null (`/D null`, or an unresolvable ref that
-            // normalises to null) is treated as absent — Null is not a usable
-            // destination even though it is a legal Object.
-            let sd = resolve_one_level_non_null(pdf, dict.get("SD").cloned())?;
-            let d_only = resolve_one_level_non_null(pdf, dict.get("D").cloned())?;
-            match sd.or(d_only) {
-                Some(d) => OutlineAction::GoTo { d },
-                None => OutlineAction::Unknown(dict),
-            }
-        }
-        Some(b"GoToR") => {
-            // ISO 32000-1 §12.6.4.3: /F must be a file specification (string
-            // path or /Type /Filespec dict). Anything else (e.g. `/F 42`)
-            // makes the action malformed → fall through to Unknown.
-            match resolve_one_level_non_null(pdf, dict.get("F").cloned())?.filter(is_file_spec) {
-                Some(f) => {
-                    let d = resolve_one_level_non_null(pdf, dict.get("D").cloned())?;
-                    OutlineAction::GoToR { f, d }
-                }
-                None => OutlineAction::Unknown(dict),
-            }
-        }
-        Some(b"URI") => {
-            match resolve_one_level_non_null(pdf, dict.get("URI").cloned())?
-                .and_then(Object::into_string)
-            {
-                Some(uri) => OutlineAction::Uri { uri },
-                None => OutlineAction::Unknown(dict),
-            }
-        }
-        Some(b"Launch") => {
-            // ISO 32000-1 §12.6.4.5: prefer /F; if absent, fall back to any
-            // of the platform-specific launch specs /Win, /Mac, /Unix. /F
-            // must be a file specification when present.
-            let f = resolve_one_level_non_null(pdf, dict.get("F").cloned())?.filter(is_file_spec);
-            let platform = f.or_else(|| {
-                for key in ["Win", "Mac", "Unix"] {
-                    if let Ok(Some(v)) = resolve_one_level_non_null(pdf, dict.get(key).cloned()) {
-                        if v.as_dict().is_some() {
-                            return Some(v);
-                        } // cov:ignore: closure early-return; LCOV misses closing brace region
-                    }
-                }
-                None
-            });
-            match platform {
-                Some(f) => OutlineAction::Launch { f },
-                None => OutlineAction::Unknown(dict),
-            }
-        }
-        Some(b"Named") => {
-            match resolve_one_level_non_null(pdf, dict.get("N").cloned())?
-                .and_then(Object::into_name)
-            {
-                Some(n) => OutlineAction::Named { n },
-                None => OutlineAction::Unknown(dict),
-            }
-        }
-        _ => OutlineAction::Unknown(dict),
-    })
-}
-
-/// Like [`resolve_one_level`] but treats an explicit `/D null` (or a
-/// reference that normalises to null) as "absent" — required action fields
-/// with `Object::Null` are unusable in practice and would otherwise be
-/// classified as a typed action carrying a null field.
-fn resolve_one_level_non_null<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    value: Option<Object>,
-) -> Result<Option<Object>> {
-    Ok(resolve_one_level(pdf, value)?.filter(|o| !matches!(o, Object::Null)))
-}
-
-/// A PDF file specification (ISO 32000-1 §7.11) is either a text string
-/// (`String`/`HexString`, holding the file path) or a `/Type /Filespec`
-/// dictionary. Reject anything else so a caller-visible typed action does
-/// not silently carry an unusable file target.
-fn is_file_spec(o: &Object) -> bool {
-    matches!(o, Object::String(_) | Object::Dictionary(_))
-}
-
-/// Recursive step of [`OutlineDocumentHelper::action_chain_with_max_depth`]:
-/// classify `value` as an action (or an array of actions), append every
-/// action found to `out` in visitation order, then repeat for each action's
-/// own `/Next`.
-///
-/// `depth` bounds the `/Next` hop count only. Descending into a `/Next`
-/// array does NOT consume budget — the array is a single "next slot" whose
-/// entries are performed in order (ISO 32000-1 §12.6.2), so a chain like
-/// `/Next [11 0 R]` under a small `max_depth` should still surface obj 11.
-///
-/// `path` tracks the CURRENT descent path (added on entry, removed on
-/// return) so a genuine self- or mutually-referencing `/Next` terminates
-/// without also silencing a legitimate repeat of the same action inside a
-/// `/Next` array (e.g. `/Next [11 0 R 11 0 R]`, where a shared `visited`
-/// set would drop the second occurrence).
-fn collect_action_chain<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    value: Object,
-    path: &mut BTreeSet<ObjectRef>,
-    depth: usize,
-    out: &mut Vec<OutlineAction>,
-) -> Result<()> {
-    if depth == 0 {
-        return Ok(()); // Chain depth exhausted (hostile/pathological /Next chain).
-    }
-    let (resolved, on_path) = match value {
-        Object::Reference(r) => {
-            if !path.insert(r) {
-                return Ok(()); // Cycle: this action is already on the active descent path.
-            }
-            (pdf.resolve(r)?, Some(r))
-        }
-        other => (other, None),
-    };
-    let result = match resolved {
-        Object::Array(arr) => {
-            // Array is a container; entries share the same /Next slot,
-            // performed in order. Descending into each element does NOT
-            // spend a `/Next` hop.
-            for elem in arr {
-                collect_action_chain(pdf, elem, path, depth, out)?;
-            }
-            Ok(())
-        }
-        Object::Dictionary(dict) => {
-            let next = dict.get("Next").cloned();
-            out.push(action_from_dict(pdf, dict)?);
-            if let Some(next) = next {
-                collect_action_chain(pdf, next, path, depth - 1, out)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()), // Not a conforming action dictionary or action array.
-    };
-    if let Some(r) = on_path {
-        path.remove(&r);
-    }
-    result
 }
 
 /// Walk one `/First`->`/Next` sibling chain (and recurse into `/First`

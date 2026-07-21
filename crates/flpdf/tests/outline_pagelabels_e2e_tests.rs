@@ -14,9 +14,9 @@
 
 use flpdf::{
     drop_struct_elem_dangling_pg, merge_documents, rebuild_page_tree, remap_outline_and_dests,
-    write_pdf, LabelRange, LabelStyle, MergeInput, Object, ObjectRef, OutlineAction, Pdf,
+    write_pdf, LabelRange, LabelStyle, MergeInput, Object, ObjectRef, Pdf,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
 /// Build a minimal cross-reffed PDF from `(objnum, body)` pairs.
@@ -52,6 +52,23 @@ fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
             .as_bytes(),
     );
     out
+}
+
+fn raw_action(pdf: &mut Pdf<Cursor<Vec<u8>>>, item_ref: ObjectRef) -> Object {
+    let Object::Dictionary(item) = pdf.resolve(item_ref).unwrap() else {
+        panic!("outline item must be a dictionary");
+    };
+    item.get("A").cloned().unwrap_or(Object::Null)
+}
+
+fn resolved_raw_action(pdf: &mut Pdf<Cursor<Vec<u8>>>, item_ref: ObjectRef) -> Object {
+    let mut value = raw_action(pdf, item_ref);
+    let mut seen = BTreeSet::new();
+    while let Object::Reference(reference) = value {
+        assert!(seen.insert(reference), "cycle in test action holder");
+        value = pdf.resolve(reference).unwrap();
+    }
+    value
 }
 
 // ---------------------------------------------------------------------------
@@ -212,10 +229,8 @@ fn combined_legacy_and_modern_named_dests_round_trip_through_write_pdf() {
 // 3. /A action /Next chain round-trip through write_pdf
 // ---------------------------------------------------------------------------
 
-/// Outline item whose `/A` (obj 10) chains two further actions via `/Next`
-/// (obj 11, obj 12): `action_chain` already covers the in-memory walk
-/// (`outline_document_helper_tests.rs`); this proves the whole chain survives
-/// serialization and reopening too.
+/// Outline item whose raw `/A` (obj 10) links two further action objects via
+/// `/Next` (obj 11, obj 12).
 fn action_chain_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -235,20 +250,27 @@ fn action_chain_pdf() -> Vec<u8> {
 #[test]
 fn action_chain_with_next_round_trips_through_write_pdf() {
     let mut pdf = Pdf::open(Cursor::new(action_chain_pdf())).unwrap();
-    let before = pdf.outline().action_chain(ObjectRef::new(5, 0)).unwrap();
-    assert_eq!(before.len(), 3, "sanity: 3-action /Next chain");
+    let action_refs = [
+        ObjectRef::new(10, 0),
+        ObjectRef::new(11, 0),
+        ObjectRef::new(12, 0),
+    ];
+    let before: Vec<Object> = action_refs
+        .iter()
+        .map(|&reference| pdf.resolve(reference).unwrap())
+        .collect();
 
     let mut out = Vec::new();
     write_pdf(&mut pdf, &mut out).unwrap();
 
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
-    let after = reopened
-        .outline()
-        .action_chain(ObjectRef::new(5, 0))
-        .unwrap();
+    let after: Vec<Object> = action_refs
+        .iter()
+        .map(|&reference| reopened.resolve(reference).unwrap())
+        .collect();
     assert_eq!(
         before, after,
-        "the entire /Next action chain must survive a write_pdf round trip"
+        "the raw action dictionaries and /Next links must survive a write_pdf round trip"
     );
 }
 
@@ -408,35 +430,44 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
     }
     assert_eq!(depth, 19, "20-level deep chain must survive intact");
 
-    // -- All five action subtypes preserved, in sibling order --
-    // Borrow each item's `.action` — `.iter()` yields `&OutlineNode`, and
-    // OutlineNode's manual Drop blocks partial moves but not borrows.
-    let actions: Vec<&Option<OutlineAction>> = roots[1..=5].iter().map(|n| &n.action).collect();
-    match actions[0].as_ref().unwrap() {
-        OutlineAction::GoTo { d } => assert_eq!(
-            d.as_array().unwrap()[0],
-            Object::Reference(ObjectRef::new(3, 0))
-        ),
-        other => panic!("expected GoTo, got {other:?}"),
+    // -- All five raw action dictionaries preserved, in sibling order --
+    let actions: Vec<Object> = roots[1..=5]
+        .iter()
+        .map(|node| resolved_raw_action(&mut reopened, node.object_ref))
+        .collect();
+    let action_dict = |index: usize| match &actions[index] {
+        Object::Dictionary(dict) => dict,
+        other => panic!("/A must resolve to a dictionary, got {other:?}"),
+    };
+    for (index, subtype) in ["GoTo", "GoToR", "URI", "Launch", "Named"]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(
+            action_dict(index).get("S"),
+            Some(&Object::Name(subtype.as_bytes().to_vec()))
+        );
     }
-    match actions[1].as_ref().unwrap() {
-        OutlineAction::GoToR { f, .. } => {
-            assert_eq!(f, &Object::String(b"other.pdf".to_vec()))
-        }
-        other => panic!("expected GoToR, got {other:?}"),
-    }
-    match actions[2].as_ref().unwrap() {
-        OutlineAction::Uri { uri } => assert_eq!(uri, b"https://example.com/combined"),
-        other => panic!("expected Uri, got {other:?}"),
-    }
-    match actions[3].as_ref().unwrap() {
-        OutlineAction::Launch { f } => assert_eq!(f, &Object::String(b"app.exe".to_vec())),
-        other => panic!("expected Launch, got {other:?}"),
-    }
-    match actions[4].as_ref().unwrap() {
-        OutlineAction::Named { n } => assert_eq!(n, b"NextPage"),
-        other => panic!("expected Named, got {other:?}"),
-    }
+    assert_eq!(
+        action_dict(0).get("D").unwrap().as_array().unwrap()[0],
+        Object::Reference(ObjectRef::new(3, 0))
+    );
+    assert_eq!(
+        action_dict(1).get("F"),
+        Some(&Object::String(b"other.pdf".to_vec()))
+    );
+    assert_eq!(
+        action_dict(2).get("URI"),
+        Some(&Object::String(b"https://example.com/combined".to_vec()))
+    );
+    assert_eq!(
+        action_dict(3).get("F"),
+        Some(&Object::String(b"app.exe".to_vec()))
+    );
+    assert_eq!(
+        action_dict(4).get("N"),
+        Some(&Object::Name(b"NextPage".to_vec()))
+    );
 
     // -- /SE link preserved and still resolves to a live /StructElem --
     let se_item = &roots[6];
