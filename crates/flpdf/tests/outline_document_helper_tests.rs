@@ -1706,6 +1706,44 @@ fn qpdf_destination_matrix_matches_raw_objects() {
 }
 
 #[test]
+#[ignore = "live qpdf 11.9.0 oracle"]
+fn qpdf_outline_destination_oracle_matches_expected_matrix() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let bytes = qpdf_destination_matrix_pdf();
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    input.write_all(&bytes).unwrap();
+
+    let output = Command::new("qpdf")
+        .args(["--json", "--json-key=outlines"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let dests: Vec<serde_json::Value> = json["outlines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|outline| outline["dest"].clone())
+        .collect();
+    assert_eq!(
+        dests,
+        vec![
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!(["3 0 R", "/Fit"]),
+        ]
+    );
+}
+
+#[test]
 fn dest_key_presence_suppresses_valid_action_fallback() {
     let bytes = build_pdf(
         &[

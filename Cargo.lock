@@ -324,6 +324,7 @@ dependencies = [
  "hex",
  "md-5",
  "rc4",
+ "serde_json",
  "sha2",
  "stringprep",
  "tempfile",
