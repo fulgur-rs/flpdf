@@ -1,5 +1,5 @@
 //! Outline / named-destination / `/PageLabels` parity vs qpdf 11.9.0 for
-//! `--pages`, plus a current-behaviour lock for `flpdf --json`'s `outlines`
+//! `--pages`, plus exact qpdf JSON v2 locks for `flpdf --json`'s `outlines`
 //! and `pagelabels` sections.
 //!
 //! Truth source: `/usr/bin/qpdf` 11.9.0, same convention as
@@ -228,9 +228,7 @@ fn cli_pages_subset_outline_and_named_dest_page_positions_match_qpdf() {
 }
 
 // ---------------------------------------------------------------------------
-// JSON current-behaviour lock (see beads flpdf-q28i for the tracked schema
-// divergence vs qpdf — out of scope to fix here; this test only guards
-// against a further, silent regression in flpdf's own JSON output).
+// JSON qpdf 11.9.0 schema lock.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -248,19 +246,40 @@ fn cli_json_outlines_and_pagelabels_sections_are_populated() {
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    // "outlines": one root item, with today's key set (see flpdf-q28i for the
-    // tracked divergence from qpdf's actual `dest`/`destpageposfrom1`/`kids`/
-    // `object`/`open`/`title` shape — this only locks flpdf's own current
-    // output against a further regression).
+    // "outlines": one root item with qpdf's exact six-key JSON v2 shape.
     let outlines = json.get("outlines").and_then(|v| v.as_array()).unwrap();
     assert_eq!(outlines.len(), 1, "one root outline item");
     let item = &outlines[0];
+    let keys = item.as_object().unwrap().keys().collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        [
+            "dest",
+            "destpageposfrom1",
+            "kids",
+            "object",
+            "open",
+            "title"
+        ]
+    );
     assert_eq!(item.get("title").and_then(|v| v.as_str()), Some("Go"));
     assert!(item.get("dest").is_some_and(|v| v.is_array()));
+    assert_eq!(
+        item.get("destpageposfrom1").and_then(|v| v.as_i64()),
+        Some(1)
+    );
+    assert_eq!(item.get("object").and_then(|v| v.as_str()), Some("40 0 R"));
+    assert_eq!(item.get("open").and_then(|v| v.as_bool()), Some(true));
     assert!(item
         .get("kids")
         .and_then(|v| v.as_array())
         .is_some_and(|a| a.is_empty()));
+    for removed in ["action", "count", "flags", "structureelement"] {
+        assert!(
+            item.get(removed).is_none(),
+            "removed key {removed} must be absent"
+        );
+    }
 
     // "pagelabels": two ranges (roman from 0, decimal from 2), today's
     // {index, label: {first, prefix, style}} shape.

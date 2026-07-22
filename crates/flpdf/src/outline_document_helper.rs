@@ -166,8 +166,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 }
             }
 
-            let Some(id) = self.build_item(cursor, 1, None, &mut tree, &mut constructor_seen)?
-            else {
+            let Some(id) = self.build_item(cursor, None, &mut tree, &mut constructor_seen)? else {
                 break;
             };
             tree.roots.push(id);
@@ -186,7 +185,6 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     fn build_item(
         &mut self,
         cursor: OutlineCursor,
-        depth: usize,
         parent: Option<OutlineId>,
         tree: &mut OutlineTree,
         constructor_seen: &mut BTreeSet<ObjectRef>,
@@ -212,7 +210,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             frames.push(Frame {
                 owner: root,
                 next: first,
-                depth: depth + 1,
+                depth: 2,
             });
         }
 
