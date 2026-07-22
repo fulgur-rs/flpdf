@@ -69,14 +69,9 @@
 //!     `/Names /Dests` are all dropped. Only `/PageLabels` is reconstructed
 //!     for the selection. Callers who need outlines/dests preserved should
 //!     use [`merge_documents`] with a single input.
-//! - **`/SE` is not pruned automatically.** Built-in page-operation helpers
-//!   only drop a structure element's now-dangling `/Pg` entry
-//!   ([`struct_tree_pg::drop_struct_elem_dangling_pg`]) — they never remove
-//!   the structure element itself, so an outline item's `/SE` reference is
-//!   never left dangling by them. [`prune_outline_se`] exists for callers
-//!   that perform their own structure-element removal and need to keep
-//!   outline `/SE` links consistent with it; no built-in page-operation
-//!   pipeline (extract, rebuild, split, merge) invokes it automatically.
+//! - **Raw outline keys are preserved.** Ordinary rewriting keeps `/SE`,
+//!   `/Dest`, `/A`, and unknown outline dictionary keys as PDF objects rather
+//!   than applying flpdf-specific validation or pruning policy.
 //! - **`flpdf --json`'s `outlines` and `pagelabels` sections** currently use
 //!   a different key layout than qpdf's own `--json=2` output for these two
 //!   sections specifically (other sections match). Both still faithfully
@@ -201,11 +196,7 @@ pub use object_copy::copy_objects;
 pub use objr_obj_annot_p::drop_objr_obj_annot_dangling_p;
 pub use outline::OutlineItem;
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
-pub use outline_document_helper::{
-    check_legacy_dests, check_name_tree_dests, check_outline_links, prune_outline_se,
-    prune_outline_se_with_max_depth, Dest, OutlineDocumentHelper, OutlineNode,
-    MAX_OUTLINE_WALK_DEPTH,
-};
+pub use outline_document_helper::{OutlineDocumentHelper, OutlineNode};
 pub use overlay::{
     apply_overlay_specs, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
     OverlayVerboseSource,

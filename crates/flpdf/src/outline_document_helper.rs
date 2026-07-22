@@ -9,10 +9,9 @@
 //! [`OutlineDocumentHelper::get_root`] and the traversals built on it
 //! ([`OutlineDocumentHelper::iter`], [`OutlineDocumentHelper::walk`]) walk the
 //! `/First`/`/Next` chain iteratively rather than by native recursion, so a
-//! document with tens of thousands of nested outline levels cannot overflow
+//! document with deeply nested outline levels cannot overflow
 //! the call stack; a shared visited set still cuts short any `/Next` or
-//! `/First` cycle. [`check_outline_links`] separately validates that every
-//! item's `/Parent` and `/Prev` actually match the tree that chain describes.
+//! `/First` cycle.
 //!
 //! # Example
 //!
@@ -30,33 +29,39 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! qpdf-incompatible outline policy APIs were removed before flpdf 1.0.
+//!
+//! ```compile_fail
+//! use flpdf::Dest;
+//! ```
+//!
+//! ```compile_fail
+//! use flpdf::{check_legacy_dests, check_name_tree_dests, check_outline_links};
+//! ```
+//!
+//! ```compile_fail
+//! use flpdf::{prune_outline_se, prune_outline_se_with_max_depth};
+//! ```
+//!
+//! ```compile_fail
+//! # use flpdf::Pdf;
+//! # use std::io::Cursor;
+//! # let mut pdf = Pdf::open(Cursor::new(Vec::<u8>::new())).unwrap();
+//! let _ = pdf.outline().get_root_with_max_depth(10);
+//! ```
 
 use crate::name_number_tree::read_name_tree;
-use crate::{Diagnostic, Diagnostics, Object, ObjectRef, Pdf, Result};
+use crate::{Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
-/// Depth bound shared by [`OutlineDocumentHelper::prune_se`] and the
-/// `/Names`/`Dests` name-tree readers ([`OutlineDocumentHelper::name_tree_dests`]).
-/// Matches [`crate::outline::DEFAULT_MAX_OUTLINE_DEPTH`]. Those traversals
-/// still recurse natively, so this bound is kept modest to protect the call
-/// stack. [`OutlineDocumentHelper::get_root`] and the traversals built on it
-/// walk iteratively instead and use the much larger [`MAX_OUTLINE_WALK_DEPTH`].
+/// Depth bound used by the raw node destination resolver's name-tree lookup.
 pub const DEFAULT_MAX_OUTLINE_DEPTH: usize = crate::outline::DEFAULT_MAX_OUTLINE_DEPTH;
 
-/// Depth bound for [`OutlineDocumentHelper::get_root`] (and the `iter`/`walk`
-/// traversals built on it) and for [`check_outline_links`]. The walk itself
-/// is iterative; the cap primarily bounds the returned [`OutlineNode`] tree
-/// so that its automatically-derived `Clone`/`Debug`/`PartialEq` (which
-/// recurse once per nesting level) and its default `Drop` cannot stack-
-/// overflow. 5,000 levels comfortably covers any legitimate document while
-/// leaving substantial headroom for the recursive derives.
-pub const MAX_OUTLINE_WALK_DEPTH: usize = 5_000;
-
-/// Indirection/`/D` nesting bound when resolving a destination. Mirrors the
-/// constant in `outline_dest_remap`. Only exists to make malformed/cyclic
-/// `/D` structures terminate instead of overflowing the stack.
-const MAX_DEST_RESOLVE_DEPTH: usize = 64;
+/// Temporary construction cap for the current recursive `OutlineNode` value.
+/// This remains private and is not a caller-configurable policy.
+const TEMPORARY_OUTLINE_BUILD_DEPTH: usize = 5_000;
 
 /// One materialized node of the outline tree (a bookmark).
 ///
@@ -80,12 +85,6 @@ pub struct OutlineNode {
     pub parent: Option<ObjectRef>,
     /// qpdf `getDest()` result; `Object::Null` means no resolved destination.
     pub dest: Object,
-    /// The `/SE` (structure-element) link: an indirect reference to a node in
-    /// the document's structure tree (ISO 32000-2 section 12.3.3, table 151),
-    /// or `None` when `/SE` is absent. Per spec `/SE` shall be an indirect
-    /// reference; a direct (non-reference) `/SE` value is malformed and is
-    /// also read as `None`.
-    pub se: Option<ObjectRef>,
     /// Child nodes in `/First`->`/Next` order.
     pub children: Vec<OutlineNode>,
 }
@@ -97,25 +96,6 @@ impl OutlineNode {
             Object::Array(items) if !items.is_empty() => items[0].clone(),
             _ => Object::Null,
         }
-    }
-}
-
-/// flpdf's normalized destination type returned by
-/// [`OutlineDocumentHelper::legacy_dests`] and
-/// [`OutlineDocumentHelper::name_tree_dests`].
-///
-/// This type is retained for those enumeration APIs; [`OutlineNode::dest`]
-/// exposes the raw resolved object instead.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Dest {
-    /// The explicit destination array. Element 0 is normally the page ref.
-    pub array: Vec<Object>,
-}
-
-impl Dest {
-    /// The destination page ref (array element 0), if it is an indirect ref.
-    pub fn page(&self) -> Option<ObjectRef> {
-        self.array.first().and_then(Object::as_ref_id)
     }
 }
 
@@ -178,25 +158,14 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// # Errors
     ///
     /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
-    /// [`MAX_OUTLINE_WALK_DEPTH`]. Propagates any error from resolving outline
+    /// the temporary internal construction cap. Propagates any error from resolving outline
     /// objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
     pub fn get_root(&mut self) -> Result<Vec<OutlineNode>> {
-        self.get_root_with_max_depth(MAX_OUTLINE_WALK_DEPTH)
-    }
-
-    /// Like [`get_root`](Self::get_root) with a caller-supplied recursion limit.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
-    /// `max_depth`. Propagates any error from resolving outline objects (for
-    /// example I/O or parse failures surfaced by [`Pdf::resolve`]).
-    pub fn get_root_with_max_depth(&mut self, max_depth: usize) -> Result<Vec<OutlineNode>> {
         let Some(first) = self.outline_root_first()? else {
             return Ok(Vec::new());
         };
         let mut visited = BTreeSet::new();
-        self.build_siblings(first, 0, None, &mut visited, max_depth)
+        self.build_siblings(first, 0, None, &mut visited, TEMPORARY_OUTLINE_BUILD_DEPTH)
     }
 
     /// Build a `/First`->`/Next` sibling chain into owned nodes, descending
@@ -206,7 +175,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// `current` is the sibling chain currently being extended and
     /// `ancestors` holds every enclosing chain waiting for it (or one of its
     /// descendants) to finish. This is what lets [`Self::get_root`] use a
-    /// depth bound as large as [`MAX_OUTLINE_WALK_DEPTH`] without risking a
+    /// large internal depth bound without risking a
     /// stack overflow on a deeply (or maliciously) nested outline — a
     /// recursive walk would consume one native stack frame per nesting level.
     fn build_siblings(
@@ -277,7 +246,6 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             // rejects it.
             let first = dict.get_ref("First");
             let next = dict.get_ref("Next");
-            let se = dict.get_ref("SE");
             let title_src = dict.get("Title").cloned();
             let count_src = dict.get("Count").cloned();
             let dest_src = dict.get("Dest").cloned();
@@ -296,7 +264,6 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 count,
                 parent: current.parent,
                 dest,
-                se,
                 children: Vec::new(),
             });
 
@@ -388,78 +355,9 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         Ok(Object::Null)
     }
 
-    /// Resolve a destination value (array / indirect / dict `/D`) to a [`Dest`].
-    /// Named (`Name`/`String`) destinations are resolved against the catalog name
-    /// tree / legacy `/Dests` dict via [`Self::resolve_named_dest`].
-    fn dest_from_value(&mut self, value: &Object, depth: usize) -> Result<Option<Dest>> {
-        if depth == 0 {
-            return Ok(None);
-        }
-        match value {
-            Object::Array(arr) => Ok(Some(Dest { array: arr.clone() })),
-            Object::Reference(r) => {
-                let concrete = self.pdf.resolve(*r)?;
-                self.dest_from_value(&concrete, depth - 1)
-            }
-            Object::Dictionary(d) => match d.get("D").cloned() {
-                Some(inner) => self.dest_from_value(&inner, depth - 1),
-                None => Ok(None),
-            },
-            Object::Name(name) => self.resolve_named_dest(name, depth),
-            Object::String(name) => self.resolve_named_dest(name, depth),
-            _ => Ok(None),
-        }
-    }
-
-    /// Resolve a named destination `name` to an explicit [`Dest`].
-    ///
-    /// Tries the modern catalog `/Names`->`/Dests` name tree first (PDF 1.2),
-    /// then the legacy catalog `/Dests` dictionary (PDF 1.1). A name-tree or
-    /// `/Dests` value may be the dest array directly or a `<< /D array >>` dict.
-    ///
-    /// `depth` is the remaining indirection/`/D` budget threaded from
-    /// [`Self::dest_from_value`]; the post-lookup value is resolved with
-    /// `depth - 1` so a cyclic named mapping (e.g. legacy `/Dests` `/a -> /b`,
-    /// `/b -> /a`) strictly decreases the budget and terminates at the bound
-    /// instead of overflowing the stack.
-    fn resolve_named_dest(&mut self, name: &[u8], depth: usize) -> Result<Option<Dest>> {
-        // 1. Modern: catalog /Names /Dests name tree (PDF 1.2+). /Names may
-        //    be reached through a multi-hop holder chain (matches the sub-2
-        //    fix to `name_tree_dests`).
-        if let Some(Object::Dictionary(mut names)) = self.catalog_value_terminal("Names")? {
-            if let Some(dests_root) = names.remove("Dests") {
-                let entries = read_name_tree(
-                    self.pdf,
-                    dests_root,
-                    |_pdf, value| Ok(Some(value)),
-                    DEFAULT_MAX_OUTLINE_DEPTH,
-                )?; // cov:ignore: /Names path requires sub-2's name-tree fixtures; tested there
-                    // Re-reads the whole name tree per named hop; acceptable
-                    // because each hop strictly decreases `depth` (no visited
-                    // set needed).
-                for (key, value) in entries {
-                    if key.as_slice() == name {
-                        return self.dest_from_value(&value, depth - 1);
-                    } // cov:ignore: early return leaves this `}` unexecuted (LCOV quirk)
-                }
-            }
-        }
-        // 2. Legacy: catalog /Dests dict (PDF 1.1). Follow the same multi-hop
-        //    holder chain `legacy_dests` uses so a name/string alias inside a
-        //    chained-through /Dests dict still resolves.
-        if let Some(Object::Dictionary(mut dests)) = self.catalog_value_terminal("Dests")? {
-            if let Some(value) = dests.remove(name) {
-                return self.dest_from_value(&value, depth - 1);
-            } // cov:ignore: early return leaves this `}` unexecuted (LCOV quirk)
-        }
-        Ok(None)
-    }
-
     /// Like [`Self::catalog_value`] but follows the full indirect reference
-    /// chain to its terminal object, mirroring [`Self::legacy_dests`]. Used
-    /// by [`Self::resolve_named_dest`] so a name/string alias inside a
-    /// `/Dests` (or `/Names`) dict that is only reachable through more than
-    /// one indirection still resolves.
+    /// chain to its terminal object. Used by the raw named-destination lookup
+    /// so a `/Dests` or `/Names` dictionary behind multiple holders resolves.
     fn catalog_value_terminal(&mut self, key: &str) -> Result<Option<Object>> {
         Ok(match self.catalog_value(key)? {
             Some(value @ Object::Reference(_)) => {
@@ -489,104 +387,6 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         }
     }
 
-    /// Read every entry of the catalog's legacy `/Dests` dictionary (ISO
-    /// 32000-1 §7.11.4; the PDF 1.1 named-destination dictionary, superseded
-    /// — but not replaced — by the `/Names /Dests` name tree added in PDF
-    /// 1.2). `/Dests` may be an indirect reference or a direct dictionary on
-    /// the catalog; both forms are read via the same resolution [`Pdf::outline`]
-    /// uses for named-destination lookup.
-    ///
-    /// Entries come back in the dictionary's lexicographic key order
-    /// (matching [`crate::Dictionary::iter`], which is not necessarily the
-    /// order the entries were declared in the source file). A value that
-    /// cannot be resolved to an explicit destination array (for example a
-    /// malformed non-array, non-reference value) yields `None` for that
-    /// entry rather than dropping the name, so a caller can still see every
-    /// declared name.
-    ///
-    /// Only the legacy dictionary is enumerated here; the `/Names /Dests`
-    /// name tree is a separate structure with its own accessor.
-    ///
-    /// # Errors
-    ///
-    /// Propagates any error from resolving the catalog or the `/Dests`
-    /// dictionary/value objects (for example I/O or parse failures surfaced
-    /// by [`Pdf::resolve`]).
-    pub fn legacy_dests(&mut self) -> Result<Vec<(Vec<u8>, Option<Dest>)>> {
-        // `catalog_value` resolves a single level of indirection but stops
-        // short of a multi-hop holder chain (catalog /Dests -> r1 -> r2 ->
-        // dict — a legal shape). Without this follow-through the reader
-        // silently returns empty, and `check_legacy_dests` misses every
-        // dangling target it is supposed to flag.
-        let dests_obj = match self.catalog_value("Dests")? {
-            Some(value @ Object::Reference(_)) => {
-                crate::ref_chain::resolve_ref_chain(self.pdf, &value)?.0
-            }
-            Some(other) => other,
-            None => return Ok(Vec::new()),
-        };
-        let Object::Dictionary(dests) = dests_obj else {
-            return Ok(Vec::new());
-        };
-        let mut out = Vec::new();
-        for (name, value) in dests.iter() {
-            let dest = self.dest_from_value(value, MAX_DEST_RESOLVE_DEPTH)?;
-            out.push((name.to_vec(), dest));
-        }
-        Ok(out)
-    }
-
-    /// Read every entry of the catalog's `/Names /Dests` name tree (ISO
-    /// 32000-2 §7.9.6 + §12.3.2.3): the PDF 1.2+ modern named-destination
-    /// structure, which supersedes — but does not replace, both may coexist
-    /// — the legacy `/Catalog /Dests` dictionary read by
-    /// [`Self::legacy_dests`]. The tree shape (`/Kids`/`/Names` nodes with
-    /// `/Limits`) is identical to `/Names /EmbeddedFiles`; see
-    /// [`crate::name_tree_dests`] for the writer.
-    ///
-    /// Entries come back in the tree's depth-first, key-ascending order (the
-    /// order the spec requires the tree be sorted in — see
-    /// [`crate::name_number_tree::read_name_tree`]). A value that cannot be
-    /// resolved to an explicit destination array (for example a malformed
-    /// non-array, non-reference, non-`/D`-bearing value) yields `None` for
-    /// that entry rather than dropping the name, so a caller can still see
-    /// every declared name.
-    ///
-    /// # Errors
-    ///
-    /// Propagates any error from resolving the catalog, `/Names`, or the
-    /// `/Dests` name-tree nodes. Returns [`crate::Error::Unsupported`] if a
-    /// `/Kids` chain exceeds [`DEFAULT_MAX_OUTLINE_DEPTH`] (guards against
-    /// cyclic or maliciously deep trees).
-    pub fn name_tree_dests(&mut self) -> Result<Vec<(Vec<u8>, Option<Dest>)>> {
-        // `catalog_value` resolves a single level of indirection but stops
-        // short of a multi-hop holder chain (catalog /Names -> r1 -> r2 ->
-        // dict). The writer (name_tree_dests module) uses `resolve_ref_chain`
-        // for this; the reader must too or it silently returns empty when
-        // a document keeps its /Names dictionary behind more than one ref.
-        let names_obj = match self.catalog_value("Names")? {
-            Some(value @ Object::Reference(_)) => {
-                crate::ref_chain::resolve_ref_chain(self.pdf, &value)?.0
-            }
-            Some(other) => other,
-            None => return Ok(Vec::new()),
-        };
-        let Object::Dictionary(mut names) = names_obj else {
-            return Ok(Vec::new());
-        };
-        let Some(dests_root) = names.remove("Dests") else {
-            return Ok(Vec::new());
-        };
-        let decode = |_pdf: &mut Pdf<R>, value: Object| Ok(Some(value));
-        let raw = read_name_tree(self.pdf, dests_root, decode, DEFAULT_MAX_OUTLINE_DEPTH)?;
-        let mut out = Vec::with_capacity(raw.len());
-        for (name, value) in raw {
-            let dest = self.dest_from_value(&value, MAX_DEST_RESOLVE_DEPTH)?;
-            out.push((name, dest));
-        }
-        Ok(out)
-    }
-
     /// Pre-order iterator over every materialized node (owned). Each yielded
     /// node has its `children` cleared — the flattened view is linear and
     /// `depth` conveys structure; use [`get_root`](Self::get_root) or
@@ -595,7 +395,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// # Errors
     ///
     /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
-    /// [`MAX_OUTLINE_WALK_DEPTH`]. Propagates any error from resolving outline
+    /// the temporary internal construction cap. Propagates any error from resolving outline
     /// objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
     pub fn iter(&mut self) -> Result<impl Iterator<Item = OutlineNode>> {
         let roots = self.get_root()?;
@@ -610,104 +410,14 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// # Errors
     ///
     /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
-    /// [`MAX_OUTLINE_WALK_DEPTH`]. Propagates any error from resolving outline
+    /// the temporary internal construction cap. Propagates any error from resolving outline
     /// objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
     pub fn walk<F: FnMut(&OutlineNode, usize)>(&mut self, mut visitor: F) -> Result<()> {
         let roots = self.get_root()?;
         walk_nodes(&roots, &mut visitor);
         Ok(())
     }
-
-    /// Drop dangling outline `/SE` links using [`DEFAULT_MAX_OUTLINE_DEPTH`].
-    /// See [`prune_outline_se`] (the free-function form of this method, which
-    /// most callers should prefer) for the full contract.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
-    /// [`DEFAULT_MAX_OUTLINE_DEPTH`]. Propagates any error from resolving outline
-    /// objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
-    pub fn prune_se(&mut self, live_struct_elem_refs: &BTreeSet<ObjectRef>) -> Result<usize> {
-        self.prune_se_with_max_depth(live_struct_elem_refs, DEFAULT_MAX_OUTLINE_DEPTH)
-    }
-
-    /// Like [`Self::prune_se`] but with a caller-supplied recursion limit.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
-    /// `max_depth`. Propagates any error from resolving outline objects.
-    pub fn prune_se_with_max_depth(
-        &mut self,
-        live_struct_elem_refs: &BTreeSet<ObjectRef>,
-        max_depth: usize,
-    ) -> Result<usize> {
-        let Some(first) = self.outline_root_first()? else {
-            return Ok(0);
-        };
-        let mut visited = BTreeSet::new();
-        walk_outline_se(
-            self.pdf,
-            first,
-            0,
-            &mut visited,
-            live_struct_elem_refs,
-            max_depth,
-        )
-    }
-
-    /// Validate `/Parent`/`/Prev` linkage across the outline tree using
-    /// [`MAX_OUTLINE_WALK_DEPTH`]. See
-    /// [`Self::check_links_with_max_depth`] for the full contract.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::Unsupported`] if the outline nesting depth
-    /// exceeds [`MAX_OUTLINE_WALK_DEPTH`]. Propagates any error from
-    /// resolving outline objects.
-    pub fn check_links(&mut self) -> Result<Diagnostics> {
-        self.check_links_with_max_depth(MAX_OUTLINE_WALK_DEPTH)
-    }
-
-    /// Like [`Self::check_links`] but with a caller-supplied recursion limit.
-    ///
-    /// Validates every outline item's `/Parent` and `/Prev` against the
-    /// `/First`->`/Next` chain the tree actually follows (ISO 32000-1 section
-    /// 12.3.3): a non-first sibling's `/Prev` should name the preceding
-    /// sibling, the first sibling in a chain should have no `/Prev`, and
-    /// every item's `/Parent` should name its containing item (or the
-    /// `/Outlines` dictionary itself, for a top-level item). Each link that
-    /// doesn't match pushes one warning [`Diagnostic`]. A `/Next` or `/First`
-    /// cycle also pushes one warning and cuts that chain short right there —
-    /// the same point [`Self::get_root`] bails out of a cyclic chain instead
-    /// of looping forever — so a hostile or malformed outline can't cause an
-    /// infinite loop or unbounded memory growth.
-    ///
-    /// Returns an empty [`Diagnostics`] when the document has no outline.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::Unsupported`] if the outline nesting depth
-    /// exceeds `max_depth`. Propagates any error from resolving outline
-    /// objects (for example I/O or parse failures surfaced by [`Pdf::resolve_borrowed`]).
-    pub fn check_links_with_max_depth(&mut self, max_depth: usize) -> Result<Diagnostics> {
-        let Some((outlines_ref, first)) = self.outline_root()? else {
-            return Ok(Diagnostics::default());
-        };
-        let mut visited = BTreeSet::new();
-        let mut diagnostics = Diagnostics::default();
-        walk_outline_links(
-            self.pdf,
-            first,
-            outlines_ref,
-            &mut visited,
-            max_depth,
-            &mut diagnostics,
-        )?;
-        Ok(diagnostics)
-    }
 }
-
 /// Match `newUnicodeString(utf8).getUTF8Value()` in qpdf 11.9.0.
 ///
 /// qpdf accepts up to six-byte UTF-8 forms while decoding, consumes malformed
@@ -777,277 +487,6 @@ impl<R: Read + Seek> Pdf<R> {
     }
 }
 
-/// Validate the catalog's legacy `/Dests` dictionary
-/// ([`OutlineDocumentHelper::legacy_dests`]): push a warning [`Diagnostic`]
-/// for every entry whose destination's target page reference is not a page
-/// currently reachable from the document's `/Pages` tree — a dangling
-/// reference, a reference to a non-`/Page` object, or a page a prior edit
-/// removed. A missing target is reported, not treated as document
-/// corruption: it never turns into an `Err` on its own.
-///
-/// # Errors
-///
-/// Propagates any error from resolving the catalog or the `/Dests`
-/// dictionary/value objects. A failure to enumerate the document's page tree
-/// (for example a missing `/Pages` entry) is downgraded to a warning
-/// [`Diagnostic`] instead, so the caller still receives a report.
-///
-/// # Known limitation
-///
-/// The live-page set comes from [`crate::pages::page_refs`], which walks
-/// `/Kids` entries but does not currently follow a `/Kids` entry that is
-/// itself a bare indirect reference chain (e.g. `/Kids [30 0 R]` where
-/// `30 0 obj` is `3 0 R` and `3 0 obj` is the actual `/Page`). In that
-/// corner case a legacy destination pointing at the terminal page is
-/// falsely flagged as dangling. Documents produced by mainstream writers
-/// (qpdf, Acrobat, common libraries) do not use bare-ref holders in
-/// `/Kids`, so this is a hostile/hand-authored input concern rather than
-/// a round-trip regression.
-///
-/// # Examples
-///
-/// ```no_run
-/// use flpdf::{check_legacy_dests, Pdf};
-/// use std::fs::File;
-/// use std::io::BufReader;
-///
-/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-/// for diagnostic in check_legacy_dests(&mut pdf)?.entries() {
-///     println!("{diagnostic:?}");
-/// }
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-pub fn check_legacy_dests<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Diagnostics> {
-    let entries = OutlineDocumentHelper::new(pdf).legacy_dests()?;
-    let mut diagnostics = Diagnostics::default();
-    if entries.is_empty() {
-        return Ok(diagnostics);
-    }
-
-    // Every `/Dests` entry with a resolvable page ref is what the page-tree
-    // walk below is validating; if not a single entry has one (all values
-    // are named/string/unresolved), the walk cannot possibly flag anything
-    // — skip the O(N) `page_refs(pdf)` traversal entirely.
-    let has_resolvable_page_ref = entries
-        .iter()
-        .any(|(_, dest)| dest.as_ref().and_then(|d| d.page()).is_some());
-    if !has_resolvable_page_ref {
-        return Ok(diagnostics);
-    }
-
-    let live_pages: BTreeSet<ObjectRef> = match crate::pages::page_refs(pdf) {
-        Ok(refs) => refs.into_iter().collect(),
-        Err(error) => {
-            diagnostics.push(Diagnostic::warning(
-                format!("could not enumerate pages to validate /Dests targets: {error}"),
-                None,
-            ));
-            return Ok(diagnostics);
-        }
-    };
-
-    for (name, dest) in entries {
-        let Some(dest) = dest else { continue };
-        let Some(page_ref_raw) = dest.page() else {
-            continue;
-        };
-        // Normalise through any holder chain: `/h [30 0 R /Fit]` with
-        // `30 0 obj 3 0 R` should compare against the terminal page ref
-        // `3 0 R`, not the intermediate `30 0 R`, otherwise a legitimately
-        // live target is falsely flagged as dangling.
-        let page_ref = resolve_page_ref_through_holders(pdf, page_ref_raw);
-        if !live_pages.contains(&page_ref) {
-            diagnostics.push(Diagnostic::warning(
-                format!(
-                    "named destination \"{}\" targets {page_ref}, which is not a page in the document",
-                    String::from_utf8_lossy(&name)
-                ),
-                None,
-            ));
-        }
-    }
-    Ok(diagnostics)
-}
-
-/// Validate the catalog's `/Names /Dests` name tree
-/// ([`OutlineDocumentHelper::name_tree_dests`]): push a warning [`Diagnostic`]
-/// for every entry whose destination's target page reference is not a page
-/// currently reachable from the document's `/Pages` tree — a dangling
-/// reference, a reference to a non-`/Page` object, or a page a prior edit
-/// removed. A missing target is reported, not treated as document
-/// corruption: it never turns into an `Err` on its own.
-///
-/// See [`check_legacy_dests`] for the equivalent check over the legacy
-/// `/Catalog /Dests` dictionary; the two structures are validated
-/// independently since a document may carry either or both.
-///
-/// # Errors
-///
-/// Propagates any error from resolving the catalog or the `/Names /Dests`
-/// name-tree nodes. A failure to enumerate the document's page tree (for
-/// example a missing `/Pages` entry) is downgraded to a warning
-/// [`Diagnostic`] instead, so the caller still receives a report.
-///
-/// # Examples
-///
-/// ```no_run
-/// use flpdf::{check_name_tree_dests, Pdf};
-/// use std::fs::File;
-/// use std::io::BufReader;
-///
-/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-/// for diagnostic in check_name_tree_dests(&mut pdf)?.entries() {
-///     println!("{diagnostic:?}");
-/// }
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-pub fn check_name_tree_dests<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Diagnostics> {
-    let entries = OutlineDocumentHelper::new(pdf).name_tree_dests()?;
-    let mut diagnostics = Diagnostics::default();
-    if entries.is_empty() {
-        return Ok(diagnostics);
-    }
-
-    // Mirror `check_legacy_dests`: if no entry has a resolvable page ref, the
-    // page-tree walk below can flag nothing. Skip it — otherwise a document
-    // with only malformed/unresolvable name-tree destinations plus a broken
-    // /Pages tree would emit a spurious "could not enumerate pages" warning.
-    let has_resolvable_page_ref = entries
-        .iter()
-        .any(|(_, dest)| dest.as_ref().and_then(|d| d.page()).is_some());
-    if !has_resolvable_page_ref {
-        return Ok(diagnostics);
-    }
-
-    let live_pages: BTreeSet<ObjectRef> = match crate::pages::page_refs(pdf) {
-        Ok(refs) => refs.into_iter().collect(),
-        Err(error) => {
-            diagnostics.push(Diagnostic::warning(
-                format!("could not enumerate pages to validate /Names /Dests targets: {error}"),
-                None,
-            ));
-            return Ok(diagnostics);
-        }
-    };
-
-    for (name, dest) in entries {
-        let Some(dest) = dest else { continue };
-        let Some(page_ref_raw) = dest.page() else {
-            continue;
-        };
-        // Normalise through any holder chain — mirrors the sub-1 fix on
-        // `check_legacy_dests`: a destination whose page operand is stored
-        // behind a holder (`/target [30 0 R /Fit]` with `30 0 obj 3 0 R`)
-        // points at a live page, but a naïve `==` against page_refs
-        // would false-flag it as dangling.
-        let page_ref = resolve_page_ref_through_holders(pdf, page_ref_raw);
-        if !live_pages.contains(&page_ref) {
-            diagnostics.push(Diagnostic::warning(
-                format!(
-                    "named destination \"{}\" (in /Names /Dests) targets {page_ref}, which is not a page in the document",
-                    String::from_utf8_lossy(&name)
-                ),
-                None,
-            ));
-        }
-    }
-    Ok(diagnostics)
-}
-
-/// Validate `/Parent`/`/Prev` linkage across the document's outline tree
-/// ([`OutlineDocumentHelper::check_links`]): push a warning [`Diagnostic`]
-/// for every outline item whose `/Parent` or `/Prev` doesn't match the
-/// `/First`->`/Next` chain the tree actually follows, and for every `/Next`
-/// or `/First` cycle encountered (the chain is then cut short there, exactly
-/// as [`OutlineDocumentHelper::get_root`] does, rather than looping forever).
-/// A missing or dangling link is reported, not treated as document
-/// corruption: it never turns into an `Err` on its own.
-///
-/// # Errors
-///
-/// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
-/// [`MAX_OUTLINE_WALK_DEPTH`]. Propagates any error from resolving outline
-/// objects (for example I/O or parse failures surfaced by [`Pdf::resolve_borrowed`]).
-///
-/// # Examples
-///
-/// ```no_run
-/// use flpdf::{check_outline_links, Pdf};
-/// use std::fs::File;
-/// use std::io::BufReader;
-///
-/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-/// for diagnostic in check_outline_links(&mut pdf)?.entries() {
-///     println!("{diagnostic:?}");
-/// }
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-pub fn check_outline_links<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Diagnostics> {
-    OutlineDocumentHelper::new(pdf).check_links()
-}
-
-/// Drop dangling outline `/SE` (structure-element) links.
-///
-/// Walks the document's `/Outlines` tree (`/First`/`/Next`/`/First` order,
-/// same as [`OutlineDocumentHelper::get_root`]) and removes the `/SE` key
-/// from every outline item dictionary whose `/SE` target is not a member of
-/// `live_struct_elem_refs`. An outline item with no `/SE`, or whose `/SE` is
-/// not a (spec-mandated) indirect reference, is left untouched — matching
-/// how [`OutlineNode::se`] reads a non-conforming `/SE` value.
-///
-/// This function does not compute `live_struct_elem_refs` itself: pass in the
-/// set of structure element refs that remain reachable from
-/// `/StructTreeRoot` after the structure tree has been dropped or rebuilt.
-/// When the structure tree is left intact, `/SE` links need no pruning —
-/// leaving a document's `/Outlines` tree and `/StructTreeRoot` unmodified
-/// (an ordinary read-then-[`crate::write_pdf`] round trip) already preserves
-/// every `/SE` entry verbatim, the same as any other outline dictionary key.
-///
-/// Returns the number of `/SE` entries removed, for diagnostics.
-///
-/// # Errors
-///
-/// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
-/// [`DEFAULT_MAX_OUTLINE_DEPTH`]. Propagates any error from resolving outline
-/// objects (for example I/O or parse failures surfaced by [`Pdf::resolve`]).
-///
-/// # Examples
-///
-/// ```no_run
-/// use flpdf::{prune_outline_se, ObjectRef, Pdf};
-/// use std::collections::BTreeSet;
-/// use std::fs::File;
-/// use std::io::BufReader;
-///
-/// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-/// // Structure elements that remain reachable from /StructTreeRoot after a
-/// // rebuild; an empty set prunes every outline /SE link.
-/// let live: BTreeSet<ObjectRef> = BTreeSet::new();
-/// let dropped = prune_outline_se(&mut pdf, &live)?;
-/// println!("dropped {dropped} dangling /SE link(s)");
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-pub fn prune_outline_se<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    live_struct_elem_refs: &BTreeSet<ObjectRef>,
-) -> Result<usize> {
-    OutlineDocumentHelper::new(pdf).prune_se(live_struct_elem_refs)
-}
-
-/// Like [`prune_outline_se`] but with a caller-supplied recursion limit.
-///
-/// # Errors
-///
-/// Returns [`crate::Error::Unsupported`] if the outline nesting depth exceeds
-/// `max_depth`. Propagates any error from resolving outline objects.
-pub fn prune_outline_se_with_max_depth<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    live_struct_elem_refs: &BTreeSet<ObjectRef>,
-    max_depth: usize,
-) -> Result<usize> {
-    OutlineDocumentHelper::new(pdf).prune_se_with_max_depth(live_struct_elem_refs, max_depth)
-}
-
 fn resolve_terminal_object<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<Object> {
     match value {
         value @ Object::Reference(_) => Ok(crate::ref_chain::resolve_ref_chain(pdf, &value)?.0),
@@ -1072,8 +511,7 @@ fn resolve_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Res
 /// each node's `children` taken/emptied (see [`OutlineDocumentHelper::iter`]).
 ///
 /// Iterative — an explicit stack of sibling iterators — rather than
-/// recursive, so a tree materialized tens of thousands of levels deep (see
-/// [`MAX_OUTLINE_WALK_DEPTH`]) can't overflow the call stack the way
+/// recursive, so a deeply nested tree can't overflow the call stack the way
 /// recursing once per level would.
 fn flatten_preorder(roots: Vec<OutlineNode>) -> Vec<OutlineNode> {
     let mut out = Vec::new();
@@ -1118,134 +556,11 @@ fn walk_nodes<F: FnMut(&OutlineNode, usize)>(roots: &[OutlineNode], visitor: &mu
 }
 
 /// Build the "outline depth exceeds maximum" [`crate::Error::Unsupported`]
-/// used by [`OutlineDocumentHelper::build_siblings`] and
-/// [`walk_outline_links`].
+/// used by [`OutlineDocumentHelper::build_siblings`].
 fn too_deep(max_depth: usize, at: ObjectRef) -> crate::Error {
     crate::Error::Unsupported(format!(
         "outline depth exceeds maximum of {max_depth} at {at}"
     ))
-}
-
-/// Iterative worklist backing [`OutlineDocumentHelper::check_links_with_max_depth`].
-///
-/// Unlike [`OutlineDocumentHelper::build_siblings`], no node tree is
-/// materialized here, so frames don't need to be folded back into a parent
-/// on completion — each frame stands alone and is simply discarded once its
-/// `next` runs out. A frame is still pushed for a node's `/First` children
-/// right after (so it pops, and is fully processed, before the node's own
-/// `/Next` continuation) to match the depth-first order
-/// [`OutlineDocumentHelper::get_root`]'s recursion would visit items in,
-/// which keeps diagnostics in document order.
-fn walk_outline_links<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    first: ObjectRef,
-    outlines_ref: ObjectRef,
-    visited: &mut BTreeSet<ObjectRef>,
-    max_depth: usize,
-    diagnostics: &mut Diagnostics,
-) -> Result<()> {
-    /// One pending sibling-chain continuation: `next` is the item to
-    /// process (`None` once the chain this frame belongs to is exhausted),
-    /// `expected_parent`/`expected_prev` are what that item's `/Parent` and
-    /// `/Prev` should be per the `/First`->`/Next` chain.
-    struct Frame {
-        next: Option<ObjectRef>,
-        expected_parent: ObjectRef,
-        expected_prev: Option<ObjectRef>,
-        depth: usize,
-    }
-
-    let mut stack = vec![Frame {
-        next: Some(first),
-        expected_parent: outlines_ref,
-        expected_prev: None,
-        depth: 0,
-    }];
-
-    while let Some(frame) = stack.pop() {
-        let Some(current_ref) = frame.next else {
-            continue; // this frame's chain already ran out
-        };
-        if frame.depth >= max_depth {
-            return Err(too_deep(max_depth, current_ref));
-        }
-        if !visited.insert(current_ref) {
-            diagnostics.push(Diagnostic::warning(
-                format!(
-                    "outline item {current_ref} was already visited via a /Next or /First cycle"
-                ),
-                None,
-            ));
-            continue; // cycle - bail this chain
-        }
-        let Object::Dictionary(dict) = pdf.resolve_borrowed(current_ref)? else {
-            continue; // non-dict item - stop this chain
-        };
-        let actual_parent = dict.get_ref("Parent");
-        let actual_prev = dict.get_ref("Prev");
-        let first_child = dict.get_ref("First");
-        let next_sibling = dict.get_ref("Next");
-
-        check_ref_link(
-            diagnostics,
-            current_ref,
-            "Parent",
-            actual_parent,
-            Some(frame.expected_parent),
-        );
-        check_ref_link(
-            diagnostics,
-            current_ref,
-            "Prev",
-            actual_prev,
-            frame.expected_prev,
-        );
-
-        // Push the sibling continuation first so the `/First` descent
-        // (pushed next) pops — and is fully processed — first, matching
-        // `/First`-before-`/Next` recursion order.
-        stack.push(Frame {
-            next: next_sibling,
-            expected_parent: frame.expected_parent,
-            expected_prev: Some(current_ref),
-            depth: frame.depth,
-        });
-        if let Some(first_child) = first_child {
-            stack.push(Frame {
-                next: Some(first_child),
-                expected_parent: current_ref,
-                expected_prev: None,
-                depth: frame.depth + 1,
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Compare an outline item's actual `/Parent` or `/Prev` ref (already read
-/// via [`crate::Dictionary::get_ref`], so `None` also covers a value stored
-/// as anything other than a direct reference) against what the
-/// `/First`->`/Next` chain implies it should be, pushing one warning
-/// [`Diagnostic`] when they differ.
-fn check_ref_link(
-    diagnostics: &mut Diagnostics,
-    item_ref: ObjectRef,
-    field: &str,
-    actual: Option<ObjectRef>,
-    expected: Option<ObjectRef>,
-) {
-    if actual == expected {
-        return;
-    }
-    let describe = |r: Option<ObjectRef>| r.map_or_else(|| "none".to_string(), |r| r.to_string());
-    diagnostics.push(Diagnostic::warning(
-        format!(
-            "outline item {item_ref}: /{field} is {}, expected {} to match the /First-/Next chain",
-            describe(actual),
-            describe(expected)
-        ),
-        None,
-    ));
 }
 
 /// Resolve one level of indirection and read an integer (review rule 2/3).
@@ -1255,90 +570,6 @@ fn resolve_int<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Resul
         Some(other) => Ok(other.as_integer()),
         None => Ok(None),
     }
-}
-
-/// Walk an object reference through any indirect-holder chain (obj N is a
-/// bare `Reference(M)`, obj M is a `Reference(K)`, …) and return the
-/// terminal ObjectRef. Stops at the first non-`Reference` value or after
-/// [`MAX_DEST_RESOLVE_DEPTH`] hops (cycle/deep-chain safety).
-///
-/// Used by `check_legacy_dests` and `check_name_tree_dests` to compare a
-/// destination's page against the live page set: the destination's own
-/// array element may be `ref → ref → page`, but `page_refs` returns only
-/// terminals, so a naive `==` check would false-flag a live target as
-/// dangling.
-fn resolve_page_ref_through_holders<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    start: ObjectRef,
-) -> ObjectRef {
-    let mut current = start;
-    for _ in 0..MAX_DEST_RESOLVE_DEPTH {
-        match pdf.resolve(current) {
-            Ok(Object::Reference(next)) if next != current => current = next,
-            _ => return current,
-        }
-    }
-    current
-}
-
-/// Walk one `/First`->`/Next` sibling chain (and recurse into `/First`
-/// grandchildren), dropping any `/SE` not present in `live`. Returns the
-/// number of `/SE` entries removed along this chain and its descendants.
-///
-/// Mirrors [`OutlineDocumentHelper::build_siblings`]'s traversal shape
-/// (same cycle-safe `visited` set, same depth cap) but mutates in place via
-/// [`Pdf::set_object`] instead of materializing [`OutlineNode`]s.
-fn walk_outline_se<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    start: ObjectRef,
-    depth: usize,
-    visited: &mut BTreeSet<ObjectRef>,
-    live: &BTreeSet<ObjectRef>,
-    max_depth: usize,
-) -> Result<usize> {
-    if depth >= max_depth {
-        return Err(crate::Error::Unsupported(format!(
-            "outline depth exceeds maximum of {max_depth} at {start}"
-        )));
-    }
-
-    let mut pruned = 0;
-    let mut current = Some(start);
-    while let Some(current_ref) = current {
-        if !visited.insert(current_ref) {
-            break; // cycle - stop this chain
-        }
-
-        // Peek via a borrow first (pruning is the rare case). We only
-        // materialize an owned mutable dict + `set_object` when there is
-        // actually a dangling `/SE` to drop; the common no-op path avoids
-        // the deep dict clone entirely.
-        let Object::Dictionary(dict) = pdf.resolve_borrowed(current_ref)? else {
-            break;
-        };
-        let first = dict.get_ref("First");
-        let next = dict.get_ref("Next");
-        let se = dict.get_ref("SE");
-
-        if let Some(se_ref) = se {
-            if !live.contains(&se_ref) {
-                // Now we need to mutate — take an owned dict via resolve().
-                if let Object::Dictionary(mut dict) = pdf.resolve(current_ref)? {
-                    dict.remove("SE");
-                    pdf.set_object(current_ref, Object::Dictionary(dict));
-                    pruned += 1;
-                }
-            }
-        }
-
-        if let Some(first) = first {
-            pruned += walk_outline_se(pdf, first, depth + 1, visited, live, max_depth)?;
-        }
-
-        current = next;
-    }
-
-    Ok(pruned)
 }
 
 #[cfg(test)]

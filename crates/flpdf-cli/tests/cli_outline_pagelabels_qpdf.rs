@@ -15,7 +15,7 @@
 //! the pattern `cli_pages_pagelabels_qpdf.rs` already uses for `/PageLabels`.
 
 use assert_cmd::Command;
-use flpdf::{pages, ObjectRef, Pdf};
+use flpdf::{pages, Object, ObjectRef, Pdf};
 use std::path::Path;
 use std::process::Command as Shell;
 
@@ -49,8 +49,8 @@ fn qpdf_available() -> bool {
 ///
 /// Both destinations target pages that SURVIVE the `1,3` (1-based) selection
 /// used below, so this exercises the "kept" path, not the null-out path
-/// (already covered extensively elsewhere, e.g.
-/// `outline_document_helper_tests.rs`'s `legacy_dests_reflects_remap_after_page_tree_rebuild`).
+/// (already covered extensively by the raw destination assertions in
+/// `page_merge_tests.rs`).
 fn outline_and_dests_four_page_pdf() -> Vec<u8> {
     let objects: &[(u32, &str)] = &[
         (
@@ -120,15 +120,46 @@ fn outline_dest_page_index(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>) -> 
     page_index_of(pdf, target)
 }
 
-/// 0-based index, within `pdf`'s own page order, of the page the modern
-/// `/Names /Dests` entry `"target"` points at.
+fn terminal_object(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>, mut value: Object) -> Object {
+    for _ in 0..64 {
+        match value {
+            Object::Reference(reference) => value = pdf.resolve(reference).unwrap(),
+            other => return other,
+        }
+    }
+    panic!("test fixture contains an excessively deep reference chain");
+}
+
+/// 0-based index, within `pdf`'s own page order, of the page the raw modern
+/// `/Names /Dests` entry `"target"` points at. This fixture has a single leaf,
+/// so the test reads that leaf directly without a normalized destination API.
 fn named_dest_page_index(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>) -> usize {
-    let entries = pdf.outline().name_tree_dests().unwrap();
-    let (_, dest) = entries
-        .iter()
-        .find(|(name, _)| name == b"target")
+    let catalog_ref = pdf.root_ref().expect("catalog ref");
+    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    let Object::Dictionary(names) =
+        terminal_object(pdf, catalog.get("Names").cloned().expect("catalog /Names"))
+    else {
+        panic!("catalog /Names must resolve to a dictionary");
+    };
+    let Object::Dictionary(dests) = terminal_object(
+        pdf,
+        names.get("Dests").cloned().expect("catalog /Names /Dests"),
+    ) else {
+        panic!("catalog /Names /Dests must resolve to a dictionary");
+    };
+    let Object::Array(entries) = dests.get("Names").expect("destination leaf /Names") else {
+        panic!("destination leaf /Names must be an array");
+    };
+    let target_index = entries
+        .chunks_exact(2)
+        .position(|pair| pair[0] == Object::String(b"target".to_vec()))
         .expect("\"target\" entry must survive");
-    let target = dest.as_ref().expect("dest must resolve").page().unwrap();
+    let Object::Array(dest) = terminal_object(pdf, entries[target_index * 2 + 1].clone()) else {
+        panic!("target destination must remain a raw array");
+    };
+    let target = dest[0].as_ref_id().expect("destination page reference");
     page_index_of(pdf, target)
 }
 

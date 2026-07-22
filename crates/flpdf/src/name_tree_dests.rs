@@ -3,8 +3,8 @@
 //!
 //! This is the *modern* named-destination structure, added in PDF 1.2 to
 //! supersede (but not replace — both may coexist) the legacy `/Catalog
-//! /Dests` dictionary handled by
-//! [`crate::OutlineDocumentHelper::legacy_dests`].
+//! /Dests` dictionary. Both stores remain raw catalog data during ordinary
+//! reading and rewriting.
 //!
 //! # Structure
 //!
@@ -21,8 +21,9 @@
 //! # Reader
 //!
 //! This module exposes only the *raw* (verbatim-value) collector used by the
-//! writer. For a reader that resolves each value to an explicit destination,
-//! see [`crate::OutlineDocumentHelper::name_tree_dests`].
+//! writer. Callers that inspect the tree read its catalog objects through
+//! [`crate::Pdf::resolve`]; flpdf does not normalize the store into a typed
+//! destination enumeration.
 //!
 //! # Writer
 //!

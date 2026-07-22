@@ -2006,47 +2006,6 @@ fn merge_inherits_inline_dests_root() {
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
-// `merge_documents` (qpdf `--pages` parity) never merges a secondary input's
-// own named destinations/outline into the target — only the primary's are
-// inherited, and a secondary's catalog-level `/Names /Dests` / `/Dests` /
-// `/Outlines` are not part of any page's object closure at all (qpdf's own
-// `addPage`/`copyForeignObject` never reaches them). So there is no
-// "overlapping named destination" scenario to collide in the first place.
-// What CAN happen — a primary named destination left pointing at a page the
-// merge dropped (nulled, as `d_b` above) — is exactly what the existing
-// `check_name_tree_dests` / `check_legacy_dests` diagnostics
-// (flpdf-9hc.14.1/.2) already detect, with no change needed here: they
-// operate on any `Pdf`, including a freshly merged one.
-#[test]
-fn check_name_tree_dests_flags_dest_nulled_by_merge() {
-    let mut a = Pdf::open_mem_owned(inline_dests_root_pdf()).unwrap();
-    let mut inputs = [MergeInput {
-        source: &mut a,
-        pages: vec![0],
-    }];
-    let mut doc = merge_documents(&mut inputs).unwrap();
-
-    let diagnostics = flpdf::check_name_tree_dests(&mut doc).unwrap();
-    let messages: Vec<&str> = diagnostics
-        .entries()
-        .iter()
-        .map(|d| d.message.as_str())
-        .collect();
-    assert_eq!(
-        messages.len(),
-        1,
-        "exactly one named dest (d_b) targets a page the merge dropped, got {messages:?}"
-    );
-    assert!(
-        messages[0].contains("d_b"),
-        "the dangling-dest warning must name d_b, got {messages:?}"
-    );
-    assert!(
-        !messages[0].contains("d_a"),
-        "d_a survives (remapped, not nulled) and must not be flagged"
-    );
-}
-
 // A primary whose /Outlines root is empty (/Type /Outlines /Count 0, no /First)
 // is a legitimate, reachable PDF shape: merge must tolerate it (no crash, no
 // dropped pages) and still inherit the (empty) /Outlines root.

@@ -71,6 +71,13 @@ fn resolved_raw_action(pdf: &mut Pdf<Cursor<Vec<u8>>>, item_ref: ObjectRef) -> O
     value
 }
 
+fn dict_value(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef, key: &str) -> Object {
+    let Object::Dictionary(dict) = pdf.resolve(object_ref).unwrap() else {
+        panic!("{object_ref} must resolve to a dictionary");
+    };
+    dict.get(key).cloned().unwrap_or(Object::Null)
+}
+
 // ---------------------------------------------------------------------------
 // 1. Deep outline round-trip through write_pdf
 // ---------------------------------------------------------------------------
@@ -176,7 +183,7 @@ fn combined_named_dests_pdf() -> Vec<u8> {
         &[
             (
                 1,
-                "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R /Names 9 0 R >>",
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 19 0 R /Dests 8 0 R /Names 9 0 R >>",
             ),
             (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
             (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
@@ -184,44 +191,47 @@ fn combined_named_dests_pdf() -> Vec<u8> {
             (8, "<< /legacy_only [3 0 R /Fit] >>"),
             (9, "<< /Dests 10 0 R >>"),
             (10, "<< /Names [(modern_only) [4 0 R /Fit]] >>"),
+            (
+                19,
+                "<< /Type /Outlines /First 20 0 R /Last 20 0 R /Count 1 >>",
+            ),
+            (
+                20,
+                "<< /Title (Raw policy keys) /Parent 19 0 R /SE 30 0 R >>",
+            ),
+            (30, "<< /Type /StructElem /S /P >>"),
         ],
         1,
     )
 }
 
 #[test]
-fn combined_legacy_and_modern_named_dests_round_trip_through_write_pdf() {
+fn raw_outline_policy_keys_survive_write_round_trip() {
     let mut pdf = Pdf::open(Cursor::new(combined_named_dests_pdf())).unwrap();
-
-    let legacy_before = pdf.outline().legacy_dests().unwrap();
-    let modern_before = pdf.outline().name_tree_dests().unwrap();
-    assert_eq!(legacy_before.len(), 1, "sanity: one legacy entry");
-    assert_eq!(modern_before.len(), 1, "sanity: one modern entry");
+    let catalog_ref = pdf.root_ref().unwrap();
+    let legacy_before = dict_value(&mut pdf, catalog_ref, "Dests");
+    let names_before = dict_value(&mut pdf, catalog_ref, "Names");
 
     let mut out = Vec::new();
     write_pdf(&mut pdf, &mut out).unwrap();
 
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
-    let legacy_after = reopened.outline().legacy_dests().unwrap();
-    let modern_after = reopened.outline().name_tree_dests().unwrap();
+    let reopened_catalog_ref = reopened.root_ref().unwrap();
+    let legacy_after = dict_value(&mut reopened, reopened_catalog_ref, "Dests");
+    let names_after = dict_value(&mut reopened, reopened_catalog_ref, "Names");
 
     assert_eq!(
         legacy_before, legacy_after,
-        "legacy /Dests must round-trip unchanged even with a modern tree present"
+        "ordinary rewriting must preserve raw /Dests"
     );
     assert_eq!(
-        modern_before, modern_after,
-        "modern /Names /Dests must round-trip unchanged even with a legacy dict present"
-    );
-    assert_eq!(legacy_after[0].0, b"legacy_only");
-    assert_eq!(modern_after[0].0, b"modern_only");
-    assert_eq!(
-        legacy_after[0].1.as_ref().unwrap().page(),
-        Some(ObjectRef::new(3, 0))
+        names_before, names_after,
+        "ordinary rewriting must preserve raw /Names"
     );
     assert_eq!(
-        modern_after[0].1.as_ref().unwrap().page(),
-        Some(ObjectRef::new(4, 0))
+        dict_value(&mut reopened, ObjectRef::new(20, 0), "SE"),
+        Object::Reference(ObjectRef::new(30, 0)),
+        "ordinary rewriting must preserve raw /SE even though no outline /SE policy API remains"
     );
 }
 
@@ -469,10 +479,13 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
         Some(&Object::Name(b"NextPage".to_vec()))
     );
 
-    // -- /SE link preserved and still resolves to a live /StructElem --
+    // -- Raw /SE link preserved and still resolves to a live /StructElem --
     let se_item = &roots[6];
     assert_eq!(se_item.title, "WithSE");
-    let se_ref = se_item.se.expect("/SE must survive the round trip");
+    let se_ref = match dict_value(&mut reopened, se_item.object_ref, "SE") {
+        Object::Reference(reference) => reference,
+        other => panic!("/SE must remain an indirect reference, got {other:?}"),
+    };
     match reopened.resolve(se_ref).unwrap() {
         Object::Dictionary(dict) => {
             assert_eq!(
@@ -483,20 +496,15 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
         other => panic!("/SE target must still be a /StructElem dict, got {other:?}"),
     }
 
-    // -- Both named-destination sources preserved independently --
-    let legacy = reopened.outline().legacy_dests().unwrap();
-    let modern = reopened.outline().name_tree_dests().unwrap();
-    assert_eq!(legacy.len(), 1);
-    assert_eq!(legacy[0].0, b"combined_legacy");
+    // -- Both raw named-destination sources preserved independently --
+    let catalog_ref = reopened.root_ref().unwrap();
     assert_eq!(
-        legacy[0].1.as_ref().unwrap().page(),
-        Some(ObjectRef::new(31, 0))
+        dict_value(&mut reopened, catalog_ref, "Dests"),
+        Object::Reference(ObjectRef::new(50, 0))
     );
-    assert_eq!(modern.len(), 1);
-    assert_eq!(modern[0].0, b"combined_modern");
     assert_eq!(
-        modern[0].1.as_ref().unwrap().page(),
-        Some(ObjectRef::new(32, 0))
+        dict_value(&mut reopened, catalog_ref, "Names"),
+        Object::Reference(ObjectRef::new(51, 0))
     );
 
     // -- /PageLabels preserved --
@@ -547,9 +555,7 @@ fn se_survives_pg_drop_pdf() -> Vec<u8> {
 /// garbage-collected (only page objects are, by the subsequent subset
 /// sweep). So the outline item's `/SE` reference is never left dangling by
 /// this pipeline alone: it still resolves to a live `/StructElem`, just one
-/// that no longer names a page. `prune_outline_se` (14.6) exists for callers
-/// that DO fully remove struct elements — which this built-in pipeline does
-/// not do — and is not invoked automatically by it.
+/// that no longer names a page. The raw outline `/SE` entry remains untouched.
 #[test]
 fn struct_elem_survives_page_rebuild_pg_drop_and_outline_se_still_resolves() {
     let mut pdf = Pdf::open(Cursor::new(se_survives_pg_drop_pdf())).unwrap();
@@ -559,10 +565,10 @@ fn struct_elem_survives_page_rebuild_pg_drop_and_outline_se_still_resolves() {
     remap_outline_and_dests(&mut pdf, &result).unwrap();
     drop_struct_elem_dangling_pg(&mut pdf, &result).unwrap();
 
-    let roots = pdf.outline().get_root().unwrap();
-    let se_ref = roots[0].se.expect(
-        "the outline /SE reference itself is untouched by this pipeline (no automatic prune)",
-    );
+    let se_ref = match dict_value(&mut pdf, ObjectRef::new(5, 0), "SE") {
+        Object::Reference(reference) => reference,
+        other => panic!("the raw outline /SE reference must survive, got {other:?}"),
+    };
     assert_eq!(se_ref, ObjectRef::new(20, 0));
 
     match pdf.resolve(se_ref).unwrap() {
