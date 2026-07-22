@@ -44,9 +44,9 @@
 //! ```
 
 use crate::outline::{OutlineId, OutlineItem, OutlineTree};
-use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 const QPDF_MAX_EXPANDED_OUTLINE_DEPTH: usize = 50;
@@ -356,8 +356,25 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Some(dests_root) = names.remove("Dests") else {
             return Ok(Object::Null);
         };
-        if let Some(value) = find_name_tree_value(self.pdf, dests_root, &lookup)? {
-            return resolve_terminal_object(self.pdf, value);
+        match find_name_tree_value(self.pdf, dests_root.clone(), &lookup)? {
+            NameTreeLookup::Found(value) => return resolve_terminal_object(self.pdf, value),
+            NameTreeLookup::Missing => {}
+            NameTreeLookup::Structural(error) => {
+                let entries = enumerate_name_tree_entries(self.pdf, dests_root.clone())?;
+                if entries.is_empty() {
+                    return Ok(Object::Null);
+                }
+                self.pdf.push_warning(format!(
+                    "attempting to repair after error: {}",
+                    error.diagnostic()
+                ));
+                let repaired_root = repair_name_tree(self.pdf, dests_root, entries)?;
+                if let NameTreeLookup::Found(value) =
+                    find_name_tree_value(self.pdf, repaired_root, &lookup)?
+                {
+                    return resolve_terminal_object(self.pdf, value);
+                }
+            }
         }
         Ok(Object::Null)
     }
@@ -470,6 +487,41 @@ fn resolve_terminal_object<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> R
     }
 }
 
+enum NameTreeLookup {
+    Found(Object),
+    Missing,
+    Structural(NameTreeStructuralError),
+}
+
+struct NameTreeStructuralError {
+    node_ref: Option<ObjectRef>,
+    message: &'static str,
+}
+
+impl NameTreeStructuralError {
+    fn diagnostic(&self) -> String {
+        match self.node_ref {
+            Some(node_ref) => format!(
+                "Name/Number tree node (object {}): {}",
+                node_ref.number, self.message
+            ),
+            None => format!("Name/Number tree node: {}", self.message),
+        }
+    }
+}
+
+enum NameTreeKidSelection {
+    Found(Object),
+    Missing,
+    Structural(NameTreeStructuralError),
+}
+
+enum NameTreeKidOrdering {
+    Order(Ordering),
+    Missing,
+    Structural(NameTreeStructuralError),
+}
+
 /// Find one key in a name tree using qpdf's `/Names`-or-`/Kids` descent.
 ///
 /// Unlike the generic public tree walker, outline destination lookup has no
@@ -478,32 +530,38 @@ fn find_name_tree_value<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mut cursor: Object,
     lookup: &[u8],
-) -> Result<Option<Object>> {
+) -> Result<NameTreeLookup> {
     let mut seen = BTreeSet::new();
     loop {
         let (node, identity) = name_tree_node(pdf, cursor)?;
         let Some(mut node) = node else {
-            return Ok(None);
+            return Ok(NameTreeLookup::Missing);
         };
         if let Some(identity) = identity {
             if !seen.insert(identity) {
-                return Ok(None);
+                return Ok(NameTreeLookup::Missing);
             }
         }
 
         if let Some(Object::Array(names)) = node.remove("Names") {
             if !names.is_empty() {
-                return Ok(find_name_tree_leaf_value(names, lookup));
+                return Ok(match find_name_tree_leaf_value(names, lookup) {
+                    Some(value) => NameTreeLookup::Found(value),
+                    None => NameTreeLookup::Missing,
+                });
             }
         }
 
         let Some(Object::Array(kids)) = node.remove("Kids") else {
-            return Ok(None);
+            return Ok(NameTreeLookup::Missing);
         };
-        let Some(next) = select_name_tree_kid(pdf, &kids, lookup)? else {
-            return Ok(None);
-        };
-        cursor = next;
+        match select_name_tree_kid(pdf, &kids, lookup)? {
+            NameTreeKidSelection::Found(next) => cursor = next,
+            NameTreeKidSelection::Missing => return Ok(NameTreeLookup::Missing),
+            NameTreeKidSelection::Structural(error) => {
+                return Ok(NameTreeLookup::Structural(error));
+            }
+        }
     }
 }
 
@@ -544,25 +602,32 @@ fn select_name_tree_kid<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     kids: &[Object],
     lookup: &[u8],
-) -> Result<Option<Object>> {
+) -> Result<NameTreeKidSelection> {
     let mut low = 0;
     let mut high = kids.len();
     let mut previous = None;
     while low < high {
         let middle = low + (high - low) / 2;
-        let Some(ordering) = name_tree_kid_ordering(pdf, &kids[middle], lookup)? else {
-            return Ok(None);
+        let ordering = match name_tree_kid_ordering(pdf, &kids[middle], lookup)? {
+            NameTreeKidOrdering::Order(ordering) => ordering,
+            NameTreeKidOrdering::Missing => return Ok(NameTreeKidSelection::Missing),
+            NameTreeKidOrdering::Structural(error) => {
+                return Ok(NameTreeKidSelection::Structural(error));
+            }
         };
         match ordering {
             Ordering::Less => high = middle,
-            Ordering::Equal => return Ok(Some(kids[middle].clone())),
+            Ordering::Equal => return Ok(NameTreeKidSelection::Found(kids[middle].clone())),
             Ordering::Greater => {
                 previous = Some(middle);
                 low = middle + 1;
             }
         }
     }
-    Ok(previous.map(|index| kids[index].clone()))
+    Ok(match previous {
+        Some(index) => NameTreeKidSelection::Found(kids[index].clone()),
+        None => NameTreeKidSelection::Missing,
+    })
 }
 
 /// Return the qpdf `withinLimits` comparison for `lookup` against one kid:
@@ -571,26 +636,206 @@ fn name_tree_kid_ordering<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     kid: &Object,
     lookup: &[u8],
-) -> Result<Option<Ordering>> {
+) -> Result<NameTreeKidOrdering> {
     let (node, _) = name_tree_node(pdf, kid.clone())?;
     let Some(node) = node else {
-        return Ok(None);
+        return Ok(NameTreeKidOrdering::Missing);
     };
     let Some(Object::Array(limits)) = node.get("Limits") else {
-        return Ok(None);
+        return Ok(NameTreeKidOrdering::Structural(NameTreeStructuralError {
+            node_ref: kid.as_ref_id(),
+            message: "node is missing /Limits",
+        }));
     };
     let [Object::String(first), Object::String(last), ..] = limits.as_slice() else {
-        return Ok(None);
+        return Ok(NameTreeKidOrdering::Structural(NameTreeStructuralError {
+            node_ref: kid.as_ref_id(),
+            message: "node is missing /Limits",
+        }));
     };
     let first = crate::json_inspect::qpdf_utf8_value(first);
     if lookup < first.as_slice() {
-        return Ok(Some(Ordering::Less));
+        return Ok(NameTreeKidOrdering::Order(Ordering::Less));
     }
     let last = crate::json_inspect::qpdf_utf8_value(last);
     if lookup > last.as_slice() {
-        return Ok(Some(Ordering::Greater));
+        return Ok(NameTreeKidOrdering::Order(Ordering::Greater));
     }
-    Ok(Some(Ordering::Equal))
+    Ok(NameTreeKidOrdering::Order(Ordering::Equal))
+}
+
+/// Enumerate the reachable entries only when qpdf's targeted lookup reports a
+/// structural error. This private repair walk is iterative, has no `/Kids`
+/// depth cap, and keys cycle detection on the terminal indirect node identity.
+fn enumerate_name_tree_entries<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    root: Object,
+) -> Result<BTreeMap<Vec<u8>, Object>> {
+    let mut entries = BTreeMap::new();
+    let mut stack = vec![root];
+    let mut seen = BTreeSet::new();
+
+    while let Some(cursor) = stack.pop() {
+        let (node, identity) = name_tree_node(pdf, cursor)?;
+        let Some(mut node) = node else {
+            continue;
+        };
+        if let Some(identity) = identity {
+            if !seen.insert(identity) {
+                continue;
+            }
+        }
+
+        if let Some(Object::Array(names)) = node.remove("Names") {
+            if !names.is_empty() {
+                for pair in names.chunks_exact(2) {
+                    let Object::String(key) = &pair[0] else {
+                        continue;
+                    };
+                    let key =
+                        qpdf_new_unicode_utf8_value(&crate::json_inspect::qpdf_utf8_value(key));
+                    entries.insert(key, pair[1].clone());
+                }
+                continue;
+            }
+        }
+
+        if let Some(Object::Array(kids)) = node.remove("Kids") {
+            stack.extend(kids.into_iter().rev());
+        }
+    }
+
+    Ok(entries)
+}
+
+fn repair_name_tree<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    original_root: Object,
+    entries: BTreeMap<Vec<u8>, Object>,
+) -> Result<Object> {
+    let rebuilt_entries: Vec<(Vec<u8>, Object)> = entries
+        .into_iter()
+        .map(|(key, value)| (qpdf_unicode_string_bytes(&key), value))
+        .collect();
+    let rebuilt = build_repaired_name_tree_root(pdf, &rebuilt_entries)?;
+
+    let (existing, terminal_ref) = name_tree_node(pdf, original_root.clone())?;
+    let Some(mut existing) = existing else {
+        return Ok(original_root); // cov:ignore: structural lookup only yields repair for a dictionary root
+    };
+    existing.remove("Kids");
+    existing.remove("Names");
+    if let Some(kids) = rebuilt.get("Kids") {
+        existing.insert("Kids", kids.clone());
+    }
+    if let Some(names) = rebuilt.get("Names") {
+        existing.insert("Names", names.clone());
+    }
+
+    match original_root {
+        Object::Reference(_) => {
+            let Some(terminal_ref) = terminal_ref else {
+                return Ok(original_root); // cov:ignore: name_tree_node always returns identity for a reference root
+            };
+            pdf.set_object(terminal_ref, Object::Dictionary(existing));
+            Ok(original_root)
+        }
+        Object::Dictionary(_) => {
+            replace_direct_dests_root(pdf, existing.clone())?;
+            Ok(Object::Dictionary(existing))
+        }
+        _ => Ok(original_root), // cov:ignore: structural lookup cannot originate from a scalar root
+    }
+}
+
+fn build_repaired_name_tree_root<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    entries: &[(Vec<u8>, Object)],
+) -> Result<Dictionary> {
+    let max_object_number = pdf
+        .object_refs()
+        .iter()
+        .map(|object_ref| object_ref.number)
+        .max()
+        .unwrap_or(0);
+    let allocation_bound = u32::try_from(entries.len())
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+    max_object_number
+        .checked_add(allocation_bound)
+        .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+
+    let mut next_object_number = max_object_number + 1;
+    let (new_root_ref, nodes) = crate::name_number_tree::build_name_tree(entries, || {
+        let object_ref = ObjectRef::new(next_object_number, 0);
+        next_object_number += 1;
+        object_ref
+    });
+
+    let mut root = None;
+    for (node_ref, node) in nodes {
+        if node_ref == new_root_ref {
+            root = node.into_dict();
+        } else {
+            pdf.set_object(node_ref, node);
+        }
+    }
+    root.ok_or_else(|| Error::Unsupported("name-tree rebuild produced no root".to_string()))
+}
+
+fn replace_direct_dests_root<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    repaired_root: Dictionary,
+) -> Result<()> {
+    let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
+    let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref)? else {
+        return Ok(()); // cov:ignore: this root was a dictionary when the direct /Dests root was read
+    };
+    let Some(names_value) = catalog.get("Names").cloned() else {
+        return Ok(()); // cov:ignore: repair follows a /Dests root just read through catalog /Names
+    };
+
+    match names_value {
+        Object::Dictionary(mut names) => {
+            names.insert("Dests", Object::Dictionary(repaired_root));
+            catalog.insert("Names", Object::Dictionary(names));
+            pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        }
+        value @ Object::Reference(_) => {
+            let (terminal, terminal_ref) = crate::ref_chain::resolve_ref_chain(pdf, &value)?;
+            let Some(mut names) = terminal.into_dict() else {
+                return Ok(()); // cov:ignore: the same terminal /Names value was a dictionary before lookup
+            };
+            let Some(terminal_ref) = terminal_ref else {
+                return Ok(()); // cov:ignore: resolve_ref_chain always returns identity for a reference start
+            };
+            names.insert("Dests", Object::Dictionary(repaired_root));
+            pdf.set_object(terminal_ref, Object::Dictionary(names));
+        }
+        _ => {} // cov:ignore: initial lookup accepts only direct or indirect /Names dictionaries
+    }
+    Ok(())
+}
+
+/// Encode the normalized UTF-8 key as qpdf `newUnicodeString`: PDFDocEncoding
+/// when every scalar is representable, otherwise UTF-16BE with a BOM.
+fn qpdf_unicode_string_bytes(utf8: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(utf8);
+    let mut pdfdoc = Vec::with_capacity(text.len());
+    for character in text.chars() {
+        let mut encoded_character = [0; 4];
+        let encoded_character = character.encode_utf8(&mut encoded_character).as_bytes();
+        let encoded = (1_u16..=u16::from(u8::MAX))
+            .map(|byte| byte as u8)
+            .filter(|byte| !matches!(byte, 0x7f | 0x9f | 0xad))
+            .find(|&byte| crate::json_inspect::qpdf_utf8_value(&[byte]) == encoded_character);
+        let Some(encoded) = encoded else {
+            return crate::filespec_helper::encode_utf16be(&text);
+        };
+        pdfdoc.push(encoded);
+    }
+    pdfdoc
 }
 
 /// Decode an outline `/Title`, resolving one level of indirection (review rule 2).
@@ -669,7 +914,37 @@ fn qpdf_object_type_name(value: &Object) -> &'static str {
 
 #[cfg(test)]
 mod qpdf_utf8_tests {
-    use super::qpdf_new_unicode_utf8_value;
+    use super::{qpdf_new_unicode_utf8_value, qpdf_unicode_string_bytes, NameTreeStructuralError};
+
+    #[test]
+    fn direct_name_tree_node_diagnostic_omits_an_object_number() {
+        let error = NameTreeStructuralError {
+            node_ref: None,
+            message: "node is missing /Limits",
+        };
+        assert_eq!(
+            error.diagnostic(),
+            "Name/Number tree node: node is missing /Limits"
+        );
+    }
+
+    #[test]
+    fn repaired_keys_use_qpdf_new_unicode_string_encoding() {
+        assert_eq!(qpdf_unicode_string_bytes(b"shape"), b"shape");
+        assert_eq!(qpdf_unicode_string_bytes("Ł".as_bytes()), vec![0x95]);
+        assert_eq!(
+            qpdf_unicode_string_bytes("😀".as_bytes()),
+            vec![0xfe, 0xff, 0xd8, 0x3d, 0xde, 0x00]
+        );
+        assert_eq!(
+            qpdf_unicode_string_bytes("�".as_bytes()),
+            vec![0xfe, 0xff, 0xff, 0xfd]
+        );
+        assert_eq!(
+            qpdf_unicode_string_bytes("\0".as_bytes()),
+            vec![0xfe, 0xff, 0x00, 0x00]
+        );
+    }
 
     #[test]
     fn new_unicode_string_normalization_matches_qpdf_error_consumption() {

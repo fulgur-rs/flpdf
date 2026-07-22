@@ -1063,6 +1063,7 @@ fn named_destination_lookup_selects_only_the_kid_covering_the_key() {
     let tree = pdf.outline().get_tree().unwrap();
     assert_eq!(tree[tree.roots()[0]].dest, page_dest(3));
     assert_eq!(tree[tree.roots()[1]].dest, page_dest(3));
+    assert!(warning_messages(&pdf).is_empty());
 }
 
 #[test]
@@ -1338,19 +1339,24 @@ fn named_destination_lookup_handles_qpdf_node_shapes() {
             Object::Null,
         ),
         (
+            "/Names << /Dests << /Kids [8 0 R] >> >>",
+            &[(8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>")][..],
+            Object::Null,
+        ),
+        (
             "/Names << /Dests << /Kids [42] >> >>",
             &[][..],
             Object::Null,
         ),
         (
             "/Names << /Dests << /Kids [8 0 R] >> >>",
-            &[(8, "<< /Names [(shape) [3 0 R /Fit]] >>")][..],
+            &[(8, "<< /Names [42 [3 0 R /Fit]] >>")][..],
             Object::Null,
         ),
         (
             "/Names << /Dests << /Kids [8 0 R] >> >>",
             &[(8, "<< /Limits [42 42] /Names [(shape) [3 0 R /Fit]] >>")][..],
-            Object::Null,
+            page_dest(3),
         ),
     ];
 
@@ -1359,6 +1365,227 @@ fn named_destination_lookup_handles_qpdf_node_shapes() {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         assert_eq!(root_items(&mut pdf)[0].dest, expected, "{catalog_entries}");
     }
+}
+
+fn missing_name_tree_limits_pdf() -> Vec<u8> {
+    single_outline_with_catalog(
+        "/Names << /Dests << /Kids [8 0 R] >> >>",
+        "/Dest (shape)",
+        &[(8, "<< /Names [(shape) [3 0 R /Fit]] >>")],
+    )
+}
+
+#[test]
+fn missing_name_tree_limits_repairs_and_mutates_the_existing_direct_root() {
+    let mut pdf = Pdf::open(Cursor::new(missing_name_tree_limits_pdf())).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    assert_eq!(
+        warning_messages(&pdf),
+        vec![
+            "attempting to repair after error: Name/Number tree node (object 8): node is missing /Limits"
+        ]
+    );
+
+    let catalog_ref = pdf.root_ref().unwrap();
+    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref).unwrap() else {
+        panic!("catalog must remain a dictionary");
+    };
+    let Object::Dictionary(names) = catalog.get("Names").unwrap() else {
+        panic!("direct /Names must remain direct");
+    };
+    let Object::Dictionary(dests) = names.get("Dests").unwrap() else {
+        panic!("direct /Dests root must remain direct");
+    };
+    assert_eq!(dests.get("Kids"), None);
+    assert_eq!(
+        dests.get("Names"),
+        Some(&Object::Array(vec![
+            Object::String(b"shape".to_vec()),
+            page_dest(3),
+        ]))
+    );
+    assert!(matches!(
+        pdf.resolve(ObjectRef::new(8, 0)).unwrap(),
+        Object::Dictionary(_)
+    ));
+
+    let mut serialized = Vec::new();
+    write_pdf(&mut pdf, &mut serialized).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(serialized)).unwrap();
+    let catalog_ref = reopened.root_ref().unwrap();
+    let Object::Dictionary(catalog) = reopened.resolve(catalog_ref).unwrap() else {
+        panic!("reopened catalog must be a dictionary");
+    };
+    let Object::Dictionary(names) = catalog.get("Names").unwrap() else {
+        panic!("reopened direct /Names must remain direct");
+    };
+    let Object::Dictionary(dests) = names.get("Dests").unwrap() else {
+        panic!("reopened direct /Dests root must remain direct");
+    };
+    assert_eq!(dests.get("Kids"), None);
+    assert!(matches!(dests.get("Names"), Some(Object::Array(_))));
+    assert!(matches!(
+        reopened.resolve(ObjectRef::new(8, 0)).unwrap(),
+        Object::Dictionary(_)
+    ));
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 oracle"]
+fn qpdf_missing_name_tree_limits_oracle_repairs_the_lookup() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    input.write_all(&missing_name_tree_limits_pdf()).unwrap();
+    let output = Command::new("qpdf")
+        .args(["--json=2", "--json-key=outlines"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("attempting to repair after error:"));
+    assert!(stderr.contains("(Name/Number tree node (object 8)): node is missing /Limits"));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["outlines"][0]["dest"][0], "3 0 R");
+}
+
+#[test]
+fn missing_name_tree_limits_repairs_the_terminal_indirect_root_without_collapsing_holders() {
+    let bytes = single_outline_with_catalog(
+        "/Names 20 0 R",
+        "/Dest (shape)",
+        &[
+            (8, "<< /Names [(shape) [3 0 R /Fit]] >>"),
+            (20, "<< /Dests 21 0 R >>"),
+            (21, "22 0 R"),
+            (22, "<< /Kids [8 0 R] >>"),
+        ],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    assert_eq!(
+        warning_messages(&pdf),
+        vec![
+            "attempting to repair after error: Name/Number tree node (object 8): node is missing /Limits"
+        ]
+    );
+
+    let catalog_ref = pdf.root_ref().unwrap();
+    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref).unwrap() else {
+        panic!("catalog must remain a dictionary");
+    };
+    assert_eq!(
+        catalog.get("Names"),
+        Some(&Object::Reference(ObjectRef::new(20, 0)))
+    );
+    let Object::Dictionary(names) = pdf.resolve(ObjectRef::new(20, 0)).unwrap() else {
+        panic!("indirect /Names holder must remain a dictionary");
+    };
+    assert_eq!(
+        names.get("Dests"),
+        Some(&Object::Reference(ObjectRef::new(21, 0)))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(21, 0)).unwrap(),
+        Object::Reference(ObjectRef::new(22, 0))
+    );
+    let Object::Dictionary(dests) = pdf.resolve(ObjectRef::new(22, 0)).unwrap() else {
+        panic!("terminal /Dests root must remain a dictionary");
+    };
+    assert_eq!(dests.get("Kids"), None);
+    assert!(matches!(dests.get("Names"), Some(Object::Array(_))));
+}
+
+#[test]
+fn malformed_name_tree_repair_enumerates_all_reachable_branches_and_terminates_cycles() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R 11 0 R] >> >>",
+        "/Dest (target)",
+        &[
+            (8, "42"),
+            (9, "<< /Limits [(a) (a)] /Kids [9 0 R] >>"),
+            (10, "<< /Names [(target) [3 0 R /Fit]] >>"),
+            (11, "<< /Limits [(z) (z)] /Names [42 [3 0 R /Fit]] >>"),
+        ],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    assert_eq!(
+        warning_messages(&pdf),
+        vec![
+            "attempting to repair after error: Name/Number tree node (object 10): node is missing /Limits"
+        ]
+    );
+}
+
+#[test]
+fn malformed_name_tree_repair_rebuilds_more_than_one_leaf() {
+    let pairs = (0..33)
+        .map(|index| format!("(k{index:02}) [3 0 R /Fit]"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let leaf = format!("<< /Names [{pairs}] >>");
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [8 0 R] >> >>",
+        "/Dest (k17)",
+        &[(8, leaf.as_str())],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    let catalog_ref = pdf.root_ref().unwrap();
+    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref).unwrap() else {
+        panic!("catalog must remain a dictionary");
+    };
+    let Object::Dictionary(names) = catalog.get("Names").unwrap() else {
+        panic!("direct /Names must remain direct");
+    };
+    let Object::Dictionary(dests) = names.get("Dests").unwrap() else {
+        panic!("direct /Dests root must remain direct");
+    };
+    assert!(matches!(dests.get("Kids"), Some(Object::Array(kids)) if kids.len() == 2));
+    assert_eq!(dests.get("Names"), None);
+}
+
+#[test]
+fn malformed_name_tree_repair_updates_a_direct_root_inside_indirect_names() {
+    let bytes = single_outline_with_catalog(
+        "/Names 20 0 R",
+        "/Dest (shape)",
+        &[
+            (8, "<< /Names [(shape) [3 0 R /Fit]] >>"),
+            (20, "<< /Dests << /Kids [8 0 R] >> >>"),
+        ],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    let catalog_ref = pdf.root_ref().unwrap();
+    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref).unwrap() else {
+        panic!("catalog must remain a dictionary");
+    };
+    assert_eq!(
+        catalog.get("Names"),
+        Some(&Object::Reference(ObjectRef::new(20, 0)))
+    );
+    let Object::Dictionary(names) = pdf.resolve(ObjectRef::new(20, 0)).unwrap() else {
+        panic!("indirect /Names must remain a dictionary");
+    };
+    let Object::Dictionary(dests) = names.get("Dests").unwrap() else {
+        panic!("direct /Dests root must remain direct");
+    };
+    assert_eq!(dests.get("Kids"), None);
+    assert!(matches!(dests.get("Names"), Some(Object::Array(_))));
 }
 
 fn qpdf_destination_matrix_pdf() -> Vec<u8> {
