@@ -113,7 +113,7 @@ pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
             // Report the first recorded failure; this parse error is only the
             // trigger when the startxref stage itself succeeded.
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
-            return recover_xref_from_linear_scan(&bytes, version, startxref, trigger);
+            return recover_xref_from_linear_scan(&bytes, version, startxref, trigger, None);
         }
         Err(error) => return Err(error),
     };
@@ -128,7 +128,13 @@ pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
     ) {
         if allow_repair {
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
-            let recovered = recover_xref_from_linear_scan(&bytes, version, startxref, trigger)?;
+            let recovered = recover_xref_from_linear_scan(
+                &bytes,
+                version,
+                startxref,
+                trigger,
+                Some(&loaded.loaded.trailer),
+            )?;
             return Ok(merge_recovered_qpdf_state(recovered, loaded));
         }
         return Err(error);
@@ -235,9 +241,14 @@ fn recover_xref_from_linear_scan(
     version: String,
     startxref: u64,
     trigger_error: Error,
+    fallback_trailer: Option<&Dictionary>,
 ) -> Result<LoadedXrefState> {
     let entries = recover_xref_entries(bytes)?;
-    let trailer = recover_trailer(bytes)?;
+    let trailer = match (recover_trailer(bytes), fallback_trailer) {
+        (Ok(trailer), _) => trailer,
+        (Err(_), Some(trailer)) => trailer.clone(),
+        (Err(error), None) => return Err(error),
+    };
 
     let mut repair_diagnostics = Diagnostics::default();
     push_repair_diagnostics(&mut repair_diagnostics, &trigger_error, startxref);

@@ -43,6 +43,14 @@ pub(crate) struct IndirectStreamLength {
     pub endstream_pos: Option<usize>,
 }
 
+pub(crate) struct ParsedIndirectObject {
+    pub(crate) object_ref: ObjectRef,
+    pub(crate) object: Object,
+    pub(crate) indirect_length: Option<IndirectStreamLength>,
+    pub(crate) empty_offset: Option<usize>,
+    pub(crate) expected_endobj_offset: Option<usize>,
+}
+
 pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)> {
     let (object_ref, object, _) = parse_indirect_object_detailed(input)?;
     Ok((object_ref, object))
@@ -56,34 +64,23 @@ pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)>
 pub(crate) fn parse_indirect_object_detailed(
     input: &[u8],
 ) -> Result<(ObjectRef, Object, Option<IndirectStreamLength>)> {
-    let (object_ref, object, indirect_len, _) = parse_indirect_object_detailed_impl(input, false)?;
-    Ok((object_ref, object, indirect_len))
+    let parsed = parse_indirect_object_detailed_impl(input, false)?;
+    Ok((parsed.object_ref, parsed.object, parsed.indirect_length))
 }
 
 /// qpdf's JSON inspection resolves an empty indirect object as null while
 /// recording a warning. Keep that recovery opt-in so ordinary PDF reads stay
-/// strict. The final tuple member is the byte offset of the `endobj` token when
-/// this recovery was used.
-pub(crate) fn parse_indirect_object_detailed_qpdf(
-    input: &[u8],
-) -> Result<(
-    ObjectRef,
-    Object,
-    Option<IndirectStreamLength>,
-    Option<usize>,
-)> {
+/// strict. The parsed result records both the byte offset of the `endobj` token
+/// when empty-object recovery was used and the byte offset where qpdf expected
+/// `endobj`.
+pub(crate) fn parse_indirect_object_detailed_qpdf(input: &[u8]) -> Result<ParsedIndirectObject> {
     parse_indirect_object_detailed_impl(input, true)
 }
 
 fn parse_indirect_object_detailed_impl(
     input: &[u8],
     allow_empty_object: bool,
-) -> Result<(
-    ObjectRef,
-    Object,
-    Option<IndirectStreamLength>,
-    Option<usize>,
-)> {
+) -> Result<ParsedIndirectObject> {
     let mut parser = Parser::new(input);
     let number = parser.integer_for_indirect()?;
     let generation = parser.integer_for_indirect()?;
@@ -97,18 +94,26 @@ fn parse_indirect_object_detailed_impl(
     let object = if empty_object_offset.is_some() {
         Object::Null
     } else {
+        parser.top_level_no_reference = allow_empty_object;
         parser.object()?
     };
-    Ok((
-        ObjectRef::new(
+    let expected_endobj_offset = if allow_empty_object && empty_object_offset.is_none() {
+        parser.skip_ws();
+        (!parser.take_keyword_token(b"endobj")).then_some(parser.pos)
+    } else {
+        None
+    };
+    Ok(ParsedIndirectObject {
+        object_ref: ObjectRef::new(
             u32::try_from(number).map_err(|_| Error::parse(0, "invalid indirect object number"))?,
             u16::try_from(generation)
                 .map_err(|_| Error::parse(0, "invalid indirect generation"))?,
         ),
         object,
-        parser.last_indirect_stream_len,
-        empty_object_offset,
-    ))
+        indirect_length: parser.last_indirect_stream_len,
+        empty_offset: empty_object_offset,
+        expected_endobj_offset,
+    })
 }
 
 pub(crate) struct Parser<'a> {
@@ -119,6 +124,11 @@ pub(crate) struct Parser<'a> {
     /// streams never contain indirect references, so the tokenizer sets this
     /// to avoid mis-parsing operands like `0 0 1 R` (rg/RG colour ops).
     no_reference: bool,
+    /// qpdf treats an indirect reference in the body of an indirect object as
+    /// a malformed direct object: it returns the first integer and warns that
+    /// `endobj` was expected at the generation number. References nested in an
+    /// array, dictionary, or stream dictionary remain valid.
+    top_level_no_reference: bool,
     /// Set by [`stream_from_dict`](Self::stream_from_dict) when a stream's
     /// `/Length` is an indirect reference, so [`parse_indirect_object_detailed`]
     /// can surface the payload window for xref-based resolution.
@@ -142,6 +152,7 @@ impl<'a> Parser<'a> {
             input,
             pos: 0,
             no_reference: false,
+            top_level_no_reference: false,
             last_indirect_stream_len: None,
             depth: 0,
         }
@@ -154,6 +165,7 @@ impl<'a> Parser<'a> {
             input,
             pos: 0,
             no_reference: true,
+            top_level_no_reference: false,
             last_indirect_stream_len: None,
             depth: 0,
         }
@@ -408,7 +420,7 @@ impl<'a> Parser<'a> {
         if matches!(self.peek(), Some(b'e' | b'E')) {
             return self.parse_real_exponent(start);
         }
-        if self.no_reference {
+        if self.no_reference || (self.top_level_no_reference && self.depth == 1) {
             self.pos = saved;
             return Ok(Object::Integer(first));
         }
@@ -909,12 +921,12 @@ mod stream_length_tests {
         let empty = b"7 0 obj\n  endobj\n";
         assert!(parse_indirect_object_detailed(empty).is_err());
 
-        let (object_ref, object, indirect_len, empty_offset) =
-            parse_indirect_object_detailed_qpdf(empty).expect("qpdf empty recovery");
-        assert_eq!(object_ref, ObjectRef::new(7, 0));
-        assert_eq!(object, Object::Null);
-        assert!(indirect_len.is_none());
-        assert_eq!(empty_offset, Some(10));
+        let parsed = parse_indirect_object_detailed_qpdf(empty).expect("qpdf empty recovery");
+        assert_eq!(parsed.object_ref, ObjectRef::new(7, 0));
+        assert_eq!(parsed.object, Object::Null);
+        assert!(parsed.indirect_length.is_none());
+        assert_eq!(parsed.empty_offset, Some(10));
+        assert_eq!(parsed.expected_endobj_offset, None);
 
         assert!(parse_indirect_object_detailed_qpdf(b"7 0 obj\nendobject\nendobj\n").is_err());
     }

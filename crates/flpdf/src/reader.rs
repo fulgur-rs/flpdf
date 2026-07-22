@@ -100,6 +100,7 @@ struct QpdfReadObject {
     object: Object,
     indirect_length: Option<crate::parser::IndirectStreamLength>,
     empty_offset: Option<usize>,
+    expected_endobj_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -1200,10 +1201,11 @@ impl<R: Read + Seek> Pdf<R> {
         match parse_indirect_object_detailed_qpdf(&bytes) {
             Ok(parsed) => Ok(QpdfReadObject {
                 bytes,
-                object_ref: parsed.0,
-                object: parsed.1,
-                indirect_length: parsed.2,
-                empty_offset: parsed.3,
+                object_ref: parsed.object_ref,
+                object: parsed.object,
+                indirect_length: parsed.indirect_length,
+                empty_offset: parsed.empty_offset,
+                expected_endobj_offset: parsed.expected_endobj_offset,
             }),
             Err(window_err) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
                 self.resolution_fallbacks_remaining -= 1;
@@ -1213,10 +1215,11 @@ impl<R: Read + Seek> Pdf<R> {
                 match parse_indirect_object_detailed_qpdf(&full) {
                     Ok(parsed) => Ok(QpdfReadObject {
                         bytes: full,
-                        object_ref: parsed.0,
-                        object: parsed.1,
-                        indirect_length: parsed.2,
-                        empty_offset: parsed.3,
+                        object_ref: parsed.object_ref,
+                        object: parsed.object,
+                        indirect_length: parsed.indirect_length,
+                        empty_offset: parsed.empty_offset,
+                        expected_endobj_offset: parsed.expected_endobj_offset,
                     }),
                     Err(_) => Err(window_err),
                 }
@@ -1251,6 +1254,14 @@ impl<R: Read + Seek> Pdf<R> {
                 if let Some(relative_offset) = parsed.empty_offset {
                     self.push_warning(format!(
                         "(object {} {}, offset {}): empty object treated as null",
+                        object_ref.number,
+                        object_ref.generation,
+                        offset.saturating_add(relative_offset as u64)
+                    ));
+                }
+                if let Some(relative_offset) = parsed.expected_endobj_offset {
+                    self.push_warning(format!(
+                        "(object {} {}, offset {}): expected endobj",
                         object_ref.number,
                         object_ref.generation,
                         offset.saturating_add(relative_offset as u64)

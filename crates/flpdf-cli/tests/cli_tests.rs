@@ -1282,6 +1282,43 @@ fn json_qpdf_preparation_treats_referenced_empty_object_as_null_with_warning() {
 }
 
 #[test]
+fn json_qpdf_preparation_treats_top_level_bare_reference_as_integer() {
+    let bytes = top_level_bare_reference_json_pdf();
+    let expected_warning_offset = bytes
+        .windows(b"4 0 obj\n3 0 R".len())
+        .position(|window| window == b"4 0 obj\n3 0 R")
+        .expect("fixture must contain malformed object")
+        + b"4 0 obj\n3 ".len();
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    fixture.write_all(&bytes).unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--json-key=qpdf", "--json-object=4"])
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["qpdf"][1]["obj:4 0 R"],
+        serde_json::json!({"value": 3})
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning = format!("(object 4 0, offset {expected_warning_offset}): expected endobj");
+    assert_eq!(stderr.matches(&warning).count(), 1, "{stderr}");
+    assert_eq!(
+        stderr.matches("operation succeeded with warnings").count(),
+        1
+    );
+    assert!(
+        stderr.find(&warning).unwrap() < stderr.find("operation succeeded with warnings").unwrap(),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn json_unselected_qpdf_does_not_resolve_unrelated_empty_object() {
     let mut fixture = tempfile::NamedTempFile::new().unwrap();
     fixture.write_all(&empty_object_json_pdf()).unwrap();
@@ -3096,6 +3133,15 @@ fn empty_object_json_pdf() -> Vec<u8> {
         b"5 0 obj\nnull\nendobj\n",
         b"6 0 obj\nnull\nendobj\n",
         b"7 0 obj\nendobj\n",
+    ])
+}
+
+fn top_level_bare_reference_json_pdf() -> Vec<u8> {
+    build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n",
+        b"3 0 obj\n<< /Answer 42 >>\nendobj\n",
+        b"4 0 obj\n3 0 R\nendobj\n",
     ])
 }
 

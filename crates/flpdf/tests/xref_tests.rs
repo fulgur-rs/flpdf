@@ -1123,6 +1123,82 @@ fn circular_prev_recovers_with_repair_and_rejected_strict() {
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
 }
 
+#[test]
+fn circular_prev_xref_stream_recovers_without_classic_trailer() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let xref_offset = bytes.len() as u64;
+    let entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 0),
+        (1, catalog_offset, 0),
+        (1, xref_offset, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_object(
+        2,
+        3,
+        Some(xref_offset),
+        1,
+        &entries,
+    ));
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    assert!(!bytes.windows(7).any(|window| window == b"trailer"));
+
+    let strict = load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
+        .expect_err("strict mode must reject the circular /Prev");
+    assert!(strict
+        .to_string()
+        .contains("loop detected following xref tables"));
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefOffset::Offset(catalog_offset))
+    );
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(2, 0)),
+        Some(&XrefOffset::Offset(xref_offset))
+    );
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+    let messages: Vec<_> = loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "file is damaged",
+            "loop detected following xref tables",
+            "Attempting to reconstruct cross-reference table"
+        ]
+    );
+}
+
+#[test]
+fn circular_prev_repair_propagates_linear_scan_failure() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 1 /Root 1 0 R /Prev {xref_offset} >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let error = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect_err("repair cannot reconstruct a file without indirect objects");
+    assert!(
+        error
+            .to_string()
+            .contains("unable to recover xref entries by linear scan"),
+        "{error}"
+    );
+}
+
 /// A `/Prev` offset pointing at a malformed (non-circular) location makes
 /// `merge_previous_xref_sections` error. Strict mode propagates that error;
 /// best-effort records it as a diagnostic and falls back to the linear scan.
