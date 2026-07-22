@@ -64,6 +64,75 @@ fn outline_pdf() -> Vec<u8> {
     )
 }
 
+fn page_index_outline_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R /Dests << /same [3 0 R /Fit] >> /Names << /Dests 20 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (5, "<< /Type /Outlines /First 6 0 R /Last 14 0 R >>"),
+            (
+                6,
+                "<< /Title (A) /Dest [3 0 R /Fit] /First 8 0 R /Next 7 0 R >>",
+            ),
+            (
+                7,
+                "<< /Title (B) /Dest /same /First 10 0 R /Next 12 0 R >>",
+            ),
+            (8, "<< /Title (A1) /Dest [3 0 R /Fit] /Next 9 0 R >>"),
+            (9, "<< /Title (A2) /Dest [4 0 R /Fit] >>"),
+            (10, "<< /Title (B1) /Dest (modern) >>"),
+            (12, "<< /Title (No dest) /Next 13 0 R >>"),
+            (
+                13,
+                "<< /Title (Integer dest) /Dest 42 /Next 14 0 R >>",
+            ),
+            (
+                14,
+                "<< /Title (Direct page operand) /Dest [<< /Type /Page >> /Fit] >>",
+            ),
+            (20, "<< /Names [(modern) [3 0 R /Fit]] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn outlines_for_page_uses_qpdf_breadth_first_order() {
+    let mut pdf = Pdf::open(Cursor::new(page_index_outline_pdf())).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+
+    let titles: Vec<_> = tree
+        .outlines_for_page(Some(ObjectRef::new(3, 0)))
+        .map(|(_id, item)| item.title.as_str())
+        .collect();
+
+    assert_eq!(titles, ["A", "B", "A1", "B1"]);
+}
+
+#[test]
+fn outlines_for_page_none_matches_qpdf_objgen_zero_bucket() {
+    let mut pdf = Pdf::open(Cursor::new(page_index_outline_pdf())).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+
+    let titles: Vec<_> = tree
+        .outlines_for_page(None)
+        .map(|(_id, item)| item.title.as_str())
+        .collect();
+
+    assert_eq!(titles, ["No dest", "Integer dest", "Direct page operand"]);
+}
+
 fn no_outline_pdf() -> Vec<u8> {
     build_pdf(
         &[

@@ -6,7 +6,9 @@
 //! ```
 
 use crate::{Object, ObjectRef};
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::Index;
+use std::sync::OnceLock;
 
 /// Stable index of an item within an [`OutlineTree`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -46,6 +48,7 @@ impl OutlineItem {
 pub struct OutlineTree {
     pub(crate) items: Vec<OutlineItem>,
     pub(crate) roots: Vec<OutlineId>,
+    by_page: OnceLock<BTreeMap<Option<ObjectRef>, Vec<OutlineId>>>,
 }
 
 impl OutlineTree {
@@ -53,7 +56,43 @@ impl OutlineTree {
         Self {
             items: Vec::new(),
             roots: Vec::new(),
+            by_page: OnceLock::new(),
         }
+    }
+
+    fn page_key(item: &OutlineItem) -> Option<ObjectRef> {
+        match item.dest_page() {
+            Object::Reference(reference) => Some(reference),
+            _ => None,
+        }
+    }
+
+    fn by_page(&self) -> &BTreeMap<Option<ObjectRef>, Vec<OutlineId>> {
+        self.by_page.get_or_init(|| {
+            let mut index = BTreeMap::<Option<ObjectRef>, Vec<OutlineId>>::new();
+            let mut queue: VecDeque<OutlineId> = self.roots.iter().copied().collect();
+            while let Some(id) = queue.pop_front() {
+                index.entry(Self::page_key(&self[id])).or_default().push(id);
+                queue.extend(self[id].kids.iter().copied());
+            }
+            index
+        })
+    }
+
+    /// Return outlines targeting `page` in qpdf breadth-first order.
+    ///
+    /// `None` represents qpdf's `QPDFObjGen(0, 0)` bucket and therefore also
+    /// contains destinations whose page operand is not an indirect reference.
+    pub fn outlines_for_page(
+        &self,
+        page: Option<ObjectRef>,
+    ) -> impl Iterator<Item = (OutlineId, &OutlineItem)> {
+        self.by_page()
+            .get(&page)
+            .into_iter()
+            .flatten()
+            .copied()
+            .map(|id| (id, &self[id]))
     }
 
     /// Top-level items in raw `/First` then `/Next` order.
