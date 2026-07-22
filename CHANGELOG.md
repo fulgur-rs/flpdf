@@ -232,6 +232,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/fulgur-rs/flpdf/compare/v0.2.1...v0.3.0) - 2026-07-22
+
+### Added
+
+- *(flpdf-7nu4)* index outlines by destination page
+- *(flpdf-x5yi)* support direct outline values
+- *(flpdf-nm2o)* match qpdf outline destinations
+- *(flpdf-nm2o)* add qpdf PDF string decoder
+- *(flpdf-9hc.14.7)* deep outline walker with cycle detection and /Prev/Next diagnostic
+- *(flpdf-9hc.14.8)* merge /PageLabels across all merge_documents inputs
+- *(flpdf-9hc.14.8)* reconstruct /PageLabels in extract_pages
+- *(flpdf-9hc.14.8)* reconstruct /PageLabels per --split-pages chunk
+- *(flpdf-9hc.14.5)* outline /A action coverage (GoTo/GoToR/URI/Launch/Named)
+- *(flpdf-9hc.14.6)* outline /SE structure-element link preservation and pruning
+- *(flpdf-9hc.14.4)* /PageLabels number tree writer with rebalance
+- *(flpdf-9hc.14.2)* read/write /Names /Dests name tree
+- *(flpdf-9hc.14.1)* read/write catalog /Dests with page remap
+
+### Fixed
+
+- *(flpdf-9hc.38.2.1)* preserve qpdf repair state
+- *(flpdf-9hc.38)* preserve qpdf repair state
+- *(flpdf-9hc.38)* preserve incremental trailer refs
+- *(flpdf-9hc.38)* discover trailer dangling refs
+- *(flpdf-9hc.38)* include dangling refs in json metadata
+- *(flpdf-9hc.38)* match dynamic qpdf json metadata
+- *(flpdf-9hc.38)* build selected json sections lazily
+- *(flpdf-9hc.38)* preserve json repair warnings
+- *(flpdf-9hc.38)* match qpdf short name tree handling
+- *(flpdf-9hc.38)* match qpdf name tree begin preflight
+- *(flpdf-9hc.38)* match qpdf name tree search order
+- *(flpdf-9hc.38)* complete malformed name tree repair
+- *(flpdf-9hc.38)* repair malformed outline name trees
+- *(flpdf-9hc.38)* close final outline parity gaps
+- *(flpdf-9hc.38.2)* match qpdf outline JSON v2
+- *(flpdf-7nu4.1)* normalize zero outline page bucket
+- *(flpdf-guru)* match qpdf outline scalar accessors
+- *(flpdf-3g9k)* remove unreachable depth guard
+- *(flpdf-3g9k)* match qpdf outline depth boundary
+- *(flpdf-x5yi)* stop outlines at resolved null
+- *(flpdf-0hrl)* preserve document carrier boundaries
+- *(flpdf-0hrl)* mirror qpdf page-boundary null-out in merges
+- *(flpdf-0hrl)* null copied removed pages during extraction
+- *(flpdf-nm2o)* preserve malformed qpdf destination keys
+- *(flpdf-9hc.14.8)* qualify Self::labels_for_page_range in LabelRange doc
+- *(flpdf-9hc.14.8)* page-label reconstruction bugs + qpdf-shaped write API
+- *(flpdf-9hc.14.5)* resolve indirect /S in resolve_node_dest fallback
+- *(flpdf-9hc.14.5)* borrow action in resolve_node_dest; non-destructive test helper
+- *(flpdf-9hc.14.4)* use checked arithmetic + i64::try_from at usize boundaries
+- *(flpdf-9hc.14.4)* merge redundant neighbor after insert_pages shift too
+- *(flpdf-9hc.14.2)* qualify [ObjectRef] intra-doc link with crate::
+- *(flpdf-9hc.14.2)* put cov:ignore markers on the flagged lines themselves
+
+### Other
+
+- *(flpdf-9hc.38)* cover name tree lookup shapes
+- *(flpdf-9hc.38.1)* remove outline-specific policy
+- *(flpdf-0hrl)* reuse selected page sets
+- *(flpdf-0hrl)* clarify inline destination remap order
+- *(flpdf-0hrl)* address merge null-out review
+- *(flpdf-0hrl)* add generic page-boundary closure root
+- *(flpdf-nm2o)* pin qpdf outline destination oracle
+- *(flpdf-nm2o)* [**breaking**] remove typed outline actions
+- *(flpdf-nm2o)* cover missing destination stores
+- *(flpdf-nm2o)* cover qpdf UTF-16LE decoder
+- *(flpdf-9hc.14.9)* correct rebuild_page_tree preservation scope
+- *(flpdf-9hc.14.9)* scope outline/dest preservation claim per operation
+- *(flpdf-9hc.14.9)* tighten fixture edge cases per iter-5 findings
+- *(flpdf-9hc.14.9)* tighten test-helper doc comments per iter-4 findings
+- *(flpdf-9hc.14.9)* drop unnecessary clones per iter-2 findings
+- *(flpdf-9hc.14.9)* partially DRY test helpers per iter-1 findings
+- *(flpdf-9hc.14.9)* outline + page-label round-trip and page-op e2e suite
+- *(flpdf-9hc.14.7)* remove Drop on OutlineNode; cap walk depth at 5K
+- *(flpdf-9hc.14.7)* explain why n.title/n.action need clone in tests
+- *(flpdf-9hc.14.7)* cover non-dict-item branches in the new iterative walkers
+- *(flpdf-9hc.14.8)* cov:ignore panic guards in to_dict prefix tests
+- *(flpdf-9hc.14.8)* fix empty-primary label pollution + UTF-16BE prefix
+- *(flpdf-9hc.14.8)* eliminate redundant /PageLabels tree parses (4 HIGH)
+- *(flpdf-9hc.14.8)* apply iteration-4 defensive-check findings
+- *(flpdf-9hc.14.8)* apply iteration-3 comment findings
+- *(flpdf-9hc.14.8)* apply iteration-2 comment findings
+- *(flpdf-9hc.14.8)* refine iteration-1 findings
+- *(flpdf-9hc.14.8)* fix private-intra-doc-link warning
+- *(flpdf-9hc.14.8)* mark defensive test-shape-guard panics cov:ignore
+- *(flpdf-9hc.14.5)* 7 codex round-2 fixes on /A action typing
+- *(flpdf-9hc.14.5)* apply iteration-5 comment refinements
+- *(flpdf-9hc.14.5)* comment intent for borrow-then-move and stack-owned resolve
+- *(flpdf-9hc.14.5)* apply roborev iteration-2 LOW findings
+- *(flpdf-9hc.14.6)* read-then-write in walk_outline_se (medium)
+- *(flpdf-9hc.14.6)* assert /SE round-trip target still resolves
+- *(flpdf-9hc.14.6)* cover non-dictionary outline item in /SE prune walk
+- *(flpdf-9hc.14.4)* insert_pages preserves surviving labels; remove_pages doc
+- *(flpdf-9hc.14.4)* preserve default decimal labels in remove_pages fallback
+- *(flpdf-9hc.14.4)* cover remove_pages fabricated-None and trailing-shift paths
+- *(flpdf-9hc.14.4)* O(N) remove_pages + write_labels key dedup
+- *(flpdf-9hc.14.4)* cover overflow branches from checked-arithmetic fix
+- *(flpdf-9hc.14.2)* normalise name-tree dest page refs through holder
+- *(flpdf-9hc.14.2)* cover check_name_tree_dests in-loop continue
+- *(flpdf-9hc.14.2)* mirror check_legacy_dests short-circuit in check_name_tree_dests
+- *(flpdf-9hc.14.2)* cover non-dict /Names fallback in name_tree_dests
+- *(flpdf-9hc.14.2)* reader follows multi-hop /Names + unstable sort
+- *(flpdf-9hc.14.2)* close patch-coverage gaps in the /Names /Dests writer
+- *(flpdf-9hc.14.1)* resolve alias through chained /Dests dict
+- *(flpdf-9hc.14.1)* document /Kids bare-ref holder chain limitation
+- *(flpdf-9hc.14.1)* cover non-dict /Dests + holder-chain depth cap
+- *(flpdf-9hc.14.1)* follow /Dests + page-ref holder chains
+- *(flpdf-9hc.14.1)* cover in-loop continue when only some /Dests lack a page ref
+- *(flpdf-9hc.14.1)* short-circuit check_legacy_dests when nothing to validate
+- *(flpdf-9hc.14.1)* cover check_legacy_dests early-return branches
+
 ## [0.2.1](https://github.com/fulgur-rs/flpdf/compare/v0.2.0...v0.2.1) - 2026-07-19
 
 ### Added
