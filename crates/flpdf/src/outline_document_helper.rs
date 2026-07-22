@@ -533,6 +533,12 @@ enum NameTreeBinarySearch {
     Structural(NameTreeStructuralError),
 }
 
+enum NameTreeFirstBoundary {
+    Empty,
+    Invalid,
+    Key(Vec<u8>),
+}
+
 /// Find one key in a name tree using qpdf's `/Names`-or-`/Kids` descent.
 ///
 /// Unlike the generic public tree walker, outline destination lookup has no
@@ -542,13 +548,22 @@ fn find_name_tree_value<R: Read + Seek>(
     mut cursor: Object,
     lookup: &[u8],
 ) -> Result<NameTreeLookup> {
+    let (updated_root, first_boundary) = name_tree_begin_preflight(pdf, cursor)?;
+    cursor = updated_root;
+    match first_boundary {
+        NameTreeFirstBoundary::Empty => return Ok(NameTreeLookup::Missing),
+        NameTreeFirstBoundary::Key(first) if lookup < first.as_slice() => {
+            return Ok(NameTreeLookup::Missing);
+        }
+        NameTreeFirstBoundary::Invalid | NameTreeFirstBoundary::Key(_) => {}
+    }
+
     let root_ref = cursor.as_ref_id();
     let mut seen = BTreeSet::new();
-    let mut at_root = true;
     loop {
         let (node, identity) = name_tree_node(pdf, cursor)?;
         let Some(mut node) = node else {
-            return Ok(NameTreeLookup::Missing);
+            return Ok(NameTreeLookup::Missing); // cov:ignore: begin preflight and kid comparison reject non-dictionary targeted cursors
         };
         if let Some(identity) = identity {
             if !seen.insert(identity) {
@@ -556,26 +571,6 @@ fn find_name_tree_value<R: Read + Seek>(
                     node_ref: Some(identity),
                     message: "loop detected in find".to_string(),
                 }));
-            }
-        }
-
-        if at_root {
-            let item_count = match node.get("Names") {
-                Some(Object::Array(names)) => names.len(),
-                _ => 0,
-            };
-            let kid_count = match node.get("Kids") {
-                Some(Object::Array(kids)) => kids.len(),
-                _ => 0,
-            };
-            if item_count == 0 && kid_count == 0 {
-                if !matches!(node.get("Names"), Some(Object::Array(_))) {
-                    pdf.push_warning(name_tree_iterator_warning(
-                        identity,
-                        "name/number tree node has neither non-empty /Names nor /Kids",
-                    ));
-                }
-                return Ok(NameTreeLookup::Missing);
             }
         }
 
@@ -601,12 +596,113 @@ fn find_name_tree_value<R: Read + Seek>(
         match select_name_tree_kid(pdf, &kids, lookup, root_ref, identity)? {
             NameTreeKidSelection::Found(next) => {
                 cursor = next;
-                at_root = false;
             }
             NameTreeKidSelection::Structural(error) => {
                 return Ok(NameTreeLookup::Structural(error));
             }
         }
+    }
+}
+
+/// Reproduce qpdf's `begin()` preflight in `NNTreeImpl::findInternal`.
+///
+/// qpdf 11.9.0 assigns `last_item = end()`, so only the first boundary is
+/// effective. While descending to it, auto-repair converts every direct kid
+/// to a fresh indirect object and replaces the actual parent array slot.
+fn name_tree_begin_preflight<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    root: Object,
+) -> Result<(Object, NameTreeFirstBoundary)> {
+    let mut updated_root = root.clone();
+    let mut cursor = root;
+    let mut seen = BTreeSet::new();
+    let mut last_object_number = pdf
+        .object_refs()
+        .iter()
+        .map(|object_ref| object_ref.number)
+        .max()
+        .unwrap_or(0);
+
+    loop {
+        let (node, identity) = name_tree_node(pdf, cursor)?;
+        let Some(mut node) = node else {
+            pdf.push_warning(name_tree_iterator_warning(
+                identity,
+                "non-dictionary node while traversing name/number tree",
+            ));
+            return Ok((updated_root, NameTreeFirstBoundary::Empty));
+        };
+        if let Some(identity) = identity {
+            if !seen.insert(identity) {
+                pdf.push_warning(name_tree_iterator_warning(
+                    Some(identity),
+                    "loop detected while traversing name/number tree",
+                ));
+                return Ok((updated_root, NameTreeFirstBoundary::Empty));
+            }
+        }
+
+        let mut has_empty_names = false;
+        if let Some(Object::Array(names)) = node.get("Names") {
+            if !names.is_empty() {
+                let boundary = match names.first() {
+                    Some(Object::String(key)) => {
+                        NameTreeFirstBoundary::Key(crate::json_inspect::qpdf_utf8_value(key))
+                    }
+                    _ => NameTreeFirstBoundary::Invalid,
+                };
+                return Ok((updated_root, boundary));
+            }
+            has_empty_names = true;
+        }
+
+        let Some(Object::Array(mut kids)) = node.remove("Kids") else {
+            if has_empty_names {
+                return Ok((updated_root, NameTreeFirstBoundary::Empty));
+            }
+            pdf.push_warning(name_tree_iterator_warning(
+                identity,
+                "name/number tree node has neither non-empty /Names nor /Kids",
+            ));
+            return Ok((updated_root, NameTreeFirstBoundary::Empty));
+        };
+        if kids.is_empty() {
+            if has_empty_names {
+                return Ok((updated_root, NameTreeFirstBoundary::Empty));
+            }
+            pdf.push_warning(name_tree_iterator_warning(
+                identity,
+                "name/number tree node has neither non-empty /Names nor /Kids",
+            ));
+            return Ok((updated_root, NameTreeFirstBoundary::Empty));
+        }
+
+        let next = kids[0].clone();
+        let next = if !matches!(next, Object::Reference(_)) {
+            pdf.push_warning(name_tree_iterator_warning(
+                identity,
+                "converting kid number 0 to an indirect object",
+            ));
+            last_object_number = last_object_number
+                .checked_add(1)
+                .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+            let next_ref = ObjectRef::new(last_object_number, 0);
+            pdf.set_object(next_ref, next);
+            let next = Object::Reference(next_ref);
+            kids[0] = next.clone();
+            node.insert("Kids", Object::Array(kids));
+
+            if let Some(identity) = identity {
+                pdf.set_object(identity, Object::Dictionary(node));
+            } else {
+                replace_direct_dests_root(pdf, node.clone())?;
+                updated_root = Object::Dictionary(node);
+            }
+            next
+        } else {
+            next
+        };
+        cursor = next;
     }
 }
 

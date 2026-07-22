@@ -1100,6 +1100,10 @@ fn cyclic_modern_name_tree_lookup_terminates_without_a_destination() {
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
     let tree = pdf.outline().get_tree().unwrap();
     assert_eq!(tree[tree.roots()[0]].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        ["Name/Number tree node (object 9): loop detected while traversing name/number tree"]
+    );
 }
 
 #[test]
@@ -1408,6 +1412,30 @@ fn qpdf_binary_search_finds_last_leaf_pair_before_visiting_an_invalid_middle_key
 }
 
 #[test]
+fn name_tree_begin_lower_bound_skips_an_invalid_middle_leaf_key() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Names [(m) [3 0 R /Fit] 42 [3 0 R /Fit] (z) [3 0 R /Fit]] >> >>",
+        "/Dest (a)",
+        &[],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert!(warning_messages(&pdf).is_empty());
+    assert_eq!(
+        direct_dests_root(&mut pdf).get("Names"),
+        Some(&Object::Array(vec![
+            Object::String(b"m".to_vec()),
+            page_dest(3),
+            Object::Integer(42),
+            page_dest(3),
+            Object::String(b"z".to_vec()),
+            page_dest(3),
+        ]))
+    );
+}
+
+#[test]
 fn qpdf_binary_search_finds_last_kid_before_visiting_an_invalid_middle_kid() {
     let bytes = single_outline_with_catalog(
         "/Names << /Dests << /Kids [8 0 R 42 9 0 R] >> >>",
@@ -1437,6 +1465,482 @@ fn qpdf_binary_search_finds_last_kid_before_visiting_an_invalid_middle_kid() {
 }
 
 #[test]
+fn name_tree_begin_lower_bound_converts_the_direct_first_path_before_skipping_search() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [<< /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >>] >> 42 9 0 R] >> >>",
+        "/Dest (a)",
+        &[(
+            9,
+            "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>",
+        )],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        [
+            "converting kid number 0 to an indirect object",
+            "Name/Number tree node (object 10): converting kid number 0 to an indirect object",
+        ]
+    );
+
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(
+        dests.get("Kids"),
+        Some(&Object::Array(vec![
+            Object::Reference(ObjectRef::new(10, 0)),
+            Object::Integer(42),
+            Object::Reference(ObjectRef::new(9, 0)),
+        ]))
+    );
+    let Object::Dictionary(first_parent) = pdf.resolve(ObjectRef::new(10, 0)).unwrap() else {
+        panic!("converted first parent must be a dictionary");
+    };
+    assert_eq!(
+        first_parent.get("Kids"),
+        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+            11, 0,
+        ))]))
+    );
+    let Object::Dictionary(first_leaf) = pdf.resolve(ObjectRef::new(11, 0)).unwrap() else {
+        panic!("converted first leaf must be a dictionary");
+    };
+    assert_eq!(
+        first_leaf.get("Names"),
+        Some(&Object::Array(vec![
+            Object::String(b"m".to_vec()),
+            page_dest(3),
+        ]))
+    );
+
+    let mut serialized = Vec::new();
+    write_pdf(&mut pdf, &mut serialized).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(serialized)).unwrap();
+    let dests = direct_dests_root(&mut reopened);
+    assert!(matches!(
+        dests.get("Kids"),
+        Some(Object::Array(kids)) if kids.first() == Some(&Object::Reference(ObjectRef::new(10, 0)))
+    ));
+    let Object::Dictionary(first_parent) = reopened.resolve(ObjectRef::new(10, 0)).unwrap() else {
+        panic!("reopened first parent must be a dictionary");
+    };
+    assert_eq!(
+        first_parent.get("Kids"),
+        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+            11, 0,
+        ))]))
+    );
+}
+
+#[test]
+fn name_tree_begin_converts_a_direct_first_kid_under_an_indirect_root() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests 8 0 R >>",
+        "/Dest (a)",
+        &[(
+            8,
+            "<< /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >>] >>",
+        )],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        ["Name/Number tree node (object 8): converting kid number 0 to an indirect object"]
+    );
+    let Object::Dictionary(root) = pdf.resolve(ObjectRef::new(8, 0)).unwrap() else {
+        panic!("indirect destination root must remain a dictionary");
+    };
+    assert_eq!(
+        root.get("Kids"),
+        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+            9, 0,
+        ))]))
+    );
+    assert!(matches!(
+        pdf.resolve(ObjectRef::new(9, 0)).unwrap(),
+        Object::Dictionary(_)
+    ));
+
+    let mut serialized = Vec::new();
+    write_pdf(&mut pdf, &mut serialized).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(serialized)).unwrap();
+    let Object::Dictionary(root) = reopened.resolve(ObjectRef::new(8, 0)).unwrap() else {
+        panic!("reopened indirect destination root must remain a dictionary");
+    };
+    assert_eq!(
+        root.get("Kids"),
+        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+            9, 0,
+        ))]))
+    );
+}
+
+#[test]
+fn name_tree_begin_updates_a_direct_root_inside_an_indirect_names_holder() {
+    let bytes = single_outline_with_catalog(
+        "/Names 8 0 R",
+        "/Dest (a)",
+        &[(
+            8,
+            "<< /Dests << /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >>] >> >>",
+        )],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        ["converting kid number 0 to an indirect object"]
+    );
+    let Object::Dictionary(names) = pdf.resolve(ObjectRef::new(8, 0)).unwrap() else {
+        panic!("indirect /Names holder must remain a dictionary");
+    };
+    let Some(Object::Dictionary(root)) = names.get("Dests") else {
+        panic!("destination root must remain direct");
+    };
+    assert_eq!(
+        root.get("Kids"),
+        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+            9, 0,
+        ))]))
+    );
+
+    let mut serialized = Vec::new();
+    write_pdf(&mut pdf, &mut serialized).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(serialized)).unwrap();
+    let Object::Dictionary(names) = reopened.resolve(ObjectRef::new(8, 0)).unwrap() else {
+        panic!("reopened indirect /Names holder must remain a dictionary");
+    };
+    let Some(Object::Dictionary(root)) = names.get("Dests") else {
+        panic!("reopened destination root must remain direct");
+    };
+    assert_eq!(
+        root.get("Kids"),
+        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+            9, 0,
+        ))]))
+    );
+}
+
+#[test]
+fn invalid_first_name_tree_key_does_not_enable_the_lower_bound_shortcut() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Names [42 [3 0 R /Fit] (m) [3 0 R /Fit] (z) [3 0 R /Fit]] >> >>",
+        "/Dest (a)",
+        &[],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        [
+            "attempting to repair after error: Name/Number tree node: item at index 0 is not the right type",
+            "item 0 has the wrong type",
+        ]
+    );
+    assert_eq!(
+        direct_dests_root(&mut pdf).get("Names"),
+        Some(&Object::Array(vec![
+            Object::String(b"m".to_vec()),
+            page_dest(3),
+            Object::String(b"z".to_vec()),
+            page_dest(3),
+        ]))
+    );
+}
+
+#[test]
+fn after_last_lookup_runs_targeted_search_without_a_last_descent() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >> 42 << /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>] >> >>",
+        "/Dest (zz)",
+        &[],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        ["converting kid number 0 to an indirect object"]
+    );
+    let dests = direct_dests_root(&mut pdf);
+    let Some(Object::Array(kids)) = dests.get("Kids") else {
+        panic!("destination root must retain /Kids");
+    };
+    assert_eq!(kids[0], Object::Reference(ObjectRef::new(6, 0)));
+    assert_eq!(kids[1], Object::Integer(42));
+    assert!(matches!(kids[2], Object::Dictionary(_)));
+}
+
+#[test]
+fn name_tree_begin_indirects_a_direct_scalar_before_reporting_it_as_non_dictionary() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [42 8 0 R] >> >>",
+        "/Dest (target)",
+        &[(
+            8,
+            "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+        )],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        [
+            "converting kid number 0 to an indirect object",
+            "Name/Number tree node (object 9): non-dictionary node while traversing name/number tree",
+        ]
+    );
+    assert_eq!(
+        direct_dests_root(&mut pdf).get("Kids"),
+        Some(&Object::Array(vec![
+            Object::Reference(ObjectRef::new(9, 0)),
+            Object::Reference(ObjectRef::new(8, 0)),
+        ]))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(9, 0)).unwrap(),
+        Object::Integer(42)
+    );
+}
+
+#[test]
+fn name_tree_begin_reports_an_indirect_scalar_without_repairing_the_tree() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [8 0 R 9 0 R] >> >>",
+        "/Dest (target)",
+        &[
+            (8, "42"),
+            (
+                9,
+                "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+            ),
+        ],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        ["Name/Number tree node (object 8): non-dictionary node while traversing name/number tree"]
+    );
+    assert_eq!(
+        direct_dests_root(&mut pdf).get("Kids"),
+        Some(&Object::Array(vec![
+            Object::Reference(ObjectRef::new(8, 0)),
+            Object::Reference(ObjectRef::new(9, 0)),
+        ]))
+    );
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 begin/deepen full-object oracle"]
+fn qpdf_name_tree_begin_lower_bound_and_direct_kid_full_object_oracle() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let cases = [
+        (
+            "deep direct first path",
+            "/Names << /Dests << /Kids [<< /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >>] >> 42 9 0 R] >> >>",
+            &[(
+                9,
+                "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>",
+            )][..],
+            "/Dest (a)",
+            Some(3),
+            &[
+                "converting kid number 0 to an indirect object",
+                "Name/Number tree node (object 10)",
+                "converting kid number 0 to an indirect object",
+            ][..],
+        ),
+        (
+            "after last",
+            "/Names << /Dests << /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >> 42 << /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>] >> >>",
+            &[][..],
+            "/Dest (zz)",
+            Some(3),
+            &["converting kid number 0 to an indirect object"][..],
+        ),
+        (
+            "indirect root",
+            "/Names << /Dests 8 0 R >>",
+            &[(
+                8,
+                "<< /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >>] >>",
+            )][..],
+            "/Dest (a)",
+            Some(3),
+            &["Name/Number tree node (object 8)", "converting kid number 0"][..],
+        ),
+        (
+            "direct scalar",
+            "/Names << /Dests << /Kids [42 8 0 R] >> >>",
+            &[(
+                8,
+                "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+            )][..],
+            "/Dest (target)",
+            Some(3),
+            &[
+                "converting kid number 0 to an indirect object",
+                "Name/Number tree node (object 9)",
+                "non-dictionary node while traversing name/number tree",
+            ][..],
+        ),
+        (
+            "indirect scalar",
+            "/Names << /Dests << /Kids [8 0 R 9 0 R] >> >>",
+            &[
+                (8, "42"),
+                (
+                    9,
+                    "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+                ),
+            ][..],
+            "/Dest (target)",
+            Some(3),
+            &[
+                "Name/Number tree node (object 8)",
+                "non-dictionary node while traversing name/number tree",
+            ][..],
+        ),
+        (
+            "leaf lower bound",
+            "/Names << /Dests << /Names [(m) [3 0 R /Fit] 42 [3 0 R /Fit] (z) [3 0 R /Fit]] >> >>",
+            &[][..],
+            "/Dest (a)",
+            Some(0),
+            &[][..],
+        ),
+        (
+            "indirect names holder",
+            "/Names 8 0 R",
+            &[(
+                8,
+                "<< /Dests << /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >>] >> >>",
+            )][..],
+            "/Dest (a)",
+            Some(3),
+            &["converting kid number 0 to an indirect object"][..],
+        ),
+        (
+            "first path cycle",
+            "/Names << /Dests << /Kids [8 0 R] >> >>",
+            &[(8, "<< /Limits [(m) (m)] /Kids [8 0 R] >>")][..],
+            "/Dest (m)",
+            Some(3),
+            &[
+                "Name/Number tree node (object 8)",
+                "loop detected while traversing name/number tree",
+            ][..],
+        ),
+    ];
+
+    for (label, catalog_entries, extra, item_entries, expected_status, ordered_warnings) in cases {
+        let mut input = tempfile::NamedTempFile::new().unwrap();
+        input
+            .write_all(&single_outline_with_catalog(
+                catalog_entries,
+                item_entries,
+                extra,
+            ))
+            .unwrap();
+        let output = Command::new("qpdf")
+            .args(["--json=2", "--json-key=outlines", "--json-key=qpdf"])
+            .arg(input.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            expected_status,
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut warning_offset = 0;
+        for warning in ordered_warnings {
+            let relative = stderr[warning_offset..]
+                .find(warning)
+                .unwrap_or_else(|| panic!("{label}: missing {warning:?} in {stderr}"));
+            warning_offset += relative + warning.len();
+        }
+
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let objects = json["qpdf"][1].as_object().unwrap();
+        match label {
+            "deep direct first path" => {
+                let kids = json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"]["/Kids"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(kids[0], "10 0 R");
+                assert_eq!(kids[1], 42);
+                assert_eq!(kids[2], "9 0 R");
+                assert_eq!(objects["obj:10 0 R"]["value"]["/Kids"][0], "11 0 R");
+                assert_eq!(
+                    objects["obj:11 0 R"]["value"]["/Names"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    2
+                );
+            }
+            "after last" => {
+                let kids = json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"]["/Kids"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(kids[0], "6 0 R");
+                assert_eq!(kids[1], 42);
+                assert!(kids[2].is_object(), "last direct kid must remain direct");
+                assert!(objects.get("obj:7 0 R").is_none());
+            }
+            "indirect root" => {
+                assert_eq!(objects["obj:8 0 R"]["value"]["/Kids"][0], "9 0 R");
+                assert!(objects["obj:9 0 R"]["value"].is_object());
+            }
+            "direct scalar" => {
+                let kids = json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"]["/Kids"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(kids[0], "9 0 R");
+                assert_eq!(kids[1], "8 0 R");
+                assert_eq!(objects["obj:9 0 R"]["value"], 42);
+            }
+            "indirect scalar" => {
+                let kids = json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"]["/Kids"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(kids[0], "8 0 R");
+                assert_eq!(kids[1], "9 0 R");
+                assert!(objects.get("obj:10 0 R").is_none());
+            }
+            "leaf lower bound" => {
+                let names = json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"]["/Names"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(names.len(), 6);
+                assert!(objects.get("obj:6 0 R").is_none());
+            }
+            "indirect names holder" => {
+                assert_eq!(objects["obj:8 0 R"]["value"]["/Dests"]["/Kids"][0], "9 0 R");
+                assert!(objects["obj:9 0 R"]["value"].is_object());
+            }
+            "first path cycle" => {
+                assert_eq!(objects["obj:8 0 R"]["value"]["/Kids"][0], "8 0 R");
+                assert!(objects.get("obj:9 0 R").is_none());
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
 fn empty_root_name_tree_warns_as_traversal_missing_without_repair_or_mutation() {
     let bytes = single_outline_with_catalog("/Names << /Dests << >> >>", "/Dest (shape)", &[]);
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
@@ -1449,6 +1953,22 @@ fn empty_root_name_tree_warns_as_traversal_missing_without_repair_or_mutation() 
     let dests = direct_dests_root(&mut pdf);
     assert_eq!(dests.get("Names"), None);
     assert_eq!(dests.get("Kids"), None);
+}
+
+#[test]
+fn empty_names_and_empty_kids_root_is_allowed_without_warning_or_mutation() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Names [] /Kids [] >> >>",
+        "/Dest (shape)",
+        &[],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert!(warning_messages(&pdf).is_empty());
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(dests.get("Names"), Some(&Object::Array(Vec::new())));
+    assert_eq!(dests.get("Kids"), Some(&Object::Array(Vec::new())));
 }
 
 #[test]
@@ -1645,16 +2165,19 @@ fn malformed_name_tree_invalid_kid_is_skipped_while_valid_entries_are_retained()
 
 #[test]
 fn malformed_name_tree_zero_entry_repair_still_installs_an_empty_names_array() {
-    let bytes =
-        single_outline_with_catalog("/Names << /Dests << /Kids [42] >> >>", "/Dest (shape)", &[]);
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Names [42 [3 0 R /Fit]] >> >>",
+        "/Dest (shape)",
+        &[],
+    );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
     assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
     assert_eq!(
         warning_messages(&pdf),
         [
-            "attempting to repair after error: Name/Number tree node: invalid kid at index 0",
-            "skipping over invalid kid at index 0",
+            "attempting to repair after error: Name/Number tree node: item at index 0 is not the right type",
+            "item 0 has the wrong type",
         ]
     );
     let dests = direct_dests_root(&mut pdf);
@@ -1898,13 +2421,14 @@ fn missing_name_tree_limits_repairs_the_terminal_indirect_root_without_collapsin
 #[test]
 fn malformed_name_tree_repair_enumerates_all_reachable_branches_and_terminates_cycles() {
     let bytes = single_outline_with_catalog(
-        "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R 11 0 R] >> >>",
+        "/Names << /Dests << /Kids [12 0 R 8 0 R 9 0 R 10 0 R 11 0 R] >> >>",
         "/Dest (target)",
         &[
             (8, "42"),
-            (9, "<< /Limits [(a) (a)] /Kids [9 0 R] >>"),
+            (9, "<< /Limits [(m) (m)] /Kids [9 0 R] >>"),
             (10, "<< /Names [(target) [3 0 R /Fit]] >>"),
             (11, "<< /Limits [(z) (z)] /Names [42 [3 0 R /Fit]] >>"),
+            (12, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
         ],
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
@@ -1914,7 +2438,7 @@ fn malformed_name_tree_repair_enumerates_all_reachable_branches_and_terminates_c
         warning_messages(&pdf),
         vec![
             "attempting to repair after error: Name/Number tree node (object 10): node is missing /Limits",
-            "skipping over invalid kid at index 0",
+            "skipping over invalid kid at index 1",
             "loop detected while traversing name/number tree",
             "item 0 has the wrong type",
         ]
