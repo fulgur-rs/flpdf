@@ -1430,6 +1430,109 @@ fn live_qpdf_dangling_generation_free_json_matches() {
 }
 
 #[test]
+fn json_qpdf_preparation_discovers_trailer_only_dangling_generations() {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    fixture.write_all(&trailer_dangling_json_pdf()).unwrap();
+    let cases: [(&str, &[&str]); 4] = [
+        (
+            "trailer",
+            &["--json=2", "--json-key=qpdf", "--json-object=trailer"],
+        ),
+        (
+            "object99",
+            &["--json=2", "--json-key=qpdf", "--json-object=99"],
+        ),
+        (
+            "generation",
+            &["--json=2", "--json-key=qpdf", "--json-object=88,4"],
+        ),
+        ("all", &["--json=2", "--json-key=qpdf"]),
+    ];
+
+    for (label, args) in cases {
+        let output = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(args)
+            .arg(fixture.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{label}");
+        assert!(output.stderr.is_empty(), "{label}");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json_qpdf_metadata(&json)["maxobjectid"], 99, "{label}");
+        let map = json["qpdf"][1].as_object().unwrap();
+        match label {
+            "trailer" => assert_eq!(
+                map.keys().map(String::as_str).collect::<Vec<_>>(),
+                vec!["trailer"]
+            ),
+            "object99" => assert_eq!(
+                map,
+                &serde_json::Map::from_iter([(
+                    "obj:99 0 R".to_string(),
+                    serde_json::json!({"value": null}),
+                )])
+            ),
+            "generation" => assert_eq!(
+                map,
+                &serde_json::Map::from_iter([(
+                    "obj:88 4 R".to_string(),
+                    serde_json::json!({"value": null}),
+                )])
+            ),
+            "all" => {
+                assert_eq!(map["obj:99 0 R"], serde_json::json!({"value": null}));
+                assert_eq!(map["obj:88 4 R"], serde_json::json!({"value": null}));
+                assert!(map.get("obj:0 0 R").is_none());
+                assert!(map.get("obj:77 65535 R").is_none());
+                assert!(map.get("obj:200 7 R").is_none());
+            }
+            _ => unreachable!(),
+        }
+        if let Some(trailer) = map.get("trailer") {
+            let value = trailer["value"].as_object().unwrap();
+            assert_eq!(value["/Root"], "1 0 R");
+            assert_eq!(value["/Size"], 201);
+            for omitted in ["/Info", "/Gen", "/Zero", "/BadGen"] {
+                assert!(value.get(omitted).is_none(), "{label}: {omitted}");
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 trailer-only dangling JSON oracle"]
+fn live_qpdf_trailer_only_dangling_json_matches() {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    fixture.write_all(&trailer_dangling_json_pdf()).unwrap();
+    let cases: [&[&str]; 4] = [
+        &["--json=2", "--json-key=qpdf", "--json-object=trailer"],
+        &["--json=2", "--json-key=qpdf", "--json-object=99"],
+        &["--json=2", "--json-key=qpdf", "--json-object=88,4"],
+        &["--json=2", "--json-key=qpdf"],
+    ];
+
+    for args in cases {
+        let qpdf = std::process::Command::new("qpdf")
+            .args(args)
+            .arg(fixture.path())
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(args)
+            .arg(fixture.path())
+            .output()
+            .unwrap();
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "{args:?}");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "{args:?}");
+        let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout).unwrap();
+        let flpdf_json: serde_json::Value = serde_json::from_slice(&flpdf.stdout).unwrap();
+        assert_eq!(flpdf_json["qpdf"], qpdf_json["qpdf"], "{args:?}");
+    }
+}
+
+#[test]
 #[ignore = "live qpdf 11.9.0 empty-object diagnostic oracle"]
 fn live_qpdf_empty_object_json_matches() {
     let mut fixture = tempfile::NamedTempFile::new().unwrap();
@@ -2569,6 +2672,40 @@ fn dangling_generation_free_json_pdf() -> Vec<u8> {
     bytes.extend_from_slice(b"200 1\n0000000000 00007 f \n");
     bytes.extend_from_slice(
         format!("trailer\n<< /Size 201 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
+fn trailer_dangling_json_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let objects: [(u32, u16, &[u8]); 3] = [
+        (1, 0, b"<< /Type /Catalog /Pages 2 0 R >>"),
+        (2, 0, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            0,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>",
+        ),
+    ];
+    let mut offsets = Vec::new();
+    for (number, generation, body) in objects {
+        offsets.push((number, generation, bytes.len()));
+        bytes.extend_from_slice(format!("{number} {generation} obj\n").as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    for (number, generation, offset) in offsets {
+        bytes
+            .extend_from_slice(format!("{number} 1\n{offset:010} {generation:05} n \n").as_bytes());
+    }
+    bytes.extend_from_slice(b"200 1\n0000000000 00007 f \n");
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 201 /Root 1 0 R /Info 99 0 R /Gen 88 4 R /Zero 0 0 R /BadGen 77 65535 R >>\nstartxref\n{xref}\n%%EOF\n"
+        )
+        .as_bytes(),
     );
     bytes
 }

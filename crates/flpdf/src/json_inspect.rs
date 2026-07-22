@@ -4436,6 +4436,22 @@ mod tests {
         free_entries: &[(u32, u16)],
         size: u32,
     ) -> Vec<u8> {
+        build_qpdf_dangling_xref_pdf_with_trailer(
+            catalog_extra,
+            "",
+            extra_objects,
+            free_entries,
+            size,
+        )
+    }
+
+    fn build_qpdf_dangling_xref_pdf_with_trailer(
+        catalog_extra: &str,
+        trailer_extra: &str,
+        extra_objects: &[(u32, u16, &str)],
+        free_entries: &[(u32, u16)],
+        size: u32,
+    ) -> Vec<u8> {
         let mut bytes = b"%PDF-1.7\n".to_vec();
         let mut entries = vec![
             (
@@ -4482,8 +4498,10 @@ mod tests {
             );
         }
         bytes.extend_from_slice(
-            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
-                .as_bytes(),
+            format!(
+                "trailer\n<< /Size {size} /Root 1 0 R {trailer_extra} >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
         );
         bytes
     }
@@ -4558,6 +4576,36 @@ mod tests {
         assert!(pdf
             .live_object_refs()
             .contains(&crate::ObjectRef::new(8, 1)));
+    }
+
+    #[test]
+    fn qpdf_dangling_preparation_includes_valid_trailer_only_generations() {
+        let bytes = build_qpdf_dangling_xref_pdf_with_trailer(
+            "",
+            "/Info 99 0 R /Gen 88 4 R /Zero 0 0 R /BadGen 77 65535 R",
+            &[],
+            &[(200, 7)],
+            201,
+        );
+        let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("open trailer-only fixture");
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        for dangling in [crate::ObjectRef::new(99, 0), crate::ObjectRef::new(88, 4)] {
+            assert!(prepared.refs.contains(&dangling), "{dangling:?}");
+            assert!(!pdf.object_refs().contains(&dangling), "{dangling:?}");
+            assert!(!pdf.live_object_refs().contains(&dangling), "{dangling:?}");
+        }
+        assert_eq!(prepared.max_object_id, 99);
+        assert!(!prepared.refs.contains(&crate::ObjectRef::new(0, 0)));
+        assert!(!prepared.refs.contains(&crate::ObjectRef::new(77, u16::MAX)));
+        assert!(!prepared
+            .refs
+            .iter()
+            .any(|reference| reference.number == 200));
+        assert!(pdf.object_refs().contains(&crate::ObjectRef::new(200, 7)));
     }
 
     fn selected_qpdf_object_map(json: &JsonValue) -> &[(String, JsonValue)] {

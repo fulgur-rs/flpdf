@@ -998,6 +998,7 @@ impl<R: Read + Seek> Pdf<R> {
     pub(crate) fn prepare_qpdf_json_objects(&mut self) -> Result<QpdfPreparedObjects> {
         let live_snapshot = self.live_object_refs();
         let mut discovered = BTreeSet::new();
+        collect_qpdf_object_references(&Object::Dictionary(self.trailer.clone()), &mut discovered);
 
         for object_ref in live_snapshot {
             let object = self.resolve_qpdf_json_object(object_ref)?;
