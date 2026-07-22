@@ -1103,6 +1103,242 @@ fn json_successful_name_tree_repair_emits_warning_summary_and_exits_three() {
 }
 
 #[test]
+fn json_key_qpdf_skips_unselected_outline_repair() {
+    let fixture = fixture_with_repaired_name_tree_and_stream();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let assert = cmd
+        .args(["--json=2", "--json-key=qpdf"])
+        .arg(fixture.path())
+        .assert()
+        .code(0);
+    let output = assert.get_output();
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json.get("outlines").is_none());
+    let dests = &json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"];
+    assert_eq!(dests["/Kids"][0], "8 0 R");
+    assert!(dests.get("/Names").is_none());
+}
+
+#[test]
+fn json_key_outlines_and_qpdf_repairs_before_raw_object_projection() {
+    let fixture = fixture_with_repaired_name_tree_and_stream();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let assert = cmd
+        .args(["--json=2", "--json-key=outlines", "--json-key=qpdf"])
+        .arg(fixture.path())
+        .assert()
+        .code(3);
+    let output = assert.get_output();
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["outlines"][0]["dest"][0], "3 0 R");
+    let dests = &json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"];
+    assert_eq!(dests["/Names"][0], "u:shape");
+    assert_eq!(dests["/Names"][1][0], "3 0 R");
+    assert!(dests.get("/Kids").is_none());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("attempting to repair after error:").count(),
+        1
+    );
+    assert_eq!(
+        stderr
+            .matches("flpdf: operation succeeded with warnings")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn json_key_selection_order_is_qpdf_fixed() {
+    let fixture = fixture_with_repaired_name_tree_and_stream();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let assert = cmd
+        .args(["--json=2", "--json-key=qpdf", "--json-key=outlines"])
+        .arg(fixture.path())
+        .assert()
+        .code(3);
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let outlines = stdout
+        .find("\"outlines\":")
+        .unwrap_or_else(|| panic!("missing outlines section in {stdout}"));
+    let qpdf = stdout
+        .find("\"qpdf\":")
+        .unwrap_or_else(|| panic!("missing qpdf section in {stdout}"));
+    assert!(outlines < qpdf, "{stdout}");
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 selected JSON section oracle"]
+fn live_qpdf_selected_json_sections_match_construction_side_effects() {
+    struct Case {
+        label: &'static str,
+        args: &'static [&'static str],
+        has_outlines: bool,
+        has_qpdf: bool,
+        warned: bool,
+    }
+
+    let cases = [
+        Case {
+            label: "qpdf only",
+            args: &["--json=2", "--json-key=qpdf"],
+            has_outlines: false,
+            has_qpdf: true,
+            warned: false,
+        },
+        Case {
+            label: "outlines only",
+            args: &["--json=2", "--json-key=outlines"],
+            has_outlines: true,
+            has_qpdf: false,
+            warned: true,
+        },
+        Case {
+            label: "outlines plus qpdf",
+            args: &["--json=2", "--json-key=outlines", "--json-key=qpdf"],
+            has_outlines: true,
+            has_qpdf: true,
+            warned: true,
+        },
+        Case {
+            label: "full",
+            args: &["--json=2"],
+            has_outlines: true,
+            has_qpdf: true,
+            warned: true,
+        },
+    ];
+
+    for case in cases {
+        let fixture = fixture_with_repaired_name_tree_and_stream();
+        let qpdf = std::process::Command::new("qpdf")
+            .args(case.args)
+            .arg(fixture.path())
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(case.args)
+            .arg(fixture.path())
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "{}: qpdf stderr={} flpdf stderr={}",
+            case.label,
+            String::from_utf8_lossy(&qpdf.stderr),
+            String::from_utf8_lossy(&flpdf.stderr)
+        );
+
+        let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout).unwrap();
+        let flpdf_json: serde_json::Value = serde_json::from_slice(&flpdf.stdout).unwrap();
+        let qpdf_keys = qpdf_json.as_object().unwrap().keys().collect::<Vec<_>>();
+        let flpdf_keys = flpdf_json.as_object().unwrap().keys().collect::<Vec<_>>();
+        assert_eq!(flpdf_keys, qpdf_keys, "{}", case.label);
+        assert_eq!(
+            flpdf_json.get("outlines").is_some(),
+            case.has_outlines,
+            "{}",
+            case.label
+        );
+        assert_eq!(
+            flpdf_json.get("qpdf").is_some(),
+            case.has_qpdf,
+            "{}",
+            case.label
+        );
+
+        if case.has_outlines {
+            assert_eq!(
+                flpdf_json["outlines"][0]["dest"], qpdf_json["outlines"][0]["dest"],
+                "{}",
+                case.label
+            );
+        }
+        if case.has_qpdf {
+            for object in ["obj:1 0 R", "obj:8 0 R"] {
+                assert_eq!(
+                    flpdf_json["qpdf"][1][object], qpdf_json["qpdf"][1][object],
+                    "{}: {object}",
+                    case.label
+                );
+            }
+        }
+
+        let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr);
+        let flpdf_stderr = String::from_utf8_lossy(&flpdf.stderr);
+        let expected_count = usize::from(case.warned);
+        assert_eq!(
+            qpdf_stderr
+                .matches("attempting to repair after error:")
+                .count(),
+            expected_count,
+            "{}: {qpdf_stderr}",
+            case.label
+        );
+        assert_eq!(
+            flpdf_stderr
+                .matches("attempting to repair after error:")
+                .count(),
+            expected_count,
+            "{}: {flpdf_stderr}",
+            case.label
+        );
+        assert_eq!(
+            qpdf_stderr
+                .matches("operation succeeded with warnings")
+                .count(),
+            expected_count,
+            "{}: {qpdf_stderr}",
+            case.label
+        );
+        assert_eq!(
+            flpdf_stderr
+                .matches("operation succeeded with warnings")
+                .count(),
+            expected_count,
+            "{}: {flpdf_stderr}",
+            case.label
+        );
+        if case.warned {
+            assert!(
+                qpdf_stderr
+                    .find("attempting to repair after error:")
+                    .unwrap()
+                    < qpdf_stderr
+                        .find("operation succeeded with warnings")
+                        .unwrap(),
+                "{}: {qpdf_stderr}",
+                case.label
+            );
+            assert!(
+                flpdf_stderr
+                    .find("attempting to repair after error:")
+                    .unwrap()
+                    < flpdf_stderr
+                        .find("operation succeeded with warnings")
+                        .unwrap(),
+                "{}: {flpdf_stderr}",
+                case.label
+            );
+        }
+    }
+}
+
+#[test]
 fn json_processing_warnings_do_not_repeat_open_time_warnings() {
     let fixture = corrupt_xref_repaired_name_tree_fixture();
 

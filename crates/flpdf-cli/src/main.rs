@@ -16,9 +16,9 @@ use flpdf::{
     flatten_annotations, flatten_rotation_on_pages, fonts, generate_button_field_appearance,
     generate_choice_field_appearance, generate_text_field_appearance,
     json_inspect::{
-        build_qpdf_json_v2_with_options, filter_json_keys, filter_json_objects,
-        format_json_side_file_path, stream_payload_for_decode_level, DecodeLevel, JsonKey,
-        JsonObjectSelector, StreamDataMode as JsonStreamDataMode,
+        build_qpdf_json_v2_selected_with_options, filter_json_objects, format_json_side_file_path,
+        stream_payload_for_decode_level, DecodeLevel, JsonKey, JsonObjectSelector,
+        StreamDataMode as JsonStreamDataMode,
     },
     linearization::{
         check_linearization_path, show_linearization_path, write_linearized,
@@ -1890,11 +1890,16 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     // 5. Build JSON.
     //
     // `decode_level` governs both the inline `data` payloads (applied inside
-    // build_qpdf_json_v2_with_options) and the file-mode side files written in
-    // step 9 below — the two must agree, so they share this single value.
+    // build_qpdf_json_v2_selected_with_options) and the file-mode side files
+    // written below — the two must agree, so they share this single value.
     let decode_level = DecodeLevel::Generalized;
     let diagnostics_start = pdf.repair_diagnostics().entries().len();
-    let mut v2 = match build_qpdf_json_v2_with_options(&mut pdf, decode_level, &stream_mode) {
+    let mut v2 = match build_qpdf_json_v2_selected_with_options(
+        &mut pdf,
+        decode_level,
+        &stream_mode,
+        &json_keys,
+    ) {
         Ok(v2) => v2,
         Err(error) => {
             emit_warnings_since(input, &pdf, diagnostics_start);
@@ -1902,17 +1907,12 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         }
     };
 
-    // 6. Apply --json-key filter.
-    if !json_keys.is_empty() {
-        v2 = filter_json_keys(v2, &json_keys);
-    }
-
-    // 7. Apply --json-object filter.
+    // 6. Apply --json-object filter.
     if !json_objects.is_empty() {
         v2 = filter_json_objects(v2, &json_objects);
     }
 
-    // 8. Write JSON to output destination. Outline/name-tree processing may
+    // 7. Write JSON to output destination. Outline/name-tree processing may
     // already have recorded warnings while building `v2`. If output fails,
     // emit those warnings before returning the fatal write error so they are
     // not lost; the success summary is intentionally omitted on this path.
@@ -1933,7 +1933,7 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         return Err(error);
     }
 
-    // 9. Write side files for stream-data=file mode — only for streams
+    // 8. Write side files for stream-data=file mode — only for streams
     // that actually survived --json-key / --json-object filtering. Walk
     // the final JSON and collect every "datafile" value emitted in the
     // qpdf objects map, then write exactly those streams to disk. Without
