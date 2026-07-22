@@ -198,28 +198,48 @@ fn single_outline_with_count(count_object: &str) -> Vec<u8> {
     single_outline_with_item_fields(&format!("/Count {count_object}"))
 }
 
+fn warning_messages(pdf: &Pdf<Cursor<Vec<u8>>>) -> Vec<&str> {
+    pdf.repair_diagnostics()
+        .entries()
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect()
+}
+
 #[test]
 fn titles_match_qpdf_get_utf8_value() {
-    let cases: &[(&str, &str)] = &[
-        ("(plain)", "plain"),
-        ("<95>", "Ł"),
-        ("<FEFF540D524D>", "名前"),
-        ("<FFFE0D544D52>", "名前"),
-        ("<EFBBBFE5908D>", "名"),
-        ("<EFBBBFFF>", "�"),
-        ("<FEFF0041D800>", "A"),
-        ("42", ""),
+    let cases: &[(&str, &str, Option<&str>)] = &[
+        ("(plain)", "plain", None),
+        ("<95>", "Ł", None),
+        ("<FEFF540D524D>", "名前", None),
+        ("<FFFE0D544D52>", "名前", None),
+        ("<EFBBBFE5908D>", "名", None),
+        ("<EFBBBFFF>", "�", None),
+        ("<FEFF0041D800>", "A", None),
+        (
+            "42",
+            "",
+            Some(
+                "operation for string attempted on object of type integer: returning empty string",
+            ),
+        ),
     ];
 
-    for &(title_object, expected) in cases {
+    for &(title_object, expected, expected_warning) in cases {
         let mut pdf = Pdf::open(Cursor::new(single_outline_with_title(title_object))).unwrap();
         let tree = pdf.outline().get_tree().unwrap();
         assert_eq!(tree[tree.roots()[0]].title, expected, "{title_object}");
+        assert_eq!(
+            warning_messages(&pdf),
+            expected_warning.into_iter().collect::<Vec<_>>(),
+            "{title_object}"
+        );
     }
 
     let mut pdf = Pdf::open(Cursor::new(single_outline_without_title())).unwrap();
     let tree = pdf.outline().get_tree().unwrap();
     assert_eq!(tree[tree.roots()[0]].title, "");
+    assert!(warning_messages(&pdf).is_empty());
 }
 
 #[test]
@@ -238,19 +258,18 @@ fn counts_match_qpdf_get_int_value_as_int() {
             i32::MAX,
             Some("requested value of integer is too big; returning INT_MAX"),
         ),
-        ("(wrong type)", 0, None),
+        (
+            "(wrong type)",
+            0,
+            Some("operation for integer attempted on object of type string: returning 0"),
+        ),
     ];
 
     for (count_object, expected, expected_warning) in cases {
         let mut pdf = Pdf::open(Cursor::new(single_outline_with_count(count_object))).unwrap();
         let tree = pdf.outline().get_tree().unwrap();
         assert_eq!(tree[tree.roots()[0]].count, expected, "{count_object}");
-        let warning_messages: Vec<&str> = pdf
-            .repair_diagnostics()
-            .entries()
-            .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
-            .collect();
+        let warning_messages = warning_messages(&pdf);
         match expected_warning {
             Some(expected_warning) => {
                 assert!(
@@ -265,6 +284,101 @@ fn counts_match_qpdf_get_int_value_as_int() {
     let mut pdf = Pdf::open(Cursor::new(single_outline_with_item_fields(""))).unwrap();
     let tree = pdf.outline().get_tree().unwrap();
     assert_eq!(tree[tree.roots()[0]].count, 0);
+    assert!(warning_messages(&pdf).is_empty());
+}
+
+#[test]
+fn present_wrong_type_scalar_warnings_use_qpdf_object_type_names() {
+    let cases = [
+        ("null", "null"),
+        ("true", "boolean"),
+        ("42", "integer"),
+        ("1.5", "real"),
+        ("/value", "name"),
+        ("(value)", "string"),
+        ("[]", "array"),
+        ("<<>>", "dictionary"),
+    ];
+
+    for (object, type_name) in cases {
+        if type_name != "string" {
+            let mut pdf = Pdf::open(Cursor::new(single_outline_with_title(object))).unwrap();
+            let tree = pdf.outline().get_tree().unwrap();
+            assert_eq!(tree[tree.roots()[0]].title, "", "title {object}");
+            assert_eq!(
+                warning_messages(&pdf),
+                [format!(
+                    "operation for string attempted on object of type {type_name}: returning empty string"
+                )],
+                "title {object}"
+            );
+        }
+
+        if type_name != "integer" {
+            let mut pdf = Pdf::open(Cursor::new(single_outline_with_count(object))).unwrap();
+            let tree = pdf.outline().get_tree().unwrap();
+            assert_eq!(tree[tree.roots()[0]].count, 0, "count {object}");
+            assert_eq!(
+                warning_messages(&pdf),
+                [format!(
+                    "operation for integer attempted on object of type {type_name}: returning 0"
+                )],
+                "count {object}"
+            );
+        }
+    }
+
+    let stream_body = "<< /Length 0 >>\nstream\n\nendstream";
+    for key in ["Title", "Count"] {
+        let item = format!("<< /{key} 8 0 R /Parent 4 0 R >>");
+        let bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+                (5, item.as_str()),
+                (8, stream_body),
+            ],
+            1,
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let tree = pdf.outline().get_tree().unwrap();
+        let expected = if key == "Title" {
+            assert_eq!(tree[tree.roots()[0]].title, "");
+            "operation for string attempted on object of type stream: returning empty string"
+        } else {
+            assert_eq!(tree[tree.roots()[0]].count, 0);
+            "operation for integer attempted on object of type stream: returning 0"
+        };
+        assert_eq!(warning_messages(&pdf), [expected], "{key}");
+    }
+
+    for key in ["Title", "Count"] {
+        let item = format!("<< /{key} 8 0 R /Parent 4 0 R >>");
+        let bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+                (5, item.as_str()),
+                (8, "9 0 R"),
+                (9, "42"),
+            ],
+            1,
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let tree = pdf.outline().get_tree().unwrap();
+        let expected = if key == "Title" {
+            assert_eq!(tree[tree.roots()[0]].title, "");
+            "operation for string attempted on object of type reference: returning empty string"
+        } else {
+            assert_eq!(tree[tree.roots()[0]].count, 0);
+            "operation for integer attempted on object of type reference: returning 0"
+        };
+        assert_eq!(warning_messages(&pdf), [expected], "{key}");
+    }
 }
 
 #[test]
@@ -871,6 +985,130 @@ fn dest_from_named_nametree() {
     assert_eq!(roots[0].dest, page_dest(3));
 }
 
+fn deep_named_dest_nametree_pdf(kid_levels: u32) -> Vec<u8> {
+    let mut objects = vec![
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names << /Dests 8 0 R >> >>"
+                .to_string(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+        ),
+        (
+            4,
+            "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>".to_string(),
+        ),
+        (
+            5,
+            "<< /Title (Deep) /Parent 4 0 R /Dest (deep) >>".to_string(),
+        ),
+    ];
+
+    for level in 0..kid_levels {
+        let object_number = 8 + level;
+        let next = object_number + 1;
+        let limits = if level == 0 {
+            ""
+        } else {
+            " /Limits [(deep) (deep)]"
+        };
+        objects.push((object_number, format!("<< /Kids [{next} 0 R]{limits} >>")));
+    }
+    objects.push((
+        8 + kid_levels,
+        "<< /Limits [(deep) (deep)] /Names [(deep) [3 0 R /Fit]] >>".to_string(),
+    ));
+
+    let refs: Vec<(u32, &str)> = objects
+        .iter()
+        .map(|(number, body)| (*number, body.as_str()))
+        .collect();
+    build_pdf(&refs, 1)
+}
+
+#[test]
+fn named_destination_lookup_has_no_hidden_tree_depth_limit() {
+    let mut pdf = Pdf::open(Cursor::new(deep_named_dest_nametree_pdf(101))).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree[tree.roots()[0]].dest, page_dest(3));
+}
+
+#[test]
+fn named_destination_lookup_selects_only_the_kid_covering_the_key() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names << /Dests 8 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 6 0 R /Count 2 >>"),
+            (5, "<< /Title (A) /Dest (a) /Next 6 0 R >>"),
+            (6, "<< /Title (Target) /Dest (target) >>"),
+            (8, "<< /Kids [9 0 R 10 0 R 11 0 R] >>"),
+            (9, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+            (10, "<< /Limits [(h) (h)] /Names [(h) [3 0 R /Fit]] >>"),
+            (
+                11,
+                "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree[tree.roots()[0]].dest, page_dest(3));
+    assert_eq!(tree[tree.roots()[1]].dest, page_dest(3));
+}
+
+#[test]
+fn cyclic_modern_name_tree_lookup_terminates_without_a_destination() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names << /Dests 8 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (Cycle) /Dest (deep) >>"),
+            (8, "<< /Kids [9 0 R] >>"),
+            (9, "<< /Limits [(deep) (deep)] /Kids [9 0 R] >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree[tree.roots()[0]].dest, Object::Null);
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 oracle"]
+fn qpdf_deep_named_destination_oracle_resolves_target() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    input.write_all(&deep_named_dest_nametree_pdf(101)).unwrap();
+    let output = Command::new("qpdf")
+        .args(["--json=2", "--json-key=outlines"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["outlines"][0]["dest"][0], "3 0 R");
+}
+
 /// Legacy named dest: /Dest is a Name (/mydest) resolved via catalog /Dests
 /// dictionary whose value is << /D [3 0 R /Fit] >>.
 fn named_dest_legacy_pdf() -> Vec<u8> {
@@ -1068,6 +1306,33 @@ fn single_outline_with_catalog(
         .map(|(number, body)| (*number, body.as_str()))
         .collect();
     build_pdf(&borrowed, 1)
+}
+
+#[test]
+fn named_destination_lookup_handles_qpdf_node_shapes() {
+    let cases = [
+        (
+            "/Names << /Dests << /Names [(shape) [3 0 R /Fit]] >> >>",
+            &[][..],
+            page_dest(3),
+        ),
+        (
+            "/Names << /Dests << /Names [] /Kids [8 0 R] >> >>",
+            &[(
+                8,
+                "<< /Limits [(shape) (shape)] /Names [(shape) [3 0 R /Fit]] >>",
+            )][..],
+            page_dest(3),
+        ),
+        ("/Names << /Dests << >> >>", &[][..], Object::Null),
+        ("/Names << /Dests << /Kids [] >> >>", &[][..], Object::Null),
+    ];
+
+    for (catalog_entries, extra, expected) in cases {
+        let bytes = single_outline_with_catalog(catalog_entries, "/Dest (shape)", extra);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(root_items(&mut pdf)[0].dest, expected, "{catalog_entries}");
+    }
 }
 
 fn qpdf_destination_matrix_pdf() -> Vec<u8> {

@@ -72,11 +72,10 @@
 //! - **Raw outline keys are preserved.** Ordinary rewriting keeps `/SE`,
 //!   `/Dest`, `/A`, and unknown outline dictionary keys as PDF objects rather
 //!   than applying flpdf-specific validation or pruning policy.
-//! - **`flpdf --json`'s `outlines` and `pagelabels` sections** currently use
-//!   a different key layout than qpdf's own `--json=2` output for these two
-//!   sections specifically (other sections match). Both still faithfully
-//!   expose the document's outline tree and page-label ranges; only the JSON
-//!   field names and shape differ from qpdf's.
+//! - **`flpdf --json`'s `pagelabels` section** keeps qpdf's outer
+//!   `{index, label}` entries, but represents each `label` as normalized
+//!   `{first, prefix, style}` fields instead of qpdf JSON v2's raw page-label
+//!   dictionary. The `outlines` section uses qpdf JSON v2's key layout.
 
 // Mechanically enforce threat-model guarantee (a): no undefined behaviour. The
 // crate contains no `unsafe` blocks, so this attribute keeps it that way.

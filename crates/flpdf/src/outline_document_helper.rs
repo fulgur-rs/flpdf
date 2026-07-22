@@ -43,9 +43,9 @@
 //! let _ = pdf.outline().get_root_with_max_depth(10);
 //! ```
 
-use crate::name_number_tree::{read_name_tree, DEFAULT_MAX_TREE_DEPTH};
 use crate::outline::{OutlineId, OutlineItem, OutlineTree};
-use crate::{Object, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
@@ -356,12 +356,8 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Some(dests_root) = names.remove("Dests") else {
             return Ok(Object::Null);
         };
-        let decode = |_pdf: &mut Pdf<R>, value| Ok(Some(value));
-        let entries = read_name_tree(self.pdf, dests_root, decode, DEFAULT_MAX_TREE_DEPTH)?;
-        for (stored, value) in entries {
-            if crate::json_inspect::qpdf_utf8_value(&stored) == lookup {
-                return resolve_terminal_object(self.pdf, value);
-            }
+        if let Some(value) = find_name_tree_value(self.pdf, dests_root, &lookup)? {
+            return resolve_terminal_object(self.pdf, value);
         }
         Ok(Object::Null)
     }
@@ -474,28 +470,168 @@ fn resolve_terminal_object<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> R
     }
 }
 
-/// Decode an outline `/Title`, resolving one level of indirection (review rule 2).
-fn resolve_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<String> {
-    Ok(qpdf_title(resolve_scalar(pdf, value)?))
+/// Find one key in a name tree using qpdf's `/Names`-or-`/Kids` descent.
+///
+/// Unlike the generic public tree walker, outline destination lookup has no
+/// caller policy or fixed depth cap and never enumerates unrelated branches.
+fn find_name_tree_value<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    mut cursor: Object,
+    lookup: &[u8],
+) -> Result<Option<Object>> {
+    let mut seen = BTreeSet::new();
+    loop {
+        let (node, identity) = name_tree_node(pdf, cursor)?;
+        let Some(mut node) = node else {
+            return Ok(None);
+        };
+        if let Some(identity) = identity {
+            if !seen.insert(identity) {
+                return Ok(None);
+            }
+        }
+
+        if let Some(Object::Array(names)) = node.remove("Names") {
+            if !names.is_empty() {
+                return Ok(find_name_tree_leaf_value(names, lookup));
+            }
+        }
+
+        let Some(Object::Array(kids)) = node.remove("Kids") else {
+            return Ok(None);
+        };
+        let Some(next) = select_name_tree_kid(pdf, &kids, lookup)? else {
+            return Ok(None);
+        };
+        cursor = next;
+    }
 }
 
-fn qpdf_title(value: Object) -> String {
+fn name_tree_node<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    cursor: Object,
+) -> Result<(Option<Dictionary>, Option<ObjectRef>)> {
+    match cursor {
+        Object::Dictionary(node) => Ok((Some(node), None)),
+        Object::Reference(reference) => {
+            let (terminal, terminal_ref) =
+                crate::ref_chain::resolve_ref_chain(pdf, &Object::Reference(reference))?;
+            Ok((terminal.into_dict(), terminal_ref.or(Some(reference))))
+        }
+        _ => Ok((None, None)),
+    }
+}
+
+fn find_name_tree_leaf_value(names: Vec<Object>, lookup: &[u8]) -> Option<Object> {
+    let pair_count = names.len() / 2;
+    let mut low = 0;
+    let mut high = pair_count;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let Object::String(stored) = &names[2 * middle] else {
+            return None;
+        };
+        match lookup.cmp(crate::json_inspect::qpdf_utf8_value(stored).as_slice()) {
+            Ordering::Less => high = middle,
+            Ordering::Greater => low = middle + 1,
+            Ordering::Equal => return Some(names[2 * middle + 1].clone()),
+        }
+    }
+    None
+}
+
+fn select_name_tree_kid<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    kids: &[Object],
+    lookup: &[u8],
+) -> Result<Option<Object>> {
+    let mut low = 0;
+    let mut high = kids.len();
+    let mut previous = None;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let Some(ordering) = name_tree_kid_ordering(pdf, &kids[middle], lookup)? else {
+            return Ok(None);
+        };
+        match ordering {
+            Ordering::Less => high = middle,
+            Ordering::Equal => return Ok(Some(kids[middle].clone())),
+            Ordering::Greater => {
+                previous = Some(middle);
+                low = middle + 1;
+            }
+        }
+    }
+    Ok(previous.map(|index| kids[index].clone()))
+}
+
+/// Return the qpdf `withinLimits` comparison for `lookup` against one kid:
+/// less when before the range, greater when after it, equal when within it.
+fn name_tree_kid_ordering<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    kid: &Object,
+    lookup: &[u8],
+) -> Result<Option<Ordering>> {
+    let (node, _) = name_tree_node(pdf, kid.clone())?;
+    let Some(node) = node else {
+        return Ok(None);
+    };
+    let Some(Object::Array(limits)) = node.get("Limits") else {
+        return Ok(None);
+    };
+    let [Object::String(first), Object::String(last), ..] = limits.as_slice() else {
+        return Ok(None);
+    };
+    let first = crate::json_inspect::qpdf_utf8_value(first);
+    if lookup < first.as_slice() {
+        return Ok(Some(Ordering::Less));
+    }
+    let last = crate::json_inspect::qpdf_utf8_value(last);
+    if lookup > last.as_slice() {
+        return Ok(Some(Ordering::Greater));
+    }
+    Ok(Some(Ordering::Equal))
+}
+
+/// Decode an outline `/Title`, resolving one level of indirection (review rule 2).
+fn resolve_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<String> {
+    let Some(value) = value else {
+        return Ok(String::new());
+    };
+    let resolved = resolve_scalar(pdf, value)?;
+    Ok(qpdf_title(pdf, resolved))
+}
+
+fn qpdf_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> String {
     match value {
         Object::String(bytes) => {
             String::from_utf8_lossy(&crate::json_inspect::qpdf_utf8_value(&bytes)).into_owned()
         }
-        _ => String::new(),
+        other => {
+            pdf.push_warning(format!(
+                "operation for string attempted on object of type {}: returning empty string",
+                qpdf_object_type_name(&other)
+            ));
+            String::new()
+        }
     }
 }
 
 /// Read an outline `/Count`, resolving one level of indirection (review rule 2/3).
 fn resolve_count<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<i32> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
     let resolved = resolve_scalar(pdf, value)?;
     Ok(qpdf_count(pdf, resolved))
 }
 
 fn qpdf_count<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> i32 {
     let Object::Integer(value) = value else {
+        pdf.push_warning(format!(
+            "operation for integer attempted on object of type {}: returning 0",
+            qpdf_object_type_name(&value)
+        ));
         return 0;
     };
     if value < i64::from(i32::MIN) {
@@ -509,11 +645,25 @@ fn qpdf_count<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> i32 {
     }
 }
 
-fn resolve_scalar<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<Object> {
+fn resolve_scalar<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<Object> {
     match value {
-        Some(Object::Reference(r)) => pdf.resolve(r),
-        Some(other) => Ok(other),
-        None => Ok(Object::Null),
+        Object::Reference(r) => pdf.resolve(r),
+        other => Ok(other),
+    }
+}
+
+fn qpdf_object_type_name(value: &Object) -> &'static str {
+    match value {
+        Object::Null => "null",
+        Object::Boolean(_) => "boolean",
+        Object::Integer(_) => "integer",
+        Object::Real(_) | Object::RealLiteral { .. } => "real",
+        Object::Name(_) => "name",
+        Object::String(_) => "string",
+        Object::Array(_) => "array",
+        Object::Dictionary(_) => "dictionary",
+        Object::Stream(_) => "stream",
+        Object::Reference(_) => "reference",
     }
 }
 
