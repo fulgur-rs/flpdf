@@ -1912,15 +1912,25 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         v2 = filter_json_objects(v2, &json_objects);
     }
 
-    // 8. Write JSON to output destination.
-    if let Some(ref out_path) = cli.json_output {
-        let mut file = File::create(out_path)?;
-        flpdf::json::write(&v2, &mut file)?;
-    } else {
-        let stdout = std::io::stdout();
-        let mut locked = stdout.lock();
-        flpdf::json::write(&v2, &mut locked)?;
-        locked.flush()?;
+    // 8. Write JSON to output destination. Outline/name-tree processing may
+    // already have recorded warnings while building `v2`. If output fails,
+    // emit those warnings before returning the fatal write error so they are
+    // not lost; the success summary is intentionally omitted on this path.
+    let json_write_result = (|| -> CliResult<()> {
+        if let Some(ref out_path) = cli.json_output {
+            let mut file = File::create(out_path)?;
+            flpdf::json::write(&v2, &mut file)?;
+        } else {
+            let stdout = std::io::stdout();
+            let mut locked = stdout.lock();
+            flpdf::json::write(&v2, &mut locked)?;
+            locked.flush()?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = json_write_result {
+        emit_warnings_since(input, &pdf, diagnostics_start);
+        return Err(error);
     }
 
     // 9. Write side files for stream-data=file mode — only for streams
@@ -1930,14 +1940,17 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     // this scoping, --json-key=pages --json-stream-data=file would dump
     // every stream to the filesystem even though the qpdf section was
     // filtered out of the output.
-    if let JsonStreamDataMode::File { ref prefix } = stream_mode {
-        let wanted_refs = collect_datafile_object_refs(&v2);
-        // Reuse the same `pdf` handle the JSON was built from. Re-opening
-        // the input here would risk the file being swapped mid-run, so the
-        // JSON body and the side files could capture different snapshots.
-        for oref in wanted_refs {
-            let obj = pdf.resolve_borrowed(oref)?;
-            if let Object::Stream(stream) = obj {
+    let side_file_result = (|| -> CliResult<()> {
+        if let JsonStreamDataMode::File { ref prefix } = stream_mode {
+            let wanted_refs = collect_datafile_object_refs(&v2);
+            // Reuse the same `pdf` handle the JSON was built from. Re-opening
+            // the input here would risk the file being swapped mid-run, so the
+            // JSON body and the side files could capture different snapshots.
+            for oref in wanted_refs {
+                let obj = pdf.resolve_borrowed(oref)?;
+                let Object::Stream(stream) = obj else {
+                    continue; // cov:ignore: collector only returns entries with stream.datafile
+                };
                 // Side-file name must match the JSON `datafile` value;
                 // both come from the same helper to avoid divergence.
                 let side_path = format_json_side_file_path(prefix, oref.number);
@@ -1947,6 +1960,23 @@ fn run_json(cli: &Cli) -> CliResult<()> {
                 std::fs::write(&side_path, &*payload)?;
             }
         }
+        Ok(())
+    })();
+    if let Err(error) = side_file_result {
+        emit_warnings_since(input, &pdf, diagnostics_start);
+        return Err(error);
+    }
+
+    // qpdf reports processing warnings after successful JSON output and exits
+    // 3. The snapshot was taken after open-time warnings were emitted, so this
+    // range contains only diagnostics added while building/writing this JSON.
+    if pdf.repair_diagnostics().entries().len() > diagnostics_start {
+        emit_warnings_since(input, &pdf, diagnostics_start);
+        eprintln!("{}: operation succeeded with warnings", progname());
+        return Err(Box::new(CliExitError {
+            code: ExitCode::Warnings,
+            message: String::new(),
+        }));
     }
 
     Ok(())

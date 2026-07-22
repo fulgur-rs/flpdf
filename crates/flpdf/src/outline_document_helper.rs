@@ -371,13 +371,13 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         match find_name_tree_value(self.pdf, dests_root.clone(), &lookup)? {
             NameTreeLookup::Found(value) => return resolve_terminal_object(self.pdf, value),
             NameTreeLookup::Missing => {}
-            NameTreeLookup::Structural(error) => {
+            NameTreeLookup::Structural { error, root } => {
                 self.pdf.push_warning(format!(
                     "attempting to repair after error: {}",
                     error.diagnostic()
                 ));
-                let entries = enumerate_name_tree_entries(self.pdf, dests_root.clone())?;
-                let repaired_root = repair_name_tree(self.pdf, dests_root, entries)?;
+                let entries = enumerate_name_tree_entries(self.pdf, root.clone())?;
+                let repaired_root = repair_name_tree(self.pdf, root, entries)?;
                 if let NameTreeLookup::Found(value) =
                     find_name_tree_value(self.pdf, repaired_root, &lookup)?
                 {
@@ -499,7 +499,10 @@ fn resolve_terminal_object<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> R
 enum NameTreeLookup {
     Found(Object),
     Missing,
-    Structural(NameTreeStructuralError),
+    Structural {
+        error: NameTreeStructuralError,
+        root: Object,
+    },
 }
 
 struct NameTreeStructuralError {
@@ -562,11 +565,14 @@ fn find_name_tree_value<R: Read + Seek>(
     lookup: &[u8],
 ) -> Result<NameTreeLookup> {
     let (updated_root, first_boundary) = name_tree_begin_preflight(pdf, cursor)?;
-    cursor = updated_root;
+    cursor = updated_root.clone();
     match first_boundary {
         NameTreeFirstBoundary::Empty => return Ok(NameTreeLookup::Missing),
         NameTreeFirstBoundary::Structural(error) => {
-            return Ok(NameTreeLookup::Structural(error));
+            return Ok(NameTreeLookup::Structural {
+                error,
+                root: updated_root,
+            });
         }
         NameTreeFirstBoundary::Key(first) if lookup < first.as_slice() => {
             return Ok(NameTreeLookup::Missing);
@@ -583,38 +589,50 @@ fn find_name_tree_value<R: Read + Seek>(
         };
         if let Some(identity) = identity {
             if !seen.insert(identity) {
-                return Ok(NameTreeLookup::Structural(NameTreeStructuralError {
-                    node_ref: Some(identity),
-                    message: "loop detected in find".to_string(),
-                }));
+                return Ok(NameTreeLookup::Structural {
+                    error: NameTreeStructuralError {
+                        node_ref: Some(identity),
+                        message: "loop detected in find".to_string(),
+                    },
+                    root: updated_root,
+                });
             }
         }
 
         let names_value = node.remove("Names");
         if let Some(Object::Array(names)) = names_value {
             if !names.is_empty() {
-                return find_name_tree_leaf_value(names, lookup, root_ref);
+                return find_name_tree_leaf_value(names, lookup, root_ref, updated_root);
             }
         }
 
         let Some(Object::Array(kids)) = node.remove("Kids") else {
-            return Ok(NameTreeLookup::Structural(NameTreeStructuralError {
-                node_ref: identity,
-                message: "bad node during find".to_string(),
-            }));
+            return Ok(NameTreeLookup::Structural {
+                error: NameTreeStructuralError {
+                    node_ref: identity,
+                    message: "bad node during find".to_string(),
+                },
+                root: updated_root,
+            });
         };
         if kids.is_empty() {
-            return Ok(NameTreeLookup::Structural(NameTreeStructuralError {
-                node_ref: identity,
-                message: "bad node during find".to_string(),
-            }));
+            return Ok(NameTreeLookup::Structural {
+                error: NameTreeStructuralError {
+                    node_ref: identity,
+                    message: "bad node during find".to_string(),
+                },
+                root: updated_root,
+            });
         }
         match select_name_tree_kid(pdf, &kids, lookup, root_ref, identity)? {
             NameTreeKidSelection::Found(next) => {
                 cursor = next;
             }
             NameTreeKidSelection::Structural(error) => {
-                return Ok(NameTreeLookup::Structural(error));
+                return Ok(NameTreeLookup::Structural {
+                    error,
+                    root: updated_root,
+                });
             }
         }
     }
@@ -750,6 +768,7 @@ fn find_name_tree_leaf_value(
     names: Vec<Object>,
     lookup: &[u8],
     root_ref: Option<ObjectRef>,
+    root: Object,
 ) -> Result<NameTreeLookup> {
     let pair_count = names.len() / 2;
     Ok(
@@ -768,7 +787,7 @@ fn find_name_tree_leaf_value(
                 NameTreeLookup::Found(names[2 * index + 1].clone())
             }
             NameTreeBinarySearch::Missing => NameTreeLookup::Missing,
-            NameTreeBinarySearch::Structural(error) => NameTreeLookup::Structural(error),
+            NameTreeBinarySearch::Structural(error) => NameTreeLookup::Structural { error, root },
         },
     )
 }

@@ -1069,6 +1069,171 @@ fn json_outlines_short_first_name_tree_pair_exits_two_without_complete_json() {
 }
 
 #[test]
+fn json_successful_name_tree_repair_emits_warning_summary_and_exits_three() {
+    let fixture = fixture_with_repaired_name_tree_and_stream();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let assert = cmd
+        .args(["--json=2", "--json-key=outlines"])
+        .arg(fixture.path())
+        .assert()
+        .code(3);
+    let output = assert.get_output();
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["outlines"][0]["dest"][0], "3 0 R");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning = stderr
+        .find("attempting to repair after error:")
+        .unwrap_or_else(|| panic!("missing repair warning in {stderr}"));
+    let summary = stderr
+        .find("flpdf: operation succeeded with warnings")
+        .unwrap_or_else(|| panic!("missing warning summary in {stderr}"));
+    assert!(warning < summary, "{stderr}");
+    assert_eq!(
+        stderr.matches("attempting to repair after error:").count(),
+        1
+    );
+    assert_eq!(
+        stderr
+            .matches("flpdf: operation succeeded with warnings")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn json_processing_warnings_do_not_repeat_open_time_warnings() {
+    let fixture = corrupt_xref_repaired_name_tree_fixture();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let assert = cmd
+        .args(["--repair", "--json=2", "--json-key=outlines"])
+        .arg(fixture.path())
+        .assert()
+        .code(3);
+    let output = assert.get_output();
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let open_warning = stderr
+        .lines()
+        .find(|line| line.starts_with("WARNING:") && !line.contains("attempting to repair"))
+        .unwrap_or_else(|| panic!("missing open-time warning in {stderr}"));
+    assert_eq!(
+        stderr.lines().filter(|line| *line == open_warning).count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("attempting to repair after error:").count(),
+        1
+    );
+    assert_eq!(
+        stderr
+            .matches("flpdf: operation succeeded with warnings")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn json_output_error_emits_recorded_processing_warning_before_fatal_error() {
+    let fixture = fixture_with_repaired_name_tree_and_stream();
+    let output_directory = tempfile::tempdir().unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let assert = cmd
+        .args(["--json=2", "--json-key=outlines", "--json-output"])
+        .arg(output_directory.path())
+        .arg(fixture.path())
+        .assert()
+        .code(2);
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning = stderr
+        .find("attempting to repair after error:")
+        .unwrap_or_else(|| panic!("missing repair warning in {stderr}"));
+    let fatal = stderr
+        .rfind("flpdf:")
+        .unwrap_or_else(|| panic!("missing fatal error in {stderr}"));
+    assert!(warning < fatal, "{stderr}");
+    assert_eq!(
+        stderr.matches("attempting to repair after error:").count(),
+        1
+    );
+    assert!(!stderr.contains("operation succeeded with warnings"));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn json_side_file_error_emits_recorded_warning_after_complete_json_before_fatal_error() {
+    let fixture = fixture_with_repaired_name_tree_and_stream();
+    let temp = tempfile::tempdir().unwrap();
+    let missing_prefix = temp.path().join("missing").join("stream");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let assert = cmd
+        .args([
+            "--json=2",
+            "--json-stream-data=file",
+            "--json-stream-prefix",
+        ])
+        .arg(&missing_prefix)
+        .arg(fixture.path())
+        .assert()
+        .code(2);
+    let output = assert.get_output();
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["outlines"][0]["dest"][0], "3 0 R");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning = stderr
+        .find("attempting to repair after error:")
+        .unwrap_or_else(|| panic!("missing repair warning in {stderr}"));
+    let fatal = stderr
+        .rfind("flpdf:")
+        .unwrap_or_else(|| panic!("missing fatal error in {stderr}"));
+    assert!(warning < fatal, "{stderr}");
+    assert_eq!(
+        stderr.matches("attempting to repair after error:").count(),
+        1
+    );
+    assert!(!stderr.contains("operation succeeded with warnings"));
+}
+
+#[test]
+fn json_and_side_files_complete_before_warning_exit_three() {
+    let fixture = fixture_with_repaired_name_tree_and_stream();
+    let temp = tempfile::tempdir().unwrap();
+    let json_path = temp.path().join("out.json");
+    let prefix = temp.path().join("stream");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let assert = cmd
+        .args(["--json=2", "--json-output"])
+        .arg(&json_path)
+        .args(["--json-stream-data=file", "--json-stream-prefix"])
+        .arg(&prefix)
+        .arg(fixture.path())
+        .assert()
+        .code(3);
+    let output = assert.get_output();
+    assert!(output.stdout.is_empty());
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+    assert_eq!(json["outlines"][0]["dest"][0], "3 0 R");
+    assert!(std::path::Path::new(&format!("{}-6", prefix.display())).is_file());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning = stderr.find("attempting to repair after error:").unwrap();
+    let summary = stderr
+        .find("flpdf: operation succeeded with warnings")
+        .unwrap();
+    assert!(warning < summary, "{stderr}");
+}
+
+#[test]
 fn show_fonts_prints_summary() {
     let fixture = fixture_with_metadata_outline_and_fonts();
 
@@ -1211,6 +1376,54 @@ fn fixture_with_short_first_name_tree_pair() -> tempfile::NamedTempFile {
         format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
     );
     fixture.as_file_mut().write_all(&bytes).unwrap();
+    fixture
+}
+
+fn fixture_with_repaired_name_tree_and_stream() -> tempfile::NamedTempFile {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    let objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names << /Dests << /Kids [8 0 R] >> >> >>\nendobj\n".as_slice(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".as_slice(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>\nendobj\n".as_slice(),
+        b"4 0 obj\n<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>\nendobj\n".as_slice(),
+        b"5 0 obj\n<< /Title (One) /Parent 4 0 R /Dest (shape) >>\nendobj\n".as_slice(),
+        b"6 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n".as_slice(),
+        b"7 0 obj\nnull\nendobj\n".as_slice(),
+        b"8 0 obj\n<< /Names [(shape) [3 0 R /Fit]] >>\nendobj\n".as_slice(),
+    ];
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for object in objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    fixture.as_file_mut().write_all(&bytes).unwrap();
+    fixture
+}
+
+fn corrupt_xref_repaired_name_tree_fixture() -> tempfile::NamedTempFile {
+    let fixture = fixture_with_repaired_name_tree_and_stream();
+    let mut bytes = std::fs::read(fixture.path()).unwrap();
+    let xref = bytes
+        .windows(4)
+        .position(|window| window == b"xref")
+        .expect("fixture must contain xref");
+    bytes[xref + 2] = b'z';
+    std::fs::write(fixture.path(), bytes).unwrap();
     fixture
 }
 

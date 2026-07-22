@@ -1445,6 +1445,93 @@ fn short_first_name_tree_pair_is_fatal_after_the_repair_warning() {
     }
 }
 
+fn direct_first_child_short_name_tree_pdf() -> Vec<u8> {
+    single_outline_with_catalog(
+        "/Names << /Dests << /Kids [<< /Names [(m)] >>] >> >>",
+        "/Dest (m)",
+        &[],
+    )
+}
+
+#[test]
+fn direct_first_child_short_pair_repairs_from_the_mutated_root() {
+    let mut pdf = Pdf::open(Cursor::new(direct_first_child_short_name_tree_pdf())).unwrap();
+
+    let error = pdf.outline().get_tree().unwrap_err();
+    match error {
+        Error::Parse { offset, message } => {
+            assert_eq!(offset, 0);
+            assert_eq!(
+                message,
+                "Name/Number tree node (object 6): update ivalue: items array is too short"
+            );
+        }
+        other => panic!("expected parse error, got {other}"),
+    }
+    assert_eq!(
+        warning_messages(&pdf),
+        [
+            "converting kid number 0 to an indirect object",
+            "attempting to repair after error: Name/Number tree node (object 6): update ivalue: items array is too short",
+        ]
+    );
+
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(
+        dests.get("Kids"),
+        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+            6, 0
+        ))]))
+    );
+    let Object::Dictionary(child) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("converted first child must be an indirect dictionary");
+    };
+    assert_eq!(
+        child.get("Names"),
+        Some(&Object::Array(vec![Object::String(b"m".to_vec())]))
+    );
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 direct-child short-pair oracle"]
+fn qpdf_direct_first_child_short_pair_preserves_converted_object_context() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    input
+        .write_all(&direct_first_child_short_name_tree_pdf())
+        .unwrap();
+    let output = Command::new("qpdf")
+        .args(["--json=2", "--json-key=outlines"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let conversion = stderr
+        .find("converting kid number 0 to an indirect object")
+        .unwrap_or_else(|| panic!("missing conversion warning in {stderr}"));
+    let repair = stderr
+        .find("attempting to repair after error:")
+        .unwrap_or_else(|| panic!("missing repair warning in {stderr}"));
+    let fatal = stderr
+        .rfind("update ivalue: items array is too short")
+        .unwrap_or_else(|| panic!("missing fatal error in {stderr}"));
+    assert!(conversion < repair && repair < fatal, "{stderr}");
+    assert_eq!(stderr.matches("object 6").count(), 2, "{stderr}");
+    assert_eq!(
+        stderr
+            .matches("update ivalue: items array is too short")
+            .count(),
+        2,
+        "{stderr}"
+    );
+    assert!(!output.stdout.is_empty());
+    assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).is_err());
+}
+
 #[test]
 fn scalar_name_tree_dests_are_silent_and_resolve_to_null() {
     let cases = [
@@ -2552,7 +2639,23 @@ fn qpdf_missing_name_tree_limits_oracle_repairs_the_lookup() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("attempting to repair after error:"));
+    let warning = stderr
+        .find("attempting to repair after error:")
+        .unwrap_or_else(|| panic!("missing repair warning in {stderr}"));
+    let summary = stderr
+        .find("qpdf: operation succeeded with warnings")
+        .unwrap_or_else(|| panic!("missing warning summary in {stderr}"));
+    assert!(warning < summary, "{stderr}");
+    assert_eq!(
+        stderr.matches("attempting to repair after error:").count(),
+        1
+    );
+    assert_eq!(
+        stderr
+            .matches("qpdf: operation succeeded with warnings")
+            .count(),
+        1
+    );
     assert!(stderr.contains("(Name/Number tree node (object 8)): node is missing /Limits"));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["outlines"][0]["dest"][0], "3 0 R");
