@@ -64,6 +64,8 @@ use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
+const DEFAULT_MAX_OUTLINE_REMAP_DEPTH: usize = 100;
+
 // ---------------------------------------------------------------------------
 // Surviving-page map
 // ---------------------------------------------------------------------------
@@ -141,7 +143,7 @@ pub fn remap_outline_and_dests<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
 ) -> Result<()> {
-    remap_outline_and_dests_with_max_depth(pdf, result, crate::outline::DEFAULT_MAX_OUTLINE_DEPTH)
+    remap_outline_and_dests_with_max_depth(pdf, result, DEFAULT_MAX_OUTLINE_REMAP_DEPTH)
 }
 
 /// Like [`remap_outline_and_dests`] but with a caller-supplied outline-depth limit.

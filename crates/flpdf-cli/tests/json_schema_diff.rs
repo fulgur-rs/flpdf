@@ -14,48 +14,76 @@ struct FixtureSpec {
     label: &'static str,
     relative_path: &'static str,
     password: Option<&'static str>,
+    compared_top_level_key: Option<&'static str>,
+}
+
+fn project_top_level_key(value: serde_json::Value, key: Option<&str>) -> serde_json::Value {
+    let Some(key) = key else {
+        return value;
+    };
+    let mut projected = serde_json::Map::new();
+    if let serde_json::Value::Object(mut object) = value {
+        if let Some(section) = object.remove(key) {
+            projected.insert(key.to_string(), section);
+        }
+    }
+    serde_json::Value::Object(projected)
 }
 
 const CORPUS: &[FixtureSpec] = &[
     FixtureSpec {
+        label: "json-diff/direct-outlines.pdf",
+        relative_path: "json-diff/direct-outlines.pdf",
+        password: None,
+        compared_top_level_key: Some("outlines"),
+    },
+    FixtureSpec {
         label: "minimal.pdf",
         relative_path: "minimal.pdf",
         password: None,
+        compared_top_level_key: None,
     },
     FixtureSpec {
         label: "compat/one-page.pdf",
         relative_path: "compat/one-page.pdf",
         password: None,
+        compared_top_level_key: None,
     },
     FixtureSpec {
         label: "compat/two-page.pdf",
         relative_path: "compat/two-page.pdf",
         password: None,
+        compared_top_level_key: None,
     },
     FixtureSpec {
         label: "compat/three-page.pdf",
         relative_path: "compat/three-page.pdf",
         password: None,
+        compared_top_level_key: None,
     },
     FixtureSpec {
         label: "compat/linearized-one-page.pdf",
         relative_path: "compat/linearized-one-page.pdf",
         password: None,
+        compared_top_level_key: None,
     },
     FixtureSpec {
         label: "compat/attachment-two-page.pdf",
         relative_path: "compat/attachment-two-page.pdf",
         password: None,
+        compared_top_level_key: None,
     },
     FixtureSpec {
         label: "compat/multi-contents-one-page.pdf",
         relative_path: "compat/multi-contents-one-page.pdf",
         password: None,
+        compared_top_level_key: None,
     },
     FixtureSpec {
         label: "compat/unref-resources-one-page.pdf",
         relative_path: "compat/unref-resources-one-page.pdf",
         password: None,
+        compared_top_level_key: None,
     },
     // qdf-fix/qdf-golden/qdf-roundtrip: QDF-form PDFs (qpdf's debug output
     // format, re-parsed as PDFs). Cover diverse content trees and xref shapes.
@@ -63,16 +91,19 @@ const CORPUS: &[FixtureSpec] = &[
         label: "qdf-fix/one-page-clean.qdf",
         relative_path: "qdf-fix/one-page-clean.qdf",
         password: None,
+        compared_top_level_key: None,
     },
     FixtureSpec {
         label: "qdf-golden/minimal.qdf",
         relative_path: "qdf-golden/minimal.qdf",
         password: None,
+        compared_top_level_key: None,
     },
     FixtureSpec {
         label: "qdf-roundtrip/three-page-clean.qdf",
         relative_path: "qdf-roundtrip/three-page-clean.qdf",
         password: None,
+        compared_top_level_key: None,
     },
     // SKIP: qdf-roundtrip/three-page-edited-payload.qdf — intentionally damaged
     // (qpdf reconstructs xref with warnings, flpdf rejects with "parse error
@@ -87,11 +118,13 @@ const CORPUS: &[FixtureSpec] = &[
         label: "encrypted/v4-aes-128-r4.pdf",
         relative_path: "encrypted/v4-aes-128-r4.pdf",
         password: Some("user-v4-aes"),
+        compared_top_level_key: None,
     },
     FixtureSpec {
         label: "encrypted/v5-aes-256-r6.pdf",
         relative_path: "encrypted/v5-aes-256-r6.pdf",
         password: Some("user-v5-r6"),
+        compared_top_level_key: None,
     },
 ];
 
@@ -105,6 +138,21 @@ fn allowlist_path() -> PathBuf {
 
 fn report_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/json-diff")
+}
+
+#[test]
+fn project_top_level_key_limits_a_fixture_to_its_oracle_section() {
+    let full = serde_json::json!({
+        "outlines": [{"title": "Chapter"}],
+        "pagelabels": [{"index": 0}],
+        "pages": [{"object": "3 0 R"}],
+    });
+
+    assert_eq!(
+        project_top_level_key(full.clone(), Some("outlines")),
+        serde_json::json!({"outlines": [{"title": "Chapter"}]})
+    );
+    assert_eq!(project_top_level_key(full.clone(), None), full);
 }
 
 #[test]
@@ -124,11 +172,15 @@ fn json_schema_diff_corpus() {
         let flpdf_out = run_flpdf_json(&path, spec.password);
 
         let (cells, qpdf_error, flpdf_error) = match (qpdf_out, flpdf_out) {
-            (Ok(qv), Ok(fv)) => (
-                compute_matrix(spec.label, &qv, &fv, &mut allowlist),
-                None,
-                None,
-            ),
+            (Ok(qv), Ok(fv)) => {
+                let qv = project_top_level_key(qv, spec.compared_top_level_key);
+                let fv = project_top_level_key(fv, spec.compared_top_level_key);
+                (
+                    compute_matrix(spec.label, &qv, &fv, &mut allowlist),
+                    None,
+                    None,
+                )
+            }
             (Err(qe), Ok(_)) => (vec![], Some(qe), None),
             (Ok(_), Err(fe)) => (vec![], None, Some(fe)),
             (Err(qe), Err(fe)) => (vec![], Some(qe), Some(fe)),

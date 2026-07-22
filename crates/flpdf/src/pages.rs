@@ -55,6 +55,7 @@ pub fn page_refs_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,
 ) -> Result<Vec<ObjectRef>> {
+    pdf.mark_get_all_pages_called();
     PageWalk::with_max_depth(pdf, max_depth)?.collect()
 }
 
@@ -1800,6 +1801,23 @@ mod tests {
             .collect::<Result<_>>()
             .unwrap();
         assert_eq!(from_page_refs, from_walk);
+    }
+
+    #[test]
+    fn page_refs_records_that_all_pages_were_requested() {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        assert!(!pdf.ever_called_get_all_pages());
+        assert_eq!(page_refs_with_max_depth(&mut pdf, 8).unwrap().len(), 1);
+        assert!(pdf.ever_called_get_all_pages());
     }
 
     /// Build a raw indirect object whose body is a bare reference (`N 0 R`),

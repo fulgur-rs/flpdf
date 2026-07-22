@@ -1,5 +1,5 @@
 //! Outline / named-destination / `/PageLabels` parity vs qpdf 11.9.0 for
-//! `--pages`, plus a current-behaviour lock for `flpdf --json`'s `outlines`
+//! `--pages`, plus exact qpdf JSON v2 locks for `flpdf --json`'s `outlines`
 //! and `pagelabels` sections.
 //!
 //! Truth source: `/usr/bin/qpdf` 11.9.0, same convention as
@@ -15,7 +15,7 @@
 //! the pattern `cli_pages_pagelabels_qpdf.rs` already uses for `/PageLabels`.
 
 use assert_cmd::Command;
-use flpdf::{pages, ObjectRef, Pdf};
+use flpdf::{pages, Object, ObjectRef, Pdf};
 use std::path::Path;
 use std::process::Command as Shell;
 
@@ -49,8 +49,8 @@ fn qpdf_available() -> bool {
 ///
 /// Both destinations target pages that SURVIVE the `1,3` (1-based) selection
 /// used below, so this exercises the "kept" path, not the null-out path
-/// (already covered extensively elsewhere, e.g.
-/// `outline_document_helper_tests.rs`'s `legacy_dests_reflects_remap_after_page_tree_rebuild`).
+/// (already covered extensively by the raw destination assertions in
+/// `page_merge_tests.rs`).
 fn outline_and_dests_four_page_pdf() -> Vec<u8> {
     let objects: &[(u32, &str)] = &[
         (
@@ -112,23 +112,54 @@ fn page_index_of(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>, target: Objec
 /// test-harness bug, not something the assertions below should tolerate
 /// silently.
 fn outline_dest_page_index(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>) -> usize {
-    let roots = pdf.outline().get_root().unwrap();
-    let target = roots[0]
+    let tree = pdf.outline().get_tree().unwrap();
+    let target = tree[tree.roots()[0]]
         .dest_page()
         .as_ref_id()
         .expect("dest must resolve to a page ref");
     page_index_of(pdf, target)
 }
 
-/// 0-based index, within `pdf`'s own page order, of the page the modern
-/// `/Names /Dests` entry `"target"` points at.
+fn terminal_object(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>, mut value: Object) -> Object {
+    for _ in 0..64 {
+        match value {
+            Object::Reference(reference) => value = pdf.resolve(reference).unwrap(),
+            other => return other,
+        }
+    }
+    panic!("test fixture contains an excessively deep reference chain");
+}
+
+/// 0-based index, within `pdf`'s own page order, of the page the raw modern
+/// `/Names /Dests` entry `"target"` points at. This fixture has a single leaf,
+/// so the test reads that leaf directly without a normalized destination API.
 fn named_dest_page_index(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>) -> usize {
-    let entries = pdf.outline().name_tree_dests().unwrap();
-    let (_, dest) = entries
-        .iter()
-        .find(|(name, _)| name == b"target")
+    let catalog_ref = pdf.root_ref().expect("catalog ref");
+    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    let Object::Dictionary(names) =
+        terminal_object(pdf, catalog.get("Names").cloned().expect("catalog /Names"))
+    else {
+        panic!("catalog /Names must resolve to a dictionary");
+    };
+    let Object::Dictionary(dests) = terminal_object(
+        pdf,
+        names.get("Dests").cloned().expect("catalog /Names /Dests"),
+    ) else {
+        panic!("catalog /Names /Dests must resolve to a dictionary");
+    };
+    let Object::Array(entries) = dests.get("Names").expect("destination leaf /Names") else {
+        panic!("destination leaf /Names must be an array");
+    };
+    let target_index = entries
+        .chunks_exact(2)
+        .position(|pair| pair[0] == Object::String(b"target".to_vec()))
         .expect("\"target\" entry must survive");
-    let target = dest.as_ref().expect("dest must resolve").page().unwrap();
+    let Object::Array(dest) = terminal_object(pdf, entries[target_index * 2 + 1].clone()) else {
+        panic!("target destination must remain a raw array");
+    };
+    let target = dest[0].as_ref_id().expect("destination page reference");
     page_index_of(pdf, target)
 }
 
@@ -197,9 +228,7 @@ fn cli_pages_subset_outline_and_named_dest_page_positions_match_qpdf() {
 }
 
 // ---------------------------------------------------------------------------
-// JSON current-behaviour lock (see beads flpdf-q28i for the tracked schema
-// divergence vs qpdf — out of scope to fix here; this test only guards
-// against a further, silent regression in flpdf's own JSON output).
+// JSON qpdf 11.9.0 schema lock.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -217,19 +246,40 @@ fn cli_json_outlines_and_pagelabels_sections_are_populated() {
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    // "outlines": one root item, with today's key set (see flpdf-q28i for the
-    // tracked divergence from qpdf's actual `dest`/`destpageposfrom1`/`kids`/
-    // `object`/`open`/`title` shape — this only locks flpdf's own current
-    // output against a further regression).
+    // "outlines": one root item with qpdf's exact six-key JSON v2 shape.
     let outlines = json.get("outlines").and_then(|v| v.as_array()).unwrap();
     assert_eq!(outlines.len(), 1, "one root outline item");
     let item = &outlines[0];
+    let keys = item.as_object().unwrap().keys().collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        [
+            "dest",
+            "destpageposfrom1",
+            "kids",
+            "object",
+            "open",
+            "title"
+        ]
+    );
     assert_eq!(item.get("title").and_then(|v| v.as_str()), Some("Go"));
     assert!(item.get("dest").is_some_and(|v| v.is_array()));
+    assert_eq!(
+        item.get("destpageposfrom1").and_then(|v| v.as_i64()),
+        Some(1)
+    );
+    assert_eq!(item.get("object").and_then(|v| v.as_str()), Some("40 0 R"));
+    assert_eq!(item.get("open").and_then(|v| v.as_bool()), Some(true));
     assert!(item
         .get("kids")
         .and_then(|v| v.as_array())
         .is_some_and(|a| a.is_empty()));
+    for removed in ["action", "count", "flags", "structureelement"] {
+        assert!(
+            item.get(removed).is_none(),
+            "removed key {removed} must be absent"
+        );
+    }
 
     // "pagelabels": two ranges (roman from 0, decimal from 2), today's
     // {index, label: {first, prefix, style}} shape.

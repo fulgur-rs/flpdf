@@ -174,6 +174,70 @@ fn json_key_invalid_exits_nonzero_with_error() {
     .stderr(predicate::str::contains("--json-key"));
 }
 
+#[test]
+fn json_v2_rejects_v1_only_object_keys_before_input_io() {
+    for key in ["objects", "objectinfo"] {
+        let mut cmd = Command::cargo_bin("flpdf").unwrap();
+        let assert = cmd
+            .args([
+                "--json=2",
+                "--json-key",
+                key,
+                "/definitely/missing/json-key-validation.pdf",
+            ])
+            .assert()
+            .code(2);
+        let output = assert.get_output();
+        assert!(output.stdout.is_empty(), "{key}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "flpdf: json keys \"objects\" and \"objectinfo\" are only valid for json version 1\n",
+            "{key}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 versioned JSON key oracle"]
+fn live_qpdf_json_v2_rejects_v1_only_object_keys_with_same_diagnostic() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let expected = "json keys \"objects\" and \"objectinfo\" are only valid for json version 1";
+
+    for key in ["objects", "objectinfo"] {
+        let key_arg = format!("--json-key={key}");
+        let qpdf = std::process::Command::new("qpdf")
+            .args(["--json=2", &key_arg])
+            .arg(input.path())
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(["--json=2", &key_arg])
+            .arg(input.path())
+            .output()
+            .unwrap();
+
+        assert_eq!(qpdf.status.code(), Some(2), "{key}");
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "{key}");
+        let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr);
+        let flpdf_stderr = String::from_utf8_lossy(&flpdf.stderr);
+        let qpdf_line = qpdf_stderr
+            .lines()
+            .find(|line| !line.is_empty())
+            .unwrap()
+            .strip_prefix("qpdf: ")
+            .unwrap();
+        let flpdf_line = flpdf_stderr
+            .lines()
+            .find(|line| !line.is_empty())
+            .unwrap()
+            .strip_prefix("flpdf: ")
+            .unwrap();
+        assert_eq!(qpdf_line, expected, "{key}");
+        assert_eq!(flpdf_line, qpdf_line, "{key}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test 6: --json-object xyz — exit code != 0, error on stderr
 // ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-use flpdf::{fonts, outline, pages, ObjectRef, Pdf};
+use flpdf::{fonts, pages, ObjectRef, Pdf};
 use std::io::Cursor;
 use std::io::Write;
 
@@ -23,71 +23,69 @@ fn page_refs_with_max_depth_rejects_too_deep_trees() {
 }
 
 #[test]
-fn outline_items_returns_titles_in_pre_order() {
+fn outline_tree_returns_titles_in_pre_order() {
     let pdf = pdf_with_metadata_outline_and_fonts();
     let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
-    let items = outline::outline_items(&mut pdf).unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].depth, 0);
-    assert_eq!(items[0].title, "Chapter One");
-    assert_eq!(items[0].object_ref, ObjectRef::new(10, 0));
+    let tree = pdf.outline().get_tree().unwrap();
+    let (depth, id, item) = tree.preorder().next().unwrap();
+    assert_eq!(tree.roots().len(), 1);
+    assert_eq!(depth, 1);
+    assert_eq!(item.title, "Chapter One");
+    assert_eq!(item.source_ref, Some(ObjectRef::new(10, 0)));
+    assert_eq!(tree.get(id), Some(item));
 }
 
 #[test]
-fn outline_items_returns_empty_when_outline_missing() {
+fn outline_tree_returns_empty_when_outline_missing() {
     let pdf = nested_pages_pdf();
     let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
-    let items = outline::outline_items(&mut pdf).unwrap();
-    assert!(items.is_empty());
+    let tree = pdf.outline().get_tree().unwrap();
+    assert!(tree.roots().is_empty());
 }
 
 #[test]
-fn outline_items_resolves_indirect_title() {
+fn outline_tree_resolves_indirect_title() {
     // /Title stored as an indirect reference (`5 0 R`) must be resolved, not
     // serialized as the literal "5 0 R".
     let object4 = b"4 0 obj\n<< /Title 5 0 R /Parent 3 0 R >>\nendobj\n".to_vec();
     let object5 = b"5 0 obj\n(Chapter One)\nendobj\n".to_vec();
     let pdf = single_outline_pdf(&[object4, object5]);
     let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
-    let items = outline::outline_items(&mut pdf).unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].title, "Chapter One");
-    assert_eq!(items[0].object_ref, ObjectRef::new(4, 0));
+    let tree = pdf.outline().get_tree().unwrap();
+    let item = &tree[tree.roots()[0]];
+    assert_eq!(tree.roots().len(), 1);
+    assert_eq!(item.title, "Chapter One");
+    assert_eq!(item.source_ref, Some(ObjectRef::new(4, 0)));
 }
 
 #[test]
-fn outline_items_decodes_utf16be_title() {
-    // /Title as a UTF-16BE string with BOM: FE FF 65 E5 = U+65E5 ("日").
+fn outline_tree_decodes_utf16be_title_like_qpdf() {
     let object4 = b"4 0 obj\n<< /Title <FEFF65E5> /Parent 3 0 R >>\nendobj\n".to_vec();
     let pdf = single_outline_pdf(&[object4]);
     let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
-    let items = outline::outline_items(&mut pdf).unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].title, "日");
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree.roots().len(), 1);
+    assert_eq!(tree[tree.roots()[0]].title, "日");
 }
 
 #[test]
-fn outline_items_uses_untitled_when_title_absent() {
-    // An outline item without a /Title must keep yielding "<untitled>".
+fn outline_tree_uses_empty_title_when_title_absent() {
     let object4 = b"4 0 obj\n<< /Parent 3 0 R >>\nendobj\n".to_vec();
     let pdf = single_outline_pdf(&[object4]);
     let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
-    let items = outline::outline_items(&mut pdf).unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].title, "<untitled>");
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree.roots().len(), 1);
+    assert_eq!(tree[tree.roots()[0]].title, "");
 }
 
 #[test]
-fn outline_items_serializes_non_string_title() {
-    // A `/Title` that is neither a string nor an indirect reference (here an
-    // integer) is not a valid PDF text string; it falls back to its serialized
-    // form rather than erroring.
+fn outline_tree_uses_empty_title_for_non_string_value() {
     let object4 = b"4 0 obj\n<< /Title 42 /Parent 3 0 R >>\nendobj\n".to_vec();
     let pdf = single_outline_pdf(&[object4]);
     let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
-    let items = outline::outline_items(&mut pdf).unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].title, "42");
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree.roots().len(), 1);
+    assert_eq!(tree[tree.roots()[0]].title, "");
 }
 
 /// Build a minimal PDF whose catalog points at an `/Outlines` tree with a single

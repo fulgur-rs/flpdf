@@ -1,6 +1,7 @@
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
-use crate::parser::{parse_indirect_object_detailed, Parser};
+use crate::object::collect_qpdf_object_references;
+use crate::parser::{parse_indirect_object_detailed, parse_indirect_object_detailed_qpdf, Parser};
 use crate::security::password::{normalize_password, PasswordMode};
 use crate::security::standard::{
     check_owner_password, check_owner_password_r5, check_owner_password_r6,
@@ -8,9 +9,9 @@ use crate::security::standard::{
     check_user_password_v4, decrypt_cipher_bytes, decrypt_strings_in_object, per_object_key,
     ObjectKeyAlg, StandardHandlerInputs, StandardHandlerR5Inputs, StringCipher,
 };
+use crate::xref::load_xref_state_with_repair;
 use crate::{
-    load_xref_and_trailer, load_xref_and_trailer_with_repair, Diagnostic, Diagnostics, Dictionary,
-    Error, Object, ObjectRef, Result, XrefForm, XrefOffset,
+    Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, Result, XrefForm, XrefOffset,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -68,7 +69,38 @@ pub struct Pdf<R: Read + Seek> {
     source_xref_offsets: Vec<(ObjectRef, u64)>,
     source_xref_entries: BTreeMap<ObjectRef, XrefOffset>,
     dirty_object_refs: BTreeSet<ObjectRef>,
+    /// Valid indirect references discovered while preparing qpdf JSON whose
+    /// exact object generation has no live xref/cache target.
+    qpdf_dangling_refs: BTreeSet<ObjectRef>,
+    /// Valid indirect references parsed from every classic trailer and xref
+    /// stream dictionary in the source `/Prev` chain.
+    qpdf_trailer_references: BTreeSet<ObjectRef>,
+    /// Xref stream objects parsed while following the source `/Prev` chain.
+    /// Kept outside the public cache so superseded/free streams remain visible
+    /// only through qpdf's raw object view.
+    qpdf_parsed_xref_streams: BTreeMap<ObjectRef, Object>,
+    /// Objects removed through [`Self::delete_object`]. qpdf's object cache
+    /// removal is persistent across repeated JSON preparation; keep this
+    /// separate from immutable source/trailer discovery so those seeds cannot
+    /// resurrect an explicitly removed reference.
+    qpdf_removed_refs: BTreeSet<ObjectRef>,
+    /// Monotonic observation matching qpdf's `everCalledGetAllPages()`.
+    ever_called_get_all_pages: bool,
     encryption: Option<EncryptionState>,
+}
+
+pub(crate) struct QpdfPreparedObjects {
+    pub(crate) refs: Vec<ObjectRef>,
+    pub(crate) max_object_id: u32,
+}
+
+struct QpdfReadObject {
+    bytes: Vec<u8>,
+    object_ref: ObjectRef,
+    object: Object,
+    indirect_length: Option<crate::parser::IndirectStreamLength>,
+    empty_offset: Option<usize>,
+    expected_endobj_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -480,11 +512,8 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     fn open_with_repair_mode(mut reader: R, options: PdfOpenOptions) -> Result<Self> {
-        let loaded = if options.repair {
-            load_xref_and_trailer_with_repair(&mut reader, options.repair)?
-        } else {
-            load_xref_and_trailer(&mut reader)?
-        };
+        let loaded_state = load_xref_state_with_repair(&mut reader, options.repair)?;
+        let loaded = loaded_state.loaded;
         let source_xref_entries = loaded.entries.clone();
         let source_xref_offsets = loaded
             .entries
@@ -535,6 +564,11 @@ impl<R: Read + Seek> Pdf<R> {
             source_xref_offsets,
             source_xref_entries,
             dirty_object_refs: BTreeSet::new(),
+            qpdf_dangling_refs: BTreeSet::new(),
+            qpdf_trailer_references: loaded_state.trailer_references,
+            qpdf_parsed_xref_streams: loaded_state.parsed_xref_streams,
+            qpdf_removed_refs: BTreeSet::new(),
+            ever_called_get_all_pages: false,
             encryption: None,
         };
         pdf.authenticate_if_encrypted(&options)?;
@@ -777,6 +811,18 @@ impl<R: Read + Seek> Pdf<R> {
         &self.version
     }
 
+    /// Whether this document has been asked to enumerate its complete page tree.
+    ///
+    /// This is monotonic for the lifetime of the [`Pdf`] and mirrors qpdf's
+    /// `everCalledGetAllPages()` observation used by JSON v2 metadata.
+    pub fn ever_called_get_all_pages(&self) -> bool {
+        self.ever_called_get_all_pages
+    }
+
+    pub(crate) fn mark_get_all_pages_called(&mut self) {
+        self.ever_called_get_all_pages = true;
+    }
+
     /// Adobe extension level from the catalog's `/Extensions /ADBE
     /// /ExtensionLevel`, resolving indirect references at each step. Returns
     /// `None` when any link in that chain is absent or is not the expected
@@ -829,6 +875,9 @@ impl<R: Read + Seek> Pdf<R> {
     /// [`crate::write_pdf`] will see the updated value when it walks the cache and emit
     /// a new revision for the touched object.
     pub fn set_object(&mut self, object_ref: ObjectRef, object: Object) {
+        self.qpdf_removed_refs.remove(&object_ref);
+        self.qpdf_parsed_xref_streams.remove(&object_ref);
+        self.qpdf_dangling_refs.remove(&object_ref);
         if let Some(CacheEntry::Compressed { stream, index }) =
             self.cache.entry(object_ref).cloned()
         {
@@ -844,6 +893,11 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub fn delete_object(&mut self, object_ref: ObjectRef) {
+        if object_ref.number != 0 {
+            self.qpdf_removed_refs.insert(object_ref);
+        }
+        self.qpdf_parsed_xref_streams.remove(&object_ref);
+        self.qpdf_dangling_refs.remove(&object_ref);
         if object_ref.number == 0
             || matches!(
                 self.cache.entry(object_ref),
@@ -898,7 +952,13 @@ impl<R: Read + Seek> Pdf<R> {
     /// Every object reference known from the cross-reference table, including objects
     /// that have not yet been parsed.
     pub fn object_refs(&self) -> Vec<ObjectRef> {
-        self.cache.object_refs()
+        self.cache
+            .entries()
+            .iter()
+            .filter_map(|(object_ref, entry)| {
+                (!matches!(entry, CacheEntry::Missing)).then_some(*object_ref)
+            })
+            .collect()
     }
 
     /// Object refs that the cross-reference table marks as live.
@@ -925,6 +985,61 @@ impl<R: Read + Seek> Pdf<R> {
                 _ => Some(*object_ref),
             })
             .collect()
+    }
+
+    /// Resolve every live xref/cache object and register valid indirect
+    /// references whose exact generation has no live target. This mirrors the
+    /// object-cache preparation performed by qpdf's `fixDanglingReferences()`
+    /// for JSON metadata without exposing placeholders through the public
+    /// object enumeration APIs.
+    pub(crate) fn prepare_qpdf_json_objects(&mut self) -> Result<QpdfPreparedObjects> {
+        let live_snapshot = self.live_object_refs();
+        let mut discovered = self.qpdf_trailer_references.clone();
+        discovered.extend(self.qpdf_parsed_xref_streams.keys().copied());
+
+        for object_ref in live_snapshot {
+            let object = self.resolve_qpdf_json_object(object_ref)?;
+            collect_qpdf_object_references(&object, &mut discovered);
+        }
+
+        for object_ref in discovered {
+            if object_ref.number == 0
+                || object_ref.generation == u16::MAX
+                || self.qpdf_removed_refs.contains(&object_ref)
+            {
+                continue;
+            }
+            let has_live_target = matches!(
+                self.cache.entry(object_ref),
+                Some(
+                    CacheEntry::Unresolved { .. }
+                        | CacheEntry::Compressed { .. }
+                        | CacheEntry::Resolved(_)
+                )
+            );
+            if !has_live_target {
+                self.qpdf_dangling_refs.insert(object_ref);
+                if self.cache.entry(object_ref).is_none() {
+                    self.cache.set_missing(object_ref);
+                }
+            }
+        }
+
+        let mut refs = self.live_object_refs();
+        refs.extend(self.qpdf_dangling_refs.iter().copied());
+        refs.retain(|object_ref| !self.qpdf_removed_refs.contains(object_ref));
+        refs.sort_unstable();
+        refs.dedup();
+        let max_object_id = refs
+            .iter()
+            .map(|object_ref| object_ref.number)
+            .max()
+            .unwrap_or(0);
+
+        Ok(QpdfPreparedObjects {
+            refs,
+            max_object_id,
+        })
     }
 
     /// `/Root` as listed in the trailer, when present.
@@ -1066,6 +1181,106 @@ impl<R: Read + Seek> Pdf<R> {
                 }
             }
             Err(window_err) => Err(window_err),
+        }
+    }
+
+    fn read_object_at_qpdf(&mut self, offset: u64) -> Result<QpdfReadObject> {
+        let next = self.next_object_offset(offset);
+        self.reader.seek(SeekFrom::Start(offset))?;
+        let mut bytes = Vec::new();
+        match next {
+            Some(next) => {
+                let len = next.saturating_sub(offset);
+                self.reader.by_ref().take(len).read_to_end(&mut bytes)?;
+            }
+            None => {
+                self.reader.read_to_end(&mut bytes)?;
+            }
+        }
+
+        match parse_indirect_object_detailed_qpdf(&bytes) {
+            Ok(parsed) => Ok(QpdfReadObject {
+                bytes,
+                object_ref: parsed.object_ref,
+                object: parsed.object,
+                indirect_length: parsed.indirect_length,
+                empty_offset: parsed.empty_offset,
+                expected_endobj_offset: parsed.expected_endobj_offset,
+            }),
+            Err(window_err) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
+                self.resolution_fallbacks_remaining -= 1;
+                self.reader.seek(SeekFrom::Start(offset))?;
+                let mut full = Vec::new();
+                self.reader.read_to_end(&mut full)?;
+                match parse_indirect_object_detailed_qpdf(&full) {
+                    Ok(parsed) => Ok(QpdfReadObject {
+                        bytes: full,
+                        object_ref: parsed.object_ref,
+                        object: parsed.object,
+                        indirect_length: parsed.indirect_length,
+                        empty_offset: parsed.empty_offset,
+                        expected_endobj_offset: parsed.expected_endobj_offset,
+                    }),
+                    Err(_) => Err(window_err),
+                }
+            }
+            Err(window_err) => Err(window_err),
+        }
+    }
+
+    pub(crate) fn resolve_qpdf_json_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
+        if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
+            return Ok(object.clone());
+        }
+
+        match self.cache.entry(object_ref).cloned() {
+            Some(CacheEntry::Unresolved { offset }) => {
+                let parsed = self.read_object_at_qpdf(offset)?;
+                if parsed.object_ref != object_ref {
+                    return Ok(Object::Null);
+                }
+                let mut object = parsed.object;
+                if let Some(isl) = parsed.indirect_length {
+                    self.apply_indirect_stream_length(
+                        object_ref,
+                        &mut object,
+                        isl,
+                        &parsed.bytes,
+                        offset,
+                    )?;
+                }
+                let object = self.decrypt_resolved_object(object_ref, object)?;
+                self.cache.set_resolved(object_ref, object.clone());
+                if let Some(relative_offset) = parsed.empty_offset {
+                    self.push_warning(format!(
+                        "(object {} {}, offset {}): empty object treated as null",
+                        object_ref.number,
+                        object_ref.generation,
+                        offset.saturating_add(relative_offset as u64)
+                    ));
+                }
+                if let Some(relative_offset) = parsed.expected_endobj_offset {
+                    self.push_warning(format!(
+                        "(object {} {}, offset {}): expected endobj",
+                        object_ref.number,
+                        object_ref.generation,
+                        offset.saturating_add(relative_offset as u64)
+                    ));
+                }
+                Ok(object)
+            }
+            Some(CacheEntry::Compressed { .. }) => self.resolve(object_ref),
+            Some(
+                CacheEntry::Resolved(_)
+                | CacheEntry::Missing
+                | CacheEntry::Deleted
+                | CacheEntry::Reserved,
+            )
+            | None => Ok(self
+                .qpdf_parsed_xref_streams
+                .get(&object_ref)
+                .cloned()
+                .unwrap_or(Object::Null)),
         }
     }
 
@@ -2303,6 +2518,7 @@ fn parse_non_negative_u64(value: i64, context: &str) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::pages::page_refs;
+    use crate::Stream;
 
     #[test]
     fn keyword_token_at_requires_token_boundary() {
@@ -2361,6 +2577,126 @@ mod tests {
             format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
         pdf.extend_from_slice(trailer.as_bytes());
         pdf
+    }
+
+    fn classic_pdf_with_bodies(bodies: &[&[u8]], root: ObjectRef) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for body in bodies {
+            offsets.push(pdf.len() as u64);
+            pdf.extend_from_slice(body);
+        }
+        let size = bodies.len() + 1;
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {size} /Root {} {} R >>\nstartxref\n{xref_start}\n%%EOF\n",
+                root.number, root.generation
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn qpdf_object_read_uses_bounded_fallback_and_preserves_strict_errors() {
+        let stream_body =
+            b"1 0 obj\n<< /Length 2 0 R >>\nstream\n9 0 obj\nnull\nendobj\nendstream\nendobj\n";
+        let length_body = b"2 0 obj\n19\nendobj\n";
+        let bytes = classic_pdf_with_bodies(&[stream_body, length_body], ObjectRef::new(1, 0));
+        let stream_offset = bytes
+            .windows(b"1 0 obj".len())
+            .position(|window| window == b"1 0 obj")
+            .unwrap() as u64;
+        let embedded_offset = bytes
+            .windows(b"9 0 obj".len())
+            .position(|window| window == b"9 0 obj")
+            .unwrap() as u64;
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fallback fixture");
+        pdf.sorted_object_offsets.push(embedded_offset);
+        pdf.sorted_object_offsets.sort_unstable();
+
+        let parsed = pdf
+            .read_object_at_qpdf(stream_offset)
+            .expect("full read fallback must recover stream");
+        assert_eq!(parsed.object_ref, ObjectRef::new(1, 0));
+        assert!(parsed.object.as_stream().is_some());
+
+        let malformed = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n", b"2 0 obj\n<<"],
+            ObjectRef::new(1, 0),
+        );
+        let malformed_offset = malformed
+            .windows(b"2 0 obj".len())
+            .position(|window| window == b"2 0 obj")
+            .unwrap() as u64;
+        let mut pdf = Pdf::open_mem_owned(malformed).expect("open malformed lazy object");
+        assert!(pdf.read_object_at_qpdf(malformed_offset).is_err());
+        pdf.sorted_object_offsets.push(malformed_offset + 5);
+        pdf.sorted_object_offsets.sort_unstable();
+        assert!(pdf.read_object_at_qpdf(malformed_offset).is_err());
+    }
+
+    #[test]
+    fn qpdf_object_resolution_covers_mismatch_indirect_length_compressed_and_absent() {
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Length 2 0 R >>\nstream\nabc\nendstream\nendobj\n",
+                b"2 0 obj\n3\nendobj\n",
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let first_offset = bytes
+            .windows(b"1 0 obj".len())
+            .position(|window| window == b"1 0 obj")
+            .unwrap() as u64;
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open indirect-length fixture");
+        let stream = pdf
+            .resolve_qpdf_json_object(ObjectRef::new(1, 0))
+            .expect("resolve qpdf stream");
+        assert_eq!(stream.as_stream().unwrap().data, b"abc");
+
+        let mismatched = ObjectRef::new(8, 0);
+        pdf.cache.set_unresolved(mismatched, first_offset);
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(mismatched).unwrap(),
+            Object::Null
+        );
+
+        let mut objstm_dict = Dictionary::new();
+        objstm_dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
+        objstm_dict.insert("N", Object::Integer(1));
+        objstm_dict.insert("First", Object::Integer(4));
+        let objstm_ref = ObjectRef::new(4, 0);
+        pdf.set_object(
+            objstm_ref,
+            Object::Stream(Stream::new(objstm_dict, b"7 0 << /Value 1 >>".to_vec())),
+        );
+        let compressed_ref = ObjectRef::new(7, 0);
+        pdf.cache.set_compressed(compressed_ref, 4, 0);
+        assert!(matches!(
+            pdf.resolve_qpdf_json_object(compressed_ref).unwrap(),
+            Object::Dictionary(_)
+        ));
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(ObjectRef::new(99, 0)).unwrap(),
+            Object::Null
+        );
+
+        let invalid_length = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Length 2 0 R >>\nstream\nabcendstream\nendobj\n",
+                b"2 0 obj\n99\nendobj\n",
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(invalid_length).expect("open invalid-length fixture");
+        assert!(pdf.resolve_qpdf_json_object(ObjectRef::new(1, 0)).is_err());
     }
 
     /// Build a minimal PDF whose object `(1, 0)` is a linearization

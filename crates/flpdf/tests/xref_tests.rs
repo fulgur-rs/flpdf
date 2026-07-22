@@ -1,10 +1,25 @@
 use flpdf::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
-    Error, ObjectRef, XrefForm, XrefOffset,
+    Diagnostics, Dictionary, Error, LoadedXref, ObjectRef, XrefForm, XrefOffset,
 };
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Cursor;
+
+#[test]
+fn loaded_xref_remains_constructible_with_original_public_fields() {
+    let loaded = LoadedXref {
+        version: "1.7".to_string(),
+        startxref: 110,
+        entries: BTreeMap::new(),
+        trailer: Dictionary::new(),
+        last_xref_form: XrefForm::Table,
+        repair_diagnostics: Diagnostics::default(),
+    };
+
+    assert_eq!(loaded.version, "1.7");
+}
 
 #[test]
 fn loads_xref_table_and_trailer() {
@@ -1067,7 +1082,7 @@ fn with_repair_appends_diagnostic_when_stream_parse_succeeds() {
 }
 
 /// A `/Prev` chain that points back at itself is a circular reference: strict
-/// mode must reject it with "xref /Prev is circular", while best-effort must
+/// mode must reject it with qpdf's loop diagnostic, while best-effort must
 /// stop following the chain and return `Ok` with the entries seen so far.
 #[test]
 fn circular_prev_recovers_with_repair_and_rejected_strict() {
@@ -1093,7 +1108,10 @@ fn circular_prev_recovers_with_repair_and_rejected_strict() {
     let err = load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
         .expect_err("circular /Prev should fail strict parse");
     let message = format!("{err}");
-    assert!(message.contains("xref /Prev is circular"), "got {message}");
+    assert!(
+        message.contains("loop detected following xref tables"),
+        "got {message}"
+    );
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 
     // Best-effort stops following the cycle and returns the entries it has.
@@ -1103,6 +1121,82 @@ fn circular_prev_recovers_with_repair_and_rejected_strict() {
         Some(&XrefOffset::Offset(obj1_offset as u64))
     );
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+}
+
+#[test]
+fn circular_prev_xref_stream_recovers_without_classic_trailer() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let xref_offset = bytes.len() as u64;
+    let entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 0),
+        (1, catalog_offset, 0),
+        (1, xref_offset, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_object(
+        2,
+        3,
+        Some(xref_offset),
+        1,
+        &entries,
+    ));
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    assert!(!bytes.windows(7).any(|window| window == b"trailer"));
+
+    let strict = load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
+        .expect_err("strict mode must reject the circular /Prev");
+    assert!(strict
+        .to_string()
+        .contains("loop detected following xref tables"));
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefOffset::Offset(catalog_offset))
+    );
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(2, 0)),
+        Some(&XrefOffset::Offset(xref_offset))
+    );
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+    let messages: Vec<_> = loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "file is damaged",
+            "loop detected following xref tables",
+            "Attempting to reconstruct cross-reference table"
+        ]
+    );
+}
+
+#[test]
+fn circular_prev_repair_propagates_linear_scan_failure() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 1 /Root 1 0 R /Prev {xref_offset} >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let error = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect_err("repair cannot reconstruct a file without indirect objects");
+    assert!(
+        error
+            .to_string()
+            .contains("unable to recover xref entries by linear scan"),
+        "{error}"
+    );
 }
 
 /// A `/Prev` offset pointing at a malformed (non-circular) location makes
@@ -1259,8 +1353,7 @@ fn pdf_with_xref_object(xref_obj: &[u8]) -> Vec<u8> {
 
 /// `parse_xref_stream`: when `startxref` points at an indirect object that
 /// parses as a plain dictionary rather than a `stream`, the non-`Object::Stream`
-/// arm returns `Error::Unsupported("xref stream expected an indirect object
-/// stream")`.
+/// arm returns qpdf's `xref not found` parse error.
 #[test]
 fn rejects_xref_stream_non_stream_object() {
     // A dictionary indirect object (no `stream`/`endstream`) at the xref offset.
@@ -1270,11 +1363,8 @@ fn rejects_xref_stream_non_stream_object() {
     let err = load_xref_and_trailer(&mut Cursor::new(bytes))
         .expect_err("non-stream xref object should fail strict parse");
     let message = format!("{err}");
-    assert!(
-        message.contains("xref stream expected an indirect object stream"),
-        "got {message}"
-    );
-    assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    assert!(message.contains("xref not found"), "got {message}");
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 }
 
 /// `parse_xref_widths`: a `/W` whose value is not an array (here an integer)

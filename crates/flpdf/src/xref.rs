@@ -1,6 +1,7 @@
+use crate::object::collect_qpdf_object_references;
 use crate::parser::{parse_indirect_object, Parser};
 use crate::{filters, Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, Result};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 
 #[derive(Debug, Clone)]
@@ -11,6 +12,13 @@ pub struct LoadedXref {
     pub trailer: Dictionary,
     pub last_xref_form: XrefForm,
     pub repair_diagnostics: Diagnostics,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LoadedXrefState {
+    pub(crate) loaded: LoadedXref,
+    pub(crate) trailer_references: BTreeSet<ObjectRef>,
+    pub(crate) parsed_xref_streams: BTreeMap<ObjectRef, Object>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +52,7 @@ pub enum XrefForm {
 /// - [`Error::Unsupported`] when a cross-reference stream uses an unsupported
 ///   object or entry type.
 pub fn load_xref_and_trailer<R: Read + Seek>(reader: &mut R) -> Result<LoadedXref> {
-    load_xref_and_trailer_with_repair(reader, false)
+    load_xref_state_with_repair(reader, false).map(|state| state.loaded)
 }
 
 /// Load the cross-reference table and trailer dictionary from `reader`, running
@@ -69,6 +77,13 @@ pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
     reader: &mut R,
     allow_repair: bool,
 ) -> Result<LoadedXref> {
+    load_xref_state_with_repair(reader, allow_repair).map(|state| state.loaded)
+}
+
+pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
+    reader: &mut R,
+    allow_repair: bool,
+) -> Result<LoadedXrefState> {
     let mut bytes = Vec::new();
     reader.seek(SeekFrom::Start(0))?;
     reader.read_to_end(&mut bytes)?;
@@ -98,7 +113,7 @@ pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
             // Report the first recorded failure; this parse error is only the
             // trigger when the startxref stage itself succeeded.
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
-            return recover_xref_from_linear_scan(&bytes, version, startxref, trigger);
+            return recover_xref_from_linear_scan(&bytes, version, startxref, trigger, None);
         }
         Err(error) => return Err(error),
     };
@@ -106,19 +121,27 @@ pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
     if let Err(error) = merge_previous_xref_sections(
         &bytes,
         &version,
-        &mut loaded.entries,
-        &loaded.trailer,
-        allow_repair,
+        &mut loaded.loaded.entries,
+        &loaded.loaded.trailer,
+        &mut loaded.trailer_references,
+        &mut loaded.parsed_xref_streams,
     ) {
         if allow_repair {
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
-            return recover_xref_from_linear_scan(&bytes, version, startxref, trigger);
+            let recovered = recover_xref_from_linear_scan(
+                &bytes,
+                version,
+                startxref,
+                trigger,
+                Some(&loaded.loaded.trailer),
+            )?;
+            return Ok(merge_recovered_qpdf_state(recovered, loaded));
         }
         return Err(error);
     }
 
     if let Some(error) = parse_errors.into_iter().next() {
-        push_repair_diagnostics(&mut loaded.repair_diagnostics, &error, startxref);
+        push_repair_diagnostics(&mut loaded.loaded.repair_diagnostics, &error, startxref);
     }
 
     Ok(loaded)
@@ -129,20 +152,25 @@ fn parse_xref_from_start(
     xref_pos: usize,
     startxref: u64,
     version: &str,
-) -> Result<LoadedXref> {
+) -> Result<LoadedXrefState> {
     if bytes
         .get(xref_pos..)
         .is_some_and(|tail| tail.starts_with(b"xref"))
     {
         let mut cursor = ByteCursor::new(bytes, xref_pos + 4);
         let (entries, trailer) = parse_xref_table(&mut cursor, bytes)?;
-        return Ok(LoadedXref {
-            version: version.to_string(),
-            startxref,
-            entries,
-            trailer,
-            last_xref_form: XrefForm::Table,
-            repair_diagnostics: Diagnostics::default(),
+        let trailer_references = collect_trailer_references(&trailer);
+        return Ok(LoadedXrefState {
+            loaded: LoadedXref {
+                version: version.to_string(),
+                startxref,
+                entries,
+                trailer,
+                last_xref_form: XrefForm::Table,
+                repair_diagnostics: Diagnostics::default(),
+            },
+            trailer_references,
+            parsed_xref_streams: BTreeMap::new(),
         });
     }
 
@@ -154,7 +182,8 @@ fn merge_previous_xref_sections(
     version: &str,
     entries: &mut BTreeMap<ObjectRef, XrefOffset>,
     trailer: &Dictionary,
-    allow_repair: bool,
+    trailer_references: &mut BTreeSet<ObjectRef>,
+    parsed_xref_streams: &mut BTreeMap<ObjectRef, Object>,
 ) -> Result<()> {
     let mut visited = HashSet::new();
     let mut previous_offset = parse_previous_xref_offset(trailer);
@@ -164,16 +193,22 @@ fn merge_previous_xref_sections(
             .map_err(|_| Error::parse(0, "xref /Prev does not fit usize"))?;
 
         if !visited.insert(offset) {
-            return if allow_repair {
-                Ok(())
-            } else {
-                Err(Error::parse(0, "xref /Prev is circular"))
-            };
+            return Err(Error::parse(0, "loop detected following xref tables"));
         }
 
         let previous = parse_xref_from_start(bytes, previous_pos, offset, version)?;
+        trailer_references.extend(previous.trailer_references.iter().copied());
+        for (object_ref, object) in previous.parsed_xref_streams {
+            let newer_live = matches!(
+                entries.get(&object_ref),
+                Some(XrefOffset::Offset(_) | XrefOffset::Compressed { .. })
+            );
+            if !newer_live {
+                parsed_xref_streams.entry(object_ref).or_insert(object);
+            }
+        }
 
-        for (object_ref, xref_offset) in previous.entries {
+        for (object_ref, xref_offset) in previous.loaded.entries {
             if !entries
                 .keys()
                 .any(|entry_ref| entry_ref.number == object_ref.number)
@@ -182,7 +217,7 @@ fn merge_previous_xref_sections(
             }
         }
 
-        previous_offset = parse_previous_xref_offset(&previous.trailer);
+        previous_offset = parse_previous_xref_offset(&previous.loaded.trailer);
     }
 
     Ok(())
@@ -195,26 +230,59 @@ fn parse_previous_xref_offset(trailer: &Dictionary) -> Option<u64> {
         .filter(|&offset| offset != 0)
 }
 
+fn collect_trailer_references(trailer: &Dictionary) -> BTreeSet<ObjectRef> {
+    let mut references = BTreeSet::new();
+    collect_qpdf_object_references(&Object::Dictionary(trailer.clone()), &mut references);
+    references
+}
+
 fn recover_xref_from_linear_scan(
     bytes: &[u8],
     version: String,
     startxref: u64,
     trigger_error: Error,
-) -> Result<LoadedXref> {
+    fallback_trailer: Option<&Dictionary>,
+) -> Result<LoadedXrefState> {
     let entries = recover_xref_entries(bytes)?;
-    let trailer = recover_trailer(bytes)?;
+    let trailer = match (recover_trailer(bytes), fallback_trailer) {
+        (Ok(trailer), _) => trailer,
+        (Err(_), Some(trailer)) => trailer.clone(),
+        (Err(error), None) => return Err(error),
+    };
 
     let mut repair_diagnostics = Diagnostics::default();
     push_repair_diagnostics(&mut repair_diagnostics, &trigger_error, startxref);
+    let trailer_references = collect_trailer_references(&trailer);
 
-    Ok(LoadedXref {
-        version,
-        startxref,
-        entries,
-        trailer,
-        last_xref_form: XrefForm::Table,
-        repair_diagnostics,
+    Ok(LoadedXrefState {
+        loaded: LoadedXref {
+            version,
+            startxref,
+            entries,
+            trailer,
+            last_xref_form: XrefForm::Table,
+            repair_diagnostics,
+        },
+        trailer_references,
+        parsed_xref_streams: BTreeMap::new(),
     })
+}
+
+fn merge_recovered_qpdf_state(
+    mut recovered: LoadedXrefState,
+    mut accumulated: LoadedXrefState,
+) -> LoadedXrefState {
+    recovered
+        .trailer_references
+        .extend(accumulated.trailer_references);
+    // `BTreeMap::append` keeps recovered-only streams while replacing
+    // collisions with values from `accumulated`. The latter came from the
+    // successfully parsed latest-to-oldest /Prev prefix, so it is qpdf's
+    // authoritative nearest cached generation.
+    recovered
+        .parsed_xref_streams
+        .append(&mut accumulated.parsed_xref_streams);
+    recovered
 }
 
 /// Load the cross-reference table and trailer dictionary from `reader`, with the
@@ -411,6 +479,9 @@ fn parse_non_negative_i64(value: i64, name: &str) -> Result<u64> {
 fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error, startxref: u64) {
     diagnostics.push(Diagnostic::warning("file is damaged", None));
     let (message, offset) = match trigger_error {
+        Error::Parse { message, .. } if message == "loop detected following xref tables" => {
+            (message.clone(), None)
+        }
         Error::Parse { offset, message } => (message.clone(), Some(*offset as u64)),
         other => (other.to_string(), Some(startxref)),
     };
@@ -672,19 +743,16 @@ fn parse_xref_stream(
     xref_pos: usize,
     startxref: u64,
     version: String,
-) -> Result<LoadedXref> {
+) -> Result<LoadedXrefState> {
     let tail = bytes
         .get(xref_pos..)
         .filter(|slice| !slice.is_empty())
         .ok_or_else(|| Error::parse(xref_pos, "xref stream offset is beyond end of file"))?;
-    let (_, object) = parse_indirect_object(tail).map_err(|err| err.rebase_offset(xref_pos))?;
-    let stream = match object {
+    let (object_ref, object) =
+        parse_indirect_object(tail).map_err(|err| err.rebase_offset(xref_pos))?;
+    let stream = match &object {
         Object::Stream(stream) => stream,
-        _ => {
-            return Err(Error::Unsupported(
-                "xref stream expected an indirect object stream".to_string(),
-            ))
-        }
+        _ => return Err(Error::parse(xref_pos, "xref not found")),
     };
 
     let trailer = stream.dict.clone();
@@ -702,14 +770,20 @@ fn parse_xref_stream(
     let stream_data = filters::decode_stream_data(&stream.dict, &stream.data)?;
     let mut cursor = ByteCursor::new(&stream_data, 0);
     let entries = parse_xref_entries(&mut cursor, size, &ranges, widths)?;
+    let trailer_references = collect_trailer_references(&trailer);
+    let parsed_xref_streams = BTreeMap::from([(object_ref, object)]);
 
-    Ok(LoadedXref {
-        version,
-        startxref,
-        entries,
-        trailer,
-        last_xref_form: XrefForm::Stream,
-        repair_diagnostics: Diagnostics::default(),
+    Ok(LoadedXrefState {
+        loaded: LoadedXref {
+            version,
+            startxref,
+            entries,
+            trailer,
+            last_xref_form: XrefForm::Stream,
+            repair_diagnostics: Diagnostics::default(),
+        },
+        trailer_references,
+        parsed_xref_streams,
     })
 }
 

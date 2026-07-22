@@ -1,9 +1,6 @@
 //! Integration tests for [`flpdf::OutlineDocumentHelper`].
 
-use flpdf::{
-    check_legacy_dests, check_name_tree_dests, check_outline_links, prune_outline_se,
-    prune_outline_se_with_max_depth, write_pdf, Object, ObjectRef, Pdf, Severity,
-};
+use flpdf::{write_pdf, Dictionary, Error, Object, ObjectRef, OutlineItem, Pdf};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
@@ -40,6 +37,11 @@ fn page_dest(page: u32) -> Object {
     ])
 }
 
+fn root_items(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<OutlineItem> {
+    let tree = pdf.outline().get_tree().unwrap();
+    tree.roots().iter().map(|&id| tree[id].clone()).collect()
+}
+
 /// Catalog + pages + a two-level outline:
 ///   root(4) -> First A(5)
 ///   A(5)    -> First A1(6); A1 has dest [3 0 R /Fit]
@@ -60,6 +62,90 @@ fn outline_pdf() -> Vec<u8> {
         ],
         1,
     )
+}
+
+fn page_index_outline_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R /Dests << /same [3 0 R /Fit] >> /Names << /Dests 20 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (5, "<< /Type /Outlines /First 6 0 R /Last 15 0 R >>"),
+            (
+                6,
+                "<< /Title (A) /Dest [3 0 R /Fit] /First 8 0 R /Next 7 0 R >>",
+            ),
+            (
+                7,
+                "<< /Title (B) /Dest /same /First 10 0 R /Next 12 0 R >>",
+            ),
+            (8, "<< /Title (A1) /Dest [3 0 R /Fit] /Next 9 0 R >>"),
+            (9, "<< /Title (A2) /Dest [4 0 R /Fit] >>"),
+            (10, "<< /Title (B1) /Dest (modern) >>"),
+            (12, "<< /Title (No dest) /Next 13 0 R >>"),
+            (
+                13,
+                "<< /Title (Integer dest) /Dest 42 /Next 14 0 R >>",
+            ),
+            (
+                14,
+                "<< /Title (Direct page operand) /Dest [<< /Type /Page >> /Fit] /Next 15 0 R >>",
+            ),
+            (15, "<< /Title (Zero reference) /Dest [0 0 R /Fit] >>"),
+            (20, "<< /Names [(modern) [3 0 R /Fit]] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn outlines_for_page_uses_qpdf_breadth_first_order() {
+    let mut pdf = Pdf::open(Cursor::new(page_index_outline_pdf())).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+
+    let titles: Vec<_> = tree
+        .outlines_for_page(Some(ObjectRef::new(3, 0)))
+        .map(|(_id, item)| item.title.as_str())
+        .collect();
+
+    assert_eq!(titles, ["A", "B", "A1", "B1"]);
+}
+
+#[test]
+fn outlines_for_page_none_matches_qpdf_objgen_zero_bucket() {
+    let mut pdf = Pdf::open(Cursor::new(page_index_outline_pdf())).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+
+    let titles: Vec<_> = tree
+        .outlines_for_page(None)
+        .map(|(_id, item)| item.title.as_str())
+        .collect();
+
+    assert_eq!(
+        titles,
+        [
+            "No dest",
+            "Integer dest",
+            "Direct page operand",
+            "Zero reference"
+        ]
+    );
+
+    let zero_ref_titles: Vec<_> = tree
+        .outlines_for_page(Some(ObjectRef::new(0, 0)))
+        .map(|(_id, item)| item.title.as_str())
+        .collect();
+    assert_eq!(zero_ref_titles, titles);
 }
 
 fn no_outline_pdf() -> Vec<u8> {
@@ -86,6 +172,229 @@ fn outline_present_but_empty_pdf() -> Vec<u8> {
     )
 }
 
+fn single_outline_with_item_fields(fields: &str) -> Vec<u8> {
+    let item = format!("<< {fields} /Parent 4 0 R >>");
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, item.as_str()),
+        ],
+        1,
+    )
+}
+
+fn single_outline_with_title(title_object: &str) -> Vec<u8> {
+    single_outline_with_item_fields(&format!("/Title {title_object}"))
+}
+
+fn single_outline_without_title() -> Vec<u8> {
+    single_outline_with_item_fields("")
+}
+
+fn single_outline_with_count(count_object: &str) -> Vec<u8> {
+    single_outline_with_item_fields(&format!("/Count {count_object}"))
+}
+
+fn warning_messages(pdf: &Pdf<Cursor<Vec<u8>>>) -> Vec<&str> {
+    pdf.repair_diagnostics()
+        .entries()
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect()
+}
+
+fn direct_dests_root(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Dictionary {
+    let catalog_ref = pdf.root_ref().unwrap();
+    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    let Object::Dictionary(names) = catalog.get("Names").unwrap() else {
+        panic!("/Names must be a direct dictionary");
+    };
+    let Object::Dictionary(dests) = names.get("Dests").unwrap() else {
+        panic!("/Dests must be a direct dictionary");
+    };
+    dests.clone()
+}
+
+#[test]
+fn titles_match_qpdf_get_utf8_value() {
+    let cases: &[(&str, &str, Option<&str>)] = &[
+        ("(plain)", "plain", None),
+        ("<95>", "Ł", None),
+        ("<FEFF540D524D>", "名前", None),
+        ("<FFFE0D544D52>", "名前", None),
+        ("<EFBBBFE5908D>", "名", None),
+        ("<EFBBBFFF>", "�", None),
+        ("<FEFF0041D800>", "A", None),
+        (
+            "42",
+            "",
+            Some(
+                "operation for string attempted on object of type integer: returning empty string",
+            ),
+        ),
+    ];
+
+    for &(title_object, expected, expected_warning) in cases {
+        let mut pdf = Pdf::open(Cursor::new(single_outline_with_title(title_object))).unwrap();
+        let tree = pdf.outline().get_tree().unwrap();
+        assert_eq!(tree[tree.roots()[0]].title, expected, "{title_object}");
+        assert_eq!(
+            warning_messages(&pdf),
+            expected_warning.into_iter().collect::<Vec<_>>(),
+            "{title_object}"
+        );
+    }
+
+    let mut pdf = Pdf::open(Cursor::new(single_outline_without_title())).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree[tree.roots()[0]].title, "");
+    assert!(warning_messages(&pdf).is_empty());
+}
+
+#[test]
+fn counts_match_qpdf_get_int_value_as_int() {
+    let cases = [
+        (
+            "-2147483649",
+            i32::MIN,
+            Some("requested value of integer is too small; returning INT_MIN"),
+        ),
+        ("-2147483648", i32::MIN, None),
+        ("7", 7, None),
+        ("2147483647", i32::MAX, None),
+        (
+            "2147483648",
+            i32::MAX,
+            Some("requested value of integer is too big; returning INT_MAX"),
+        ),
+        (
+            "(wrong type)",
+            0,
+            Some("operation for integer attempted on object of type string: returning 0"),
+        ),
+    ];
+
+    for (count_object, expected, expected_warning) in cases {
+        let mut pdf = Pdf::open(Cursor::new(single_outline_with_count(count_object))).unwrap();
+        let tree = pdf.outline().get_tree().unwrap();
+        assert_eq!(tree[tree.roots()[0]].count, expected, "{count_object}");
+        let warning_messages = warning_messages(&pdf);
+        match expected_warning {
+            Some(expected_warning) => {
+                assert!(
+                    warning_messages.contains(&expected_warning),
+                    "{count_object}"
+                )
+            }
+            None => assert!(warning_messages.is_empty(), "{count_object}"),
+        }
+    }
+
+    let mut pdf = Pdf::open(Cursor::new(single_outline_with_item_fields(""))).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree[tree.roots()[0]].count, 0);
+    assert!(warning_messages(&pdf).is_empty());
+}
+
+#[test]
+fn present_wrong_type_scalar_warnings_use_qpdf_object_type_names() {
+    let cases = [
+        ("null", "null"),
+        ("true", "boolean"),
+        ("42", "integer"),
+        ("1.5", "real"),
+        ("/value", "name"),
+        ("(value)", "string"),
+        ("[]", "array"),
+        ("<<>>", "dictionary"),
+    ];
+
+    for (object, type_name) in cases {
+        if type_name != "string" {
+            let mut pdf = Pdf::open(Cursor::new(single_outline_with_title(object))).unwrap();
+            let tree = pdf.outline().get_tree().unwrap();
+            assert_eq!(tree[tree.roots()[0]].title, "", "title {object}");
+            assert_eq!(
+                warning_messages(&pdf),
+                [format!(
+                    "operation for string attempted on object of type {type_name}: returning empty string"
+                )],
+                "title {object}"
+            );
+        }
+
+        if type_name != "integer" {
+            let mut pdf = Pdf::open(Cursor::new(single_outline_with_count(object))).unwrap();
+            let tree = pdf.outline().get_tree().unwrap();
+            assert_eq!(tree[tree.roots()[0]].count, 0, "count {object}");
+            assert_eq!(
+                warning_messages(&pdf),
+                [format!(
+                    "operation for integer attempted on object of type {type_name}: returning 0"
+                )],
+                "count {object}"
+            );
+        }
+    }
+
+    let stream_body = "<< /Length 0 >>\nstream\n\nendstream";
+    for key in ["Title", "Count"] {
+        let item = format!("<< /{key} 8 0 R /Parent 4 0 R >>");
+        let bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+                (5, item.as_str()),
+                (8, stream_body),
+            ],
+            1,
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let tree = pdf.outline().get_tree().unwrap();
+        let expected = if key == "Title" {
+            assert_eq!(tree[tree.roots()[0]].title, "");
+            "operation for string attempted on object of type stream: returning empty string"
+        } else {
+            assert_eq!(tree[tree.roots()[0]].count, 0);
+            "operation for integer attempted on object of type stream: returning 0"
+        };
+        assert_eq!(warning_messages(&pdf), [expected], "{key}");
+    }
+
+    for key in ["Title", "Count"] {
+        let item = format!("<< /{key} 8 0 R /Parent 4 0 R >>");
+        let bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+                (5, item.as_str()),
+                (8, "9 0 R"),
+                (9, "42"),
+            ],
+            1,
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let tree = pdf.outline().get_tree().unwrap();
+        let expected = if key == "Title" {
+            assert_eq!(tree[tree.roots()[0]].title, "");
+            "operation for string attempted on object of type reference: returning empty string"
+        } else {
+            assert_eq!(tree[tree.roots()[0]].count, 0);
+            "operation for integer attempted on object of type reference: returning 0"
+        };
+        assert_eq!(warning_messages(&pdf), [expected], "{key}");
+    }
+}
+
 #[test]
 fn has_outlines_true_when_present() {
     let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
@@ -99,71 +408,379 @@ fn has_outlines_false_when_absent() {
 }
 
 #[test]
+fn missing_or_non_dictionary_catalog_has_no_outline_tree() {
+    let mut missing_root = no_outline_pdf();
+    let marker = b"/Root 1 0 R";
+    let start = missing_root
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .unwrap();
+    missing_root[start + 1..start + 5].copy_from_slice(b"Info");
+
+    let non_dictionary_catalog = build_pdf(&[(1, "42")], 1);
+    for bytes in [missing_root, non_dictionary_catalog] {
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        assert!(!pdf.outline().has_outlines().unwrap());
+        assert!(pdf.outline().get_tree().unwrap().roots().is_empty());
+    }
+}
+
+#[test]
 fn has_outlines_false_when_outline_dict_has_no_first() {
     let mut pdf = Pdf::open(Cursor::new(outline_present_but_empty_pdf())).unwrap();
     assert!(!pdf.outline().has_outlines().unwrap());
 }
 
 #[test]
-fn get_root_materializes_tree_with_titles_counts_parents() {
+fn direct_outlines_first_and_next_are_materialized() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First << /Title (A) /Next << /Title (B) >> >> >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert!(pdf.outline().has_outlines().unwrap());
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree.roots().len(), 2);
+    assert_eq!(tree[tree.roots()[0]].source_ref, None);
+    assert_eq!(tree[tree.roots()[0]].title, "A");
+    assert_eq!(tree[tree.roots()[1]].source_ref, None);
+    assert_eq!(tree[tree.roots()[1]].title, "B");
+
+    // qpdf 11.9.0 `--json=2 --json-key=outlines` on
+    // `/tmp/direct-outline-fixture.pdf` reports two direct roots. The first raw
+    // `object` contains /Count, /Dest, /Next, and /Title, the second is only
+    // `{\"/Title\":\"u:Direct B\"}`, and neither is represented as `0 0 R`.
+}
+
+#[test]
+fn mixed_direct_and_indirect_items_keep_identity_and_parent_ids() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                5,
+                "<< /Title (Parent) /First << /Title (Direct child) /Next 6 0 R >> >>",
+            ),
+            (6, "<< /Title (Indirect child) >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    let parent = tree.roots()[0];
+    let direct = tree[parent].kids[0];
+    let indirect = tree[parent].kids[1];
+
+    assert_eq!(tree[parent].source_ref, Some(ObjectRef::new(5, 0)));
+    assert_eq!(tree[direct].source_ref, None);
+    assert_eq!(tree[indirect].source_ref, Some(ObjectRef::new(6, 0)));
+    assert_eq!(tree[direct].parent, Some(parent));
+    assert_eq!(tree[indirect].parent, Some(parent));
+}
+
+#[test]
+fn non_dictionary_first_is_still_an_outline_item_with_default_accessors() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 42 >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    let id = tree.roots()[0];
+
+    assert_eq!(tree[id].object, Object::Integer(42));
+    assert_eq!(tree[id].title, "");
+    assert_eq!(tree[id].count, 0);
+    assert_eq!(tree[id].dest, Object::Null);
+    assert!(tree[id].kids.is_empty());
+}
+
+#[test]
+fn indirect_null_first_has_no_outlines_and_materializes_no_item() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "null"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert!(!pdf.outline().has_outlines().unwrap());
+    assert!(pdf.outline().get_tree().unwrap().roots().is_empty());
+}
+
+#[test]
+fn has_outlines_is_true_when_indirect_first_resolves_to_non_null_scalar() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "42"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert!(pdf.outline().has_outlines().unwrap());
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree[tree.roots()[0]].object, Object::Integer(42));
+}
+
+#[test]
+fn indirect_null_next_terminates_the_root_sibling_chain() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Title (A) /Next 6 0 R >>"),
+            (6, "null"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+
+    assert_eq!(tree.roots().len(), 1);
+    assert_eq!(tree[tree.roots()[0]].title, "A");
+}
+
+#[test]
+fn construction_resolves_a_bare_reference_item_exactly_once() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "6 0 R"),
+            (6, "<< /Title (Must not be followed) >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(5, 0)).unwrap(),
+        Object::Reference(ObjectRef::new(6, 0))
+    );
+    let tree = pdf.outline().get_tree().unwrap();
+    let item = &tree[tree.roots()[0]];
+    assert_eq!(tree.roots().len(), 1);
+    assert_eq!(item.source_ref, Some(ObjectRef::new(5, 0)));
+    assert_eq!(item.object, Object::Reference(ObjectRef::new(6, 0)));
+    assert_eq!(item.title, "");
+}
+
+#[test]
+fn top_level_indirect_next_cycle_stops_before_duplicate_root() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Title (A) /Next 6 0 R >>"),
+            (6, "<< /Title (B) /Next 5 0 R >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+
+    assert_eq!(tree.roots().len(), 2);
+    assert_eq!(tree[tree.roots()[0]].title, "A");
+    assert_eq!(tree[tree.roots()[1]].title, "B");
+}
+
+#[test]
+fn child_first_back_to_seen_indirect_ancestor_is_materialized_without_expansion() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Title (Ancestor) /First 5 0 R >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    let ancestor = tree.roots()[0];
+    let repeated = tree[ancestor].kids[0];
+
+    assert_eq!(tree[repeated].source_ref, Some(ObjectRef::new(5, 0)));
+    assert_eq!(tree[repeated].parent, Some(ancestor));
+    assert!(tree[repeated].kids.is_empty());
+}
+
+#[test]
+fn equal_direct_dictionary_values_in_separate_positions_are_materialized_twice() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                5,
+                "<< /Title (A) /First << /Title (Repeated) >> /Next 6 0 R >>",
+            ),
+            (6, "<< /Title (B) /First << /Title (Repeated) >> >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    let first = tree[tree.roots()[0]].kids[0];
+    let second = tree[tree.roots()[1]].kids[0];
+
+    assert_ne!(first, second);
+    assert_eq!(tree[first].source_ref, None);
+    assert_eq!(tree[second].source_ref, None);
+    assert_eq!(tree[first].object, tree[second].object);
+}
+
+#[test]
+fn get_tree_materializes_tree_with_titles_counts_parents() {
     let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    let roots = tree.roots();
 
     // Two top-level nodes: A, B.
     assert_eq!(roots.len(), 2);
-    assert_eq!(roots[0].title, "A");
-    assert_eq!(roots[0].depth, 0);
-    assert_eq!(roots[0].parent, None); // top-level: /Outlines dict is not an item -> None (qpdf getParent)
-    assert_eq!(roots[0].count, 1);
-    assert_eq!(roots[1].title, "B");
-    assert_eq!(roots[1].count, 2);
+    assert_eq!(tree[roots[0]].title, "A");
+    assert_eq!(tree[roots[0]].parent, None);
+    assert_eq!(tree[roots[0]].count, 1);
+    assert_eq!(tree[roots[1]].title, "B");
+    assert_eq!(tree[roots[1]].count, 2);
 
     // A has one child A1.
-    assert_eq!(roots[0].children.len(), 1);
-    let a1 = &roots[0].children[0];
-    assert_eq!(a1.title, "A1");
-    assert_eq!(a1.depth, 1);
-    assert_eq!(a1.parent, Some(ObjectRef::new(5, 0)));
-    assert_eq!(a1.count, 0); // /Count absent -> 0 (qpdf)
-    assert_eq!(a1.object_ref, ObjectRef::new(6, 0));
+    assert_eq!(tree[roots[0]].kids.len(), 1);
+    let a1 = tree[roots[0]].kids[0];
+    assert_eq!(tree[a1].title, "A1");
+    assert_eq!(tree[a1].parent, Some(roots[0]));
+    assert_eq!(tree[a1].count, 0); // /Count absent -> 0 (qpdf)
+    assert_eq!(tree[a1].source_ref, Some(ObjectRef::new(6, 0)));
 }
 
 #[test]
-fn get_root_empty_when_no_outline() {
+fn get_tree_empty_when_no_outline() {
     let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
-    assert!(pdf.outline().get_root().unwrap().is_empty());
+    assert!(pdf.outline().get_tree().unwrap().roots().is_empty());
 }
 
 #[test]
-fn iter_yields_preorder() {
+fn null_and_non_dictionary_outline_containers_are_empty() {
+    for outlines in ["null", "42", "<< >>", "<< /First null >>"] {
+        let catalog = format!("<< /Type /Catalog /Pages 2 0 R /Outlines {outlines} >>");
+        let bytes = build_pdf(
+            &[
+                (1, catalog.as_str()),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+            1,
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        assert!(!pdf.outline().has_outlines().unwrap(), "{outlines}");
+        assert!(
+            pdf.outline().get_tree().unwrap().roots().is_empty(),
+            "{outlines}"
+        );
+    }
+}
+
+#[test]
+fn indirect_item_seen_as_a_child_is_materialized_again_as_a_root_without_expansion() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Title (A) /First 6 0 R /Next 6 0 R >>"),
+            (6, "<< /Title (B) /First 7 0 R >>"),
+            (7, "<< /Title (C) >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+
+    assert_eq!(tree.roots().len(), 2);
+    let a = tree.roots()[0];
+    let b_as_child = tree[a].kids[0];
+    let b_as_root = tree.roots()[1];
+    assert_eq!(tree[b_as_child].source_ref, Some(ObjectRef::new(6, 0)));
+    assert_eq!(tree[b_as_child].kids.len(), 1);
+    assert_eq!(tree[b_as_root].source_ref, Some(ObjectRef::new(6, 0)));
+    assert!(tree[b_as_root].kids.is_empty());
+}
+
+#[test]
+fn preorder_yields_lossless_arena_items() {
     let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
-    let titles: Vec<String> = pdf.outline().iter().unwrap().map(|n| n.title).collect();
+    let tree = pdf.outline().get_tree().unwrap();
+    let titles: Vec<&str> = tree
+        .preorder()
+        .map(|(_depth, _id, item)| item.title.as_str())
+        .collect();
     assert_eq!(titles, vec!["A", "A1", "B"]); // pre-order: A, its child A1, then B
 
-    // iter() yields a flattened view: every node has its children cleared.
-    let mut pdf2 = Pdf::open(Cursor::new(outline_pdf())).unwrap();
-    assert!(pdf2
-        .outline()
-        .iter()
-        .unwrap()
-        .all(|n| n.children.is_empty()));
-}
-
-#[test]
-fn walk_visits_preorder_with_depth() {
-    let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
-    let mut seen: Vec<(String, usize, usize)> = Vec::new(); // (title, depth, child_count)
-    pdf.outline()
-        .walk(|node, depth| seen.push((node.title.clone(), depth, node.children.len())))
-        .unwrap();
-    assert_eq!(
-        seen,
-        vec![
-            ("A".to_string(), 0, 1), // A has one child (A1) — populated in walk
-            ("A1".to_string(), 1, 0),
-            ("B".to_string(), 0, 0),
-        ]
-    );
+    let seen: Vec<(&str, usize, usize)> = tree
+        .preorder()
+        .map(|(depth, _id, item)| (item.title.as_str(), depth, item.kids.len()))
+        .collect();
+    assert_eq!(seen, vec![("A", 1, 1), ("A1", 2, 0), ("B", 1, 0),]);
 }
 
 /// Build a linear chain of `n` nested outline items (each is the sole child of
@@ -204,106 +821,40 @@ fn deep_outline_pdf(n: u32) -> Vec<u8> {
 #[test]
 fn deep_outline_walks_to_full_depth() {
     let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(30))).unwrap();
-    let count = pdf.outline().iter().unwrap().count();
+    let tree = pdf.outline().get_tree().unwrap();
+    let count = tree.preorder().count();
     assert_eq!(count, 30);
-    // deepest node is at depth 29
-    let max_depth = pdf
-        .outline()
-        .iter()
-        .unwrap()
-        .map(|n| n.depth)
+    // The arena's public preorder depth is one-based.
+    let max_depth = tree
+        .preorder()
+        .map(|(depth, _id, _item)| depth)
         .max()
         .unwrap();
-    assert_eq!(max_depth, 29);
+    assert_eq!(max_depth, 30);
 }
 
 #[test]
-fn depth_cap_is_enforced() {
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(10))).unwrap();
-    let err = pdf.outline().get_root_with_max_depth(5);
-    assert!(err.is_err(), "expected depth-cap error, got {err:?}");
-}
+fn qpdf_depth_50_boundary_materializes_depth_51_without_expanding_it() {
+    for (input_levels, expected_levels) in [(50, 50), (51, 51), (52, 51)] {
+        let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(input_levels))).unwrap();
+        let tree = pdf.outline().get_tree().unwrap();
+        let visits: Vec<_> = tree.preorder().collect();
 
-#[test]
-fn get_root_with_max_depth_zero_rejects_even_top_level() {
-    // Covers the depth check at the very top of `build_siblings` (before any
-    // sibling is processed), distinct from the child-frame check that
-    // `depth_cap_is_enforced` exercises.
-    let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
-    let err = pdf.outline().get_root_with_max_depth(0);
-    assert!(err.is_err(), "expected depth-cap error, got {err:?}");
-}
-
-/// A 1000-level-deep outline (a straight chain, one child per level) walks to
-/// completion through the default (no explicit `max_depth`) API: `get_root`,
-/// `iter`, and `walk` all succeed and see every level.
-#[test]
-fn deep_outline_walks_1000_levels_with_default_depth() {
-    let n = 1000u32;
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
-    assert_eq!(roots.len(), 1);
-
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
-    let depths: Vec<usize> = pdf
-        .outline()
-        .iter()
-        .unwrap()
-        .map(|node| node.depth)
-        .collect();
-    assert_eq!(depths.len(), n as usize);
-    assert_eq!(*depths.last().unwrap(), (n - 1) as usize);
-
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
-    let mut visits = 0usize;
-    pdf.outline().walk(|_node, _depth| visits += 1).unwrap();
-    assert_eq!(visits, n as usize);
-}
-
-/// A 3,000-level chain (comfortably above the epic acceptance criterion of
-/// 1,000 and well within the `MAX_OUTLINE_WALK_DEPTH` = 5,000 cap) proves
-/// `get_root`/`iter`/`walk` scale past the old 100-level cap without
-/// overflowing on their iterative walk, and that the returned tree can then
-/// be inspected, dropped, and re-materialised without recursive-Clone or
-/// recursive-Drop pain.
-#[test]
-fn deep_outline_iterative_walk_survives_three_thousand_levels() {
-    let n = 3_000u32;
-
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
-    assert_eq!(roots.len(), 1);
-    // Walk down the single child chain to confirm the tree was built to the
-    // full depth (not silently truncated).
-    let mut depth = 0;
-    let mut node = &roots[0];
-    loop {
-        assert_eq!(node.depth, depth);
-        match node.children.first() {
-            Some(child) => {
-                node = child;
-                depth += 1;
-            }
-            None => break,
+        assert_eq!(visits.len(), expected_levels);
+        assert_eq!(visits.first().unwrap().0, 1);
+        assert_eq!(visits.last().unwrap().0, expected_levels);
+        if input_levels == 52 {
+            assert!(visits.last().unwrap().2.kids.is_empty());
         }
     }
-    assert_eq!(depth, (n - 1) as usize);
+}
 
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
-    let count = pdf.outline().iter().unwrap().count();
-    assert_eq!(count, n as usize);
+#[test]
+fn qpdf_depth_50_boundary_returns_no_depth_error() {
+    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(52))).unwrap();
 
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
-    let mut visits = 0usize;
-    let mut max_seen_depth = 0usize;
-    pdf.outline()
-        .walk(|_node, depth| {
-            visits += 1;
-            max_seen_depth = max_seen_depth.max(depth);
-        })
-        .unwrap();
-    assert_eq!(visits, n as usize);
-    assert_eq!(max_seen_depth, (n - 1) as usize);
+    assert!(pdf.outline().has_outlines().unwrap());
+    assert_eq!(pdf.outline().get_tree().unwrap().preorder().count(), 51);
 }
 
 /// Outline with a /Next cycle: 5 -> Next 6 -> Next 5 ...
@@ -324,7 +875,11 @@ fn cyclic_outline_pdf() -> Vec<u8> {
 #[test]
 fn cyclic_outline_terminates() {
     let mut pdf = Pdf::open(Cursor::new(cyclic_outline_pdf())).unwrap();
-    let titles: Vec<String> = pdf.outline().iter().unwrap().map(|n| n.title).collect();
+    let tree = pdf.outline().get_tree().unwrap();
+    let titles: Vec<&str> = tree
+        .preorder()
+        .map(|(_depth, _id, item)| item.title.as_str())
+        .collect();
     // Visits X and Y once each, then the cycle back to 5 is cut by `visited`.
     assert_eq!(titles, vec!["X", "Y"]);
 }
@@ -332,12 +887,16 @@ fn cyclic_outline_terminates() {
 #[test]
 fn dest_from_explicit_dest_array() {
     let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
-    let a1 = &roots[0].children[0]; // A1 has /Dest [3 0 R /Fit]
-    assert_eq!(a1.dest, page_dest(3));
-    assert_eq!(a1.dest_page(), Object::Reference(ObjectRef::new(3, 0)));
+    let tree = pdf.outline().get_tree().unwrap();
+    let roots = tree.roots();
+    let a1 = tree[roots[0]].kids[0]; // A1 has /Dest [3 0 R /Fit]
+    assert_eq!(tree[a1].dest, page_dest(3));
+    assert_eq!(
+        tree[a1].dest_page(),
+        Object::Reference(ObjectRef::new(3, 0))
+    );
     // Nodes without a destination have qpdf's null sentinel.
-    assert_eq!(roots[1].dest, Object::Null); // B
+    assert_eq!(tree[roots[1]].dest, Object::Null); // B
 }
 
 /// Outline item whose destination is a GoTo action: /A << /S /GoTo /D [3 0 R /Fit] >>.
@@ -360,7 +919,7 @@ fn action_dest_pdf() -> Vec<u8> {
 #[test]
 fn dest_from_goto_action() {
     let mut pdf = Pdf::open(Cursor::new(action_dest_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert_eq!(roots[0].dest, page_dest(3));
     assert_eq!(
         roots[0].dest_page(),
@@ -386,7 +945,7 @@ fn indirect_dest_pdf() -> Vec<u8> {
 #[test]
 fn dest_from_indirect_dest_reference() {
     let mut pdf = Pdf::open(Cursor::new(indirect_dest_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert_eq!(roots[0].dest, page_dest(3));
 }
 
@@ -409,7 +968,7 @@ fn cyclic_dest_pdf() -> Vec<u8> {
 #[test]
 fn cyclic_dest_preserves_dictionary_shape() {
     let mut pdf = Pdf::open(Cursor::new(cyclic_dest_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert!(matches!(roots[0].dest, Object::Dictionary(_)));
 }
 
@@ -436,8 +995,137 @@ fn named_dest_nametree_pdf() -> Vec<u8> {
 #[test]
 fn dest_from_named_nametree() {
     let mut pdf = Pdf::open(Cursor::new(named_dest_nametree_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert_eq!(roots[0].dest, page_dest(3));
+}
+
+fn deep_named_dest_nametree_pdf(kid_levels: u32) -> Vec<u8> {
+    let mut objects = vec![
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names << /Dests 8 0 R >> >>"
+                .to_string(),
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+        ),
+        (
+            4,
+            "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>".to_string(),
+        ),
+        (
+            5,
+            "<< /Title (Deep) /Parent 4 0 R /Dest (deep) >>".to_string(),
+        ),
+    ];
+
+    for level in 0..kid_levels {
+        let object_number = 8 + level;
+        let next = object_number + 1;
+        let limits = if level == 0 {
+            ""
+        } else {
+            " /Limits [(deep) (deep)]"
+        };
+        objects.push((object_number, format!("<< /Kids [{next} 0 R]{limits} >>")));
+    }
+    objects.push((
+        8 + kid_levels,
+        "<< /Limits [(deep) (deep)] /Names [(deep) [3 0 R /Fit]] >>".to_string(),
+    ));
+
+    let refs: Vec<(u32, &str)> = objects
+        .iter()
+        .map(|(number, body)| (*number, body.as_str()))
+        .collect();
+    build_pdf(&refs, 1)
+}
+
+#[test]
+fn named_destination_lookup_has_no_hidden_tree_depth_limit() {
+    let mut pdf = Pdf::open(Cursor::new(deep_named_dest_nametree_pdf(101))).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree[tree.roots()[0]].dest, page_dest(3));
+}
+
+#[test]
+fn named_destination_lookup_selects_only_the_kid_covering_the_key() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names << /Dests 8 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 6 0 R /Count 2 >>"),
+            (5, "<< /Title (A) /Dest (a) /Next 6 0 R >>"),
+            (6, "<< /Title (Target) /Dest (target) >>"),
+            (8, "<< /Kids [9 0 R 10 0 R 11 0 R] >>"),
+            (9, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+            (10, "<< /Limits [(h) (h)] /Names [(h) [3 0 R /Fit]] >>"),
+            (
+                11,
+                "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree[tree.roots()[0]].dest, page_dest(3));
+    assert_eq!(tree[tree.roots()[1]].dest, page_dest(3));
+    assert!(warning_messages(&pdf).is_empty());
+}
+
+#[test]
+fn cyclic_modern_name_tree_lookup_terminates_without_a_destination() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names << /Dests 8 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (Cycle) /Dest (deep) >>"),
+            (8, "<< /Kids [9 0 R] >>"),
+            (9, "<< /Limits [(deep) (deep)] /Kids [9 0 R] >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree[tree.roots()[0]].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        ["Name/Number tree node (object 9): loop detected while traversing name/number tree"]
+    );
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 oracle"]
+fn qpdf_deep_named_destination_oracle_resolves_target() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    input.write_all(&deep_named_dest_nametree_pdf(101)).unwrap();
+    let output = Command::new("qpdf")
+        .args(["--json=2", "--json-key=outlines"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["outlines"][0]["dest"][0], "3 0 R");
 }
 
 /// Legacy named dest: /Dest is a Name (/mydest) resolved via catalog /Dests
@@ -462,7 +1150,7 @@ fn named_dest_legacy_pdf() -> Vec<u8> {
 #[test]
 fn dest_from_named_legacy() {
     let mut pdf = Pdf::open(Cursor::new(named_dest_legacy_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert!(matches!(roots[0].dest, Object::Dictionary(_)));
     assert_eq!(roots[0].dest_page(), Object::Null);
 }
@@ -489,7 +1177,7 @@ fn cyclic_named_dest_pdf() -> Vec<u8> {
 #[test]
 fn cyclic_named_dest_preserves_first_alias() {
     let mut pdf = Pdf::open(Cursor::new(cyclic_named_dest_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert_eq!(roots[0].dest, Object::Name(b"b".to_vec()));
 }
 
@@ -517,7 +1205,7 @@ fn named_dest_collision_pdf() -> Vec<u8> {
 #[test]
 fn named_dest_modern_wins_over_legacy() {
     let mut pdf = Pdf::open(Cursor::new(named_dest_collision_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     // Modern name-tree entry ([3 0 R ...]) wins over legacy /Dests ([2 0 R ...]).
     assert_eq!(roots[0].dest, page_dest(3));
 }
@@ -540,1042 +1228,14 @@ fn indirect_title_pdf() -> Vec<u8> {
 #[test]
 fn title_resolves_indirect_reference() {
     let mut pdf = Pdf::open(Cursor::new(indirect_title_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert_eq!(roots[0].title, "RealTitle");
-}
-
-// -----------------------------------------------------------------------
-// flpdf-9hc.14.1: catalog-level legacy /Dests dictionary read/diagnostics
-// -----------------------------------------------------------------------
-
-/// Catalog whose legacy `/Dests` is an INLINE (direct) dictionary on the
-/// catalog with three entries, two distinct target pages.
-fn legacy_dests_inline_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (
-                1,
-                "<< /Type /Catalog /Pages 2 0 R /Dests << /alpha [3 0 R /Fit] \
-                 /beta [4 0 R /XYZ 0 792 0] /gamma [3 0 R /FitH 792] >> >>",
-            ),
-            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn legacy_dests_reads_inline_dictionary_entries_sorted_by_name() {
-    let mut pdf = Pdf::open(Cursor::new(legacy_dests_inline_pdf())).unwrap();
-    let entries = pdf.outline().legacy_dests().unwrap();
-
-    // Dictionary::iter() yields lexicographic key order.
-    let names: Vec<Vec<u8>> = entries.iter().map(|(n, _)| n.clone()).collect();
-    assert_eq!(
-        names,
-        vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]
-    );
-
-    let alpha = entries[0].1.as_ref().expect("alpha dest should resolve");
-    assert_eq!(alpha.page(), Some(ObjectRef::new(3, 0)));
-    let beta = entries[1].1.as_ref().expect("beta dest should resolve");
-    assert_eq!(beta.page(), Some(ObjectRef::new(4, 0)));
-    let gamma = entries[2].1.as_ref().expect("gamma dest should resolve");
-    assert_eq!(gamma.page(), Some(ObjectRef::new(3, 0)));
-}
-
-/// Catalog whose legacy `/Dests` is an INDIRECT reference (object 8) to the
-/// dictionary — the other form permitted by the spec.
-fn legacy_dests_indirect_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (8, "<< /solo [3 0 R /Fit] >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn legacy_dests_reads_indirect_dictionary() {
-    let mut pdf = Pdf::open(Cursor::new(legacy_dests_indirect_pdf())).unwrap();
-    let entries = pdf.outline().legacy_dests().unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].0, b"solo");
-    assert_eq!(
-        entries[0].1.as_ref().unwrap().page(),
-        Some(ObjectRef::new(3, 0))
-    );
-}
-
-#[test]
-fn legacy_dests_absent_yields_empty_vec() {
-    let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
-    assert!(pdf.outline().legacy_dests().unwrap().is_empty());
-}
-
-/// Round-trip acceptance: opening a document with a legacy `/Dests`
-/// dictionary and rewriting it via [`write_pdf`] (no page operations, no
-/// mutation) must preserve every entry unchanged.
-#[test]
-fn legacy_dests_round_trip_through_write_pdf_unmodified() {
-    let mut pdf = Pdf::open(Cursor::new(legacy_dests_indirect_pdf())).unwrap();
-    let before = pdf.outline().legacy_dests().unwrap();
-    assert_eq!(before.len(), 1, "sanity: fixture has one dest entry");
-
-    let mut out = Vec::new();
-    write_pdf(&mut pdf, &mut out).unwrap();
-
-    let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
-    let after = reopened.outline().legacy_dests().unwrap();
-    assert_eq!(before, after, "/Dests entries must round-trip unmodified");
-}
-
-#[test]
-fn check_legacy_dests_no_diagnostics_when_all_targets_exist() {
-    let mut pdf = Pdf::open(Cursor::new(legacy_dests_inline_pdf())).unwrap();
-    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
-    assert!(diagnostics.entries().is_empty());
-}
-
-/// A `/Dests` entry ("gone") targets object `99 0 R`, which is never defined
-/// in this document — a dangling reference. Acceptance: this must produce a
-/// diagnostic, not fail the call.
-fn legacy_dests_missing_target_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (8, "<< /gone [99 0 R /Fit] /here [3 0 R /Fit] >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn check_legacy_dests_missing_target_is_warning_not_error() {
-    let mut pdf = Pdf::open(Cursor::new(legacy_dests_missing_target_pdf())).unwrap();
-    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
-    let entries = diagnostics.entries();
-    assert_eq!(
-        entries.len(),
-        1,
-        "only the dangling entry should be flagged"
-    );
-    assert_eq!(entries[0].severity, Severity::Warning);
-    assert!(entries[0].message.contains("gone"));
-    assert!(entries[0].message.contains("99 0 R"));
-}
-
-/// A `/Dests` entry targets object `2 0 R`, which exists but is the `/Pages`
-/// root, not a `/Page` leaf — also a "missing target page".
-fn legacy_dests_non_page_target_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (8, "<< /wrong [2 0 R /Fit] >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn check_legacy_dests_target_not_a_page_is_warning() {
-    let mut pdf = Pdf::open(Cursor::new(legacy_dests_non_page_target_pdf())).unwrap();
-    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
-    assert_eq!(diagnostics.entries().len(), 1);
-    assert_eq!(diagnostics.entries()[0].severity, Severity::Warning);
-}
-
-/// `check_legacy_dests` must not fail even when the document has no `/Pages`
-/// tree at all to enumerate (downgraded to a warning, matching `check.rs`'s
-/// own page-enumeration-failure posture).
-#[test]
-fn check_legacy_dests_missing_page_tree_downgrades_to_warning() {
-    let mut pdf = Pdf::open(Cursor::new(build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Dests 8 0 R >>"),
-            (8, "<< /gone [99 0 R /Fit] >>"),
-        ],
-        1,
-    )))
-    .unwrap();
-    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
-    assert!(diagnostics.entries().iter().any(
-        |d| d.severity == Severity::Warning && d.message.contains("could not enumerate pages")
-    ));
-}
-
-/// Acceptance: after a page-tree rebuild (e.g. `--pages` subset selection)
-/// renumbers pages, a surviving-page legacy `/Dests` entry must read back
-/// remapped to its new ref, and a removed-page entry (left verbatim,
-/// resolving to the nulled-out page) must be flagged by
-/// [`check_legacy_dests`].
-#[test]
-fn legacy_dests_reflects_remap_after_page_tree_rebuild() {
-    let mut pdf = Pdf::open(Cursor::new(build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (8, "<< /keep [3 0 R /Fit] /drop [4 0 R /Fit] >>"),
-        ],
-        1,
-    )))
-    .unwrap();
-
-    let result = flpdf::rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
-    let new_p1 = result.ref_map[&ObjectRef::new(3, 0)][0];
-    flpdf::remap_outline_and_dests(&mut pdf, &result).unwrap();
-
-    let entries = pdf.outline().legacy_dests().unwrap();
-    let keep = entries
-        .iter()
-        .find(|(n, _)| n == b"keep")
-        .expect("keep entry present");
-    assert_eq!(
-        keep.1.as_ref().unwrap().page(),
-        Some(new_p1),
-        "surviving page's dest should read back remapped to its new ref"
-    );
-
-    let drop = entries
-        .iter()
-        .find(|(n, _)| n == b"drop")
-        .expect("drop entry present (qpdf null-out parity: never dropped)");
-    assert_eq!(
-        drop.1.as_ref().unwrap().page(),
-        Some(ObjectRef::new(4, 0)),
-        "removed page's dest is left verbatim, now resolving to a nulled object"
-    );
-
-    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
-    assert_eq!(
-        diagnostics.entries().len(),
-        1,
-        "the nulled removed-page dest should be the only flagged entry"
-    );
-    assert!(diagnostics.entries()[0].message.contains("drop"));
-}
-
-/// `check_legacy_dests` must short-circuit before enumerating the page tree
-/// when the catalog carries no legacy `/Dests` dictionary at all.
-#[test]
-fn check_legacy_dests_returns_empty_when_no_dests_dict() {
-    let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
-    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
-    assert!(diagnostics.entries().is_empty());
-}
-
-/// A `/Dests` entry whose value is an array with no resolvable page
-/// reference (first element is a name, not an indirect reference). This is a
-/// malformed destination, not a "missing target page": `Dest::page()`
-/// returns `None`, so no diagnostic is produced for it.
-fn legacy_dests_no_page_ref_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (8, "<< /odd [/NotAPageRef /Fit] >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn check_legacy_dests_skips_entries_without_resolvable_page_ref() {
-    let mut pdf = Pdf::open(Cursor::new(legacy_dests_no_page_ref_pdf())).unwrap();
-    // The value parses as a Dest (it is an array), but has no page ref.
-    let entries = pdf.outline().legacy_dests().unwrap();
-    assert_eq!(entries.len(), 1);
-    assert!(entries[0].1.as_ref().unwrap().page().is_none());
-
-    // check_legacy_dests must not flag it (nothing to validate) and must not error.
-    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
-    assert!(diagnostics.entries().is_empty());
-}
-
-/// Mixed /Dests: one entry has a resolvable page ref (so the early-return
-/// short-circuit does NOT fire), a second entry has no resolvable page ref
-/// (so the validation loop below must `continue` past it without adding a
-/// diagnostic). This covers the in-loop skip for `dest.page().is_none()`.
-fn legacy_dests_mixed_page_ref_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (8, "<< /good [3 0 R /Fit] /odd [/NotAPageRef /Fit] >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn check_legacy_dests_continues_past_entry_without_page_ref_when_others_have_one() {
-    let mut pdf = Pdf::open(Cursor::new(legacy_dests_mixed_page_ref_pdf())).unwrap();
-    // Sanity: one entry resolves to page 3, the other resolves to None.
-    let entries = pdf.outline().legacy_dests().unwrap();
-    assert_eq!(entries.len(), 2);
-    // Both targets are live/malformed but present in a live document → no
-    // diagnostics: the `good` entry hits page 3, the `odd` entry hits the
-    // `continue` in the validation loop.
-    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
-    assert!(
-        diagnostics.entries().is_empty(),
-        "no page is missing and the odd entry has no page ref to validate"
-    );
-}
-
-/// B1 regression: catalog `/Dests` reached through a multi-hop holder chain
-/// (catalog `/Dests 10 0 R`, obj 10 → obj 11 → dict) must still be read.
-/// The prior reader stopped after a single hop and returned Vec::new(),
-/// silently missing every named destination — and, by extension, every
-/// dangling-target warning `check_legacy_dests` would have emitted for
-/// them.
-#[test]
-fn legacy_dests_reads_through_multi_hop_holder_chain() {
-    let pdf_bytes = build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 10 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            // 2-hop holder chain into the /Dests dict.
-            (10, "11 0 R"),
-            (11, "<< /only [3 0 R /Fit] >>"),
-        ],
-        1,
-    );
-    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    let entries = pdf.outline().legacy_dests().unwrap();
-    assert_eq!(entries.len(), 1, "multi-hop /Dests must still resolve");
-    assert_eq!(entries[0].0, b"only");
-    assert_eq!(
-        entries[0].1.as_ref().expect("dest resolves").page(),
-        Some(ObjectRef::new(3, 0)),
-    );
-}
-
-/// B2 regression: a destination whose page operand is stored behind a
-/// holder (`/h [30 0 R /Fit]` where `30 0 obj 3 0 R`) points at a live
-/// page — `check_legacy_dests` must normalise through the holder chain
-/// before comparing against `page_refs`, or it emits a false-positive
-/// "not a page" warning.
-#[test]
-fn check_legacy_dests_follows_page_ref_through_holder() {
-    let pdf_bytes = build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            // /Dests -> /h [30 0 R /Fit], and obj 30 is a bare ref to page 3.
-            (8, "<< /h [30 0 R /Fit] >>"),
-            (30, "3 0 R"),
-        ],
-        1,
-    );
-    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
-    assert!(
-        diagnostics.entries().is_empty(),
-        "the holder-chain page ref resolves to a live page, no diagnostic: got {:?}",
-        diagnostics.entries()
-    );
-}
-
-/// Malformed catalog: `/Dests` is present but resolves to a non-dictionary
-/// value (an integer here). Covers the `let Object::Dictionary(dests) = ..
-/// else { return Ok(Vec::new()); }` fallback added alongside the multi-hop
-/// holder-chain resolve — matches the sibling `/Names` fallback on sub-2.
-#[test]
-fn legacy_dests_returns_empty_when_dests_is_not_a_dictionary() {
-    let pdf_bytes = build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 10 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            // /Dests resolves to a plain integer — spec-nonconforming.
-            (10, "42"),
-        ],
-        1,
-    );
-    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    let entries = pdf.outline().legacy_dests().unwrap();
-    assert!(entries.is_empty(), "non-dict /Dests must read as empty");
-}
-
-/// Cover the depth-cap fallback in `resolve_page_ref_through_holders`: a
-/// destination whose page operand is an unbounded ref chain must terminate
-/// (returning the last ref we managed to walk to) instead of looping
-/// forever. Uses a chain that exceeds MAX_DEST_RESOLVE_DEPTH via reused
-/// object numbers.
-#[test]
-fn check_legacy_dests_holder_chain_depth_cap_terminates() {
-    // Build a 70-object bare-ref chain 100 → 101 → 102 → … → 169 → 3 0 R
-    // (page 3). MAX_DEST_RESOLVE_DEPTH is 64, so the walker gives up at
-    // hop 64 and returns object 164, which is NOT in live_pages, so this
-    // legitimately-if-pathologically-deep target reads as dangling. The
-    // point of this test is that it terminates (no infinite loop) and
-    // emits a diagnostic instead.
-    let mut objs: Vec<(u32, String)> = vec![
-        (
-            1,
-            "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R >>".to_string(),
-        ),
-        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
-        (
-            3,
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
-        ),
-        (8, "<< /deep [100 0 R /Fit] >>".to_string()),
-    ];
-    for i in 100..169 {
-        objs.push((i, format!("{} 0 R", i + 1)));
-    }
-    objs.push((169, "3 0 R".to_string()));
-    let refs: Vec<(u32, &str)> = objs.iter().map(|(n, s)| (*n, s.as_str())).collect();
-    let pdf_bytes = build_pdf(&refs, 1);
-    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    let diagnostics = check_legacy_dests(&mut pdf).unwrap();
-    // Test succeeded by not looping forever; the depth-capped ref is not
-    // in the page tree, so one warning is emitted.
-    assert_eq!(
-        diagnostics.entries().len(),
-        1,
-        "got {:?}",
-        diagnostics.entries()
-    );
-}
-
-/// Codex round-3: alias resolution inside a chained-through `/Dests` dict.
-/// `/Dests 10 0 R` → obj 10 = `11 0 R` → obj 11 = `<< /alias /target /target [3 0 R /Fit] >>`.
-/// The `alias` entry is a name pointing at `target`. Before the fix,
-/// legacy_dests followed the chain (sub-1) but resolve_named_dest still
-/// used the single-hop catalog_value, so the alias silently resolved to
-/// None and check_legacy_dests skipped the entry entirely.
-#[test]
-fn legacy_dests_resolves_alias_through_chained_dests_dict() {
-    let pdf_bytes = build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Dests 10 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            // Multi-hop holder chain to the dict.
-            (10, "11 0 R"),
-            (11, "<< /alias /target /target [3 0 R /Fit] >>"),
-        ],
-        1,
-    );
-    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    let entries = pdf.outline().legacy_dests().unwrap();
-    // Two entries; both must resolve to the same page (alias → target →
-    // page 3), not None for alias.
-    assert_eq!(entries.len(), 2, "got {entries:?}");
-    for (name, dest) in &entries {
-        assert!(
-            dest.as_ref().and_then(|d| d.page()).is_some(),
-            "entry {:?} must resolve to a page (alias must chase target through chained /Dests)",
-            std::str::from_utf8(name).unwrap_or("?")
-        );
-    }
-}
-
-// ── /Names /Dests name tree (modern, PDF 1.2+) ────────────────────────────────
-//
-// Reader ([`OutlineDocumentHelper::name_tree_dests`]) and diagnostic
-// ([`check_name_tree_dests`]) coverage. Mirrors the legacy_dests tests above;
-// the writer (insert/delete/rebuild) is covered separately in
-// `name_tree_dests_tests.rs`.
-
-/// A flat `/Names /Dests` leaf with two entries, one holding a dict value
-/// (`<< /D array >>`) instead of a bare array (both forms are valid per ISO
-/// 32000-2 §12.3.2.3).
-fn name_tree_dests_single_level_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (8, "<< /Dests 9 0 R >>"),
-            (
-                9,
-                "<< /Names [(alpha) [3 0 R /Fit] (beta) << /D [4 0 R /XYZ 0 792 0] >>] >>",
-            ),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn name_tree_dests_reads_flat_leaf_entries_in_key_order() {
-    let mut pdf = Pdf::open(Cursor::new(name_tree_dests_single_level_pdf())).unwrap();
-    let entries = pdf.outline().name_tree_dests().unwrap();
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].0, b"alpha");
-    assert_eq!(
-        entries[0].1.as_ref().expect("alpha resolves").page(),
-        Some(ObjectRef::new(3, 0))
-    );
-    assert_eq!(entries[1].0, b"beta");
-    assert_eq!(
-        entries[1].1.as_ref().expect("beta resolves").page(),
-        Some(ObjectRef::new(4, 0)),
-        "a << /D array >> dict value must resolve just like a bare array"
-    );
-}
-
-/// A `/Names /Dests` tree nested 5 levels deep via `/Kids` chains, with the
-/// sole entry at the deepest leaf. Verifies the reader's depth-first walk
-/// reaches entries well past a shallow tree (acceptance: "round-trip
-/// preserves ordering and depth").
-///
-/// Object layout: 10 -> Kids[11] -> Kids[12] -> Kids[13] -> Kids[14] -> leaf
-/// (/Names [(deep) [3 0 R /Fit]]).
-fn name_tree_dests_deep_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (8, "<< /Dests 10 0 R >>"),
-            (10, "<< /Kids [11 0 R] >>"),
-            (11, "<< /Kids [12 0 R] >>"),
-            (12, "<< /Kids [13 0 R] >>"),
-            (13, "<< /Kids [14 0 R] >>"),
-            (14, "<< /Names [(deep) [3 0 R /Fit]] >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn name_tree_dests_reads_through_five_level_deep_kids_chain() {
-    let mut pdf = Pdf::open(Cursor::new(name_tree_dests_deep_pdf())).unwrap();
-    let entries = pdf.outline().name_tree_dests().unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].0, b"deep");
-    assert_eq!(
-        entries[0].1.as_ref().expect("deep entry resolves").page(),
-        Some(ObjectRef::new(3, 0))
-    );
-}
-
-#[test]
-fn name_tree_dests_absent_names_key_yields_empty_vec() {
-    let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
-    assert!(pdf.outline().name_tree_dests().unwrap().is_empty());
-}
-
-#[test]
-fn name_tree_dests_names_present_but_no_dests_key_yields_empty_vec() {
-    // /Names dict exists (e.g. for /EmbeddedFiles) but has no /Dests entry.
-    let mut pdf = Pdf::open(Cursor::new(build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
-            (2, "<< /Type /Pages /Kids [] /Count 0 >>"),
-            (8, "<< /EmbeddedFiles 9 0 R >>"),
-            (9, "<< /Names [] >>"),
-        ],
-        1,
-    )))
-    .unwrap();
-    assert!(pdf.outline().name_tree_dests().unwrap().is_empty());
-}
-
-/// Regression: `/Names` reached via a 2-hop indirect holder chain (catalog
-/// /Names -> ref -> ref -> dict) must not silently return empty. The writer
-/// already uses `resolve_ref_chain` for this; before this fix the reader
-/// stopped after a single hop and matched the intermediate Reference
-/// against Object::Dictionary, dropping every entry on the floor.
-#[test]
-fn name_tree_dests_reads_through_multi_hop_names_chain() {
-    let pdf_bytes = build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Names 10 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            // 2-hop holder chain into the /Names dict.
-            (10, "11 0 R"),
-            (11, "<< /Dests 12 0 R >>"),
-            (12, "<< /Names [(only) [3 0 R /Fit]] >>"),
-        ],
-        1,
-    );
-    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    let entries = pdf.outline().name_tree_dests().unwrap();
-    assert_eq!(entries.len(), 1, "multi-hop /Names must still resolve");
-    assert_eq!(entries[0].0, b"only");
-    assert_eq!(
-        entries[0].1.as_ref().expect("dest resolves").page(),
-        Some(ObjectRef::new(3, 0)),
-    );
-}
-
-/// Malformed catalog: `/Names` is present but resolves to a non-dictionary
-/// value (an integer here). The reader must not panic and must return an
-/// empty result, matching the "absent" behavior of `/Names /Dests`. Covers
-/// the `let Object::Dictionary(mut names) = names_obj else { .. }` fallback.
-#[test]
-fn name_tree_dests_returns_empty_when_names_is_not_a_dictionary() {
-    let pdf_bytes = build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Names 10 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            // /Names resolves to a plain integer — spec-nonconforming.
-            (10, "42"),
-        ],
-        1,
-    );
-    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    let entries = pdf.outline().name_tree_dests().unwrap();
-    assert!(entries.is_empty(), "non-dict /Names must read as empty");
-}
-
-/// Round-trip acceptance: opening a document with a `/Names /Dests` name
-/// tree and rewriting it via [`write_pdf`] (no page operations, no mutation)
-/// must preserve every entry, in the same order, unchanged.
-#[test]
-fn name_tree_dests_round_trip_through_write_pdf_unmodified() {
-    let mut pdf = Pdf::open(Cursor::new(name_tree_dests_deep_pdf())).unwrap();
-    let before = pdf.outline().name_tree_dests().unwrap();
-    assert_eq!(before.len(), 1, "sanity: fixture has one dest entry");
-
-    let mut out = Vec::new();
-    write_pdf(&mut pdf, &mut out).unwrap();
-
-    let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
-    let after = reopened.outline().name_tree_dests().unwrap();
-    assert_eq!(
-        before, after,
-        "/Names /Dests entries must round-trip unmodified"
-    );
-}
-
-#[test]
-fn check_name_tree_dests_no_diagnostics_when_all_targets_exist() {
-    let mut pdf = Pdf::open(Cursor::new(name_tree_dests_single_level_pdf())).unwrap();
-    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
-    assert!(diagnostics.entries().is_empty());
-}
-
-/// A `/Names /Dests` entry ("gone") targets object `99 0 R`, which is never
-/// defined in this document — a dangling reference. Acceptance: this must
-/// produce a diagnostic, not fail the call.
-fn name_tree_dests_missing_target_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (8, "<< /Dests 9 0 R >>"),
-            (9, "<< /Names [(gone) [99 0 R /Fit] (here) [3 0 R /Fit]] >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn check_name_tree_dests_missing_target_is_warning_not_error() {
-    let mut pdf = Pdf::open(Cursor::new(name_tree_dests_missing_target_pdf())).unwrap();
-    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
-    let entries = diagnostics.entries();
-    assert_eq!(
-        entries.len(),
-        1,
-        "only the dangling entry should be flagged"
-    );
-    assert_eq!(entries[0].severity, Severity::Warning);
-    assert!(entries[0].message.contains("gone"));
-    assert!(entries[0].message.contains("99 0 R"));
-}
-
-/// A `/Names /Dests` entry targets object `2 0 R`, which exists but is the
-/// `/Pages` root, not a `/Page` leaf — also a "missing target page".
-fn name_tree_dests_non_page_target_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (8, "<< /Dests 9 0 R >>"),
-            (9, "<< /Names [(wrong) [2 0 R /Fit]] >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn check_name_tree_dests_target_not_a_page_is_warning() {
-    let mut pdf = Pdf::open(Cursor::new(name_tree_dests_non_page_target_pdf())).unwrap();
-    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
-    assert_eq!(diagnostics.entries().len(), 1);
-    assert_eq!(diagnostics.entries()[0].severity, Severity::Warning);
-}
-
-/// `check_name_tree_dests` must not fail even when the document has no
-/// `/Pages` tree at all to enumerate (downgraded to a warning).
-#[test]
-fn check_name_tree_dests_missing_page_tree_downgrades_to_warning() {
-    let mut pdf = Pdf::open(Cursor::new(build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Names 8 0 R >>"),
-            (8, "<< /Dests 9 0 R >>"),
-            (9, "<< /Names [(gone) [99 0 R /Fit]] >>"),
-        ],
-        1,
-    )))
-    .unwrap();
-    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
-    assert!(diagnostics.entries().iter().any(
-        |d| d.severity == Severity::Warning && d.message.contains("could not enumerate pages")
-    ));
-}
-
-/// `check_name_tree_dests` must short-circuit before enumerating the page
-/// tree when the catalog carries no `/Names /Dests` name tree at all.
-#[test]
-fn check_name_tree_dests_returns_empty_when_no_dests_tree() {
-    let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
-    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
-    assert!(diagnostics.entries().is_empty());
-}
-
-/// A `/Names /Dests` entry whose value is an array with no resolvable page
-/// reference (first element is a name, not an indirect reference). This is a
-/// malformed destination, not a "missing target page": `Dest::page()`
-/// returns `None`, so no diagnostic is produced for it.
-fn name_tree_dests_no_page_ref_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (8, "<< /Dests 9 0 R >>"),
-            (9, "<< /Names [(odd) [/NotAPageRef /Fit]] >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn check_name_tree_dests_skips_entries_without_resolvable_page_ref() {
-    let mut pdf = Pdf::open(Cursor::new(name_tree_dests_no_page_ref_pdf())).unwrap();
-    let entries = pdf.outline().name_tree_dests().unwrap();
-    assert_eq!(entries.len(), 1);
-    assert!(entries[0].1.as_ref().unwrap().page().is_none());
-
-    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
-    assert!(diagnostics.entries().is_empty());
-}
-
-/// Cover the in-loop `continue` on `dest.page().is_none()` in
-/// `check_name_tree_dests`: at least one entry must have a resolvable page
-/// ref (so the sub-2 short-circuit does NOT fire), plus at least one
-/// malformed entry whose page ref resolves to None (so the loop actually
-/// runs and hits `continue`). Same shape as
-/// `check_legacy_dests_continues_past_entry_without_page_ref_when_others_have_one`
-/// on sub-1, for the modern `/Names /Dests` sibling.
-#[test]
-fn check_name_tree_dests_continues_past_entry_without_page_ref_when_others_have_one() {
-    let pdf_bytes = build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (8, "<< /Dests 9 0 R >>"),
-            (
-                9,
-                "<< /Names [(good) [3 0 R /Fit] (odd) [/NotAPageRef /Fit]] >>",
-            ),
-        ],
-        1,
-    );
-    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
-    assert!(
-        diagnostics.entries().is_empty(),
-        "no page is missing and the odd entry has no page ref to validate: {:?}",
-        diagnostics.entries()
-    );
-}
-
-/// N2 regression: sibling of the sub-1 `check_legacy_dests_follows_page_ref_through_holder`
-/// fix — a `/Names /Dests` entry whose page operand goes through a holder
-/// must not be flagged as dangling.
-#[test]
-fn check_name_tree_dests_follows_page_ref_through_holder() {
-    let pdf_bytes = build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Names 8 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (8, "<< /Dests 9 0 R >>"),
-            (9, "<< /Names [(target) [30 0 R /Fit]] >>"),
-            (30, "3 0 R"),
-        ],
-        1,
-    );
-    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    let diagnostics = check_name_tree_dests(&mut pdf).unwrap();
-    assert!(
-        diagnostics.entries().is_empty(),
-        "the holder-chain page ref resolves to a live page, no diagnostic: {:?}",
-        diagnostics.entries()
-    );
-}
-// -----------------------------------------------------------------------
-// /SE (structure-element link) tests
-// -----------------------------------------------------------------------
-
-/// Catalog + pages + `/StructTreeRoot` (10, `/K` holding struct elements 20
-/// and 21) + a two-item outline: A(5)'s `/SE` points at struct elem 20; B(7)
-/// has no `/SE` at all.
-fn outline_se_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (
-                1,
-                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /StructTreeRoot 10 0 R >>",
-            ),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Type /Outlines /First 5 0 R /Last 7 0 R /Count 2 >>"),
-            (5, "<< /Title (A) /Parent 4 0 R /Next 7 0 R /SE 20 0 R >>"),
-            (7, "<< /Title (B) /Parent 4 0 R /Prev 5 0 R >>"),
-            (10, "<< /Type /StructTreeRoot /K [20 0 R 21 0 R] >>"),
-            (20, "<< /Type /StructElem /S /P /P 10 0 R /Pg 3 0 R >>"),
-            (21, "<< /Type /StructElem /S /P /P 10 0 R /Pg 3 0 R >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn outline_se_reads_indirect_reference_and_none_when_absent() {
-    let mut pdf = Pdf::open(Cursor::new(outline_se_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
-    assert_eq!(roots.len(), 2);
-    assert_eq!(
-        roots[0].se,
-        Some(ObjectRef::new(20, 0)),
-        "A's indirect /SE must resolve to the struct elem ref"
-    );
-    assert_eq!(roots[1].se, None, "B has no /SE");
-}
-
-/// `/SE` stored as a *direct* dictionary (not an indirect reference) is
-/// malformed per ISO 32000-2 section 12.3.3 table 151 ("shall be an
-/// indirect reference"); it is read as absent, the same as every other
-/// non-conforming outline value in this module.
-fn outline_se_direct_dict_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
-            (
-                5,
-                "<< /Title (A) /Parent 4 0 R /SE << /Type /StructElem /S /P >> >>",
-            ),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn outline_se_direct_dictionary_value_is_malformed_and_ignored() {
-    let mut pdf = Pdf::open(Cursor::new(outline_se_direct_dict_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
-    assert_eq!(roots[0].se, None);
-}
-
-/// Round-trip acceptance: opening a document whose `/StructTreeRoot` is left
-/// intact and rewriting it via [`write_pdf`] (no page operations, no
-/// mutation) must preserve every outline `/SE` link unchanged, the same as
-/// [`legacy_dests_round_trip_through_write_pdf_unmodified`] does for
-/// `/Dests`.
-#[test]
-fn outline_se_round_trip_through_write_pdf_unmodified() {
-    let mut pdf = Pdf::open(Cursor::new(outline_se_pdf())).unwrap();
-    let before: Vec<Option<ObjectRef>> = pdf
-        .outline()
-        .get_root()
-        .unwrap()
-        .iter()
-        .map(|n| n.se)
-        .collect();
-    assert_eq!(
-        before,
-        vec![Some(ObjectRef::new(20, 0)), None],
-        "sanity: fixture has one /SE entry"
-    );
-
-    let mut out = Vec::new();
-    write_pdf(&mut pdf, &mut out).unwrap();
-
-    let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
-    let after: Vec<Option<ObjectRef>> = reopened
-        .outline()
-        .get_root()
-        .unwrap()
-        .iter()
-        .map(|n| n.se)
-        .collect();
-    assert_eq!(
-        before, after,
-        "/SE links must round-trip unmodified when /StructTreeRoot is left intact"
-    );
-
-    // The link must still *resolve*, not merely have the same ref value: the
-    // structure element it targets must have survived as a real /StructElem
-    // dictionary (a writer that GC'd it while leaving the /SE ref dangling
-    // would still pass the `before == after` check above, so that check
-    // alone is not sufficient).
-    let se_ref = after[0].expect("A's /SE must still be present");
-    match reopened.resolve(se_ref).unwrap() {
-        Object::Dictionary(dict) => {
-            assert_eq!(
-                dict.get("Type"),
-                Some(&Object::Name(b"StructElem".to_vec())),
-                "the /SE target must still be a /StructElem dictionary"
-            );
-        }
-        other => panic!("/SE target must resolve to a dictionary, got {other:?}"),
-    }
-}
-
-#[test]
-fn prune_outline_se_drops_entries_not_in_live_set() {
-    let mut pdf = Pdf::open(Cursor::new(outline_se_pdf())).unwrap();
-    let live: BTreeSet<ObjectRef> = BTreeSet::new(); // struct elem 20 is not live
-    let dropped = prune_outline_se(&mut pdf, &live).unwrap();
-    assert_eq!(dropped, 1);
-
-    let roots = pdf.outline().get_root().unwrap();
-    assert_eq!(roots[0].se, None, "dangling /SE must be dropped");
-    assert_eq!(
-        roots[0].title, "A",
-        "the rest of the outline item must be untouched"
-    );
-    assert_eq!(roots[1].se, None, "B never had /SE");
-}
-
-#[test]
-fn prune_outline_se_keeps_entries_in_live_set() {
-    let mut pdf = Pdf::open(Cursor::new(outline_se_pdf())).unwrap();
-    let mut live = BTreeSet::new();
-    live.insert(ObjectRef::new(20, 0));
-    let dropped = prune_outline_se(&mut pdf, &live).unwrap();
-    assert_eq!(dropped, 0);
-
-    let roots = pdf.outline().get_root().unwrap();
-    assert_eq!(
-        roots[0].se,
-        Some(ObjectRef::new(20, 0)),
-        "a live /SE target must be kept"
-    );
-}
-
-/// Three siblings A(/SE -> 20, dropped), B(/SE -> 21, kept), C(no /SE).
-/// Exercises that pruning is entry-by-entry: only the dangling link is
-/// removed, and the `/First`/`/Next` sibling chain still walks afterward.
-fn outline_se_three_siblings_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (
-                1,
-                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /StructTreeRoot 10 0 R >>",
-            ),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Type /Outlines /First 5 0 R /Last 8 0 R /Count 3 >>"),
-            (5, "<< /Title (A) /Parent 4 0 R /Next 6 0 R /SE 20 0 R >>"),
-            (
-                6,
-                "<< /Title (B) /Parent 4 0 R /Prev 5 0 R /Next 8 0 R /SE 21 0 R >>",
-            ),
-            (8, "<< /Title (C) /Parent 4 0 R /Prev 6 0 R >>"),
-            (10, "<< /Type /StructTreeRoot /K [20 0 R 21 0 R] >>"),
-            (20, "<< /Type /StructElem /S /P /P 10 0 R /Pg 3 0 R >>"),
-            (21, "<< /Type /StructElem /S /P /P 10 0 R /Pg 3 0 R >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn prune_outline_se_mixed_siblings_only_drops_dangling() {
-    let mut pdf = Pdf::open(Cursor::new(outline_se_three_siblings_pdf())).unwrap();
-    let mut live = BTreeSet::new();
-    live.insert(ObjectRef::new(21, 0)); // only B's target survives
-
-    let dropped = prune_outline_se(&mut pdf, &live).unwrap();
-    assert_eq!(dropped, 1);
-
-    let roots = pdf.outline().get_root().unwrap();
-    assert_eq!(
-        roots.len(),
-        3,
-        "the sibling chain must survive pruning intact"
-    );
-    assert_eq!(roots[0].title, "A");
-    assert_eq!(roots[0].se, None, "A's dangling /SE must be dropped");
-    assert_eq!(roots[1].title, "B");
-    assert_eq!(
-        roots[1].se,
-        Some(ObjectRef::new(21, 0)),
-        "B's live /SE must be kept"
-    );
-    assert_eq!(roots[2].title, "C");
-    assert_eq!(roots[2].se, None, "C never had /SE");
-}
-
-#[test]
-fn prune_outline_se_no_outlines_is_noop() {
-    let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
-    let live = BTreeSet::new();
-    let dropped = prune_outline_se(&mut pdf, &live).unwrap();
-    assert_eq!(dropped, 0);
-}
-
-/// Reuses the `/Next`-cycle fixture from [`cyclic_outline_terminates`]: no
-/// item in it has `/SE`, so pruning must terminate (not hang) and report
-/// zero drops.
-#[test]
-fn prune_outline_se_cycle_terminates() {
-    let mut pdf = Pdf::open(Cursor::new(cyclic_outline_pdf())).unwrap();
-    let live = BTreeSet::new();
-    let dropped = prune_outline_se(&mut pdf, &live).unwrap();
-    assert_eq!(dropped, 0, "fixture has no /SE entries to drop");
-}
-
-/// Deep `/First`-nested outline (10 levels): pruning with a max depth of 5
-/// must surface `Error::Unsupported`, mirroring `depth_cap_is_enforced` for
-/// `get_root_with_max_depth`.
-#[test]
-fn prune_outline_se_depth_cap_is_enforced() {
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(10))).unwrap();
-    let live = BTreeSet::new();
-    let err = prune_outline_se_with_max_depth(&mut pdf, &live, 5);
-    assert!(err.is_err(), "expected depth-cap error, got {err:?}");
 }
 
 /// The outline root's `/First` resolves to a non-dictionary object (a stray
 /// integer): the walk must break out of that chain gracefully instead of
 /// panicking or erroring.
-fn outline_se_first_not_a_dict_pdf() -> Vec<u8> {
+fn outline_first_not_a_dict_pdf() -> Vec<u8> {
     build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
@@ -1589,24 +1249,11 @@ fn outline_se_first_not_a_dict_pdf() -> Vec<u8> {
 }
 
 #[test]
-fn prune_outline_se_non_dict_item_breaks_walk_gracefully() {
-    let mut pdf = Pdf::open(Cursor::new(outline_se_first_not_a_dict_pdf())).unwrap();
-    let live = BTreeSet::new();
-    let dropped = prune_outline_se(&mut pdf, &live).unwrap();
-    assert_eq!(
-        dropped, 0,
-        "a non-dictionary outline item must be skipped, not pruned"
-    );
-}
-
-#[test]
-fn get_root_non_dict_first_item_breaks_walk_gracefully() {
-    let mut pdf = Pdf::open(Cursor::new(outline_se_first_not_a_dict_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
-    assert!(
-        roots.is_empty(),
-        "a non-dictionary outline item must be skipped, not produce a node"
-    );
+fn get_tree_non_dict_first_item_materializes_raw_value() {
+    let mut pdf = Pdf::open(Cursor::new(outline_first_not_a_dict_pdf())).unwrap();
+    let roots = root_items(&mut pdf);
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].object, Object::Integer(42));
 }
 
 // -----------------------------------------------------------------------
@@ -1680,6 +1327,1632 @@ fn single_outline_with_catalog(
     build_pdf(&borrowed, 1)
 }
 
+#[test]
+fn named_destination_lookup_handles_qpdf_node_shapes() {
+    let cases = [
+        (
+            "/Names << /Dests << /Names [(shape) [3 0 R /Fit]] >> >>",
+            &[][..],
+            page_dest(3),
+        ),
+        (
+            "/Names << /Dests << /Names [] /Kids [8 0 R] >> >>",
+            &[(
+                8,
+                "<< /Limits [(shape) (shape)] /Names [(shape) [3 0 R /Fit]] >>",
+            )][..],
+            page_dest(3),
+        ),
+        ("/Names << /Dests << >> >>", &[][..], Object::Null),
+        ("/Names << /Dests << /Kids [] >> >>", &[][..], Object::Null),
+        ("/Names << /Dests 42 >>", &[][..], Object::Null),
+        (
+            "/Names << /Dests << /Names [42 [3 0 R /Fit]] >> >>",
+            &[][..],
+            Object::Null,
+        ),
+        (
+            "/Names << /Dests << /Names [(a) [3 0 R /Fit]] >> >>",
+            &[][..],
+            Object::Null,
+        ),
+        (
+            "/Names << /Dests << /Kids [8 0 R] >> >>",
+            &[(8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>")][..],
+            Object::Null,
+        ),
+        (
+            "/Names << /Dests << /Kids [42] >> >>",
+            &[][..],
+            Object::Null,
+        ),
+        (
+            "/Names << /Dests << /Kids [8 0 R] >> >>",
+            &[(8, "<< /Names [42 [3 0 R /Fit]] >>")][..],
+            Object::Null,
+        ),
+        (
+            "/Names << /Dests << /Kids [8 0 R] >> >>",
+            &[(8, "<< /Limits [42 42] /Names [(shape) [3 0 R /Fit]] >>")][..],
+            page_dest(3),
+        ),
+    ];
+
+    for (catalog_entries, extra, expected) in cases {
+        let bytes = single_outline_with_catalog(catalog_entries, "/Dest (shape)", extra);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(root_items(&mut pdf)[0].dest, expected, "{catalog_entries}");
+    }
+}
+
+#[test]
+fn short_first_name_tree_pair_is_fatal_after_the_repair_warning() {
+    let cases = [
+        (
+            "direct root",
+            "/Names << /Dests << /Names [(m)] >> >>",
+            &[][..],
+            "Name/Number tree node: update ivalue: items array is too short",
+        ),
+        (
+            "indirect root",
+            "/Names << /Dests 8 0 R >>",
+            &[(8, "<< /Names [(m)] >>")][..],
+            "Name/Number tree node (object 8): update ivalue: items array is too short",
+        ),
+    ];
+
+    for (label, catalog_entries, extra, expected_message) in cases {
+        let bytes = single_outline_with_catalog(catalog_entries, "/Dest (m)", extra);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let error = pdf.outline().get_tree().unwrap_err();
+        match error {
+            Error::Parse { offset, message } => {
+                assert_eq!(offset, 0, "{label}");
+                assert_eq!(message, expected_message, "{label}");
+            }
+            other => panic!("{label}: expected parse error, got {other}"),
+        }
+        assert_eq!(
+            warning_messages(&pdf),
+            [format!(
+                "attempting to repair after error: {expected_message}"
+            )],
+            "{label}"
+        );
+
+        match extra {
+            [] => assert_eq!(
+                direct_dests_root(&mut pdf).get("Names"),
+                Some(&Object::Array(vec![Object::String(b"m".to_vec())])),
+                "{label}"
+            ),
+            [(object_number, _)] => {
+                let Object::Dictionary(root) =
+                    pdf.resolve(ObjectRef::new(*object_number, 0)).unwrap()
+                else {
+                    panic!("{label}: indirect root must remain a dictionary");
+                };
+                assert_eq!(
+                    root.get("Names"),
+                    Some(&Object::Array(vec![Object::String(b"m".to_vec())])),
+                    "{label}"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn direct_first_child_short_name_tree_pdf() -> Vec<u8> {
+    single_outline_with_catalog(
+        "/Names << /Dests << /Kids [<< /Names [(m)] >>] >> >>",
+        "/Dest (m)",
+        &[],
+    )
+}
+
+#[test]
+fn direct_first_child_short_pair_repairs_from_the_mutated_root() {
+    let mut pdf = Pdf::open(Cursor::new(direct_first_child_short_name_tree_pdf())).unwrap();
+
+    let error = pdf.outline().get_tree().unwrap_err();
+    match error {
+        Error::Parse { offset, message } => {
+            assert_eq!(offset, 0);
+            assert_eq!(
+                message,
+                "Name/Number tree node (object 6): update ivalue: items array is too short"
+            );
+        }
+        other => panic!("expected parse error, got {other}"),
+    }
+    assert_eq!(
+        warning_messages(&pdf),
+        [
+            "converting kid number 0 to an indirect object",
+            "attempting to repair after error: Name/Number tree node (object 6): update ivalue: items array is too short",
+        ]
+    );
+
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(
+        dests.get("Kids"),
+        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+            6, 0
+        ))]))
+    );
+    let Object::Dictionary(child) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("converted first child must be an indirect dictionary");
+    };
+    assert_eq!(
+        child.get("Names"),
+        Some(&Object::Array(vec![Object::String(b"m".to_vec())]))
+    );
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 direct-child short-pair oracle"]
+fn qpdf_direct_first_child_short_pair_preserves_converted_object_context() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    input
+        .write_all(&direct_first_child_short_name_tree_pdf())
+        .unwrap();
+    let output = Command::new("qpdf")
+        .args(["--json=2", "--json-key=outlines"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let conversion = stderr
+        .find("converting kid number 0 to an indirect object")
+        .unwrap_or_else(|| panic!("missing conversion warning in {stderr}"));
+    let repair = stderr
+        .find("attempting to repair after error:")
+        .unwrap_or_else(|| panic!("missing repair warning in {stderr}"));
+    let fatal = stderr
+        .rfind("update ivalue: items array is too short")
+        .unwrap_or_else(|| panic!("missing fatal error in {stderr}"));
+    assert!(conversion < repair && repair < fatal, "{stderr}");
+    assert_eq!(stderr.matches("object 6").count(), 2, "{stderr}");
+    assert_eq!(
+        stderr
+            .matches("update ivalue: items array is too short")
+            .count(),
+        2,
+        "{stderr}"
+    );
+    assert!(!output.stdout.is_empty());
+    assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).is_err());
+}
+
+#[test]
+fn scalar_name_tree_dests_are_silent_and_resolve_to_null() {
+    let cases = [
+        ("direct scalar", "/Names << /Dests 42 >>", &[][..]),
+        (
+            "indirect scalar",
+            "/Names << /Dests 8 0 R >>",
+            &[(8, "42")][..],
+        ),
+    ];
+
+    for (label, catalog_entries, extra) in cases {
+        let bytes = single_outline_with_catalog(catalog_entries, "/Dest (m)", extra);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        assert_eq!(root_items(&mut pdf)[0].dest, Object::Null, "{label}");
+        assert!(warning_messages(&pdf).is_empty(), "{label}");
+    }
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 short first-pair oracle"]
+fn qpdf_short_first_name_tree_pair_is_fatal_after_repair_warning() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let cases = [
+        (
+            "direct root",
+            "/Names << /Dests << /Names [(m)] >> >>",
+            &[][..],
+        ),
+        (
+            "indirect root",
+            "/Names << /Dests 8 0 R >>",
+            &[(8, "<< /Names [(m)] >>")][..],
+        ),
+    ];
+
+    for (label, catalog_entries, extra) in cases {
+        let mut input = tempfile::NamedTempFile::new().unwrap();
+        input
+            .write_all(&single_outline_with_catalog(
+                catalog_entries,
+                "/Dest (m)",
+                extra,
+            ))
+            .unwrap();
+        let output = Command::new("qpdf")
+            .args(["--json=2", "--json-key=outlines"])
+            .arg(input.path())
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(2), "{label}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let repair = stderr
+            .find("attempting to repair after error:")
+            .unwrap_or_else(|| panic!("{label}: missing repair warning in {stderr}"));
+        let fatal = stderr
+            .rfind("update ivalue: items array is too short")
+            .unwrap_or_else(|| panic!("{label}: missing fatal error in {stderr}"));
+        assert!(repair < fatal, "{label}: {stderr}");
+        assert_eq!(
+            stderr.matches("attempting to repair after error:").count(),
+            1,
+            "{label}"
+        );
+        assert_eq!(
+            stderr
+                .matches("update ivalue: items array is too short")
+                .count(),
+            2,
+            "{label}"
+        );
+        assert!(!output.stdout.is_empty(), "{label}");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).is_err(),
+            "{label}: qpdf must leave partial, incomplete JSON"
+        );
+    }
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 scalar /Dests oracle"]
+fn qpdf_scalar_name_tree_dests_are_silent_and_null() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let cases = [
+        ("direct scalar", "/Names << /Dests 42 >>", &[][..]),
+        (
+            "indirect scalar",
+            "/Names << /Dests 8 0 R >>",
+            &[(8, "42")][..],
+        ),
+    ];
+
+    for (label, catalog_entries, extra) in cases {
+        let mut input = tempfile::NamedTempFile::new().unwrap();
+        input
+            .write_all(&single_outline_with_catalog(
+                catalog_entries,
+                "/Dest (m)",
+                extra,
+            ))
+            .unwrap();
+        let output = Command::new("qpdf")
+            .args(["--json=2", "--json-key=outlines"])
+            .arg(input.path())
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(0), "{label}");
+        assert!(
+            output.stderr.is_empty(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            json["outlines"][0]["dest"],
+            serde_json::Value::Null,
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn qpdf_binary_search_finds_last_leaf_pair_before_visiting_an_invalid_middle_key() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Names [(a) [3 0 R /Fit] 42 [3 0 R /Fit] (target) [3 0 R /Fit]] >> >>",
+        "/Dest (target)",
+        &[],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    assert!(warning_messages(&pdf).is_empty());
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(dests.get("Kids"), None);
+    assert_eq!(
+        dests.get("Names"),
+        Some(&Object::Array(vec![
+            Object::String(b"a".to_vec()),
+            page_dest(3),
+            Object::Integer(42),
+            page_dest(3),
+            Object::String(b"target".to_vec()),
+            page_dest(3),
+        ]))
+    );
+}
+
+#[test]
+fn name_tree_begin_lower_bound_skips_an_invalid_middle_leaf_key() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Names [(m) [3 0 R /Fit] 42 [3 0 R /Fit] (z) [3 0 R /Fit]] >> >>",
+        "/Dest (a)",
+        &[],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert!(warning_messages(&pdf).is_empty());
+    assert_eq!(
+        direct_dests_root(&mut pdf).get("Names"),
+        Some(&Object::Array(vec![
+            Object::String(b"m".to_vec()),
+            page_dest(3),
+            Object::Integer(42),
+            page_dest(3),
+            Object::String(b"z".to_vec()),
+            page_dest(3),
+        ]))
+    );
+}
+
+#[test]
+fn qpdf_binary_search_finds_last_kid_before_visiting_an_invalid_middle_kid() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [8 0 R 42 9 0 R] >> >>",
+        "/Dest (target)",
+        &[
+            (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+            (
+                9,
+                "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+            ),
+        ],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    assert!(warning_messages(&pdf).is_empty());
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(dests.get("Names"), None);
+    assert_eq!(
+        dests.get("Kids"),
+        Some(&Object::Array(vec![
+            Object::Reference(ObjectRef::new(8, 0)),
+            Object::Integer(42),
+            Object::Reference(ObjectRef::new(9, 0)),
+        ]))
+    );
+}
+
+#[test]
+fn name_tree_begin_lower_bound_converts_the_direct_first_path_before_skipping_search() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [<< /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >>] >> 42 9 0 R] >> >>",
+        "/Dest (a)",
+        &[(
+            9,
+            "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>",
+        )],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        [
+            "converting kid number 0 to an indirect object",
+            "Name/Number tree node (object 10): converting kid number 0 to an indirect object",
+        ]
+    );
+
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(
+        dests.get("Kids"),
+        Some(&Object::Array(vec![
+            Object::Reference(ObjectRef::new(10, 0)),
+            Object::Integer(42),
+            Object::Reference(ObjectRef::new(9, 0)),
+        ]))
+    );
+    let Object::Dictionary(first_parent) = pdf.resolve(ObjectRef::new(10, 0)).unwrap() else {
+        panic!("converted first parent must be a dictionary");
+    };
+    assert_eq!(
+        first_parent.get("Kids"),
+        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+            11, 0,
+        ))]))
+    );
+    let Object::Dictionary(first_leaf) = pdf.resolve(ObjectRef::new(11, 0)).unwrap() else {
+        panic!("converted first leaf must be a dictionary");
+    };
+    assert_eq!(
+        first_leaf.get("Names"),
+        Some(&Object::Array(vec![
+            Object::String(b"m".to_vec()),
+            page_dest(3),
+        ]))
+    );
+
+    let mut serialized = Vec::new();
+    write_pdf(&mut pdf, &mut serialized).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(serialized)).unwrap();
+    let dests = direct_dests_root(&mut reopened);
+    assert!(matches!(
+        dests.get("Kids"),
+        Some(Object::Array(kids)) if kids.first() == Some(&Object::Reference(ObjectRef::new(10, 0)))
+    ));
+    let Object::Dictionary(first_parent) = reopened.resolve(ObjectRef::new(10, 0)).unwrap() else {
+        panic!("reopened first parent must be a dictionary");
+    };
+    assert_eq!(
+        first_parent.get("Kids"),
+        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+            11, 0,
+        ))]))
+    );
+}
+
+#[test]
+fn name_tree_begin_converts_a_direct_first_kid_under_an_indirect_root() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests 8 0 R >>",
+        "/Dest (a)",
+        &[(
+            8,
+            "<< /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >>] >>",
+        )],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        ["Name/Number tree node (object 8): converting kid number 0 to an indirect object"]
+    );
+    let Object::Dictionary(root) = pdf.resolve(ObjectRef::new(8, 0)).unwrap() else {
+        panic!("indirect destination root must remain a dictionary");
+    };
+    assert_eq!(
+        root.get("Kids"),
+        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+            9, 0,
+        ))]))
+    );
+    assert!(matches!(
+        pdf.resolve(ObjectRef::new(9, 0)).unwrap(),
+        Object::Dictionary(_)
+    ));
+
+    let mut serialized = Vec::new();
+    write_pdf(&mut pdf, &mut serialized).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(serialized)).unwrap();
+    let Object::Dictionary(root) = reopened.resolve(ObjectRef::new(8, 0)).unwrap() else {
+        panic!("reopened indirect destination root must remain a dictionary");
+    };
+    assert_eq!(
+        root.get("Kids"),
+        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+            9, 0,
+        ))]))
+    );
+}
+
+#[test]
+fn name_tree_begin_updates_a_direct_root_inside_an_indirect_names_holder() {
+    let bytes = single_outline_with_catalog(
+        "/Names 8 0 R",
+        "/Dest (a)",
+        &[(
+            8,
+            "<< /Dests << /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >>] >> >>",
+        )],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        ["converting kid number 0 to an indirect object"]
+    );
+    let Object::Dictionary(names) = pdf.resolve(ObjectRef::new(8, 0)).unwrap() else {
+        panic!("indirect /Names holder must remain a dictionary");
+    };
+    let Some(Object::Dictionary(root)) = names.get("Dests") else {
+        panic!("destination root must remain direct");
+    };
+    assert_eq!(
+        root.get("Kids"),
+        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+            9, 0,
+        ))]))
+    );
+
+    let mut serialized = Vec::new();
+    write_pdf(&mut pdf, &mut serialized).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(serialized)).unwrap();
+    let Object::Dictionary(names) = reopened.resolve(ObjectRef::new(8, 0)).unwrap() else {
+        panic!("reopened indirect /Names holder must remain a dictionary");
+    };
+    let Some(Object::Dictionary(root)) = names.get("Dests") else {
+        panic!("reopened destination root must remain direct");
+    };
+    assert_eq!(
+        root.get("Kids"),
+        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+            9, 0,
+        ))]))
+    );
+}
+
+#[test]
+fn invalid_first_name_tree_key_does_not_enable_the_lower_bound_shortcut() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Names [42 [3 0 R /Fit] (m) [3 0 R /Fit] (z) [3 0 R /Fit]] >> >>",
+        "/Dest (a)",
+        &[],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        [
+            "attempting to repair after error: Name/Number tree node: item at index 0 is not the right type",
+            "item 0 has the wrong type",
+        ]
+    );
+    assert_eq!(
+        direct_dests_root(&mut pdf).get("Names"),
+        Some(&Object::Array(vec![
+            Object::String(b"m".to_vec()),
+            page_dest(3),
+            Object::String(b"z".to_vec()),
+            page_dest(3),
+        ]))
+    );
+}
+
+#[test]
+fn after_last_lookup_runs_targeted_search_without_a_last_descent() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >> 42 << /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>] >> >>",
+        "/Dest (zz)",
+        &[],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        ["converting kid number 0 to an indirect object"]
+    );
+    let dests = direct_dests_root(&mut pdf);
+    let Some(Object::Array(kids)) = dests.get("Kids") else {
+        panic!("destination root must retain /Kids");
+    };
+    assert_eq!(kids[0], Object::Reference(ObjectRef::new(6, 0)));
+    assert_eq!(kids[1], Object::Integer(42));
+    assert!(matches!(kids[2], Object::Dictionary(_)));
+}
+
+#[test]
+fn name_tree_begin_indirects_a_direct_scalar_before_reporting_it_as_non_dictionary() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [42 8 0 R] >> >>",
+        "/Dest (target)",
+        &[(
+            8,
+            "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+        )],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        [
+            "converting kid number 0 to an indirect object",
+            "Name/Number tree node (object 9): non-dictionary node while traversing name/number tree",
+        ]
+    );
+    assert_eq!(
+        direct_dests_root(&mut pdf).get("Kids"),
+        Some(&Object::Array(vec![
+            Object::Reference(ObjectRef::new(9, 0)),
+            Object::Reference(ObjectRef::new(8, 0)),
+        ]))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(9, 0)).unwrap(),
+        Object::Integer(42)
+    );
+}
+
+#[test]
+fn name_tree_begin_reports_an_indirect_scalar_without_repairing_the_tree() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [8 0 R 9 0 R] >> >>",
+        "/Dest (target)",
+        &[
+            (8, "42"),
+            (
+                9,
+                "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+            ),
+        ],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        ["Name/Number tree node (object 8): non-dictionary node while traversing name/number tree"]
+    );
+    assert_eq!(
+        direct_dests_root(&mut pdf).get("Kids"),
+        Some(&Object::Array(vec![
+            Object::Reference(ObjectRef::new(8, 0)),
+            Object::Reference(ObjectRef::new(9, 0)),
+        ]))
+    );
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 begin/deepen full-object oracle"]
+fn qpdf_name_tree_begin_lower_bound_and_direct_kid_full_object_oracle() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let cases = [
+        (
+            "deep direct first path",
+            "/Names << /Dests << /Kids [<< /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >>] >> 42 9 0 R] >> >>",
+            &[(
+                9,
+                "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>",
+            )][..],
+            "/Dest (a)",
+            Some(3),
+            &[
+                "converting kid number 0 to an indirect object",
+                "Name/Number tree node (object 10)",
+                "converting kid number 0 to an indirect object",
+            ][..],
+        ),
+        (
+            "after last",
+            "/Names << /Dests << /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >> 42 << /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>] >> >>",
+            &[][..],
+            "/Dest (zz)",
+            Some(3),
+            &["converting kid number 0 to an indirect object"][..],
+        ),
+        (
+            "indirect root",
+            "/Names << /Dests 8 0 R >>",
+            &[(
+                8,
+                "<< /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >>] >>",
+            )][..],
+            "/Dest (a)",
+            Some(3),
+            &["Name/Number tree node (object 8)", "converting kid number 0"][..],
+        ),
+        (
+            "direct scalar",
+            "/Names << /Dests << /Kids [42 8 0 R] >> >>",
+            &[(
+                8,
+                "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+            )][..],
+            "/Dest (target)",
+            Some(3),
+            &[
+                "converting kid number 0 to an indirect object",
+                "Name/Number tree node (object 9)",
+                "non-dictionary node while traversing name/number tree",
+            ][..],
+        ),
+        (
+            "indirect scalar",
+            "/Names << /Dests << /Kids [8 0 R 9 0 R] >> >>",
+            &[
+                (8, "42"),
+                (
+                    9,
+                    "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+                ),
+            ][..],
+            "/Dest (target)",
+            Some(3),
+            &[
+                "Name/Number tree node (object 8)",
+                "non-dictionary node while traversing name/number tree",
+            ][..],
+        ),
+        (
+            "leaf lower bound",
+            "/Names << /Dests << /Names [(m) [3 0 R /Fit] 42 [3 0 R /Fit] (z) [3 0 R /Fit]] >> >>",
+            &[][..],
+            "/Dest (a)",
+            Some(0),
+            &[][..],
+        ),
+        (
+            "indirect names holder",
+            "/Names 8 0 R",
+            &[(
+                8,
+                "<< /Dests << /Kids [<< /Limits [(m) (m)] /Names [(m) [3 0 R /Fit]] >>] >> >>",
+            )][..],
+            "/Dest (a)",
+            Some(3),
+            &["converting kid number 0 to an indirect object"][..],
+        ),
+        (
+            "first path cycle",
+            "/Names << /Dests << /Kids [8 0 R] >> >>",
+            &[(8, "<< /Limits [(m) (m)] /Kids [8 0 R] >>")][..],
+            "/Dest (m)",
+            Some(3),
+            &[
+                "Name/Number tree node (object 8)",
+                "loop detected while traversing name/number tree",
+            ][..],
+        ),
+    ];
+
+    for (label, catalog_entries, extra, item_entries, expected_status, ordered_warnings) in cases {
+        let mut input = tempfile::NamedTempFile::new().unwrap();
+        input
+            .write_all(&single_outline_with_catalog(
+                catalog_entries,
+                item_entries,
+                extra,
+            ))
+            .unwrap();
+        let output = Command::new("qpdf")
+            .args(["--json=2", "--json-key=outlines", "--json-key=qpdf"])
+            .arg(input.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            expected_status,
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut warning_offset = 0;
+        for warning in ordered_warnings {
+            let relative = stderr[warning_offset..]
+                .find(warning)
+                .unwrap_or_else(|| panic!("{label}: missing {warning:?} in {stderr}"));
+            warning_offset += relative + warning.len();
+        }
+
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let objects = json["qpdf"][1].as_object().unwrap();
+        match label {
+            "deep direct first path" => {
+                let kids = json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"]["/Kids"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(kids[0], "10 0 R");
+                assert_eq!(kids[1], 42);
+                assert_eq!(kids[2], "9 0 R");
+                assert_eq!(objects["obj:10 0 R"]["value"]["/Kids"][0], "11 0 R");
+                assert_eq!(
+                    objects["obj:11 0 R"]["value"]["/Names"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    2
+                );
+            }
+            "after last" => {
+                let kids = json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"]["/Kids"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(kids[0], "6 0 R");
+                assert_eq!(kids[1], 42);
+                assert!(kids[2].is_object(), "last direct kid must remain direct");
+                assert!(objects.get("obj:7 0 R").is_none());
+            }
+            "indirect root" => {
+                assert_eq!(objects["obj:8 0 R"]["value"]["/Kids"][0], "9 0 R");
+                assert!(objects["obj:9 0 R"]["value"].is_object());
+            }
+            "direct scalar" => {
+                let kids = json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"]["/Kids"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(kids[0], "9 0 R");
+                assert_eq!(kids[1], "8 0 R");
+                assert_eq!(objects["obj:9 0 R"]["value"], 42);
+            }
+            "indirect scalar" => {
+                let kids = json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"]["/Kids"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(kids[0], "8 0 R");
+                assert_eq!(kids[1], "9 0 R");
+                assert!(objects.get("obj:10 0 R").is_none());
+            }
+            "leaf lower bound" => {
+                let names = json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"]["/Names"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(names.len(), 6);
+                assert!(objects.get("obj:6 0 R").is_none());
+            }
+            "indirect names holder" => {
+                assert_eq!(objects["obj:8 0 R"]["value"]["/Dests"]["/Kids"][0], "9 0 R");
+                assert!(objects["obj:9 0 R"]["value"].is_object());
+            }
+            "first path cycle" => {
+                assert_eq!(objects["obj:8 0 R"]["value"]["/Kids"][0], "8 0 R");
+                assert!(objects.get("obj:9 0 R").is_none());
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn empty_root_name_tree_warns_as_traversal_missing_without_repair_or_mutation() {
+    let bytes = single_outline_with_catalog("/Names << /Dests << >> >>", "/Dest (shape)", &[]);
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        ["name/number tree node has neither non-empty /Names nor /Kids"]
+    );
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(dests.get("Names"), None);
+    assert_eq!(dests.get("Kids"), None);
+}
+
+#[test]
+fn empty_names_and_empty_kids_root_is_allowed_without_warning_or_mutation() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Names [] /Kids [] >> >>",
+        "/Dest (shape)",
+        &[],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert!(warning_messages(&pdf).is_empty());
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(dests.get("Names"), Some(&Object::Array(Vec::new())));
+    assert_eq!(dests.get("Kids"), Some(&Object::Array(Vec::new())));
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 search-order and empty-root oracle"]
+fn qpdf_binary_search_and_empty_root_full_object_oracle() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let cases = [
+        (
+            "/Names << /Dests << /Names [(a) [3 0 R /Fit] 42 [3 0 R /Fit] (target) [3 0 R /Fit]] >> >>",
+            &[][..],
+            "/Dest (target)",
+            Some(0),
+            None,
+            "Names",
+        ),
+        (
+            "/Names << /Dests << /Kids [8 0 R 42 9 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (
+                    9,
+                    "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+                ),
+            ][..],
+            "/Dest (target)",
+            Some(0),
+            None,
+            "Kids",
+        ),
+        (
+            "/Names << /Dests << >> >>",
+            &[][..],
+            "/Dest (shape)",
+            Some(3),
+            Some("name/number tree node has neither non-empty /Names nor /Kids"),
+            "Empty",
+        ),
+    ];
+
+    for (catalog_entries, extra, item_entries, expected_status, warning, shape) in cases {
+        let mut input = tempfile::NamedTempFile::new().unwrap();
+        input
+            .write_all(&single_outline_with_catalog(
+                catalog_entries,
+                item_entries,
+                extra,
+            ))
+            .unwrap();
+        let output = Command::new("qpdf")
+            .args(["--json=2", "--json-key=outlines", "--json-key=qpdf"])
+            .arg(input.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            expected_status,
+            "{shape}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match warning {
+            Some(warning) => assert!(stderr.contains(warning), "{shape}: {stderr}"),
+            None => assert!(stderr.is_empty(), "{shape}: {stderr}"),
+        }
+
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let root = &json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"];
+        match shape {
+            "Names" => {
+                assert_eq!(root["/Names"].as_array().unwrap().len(), 6);
+                assert!(root.get("/Kids").is_none());
+            }
+            "Kids" => {
+                assert_eq!(root["/Kids"].as_array().unwrap().len(), 3);
+                assert!(root.get("/Names").is_none());
+            }
+            "Empty" => assert!(root.as_object().unwrap().is_empty()),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn malformed_name_tree_structural_errors_warn_repair_and_retry() {
+    let cases = [
+        (
+            "invalid leaf key",
+            "/Names << /Dests << /Names [(a) [3 0 R /Fit] 42 [3 0 R /Fit] (z) [3 0 R /Fit]] >> >>",
+            &[][..],
+            "/Dest (m)",
+            "attempting to repair after error: Name/Number tree node: item at index 2 is not the right type",
+        ),
+        (
+            "targeted cycle",
+            "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (9, "<< /Limits [(m) (m)] /Kids [9 0 R] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (m)",
+            "attempting to repair after error: Name/Number tree node (object 9): loop detected in find",
+        ),
+        (
+            "bad node",
+            "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (9, "<< /Limits [(m) (m)] /Kids [] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (m)",
+            "attempting to repair after error: Name/Number tree node (object 9): bad node during find",
+        ),
+        (
+            "empty leaf bad node",
+            "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (9, "<< /Limits [(m) (m)] /Names [] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (m)",
+            "attempting to repair after error: Name/Number tree node (object 9): bad node during find",
+        ),
+        (
+            "binary search no candidate",
+            "/Names << /Dests << /Kids [8 0 R 9 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(m) (m)] /Names [(a) [3 0 R /Fit]] >>"),
+                (9, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (b)",
+            "attempting to repair after error: Name/Number tree node: unexpected -1 from binary search of kids; limits may by wrong",
+        ),
+    ];
+
+    for (label, catalog_entries, extra, item_entries, expected_warning) in cases {
+        let bytes = single_outline_with_catalog(catalog_entries, item_entries, extra);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        assert_eq!(root_items(&mut pdf)[0].dest, Object::Null, "{label}");
+        assert_eq!(
+            warning_messages(&pdf).first().copied(),
+            Some(expected_warning),
+            "{label}"
+        );
+        let dests = direct_dests_root(&mut pdf);
+        assert_eq!(dests.get("Kids"), None, "{label}");
+        assert!(
+            matches!(dests.get("Names"), Some(Object::Array(_))),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn malformed_name_tree_invalid_kid_is_skipped_while_valid_entries_are_retained() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [8 0 R 42 9 0 R] >> >>",
+        "/Dest (target)",
+        &[
+            (
+                8,
+                "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+            ),
+            (9, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+        ],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    assert_eq!(
+        warning_messages(&pdf),
+        [
+            "attempting to repair after error: Name/Number tree node: invalid kid at index 1",
+            "skipping over invalid kid at index 1",
+        ]
+    );
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(dests.get("Kids"), None);
+    assert_eq!(
+        dests.get("Names"),
+        Some(&Object::Array(vec![
+            Object::String(b"target".to_vec()),
+            page_dest(3),
+            Object::String(b"z".to_vec()),
+            page_dest(3),
+        ]))
+    );
+}
+
+#[test]
+fn malformed_name_tree_zero_entry_repair_still_installs_an_empty_names_array() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Names [42 [3 0 R /Fit]] >> >>",
+        "/Dest (shape)",
+        &[],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        [
+            "attempting to repair after error: Name/Number tree node: item at index 0 is not the right type",
+            "item 0 has the wrong type",
+        ]
+    );
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(dests.get("Kids"), None);
+    assert_eq!(dests.get("Names"), Some(&Object::Array(Vec::new())));
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 structural-repair oracle"]
+fn qpdf_malformed_name_tree_structural_matrix_warns_and_repairs() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let cases = [
+        (
+            "/Names << /Dests << /Kids [8 0 R 42 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (m)",
+            "invalid kid at index 1",
+        ),
+        (
+            "/Names << /Dests << /Names [(a) [3 0 R /Fit] 42 [3 0 R /Fit] (z) [3 0 R /Fit]] >> >>",
+            &[][..],
+            "/Dest (m)",
+            "item at index 2 is not the right type",
+        ),
+        (
+            "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (9, "<< /Limits [(m) (m)] /Kids [9 0 R] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (m)",
+            "loop detected in find",
+        ),
+        (
+            "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (9, "<< /Limits [(m) (m)] /Kids [] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (m)",
+            "bad node during find",
+        ),
+        (
+            "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (9, "<< /Limits [(m) (m)] /Names [] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (m)",
+            "bad node during find",
+        ),
+        (
+            "/Names << /Dests << /Kids [8 0 R 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(m) (m)] /Names [(a) [3 0 R /Fit]] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (b)",
+            "unexpected -1 from binary search of kids; limits may by wrong",
+        ),
+    ];
+
+    for (catalog_entries, extra, item_entries, expected_suffix) in cases {
+        let mut input = tempfile::NamedTempFile::new().unwrap();
+        input
+            .write_all(&single_outline_with_catalog(
+                catalog_entries,
+                item_entries,
+                extra,
+            ))
+            .unwrap();
+        let output = Command::new("qpdf")
+            .args(["--json=2", "--json-key=outlines", "--json-key=qpdf"])
+            .arg(input.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{expected_suffix}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected_suffix),
+            "{expected_suffix}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let repaired_root = &json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"];
+        assert!(repaired_root.get("/Kids").is_none(), "{expected_suffix}");
+        assert!(repaired_root["/Names"].is_array(), "{expected_suffix}");
+    }
+}
+
+fn missing_name_tree_limits_pdf() -> Vec<u8> {
+    single_outline_with_catalog(
+        "/Names << /Dests << /Kids [8 0 R] >> >>",
+        "/Dest (shape)",
+        &[(8, "<< /Names [(shape) [3 0 R /Fit]] >>")],
+    )
+}
+
+#[test]
+fn missing_name_tree_limits_repairs_and_mutates_the_existing_direct_root() {
+    let mut pdf = Pdf::open(Cursor::new(missing_name_tree_limits_pdf())).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    assert_eq!(
+        warning_messages(&pdf),
+        vec![
+            "attempting to repair after error: Name/Number tree node (object 8): node is missing /Limits"
+        ]
+    );
+
+    let catalog_ref = pdf.root_ref().unwrap();
+    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref).unwrap() else {
+        panic!("catalog must remain a dictionary");
+    };
+    let Object::Dictionary(names) = catalog.get("Names").unwrap() else {
+        panic!("direct /Names must remain direct");
+    };
+    let Object::Dictionary(dests) = names.get("Dests").unwrap() else {
+        panic!("direct /Dests root must remain direct");
+    };
+    assert_eq!(dests.get("Kids"), None);
+    assert_eq!(
+        dests.get("Names"),
+        Some(&Object::Array(vec![
+            Object::String(b"shape".to_vec()),
+            page_dest(3),
+        ]))
+    );
+    assert!(matches!(
+        pdf.resolve(ObjectRef::new(8, 0)).unwrap(),
+        Object::Dictionary(_)
+    ));
+
+    let mut serialized = Vec::new();
+    write_pdf(&mut pdf, &mut serialized).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(serialized)).unwrap();
+    let catalog_ref = reopened.root_ref().unwrap();
+    let Object::Dictionary(catalog) = reopened.resolve(catalog_ref).unwrap() else {
+        panic!("reopened catalog must be a dictionary");
+    };
+    let Object::Dictionary(names) = catalog.get("Names").unwrap() else {
+        panic!("reopened direct /Names must remain direct");
+    };
+    let Object::Dictionary(dests) = names.get("Dests").unwrap() else {
+        panic!("reopened direct /Dests root must remain direct");
+    };
+    assert_eq!(dests.get("Kids"), None);
+    assert!(matches!(dests.get("Names"), Some(Object::Array(_))));
+    assert!(matches!(
+        reopened.resolve(ObjectRef::new(8, 0)).unwrap(),
+        Object::Dictionary(_)
+    ));
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 oracle"]
+fn qpdf_missing_name_tree_limits_oracle_repairs_the_lookup() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    input.write_all(&missing_name_tree_limits_pdf()).unwrap();
+    let output = Command::new("qpdf")
+        .args(["--json=2", "--json-key=outlines"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning = stderr
+        .find("attempting to repair after error:")
+        .unwrap_or_else(|| panic!("missing repair warning in {stderr}"));
+    let summary = stderr
+        .find("qpdf: operation succeeded with warnings")
+        .unwrap_or_else(|| panic!("missing warning summary in {stderr}"));
+    assert!(warning < summary, "{stderr}");
+    assert_eq!(
+        stderr.matches("attempting to repair after error:").count(),
+        1
+    );
+    assert_eq!(
+        stderr
+            .matches("qpdf: operation succeeded with warnings")
+            .count(),
+        1
+    );
+    assert!(stderr.contains("(Name/Number tree node (object 8)): node is missing /Limits"));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["outlines"][0]["dest"][0], "3 0 R");
+}
+
+#[test]
+fn missing_name_tree_limits_repairs_the_terminal_indirect_root_without_collapsing_holders() {
+    let bytes = single_outline_with_catalog(
+        "/Names 20 0 R",
+        "/Dest (shape)",
+        &[
+            (8, "<< /Names [(shape) [3 0 R /Fit]] >>"),
+            (20, "<< /Dests 21 0 R >>"),
+            (21, "22 0 R"),
+            (22, "<< /Kids [8 0 R] >>"),
+        ],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    assert_eq!(
+        warning_messages(&pdf),
+        vec![
+            "attempting to repair after error: Name/Number tree node (object 8): node is missing /Limits"
+        ]
+    );
+
+    let catalog_ref = pdf.root_ref().unwrap();
+    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref).unwrap() else {
+        panic!("catalog must remain a dictionary");
+    };
+    assert_eq!(
+        catalog.get("Names"),
+        Some(&Object::Reference(ObjectRef::new(20, 0)))
+    );
+    let Object::Dictionary(names) = pdf.resolve(ObjectRef::new(20, 0)).unwrap() else {
+        panic!("indirect /Names holder must remain a dictionary");
+    };
+    assert_eq!(
+        names.get("Dests"),
+        Some(&Object::Reference(ObjectRef::new(21, 0)))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(21, 0)).unwrap(),
+        Object::Reference(ObjectRef::new(22, 0))
+    );
+    let Object::Dictionary(dests) = pdf.resolve(ObjectRef::new(22, 0)).unwrap() else {
+        panic!("terminal /Dests root must remain a dictionary");
+    };
+    assert_eq!(dests.get("Kids"), None);
+    assert!(matches!(dests.get("Names"), Some(Object::Array(_))));
+}
+
+#[test]
+fn malformed_name_tree_repair_enumerates_all_reachable_branches_and_terminates_cycles() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [12 0 R 8 0 R 9 0 R 10 0 R 11 0 R] >> >>",
+        "/Dest (target)",
+        &[
+            (8, "42"),
+            (9, "<< /Limits [(m) (m)] /Kids [9 0 R] >>"),
+            (10, "<< /Names [(target) [3 0 R /Fit]] >>"),
+            (11, "<< /Limits [(z) (z)] /Names [42 [3 0 R /Fit]] >>"),
+            (12, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+        ],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    assert_eq!(
+        warning_messages(&pdf),
+        vec![
+            "attempting to repair after error: Name/Number tree node (object 10): node is missing /Limits",
+            "skipping over invalid kid at index 1",
+            "loop detected while traversing name/number tree",
+            "item 0 has the wrong type",
+        ]
+    );
+}
+
+fn malformed_name_tree_split_pdf() -> Vec<u8> {
+    let pairs = (0..33)
+        .map(|index| format!("(k{index:02}) [3 0 R /Fit]"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let leaf = format!("<< /Names [{pairs}] >>");
+    single_outline_with_catalog(
+        "/Names << /Dests << /Kids [8 0 R] >> >>",
+        "/Dest (k17)",
+        &[(8, leaf.as_str())],
+    )
+}
+
+#[test]
+fn malformed_name_tree_repair_rebuilds_more_than_one_leaf() {
+    let mut pdf = Pdf::open(Cursor::new(malformed_name_tree_split_pdf())).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    let dests = direct_dests_root(&mut pdf);
+    let Some(Object::Array(kids)) = dests.get("Kids") else {
+        panic!("repaired root must contain /Kids");
+    };
+    assert_eq!(
+        kids.as_slice(),
+        &[
+            Object::Reference(ObjectRef::new(9, 0)),
+            Object::Reference(ObjectRef::new(10, 0)),
+        ]
+    );
+    assert_eq!(dests.get("Names"), None);
+
+    let Object::Dictionary(first) = pdf.resolve(ObjectRef::new(9, 0)).unwrap() else {
+        panic!("first repaired leaf must be a dictionary");
+    };
+    let Object::Dictionary(second) = pdf.resolve(ObjectRef::new(10, 0)).unwrap() else {
+        panic!("second repaired leaf must be a dictionary");
+    };
+    assert!(matches!(first.get("Names"), Some(Object::Array(names)) if names.len() == 32));
+    assert!(matches!(second.get("Names"), Some(Object::Array(names)) if names.len() == 34));
+    assert_eq!(
+        first.get("Limits"),
+        Some(&Object::Array(vec![
+            Object::String(b"k00".to_vec()),
+            Object::String(b"k15".to_vec()),
+        ]))
+    );
+    assert_eq!(
+        second.get("Limits"),
+        Some(&Object::Array(vec![
+            Object::String(b"k16".to_vec()),
+            Object::String(b"k32".to_vec()),
+        ]))
+    );
+}
+
+#[test]
+fn malformed_name_tree_repair_reproduces_qpdf_parent_split_order() {
+    let pairs = (0..529)
+        .map(|index| format!("(k{index:04}) [3 0 R /Fit]"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let leaf = format!("<< /Names [{pairs}] >>");
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [8 0 R] >> >>",
+        "/Dest (k0528)",
+        &[(8, leaf.as_str())],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    let dests = direct_dests_root(&mut pdf);
+    let Some(Object::Array(root_kids)) = dests.get("Kids") else {
+        panic!("repaired root must contain /Kids");
+    };
+    assert_eq!(root_kids.len(), 2);
+    let Object::Reference(first_parent_ref) = root_kids[0] else {
+        panic!("first repaired parent must be indirect");
+    };
+    let Object::Reference(second_parent_ref) = root_kids[1] else {
+        panic!("second repaired parent must be indirect");
+    };
+    let Object::Dictionary(first_parent) = pdf.resolve(first_parent_ref).unwrap() else {
+        panic!("first repaired parent must be a dictionary");
+    };
+    let Object::Dictionary(second_parent) = pdf.resolve(second_parent_ref).unwrap() else {
+        panic!("second repaired parent must be a dictionary");
+    };
+    assert!(matches!(first_parent.get("Kids"), Some(Object::Array(kids)) if kids.len() == 16));
+    assert!(matches!(second_parent.get("Kids"), Some(Object::Array(kids)) if kids.len() == 17));
+    assert_eq!(
+        first_parent.get("Limits"),
+        Some(&Object::Array(vec![
+            Object::String(b"k0000".to_vec()),
+            Object::String(b"k0255".to_vec()),
+        ]))
+    );
+    assert_eq!(
+        second_parent.get("Limits"),
+        Some(&Object::Array(vec![
+            Object::String(b"k0256".to_vec()),
+            Object::String(b"k0528".to_vec()),
+        ]))
+    );
+}
+
+#[test]
+fn malformed_name_tree_repair_warns_for_a_short_names_array_and_visits_an_empty_leaf() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [8 0 R 9 0 R] >> >>",
+        "/Dest (shape)",
+        &[
+            (8, "<< /Names [(shape) [3 0 R /Fit] (dangling)] >>"),
+            (9, "<< /Limits [(z) (z)] /Names [] >>"),
+        ],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    assert_eq!(
+        warning_messages(&pdf),
+        [
+            "attempting to repair after error: Name/Number tree node (object 8): node is missing /Limits",
+            "items array doesn't have enough elements",
+            "Name/Number tree node (object 9): name/number tree node has neither non-empty /Names nor /Kids",
+        ]
+    );
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 full-object oracle"]
+fn qpdf_malformed_name_tree_repair_splits_33_pairs_as_16_then_17() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    input.write_all(&malformed_name_tree_split_pdf()).unwrap();
+    let output = Command::new("qpdf")
+        .args(["--json=2", "--json-key=outlines", "--json-key=qpdf"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["outlines"][0]["dest"][0], "3 0 R");
+    let objects = json["qpdf"][1].as_object().unwrap();
+    let repaired_root = &objects["obj:1 0 R"]["value"]["/Names"]["/Dests"];
+    assert_eq!(repaired_root["/Kids"].as_array().unwrap().len(), 2);
+    assert!(repaired_root.get("/Names").is_none());
+
+    let mut leaves = objects
+        .values()
+        .filter_map(|object| {
+            let value = &object["value"];
+            let names = value.get("/Names")?.as_array()?;
+            let limits = value.get("/Limits")?.as_array()?;
+            Some((names.len(), limits.clone()))
+        })
+        .collect::<Vec<_>>();
+    leaves.sort_by(|left, right| left.1[0].as_str().cmp(&right.1[0].as_str()));
+    assert_eq!(
+        leaves,
+        vec![
+            (
+                32,
+                vec![
+                    serde_json::Value::String("u:k00".to_string()),
+                    serde_json::Value::String("u:k15".to_string()),
+                ],
+            ),
+            (
+                34,
+                vec![
+                    serde_json::Value::String("u:k16".to_string()),
+                    serde_json::Value::String("u:k32".to_string()),
+                ],
+            ),
+        ]
+    );
+}
+
+#[test]
+fn malformed_name_tree_repair_updates_a_direct_root_inside_indirect_names() {
+    let bytes = single_outline_with_catalog(
+        "/Names 20 0 R",
+        "/Dest (shape)",
+        &[
+            (8, "<< /Names [(shape) [3 0 R /Fit]] >>"),
+            (20, "<< /Dests << /Kids [8 0 R] >> >>"),
+        ],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    let catalog_ref = pdf.root_ref().unwrap();
+    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref).unwrap() else {
+        panic!("catalog must remain a dictionary");
+    };
+    assert_eq!(
+        catalog.get("Names"),
+        Some(&Object::Reference(ObjectRef::new(20, 0)))
+    );
+    let Object::Dictionary(names) = pdf.resolve(ObjectRef::new(20, 0)).unwrap() else {
+        panic!("indirect /Names must remain a dictionary");
+    };
+    let Object::Dictionary(dests) = names.get("Dests").unwrap() else {
+        panic!("direct /Dests root must remain direct");
+    };
+    assert_eq!(dests.get("Kids"), None);
+    assert!(matches!(dests.get("Names"), Some(Object::Array(_))));
+}
+
 fn qpdf_destination_matrix_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -1699,7 +2972,7 @@ fn qpdf_destination_matrix_pdf() -> Vec<u8> {
 #[test]
 fn qpdf_destination_matrix_matches_raw_objects() {
     let mut pdf = Pdf::open(Cursor::new(qpdf_destination_matrix_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert_eq!(roots[0].dest, Object::Null);
     assert_eq!(roots[1].dest, Object::Integer(42));
     assert_eq!(roots[2].dest, page_dest(3));
@@ -1759,10 +3032,7 @@ fn dest_key_presence_suppresses_valid_action_fallback() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    assert_eq!(
-        pdf.outline().get_root().unwrap()[0].dest,
-        Object::Integer(42)
-    );
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Integer(42));
 }
 
 #[test]
@@ -1779,7 +3049,7 @@ fn root_action_array_is_not_an_action_dictionary() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, Object::Null);
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
 }
 
 #[test]
@@ -1808,7 +3078,7 @@ fn candidate_type_selects_only_qpdf_named_destination_store() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert_eq!(roots[0].dest, page_dest(2));
     assert_eq!(roots[1].dest, page_dest(3));
 }
@@ -1825,7 +3095,7 @@ fn malformed_or_non_goto_actions_have_null_destination() {
         "(not a dictionary)",
     ] {
         let mut pdf = Pdf::open(Cursor::new(action_pdf(action))).unwrap();
-        assert_eq!(pdf.outline().get_root().unwrap()[0].dest, Object::Null);
+        assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
     }
 }
 
@@ -1837,7 +3107,7 @@ fn unresolved_dest_name_suppresses_action_fallback() {
         &[],
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, Object::Null);
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
 }
 
 #[test]
@@ -1872,11 +3142,7 @@ fn missing_named_candidate_store_paths_have_null_destination() {
     for (label, catalog_entries, item_entries, extra) in cases {
         let bytes = single_outline_with_catalog(catalog_entries, item_entries, &[extra]);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        assert_eq!(
-            pdf.outline().get_root().unwrap()[0].dest,
-            Object::Null,
-            "{label}"
-        );
+        assert_eq!(root_items(&mut pdf)[0].dest, Object::Null, "{label}");
     }
 }
 
@@ -1888,7 +3154,7 @@ fn utf16_string_key_uses_qpdf_utf8_value() {
         &[(8, "<< /Names [<FEFF540D524D> [3 0 R /Fit]] >>")],
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, page_dest(3));
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
 }
 
 /// qpdf keeps bytes after an explicit UTF-8 BOM raw for both the outline
@@ -1907,7 +3173,7 @@ fn malformed_explicit_utf8_named_dest_pdf() -> Vec<u8> {
 fn malformed_explicit_utf8_candidate_does_not_resolve_same_raw_key() {
     let mut pdf = Pdf::open(Cursor::new(malformed_explicit_utf8_named_dest_pdf())).unwrap();
     assert_eq!(
-        pdf.outline().get_root().unwrap()[0].dest,
+        root_items(&mut pdf)[0].dest,
         Object::Null,
         "candidate normalization must not create a match against the raw malformed stored key"
     );
@@ -1945,7 +3211,7 @@ fn named_destination_preserves_dictionary_shape() {
         &[],
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    let node = &pdf.outline().get_root().unwrap()[0];
+    let node = root_items(&mut pdf).remove(0);
     assert!(matches!(node.dest, Object::Dictionary(_)));
     assert_eq!(node.dest_page(), Object::Null);
 }
@@ -1954,7 +3220,7 @@ fn named_destination_preserves_dictionary_shape() {
 fn empty_destination_array_has_null_dest_page() {
     let bytes = single_outline_with_catalog("", "/Dest []", &[]);
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    let node = &pdf.outline().get_root().unwrap()[0];
+    let node = root_items(&mut pdf).remove(0);
     assert_eq!(node.dest, Object::Array(Vec::new()));
     assert_eq!(node.dest_page(), Object::Null);
 }
@@ -1967,7 +3233,7 @@ fn named_destination_materializes_indirect_result_holder() {
         &[(8, "[3 0 R /Fit]")],
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, page_dest(3));
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
 }
 
 fn raw_action(pdf: &mut Pdf<Cursor<Vec<u8>>>, item_ref: ObjectRef) -> Object {
@@ -1990,7 +3256,7 @@ fn resolved_raw_action(pdf: &mut Pdf<Cursor<Vec<u8>>>, item_ref: ObjectRef) -> O
 #[test]
 fn action_goto_direct_d_is_the_node_destination() {
     let mut pdf = Pdf::open(Cursor::new(action_pdf("<< /S /GoTo /D [3 0 R /Fit] >>"))).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, page_dest(3));
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
 }
 
 /// GoTo action whose `/D` is an INDIRECT reference (obj 8, using the ≥6
@@ -2015,7 +3281,7 @@ fn action_goto_indirect_d_pdf() -> Vec<u8> {
 #[test]
 fn action_goto_indirect_d_is_the_node_destination() {
     let mut pdf = Pdf::open(Cursor::new(action_goto_indirect_d_pdf())).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, page_dest(3));
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
 }
 
 /// The outline item's `/A` itself is an INDIRECT reference (obj 9) to the
@@ -2037,7 +3303,7 @@ fn action_indirect_a_pdf() -> Vec<u8> {
 #[test]
 fn action_indirect_a_contributes_the_node_destination() {
     let mut pdf = Pdf::open(Cursor::new(action_indirect_a_pdf())).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, page_dest(3));
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
 }
 
 /// Regression: `/A /S` stored as an indirect reference (obj 8) to a Name.
@@ -2059,7 +3325,7 @@ fn resolve_node_dest_follows_indirect_s_name() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    let root = pdf.outline().get_root().unwrap();
+    let root = root_items(&mut pdf);
     assert_eq!(
         root[0].dest_page(),
         Object::Reference(ObjectRef::new(3, 0)),
@@ -2070,7 +3336,7 @@ fn resolve_node_dest_follows_indirect_s_name() {
 #[test]
 fn action_non_dict_value_has_null_destination() {
     let mut pdf = Pdf::open(Cursor::new(action_pdf("(not a dict)"))).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, Object::Null);
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
 }
 
 /// A non-standard action subtype (`/SubmitForm`) with arbitrary keys,
@@ -2135,12 +3401,9 @@ fn multi_action_pdf() -> Vec<u8> {
 #[test]
 fn action_round_trip_through_write_pdf_unmodified() {
     let mut pdf = Pdf::open(Cursor::new(multi_action_pdf())).unwrap();
-    let refs: Vec<ObjectRef> = pdf
-        .outline()
-        .get_root()
-        .unwrap()
+    let refs: Vec<ObjectRef> = root_items(&mut pdf)
         .into_iter()
-        .map(|node| node.object_ref)
+        .map(|item| item.source_ref.expect("fixture items are indirect"))
         .collect();
     let before: Vec<Object> = refs.iter().map(|&r| raw_action(&mut pdf, r)).collect();
     assert_eq!(refs.len(), 5, "sanity: fixture has 5 outline items");
@@ -2212,7 +3475,7 @@ fn action_goto_dest_remapped_to_first_occurrence_of_duplicated_page() {
     flpdf::remap_outline_and_dests(&mut pdf, &result).unwrap();
 
     assert_eq!(
-        pdf.outline().get_root().unwrap()[0].dest,
+        root_items(&mut pdf)[0].dest,
         Object::Array(vec![
             Object::Reference(first_new),
             Object::Name(b"Fit".to_vec()),
@@ -2265,7 +3528,7 @@ fn action_goto_named_dest_kept_verbatim_while_name_tree_remaps() {
         "the named GoTo action keeps the literal destination name"
     );
     assert_eq!(
-        pdf.outline().get_root().unwrap()[0].dest,
+        root_items(&mut pdf)[0].dest,
         Object::Array(vec![
             Object::Reference(new_p2),
             Object::Name(b"Fit".to_vec()),
@@ -2273,13 +3536,17 @@ fn action_goto_named_dest_kept_verbatim_while_name_tree_remaps() {
         "the named GoTo destination must resolve through the remapped name tree"
     );
 
-    // The name tree's own "mydest" entry is what gets remapped.
-    let entries = pdf.outline().name_tree_dests().unwrap();
-    let (_, dest) = entries
-        .iter()
-        .find(|(n, _)| n == b"mydest")
-        .expect("mydest entry present");
-    assert_eq!(dest.as_ref().unwrap().page(), Some(new_p2));
+    // The name tree's raw "mydest" destination array is what gets remapped.
+    let Object::Dictionary(dests) = pdf.resolve(ObjectRef::new(9, 0)).unwrap() else {
+        panic!("/Names /Dests leaf must remain a dictionary");
+    };
+    let Object::Array(entries) = dests.get("Names").unwrap() else {
+        panic!("name-tree leaf must retain its raw /Names array");
+    };
+    let Object::Array(dest) = &entries[1] else {
+        panic!("mydest value must remain a raw destination array");
+    };
+    assert_eq!(dest[0], Object::Reference(new_p2));
 }
 
 /// GoToR's `/D` looks like a local page reference (`30 0 R`), but a remote
@@ -2379,190 +3646,7 @@ fn outline_destination_resolves_through_multi_hop_action_holder_chain() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, page_dest(3));
-}
-
-// --- check_outline_links: /Parent, /Prev, and cycle diagnostics ---
-
-#[test]
-fn check_outline_links_returns_empty_when_no_outline() {
-    let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
-    assert!(check_outline_links(&mut pdf).unwrap().entries().is_empty());
-}
-
-#[test]
-fn check_outline_links_no_diagnostics_for_well_formed_outline() {
-    // `outline_pdf()`'s /Parent and /Prev entries are all internally
-    // consistent with its /First-/Next chain (checked by hand against the
-    // fixture): no diagnostics should be raised.
-    let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
-    let diagnostics = check_outline_links(&mut pdf).unwrap();
-    assert!(
-        diagnostics.entries().is_empty(),
-        "expected no diagnostics, got {:?}",
-        diagnostics.entries()
-    );
-}
-
-/// Two top-level siblings A(5)->Next->B(7); B's `/Prev` wrongly names the
-/// `/Outlines` dict (4) instead of A (5).
-fn wrong_prev_ref_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Type /Outlines /First 5 0 R /Last 7 0 R /Count 2 >>"),
-            (5, "<< /Title (A) /Parent 4 0 R /Next 7 0 R >>"),
-            (7, "<< /Title (B) /Parent 4 0 R /Prev 4 0 R >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn check_outline_links_flags_wrong_prev_ref() {
-    let mut pdf = Pdf::open(Cursor::new(wrong_prev_ref_pdf())).unwrap();
-    let diagnostics = check_outline_links(&mut pdf).unwrap();
-    let entries = diagnostics.entries();
-    assert_eq!(entries.len(), 1, "got {entries:?}");
-    assert_eq!(entries[0].severity, Severity::Warning);
-    assert!(entries[0].message.contains("7 0 R"));
-    assert!(entries[0].message.contains("/Prev"));
-    assert!(entries[0].message.contains("4 0 R"));
-    assert!(entries[0].message.contains("expected 5 0 R"));
-}
-
-/// Two top-level siblings A(5)->Next->B(7); B has no `/Prev` at all even
-/// though it isn't the first sibling.
-fn missing_prev_on_non_first_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Type /Outlines /First 5 0 R /Last 7 0 R /Count 2 >>"),
-            (5, "<< /Title (A) /Parent 4 0 R /Next 7 0 R >>"),
-            (7, "<< /Title (B) /Parent 4 0 R >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn check_outline_links_flags_missing_prev_on_non_first_sibling() {
-    let mut pdf = Pdf::open(Cursor::new(missing_prev_on_non_first_pdf())).unwrap();
-    let diagnostics = check_outline_links(&mut pdf).unwrap();
-    let entries = diagnostics.entries();
-    assert_eq!(entries.len(), 1, "got {entries:?}");
-    assert!(entries[0].message.contains("7 0 R"));
-    assert!(entries[0].message.contains("/Prev is none"));
-    assert!(entries[0].message.contains("expected 5 0 R"));
-}
-
-/// Two top-level siblings A(5)->Next->B(7); A (the first sibling) has a
-/// stray `/Prev` pointing at B, even though a first sibling shouldn't have
-/// one at all.
-fn stray_prev_on_first_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Type /Outlines /First 5 0 R /Last 7 0 R /Count 2 >>"),
-            (5, "<< /Title (A) /Parent 4 0 R /Prev 7 0 R /Next 7 0 R >>"),
-            (7, "<< /Title (B) /Parent 4 0 R /Prev 5 0 R >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn check_outline_links_flags_stray_prev_on_first_sibling() {
-    let mut pdf = Pdf::open(Cursor::new(stray_prev_on_first_pdf())).unwrap();
-    let diagnostics = check_outline_links(&mut pdf).unwrap();
-    let entries = diagnostics.entries();
-    assert_eq!(entries.len(), 1, "got {entries:?}");
-    assert!(entries[0].message.contains("5 0 R"));
-    assert!(entries[0].message.contains("/Prev is 7 0 R"));
-    assert!(entries[0].message.contains("expected none"));
-}
-
-/// Two top-level siblings A(5)->Next->B(7); B's `/Parent` wrongly names A (5)
-/// instead of the `/Outlines` dict (4).
-fn wrong_parent_ref_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Type /Outlines /First 5 0 R /Last 7 0 R /Count 2 >>"),
-            (5, "<< /Title (A) /Parent 4 0 R /Next 7 0 R >>"),
-            (7, "<< /Title (B) /Parent 5 0 R /Prev 5 0 R >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn check_outline_links_flags_wrong_parent_ref() {
-    let mut pdf = Pdf::open(Cursor::new(wrong_parent_ref_pdf())).unwrap();
-    let diagnostics = check_outline_links(&mut pdf).unwrap();
-    let entries = diagnostics.entries();
-    assert_eq!(entries.len(), 1, "got {entries:?}");
-    assert!(entries[0].message.contains("7 0 R"));
-    assert!(entries[0].message.contains("/Parent is 5 0 R"));
-    assert!(entries[0].message.contains("expected 4 0 R"));
-}
-
-/// Two top-level siblings A(5)->Next->B(7); B has no `/Parent` entry at all.
-fn missing_parent_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Type /Outlines /First 5 0 R /Last 7 0 R /Count 2 >>"),
-            (5, "<< /Title (A) /Parent 4 0 R /Next 7 0 R >>"),
-            (7, "<< /Title (B) /Prev 5 0 R >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn check_outline_links_flags_missing_parent() {
-    let mut pdf = Pdf::open(Cursor::new(missing_parent_pdf())).unwrap();
-    let diagnostics = check_outline_links(&mut pdf).unwrap();
-    let entries = diagnostics.entries();
-    assert_eq!(entries.len(), 1, "got {entries:?}");
-    assert!(entries[0].message.contains("7 0 R"));
-    assert!(entries[0].message.contains("/Parent is none"));
-    assert!(entries[0].message.contains("expected 4 0 R"));
-}
-
-/// A(5)'s `/First` loops back to itself.
-fn self_cycle_first_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
-            (5, "<< /Title (A) /Parent 4 0 R /First 5 0 R /Last 5 0 R >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn check_outline_links_self_cycle_produces_diagnostic_and_bails() {
-    let mut pdf = Pdf::open(Cursor::new(self_cycle_first_pdf())).unwrap();
-    let diagnostics = check_outline_links(&mut pdf).unwrap();
-    let entries = diagnostics.entries();
-    assert_eq!(entries.len(), 1, "got {entries:?}");
-    assert!(entries[0].message.contains("5 0 R"));
-    assert!(entries[0].message.contains("cycle"));
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
 }
 
 #[test]
@@ -2581,7 +3665,7 @@ fn outline_action_null_d_has_null_destination() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, Object::Null);
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
 }
 
 /// qpdf ignores `/SD` when a GoTo action has no `/D`.
@@ -2601,48 +3685,5 @@ fn outline_action_sd_without_d_has_null_destination() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, Object::Null);
-}
-
-/// A(5)'s `/First` is B(6); B(6)'s `/First` loops back to A(5).
-fn mutual_cycle_first_pdf() -> Vec<u8> {
-    build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
-            (5, "<< /Title (A) /Parent 4 0 R /First 6 0 R /Last 6 0 R >>"),
-            (6, "<< /Title (B) /Parent 5 0 R /First 5 0 R /Last 5 0 R >>"),
-        ],
-        1,
-    )
-}
-
-#[test]
-fn check_outline_links_mutual_cycle_produces_diagnostic_and_bails() {
-    let mut pdf = Pdf::open(Cursor::new(mutual_cycle_first_pdf())).unwrap();
-    let diagnostics = check_outline_links(&mut pdf).unwrap();
-    let entries = diagnostics.entries();
-    assert_eq!(entries.len(), 1, "got {entries:?}");
-    assert!(entries[0].message.contains("5 0 R"));
-    assert!(entries[0].message.contains("cycle"));
-}
-
-#[test]
-fn check_outline_links_depth_cap_is_enforced() {
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(10))).unwrap();
-    let err = pdf.outline().check_links_with_max_depth(5);
-    assert!(err.is_err(), "expected depth-cap error, got {err:?}");
-}
-
-#[test]
-fn check_outline_links_non_dict_item_breaks_walk_gracefully() {
-    let mut pdf = Pdf::open(Cursor::new(outline_se_first_not_a_dict_pdf())).unwrap();
-    let diagnostics = check_outline_links(&mut pdf).unwrap();
-    assert!(
-        diagnostics.entries().is_empty(),
-        "a non-dictionary outline item must be skipped, not diagnosed: {:?}",
-        diagnostics.entries()
-    );
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
 }

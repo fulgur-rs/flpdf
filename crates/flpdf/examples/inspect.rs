@@ -10,7 +10,7 @@
 //! cargo run --example inspect -- path/to/file.pdf
 //! ```
 
-use flpdf::{outline, pages, Pdf};
+use flpdf::{pages, Pdf};
 use std::env;
 use std::fs::File;
 use std::io::BufReader;
@@ -37,13 +37,13 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let page_refs = pages::page_refs(&mut pdf)?;
     println!("pages: {}", page_refs.len());
 
-    let outline = outline::outline_items(&mut pdf)?;
-    if outline.is_empty() {
+    let outline = pdf.outline().get_tree()?;
+    if outline.roots().is_empty() {
         println!("outline: <empty>");
     } else {
         println!("outline:");
-        for item in outline {
-            println!("{}- {}", "  ".repeat(item.depth + 1), item.title);
+        for (depth, _id, item) in outline.preorder() {
+            println!("{}- {}", "  ".repeat(depth), item.title);
         }
     }
     Ok(())

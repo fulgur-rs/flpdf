@@ -16,15 +16,15 @@ use flpdf::{
     flatten_annotations, flatten_rotation_on_pages, fonts, generate_button_field_appearance,
     generate_choice_field_appearance, generate_text_field_appearance,
     json_inspect::{
-        build_qpdf_json_v2_with_options, filter_json_keys, filter_json_objects,
-        format_json_side_file_path, stream_payload_for_decode_level, DecodeLevel, JsonKey,
-        JsonObjectSelector, StreamDataMode as JsonStreamDataMode,
+        build_qpdf_json_v2_selected_objects_with_options, format_json_side_file_path,
+        qpdf_raw_stream_payload, DecodeLevel, JsonKey, JsonObjectSelector,
+        StreamDataMode as JsonStreamDataMode,
     },
     linearization::{
         check_linearization_path, show_linearization_path, write_linearized,
         LinearizationCheckError, LinearizationPlan, RenumberMap, ShowLinearizationError,
     },
-    normalize_content_stream, outline, pages,
+    normalize_content_stream, pages,
     pages::coalesce_page_contents,
     parse_pdf_version, write_pdf_with_options, AnnotationObjectHelper, CompressStreams,
     CopyEncryptionSource, Dictionary, EncryptMethod, EncryptParams, FlattenMode,
@@ -210,8 +210,8 @@ struct Cli {
     json_output: Option<PathBuf>,
 
     /// Limit JSON output to the specified top-level key (repeatable).
-    /// Valid keys: acroform, attachments, encrypt, objectinfo, objects,
-    /// outlines, pagelabels, pages, qpdf.
+    /// Valid JSON v2 keys: acroform, attachments, encrypt, outlines,
+    /// pagelabels, pages, qpdf.
     #[arg(
         long = "json-key",
         value_name = "KEY",
@@ -1825,13 +1825,31 @@ fn main() {
 }
 
 fn run_json(cli: &Cli) -> CliResult<()> {
+    const QPDF_JSON_KEY_NAMES: &[&str] = &[
+        "acroform",
+        "attachments",
+        "encrypt",
+        "objectinfo",
+        "objects",
+        "outlines",
+        "pagelabels",
+        "pages",
+        "qpdf",
+    ];
+
     // 1. Validate --json-key values before doing any I/O.
     let mut json_keys: Vec<JsonKey> = Vec::new();
     for raw in &cli.json_key {
+        if matches!(raw.as_str(), "objects" | "objectinfo") {
+            eprintln!(
+                "flpdf: json keys \"objects\" and \"objectinfo\" are only valid for json version 1"
+            );
+            std::process::exit(2);
+        }
         match JsonKey::from_str(raw.as_str()) {
             Some(k) => json_keys.push(k),
             None => {
-                let names = JsonKey::ALL_NAMES.join(",");
+                let names = QPDF_JSON_KEY_NAMES.join(",");
                 eprintln!("flpdf: --json-key must be given as --json-key={{{names}}}");
                 std::process::exit(2);
             }
@@ -1890,57 +1908,88 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     // 5. Build JSON.
     //
     // `decode_level` governs both the inline `data` payloads (applied inside
-    // build_qpdf_json_v2_with_options) and the file-mode side files written in
-    // step 9 below — the two must agree, so they share this single value.
+    // build_qpdf_json_v2_selected_with_options) and the file-mode side files
+    // written below — the two must agree, so they share this single value.
     let decode_level = DecodeLevel::Generalized;
-    let mut v2 = build_qpdf_json_v2_with_options(&mut pdf, decode_level, &stream_mode)
-        .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+    let diagnostics_start = pdf.repair_diagnostics().entries().len();
+    let had_open_warnings = diagnostics_start > 0;
+    let v2 = match build_qpdf_json_v2_selected_objects_with_options(
+        &mut pdf,
+        decode_level,
+        &stream_mode,
+        &json_keys,
+        &json_objects,
+    ) {
+        Ok(v2) => v2,
+        Err(error) => {
+            emit_warnings_since(input, &pdf, diagnostics_start);
+            return Err(Box::<dyn std::error::Error>::from(error.to_string()));
+        }
+    };
 
-    // 6. Apply --json-key filter.
-    if !json_keys.is_empty() {
-        v2 = filter_json_keys(v2, &json_keys);
+    // 6. Write JSON to output destination. Outline/name-tree processing may
+    // already have recorded warnings while building `v2`. If output fails,
+    // emit those warnings before returning the fatal write error so they are
+    // not lost; the success summary is intentionally omitted on this path.
+    let json_write_result = (|| -> CliResult<()> {
+        if let Some(ref out_path) = cli.json_output {
+            let mut file = File::create(out_path)?;
+            flpdf::json::write(&v2, &mut file)?;
+        } else {
+            let stdout = std::io::stdout();
+            let mut locked = stdout.lock();
+            flpdf::json::write(&v2, &mut locked)?;
+            locked.flush()?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = json_write_result {
+        emit_warnings_since(input, &pdf, diagnostics_start);
+        return Err(error);
     }
 
-    // 7. Apply --json-object filter.
-    if !json_objects.is_empty() {
-        v2 = filter_json_objects(v2, &json_objects);
-    }
-
-    // 8. Write JSON to output destination.
-    if let Some(ref out_path) = cli.json_output {
-        let mut file = File::create(out_path)?;
-        flpdf::json::write(&v2, &mut file)?;
-    } else {
-        let stdout = std::io::stdout();
-        let mut locked = stdout.lock();
-        flpdf::json::write(&v2, &mut locked)?;
-        locked.flush()?;
-    }
-
-    // 9. Write side files for stream-data=file mode — only for streams
+    // 7. Write side files for stream-data=file mode — only for streams
     // that actually survived --json-key / --json-object filtering. Walk
     // the final JSON and collect every "datafile" value emitted in the
     // qpdf objects map, then write exactly those streams to disk. Without
     // this scoping, --json-key=pages --json-stream-data=file would dump
     // every stream to the filesystem even though the qpdf section was
     // filtered out of the output.
-    if let JsonStreamDataMode::File { ref prefix } = stream_mode {
-        let wanted_refs = collect_datafile_object_refs(&v2);
-        // Reuse the same `pdf` handle the JSON was built from. Re-opening
-        // the input here would risk the file being swapped mid-run, so the
-        // JSON body and the side files could capture different snapshots.
-        for oref in wanted_refs {
-            let obj = pdf.resolve_borrowed(oref)?;
-            if let Object::Stream(stream) = obj {
+    let side_file_result = (|| -> CliResult<()> {
+        if let JsonStreamDataMode::File { ref prefix } = stream_mode {
+            let wanted_refs = collect_datafile_object_refs(&v2);
+            // Reuse the same `pdf` handle the JSON was built from. Re-opening
+            // the input here would risk the file being swapped mid-run, so the
+            // JSON body and the side files could capture different snapshots.
+            for oref in wanted_refs {
+                let Some(payload) = qpdf_raw_stream_payload(&mut pdf, oref, decode_level)? else {
+                    continue; // cov:ignore: collector only returns entries with stream.datafile
+                };
                 // Side-file name must match the JSON `datafile` value;
                 // both come from the same helper to avoid divergence.
                 let side_path = format_json_side_file_path(prefix, oref.number);
                 // Apply the same DecodeLevel the JSON body was built with so
                 // the side file matches what inline mode would emit.
-                let payload = stream_payload_for_decode_level(stream, decode_level);
-                std::fs::write(&side_path, &*payload)?;
+                std::fs::write(&side_path, payload)?;
             }
         }
+        Ok(())
+    })();
+    if let Err(error) = side_file_result {
+        emit_warnings_since(input, &pdf, diagnostics_start);
+        return Err(error);
+    }
+
+    // qpdf exits 3 after successful JSON output when either opening or later
+    // processing warned. Open-time warnings were already emitted by
+    // `open_pdf`; only emit the post-snapshot range here, then one summary.
+    if had_open_warnings || pdf.repair_diagnostics().entries().len() > diagnostics_start {
+        emit_warnings_since(input, &pdf, diagnostics_start);
+        eprintln!("{}: operation succeeded with warnings", progname());
+        return Err(Box::new(CliExitError {
+            code: ExitCode::Warnings,
+            message: String::new(),
+        }));
     }
 
     Ok(())
@@ -4513,22 +4562,24 @@ fn run_show_outline(
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
 
-    let items = match outline::outline_items(&mut pdf) {
-        Ok(items) => items,
+    let tree = match pdf.outline().get_tree() {
+        Ok(tree) => tree,
         Err(error) => {
             eprintln!("Warning: {error}");
-            Vec::new()
+            println!("Outline:");
+            println!("  <empty>");
+            return Ok(());
         }
     };
 
     println!("Outline:");
-    if items.is_empty() {
+    if tree.roots().is_empty() {
         println!("  <empty>");
         return Ok(());
     }
 
-    for (index, item) in items.iter().enumerate() {
-        println!("{}{}: {}", "  ".repeat(item.depth), index + 1, item.title);
+    for (index, (depth, _id, item)) in tree.preorder().enumerate() {
+        println!("{}{}: {}", "  ".repeat(depth - 1), index + 1, item.title);
     }
     Ok(())
 }
@@ -4996,7 +5047,11 @@ fn diagnostic_location(input: &Path, offset: Option<u64>) -> String {
 /// open (`build_overlay_specs`) so both surfaces print open-time warnings
 /// identically.
 fn emit_open_warnings<R: Read + Seek>(path: &Path, pdf: &Pdf<R>) {
-    for diagnostic in pdf.repair_diagnostics().entries() {
+    emit_warnings_since(path, pdf, 0);
+}
+
+fn emit_warnings_since<R: Read + Seek>(path: &Path, pdf: &Pdf<R>, start: usize) {
+    for diagnostic in pdf.repair_diagnostics().entries().iter().skip(start) {
         let location = diagnostic_location(path, diagnostic.offset);
         eprintln!("WARNING: {location}: {}", diagnostic.message);
     }

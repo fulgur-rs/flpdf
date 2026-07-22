@@ -1,7 +1,7 @@
 //! Integration tests for [`flpdf::name_tree_dests`] (the `/Names /Dests`
-//! name-tree writer). Reader-side resolved-destination behavior is covered
-//! separately in `outline_document_helper_tests.rs`
-//! ([`flpdf::OutlineDocumentHelper::name_tree_dests`]).
+//! name-tree writer). Raw store preservation and outline-node destination
+//! resolution are covered separately in `outline_pagelabels_e2e_tests.rs`
+//! and `outline_document_helper_tests.rs`.
 //!
 //! Mirrors `embedded_files_tests.rs`'s writer scenarios (insert/delete/
 //! rebuild), minus the `/AF` bookkeeping tests, which have no `/Dests`

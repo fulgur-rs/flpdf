@@ -5,7 +5,7 @@
 //! (pages, objects, …) in later subtasks.
 
 use crate::json::JsonValue;
-use crate::object::{Dictionary, Object, Stream};
+use crate::object::{Dictionary, Object, ObjectRef, Stream};
 use crate::reader::Pdf;
 use std::borrow::Cow;
 use std::io::{Read, Seek};
@@ -357,6 +357,118 @@ fn dict_to_json(dict: &Dictionary) -> Result<JsonValue, ConvertError> {
     Ok(JsonValue::Object(pairs))
 }
 
+fn qpdf_reference_is_valid(reference: ObjectRef) -> bool {
+    reference.number > 0 && reference.generation < u16::MAX
+}
+
+fn qpdf_reference_resolves_to_null<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    reference: ObjectRef,
+) -> Result<bool, ConvertError> {
+    if !qpdf_reference_is_valid(reference) {
+        return Ok(true);
+    }
+    let mut current = reference;
+    let mut visited = std::collections::BTreeSet::new();
+    loop {
+        if !visited.insert(current) {
+            return Ok(true);
+        }
+        match pdf.resolve_qpdf_json_object(current)? {
+            Object::Null => return Ok(true),
+            Object::Reference(next) => current = next,
+            _ => return Ok(false),
+        }
+    }
+}
+
+fn qpdf_dict_to_json<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dict: &Dictionary,
+) -> Result<JsonValue, ConvertError> {
+    let mut pairs = Vec::new();
+    for (raw_key, value) in dict.iter() {
+        let omit = match value {
+            Object::Null => true,
+            Object::Reference(reference) => qpdf_reference_resolves_to_null(pdf, *reference)?,
+            _ => false,
+        };
+        if omit {
+            continue;
+        }
+        pairs.push((
+            encode_pdf_name_bytes(raw_key),
+            qpdf_pdf_object_to_json(pdf, value)?,
+        ));
+    }
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(JsonValue::Object(pairs))
+}
+
+fn qpdf_pdf_object_to_json<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object: &Object,
+) -> Result<JsonValue, ConvertError> {
+    match object {
+        Object::Reference(reference) if !qpdf_reference_is_valid(*reference) => Ok(JsonValue::Null),
+        Object::Reference(reference) => Ok(JsonValue::String(format!(
+            "{} {} R",
+            reference.number, reference.generation
+        ))),
+        Object::Array(items) => items
+            .iter()
+            .map(|item| qpdf_pdf_object_to_json(pdf, item))
+            .collect::<Result<Vec<_>, _>>()
+            .map(JsonValue::Array),
+        Object::Dictionary(dict) => qpdf_dict_to_json(pdf, dict),
+        Object::Stream(stream) => Ok(JsonValue::Object(vec![(
+            "stream".to_string(),
+            JsonValue::Object(vec![(
+                "dict".to_string(),
+                qpdf_dict_to_json(pdf, &stream.dict)?,
+            )]),
+        )])),
+        other => pdf_object_to_json(other),
+    }
+}
+
+fn qpdf_resolve_top_level_object<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    start: ObjectRef,
+) -> Result<Object, ConvertError> {
+    let mut current = start;
+    let mut visited = std::collections::BTreeSet::new();
+    loop {
+        if !visited.insert(current) {
+            return Ok(Object::Null);
+        }
+        match pdf.resolve_qpdf_json_object(current)? {
+            Object::Reference(next) => current = next,
+            terminal => return Ok(terminal),
+        }
+    }
+}
+
+/// Return the qpdf JSON payload for a selected top-level stream object.
+///
+/// Unlike [`Pdf::resolve`](crate::Pdf::resolve), this intentionally uses the
+/// qpdf JSON object-cache view, which can retain a historical xref stream that
+/// a newer xref section has freed. The owned return value keeps that internal
+/// resolver and its cache semantics out of the public API while allowing the
+/// CLI to write exactly the bytes named by a generated `datafile` entry.
+pub fn qpdf_raw_stream_payload<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object_ref: ObjectRef,
+    decode_level: DecodeLevel,
+) -> Result<Option<Vec<u8>>, ConvertError> {
+    let Object::Stream(stream) = qpdf_resolve_top_level_object(pdf, object_ref)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        stream_payload_for_decode_level(&stream, decode_level).into_owned(),
+    ))
+}
+
 /// Convert a stream's dict to a JSON stream-shape object: `{ "stream": { "dict": ... } }`.
 fn stream_to_json(stream: &Stream) -> Result<JsonValue, ConvertError> {
     let dict_json = dict_to_json(&stream.dict)?;
@@ -412,9 +524,9 @@ pub struct QpdfMetadata {
     pub pdf_version: String,
     /// Maximum object id seen in this document.
     pub max_object_id: u32,
-    /// Whether inherited page resources were pushed.  Pass `false` for now.
+    /// Whether inherited page resources were pushed into page dictionaries.
     pub pushed_inherited_page_resources: bool,
-    /// Whether `getAllPages()` was called.  Pass `true` for now.
+    /// Whether the document's complete page tree was enumerated before emission.
     pub called_get_all_pages: bool,
     // jsonversion is always 2 in v2 output.
 }
@@ -532,6 +644,25 @@ pub fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
     decode_level: DecodeLevel,
     stream_mode: &StreamDataMode,
 ) -> Result<JsonValue, ConvertError> {
+    let prepared = pdf.prepare_qpdf_json_objects()?;
+    build_qpdf_key_selected_with_stream_mode(
+        pdf,
+        metadata,
+        decode_level,
+        stream_mode,
+        &[],
+        &prepared.refs,
+    )
+}
+
+fn build_qpdf_key_selected_with_stream_mode<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    metadata: QpdfMetadata,
+    decode_level: DecodeLevel,
+    stream_mode: &StreamDataMode,
+    selectors: &[JsonObjectSelector],
+    prepared_refs: &[ObjectRef],
+) -> Result<JsonValue, ConvertError> {
     // ── 1. Build metadata object (fixed key order per qpdf v2 spec) ────────
     let meta = JsonValue::Object(vec![
         ("jsonversion".to_string(), JsonValue::Integer(2)),
@@ -554,22 +685,29 @@ pub fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
     ]);
 
     // ── 2. Build objects_map ───────────────────────────────────────────────
-    // live_object_refs() already excludes Free / Deleted / Missing / Reserved
-    // entries at the xref-status level, so any ref returned here is a real
-    // indirect object that we should emit. A live indirect object that *is*
-    // null (e.g. `1 0 obj null endobj`) is emitted as `{ "value": null }`,
-    // matching qpdf.
-    let all_refs: Vec<crate::ObjectRef> = pdf.live_object_refs();
-
+    // `prepared_refs` contains every live object plus qpdf-style placeholders
+    // for valid references whose exact generation is absent. Both a placeholder
+    // and a live indirect null are emitted as `{ "value": null }`.
     let mut map_pairs: Vec<(String, JsonValue)> = Vec::new();
 
-    for oref in all_refs {
+    for &oref in prepared_refs {
+        let selected = selectors.is_empty()
+            || selectors.iter().any(|selector| {
+                matches!(
+                    selector,
+                    JsonObjectSelector::Object { number, generation }
+                        if *number == oref.number && *generation == oref.generation
+                )
+            });
+        if !selected {
+            continue;
+        }
         let key = format!("obj:{} {} R", oref.number, oref.generation);
-        let obj = pdf.resolve_borrowed(oref)?;
-        let json_val = match obj {
+        let obj = qpdf_resolve_top_level_object(pdf, oref)?;
+        let json_val = match &obj {
             Object::Stream(stream) => {
                 // Stream: emit according to stream_mode.
-                let dict_json = dict_to_json(&stream.dict)?;
+                let dict_json = qpdf_dict_to_json(pdf, &stream.dict)?;
                 let stream_inner = match stream_mode {
                     StreamDataMode::None => {
                         // Default: dict only.
@@ -601,7 +739,7 @@ pub fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
             }
             other => {
                 // Non-stream (including live Object::Null): emit { "value": <json> }.
-                let val = pdf_object_to_json(other)?;
+                let val = qpdf_pdf_object_to_json(pdf, other)?;
                 JsonValue::Object(vec![("value".to_string(), val)])
             }
         };
@@ -609,9 +747,13 @@ pub fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
     }
 
     // ── 3. Add trailer ─────────────────────────────────────────────────────
+    if selectors.is_empty()
+        || selectors
+            .iter()
+            .any(|selector| matches!(selector, JsonObjectSelector::Trailer))
     {
         let trailer_dict = pdf.trailer().clone();
-        let trailer_json = dict_to_json(&trailer_dict)?;
+        let trailer_json = qpdf_dict_to_json(pdf, &trailer_dict)?;
         let trailer_val = JsonValue::Object(vec![("value".to_string(), trailer_json)]);
         map_pairs.push(("trailer".to_string(), trailer_val));
     }
@@ -940,6 +1082,11 @@ pub fn build_pagelabels_section<R: Read + Seek>(
 ) -> Result<JsonValue, ConvertError> {
     use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 
+    // qpdf's doJSONPageLabels obtains the full page list before checking
+    // whether /PageLabels exists. Preserve both that validation side effect
+    // and the observable everCalledGetAllPages metadata state.
+    crate::pages::page_refs(pdf)?;
+
     // Resolve the Catalog.
     let catalog_ref = match pdf.root_ref() {
         Some(r) => r,
@@ -993,142 +1140,41 @@ pub fn build_pagelabels_section<R: Read + Seek>(
 
 // ── build_outlines_section ────────────────────────────────────────────────────
 
-/// Walk a single outline item and return its JSON representation.
-///
-/// Each item has alphabetically-ordered keys: `action`, `count`, `dest`,
-/// `flags`, `kids`, `object`, `structureelement`, `title`.
-///
-/// The `seen` set prevents infinite loops due to cyclic `/First`/`/Next`
-/// links. `depth` / `max_depth` prevent unbounded recursion on deep trees.
-fn outline_entry_to_json<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    item_ref: crate::ObjectRef,
-    seen: &mut std::collections::BTreeSet<crate::ObjectRef>,
-    depth: usize,
-    max_depth: usize,
+/// Project one materialized outline item into qpdf's JSON v2 shape.
+fn outline_item_to_json(
+    tree: &crate::OutlineTree,
+    id: crate::OutlineId,
+    page_numbers: &std::collections::BTreeMap<crate::ObjectRef, i64>,
 ) -> Result<JsonValue, ConvertError> {
-    let item_obj = pdf.resolve_borrowed(item_ref).map_err(ConvertError::from)?;
-    let item_dict = match item_obj {
-        Object::Dictionary(d) => d.clone(),
-        _ => {
-            // Not a dictionary — return a minimal entry with empty kids.
-            let object_str = format!("{} {} R", item_ref.number, item_ref.generation);
-            return Ok(JsonValue::Object(vec![
-                ("action".to_string(), JsonValue::Null),
-                ("count".to_string(), JsonValue::Null),
-                ("dest".to_string(), JsonValue::Null),
-                ("flags".to_string(), JsonValue::Null),
-                ("kids".to_string(), JsonValue::Array(vec![])),
-                ("object".to_string(), JsonValue::String(object_str)),
-                ("structureelement".to_string(), JsonValue::Null),
-                ("title".to_string(), JsonValue::Null),
-            ]));
-        }
-    };
-
-    let object_str = format!("{} {} R", item_ref.number, item_ref.generation);
-
-    // action: /A — any value (direct action dictionary, /URI, /GoTo, or an
-    // indirect reference) is converted through pdf_object_to_json so direct
-    // action dicts are preserved alongside Reference shapes.
-    let action = match item_dict.get("A") {
-        Some(v) => pdf_object_to_json(v)?,
-        None => JsonValue::Null,
-    };
-
-    // count: /Count integer.
-    let count = match item_dict.get("Count") {
-        Some(Object::Integer(n)) => JsonValue::Integer(*n),
+    let item = &tree[id];
+    let dest = pdf_object_to_json(&item.dest)?;
+    let destpageposfrom1 = match item.dest_page() {
+        Object::Reference(reference) => page_numbers
+            .get(&reference)
+            .copied()
+            .map(JsonValue::Integer)
+            .unwrap_or(JsonValue::Null),
         _ => JsonValue::Null,
     };
-
-    // dest: /Dest — any value, converted via pdf_object_to_json.
-    let dest = match item_dict.get("Dest") {
-        Some(v) => pdf_object_to_json(v)?,
-        None => JsonValue::Null,
-    };
-
-    // flags: /F integer.
-    let flags = match item_dict.get("F") {
-        Some(Object::Integer(n)) => JsonValue::Integer(*n),
-        _ => JsonValue::Null,
-    };
-
-    // structureelement: /SE — only emit ref string when indirect Reference.
-    let structureelement = match item_dict.get("SE") {
-        Some(Object::Reference(r)) => JsonValue::String(format!("{} {} R", r.number, r.generation)),
-        _ => JsonValue::Null,
-    };
-
-    // title: /Title — decode as PDF text string, bare (no u:/b: prefix).
-    let title = match item_dict.get("Title") {
-        Some(Object::String(bytes)) => match decode_pdf_text_string(bytes) {
-            Some(s) => JsonValue::String(s),
-            None => JsonValue::Null,
-        },
-        _ => JsonValue::Null,
-    };
-
-    // kids: walk /First → /Next chain if depth allows.
-    let kids = if depth >= max_depth {
-        vec![]
-    } else {
-        // Get the /First reference for this item's children.
-        let first_ref = match item_dict.get("First") {
-            Some(Object::Reference(r)) => Some(*r),
-            _ => None,
-        };
-        collect_outline_chain(pdf, first_ref, seen, depth + 1, max_depth)?
+    let kids = item
+        .kids
+        .iter()
+        .copied()
+        .map(|kid| outline_item_to_json(tree, kid, page_numbers))
+        .collect::<Result<Vec<_>, _>>()?;
+    let object = match item.source_ref {
+        Some(reference) => JsonValue::String(reference.to_string()),
+        None => pdf_object_to_json(&item.object)?,
     };
 
     Ok(JsonValue::Object(vec![
-        ("action".to_string(), action),
-        ("count".to_string(), count),
         ("dest".to_string(), dest),
-        ("flags".to_string(), flags),
+        ("destpageposfrom1".to_string(), destpageposfrom1),
         ("kids".to_string(), JsonValue::Array(kids)),
-        ("object".to_string(), JsonValue::String(object_str)),
-        ("structureelement".to_string(), structureelement),
-        ("title".to_string(), title),
+        ("object".to_string(), object),
+        ("open".to_string(), JsonValue::Bool(item.count >= 0)),
+        ("title".to_string(), JsonValue::String(item.title.clone())),
     ]))
-}
-
-/// Walk an outline item chain starting at `first_ref`, following `/Next`
-/// links, and return JSON entries for each item (recursively expanding kids).
-///
-/// `seen` is a shared cycle guard across the entire outline tree.
-fn collect_outline_chain<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    first_ref: Option<crate::ObjectRef>,
-    seen: &mut std::collections::BTreeSet<crate::ObjectRef>,
-    depth: usize,
-    max_depth: usize,
-) -> Result<Vec<JsonValue>, ConvertError> {
-    let mut entries = Vec::new();
-    let mut current = first_ref;
-
-    while let Some(item_ref) = current {
-        // Cycle guard: skip if already visited.
-        if !seen.insert(item_ref) {
-            break;
-        }
-
-        let entry = outline_entry_to_json(pdf, item_ref, seen, depth, max_depth)?;
-        entries.push(entry);
-
-        // Advance to the next sibling — must re-resolve to get /Next
-        // (outline_entry_to_json consumed the object).
-        let item_obj = pdf.resolve_borrowed(item_ref).map_err(ConvertError::from)?;
-        current = match &item_obj {
-            Object::Dictionary(d) => match d.get("Next") {
-                Some(Object::Reference(r)) => Some(*r),
-                _ => None,
-            },
-            _ => None,
-        };
-    }
-
-    Ok(entries)
 }
 
 /// Build the qpdf JSON v2 `"outlines"` section.
@@ -1138,54 +1184,25 @@ fn collect_outline_chain<R: Read + Seek>(
 /// expanded).  Returns `JsonValue::Array(vec![])` when the document has no
 /// `/Outlines` entry or the outline dictionary has no `/First` child.
 ///
-/// Each entry has keys in alphabetical order:
-/// `action`, `count`, `dest`, `flags`, `kids`, `object`,
-/// `structureelement`, `title`.
+/// Each entry has keys in alphabetical order: `dest`, `destpageposfrom1`,
+/// `kids`, `object`, `open`, `title`.
 ///
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if any indirect object resolution fails.
 pub fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
-    use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
-
-    // Resolve the Catalog.
-    let catalog_ref = match pdf.root_ref() {
-        Some(r) => r,
-        None => return Ok(JsonValue::Array(vec![])),
-    };
-    let catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .map_err(ConvertError::from)?;
-    let catalog_dict = match catalog {
-        Object::Dictionary(d) => d,
-        _ => return Ok(JsonValue::Array(vec![])),
-    };
-
-    // Look up /Outlines. May be absent, a direct Dictionary, or a Reference.
-    let outlines_val = match catalog_dict.get("Outlines") {
-        Some(v) => v.clone(),
-        None => return Ok(JsonValue::Array(vec![])),
-    };
-
-    // Resolve indirect reference if needed.
-    let outlines_dict = match outlines_val {
-        Object::Reference(r) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
-            Object::Dictionary(d) => d.clone(),
-            _ => return Ok(JsonValue::Array(vec![])),
-        },
-        Object::Dictionary(d) => d,
-        _ => return Ok(JsonValue::Array(vec![])),
-    };
-
-    // Get the /First reference for the root outline chain.
-    let first_ref = match outlines_dict.get("First") {
-        Some(Object::Reference(r)) => Some(*r),
-        _ => return Ok(JsonValue::Array(vec![])),
-    };
-
-    let mut seen = std::collections::BTreeSet::new();
-    let entries = collect_outline_chain(pdf, first_ref, &mut seen, 0, DEFAULT_MAX_PAGE_TREE_DEPTH)?;
-
+    let page_numbers = crate::pages::page_refs(pdf)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, reference)| (reference, index as i64 + 1))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let tree = pdf.outline().get_tree()?;
+    let entries = tree
+        .roots()
+        .iter()
+        .copied()
+        .map(|id| outline_item_to_json(&tree, id, &page_numbers))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(JsonValue::Array(entries))
 }
 
@@ -1463,6 +1480,10 @@ fn inherited_field_value<R: Read + Seek>(
 /// Returns a [`ConvertError`] if any indirect object resolution fails.
 pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
     use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+
+    // qpdf's doJSONAcroform always walks every page to discover widgets,
+    // including when the catalog has no /AcroForm entry.
+    crate::pages::page_refs(pdf)?;
 
     // Resolve the Catalog.
     let catalog_ref = match pdf.root_ref() {
@@ -2261,19 +2282,13 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVal
 
 /// A top-level qpdf JSON v2 key that the caller may request via --json-key.
 ///
-/// Note: "objects" and "objectinfo" are v1-era names; in qpdf JSON v2 the
-/// object information has been consolidated into the "qpdf" top-level key.
-/// We still accept them for qpdf compatibility but treat them as aliases
-/// for "qpdf" (i.e. requesting "objects" includes the "qpdf" key).
+/// qpdf's v1-only `objects` and `objectinfo` selectors are intentionally not
+/// represented: qpdf rejects both when JSON version 2 is selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JsonKey {
     Acroform,
     Attachments,
     Encrypt,
-    /// v1 alias — maps to the `"qpdf"` top-level key in v2 output.
-    Objectinfo,
-    /// v1 alias — maps to the `"qpdf"` top-level key in v2 output.
-    Objects,
     Outlines,
     Pagelabels,
     Pages,
@@ -2281,16 +2296,11 @@ pub enum JsonKey {
 }
 
 impl JsonKey {
-    /// All accepted key name strings in qpdf order (alphabetical).
-    ///
-    /// This list is the canonical source for the CLI error message:
-    /// `--json-key must be given as --json-key={acroform,...}`.
+    /// All qpdf JSON v2 key names in alphabetical order.
     pub const ALL_NAMES: &'static [&'static str] = &[
         "acroform",
         "attachments",
         "encrypt",
-        "objectinfo",
-        "objects",
         "outlines",
         "pagelabels",
         "pages",
@@ -2304,8 +2314,6 @@ impl JsonKey {
             "acroform" => Some(JsonKey::Acroform),
             "attachments" => Some(JsonKey::Attachments),
             "encrypt" => Some(JsonKey::Encrypt),
-            "objectinfo" => Some(JsonKey::Objectinfo),
-            "objects" => Some(JsonKey::Objects),
             "outlines" => Some(JsonKey::Outlines),
             "pagelabels" => Some(JsonKey::Pagelabels),
             "pages" => Some(JsonKey::Pages),
@@ -2314,16 +2322,12 @@ impl JsonKey {
         }
     }
 
-    /// The v2 top-level key name this filter maps to in the output JSON.
-    ///
-    /// `Objectinfo` and `Objects` are v1 aliases that map to `"qpdf"`.
+    /// The v2 top-level key name represented by this selector.
     fn output_key_name(self) -> &'static str {
         match self {
             JsonKey::Acroform => "acroform",
             JsonKey::Attachments => "attachments",
             JsonKey::Encrypt => "encrypt",
-            JsonKey::Objectinfo => "qpdf",
-            JsonKey::Objects => "qpdf",
             JsonKey::Outlines => "outlines",
             JsonKey::Pagelabels => "pagelabels",
             JsonKey::Pages => "pages",
@@ -2338,8 +2342,7 @@ impl JsonKey {
 /// `keys` may contain duplicates; the result still contains each key at
 /// most once. Returns the input unchanged when `keys` is empty (no filter).
 ///
-/// When `Objects` or `Objectinfo` is requested, it is aliased to `Qpdf`
-/// (since v2 consolidates that information into the "qpdf" top-level key).
+/// Every selector maps directly to the same-named qpdf JSON v2 section.
 pub fn filter_json_keys(v2: JsonValue, keys: &[JsonKey]) -> JsonValue {
     // No filter — return unchanged.
     if keys.is_empty() {
@@ -2571,48 +2574,112 @@ pub fn build_qpdf_json_v2_with_options<R: Read + Seek>(
     decode_level: DecodeLevel,
     stream_mode: &StreamDataMode,
 ) -> Result<JsonValue, ConvertError> {
+    build_qpdf_json_v2_selected_with_options(pdf, decode_level, stream_mode, &[])
+}
+
+fn json_section_selected(keys: &[JsonKey], section: JsonKey) -> bool {
+    keys.is_empty()
+        || keys
+            .iter()
+            .any(|key| key.output_key_name() == section.output_key_name())
+}
+
+/// Build a qpdf JSON v2 document containing only the requested top-level
+/// sections.
+///
+/// The `version` and `parameters` envelope is always present. An empty
+/// `keys` slice selects every section. Selected sections are constructed in
+/// qpdf's fixed order; unselected section builders are not called. This API
+/// accepts only JSON v2 selectors; qpdf's v1-only `objects` and `objectinfo`
+/// names are not aliases for `qpdf`.
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] if a selected section builder fails.
+pub fn build_qpdf_json_v2_selected_with_options<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    decode_level: DecodeLevel,
+    stream_mode: &StreamDataMode,
+    keys: &[JsonKey],
+) -> Result<JsonValue, ConvertError> {
+    build_qpdf_json_v2_selected_objects_with_options(pdf, decode_level, stream_mode, keys, &[])
+}
+
+/// Build selected qpdf JSON v2 sections and serialize only the requested raw
+/// qpdf objects after completing qpdf's all-xref preparation pass.
+///
+/// An empty `objects` slice emits every prepared object plus the trailer.
+/// Non-empty selectors affect only the qpdf raw map; metadata preparation still
+/// resolves every live xref object. Existing section selection semantics are
+/// identical to [`build_qpdf_json_v2_selected_with_options`].
+///
+/// # Errors
+///
+/// Returns a [`ConvertError`] if a selected section or raw object cannot be
+/// resolved or converted.
+pub fn build_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    decode_level: DecodeLevel,
+    stream_mode: &StreamDataMode,
+    keys: &[JsonKey],
+    objects: &[JsonObjectSelector],
+) -> Result<JsonValue, ConvertError> {
     let mut pairs = match build_envelope(decode_level) {
         JsonValue::Object(p) => p,
         _ => unreachable!("build_envelope always returns an Object"),
     };
 
-    let pages = build_pages_section(pdf)?;
-    pairs.push(("pages".to_string(), pages));
+    if json_section_selected(keys, JsonKey::Pages) {
+        let pages = build_pages_section(pdf)?;
+        pairs.push(("pages".to_string(), pages));
+    }
 
-    let pagelabels = build_pagelabels_section(pdf)?;
-    pairs.push(("pagelabels".to_string(), pagelabels));
+    if json_section_selected(keys, JsonKey::Pagelabels) {
+        let pagelabels = build_pagelabels_section(pdf)?;
+        pairs.push(("pagelabels".to_string(), pagelabels));
+    }
 
-    let acroform = build_acroform_section(pdf)?;
-    pairs.push(("acroform".to_string(), acroform));
+    if json_section_selected(keys, JsonKey::Acroform) {
+        let acroform = build_acroform_section(pdf)?;
+        pairs.push(("acroform".to_string(), acroform));
+    }
 
-    let attachments = build_attachments_section(pdf)?;
-    pairs.push(("attachments".to_string(), attachments));
+    if json_section_selected(keys, JsonKey::Attachments) {
+        let attachments = build_attachments_section(pdf)?;
+        pairs.push(("attachments".to_string(), attachments));
+    }
 
-    let encrypt = build_encrypt_section(pdf)?;
-    pairs.push(("encrypt".to_string(), encrypt));
+    if json_section_selected(keys, JsonKey::Encrypt) {
+        let encrypt = build_encrypt_section(pdf)?;
+        pairs.push(("encrypt".to_string(), encrypt));
+    }
 
-    let outlines = build_outlines_section(pdf)?;
-    pairs.push(("outlines".to_string(), outlines));
+    if json_section_selected(keys, JsonKey::Outlines) {
+        let outlines = build_outlines_section(pdf)?;
+        pairs.push(("outlines".to_string(), outlines));
+    }
 
-    // qpdf metadata: maxobjectid is the highest object id present in the
-    // xref table, *including* deleted/free entries — qpdf's JSON v2 spec
-    // wants the highest ID ever assigned in the file, not the highest live
-    // ID. pushedinheritedpageresources / calledgetallpages mirror qpdf's
-    // defaults.
-    let max_object_id = pdf
-        .object_refs()
-        .iter()
-        .map(|r| r.number)
-        .max()
-        .unwrap_or(0);
-    let qpdf_metadata = QpdfMetadata {
-        pdf_version: pdf.version().to_string(),
-        max_object_id,
-        pushed_inherited_page_resources: false,
-        called_get_all_pages: true,
-    };
-    let qpdf = build_qpdf_key_with_stream_mode(pdf, qpdf_metadata, decode_level, stream_mode)?;
-    pairs.push(("qpdf".to_string(), qpdf));
+    if json_section_selected(keys, JsonKey::Qpdf) {
+        // qpdf resolves every live xref object before reading the object-cache
+        // maximum. Parsing those bodies registers dangling generations as
+        // placeholders, while unrelated free xref entries remain excluded.
+        let prepared = pdf.prepare_qpdf_json_objects()?;
+        let qpdf_metadata = QpdfMetadata {
+            pdf_version: pdf.version().to_string(),
+            max_object_id: prepared.max_object_id,
+            pushed_inherited_page_resources: false,
+            called_get_all_pages: pdf.ever_called_get_all_pages(),
+        };
+        let qpdf = build_qpdf_key_selected_with_stream_mode(
+            pdf,
+            qpdf_metadata,
+            decode_level,
+            stream_mode,
+            objects,
+            &prepared.refs,
+        )?; // cov:ignore: Err propagation requires an I/O failure after the Pdf has opened
+        pairs.push(("qpdf".to_string(), qpdf));
+    }
 
     Ok(JsonValue::Object(pairs))
 }
@@ -3529,6 +3596,40 @@ mod tests {
         assert_eq!(pairs[5].1, JsonValue::Integer(1), "pageposfrom1 must be 1");
     }
 
+    #[test]
+    fn collect_image_refs_keeps_only_indirect_image_streams() {
+        let mut pdf = load_one_page_pdf();
+        let page_ref = ObjectRef::new(3, 0);
+        let image_ref = ObjectRef::new(99, 0);
+
+        let mut image_dict = Dictionary::new();
+        image_dict.insert("Subtype", Object::Name(b"Image".to_vec()));
+        pdf.set_object(
+            image_ref,
+            Object::Stream(Stream::new(image_dict, Vec::new())),
+        );
+
+        let mut xobjects = Dictionary::new();
+        xobjects.insert(
+            "Direct",
+            Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
+        );
+        xobjects.insert("Im", Object::Reference(image_ref));
+        let mut resources = Dictionary::new();
+        resources.insert("XObject", Object::Dictionary(xobjects));
+
+        let Object::Dictionary(mut page) = pdf.resolve(page_ref).expect("resolve page") else {
+            panic!("page must be a dictionary"); // cov:ignore: fixture-shape guard
+        };
+        page.insert("Resources", Object::Dictionary(resources));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+
+        assert_eq!(
+            collect_image_refs(&mut pdf, page_ref).expect("collect images"),
+            vec!["99 0 R"]
+        );
+    }
+
     // ── 29. three-page.pdf: length and pageposfrom1 sequence ─────────────────
 
     #[test]
@@ -3807,7 +3908,7 @@ mod tests {
 
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
         let JsonValue::Array(arr) = &result else {
-            panic!("expected Array");
+            panic!("expected Array"); // cov:ignore: test-shape guard
         };
         assert_eq!(arr.len(), 3, "expected 3 entries");
 
@@ -3925,14 +4026,14 @@ mod tests {
 
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
         let JsonValue::Array(arr) = &result else {
-            panic!("expected Array");
+            panic!("expected Array"); // cov:ignore: test-shape guard
         };
         assert_eq!(arr.len(), 1);
         let JsonValue::Object(entry) = &arr[0] else {
-            panic!()
+            panic!() // cov:ignore: test-shape guard
         };
         let JsonValue::Object(label_pairs) = &entry[1].1 else {
-            panic!()
+            panic!() // cov:ignore: test-shape guard
         };
         assert_eq!(label_pairs[2].0, "style");
         assert_eq!(
@@ -3970,15 +4071,15 @@ mod tests {
 
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
         let JsonValue::Array(arr) = &result else {
-            panic!("expected Array");
+            panic!("expected Array"); // cov:ignore: test-shape guard
         };
         assert_eq!(arr.len(), 1, "expected 1 entry from /Kids walk");
         let JsonValue::Object(entry) = &arr[0] else {
-            panic!()
+            panic!() // cov:ignore: test-shape guard
         };
         assert_eq!(entry[0].1, JsonValue::Integer(0));
         let JsonValue::Object(lp) = &entry[1].1 else {
-            panic!()
+            panic!() // cov:ignore: test-shape guard
         };
         assert_eq!(lp[2].1, JsonValue::String("r".to_string()));
     }
@@ -4008,7 +4109,7 @@ mod tests {
         let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
             .expect("build_qpdf_json_v2 failed");
         let JsonValue::Object(pairs) = v2 else {
-            panic!("expected Object at top level");
+            panic!("expected Object at top level"); // cov:ignore: test-shape guard
         };
         // qpdf-style fixed order: version, parameters, pages, pagelabels, acroform, attachments, encrypt, outlines, qpdf
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
@@ -4028,6 +4129,1150 @@ mod tests {
         );
     }
 
+    fn load_repairable_outline_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names << /Dests << /Kids [8 0 R] >> >> >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>",
+            "<< /Title (One) /Parent 4 0 R /Dest (shape) >>",
+            "null",
+            "null",
+            "<< /Names [(shape) [3 0 R /Fit]] >>",
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes
+                .extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", index + 1, object).as_bytes());
+        }
+        let start_xref = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        Pdf::open(std::io::Cursor::new(bytes)).unwrap()
+    }
+
+    fn top_level_key_names(value: &JsonValue) -> Vec<&str> {
+        let JsonValue::Object(pairs) = value else {
+            panic!("expected top-level JSON object"); // cov:ignore: test-shape guard
+        };
+        pairs.iter().map(|(key, _)| key.as_str()).collect()
+    }
+
+    fn qpdf_object_value<'a>(value: &'a JsonValue, object: &str) -> &'a JsonValue {
+        let JsonValue::Object(top) = value else {
+            panic!("expected top-level JSON object"); // cov:ignore: test-shape guard
+        };
+        let JsonValue::Array(qpdf) = value_for_key(top, "qpdf") else {
+            panic!("expected qpdf array"); // cov:ignore: test-shape guard
+        };
+        let JsonValue::Object(objects) = &qpdf[1] else {
+            panic!("expected qpdf object map"); // cov:ignore: test-shape guard
+        };
+        let JsonValue::Object(entry) = value_for_key(objects, object) else {
+            panic!("expected qpdf object entry"); // cov:ignore: test-shape guard
+        };
+        value_for_key(entry, "value")
+    }
+
+    fn direct_dests_root(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> Dictionary {
+        let Object::Dictionary(catalog) = pdf.resolve(crate::ObjectRef::new(1, 0)).unwrap() else {
+            panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
+        };
+        let Some(Object::Dictionary(names)) = catalog.get("Names") else {
+            panic!("catalog /Names must be a direct dictionary"); // cov:ignore: test-fixture shape guard
+        };
+        let Some(Object::Dictionary(dests)) = names.get("Dests") else {
+            panic!("/Names /Dests must be a direct dictionary"); // cov:ignore: test-fixture shape guard
+        };
+        dests.clone()
+    }
+
+    #[test]
+    fn selected_qpdf_skips_outline_repair_and_preserves_raw_objects() {
+        let mut pdf = load_repairable_outline_pdf();
+        let before = pdf.resolve(crate::ObjectRef::new(1, 0)).unwrap().clone();
+
+        let json = build_qpdf_json_v2_selected_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Qpdf],
+        )
+        .unwrap();
+
+        assert_eq!(
+            top_level_key_names(&json),
+            ["version", "parameters", "qpdf"]
+        );
+        assert!(pdf.repair_diagnostics().entries().is_empty());
+        assert_eq!(pdf.resolve(crate::ObjectRef::new(1, 0)).unwrap(), before);
+        assert_eq!(
+            qpdf_object_value(&json, "obj:1 0 R"),
+            &pdf_object_to_json(&before).unwrap()
+        );
+    }
+
+    #[test]
+    fn selected_outlines_repairs_only_the_requested_section() {
+        let mut pdf = load_repairable_outline_pdf();
+
+        let json = build_qpdf_json_v2_selected_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Outlines],
+        )
+        .unwrap();
+
+        assert_eq!(
+            top_level_key_names(&json),
+            ["version", "parameters", "outlines"]
+        );
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
+        let dests = direct_dests_root(&mut pdf);
+        assert!(dests.get("Kids").is_none());
+        assert!(matches!(dests.get("Names"), Some(Object::Array(_))));
+    }
+
+    #[test]
+    fn selected_outlines_precede_qpdf_and_raw_objects_reflect_repair() {
+        let mut pdf = load_repairable_outline_pdf();
+
+        let json = build_qpdf_json_v2_selected_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Qpdf, JsonKey::Outlines],
+        )
+        .unwrap();
+
+        assert_eq!(
+            top_level_key_names(&json),
+            ["version", "parameters", "outlines", "qpdf"]
+        );
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
+        let repaired_catalog = pdf.resolve(crate::ObjectRef::new(1, 0)).unwrap().clone();
+        assert_eq!(
+            qpdf_object_value(&json, "obj:1 0 R"),
+            &pdf_object_to_json(&repaired_catalog).unwrap()
+        );
+    }
+
+    #[test]
+    fn selected_json_section_matrix_preserves_v2_order() {
+        let cases = vec![
+            (
+                vec![],
+                vec![
+                    "version",
+                    "parameters",
+                    "pages",
+                    "pagelabels",
+                    "acroform",
+                    "attachments",
+                    "encrypt",
+                    "outlines",
+                    "qpdf",
+                ],
+            ),
+            (vec![JsonKey::Pages], vec!["version", "parameters", "pages"]),
+            (
+                vec![JsonKey::Pagelabels],
+                vec!["version", "parameters", "pagelabels"],
+            ),
+            (
+                vec![JsonKey::Acroform],
+                vec!["version", "parameters", "acroform"],
+            ),
+            (
+                vec![JsonKey::Attachments],
+                vec!["version", "parameters", "attachments"],
+            ),
+            (
+                vec![JsonKey::Encrypt],
+                vec!["version", "parameters", "encrypt"],
+            ),
+            (
+                vec![JsonKey::Outlines],
+                vec!["version", "parameters", "outlines"],
+            ),
+            (vec![JsonKey::Qpdf], vec!["version", "parameters", "qpdf"]),
+            (
+                vec![JsonKey::Qpdf, JsonKey::Outlines, JsonKey::Qpdf],
+                vec!["version", "parameters", "outlines", "qpdf"],
+            ),
+        ];
+
+        for (keys, expected) in cases {
+            let mut pdf = load_one_page_pdf();
+            let json = build_qpdf_json_v2_selected_with_options(
+                &mut pdf,
+                DecodeLevel::Generalized,
+                &StreamDataMode::None,
+                &keys,
+            )
+            .unwrap();
+            assert_eq!(top_level_key_names(&json), expected, "keys={keys:?}");
+        }
+    }
+
+    fn selected_qpdf_metadata(json: &JsonValue) -> &JsonValue {
+        let JsonValue::Object(top) = json else {
+            panic!("top-level JSON must be an object"); // cov:ignore: test-shape guard
+        };
+        let qpdf = top
+            .iter()
+            .find(|(key, _)| key == "qpdf")
+            .map(|(_, value)| value)
+            .expect("selected document must contain qpdf");
+        let JsonValue::Array(qpdf) = qpdf else {
+            panic!("qpdf must be an array"); // cov:ignore: test-shape guard
+        };
+        qpdf.first().expect("qpdf metadata element")
+    }
+
+    #[test]
+    fn selected_json_metadata_reflects_actual_page_enumeration() {
+        let cases = [
+            ("qpdf only", vec![JsonKey::Qpdf], false),
+            (
+                "attachments then qpdf",
+                vec![JsonKey::Attachments, JsonKey::Qpdf],
+                false,
+            ),
+            (
+                "encrypt then qpdf",
+                vec![JsonKey::Encrypt, JsonKey::Qpdf],
+                false,
+            ),
+            ("pages then qpdf", vec![JsonKey::Pages, JsonKey::Qpdf], true),
+            (
+                "pagelabels then qpdf",
+                vec![JsonKey::Pagelabels, JsonKey::Qpdf],
+                true,
+            ),
+            (
+                "acroform then qpdf",
+                vec![JsonKey::Acroform, JsonKey::Qpdf],
+                true,
+            ),
+            (
+                "outlines then qpdf",
+                vec![JsonKey::Outlines, JsonKey::Qpdf],
+                true,
+            ),
+            (
+                "request order does not change construction order",
+                vec![JsonKey::Qpdf, JsonKey::Attachments, JsonKey::Pages],
+                true,
+            ),
+            ("full document", vec![], true),
+        ];
+
+        for (label, keys, called_get_all_pages) in cases {
+            let mut pdf = load_one_page_pdf();
+            let pdf_version = pdf.version().to_string();
+            let max_object_id = pdf
+                .object_refs()
+                .iter()
+                .map(|reference| reference.number)
+                .max()
+                .unwrap_or(0);
+            let json = build_qpdf_json_v2_selected_with_options(
+                &mut pdf,
+                DecodeLevel::Generalized,
+                &StreamDataMode::None,
+                &keys,
+            )
+            .unwrap();
+
+            assert_eq!(
+                selected_qpdf_metadata(&json),
+                &JsonValue::Object(vec![
+                    ("jsonversion".to_string(), JsonValue::Integer(2)),
+                    ("pdfversion".to_string(), JsonValue::String(pdf_version)),
+                    (
+                        "pushedinheritedpageresources".to_string(),
+                        JsonValue::Bool(false),
+                    ),
+                    (
+                        "calledgetallpages".to_string(),
+                        JsonValue::Bool(called_get_all_pages),
+                    ),
+                    (
+                        "maxobjectid".to_string(),
+                        JsonValue::Integer(i64::from(max_object_id)),
+                    ),
+                ]),
+                "{label}: keys={keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qpdf_dangling_body_reference_participates_in_maxobjectid_for_trailer_selection() {
+        let mut pdf = load_fixture_pdf("dangling-body-one-page.pdf");
+        let json = build_qpdf_json_v2_selected_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Qpdf],
+        )
+        .expect("build selected qpdf JSON");
+
+        assert_eq!(
+            selected_qpdf_metadata(&json),
+            &JsonValue::Object(vec![
+                ("jsonversion".to_string(), JsonValue::Integer(2)),
+                (
+                    "pdfversion".to_string(),
+                    JsonValue::String("1.3".to_string()),
+                ),
+                (
+                    "pushedinheritedpageresources".to_string(),
+                    JsonValue::Bool(false),
+                ),
+                ("calledgetallpages".to_string(), JsonValue::Bool(false),),
+                ("maxobjectid".to_string(), JsonValue::Integer(99)),
+            ])
+        );
+    }
+
+    fn build_qpdf_dangling_xref_pdf(
+        catalog_extra: &str,
+        extra_objects: &[(u32, u16, &str)],
+        free_entries: &[(u32, u16)],
+        size: u32,
+    ) -> Vec<u8> {
+        build_qpdf_dangling_xref_pdf_with_trailer(
+            catalog_extra,
+            "",
+            extra_objects,
+            free_entries,
+            size,
+        )
+    }
+
+    fn build_qpdf_dangling_xref_pdf_with_trailer(
+        catalog_extra: &str,
+        trailer_extra: &str,
+        extra_objects: &[(u32, u16, &str)],
+        free_entries: &[(u32, u16)],
+        size: u32,
+    ) -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut entries = vec![
+            (
+                1u32,
+                0u16,
+                format!("<< /Type /Catalog /Pages 2 0 R {catalog_extra} >>"),
+            ),
+            (
+                2,
+                0,
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            ),
+            (
+                3,
+                0,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>".to_string(),
+            ),
+        ];
+        entries.extend(
+            extra_objects
+                .iter()
+                .map(|(number, generation, body)| (*number, *generation, (*body).to_string())),
+        );
+        entries.sort_by_key(|(number, generation, _)| (*number, *generation));
+
+        let mut offsets = Vec::new();
+        for (number, generation, body) in &entries {
+            offsets.push((*number, *generation, bytes.len()));
+            bytes.extend_from_slice(
+                format!("{number} {generation} obj\n{body}\nendobj\n").as_bytes(),
+            );
+        }
+
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+        for (number, generation, offset) in offsets {
+            bytes.extend_from_slice(
+                format!("{number} 1\n{offset:010} {generation:05} n \n").as_bytes(),
+            );
+        }
+        for (number, generation) in free_entries {
+            bytes.extend_from_slice(
+                format!("{number} 1\n0000000000 {generation:05} f \n").as_bytes(),
+            );
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {size} /Root 1 0 R {trailer_extra} >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    fn last_startxref(bytes: &[u8]) -> u64 {
+        let marker = b"startxref\n";
+        let start = bytes
+            .windows(marker.len())
+            .rposition(|window| window == marker)
+            .expect("startxref marker")
+            + marker.len();
+        let end = bytes[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|length| start + length)
+            .expect("startxref newline");
+        std::str::from_utf8(&bytes[start..end])
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn append_classic_increment(
+        bytes: &mut Vec<u8>,
+        objects: &[(u32, u16, &str)],
+        free_entries: &[(u32, u16)],
+        size: u32,
+        trailer_extra: &str,
+        previous_xref: u64,
+    ) -> u64 {
+        let mut offsets = Vec::new();
+        for (number, generation, body) in objects {
+            offsets.push((*number, *generation, bytes.len()));
+            bytes.extend_from_slice(
+                format!("{number} {generation} obj\n{body}\nendobj\n").as_bytes(),
+            );
+        }
+        let xref = bytes.len() as u64;
+        bytes.extend_from_slice(b"xref\n");
+        for (number, generation, offset) in offsets {
+            bytes.extend_from_slice(
+                format!("{number} 1\n{offset:010} {generation:05} n \n").as_bytes(),
+            );
+        }
+        for (number, generation) in free_entries {
+            bytes.extend_from_slice(
+                format!("{number} 1\n0000000000 {generation:05} f \n").as_bytes(),
+            );
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {size} /Root 1 0 R /Prev {previous_xref} {trailer_extra} >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        xref
+    }
+
+    fn two_revision_historical_trailer_pdf() -> Vec<u8> {
+        let mut bytes = build_qpdf_dangling_xref_pdf_with_trailer("", "/Info 99 0 R", &[], &[], 4);
+        let previous = last_startxref(&bytes);
+        append_classic_increment(&mut bytes, &[(4, 0, "null")], &[], 5, "", previous);
+        bytes
+    }
+
+    fn three_revision_historical_trailer_pdf() -> Vec<u8> {
+        let mut bytes = build_qpdf_dangling_xref_pdf_with_trailer(
+            "",
+            "/Info 99 0 R /OldGen 88 4 R /Freed 20 7 R /Zero 0 0 R /BadGen 77 65535 R",
+            &[],
+            &[],
+            4,
+        );
+        let oldest = last_startxref(&bytes);
+        let middle = append_classic_increment(
+            &mut bytes,
+            &[(4, 0, "null")],
+            &[],
+            5,
+            "/Info 60 1 R /Middle 70 3 R",
+            oldest,
+        );
+        append_classic_increment(
+            &mut bytes,
+            &[(5, 0, "null")],
+            &[(20, 7), (200, 7)],
+            201,
+            "/Newest 50 2 R",
+            middle,
+        );
+        bytes
+    }
+
+    fn historical_xref_stream_trailer_pdf_with_free_generation(free_generation: u16) -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (number, body) in [
+            (1u32, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>"),
+        ] {
+            offsets.push(bytes.len() as u32);
+            bytes.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref_stream_offset = bytes.len() as u32;
+        let mut entries = Vec::new();
+        for (kind, offset, generation) in [
+            (0u8, 0u32, u16::MAX),
+            (1, offsets[0], 0),
+            (1, offsets[1], 0),
+            (1, offsets[2], 0),
+            (1, xref_stream_offset, 0),
+        ] {
+            entries.push(kind);
+            entries.extend_from_slice(&offset.to_be_bytes());
+            entries.extend_from_slice(&generation.to_be_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /Info 99 0 R /Gen 88 4 R /W [1 4 2] /Index [0 5] /Length {} >>\nstream\n",
+                entries.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&entries);
+        bytes.extend_from_slice(
+            format!("\nendstream\nendobj\nstartxref\n{xref_stream_offset}\n%%EOF\n").as_bytes(),
+        );
+        append_classic_increment(
+            &mut bytes,
+            &[(5, 0, "null")],
+            &[(4, free_generation)],
+            6,
+            "",
+            u64::from(xref_stream_offset),
+        );
+        bytes
+    }
+
+    fn historical_xref_stream_trailer_pdf() -> Vec<u8> {
+        historical_xref_stream_trailer_pdf_with_free_generation(1)
+    }
+
+    fn latest_xref_stream_pdf() -> Vec<u8> {
+        let bytes = historical_xref_stream_trailer_pdf();
+        let eof = bytes
+            .windows(b"%%EOF\n".len())
+            .position(|window| window == b"%%EOF\n")
+            .expect("first xref stream eof")
+            + b"%%EOF\n".len();
+        bytes[..eof].to_vec()
+    }
+
+    fn reused_historical_xref_stream_pdf() -> Vec<u8> {
+        let mut bytes = latest_xref_stream_pdf();
+        let previous = last_startxref(&bytes);
+        append_classic_increment(
+            &mut bytes,
+            &[(4, 0, "<< /Marker /New >>"), (5, 0, "null")],
+            &[],
+            6,
+            "",
+            previous,
+        );
+        bytes
+    }
+
+    fn repeated_historical_xref_stream_pdf() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (number, body) in [
+            (1u32, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>"),
+        ] {
+            offsets.push(bytes.len() as u32);
+            bytes.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+
+        let append_xref_stream = |bytes: &mut Vec<u8>,
+                                  marker: &str,
+                                  info: u32,
+                                  previous: Option<u64>| {
+            let xref_stream_offset = bytes.len() as u32;
+            let mut entries = Vec::new();
+            for (kind, offset, generation) in [
+                (0u8, 0u32, u16::MAX),
+                (1, offsets[0], 0),
+                (1, offsets[1], 0),
+                (1, offsets[2], 0),
+                (1, xref_stream_offset, 0),
+            ] {
+                entries.push(kind);
+                entries.extend_from_slice(&offset.to_be_bytes());
+                entries.extend_from_slice(&generation.to_be_bytes());
+            }
+            let prev = previous.map_or_else(String::new, |value| format!("/Prev {value} "));
+            bytes.extend_from_slice(
+                    format!(
+                        "4 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /Marker /{marker} /Info {info} 0 R {prev}/W [1 4 2] /Index [0 5] /Length {} >>\nstream\n",
+                        entries.len()
+                    )
+                    .as_bytes(),
+                );
+            bytes.extend_from_slice(&entries);
+            bytes.extend_from_slice(
+                format!("\nendstream\nendobj\nstartxref\n{xref_stream_offset}\n%%EOF\n").as_bytes(),
+            );
+            u64::from(xref_stream_offset)
+        };
+
+        let oldest = append_xref_stream(&mut bytes, "Old", 91, None);
+        let nearest = append_xref_stream(&mut bytes, "Near", 92, Some(oldest));
+        append_classic_increment(&mut bytes, &[(5, 0, "null")], &[(4, 1)], 6, "", nearest);
+        bytes
+    }
+
+    fn circular_historical_trailer_pdf() -> Vec<u8> {
+        let mut bytes = build_qpdf_dangling_xref_pdf_with_trailer(
+            "",
+            "/Info 99 0 R /Prev 0000000000",
+            &[],
+            &[],
+            4,
+        );
+        let old_xref = last_startxref(&bytes);
+        let latest_xref =
+            append_classic_increment(&mut bytes, &[(4, 0, "null")], &[], 5, "", old_xref);
+        let marker = b"/Prev 0000000000";
+        let start = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("old /Prev placeholder")
+            + b"/Prev ".len();
+        bytes[start..start + 10].copy_from_slice(format!("{latest_xref:010}").as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn qpdf_dangling_preparation_does_not_leak_missing_refs_to_public_enumeration() {
+        let mut pdf = load_fixture_pdf("dangling-body-one-page.pdf");
+        let dangling = crate::ObjectRef::new(99, 0);
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        assert!(prepared.refs.contains(&dangling));
+        assert_eq!(prepared.max_object_id, 99);
+        assert!(!pdf.object_refs().contains(&dangling));
+        assert!(!pdf.live_object_refs().contains(&dangling));
+    }
+
+    #[test]
+    fn qpdf_dangling_preparation_excludes_unreferenced_high_free_xref_entry() {
+        let bytes = build_qpdf_dangling_xref_pdf("", &[], &[(200, 7)], 201);
+        let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("open high-free fixture");
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        assert_eq!(prepared.max_object_id, 3);
+        assert!(!prepared
+            .refs
+            .iter()
+            .any(|reference| reference.number == 200));
+        assert!(pdf.object_refs().contains(&crate::ObjectRef::new(200, 7)));
+    }
+
+    #[test]
+    fn qpdf_dangling_preparation_includes_referenced_free_generation() {
+        let bytes = build_qpdf_dangling_xref_pdf("/Probe 200 7 R", &[], &[(200, 7)], 201);
+        let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("open referenced-free fixture");
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        assert_eq!(prepared.max_object_id, 200);
+        assert!(prepared.refs.contains(&crate::ObjectRef::new(200, 7)));
+        assert!(!pdf
+            .live_object_refs()
+            .contains(&crate::ObjectRef::new(200, 7)));
+    }
+
+    #[test]
+    fn qpdf_dangling_preparation_keeps_live_and_dangling_generations_distinct() {
+        let bytes = build_qpdf_dangling_xref_pdf(
+            "/Live 8 1 R /Stale 8 0 R",
+            &[(8, 1, "<< /Value 1 >>")],
+            &[],
+            9,
+        );
+        let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("open generation fixture");
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        assert!(prepared.refs.contains(&crate::ObjectRef::new(8, 0)));
+        assert!(prepared.refs.contains(&crate::ObjectRef::new(8, 1)));
+        assert!(!pdf
+            .live_object_refs()
+            .contains(&crate::ObjectRef::new(8, 0)));
+        assert!(pdf
+            .live_object_refs()
+            .contains(&crate::ObjectRef::new(8, 1)));
+    }
+
+    #[test]
+    fn qpdf_dangling_preparation_includes_valid_trailer_only_generations() {
+        let bytes = build_qpdf_dangling_xref_pdf_with_trailer(
+            "",
+            "/Info 99 0 R /Gen 88 4 R /Zero 0 0 R /BadGen 77 65535 R",
+            &[],
+            &[(200, 7)],
+            201,
+        );
+        let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("open trailer-only fixture");
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        for dangling in [crate::ObjectRef::new(99, 0), crate::ObjectRef::new(88, 4)] {
+            assert!(prepared.refs.contains(&dangling), "{dangling:?}");
+            assert!(!pdf.object_refs().contains(&dangling), "{dangling:?}");
+            assert!(!pdf.live_object_refs().contains(&dangling), "{dangling:?}");
+        }
+        assert_eq!(prepared.max_object_id, 99);
+        assert!(!prepared.refs.contains(&crate::ObjectRef::new(0, 0)));
+        assert!(!prepared.refs.contains(&crate::ObjectRef::new(77, u16::MAX)));
+        assert!(!prepared
+            .refs
+            .iter()
+            .any(|reference| reference.number == 200));
+        assert!(pdf.object_refs().contains(&crate::ObjectRef::new(200, 7)));
+    }
+
+    #[test]
+    fn qpdf_preparation_collects_refs_from_an_older_omitted_trailer() {
+        let mut pdf = crate::Pdf::open_mem_owned(two_revision_historical_trailer_pdf())
+            .expect("open two-revision fixture");
+        assert!(pdf.trailer().get("Info").is_none());
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        let historical = crate::ObjectRef::new(99, 0);
+        assert_eq!(prepared.max_object_id, 99);
+        assert!(prepared.refs.contains(&historical));
+        assert!(!pdf.object_refs().contains(&historical));
+        assert!(!pdf.live_object_refs().contains(&historical));
+    }
+
+    #[test]
+    fn qpdf_preparation_unions_replaced_multigeneration_trailer_refs() {
+        let mut pdf = crate::Pdf::open_mem_owned(three_revision_historical_trailer_pdf())
+            .expect("open three-revision fixture");
+        assert!(pdf.trailer().get("Info").is_none());
+        assert_eq!(
+            pdf.trailer().get_ref("Newest"),
+            Some(crate::ObjectRef::new(50, 2))
+        );
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        for historical in [
+            crate::ObjectRef::new(99, 0),
+            crate::ObjectRef::new(88, 4),
+            crate::ObjectRef::new(20, 7),
+            crate::ObjectRef::new(60, 1),
+            crate::ObjectRef::new(70, 3),
+            crate::ObjectRef::new(50, 2),
+        ] {
+            assert!(prepared.refs.contains(&historical), "{historical:?}");
+            assert!(
+                !pdf.live_object_refs().contains(&historical),
+                "{historical:?}"
+            );
+        }
+        assert_eq!(prepared.max_object_id, 99);
+        assert!(!prepared.refs.contains(&crate::ObjectRef::new(0, 0)));
+        assert!(!prepared.refs.contains(&crate::ObjectRef::new(77, u16::MAX)));
+        assert!(!prepared
+            .refs
+            .iter()
+            .any(|reference| reference.number == 200));
+        assert!(pdf.object_refs().contains(&crate::ObjectRef::new(200, 7)));
+    }
+
+    #[test]
+    fn qpdf_preparation_collects_refs_from_a_freed_old_xref_stream() {
+        let mut pdf = crate::Pdf::open_mem_owned(historical_xref_stream_trailer_pdf())
+            .expect("open mixed xref fixture");
+        assert!(pdf.trailer().get("Info").is_none());
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        assert_eq!(prepared.max_object_id, 99);
+        assert!(prepared.refs.contains(&crate::ObjectRef::new(99, 0)));
+        assert!(prepared.refs.contains(&crate::ObjectRef::new(88, 4)));
+        let stream_ref = crate::ObjectRef::new(4, 0);
+        assert!(prepared.refs.contains(&stream_ref));
+        assert!(!pdf.object_refs().contains(&stream_ref));
+        assert!(!pdf.live_object_refs().contains(&stream_ref));
+        assert_eq!(pdf.resolve(stream_ref).unwrap(), crate::Object::Null);
+    }
+
+    #[test]
+    fn qpdf_raw_stream_payload_uses_historical_view_and_rejects_non_streams() {
+        let mut pdf = crate::Pdf::open_mem_owned(historical_xref_stream_trailer_pdf())
+            .expect("open mixed xref fixture");
+
+        let payload = qpdf_raw_stream_payload(
+            &mut pdf,
+            crate::ObjectRef::new(4, 0),
+            DecodeLevel::Generalized,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(payload.len(), 35);
+        assert_eq!(
+            qpdf_raw_stream_payload(
+                &mut pdf,
+                crate::ObjectRef::new(99, 0),
+                DecodeLevel::Generalized,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn qpdf_preparation_keeps_old_xref_streams_freed_at_the_same_generation() {
+        let mut pdf =
+            crate::Pdf::open_mem_owned(historical_xref_stream_trailer_pdf_with_free_generation(0))
+                .expect("open same-generation free xref stream fixture");
+        let stream_ref = crate::ObjectRef::new(4, 0);
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        assert!(prepared.refs.contains(&stream_ref));
+        assert!(matches!(
+            qpdf_resolve_top_level_object(&mut pdf, stream_ref).unwrap(),
+            crate::Object::Stream(_)
+        ));
+        assert_eq!(pdf.resolve(stream_ref).unwrap(), crate::Object::Null);
+    }
+
+    #[test]
+    fn qpdf_preparation_prefers_a_new_live_object_reusing_an_xref_stream_ref() {
+        let mut pdf = crate::Pdf::open_mem_owned(reused_historical_xref_stream_pdf())
+            .expect("open live-reused xref stream fixture");
+        let stream_ref = crate::ObjectRef::new(4, 0);
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+        let replacement = qpdf_resolve_top_level_object(&mut pdf, stream_ref).unwrap();
+
+        assert_eq!(prepared.max_object_id, 99);
+        assert_eq!(
+            replacement.as_dict().and_then(|dict| dict.get("Marker")),
+            Some(&crate::Object::Name(b"New".to_vec()))
+        );
+    }
+
+    #[test]
+    fn qpdf_parsed_xref_streams_do_not_shadow_set_or_delete() {
+        for bytes in [
+            latest_xref_stream_pdf(),
+            historical_xref_stream_trailer_pdf(),
+        ] {
+            let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("open xref stream fixture");
+            let stream_ref = crate::ObjectRef::new(4, 0);
+            pdf.set_object(stream_ref, crate::Object::Name(b"Mutated".to_vec()));
+
+            assert_eq!(
+                qpdf_resolve_top_level_object(&mut pdf, stream_ref).unwrap(),
+                crate::Object::Name(b"Mutated".to_vec())
+            );
+
+            pdf.delete_object(stream_ref);
+            assert_eq!(
+                qpdf_resolve_top_level_object(&mut pdf, stream_ref).unwrap(),
+                crate::Object::Null
+            );
+        }
+    }
+
+    #[test]
+    fn qpdf_removed_refs_stay_removed_across_repeated_preparation_until_set() {
+        let cases = [
+            (
+                historical_xref_stream_trailer_pdf(),
+                crate::ObjectRef::new(4, 0),
+            ),
+            (
+                historical_xref_stream_trailer_pdf(),
+                crate::ObjectRef::new(99, 0),
+            ),
+        ];
+
+        for (bytes, removed) in cases {
+            let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("open historical fixture");
+            assert!(pdf
+                .prepare_qpdf_json_objects()
+                .unwrap()
+                .refs
+                .contains(&removed));
+
+            pdf.delete_object(removed);
+            for _ in 0..2 {
+                assert!(!pdf
+                    .prepare_qpdf_json_objects()
+                    .unwrap()
+                    .refs
+                    .contains(&removed));
+            }
+
+            pdf.set_object(removed, crate::Object::Name(b"Restored".to_vec()));
+            assert!(pdf
+                .prepare_qpdf_json_objects()
+                .unwrap()
+                .refs
+                .contains(&removed));
+            assert_eq!(
+                qpdf_resolve_top_level_object(&mut pdf, removed).unwrap(),
+                crate::Object::Name(b"Restored".to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn qpdf_removed_body_discovery_does_not_resurrect_a_missing_ref() {
+        let mut pdf = load_fixture_pdf("dangling-body-one-page.pdf");
+        let removed = crate::ObjectRef::new(99, 0);
+        assert!(pdf
+            .prepare_qpdf_json_objects()
+            .unwrap()
+            .refs
+            .contains(&removed));
+
+        pdf.delete_object(removed);
+        for _ in 0..2 {
+            assert!(!pdf
+                .prepare_qpdf_json_objects()
+                .unwrap()
+                .refs
+                .contains(&removed));
+        }
+    }
+
+    #[test]
+    fn qpdf_preparation_keeps_the_nearest_parsed_xref_stream_generation() {
+        let mut pdf = crate::Pdf::open_mem_owned(repeated_historical_xref_stream_pdf())
+            .expect("open repeated xref stream fixture");
+        let stream_ref = crate::ObjectRef::new(4, 0);
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        assert!(prepared.refs.contains(&stream_ref));
+        assert!(!pdf.object_refs().contains(&stream_ref));
+        assert!(!pdf.live_object_refs().contains(&stream_ref));
+    }
+
+    #[test]
+    fn qpdf_preparation_deduplicates_historical_refs_in_a_repaired_prev_cycle() {
+        let bytes = circular_historical_trailer_pdf();
+        assert!(crate::Pdf::open_mem_owned(bytes.clone()).is_err());
+        let mut pdf = crate::Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("repair circular /Prev fixture");
+        assert!(pdf.trailer().get("Info").is_none());
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        assert_eq!(prepared.max_object_id, 99);
+        assert_eq!(
+            prepared
+                .refs
+                .iter()
+                .filter(|reference| **reference == crate::ObjectRef::new(99, 0))
+                .count(),
+            1
+        );
+    }
+
+    fn selected_qpdf_object_map(json: &JsonValue) -> &[(String, JsonValue)] {
+        let JsonValue::Object(top) = json else {
+            panic!("top-level JSON must be an object"); // cov:ignore: test-shape guard
+        };
+        let JsonValue::Array(qpdf) = top
+            .iter()
+            .find(|(key, _)| key == "qpdf")
+            .map(|(_, value)| value)
+            .expect("qpdf section")
+        else {
+            panic!("qpdf section must be an array"); // cov:ignore: test-shape guard
+        };
+        let JsonValue::Object(map) = &qpdf[1] else {
+            panic!("qpdf object map"); // cov:ignore: test-shape guard
+        };
+        map
+    }
+
+    #[test]
+    fn qpdf_dangling_raw_projection_matches_qpdf_container_null_rules() {
+        let mut pdf = load_fixture_pdf("dangling-body-one-page.pdf");
+        let json = build_qpdf_json_v2_selected_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Qpdf],
+        )
+        .expect("build qpdf JSON");
+        let map = selected_qpdf_object_map(&json);
+
+        let obj4 = map
+            .iter()
+            .find(|(key, _)| key == "obj:4 0 R")
+            .map(|(_, value)| value)
+            .expect("catalog object");
+        assert_eq!(
+            obj4,
+            &JsonValue::Object(vec![(
+                "value".to_string(),
+                JsonValue::Object(vec![
+                    (
+                        "/ArrZero".to_string(),
+                        JsonValue::Array(vec![JsonValue::Null]),
+                    ),
+                    ("/Nested".to_string(), JsonValue::Object(Vec::new()),),
+                    (
+                        "/PageMode".to_string(),
+                        JsonValue::String("/UseNone".to_string()),
+                    ),
+                    ("/Pages".to_string(), JsonValue::String("6 0 R".to_string()),),
+                    (
+                        "/Type".to_string(),
+                        JsonValue::String("/Catalog".to_string()),
+                    ),
+                ]),
+            )])
+        );
+        assert_eq!(
+            map.iter()
+                .find(|(key, _)| key == "obj:99 0 R")
+                .map(|(_, value)| value),
+            Some(&JsonValue::Object(vec![(
+                "value".to_string(),
+                JsonValue::Null,
+            )]))
+        );
+    }
+
+    #[test]
+    fn qpdf_dangling_raw_selectors_filter_serialization_after_full_preparation() {
+        let cases = [
+            (
+                "trailer",
+                vec![JsonObjectSelector::Trailer],
+                vec!["trailer"],
+            ),
+            (
+                "dangling generation",
+                vec![JsonObjectSelector::Object {
+                    number: 99,
+                    generation: 0,
+                }],
+                vec!["obj:99 0 R"],
+            ),
+        ];
+
+        for (label, selectors, expected_keys) in cases {
+            let mut pdf = load_fixture_pdf("dangling-body-one-page.pdf");
+            let json = build_qpdf_json_v2_selected_objects_with_options(
+                &mut pdf,
+                DecodeLevel::Generalized,
+                &StreamDataMode::None,
+                &[JsonKey::Qpdf],
+                &selectors,
+            )
+            .expect("build selected objects");
+
+            let JsonValue::Object(metadata) = selected_qpdf_metadata(&json) else {
+                panic!("qpdf metadata must be an object"); // cov:ignore: test-shape guard
+            };
+            assert_eq!(
+                metadata
+                    .iter()
+                    .find(|(key, _)| key == "maxobjectid")
+                    .map(|(_, value)| value),
+                Some(&JsonValue::Integer(99)),
+                "{label}"
+            );
+            assert_eq!(
+                selected_qpdf_object_map(&json)
+                    .iter()
+                    .map(|(key, _)| key.as_str())
+                    .collect::<Vec<_>>(),
+                expected_keys,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn qpdf_json_helpers_cover_reference_cycles_nulls_and_nested_streams() {
+        let mut pdf = load_one_page_pdf();
+        let first = ObjectRef::new(80, 0);
+        let second = ObjectRef::new(81, 0);
+        pdf.set_object(first, Object::Reference(second));
+        pdf.set_object(second, Object::Reference(first));
+
+        assert!(qpdf_reference_resolves_to_null(&mut pdf, first).unwrap());
+        assert_eq!(
+            qpdf_resolve_top_level_object(&mut pdf, first).unwrap(),
+            Object::Null
+        );
+
+        let mut nested_dict = Dictionary::new();
+        nested_dict.insert("Drop", Object::Null);
+        let nested_stream = Object::Stream(Stream::new(nested_dict, Vec::new()));
+        assert_eq!(
+            qpdf_pdf_object_to_json(&mut pdf, &nested_stream).unwrap(),
+            JsonValue::Object(vec![(
+                "stream".to_string(),
+                JsonValue::Object(vec![("dict".to_string(), JsonValue::Object(Vec::new()),)]),
+            )])
+        );
+    }
+
     #[test]
     fn build_qpdf_json_v2_includes_pagelabels_section() {
         // Regression for CodeRabbit's flpdf-9hc.11.5 finding: the
@@ -4038,7 +5283,7 @@ mod tests {
         let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
             .expect("build_qpdf_json_v2 failed");
         let JsonValue::Object(pairs) = v2 else {
-            panic!("expected Object at top level");
+            panic!("expected Object at top level"); // cov:ignore: test-shape guard
         };
         let pagelabels = pairs
             .iter()
@@ -4057,7 +5302,7 @@ mod tests {
         let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
             .expect("build_qpdf_json_v2 failed");
         let JsonValue::Object(pairs) = v2 else {
-            panic!("expected Object at top level");
+            panic!("expected Object at top level"); // cov:ignore: test-shape guard
         };
         let pages = pairs
             .iter()
@@ -4065,7 +5310,7 @@ mod tests {
             .map(|(_, v)| v)
             .expect("pages key missing");
         let JsonValue::Array(page_entries) = pages else {
-            panic!("pages must be Array");
+            panic!("pages must be Array"); // cov:ignore: test-shape guard
         };
         assert_eq!(
             page_entries.len(),
@@ -4080,7 +5325,7 @@ mod tests {
         let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
             .expect("build_qpdf_json_v2 failed");
         let JsonValue::Object(pairs) = v2 else {
-            panic!("expected Object");
+            panic!("expected Object"); // cov:ignore: test-shape guard
         };
         let qpdf = pairs.iter().find(|(k, _)| k == "qpdf").unwrap().1.clone();
         let JsonValue::Array(qpdf_arr) = qpdf else {
@@ -4101,6 +5346,243 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════════════
     // build_outlines_section tests (flpdf-9hc.11.6)
     // ══════════════════════════════════════════════════════════════════════════
+
+    fn load_direct_outline_fixture() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/json-diff/direct-outlines.pdf"
+        ));
+        Pdf::open(std::io::Cursor::new(bytes.to_vec())).unwrap()
+    }
+
+    fn value_for_key<'a>(pairs: &'a [(String, JsonValue)], key: &str) -> &'a JsonValue {
+        &pairs.iter().find(|(name, _)| name == key).unwrap().1
+    }
+
+    fn json_array(value: &JsonValue) -> &[JsonValue] {
+        match value {
+            JsonValue::Array(items) => items,
+            _ => panic!("expected JSON array"), // cov:ignore: test-shape guard
+        }
+    }
+
+    fn json_object(value: &JsonValue) -> &[(String, JsonValue)] {
+        match value {
+            JsonValue::Object(pairs) => pairs,
+            _ => panic!("expected JSON object"), // cov:ignore: test-shape guard
+        }
+    }
+
+    #[test]
+    fn outline_json_v2_has_exact_qpdf_keys_and_values() {
+        let mut pdf = load_direct_outline_fixture();
+        let result = build_outlines_section(&mut pdf).unwrap();
+        let entries = json_array(&result);
+        let first = json_object(&entries[0]);
+
+        let keys: Vec<_> = first.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "dest",
+                "destpageposfrom1",
+                "kids",
+                "object",
+                "open",
+                "title"
+            ]
+        );
+        assert_eq!(
+            value_for_key(first, "dest"),
+            &JsonValue::Array(vec![
+                JsonValue::String("8 0 R".into()),
+                JsonValue::String("/XYZ".into()),
+                JsonValue::Null,
+                JsonValue::Null,
+                JsonValue::Null,
+            ])
+        );
+        assert_eq!(
+            value_for_key(first, "destpageposfrom1"),
+            &JsonValue::Integer(6)
+        );
+        assert_eq!(
+            value_for_key(first, "object"),
+            &JsonValue::String("96 0 R".into())
+        );
+        assert_eq!(value_for_key(first, "open"), &JsonValue::Bool(true));
+        assert_eq!(
+            value_for_key(first, "title"),
+            &JsonValue::String("Isís 1 -> 5: /XYZ null null null".into())
+        );
+
+        let kids = json_array(value_for_key(first, "kids"));
+        assert_eq!(kids.len(), 2);
+        let first_kid = json_object(&kids[0]);
+        let second_kid = json_object(&kids[1]);
+        assert_eq!(
+            value_for_key(first_kid, "title"),
+            &JsonValue::String("Amanda 1.1 -> 11: /Fit".into())
+        );
+        assert_eq!(value_for_key(first_kid, "open"), &JsonValue::Bool(false));
+        assert_eq!(
+            value_for_key(second_kid, "title"),
+            &JsonValue::String("Sandy ÷Σανδι÷ 1.2 -> 13: /FitH 792".into())
+        );
+    }
+
+    #[test]
+    fn outline_json_v2_projects_direct_items_exactly() {
+        let mut pdf = load_one_page_pdf();
+        let page_ref = crate::pages::page_refs(&mut pdf).unwrap()[0];
+
+        let mut next = Dictionary::new();
+        next.insert("Title", Object::String(b"Direct B".to_vec()));
+
+        let mut first = Dictionary::new();
+        first.insert("Count", Object::Integer(-1));
+        first.insert(
+            "Dest",
+            Object::Array(vec![
+                Object::Reference(page_ref),
+                Object::Name(b"Fit".to_vec()),
+            ]),
+        );
+        first.insert("Next", Object::Dictionary(next));
+        first.insert("Title", Object::String(b"Direct A".to_vec()));
+
+        let mut outlines = Dictionary::new();
+        outlines.insert("First", Object::Dictionary(first));
+        let catalog_ref = pdf.root_ref().unwrap();
+        let mut catalog = pdf.resolve(catalog_ref).unwrap().as_dict().unwrap().clone();
+        catalog.insert("Outlines", Object::Dictionary(outlines));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let result = build_outlines_section(&mut pdf).unwrap();
+        let entries = json_array(&result);
+        assert_eq!(entries.len(), 2);
+        let first = json_object(&entries[0]);
+        let second = json_object(&entries[1]);
+
+        assert_eq!(
+            value_for_key(first, "object"),
+            &JsonValue::Object(vec![
+                ("/Count".into(), JsonValue::Integer(-1)),
+                (
+                    "/Dest".into(),
+                    JsonValue::Array(vec![
+                        JsonValue::String(page_ref.to_string()),
+                        JsonValue::String("/Fit".into()),
+                    ]),
+                ),
+                (
+                    "/Next".into(),
+                    JsonValue::Object(vec![(
+                        "/Title".into(),
+                        JsonValue::String("u:Direct B".into()),
+                    )]),
+                ),
+                ("/Title".into(), JsonValue::String("u:Direct A".into())),
+            ])
+        );
+        assert_eq!(
+            value_for_key(first, "destpageposfrom1"),
+            &JsonValue::Integer(1)
+        );
+        assert_eq!(value_for_key(first, "open"), &JsonValue::Bool(false));
+        assert_eq!(
+            value_for_key(first, "title"),
+            &JsonValue::String("Direct A".into())
+        );
+
+        assert_eq!(value_for_key(second, "dest"), &JsonValue::Null);
+        assert_eq!(value_for_key(second, "destpageposfrom1"), &JsonValue::Null);
+        assert_eq!(
+            value_for_key(second, "object"),
+            &JsonValue::Object(vec![(
+                "/Title".into(),
+                JsonValue::String("u:Direct B".into()),
+            )])
+        );
+        assert_eq!(value_for_key(second, "open"), &JsonValue::Bool(true));
+        assert_eq!(
+            value_for_key(second, "title"),
+            &JsonValue::String("Direct B".into())
+        );
+    }
+
+    #[test]
+    fn outline_json_v2_stops_at_an_indirect_null_child() {
+        let mut pdf = load_one_page_pdf();
+        let outline_root_ref = crate::ObjectRef::new(100, 0);
+        let item_ref = crate::ObjectRef::new(101, 0);
+        let null_child_ref = crate::ObjectRef::new(102, 0);
+
+        let mut outline_root = Dictionary::new();
+        outline_root.insert("First", Object::Reference(item_ref));
+        patch_outline_root(&mut pdf, outline_root_ref, outline_root);
+
+        let mut item = Dictionary::new();
+        item.insert("Title", Object::String(b"Parent".to_vec()));
+        item.insert("First", Object::Reference(null_child_ref));
+        pdf.set_object(item_ref, Object::Dictionary(item));
+        pdf.set_object(null_child_ref, Object::Null);
+
+        let result = build_outlines_section(&mut pdf).unwrap();
+        let entries = json_array(&result);
+        let parent = json_object(&entries[0]);
+        assert_eq!(value_for_key(parent, "kids"), &JsonValue::Array(Vec::new()));
+    }
+
+    #[test]
+    fn outline_json_v2_resolves_a_multi_hop_catalog_dest_holder() {
+        let mut pdf = load_one_page_pdf();
+        let page_ref = crate::pages::page_refs(&mut pdf).unwrap()[0];
+        let outline_root_ref = crate::ObjectRef::new(100, 0);
+        let item_ref = crate::ObjectRef::new(101, 0);
+        let first_holder_ref = crate::ObjectRef::new(110, 0);
+        let dests_ref = crate::ObjectRef::new(111, 0);
+
+        let mut outline_root = Dictionary::new();
+        outline_root.insert("First", Object::Reference(item_ref));
+        patch_outline_root(&mut pdf, outline_root_ref, outline_root);
+
+        let mut item = Dictionary::new();
+        item.insert("Title", Object::String(b"Named".to_vec()));
+        item.insert("Dest", Object::Name(b"named".to_vec()));
+        pdf.set_object(item_ref, Object::Dictionary(item));
+
+        let mut dests = Dictionary::new();
+        dests.insert(
+            "named",
+            Object::Array(vec![
+                Object::Reference(page_ref),
+                Object::Name(b"Fit".to_vec()),
+            ]),
+        );
+        pdf.set_object(first_holder_ref, Object::Reference(dests_ref));
+        pdf.set_object(dests_ref, Object::Dictionary(dests));
+
+        let catalog_ref = pdf.root_ref().unwrap();
+        let mut catalog = pdf.resolve(catalog_ref).unwrap().as_dict().unwrap().clone();
+        catalog.insert("Dests", Object::Reference(first_holder_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let result = build_outlines_section(&mut pdf).unwrap();
+        let entries = json_array(&result);
+        let item = json_object(&entries[0]);
+        assert_eq!(
+            value_for_key(item, "dest"),
+            &JsonValue::Array(vec![
+                JsonValue::String(page_ref.to_string()),
+                JsonValue::String("/Fit".into()),
+            ])
+        );
+        assert_eq!(
+            value_for_key(item, "destpageposfrom1"),
+            &JsonValue::Integer(1)
+        );
+    }
 
     /// Helper: inject a synthetic /Outlines tree into the catalog of `pdf`.
     ///
@@ -4186,40 +5668,35 @@ mod tests {
             panic!("entry is not an Object");
         };
 
-        // Key order: action, count, dest, flags, kids, object, structureelement, title
+        // Key order: dest, destpageposfrom1, kids, object, open, title.
         let keys: Vec<&str> = entry.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
             vec![
-                "action",
-                "count",
                 "dest",
-                "flags",
+                "destpageposfrom1",
                 "kids",
                 "object",
-                "structureelement",
+                "open",
                 "title"
             ],
             "key order must be alphabetical"
         );
 
-        // action, count, dest, flags, structureelement = Null (absent in item)
-        assert_eq!(entry[0].1, JsonValue::Null, "action must be Null");
-        assert_eq!(entry[1].1, JsonValue::Null, "count must be Null");
-        assert_eq!(entry[2].1, JsonValue::Null, "dest must be Null");
-        assert_eq!(entry[3].1, JsonValue::Null, "flags must be Null");
+        assert_eq!(entry[0].1, JsonValue::Null, "dest must be Null");
+        assert_eq!(entry[1].1, JsonValue::Null, "page position must be Null");
         // kids = [] (no /First in item)
-        assert_eq!(entry[4].1, JsonValue::Array(vec![]), "kids must be empty");
+        assert_eq!(entry[2].1, JsonValue::Array(vec![]), "kids must be empty");
         // object = "101 0 R"
         assert_eq!(
-            entry[5].1,
+            entry[3].1,
             JsonValue::String("101 0 R".to_string()),
             "object mismatch"
         );
-        assert_eq!(entry[6].1, JsonValue::Null, "structureelement must be Null");
+        assert_eq!(entry[4].1, JsonValue::Bool(true), "open must default true");
         // title = bare "Chapter 1" (no u: prefix)
         assert_eq!(
-            entry[7].1,
+            entry[5].1,
             JsonValue::String("Chapter 1".to_string()),
             "title must be bare string without u: prefix"
         );
@@ -4432,17 +5909,12 @@ mod tests {
         assert_eq!(title, JsonValue::String("AB".to_string()));
     }
 
-    // ── Test 8: Direct /A action dictionary is preserved (not dropped) ────────
+    // ── Test 8: raw actions are projected only through resolved dest ──────
     //
-    // Regression for CodeRabbit's review: previously the `/A` field was only
-    // emitted when it was an indirect Reference; direct action dictionaries
-    // (e.g. `/A << /S /URI /URI (https://example.com) >>`) silently became
-    // null. The serializer must now run any /A value through
-    // pdf_object_to_json so direct actions, references, and other shapes all
-    // survive.
+    // The JSON projection exposes the resolved destination, not the raw action.
 
     #[test]
-    fn outlines_direct_action_dictionary_is_preserved() {
+    fn outlines_non_goto_action_yields_null_dest() {
         let mut pdf = load_one_page_pdf();
 
         let outline_root_ref = crate::ObjectRef::new(100, 0);
@@ -4454,7 +5926,7 @@ mod tests {
         outline_root.insert("Last", Object::Reference(item_ref));
         patch_outline_root(&mut pdf, outline_root_ref, outline_root);
 
-        // /A is a direct URI action dictionary — must survive serialization.
+        // /A is a direct URI action dictionary, not a destination.
         let mut action = Dictionary::new();
         action.insert("S", Object::Name(b"URI".to_vec()));
         action.insert("URI", Object::String(b"https://example.com".to_vec()));
@@ -4472,39 +5944,16 @@ mod tests {
         let JsonValue::Object(entry) = &entries[0] else {
             panic!("entry is not an Object");
         };
-        let action_value = entry
-            .iter()
-            .find(|(k, _)| k == "action")
-            .map(|(_, v)| v)
-            .expect("action key missing");
-
-        let JsonValue::Object(action_pairs) = action_value else {
-            panic!(
-                "expected the direct /A dictionary to be preserved as an Object, got {:?}",
-                action_value
-            );
-        };
-        // /S /URI -> "/URI" Name string under key "/S"; URI text becomes "u:..."
-        let s_value = action_pairs
-            .iter()
-            .find(|(k, _)| k == "/S")
-            .map(|(_, v)| v)
-            .expect("/S key missing");
-        assert_eq!(s_value, &JsonValue::String("/URI".to_string()));
-        let uri_value = action_pairs
-            .iter()
-            .find(|(k, _)| k == "/URI")
-            .map(|(_, v)| v)
-            .expect("/URI key missing");
+        assert_eq!(value_for_key(entry, "dest"), &JsonValue::Null);
         assert_eq!(
-            uri_value,
-            &JsonValue::String("u:https://example.com".to_string())
+            value_for_key(entry, "object"),
+            &JsonValue::String("101 0 R".to_string())
         );
+        assert!(entry.iter().all(|(key, _)| key != "action"));
     }
 
     #[test]
-    fn outlines_indirect_action_reference_still_emits_ref_string() {
-        // Verify the Reference path still works after the refactor.
+    fn outlines_goto_action_without_destination_yields_null_dest() {
         let mut pdf = load_one_page_pdf();
         let outline_root_ref = crate::ObjectRef::new(100, 0);
         let item_ref = crate::ObjectRef::new(101, 0);
@@ -4533,12 +5982,11 @@ mod tests {
         let JsonValue::Object(entry) = &entries[0] else {
             panic!("entry is not an Object");
         };
-        let action_value = entry
-            .iter()
-            .find(|(k, _)| k == "action")
-            .map(|(_, v)| v.clone())
-            .unwrap();
-        assert_eq!(action_value, JsonValue::String("102 0 R".to_string()));
+        assert_eq!(value_for_key(entry, "dest"), &JsonValue::Null);
+        assert_eq!(
+            value_for_key(entry, "object"),
+            &JsonValue::String("101 0 R".to_string())
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -6510,7 +7958,7 @@ mod tests {
         let mut pdf_plain = load_one_page_pdf();
         let enc_plain = build_encrypt_section(&mut pdf_plain).expect("plain failed");
         let JsonValue::Object(ref p) = enc_plain else {
-            panic!("not Object")
+            panic!("not Object") // cov:ignore: test-shape guard
         };
         let v = p
             .iter()
@@ -6523,7 +7971,7 @@ mod tests {
         let mut pdf_enc = load_encrypted_r4_pdf();
         let enc_enc = build_encrypt_section(&mut pdf_enc).expect("encrypted failed");
         let JsonValue::Object(ref pe) = enc_enc else {
-            panic!("not Object")
+            panic!("not Object") // cov:ignore: test-shape guard
         };
         let ve = pe
             .iter()
@@ -6944,15 +8392,13 @@ mod tests {
     // JsonKey / filter_json_keys unit tests  (flpdf-9hc.11.11)
     // ══════════════════════════════════════════════════════════════════════════
 
-    // ── JsonKey::from_str: all 9 accepted names ───────────────────────────────
+    // ── JsonKey::from_str: all JSON v2 names ─────────────────────────────────
 
     #[test]
     fn json_key_from_str_all_known() {
         assert_eq!(JsonKey::from_str("acroform"), Some(JsonKey::Acroform));
         assert_eq!(JsonKey::from_str("attachments"), Some(JsonKey::Attachments));
         assert_eq!(JsonKey::from_str("encrypt"), Some(JsonKey::Encrypt));
-        assert_eq!(JsonKey::from_str("objectinfo"), Some(JsonKey::Objectinfo));
-        assert_eq!(JsonKey::from_str("objects"), Some(JsonKey::Objects));
         assert_eq!(JsonKey::from_str("outlines"), Some(JsonKey::Outlines));
         assert_eq!(JsonKey::from_str("pagelabels"), Some(JsonKey::Pagelabels));
         assert_eq!(JsonKey::from_str("pages"), Some(JsonKey::Pages));
@@ -6967,33 +8413,29 @@ mod tests {
         assert_eq!(JsonKey::from_str("Pages"), None); // case-sensitive
         assert_eq!(JsonKey::from_str("version"), None);
         assert_eq!(JsonKey::from_str("parameters"), None);
+        assert_eq!(JsonKey::from_str("objectinfo"), None);
+        assert_eq!(JsonKey::from_str("objects"), None);
         assert_eq!(JsonKey::from_str("bogus"), None);
     }
 
-    // ── ALL_NAMES ordering matches alphabetical qpdf error message order ──────
+    // ── ALL_NAMES contains only JSON v2 keys in alphabetical order ───────────
 
     #[test]
     fn json_key_all_names_order() {
         assert_eq!(JsonKey::ALL_NAMES[0], "acroform");
         assert_eq!(JsonKey::ALL_NAMES[1], "attachments");
         assert_eq!(JsonKey::ALL_NAMES[2], "encrypt");
-        assert_eq!(JsonKey::ALL_NAMES[3], "objectinfo");
-        assert_eq!(JsonKey::ALL_NAMES[4], "objects");
-        assert_eq!(JsonKey::ALL_NAMES[5], "outlines");
-        assert_eq!(JsonKey::ALL_NAMES[6], "pagelabels");
-        assert_eq!(JsonKey::ALL_NAMES[7], "pages");
-        assert_eq!(JsonKey::ALL_NAMES[8], "qpdf");
-        assert_eq!(JsonKey::ALL_NAMES.len(), 9);
+        assert_eq!(JsonKey::ALL_NAMES[3], "outlines");
+        assert_eq!(JsonKey::ALL_NAMES[4], "pagelabels");
+        assert_eq!(JsonKey::ALL_NAMES[5], "pages");
+        assert_eq!(JsonKey::ALL_NAMES[6], "qpdf");
+        assert_eq!(JsonKey::ALL_NAMES.len(), 7);
     }
 
-    // ── output_key_name: aliasing ─────────────────────────────────────────────
+    // ── output_key_name maps every v2 selector directly ──────────────────────
 
     #[test]
-    fn json_key_output_key_name_aliasing() {
-        // v1 aliases map to "qpdf"
-        assert_eq!(JsonKey::Objectinfo.output_key_name(), "qpdf");
-        assert_eq!(JsonKey::Objects.output_key_name(), "qpdf");
-        // canonical v2 names map to themselves
+    fn json_key_output_key_name_is_direct() {
         assert_eq!(JsonKey::Acroform.output_key_name(), "acroform");
         assert_eq!(JsonKey::Attachments.output_key_name(), "attachments");
         assert_eq!(JsonKey::Encrypt.output_key_name(), "encrypt");
@@ -7064,26 +8506,6 @@ mod tests {
         assert_eq!(names, vec!["version", "parameters", "pages", "pagelabels"]);
     }
 
-    // ── filter_json_keys: [Objects] → aliased to qpdf ────────────────────────
-
-    #[test]
-    fn filter_json_keys_objects_alias_to_qpdf() {
-        let doc = make_v2_doc();
-        let filtered = filter_json_keys(doc, &[JsonKey::Objects]);
-        let names = key_names(&filtered);
-        assert_eq!(names, vec!["version", "parameters", "qpdf"]);
-    }
-
-    // ── filter_json_keys: [Objectinfo] → aliased to qpdf ─────────────────────
-
-    #[test]
-    fn filter_json_keys_objectinfo_alias_to_qpdf() {
-        let doc = make_v2_doc();
-        let filtered = filter_json_keys(doc, &[JsonKey::Objectinfo]);
-        let names = key_names(&filtered);
-        assert_eq!(names, vec!["version", "parameters", "qpdf"]);
-    }
-
     // ── filter_json_keys: duplicate dedupe ([Pages, Pages]) ──────────────────
 
     #[test]
@@ -7092,16 +8514,6 @@ mod tests {
         let filtered = filter_json_keys(doc, &[JsonKey::Pages, JsonKey::Pages]);
         let names = key_names(&filtered);
         assert_eq!(names, vec!["version", "parameters", "pages"]);
-    }
-
-    // ── filter_json_keys: [Objects, Qpdf] → only one "qpdf" in output ────────
-
-    #[test]
-    fn filter_json_keys_objects_and_qpdf_dedupe() {
-        let doc = make_v2_doc();
-        let filtered = filter_json_keys(doc, &[JsonKey::Objects, JsonKey::Qpdf]);
-        let names = key_names(&filtered);
-        assert_eq!(names, vec!["version", "parameters", "qpdf"]);
     }
 
     // ── filter_json_keys: key absent from input → not in output (no panic) ────
@@ -7404,6 +8816,31 @@ mod tests {
         };
         let filtered = filter_json_objects(doc, &[sel]);
         assert_eq!(key_names(&filtered), vec!["version", "pages"]);
+    }
+
+    #[test]
+    fn filter_json_objects_preserves_malformed_envelope_shapes() {
+        let selector = [JsonObjectSelector::Trailer];
+
+        assert_eq!(
+            filter_json_objects(JsonValue::Null, &selector),
+            JsonValue::Null
+        );
+
+        let scalar_qpdf = JsonValue::Object(vec![("qpdf".to_string(), JsonValue::Integer(7))]);
+        assert_eq!(
+            filter_json_objects(scalar_qpdf.clone(), &selector),
+            scalar_qpdf
+        );
+
+        let scalar_map = JsonValue::Object(vec![(
+            "qpdf".to_string(),
+            JsonValue::Array(vec![JsonValue::Null, JsonValue::Integer(9)]),
+        )]);
+        assert_eq!(
+            filter_json_objects(scalar_map.clone(), &selector),
+            scalar_map
+        );
     }
 
     // ── filter_json_objects: envelope and other sections preserved ─────────────

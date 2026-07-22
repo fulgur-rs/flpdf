@@ -71,6 +71,13 @@ fn resolved_raw_action(pdf: &mut Pdf<Cursor<Vec<u8>>>, item_ref: ObjectRef) -> O
     value
 }
 
+fn dict_value(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef, key: &str) -> Object {
+    let Object::Dictionary(dict) = pdf.resolve(object_ref).unwrap() else {
+        panic!("{object_ref} must resolve to a dictionary");
+    };
+    dict.get(key).cloned().unwrap_or(Object::Null)
+}
+
 // ---------------------------------------------------------------------------
 // 1. Deep outline round-trip through write_pdf
 // ---------------------------------------------------------------------------
@@ -114,53 +121,89 @@ fn deep_outline_with_dests_pdf(n: u32) -> Vec<u8> {
     build_pdf(&refs, 1)
 }
 
-/// A 150-level-deep outline chain survives a full `write_pdf` round trip: the
-/// reopened document's depth, per-level titles, and per-level `/Dest`
-/// resolution are all preserved — not just the in-memory walk that
-/// `deep_outline_walks_1000_levels_with_default_depth` (in
-/// `outline_document_helper_tests.rs`) already covers without ever calling
-/// [`write_pdf`].
+/// A 150-level-deep outline chain survives a full `write_pdf` round trip. The
+/// qpdf-compatible helper view stops after materializing depth 51, while the
+/// raw dictionaries and their `/First` links remain intact through depth 150.
 #[test]
 fn deep_outline_round_trip_through_write_pdf() {
     let n = 150u32;
     let mut pdf = Pdf::open(Cursor::new(deep_outline_with_dests_pdf(n))).unwrap();
 
-    let before = pdf.outline().iter().unwrap().count();
-    assert_eq!(before, n as usize, "sanity: fixture has n levels");
+    let before_tree = pdf.outline().get_tree().unwrap();
+    let before = before_tree.preorder().count();
+    assert_eq!(before, 51, "helper view stops at qpdf's depth boundary");
 
     let mut out = Vec::new();
     write_pdf(&mut pdf, &mut out).unwrap();
 
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
-    let roots = reopened.outline().get_root().unwrap();
-    assert_eq!(roots.len(), 1, "single top-level root after round trip");
+    let tree = reopened.outline().get_tree().unwrap();
+    assert_eq!(
+        tree.roots().len(),
+        1,
+        "single top-level root after round trip"
+    );
+    assert_eq!(tree.preorder().count(), 51);
 
-    // Walk the single-child chain end to end, checking every level's title,
-    // depth, and dest resolution survived the round trip intact.
+    // The materialized helper view includes level 51 but does not expand it.
     let mut depth = 0usize;
-    let mut node = &roots[0];
+    let mut id = tree.roots()[0];
     loop {
-        assert_eq!(node.depth, depth);
-        assert_eq!(node.title, format!("L{depth}"));
+        let item = &tree[id];
+        assert_eq!(item.title, format!("L{depth}"));
         assert_eq!(
-            node.dest_page(),
+            item.dest_page(),
             Object::Reference(ObjectRef::new(3, 0)),
             "level {depth} must keep its /Dest after the round trip"
         );
-        match node.children.first() {
-            Some(child) => {
-                node = child;
+        match item.kids.first() {
+            Some(&child) => {
+                id = child;
                 depth += 1;
             }
             None => break,
         }
     }
-    assert_eq!(depth, (n - 1) as usize, "full depth must survive intact");
+    assert_eq!(depth, 50, "depth 51 is the last materialized helper item");
+    assert!(tree[id].kids.is_empty());
 
-    // `iter()` (the flattened preorder view) must also see every level after
-    // the round trip, not just the recursive `get_root()` tree.
-    let after_count = reopened.outline().iter().unwrap().count();
-    assert_eq!(after_count, n as usize, "iter() must see every level too");
+    // Follow the serialized raw `/First` chain independently of the helper.
+    let catalog_ref = reopened.root_ref().unwrap();
+    let Object::Dictionary(catalog) = reopened.resolve(catalog_ref).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    let Object::Reference(outlines_ref) = catalog.get("Outlines").cloned().unwrap() else {
+        panic!("catalog /Outlines must be indirect");
+    };
+    let Object::Dictionary(outlines) = reopened.resolve(outlines_ref).unwrap() else {
+        panic!("outlines root must be a dictionary");
+    };
+    let mut cursor = outlines.get("First").cloned().unwrap();
+    let mut raw_count = 0usize;
+    let mut item_51_first = None;
+    loop {
+        let Object::Reference(reference) = cursor else {
+            panic!("raw outline item {raw_count} must be indirect");
+        };
+        let Object::Dictionary(item) = reopened.resolve(reference).unwrap() else {
+            panic!("raw outline item {reference} must be a dictionary");
+        };
+        raw_count += 1;
+        let first = item.get("First").cloned();
+        if raw_count == 51 {
+            item_51_first = first.clone();
+        }
+        let Some(first) = first else {
+            break;
+        };
+        cursor = first;
+    }
+
+    assert_eq!(raw_count, n as usize, "all raw outline items survive");
+    assert!(
+        matches!(item_51_first, Some(Object::Reference(_))),
+        "raw depth-51 item keeps /First although the helper leaves kids empty"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +219,7 @@ fn combined_named_dests_pdf() -> Vec<u8> {
         &[
             (
                 1,
-                "<< /Type /Catalog /Pages 2 0 R /Dests 8 0 R /Names 9 0 R >>",
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 19 0 R /Dests 8 0 R /Names 9 0 R >>",
             ),
             (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
             (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
@@ -184,44 +227,47 @@ fn combined_named_dests_pdf() -> Vec<u8> {
             (8, "<< /legacy_only [3 0 R /Fit] >>"),
             (9, "<< /Dests 10 0 R >>"),
             (10, "<< /Names [(modern_only) [4 0 R /Fit]] >>"),
+            (
+                19,
+                "<< /Type /Outlines /First 20 0 R /Last 20 0 R /Count 1 >>",
+            ),
+            (
+                20,
+                "<< /Title (Raw policy keys) /Parent 19 0 R /SE 30 0 R >>",
+            ),
+            (30, "<< /Type /StructElem /S /P >>"),
         ],
         1,
     )
 }
 
 #[test]
-fn combined_legacy_and_modern_named_dests_round_trip_through_write_pdf() {
+fn raw_outline_policy_keys_survive_write_round_trip() {
     let mut pdf = Pdf::open(Cursor::new(combined_named_dests_pdf())).unwrap();
-
-    let legacy_before = pdf.outline().legacy_dests().unwrap();
-    let modern_before = pdf.outline().name_tree_dests().unwrap();
-    assert_eq!(legacy_before.len(), 1, "sanity: one legacy entry");
-    assert_eq!(modern_before.len(), 1, "sanity: one modern entry");
+    let catalog_ref = pdf.root_ref().unwrap();
+    let legacy_before = dict_value(&mut pdf, catalog_ref, "Dests");
+    let names_before = dict_value(&mut pdf, catalog_ref, "Names");
 
     let mut out = Vec::new();
     write_pdf(&mut pdf, &mut out).unwrap();
 
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
-    let legacy_after = reopened.outline().legacy_dests().unwrap();
-    let modern_after = reopened.outline().name_tree_dests().unwrap();
+    let reopened_catalog_ref = reopened.root_ref().unwrap();
+    let legacy_after = dict_value(&mut reopened, reopened_catalog_ref, "Dests");
+    let names_after = dict_value(&mut reopened, reopened_catalog_ref, "Names");
 
     assert_eq!(
         legacy_before, legacy_after,
-        "legacy /Dests must round-trip unchanged even with a modern tree present"
+        "ordinary rewriting must preserve raw /Dests"
     );
     assert_eq!(
-        modern_before, modern_after,
-        "modern /Names /Dests must round-trip unchanged even with a legacy dict present"
-    );
-    assert_eq!(legacy_after[0].0, b"legacy_only");
-    assert_eq!(modern_after[0].0, b"modern_only");
-    assert_eq!(
-        legacy_after[0].1.as_ref().unwrap().page(),
-        Some(ObjectRef::new(3, 0))
+        names_before, names_after,
+        "ordinary rewriting must preserve raw /Names"
     );
     assert_eq!(
-        modern_after[0].1.as_ref().unwrap().page(),
-        Some(ObjectRef::new(4, 0))
+        dict_value(&mut reopened, ObjectRef::new(20, 0), "SE"),
+        Object::Reference(ObjectRef::new(30, 0)),
+        "ordinary rewriting must preserve raw /SE even though no outline /SE policy API remains"
     );
 }
 
@@ -402,9 +448,9 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
     let mut pdf = Pdf::open(Cursor::new(combined_e2e_pdf())).unwrap();
 
     // Sanity on the freshly opened document before the round trip.
-    let roots_before = pdf.outline().get_root().unwrap();
+    let tree_before = pdf.outline().get_tree().unwrap();
     assert_eq!(
-        roots_before.len(),
+        tree_before.roots().len(),
         7,
         "7 top-level siblings: deep chain root + 5 action items + /SE item"
     );
@@ -414,15 +460,17 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
 
     // -- Deep chain (20 levels) preserved --
-    let roots = reopened.outline().get_root().unwrap();
+    let tree = reopened.outline().get_tree().unwrap();
+    let roots = tree.roots();
     assert_eq!(roots.len(), 7);
     let mut depth = 0usize;
-    let mut node = &roots[0];
+    let mut id = roots[0];
     loop {
-        assert_eq!(node.title, format!("Deep{depth}"));
-        match node.children.first() {
-            Some(child) => {
-                node = child;
+        let item = &tree[id];
+        assert_eq!(item.title, format!("Deep{depth}"));
+        match item.kids.first() {
+            Some(&child) => {
+                id = child;
                 depth += 1;
             }
             None => break,
@@ -433,7 +481,12 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
     // -- All five raw action dictionaries preserved, in sibling order --
     let actions: Vec<Object> = roots[1..=5]
         .iter()
-        .map(|node| resolved_raw_action(&mut reopened, node.object_ref))
+        .map(|&id| {
+            resolved_raw_action(
+                &mut reopened,
+                tree[id].source_ref.expect("fixture item is indirect"),
+            )
+        })
         .collect();
     let action_dict = |index: usize| match &actions[index] {
         Object::Dictionary(dict) => dict,
@@ -469,10 +522,17 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
         Some(&Object::Name(b"NextPage".to_vec()))
     );
 
-    // -- /SE link preserved and still resolves to a live /StructElem --
-    let se_item = &roots[6];
+    // -- Raw /SE link preserved and still resolves to a live /StructElem --
+    let se_item = &tree[roots[6]];
     assert_eq!(se_item.title, "WithSE");
-    let se_ref = se_item.se.expect("/SE must survive the round trip");
+    let se_ref = match dict_value(
+        &mut reopened,
+        se_item.source_ref.expect("fixture item is indirect"),
+        "SE",
+    ) {
+        Object::Reference(reference) => reference,
+        other => panic!("/SE must remain an indirect reference, got {other:?}"),
+    };
     match reopened.resolve(se_ref).unwrap() {
         Object::Dictionary(dict) => {
             assert_eq!(
@@ -483,20 +543,15 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
         other => panic!("/SE target must still be a /StructElem dict, got {other:?}"),
     }
 
-    // -- Both named-destination sources preserved independently --
-    let legacy = reopened.outline().legacy_dests().unwrap();
-    let modern = reopened.outline().name_tree_dests().unwrap();
-    assert_eq!(legacy.len(), 1);
-    assert_eq!(legacy[0].0, b"combined_legacy");
+    // -- Both raw named-destination sources preserved independently --
+    let catalog_ref = reopened.root_ref().unwrap();
     assert_eq!(
-        legacy[0].1.as_ref().unwrap().page(),
-        Some(ObjectRef::new(31, 0))
+        dict_value(&mut reopened, catalog_ref, "Dests"),
+        Object::Reference(ObjectRef::new(50, 0))
     );
-    assert_eq!(modern.len(), 1);
-    assert_eq!(modern[0].0, b"combined_modern");
     assert_eq!(
-        modern[0].1.as_ref().unwrap().page(),
-        Some(ObjectRef::new(32, 0))
+        dict_value(&mut reopened, catalog_ref, "Names"),
+        Object::Reference(ObjectRef::new(51, 0))
     );
 
     // -- /PageLabels preserved --
@@ -547,9 +602,7 @@ fn se_survives_pg_drop_pdf() -> Vec<u8> {
 /// garbage-collected (only page objects are, by the subsequent subset
 /// sweep). So the outline item's `/SE` reference is never left dangling by
 /// this pipeline alone: it still resolves to a live `/StructElem`, just one
-/// that no longer names a page. `prune_outline_se` (14.6) exists for callers
-/// that DO fully remove struct elements — which this built-in pipeline does
-/// not do — and is not invoked automatically by it.
+/// that no longer names a page. The raw outline `/SE` entry remains untouched.
 #[test]
 fn struct_elem_survives_page_rebuild_pg_drop_and_outline_se_still_resolves() {
     let mut pdf = Pdf::open(Cursor::new(se_survives_pg_drop_pdf())).unwrap();
@@ -559,10 +612,10 @@ fn struct_elem_survives_page_rebuild_pg_drop_and_outline_se_still_resolves() {
     remap_outline_and_dests(&mut pdf, &result).unwrap();
     drop_struct_elem_dangling_pg(&mut pdf, &result).unwrap();
 
-    let roots = pdf.outline().get_root().unwrap();
-    let se_ref = roots[0].se.expect(
-        "the outline /SE reference itself is untouched by this pipeline (no automatic prune)",
-    );
+    let se_ref = match dict_value(&mut pdf, ObjectRef::new(5, 0), "SE") {
+        Object::Reference(reference) => reference,
+        other => panic!("the raw outline /SE reference must survive, got {other:?}"),
+    };
     assert_eq!(se_ref, ObjectRef::new(20, 0));
 
     match pdf.resolve(se_ref).unwrap() {
