@@ -9,9 +9,9 @@ use crate::security::standard::{
     check_user_password_v4, decrypt_cipher_bytes, decrypt_strings_in_object, per_object_key,
     ObjectKeyAlg, StandardHandlerInputs, StandardHandlerR5Inputs, StringCipher,
 };
+use crate::xref::load_xref_state_with_repair;
 use crate::{
-    load_xref_and_trailer, load_xref_and_trailer_with_repair, Diagnostic, Diagnostics, Dictionary,
-    Error, Object, ObjectRef, Result, XrefForm, XrefOffset,
+    Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, Result, XrefForm, XrefOffset,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -79,6 +79,11 @@ pub struct Pdf<R: Read + Seek> {
     /// Kept outside the public cache so superseded/free streams remain visible
     /// only through qpdf's raw object view.
     qpdf_parsed_xref_streams: BTreeMap<ObjectRef, Object>,
+    /// Objects removed through [`Self::delete_object`]. qpdf's object cache
+    /// removal is persistent across repeated JSON preparation; keep this
+    /// separate from immutable source/trailer discovery so those seeds cannot
+    /// resurrect an explicitly removed reference.
+    qpdf_removed_refs: BTreeSet<ObjectRef>,
     /// Monotonic observation matching qpdf's `everCalledGetAllPages()`.
     ever_called_get_all_pages: bool,
     encryption: Option<EncryptionState>,
@@ -506,11 +511,8 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     fn open_with_repair_mode(mut reader: R, options: PdfOpenOptions) -> Result<Self> {
-        let loaded = if options.repair {
-            load_xref_and_trailer_with_repair(&mut reader, options.repair)?
-        } else {
-            load_xref_and_trailer(&mut reader)?
-        };
+        let loaded_state = load_xref_state_with_repair(&mut reader, options.repair)?;
+        let loaded = loaded_state.loaded;
         let source_xref_entries = loaded.entries.clone();
         let source_xref_offsets = loaded
             .entries
@@ -562,8 +564,9 @@ impl<R: Read + Seek> Pdf<R> {
             source_xref_entries,
             dirty_object_refs: BTreeSet::new(),
             qpdf_dangling_refs: BTreeSet::new(),
-            qpdf_trailer_references: loaded.trailer_references,
-            qpdf_parsed_xref_streams: loaded.parsed_xref_streams,
+            qpdf_trailer_references: loaded_state.trailer_references,
+            qpdf_parsed_xref_streams: loaded_state.parsed_xref_streams,
+            qpdf_removed_refs: BTreeSet::new(),
             ever_called_get_all_pages: false,
             encryption: None,
         };
@@ -871,6 +874,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// [`crate::write_pdf`] will see the updated value when it walks the cache and emit
     /// a new revision for the touched object.
     pub fn set_object(&mut self, object_ref: ObjectRef, object: Object) {
+        self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         if let Some(CacheEntry::Compressed { stream, index }) =
@@ -888,6 +892,9 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub fn delete_object(&mut self, object_ref: ObjectRef) {
+        if object_ref.number != 0 {
+            self.qpdf_removed_refs.insert(object_ref);
+        }
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         if object_ref.number == 0
@@ -995,7 +1002,10 @@ impl<R: Read + Seek> Pdf<R> {
         }
 
         for object_ref in discovered {
-            if object_ref.number == 0 || object_ref.generation == u16::MAX {
+            if object_ref.number == 0
+                || object_ref.generation == u16::MAX
+                || self.qpdf_removed_refs.contains(&object_ref)
+            {
                 continue;
             }
             let has_live_target = matches!(
@@ -1016,6 +1026,7 @@ impl<R: Read + Seek> Pdf<R> {
 
         let mut refs = self.live_object_refs();
         refs.extend(self.qpdf_dangling_refs.iter().copied());
+        refs.retain(|object_ref| !self.qpdf_removed_refs.contains(object_ref));
         refs.sort_unstable();
         refs.dedup();
         let max_object_id = refs

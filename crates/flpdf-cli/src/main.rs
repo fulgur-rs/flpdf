@@ -17,7 +17,7 @@ use flpdf::{
     generate_choice_field_appearance, generate_text_field_appearance,
     json_inspect::{
         build_qpdf_json_v2_selected_objects_with_options, format_json_side_file_path,
-        stream_payload_for_decode_level, DecodeLevel, JsonKey, JsonObjectSelector,
+        qpdf_raw_stream_payload, DecodeLevel, JsonKey, JsonObjectSelector,
         StreamDataMode as JsonStreamDataMode,
     },
     linearization::{
@@ -1912,6 +1912,7 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     // written below — the two must agree, so they share this single value.
     let decode_level = DecodeLevel::Generalized;
     let diagnostics_start = pdf.repair_diagnostics().entries().len();
+    let had_open_warnings = diagnostics_start > 0;
     let v2 = match build_qpdf_json_v2_selected_objects_with_options(
         &mut pdf,
         decode_level,
@@ -1961,8 +1962,7 @@ fn run_json(cli: &Cli) -> CliResult<()> {
             // the input here would risk the file being swapped mid-run, so the
             // JSON body and the side files could capture different snapshots.
             for oref in wanted_refs {
-                let obj = pdf.resolve_borrowed(oref)?;
-                let Object::Stream(stream) = obj else {
+                let Some(payload) = qpdf_raw_stream_payload(&mut pdf, oref, decode_level)? else {
                     continue; // cov:ignore: collector only returns entries with stream.datafile
                 };
                 // Side-file name must match the JSON `datafile` value;
@@ -1970,8 +1970,7 @@ fn run_json(cli: &Cli) -> CliResult<()> {
                 let side_path = format_json_side_file_path(prefix, oref.number);
                 // Apply the same DecodeLevel the JSON body was built with so
                 // the side file matches what inline mode would emit.
-                let payload = stream_payload_for_decode_level(stream, decode_level);
-                std::fs::write(&side_path, &*payload)?;
+                std::fs::write(&side_path, payload)?;
             }
         }
         Ok(())
@@ -1981,10 +1980,10 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         return Err(error);
     }
 
-    // qpdf reports processing warnings after successful JSON output and exits
-    // 3. The snapshot was taken after open-time warnings were emitted, so this
-    // range contains only diagnostics added while building/writing this JSON.
-    if pdf.repair_diagnostics().entries().len() > diagnostics_start {
+    // qpdf exits 3 after successful JSON output when either opening or later
+    // processing warned. Open-time warnings were already emitted by
+    // `open_pdf`; only emit the post-snapshot range here, then one summary.
+    if had_open_warnings || pdf.repair_diagnostics().entries().len() > diagnostics_start {
         emit_warnings_since(input, &pdf, diagnostics_start);
         eprintln!("{}: operation succeeded with warnings", progname());
         return Err(Box::new(CliExitError {

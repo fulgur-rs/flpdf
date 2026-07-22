@@ -449,6 +449,26 @@ fn qpdf_resolve_top_level_object<R: Read + Seek>(
     }
 }
 
+/// Return the qpdf JSON payload for a selected top-level stream object.
+///
+/// Unlike [`Pdf::resolve`](crate::Pdf::resolve), this intentionally uses the
+/// qpdf JSON object-cache view, which can retain a historical xref stream that
+/// a newer xref section has freed. The owned return value keeps that internal
+/// resolver and its cache semantics out of the public API while allowing the
+/// CLI to write exactly the bytes named by a generated `datafile` entry.
+pub fn qpdf_raw_stream_payload<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object_ref: ObjectRef,
+    decode_level: DecodeLevel,
+) -> Result<Option<Vec<u8>>, ConvertError> {
+    let Object::Stream(stream) = qpdf_resolve_top_level_object(pdf, object_ref)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        stream_payload_for_decode_level(&stream, decode_level).into_owned(),
+    ))
+}
+
 /// Convert a stream's dict to a JSON stream-shape object: `{ "stream": { "dict": ... } }`.
 fn stream_to_json(stream: &Stream) -> Result<JsonValue, ConvertError> {
     let dict_json = dict_to_json(&stream.dict)?;
@@ -4918,6 +4938,30 @@ mod tests {
     }
 
     #[test]
+    fn qpdf_raw_stream_payload_uses_historical_view_and_rejects_non_streams() {
+        let mut pdf = crate::Pdf::open_mem_owned(historical_xref_stream_trailer_pdf())
+            .expect("open mixed xref fixture");
+
+        let payload = qpdf_raw_stream_payload(
+            &mut pdf,
+            crate::ObjectRef::new(4, 0),
+            DecodeLevel::Generalized,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(payload.len(), 35);
+        assert_eq!(
+            qpdf_raw_stream_payload(
+                &mut pdf,
+                crate::ObjectRef::new(99, 0),
+                DecodeLevel::Generalized,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn qpdf_preparation_keeps_old_xref_streams_freed_at_the_same_generation() {
         let mut pdf =
             crate::Pdf::open_mem_owned(historical_xref_stream_trailer_pdf_with_free_generation(0))
@@ -4974,6 +5018,69 @@ mod tests {
                 qpdf_resolve_top_level_object(&mut pdf, stream_ref).unwrap(),
                 crate::Object::Null
             );
+        }
+    }
+
+    #[test]
+    fn qpdf_removed_refs_stay_removed_across_repeated_preparation_until_set() {
+        let cases = [
+            (
+                historical_xref_stream_trailer_pdf(),
+                crate::ObjectRef::new(4, 0),
+            ),
+            (
+                historical_xref_stream_trailer_pdf(),
+                crate::ObjectRef::new(99, 0),
+            ),
+        ];
+
+        for (bytes, removed) in cases {
+            let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("open historical fixture");
+            assert!(pdf
+                .prepare_qpdf_json_objects()
+                .unwrap()
+                .refs
+                .contains(&removed));
+
+            pdf.delete_object(removed);
+            for _ in 0..2 {
+                assert!(!pdf
+                    .prepare_qpdf_json_objects()
+                    .unwrap()
+                    .refs
+                    .contains(&removed));
+            }
+
+            pdf.set_object(removed, crate::Object::Name(b"Restored".to_vec()));
+            assert!(pdf
+                .prepare_qpdf_json_objects()
+                .unwrap()
+                .refs
+                .contains(&removed));
+            assert_eq!(
+                qpdf_resolve_top_level_object(&mut pdf, removed).unwrap(),
+                crate::Object::Name(b"Restored".to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn qpdf_removed_body_discovery_does_not_resurrect_a_missing_ref() {
+        let mut pdf = load_fixture_pdf("dangling-body-one-page.pdf");
+        let removed = crate::ObjectRef::new(99, 0);
+        assert!(pdf
+            .prepare_qpdf_json_objects()
+            .unwrap()
+            .refs
+            .contains(&removed));
+
+        pdf.delete_object(removed);
+        for _ in 0..2 {
+            assert!(!pdf
+                .prepare_qpdf_json_objects()
+                .unwrap()
+                .refs
+                .contains(&removed));
         }
     }
 

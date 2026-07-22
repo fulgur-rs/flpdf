@@ -1654,6 +1654,109 @@ fn json_qpdf_preparation_discovers_refs_from_a_freed_historical_xref_stream() {
 }
 
 #[test]
+fn json_file_mode_writes_selected_historical_xref_stream_bytes_only() {
+    for free_generation in [0, 1] {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        fixture
+            .write_all(&historical_xref_stream_json_pdf_with_free_generation(
+                free_generation,
+            ))
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = temp.path().join(format!("stream-{free_generation}"));
+        let output = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args([
+                "--json=2",
+                "--json-key=qpdf",
+                "--json-object=4,0",
+                "--json-stream-data=file",
+                "--json-stream-prefix",
+            ])
+            .arg(&prefix)
+            .arg(fixture.path())
+            .output()
+            .unwrap();
+
+        assert!(output.status.success(), "generation {free_generation}");
+        assert!(output.stderr.is_empty(), "generation {free_generation}");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let side_path = format!("{}-4", prefix.display());
+        assert_eq!(
+            json["qpdf"][1]["obj:4 0 R"]["stream"]["datafile"],
+            side_path
+        );
+        assert_eq!(std::fs::read(&side_path).unwrap().len(), 35);
+
+        let unselected_prefix = temp.path().join(format!("unselected-{free_generation}"));
+        let unselected = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args([
+                "--json=2",
+                "--json-key=pages",
+                "--json-stream-data=file",
+                "--json-stream-prefix",
+            ])
+            .arg(&unselected_prefix)
+            .arg(fixture.path())
+            .output()
+            .unwrap();
+        assert!(unselected.status.success());
+        assert!(!std::path::Path::new(&format!("{}-4", unselected_prefix.display())).exists());
+    }
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 historical xref stream datafile oracle"]
+fn live_qpdf_historical_xref_stream_file_payload_matches() {
+    for free_generation in [0, 1] {
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        fixture
+            .write_all(&historical_xref_stream_json_pdf_with_free_generation(
+                free_generation,
+            ))
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = temp.path().join("stream");
+        let args = [
+            "--json=2",
+            "--json-key=qpdf",
+            "--json-object=4,0",
+            "--json-stream-data=file",
+        ];
+        let prefix_arg = format!("--json-stream-prefix={}", prefix.display());
+        let qpdf = std::process::Command::new("qpdf")
+            .args(args)
+            .arg(&prefix_arg)
+            .arg(fixture.path())
+            .output()
+            .unwrap();
+        let side_path = format!("{}-4", prefix.display());
+        let qpdf_payload = std::fs::read(&side_path).unwrap();
+        std::fs::remove_file(&side_path).unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(args)
+            .arg(&prefix_arg)
+            .arg(fixture.path())
+            .env("FLPDF_PROGNAME", "qpdf")
+            .output()
+            .unwrap();
+        let flpdf_payload = std::fs::read(&side_path).unwrap();
+
+        assert_eq!(flpdf.status.code(), qpdf.status.code());
+        assert_eq!(flpdf.stderr, qpdf.stderr);
+        assert_eq!(flpdf_payload, qpdf_payload);
+        let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout).unwrap();
+        let flpdf_json: serde_json::Value = serde_json::from_slice(&flpdf.stdout).unwrap();
+        assert_eq!(
+            flpdf_json["qpdf"][1]["obj:4 0 R"]["stream"]["datafile"],
+            qpdf_json["qpdf"][1]["obj:4 0 R"]["stream"]["datafile"]
+        );
+    }
+}
+
+#[test]
 fn json_qpdf_preparation_prefers_a_live_reuse_of_an_xref_stream_ref() {
     let mut fixture = tempfile::NamedTempFile::new().unwrap();
     fixture
@@ -1718,7 +1821,10 @@ fn json_qpdf_preparation_keeps_historical_refs_when_repair_stops_a_prev_cycle() 
         .arg(fixture.path())
         .output()
         .unwrap();
-    assert!(matches!(repaired.status.code(), Some(0 | 3)));
+    assert_eq!(repaired.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&repaired.stderr);
+    assert_eq!(stderr.matches("WARNING:").count(), 3, "{stderr}");
+    assert!(stderr.ends_with("flpdf: operation succeeded with warnings\n"));
     let json: serde_json::Value = serde_json::from_slice(&repaired.stdout).unwrap();
     assert_eq!(json_qpdf_metadata(&json)["maxobjectid"], 99);
     assert_eq!(
@@ -1726,6 +1832,56 @@ fn json_qpdf_preparation_keeps_historical_refs_when_repair_stops_a_prev_cycle() 
         serde_json::json!({"value": null})
     );
     assert!(json["qpdf"][1]["trailer"]["value"].get("/Info").is_none());
+}
+
+#[test]
+fn json_repair_preserves_refs_and_xref_stream_after_a_late_malformed_prev() {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    fixture
+        .write_all(&malformed_late_prev_after_valid_sections_json_pdf())
+        .unwrap();
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--repair", "--json=2", "--json-key=qpdf"])
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("WARNING:").count(), 3, "{stderr}");
+    assert!(stderr.ends_with("flpdf: operation succeeded with warnings\n"));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let objects = json["qpdf"][1].as_object().unwrap();
+    for key in ["obj:99 0 R", "obj:88 4 R", "obj:70 3 R", "obj:50 2 R"] {
+        assert!(objects.contains_key(key), "missing {key}: {json}");
+    }
+    assert_eq!(objects["obj:4 0 R"]["stream"]["dict"]["/Type"], "/XRef");
+}
+
+#[test]
+fn json_open_warnings_precede_fatal_output_error_without_success_summary() {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    fixture
+        .write_all(&malformed_late_prev_after_valid_sections_json_pdf())
+        .unwrap();
+    let output_directory = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--repair", "--json=2", "--json-key=qpdf", "--json-output"])
+        .arg(output_directory.path())
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("WARNING:").count(), 3, "{stderr}");
+    let last_warning = stderr.rfind("WARNING:").unwrap();
+    let fatal = stderr.rfind("flpdf:").unwrap();
+    assert!(last_warning < fatal, "{stderr}");
+    assert!(!stderr.contains("operation succeeded with warnings"));
 }
 
 #[test]
@@ -1811,8 +1967,39 @@ fn live_qpdf_prev_cycle_historical_trailer_json_matches() {
         .unwrap()
         .args(["--repair", "--json=2", "--json-key=qpdf"])
         .arg(fixture.path())
+        .env("FLPDF_PROGNAME", "qpdf")
         .output()
         .unwrap();
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout).unwrap();
+    let flpdf_json: serde_json::Value = serde_json::from_slice(&flpdf.stdout).unwrap();
+    assert_eq!(flpdf_json["qpdf"], qpdf_json["qpdf"]);
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 malformed late /Prev repair oracle"]
+fn live_qpdf_malformed_late_prev_json_matches() {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    fixture
+        .write_all(&malformed_late_prev_after_valid_sections_json_pdf())
+        .unwrap();
+    let args = ["--json=2", "--json-key=qpdf"];
+    let qpdf = std::process::Command::new("qpdf")
+        .args(args)
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--repair", "--json=2", "--json-key=qpdf"])
+        .arg(fixture.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stderr, qpdf.stderr);
     let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout).unwrap();
     let flpdf_json: serde_json::Value = serde_json::from_slice(&flpdf.stdout).unwrap();
     assert_eq!(flpdf_json["qpdf"], qpdf_json["qpdf"]);
@@ -3095,7 +3282,11 @@ fn multigeneration_historical_trailer_json_pdf() -> Vec<u8> {
     bytes
 }
 
-fn historical_xref_stream_json_pdf_with_free_generation(free_generation: u16) -> Vec<u8> {
+fn historical_xref_stream_json_pdf_with_options(
+    free_generation: u16,
+    previous: Option<u64>,
+    latest_trailer_extra: &str,
+) -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
     for (number, body) in [
@@ -3119,9 +3310,10 @@ fn historical_xref_stream_json_pdf_with_free_generation(free_generation: u16) ->
         entries.extend_from_slice(&offset.to_be_bytes());
         entries.extend_from_slice(&generation.to_be_bytes());
     }
+    let prev = previous.map_or_else(String::new, |offset| format!("/Prev {offset} "));
     bytes.extend_from_slice(
         format!(
-            "4 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /Info 99 0 R /Gen 88 4 R /W [1 4 2] /Index [0 5] /Length {} >>\nstream\n",
+            "4 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /Info 99 0 R /Gen 88 4 R {prev}/W [1 4 2] /Index [0 5] /Length {} >>\nstream\n",
             entries.len()
         )
         .as_bytes(),
@@ -3135,8 +3327,26 @@ fn historical_xref_stream_json_pdf_with_free_generation(free_generation: u16) ->
         &[(5, 0, "null")],
         &[(4, free_generation)],
         6,
-        "",
+        latest_trailer_extra,
         u64::from(xref_stream_offset),
+    );
+    bytes
+}
+
+fn historical_xref_stream_json_pdf_with_free_generation(free_generation: u16) -> Vec<u8> {
+    historical_xref_stream_json_pdf_with_options(free_generation, None, "")
+}
+
+fn malformed_late_prev_after_valid_sections_json_pdf() -> Vec<u8> {
+    let mut bytes = historical_xref_stream_json_pdf_with_options(1, Some(9), "/Middle 70 3 R");
+    let middle = incremental_last_startxref(&bytes);
+    append_json_classic_increment(
+        &mut bytes,
+        &[(6, 0, "null")],
+        &[],
+        7,
+        "/Newest 50 2 R",
+        middle,
     );
     bytes
 }

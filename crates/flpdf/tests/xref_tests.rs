@@ -1,10 +1,25 @@
 use flpdf::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
-    Error, ObjectRef, XrefForm, XrefOffset,
+    Diagnostics, Dictionary, Error, LoadedXref, ObjectRef, XrefForm, XrefOffset,
 };
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Cursor;
+
+#[test]
+fn loaded_xref_remains_constructible_with_original_public_fields() {
+    let loaded = LoadedXref {
+        version: "1.7".to_string(),
+        startxref: 110,
+        entries: BTreeMap::new(),
+        trailer: Dictionary::new(),
+        last_xref_form: XrefForm::Table,
+        repair_diagnostics: Diagnostics::default(),
+    };
+
+    assert_eq!(loaded.version, "1.7");
+}
 
 #[test]
 fn loads_xref_table_and_trailer() {
@@ -1067,7 +1082,7 @@ fn with_repair_appends_diagnostic_when_stream_parse_succeeds() {
 }
 
 /// A `/Prev` chain that points back at itself is a circular reference: strict
-/// mode must reject it with "xref /Prev is circular", while best-effort must
+/// mode must reject it with qpdf's loop diagnostic, while best-effort must
 /// stop following the chain and return `Ok` with the entries seen so far.
 #[test]
 fn circular_prev_recovers_with_repair_and_rejected_strict() {
@@ -1093,7 +1108,10 @@ fn circular_prev_recovers_with_repair_and_rejected_strict() {
     let err = load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
         .expect_err("circular /Prev should fail strict parse");
     let message = format!("{err}");
-    assert!(message.contains("xref /Prev is circular"), "got {message}");
+    assert!(
+        message.contains("loop detected following xref tables"),
+        "got {message}"
+    );
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 
     // Best-effort stops following the cycle and returns the entries it has.
@@ -1259,8 +1277,7 @@ fn pdf_with_xref_object(xref_obj: &[u8]) -> Vec<u8> {
 
 /// `parse_xref_stream`: when `startxref` points at an indirect object that
 /// parses as a plain dictionary rather than a `stream`, the non-`Object::Stream`
-/// arm returns `Error::Unsupported("xref stream expected an indirect object
-/// stream")`.
+/// arm returns qpdf's `xref not found` parse error.
 #[test]
 fn rejects_xref_stream_non_stream_object() {
     // A dictionary indirect object (no `stream`/`endstream`) at the xref offset.
@@ -1270,11 +1287,8 @@ fn rejects_xref_stream_non_stream_object() {
     let err = load_xref_and_trailer(&mut Cursor::new(bytes))
         .expect_err("non-stream xref object should fail strict parse");
     let message = format!("{err}");
-    assert!(
-        message.contains("xref stream expected an indirect object stream"),
-        "got {message}"
-    );
-    assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    assert!(message.contains("xref not found"), "got {message}");
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 }
 
 /// `parse_xref_widths`: a `/W` whose value is not an array (here an integer)
