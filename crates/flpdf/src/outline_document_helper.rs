@@ -107,12 +107,16 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Some(cursor) = OutlineCursor::from_object(outlines) else {
             return Ok(false);
         };
-        let resolved = self.resolve_cursor(&cursor)?;
-        Ok(matches!(
-            resolved,
-            Object::Dictionary(ref dict)
-                if !matches!(dict.get("First"), None | Some(Object::Null))
-        ))
+        let Object::Dictionary(dict) = self.resolve_cursor(&cursor)? else {
+            return Ok(false);
+        };
+        let Some(first) = dict.get("First").cloned() else {
+            return Ok(false);
+        };
+        let Some(first_cursor) = OutlineCursor::from_object(first) else {
+            return Ok(false);
+        };
+        Ok(!matches!(self.resolve_cursor(&first_cursor)?, Object::Null))
     }
 
     fn resolve_cursor(&mut self, cursor: &OutlineCursor) -> Result<Object> {
@@ -165,7 +169,10 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 }
             }
 
-            let id = self.build_item(cursor, 1, None, &mut tree, &mut constructor_seen)?;
+            let Some(id) = self.build_item(cursor, 1, None, &mut tree, &mut constructor_seen)?
+            else {
+                break;
+            };
             tree.roots.push(id);
             let Some(next) = OutlineCursor::from_object(object_key(&tree[id].object, "Next"))
             else {
@@ -186,11 +193,15 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         parent: Option<OutlineId>,
         tree: &mut OutlineTree,
         constructor_seen: &mut BTreeSet<ObjectRef>,
-    ) -> Result<OutlineId> {
+    ) -> Result<Option<OutlineId>> {
         self.check_temporary_depth(depth, &cursor)?;
-        let (root, expand_root) = self.materialize_item(cursor, parent, tree, constructor_seen)?;
+        let Some((root, expand_root)) =
+            self.materialize_item(cursor, parent, tree, constructor_seen)?
+        else {
+            return Ok(None);
+        };
         if !expand_root {
-            return Ok(root);
+            return Ok(Some(root));
         };
 
         struct Frame {
@@ -220,8 +231,11 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 (frame.owner, frame.depth)
             };
             self.check_temporary_depth(child_depth, &cursor)?;
-            let (child, expand_child) =
-                self.materialize_item(cursor, Some(owner), tree, constructor_seen)?;
+            let Some((child, expand_child)) =
+                self.materialize_item(cursor, Some(owner), tree, constructor_seen)?
+            else {
+                continue;
+            };
             tree.items[owner.0].kids.push(child);
 
             // qpdf advances the parent's raw child `/Next` chain even when the
@@ -243,7 +257,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             }
         }
 
-        Ok(root)
+        Ok(Some(root))
     }
 
     fn materialize_item(
@@ -252,9 +266,12 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         parent: Option<OutlineId>,
         tree: &mut OutlineTree,
         constructor_seen: &mut BTreeSet<ObjectRef>,
-    ) -> Result<(OutlineId, bool)> {
+    ) -> Result<Option<(OutlineId, bool)>> {
         let source_ref = cursor.source_ref();
         let object = self.resolve_cursor(&cursor)?;
+        if matches!(object, Object::Null) {
+            return Ok(None);
+        }
         let (title_src, count_src, dest_src, action_src) = match &object {
             Object::Dictionary(dict) => (
                 dict.get("Title").cloned(),
@@ -265,9 +282,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             _ => (None, None, None, None),
         };
         let title = resolve_title(self.pdf, title_src)?;
-        let count = resolve_int(self.pdf, count_src)?
-            .unwrap_or(0)
-            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        let count = resolve_int(self.pdf, count_src)?.unwrap_or(0) as i32;
         let dest = self.resolve_node_dest(dest_src.as_ref(), action_src.as_ref())?;
         let id = OutlineId(tree.items.len());
         tree.items.push(OutlineItem {
@@ -283,7 +298,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let expand = source_ref
             .map(|reference| constructor_seen.insert(reference))
             .unwrap_or(true);
-        Ok((id, expand))
+        Ok(Some((id, expand)))
     }
 
     fn check_temporary_depth(&self, depth: usize, cursor: &OutlineCursor) -> Result<()> {
@@ -478,16 +493,15 @@ fn resolve_terminal_object<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> R
 }
 
 /// Decode an outline `/Title`, resolving one level of indirection (review rule 2).
-/// qpdf yields an empty string when absent or not a (resolved) string.
+/// This keeps Task 1's temporary lossy-byte behavior until Task 4 adds the
+/// qpdf-compatible title oracle.
 fn resolve_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<String> {
     let resolved = match value {
         Some(Object::Reference(r)) => Some(pdf.resolve(r)?),
         other => other,
     };
     Ok(match resolved {
-        Some(Object::String(bytes)) => {
-            String::from_utf8_lossy(&crate::json_inspect::qpdf_utf8_value(&bytes)).into_owned()
-        }
+        Some(Object::String(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
         _ => String::new(),
     })
 }

@@ -101,6 +101,24 @@ fn has_outlines_false_when_absent() {
 }
 
 #[test]
+fn missing_or_non_dictionary_catalog_has_no_outline_tree() {
+    let mut missing_root = no_outline_pdf();
+    let marker = b"/Root 1 0 R";
+    let start = missing_root
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .unwrap();
+    missing_root[start + 1..start + 5].copy_from_slice(b"Info");
+
+    let non_dictionary_catalog = build_pdf(&[(1, "42")], 1);
+    for bytes in [missing_root, non_dictionary_catalog] {
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        assert!(!pdf.outline().has_outlines().unwrap());
+        assert!(pdf.outline().get_tree().unwrap().roots().is_empty());
+    }
+}
+
+#[test]
 fn has_outlines_false_when_outline_dict_has_no_first() {
     let mut pdf = Pdf::open(Cursor::new(outline_present_but_empty_pdf())).unwrap();
     assert!(!pdf.outline().has_outlines().unwrap());
@@ -191,6 +209,98 @@ fn non_dictionary_first_is_still_an_outline_item_with_default_accessors() {
     assert_eq!(tree[id].count, 0);
     assert_eq!(tree[id].dest, Object::Null);
     assert!(tree[id].kids.is_empty());
+}
+
+#[test]
+fn indirect_null_first_has_no_outlines_and_materializes_no_item() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "null"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert!(!pdf.outline().has_outlines().unwrap());
+    assert!(pdf.outline().get_tree().unwrap().roots().is_empty());
+}
+
+#[test]
+fn has_outlines_is_true_when_indirect_first_resolves_to_non_null_scalar() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "42"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert!(pdf.outline().has_outlines().unwrap());
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree[tree.roots()[0]].object, Object::Integer(42));
+}
+
+#[test]
+fn indirect_null_next_terminates_the_root_sibling_chain() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Title (A) /Next 6 0 R >>"),
+            (6, "null"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+
+    assert_eq!(tree.roots().len(), 1);
+    assert_eq!(tree[tree.roots()[0]].title, "A");
+}
+
+#[test]
+fn construction_resolves_a_bare_reference_item_exactly_once() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "6 0 R"),
+            (6, "<< /Title (Must not be followed) >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(5, 0)).unwrap(),
+        Object::Reference(ObjectRef::new(6, 0))
+    );
+    let tree = pdf.outline().get_tree().unwrap();
+    let item = &tree[tree.roots()[0]];
+    assert_eq!(tree.roots().len(), 1);
+    assert_eq!(item.source_ref, Some(ObjectRef::new(5, 0)));
+    assert_eq!(item.object, Object::Reference(ObjectRef::new(6, 0)));
+    assert_eq!(item.title, "");
 }
 
 #[test]
