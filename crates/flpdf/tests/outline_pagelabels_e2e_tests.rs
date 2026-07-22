@@ -132,31 +132,36 @@ fn deep_outline_round_trip_through_write_pdf() {
     let n = 150u32;
     let mut pdf = Pdf::open(Cursor::new(deep_outline_with_dests_pdf(n))).unwrap();
 
-    let before = pdf.outline().iter().unwrap().count();
+    let before_tree = pdf.outline().get_tree().unwrap();
+    let before = before_tree.preorder().count();
     assert_eq!(before, n as usize, "sanity: fixture has n levels");
 
     let mut out = Vec::new();
     write_pdf(&mut pdf, &mut out).unwrap();
 
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
-    let roots = reopened.outline().get_root().unwrap();
-    assert_eq!(roots.len(), 1, "single top-level root after round trip");
+    let tree = reopened.outline().get_tree().unwrap();
+    assert_eq!(
+        tree.roots().len(),
+        1,
+        "single top-level root after round trip"
+    );
 
     // Walk the single-child chain end to end, checking every level's title,
     // depth, and dest resolution survived the round trip intact.
     let mut depth = 0usize;
-    let mut node = &roots[0];
+    let mut id = tree.roots()[0];
     loop {
-        assert_eq!(node.depth, depth);
-        assert_eq!(node.title, format!("L{depth}"));
+        let item = &tree[id];
+        assert_eq!(item.title, format!("L{depth}"));
         assert_eq!(
-            node.dest_page(),
+            item.dest_page(),
             Object::Reference(ObjectRef::new(3, 0)),
             "level {depth} must keep its /Dest after the round trip"
         );
-        match node.children.first() {
-            Some(child) => {
-                node = child;
+        match item.kids.first() {
+            Some(&child) => {
+                id = child;
                 depth += 1;
             }
             None => break,
@@ -164,10 +169,8 @@ fn deep_outline_round_trip_through_write_pdf() {
     }
     assert_eq!(depth, (n - 1) as usize, "full depth must survive intact");
 
-    // `iter()` (the flattened preorder view) must also see every level after
-    // the round trip, not just the recursive `get_root()` tree.
-    let after_count = reopened.outline().iter().unwrap().count();
-    assert_eq!(after_count, n as usize, "iter() must see every level too");
+    let after_count = tree.preorder().count();
+    assert_eq!(after_count, n as usize, "preorder must see every level too");
 }
 
 // ---------------------------------------------------------------------------
@@ -412,9 +415,9 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
     let mut pdf = Pdf::open(Cursor::new(combined_e2e_pdf())).unwrap();
 
     // Sanity on the freshly opened document before the round trip.
-    let roots_before = pdf.outline().get_root().unwrap();
+    let tree_before = pdf.outline().get_tree().unwrap();
     assert_eq!(
-        roots_before.len(),
+        tree_before.roots().len(),
         7,
         "7 top-level siblings: deep chain root + 5 action items + /SE item"
     );
@@ -424,15 +427,17 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
 
     // -- Deep chain (20 levels) preserved --
-    let roots = reopened.outline().get_root().unwrap();
+    let tree = reopened.outline().get_tree().unwrap();
+    let roots = tree.roots();
     assert_eq!(roots.len(), 7);
     let mut depth = 0usize;
-    let mut node = &roots[0];
+    let mut id = roots[0];
     loop {
-        assert_eq!(node.title, format!("Deep{depth}"));
-        match node.children.first() {
-            Some(child) => {
-                node = child;
+        let item = &tree[id];
+        assert_eq!(item.title, format!("Deep{depth}"));
+        match item.kids.first() {
+            Some(&child) => {
+                id = child;
                 depth += 1;
             }
             None => break,
@@ -443,7 +448,12 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
     // -- All five raw action dictionaries preserved, in sibling order --
     let actions: Vec<Object> = roots[1..=5]
         .iter()
-        .map(|node| resolved_raw_action(&mut reopened, node.object_ref))
+        .map(|&id| {
+            resolved_raw_action(
+                &mut reopened,
+                tree[id].source_ref.expect("fixture item is indirect"),
+            )
+        })
         .collect();
     let action_dict = |index: usize| match &actions[index] {
         Object::Dictionary(dict) => dict,
@@ -480,9 +490,13 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
     );
 
     // -- Raw /SE link preserved and still resolves to a live /StructElem --
-    let se_item = &roots[6];
+    let se_item = &tree[roots[6]];
     assert_eq!(se_item.title, "WithSE");
-    let se_ref = match dict_value(&mut reopened, se_item.object_ref, "SE") {
+    let se_ref = match dict_value(
+        &mut reopened,
+        se_item.source_ref.expect("fixture item is indirect"),
+        "SE",
+    ) {
         Object::Reference(reference) => reference,
         other => panic!("/SE must remain an indirect reference, got {other:?}"),
     };

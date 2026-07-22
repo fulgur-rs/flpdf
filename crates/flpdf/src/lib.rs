@@ -194,9 +194,9 @@ pub use name_tree_dests::{
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use object_copy::copy_objects;
 pub use objr_obj_annot_p::drop_objr_obj_annot_dangling_p;
-pub use outline::OutlineItem;
+pub use outline::{OutlineId, OutlineItem, OutlineTree, OutlineTreeIter};
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
-pub use outline_document_helper::{OutlineDocumentHelper, OutlineNode};
+pub use outline_document_helper::OutlineDocumentHelper;
 pub use overlay::{
     apply_overlay_specs, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
     OverlayVerboseSource,

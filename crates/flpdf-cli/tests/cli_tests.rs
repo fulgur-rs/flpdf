@@ -1025,6 +1025,18 @@ fn show_outline_prints_titles() {
 }
 
 #[test]
+fn show_outline_warns_and_prints_empty_when_outline_resolution_fails() {
+    let fixture = fixture_with_unresolvable_outline();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--show-outline", fixture.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Warning:"))
+        .stdout(predicate::str::contains("Outline:\n  <empty>"));
+}
+
+#[test]
 fn show_fonts_prints_summary() {
     let fixture = fixture_with_metadata_outline_and_fonts();
 
@@ -1138,6 +1150,19 @@ fn fixture_with_metadata_outline_and_fonts() -> tempfile::NamedTempFile {
     let file = fixture.as_file_mut();
     file.write_all(&bytes).unwrap();
 
+    fixture
+}
+
+fn fixture_with_unresolvable_outline() -> tempfile::NamedTempFile {
+    let fixture = fixture_with_metadata_outline_and_fonts();
+    let mut bytes = std::fs::read(fixture.path()).unwrap();
+    let marker = b"3 0 obj\n<< /Type /Outlines";
+    let start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .unwrap();
+    bytes[start + b"3 0 obj\n".len()] = b'@';
+    std::fs::write(fixture.path(), bytes).unwrap();
     fixture
 }
 

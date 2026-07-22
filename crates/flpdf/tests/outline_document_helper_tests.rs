@@ -1,6 +1,6 @@
 //! Integration tests for [`flpdf::OutlineDocumentHelper`].
 
-use flpdf::{write_pdf, Object, ObjectRef, Pdf};
+use flpdf::{write_pdf, Object, ObjectRef, OutlineItem, Pdf};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
@@ -35,6 +35,11 @@ fn page_dest(page: u32) -> Object {
         Object::Reference(ObjectRef::new(page, 0)),
         Object::Name(b"Fit".to_vec()),
     ])
+}
+
+fn root_items(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<OutlineItem> {
+    let tree = pdf.outline().get_tree().unwrap();
+    tree.roots().iter().map(|&id| tree[id].clone()).collect()
 }
 
 /// Catalog + pages + a two-level outline:
@@ -102,65 +107,263 @@ fn has_outlines_false_when_outline_dict_has_no_first() {
 }
 
 #[test]
-fn get_root_materializes_tree_with_titles_counts_parents() {
+fn direct_outlines_first_and_next_are_materialized() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First << /Title (A) /Next << /Title (B) >> >> >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert!(pdf.outline().has_outlines().unwrap());
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree.roots().len(), 2);
+    assert_eq!(tree[tree.roots()[0]].source_ref, None);
+    assert_eq!(tree[tree.roots()[0]].title, "A");
+    assert_eq!(tree[tree.roots()[1]].source_ref, None);
+    assert_eq!(tree[tree.roots()[1]].title, "B");
+
+    // qpdf 11.9.0 `--json=2 --json-key=outlines` on
+    // `/tmp/direct-outline-fixture.pdf` reports two direct roots. The first raw
+    // `object` contains /Count, /Dest, /Next, and /Title, the second is only
+    // `{\"/Title\":\"u:Direct B\"}`, and neither is represented as `0 0 R`.
+}
+
+#[test]
+fn mixed_direct_and_indirect_items_keep_identity_and_parent_ids() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                5,
+                "<< /Title (Parent) /First << /Title (Direct child) /Next 6 0 R >> >>",
+            ),
+            (6, "<< /Title (Indirect child) >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    let parent = tree.roots()[0];
+    let direct = tree[parent].kids[0];
+    let indirect = tree[parent].kids[1];
+
+    assert_eq!(tree[parent].source_ref, Some(ObjectRef::new(5, 0)));
+    assert_eq!(tree[direct].source_ref, None);
+    assert_eq!(tree[indirect].source_ref, Some(ObjectRef::new(6, 0)));
+    assert_eq!(tree[direct].parent, Some(parent));
+    assert_eq!(tree[indirect].parent, Some(parent));
+}
+
+#[test]
+fn non_dictionary_first_is_still_an_outline_item_with_default_accessors() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 42 >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    let id = tree.roots()[0];
+
+    assert_eq!(tree[id].object, Object::Integer(42));
+    assert_eq!(tree[id].title, "");
+    assert_eq!(tree[id].count, 0);
+    assert_eq!(tree[id].dest, Object::Null);
+    assert!(tree[id].kids.is_empty());
+}
+
+#[test]
+fn top_level_indirect_next_cycle_stops_before_duplicate_root() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Title (A) /Next 6 0 R >>"),
+            (6, "<< /Title (B) /Next 5 0 R >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+
+    assert_eq!(tree.roots().len(), 2);
+    assert_eq!(tree[tree.roots()[0]].title, "A");
+    assert_eq!(tree[tree.roots()[1]].title, "B");
+}
+
+#[test]
+fn child_first_back_to_seen_indirect_ancestor_is_materialized_without_expansion() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Title (Ancestor) /First 5 0 R >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    let ancestor = tree.roots()[0];
+    let repeated = tree[ancestor].kids[0];
+
+    assert_eq!(tree[repeated].source_ref, Some(ObjectRef::new(5, 0)));
+    assert_eq!(tree[repeated].parent, Some(ancestor));
+    assert!(tree[repeated].kids.is_empty());
+}
+
+#[test]
+fn equal_direct_dictionary_values_in_separate_positions_are_materialized_twice() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                5,
+                "<< /Title (A) /First << /Title (Repeated) >> /Next 6 0 R >>",
+            ),
+            (6, "<< /Title (B) /First << /Title (Repeated) >> >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    let first = tree[tree.roots()[0]].kids[0];
+    let second = tree[tree.roots()[1]].kids[0];
+
+    assert_ne!(first, second);
+    assert_eq!(tree[first].source_ref, None);
+    assert_eq!(tree[second].source_ref, None);
+    assert_eq!(tree[first].object, tree[second].object);
+}
+
+#[test]
+fn get_tree_materializes_tree_with_titles_counts_parents() {
     let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    let roots = tree.roots();
 
     // Two top-level nodes: A, B.
     assert_eq!(roots.len(), 2);
-    assert_eq!(roots[0].title, "A");
-    assert_eq!(roots[0].depth, 0);
-    assert_eq!(roots[0].parent, None); // top-level: /Outlines dict is not an item -> None (qpdf getParent)
-    assert_eq!(roots[0].count, 1);
-    assert_eq!(roots[1].title, "B");
-    assert_eq!(roots[1].count, 2);
+    assert_eq!(tree[roots[0]].title, "A");
+    assert_eq!(tree[roots[0]].parent, None);
+    assert_eq!(tree[roots[0]].count, 1);
+    assert_eq!(tree[roots[1]].title, "B");
+    assert_eq!(tree[roots[1]].count, 2);
 
     // A has one child A1.
-    assert_eq!(roots[0].children.len(), 1);
-    let a1 = &roots[0].children[0];
-    assert_eq!(a1.title, "A1");
-    assert_eq!(a1.depth, 1);
-    assert_eq!(a1.parent, Some(ObjectRef::new(5, 0)));
-    assert_eq!(a1.count, 0); // /Count absent -> 0 (qpdf)
-    assert_eq!(a1.object_ref, ObjectRef::new(6, 0));
+    assert_eq!(tree[roots[0]].kids.len(), 1);
+    let a1 = tree[roots[0]].kids[0];
+    assert_eq!(tree[a1].title, "A1");
+    assert_eq!(tree[a1].parent, Some(roots[0]));
+    assert_eq!(tree[a1].count, 0); // /Count absent -> 0 (qpdf)
+    assert_eq!(tree[a1].source_ref, Some(ObjectRef::new(6, 0)));
 }
 
 #[test]
-fn get_root_empty_when_no_outline() {
+fn get_tree_empty_when_no_outline() {
     let mut pdf = Pdf::open(Cursor::new(no_outline_pdf())).unwrap();
-    assert!(pdf.outline().get_root().unwrap().is_empty());
+    assert!(pdf.outline().get_tree().unwrap().roots().is_empty());
 }
 
 #[test]
-fn iter_yields_preorder() {
+fn null_and_non_dictionary_outline_containers_are_empty() {
+    for outlines in ["null", "42", "<< >>", "<< /First null >>"] {
+        let catalog = format!("<< /Type /Catalog /Pages 2 0 R /Outlines {outlines} >>");
+        let bytes = build_pdf(
+            &[
+                (1, catalog.as_str()),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+            1,
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        assert!(!pdf.outline().has_outlines().unwrap(), "{outlines}");
+        assert!(
+            pdf.outline().get_tree().unwrap().roots().is_empty(),
+            "{outlines}"
+        );
+    }
+}
+
+#[test]
+fn indirect_item_seen_as_a_child_is_materialized_again_as_a_root_without_expansion() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Title (A) /First 6 0 R /Next 6 0 R >>"),
+            (6, "<< /Title (B) /First 7 0 R >>"),
+            (7, "<< /Title (C) >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+
+    assert_eq!(tree.roots().len(), 2);
+    let a = tree.roots()[0];
+    let b_as_child = tree[a].kids[0];
+    let b_as_root = tree.roots()[1];
+    assert_eq!(tree[b_as_child].source_ref, Some(ObjectRef::new(6, 0)));
+    assert_eq!(tree[b_as_child].kids.len(), 1);
+    assert_eq!(tree[b_as_root].source_ref, Some(ObjectRef::new(6, 0)));
+    assert!(tree[b_as_root].kids.is_empty());
+}
+
+#[test]
+fn preorder_yields_lossless_arena_items() {
     let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
-    let titles: Vec<String> = pdf.outline().iter().unwrap().map(|n| n.title).collect();
+    let tree = pdf.outline().get_tree().unwrap();
+    let titles: Vec<&str> = tree
+        .preorder()
+        .map(|(_depth, _id, item)| item.title.as_str())
+        .collect();
     assert_eq!(titles, vec!["A", "A1", "B"]); // pre-order: A, its child A1, then B
 
-    // iter() yields a flattened view: every node has its children cleared.
-    let mut pdf2 = Pdf::open(Cursor::new(outline_pdf())).unwrap();
-    assert!(pdf2
-        .outline()
-        .iter()
-        .unwrap()
-        .all(|n| n.children.is_empty()));
-}
-
-#[test]
-fn walk_visits_preorder_with_depth() {
-    let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
-    let mut seen: Vec<(String, usize, usize)> = Vec::new(); // (title, depth, child_count)
-    pdf.outline()
-        .walk(|node, depth| seen.push((node.title.clone(), depth, node.children.len())))
-        .unwrap();
-    assert_eq!(
-        seen,
-        vec![
-            ("A".to_string(), 0, 1), // A has one child (A1) — populated in walk
-            ("A1".to_string(), 1, 0),
-            ("B".to_string(), 0, 0),
-        ]
-    );
+    let seen: Vec<(&str, usize, usize)> = tree
+        .preorder()
+        .map(|(depth, _id, item)| (item.title.as_str(), depth, item.kids.len()))
+        .collect();
+    assert_eq!(seen, vec![("A", 1, 1), ("A1", 2, 0), ("B", 1, 0),]);
 }
 
 /// Build a linear chain of `n` nested outline items (each is the sole child of
@@ -201,88 +404,65 @@ fn deep_outline_pdf(n: u32) -> Vec<u8> {
 #[test]
 fn deep_outline_walks_to_full_depth() {
     let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(30))).unwrap();
-    let count = pdf.outline().iter().unwrap().count();
+    let tree = pdf.outline().get_tree().unwrap();
+    let count = tree.preorder().count();
     assert_eq!(count, 30);
-    // deepest node is at depth 29
-    let max_depth = pdf
-        .outline()
-        .iter()
-        .unwrap()
-        .map(|n| n.depth)
+    // The arena's public preorder depth is one-based.
+    let max_depth = tree
+        .preorder()
+        .map(|(depth, _id, _item)| depth)
         .max()
         .unwrap();
-    assert_eq!(max_depth, 29);
+    assert_eq!(max_depth, 30);
 }
 
 /// A 1000-level-deep outline (a straight chain, one child per level) walks to
-/// completion through the default (no explicit `max_depth`) API: `get_root`,
-/// `iter`, and `walk` all succeed and see every level.
+/// completion through the non-configurable `get_tree` API.
 #[test]
 fn deep_outline_walks_1000_levels_with_default_depth() {
     let n = 1000u32;
     let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
-    assert_eq!(roots.len(), 1);
-
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
-    let depths: Vec<usize> = pdf
-        .outline()
-        .iter()
-        .unwrap()
-        .map(|node| node.depth)
-        .collect();
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree.roots().len(), 1);
+    let depths: Vec<usize> = tree.preorder().map(|(depth, _id, _item)| depth).collect();
     assert_eq!(depths.len(), n as usize);
-    assert_eq!(*depths.last().unwrap(), (n - 1) as usize);
-
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
-    let mut visits = 0usize;
-    pdf.outline().walk(|_node, _depth| visits += 1).unwrap();
-    assert_eq!(visits, n as usize);
+    assert_eq!(*depths.last().unwrap(), n as usize);
 }
 
 /// A 3,000-level chain (comfortably above the epic acceptance criterion of
-/// 1,000) proves `get_root`/`iter`/`walk` scale past the old 100-level cap without
-/// overflowing on their iterative walk, and that the returned tree can then
-/// be inspected, dropped, and re-materialised without recursive-Clone or
-/// recursive-Drop pain.
+/// 1,000) proves the arena scales past the old 100-level cap without consuming
+/// a native call frame per outline level.
 #[test]
 fn deep_outline_iterative_walk_survives_three_thousand_levels() {
     let n = 3_000u32;
 
     let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
-    assert_eq!(roots.len(), 1);
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree.roots().len(), 1);
     // Walk down the single child chain to confirm the tree was built to the
     // full depth (not silently truncated).
-    let mut depth = 0;
-    let mut node = &roots[0];
-    loop {
-        assert_eq!(node.depth, depth);
-        match node.children.first() {
-            Some(child) => {
-                node = child;
-                depth += 1;
-            }
-            None => break,
-        }
+    let mut depth = 1;
+    let mut id = tree.roots()[0];
+    while let Some(&child) = tree[id].kids.first() {
+        id = child;
+        depth += 1;
     }
-    assert_eq!(depth, (n - 1) as usize);
+    assert_eq!(depth, n as usize);
+    assert_eq!(tree.preorder().count(), n as usize);
+    assert_eq!(tree.preorder().map(|entry| entry.0).max(), Some(n as usize));
+}
 
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
-    let count = pdf.outline().iter().unwrap().count();
-    assert_eq!(count, n as usize);
+#[test]
+fn private_temporary_depth_guard_reports_the_indirect_item() {
+    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(5_002))).unwrap();
+    let error = pdf.outline().get_tree().unwrap_err();
 
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
-    let mut visits = 0usize;
-    let mut max_seen_depth = 0usize;
-    pdf.outline()
-        .walk(|_node, depth| {
-            visits += 1;
-            max_seen_depth = max_seen_depth.max(depth);
-        })
-        .unwrap();
-    assert_eq!(visits, n as usize);
-    assert_eq!(max_seen_depth, (n - 1) as usize);
+    assert!(
+        error
+            .to_string()
+            .contains("outline depth exceeds temporary maximum of 5000 at 5005 0 R"),
+        "{error}"
+    );
 }
 
 /// Outline with a /Next cycle: 5 -> Next 6 -> Next 5 ...
@@ -303,7 +483,11 @@ fn cyclic_outline_pdf() -> Vec<u8> {
 #[test]
 fn cyclic_outline_terminates() {
     let mut pdf = Pdf::open(Cursor::new(cyclic_outline_pdf())).unwrap();
-    let titles: Vec<String> = pdf.outline().iter().unwrap().map(|n| n.title).collect();
+    let tree = pdf.outline().get_tree().unwrap();
+    let titles: Vec<&str> = tree
+        .preorder()
+        .map(|(_depth, _id, item)| item.title.as_str())
+        .collect();
     // Visits X and Y once each, then the cycle back to 5 is cut by `visited`.
     assert_eq!(titles, vec!["X", "Y"]);
 }
@@ -311,12 +495,16 @@ fn cyclic_outline_terminates() {
 #[test]
 fn dest_from_explicit_dest_array() {
     let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
-    let a1 = &roots[0].children[0]; // A1 has /Dest [3 0 R /Fit]
-    assert_eq!(a1.dest, page_dest(3));
-    assert_eq!(a1.dest_page(), Object::Reference(ObjectRef::new(3, 0)));
+    let tree = pdf.outline().get_tree().unwrap();
+    let roots = tree.roots();
+    let a1 = tree[roots[0]].kids[0]; // A1 has /Dest [3 0 R /Fit]
+    assert_eq!(tree[a1].dest, page_dest(3));
+    assert_eq!(
+        tree[a1].dest_page(),
+        Object::Reference(ObjectRef::new(3, 0))
+    );
     // Nodes without a destination have qpdf's null sentinel.
-    assert_eq!(roots[1].dest, Object::Null); // B
+    assert_eq!(tree[roots[1]].dest, Object::Null); // B
 }
 
 /// Outline item whose destination is a GoTo action: /A << /S /GoTo /D [3 0 R /Fit] >>.
@@ -339,7 +527,7 @@ fn action_dest_pdf() -> Vec<u8> {
 #[test]
 fn dest_from_goto_action() {
     let mut pdf = Pdf::open(Cursor::new(action_dest_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert_eq!(roots[0].dest, page_dest(3));
     assert_eq!(
         roots[0].dest_page(),
@@ -365,7 +553,7 @@ fn indirect_dest_pdf() -> Vec<u8> {
 #[test]
 fn dest_from_indirect_dest_reference() {
     let mut pdf = Pdf::open(Cursor::new(indirect_dest_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert_eq!(roots[0].dest, page_dest(3));
 }
 
@@ -388,7 +576,7 @@ fn cyclic_dest_pdf() -> Vec<u8> {
 #[test]
 fn cyclic_dest_preserves_dictionary_shape() {
     let mut pdf = Pdf::open(Cursor::new(cyclic_dest_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert!(matches!(roots[0].dest, Object::Dictionary(_)));
 }
 
@@ -415,7 +603,7 @@ fn named_dest_nametree_pdf() -> Vec<u8> {
 #[test]
 fn dest_from_named_nametree() {
     let mut pdf = Pdf::open(Cursor::new(named_dest_nametree_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert_eq!(roots[0].dest, page_dest(3));
 }
 
@@ -441,7 +629,7 @@ fn named_dest_legacy_pdf() -> Vec<u8> {
 #[test]
 fn dest_from_named_legacy() {
     let mut pdf = Pdf::open(Cursor::new(named_dest_legacy_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert!(matches!(roots[0].dest, Object::Dictionary(_)));
     assert_eq!(roots[0].dest_page(), Object::Null);
 }
@@ -468,7 +656,7 @@ fn cyclic_named_dest_pdf() -> Vec<u8> {
 #[test]
 fn cyclic_named_dest_preserves_first_alias() {
     let mut pdf = Pdf::open(Cursor::new(cyclic_named_dest_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert_eq!(roots[0].dest, Object::Name(b"b".to_vec()));
 }
 
@@ -496,7 +684,7 @@ fn named_dest_collision_pdf() -> Vec<u8> {
 #[test]
 fn named_dest_modern_wins_over_legacy() {
     let mut pdf = Pdf::open(Cursor::new(named_dest_collision_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     // Modern name-tree entry ([3 0 R ...]) wins over legacy /Dests ([2 0 R ...]).
     assert_eq!(roots[0].dest, page_dest(3));
 }
@@ -519,7 +707,7 @@ fn indirect_title_pdf() -> Vec<u8> {
 #[test]
 fn title_resolves_indirect_reference() {
     let mut pdf = Pdf::open(Cursor::new(indirect_title_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert_eq!(roots[0].title, "RealTitle");
 }
 
@@ -540,13 +728,11 @@ fn outline_first_not_a_dict_pdf() -> Vec<u8> {
 }
 
 #[test]
-fn get_root_non_dict_first_item_breaks_walk_gracefully() {
+fn get_tree_non_dict_first_item_materializes_raw_value() {
     let mut pdf = Pdf::open(Cursor::new(outline_first_not_a_dict_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
-    assert!(
-        roots.is_empty(),
-        "a non-dictionary outline item must be skipped, not produce a node"
-    );
+    let roots = root_items(&mut pdf);
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].object, Object::Integer(42));
 }
 
 // -----------------------------------------------------------------------
@@ -639,7 +825,7 @@ fn qpdf_destination_matrix_pdf() -> Vec<u8> {
 #[test]
 fn qpdf_destination_matrix_matches_raw_objects() {
     let mut pdf = Pdf::open(Cursor::new(qpdf_destination_matrix_pdf())).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert_eq!(roots[0].dest, Object::Null);
     assert_eq!(roots[1].dest, Object::Integer(42));
     assert_eq!(roots[2].dest, page_dest(3));
@@ -699,10 +885,7 @@ fn dest_key_presence_suppresses_valid_action_fallback() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    assert_eq!(
-        pdf.outline().get_root().unwrap()[0].dest,
-        Object::Integer(42)
-    );
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Integer(42));
 }
 
 #[test]
@@ -719,7 +902,7 @@ fn root_action_array_is_not_an_action_dictionary() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, Object::Null);
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
 }
 
 #[test]
@@ -748,7 +931,7 @@ fn candidate_type_selects_only_qpdf_named_destination_store() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    let roots = pdf.outline().get_root().unwrap();
+    let roots = root_items(&mut pdf);
     assert_eq!(roots[0].dest, page_dest(2));
     assert_eq!(roots[1].dest, page_dest(3));
 }
@@ -765,7 +948,7 @@ fn malformed_or_non_goto_actions_have_null_destination() {
         "(not a dictionary)",
     ] {
         let mut pdf = Pdf::open(Cursor::new(action_pdf(action))).unwrap();
-        assert_eq!(pdf.outline().get_root().unwrap()[0].dest, Object::Null);
+        assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
     }
 }
 
@@ -777,7 +960,7 @@ fn unresolved_dest_name_suppresses_action_fallback() {
         &[],
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, Object::Null);
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
 }
 
 #[test]
@@ -812,11 +995,7 @@ fn missing_named_candidate_store_paths_have_null_destination() {
     for (label, catalog_entries, item_entries, extra) in cases {
         let bytes = single_outline_with_catalog(catalog_entries, item_entries, &[extra]);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        assert_eq!(
-            pdf.outline().get_root().unwrap()[0].dest,
-            Object::Null,
-            "{label}"
-        );
+        assert_eq!(root_items(&mut pdf)[0].dest, Object::Null, "{label}");
     }
 }
 
@@ -828,7 +1007,7 @@ fn utf16_string_key_uses_qpdf_utf8_value() {
         &[(8, "<< /Names [<FEFF540D524D> [3 0 R /Fit]] >>")],
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, page_dest(3));
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
 }
 
 /// qpdf keeps bytes after an explicit UTF-8 BOM raw for both the outline
@@ -847,7 +1026,7 @@ fn malformed_explicit_utf8_named_dest_pdf() -> Vec<u8> {
 fn malformed_explicit_utf8_candidate_does_not_resolve_same_raw_key() {
     let mut pdf = Pdf::open(Cursor::new(malformed_explicit_utf8_named_dest_pdf())).unwrap();
     assert_eq!(
-        pdf.outline().get_root().unwrap()[0].dest,
+        root_items(&mut pdf)[0].dest,
         Object::Null,
         "candidate normalization must not create a match against the raw malformed stored key"
     );
@@ -885,7 +1064,7 @@ fn named_destination_preserves_dictionary_shape() {
         &[],
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    let node = &pdf.outline().get_root().unwrap()[0];
+    let node = root_items(&mut pdf).remove(0);
     assert!(matches!(node.dest, Object::Dictionary(_)));
     assert_eq!(node.dest_page(), Object::Null);
 }
@@ -894,7 +1073,7 @@ fn named_destination_preserves_dictionary_shape() {
 fn empty_destination_array_has_null_dest_page() {
     let bytes = single_outline_with_catalog("", "/Dest []", &[]);
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    let node = &pdf.outline().get_root().unwrap()[0];
+    let node = root_items(&mut pdf).remove(0);
     assert_eq!(node.dest, Object::Array(Vec::new()));
     assert_eq!(node.dest_page(), Object::Null);
 }
@@ -907,7 +1086,7 @@ fn named_destination_materializes_indirect_result_holder() {
         &[(8, "[3 0 R /Fit]")],
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, page_dest(3));
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
 }
 
 fn raw_action(pdf: &mut Pdf<Cursor<Vec<u8>>>, item_ref: ObjectRef) -> Object {
@@ -930,7 +1109,7 @@ fn resolved_raw_action(pdf: &mut Pdf<Cursor<Vec<u8>>>, item_ref: ObjectRef) -> O
 #[test]
 fn action_goto_direct_d_is_the_node_destination() {
     let mut pdf = Pdf::open(Cursor::new(action_pdf("<< /S /GoTo /D [3 0 R /Fit] >>"))).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, page_dest(3));
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
 }
 
 /// GoTo action whose `/D` is an INDIRECT reference (obj 8, using the ≥6
@@ -955,7 +1134,7 @@ fn action_goto_indirect_d_pdf() -> Vec<u8> {
 #[test]
 fn action_goto_indirect_d_is_the_node_destination() {
     let mut pdf = Pdf::open(Cursor::new(action_goto_indirect_d_pdf())).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, page_dest(3));
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
 }
 
 /// The outline item's `/A` itself is an INDIRECT reference (obj 9) to the
@@ -977,7 +1156,7 @@ fn action_indirect_a_pdf() -> Vec<u8> {
 #[test]
 fn action_indirect_a_contributes_the_node_destination() {
     let mut pdf = Pdf::open(Cursor::new(action_indirect_a_pdf())).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, page_dest(3));
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
 }
 
 /// Regression: `/A /S` stored as an indirect reference (obj 8) to a Name.
@@ -999,7 +1178,7 @@ fn resolve_node_dest_follows_indirect_s_name() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    let root = pdf.outline().get_root().unwrap();
+    let root = root_items(&mut pdf);
     assert_eq!(
         root[0].dest_page(),
         Object::Reference(ObjectRef::new(3, 0)),
@@ -1010,7 +1189,7 @@ fn resolve_node_dest_follows_indirect_s_name() {
 #[test]
 fn action_non_dict_value_has_null_destination() {
     let mut pdf = Pdf::open(Cursor::new(action_pdf("(not a dict)"))).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, Object::Null);
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
 }
 
 /// A non-standard action subtype (`/SubmitForm`) with arbitrary keys,
@@ -1075,12 +1254,9 @@ fn multi_action_pdf() -> Vec<u8> {
 #[test]
 fn action_round_trip_through_write_pdf_unmodified() {
     let mut pdf = Pdf::open(Cursor::new(multi_action_pdf())).unwrap();
-    let refs: Vec<ObjectRef> = pdf
-        .outline()
-        .get_root()
-        .unwrap()
+    let refs: Vec<ObjectRef> = root_items(&mut pdf)
         .into_iter()
-        .map(|node| node.object_ref)
+        .map(|item| item.source_ref.expect("fixture items are indirect"))
         .collect();
     let before: Vec<Object> = refs.iter().map(|&r| raw_action(&mut pdf, r)).collect();
     assert_eq!(refs.len(), 5, "sanity: fixture has 5 outline items");
@@ -1152,7 +1328,7 @@ fn action_goto_dest_remapped_to_first_occurrence_of_duplicated_page() {
     flpdf::remap_outline_and_dests(&mut pdf, &result).unwrap();
 
     assert_eq!(
-        pdf.outline().get_root().unwrap()[0].dest,
+        root_items(&mut pdf)[0].dest,
         Object::Array(vec![
             Object::Reference(first_new),
             Object::Name(b"Fit".to_vec()),
@@ -1205,7 +1381,7 @@ fn action_goto_named_dest_kept_verbatim_while_name_tree_remaps() {
         "the named GoTo action keeps the literal destination name"
     );
     assert_eq!(
-        pdf.outline().get_root().unwrap()[0].dest,
+        root_items(&mut pdf)[0].dest,
         Object::Array(vec![
             Object::Reference(new_p2),
             Object::Name(b"Fit".to_vec()),
@@ -1323,7 +1499,7 @@ fn outline_destination_resolves_through_multi_hop_action_holder_chain() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, page_dest(3));
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
 }
 
 #[test]
@@ -1342,7 +1518,7 @@ fn outline_action_null_d_has_null_destination() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, Object::Null);
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
 }
 
 /// qpdf ignores `/SD` when a GoTo action has no `/D`.
@@ -1362,5 +1538,5 @@ fn outline_action_sd_without_d_has_null_destination() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
-    assert_eq!(pdf.outline().get_root().unwrap()[0].dest, Object::Null);
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
 }

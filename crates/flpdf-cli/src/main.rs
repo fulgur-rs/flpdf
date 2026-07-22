@@ -24,7 +24,7 @@ use flpdf::{
         check_linearization_path, show_linearization_path, write_linearized,
         LinearizationCheckError, LinearizationPlan, RenumberMap, ShowLinearizationError,
     },
-    normalize_content_stream, outline, pages,
+    normalize_content_stream, pages,
     pages::coalesce_page_contents,
     parse_pdf_version, write_pdf_with_options, AnnotationObjectHelper, CompressStreams,
     CopyEncryptionSource, Dictionary, EncryptMethod, EncryptParams, FlattenMode,
@@ -4513,22 +4513,24 @@ fn run_show_outline(
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
 
-    let items = match outline::outline_items(&mut pdf) {
-        Ok(items) => items,
+    let tree = match pdf.outline().get_tree() {
+        Ok(tree) => tree,
         Err(error) => {
             eprintln!("Warning: {error}");
-            Vec::new()
+            println!("Outline:");
+            println!("  <empty>");
+            return Ok(());
         }
     };
 
     println!("Outline:");
-    if items.is_empty() {
+    if tree.roots().is_empty() {
         println!("  <empty>");
         return Ok(());
     }
 
-    for (index, item) in items.iter().enumerate() {
-        println!("{}{}: {}", "  ".repeat(item.depth), index + 1, item.title);
+    for (index, (depth, _id, item)) in tree.preorder().enumerate() {
+        println!("{}{}: {}", "  ".repeat(depth - 1), index + 1, item.title);
     }
     Ok(())
 }

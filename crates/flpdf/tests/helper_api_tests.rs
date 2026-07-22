@@ -379,18 +379,19 @@ fn outline_helper_walk_yields_preorder_titles_with_depth() {
 
     assert!(pdf.outline().has_outlines().unwrap());
 
-    let mut seen: Vec<(String, usize)> = Vec::new();
-    pdf.outline()
-        .walk(|node, depth| seen.push((node.title.clone(), depth)))
-        .unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    let seen: Vec<(String, usize)> = tree
+        .preorder()
+        .map(|(depth, _id, item)| (item.title.clone(), depth))
+        .collect();
 
     assert_eq!(
         seen,
         vec![
-            ("A".to_string(), 0),
-            ("A.1".to_string(), 1),
-            ("A.2".to_string(), 1),
-            ("B".to_string(), 0),
+            ("A".to_string(), 1),
+            ("A.1".to_string(), 2),
+            ("A.2".to_string(), 2),
+            ("B".to_string(), 1),
         ]
     );
 }
