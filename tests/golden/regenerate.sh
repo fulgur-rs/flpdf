@@ -2093,6 +2093,15 @@ qpdf --static-id --qdf --warning-exit-0 \
     "$REF/qdf-contents-ref-array/qdf-static-id.pdf"
 echo "qdf-contents-ref-array/qdf-static-id.pdf"
 
+# --- qdf-ignore-newline: a one-byte metadata stream whose payload does not
+# end in LF. qpdf adds stream framing, emits `%QDF: ignore_newline`, and keeps
+# the indirect length holder at the raw payload length (flpdf-tzgk). ---
+mkdir -p "$REF/qdf-ignore-newline"
+qpdf --static-id --qdf --warning-exit-0 \
+    "$FIX/qdf-ignore-newline.pdf" \
+    "$REF/qdf-ignore-newline/qdf-static-id.pdf"
+echo "qdf-ignore-newline/qdf-static-id.pdf"
+
 
 echo ""
 

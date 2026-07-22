@@ -1997,12 +1997,11 @@ fn non_qdf_exact_window_indirect_length_preserves_trailing_newline() {
     );
 }
 
-/// Same object bytes but the header carries `%QDF-1.0`: whole-file QDF
-/// detection keeps the strict `<` branch (endstream-scan / one-EOL trim) so
-/// QDF round-trip & idempotence stay byte-stable. The discriminator flips on
-/// the marker alone.
+/// Same object bytes but the header carries `%QDF-1.0`: qpdf's indirect
+/// holder still gives the authoritative logical payload length, so an exact
+/// endpoint keeps the trailing LF just as it does for an ordinary PDF.
 #[test]
-fn qdf_marker_keeps_endstream_scan_for_exact_window() {
+fn qdf_exact_window_indirect_length_preserves_trailing_newline() {
     let pdf = exact_window_indirect_length_pdf(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n");
     let mut pdf = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
     let Object::Stream(s) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
@@ -2010,18 +2009,16 @@ fn qdf_marker_keeps_endstream_scan_for_exact_window() {
     };
     assert_eq!(
         s.data,
-        b"ab",
-        "QDF-marked file must keep endstream-scan (one EOL trimmed) for the \
-         exact-window case, got {:?}",
+        b"ab\n",
+        "QDF exact-window indirect /Length must keep the trailing newline, got {:?}",
         String::from_utf8_lossy(&s.data)
     );
 }
 
-/// flpdf-9hc.28 (coderabbit #200): the %QDF-1.0 header sniff must survive a
-/// reader that returns short reads (1 byte at a time) — a single
-/// `Read::read` could otherwise split the marker and miss it.
+/// The exact-window indirect length path must also work through a reader that
+/// returns one byte at a time.
 #[test]
-fn qdf_marker_detected_through_short_reads() {
+fn qdf_exact_window_indirect_length_works_through_short_reads() {
     use std::io::{Read, Seek, SeekFrom};
 
     struct OneByteReader(std::io::Cursor<Vec<u8>>);
@@ -2044,11 +2041,10 @@ fn qdf_marker_detected_through_short_reads() {
     let Object::Stream(s) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
         panic!("object 1 must be a stream");
     };
-    // QDF detected despite 1-byte reads → strict `<` → endstream-scan trim.
     assert_eq!(
         s.data,
-        b"ab",
-        "QDF marker must be detected through short reads (got {:?})",
+        b"ab\n",
+        "QDF exact-window indirect /Length must survive short reads (got {:?})",
         String::from_utf8_lossy(&s.data)
     );
 }

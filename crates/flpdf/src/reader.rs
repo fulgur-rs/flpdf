@@ -41,12 +41,6 @@ static NULL_OBJECT: Object = Object::Null;
 pub struct Pdf<R: Read + Seek> {
     reader: R,
     version: String,
-    /// `true` when the file header carries the `%QDF-1.0` marker (qpdf/flpdf
-    /// QDF form). Used by [`resolve`](Self::resolve) to disambiguate the
-    /// exact-window indirect `/Length` case: QDF holders count the framing
-    /// EOL (keep the parser's endstream-scan to preserve round-trip), whereas
-    /// non-QDF holders are the spec content length.
-    is_qdf: bool,
     trailer: Dictionary,
     startxref: u64,
     last_xref_form: XrefForm,
@@ -535,24 +529,9 @@ impl<R: Read + Seek> Pdf<R> {
         sorted_object_offsets.sort_unstable();
         sorted_object_offsets.dedup();
         let cache = ObjectCache::from_offsets(&loaded.entries);
-        // Sniff the file header for the `%QDF-1.0` marker (flpdf-9hc.28). It
-        // sits within the first few lines (`%PDF-x.y`, binary marker,
-        // `%QDF-1.0`); 64 bytes is ample. Best-effort: any read error → false.
-        let is_qdf = {
-            // `Read::read` may return a short read (BufReader, pipes, …), so
-            // a single call could split `%QDF-1.0` across reads and miss it.
-            // `take(64).read_to_end` reads until 64 bytes or EOF regardless of
-            // chunking. Best-effort: any error → false.
-            let mut header = Vec::with_capacity(64);
-            if reader.seek(SeekFrom::Start(0)).is_ok() {
-                let _ = reader.by_ref().take(64).read_to_end(&mut header);
-            }
-            header.windows(b"%QDF-1.0".len()).any(|w| w == b"%QDF-1.0")
-        };
         let mut pdf = Self {
             reader,
             version: loaded.version,
-            is_qdf,
             trailer: loaded.trailer,
             startxref: loaded.startxref,
             last_xref_form: loaded.last_xref_form,
@@ -1400,37 +1379,14 @@ impl<R: Read + Seek> Pdf<R> {
                         if let (Ok(n), Object::Stream(stream)) = (usize::try_from(*n), &mut *object)
                         {
                             let auth_end = isl.data_start.saturating_add(n);
-                            // Override only when the authoritative length lands
-                            // STRICTLY inside the window — i.e. the resolved
-                            // /Length is the spec content length and `endstream`
-                            // (plus its mandatory preceding EOL) still follows.
-                            // Then the exact `n` content bytes are used verbatim
-                            // (no EOL trim), fixing non-QDF streams whose data
-                            // legitimately ends with a newline.
-                            //
-                            // STRICT `<` for QDF by design. `auth_end ==
-                            // endstream_pos` is ambiguous: produced BOTH by
-                            // flpdf's QDF holder convention (n counts the whole
-                            // window incl. the framing EOL) AND by a
-                            // non-conformant PDF lacking the ISO 32000-1 §7.3.8.1
-                            // mandatory pre-`endstream` EOL. These want opposite
-                            // handling and are indistinguishable from the object
-                            // bytes alone. Treating the exact-window case as QDF
-                            // (keep the parser's endstream-scan, which strips one
-                            // framing EOL) preserves the pinned QDF round-trip /
-                            // idempotence invariant; relaxing to `<=` empirically
-                            // regresses qdf_tests
-                            // `qdf_mode_round_trip_content_preserved` and
-                            // `qdf_output_is_idempotent`. Whole-file QDF
-                            // detection picks the branch: strict `<` for QDF,
-                            // inclusive `<=` for non-QDF. A too-large/garbage
-                            // holder also lands here → safe endstream-scan
-                            // fallback.
-                            let within_window = if self.is_qdf {
-                                auth_end < endstream_pos
-                            } else {
-                                auth_end <= endstream_pos
-                            };
+                            // Override whenever the authoritative length lands
+                            // at or before `endstream`. qpdf QDF holders contain
+                            // the logical payload length; `%QDF:
+                            // ignore_newline` accounts for any extra framing LF
+                            // in fix-qdf rather than changing reader semantics.
+                            // A too-large/garbage holder falls back to the safe
+                            // endstream scan.
+                            let within_window = auth_end <= endstream_pos;
                             if within_window && auth_end <= bytes.len() {
                                 stream.data = bytes[isl.data_start..auth_end].to_vec();
                             }

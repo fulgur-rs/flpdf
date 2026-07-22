@@ -2182,6 +2182,37 @@ fn write_qdf_indirect_contents_array_is_byte_identical_to_qpdf() {
     }
 }
 
+/// qpdf 11.9.0 byte gate for a stream whose logical payload does not end in
+/// LF. qpdf adds one framing LF, emits `%QDF: ignore_newline` after the stream
+/// object, and keeps the indirect `/Length` holder at the raw payload length.
+#[test]
+fn write_qdf_non_eol_stream_is_byte_identical_to_qpdf() {
+    let file = File::open("../../tests/fixtures/compat/qdf-ignore-newline.pdf").unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.static_id = true;
+    options.qdf = true;
+
+    let mut actual = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut actual, &options).unwrap();
+
+    let expected =
+        fs::read("../../tests/golden/references/qdf-ignore-newline/qdf-static-id.pdf").unwrap();
+    if actual != expected {
+        let common = actual.len().min(expected.len());
+        let first_diff = (0..common)
+            .find(|&idx| actual[idx] != expected[idx])
+            .unwrap_or(common);
+        panic!(
+            "non-EOL QDF output must be byte-identical to qpdf 11.9.0: \
+             first diff at byte {first_diff}, flpdf length {}, qpdf length {}",
+            actual.len(),
+            expected.len()
+        );
+    }
+}
+
 /// A page whose `/Contents` is a DIRECT Array containing a mix of Reference
 /// and non-Reference elements (e.g. a stray `null`) must still tag the
 /// Reference elements. Exercises the `_ => None` filter_map arm that skips

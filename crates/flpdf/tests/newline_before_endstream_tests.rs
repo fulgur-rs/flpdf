@@ -494,24 +494,18 @@ fn write_qdf_wrapper_respects_no_promotion_via_public_api() {
 /// QDF form promotes the caller's `Never` to `No` (see
 /// `qdf_wraps_endstream_on_own_line_regardless_of_caller_policy` above),
 /// matching
-/// qpdf's `--qdf` behaviour: when the payload already ends with `\n`/`\r`,
+/// qpdf's `--qdf` behaviour: when the payload already ends with `\n`,
 /// no additional framing byte is inserted, and `/Length` equals the raw
-/// payload length. Round-trip characterization: for a payload ending in EOL,
-/// the on-disk bytes `abc\nendstream` are ambiguous — they could come from
-/// payload `abc` (No policy adds framing `\n`) OR from payload `abc\n` (No
-/// policy adds nothing). The reader resolves this ambiguity in QDF mode by
-/// keeping the parser's endstream-scan value (strips one framing EOL), so
-/// the trailing byte is dropped on re-open. This mirrors qpdf's --qdf
-/// re-read behaviour and preserves the pinned QDF idempotence invariant.
+/// payload length. The authoritative indirect holder therefore preserves the
+/// payload's trailing LF on re-open. Non-EOL payloads use
+/// `%QDF: ignore_newline` to distinguish an added framing LF.
 #[test]
-fn round_trip_qdf_eol_ending_payload_drops_trailing_eol_via_no_promotion() {
+fn round_trip_qdf_eol_ending_payload_preserves_trailing_eol_via_raw_length() {
     let raw: &[u8] = b"abc\n";
     assert_eq!(
         round_trip_qdf(raw, NewlineBeforeEndstream::Never).as_slice(),
-        b"abc",
-        "QDF promotes Never to No, so an EOL-ending payload loses its \
-         trailing EOL on re-open (the pre-endstream framing byte and the \
-         payload's trailing EOL are indistinguishable on disk); matches qpdf"
+        raw,
+        "QDF indirect /Length must preserve a payload's real trailing LF"
     );
 }
 

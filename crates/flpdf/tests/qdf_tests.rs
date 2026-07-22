@@ -199,15 +199,14 @@ fn qdf_mode_strips_filter_from_flate_stream() {
         raw,
         "qdf=true: stream data must be the decoded (human-readable) bytes"
     );
-    // The holder body must equal the ON-DISK stream byte count that
-    // flpdf::fix_qdf recomputes. QDF mode forces `NewlineBeforeEndstream::Yes`
-    // (qpdf --qdf parity), so a single EOL is inserted before `endstream`
-    // when the payload does not already end with one.
+    // qpdf keeps the raw payload length in the holder and emits a marker so
+    // fix_qdf excludes the framing LF from its byte scan.
     assert_eq!(
         read_length_holder(&output, s.length_holder),
-        raw.len() as i64 + 1,
-        "indirect length-holder must hold the on-disk byte count (payload + 1 EOL)"
+        raw.len() as i64,
+        "indirect length-holder must hold the raw payload byte count"
     );
+    assert!(find_subslice(&output, b"%QDF: ignore_newline\n").is_some());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -244,14 +243,14 @@ fn qdf_mode_keeps_dct_stream_verbatim() {
         fake_jpeg,
         "qdf=true: DCTDecode image data must be bit-for-bit unchanged"
     );
-    // Holder body equals the on-disk byte count. QDF mode forces
-    // `NewlineBeforeEndstream::Yes`, so a single EOL is inserted before
-    // `endstream` (the verbatim payload does not end in EOL).
+    // Holder body is the raw payload byte count; the marker excludes the
+    // added framing LF when fix_qdf measures the stream.
     assert_eq!(
         read_length_holder(&output, s.length_holder),
-        fake_jpeg.len() as i64 + 1,
-        "indirect length-holder must hold the on-disk byte count (payload + 1 EOL)"
+        fake_jpeg.len() as i64,
+        "indirect length-holder must hold the raw payload byte count"
     );
+    assert!(find_subslice(&output, b"%QDF: ignore_newline\n").is_some());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -277,15 +276,15 @@ fn qdf_mode_length_matches_decoded_bytes() {
     // bare-integer holder object — qpdf 11.9.0 --qdf + flpdf::fix_qdf parity.
     let s = parse_qdf_stream(&output, metadata_stream_number(&output));
 
-    // The holder body must equal the ON-DISK byte count fix_qdf recomputes.
-    // QDF mode forces `NewlineBeforeEndstream::Yes`, so a single EOL is
-    // inserted before `endstream` (the raw payload has no trailing EOL).
+    // The holder body is the raw decoded byte count. The marker tells fix_qdf
+    // to exclude the framing LF from its measured on-disk window.
     let holder_value = read_length_holder(&output, s.length_holder);
     assert_eq!(
         holder_value,
-        raw.len() as i64 + 1,
-        "indirect /Length holder must equal the on-disk byte count (payload + 1 EOL)"
+        raw.len() as i64,
+        "indirect /Length holder must equal the raw decoded byte count"
     );
+    assert!(find_subslice(&output, b"%QDF: ignore_newline\n").is_some());
     // Actual emitted payload length must also equal the decoded byte count.
     assert_eq!(
         s.payload.len(),
@@ -446,13 +445,14 @@ fn qdf_mode_strips_filter_from_lzw_stream() {
         expected_plain,
         "qdf=true: LZWDecode stream data must be the decoded bytes"
     );
-    // QDF mode forces `NewlineBeforeEndstream::Yes`, so a single EOL is
-    // inserted before `endstream` (the decoded payload has no trailing EOL).
+    // The marker accounts for the framing LF, leaving the holder at the raw
+    // decoded payload length.
     assert_eq!(
         read_length_holder(&output, s.length_holder),
-        expected_plain.len() as i64 + 1,
-        "indirect length-holder must hold the on-disk byte count (payload + 1 EOL)"
+        expected_plain.len() as i64,
+        "indirect length-holder must hold the raw payload byte count"
     );
+    assert!(find_subslice(&output, b"%QDF: ignore_newline\n").is_some());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

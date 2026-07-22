@@ -3709,9 +3709,10 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             format!("{} {} obj\n", emit_ref.number, emit_ref.generation).as_bytes(),
         );
 
-        // Will be set to Some((holder_num, len_value)) for QDF streams so we
-        // can emit the holder immediately after the stream's endobj.
-        let mut qdf_holder_to_emit: Option<(u32, i64)> = None;
+        // Will be set to Some((holder_num, len_value, ignore_newline)) for QDF
+        // streams so we can emit the marker and holder immediately after the
+        // stream's endobj.
+        let mut qdf_holder_to_emit: Option<(u32, i64, bool)> = None;
 
         if let Object::Stream(stream) = object {
             // Determine the effective stream policy.
@@ -3767,19 +3768,12 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     // length after a hand edit, then replace the dict entry
                     // with `H 0 R`.
                     //
-                    // The holder body is the ON-DISK byte count (raw `data`
-                    // plus the single EOL the framing inserts before
-                    // `endstream`), NOT `apply_stream_compress_policy`'s raw
-                    // decoded length. fix_qdf counts the emitted bytes between
-                    // `stream`+EOL and the `endstream` line; the holder must
-                    // equal that, or the writer and fix_qdf disagree by the
-                    // newline-before-endstream byte and the "edit then fix"
-                    // loop is broken (flpdf-9hc.6.12).
-                    let len_value = i64::try_from(on_disk_stream_len(
-                        &s.data,
-                        options.newline_before_endstream,
-                    ))
-                    .unwrap_or(i64::MAX);
+                    // qpdf's QDF holder stores the raw payload length. When
+                    // stream framing adds one LF, `%QDF: ignore_newline` tells
+                    // fix-qdf to exclude that byte from its measured length.
+                    let len_value = i64::try_from(s.data.len()).unwrap_or(i64::MAX);
+                    let ignore_newline =
+                        stream_framing_adds_newline(&s.data, options.newline_before_endstream);
                     // The holder number was assigned by the QDF emission pre-scan
                     // as the slot immediately following this stream's emission slot.
                     let holder_num =
@@ -3795,7 +3789,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                                     emit_ref.number
                                 ))
                             })?; // cov:ignore-end
-                    qdf_holder_to_emit = Some((holder_num, len_value));
+                    qdf_holder_to_emit = Some((holder_num, len_value, ignore_newline));
 
                     let mut holder_stream = s.clone();
                     holder_stream
@@ -3847,7 +3841,10 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         // object file positions are strictly ascending 1..N (qpdf 11.9.0
         // behaviour). No "%% Original object ID:" comment for holder objects
         // (they are synthetic; qpdf only emits that comment for source objects).
-        if let Some((hnum, hlen)) = qdf_holder_to_emit {
+        if let Some((hnum, hlen, ignore_newline)) = qdf_holder_to_emit {
+            if ignore_newline {
+                bytes.extend_from_slice(b"%QDF: ignore_newline\n");
+            }
             let h_offset = bytes.len();
             bytes.extend_from_slice(format!("{hnum} 0 obj\n{hlen}\nendobj\n").as_bytes());
             bytes.push(b'\n'); // QDF inter-object blank line
@@ -4774,57 +4771,21 @@ fn write_stream_payload(buf: &mut Vec<u8>, data: &[u8], policy: NewlineBeforeEnd
     buf.extend_from_slice(b"\nstream\n");
     buf.extend_from_slice(data);
 
-    match policy {
-        NewlineBeforeEndstream::Yes => {
-            // Always write exactly one newline before endstream.
-            buf.push(b'\n');
-        }
-        NewlineBeforeEndstream::No => {
-            // Write a newline when the payload does not already end with
-            // exactly `\n`. Matches qpdf's `(last_char != '\n')` in
-            // QPDFWriter.cc:1560 — bare-`\r` or `\r\n`-terminated payloads
-            // still receive an added `\n` before `endstream`.
-            let ends_with_nl = data.last().map(|&b| b == b'\n').unwrap_or(false);
-            if !ends_with_nl {
-                buf.push(b'\n');
-            }
-        }
-        NewlineBeforeEndstream::Never => {
-            // Write nothing: endstream is adjacent to the raw payload (qpdf
-            // default output).
-        }
+    if stream_framing_adds_newline(data, policy) {
+        buf.push(b'\n');
     }
 
     buf.extend_from_slice(b"endstream");
 }
 
-/// On-disk byte count of a stream payload as written by
-/// [`write_stream_to_buf`] / [`write_stream_to_buf_qdf`] for the given
-/// [`NewlineBeforeEndstream`] policy: the raw `data` length plus the single
-/// EOL byte the writer inserts before `endstream` (if any).
-///
-/// This is the value ISO 32000-1 §7.3.8.1 mandates for `/Length` (bytes
-/// between the `stream` EOL and the `endstream` keyword) and is exactly the
-/// count [`crate::fix_qdf`] (qdf_fix.rs) recomputes from the emitted bytes.
-/// In QDF mode the indirect length-holder body MUST equal this — not the
-/// raw decoded length — so the writer and `fix_qdf` mesh.
-fn on_disk_stream_len(data: &[u8], policy: NewlineBeforeEndstream) -> usize {
-    let n = data.len();
+/// Whether stream framing adds one LF before `endstream` for this payload.
+/// This mirrors qpdf's `added_newline` state and is shared by the byte emitter
+/// and QDF marker decision so they cannot drift.
+fn stream_framing_adds_newline(data: &[u8], policy: NewlineBeforeEndstream) -> bool {
     match policy {
-        NewlineBeforeEndstream::Yes => n + 1,
-        NewlineBeforeEndstream::No => {
-            // Add one byte unless the payload already ends with exactly `\n`
-            // (matches the check in write_stream_payload, which mirrors qpdf's
-            // `(last_char != '\n')` in QPDFWriter.cc:1560).
-            let ends_with_nl = data.last().map(|&b| b == b'\n').unwrap_or(false);
-            if ends_with_nl {
-                n
-            } else {
-                n + 1
-            }
-        }
-        // No EOL is ever added, so the on-disk length is exactly the payload.
-        NewlineBeforeEndstream::Never => n,
+        NewlineBeforeEndstream::Yes => true,
+        NewlineBeforeEndstream::No => data.last() != Some(&b'\n'),
+        NewlineBeforeEndstream::Never => false,
     }
 }
 
