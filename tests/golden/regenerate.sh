@@ -1359,6 +1359,7 @@ mkdir -p \
     "$REF/encrypted-r4-three-page" \
     "$REF/attachment-two-page" \
     "$REF/lone-flate-l9" \
+    "$REF/qdf-contents-ref-array" \
     "$REF/objstm-gen-nostream-5" \
     "$REF/objstm-gen-nostream-130rev"
 
@@ -2082,6 +2083,15 @@ qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
     --overlay "$FIX/two-page.pdf" -- \
     "$REF/overlay/three-page-two-overlays-qdf.pdf"
 echo "overlay/three-page-two-overlays-qdf.pdf"
+
+# --- qdf-contents-ref-array: /Contents is an indirect reference to an Array
+# whose two elements are content-stream references. qpdf marks only the two
+# streams with `%% Contents for page 1`; the intermediate Array stays unmarked
+# (flpdf-10de). ---
+qpdf --static-id --qdf --warning-exit-0 \
+    "$FIX/qdf-contents-ref-array.pdf" \
+    "$REF/qdf-contents-ref-array/qdf-static-id.pdf"
+echo "qdf-contents-ref-array/qdf-static-id.pdf"
 
 
 echo ""

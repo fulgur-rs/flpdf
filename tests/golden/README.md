@@ -88,3 +88,15 @@ from this tree.
 | `overlay/three-page-two-overlays-qdf.pdf`         | two `--overlay` flags composed left-to-right            |
 
 qpdf command (all three): `qpdf --static-id --qdf --no-original-object-ids ...`.
+
+## Indirect `/Contents` Array QDF marker (flpdf-10de)
+
+`qdf-contents-ref-array/qdf-static-id.pdf` pins a page whose `/Contents`
+is an indirect reference to an Array containing two content-stream references.
+qpdf emits `%% Contents for page 1` before each stream, but not before the
+intermediate Array object. The source streams contain `A\n` and `B\n` as their
+actual payloads so this gate remains independent of the non-EOL
+`%QDF: ignore_newline` gap tracked by `flpdf-tzgk`.
+
+qpdf command:
+`qpdf --static-id --qdf --warning-exit-0 tests/fixtures/compat/qdf-contents-ref-array.pdf tests/golden/references/qdf-contents-ref-array/qdf-static-id.pdf`.
