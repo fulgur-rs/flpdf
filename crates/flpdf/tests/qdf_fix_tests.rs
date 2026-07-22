@@ -434,10 +434,9 @@ fn writer_qdf_then_edit_then_fix_qdf_closed_loop() {
     edited.splice(payload_start..payload_start, inject.iter().copied());
 
     // The clean writer holder body — read it from the unedited QDF so the
-    // test does not hardcode the fixture's content length. It is the on-disk
-    // byte count (payload + the single EOL the Yes framing adds), which is
-    // exactly what flpdf::fix_qdf recomputes — so on the UNEDITED file
-    // fix_qdf must be a perfect no-op (writer↔fix_qdf mesh).
+    // test does not hardcode the fixture's raw payload length. fix_qdf must
+    // reproduce it exactly, accounting for `%QDF: ignore_newline` whenever
+    // stream framing adds an LF.
     assert_eq!(
         flpdf::fix_qdf(&qdf).expect("fix_qdf on clean writer QDF"),
         qdf,
@@ -495,6 +494,41 @@ fn writer_qdf_then_edit_then_fix_qdf_closed_loop() {
     assert_eq!(
         again, fixed,
         "fix_qdf must be idempotent on repaired writer QDF"
+    );
+}
+
+/// qpdf 11.9.0 writes the raw payload length to the indirect holder and uses
+/// this marker to tell fix-qdf that its byte scan includes one framing LF.
+#[test]
+fn ignore_newline_marker_repairs_raw_length_and_is_idempotent() {
+    let qdf = fs::read("../../tests/golden/references/qdf-ignore-newline/qdf-static-id.pdf")
+        .expect("read qpdf non-EOL QDF golden");
+
+    assert_eq!(
+        flpdf::fix_qdf(&qdf).expect("fix_qdf on clean qpdf QDF"),
+        qdf,
+        "fix_qdf must exclude the framing LF named by %QDF: ignore_newline"
+    );
+
+    // Simulate a human changing the raw payload from `A` to `ABC`. The
+    // framing LF remains on disk but is still excluded from the repaired
+    // holder, so qpdf's holder object 3 must become 3 rather than 4.
+    let payload_start = find(&qdf, b"\nstream\n").expect("stream keyword") + b"\nstream\n".len();
+    let mut edited = qdf.clone();
+    edited.splice(payload_start + 1..payload_start + 1, b"BC".iter().copied());
+    let fixed = flpdf::fix_qdf(&edited).expect("fix_qdf on edited qpdf QDF");
+    assert!(
+        find(&fixed, b"\n3 0 obj\n3\nendobj").is_some(),
+        "holder must contain the edited raw payload length, excluding framing LF"
+    );
+    assert!(
+        find(&fixed, b"%QDF: ignore_newline\n3 0 obj").is_some(),
+        "marker must remain immediately before the holder"
+    );
+    assert_eq!(
+        flpdf::fix_qdf(&fixed).expect("fix_qdf idempotence"),
+        fixed,
+        "marker-aware fix_qdf output must be idempotent"
     );
 }
 

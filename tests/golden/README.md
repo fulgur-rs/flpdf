@@ -100,3 +100,13 @@ actual payloads so this gate remains independent of the non-EOL
 
 qpdf command:
 `qpdf --static-id --qdf --warning-exit-0 tests/fixtures/compat/qdf-contents-ref-array.pdf tests/golden/references/qdf-contents-ref-array/qdf-static-id.pdf`.
+
+## Non-EOL QDF stream framing (flpdf-tzgk)
+
+`qdf-ignore-newline/qdf-static-id.pdf` pins a metadata stream whose logical
+payload is the single byte `A`, with no trailing LF. qpdf adds an LF for stream
+framing, writes `%QDF: ignore_newline` immediately before the indirect length
+holder, and stores the raw payload length `1` in that holder.
+
+qpdf command:
+`qpdf --static-id --qdf --warning-exit-0 tests/fixtures/compat/qdf-ignore-newline.pdf tests/golden/references/qdf-ignore-newline/qdf-static-id.pdf`.

@@ -40,9 +40,11 @@
 //!    keyword and the `endstream` keyword: counting starts at the first byte
 //!    after the `stream` keyword's end-of-line marker (`\r\n`, `\n`, or `\r`)
 //!    and ends at (but excludes) the `endstream` keyword. No EOL normalization
-//!    is performed — the count is verbatim. The recomputed value is written
-//!    into the indirect length object's body as a plain decimal integer (no
-//!    zero padding).
+//!    is performed. If the exact standalone line `%QDF: ignore_newline` occurs
+//!    between the stream object and its immediately following length holder,
+//!    one framing byte is excluded. The recomputed value is written into the
+//!    indirect length object's body as a plain decimal integer (no zero
+//!    padding).
 //! 2. **xref offsets** — each in-use object's 10-digit offset is the byte
 //!    offset of the start of its `N G obj` line in the *rewritten* output.
 //! 3. **trailer `/Size`** — object count + 1 (equivalently the highest object
@@ -72,6 +74,8 @@ struct ObjectSpan {
     /// If this object's stream dict uses an indirect `/Length M G R`, the
     /// object number `M` that holds the length integer.
     length_holder: Option<u32>,
+    /// qpdf emitted one framing LF that fix-qdf must exclude from `stream_len`.
+    ignore_newline: bool,
 }
 
 /// Find the next line that begins exactly with `N G obj` at `from`, scanning
@@ -264,6 +268,15 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Whether an inter-object separator contains qpdf's exact standalone marker.
+/// qpdf's fix-qdf recognizes only the LF-terminated line with no surrounding
+/// whitespace, so CRLF and lookalike comments intentionally do not match.
+fn has_ignore_newline_marker(separator: &[u8]) -> bool {
+    separator
+        .split_inclusive(|&b| b == b'\n')
+        .any(|line| line == b"%QDF: ignore_newline\n")
+}
+
 /// The recomputed value to be written into a length-holder object.
 fn detect_objstm(body: &[u8]) -> bool {
     // An object stream is `<< ... /Type /ObjStm ... >>`. Only reject when a
@@ -422,6 +435,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
             end,
             stream_len,
             length_holder,
+            ignore_newline: false,
         });
         cursor = end;
     }
@@ -450,6 +464,18 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         }
     }
 
+    // qpdf writes the marker after the stream object's `endobj` and directly
+    // before its synthetic length holder. Associate only that exact separator
+    // with the stream; marker-like bytes in the dictionary, payload, or a
+    // different inter-object region cannot affect its length.
+    for i in 0..objects.len().saturating_sub(1) {
+        let is_immediate_holder = objects[i].length_holder == Some(objects[i + 1].num);
+        if is_immediate_holder {
+            let separator = &body_region[objects[i].end..objects[i + 1].obj_line_start];
+            objects[i].ignore_newline = has_ignore_newline_marker(separator);
+        }
+    }
+
     // ---- 3. Compute the new length-holder integer bodies. ---------------
     // Validate every indirect `/Length M G R` holder (flpdf-9hc.25):
     //   * the holder object `M` must actually exist in the parsed set —
@@ -469,7 +495,12 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         .collect();
     let mut new_len_body: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     for obj in &objects {
-        if let (Some(len), Some(holder)) = (obj.stream_len, obj.length_holder) {
+        if let (Some(measured_len), Some(holder)) = (obj.stream_len, obj.length_holder) {
+            let len = if obj.ignore_newline {
+                measured_len.saturating_sub(1)
+            } else {
+                measured_len
+            };
             if !gen0_object_numbers.contains(&holder) {
                 return Err(Error::parse(
                     obj.obj_line_start,
