@@ -1382,6 +1382,158 @@ fn named_destination_lookup_handles_qpdf_node_shapes() {
 }
 
 #[test]
+fn qpdf_binary_search_finds_last_leaf_pair_before_visiting_an_invalid_middle_key() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Names [(a) [3 0 R /Fit] 42 [3 0 R /Fit] (target) [3 0 R /Fit]] >> >>",
+        "/Dest (target)",
+        &[],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    assert!(warning_messages(&pdf).is_empty());
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(dests.get("Kids"), None);
+    assert_eq!(
+        dests.get("Names"),
+        Some(&Object::Array(vec![
+            Object::String(b"a".to_vec()),
+            page_dest(3),
+            Object::Integer(42),
+            page_dest(3),
+            Object::String(b"target".to_vec()),
+            page_dest(3),
+        ]))
+    );
+}
+
+#[test]
+fn qpdf_binary_search_finds_last_kid_before_visiting_an_invalid_middle_kid() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [8 0 R 42 9 0 R] >> >>",
+        "/Dest (target)",
+        &[
+            (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+            (
+                9,
+                "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+            ),
+        ],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    assert!(warning_messages(&pdf).is_empty());
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(dests.get("Names"), None);
+    assert_eq!(
+        dests.get("Kids"),
+        Some(&Object::Array(vec![
+            Object::Reference(ObjectRef::new(8, 0)),
+            Object::Integer(42),
+            Object::Reference(ObjectRef::new(9, 0)),
+        ]))
+    );
+}
+
+#[test]
+fn empty_root_name_tree_warns_as_traversal_missing_without_repair_or_mutation() {
+    let bytes = single_outline_with_catalog("/Names << /Dests << >> >>", "/Dest (shape)", &[]);
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        ["name/number tree node has neither non-empty /Names nor /Kids"]
+    );
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(dests.get("Names"), None);
+    assert_eq!(dests.get("Kids"), None);
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 search-order and empty-root oracle"]
+fn qpdf_binary_search_and_empty_root_full_object_oracle() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let cases = [
+        (
+            "/Names << /Dests << /Names [(a) [3 0 R /Fit] 42 [3 0 R /Fit] (target) [3 0 R /Fit]] >> >>",
+            &[][..],
+            "/Dest (target)",
+            Some(0),
+            None,
+            "Names",
+        ),
+        (
+            "/Names << /Dests << /Kids [8 0 R 42 9 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (
+                    9,
+                    "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+                ),
+            ][..],
+            "/Dest (target)",
+            Some(0),
+            None,
+            "Kids",
+        ),
+        (
+            "/Names << /Dests << >> >>",
+            &[][..],
+            "/Dest (shape)",
+            Some(3),
+            Some("name/number tree node has neither non-empty /Names nor /Kids"),
+            "Empty",
+        ),
+    ];
+
+    for (catalog_entries, extra, item_entries, expected_status, warning, shape) in cases {
+        let mut input = tempfile::NamedTempFile::new().unwrap();
+        input
+            .write_all(&single_outline_with_catalog(
+                catalog_entries,
+                item_entries,
+                extra,
+            ))
+            .unwrap();
+        let output = Command::new("qpdf")
+            .args(["--json=2", "--json-key=outlines", "--json-key=qpdf"])
+            .arg(input.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            expected_status,
+            "{shape}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match warning {
+            Some(warning) => assert!(stderr.contains(warning), "{shape}: {stderr}"),
+            None => assert!(stderr.is_empty(), "{shape}: {stderr}"),
+        }
+
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let root = &json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"];
+        match shape {
+            "Names" => {
+                assert_eq!(root["/Names"].as_array().unwrap().len(), 6);
+                assert!(root.get("/Kids").is_none());
+            }
+            "Kids" => {
+                assert_eq!(root["/Kids"].as_array().unwrap().len(), 3);
+                assert!(root.get("/Names").is_none());
+            }
+            "Empty" => assert!(root.as_object().unwrap().is_empty()),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
 fn malformed_name_tree_structural_errors_warn_repair_and_retry() {
     let cases = [
         (
@@ -1404,6 +1556,17 @@ fn malformed_name_tree_structural_errors_warn_repair_and_retry() {
         ),
         (
             "bad node",
+            "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (9, "<< /Limits [(m) (m)] /Kids [] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (m)",
+            "attempting to repair after error: Name/Number tree node (object 9): bad node during find",
+        ),
+        (
+            "empty leaf bad node",
             "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R] >> >>",
             &[
                 (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
@@ -1450,11 +1613,11 @@ fn malformed_name_tree_invalid_kid_is_skipped_while_valid_entries_are_retained()
         "/Names << /Dests << /Kids [8 0 R 42 9 0 R] >> >>",
         "/Dest (target)",
         &[
-            (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
             (
-                9,
+                8,
                 "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
             ),
+            (9, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
         ],
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
@@ -1472,9 +1635,9 @@ fn malformed_name_tree_invalid_kid_is_skipped_while_valid_entries_are_retained()
     assert_eq!(
         dests.get("Names"),
         Some(&Object::Array(vec![
-            Object::String(b"a".to_vec()),
-            page_dest(3),
             Object::String(b"target".to_vec()),
+            page_dest(3),
+            Object::String(b"z".to_vec()),
             page_dest(3),
         ]))
     );
@@ -1530,6 +1693,16 @@ fn qpdf_malformed_name_tree_structural_matrix_warns_and_repairs() {
             ][..],
             "/Dest (m)",
             "loop detected in find",
+        ),
+        (
+            "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (9, "<< /Limits [(m) (m)] /Kids [] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (m)",
+            "bad node during find",
         ),
         (
             "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R] >> >>",
@@ -1871,6 +2044,7 @@ fn malformed_name_tree_repair_warns_for_a_short_names_array_and_visits_an_empty_
         [
             "attempting to repair after error: Name/Number tree node (object 8): node is missing /Limits",
             "items array doesn't have enough elements",
+            "Name/Number tree node (object 9): name/number tree node has neither non-empty /Names nor /Kids",
         ]
     );
 }

@@ -507,6 +507,16 @@ impl NameTreeStructuralError {
     }
 }
 
+fn name_tree_iterator_warning(node_ref: Option<ObjectRef>, message: &str) -> String {
+    match node_ref {
+        Some(node_ref) => format!(
+            "Name/Number tree node (object {}): {message}",
+            node_ref.number
+        ),
+        None => message.to_string(),
+    }
+}
+
 enum NameTreeKidSelection {
     Found(Object),
     Structural(NameTreeStructuralError),
@@ -514,6 +524,12 @@ enum NameTreeKidSelection {
 
 enum NameTreeKidOrdering {
     Order(Ordering),
+    Structural(NameTreeStructuralError),
+}
+
+enum NameTreeBinarySearch {
+    Found(usize),
+    Missing,
     Structural(NameTreeStructuralError),
 }
 
@@ -543,14 +559,30 @@ fn find_name_tree_value<R: Read + Seek>(
             }
         }
 
+        if at_root {
+            let item_count = match node.get("Names") {
+                Some(Object::Array(names)) => names.len(),
+                _ => 0,
+            };
+            let kid_count = match node.get("Kids") {
+                Some(Object::Array(kids)) => kids.len(),
+                _ => 0,
+            };
+            if item_count == 0 && kid_count == 0 {
+                if !matches!(node.get("Names"), Some(Object::Array(_))) {
+                    pdf.push_warning(name_tree_iterator_warning(
+                        identity,
+                        "name/number tree node has neither non-empty /Names nor /Kids",
+                    ));
+                }
+                return Ok(NameTreeLookup::Missing);
+            }
+        }
+
         let names_value = node.remove("Names");
         if let Some(Object::Array(names)) = names_value {
             if !names.is_empty() {
-                return Ok(find_name_tree_leaf_value(names, lookup, root_ref));
-            } else if at_root
-                && !matches!(node.get("Kids"), Some(Object::Array(kids)) if !kids.is_empty())
-            {
-                return Ok(NameTreeLookup::Missing);
+                return find_name_tree_leaf_value(names, lookup, root_ref);
             }
         }
 
@@ -597,25 +629,27 @@ fn find_name_tree_leaf_value(
     names: Vec<Object>,
     lookup: &[u8],
     root_ref: Option<ObjectRef>,
-) -> NameTreeLookup {
+) -> Result<NameTreeLookup> {
     let pair_count = names.len() / 2;
-    let mut low = 0;
-    let mut high = pair_count;
-    while low < high {
-        let middle = low + (high - low) / 2;
-        let Object::String(stored) = &names[2 * middle] else {
-            return NameTreeLookup::Structural(NameTreeStructuralError {
-                node_ref: root_ref,
-                message: format!("item at index {} is not the right type", 2 * middle),
-            });
-        };
-        match lookup.cmp(crate::json_inspect::qpdf_utf8_value(stored).as_slice()) {
-            Ordering::Less => high = middle,
-            Ordering::Greater => low = middle + 1,
-            Ordering::Equal => return NameTreeLookup::Found(names[2 * middle + 1].clone()),
-        }
-    }
-    NameTreeLookup::Missing
+    Ok(
+        match qpdf_name_tree_binary_search(pair_count, false, |index| {
+            let Object::String(stored) = &names[2 * index] else {
+                return Ok(NameTreeKidOrdering::Structural(NameTreeStructuralError {
+                    node_ref: root_ref,
+                    message: format!("item at index {} is not the right type", 2 * index),
+                }));
+            };
+            Ok(NameTreeKidOrdering::Order(lookup.cmp(
+                crate::json_inspect::qpdf_utf8_value(stored).as_slice(),
+            )))
+        })? {
+            NameTreeBinarySearch::Found(index) => {
+                NameTreeLookup::Found(names[2 * index + 1].clone())
+            }
+            NameTreeBinarySearch::Missing => NameTreeLookup::Missing,
+            NameTreeBinarySearch::Structural(error) => NameTreeLookup::Structural(error),
+        },
+    )
 }
 
 fn select_name_tree_kid<R: Read + Seek>(
@@ -625,32 +659,85 @@ fn select_name_tree_kid<R: Read + Seek>(
     root_ref: Option<ObjectRef>,
     node_ref: Option<ObjectRef>,
 ) -> Result<NameTreeKidSelection> {
-    let mut low = 0;
-    let mut high = kids.len();
-    let mut previous = None;
-    while low < high {
-        let middle = low + (high - low) / 2;
-        let ordering = match name_tree_kid_ordering(pdf, &kids[middle], lookup, middle, root_ref)? {
-            NameTreeKidOrdering::Order(ordering) => ordering,
-            NameTreeKidOrdering::Structural(error) => {
-                return Ok(NameTreeKidSelection::Structural(error));
+    Ok(
+        match qpdf_name_tree_binary_search(kids.len(), true, |index| {
+            name_tree_kid_ordering(pdf, &kids[index], lookup, index, root_ref)
+        })? {
+            NameTreeBinarySearch::Found(index) => NameTreeKidSelection::Found(kids[index].clone()),
+            NameTreeBinarySearch::Missing => {
+                NameTreeKidSelection::Structural(NameTreeStructuralError {
+                    node_ref,
+                    message: "unexpected -1 from binary search of kids; limits may by wrong"
+                        .to_string(),
+                })
             }
+            NameTreeBinarySearch::Structural(error) => NameTreeKidSelection::Structural(error),
+        },
+    )
+}
+
+fn qpdf_name_tree_binary_search<F>(
+    num_items: usize,
+    return_prev_if_not_found: bool,
+    mut compare: F,
+) -> Result<NameTreeBinarySearch>
+where
+    F: FnMut(usize) -> Result<NameTreeKidOrdering>,
+{
+    let mut max_idx = 1;
+    while max_idx < num_items {
+        max_idx <<= 1;
+    }
+
+    let mut step = max_idx / 2;
+    let mut checks = max_idx;
+    let mut index = step;
+    let mut found_index = None;
+    let mut found = false;
+    let mut found_leq = false;
+
+    while !found && checks > 0 {
+        let status = if index < num_items {
+            match compare(index)? {
+                NameTreeKidOrdering::Order(ordering) => {
+                    if ordering != Ordering::Less {
+                        found_leq = true;
+                        found_index = Some(index);
+                    }
+                    ordering
+                }
+                NameTreeKidOrdering::Structural(error) => {
+                    return Ok(NameTreeBinarySearch::Structural(error));
+                }
+            }
+        } else {
+            Ordering::Less
         };
-        match ordering {
-            Ordering::Less => high = middle,
-            Ordering::Equal => return Ok(NameTreeKidSelection::Found(kids[middle].clone())),
-            Ordering::Greater => {
-                previous = Some(middle);
-                low = middle + 1;
+
+        if status == Ordering::Equal {
+            found = true;
+        } else {
+            checks >>= 1;
+            if checks > 0 {
+                step >>= 1;
+                if step == 0 {
+                    step = 1;
+                }
+                if status == Ordering::Less {
+                    index -= step;
+                } else {
+                    index += step;
+                }
             }
         }
     }
-    Ok(match previous {
-        Some(index) => NameTreeKidSelection::Found(kids[index].clone()),
-        None => NameTreeKidSelection::Structural(NameTreeStructuralError {
-            node_ref,
-            message: "unexpected -1 from binary search of kids; limits may by wrong".to_string(),
-        }),
+
+    Ok(if found || (found_leq && return_prev_if_not_found) {
+        NameTreeBinarySearch::Found(
+            found_index.expect("qpdf binary search records every exact or prior match"),
+        )
+    } else {
+        NameTreeBinarySearch::Missing
     })
 }
 
@@ -701,17 +788,20 @@ fn enumerate_name_tree_entries<R: Read + Seek>(
     root: Object,
 ) -> Result<BTreeMap<Vec<u8>, Object>> {
     enum RepairWalkItem {
-        Node(Object),
+        Node { cursor: Object, at_root: bool },
         InvalidKid(usize),
     }
 
     let mut entries = BTreeMap::new();
-    let mut stack = vec![RepairWalkItem::Node(root)];
+    let mut stack = vec![RepairWalkItem::Node {
+        cursor: root,
+        at_root: true,
+    }];
     let mut seen = BTreeSet::new();
 
     while let Some(item) = stack.pop() {
-        let cursor = match item {
-            RepairWalkItem::Node(cursor) => cursor,
+        let (cursor, at_root) = match item {
+            RepairWalkItem::Node { cursor, at_root } => (cursor, at_root),
             RepairWalkItem::InvalidKid(kid_index) => {
                 pdf.push_warning(format!("skipping over invalid kid at index {kid_index}"));
                 continue;
@@ -729,7 +819,7 @@ fn enumerate_name_tree_entries<R: Read + Seek>(
         }
 
         let names_value = node.remove("Names");
-        let had_names = names_value.is_some();
+        let mut allow_empty_root = false;
         if let Some(Object::Array(names)) = names_value {
             if !names.is_empty() {
                 let mut pairs = names.chunks_exact(2);
@@ -747,22 +837,38 @@ fn enumerate_name_tree_entries<R: Read + Seek>(
                 }
                 continue;
             }
+            allow_empty_root = at_root;
         }
 
         if let Some(Object::Array(kids)) = node.remove("Kids") {
+            if kids.is_empty() {
+                if !allow_empty_root {
+                    pdf.push_warning(name_tree_iterator_warning(
+                        identity,
+                        "name/number tree node has neither non-empty /Names nor /Kids",
+                    ));
+                }
+                continue;
+            }
             for (kid_index, kid) in kids.into_iter().enumerate().rev() {
                 let (kid_node, _) = name_tree_node(pdf, kid.clone())?;
                 let traversable = kid_node.as_ref().is_some_and(|kid_node| {
                     kid_node.get("Kids").is_some() || kid_node.get("Names").is_some()
                 });
                 if traversable {
-                    stack.push(RepairWalkItem::Node(kid));
+                    stack.push(RepairWalkItem::Node {
+                        cursor: kid,
+                        at_root: false,
+                    });
                 } else {
                     stack.push(RepairWalkItem::InvalidKid(kid_index));
                 }
             }
-        } else if !had_names {
-            pdf.push_warning("name/number tree node has neither non-empty /Names nor /Kids");
+        } else if !allow_empty_root {
+            pdf.push_warning(name_tree_iterator_warning(
+                identity,
+                "name/number tree node has neither non-empty /Names nor /Kids",
+            ));
         }
     }
 
@@ -1141,7 +1247,10 @@ fn qpdf_object_type_name(value: &Object) -> &'static str {
 
 #[cfg(test)]
 mod qpdf_utf8_tests {
-    use super::{qpdf_new_unicode_utf8_value, qpdf_unicode_string_bytes, NameTreeStructuralError};
+    use super::{
+        qpdf_name_tree_binary_search, qpdf_new_unicode_utf8_value, qpdf_unicode_string_bytes,
+        NameTreeBinarySearch, NameTreeKidOrdering, NameTreeStructuralError,
+    };
 
     #[test]
     fn direct_name_tree_node_diagnostic_omits_an_object_number() {
@@ -1153,6 +1262,34 @@ mod qpdf_utf8_tests {
             error.diagnostic(),
             "Name/Number tree node: node is missing /Limits"
         );
+    }
+
+    #[test]
+    fn binary_search_uses_qpdf_power_of_two_visit_order() {
+        let cases = [
+            (3, 2, vec![2]),
+            (4, 3, vec![2, 3]),
+            (5, 0, vec![4, 2, 1, 0]),
+        ];
+        for (num_items, target, expected_visits) in cases {
+            let mut visits = Vec::new();
+            let result = qpdf_name_tree_binary_search(num_items, false, |index| {
+                visits.push(index);
+                Ok(NameTreeKidOrdering::Order(target.cmp(&index)))
+            })
+            .unwrap();
+            assert!(matches!(result, NameTreeBinarySearch::Found(index) if index == target));
+            assert_eq!(visits, expected_visits);
+        }
+
+        let mut visits = Vec::new();
+        let result = qpdf_name_tree_binary_search(3, false, |index| {
+            visits.push(index);
+            Ok(NameTreeKidOrdering::Order(3_usize.cmp(&index)))
+        })
+        .unwrap();
+        assert!(matches!(result, NameTreeBinarySearch::Missing));
+        assert_eq!(visits, [2, 2]);
     }
 
     #[test]
