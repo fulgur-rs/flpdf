@@ -49,6 +49,16 @@ impl ObjectCache {
             .insert(object_ref, CacheEntry::Resolved(object));
     }
 
+    pub(crate) fn set_missing(&mut self, object_ref: ObjectRef) {
+        self.entries.insert(object_ref, CacheEntry::Missing);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_compressed(&mut self, object_ref: ObjectRef, stream: u32, index: u32) {
+        self.entries
+            .insert(object_ref, CacheEntry::Compressed { stream, index });
+    }
+
     /// Mark `object_ref` as resolution-in-progress. A re-entrant
     /// [`resolve`](crate::Pdf::resolve) for the same ref then hits the
     /// `Reserved => Null` arm instead of recursing, breaking indirect cycles

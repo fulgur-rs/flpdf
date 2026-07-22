@@ -16,7 +16,7 @@ use flpdf::{
     flatten_annotations, flatten_rotation_on_pages, fonts, generate_button_field_appearance,
     generate_choice_field_appearance, generate_text_field_appearance,
     json_inspect::{
-        build_qpdf_json_v2_selected_with_options, filter_json_objects, format_json_side_file_path,
+        build_qpdf_json_v2_selected_objects_with_options, format_json_side_file_path,
         stream_payload_for_decode_level, DecodeLevel, JsonKey, JsonObjectSelector,
         StreamDataMode as JsonStreamDataMode,
     },
@@ -1912,11 +1912,12 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     // written below — the two must agree, so they share this single value.
     let decode_level = DecodeLevel::Generalized;
     let diagnostics_start = pdf.repair_diagnostics().entries().len();
-    let mut v2 = match build_qpdf_json_v2_selected_with_options(
+    let v2 = match build_qpdf_json_v2_selected_objects_with_options(
         &mut pdf,
         decode_level,
         &stream_mode,
         &json_keys,
+        &json_objects,
     ) {
         Ok(v2) => v2,
         Err(error) => {
@@ -1925,12 +1926,7 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         }
     };
 
-    // 6. Apply --json-object filter.
-    if !json_objects.is_empty() {
-        v2 = filter_json_objects(v2, &json_objects);
-    }
-
-    // 7. Write JSON to output destination. Outline/name-tree processing may
+    // 6. Write JSON to output destination. Outline/name-tree processing may
     // already have recorded warnings while building `v2`. If output fails,
     // emit those warnings before returning the fatal write error so they are
     // not lost; the success summary is intentionally omitted on this path.
@@ -1951,7 +1947,7 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         return Err(error);
     }
 
-    // 8. Write side files for stream-data=file mode — only for streams
+    // 7. Write side files for stream-data=file mode — only for streams
     // that actually survived --json-key / --json-object filtering. Walk
     // the final JSON and collect every "datafile" value emitted in the
     // qpdf objects map, then write exactly those streams to disk. Without

@@ -56,11 +56,49 @@ pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)>
 pub(crate) fn parse_indirect_object_detailed(
     input: &[u8],
 ) -> Result<(ObjectRef, Object, Option<IndirectStreamLength>)> {
+    let (object_ref, object, indirect_len, _) = parse_indirect_object_detailed_impl(input, false)?;
+    Ok((object_ref, object, indirect_len))
+}
+
+/// qpdf's JSON inspection resolves an empty indirect object as null while
+/// recording a warning. Keep that recovery opt-in so ordinary PDF reads stay
+/// strict. The final tuple member is the byte offset of the `endobj` token when
+/// this recovery was used.
+pub(crate) fn parse_indirect_object_detailed_qpdf(
+    input: &[u8],
+) -> Result<(
+    ObjectRef,
+    Object,
+    Option<IndirectStreamLength>,
+    Option<usize>,
+)> {
+    parse_indirect_object_detailed_impl(input, true)
+}
+
+fn parse_indirect_object_detailed_impl(
+    input: &[u8],
+    allow_empty_object: bool,
+) -> Result<(
+    ObjectRef,
+    Object,
+    Option<IndirectStreamLength>,
+    Option<usize>,
+)> {
     let mut parser = Parser::new(input);
     let number = parser.integer_for_indirect()?;
     let generation = parser.integer_for_indirect()?;
     parser.expect_keyword_for_indirect(b"obj")?;
-    let object = parser.object()?;
+    parser.skip_ws();
+    let empty_object_offset = if allow_empty_object && parser.take_keyword_token(b"endobj") {
+        Some(parser.pos - b"endobj".len())
+    } else {
+        None
+    };
+    let object = if empty_object_offset.is_some() {
+        Object::Null
+    } else {
+        parser.object()?
+    };
     Ok((
         ObjectRef::new(
             u32::try_from(number).map_err(|_| Error::parse(0, "invalid indirect object number"))?,
@@ -69,6 +107,7 @@ pub(crate) fn parse_indirect_object_detailed(
         ),
         object,
         parser.last_indirect_stream_len,
+        empty_object_offset,
     ))
 }
 
@@ -632,6 +671,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn take_keyword_token(&mut self, keyword: &[u8]) -> bool {
+        if !self.starts_with(keyword) {
+            return false;
+        }
+        let following = self.input.get(self.pos + keyword.len()).copied();
+        if following.is_some_and(|byte| !is_ws(byte) && !is_delimiter(byte)) {
+            return false;
+        }
+        self.pos += keyword.len();
+        true
+    }
+
     fn expect_byte(&mut self, expected: u8) -> Result<()> {
         if self.peek() == Some(expected) {
             self.pos += 1;
@@ -735,8 +786,10 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod stream_length_tests {
-    use super::parse_indirect_object;
-    use crate::Object;
+    use super::{
+        parse_indirect_object, parse_indirect_object_detailed, parse_indirect_object_detailed_qpdf,
+    };
+    use crate::{Object, ObjectRef};
 
     fn parse_stream(bytes: &[u8]) -> crate::Stream {
         let (_, object) = parse_indirect_object(bytes).expect("indirect object must parse");
@@ -849,5 +902,20 @@ mod stream_length_tests {
         assert!(!contains_keyword_token(b"endstreamX", b"endstream", 0));
         // Absent keyword does not.
         assert!(!contains_keyword_token(b"no keyword here", b"endstream", 0));
+    }
+
+    #[test]
+    fn empty_indirect_object_recovery_is_qpdf_only_and_token_bounded() {
+        let empty = b"7 0 obj\n  endobj\n";
+        assert!(parse_indirect_object_detailed(empty).is_err());
+
+        let (object_ref, object, indirect_len, empty_offset) =
+            parse_indirect_object_detailed_qpdf(empty).expect("qpdf empty recovery");
+        assert_eq!(object_ref, ObjectRef::new(7, 0));
+        assert_eq!(object, Object::Null);
+        assert!(indirect_len.is_none());
+        assert_eq!(empty_offset, Some(10));
+
+        assert!(parse_indirect_object_detailed_qpdf(b"7 0 obj\nendobject\nendobj\n").is_err());
     }
 }

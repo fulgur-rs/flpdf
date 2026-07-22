@@ -1251,6 +1251,349 @@ fn json_metadata_includes_outline_repair_allocations_in_maxobjectid() {
 }
 
 #[test]
+fn json_qpdf_preparation_treats_referenced_empty_object_as_null_with_warning() {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    fixture.write_all(&empty_object_json_pdf()).unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--json-key=qpdf", "--json-object=7"])
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["qpdf"][1]["obj:7 0 R"],
+        serde_json::json!({"value": null})
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("empty object treated as null").count(), 1);
+    assert_eq!(
+        stderr.matches("operation succeeded with warnings").count(),
+        1
+    );
+    assert!(
+        stderr.find("empty object treated as null").unwrap()
+            < stderr.find("operation succeeded with warnings").unwrap(),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn json_unselected_qpdf_does_not_resolve_unrelated_empty_object() {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    fixture.write_all(&empty_object_json_pdf()).unwrap();
+
+    for section in ["pages", "outlines"] {
+        let output = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(["--json=2", &format!("--json-key={section}")])
+            .arg(fixture.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{section}");
+        assert!(output.stderr.is_empty(), "{section}");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(json.get(section).is_some(), "{section}");
+        assert!(json.get("qpdf").is_none(), "{section}");
+    }
+}
+
+#[test]
+fn json_qpdf_preparation_walks_nested_stream_holder_and_cycle_objects() {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    fixture.write_all(&dangling_container_json_pdf()).unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--json-key=qpdf"])
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json_qpdf_metadata(&json)["maxobjectid"], 99);
+    assert_eq!(
+        json["qpdf"][1]["obj:1 0 R"]["value"]["/Nested"],
+        serde_json::json!({"/Array": ["99 2 R", null]})
+    );
+    assert_eq!(
+        json["qpdf"][1]["obj:4 0 R"]["stream"]["dict"],
+        serde_json::json!({"/Length": 0})
+    );
+    assert_eq!(
+        json["qpdf"][1]["obj:5 0 R"],
+        serde_json::json!({"value": {}})
+    );
+    assert_eq!(
+        json["qpdf"][1]["obj:99 2 R"],
+        serde_json::json!({"value": null})
+    );
+    assert_eq!(
+        json["qpdf"][1]["obj:6 0 R"],
+        serde_json::json!({"value": {"/Next": "7 0 R"}})
+    );
+    assert_eq!(
+        json["qpdf"][1]["obj:7 0 R"],
+        serde_json::json!({"value": {"/Next": "6 0 R"}})
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 dangling container JSON oracle"]
+fn live_qpdf_dangling_container_json_matches() {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    fixture.write_all(&dangling_container_json_pdf()).unwrap();
+    let args = ["--json=2", "--json-key=qpdf"];
+    let qpdf = std::process::Command::new("qpdf")
+        .args(args)
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+
+    let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr);
+    let flpdf_stderr = String::from_utf8_lossy(&flpdf.stderr);
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "qpdf stderr: {qpdf_stderr}\nflpdf stderr: {flpdf_stderr}"
+    );
+    let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout).unwrap();
+    let flpdf_json: serde_json::Value = serde_json::from_slice(&flpdf.stdout).unwrap();
+    assert_eq!(flpdf_json["qpdf"], qpdf_json["qpdf"]);
+    assert_eq!(flpdf_stderr, qpdf_stderr);
+}
+
+#[test]
+fn json_qpdf_preparation_resolves_lazy_objects_and_exact_free_generations() {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    fixture
+        .write_all(&dangling_generation_free_json_pdf())
+        .unwrap();
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--json-key=qpdf"])
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json_qpdf_metadata(&json)["maxobjectid"], 88);
+    let objects = &json["qpdf"][1];
+    assert_eq!(objects["obj:8 0 R"], serde_json::json!({"value": null}));
+    assert_eq!(
+        objects["obj:8 1 R"],
+        serde_json::json!({"value": {"/Value": 1}})
+    );
+    assert_eq!(objects["obj:20 7 R"], serde_json::json!({"value": null}));
+    assert_eq!(objects["obj:88 4 R"], serde_json::json!({"value": null}));
+    assert!(objects.get("obj:200 7 R").is_none());
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 lazy/generation/free JSON oracle"]
+fn live_qpdf_dangling_generation_free_json_matches() {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    fixture
+        .write_all(&dangling_generation_free_json_pdf())
+        .unwrap();
+    let args = ["--json=2", "--json-key=qpdf"];
+    let qpdf = std::process::Command::new("qpdf")
+        .args(args)
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout).unwrap();
+    let flpdf_json: serde_json::Value = serde_json::from_slice(&flpdf.stdout).unwrap();
+    assert_eq!(flpdf_json["qpdf"], qpdf_json["qpdf"]);
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 empty-object diagnostic oracle"]
+fn live_qpdf_empty_object_json_matches() {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    fixture.write_all(&empty_object_json_pdf()).unwrap();
+    let args = ["--json=2", "--json-key=qpdf", "--json-object=7"];
+    let qpdf = std::process::Command::new("qpdf")
+        .args(args)
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout).unwrap();
+    let flpdf_json: serde_json::Value = serde_json::from_slice(&flpdf.stdout).unwrap();
+    assert_eq!(flpdf_json["qpdf"], qpdf_json["qpdf"]);
+    for stderr in [&qpdf.stderr, &flpdf.stderr] {
+        let stderr = String::from_utf8_lossy(stderr);
+        assert_eq!(stderr.matches("empty object treated as null").count(), 1);
+        assert_eq!(
+            stderr.matches("operation succeeded with warnings").count(),
+            1
+        );
+    }
+    let warning_suffix = |stderr: &[u8]| {
+        String::from_utf8_lossy(stderr)
+            .lines()
+            .find(|line| line.contains("empty object treated as null"))
+            .and_then(|line| line.split_once("(object"))
+            .map(|(_, suffix)| suffix.to_string())
+            .unwrap()
+    };
+    assert_eq!(warning_suffix(&flpdf.stderr), warning_suffix(&qpdf.stderr));
+}
+
+#[test]
+fn json_qpdf_dangling_fixture_selectors_and_all_match_raw_rules() {
+    let input = "../../tests/fixtures/compat/dangling-body-one-page.pdf";
+    let cases: [(&str, &[&str], &[&str]); 3] = [
+        (
+            "trailer",
+            &["--json=2", "--json-key=qpdf", "--json-object=trailer"],
+            &["trailer"],
+        ),
+        (
+            "dangling",
+            &["--json=2", "--json-key=qpdf", "--json-object=99"],
+            &["obj:99 0 R"],
+        ),
+        (
+            "all",
+            &["--json=2", "--json-key=qpdf"],
+            &["obj:4 0 R", "obj:99 0 R", "trailer"],
+        ),
+    ];
+
+    for (label, args, expected_keys) in cases {
+        let output = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(args)
+            .arg(input)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{label}");
+        assert!(output.stderr.is_empty(), "{label}");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json_qpdf_metadata(&json)["maxobjectid"], 99, "{label}");
+        let map = json["qpdf"][1].as_object().unwrap();
+        if label == "all" {
+            assert!(expected_keys.iter().all(|key| map.contains_key(*key)));
+        } else {
+            assert_eq!(
+                map.keys().map(String::as_str).collect::<Vec<_>>(),
+                expected_keys,
+                "{label}"
+            );
+        }
+        if label != "trailer" {
+            assert_eq!(map["obj:99 0 R"], serde_json::json!({"value": null}));
+        }
+        if label == "all" {
+            let catalog = &map["obj:4 0 R"]["value"];
+            assert!(catalog.get("/Bad").is_none());
+            assert!(catalog.get("/Junk").is_none());
+            assert_eq!(catalog["/Nested"], serde_json::json!({}));
+            assert_eq!(catalog["/ArrZero"], serde_json::json!([null]));
+        }
+    }
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 dangling selectors/all oracle"]
+fn live_qpdf_dangling_fixture_selectors_and_all_match() {
+    let input = "../../tests/fixtures/compat/dangling-body-one-page.pdf";
+    let cases: [&[&str]; 3] = [
+        &["--json=2", "--json-key=qpdf", "--json-object=trailer"],
+        &["--json=2", "--json-key=qpdf", "--json-object=99"],
+        &["--json=2", "--json-key=qpdf"],
+    ];
+    for args in cases {
+        let qpdf = std::process::Command::new("qpdf")
+            .args(args)
+            .arg(input)
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(args)
+            .arg(input)
+            .output()
+            .unwrap();
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "{args:?}");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "{args:?}");
+        let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout).unwrap();
+        let flpdf_json: serde_json::Value = serde_json::from_slice(&flpdf.stdout).unwrap();
+        assert_eq!(flpdf_json["qpdf"], qpdf_json["qpdf"], "{args:?}");
+    }
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 compressed dangling JSON oracle"]
+fn live_qpdf_compressed_dangling_json_matches() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input.pdf");
+    let compressed = temp.path().join("compressed.pdf");
+    std::fs::write(&input, dangling_container_json_pdf()).unwrap();
+    let generate = std::process::Command::new("qpdf")
+        .args(["--object-streams=generate"])
+        .arg(&input)
+        .arg(&compressed)
+        .output()
+        .unwrap();
+    assert!(
+        generate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generate.stderr)
+    );
+    assert!(contains(&std::fs::read(&compressed).unwrap(), b"/ObjStm"));
+
+    let args = ["--json=2", "--json-key=qpdf"];
+    let qpdf = std::process::Command::new("qpdf")
+        .args(args)
+        .arg(&compressed)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(&compressed)
+        .output()
+        .unwrap();
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout).unwrap();
+    let flpdf_json: serde_json::Value = serde_json::from_slice(&flpdf.stdout).unwrap();
+    assert_eq!(flpdf_json["qpdf"], qpdf_json["qpdf"]);
+}
+
+#[test]
 #[ignore = "live qpdf 11.9.0 selected JSON section oracle"]
 fn live_qpdf_selected_json_sections_match_construction_side_effects() {
     struct Case {
@@ -2164,6 +2507,68 @@ fn build_classic_pdf(objects: &[&[u8]]) -> Vec<u8> {
     bytes.extend_from_slice(
         format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
             .as_bytes(),
+    );
+    bytes
+}
+
+fn empty_object_json_pdf() -> Vec<u8> {
+    build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Probe 7 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>\nendobj\n",
+        b"4 0 obj\nnull\nendobj\n",
+        b"5 0 obj\nnull\nendobj\n",
+        b"6 0 obj\nnull\nendobj\n",
+        b"7 0 obj\nendobj\n",
+    ])
+}
+
+fn dangling_container_json_pdf() -> Vec<u8> {
+    build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Nested << /Drop 99 2 R /Array [99 2 R 0 0 R] >> >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>\nendobj\n",
+        b"4 0 obj\n<< /Length 0 /Drop 99 2 R >>\nstream\nendstream\nendobj\n",
+        b"5 0 obj\n<< /Held 99 2 R >>\nendobj\n",
+        b"6 0 obj\n<< /Next 7 0 R >>\nendobj\n",
+        b"7 0 obj\n<< /Next 6 0 R >>\nendobj\n",
+    ])
+}
+
+fn dangling_generation_free_json_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let objects: [(u32, u16, &[u8]); 5] = [
+        (
+            1,
+            0,
+            b"<< /Type /Catalog /Pages 2 0 R /Live 8 1 R /Stale 8 0 R /Freed 20 7 R >>",
+        ),
+        (2, 0, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            0,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>",
+        ),
+        (8, 1, b"<< /Value 1 >>"),
+        (9, 0, b"<< /Lazy 88 4 R >>"),
+    ];
+    let mut offsets = Vec::new();
+    for (number, generation, body) in objects {
+        offsets.push((number, generation, bytes.len()));
+        bytes.extend_from_slice(format!("{number} {generation} obj\n").as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    for (number, generation, offset) in offsets {
+        bytes
+            .extend_from_slice(format!("{number} 1\n{offset:010} {generation:05} n \n").as_bytes());
+    }
+    bytes.extend_from_slice(b"20 1\n0000000000 00007 f \n");
+    bytes.extend_from_slice(b"200 1\n0000000000 00007 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 201 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
     );
     bytes
 }
