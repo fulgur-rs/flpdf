@@ -1893,8 +1893,14 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     // build_qpdf_json_v2_with_options) and the file-mode side files written in
     // step 9 below — the two must agree, so they share this single value.
     let decode_level = DecodeLevel::Generalized;
-    let mut v2 = build_qpdf_json_v2_with_options(&mut pdf, decode_level, &stream_mode)
-        .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+    let diagnostics_start = pdf.repair_diagnostics().entries().len();
+    let mut v2 = match build_qpdf_json_v2_with_options(&mut pdf, decode_level, &stream_mode) {
+        Ok(v2) => v2,
+        Err(error) => {
+            emit_warnings_since(input, &pdf, diagnostics_start);
+            return Err(Box::<dyn std::error::Error>::from(error.to_string()));
+        }
+    };
 
     // 6. Apply --json-key filter.
     if !json_keys.is_empty() {
@@ -4998,7 +5004,11 @@ fn diagnostic_location(input: &Path, offset: Option<u64>) -> String {
 /// open (`build_overlay_specs`) so both surfaces print open-time warnings
 /// identically.
 fn emit_open_warnings<R: Read + Seek>(path: &Path, pdf: &Pdf<R>) {
-    for diagnostic in pdf.repair_diagnostics().entries() {
+    emit_warnings_since(path, pdf, 0);
+}
+
+fn emit_warnings_since<R: Read + Seek>(path: &Path, pdf: &Pdf<R>, start: usize) {
+    for diagnostic in pdf.repair_diagnostics().entries().iter().skip(start) {
         let location = diagnostic_location(path, diagnostic.offset);
         eprintln!("WARNING: {location}: {}", diagnostic.message);
     }

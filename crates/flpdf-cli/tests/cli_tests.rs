@@ -1037,6 +1037,38 @@ fn show_outline_warns_and_prints_empty_when_outline_resolution_fails() {
 }
 
 #[test]
+fn json_outlines_short_first_name_tree_pair_exits_two_without_complete_json() {
+    let fixture = fixture_with_short_first_name_tree_pair();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let assert = cmd
+        .args(["--json=2", "--json-key=outlines"])
+        .arg(fixture.path())
+        .assert()
+        .code(2);
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let repair = stderr
+        .find("attempting to repair after error:")
+        .unwrap_or_else(|| panic!("missing repair warning in {stderr}"));
+    let fatal = stderr
+        .rfind("update ivalue: items array is too short")
+        .unwrap_or_else(|| panic!("missing fatal error in {stderr}"));
+    assert!(repair < fatal, "{stderr}");
+    assert_eq!(
+        stderr.matches("attempting to repair after error:").count(),
+        1
+    );
+    assert_eq!(
+        stderr
+            .matches("update ivalue: items array is too short")
+            .count(),
+        2
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
 fn show_fonts_prints_summary() {
     let fixture = fixture_with_metadata_outline_and_fonts();
 
@@ -1150,6 +1182,35 @@ fn fixture_with_metadata_outline_and_fonts() -> tempfile::NamedTempFile {
     let file = fixture.as_file_mut();
     file.write_all(&bytes).unwrap();
 
+    fixture
+}
+
+fn fixture_with_short_first_name_tree_pair() -> tempfile::NamedTempFile {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    let objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names << /Dests << /Names [(m)] >> >> >>\nendobj\n".as_slice(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".as_slice(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".as_slice(),
+        b"4 0 obj\n<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>\nendobj\n".as_slice(),
+        b"5 0 obj\n<< /Title (One) /Parent 4 0 R /Dest (m) >>\nendobj\n".as_slice(),
+    ];
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for object in objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+    fixture.as_file_mut().write_all(&bytes).unwrap();
     fixture
 }
 

@@ -356,6 +356,18 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Some(dests_root) = names.remove("Dests") else {
             return Ok(Object::Null);
         };
+        match &dests_root {
+            Object::Dictionary(_) => {}
+            Object::Reference(_) => {
+                if !matches!(
+                    crate::ref_chain::resolve_ref_chain(self.pdf, &dests_root)?.0,
+                    Object::Dictionary(_)
+                ) {
+                    return Ok(Object::Null);
+                }
+            }
+            _ => return Ok(Object::Null),
+        }
         match find_name_tree_value(self.pdf, dests_root.clone(), &lookup)? {
             NameTreeLookup::Found(value) => return resolve_terminal_object(self.pdf, value),
             NameTreeLookup::Missing => {}
@@ -537,6 +549,7 @@ enum NameTreeFirstBoundary {
     Empty,
     Invalid,
     Key(Vec<u8>),
+    Structural(NameTreeStructuralError),
 }
 
 /// Find one key in a name tree using qpdf's `/Names`-or-`/Kids` descent.
@@ -552,6 +565,9 @@ fn find_name_tree_value<R: Read + Seek>(
     cursor = updated_root;
     match first_boundary {
         NameTreeFirstBoundary::Empty => return Ok(NameTreeLookup::Missing),
+        NameTreeFirstBoundary::Structural(error) => {
+            return Ok(NameTreeLookup::Structural(error));
+        }
         NameTreeFirstBoundary::Key(first) if lookup < first.as_slice() => {
             return Ok(NameTreeLookup::Missing);
         }
@@ -645,6 +661,15 @@ fn name_tree_begin_preflight<R: Read + Seek>(
         let mut has_empty_names = false;
         if let Some(Object::Array(names)) = node.get("Names") {
             if !names.is_empty() {
+                if names.len() < 2 {
+                    return Ok((
+                        updated_root,
+                        NameTreeFirstBoundary::Structural(NameTreeStructuralError {
+                            node_ref: identity,
+                            message: "update ivalue: items array is too short".to_string(),
+                        }),
+                    ));
+                }
                 let boundary = match names.first() {
                     Some(Object::String(key)) => {
                         NameTreeFirstBoundary::Key(crate::json_inspect::qpdf_utf8_value(key))
@@ -918,6 +943,16 @@ fn enumerate_name_tree_entries<R: Read + Seek>(
         let mut allow_empty_root = false;
         if let Some(Object::Array(names)) = names_value {
             if !names.is_empty() {
+                if names.len() < 2 {
+                    return Err(Error::parse(
+                        0,
+                        NameTreeStructuralError {
+                            node_ref: identity,
+                            message: "update ivalue: items array is too short".to_string(),
+                        }
+                        .diagnostic(),
+                    ));
+                }
                 let mut pairs = names.chunks_exact(2);
                 for (pair_index, pair) in pairs.by_ref().enumerate() {
                     let Object::String(key) = &pair[0] else {

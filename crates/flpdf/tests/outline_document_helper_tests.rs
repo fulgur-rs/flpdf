@@ -1,6 +1,6 @@
 //! Integration tests for [`flpdf::OutlineDocumentHelper`].
 
-use flpdf::{write_pdf, Dictionary, Object, ObjectRef, OutlineItem, Pdf};
+use flpdf::{write_pdf, Dictionary, Error, Object, ObjectRef, OutlineItem, Pdf};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
@@ -1382,6 +1382,194 @@ fn named_destination_lookup_handles_qpdf_node_shapes() {
         let bytes = single_outline_with_catalog(catalog_entries, "/Dest (shape)", extra);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         assert_eq!(root_items(&mut pdf)[0].dest, expected, "{catalog_entries}");
+    }
+}
+
+#[test]
+fn short_first_name_tree_pair_is_fatal_after_the_repair_warning() {
+    let cases = [
+        (
+            "direct root",
+            "/Names << /Dests << /Names [(m)] >> >>",
+            &[][..],
+            "Name/Number tree node: update ivalue: items array is too short",
+        ),
+        (
+            "indirect root",
+            "/Names << /Dests 8 0 R >>",
+            &[(8, "<< /Names [(m)] >>")][..],
+            "Name/Number tree node (object 8): update ivalue: items array is too short",
+        ),
+    ];
+
+    for (label, catalog_entries, extra, expected_message) in cases {
+        let bytes = single_outline_with_catalog(catalog_entries, "/Dest (m)", extra);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let error = pdf.outline().get_tree().unwrap_err();
+        match error {
+            Error::Parse { offset, message } => {
+                assert_eq!(offset, 0, "{label}");
+                assert_eq!(message, expected_message, "{label}");
+            }
+            other => panic!("{label}: expected parse error, got {other}"),
+        }
+        assert_eq!(
+            warning_messages(&pdf),
+            [format!(
+                "attempting to repair after error: {expected_message}"
+            )],
+            "{label}"
+        );
+
+        match extra {
+            [] => assert_eq!(
+                direct_dests_root(&mut pdf).get("Names"),
+                Some(&Object::Array(vec![Object::String(b"m".to_vec())])),
+                "{label}"
+            ),
+            [(object_number, _)] => {
+                let Object::Dictionary(root) =
+                    pdf.resolve(ObjectRef::new(*object_number, 0)).unwrap()
+                else {
+                    panic!("{label}: indirect root must remain a dictionary");
+                };
+                assert_eq!(
+                    root.get("Names"),
+                    Some(&Object::Array(vec![Object::String(b"m".to_vec())])),
+                    "{label}"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn scalar_name_tree_dests_are_silent_and_resolve_to_null() {
+    let cases = [
+        ("direct scalar", "/Names << /Dests 42 >>", &[][..]),
+        (
+            "indirect scalar",
+            "/Names << /Dests 8 0 R >>",
+            &[(8, "42")][..],
+        ),
+    ];
+
+    for (label, catalog_entries, extra) in cases {
+        let bytes = single_outline_with_catalog(catalog_entries, "/Dest (m)", extra);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        assert_eq!(root_items(&mut pdf)[0].dest, Object::Null, "{label}");
+        assert!(warning_messages(&pdf).is_empty(), "{label}");
+    }
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 short first-pair oracle"]
+fn qpdf_short_first_name_tree_pair_is_fatal_after_repair_warning() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let cases = [
+        (
+            "direct root",
+            "/Names << /Dests << /Names [(m)] >> >>",
+            &[][..],
+        ),
+        (
+            "indirect root",
+            "/Names << /Dests 8 0 R >>",
+            &[(8, "<< /Names [(m)] >>")][..],
+        ),
+    ];
+
+    for (label, catalog_entries, extra) in cases {
+        let mut input = tempfile::NamedTempFile::new().unwrap();
+        input
+            .write_all(&single_outline_with_catalog(
+                catalog_entries,
+                "/Dest (m)",
+                extra,
+            ))
+            .unwrap();
+        let output = Command::new("qpdf")
+            .args(["--json=2", "--json-key=outlines"])
+            .arg(input.path())
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(2), "{label}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let repair = stderr
+            .find("attempting to repair after error:")
+            .unwrap_or_else(|| panic!("{label}: missing repair warning in {stderr}"));
+        let fatal = stderr
+            .rfind("update ivalue: items array is too short")
+            .unwrap_or_else(|| panic!("{label}: missing fatal error in {stderr}"));
+        assert!(repair < fatal, "{label}: {stderr}");
+        assert_eq!(
+            stderr.matches("attempting to repair after error:").count(),
+            1,
+            "{label}"
+        );
+        assert_eq!(
+            stderr
+                .matches("update ivalue: items array is too short")
+                .count(),
+            2,
+            "{label}"
+        );
+        assert!(!output.stdout.is_empty(), "{label}");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).is_err(),
+            "{label}: qpdf must leave partial, incomplete JSON"
+        );
+    }
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 scalar /Dests oracle"]
+fn qpdf_scalar_name_tree_dests_are_silent_and_null() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let cases = [
+        ("direct scalar", "/Names << /Dests 42 >>", &[][..]),
+        (
+            "indirect scalar",
+            "/Names << /Dests 8 0 R >>",
+            &[(8, "42")][..],
+        ),
+    ];
+
+    for (label, catalog_entries, extra) in cases {
+        let mut input = tempfile::NamedTempFile::new().unwrap();
+        input
+            .write_all(&single_outline_with_catalog(
+                catalog_entries,
+                "/Dest (m)",
+                extra,
+            ))
+            .unwrap();
+        let output = Command::new("qpdf")
+            .args(["--json=2", "--json-key=outlines"])
+            .arg(input.path())
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(0), "{label}");
+        assert!(
+            output.stderr.is_empty(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            json["outlines"][0]["dest"],
+            serde_json::Value::Null,
+            "{label}"
+        );
     }
 }
 
