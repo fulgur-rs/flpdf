@@ -210,8 +210,8 @@ struct Cli {
     json_output: Option<PathBuf>,
 
     /// Limit JSON output to the specified top-level key (repeatable).
-    /// Valid keys: acroform, attachments, encrypt, objectinfo, objects,
-    /// outlines, pagelabels, pages, qpdf.
+    /// Valid JSON v2 keys: acroform, attachments, encrypt, outlines,
+    /// pagelabels, pages, qpdf.
     #[arg(
         long = "json-key",
         value_name = "KEY",
@@ -1825,13 +1825,31 @@ fn main() {
 }
 
 fn run_json(cli: &Cli) -> CliResult<()> {
+    const QPDF_JSON_KEY_NAMES: &[&str] = &[
+        "acroform",
+        "attachments",
+        "encrypt",
+        "objectinfo",
+        "objects",
+        "outlines",
+        "pagelabels",
+        "pages",
+        "qpdf",
+    ];
+
     // 1. Validate --json-key values before doing any I/O.
     let mut json_keys: Vec<JsonKey> = Vec::new();
     for raw in &cli.json_key {
+        if matches!(raw.as_str(), "objects" | "objectinfo") {
+            eprintln!(
+                "flpdf: json keys \"objects\" and \"objectinfo\" are only valid for json version 1"
+            );
+            std::process::exit(2);
+        }
         match JsonKey::from_str(raw.as_str()) {
             Some(k) => json_keys.push(k),
             None => {
-                let names = JsonKey::ALL_NAMES.join(",");
+                let names = QPDF_JSON_KEY_NAMES.join(",");
                 eprintln!("flpdf: --json-key must be given as --json-key={{{names}}}");
                 std::process::exit(2);
             }

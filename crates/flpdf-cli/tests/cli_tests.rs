@@ -15,6 +15,10 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
+fn json_qpdf_metadata(json: &serde_json::Value) -> &serde_json::Value {
+    &json["qpdf"][0]
+}
+
 #[test]
 fn check_valid_fixture_exits_successfully() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
@@ -1179,6 +1183,74 @@ fn json_key_selection_order_is_qpdf_fixed() {
 }
 
 #[test]
+fn json_metadata_tracks_page_enumeration_without_pushing_inherited_resources() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/inherited-resources-one-page.pdf");
+    let cases = [
+        ("qpdf only", &["--json=2", "--json-key=qpdf"][..], false),
+        (
+            "pages then qpdf",
+            &["--json=2", "--json-key=pages", "--json-key=qpdf"][..],
+            true,
+        ),
+    ];
+
+    for (label, args, called_get_all_pages) in cases {
+        let output = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(args)
+            .arg(&fixture)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{label}");
+        assert!(output.stderr.is_empty(), "{label}");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            json_qpdf_metadata(&json),
+            &serde_json::json!({
+                "jsonversion": 2,
+                "pdfversion": "1.4",
+                "pushedinheritedpageresources": false,
+                "calledgetallpages": called_get_all_pages,
+                "maxobjectid": 5
+            }),
+            "{label}"
+        );
+        assert!(
+            json["qpdf"][1]["obj:3 0 R"]["value"]
+                .get("/Resources")
+                .is_none(),
+            "{label}: page dictionary must remain unmodified"
+        );
+    }
+}
+
+#[test]
+fn json_metadata_includes_outline_repair_allocations_in_maxobjectid() {
+    let fixture = fixture_with_name_tree_repair_allocations();
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--json-key=outlines", "--json-key=qpdf"])
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json_qpdf_metadata(&json),
+        &serde_json::json!({
+            "jsonversion": 2,
+            "pdfversion": "1.7",
+            "pushedinheritedpageresources": false,
+            "calledgetallpages": true,
+            "maxobjectid": 10
+        })
+    );
+    assert!(json["qpdf"][1].get("obj:9 0 R").is_some());
+    assert!(json["qpdf"][1].get("obj:10 0 R").is_some());
+}
+
+#[test]
 #[ignore = "live qpdf 11.9.0 selected JSON section oracle"]
 fn live_qpdf_selected_json_sections_match_construction_side_effects() {
     struct Case {
@@ -1269,6 +1341,12 @@ fn live_qpdf_selected_json_sections_match_construction_side_effects() {
             );
         }
         if case.has_qpdf {
+            assert_eq!(
+                json_qpdf_metadata(&flpdf_json),
+                json_qpdf_metadata(&qpdf_json),
+                "{}: complete qpdf metadata",
+                case.label
+            );
             for object in ["obj:1 0 R", "obj:8 0 R"] {
                 assert_eq!(
                     flpdf_json["qpdf"][1][object], qpdf_json["qpdf"][1][object],
@@ -1335,6 +1413,108 @@ fn live_qpdf_selected_json_sections_match_construction_side_effects() {
                 case.label
             );
         }
+    }
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 JSON metadata oracle"]
+fn live_qpdf_json_metadata_matches_inherited_resources_and_outline_allocation() {
+    let inherited = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/inherited-resources-one-page.pdf");
+    let allocation = fixture_with_name_tree_repair_allocations();
+    let cases = [
+        (
+            "inherited qpdf only",
+            inherited.as_path(),
+            &["--json=2", "--json-key=qpdf"][..],
+        ),
+        (
+            "inherited pages then qpdf",
+            inherited.as_path(),
+            &["--json=2", "--json-key=pages", "--json-key=qpdf"][..],
+        ),
+        (
+            "inherited pagelabels then qpdf",
+            inherited.as_path(),
+            &["--json=2", "--json-key=pagelabels", "--json-key=qpdf"][..],
+        ),
+        (
+            "inherited acroform then qpdf",
+            inherited.as_path(),
+            &["--json=2", "--json-key=acroform", "--json-key=qpdf"][..],
+        ),
+        (
+            "inherited attachments then qpdf",
+            inherited.as_path(),
+            &["--json=2", "--json-key=attachments", "--json-key=qpdf"][..],
+        ),
+        (
+            "inherited encrypt then qpdf",
+            inherited.as_path(),
+            &["--json=2", "--json-key=encrypt", "--json-key=qpdf"][..],
+        ),
+        (
+            "inherited outlines then qpdf",
+            inherited.as_path(),
+            &["--json=2", "--json-key=outlines", "--json-key=qpdf"][..],
+        ),
+        (
+            "inherited non-page combination",
+            inherited.as_path(),
+            &[
+                "--json=2",
+                "--json-key=attachments",
+                "--json-key=encrypt",
+                "--json-key=qpdf",
+            ][..],
+        ),
+        (
+            "inherited mixed combination",
+            inherited.as_path(),
+            &[
+                "--json=2",
+                "--json-key=qpdf",
+                "--json-key=attachments",
+                "--json-key=outlines",
+            ][..],
+        ),
+        (
+            "inherited full document",
+            inherited.as_path(),
+            &["--json=2"][..],
+        ),
+        (
+            "outline repair allocation",
+            allocation.path(),
+            &["--json=2", "--json-key=outlines", "--json-key=qpdf"][..],
+        ),
+    ];
+
+    for (label, fixture, args) in cases {
+        let qpdf = std::process::Command::new("qpdf")
+            .args(args)
+            .arg(fixture)
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(args)
+            .arg(fixture)
+            .output()
+            .unwrap();
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "{label}");
+        let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout).unwrap();
+        let flpdf_json: serde_json::Value = serde_json::from_slice(&flpdf.stdout).unwrap();
+        assert_eq!(
+            json_qpdf_metadata(&flpdf_json),
+            json_qpdf_metadata(&qpdf_json),
+            "{label}"
+        );
+        assert_eq!(
+            flpdf_json["qpdf"][1]["obj:3 0 R"]["value"].get("/Resources"),
+            qpdf_json["qpdf"][1]["obj:3 0 R"]["value"].get("/Resources"),
+            "{label}"
+        );
     }
 }
 
@@ -1610,6 +1790,46 @@ fn fixture_with_short_first_name_tree_pair() -> tempfile::NamedTempFile {
     }
     bytes.extend_from_slice(
         format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+    fixture.as_file_mut().write_all(&bytes).unwrap();
+    fixture
+}
+
+fn fixture_with_name_tree_repair_allocations() -> tempfile::NamedTempFile {
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    let pairs = (0..33)
+        .map(|index| format!("(k{index:02}) [3 0 R /Fit]"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let objects = vec![
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names << /Dests << /Kids [8 0 R] >> >> >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".to_vec(),
+        b"4 0 obj\n<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>\nendobj\n".to_vec(),
+        b"5 0 obj\n<< /Title (One) /Parent 4 0 R /Dest (k17) >>\nendobj\n".to_vec(),
+        b"6 0 obj\nnull\nendobj\n".to_vec(),
+        b"7 0 obj\nnull\nendobj\n".to_vec(),
+        format!("8 0 obj\n<< /Names [{pairs}] >>\nendobj\n").into_bytes(),
+    ];
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for object in &objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
     );
     fixture.as_file_mut().write_all(&bytes).unwrap();
     fixture

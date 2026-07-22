@@ -68,6 +68,8 @@ pub struct Pdf<R: Read + Seek> {
     source_xref_offsets: Vec<(ObjectRef, u64)>,
     source_xref_entries: BTreeMap<ObjectRef, XrefOffset>,
     dirty_object_refs: BTreeSet<ObjectRef>,
+    /// Monotonic observation matching qpdf's `everCalledGetAllPages()`.
+    ever_called_get_all_pages: bool,
     encryption: Option<EncryptionState>,
 }
 
@@ -535,6 +537,7 @@ impl<R: Read + Seek> Pdf<R> {
             source_xref_offsets,
             source_xref_entries,
             dirty_object_refs: BTreeSet::new(),
+            ever_called_get_all_pages: false,
             encryption: None,
         };
         pdf.authenticate_if_encrypted(&options)?;
@@ -775,6 +778,18 @@ impl<R: Read + Seek> Pdf<R> {
     /// PDF version header as written in the first line of the file (e.g. `"1.7"`).
     pub fn version(&self) -> &str {
         &self.version
+    }
+
+    /// Whether this document has been asked to enumerate its complete page tree.
+    ///
+    /// This is monotonic for the lifetime of the [`Pdf`] and mirrors qpdf's
+    /// `everCalledGetAllPages()` observation used by JSON v2 metadata.
+    pub fn ever_called_get_all_pages(&self) -> bool {
+        self.ever_called_get_all_pages
+    }
+
+    pub(crate) fn mark_get_all_pages_called(&mut self) {
+        self.ever_called_get_all_pages = true;
     }
 
     /// Adobe extension level from the catalog's `/Extensions /ADBE
