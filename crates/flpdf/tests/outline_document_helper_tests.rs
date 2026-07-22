@@ -1,6 +1,6 @@
 //! Integration tests for [`flpdf::OutlineDocumentHelper`].
 
-use flpdf::{write_pdf, Object, ObjectRef, OutlineItem, Pdf};
+use flpdf::{write_pdf, Dictionary, Object, ObjectRef, OutlineItem, Pdf};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
@@ -204,6 +204,20 @@ fn warning_messages(pdf: &Pdf<Cursor<Vec<u8>>>) -> Vec<&str> {
         .iter()
         .map(|diagnostic| diagnostic.message.as_str())
         .collect()
+}
+
+fn direct_dests_root(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Dictionary {
+    let catalog_ref = pdf.root_ref().unwrap();
+    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    let Object::Dictionary(names) = catalog.get("Names").unwrap() else {
+        panic!("/Names must be a direct dictionary");
+    };
+    let Object::Dictionary(dests) = names.get("Dests").unwrap() else {
+        panic!("/Dests must be a direct dictionary");
+    };
+    dests.clone()
 }
 
 #[test]
@@ -1367,6 +1381,209 @@ fn named_destination_lookup_handles_qpdf_node_shapes() {
     }
 }
 
+#[test]
+fn malformed_name_tree_structural_errors_warn_repair_and_retry() {
+    let cases = [
+        (
+            "invalid leaf key",
+            "/Names << /Dests << /Names [(a) [3 0 R /Fit] 42 [3 0 R /Fit] (z) [3 0 R /Fit]] >> >>",
+            &[][..],
+            "/Dest (m)",
+            "attempting to repair after error: Name/Number tree node: item at index 2 is not the right type",
+        ),
+        (
+            "targeted cycle",
+            "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (9, "<< /Limits [(m) (m)] /Kids [9 0 R] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (m)",
+            "attempting to repair after error: Name/Number tree node (object 9): loop detected in find",
+        ),
+        (
+            "bad node",
+            "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (9, "<< /Limits [(m) (m)] /Names [] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (m)",
+            "attempting to repair after error: Name/Number tree node (object 9): bad node during find",
+        ),
+        (
+            "binary search no candidate",
+            "/Names << /Dests << /Kids [8 0 R 9 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(m) (m)] /Names [(a) [3 0 R /Fit]] >>"),
+                (9, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (b)",
+            "attempting to repair after error: Name/Number tree node: unexpected -1 from binary search of kids; limits may by wrong",
+        ),
+    ];
+
+    for (label, catalog_entries, extra, item_entries, expected_warning) in cases {
+        let bytes = single_outline_with_catalog(catalog_entries, item_entries, extra);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        assert_eq!(root_items(&mut pdf)[0].dest, Object::Null, "{label}");
+        assert_eq!(
+            warning_messages(&pdf).first().copied(),
+            Some(expected_warning),
+            "{label}"
+        );
+        let dests = direct_dests_root(&mut pdf);
+        assert_eq!(dests.get("Kids"), None, "{label}");
+        assert!(
+            matches!(dests.get("Names"), Some(Object::Array(_))),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn malformed_name_tree_invalid_kid_is_skipped_while_valid_entries_are_retained() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [8 0 R 42 9 0 R] >> >>",
+        "/Dest (target)",
+        &[
+            (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+            (
+                9,
+                "<< /Limits [(target) (target)] /Names [(target) [3 0 R /Fit]] >>",
+            ),
+        ],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    assert_eq!(
+        warning_messages(&pdf),
+        [
+            "attempting to repair after error: Name/Number tree node: invalid kid at index 1",
+            "skipping over invalid kid at index 1",
+        ]
+    );
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(dests.get("Kids"), None);
+    assert_eq!(
+        dests.get("Names"),
+        Some(&Object::Array(vec![
+            Object::String(b"a".to_vec()),
+            page_dest(3),
+            Object::String(b"target".to_vec()),
+            page_dest(3),
+        ]))
+    );
+}
+
+#[test]
+fn malformed_name_tree_zero_entry_repair_still_installs_an_empty_names_array() {
+    let bytes =
+        single_outline_with_catalog("/Names << /Dests << /Kids [42] >> >>", "/Dest (shape)", &[]);
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    assert_eq!(
+        warning_messages(&pdf),
+        [
+            "attempting to repair after error: Name/Number tree node: invalid kid at index 0",
+            "skipping over invalid kid at index 0",
+        ]
+    );
+    let dests = direct_dests_root(&mut pdf);
+    assert_eq!(dests.get("Kids"), None);
+    assert_eq!(dests.get("Names"), Some(&Object::Array(Vec::new())));
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 structural-repair oracle"]
+fn qpdf_malformed_name_tree_structural_matrix_warns_and_repairs() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let cases = [
+        (
+            "/Names << /Dests << /Kids [8 0 R 42 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (m)",
+            "invalid kid at index 1",
+        ),
+        (
+            "/Names << /Dests << /Names [(a) [3 0 R /Fit] 42 [3 0 R /Fit] (z) [3 0 R /Fit]] >> >>",
+            &[][..],
+            "/Dest (m)",
+            "item at index 2 is not the right type",
+        ),
+        (
+            "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (9, "<< /Limits [(m) (m)] /Kids [9 0 R] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (m)",
+            "loop detected in find",
+        ),
+        (
+            "/Names << /Dests << /Kids [8 0 R 9 0 R 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(a) (a)] /Names [(a) [3 0 R /Fit]] >>"),
+                (9, "<< /Limits [(m) (m)] /Names [] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (m)",
+            "bad node during find",
+        ),
+        (
+            "/Names << /Dests << /Kids [8 0 R 10 0 R] >> >>",
+            &[
+                (8, "<< /Limits [(m) (m)] /Names [(a) [3 0 R /Fit]] >>"),
+                (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
+            ][..],
+            "/Dest (b)",
+            "unexpected -1 from binary search of kids; limits may by wrong",
+        ),
+    ];
+
+    for (catalog_entries, extra, item_entries, expected_suffix) in cases {
+        let mut input = tempfile::NamedTempFile::new().unwrap();
+        input
+            .write_all(&single_outline_with_catalog(
+                catalog_entries,
+                item_entries,
+                extra,
+            ))
+            .unwrap();
+        let output = Command::new("qpdf")
+            .args(["--json=2", "--json-key=outlines", "--json-key=qpdf"])
+            .arg(input.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{expected_suffix}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected_suffix),
+            "{expected_suffix}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let repaired_root = &json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"];
+        assert!(repaired_root.get("/Kids").is_none(), "{expected_suffix}");
+        assert!(repaired_root["/Names"].is_array(), "{expected_suffix}");
+    }
+}
+
 fn missing_name_tree_limits_pdf() -> Vec<u8> {
     single_outline_with_catalog(
         "/Names << /Dests << /Kids [8 0 R] >> >>",
@@ -1523,38 +1740,197 @@ fn malformed_name_tree_repair_enumerates_all_reachable_branches_and_terminates_c
     assert_eq!(
         warning_messages(&pdf),
         vec![
-            "attempting to repair after error: Name/Number tree node (object 10): node is missing /Limits"
+            "attempting to repair after error: Name/Number tree node (object 10): node is missing /Limits",
+            "skipping over invalid kid at index 0",
+            "loop detected while traversing name/number tree",
+            "item 0 has the wrong type",
         ]
     );
 }
 
-#[test]
-fn malformed_name_tree_repair_rebuilds_more_than_one_leaf() {
+fn malformed_name_tree_split_pdf() -> Vec<u8> {
     let pairs = (0..33)
         .map(|index| format!("(k{index:02}) [3 0 R /Fit]"))
         .collect::<Vec<_>>()
         .join(" ");
     let leaf = format!("<< /Names [{pairs}] >>");
-    let bytes = single_outline_with_catalog(
+    single_outline_with_catalog(
         "/Names << /Dests << /Kids [8 0 R] >> >>",
         "/Dest (k17)",
+        &[(8, leaf.as_str())],
+    )
+}
+
+#[test]
+fn malformed_name_tree_repair_rebuilds_more_than_one_leaf() {
+    let mut pdf = Pdf::open(Cursor::new(malformed_name_tree_split_pdf())).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    let dests = direct_dests_root(&mut pdf);
+    let Some(Object::Array(kids)) = dests.get("Kids") else {
+        panic!("repaired root must contain /Kids");
+    };
+    assert_eq!(
+        kids.as_slice(),
+        &[
+            Object::Reference(ObjectRef::new(9, 0)),
+            Object::Reference(ObjectRef::new(10, 0)),
+        ]
+    );
+    assert_eq!(dests.get("Names"), None);
+
+    let Object::Dictionary(first) = pdf.resolve(ObjectRef::new(9, 0)).unwrap() else {
+        panic!("first repaired leaf must be a dictionary");
+    };
+    let Object::Dictionary(second) = pdf.resolve(ObjectRef::new(10, 0)).unwrap() else {
+        panic!("second repaired leaf must be a dictionary");
+    };
+    assert!(matches!(first.get("Names"), Some(Object::Array(names)) if names.len() == 32));
+    assert!(matches!(second.get("Names"), Some(Object::Array(names)) if names.len() == 34));
+    assert_eq!(
+        first.get("Limits"),
+        Some(&Object::Array(vec![
+            Object::String(b"k00".to_vec()),
+            Object::String(b"k15".to_vec()),
+        ]))
+    );
+    assert_eq!(
+        second.get("Limits"),
+        Some(&Object::Array(vec![
+            Object::String(b"k16".to_vec()),
+            Object::String(b"k32".to_vec()),
+        ]))
+    );
+}
+
+#[test]
+fn malformed_name_tree_repair_reproduces_qpdf_parent_split_order() {
+    let pairs = (0..529)
+        .map(|index| format!("(k{index:04}) [3 0 R /Fit]"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let leaf = format!("<< /Names [{pairs}] >>");
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [8 0 R] >> >>",
+        "/Dest (k0528)",
         &[(8, leaf.as_str())],
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
     assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
-    let catalog_ref = pdf.root_ref().unwrap();
-    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref).unwrap() else {
-        panic!("catalog must remain a dictionary");
+    let dests = direct_dests_root(&mut pdf);
+    let Some(Object::Array(root_kids)) = dests.get("Kids") else {
+        panic!("repaired root must contain /Kids");
     };
-    let Object::Dictionary(names) = catalog.get("Names").unwrap() else {
-        panic!("direct /Names must remain direct");
+    assert_eq!(root_kids.len(), 2);
+    let Object::Reference(first_parent_ref) = root_kids[0] else {
+        panic!("first repaired parent must be indirect");
     };
-    let Object::Dictionary(dests) = names.get("Dests").unwrap() else {
-        panic!("direct /Dests root must remain direct");
+    let Object::Reference(second_parent_ref) = root_kids[1] else {
+        panic!("second repaired parent must be indirect");
     };
-    assert!(matches!(dests.get("Kids"), Some(Object::Array(kids)) if kids.len() == 2));
-    assert_eq!(dests.get("Names"), None);
+    let Object::Dictionary(first_parent) = pdf.resolve(first_parent_ref).unwrap() else {
+        panic!("first repaired parent must be a dictionary");
+    };
+    let Object::Dictionary(second_parent) = pdf.resolve(second_parent_ref).unwrap() else {
+        panic!("second repaired parent must be a dictionary");
+    };
+    assert!(matches!(first_parent.get("Kids"), Some(Object::Array(kids)) if kids.len() == 16));
+    assert!(matches!(second_parent.get("Kids"), Some(Object::Array(kids)) if kids.len() == 17));
+    assert_eq!(
+        first_parent.get("Limits"),
+        Some(&Object::Array(vec![
+            Object::String(b"k0000".to_vec()),
+            Object::String(b"k0255".to_vec()),
+        ]))
+    );
+    assert_eq!(
+        second_parent.get("Limits"),
+        Some(&Object::Array(vec![
+            Object::String(b"k0256".to_vec()),
+            Object::String(b"k0528".to_vec()),
+        ]))
+    );
+}
+
+#[test]
+fn malformed_name_tree_repair_warns_for_a_short_names_array_and_visits_an_empty_leaf() {
+    let bytes = single_outline_with_catalog(
+        "/Names << /Dests << /Kids [8 0 R 9 0 R] >> >>",
+        "/Dest (shape)",
+        &[
+            (8, "<< /Names [(shape) [3 0 R /Fit] (dangling)] >>"),
+            (9, "<< /Limits [(z) (z)] /Names [] >>"),
+        ],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
+    assert_eq!(
+        warning_messages(&pdf),
+        [
+            "attempting to repair after error: Name/Number tree node (object 8): node is missing /Limits",
+            "items array doesn't have enough elements",
+        ]
+    );
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 full-object oracle"]
+fn qpdf_malformed_name_tree_repair_splits_33_pairs_as_16_then_17() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    input.write_all(&malformed_name_tree_split_pdf()).unwrap();
+    let output = Command::new("qpdf")
+        .args(["--json=2", "--json-key=outlines", "--json-key=qpdf"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["outlines"][0]["dest"][0], "3 0 R");
+    let objects = json["qpdf"][1].as_object().unwrap();
+    let repaired_root = &objects["obj:1 0 R"]["value"]["/Names"]["/Dests"];
+    assert_eq!(repaired_root["/Kids"].as_array().unwrap().len(), 2);
+    assert!(repaired_root.get("/Names").is_none());
+
+    let mut leaves = objects
+        .values()
+        .filter_map(|object| {
+            let value = &object["value"];
+            let names = value.get("/Names")?.as_array()?;
+            let limits = value.get("/Limits")?.as_array()?;
+            Some((names.len(), limits.clone()))
+        })
+        .collect::<Vec<_>>();
+    leaves.sort_by(|left, right| left.1[0].as_str().cmp(&right.1[0].as_str()));
+    assert_eq!(
+        leaves,
+        vec![
+            (
+                32,
+                vec![
+                    serde_json::Value::String("u:k00".to_string()),
+                    serde_json::Value::String("u:k15".to_string()),
+                ],
+            ),
+            (
+                34,
+                vec![
+                    serde_json::Value::String("u:k16".to_string()),
+                    serde_json::Value::String("u:k32".to_string()),
+                ],
+            ),
+        ]
+    );
 }
 
 #[test]

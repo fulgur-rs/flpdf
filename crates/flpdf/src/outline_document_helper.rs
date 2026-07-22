@@ -360,14 +360,11 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             NameTreeLookup::Found(value) => return resolve_terminal_object(self.pdf, value),
             NameTreeLookup::Missing => {}
             NameTreeLookup::Structural(error) => {
-                let entries = enumerate_name_tree_entries(self.pdf, dests_root.clone())?;
-                if entries.is_empty() {
-                    return Ok(Object::Null);
-                }
                 self.pdf.push_warning(format!(
                     "attempting to repair after error: {}",
                     error.diagnostic()
                 ));
+                let entries = enumerate_name_tree_entries(self.pdf, dests_root.clone())?;
                 let repaired_root = repair_name_tree(self.pdf, dests_root, entries)?;
                 if let NameTreeLookup::Found(value) =
                     find_name_tree_value(self.pdf, repaired_root, &lookup)?
@@ -495,7 +492,7 @@ enum NameTreeLookup {
 
 struct NameTreeStructuralError {
     node_ref: Option<ObjectRef>,
-    message: &'static str,
+    message: String,
 }
 
 impl NameTreeStructuralError {
@@ -512,13 +509,11 @@ impl NameTreeStructuralError {
 
 enum NameTreeKidSelection {
     Found(Object),
-    Missing,
     Structural(NameTreeStructuralError),
 }
 
 enum NameTreeKidOrdering {
     Order(Ordering),
-    Missing,
     Structural(NameTreeStructuralError),
 }
 
@@ -531,7 +526,9 @@ fn find_name_tree_value<R: Read + Seek>(
     mut cursor: Object,
     lookup: &[u8],
 ) -> Result<NameTreeLookup> {
+    let root_ref = cursor.as_ref_id();
     let mut seen = BTreeSet::new();
+    let mut at_root = true;
     loop {
         let (node, identity) = name_tree_node(pdf, cursor)?;
         let Some(mut node) = node else {
@@ -539,25 +536,41 @@ fn find_name_tree_value<R: Read + Seek>(
         };
         if let Some(identity) = identity {
             if !seen.insert(identity) {
+                return Ok(NameTreeLookup::Structural(NameTreeStructuralError {
+                    node_ref: Some(identity),
+                    message: "loop detected in find".to_string(),
+                }));
+            }
+        }
+
+        let names_value = node.remove("Names");
+        if let Some(Object::Array(names)) = names_value {
+            if !names.is_empty() {
+                return Ok(find_name_tree_leaf_value(names, lookup, root_ref));
+            } else if at_root
+                && !matches!(node.get("Kids"), Some(Object::Array(kids)) if !kids.is_empty())
+            {
                 return Ok(NameTreeLookup::Missing);
             }
         }
 
-        if let Some(Object::Array(names)) = node.remove("Names") {
-            if !names.is_empty() {
-                return Ok(match find_name_tree_leaf_value(names, lookup) {
-                    Some(value) => NameTreeLookup::Found(value),
-                    None => NameTreeLookup::Missing,
-                });
-            }
-        }
-
         let Some(Object::Array(kids)) = node.remove("Kids") else {
-            return Ok(NameTreeLookup::Missing);
+            return Ok(NameTreeLookup::Structural(NameTreeStructuralError {
+                node_ref: identity,
+                message: "bad node during find".to_string(),
+            }));
         };
-        match select_name_tree_kid(pdf, &kids, lookup)? {
-            NameTreeKidSelection::Found(next) => cursor = next,
-            NameTreeKidSelection::Missing => return Ok(NameTreeLookup::Missing),
+        if kids.is_empty() {
+            return Ok(NameTreeLookup::Structural(NameTreeStructuralError {
+                node_ref: identity,
+                message: "bad node during find".to_string(),
+            }));
+        }
+        match select_name_tree_kid(pdf, &kids, lookup, root_ref, identity)? {
+            NameTreeKidSelection::Found(next) => {
+                cursor = next;
+                at_root = false;
+            }
             NameTreeKidSelection::Structural(error) => {
                 return Ok(NameTreeLookup::Structural(error));
             }
@@ -580,37 +593,45 @@ fn name_tree_node<R: Read + Seek>(
     }
 }
 
-fn find_name_tree_leaf_value(names: Vec<Object>, lookup: &[u8]) -> Option<Object> {
+fn find_name_tree_leaf_value(
+    names: Vec<Object>,
+    lookup: &[u8],
+    root_ref: Option<ObjectRef>,
+) -> NameTreeLookup {
     let pair_count = names.len() / 2;
     let mut low = 0;
     let mut high = pair_count;
     while low < high {
         let middle = low + (high - low) / 2;
         let Object::String(stored) = &names[2 * middle] else {
-            return None;
+            return NameTreeLookup::Structural(NameTreeStructuralError {
+                node_ref: root_ref,
+                message: format!("item at index {} is not the right type", 2 * middle),
+            });
         };
         match lookup.cmp(crate::json_inspect::qpdf_utf8_value(stored).as_slice()) {
             Ordering::Less => high = middle,
             Ordering::Greater => low = middle + 1,
-            Ordering::Equal => return Some(names[2 * middle + 1].clone()),
+            Ordering::Equal => return NameTreeLookup::Found(names[2 * middle + 1].clone()),
         }
     }
-    None
+    NameTreeLookup::Missing
 }
 
 fn select_name_tree_kid<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     kids: &[Object],
     lookup: &[u8],
+    root_ref: Option<ObjectRef>,
+    node_ref: Option<ObjectRef>,
 ) -> Result<NameTreeKidSelection> {
     let mut low = 0;
     let mut high = kids.len();
     let mut previous = None;
     while low < high {
         let middle = low + (high - low) / 2;
-        let ordering = match name_tree_kid_ordering(pdf, &kids[middle], lookup)? {
+        let ordering = match name_tree_kid_ordering(pdf, &kids[middle], lookup, middle, root_ref)? {
             NameTreeKidOrdering::Order(ordering) => ordering,
-            NameTreeKidOrdering::Missing => return Ok(NameTreeKidSelection::Missing),
             NameTreeKidOrdering::Structural(error) => {
                 return Ok(NameTreeKidSelection::Structural(error));
             }
@@ -626,7 +647,10 @@ fn select_name_tree_kid<R: Read + Seek>(
     }
     Ok(match previous {
         Some(index) => NameTreeKidSelection::Found(kids[index].clone()),
-        None => NameTreeKidSelection::Missing,
+        None => NameTreeKidSelection::Structural(NameTreeStructuralError {
+            node_ref,
+            message: "unexpected -1 from binary search of kids; limits may by wrong".to_string(),
+        }),
     })
 }
 
@@ -636,21 +660,26 @@ fn name_tree_kid_ordering<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     kid: &Object,
     lookup: &[u8],
+    kid_index: usize,
+    root_ref: Option<ObjectRef>,
 ) -> Result<NameTreeKidOrdering> {
     let (node, _) = name_tree_node(pdf, kid.clone())?;
     let Some(node) = node else {
-        return Ok(NameTreeKidOrdering::Missing);
+        return Ok(NameTreeKidOrdering::Structural(NameTreeStructuralError {
+            node_ref: root_ref,
+            message: format!("invalid kid at index {kid_index}"),
+        }));
     };
     let Some(Object::Array(limits)) = node.get("Limits") else {
         return Ok(NameTreeKidOrdering::Structural(NameTreeStructuralError {
             node_ref: kid.as_ref_id(),
-            message: "node is missing /Limits",
+            message: "node is missing /Limits".to_string(),
         }));
     };
     let [Object::String(first), Object::String(last), ..] = limits.as_slice() else {
         return Ok(NameTreeKidOrdering::Structural(NameTreeStructuralError {
             node_ref: kid.as_ref_id(),
-            message: "node is missing /Limits",
+            message: "node is missing /Limits".to_string(),
         }));
     };
     let first = crate::json_inspect::qpdf_utf8_value(first);
@@ -671,37 +700,69 @@ fn enumerate_name_tree_entries<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     root: Object,
 ) -> Result<BTreeMap<Vec<u8>, Object>> {
+    enum RepairWalkItem {
+        Node(Object),
+        InvalidKid(usize),
+    }
+
     let mut entries = BTreeMap::new();
-    let mut stack = vec![root];
+    let mut stack = vec![RepairWalkItem::Node(root)];
     let mut seen = BTreeSet::new();
 
-    while let Some(cursor) = stack.pop() {
+    while let Some(item) = stack.pop() {
+        let cursor = match item {
+            RepairWalkItem::Node(cursor) => cursor,
+            RepairWalkItem::InvalidKid(kid_index) => {
+                pdf.push_warning(format!("skipping over invalid kid at index {kid_index}"));
+                continue;
+            }
+        };
         let (node, identity) = name_tree_node(pdf, cursor)?;
         let Some(mut node) = node else {
-            continue;
+            continue; // cov:ignore: only validated dictionary kids are scheduled by this repair walk
         };
         if let Some(identity) = identity {
             if !seen.insert(identity) {
+                pdf.push_warning("loop detected while traversing name/number tree");
                 continue;
             }
         }
 
-        if let Some(Object::Array(names)) = node.remove("Names") {
+        let names_value = node.remove("Names");
+        let had_names = names_value.is_some();
+        if let Some(Object::Array(names)) = names_value {
             if !names.is_empty() {
-                for pair in names.chunks_exact(2) {
+                let mut pairs = names.chunks_exact(2);
+                for (pair_index, pair) in pairs.by_ref().enumerate() {
                     let Object::String(key) = &pair[0] else {
+                        pdf.push_warning(format!("item {} has the wrong type", pair_index * 2));
                         continue;
                     };
                     let key =
                         qpdf_new_unicode_utf8_value(&crate::json_inspect::qpdf_utf8_value(key));
                     entries.insert(key, pair[1].clone());
                 }
+                if !pairs.remainder().is_empty() {
+                    pdf.push_warning("items array doesn't have enough elements");
+                }
                 continue;
             }
         }
 
         if let Some(Object::Array(kids)) = node.remove("Kids") {
-            stack.extend(kids.into_iter().rev());
+            for (kid_index, kid) in kids.into_iter().enumerate().rev() {
+                let (kid_node, _) = name_tree_node(pdf, kid.clone())?;
+                let traversable = kid_node.as_ref().is_some_and(|kid_node| {
+                    kid_node.get("Kids").is_some() || kid_node.get("Names").is_some()
+                });
+                if traversable {
+                    stack.push(RepairWalkItem::Node(kid));
+                } else {
+                    stack.push(RepairWalkItem::InvalidKid(kid_index));
+                }
+            }
+        } else if !had_names {
+            pdf.push_warning("name/number tree node has neither non-empty /Names nor /Kids");
         }
     }
 
@@ -767,21 +828,187 @@ fn build_repaired_name_tree_root<R: Read + Seek>(
         .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
 
     let mut next_object_number = max_object_number + 1;
-    let (new_root_ref, nodes) = crate::name_number_tree::build_name_tree(entries, || {
-        let object_ref = ObjectRef::new(next_object_number, 0);
-        next_object_number += 1;
-        object_ref
-    });
+    let mut nodes = vec![RepairedNameTreeNode {
+        reference: None,
+        kind: RepairedNameTreeNodeKind::Leaf(Vec::new()),
+    }];
 
-    let mut root = None;
-    for (node_ref, node) in nodes {
-        if node_ref == new_root_ref {
-            root = node.into_dict();
-        } else {
-            pdf.set_object(node_ref, node);
+    for entry in entries.iter().cloned() {
+        let mut path = vec![0];
+        loop {
+            let node_index = *path.last().expect("repair path contains the root");
+            match &nodes[node_index].kind {
+                RepairedNameTreeNodeKind::Leaf(_) => break,
+                RepairedNameTreeNodeKind::Branch(kids) => {
+                    path.push(*kids.last().expect("repair branch contains a child"));
+                }
+            }
+        }
+        let leaf_index = *path.last().expect("repair path contains a leaf");
+        let RepairedNameTreeNodeKind::Leaf(leaf_entries) = &mut nodes[leaf_index].kind else {
+            unreachable!("repair descent terminates at a leaf"); // cov:ignore: descent stops only on the Leaf match arm
+        };
+        leaf_entries.push(entry);
+
+        while repaired_name_tree_node_overflows(&nodes[*path.last().unwrap()]) {
+            let node_index = *path.last().unwrap();
+            if path.len() == 1 {
+                let old_kind = std::mem::replace(
+                    &mut nodes[0].kind,
+                    RepairedNameTreeNodeKind::Branch(Vec::new()),
+                );
+                let first_index = nodes.len();
+                nodes.push(RepairedNameTreeNode {
+                    reference: Some(ObjectRef::new(next_object_number, 0)),
+                    kind: old_kind,
+                });
+                next_object_number += 1;
+                let second_index =
+                    split_repaired_name_tree_node(&mut nodes, first_index, &mut next_object_number);
+                let RepairedNameTreeNodeKind::Branch(root_kids) = &mut nodes[0].kind else {
+                    unreachable!("overflowing root becomes a branch"); // cov:ignore: root kind was replaced with Branch immediately above
+                };
+                root_kids.extend([first_index, second_index]);
+                break;
+            }
+
+            let parent_index = path[path.len() - 2];
+            let second_index =
+                split_repaired_name_tree_node(&mut nodes, node_index, &mut next_object_number);
+            let RepairedNameTreeNodeKind::Branch(parent_kids) = &mut nodes[parent_index].kind
+            else {
+                unreachable!("repair path parent is a branch"); // cov:ignore: path adds children only from Branch nodes
+            };
+            let child_position = parent_kids
+                .iter()
+                .position(|&child| child == node_index)
+                .expect("repair path child belongs to parent");
+            parent_kids.insert(child_position + 1, second_index);
+            path.pop();
         }
     }
-    root.ok_or_else(|| Error::Unsupported("name-tree rebuild produced no root".to_string()))
+
+    let root = repaired_name_tree_dictionary(&nodes, 0, false);
+    for node_index in 1..nodes.len() {
+        let node_ref = nodes[node_index]
+            .reference
+            .expect("every repaired non-root node is indirect");
+        pdf.set_object(
+            node_ref,
+            Object::Dictionary(repaired_name_tree_dictionary(&nodes, node_index, true)),
+        );
+    }
+    Ok(root)
+}
+
+enum RepairedNameTreeNodeKind {
+    Leaf(Vec<(Vec<u8>, Object)>),
+    Branch(Vec<usize>),
+}
+
+struct RepairedNameTreeNode {
+    reference: Option<ObjectRef>,
+    kind: RepairedNameTreeNodeKind,
+}
+
+fn repaired_name_tree_node_overflows(node: &RepairedNameTreeNode) -> bool {
+    match &node.kind {
+        RepairedNameTreeNodeKind::Leaf(entries) => entries.len() > 32,
+        RepairedNameTreeNodeKind::Branch(kids) => kids.len() > 32,
+    }
+}
+
+fn split_repaired_name_tree_node(
+    nodes: &mut Vec<RepairedNameTreeNode>,
+    node_index: usize,
+    next_object_number: &mut u32,
+) -> usize {
+    let second_kind = match &mut nodes[node_index].kind {
+        RepairedNameTreeNodeKind::Leaf(entries) => {
+            RepairedNameTreeNodeKind::Leaf(entries.split_off(16))
+        }
+        RepairedNameTreeNodeKind::Branch(kids) => {
+            RepairedNameTreeNodeKind::Branch(kids.split_off(16))
+        }
+    };
+    let second_index = nodes.len();
+    nodes.push(RepairedNameTreeNode {
+        reference: Some(ObjectRef::new(*next_object_number, 0)),
+        kind: second_kind,
+    });
+    *next_object_number += 1;
+    second_index
+}
+
+fn repaired_name_tree_dictionary(
+    nodes: &[RepairedNameTreeNode],
+    node_index: usize,
+    include_limits: bool,
+) -> Dictionary {
+    let mut dictionary = Dictionary::new();
+    match &nodes[node_index].kind {
+        RepairedNameTreeNodeKind::Leaf(entries) => {
+            let mut names = Vec::with_capacity(entries.len() * 2);
+            for (key, value) in entries {
+                names.push(Object::String(key.clone()));
+                names.push(value.clone());
+            }
+            dictionary.insert("Names", Object::Array(names));
+        }
+        RepairedNameTreeNodeKind::Branch(kids) => {
+            dictionary.insert(
+                "Kids",
+                Object::Array(
+                    kids.iter()
+                        .map(|&kid| {
+                            Object::Reference(
+                                nodes[kid]
+                                    .reference
+                                    .expect("every repaired child node is indirect"),
+                            )
+                        })
+                        .collect(),
+                ),
+            );
+        }
+    }
+    if include_limits {
+        let first = repaired_name_tree_limit(nodes, node_index, true);
+        let last = repaired_name_tree_limit(nodes, node_index, false);
+        dictionary.insert(
+            "Limits",
+            Object::Array(vec![Object::String(first), Object::String(last)]),
+        );
+    }
+    dictionary
+}
+
+fn repaired_name_tree_limit(
+    nodes: &[RepairedNameTreeNode],
+    mut node_index: usize,
+    first: bool,
+) -> Vec<u8> {
+    loop {
+        match &nodes[node_index].kind {
+            RepairedNameTreeNodeKind::Leaf(entries) => {
+                return if first {
+                    entries.first()
+                } else {
+                    entries.last()
+                }
+                .expect("only non-empty repaired child nodes have limits")
+                .0
+                .clone();
+            }
+            RepairedNameTreeNodeKind::Branch(kids) => {
+                node_index = if first {
+                    *kids.first().expect("repair branch contains a child")
+                } else {
+                    *kids.last().expect("repair branch contains a child")
+                };
+            }
+        }
+    }
 }
 
 fn replace_direct_dests_root<R: Read + Seek>(
@@ -920,7 +1147,7 @@ mod qpdf_utf8_tests {
     fn direct_name_tree_node_diagnostic_omits_an_object_number() {
         let error = NameTreeStructuralError {
             node_ref: None,
-            message: "node is missing /Limits",
+            message: "node is missing /Limits".to_string(),
         };
         assert_eq!(
             error.diagnostic(),
