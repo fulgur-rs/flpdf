@@ -80,7 +80,7 @@ fn page_index_outline_pdf() -> Vec<u8> {
                 4,
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
             ),
-            (5, "<< /Type /Outlines /First 6 0 R /Last 14 0 R >>"),
+            (5, "<< /Type /Outlines /First 6 0 R /Last 15 0 R >>"),
             (
                 6,
                 "<< /Title (A) /Dest [3 0 R /Fit] /First 8 0 R /Next 7 0 R >>",
@@ -99,8 +99,9 @@ fn page_index_outline_pdf() -> Vec<u8> {
             ),
             (
                 14,
-                "<< /Title (Direct page operand) /Dest [<< /Type /Page >> /Fit] >>",
+                "<< /Title (Direct page operand) /Dest [<< /Type /Page >> /Fit] /Next 15 0 R >>",
             ),
+            (15, "<< /Title (Zero reference) /Dest [0 0 R /Fit] >>"),
             (20, "<< /Names [(modern) [3 0 R /Fit]] >>"),
         ],
         1,
@@ -130,7 +131,21 @@ fn outlines_for_page_none_matches_qpdf_objgen_zero_bucket() {
         .map(|(_id, item)| item.title.as_str())
         .collect();
 
-    assert_eq!(titles, ["No dest", "Integer dest", "Direct page operand"]);
+    assert_eq!(
+        titles,
+        [
+            "No dest",
+            "Integer dest",
+            "Direct page operand",
+            "Zero reference"
+        ]
+    );
+
+    let zero_ref_titles: Vec<_> = tree
+        .outlines_for_page(Some(ObjectRef::new(0, 0)))
+        .map(|(_id, item)| item.title.as_str())
+        .collect();
+    assert_eq!(zero_ref_titles, titles);
 }
 
 fn no_outline_pdf() -> Vec<u8> {

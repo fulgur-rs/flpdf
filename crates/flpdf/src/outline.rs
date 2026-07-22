@@ -60,9 +60,13 @@ impl OutlineTree {
         }
     }
 
+    fn normalize_page_key(page: Option<ObjectRef>) -> Option<ObjectRef> {
+        page.filter(|reference| *reference != ObjectRef::new(0, 0))
+    }
+
     fn page_key(item: &OutlineItem) -> Option<ObjectRef> {
         match item.dest_page() {
-            Object::Reference(reference) => Some(reference),
+            Object::Reference(reference) => Self::normalize_page_key(Some(reference)),
             _ => None,
         }
     }
@@ -88,7 +92,7 @@ impl OutlineTree {
         page: Option<ObjectRef>,
     ) -> impl Iterator<Item = (OutlineId, &OutlineItem)> {
         self.by_page()
-            .get(&page)
+            .get(&Self::normalize_page_key(page))
             .into_iter()
             .flatten()
             .copied()
