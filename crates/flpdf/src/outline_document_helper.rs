@@ -194,9 +194,6 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Some(root) = self.materialize_item(cursor, parent, tree)? else {
             return Ok(None);
         };
-        if depth > QPDF_MAX_EXPANDED_OUTLINE_DEPTH {
-            return Ok(Some(root));
-        }
         if let Some(reference) = tree[root].source_ref {
             if !constructor_seen.insert(reference) {
                 return Ok(Some(root));
