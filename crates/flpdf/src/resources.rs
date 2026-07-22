@@ -1297,8 +1297,15 @@ mod tests {
         bytes: Vec<u8>,
         mode: RemoveUnreferencedResources,
         terminal_obj: u32,
+        carriers: &[(u32, u32)],
     ) -> Vec<String> {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        for &(from, to) in carriers {
+            pdf.set_object(
+                ObjectRef::new(from, 0),
+                Object::Reference(ObjectRef::new(to, 0)),
+            );
+        }
         remove_unreferenced_resources(&mut pdf, mode).expect("prune should succeed");
         let obj = pdf
             .resolve_borrowed(ObjectRef::new(terminal_obj, 0))
@@ -1324,6 +1331,7 @@ mod tests {
             build_inherited_indirect_resources_pdf(4, "5 0 R"),
             RemoveUnreferencedResources::Auto,
             5,
+            &[(4, 5)],
         );
         assert!(
             keys.contains(&"F1".to_string()),
@@ -1344,6 +1352,7 @@ mod tests {
             build_inherited_indirect_resources_pdf(5, "<< >>"),
             RemoveUnreferencedResources::Auto,
             5,
+            &[],
         );
         assert!(
             keys.contains(&"F1".to_string()),
@@ -1432,8 +1441,12 @@ mod tests {
             RemoveUnreferencedResources::Auto,
             RemoveUnreferencedResources::Yes,
         ] {
-            let keys =
-                font_keys_after_prune(build_shared_terminal_distinct_carriers_pdf(), mode, 8);
+            let keys = font_keys_after_prune(
+                build_shared_terminal_distinct_carriers_pdf(),
+                mode,
+                8,
+                &[(7, 8), (9, 8)],
+            );
             assert!(
                 keys.contains(&"F1".to_string()) && keys.contains(&"F2".to_string()),
                 "shared terminal must keep both fonts in {mode:?} mode: {keys:?}"
@@ -1518,7 +1531,7 @@ mod tests {
             RemoveUnreferencedResources::Auto,
             RemoveUnreferencedResources::Yes,
         ] {
-            let keys = font_keys_after_prune(build_null_chain_resources_pdf(), mode, 8);
+            let keys = font_keys_after_prune(build_null_chain_resources_pdf(), mode, 8, &[]);
             assert!(
                 keys.contains(&"F1".to_string()) && keys.contains(&"F2".to_string()),
                 "inherited parent dict must keep both fonts in {mode:?} mode: {keys:?}"

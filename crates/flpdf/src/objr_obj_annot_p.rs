@@ -213,7 +213,13 @@ mod tests {
     }
 
     fn open(objs: &BTreeMap<u32, String>) -> Pdf<Cursor<Vec<u8>>> {
-        Pdf::open(Cursor::new(build_pdf(objs))).expect("open fixture")
+        let mut pdf = Pdf::open(Cursor::new(build_pdf(objs))).expect("open fixture");
+        for (&number, body) in objs {
+            if let Ok(Object::Reference(target)) = crate::parse_object(body.as_bytes()) {
+                pdf.set_object(ObjectRef::new(number, 0), Object::Reference(target));
+            }
+        }
+        pdf
     }
 
     /// Base: catalog (1), pages root (2) /Kids [3 4 5], three pages (3,4,5).

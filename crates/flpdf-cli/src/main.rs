@@ -3066,6 +3066,7 @@ fn run_rewrite(
         // omitted.
     } else {
         let mut pdf = open_pdf(&input, repair, password)?;
+        let diagnostics_start = pdf.repair_diagnostics().entries().len();
         // Capture encryption state BEFORE the write: the plaintext path
         // below drops /Encrypt, so this must be sampled while the in-memory
         // model still reflects the input.
@@ -3293,6 +3294,7 @@ fn run_rewrite(
         // (exit 0, valid output, no diagnostic) — nothing was restricted,
         // matching qpdf's lenient handling of --remove-restrictions on
         // unencrypted files.
+        finish_write_warnings(&input, &pdf, diagnostics_start)?;
     }
     Ok(())
 }
@@ -4334,6 +4336,7 @@ fn run_qdf(
     let output = output.ok_or("missing output file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
     reject_encrypted_write(&pdf)?;
+    let diagnostics_start = pdf.repair_diagnostics().entries().len();
 
     // The `qdf` subcommand is an alias of `rewrite --qdf` (epic flpdf-9hc.6
     // architecture decision): produce canonical QDF via the full-rewrite
@@ -4344,7 +4347,7 @@ fn run_qdf(
     options.full_rewrite = true;
     let mut out = File::create(output)?;
     write_pdf_with_options(&mut pdf, &mut out, &options)?;
-    Ok(())
+    finish_write_warnings(&input, &pdf, diagnostics_start)
 }
 
 /// `qdf-fix` (qpdf `fix-qdf` equivalent): repair stream `/Length`, xref
@@ -5055,6 +5058,25 @@ fn emit_warnings_since<R: Read + Seek>(path: &Path, pdf: &Pdf<R>, start: usize) 
         let location = diagnostic_location(path, diagnostic.offset);
         eprintln!("WARNING: {location}: {}", diagnostic.message);
     }
+}
+
+/// Finish a successful rewrite that accumulated lazy object-recovery warnings.
+/// The writer has already completed the output before this is called; qpdf
+/// likewise leaves the resulting file in place and reports exit 3.
+fn finish_write_warnings<R: Read + Seek>(
+    input: &Path,
+    pdf: &Pdf<R>,
+    diagnostics_start: usize,
+) -> CliResult<()> {
+    if pdf.repair_diagnostics().entries().len() == diagnostics_start {
+        return Ok(());
+    }
+    emit_warnings_since(input, pdf, diagnostics_start);
+    eprintln!("{}: operation succeeded with warnings", progname());
+    Err(Box::new(CliExitError {
+        code: ExitCode::Warnings,
+        message: String::new(),
+    }))
 }
 
 /// Prefix a fatal error with the input path so main() renders the observed

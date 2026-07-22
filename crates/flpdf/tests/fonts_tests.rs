@@ -7,7 +7,7 @@
 //! module documentation.
 
 use flpdf::fonts::{font_entries, font_entries_with_max_depth};
-use flpdf::{Error, Object, Pdf};
+use flpdf::{Error, Object, ObjectRef, Pdf};
 use std::io::Cursor;
 
 mod common;
@@ -484,6 +484,10 @@ fn font_entries_resolves_holder_chain_resources_dictionary() {
         1,
     );
     let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(8, 0),
+        Object::Reference(ObjectRef::new(10, 0)),
+    );
     let fonts = font_entries(&mut pdf).unwrap();
     assert!(fonts.contains_key(b"F1".as_slice()));
 }
@@ -509,6 +513,10 @@ fn font_entries_resolves_holder_chain_font_dictionary() {
         1,
     );
     let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(9, 0),
+        Object::Reference(ObjectRef::new(11, 0)),
+    );
     let fonts = font_entries(&mut pdf).unwrap();
     assert!(fonts.contains_key(b"F1".as_slice()));
 }
@@ -534,6 +542,10 @@ fn font_entries_resolves_holder_chain_font_entry() {
         1,
     );
     let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Reference(ObjectRef::new(12, 0)),
+    );
     let fonts = font_entries(&mut pdf).unwrap();
     assert!(fonts.contains_key(b"F1".as_slice()));
 }
@@ -557,6 +569,10 @@ fn font_entries_skips_holder_chain_terminating_at_non_dictionary() {
         1,
     );
     let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Reference(ObjectRef::new(12, 0)),
+    );
     let fonts = font_entries(&mut pdf).unwrap();
     assert!(!fonts.contains_key(b"F1".as_slice()));
 }

@@ -1158,6 +1158,10 @@ mod tests {
             ],
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Reference(ObjectRef::new(6, 0)),
+        );
         let entries = page_content_stream_entries(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         assert_eq!(entries.len(), 1);
         // Terminal ref is the stream (6 0 R), not the first hop (5 0 R).
@@ -1840,6 +1844,10 @@ mod tests {
         let stream_bytes = stream_object_bytes(5, body);
         let bytes = build_pdf_with_binary_extras("4 0 R", &[(4, carrier), (5, stream_bytes)]);
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Reference(ObjectRef::new(5, 0)),
+        );
         let content = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         assert_eq!(content, body);
     }
@@ -1852,6 +1860,10 @@ mod tests {
         let non_stream = b"5 0 obj\n<< /NotAStream true >>\nendobj\n".to_vec();
         let bytes = build_pdf_with_binary_extras("4 0 R", &[(4, carrier), (5, non_stream)]);
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Reference(ObjectRef::new(5, 0)),
+        );
         let err = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap_err();
         // A single /Contents reference dispatches on its terminal type: a value
         // that is neither a stream nor an array hits the catch-all error.
@@ -1875,6 +1887,10 @@ mod tests {
             &[(4, stream1), (5, carrier), (6, stream2)],
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Reference(ObjectRef::new(6, 0)),
+        );
         let content = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let mut expected = body1.to_vec();
         expected.push(b'\n');
@@ -1893,6 +1909,10 @@ mod tests {
             &[(4, stream1), (5, carrier), (6, non_stream)],
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Reference(ObjectRef::new(6, 0)),
+        );
         let err = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap_err();
         assert!(
             matches!(&err, Error::Unsupported(msg) if msg.contains("does not resolve to a stream")),
@@ -1930,6 +1950,10 @@ mod tests {
         pdf.extend_from_slice(trailer.as_bytes());
 
         let mut pdf = Pdf::open(Cursor::new(pdf)).expect("PDF should parse");
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Reference(ObjectRef::new(5, 0)),
+        );
         let result = resolve_inherited_resources(&mut pdf, ObjectRef::new(3, 0))
             .expect("should succeed")
             .expect("should find inherited /Resources via holder chain");
@@ -1969,6 +1993,10 @@ mod tests {
         pdf.extend_from_slice(trailer.as_bytes());
 
         let mut pdf = Pdf::open(Cursor::new(pdf)).expect("PDF should parse");
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Reference(ObjectRef::new(5, 0)),
+        );
         let err = resolve_inherited_resources(&mut pdf, ObjectRef::new(3, 0)).unwrap_err();
         assert!(
             matches!(&err, Error::Unsupported(msg) if msg.contains("does not resolve to a dictionary")),
@@ -2011,6 +2039,10 @@ mod tests {
         pdf.extend_from_slice(trailer.as_bytes());
 
         let mut pdf = Pdf::open(Cursor::new(pdf)).expect("PDF should parse");
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Reference(ObjectRef::new(6, 0)),
+        );
         let result = resolve_inherited_resources(&mut pdf, ObjectRef::new(3, 0))
             .expect("should succeed")
             .expect("null /Resources chain should fall through to parent's /Resources");

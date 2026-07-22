@@ -6,7 +6,7 @@
 mod common;
 
 use common::build_pdf;
-use flpdf::{LabelStyle, Pdf};
+use flpdf::{LabelStyle, Object, ObjectRef, Pdf};
 use std::io::Cursor;
 
 /// A `/Nums` label-range value stored behind a two-hop holder chain
@@ -38,6 +38,10 @@ fn ranges_follows_two_hop_holder_chain_for_label_dict() {
     );
 
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    pdf.set_object(
+        ObjectRef::new(6, 0),
+        Object::Reference(ObjectRef::new(7, 0)),
+    );
     let mut h = pdf.page_labels();
     let ranges = h.ranges().expect("read ranges");
 

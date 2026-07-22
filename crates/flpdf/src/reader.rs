@@ -1,7 +1,7 @@
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
-use crate::parser::{parse_indirect_object_detailed, parse_indirect_object_detailed_qpdf, Parser};
+use crate::parser::{parse_indirect_object_detailed_qpdf, parse_qpdf_file_object, Parser};
 use crate::security::password::{normalize_password, PasswordMode};
 use crate::security::standard::{
     check_owner_password, check_owner_password_r5, check_owner_password_r6,
@@ -88,7 +88,7 @@ pub(crate) struct QpdfPreparedObjects {
     pub(crate) max_object_id: u32,
 }
 
-struct QpdfReadObject {
+struct FileObjectRead {
     bytes: Vec<u8>,
     object_ref: ObjectRef,
     object: Object,
@@ -1118,52 +1118,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// stream data during repair) — it falls back to reading to EOF, but only
     /// while [`Self::resolution_fallbacks_remaining`] permits, so a flood of such
     /// objects cannot revive the quadratic cost.
-    fn read_object_at(
-        &mut self,
-        offset: u64,
-    ) -> Result<(
-        Vec<u8>,
-        ObjectRef,
-        Object,
-        Option<crate::parser::IndirectStreamLength>,
-    )> {
-        let next = self.next_object_offset(offset);
-        self.reader.seek(SeekFrom::Start(offset))?;
-        let mut bytes = Vec::new();
-        match next {
-            Some(next) => {
-                let len = next.saturating_sub(offset);
-                self.reader.by_ref().take(len).read_to_end(&mut bytes)?;
-            }
-            None => {
-                self.reader.read_to_end(&mut bytes)?;
-            }
-        }
-
-        match parse_indirect_object_detailed(&bytes) {
-            Ok((parsed_ref, object, indirect_len)) => Ok((bytes, parsed_ref, object, indirect_len)),
-            // The window stopped short of a complete object. Only a bounded
-            // window (`next` is `Some`) can do this; if we already read to EOF,
-            // the input itself is the limit and the error is real.
-            Err(window_err) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
-                self.resolution_fallbacks_remaining -= 1;
-                self.reader.seek(SeekFrom::Start(offset))?;
-                let mut full = Vec::new();
-                self.reader.read_to_end(&mut full)?;
-                // Prefer the full parse, but keep the window error if even the
-                // full read cannot parse (so the failure stays the parser's).
-                match parse_indirect_object_detailed(&full) {
-                    Ok((parsed_ref, object, indirect_len)) => {
-                        Ok((full, parsed_ref, object, indirect_len))
-                    }
-                    Err(_) => Err(window_err),
-                }
-            }
-            Err(window_err) => Err(window_err),
-        }
-    }
-
-    fn read_object_at_qpdf(&mut self, offset: u64) -> Result<QpdfReadObject> {
+    fn read_object_at(&mut self, offset: u64) -> Result<FileObjectRead> {
         let next = self.next_object_offset(offset);
         self.reader.seek(SeekFrom::Start(offset))?;
         let mut bytes = Vec::new();
@@ -1178,7 +1133,7 @@ impl<R: Read + Seek> Pdf<R> {
         }
 
         match parse_indirect_object_detailed_qpdf(&bytes) {
-            Ok(parsed) => Ok(QpdfReadObject {
+            Ok(parsed) => Ok(FileObjectRead {
                 bytes,
                 object_ref: parsed.object_ref,
                 object: parsed.object,
@@ -1186,13 +1141,18 @@ impl<R: Read + Seek> Pdf<R> {
                 empty_offset: parsed.empty_offset,
                 expected_endobj_offset: parsed.expected_endobj_offset,
             }),
+            // The window stopped short of a complete object. Only a bounded
+            // window (`next` is `Some`) can do this; if we already read to EOF,
+            // the input itself is the limit and the error is real.
             Err(window_err) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
                 self.resolution_fallbacks_remaining -= 1;
                 self.reader.seek(SeekFrom::Start(offset))?;
                 let mut full = Vec::new();
                 self.reader.read_to_end(&mut full)?;
+                // Prefer the full parse, but keep the window error if even the
+                // full read cannot parse (so the failure stays the parser's).
                 match parse_indirect_object_detailed_qpdf(&full) {
-                    Ok(parsed) => Ok(QpdfReadObject {
+                    Ok(parsed) => Ok(FileObjectRead {
                         bytes: full,
                         object_ref: parsed.object_ref,
                         object: parsed.object,
@@ -1208,59 +1168,17 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn resolve_qpdf_json_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
-        if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
-            return Ok(object.clone());
+        if self.resolve_to_cache(object_ref)? {
+            if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
+                return Ok(object.clone());
+            }
         }
 
-        match self.cache.entry(object_ref).cloned() {
-            Some(CacheEntry::Unresolved { offset }) => {
-                let parsed = self.read_object_at_qpdf(offset)?;
-                if parsed.object_ref != object_ref {
-                    return Ok(Object::Null);
-                }
-                let mut object = parsed.object;
-                if let Some(isl) = parsed.indirect_length {
-                    self.apply_indirect_stream_length(
-                        object_ref,
-                        &mut object,
-                        isl,
-                        &parsed.bytes,
-                        offset,
-                    )?;
-                }
-                let object = self.decrypt_resolved_object(object_ref, object)?;
-                self.cache.set_resolved(object_ref, object.clone());
-                if let Some(relative_offset) = parsed.empty_offset {
-                    self.push_warning(format!(
-                        "(object {} {}, offset {}): empty object treated as null",
-                        object_ref.number,
-                        object_ref.generation,
-                        offset.saturating_add(relative_offset as u64)
-                    ));
-                }
-                if let Some(relative_offset) = parsed.expected_endobj_offset {
-                    self.push_warning(format!(
-                        "(object {} {}, offset {}): expected endobj",
-                        object_ref.number,
-                        object_ref.generation,
-                        offset.saturating_add(relative_offset as u64)
-                    ));
-                }
-                Ok(object)
-            }
-            Some(CacheEntry::Compressed { .. }) => self.resolve(object_ref),
-            Some(
-                CacheEntry::Resolved(_)
-                | CacheEntry::Missing
-                | CacheEntry::Deleted
-                | CacheEntry::Reserved,
-            )
-            | None => Ok(self
-                .qpdf_parsed_xref_streams
-                .get(&object_ref)
-                .cloned()
-                .unwrap_or(Object::Null)),
-        }
+        Ok(self
+            .qpdf_parsed_xref_streams
+            .get(&object_ref)
+            .cloned()
+            .unwrap_or(Object::Null))
     }
 
     /// Offset of the first recorded object that starts strictly after `offset`,
@@ -1278,22 +1196,23 @@ impl<R: Read + Seek> Pdf<R> {
 
         match entry.cloned() {
             Some(CacheEntry::Unresolved { offset }) => {
-                let (bytes, parsed_ref, mut object, indirect_len) = self.read_object_at(offset)?;
-                if parsed_ref != object_ref {
+                let parsed = self.read_object_at(offset)?;
+                if parsed.object_ref != object_ref {
                     return Ok(false);
                 }
+                let mut object = parsed.object;
                 // When the stream's /Length is an indirect reference, the parser
                 // had no xref and recorded the payload window instead of a
                 // resolved length. Resolve the holder via the xref and re-slice
                 // to the authoritative length. This MUST happen before
                 // decryption: `object`/`bytes` are still ciphertext here, and
                 // `decrypt_resolved_object` decrypts in place afterwards.
-                if let Some(isl) = indirect_len {
+                if let Some(isl) = parsed.indirect_length {
                     self.apply_indirect_stream_length(
                         object_ref,
                         &mut object,
                         isl,
-                        &bytes,
+                        &parsed.bytes,
                         offset,
                     )?;
                 }
@@ -1303,6 +1222,12 @@ impl<R: Read + Seek> Pdf<R> {
                 // retry.
                 let object = self.decrypt_resolved_object(object_ref, object)?;
                 self.cache.set_resolved(object_ref, object);
+                self.record_file_object_warnings(
+                    object_ref,
+                    offset,
+                    parsed.empty_offset,
+                    parsed.expected_endobj_offset,
+                );
                 Ok(true)
             }
             Some(CacheEntry::Compressed { stream, index }) => {
@@ -1315,6 +1240,31 @@ impl<R: Read + Seek> Pdf<R> {
                 | CacheEntry::Reserved,
             )
             | None => Ok(false),
+        }
+    }
+
+    fn record_file_object_warnings(
+        &mut self,
+        object_ref: ObjectRef,
+        offset: u64,
+        empty_offset: Option<usize>,
+        expected_endobj_offset: Option<usize>,
+    ) {
+        if let Some(relative_offset) = empty_offset {
+            self.push_warning(format!(
+                "(object {} {}, offset {}): empty object treated as null",
+                object_ref.number,
+                object_ref.generation,
+                offset.saturating_add(relative_offset as u64)
+            ));
+        }
+        if let Some(relative_offset) = expected_endobj_offset {
+            self.push_warning(format!(
+                "(object {} {}, offset {}): expected endobj",
+                object_ref.number,
+                object_ref.generation,
+                offset.saturating_add(relative_offset as u64)
+            ));
         }
     }
 
@@ -1451,16 +1401,17 @@ impl<R: Read + Seek> Pdf<R> {
                 // the adjacent no-EOL `endstream` case) goes through the same
                 // authoritative re-slice as top-level streams; otherwise its
                 // compressed members would be unreadable.
-                let (bytes, parsed_ref, mut object, indirect_len) = self.read_object_at(offset)?;
-                if parsed_ref != stream_ref {
+                let parsed = self.read_object_at(offset)?;
+                if parsed.object_ref != stream_ref {
                     return Ok(false);
                 }
-                if let Some(isl) = indirect_len {
+                let mut object = parsed.object;
+                if let Some(isl) = parsed.indirect_length {
                     self.apply_indirect_stream_length(
                         stream_ref,
                         &mut object,
                         isl,
-                        &bytes,
+                        &parsed.bytes,
                         offset,
                     )?;
                 }
@@ -1468,6 +1419,12 @@ impl<R: Read + Seek> Pdf<R> {
                 // so a decryption error here leaves it `Unresolved`.
                 let object = self.decrypt_resolved_object(stream_ref, object)?;
                 self.cache.set_resolved(stream_ref, object.clone());
+                self.record_file_object_warnings(
+                    stream_ref,
+                    offset,
+                    parsed.empty_offset,
+                    parsed.expected_endobj_offset,
+                );
                 object
             }
             Some(
@@ -1993,8 +1950,7 @@ pub(crate) fn parse_object_stream_entry(
         return Err(Error::parse(0, "compressed object offset out of range"));
     }
 
-    let mut object_parser = Parser::new(&stream_data[start..]);
-    object_parser.object()
+    parse_qpdf_file_object(&stream_data[start..])
 }
 
 fn standard_handler_inputs<'a>(
@@ -2578,7 +2534,7 @@ mod tests {
         pdf.sorted_object_offsets.sort_unstable();
 
         let parsed = pdf
-            .read_object_at_qpdf(stream_offset)
+            .read_object_at(stream_offset)
             .expect("full read fallback must recover stream");
         assert_eq!(parsed.object_ref, ObjectRef::new(1, 0));
         assert!(parsed.object.as_stream().is_some());
@@ -2592,10 +2548,10 @@ mod tests {
             .position(|window| window == b"2 0 obj")
             .unwrap() as u64;
         let mut pdf = Pdf::open_mem_owned(malformed).expect("open malformed lazy object");
-        assert!(pdf.read_object_at_qpdf(malformed_offset).is_err());
+        assert!(pdf.read_object_at(malformed_offset).is_err());
         pdf.sorted_object_offsets.push(malformed_offset + 5);
         pdf.sorted_object_offsets.sort_unstable();
-        assert!(pdf.read_object_at_qpdf(malformed_offset).is_err());
+        assert!(pdf.read_object_at(malformed_offset).is_err());
     }
 
     #[test]
@@ -2653,6 +2609,128 @@ mod tests {
         );
         let mut pdf = Pdf::open_mem_owned(invalid_length).expect("open invalid-length fixture");
         assert!(pdf.resolve_qpdf_json_object(ObjectRef::new(1, 0)).is_err());
+    }
+
+    fn top_level_bare_reference_pdf() -> Vec<u8> {
+        classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Probe 4 0 R >>\nendobj\n",
+                b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n",
+                b"3 0 obj\n99\nendobj\n",
+                b"4 0 obj\n3 0 R\nendobj\n",
+            ],
+            ObjectRef::new(1, 0),
+        )
+    }
+
+    #[test]
+    fn normal_and_json_resolution_share_qpdf_file_object_value_and_warning() {
+        let object_ref = ObjectRef::new(4, 0);
+
+        let mut normal_first =
+            Pdf::open_mem_owned(top_level_bare_reference_pdf()).expect("open fixture");
+        assert_eq!(
+            normal_first.resolve(object_ref).unwrap(),
+            Object::Integer(3)
+        );
+        assert_eq!(
+            normal_first.resolve_qpdf_json_object(object_ref).unwrap(),
+            Object::Integer(3)
+        );
+        let diagnostics = normal_first.repair_diagnostics().entries();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("expected endobj"));
+
+        let mut json_first =
+            Pdf::open_mem_owned(top_level_bare_reference_pdf()).expect("open fixture");
+        assert_eq!(
+            json_first.resolve_qpdf_json_object(object_ref).unwrap(),
+            Object::Integer(3)
+        );
+        assert_eq!(json_first.resolve(object_ref).unwrap(), Object::Integer(3));
+        assert_eq!(json_first.repair_diagnostics().entries().len(), 1);
+    }
+
+    #[test]
+    fn normal_resolution_recovers_empty_file_object_once() {
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Probe 3 0 R >>\nendobj\n",
+                b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n",
+                b"3 0 obj\nendobj\n",
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+
+        assert_eq!(pdf.resolve(ObjectRef::new(3, 0)).unwrap(), Object::Null);
+        assert_eq!(pdf.resolve(ObjectRef::new(3, 0)).unwrap(), Object::Null);
+        let diagnostics = pdf.repair_diagnostics().entries();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0]
+            .message
+            .contains("empty object treated as null"));
+    }
+
+    #[test]
+    fn repaired_xref_uses_same_qpdf_file_object_value() {
+        let mut bytes = top_level_bare_reference_pdf();
+        let marker = b"startxref\n";
+        let start = bytes
+            .windows(marker.len())
+            .rposition(|window| window == marker)
+            .expect("startxref marker")
+            + marker.len();
+        for byte in bytes[start..]
+            .iter_mut()
+            .take_while(|byte| byte.is_ascii_digit())
+        {
+            *byte = b'9';
+        }
+
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                repair: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("linear-scan xref repair");
+        assert_eq!(
+            pdf.resolve(ObjectRef::new(4, 0)).unwrap(),
+            Object::Integer(3)
+        );
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("expected endobj"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn object_stream_file_object_mode_only_integerizes_bare_reference_member() {
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
+        dict.insert("N", Object::Integer(3));
+        dict.insert("First", Object::Integer(13));
+        let stream = Stream::new(dict, b"7 0 8 6 9 14 6 0 R [6 0 R] << /V 6 0 R >>".to_vec());
+
+        assert_eq!(
+            parse_object_stream_entry(&stream, 0).unwrap(),
+            Object::Integer(6)
+        );
+        assert_eq!(
+            parse_object_stream_entry(&stream, 1).unwrap(),
+            Object::Array(vec![Object::Reference(ObjectRef::new(6, 0))])
+        );
+        let dictionary = parse_object_stream_entry(&stream, 2)
+            .unwrap()
+            .into_dict()
+            .expect("dictionary member");
+        assert_eq!(dictionary.get_ref("V"), Some(ObjectRef::new(6, 0)));
     }
 
     /// Build a minimal PDF whose object `(1, 0)` is a linearization

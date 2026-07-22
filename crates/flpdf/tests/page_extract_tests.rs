@@ -1,7 +1,8 @@
 //! Integration tests for [`flpdf::extract_page`] / [`flpdf::extract_pages`].
 
 use flpdf::{
-    extract_page, extract_pages, pages, write_pdf_with_options, Object, Pdf, WriteOptions,
+    extract_page, extract_pages, pages, write_pdf_with_options, Object, ObjectRef, Pdf,
+    WriteOptions,
 };
 use std::collections::BTreeMap;
 
@@ -2313,6 +2314,10 @@ fn bead_p_via_indirect_chain_is_preserved_and_removed_page_is_null() {
         1,
     );
     let mut src = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
+    src.set_object(
+        ObjectRef::new(13, 0),
+        Object::Reference(ObjectRef::new(11, 0)),
+    );
     let mut out = extract_page(&mut src, 0).unwrap();
     assert_eq!(
         count_type(&mut out, b"Page"),

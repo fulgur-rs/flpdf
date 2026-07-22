@@ -1,7 +1,7 @@
 //! Integration tests for [`flpdf::merge_documents`].
 
 use flpdf::{
-    merge_documents, pages, write_pdf, write_pdf_with_options, MergeInput, Object, Pdf,
+    merge_documents, pages, write_pdf, write_pdf_with_options, MergeInput, Object, ObjectRef, Pdf,
     WriteOptions,
 };
 use std::collections::BTreeMap;
@@ -2154,6 +2154,10 @@ fn merge_inline_dest_holder_chain_leading_ref_remapped() {
         1,
     );
     let mut a = Pdf::open_mem_owned(pdf).unwrap();
+    a.set_object(
+        ObjectRef::new(30, 0),
+        Object::Reference(ObjectRef::new(3, 0)),
+    );
     let mut inputs = [MergeInput {
         source: &mut a,
         pages: vec![0],
@@ -3147,6 +3151,10 @@ fn form_pdf_multi_hop_t(field_name: &[u8]) -> Vec<u8> {
 fn merge_resolves_multi_hop_field_name() {
     let mut a = Pdf::open_mem_owned(form_pdf(b"name")).unwrap();
     let mut b = Pdf::open_mem_owned(form_pdf_multi_hop_t(b"name")).unwrap();
+    b.set_object(
+        ObjectRef::new(7, 0),
+        Object::Reference(ObjectRef::new(8, 0)),
+    );
     let mut inputs = [
         MergeInput {
             source: &mut a,
@@ -3204,6 +3212,12 @@ fn nonterminal_field_ref_chain_widget_pdf() -> Vec<u8> {
 #[test]
 fn merge_keeps_field_whose_widget_is_reached_through_ref_chains() {
     let mut a = Pdf::open_mem_owned(nonterminal_field_ref_chain_widget_pdf()).unwrap();
+    for holder in [20, 21] {
+        a.set_object(
+            ObjectRef::new(holder, 0),
+            Object::Reference(ObjectRef::new(4, 0)),
+        );
+    }
     let mut inputs = [MergeInput {
         source: &mut a,
         pages: vec![0],
@@ -4680,6 +4694,10 @@ fn three_page_multihop_annots_pdf() -> Vec<u8> {
 #[test]
 fn merge_multihop_indirect_annots_nulls_removed_dest() {
     let mut a = Pdf::open_mem_owned(three_page_multihop_annots_pdf()).unwrap();
+    a.set_object(
+        ObjectRef::new(20, 0),
+        Object::Reference(ObjectRef::new(21, 0)),
+    );
     let mut inputs = [MergeInput {
         source: &mut a,
         pages: vec![0, 1],
@@ -4850,6 +4868,10 @@ fn names_holder_chain_pdf() -> Vec<u8> {
 #[test]
 fn merge_inherits_names_tree_behind_holder_chain() {
     let mut a = Pdf::open_mem_owned(names_holder_chain_pdf()).unwrap();
+    a.set_object(
+        ObjectRef::new(10, 0),
+        Object::Reference(ObjectRef::new(11, 0)),
+    );
     let mut inputs = [MergeInput {
         source: &mut a,
         pages: vec![0],
@@ -5029,6 +5051,10 @@ fn top_field_element_chain_pdf() -> Vec<u8> {
 #[test]
 fn merge_keeps_top_level_field_behind_element_chain() {
     let mut a = Pdf::open_mem_owned(top_field_element_chain_pdf()).unwrap();
+    a.set_object(
+        ObjectRef::new(20, 0),
+        Object::Reference(ObjectRef::new(4, 0)),
+    );
     let mut inputs = [MergeInput {
         source: &mut a,
         pages: vec![0],

@@ -524,6 +524,10 @@ fn coalesce_follows_array_element_holder_chain() {
     let bytes = build_pdf("[4 0 R 5 0 R]", &[(4, s1), (5, carrier), (6, s2)]);
 
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
+    pdf.set_object(
+        ObjectRef::new(5, 0),
+        Object::Reference(ObjectRef::new(6, 0)),
+    );
     let page_ref = ObjectRef::new(3, 0);
     pages::coalesce_page_contents(&mut pdf, page_ref).expect("coalesce should succeed");
 
@@ -556,6 +560,10 @@ fn coalesce_array_element_chain_to_non_stream_errors() {
     let bytes = build_pdf("[4 0 R 5 0 R]", &[(4, s1), (5, carrier), (6, non_stream)]);
 
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
+    pdf.set_object(
+        ObjectRef::new(5, 0),
+        Object::Reference(ObjectRef::new(6, 0)),
+    );
     let err = pages::coalesce_page_contents(&mut pdf, ObjectRef::new(3, 0)).unwrap_err();
     assert!(
         matches!(&err, flpdf::Error::Unsupported(msg) if msg.contains("does not resolve to a stream")),

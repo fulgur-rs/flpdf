@@ -383,6 +383,10 @@ fn present_wrong_type_scalar_warnings_use_qpdf_object_type_names() {
             1,
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        pdf.set_object(
+            ObjectRef::new(8, 0),
+            Object::Reference(ObjectRef::new(9, 0)),
+        );
         let tree = pdf.outline().get_tree().unwrap();
         let expected = if key == "Title" {
             assert_eq!(tree[tree.roots()[0]].title, "");
@@ -582,7 +586,7 @@ fn indirect_null_next_terminates_the_root_sibling_chain() {
 }
 
 #[test]
-fn construction_resolves_a_bare_reference_item_exactly_once() {
+fn construction_integerizes_a_bare_reference_item() {
     let bytes = build_pdf(
         &[
             (
@@ -600,13 +604,13 @@ fn construction_resolves_a_bare_reference_item_exactly_once() {
 
     assert_eq!(
         pdf.resolve(ObjectRef::new(5, 0)).unwrap(),
-        Object::Reference(ObjectRef::new(6, 0))
+        Object::Integer(6)
     );
     let tree = pdf.outline().get_tree().unwrap();
     let item = &tree[tree.roots()[0]];
     assert_eq!(tree.roots().len(), 1);
     assert_eq!(item.source_ref, Some(ObjectRef::new(5, 0)));
-    assert_eq!(item.object, Object::Reference(ObjectRef::new(6, 0)));
+    assert_eq!(item.object, Object::Integer(6));
     assert_eq!(item.title, "");
 }
 
@@ -2674,6 +2678,10 @@ fn missing_name_tree_limits_repairs_the_terminal_indirect_root_without_collapsin
         ],
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    pdf.set_object(
+        ObjectRef::new(21, 0),
+        Object::Reference(ObjectRef::new(22, 0)),
+    );
 
     assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
     assert_eq!(
@@ -3646,6 +3654,10 @@ fn outline_destination_resolves_through_multi_hop_action_holder_chain() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+    pdf.set_object(
+        ObjectRef::new(8, 0),
+        Object::Reference(ObjectRef::new(9, 0)),
+    );
     assert_eq!(root_items(&mut pdf)[0].dest, page_dest(3));
 }
 

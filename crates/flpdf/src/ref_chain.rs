@@ -113,16 +113,27 @@ mod tests {
         out
     }
 
+    fn open_chain_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let mut pdf = Pdf::open(Cursor::new(build_chain_pdf())).expect("parse");
+        for (from, to) in [(4, 5), (5, 6), (7, 8), (8, 7)] {
+            pdf.set_object(
+                ObjectRef::new(from, 0),
+                Object::Reference(ObjectRef::new(to, 0)),
+            );
+        }
+        pdf
+    }
+
     #[test]
     fn terminal_ref_of_chain_follows_multi_hop_to_terminal() {
-        let mut pdf = Pdf::open(Cursor::new(build_chain_pdf())).expect("parse");
+        let mut pdf = open_chain_pdf();
         let terminal = terminal_ref_of_chain(&mut pdf, ObjectRef::new(4, 0)).expect("ok");
         assert_eq!(terminal, ObjectRef::new(6, 0));
     }
 
     #[test]
     fn terminal_ref_of_chain_single_hop_is_self() {
-        let mut pdf = Pdf::open(Cursor::new(build_chain_pdf())).expect("parse");
+        let mut pdf = open_chain_pdf();
         // Object 6 is already a dictionary (not a reference), so its terminal ref
         // is itself.
         let terminal = terminal_ref_of_chain(&mut pdf, ObjectRef::new(6, 0)).expect("ok");
@@ -131,7 +142,7 @@ mod tests {
 
     #[test]
     fn terminal_ref_of_chain_cyclic_terminates_at_bound() {
-        let mut pdf = Pdf::open(Cursor::new(build_chain_pdf())).expect("parse");
+        let mut pdf = open_chain_pdf();
         // 7 → 8 → 7 → … never reaches a non-reference; the depth bound must stop
         // it and return a ref from the cycle rather than looping forever.
         let terminal = terminal_ref_of_chain(&mut pdf, ObjectRef::new(7, 0)).expect("ok");

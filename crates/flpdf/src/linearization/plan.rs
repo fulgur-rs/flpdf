@@ -4340,6 +4340,10 @@ mod tests {
     fn from_pdf_follows_reference_chain_parent() {
         let bytes = reference_chain_parent_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("fixture must parse");
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Reference(ObjectRef::new(5, 0)),
+        );
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
         // Single-page document: the page's whole closure is Part 2.

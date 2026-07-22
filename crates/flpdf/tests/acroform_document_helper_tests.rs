@@ -422,6 +422,10 @@ fn fields_follows_holder_chain_carrier() {
         1,
     );
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+    pdf.set_object(
+        ObjectRef::new(6, 0),
+        Object::Reference(ObjectRef::new(7, 0)),
+    );
     let fields = pdf.acroform().fields().unwrap();
     assert_eq!(fields, vec![ObjectRef::new(4, 0)]);
 }

@@ -21,7 +21,8 @@
 //!   W8. Round-trip: insert → list_embedded_files → same sorted keys.
 
 use flpdf::{
-    delete_embedded_file, insert_embedded_file, list_embedded_files, ObjectRef, Pdf, LEAF_MAX,
+    delete_embedded_file, insert_embedded_file, list_embedded_files, Object, ObjectRef, Pdf,
+    LEAF_MAX,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -823,11 +824,20 @@ fn build_two_hop_names_pdf() -> Vec<u8> {
     out
 }
 
+fn open_two_hop_names_pdf() -> Pdf<Cursor<Vec<u8>>> {
+    let mut pdf = open(build_two_hop_names_pdf());
+    pdf.set_object(
+        ObjectRef::new(2, 0),
+        Object::Reference(ObjectRef::new(3, 0)),
+    );
+    pdf
+}
+
 // ── Site 2: list_embedded_files reads through a 2-hop /Names ──────────────────
 
 #[test]
 fn list_enumerates_through_two_hop_names() {
-    let mut pdf = open(build_two_hop_names_pdf());
+    let mut pdf = open_two_hop_names_pdf();
     let entries = list_embedded_files(&mut pdf).expect("list_embedded_files");
     assert_eq!(
         entries.len(),
@@ -849,7 +859,7 @@ fn list_enumerates_through_two_hop_names() {
 fn insert_through_two_hop_names_preserves_sibling_and_existing() {
     use flpdf::Object;
 
-    let mut pdf = open(build_two_hop_names_pdf());
+    let mut pdf = open_two_hop_names_pdf();
 
     // Add a sibling key to the terminal /Names dict (object 3) so we can detect
     // whether the rebuild operated on the real terminal dict or a fresh one.
@@ -910,7 +920,7 @@ fn insert_through_two_hop_names_preserves_sibling_and_existing() {
 fn delete_last_entry_through_two_hop_names() {
     use flpdf::Object;
 
-    let mut pdf = open(build_two_hop_names_pdf());
+    let mut pdf = open_two_hop_names_pdf();
 
     // Add a sibling /Dests key so the terminal /Names dict is non-empty after
     // /EmbeddedFiles is dropped — exercises the non-empty set_object branch of
@@ -1002,6 +1012,10 @@ fn remove_attachment_clears_ref_from_two_hop_af_array() {
     use flpdf::{remove_attachment, Object};
 
     let mut pdf = open(build_two_hop_af_pdf());
+    pdf.set_object(
+        ObjectRef::new(6, 0),
+        Object::Reference(ObjectRef::new(7, 0)),
+    );
 
     let removed = remove_attachment(&mut pdf, b"gone").expect("remove");
     assert!(removed, "existing attachment must report removed");

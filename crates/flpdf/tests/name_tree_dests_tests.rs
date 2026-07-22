@@ -436,9 +436,18 @@ fn build_two_hop_names_pdf() -> Vec<u8> {
     out
 }
 
+fn open_two_hop_names_pdf() -> Pdf<Cursor<Vec<u8>>> {
+    let mut pdf = open(build_two_hop_names_pdf());
+    pdf.set_object(
+        ObjectRef::new(2, 0),
+        Object::Reference(ObjectRef::new(3, 0)),
+    );
+    pdf
+}
+
 #[test]
 fn insert_through_two_hop_names_preserves_sibling_and_existing() {
-    let mut pdf = open(build_two_hop_names_pdf());
+    let mut pdf = open_two_hop_names_pdf();
 
     // Add a sibling key to the terminal /Names dict (object 3) so we can
     // detect whether the rebuild operated on the real terminal dict.
@@ -486,7 +495,7 @@ fn insert_through_two_hop_names_preserves_sibling_and_existing() {
 
 #[test]
 fn delete_last_entry_through_two_hop_names() {
-    let mut pdf = open(build_two_hop_names_pdf());
+    let mut pdf = open_two_hop_names_pdf();
 
     // Add a sibling /EmbeddedFiles key so the terminal /Names dict is
     // non-empty after /Dests is dropped — exercises the non-empty
