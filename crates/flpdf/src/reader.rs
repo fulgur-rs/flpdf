@@ -1,5 +1,6 @@
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
+use crate::object::collect_qpdf_object_references;
 use crate::parser::{parse_indirect_object_detailed, parse_indirect_object_detailed_qpdf, Parser};
 use crate::security::password::{normalize_password, PasswordMode};
 use crate::security::standard::{
@@ -71,6 +72,13 @@ pub struct Pdf<R: Read + Seek> {
     /// Valid indirect references discovered while preparing qpdf JSON whose
     /// exact object generation has no live xref/cache target.
     qpdf_dangling_refs: BTreeSet<ObjectRef>,
+    /// Valid indirect references parsed from every classic trailer and xref
+    /// stream dictionary in the source `/Prev` chain.
+    qpdf_trailer_references: BTreeSet<ObjectRef>,
+    /// Xref stream objects parsed while following the source `/Prev` chain.
+    /// Kept outside the public cache so superseded/free streams remain visible
+    /// only through qpdf's raw object view.
+    qpdf_parsed_xref_streams: BTreeMap<ObjectRef, Object>,
     /// Monotonic observation matching qpdf's `everCalledGetAllPages()`.
     ever_called_get_all_pages: bool,
     encryption: Option<EncryptionState>,
@@ -87,31 +95,6 @@ struct QpdfReadObject {
     object: Object,
     indirect_length: Option<crate::parser::IndirectStreamLength>,
     empty_offset: Option<usize>,
-}
-
-fn collect_qpdf_object_references(object: &Object, references: &mut BTreeSet<ObjectRef>) {
-    let mut stack = vec![object];
-    while let Some(current) = stack.pop() {
-        match current {
-            Object::Reference(object_ref) => {
-                references.insert(*object_ref);
-            }
-            Object::Array(items) => stack.extend(items.iter()),
-            Object::Dictionary(dictionary) => {
-                stack.extend(dictionary.iter().map(|(_, value)| value));
-            }
-            Object::Stream(stream) => {
-                stack.extend(stream.dict.iter().map(|(_, value)| value));
-            }
-            Object::Null
-            | Object::Boolean(_)
-            | Object::Integer(_)
-            | Object::Real(_)
-            | Object::RealLiteral { .. }
-            | Object::Name(_)
-            | Object::String(_) => {}
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -579,6 +562,8 @@ impl<R: Read + Seek> Pdf<R> {
             source_xref_entries,
             dirty_object_refs: BTreeSet::new(),
             qpdf_dangling_refs: BTreeSet::new(),
+            qpdf_trailer_references: loaded.trailer_references,
+            qpdf_parsed_xref_streams: loaded.parsed_xref_streams,
             ever_called_get_all_pages: false,
             encryption: None,
         };
@@ -886,6 +871,8 @@ impl<R: Read + Seek> Pdf<R> {
     /// [`crate::write_pdf`] will see the updated value when it walks the cache and emit
     /// a new revision for the touched object.
     pub fn set_object(&mut self, object_ref: ObjectRef, object: Object) {
+        self.qpdf_parsed_xref_streams.remove(&object_ref);
+        self.qpdf_dangling_refs.remove(&object_ref);
         if let Some(CacheEntry::Compressed { stream, index }) =
             self.cache.entry(object_ref).cloned()
         {
@@ -901,6 +888,8 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub fn delete_object(&mut self, object_ref: ObjectRef) {
+        self.qpdf_parsed_xref_streams.remove(&object_ref);
+        self.qpdf_dangling_refs.remove(&object_ref);
         if object_ref.number == 0
             || matches!(
                 self.cache.entry(object_ref),
@@ -997,8 +986,8 @@ impl<R: Read + Seek> Pdf<R> {
     /// object enumeration APIs.
     pub(crate) fn prepare_qpdf_json_objects(&mut self) -> Result<QpdfPreparedObjects> {
         let live_snapshot = self.live_object_refs();
-        let mut discovered = BTreeSet::new();
-        collect_qpdf_object_references(&Object::Dictionary(self.trailer.clone()), &mut discovered);
+        let mut discovered = self.qpdf_trailer_references.clone();
+        discovered.extend(self.qpdf_parsed_xref_streams.keys().copied());
 
         for object_ref in live_snapshot {
             let object = self.resolve_qpdf_json_object(object_ref)?;
@@ -1225,7 +1214,7 @@ impl<R: Read + Seek> Pdf<R> {
         }
     }
 
-    fn resolve_qpdf_json_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
+    pub(crate) fn resolve_qpdf_json_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
         if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
             return Ok(object.clone());
         }
@@ -1265,7 +1254,11 @@ impl<R: Read + Seek> Pdf<R> {
                 | CacheEntry::Deleted
                 | CacheEntry::Reserved,
             )
-            | None => Ok(Object::Null),
+            | None => Ok(self
+                .qpdf_parsed_xref_streams
+                .get(&object_ref)
+                .cloned()
+                .unwrap_or(Object::Null)),
         }
     }
 

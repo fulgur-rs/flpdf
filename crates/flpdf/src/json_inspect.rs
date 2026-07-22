@@ -374,7 +374,7 @@ fn qpdf_reference_resolves_to_null<R: Read + Seek>(
         if !visited.insert(current) {
             return Ok(true);
         }
-        match pdf.resolve(current)? {
+        match pdf.resolve_qpdf_json_object(current)? {
             Object::Null => return Ok(true),
             Object::Reference(next) => current = next,
             _ => return Ok(false),
@@ -442,7 +442,7 @@ fn qpdf_resolve_top_level_object<R: Read + Seek>(
         if !visited.insert(current) {
             return Ok(Object::Null);
         }
-        match pdf.resolve(current)? {
+        match pdf.resolve_qpdf_json_object(current)? {
             Object::Reference(next) => current = next,
             terminal => return Ok(terminal),
         }
@@ -4506,6 +4506,240 @@ mod tests {
         bytes
     }
 
+    fn last_startxref(bytes: &[u8]) -> u64 {
+        let marker = b"startxref\n";
+        let start = bytes
+            .windows(marker.len())
+            .rposition(|window| window == marker)
+            .expect("startxref marker")
+            + marker.len();
+        let end = bytes[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|length| start + length)
+            .expect("startxref newline");
+        std::str::from_utf8(&bytes[start..end])
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn append_classic_increment(
+        bytes: &mut Vec<u8>,
+        objects: &[(u32, u16, &str)],
+        free_entries: &[(u32, u16)],
+        size: u32,
+        trailer_extra: &str,
+        previous_xref: u64,
+    ) -> u64 {
+        let mut offsets = Vec::new();
+        for (number, generation, body) in objects {
+            offsets.push((*number, *generation, bytes.len()));
+            bytes.extend_from_slice(
+                format!("{number} {generation} obj\n{body}\nendobj\n").as_bytes(),
+            );
+        }
+        let xref = bytes.len() as u64;
+        bytes.extend_from_slice(b"xref\n");
+        for (number, generation, offset) in offsets {
+            bytes.extend_from_slice(
+                format!("{number} 1\n{offset:010} {generation:05} n \n").as_bytes(),
+            );
+        }
+        for (number, generation) in free_entries {
+            bytes.extend_from_slice(
+                format!("{number} 1\n0000000000 {generation:05} f \n").as_bytes(),
+            );
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {size} /Root 1 0 R /Prev {previous_xref} {trailer_extra} >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        xref
+    }
+
+    fn two_revision_historical_trailer_pdf() -> Vec<u8> {
+        let mut bytes = build_qpdf_dangling_xref_pdf_with_trailer("", "/Info 99 0 R", &[], &[], 4);
+        let previous = last_startxref(&bytes);
+        append_classic_increment(&mut bytes, &[(4, 0, "null")], &[], 5, "", previous);
+        bytes
+    }
+
+    fn three_revision_historical_trailer_pdf() -> Vec<u8> {
+        let mut bytes = build_qpdf_dangling_xref_pdf_with_trailer(
+            "",
+            "/Info 99 0 R /OldGen 88 4 R /Freed 20 7 R /Zero 0 0 R /BadGen 77 65535 R",
+            &[],
+            &[],
+            4,
+        );
+        let oldest = last_startxref(&bytes);
+        let middle = append_classic_increment(
+            &mut bytes,
+            &[(4, 0, "null")],
+            &[],
+            5,
+            "/Info 60 1 R /Middle 70 3 R",
+            oldest,
+        );
+        append_classic_increment(
+            &mut bytes,
+            &[(5, 0, "null")],
+            &[(20, 7), (200, 7)],
+            201,
+            "/Newest 50 2 R",
+            middle,
+        );
+        bytes
+    }
+
+    fn historical_xref_stream_trailer_pdf_with_free_generation(free_generation: u16) -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (number, body) in [
+            (1u32, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>"),
+        ] {
+            offsets.push(bytes.len() as u32);
+            bytes.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref_stream_offset = bytes.len() as u32;
+        let mut entries = Vec::new();
+        for (kind, offset, generation) in [
+            (0u8, 0u32, u16::MAX),
+            (1, offsets[0], 0),
+            (1, offsets[1], 0),
+            (1, offsets[2], 0),
+            (1, xref_stream_offset, 0),
+        ] {
+            entries.push(kind);
+            entries.extend_from_slice(&offset.to_be_bytes());
+            entries.extend_from_slice(&generation.to_be_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /Info 99 0 R /Gen 88 4 R /W [1 4 2] /Index [0 5] /Length {} >>\nstream\n",
+                entries.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&entries);
+        bytes.extend_from_slice(
+            format!("\nendstream\nendobj\nstartxref\n{xref_stream_offset}\n%%EOF\n").as_bytes(),
+        );
+        append_classic_increment(
+            &mut bytes,
+            &[(5, 0, "null")],
+            &[(4, free_generation)],
+            6,
+            "",
+            u64::from(xref_stream_offset),
+        );
+        bytes
+    }
+
+    fn historical_xref_stream_trailer_pdf() -> Vec<u8> {
+        historical_xref_stream_trailer_pdf_with_free_generation(1)
+    }
+
+    fn latest_xref_stream_pdf() -> Vec<u8> {
+        let bytes = historical_xref_stream_trailer_pdf();
+        let eof = bytes
+            .windows(b"%%EOF\n".len())
+            .position(|window| window == b"%%EOF\n")
+            .expect("first xref stream eof")
+            + b"%%EOF\n".len();
+        bytes[..eof].to_vec()
+    }
+
+    fn reused_historical_xref_stream_pdf() -> Vec<u8> {
+        let mut bytes = latest_xref_stream_pdf();
+        let previous = last_startxref(&bytes);
+        append_classic_increment(
+            &mut bytes,
+            &[(4, 0, "<< /Marker /New >>"), (5, 0, "null")],
+            &[],
+            6,
+            "",
+            previous,
+        );
+        bytes
+    }
+
+    fn repeated_historical_xref_stream_pdf() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (number, body) in [
+            (1u32, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>"),
+        ] {
+            offsets.push(bytes.len() as u32);
+            bytes.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+
+        let append_xref_stream = |bytes: &mut Vec<u8>,
+                                  marker: &str,
+                                  info: u32,
+                                  previous: Option<u64>| {
+            let xref_stream_offset = bytes.len() as u32;
+            let mut entries = Vec::new();
+            for (kind, offset, generation) in [
+                (0u8, 0u32, u16::MAX),
+                (1, offsets[0], 0),
+                (1, offsets[1], 0),
+                (1, offsets[2], 0),
+                (1, xref_stream_offset, 0),
+            ] {
+                entries.push(kind);
+                entries.extend_from_slice(&offset.to_be_bytes());
+                entries.extend_from_slice(&generation.to_be_bytes());
+            }
+            let prev = previous.map_or_else(String::new, |value| format!("/Prev {value} "));
+            bytes.extend_from_slice(
+                    format!(
+                        "4 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /Marker /{marker} /Info {info} 0 R {prev}/W [1 4 2] /Index [0 5] /Length {} >>\nstream\n",
+                        entries.len()
+                    )
+                    .as_bytes(),
+                );
+            bytes.extend_from_slice(&entries);
+            bytes.extend_from_slice(
+                format!("\nendstream\nendobj\nstartxref\n{xref_stream_offset}\n%%EOF\n").as_bytes(),
+            );
+            u64::from(xref_stream_offset)
+        };
+
+        let oldest = append_xref_stream(&mut bytes, "Old", 91, None);
+        let nearest = append_xref_stream(&mut bytes, "Near", 92, Some(oldest));
+        append_classic_increment(&mut bytes, &[(5, 0, "null")], &[(4, 1)], 6, "", nearest);
+        bytes
+    }
+
+    fn circular_historical_trailer_pdf() -> Vec<u8> {
+        let mut bytes = build_qpdf_dangling_xref_pdf_with_trailer(
+            "",
+            "/Info 99 0 R /Prev 0000000000",
+            &[],
+            &[],
+            4,
+        );
+        let old_xref = last_startxref(&bytes);
+        let latest_xref =
+            append_classic_increment(&mut bytes, &[(4, 0, "null")], &[], 5, "", old_xref);
+        let marker = b"/Prev 0000000000";
+        let start = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("old /Prev placeholder")
+            + b"/Prev ".len();
+        bytes[start..start + 10].copy_from_slice(format!("{latest_xref:010}").as_bytes());
+        bytes
+    }
+
     #[test]
     fn qpdf_dangling_preparation_does_not_leak_missing_refs_to_public_enumeration() {
         let mut pdf = load_fixture_pdf("dangling-body-one-page.pdf");
@@ -4606,6 +4840,185 @@ mod tests {
             .iter()
             .any(|reference| reference.number == 200));
         assert!(pdf.object_refs().contains(&crate::ObjectRef::new(200, 7)));
+    }
+
+    #[test]
+    fn qpdf_preparation_collects_refs_from_an_older_omitted_trailer() {
+        let mut pdf = crate::Pdf::open_mem_owned(two_revision_historical_trailer_pdf())
+            .expect("open two-revision fixture");
+        assert!(pdf.trailer().get("Info").is_none());
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        let historical = crate::ObjectRef::new(99, 0);
+        assert_eq!(prepared.max_object_id, 99);
+        assert!(prepared.refs.contains(&historical));
+        assert!(!pdf.object_refs().contains(&historical));
+        assert!(!pdf.live_object_refs().contains(&historical));
+    }
+
+    #[test]
+    fn qpdf_preparation_unions_replaced_multigeneration_trailer_refs() {
+        let mut pdf = crate::Pdf::open_mem_owned(three_revision_historical_trailer_pdf())
+            .expect("open three-revision fixture");
+        assert!(pdf.trailer().get("Info").is_none());
+        assert_eq!(
+            pdf.trailer().get_ref("Newest"),
+            Some(crate::ObjectRef::new(50, 2))
+        );
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        for historical in [
+            crate::ObjectRef::new(99, 0),
+            crate::ObjectRef::new(88, 4),
+            crate::ObjectRef::new(20, 7),
+            crate::ObjectRef::new(60, 1),
+            crate::ObjectRef::new(70, 3),
+            crate::ObjectRef::new(50, 2),
+        ] {
+            assert!(prepared.refs.contains(&historical), "{historical:?}");
+            assert!(
+                !pdf.live_object_refs().contains(&historical),
+                "{historical:?}"
+            );
+        }
+        assert_eq!(prepared.max_object_id, 99);
+        assert!(!prepared.refs.contains(&crate::ObjectRef::new(0, 0)));
+        assert!(!prepared.refs.contains(&crate::ObjectRef::new(77, u16::MAX)));
+        assert!(!prepared
+            .refs
+            .iter()
+            .any(|reference| reference.number == 200));
+        assert!(pdf.object_refs().contains(&crate::ObjectRef::new(200, 7)));
+    }
+
+    #[test]
+    fn qpdf_preparation_collects_refs_from_a_freed_old_xref_stream() {
+        let mut pdf = crate::Pdf::open_mem_owned(historical_xref_stream_trailer_pdf())
+            .expect("open mixed xref fixture");
+        assert!(pdf.trailer().get("Info").is_none());
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        assert_eq!(prepared.max_object_id, 99);
+        assert!(prepared.refs.contains(&crate::ObjectRef::new(99, 0)));
+        assert!(prepared.refs.contains(&crate::ObjectRef::new(88, 4)));
+        let stream_ref = crate::ObjectRef::new(4, 0);
+        assert!(prepared.refs.contains(&stream_ref));
+        assert!(!pdf.object_refs().contains(&stream_ref));
+        assert!(!pdf.live_object_refs().contains(&stream_ref));
+        assert_eq!(pdf.resolve(stream_ref).unwrap(), crate::Object::Null);
+    }
+
+    #[test]
+    fn qpdf_preparation_keeps_old_xref_streams_freed_at_the_same_generation() {
+        let mut pdf =
+            crate::Pdf::open_mem_owned(historical_xref_stream_trailer_pdf_with_free_generation(0))
+                .expect("open same-generation free xref stream fixture");
+        let stream_ref = crate::ObjectRef::new(4, 0);
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        assert!(prepared.refs.contains(&stream_ref));
+        assert!(matches!(
+            qpdf_resolve_top_level_object(&mut pdf, stream_ref).unwrap(),
+            crate::Object::Stream(_)
+        ));
+        assert_eq!(pdf.resolve(stream_ref).unwrap(), crate::Object::Null);
+    }
+
+    #[test]
+    fn qpdf_preparation_prefers_a_new_live_object_reusing_an_xref_stream_ref() {
+        let mut pdf = crate::Pdf::open_mem_owned(reused_historical_xref_stream_pdf())
+            .expect("open live-reused xref stream fixture");
+        let stream_ref = crate::ObjectRef::new(4, 0);
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+        let replacement = qpdf_resolve_top_level_object(&mut pdf, stream_ref).unwrap();
+
+        assert_eq!(prepared.max_object_id, 99);
+        assert_eq!(
+            replacement.as_dict().and_then(|dict| dict.get("Marker")),
+            Some(&crate::Object::Name(b"New".to_vec()))
+        );
+    }
+
+    #[test]
+    fn qpdf_parsed_xref_streams_do_not_shadow_set_or_delete() {
+        for bytes in [
+            latest_xref_stream_pdf(),
+            historical_xref_stream_trailer_pdf(),
+        ] {
+            let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("open xref stream fixture");
+            let stream_ref = crate::ObjectRef::new(4, 0);
+            pdf.set_object(stream_ref, crate::Object::Name(b"Mutated".to_vec()));
+
+            assert_eq!(
+                qpdf_resolve_top_level_object(&mut pdf, stream_ref).unwrap(),
+                crate::Object::Name(b"Mutated".to_vec())
+            );
+
+            pdf.delete_object(stream_ref);
+            assert_eq!(
+                qpdf_resolve_top_level_object(&mut pdf, stream_ref).unwrap(),
+                crate::Object::Null
+            );
+        }
+    }
+
+    #[test]
+    fn qpdf_preparation_keeps_the_nearest_parsed_xref_stream_generation() {
+        let mut pdf = crate::Pdf::open_mem_owned(repeated_historical_xref_stream_pdf())
+            .expect("open repeated xref stream fixture");
+        let stream_ref = crate::ObjectRef::new(4, 0);
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        assert!(prepared.refs.contains(&stream_ref));
+        assert!(!pdf.object_refs().contains(&stream_ref));
+        assert!(!pdf.live_object_refs().contains(&stream_ref));
+    }
+
+    #[test]
+    fn qpdf_preparation_deduplicates_historical_refs_in_a_repaired_prev_cycle() {
+        let bytes = circular_historical_trailer_pdf();
+        assert!(crate::Pdf::open_mem_owned(bytes.clone()).is_err());
+        let mut pdf = crate::Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("repair circular /Prev fixture");
+        assert!(pdf.trailer().get("Info").is_none());
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf objects");
+
+        assert_eq!(prepared.max_object_id, 99);
+        assert_eq!(
+            prepared
+                .refs
+                .iter()
+                .filter(|reference| **reference == crate::ObjectRef::new(99, 0))
+                .count(),
+            1
+        );
     }
 
     fn selected_qpdf_object_map(json: &JsonValue) -> &[(String, JsonValue)] {

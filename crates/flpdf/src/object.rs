@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -164,6 +164,34 @@ pub enum Object {
     Dictionary(Dictionary),
     Stream(Stream),
     Reference(ObjectRef),
+}
+
+pub(crate) fn collect_qpdf_object_references(
+    object: &Object,
+    references: &mut BTreeSet<ObjectRef>,
+) {
+    let mut stack = vec![object];
+    while let Some(current) = stack.pop() {
+        match current {
+            Object::Reference(object_ref) => {
+                references.insert(*object_ref);
+            }
+            Object::Array(items) => stack.extend(items.iter()),
+            Object::Dictionary(dictionary) => {
+                stack.extend(dictionary.iter().map(|(_, value)| value));
+            }
+            Object::Stream(stream) => {
+                stack.extend(stream.dict.iter().map(|(_, value)| value));
+            }
+            Object::Null
+            | Object::Boolean(_)
+            | Object::Integer(_)
+            | Object::Real(_)
+            | Object::RealLiteral { .. }
+            | Object::Name(_)
+            | Object::String(_) => {}
+        }
+    }
 }
 
 impl Object {
