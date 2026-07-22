@@ -49,9 +49,7 @@ use crate::{Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
-/// Temporary construction cap for the arena builder.
-/// This remains private and is not a caller-configurable policy.
-const TEMPORARY_OUTLINE_BUILD_DEPTH: usize = 5_000;
+const QPDF_MAX_EXPANDED_OUTLINE_DEPTH: usize = 50;
 
 #[derive(Clone)]
 enum OutlineCursor {
@@ -140,8 +138,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Unsupported`] if nesting exceeds the private
-    /// temporary construction cap. Propagates outline-resolution errors.
+    /// Propagates outline-resolution errors.
     pub fn get_tree(&mut self) -> Result<OutlineTree> {
         let mut tree = OutlineTree::new();
         let Some(outlines) = self.catalog_outlines()? else {
@@ -194,15 +191,17 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         tree: &mut OutlineTree,
         constructor_seen: &mut BTreeSet<ObjectRef>,
     ) -> Result<Option<OutlineId>> {
-        self.check_temporary_depth(depth, &cursor)?;
-        let Some((root, expand_root)) =
-            self.materialize_item(cursor, parent, tree, constructor_seen)?
-        else {
+        let Some(root) = self.materialize_item(cursor, parent, tree)? else {
             return Ok(None);
         };
-        if !expand_root {
+        if depth > QPDF_MAX_EXPANDED_OUTLINE_DEPTH {
             return Ok(Some(root));
-        };
+        }
+        if let Some(reference) = tree[root].source_ref {
+            if !constructor_seen.insert(reference) {
+                return Ok(Some(root));
+            }
+        }
 
         struct Frame {
             owner: OutlineId,
@@ -230,13 +229,18 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 let frame = frames.last().expect("outline construction frame exists");
                 (frame.owner, frame.depth)
             };
-            self.check_temporary_depth(child_depth, &cursor)?;
-            let Some((child, expand_child)) =
-                self.materialize_item(cursor, Some(owner), tree, constructor_seen)?
-            else {
+            let Some(child) = self.materialize_item(cursor, Some(owner), tree)? else {
                 continue;
             };
             tree.items[owner.0].kids.push(child);
+
+            let expand_child = if child_depth > QPDF_MAX_EXPANDED_OUTLINE_DEPTH {
+                false
+            } else if let Some(reference) = tree[child].source_ref {
+                constructor_seen.insert(reference)
+            } else {
+                true
+            };
 
             // qpdf advances the parent's raw child `/Next` chain even when the
             // child's constructor seen check prevented that child expanding.
@@ -265,8 +269,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         cursor: OutlineCursor,
         parent: Option<OutlineId>,
         tree: &mut OutlineTree,
-        constructor_seen: &mut BTreeSet<ObjectRef>,
-    ) -> Result<Option<(OutlineId, bool)>> {
+    ) -> Result<Option<OutlineId>> {
         let source_ref = cursor.source_ref();
         let object = self.resolve_cursor(&cursor)?;
         if matches!(object, Object::Null) {
@@ -295,23 +298,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             dest,
         });
 
-        let expand = source_ref
-            .map(|reference| constructor_seen.insert(reference))
-            .unwrap_or(true);
-        Ok(Some((id, expand)))
-    }
-
-    fn check_temporary_depth(&self, depth: usize, cursor: &OutlineCursor) -> Result<()> {
-        if depth > TEMPORARY_OUTLINE_BUILD_DEPTH {
-            let location = cursor
-                .source_ref()
-                .map(|reference| format!(" at {reference}"))
-                .unwrap_or_default();
-            return Err(crate::Error::Unsupported(format!(
-                "outline depth exceeds temporary maximum of {TEMPORARY_OUTLINE_BUILD_DEPTH}{location}"
-            )));
-        }
-        Ok(())
+        Ok(Some(id))
     }
 
     /// Resolve a node's destination from `/Dest`, else a `/A` GoTo action's `/D`.

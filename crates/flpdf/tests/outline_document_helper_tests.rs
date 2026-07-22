@@ -526,53 +526,28 @@ fn deep_outline_walks_to_full_depth() {
     assert_eq!(max_depth, 30);
 }
 
-/// A 1000-level-deep outline (a straight chain, one child per level) walks to
-/// completion through the non-configurable `get_tree` API.
 #[test]
-fn deep_outline_walks_1000_levels_with_default_depth() {
-    let n = 1000u32;
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
-    let tree = pdf.outline().get_tree().unwrap();
-    assert_eq!(tree.roots().len(), 1);
-    let depths: Vec<usize> = tree.preorder().map(|(depth, _id, _item)| depth).collect();
-    assert_eq!(depths.len(), n as usize);
-    assert_eq!(*depths.last().unwrap(), n as usize);
-}
+fn qpdf_depth_50_boundary_materializes_depth_51_without_expanding_it() {
+    for (input_levels, expected_levels) in [(50, 50), (51, 51), (52, 51)] {
+        let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(input_levels))).unwrap();
+        let tree = pdf.outline().get_tree().unwrap();
+        let visits: Vec<_> = tree.preorder().collect();
 
-/// A 3,000-level chain (comfortably above the epic acceptance criterion of
-/// 1,000) proves the arena scales past the old 100-level cap without consuming
-/// a native call frame per outline level.
-#[test]
-fn deep_outline_iterative_walk_survives_three_thousand_levels() {
-    let n = 3_000u32;
-
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(n))).unwrap();
-    let tree = pdf.outline().get_tree().unwrap();
-    assert_eq!(tree.roots().len(), 1);
-    // Walk down the single child chain to confirm the tree was built to the
-    // full depth (not silently truncated).
-    let mut depth = 1;
-    let mut id = tree.roots()[0];
-    while let Some(&child) = tree[id].kids.first() {
-        id = child;
-        depth += 1;
+        assert_eq!(visits.len(), expected_levels);
+        assert_eq!(visits.first().unwrap().0, 1);
+        assert_eq!(visits.last().unwrap().0, expected_levels);
+        if input_levels == 52 {
+            assert!(visits.last().unwrap().2.kids.is_empty());
+        }
     }
-    assert_eq!(depth, n as usize);
-    assert_eq!(tree.preorder().count(), n as usize);
-    assert_eq!(tree.preorder().map(|entry| entry.0).max(), Some(n as usize));
 }
 
 #[test]
-fn private_temporary_depth_guard_reports_the_indirect_item() {
-    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(5_002))).unwrap();
-    let error = pdf.outline().get_tree().unwrap_err();
+fn qpdf_depth_50_boundary_returns_no_depth_error() {
+    let mut pdf = Pdf::open(Cursor::new(deep_outline_pdf(52))).unwrap();
 
-    assert!(
-        error
-            .to_string()
-            .contains("outline depth exceeds temporary maximum of 5000 at 5005 0 R"),
-        "{error}"
-    );
+    assert!(pdf.outline().has_outlines().unwrap());
+    assert_eq!(pdf.outline().get_tree().unwrap().preorder().count(), 51);
 }
 
 /// Outline with a /Next cycle: 5 -> Next 6 -> Next 5 ...

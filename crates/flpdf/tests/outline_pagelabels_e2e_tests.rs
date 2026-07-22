@@ -121,12 +121,9 @@ fn deep_outline_with_dests_pdf(n: u32) -> Vec<u8> {
     build_pdf(&refs, 1)
 }
 
-/// A 150-level-deep outline chain survives a full `write_pdf` round trip: the
-/// reopened document's depth, per-level titles, and per-level `/Dest`
-/// resolution are all preserved — not just the in-memory walk that
-/// `deep_outline_walks_1000_levels_with_default_depth` (in
-/// `outline_document_helper_tests.rs`) already covers without ever calling
-/// [`write_pdf`].
+/// A 150-level-deep outline chain survives a full `write_pdf` round trip. The
+/// qpdf-compatible helper view stops after materializing depth 51, while the
+/// raw dictionaries and their `/First` links remain intact through depth 150.
 #[test]
 fn deep_outline_round_trip_through_write_pdf() {
     let n = 150u32;
@@ -134,7 +131,7 @@ fn deep_outline_round_trip_through_write_pdf() {
 
     let before_tree = pdf.outline().get_tree().unwrap();
     let before = before_tree.preorder().count();
-    assert_eq!(before, n as usize, "sanity: fixture has n levels");
+    assert_eq!(before, 51, "helper view stops at qpdf's depth boundary");
 
     let mut out = Vec::new();
     write_pdf(&mut pdf, &mut out).unwrap();
@@ -146,9 +143,9 @@ fn deep_outline_round_trip_through_write_pdf() {
         1,
         "single top-level root after round trip"
     );
+    assert_eq!(tree.preorder().count(), 51);
 
-    // Walk the single-child chain end to end, checking every level's title,
-    // depth, and dest resolution survived the round trip intact.
+    // The materialized helper view includes level 51 but does not expand it.
     let mut depth = 0usize;
     let mut id = tree.roots()[0];
     loop {
@@ -167,10 +164,46 @@ fn deep_outline_round_trip_through_write_pdf() {
             None => break,
         }
     }
-    assert_eq!(depth, (n - 1) as usize, "full depth must survive intact");
+    assert_eq!(depth, 50, "depth 51 is the last materialized helper item");
+    assert!(tree[id].kids.is_empty());
 
-    let after_count = tree.preorder().count();
-    assert_eq!(after_count, n as usize, "preorder must see every level too");
+    // Follow the serialized raw `/First` chain independently of the helper.
+    let catalog_ref = reopened.root_ref().unwrap();
+    let Object::Dictionary(catalog) = reopened.resolve(catalog_ref).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    let Object::Reference(outlines_ref) = catalog.get("Outlines").cloned().unwrap() else {
+        panic!("catalog /Outlines must be indirect");
+    };
+    let Object::Dictionary(outlines) = reopened.resolve(outlines_ref).unwrap() else {
+        panic!("outlines root must be a dictionary");
+    };
+    let mut cursor = outlines.get("First").cloned().unwrap();
+    let mut raw_count = 0usize;
+    let mut item_51_first = None;
+    loop {
+        let Object::Reference(reference) = cursor else {
+            panic!("raw outline item {raw_count} must be indirect");
+        };
+        let Object::Dictionary(item) = reopened.resolve(reference).unwrap() else {
+            panic!("raw outline item {reference} must be a dictionary");
+        };
+        raw_count += 1;
+        let first = item.get("First").cloned();
+        if raw_count == 51 {
+            item_51_first = first.clone();
+        }
+        let Some(first) = first else {
+            break;
+        };
+        cursor = first;
+    }
+
+    assert_eq!(raw_count, n as usize, "all raw outline items survive");
+    assert!(
+        matches!(item_51_first, Some(Object::Reference(_))),
+        "raw depth-51 item keeps /First although the helper leaves kids empty"
+    );
 }
 
 // ---------------------------------------------------------------------------
