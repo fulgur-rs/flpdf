@@ -1326,6 +1326,32 @@ fn named_destination_lookup_handles_qpdf_node_shapes() {
         ),
         ("/Names << /Dests << >> >>", &[][..], Object::Null),
         ("/Names << /Dests << /Kids [] >> >>", &[][..], Object::Null),
+        ("/Names << /Dests 42 >>", &[][..], Object::Null),
+        (
+            "/Names << /Dests << /Names [42 [3 0 R /Fit]] >> >>",
+            &[][..],
+            Object::Null,
+        ),
+        (
+            "/Names << /Dests << /Names [(a) [3 0 R /Fit]] >> >>",
+            &[][..],
+            Object::Null,
+        ),
+        (
+            "/Names << /Dests << /Kids [42] >> >>",
+            &[][..],
+            Object::Null,
+        ),
+        (
+            "/Names << /Dests << /Kids [8 0 R] >> >>",
+            &[(8, "<< /Names [(shape) [3 0 R /Fit]] >>")][..],
+            Object::Null,
+        ),
+        (
+            "/Names << /Dests << /Kids [8 0 R] >> >>",
+            &[(8, "<< /Limits [42 42] /Names [(shape) [3 0 R /Fit]] >>")][..],
+            Object::Null,
+        ),
     ];
 
     for (catalog_entries, extra, expected) in cases {
