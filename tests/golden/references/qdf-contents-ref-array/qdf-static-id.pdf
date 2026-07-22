@@ -1,0 +1,96 @@
+%PDF-1.4
+%¿÷¢þ
+%QDF-1.0
+
+%% Original object ID: 1 0
+1 0 obj
+<<
+  /Pages 2 0 R
+  /Type /Catalog
+>>
+endobj
+
+%% Original object ID: 2 0
+2 0 obj
+<<
+  /Count 1
+  /Kids [
+    3 0 R
+  ]
+  /Type /Pages
+>>
+endobj
+
+%% Page 1
+%% Original object ID: 3 0
+3 0 obj
+<<
+  /Contents 4 0 R
+  /MediaBox [
+    0
+    0
+    100
+    100
+  ]
+  /Parent 2 0 R
+  /Type /Page
+>>
+endobj
+
+%% Original object ID: 5 0
+4 0 obj
+[
+  5 0 R
+  7 0 R
+]
+endobj
+
+%% Contents for page 1
+%% Original object ID: 6 0
+5 0 obj
+<<
+  /Length 6 0 R
+>>
+stream
+A
+endstream
+endobj
+
+6 0 obj
+2
+endobj
+
+%% Contents for page 1
+%% Original object ID: 7 0
+7 0 obj
+<<
+  /Length 8 0 R
+>>
+stream
+B
+endstream
+endobj
+
+8 0 obj
+2
+endobj
+
+xref
+0 9
+0000000000 65535 f 
+0000000052 00000 n 
+0000000133 00000 n 
+0000000242 00000 n 
+0000000385 00000 n 
+0000000471 00000 n 
+0000000528 00000 n 
+0000000596 00000 n 
+0000000653 00000 n 
+trailer <<
+  /Root 1 0 R
+  /Size 9
+  /ID [<31415926535897932384626433832795><31415926535897932384626433832795>]
+>>
+startxref
+671
+%%EOF
