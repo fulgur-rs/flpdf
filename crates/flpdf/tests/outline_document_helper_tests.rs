@@ -88,6 +88,101 @@ fn outline_present_but_empty_pdf() -> Vec<u8> {
     )
 }
 
+fn single_outline_with_item_fields(fields: &str) -> Vec<u8> {
+    let item = format!("<< {fields} /Parent 4 0 R >>");
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, item.as_str()),
+        ],
+        1,
+    )
+}
+
+fn single_outline_with_title(title_object: &str) -> Vec<u8> {
+    single_outline_with_item_fields(&format!("/Title {title_object}"))
+}
+
+fn single_outline_without_title() -> Vec<u8> {
+    single_outline_with_item_fields("")
+}
+
+fn single_outline_with_count(count_object: &str) -> Vec<u8> {
+    single_outline_with_item_fields(&format!("/Count {count_object}"))
+}
+
+#[test]
+fn titles_match_qpdf_get_utf8_value() {
+    let cases: &[(&str, &str)] = &[
+        ("(plain)", "plain"),
+        ("<95>", "Ł"),
+        ("<FEFF540D524D>", "名前"),
+        ("<FFFE0D544D52>", "名前"),
+        ("<EFBBBFE5908D>", "名"),
+        ("<EFBBBFFF>", "�"),
+        ("<FEFF0041D800>", "A"),
+        ("42", ""),
+    ];
+
+    for &(title_object, expected) in cases {
+        let mut pdf = Pdf::open(Cursor::new(single_outline_with_title(title_object))).unwrap();
+        let tree = pdf.outline().get_tree().unwrap();
+        assert_eq!(tree[tree.roots()[0]].title, expected, "{title_object}");
+    }
+
+    let mut pdf = Pdf::open(Cursor::new(single_outline_without_title())).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree[tree.roots()[0]].title, "");
+}
+
+#[test]
+fn counts_match_qpdf_get_int_value_as_int() {
+    let cases = [
+        (
+            "-2147483649",
+            i32::MIN,
+            Some("requested value of integer is too small; returning INT_MIN"),
+        ),
+        ("-2147483648", i32::MIN, None),
+        ("7", 7, None),
+        ("2147483647", i32::MAX, None),
+        (
+            "2147483648",
+            i32::MAX,
+            Some("requested value of integer is too big; returning INT_MAX"),
+        ),
+        ("(wrong type)", 0, None),
+    ];
+
+    for (count_object, expected, expected_warning) in cases {
+        let mut pdf = Pdf::open(Cursor::new(single_outline_with_count(count_object))).unwrap();
+        let tree = pdf.outline().get_tree().unwrap();
+        assert_eq!(tree[tree.roots()[0]].count, expected, "{count_object}");
+        let warning_messages: Vec<&str> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        match expected_warning {
+            Some(expected_warning) => {
+                assert!(
+                    warning_messages.contains(&expected_warning),
+                    "{count_object}"
+                )
+            }
+            None => assert!(warning_messages.is_empty(), "{count_object}"),
+        }
+    }
+
+    let mut pdf = Pdf::open(Cursor::new(single_outline_with_item_fields(""))).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree[tree.roots()[0]].count, 0);
+}
+
 #[test]
 fn has_outlines_true_when_present() {
     let mut pdf = Pdf::open(Cursor::new(outline_pdf())).unwrap();

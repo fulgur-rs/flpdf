@@ -282,7 +282,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             _ => (None, None, None, None),
         };
         let title = resolve_title(self.pdf, title_src)?;
-        let count = resolve_int(self.pdf, count_src)?.unwrap_or(0) as i32;
+        let count = resolve_count(self.pdf, count_src)?;
         let dest = self.resolve_node_dest(dest_src.as_ref(), action_src.as_ref())?;
         let id = OutlineId(tree.items.len());
         tree.items.push(OutlineItem {
@@ -477,25 +477,45 @@ fn resolve_terminal_object<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> R
 }
 
 /// Decode an outline `/Title`, resolving one level of indirection (review rule 2).
-/// This keeps Task 1's temporary lossy-byte behavior until Task 4 adds the
-/// qpdf-compatible title oracle.
 fn resolve_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<String> {
-    let resolved = match value {
-        Some(Object::Reference(r)) => Some(pdf.resolve(r)?),
-        other => other,
-    };
-    Ok(match resolved {
-        Some(Object::String(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
-        _ => String::new(),
-    })
+    Ok(qpdf_title(resolve_scalar(pdf, value)?))
 }
 
-/// Resolve one level of indirection and read an integer (review rule 2/3).
-fn resolve_int<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<Option<i64>> {
+fn qpdf_title(value: Object) -> String {
     match value {
-        Some(Object::Reference(r)) => Ok(pdf.resolve(r)?.as_integer()),
-        Some(other) => Ok(other.as_integer()),
-        None => Ok(None),
+        Object::String(bytes) => {
+            String::from_utf8_lossy(&crate::json_inspect::qpdf_utf8_value(&bytes)).into_owned()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Read an outline `/Count`, resolving one level of indirection (review rule 2/3).
+fn resolve_count<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<i32> {
+    let resolved = resolve_scalar(pdf, value)?;
+    Ok(qpdf_count(pdf, resolved))
+}
+
+fn qpdf_count<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> i32 {
+    let Object::Integer(value) = value else {
+        return 0;
+    };
+    if value < i64::from(i32::MIN) {
+        pdf.push_warning("requested value of integer is too small; returning INT_MIN");
+        i32::MIN
+    } else if value > i64::from(i32::MAX) {
+        pdf.push_warning("requested value of integer is too big; returning INT_MAX");
+        i32::MAX
+    } else {
+        value as i32
+    }
+}
+
+fn resolve_scalar<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<Object> {
+    match value {
+        Some(Object::Reference(r)) => pdf.resolve(r),
+        Some(other) => Ok(other),
+        None => Ok(Object::Null),
     }
 }
 
