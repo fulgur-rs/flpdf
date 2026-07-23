@@ -19,28 +19,20 @@ so the baseline detects byte-level drift even when every comparator
 verdict stays at `diverge`. The `byte-equal` column likewise compares
 with `/ID` elided.
 
-## Byte-identity (feature-gated)
+## Backend (feature-gated)
 
-The `byte-equal` column reflects the **default Pure-Rust build** (miniz_oxide
-deflate) with the CLI's default `--newline-before-endstream=never` framing.
-Framing now matches qpdf, but miniz's DEFLATE bytes still differ from qpdf's
-zlib bytes, so every row whose output carries a deflate stream stays `diverge`
-in the default build — it deliberately does **not** chase byte-identity (see
-`tests/golden/README.md`).
+This matrix is gated on the `qpdf-zlib-compat` feature (classic libz deflate,
+matching qpdf's `compress2()`). Under the default Pure-Rust build
+(miniz_oxide) the test is compiled out entirely — miniz's DEFLATE bytes
+differ from qpdf's zlib bytes, so `flpdf-sha` and `byte-equal` would be a
+miniz-drift snapshot rather than a qpdf byte-parity signal, which is the
+one sanctioned deviation the pre-v1.0 mimicry policy tolerates. Byte-parity
+under miniz is deliberately **not** chased (see `tests/golden/README.md`).
 
-Byte-for-byte identity with `qpdf --static-id` **is** achievable, but only as an
-opt-in combination, and is verified separately by
-`crates/flpdf/tests/cmp_diff_zero_tests.rs` (gated on the `qpdf-zlib-compat`
-feature, run in the Linux amd64 CI job). It requires all of:
-
-- the `qpdf-zlib-compat` feature (classic libz deflate, matching qpdf), and
-- `WriteOptions { full_rewrite: true, static_id: true,
-  newline_before_endstream: NewlineBeforeEndstream::Never, .. }`.
-
-Under those conditions `one-page`, `two-page`, and `three-page` plain rewrites
-are `cmp`-diff-0 against the committed `static-id.pdf` goldens. This is kept out
-of the default-build matrix on purpose: faking `byte-equal: match` here would
-misrepresent the default build. (Byte-identity pins to the linked libz version.)
+Framing uses the CLI's default `--newline-before-endstream=never`, which
+also matches qpdf. `crates/flpdf/tests/cmp_diff_zero_tests.rs` provides the
+stricter per-fixture assertions of `cmp`-diff-0 against the committed
+`static-id.pdf` goldens under the same feature.
 
 ## Review cadence
 
@@ -49,21 +41,21 @@ Re-bless this file when:
 - flpdf changes byte / structural output for any covered fixture × flag
 - New fixtures or flags are added to the corpus
 
-Update via: `BLESS=1 cargo test --test compat_matrix_baseline`
+Update via: `BLESS=1 cargo test -p flpdf-cli --features qpdf-zlib-compat --test compat_matrix_baseline`
 
 ## Matrix
 
 | fixture | flag | flpdf-sha | byte-equal | qpdf-json | structural |
 |---|---|---|---|---|---|
-| one-page.pdf | plain | 5b99c65b6e6a01b7 | diverge | diverge | diverge |
-| one-page.pdf | static-id | 5b99c65b6e6a01b7 | diverge | diverge | match |
-| one-page.pdf | linearize | f85d24b9e1ea4aec | diverge | diverge | diverge |
-| two-page.pdf | plain | 129242f3cdfe6d59 | diverge | diverge | diverge |
-| two-page.pdf | static-id | 129242f3cdfe6d59 | diverge | diverge | match |
-| two-page.pdf | linearize | e61172249cfa3cac | diverge | diverge | diverge |
-| three-page.pdf | plain | 38d1f54a9966f6d9 | diverge | diverge | diverge |
-| three-page.pdf | static-id | 38d1f54a9966f6d9 | diverge | diverge | match |
-| three-page.pdf | linearize | cc4903e1dc9b2372 | diverge | diverge | diverge |
+| one-page.pdf | plain | c84aff66bcabe086 | match | diverge | diverge |
+| one-page.pdf | static-id | c84aff66bcabe086 | match | match | match |
+| one-page.pdf | linearize | 778b1fab21a8d9cd | match | diverge | diverge |
+| two-page.pdf | plain | 9341fcf853b1a133 | match | diverge | diverge |
+| two-page.pdf | static-id | 9341fcf853b1a133 | match | match | match |
+| two-page.pdf | linearize | 486569e35db6b2f7 | match | diverge | diverge |
+| three-page.pdf | plain | 89a59a10919cb54a | match | diverge | diverge |
+| three-page.pdf | static-id | 89a59a10919cb54a | match | match | match |
+| three-page.pdf | linearize | f31a99ebff659763 | match | diverge | diverge |
 | linearized-one-page.pdf | plain | 3b88c6941c9fee5c | match | diverge | diverge |
 | attachment-two-page.pdf | plain | a99565e04f211908 | match | diverge | diverge |
 | attachment-two-page.pdf | static-id | a99565e04f211908 | match | match | match |
