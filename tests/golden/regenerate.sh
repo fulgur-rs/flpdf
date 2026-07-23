@@ -863,6 +863,13 @@ for stem in "${!G6HB2_FIX[@]}"; do
     fi
 done
 
+python3 "$ROOT/docs/plans/tools/gen_firstpage_objstm_container_order.py" \
+    "$FIX/objstm-lin-firstpage-private-before-shared.pdf"
+
+qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-firstpage-private-before-shared.pdf" \
+    "$FIX/objstm-lin-firstpage-private-before-shared-bearing.pdf"
+
 # ObjStm-bearing variant of the cap-boundary-199 fixture (flpdf-ihb.4). The raw
 # gen_shared_fonts.py 199 output has no source ObjStms, so --object-streams=preserve
 # on it yields an empty plan. Re-encoding through --object-streams=generate produces
@@ -1778,6 +1785,21 @@ qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/shared-stream-objstm.pdf" "$REF/shared-stream-objstm/linearize-objstm.pdf"
 qpdf --check "$REF/shared-stream-objstm/linearize-objstm.pdf" >/dev/null
 echo "shared-stream-objstm/linearize-objstm.pdf"
+
+mkdir -p "$REF/objstm-lin-firstpage-private-before-shared"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-firstpage-private-before-shared.pdf" \
+    "$REF/objstm-lin-firstpage-private-before-shared/linearize-objstm.pdf"
+
+mkdir -p "$REF/objstm-lin-firstpage-private-before-shared-bearing"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-firstpage-private-before-shared-bearing.pdf" \
+    "$REF/objstm-lin-firstpage-private-before-shared-bearing/linearize-objstm-preserve.pdf"
+
+qpdf --check-linearization \
+    "$REF/objstm-lin-firstpage-private-before-shared/linearize-objstm.pdf"
+qpdf --check-linearization \
+    "$REF/objstm-lin-firstpage-private-before-shared-bearing/linearize-objstm-preserve.pdf"
 
 # Linearized generate-mode >cap goldens (flpdf-g6hb.2). See the fixture block
 # above for each scenario. Compared structurally (and strictly where flpdf
