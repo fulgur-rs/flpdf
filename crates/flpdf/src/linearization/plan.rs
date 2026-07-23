@@ -2084,31 +2084,18 @@ impl LinearizationPlan {
         let mut part4_rest: Vec<RoutedObjStmBatch> = Vec::new();
         for (mut members, route) in containers.into_iter().zip(routes) {
             members.sort_unstable_by_key(|r| r.number);
-            match route {
-                ContainerPart::OpenDocument => open_document_batches.push(members),
-                ContainerPart::FirstPage => {
-                    if !outline_set.is_empty() && members.iter().any(|m| outline_set.contains(m)) {
-                        part3_outlines.push(members);
-                    } else {
-                        part3_regular.push(members);
-                    }
-                }
-                ContainerPart::OtherPagePrivate => part4_private.push(RoutedObjStmBatch {
-                    members,
-                    route,
-                    source_container_number: None,
-                }),
-                ContainerPart::OtherPageShared => part4_shared.push(RoutedObjStmBatch {
-                    members,
-                    route,
-                    source_container_number: None,
-                }),
-                ContainerPart::Rest => part4_rest.push(RoutedObjStmBatch {
-                    members,
-                    route,
-                    source_container_number: None,
-                }),
-            }
+            push_routed_objstm_batch(
+                members,
+                route,
+                None,
+                outline_set,
+                &mut open_document_batches,
+                &mut part3_regular,
+                &mut part3_outlines,
+                &mut part4_private,
+                &mut part4_shared,
+                &mut part4_rest,
+            );
         }
         // Concatenate the buckets in part order (part7, part8, part9).
         let mut part4_batches = part4_private;
@@ -2192,31 +2179,18 @@ impl LinearizationPlan {
             .zip(routes)
             .zip(source_container_numbers)
         {
-            match route {
-                ContainerPart::OpenDocument => open_document_batches.push(members),
-                ContainerPart::FirstPage => {
-                    if !outline_set.is_empty() && members.iter().any(|m| outline_set.contains(m)) {
-                        part3_outlines.push(members);
-                    } else {
-                        part3_regular.push(members);
-                    }
-                }
-                ContainerPart::OtherPagePrivate => part4_private.push(RoutedObjStmBatch {
-                    members,
-                    route,
-                    source_container_number: Some(source_container_number),
-                }),
-                ContainerPart::OtherPageShared => part4_shared.push(RoutedObjStmBatch {
-                    members,
-                    route,
-                    source_container_number: Some(source_container_number),
-                }),
-                ContainerPart::Rest => part4_rest.push(RoutedObjStmBatch {
-                    members,
-                    route,
-                    source_container_number: Some(source_container_number),
-                }),
-            }
+            push_routed_objstm_batch(
+                members,
+                route,
+                Some(source_container_number),
+                outline_set,
+                &mut open_document_batches,
+                &mut part3_regular,
+                &mut part3_outlines,
+                &mut part4_private,
+                &mut part4_shared,
+                &mut part4_rest,
+            );
         }
 
         let mut part3_batches = part3_regular;
@@ -2288,20 +2262,51 @@ pub(crate) struct RoutedObjStmBatch {
     pub(crate) source_container_number: Option<u32>,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_routed_objstm_batch(
+    members: Vec<ObjectRef>,
+    route: ContainerPart,
+    source_container_number: Option<u32>,
+    outline_set: &[ObjectRef],
+    open_document_batches: &mut Vec<Vec<ObjectRef>>,
+    part3_regular: &mut Vec<Vec<ObjectRef>>,
+    part3_outlines: &mut Vec<Vec<ObjectRef>>,
+    part4_private: &mut Vec<RoutedObjStmBatch>,
+    part4_shared: &mut Vec<RoutedObjStmBatch>,
+    part4_rest: &mut Vec<RoutedObjStmBatch>,
+) {
+    match route {
+        ContainerPart::OpenDocument => open_document_batches.push(members),
+        ContainerPart::FirstPage => {
+            if !outline_set.is_empty() && members.iter().any(|m| outline_set.contains(m)) {
+                part3_outlines.push(members);
+            } else {
+                part3_regular.push(members);
+            }
+        }
+        ContainerPart::OtherPagePrivate => part4_private.push(RoutedObjStmBatch {
+            members,
+            route,
+            source_container_number,
+        }),
+        ContainerPart::OtherPageShared => part4_shared.push(RoutedObjStmBatch {
+            members,
+            route,
+            source_container_number,
+        }),
+        ContainerPart::Rest => part4_rest.push(RoutedObjStmBatch {
+            members,
+            route,
+            source_container_number,
+        }),
+    }
+}
+
 impl std::ops::Deref for RoutedObjStmBatch {
     type Target = [ObjectRef];
 
     fn deref(&self) -> &Self::Target {
         &self.members
-    }
-}
-
-impl<'a> IntoIterator for &'a RoutedObjStmBatch {
-    type Item = &'a ObjectRef;
-    type IntoIter = std::slice::Iter<'a, ObjectRef>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.members.iter()
     }
 }
 

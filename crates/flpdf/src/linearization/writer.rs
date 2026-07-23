@@ -2419,6 +2419,7 @@ fn second_half_container_anchors(
                 ContainerPart::Rest => (2, 0, 0, object_number),
                 ContainerPart::OpenDocument | ContainerPart::FirstPage => {
                     unreachable!("first-half route in second-half ObjStm batches")
+                    // cov:ignore: routed batch invariant
                 }
             };
             let previous = plain_ranked
@@ -2432,6 +2433,31 @@ fn second_half_container_anchors(
             }
         })
         .collect()
+}
+
+fn preserved_source_container_number(
+    container: &ObjStmContainer,
+    source_container_by_member: &BTreeMap<ObjectRef, u32>,
+) -> Result<u32> {
+    let source_container_number = container
+        .members
+        .first()
+        .and_then(|(original_ref, _)| source_container_by_member.get(original_ref).copied())
+        .ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "preserved ObjStm container {} has no source container",
+                container.container_new_num
+            ))
+        })?;
+    if container.members.iter().any(|(original_ref, _)| {
+        source_container_by_member.get(original_ref).copied() != Some(source_container_number)
+    }) {
+        return Err(crate::Error::Unsupported(format!(
+            "preserved ObjStm container {} combines multiple source containers",
+            container.container_new_num
+        )));
+    }
+    Ok(source_container_number)
 }
 
 pub fn write_linearized<R: Read + Seek>(
@@ -2691,27 +2717,8 @@ pub fn write_linearized<R: Read + Seek>(
                 .chain(&objstm_layout.part3)
                 .chain(&objstm_layout.part4)
             {
-                let source_container_number = container
-                    .members
-                    .first()
-                    .and_then(|(original_ref, _)| {
-                        source_container_by_member.get(original_ref).copied()
-                    })
-                    .ok_or_else(|| {
-                        crate::Error::Unsupported(format!(
-                            "preserved ObjStm container {} has no source container",
-                            container.container_new_num
-                        ))
-                    })?;
-                if container.members.iter().any(|(original_ref, _)| {
-                    source_container_by_member.get(original_ref).copied()
-                        != Some(source_container_number)
-                }) {
-                    return Err(crate::Error::Unsupported(format!(
-                        "preserved ObjStm container {} combines multiple source containers",
-                        container.container_new_num
-                    )));
-                }
+                let source_container_number =
+                    preserved_source_container_number(container, &source_container_by_member)?;
                 keys.insert(container.container_new_num, (0, source_container_number));
             }
             keys
@@ -3588,6 +3595,68 @@ mod tests {
             second_half_container_anchors(&plan, &batches),
             vec![SecondHalfContainerAnchor::After(plain_part8)]
         );
+    }
+
+    #[test]
+    fn second_half_anchor_covers_before_first_and_after_last() {
+        let member = ObjectRef::new(20, 0);
+        let plain = ObjectRef::new(10, 0);
+        let before_first_plan = LinearizationPlan {
+            part4_rest: vec![plain, member],
+            ..Default::default()
+        };
+        let before_first_batch = RoutedObjStmBatch {
+            members: vec![member],
+            route: ContainerPart::Rest,
+            source_container_number: Some(1),
+        };
+        assert_eq!(
+            second_half_container_anchors(&before_first_plan, &[before_first_batch]),
+            vec![SecondHalfContainerAnchor::BeforeFirst]
+        );
+
+        let after_last_plan = LinearizationPlan {
+            part4_rest: vec![member],
+            ..Default::default()
+        };
+        let after_last_batch = RoutedObjStmBatch {
+            members: vec![member],
+            route: ContainerPart::Rest,
+            source_container_number: Some(1),
+        };
+        assert_eq!(
+            second_half_container_anchors(&after_last_plan, &[after_last_batch]),
+            vec![SecondHalfContainerAnchor::AfterLast]
+        );
+    }
+
+    #[test]
+    fn preserved_source_container_number_validates_membership() {
+        let member1 = ObjectRef::new(10, 0);
+        let member2 = ObjectRef::new(11, 0);
+        let container = ObjStmContainer {
+            container_new_num: 20,
+            members: vec![
+                (member1, ObjectRef::new(30, 0)),
+                (member2, ObjectRef::new(31, 0)),
+            ],
+        };
+
+        let valid = BTreeMap::from([(member1, 7), (member2, 7)]);
+        assert_eq!(
+            preserved_source_container_number(&container, &valid).unwrap(),
+            7
+        );
+
+        let missing = BTreeMap::new();
+        let err = preserved_source_container_number(&container, &missing).unwrap_err();
+        assert!(err.to_string().contains("has no source container"));
+
+        let mixed = BTreeMap::from([(member1, 7), (member2, 8)]);
+        let err = preserved_source_container_number(&container, &mixed).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("combines multiple source containers"));
     }
 
     // -----------------------------------------------------------------------

@@ -1415,6 +1415,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn per_half_places_before_first_container_before_plain_objects() {
+        let plan = two_page_plan();
+        let mut rn = RenumberMap::from_plan(&plan);
+        let member = ObjectRef::new(4, 0);
+        let later_plain = ObjectRef::new(7, 0);
+        let relocation = rn.place_objstm_members_per_half(
+            &[],
+            &[],
+            &[vec![member]],
+            &[SecondHalfContainerAnchor::BeforeFirst],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+
+        assert!(relocation.container_numbers[0] < rn.new_for_original(later_plain).unwrap().number);
+    }
+
     /// A FIRST-half (Part-3) batch must be numbered LAST within the first half:
     /// its container + members sit ABOVE the param dict, first-page xref, and
     /// every first-half plain object, and the members are the highest numbers
