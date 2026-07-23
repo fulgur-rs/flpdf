@@ -888,7 +888,8 @@ impl LinearizationPlan {
         };
         if let Some(users) = page_object_users.page.first() {
             first_page_closure.retain(|object_ref| users.contains(object_ref));
-        }
+        } // cov:ignore: llvm-cov attributes this executed closure's terminator to the uninstrumented brace (the retain call on line 890 records hits)
+
         // compute_closure does not follow a stream dict's /Length (qpdf directizes
         // /Length before computing object users), so a stream's indirect /Length
         // holder never enters a page closure: an orphan holder (referenced only via
@@ -2526,9 +2527,11 @@ fn page_dictionary_with_inherited<R: Read + Seek>(
     page_ref: ObjectRef,
 ) -> crate::Result<crate::Dictionary> {
     let Object::Dictionary(mut page) = pdf.resolve(page_ref)? else {
+        // cov:ignore-start: page_refs runs immediately before page_object_users and only yields refs that resolve to dictionaries with /Type /Page; no mutation occurs between the two resolutions
         return Err(crate::Error::Unsupported(format!(
             "linearization plan: page {page_ref} is not a dictionary"
         )));
+        // cov:ignore-end
     };
 
     let mut parent = page.get_ref("Parent");
@@ -2613,11 +2616,13 @@ fn page_object_users<R: Read + Seek>(
         let mut seen_as_array = BTreeSet::new();
 
         while let Some((object, user, top, via_array, depth)) = stack.pop() {
+            // cov:ignore-start: reachable_object_set runs before page_object_users in LinearizationPlan::from_pdf and rejects the same MAX_INLINE_DEPTH overflow, so parsed public inputs cannot reach this duplicate defensive bound
             if depth > MAX_INLINE_DEPTH {
                 return Err(crate::Error::Unsupported(format!(
                     "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
                 )));
             }
+            // cov:ignore-end
 
             match object {
                 Object::Reference(object_ref) => {
