@@ -4544,11 +4544,10 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
     if groups.is_empty() {
         let xref_offset = bytes.len();
         let max_object_number = offsets.keys().next_back().copied().unwrap_or(0);
-        let object_count = max_object_number.checked_add(1).ok_or_else(|| {
-            crate::Error::Unsupported(
-                "containerized rewrite: object count overflows u32".to_string(),
-            )
-        })?; // cov:ignore: requires u32::MAX emitted objects
+        let object_count = generate_invariant(
+            max_object_number.checked_add(1),
+            "empty-container preserve xref size overflows u32",
+        )?; // cov:ignore: requires u32::MAX emitted objects
         bytes.extend_from_slice(format!("xref\n0 {object_count}\n").as_bytes());
         bytes.extend_from_slice(b"0000000000 65535 f \n");
         for number in 1..object_count {
