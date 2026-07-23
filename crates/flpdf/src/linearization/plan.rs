@@ -876,15 +876,19 @@ impl LinearizationPlan {
         // once so the per-page `compute_closure` calls below do not each re-scan
         // the whole xref table (which would be O(pages × objects)).
         let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+        let page_object_users = page_object_users(pdf, &page_refs, &live, &resurrectable)?;
 
         // ----------------------------------------------------------------
         // Step 3: compute first-page closure
         // ----------------------------------------------------------------
-        let first_page_closure: Vec<ObjectRef> = if let Some(&first_page) = page_refs.first() {
+        let mut first_page_closure: Vec<ObjectRef> = if let Some(&first_page) = page_refs.first() {
             compute_closure(pdf, first_page, &live, &resurrectable)?
         } else {
             Vec::new()
         };
+        if let Some(users) = page_object_users.page.first() {
+            first_page_closure.retain(|object_ref| users.contains(object_ref));
+        }
         // compute_closure does not follow a stream dict's /Length (qpdf directizes
         // /Length before computing object users), so a stream's indirect /Length
         // holder never enters a page closure: an orphan holder (referenced only via
@@ -918,7 +922,8 @@ impl LinearizationPlan {
         }
 
         for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
-            let closure = compute_closure(pdf, page_ref, &live, &resurrectable)?;
+            let mut closure = compute_closure(pdf, page_ref, &live, &resurrectable)?;
+            closure.retain(|object_ref| page_object_users.page[page_idx].contains(object_ref));
             for obj_ref in &closure {
                 // Track cross-page sharing for first-page objects (used by Part 3 partition).
                 if first_page_set.contains(obj_ref) {
@@ -939,20 +944,11 @@ impl LinearizationPlan {
         // ----------------------------------------------------------------
         // Step 4b: thumb-set for the first-page private/shared split.
         // ----------------------------------------------------------------
-        // qpdf gives a page's /Thumb target the separate `ou_thumb` user
-        // (QPDF_optimization.cc:317-324), sharing that page's ou_page `visited`. A
-        // first-page object that is also some page's /Thumb therefore has thumbs>0 and
-        // is lc_first_page_shared, not lc_first_page_private
-        // (QPDF_linearization.cc:1124-1127). compute_closure skips /Thumb, so neither
-        // shared_page_indices nor document_other_set captures this; recover the set
-        // here. Object-stream-mode independent, like open_document/outlines/others.
-        let thumb_shared_set = thumbnail_user_set(
-            pdf,
-            &page_refs,
-            &first_page_set,
-            &other_page_closures,
-            &live,
-        )?;
+        // qpdf gives a page's /Thumb descendants the separate `ou_thumb` user
+        // while sharing the page traversal's one ordered `visited` set
+        // (QPDF_optimization.cc:261-337). The same exact map supplies ordinary
+        // page membership above and thumbnail membership here.
+        let thumbnail_user_set = page_object_users.thumbnail_set();
 
         // ----------------------------------------------------------------
         // Step 5: partition into Part 2 (exclusive) and Part 3 (shared)
@@ -1000,13 +996,13 @@ impl LinearizationPlan {
                 part2_objects.push(*obj_ref);
             } else if shared_page_indices.contains_key(obj_ref)
                 || document_other_set.contains(obj_ref)
-                || thumb_shared_set.contains(obj_ref)
+                || thumbnail_user_set.contains(obj_ref)
             {
                 // lc_first_page_shared: in_first_page AND (other_pages>0 ||
                 // others>0 || thumbs>0). `shared_page_indices` supplies
                 // other_pages (another page's closure); `document_other_set`
                 // supplies others (a document-level reference such as a Catalog
-                // key); `thumb_shared_set` supplies thumbs (a page's /Thumb
+                // key); `thumbnail_user_set` supplies thumbs (a page's /Thumb
                 // target). Any of these makes the object shared
                 // (QPDF_linearization.cc:1124-1127), so it sorts after the
                 // first-page-private objects in part 6.
@@ -1134,6 +1130,12 @@ impl LinearizationPlan {
                     // flows through part4_provisional into the part8/part9 loop and
                     // lands in part4_rest (part9) (flpdf-zda0).
                     if document_other_set.contains(r) {
+                        return false;
+                    }
+                    // qpdf's lc_other_page_private predicate also requires
+                    // thumbs==0. A normal page object that is another page's
+                    // thumbnail belongs to part9, not part7.
+                    if thumbnail_user_set.contains(r) {
                         return false;
                     }
                     page_reach.get(r).copied() == Some(1)
@@ -2477,57 +2479,6 @@ fn document_other_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSe
     closure_from_seeds(pdf, seeds, &page_tree, &live)
 }
 
-/// Compute objects that receive qpdf's separate `ou_thumb` user.
-///
-/// A direct inline `/Thumb` dictionary has no indirect object reference and is
-/// skipped. For each indirect thumbnail, the same page's ordinary page closure
-/// is subtracted because qpdf visits `/Thumb` after the page's other
-/// reference-bearing keys with one shared `visited` set. Thus a page's
-/// self-thumbnail stays first-page-private, while a first-page object used as a
-/// different page's thumbnail becomes first-page-shared.
-///
-/// `live` is supplied by the caller so thumbnail-heavy documents do not rescan
-/// the xref table once per thumbnail.
-///
-/// # Errors
-///
-/// Propagates reader errors from resolving page dictionaries or thumbnail
-/// closures.
-fn thumbnail_user_set<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_refs: &[ObjectRef],
-    first_page_set: &BTreeSet<ObjectRef>,
-    other_page_closures: &[Vec<ObjectRef>],
-    live: &BTreeSet<ObjectRef>,
-) -> crate::Result<BTreeSet<ObjectRef>> {
-    let page_tree = page_tree_node_refs(pdf)?;
-    let mut thumb_refs = Vec::new();
-    for (page_idx, &page_ref) in page_refs.iter().enumerate() {
-        let thumb = pdf
-            .resolve_borrowed(page_ref)?
-            .as_dict()
-            .and_then(|dict| dict.get("Thumb"))
-            .and_then(|object| object.as_ref_id());
-        thumb_refs.extend(thumb.map(|thumb_ref| (page_idx, thumb_ref)));
-    }
-
-    let mut result = BTreeSet::new();
-    for (page_idx, thumb_ref) in thumb_refs {
-        let closure = closure_from_seeds(pdf, vec![(thumb_ref, false)], &page_tree, live)?;
-        for object_ref in closure {
-            let visited_by_page = if page_idx == 0 {
-                first_page_set.contains(&object_ref)
-            } else {
-                other_page_closures[page_idx - 1].contains(&object_ref)
-            };
-            if !visited_by_page {
-                result.insert(object_ref);
-            }
-        }
-    }
-    Ok(result)
-}
-
 /// The inheritable page attributes (ISO 32000-1 Table 30) that qpdf's
 /// `pushInheritedAttributesToPage` (QPDF_optimization.cc:165-205) removes from
 /// interior `/Pages` nodes before the object-user maps are built.
@@ -2535,6 +2486,236 @@ fn thumbnail_user_set<R: Read + Seek>(
 /// inherited attribute on a `/Pages` node is not recorded as a document-level
 /// user (it would already be reached, post-push, from its `/Page` leaf instead).
 const INHERITABLE_PAGE_KEYS: [&[u8]; 4] = [b"MediaBox", b"CropBox", b"Resources", b"Rotate"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PageObjectUser {
+    Page,
+    Thumbnail,
+}
+
+/// Exact qpdf-style page and thumbnail users, indexed by page number.
+///
+/// `updateObjectMaps` starts with a fresh `visited` set for each page, walks
+/// dictionary keys in lexical order, and switches the active user to
+/// `ou_thumb` only while descending that page's `/Thumb` value. Both users share
+/// the one `visited` set, so whichever edge reaches an indirect object first
+/// owns it for that page.
+#[derive(Debug, Default)]
+struct PageObjectUsers {
+    page: Vec<BTreeSet<ObjectRef>>,
+    thumbnail: Vec<BTreeSet<ObjectRef>>,
+}
+
+impl PageObjectUsers {
+    fn thumbnail_set(&self) -> BTreeSet<ObjectRef> {
+        self.thumbnail
+            .iter()
+            .flat_map(|users| users.iter().copied())
+            .collect()
+    }
+}
+
+/// Clone a page dictionary and materialize its nearest inherited attributes.
+///
+/// qpdf runs `pushInheritedAttributesToPage` before `updateObjectMaps`, so the
+/// ordered user traversal sees `/MediaBox`, `/CropBox`, `/Resources`, and
+/// `/Rotate` on the leaf even when they originate on a `/Pages` ancestor. The
+/// cloned dictionary supplies the same traversal view without mutating `Pdf`.
+fn page_dictionary_with_inherited<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> crate::Result<crate::Dictionary> {
+    let Object::Dictionary(mut page) = pdf.resolve(page_ref)? else {
+        return Err(crate::Error::Unsupported(format!(
+            "linearization plan: page {page_ref} is not a dictionary"
+        )));
+    };
+
+    let mut parent = page.get_ref("Parent");
+    let mut visited = BTreeSet::new();
+    let mut depth = 0usize;
+    while let Some(parent_ref) = parent {
+        if !visited.insert(parent_ref) {
+            break;
+        }
+        if depth >= crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH {
+            return Err(crate::Error::Unsupported(format!(
+                "linearization plan: page tree depth exceeds maximum of {} at {parent_ref}",
+                crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH
+            )));
+        }
+        depth += 1;
+
+        let (parent_object, _) =
+            crate::ref_chain::resolve_ref_chain(pdf, &Object::Reference(parent_ref))?;
+        let Object::Dictionary(parent_dict) = parent_object else {
+            break;
+        };
+        for key in INHERITABLE_PAGE_KEYS {
+            let page_has_key = page
+                .get(key)
+                .is_some_and(|value| !matches!(value, Object::Null));
+            if !page_has_key {
+                if let Some(value) = parent_dict
+                    .get(key)
+                    .filter(|value| !matches!(value, Object::Null))
+                {
+                    page.insert(key, value.clone());
+                }
+            }
+        }
+        parent = parent_dict.get_ref("Parent");
+    }
+    Ok(page)
+}
+
+/// Reproduce qpdf 11.9.0's ordered per-page `updateObjectMaps` traversal.
+///
+/// Direct arrays and dictionaries are traversed in place, so indirect
+/// descendants of a direct `/Thumb` value receive the thumbnail user. Indirect
+/// references are the only visited nodes; direct containers do not erase the
+/// active user. A non-top `/Page` is a boundary and is neither recorded nor
+/// descended. Stream `/Length` is skipped because the linearized writer
+/// directizes it before qpdf computes object users.
+///
+/// `live` and `resurrectable` preserve the existing planner's handling of
+/// null-resolving references: live null bodies are users, while an absent ref is
+/// retained only when the same page reaches it through a surviving array edge.
+fn page_object_users<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_refs: &[ObjectRef],
+    live: &BTreeSet<ObjectRef>,
+    resurrectable: &BTreeSet<ObjectRef>,
+) -> crate::Result<PageObjectUsers> {
+    let mut result = PageObjectUsers {
+        page: Vec::with_capacity(page_refs.len()),
+        thumbnail: Vec::with_capacity(page_refs.len()),
+    };
+
+    for &page_ref in page_refs {
+        let page_dict = page_dictionary_with_inherited(pdf, page_ref)?;
+        let mut visited = BTreeSet::from([page_ref]);
+        let mut page_users = BTreeSet::new();
+        let mut thumbnail_users = BTreeSet::new();
+        if live.contains(&page_ref) {
+            page_users.insert(page_ref);
+        }
+
+        // (object, active user, top page, immediate array edge, inline depth)
+        let mut stack = vec![(
+            Object::Dictionary(page_dict),
+            PageObjectUser::Page,
+            true,
+            false,
+            0usize,
+        )];
+        let mut tentative_absent = BTreeSet::new();
+        let mut seen_as_array = BTreeSet::new();
+
+        while let Some((object, user, top, via_array, depth)) = stack.pop() {
+            if depth > MAX_INLINE_DEPTH {
+                return Err(crate::Error::Unsupported(format!(
+                    "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+                )));
+            }
+
+            match object {
+                Object::Reference(object_ref) => {
+                    if via_array {
+                        seen_as_array.insert(object_ref);
+                    }
+                    let resolved = pdf.resolve(object_ref)?;
+                    let is_page = matches!(&resolved, Object::Dictionary(dict)
+                        if matches!(dict.get("Type"), Some(Object::Name(name))
+                            if name.as_slice() == b"Page"));
+                    if is_page && !top {
+                        continue;
+                    }
+                    if !visited.insert(object_ref) {
+                        continue;
+                    }
+
+                    let users = match user {
+                        PageObjectUser::Page => &mut page_users,
+                        PageObjectUser::Thumbnail => &mut thumbnail_users,
+                    };
+                    if live.contains(&object_ref) {
+                        users.insert(object_ref);
+                    } else if resurrectable.contains(&object_ref) {
+                        users.insert(object_ref);
+                        tentative_absent.insert((object_ref, user));
+                    } else {
+                        continue;
+                    }
+
+                    stack.push((resolved, user, top, false, 0));
+                }
+                Object::Array(items) => {
+                    for item in items.into_iter().rev() {
+                        stack.push((item, user, false, true, depth + 1));
+                    }
+                }
+                Object::Dictionary(dict) => {
+                    let is_page = matches!(dict.get("Type"), Some(Object::Name(name))
+                        if name.as_slice() == b"Page");
+                    if is_page && !top {
+                        continue;
+                    }
+                    let mut children = Vec::new();
+                    for (key, value) in dict.iter() {
+                        if matches!(value, Object::Null) || (is_page && key == b"Parent") {
+                            continue;
+                        }
+                        let child_user = if is_page && key == b"Thumb" {
+                            PageObjectUser::Thumbnail
+                        } else {
+                            user
+                        };
+                        children.push((value.clone(), child_user));
+                    }
+                    for (value, child_user) in children.into_iter().rev() {
+                        stack.push((value, child_user, false, false, depth + 1));
+                    }
+                }
+                Object::Stream(stream) => {
+                    let mut children = Vec::new();
+                    for (key, value) in stream.dict.iter() {
+                        if key != b"Length" && !matches!(value, Object::Null) {
+                            children.push(value.clone());
+                        }
+                    }
+                    for value in children.into_iter().rev() {
+                        stack.push((value, user, false, false, depth + 1));
+                    }
+                }
+                Object::Null
+                | Object::Boolean(_)
+                | Object::Integer(_)
+                | Object::Real(_)
+                | Object::RealLiteral { .. }
+                | Object::Name(_)
+                | Object::String(_) => {}
+            }
+        }
+
+        for (object_ref, user) in tentative_absent {
+            if !seen_as_array.contains(&object_ref) {
+                match user {
+                    PageObjectUser::Page => {
+                        page_users.remove(&object_ref);
+                    }
+                    PageObjectUser::Thumbnail => {
+                        thumbnail_users.remove(&object_ref);
+                    }
+                }
+            }
+        }
+        result.page.push(page_users);
+        result.thumbnail.push(thumbnail_users);
+    }
+
+    Ok(result)
+}
 
 /// The indirect refs of the interior `/Type /Pages` nodes of the catalog's
 /// actual page tree (reachable from `/Root` → `/Pages` → `/Kids`).
@@ -2781,14 +2962,15 @@ fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::
 /// part 9 by the number of *distinct non-first* pages their members reach (one →
 /// [`ContainerPart::OtherPagePrivate`], two or more →
 /// [`ContainerPart::OtherPageShared`], none → [`ContainerPart::Rest`]). The
-/// one-page case is part 7 ONLY when the member union has no document-level
-/// `others` object (QPDF_linearization.cc:1128 gates lc_other_page_private on
-/// `others==0`); a member in [`document_other_set`] demotes it to part 9
+/// one-page case is part 7 ONLY when the member union has neither a
+/// document-level `others` object nor a thumbnail user
+/// (QPDF_linearization.cc:1128 gates lc_other_page_private on `others==0` and
+/// `thumbs==0`); either signal demotes it to part 9
 /// ([`ContainerPart::Rest`]). The two-or-more case is part 8 regardless of
-/// `others` (QPDF_linearization.cc:1130).
+/// `others` or thumbnails (QPDF_linearization.cc:1130).
 ///
-/// The page-user signals (first-page closure and the per-object referencing-page
-/// map) are recomputed exactly as [`LinearizationPlan::from_pdf`] derives them.
+/// The ordered page and thumbnail users come from the same [`page_object_users`]
+/// source used by [`LinearizationPlan::from_pdf`].
 ///
 /// # Deviation
 ///
@@ -2802,8 +2984,8 @@ fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::
 ///
 /// # Errors
 ///
-/// Propagates reader errors from the page-tree walk, the per-page closures, or
-/// the open-document traversal.
+/// Propagates reader errors from the page-tree walk, the ordered per-page user
+/// traversal, or the open-document traversal.
 pub(crate) fn route_objstm_containers<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     containers: &[Vec<ObjectRef>],
@@ -2828,43 +3010,27 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
 
     let page_refs = crate::pages::page_refs(pdf)?;
 
-    // Computed once and shared across every per-page closure below (the loop
+    // Computed once and shared across every per-page traversal below (the loop
     // would otherwise re-scan the whole xref table O(pages) times).
     let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
     let resurrectable = crate::rewrite_renumber::resurrectable_null_refs(pdf)?;
 
-    let first_page_closure = match page_refs.first() {
-        Some(&first_page) => compute_closure(pdf, first_page, &live, &resurrectable)?,
-        // A linearizable document always has at least one page, so the page-less
-        // branch never fires on the generate-mode call path.
-        None => Vec::new(), // cov:ignore: page-less catalog unreachable here
-    };
-    let first_page_set: BTreeSet<ObjectRef> = first_page_closure.iter().copied().collect();
+    let page_object_users = page_object_users(pdf, &page_refs, &live, &resurrectable)?;
+    let first_page_set = page_object_users.page.first().cloned().unwrap_or_default();
 
-    // obj_user page map: object -> set of page indices whose closure reaches it.
+    // obj_user page map: object -> exact set of page users. This is the same
+    // ordered per-page traversal used by the classic partition above.
     let mut referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>> = BTreeMap::new();
-    for &r in &first_page_closure {
-        referenced_pages.entry(r).or_default().insert(0);
-    }
-    let mut other_page_closures = Vec::new();
-    for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
-        let closure = compute_closure(pdf, page_ref, &live, &resurrectable)?;
-        for &r in &closure {
+    for (page_idx, users) in page_object_users.page.iter().enumerate() {
+        for &r in users {
             referenced_pages
                 .entry(r)
                 .or_default()
                 .insert(page_idx as u32);
         }
-        other_page_closures.push(closure);
     }
 
-    let thumbnail_user_set = thumbnail_user_set(
-        pdf,
-        &page_refs,
-        &first_page_set,
-        &other_page_closures,
-        &live,
-    )?;
+    let thumbnail_user_set = page_object_users.thumbnail_set();
 
     Ok(containers
         .iter()
@@ -2907,7 +3073,12 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
                 // union has others==0 (QPDF_linearization.cc:1128). A member in
                 // `document_other_set` makes others>0, so the container is
                 // lc_other (part9) instead (flpdf-zda0 gate, generate path).
-                1 if members.iter().any(|m| document_other_set.contains(m)) => ContainerPart::Rest,
+                1 if members
+                    .iter()
+                    .any(|m| document_other_set.contains(m) || thumbnail_user_set.contains(m)) =>
+                {
+                    ContainerPart::Rest
+                }
                 1 => ContainerPart::OtherPagePrivate,
                 // other_pages>1 is lc_other_page_shared (part8) regardless of
                 // others (QPDF_linearization.cc:1130), so no gate here.
@@ -3466,6 +3637,119 @@ mod tests {
                 .as_bytes(),
         );
         pdf
+    }
+
+    /// Variant of [`thumb_first_page_shared_pdf_bytes`] where page 1's
+    /// `/Thumb` value is a direct dictionary whose `/Image` entry reaches obj 5.
+    /// qpdf recursively walks that direct value as `ou_thumb(1)`, so obj 5 has
+    /// both `ou_page(0)` and `ou_thumb(1)` users.
+    fn direct_thumb_descendant_first_page_shared_pdf_bytes() -> Vec<u8> {
+        let mut bytes = thumb_first_page_shared_pdf_bytes();
+        let indirect = b"/Thumb 5 0 R";
+        let direct = b"/Thumb << /Image 5 0 R >>";
+        let offset = bytes
+            .windows(indirect.len())
+            .position(|window| window == indirect)
+            .expect("base fixture must contain indirect /Thumb");
+        bytes.splice(offset..offset + indirect.len(), direct.iter().copied());
+
+        // Rebuild the xref after changing the page dictionary length.
+        let xref_offset = bytes
+            .windows(b"xref\n".len())
+            .position(|window| window == b"xref\n")
+            .expect("base fixture must contain xref");
+        let objects = bytes[..xref_offset].to_vec();
+        let mut rebuilt = objects;
+        let mut offsets = [0u64; 8];
+        for (number, object_offset) in offsets.iter_mut().enumerate().skip(1) {
+            let marker = format!("{number} 0 obj\n");
+            *object_offset = rebuilt
+                .windows(marker.len())
+                .position(|window| window == marker.as_bytes())
+                .expect("fixture object must exist") as u64;
+        }
+        let new_xref_offset = rebuilt.len() as u64;
+        rebuilt.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+        for offset in offsets.iter().skip(1) {
+            rebuilt.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        rebuilt.extend_from_slice(
+            format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{new_xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        rebuilt
+    }
+
+    /// One-page PDF where `/Thumb` sorts before `/Zzz`, and both edges reach
+    /// obj 5. qpdf's shared per-page `visited` set gives the first edge the only
+    /// user, so obj 5 is thumbnail-only rather than a first-page object.
+    fn thumb_before_ordinary_first_edge_wins_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = [0u64; 6];
+        let mut push = |pdf: &mut Vec<u8>, n: usize, body: &str| {
+            offs[n] = pdf.len() as u64;
+            pdf.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+        };
+        push(&mut pdf, 1, "<< /Type /Catalog /Pages 2 0 R >>");
+        push(&mut pdf, 2, "<< /Type /Pages /Count 1 /Kids [3 0 R] >>");
+        push(
+            &mut pdf,
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Contents 4 0 R /Thumb 5 0 R /Zzz 5 0 R >>",
+        );
+        push(&mut pdf, 4, "<< /Length 2 >>\nstream\nBT\nendstream");
+        push(&mut pdf, 5, "<< /Marker /thumbnail-first >>");
+        let xref_start = pdf.len() as u64;
+        let mut xref = String::from("xref\n0 6\n0000000000 65535 f \n");
+        for off in offs.iter().skip(1) {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn direct_thumb_descendant_routes_first_page_object_to_part3() {
+        let mut pdf = Pdf::open(Cursor::new(
+            direct_thumb_descendant_first_page_shared_pdf_bytes(),
+        ))
+        .unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+        let image = ObjectRef::new(5, 0);
+        assert!(
+            plan.part3_objects.contains(&image),
+            "direct /Thumb descendant must add an ou_thumb user; part2={:?} part3={:?}",
+            plan.part2_objects,
+            plan.part3_objects
+        );
+        assert!(!plan.part2_objects.contains(&image));
+    }
+
+    #[test]
+    fn thumb_before_later_ordinary_edge_keeps_object_out_of_first_page() {
+        let mut pdf = Pdf::open(Cursor::new(
+            thumb_before_ordinary_first_edge_wins_pdf_bytes(),
+        ))
+        .unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+        let thumbnail = ObjectRef::new(5, 0);
+        assert!(
+            plan.part4_rest.contains(&thumbnail),
+            "/Thumb wins before /Zzz, so the thumbnail-only object belongs to part 9; \
+             part2={:?} part3={:?} part4_rest={:?}",
+            plan.part2_objects,
+            plan.part3_objects,
+            plan.part4_rest
+        );
+        assert!(!plan.part2_objects.contains(&thumbnail));
+        assert!(!plan.part3_objects.contains(&thumbnail));
+        assert_eq!(plan.page_hints[0].object_count, 2);
     }
 
     // Non-gated integration guard for the Step-4b thumb-set route: a first-page
@@ -6143,6 +6427,26 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(self_thumb_first_page_private_pdf_bytes())).unwrap();
         let routes = route_objstm_containers(&mut pdf, &[vec![ObjectRef::new(5, 0)]]).unwrap();
         assert_eq!(routes, vec![ContainerPart::FirstPagePrivate]);
+    }
+
+    #[test]
+    fn route_objstm_containers_follows_direct_thumb_descendants() {
+        let mut pdf = Pdf::open(Cursor::new(
+            direct_thumb_descendant_first_page_shared_pdf_bytes(),
+        ))
+        .unwrap();
+        let routes = route_objstm_containers(&mut pdf, &[vec![ObjectRef::new(5, 0)]]).unwrap();
+        assert_eq!(routes, vec![ContainerPart::FirstPageShared]);
+    }
+
+    #[test]
+    fn route_objstm_containers_honors_thumb_first_edge_wins() {
+        let mut pdf = Pdf::open(Cursor::new(
+            thumb_before_ordinary_first_edge_wins_pdf_bytes(),
+        ))
+        .unwrap();
+        let routes = route_objstm_containers(&mut pdf, &[vec![ObjectRef::new(5, 0)]]).unwrap();
+        assert_eq!(routes, vec![ContainerPart::Rest]);
     }
 
     #[test]

@@ -1222,6 +1222,84 @@ fn thumb_firstpage_shared_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// qpdf recursively traverses a direct /Thumb dictionary using ou_thumb, so
+// obj 5 is first-page-shared through page 0 plus page 1's direct thumbnail.
+#[test]
+fn thumb_direct_descendant_generate_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-thumb-direct-descendant.pdf",
+        "objstm-lin-thumb-direct-descendant",
+    );
+}
+
+#[test]
+fn thumb_direct_descendant_generate_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-thumb-direct-descendant.pdf",
+        "objstm-lin-thumb-direct-descendant",
+    );
+}
+
+#[test]
+fn thumb_direct_descendant_preserve_structurally_byte_identical_to_qpdf() {
+    let fixture = "objstm-lin-thumb-direct-descendant-bearing.pdf";
+    let actual = flpdf_linearized_objstm_preserve(fixture);
+    let expected = golden_preserve("objstm-lin-thumb-direct-descendant-bearing");
+    report(
+        fixture,
+        &mask_id1(&actual),
+        &mask_id1(&expected),
+        "preserve structural",
+    );
+}
+
+#[test]
+fn thumb_direct_descendant_preserve_byte_identical_to_qpdf() {
+    let fixture = "objstm-lin-thumb-direct-descendant-bearing.pdf";
+    let actual = flpdf_linearized_objstm_preserve(fixture);
+    let expected = golden_preserve("objstm-lin-thumb-direct-descendant-bearing");
+    report(fixture, &actual, &expected, "preserve strict");
+}
+
+// /Thumb sorts before /Zzz. qpdf's one per-page visited set assigns obj 5 only
+// ou_thumb; the later ordinary edge cannot turn it into a first-page object.
+#[test]
+fn thumb_first_edge_wins_generate_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-thumb-first-edge-wins.pdf",
+        "objstm-lin-thumb-first-edge-wins",
+    );
+}
+
+#[test]
+fn thumb_first_edge_wins_generate_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-thumb-first-edge-wins.pdf",
+        "objstm-lin-thumb-first-edge-wins",
+    );
+}
+
+#[test]
+fn thumb_first_edge_wins_preserve_structurally_byte_identical_to_qpdf() {
+    let fixture = "objstm-lin-thumb-first-edge-wins-bearing.pdf";
+    let actual = flpdf_linearized_objstm_preserve(fixture);
+    let expected = golden_preserve("objstm-lin-thumb-first-edge-wins-bearing");
+    report(
+        fixture,
+        &mask_id1(&actual),
+        &mask_id1(&expected),
+        "preserve structural",
+    );
+}
+
+#[test]
+fn thumb_first_edge_wins_preserve_byte_identical_to_qpdf() {
+    let fixture = "objstm-lin-thumb-first-edge-wins-bearing.pdf";
+    let actual = flpdf_linearized_objstm_preserve(fixture);
+    let expected = golden_preserve("objstm-lin-thumb-first-edge-wins-bearing");
+    report(fixture, &actual, &expected, "preserve strict");
+}
+
 // cap-boundary-199-bearing (flpdf-ihb.4): PRESERVE mode (qpdf
 // --object-streams=preserve) on an ObjStm-bearing input. qpdf's
 // preserveObjectStreams keeps the SOURCE document's ObjStm grouping rather than

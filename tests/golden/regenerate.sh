@@ -870,6 +870,18 @@ qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/objstm-lin-firstpage-private-before-shared.pdf" \
     "$FIX/objstm-lin-firstpage-private-before-shared-bearing.pdf"
 
+python3 "$ROOT/docs/plans/tools/gen_thumbnail_user_order.py" \
+    direct-descendant "$FIX/objstm-lin-thumb-direct-descendant.pdf"
+qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-thumb-direct-descendant.pdf" \
+    "$FIX/objstm-lin-thumb-direct-descendant-bearing.pdf"
+
+python3 "$ROOT/docs/plans/tools/gen_thumbnail_user_order.py" \
+    first-edge-wins "$FIX/objstm-lin-thumb-first-edge-wins.pdf"
+qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-thumb-first-edge-wins.pdf" \
+    "$FIX/objstm-lin-thumb-first-edge-wins-bearing.pdf"
+
 # ObjStm-bearing variant of the cap-boundary-199 fixture (flpdf-ihb.4). The raw
 # gen_shared_fonts.py 199 output has no source ObjStms, so --object-streams=preserve
 # on it yields an empty plan. Re-encoding through --object-streams=generate produces
@@ -1800,6 +1812,19 @@ qpdf --check-linearization \
     "$REF/objstm-lin-firstpage-private-before-shared/linearize-objstm.pdf"
 qpdf --check-linearization \
     "$REF/objstm-lin-firstpage-private-before-shared-bearing/linearize-objstm-preserve.pdf"
+
+for stem in objstm-lin-thumb-direct-descendant objstm-lin-thumb-first-edge-wins; do
+    mkdir -p "$REF/$stem"
+    qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+        "$FIX/$stem.pdf" "$REF/$stem/linearize-objstm.pdf"
+    qpdf --check-linearization "$REF/$stem/linearize-objstm.pdf"
+
+    bearing="$stem-bearing"
+    mkdir -p "$REF/$bearing"
+    qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+        "$FIX/$bearing.pdf" "$REF/$bearing/linearize-objstm-preserve.pdf"
+    qpdf --check-linearization "$REF/$bearing/linearize-objstm-preserve.pdf"
+done
 
 # Linearized generate-mode >cap goldens (flpdf-g6hb.2). See the fixture block
 # above for each scenario. Compared structurally (and strictly where flpdf
