@@ -65,7 +65,7 @@ use crate::linearization::hint_page::{bits_needed, PageOffsetHintTable};
 use crate::linearization::hint_shared::SharedObjectHintTable;
 use crate::linearization::hint_stream::{encode_hint_stream, OutlineHintTable};
 use crate::linearization::part1::{Part1Bytes, Part1Placeholders};
-use crate::linearization::plan::LinearizationPlan;
+use crate::linearization::plan::{ContainerPart, LinearizationPlan, RoutedObjStmBatch};
 use crate::linearization::renumber::{ObjStmRelocation, RenumberMap};
 use crate::linearization::xref_stream;
 use crate::object::MAX_INLINE_DEPTH;
@@ -168,10 +168,26 @@ impl ObjStmLayout {
                 })
                 .collect()
         };
+        let filter_routed_batches = |batches: Vec<RoutedObjStmBatch>| -> Vec<RoutedObjStmBatch> {
+            batches
+                .into_iter()
+                .filter_map(|batch| {
+                    let members: Vec<ObjectRef> = batch
+                        .members
+                        .into_iter()
+                        .filter(|r| !page_dicts.contains(r))
+                        .collect();
+                    (!members.is_empty()).then_some(RoutedObjStmBatch {
+                        members,
+                        route: batch.route,
+                    })
+                })
+                .collect()
+        };
         Ok(crate::linearization::plan::ObjStmBatchPlan {
             open_document_batches: filter_batches(batch_plan.open_document_batches),
             part3_batches: filter_batches(batch_plan.part3_batches),
-            part4_batches: filter_batches(batch_plan.part4_batches),
+            part4_batches: filter_routed_batches(batch_plan.part4_batches),
         })
     }
 
@@ -237,6 +253,11 @@ impl ObjStmLayout {
         let mut open_document = Vec::new();
         let mut part3 = Vec::new();
         let mut part4 = Vec::new();
+        let part4_members: Vec<Vec<ObjectRef>> = batch_plan
+            .part4_batches
+            .iter()
+            .map(|batch| batch.members.clone())
+            .collect();
         // Consumption order MUST match `place_objstm_members_per_half`'s
         // `container_numbers` order: open-document, then Part-3, then Part-4.
         take(
@@ -252,7 +273,7 @@ impl ObjStmLayout {
             &mut container_iter,
         )?;
         take(
-            &batch_plan.part4_batches,
+            &part4_members,
             &mut part4,
             &mut member_to_container,
             &mut container_iter,
@@ -2342,9 +2363,12 @@ fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize 
 /// the container's group is the last one).
 fn second_half_container_anchors(
     plan: &LinearizationPlan,
-    part4_batches: &[Vec<ObjectRef>],
+    part4_batches: &[RoutedObjStmBatch],
 ) -> Vec<Option<ObjectRef>> {
-    let member_set: BTreeSet<ObjectRef> = part4_batches.iter().flatten().copied().collect();
+    let member_set: BTreeSet<ObjectRef> = part4_batches
+        .iter()
+        .flat_map(|batch| batch.members.iter().copied())
+        .collect();
 
     // Second-half plain (non-member) objects in qpdf part order, each tagged with
     // a group rank: part7 page i → (0, i); part8 → (1, 0); part9 → (2, 0).
@@ -2372,52 +2396,29 @@ fn second_half_container_anchors(
         .iter()
         .map(|v| v.iter().copied().collect())
         .collect();
-    let shared_set: BTreeSet<ObjectRef> = plan.part4_other_pages_shared.iter().copied().collect();
-    let rest_set: BTreeSet<ObjectRef> = plan.part4_rest.iter().copied().collect();
-
     part4_batches
         .iter()
         .map(|batch| {
-            if batch.is_empty() {
+            if batch.members.is_empty() {
                 return None; // cov:ignore: resolve_batches drops empty batches before this point
             }
-            // The container's part is the UNION of its members' page ownership —
-            // the even split can co-locate one page's privates with another's in
-            // a single container, which qpdf then routes to part8 (shared by 2+
-            // pages). So inspect EVERY member, not just the first: any member in
-            // the reach-≥2 shared set, or members spanning two different pages'
-            // private sets, makes the whole container part8.
-            let mut pages: BTreeSet<usize> = BTreeSet::new();
-            let mut shared = false;
-            let mut rest = false;
-            for &m in batch {
-                if shared_set.contains(&m) {
-                    shared = true;
-                } else if let Some(i) =
-                    (1..page_private_sets.len()).find(|&i| page_private_sets[i].contains(&m))
-                {
-                    pages.insert(i);
-                } else if rest_set.contains(&m) {
-                    rest = true;
+            let batch_rank: (u8, usize) = match batch.route {
+                ContainerPart::OtherPagePrivate => {
+                    let owner = (1..page_private_sets.len())
+                        .find(|&i| {
+                            batch
+                                .members
+                                .iter()
+                                .any(|m| page_private_sets[i].contains(m))
+                        })
+                        .expect("Part-7 ObjStm route must have one non-first-page owner");
+                    (0, owner)
                 }
-            }
-            let batch_rank: (u8, usize) = if shared || pages.len() >= 2 {
-                (1, 0) // part8 (other-page-shared)
-            } else if let Some(&i) = pages.iter().next().filter(|_| !rest) {
-                // part7 (private to one other page) ONLY when the container's member
-                // union has no document-`others` object. A `rest`-set member (a
-                // Catalog non-open-document key / trailer key = document_other, or
-                // the /Pages tree) makes others>0, so qpdf categorizes the whole
-                // container lc_other (part9), matching `route_objstm_containers`'
-                // others gate (QPDF_linearization.cc:1128). Without this `!rest`
-                // guard the container object would be numbered at a part7 anchor
-                // while its members are numbered in the part9 range — an internally
-                // inconsistent layout that diverges from qpdf.
-                (0, i)
-            } else if rest {
-                (2, 0) // part9 (rest / others-demoted)
-            } else {
-                return None; // cov:ignore: every Part-4 batch member is page-private, shared, or rest
+                ContainerPart::OtherPageShared => (1, 0),
+                ContainerPart::Rest => (2, 0),
+                ContainerPart::OpenDocument | ContainerPart::FirstPage => {
+                    unreachable!("first-half route in second-half ObjStm batches")
+                }
             };
             // `plain_ranked` is already in ascending rank order, so the last entry
             // with rank ≤ batch_rank is the container's group's last plain object
@@ -2557,6 +2558,11 @@ pub fn write_linearized<R: Read + Seek>(
     // container's group is the last one (the single-second-half-container case).
     let second_half_anchors =
         second_half_container_anchors(plan, &resolved_batch_plan.part4_batches);
+    let part4_members: Vec<Vec<ObjectRef>> = resolved_batch_plan
+        .part4_batches
+        .iter()
+        .map(|batch| batch.members.clone())
+        .collect();
     // Part-4 non-member objects (e.g. lc_thumbnail streams, and ineligible
     // outline streams) must be placed AFTER the second-half ObjStm containers in
     // the file, not before.  Compute the set of such objects so
@@ -2567,12 +2573,7 @@ pub fn write_linearized<R: Read + Seek>(
     // `part4_member_set`), but an ineligible outline stream (an Object::Stream
     // reachable from `/Outlines`, e.g. a shared /JS action stream) is emitted
     // plain and qpdf numbers it AFTER the outline container, not before.
-    let part4_member_set: BTreeSet<ObjectRef> = resolved_batch_plan
-        .part4_batches
-        .iter()
-        .flatten()
-        .copied()
-        .collect();
+    let part4_member_set: BTreeSet<ObjectRef> = part4_members.iter().flatten().copied().collect();
     let second_half_post_plain: BTreeSet<ObjectRef> = plan
         .part4_rest
         .iter()
@@ -2612,7 +2613,7 @@ pub fn write_linearized<R: Read + Seek>(
     let relocation = local_renumber.place_objstm_members_per_half(
         &resolved_batch_plan.open_document_batches,
         &resolved_batch_plan.part3_batches,
-        &resolved_batch_plan.part4_batches,
+        &part4_members,
         &second_half_anchors,
         &second_half_post_plain,
         &first_half_post_plain,
@@ -3533,6 +3534,29 @@ mod tests {
     #[test]
     fn write_linearized_succeeds() {
         let _doc = build_linearized();
+    }
+
+    #[test]
+    fn second_half_anchor_uses_retained_part8_route_for_docother_drift() {
+        let page1_private = ObjectRef::new(10, 0);
+        let document_other = ObjectRef::new(11, 0);
+        let plain_part8 = ObjectRef::new(12, 0);
+        let plain_part9 = ObjectRef::new(13, 0);
+        let plan = LinearizationPlan {
+            per_page_private_objects: vec![vec![], vec![page1_private]],
+            part4_other_pages_shared: vec![plain_part8],
+            part4_rest: vec![document_other, plain_part9],
+            ..Default::default()
+        };
+        let batches = vec![RoutedObjStmBatch {
+            members: vec![page1_private, document_other],
+            route: ContainerPart::OtherPageShared,
+        }];
+
+        assert_eq!(
+            second_half_container_anchors(&plan, &batches),
+            vec![Some(plain_part8)]
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -1945,14 +1945,14 @@ impl Default for LinearizationPlan {
 /// (first-page closure exclusives) are **never** placed in any batch list —
 /// they stay as plain indirect objects.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ObjStmBatchPlan {
+pub(crate) struct ObjStmBatchPlan {
     /// ObjStm batches for qpdf part4 (open-document objects). Numbered and
     /// emitted in the first half, before the first-page section.
-    pub open_document_batches: Vec<Vec<ObjectRef>>,
+    pub(crate) open_document_batches: Vec<Vec<ObjectRef>>,
     /// ObjStm batches for Part 3 (shared/catalog) objects.
-    pub part3_batches: Vec<Vec<ObjectRef>>,
+    pub(crate) part3_batches: Vec<Vec<ObjectRef>>,
     /// ObjStm batches for Part 4 (rest-of-document) objects.
-    pub part4_batches: Vec<Vec<ObjectRef>>,
+    pub(crate) part4_batches: Vec<RoutedObjStmBatch>,
 }
 
 // These items are consumed by the upcoming ObjStm linearized writer (5.8.2+);
@@ -2035,11 +2035,15 @@ impl LinearizationPlan {
         plan.part4_batches = std::mem::take(&mut plan.part4_batches)
             .into_iter()
             .filter_map(|batch| {
-                let kept: Vec<ObjectRef> = batch
+                let members: Vec<ObjectRef> = batch
+                    .members
                     .into_iter()
                     .filter(|r| !excluded.contains(r))
                     .collect();
-                (!kept.is_empty()).then_some(kept)
+                (!members.is_empty()).then_some(RoutedObjStmBatch {
+                    members,
+                    route: batch.route,
+                })
             })
             .collect();
     }
@@ -2106,9 +2110,9 @@ impl LinearizationPlan {
         // lc_other sub-order) only have one container each in the fixtures seen so
         // far, so their within-part multi-container order is untested (see flpdf-g1eu
         // follow-up); if such a case ever arises a finer per-part sort may be needed.
-        let mut part4_private: Vec<Vec<ObjectRef>> = Vec::new();
-        let mut part4_shared: Vec<Vec<ObjectRef>> = Vec::new();
-        let mut part4_rest: Vec<Vec<ObjectRef>> = Vec::new();
+        let mut part4_private: Vec<RoutedObjStmBatch> = Vec::new();
+        let mut part4_shared: Vec<RoutedObjStmBatch> = Vec::new();
+        let mut part4_rest: Vec<RoutedObjStmBatch> = Vec::new();
         for (mut members, route) in containers.into_iter().zip(routes) {
             members.sort_unstable_by_key(|r| r.number);
             match route {
@@ -2120,9 +2124,13 @@ impl LinearizationPlan {
                         part3_regular.push(members);
                     }
                 }
-                ContainerPart::OtherPagePrivate => part4_private.push(members),
-                ContainerPart::OtherPageShared => part4_shared.push(members),
-                ContainerPart::Rest => part4_rest.push(members),
+                ContainerPart::OtherPagePrivate => {
+                    part4_private.push(RoutedObjStmBatch { members, route })
+                }
+                ContainerPart::OtherPageShared => {
+                    part4_shared.push(RoutedObjStmBatch { members, route })
+                }
+                ContainerPart::Rest => part4_rest.push(RoutedObjStmBatch { members, route }),
             }
         }
         // Concatenate the buckets in part order (part7, part8, part9).
@@ -2229,7 +2237,7 @@ impl LinearizationPlan {
         };
 
         let mut part3_batches: Vec<Vec<ObjectRef>> = Vec::new();
-        let mut part4_batches: Vec<Vec<ObjectRef>> = Vec::new();
+        let mut part4_batches: Vec<RoutedObjStmBatch> = Vec::new();
 
         // Iterate containers in ascending container-number order.
         for (_container_num, mut members) in groups {
@@ -2289,10 +2297,18 @@ impl LinearizationPlan {
                     part3_batches.push(chunk.to_vec());
                 }
             }
-            for refs in p4_by_owner.values() {
+            for (owner, refs) in &p4_by_owner {
+                let route = match owner {
+                    Owner::Page(_) => ContainerPart::OtherPagePrivate,
+                    Owner::Shared => ContainerPart::OtherPageShared,
+                    Owner::Rest => ContainerPart::Rest,
+                };
                 for chunk in refs.chunks(cap) {
                     if !chunk.is_empty() {
-                        part4_batches.push(chunk.to_vec());
+                        part4_batches.push(RoutedObjStmBatch {
+                            members: chunk.to_vec(),
+                            route,
+                        });
                     }
                 }
             }
@@ -2349,6 +2365,34 @@ pub(crate) enum ContainerPart {
     OtherPageShared,
     /// qpdf part 9 — the container reaches no page (trailer-only members).
     Rest,
+}
+
+/// One second-half ObjStm batch paired with qpdf's canonical container route.
+///
+/// Keeping the route beside the members prevents the writer from reclassifying
+/// the container from per-object classic partitions after qpdf's member-user
+/// union has already selected its part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoutedObjStmBatch {
+    pub(crate) members: Vec<ObjectRef>,
+    pub(crate) route: ContainerPart,
+}
+
+impl std::ops::Deref for RoutedObjStmBatch {
+    type Target = [ObjectRef];
+
+    fn deref(&self) -> &Self::Target {
+        &self.members
+    }
+}
+
+impl<'a> IntoIterator for &'a RoutedObjStmBatch {
+    type Item = &'a ObjectRef;
+    type IntoIter = std::slice::Iter<'a, ObjectRef>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.members.iter()
+    }
 }
 
 /// Compute the linearized generate-mode ObjStm membership.
@@ -4648,8 +4692,13 @@ mod tests {
         let all_batched: Vec<ObjectRef> = batch_plan
             .part3_batches
             .iter()
-            .chain(&batch_plan.part4_batches)
             .flat_map(|b| b.iter().copied())
+            .chain(
+                batch_plan
+                    .part4_batches
+                    .iter()
+                    .flat_map(|b| b.members.iter().copied()),
+            )
             .collect();
 
         for r in &all_batched {
@@ -4676,8 +4725,13 @@ mod tests {
         let all_batched: Vec<ObjectRef> = batch_plan
             .part3_batches
             .iter()
-            .chain(&batch_plan.part4_batches)
             .flat_map(|b| b.iter().copied())
+            .chain(
+                batch_plan
+                    .part4_batches
+                    .iter()
+                    .flat_map(|b| b.members.iter().copied()),
+            )
             .collect();
 
         for r in &all_batched {
@@ -4706,8 +4760,13 @@ mod tests {
         let all_batched: std::collections::BTreeSet<ObjectRef> = batch_plan
             .part3_batches
             .iter()
-            .chain(&batch_plan.part4_batches)
             .flat_map(|b| b.iter().copied())
+            .chain(
+                batch_plan
+                    .part4_batches
+                    .iter()
+                    .flat_map(|b| b.members.iter().copied()),
+            )
             .collect();
 
         // 6 0 R: content stream (page 1 only) → part2 + stream ineligible
@@ -5098,11 +5157,12 @@ mod tests {
             .expect("Preserve with cap=1 must succeed");
 
         // Each batch must have at most 1 member.
-        for batch in batch_plan
-            .part3_batches
-            .iter()
-            .chain(&batch_plan.part4_batches)
-        {
+        for batch in batch_plan.part3_batches.iter().map(Vec::as_slice).chain(
+            batch_plan
+                .part4_batches
+                .iter()
+                .map(|batch| batch.members.as_slice()),
+        ) {
             assert!(
                 batch.len() <= 1,
                 "with cap=1, each batch must have at most 1 member; got {} members: {batch:?}",
@@ -5114,8 +5174,13 @@ mod tests {
         let all_batched: BTreeSet<ObjectRef> = batch_plan
             .part3_batches
             .iter()
-            .chain(&batch_plan.part4_batches)
             .flat_map(|b| b.iter().copied())
+            .chain(
+                batch_plan
+                    .part4_batches
+                    .iter()
+                    .flat_map(|b| b.members.iter().copied()),
+            )
             .collect();
 
         let resources_ref = ObjectRef::new(5, 0);
@@ -6955,7 +7020,13 @@ mod tests {
                 .open_document_batches
                 .iter()
                 .chain(&batch_plan.part3_batches)
-                .chain(&batch_plan.part4_batches)
+                .map(Vec::as_slice)
+                .chain(
+                    batch_plan
+                        .part4_batches
+                        .iter()
+                        .map(|batch| batch.members.as_slice()),
+                )
                 .any(|batch| batch.contains(&missing)),
             "missing /Info 99 0 R must not be batched into a generated ObjStm"
         );
