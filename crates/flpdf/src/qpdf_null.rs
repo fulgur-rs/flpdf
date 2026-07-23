@@ -130,4 +130,67 @@ mod tests {
         let mut pdf = open_null_fixture();
         assert!(reference_is_null(&mut pdf, ObjectRef::new(6, 0)).unwrap());
     }
+
+    #[test]
+    fn snapshot_and_visible_entries_preserve_sources_and_filter_nulls() {
+        let mut pdf = open_null_fixture();
+        let mut dict = Dictionary::new();
+        dict.insert("Zulu", Object::Integer(26));
+        dict.insert("Length", Object::Integer(5));
+        dict.insert("DirectNull", Object::Null);
+        dict.insert("RefNull", Object::Reference(ObjectRef::new(4, 0)));
+        dict.insert("Visible", Object::Reference(ObjectRef::new(1, 0)));
+        let dict_before = dict.clone();
+        let refs_before = pdf.live_object_refs();
+        let values_before = [
+            pdf.resolve_qpdf_json_object(ObjectRef::new(1, 0)).unwrap(),
+            pdf.resolve_qpdf_json_object(ObjectRef::new(4, 0)).unwrap(),
+            pdf.resolve_qpdf_json_object(ObjectRef::new(5, 0)).unwrap(),
+        ];
+
+        let snapshot = snapshot_entries(&dict, false);
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|(key, _)| key.as_slice())
+                .collect::<Vec<_>>(),
+            [
+                b"DirectNull".as_slice(),
+                b"Length",
+                b"RefNull",
+                b"Visible",
+                b"Zulu"
+            ]
+        );
+        assert_eq!(dict, dict_before);
+
+        let without_length = snapshot_entries(&dict, true);
+        assert_eq!(
+            without_length
+                .iter()
+                .map(|(key, _)| key.as_slice())
+                .collect::<Vec<_>>(),
+            [b"DirectNull".as_slice(), b"RefNull", b"Visible", b"Zulu"]
+        );
+        assert_eq!(dict, dict_before);
+
+        let visible = visible_entries(&mut pdf, snapshot).unwrap();
+        assert_eq!(
+            visible
+                .iter()
+                .map(|(key, _)| key.as_slice())
+                .collect::<Vec<_>>(),
+            [b"Length".as_slice(), b"Visible", b"Zulu"]
+        );
+        assert_eq!(dict, dict_before);
+        assert_eq!(pdf.live_object_refs(), refs_before);
+        assert_eq!(
+            [
+                pdf.resolve_qpdf_json_object(ObjectRef::new(1, 0)).unwrap(),
+                pdf.resolve_qpdf_json_object(ObjectRef::new(4, 0)).unwrap(),
+                pdf.resolve_qpdf_json_object(ObjectRef::new(5, 0)).unwrap(),
+            ],
+            values_before
+        );
+    }
 }
