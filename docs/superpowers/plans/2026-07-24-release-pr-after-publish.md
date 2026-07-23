@@ -1,156 +1,69 @@
-# Release PR Cross-Run Serialization Implementation Plan
+# Release PR Queue-Ordering Gate Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use
+> superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Prevent any later `main` push from running `release-pr` while an earlier release workflow is awaiting approval or publishing.
+**Goal:** Prevent a later active Release-plz run from updating a Release PR
+while an older release run is still queued, without relying on GitHub's queued
+run ordering.
 
-**Architecture:** Preserve the existing in-run dependency from `release-pr` to `release`, and serialize complete Release-plz workflow runs per ref. Use GitHub Actions `queue: max` so subsequent pushes wait without replacing a pending release run.
+**Architecture:** Retain the per-ref workflow queue and in-run publish
+dependency. Add a fail-closed gate before `release-pr` that queries queued runs
+for the same workflow and branch. The active run yields when any queued run has
+a lower `run_number`; otherwise it may maintain the next Release PR.
 
-**Tech Stack:** GitHub Actions YAML, Rust integration tests, Ruby/Psych YAML parsing
+**Tech Stack:** GitHub Actions YAML, GitHub Actions workflow-runs REST API,
+`gh`, `jq`, Rust integration tests, Ruby/Psych YAML parsing
 
 ## Global Constraints
 
-- Ordinary pushes to `main` must run `release-pr` without requesting release-environment approval.
-- A real release must publish successfully before any current or later run reads crates.io.
-- A failed, rejected, or cancelled release must not update the next Release PR in that run.
-- Workflow concurrency must retain multiple pending pushes instead of replacing them.
-- The existing job-level publish and Release PR concurrency groups must remain unchanged.
-- `release` must continue to depend only on `check-releases`.
-- Review thread 2 about `docs/superpowers/...` is intentionally outside this implementation scope.
+- Ordinary pushes to `main` must run `release-pr` when no older run is queued.
+- A real release must publish successfully before its own `release-pr`.
+- A run must skip `release-pr` when an older run is queued.
+- API or JSON-processing failures must fail closed.
+- The gate receives only `actions: read`.
+- `release` continues to depend only on `check-releases`.
+- Existing workflow-level and job-level concurrency blocks remain.
+- Review thread 2 about `docs/superpowers/...` remains outside scope.
 
 ---
 
-### Task 1: Serialize Release-plz workflow runs
+### Task 1: Add the queue-ordering contract
 
 **Files:**
 - Modify: `crates/flpdf-cli/tests/release_workflow_contract.rs`
-- Modify: `.github/workflows/release-plz.yml:21-33`
 
-**Interfaces:**
-- Consumes: GitHub Actions workflow-level `concurrency`, `github.ref`, and the existing in-run `needs` contract.
-- Produces: A per-ref workflow queue that runs at most one Release-plz workflow at a time and retains up to GitHub's `queue: max` limit.
+- [x] Add a test requiring:
+  - a `check-release-pr-turn` job;
+  - dependencies on `check-releases` and `release`;
+  - job-level `actions: read`;
+  - a queued workflow-runs API query for the current branch;
+  - comparison of queued `run_number` values with `github.run_number`;
+  - a `should_run` job output;
+  - `release-pr` dependence on the gate and a successful `should_run` result.
+- [x] Run the focused test and verify RED because the gate is absent.
 
-- [ ] **Step 1: Write the failing cross-run workflow contract test**
+### Task 2: Implement the fail-closed gate
 
-Add this helper and test to
-`crates/flpdf-cli/tests/release_workflow_contract.rs`:
+**Files:**
+- Modify: `.github/workflows/release-plz.yml`
 
-```rust
-fn workflow_preamble() -> &str {
-    RELEASE_WORKFLOW
-        .split_once("\njobs:")
-        .map(|(preamble, _)| preamble)
-        .expect("release-plz.yml must contain a top-level jobs mapping")
-}
+- [x] Add `check-release-pr-turn` after `check-releases`.
+- [x] Reuse the existing release-state eligibility condition so ordinary pushes
+  are eligible after a skipped `release`, while failed releases are not.
+- [x] Query up to 100 queued runs for `release-plz.yml` and the current branch.
+- [x] Emit `should_run=false` when a lower `run_number` exists; otherwise emit
+  `should_run=true`.
+- [x] Use `set -euo pipefail` and emit no permissive output after failures.
+- [x] Make `release-pr` depend on the gate and require its successful true
+  output.
+- [x] Run the contract test and verify GREEN.
 
-#[test]
-fn workflow_runs_are_serialized_without_dropping_pending_pushes() {
-    let preamble = workflow_preamble();
+### Task 3: Verify and publish
 
-    assert!(preamble.contains(
-        "\nconcurrency:\n  group: release-plz-${{ github.ref }}\n  cancel-in-progress: false\n  queue: max"
-    ));
-}
-```
-
-- [ ] **Step 2: Run the focused test and verify RED**
-
-Run:
-
-```bash
-cargo test -p flpdf-cli --test release_workflow_contract \
-  workflow_runs_are_serialized_without_dropping_pending_pushes
-```
-
-Expected: FAIL at the `preamble.contains(...)` assertion because the workflow
-does not yet define top-level concurrency.
-
-- [ ] **Step 3: Implement the minimal workflow-level queue**
-
-Insert this block after the top-level `on` mapping and before `env` in
-`.github/workflows/release-plz.yml`:
-
-```yaml
-# Serialize complete runs so a later ordinary main push cannot run release-pr
-# while an earlier release is waiting for approval or publishing. `queue: max`
-# retains pending runs; the default single pending slot could replace the run
-# responsible for publishing.
-concurrency:
-  group: release-plz-${{ github.ref }}
-  cancel-in-progress: false
-  queue: max
-```
-
-Do not alter either existing job-level concurrency block:
-
-```yaml
-    concurrency:
-      group: release-plz-pr-${{ github.ref }}
-      cancel-in-progress: false
-```
-
-```yaml
-    concurrency:
-      group: release-plz-publish
-      cancel-in-progress: false
-```
-
-- [ ] **Step 4: Run the focused contract suite and verify GREEN**
-
-Run:
-
-```bash
-cargo test -p flpdf-cli --test release_workflow_contract
-```
-
-Expected: PASS, 3 passed and 0 failed.
-
-- [ ] **Step 5: Validate workflow syntax and repository quality gates**
-
-Run:
-
-```bash
-ruby -e 'require "yaml"; YAML.load_file(".github/workflows/release-plz.yml")'
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links -D rustdoc::invalid_html_tags" cargo doc --workspace --no-deps --document-private-items
-cargo test
-git diff --check
-```
-
-If `actionlint` is installed, also run:
-
-```bash
-actionlint .github/workflows/release-plz.yml
-```
-
-Expected: every available command exits 0, all tests pass, and no warnings are
-promoted to errors.
-
-- [ ] **Step 6: Commit and publish the review fix**
-
-Run:
-
-```bash
-git add .github/workflows/release-plz.yml \
-  crates/flpdf-cli/tests/release_workflow_contract.rs \
-  docs/superpowers/plans/2026-07-24-release-pr-after-publish.md
-git commit -m "fix(release): serialize release workflow runs (flpdf-116l)"
-git push
-```
-
-Expected: the remote PR branch advances to the new local `HEAD`.
-
-- [ ] **Step 7: Verify PR and tracker state**
-
-Run:
-
-```bash
-gh pr checks 525
-git status -sb
-bd close flpdf-116l --reason="Release-plz workflow runs are serialized across main pushes and the cross-run contract is tested"
-bd dolt push
-```
-
-Expected: local and remote branches agree, the worktree is clean, and
-`flpdf-116l` is closed after the review fix is published.
+- [x] Parse the workflow with Ruby/Psych.
+- [x] Check for `actionlint` (not installed in this environment).
+- [x] Run formatting, clippy, strict rustdoc, workspace tests, and
+  `git diff --check`.
+- [ ] Commit and push the workflow, contract test, and updated plan.
+- [ ] Verify PR checks, then close `flpdf-116l` and push Beads state.
