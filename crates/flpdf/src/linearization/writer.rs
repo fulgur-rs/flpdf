@@ -1185,6 +1185,7 @@ fn write_first_page_xref_stream(
     // shifts.
     let region_len = {
         let dict = xref_stream::XrefStreamDict {
+            filtered: true,
             widths: xref_stream::first_pass_widths(max_id, max_ostream_index, 0),
             index: Some((index_start, index_count)),
             info: info_new_ref,
@@ -1296,6 +1297,7 @@ fn patch_first_page_xref(
         (widths, payload, main_xref_offset as u64)
     };
     let dict = xref_stream::XrefStreamDict {
+        filtered: true,
         widths,
         index: Some((patch.index_start, patch.index_count)),
         info: patch.info_new_ref,
@@ -1391,6 +1393,7 @@ fn write_main_xref_stream_and_trailer(
     // the omitted `/Index` defaults to `[0, main_count)` — exactly the objects
     // this stream covers (qpdf's `second_trailer_size`).
     let dict = xref_stream::XrefStreamDict {
+        filtered: true,
         widths,
         index: None,
         info: None,
@@ -1408,6 +1411,7 @@ fn write_main_xref_stream_and_trailer(
     let main_obj_ref = ObjectRef::new(main_xref_num, 0);
     let region_len = {
         let p1_dict = xref_stream::XrefStreamDict {
+            filtered: true,
             widths,
             index: None,
             info: None,

@@ -3160,7 +3160,13 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     {
         let plan = object_streams::plan_qpdf_preserve_object_streams(pdf)?;
         if !plan.batches.is_empty() {
-            return write_pdf_containerized_qpdf(pdf, out, options, plan.batches);
+            return write_pdf_containerized_qpdf(
+                pdf,
+                out,
+                options,
+                plan.batches,
+                plan.removed_refs,
+            );
         }
     }
 
@@ -4315,10 +4321,10 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
 ) -> Result<()> {
     // ── object-stream assignment + generate-mode numbering ───────────────────
     // 1. getCompressibleObjGens DFS from the trailer => eligible list, ordered.
-    let eligible = object_streams::compressible_objgens(pdf)?;
+    let compressible = object_streams::compressible_objgens_qpdf_plan(pdf)?;
     // 2. generateObjectStreams even split => one group per container.
-    let groups = object_streams::even_split_into_streams(&eligible);
-    write_pdf_containerized_qpdf(pdf, out, options, groups)
+    let groups = object_streams::even_split_into_streams(&compressible.eligible);
+    write_pdf_containerized_qpdf(pdf, out, options, groups, compressible.removed_refs)
 }
 
 fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
@@ -4326,9 +4332,21 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
     mut out: W,
     options: &WriteOptions,
     groups: Vec<Vec<ObjectRef>>,
+    removed_refs: BTreeSet<ObjectRef>,
 ) -> Result<()> {
-    use crate::rewrite_renumber::{renumber_qpdf_refs_in_place, GenerateRenumber};
+    use crate::rewrite_renumber::{renumber_qpdf_refs_in_place_with_removed, GenerateRenumber};
     use std::collections::HashSet;
+
+    // qpdf applies one global compression decision to structural streams it
+    // creates. Preserve and Uncompress both mean raw ObjStm/xref payloads;
+    // Compress means Flate plus the xref PNG predictor.
+    let structural_filtered =
+        matches!(effective_stream_policy(options), Some(CompressStreams::Yes));
+    let structural_compress = if structural_filtered {
+        CompressStreams::Yes
+    } else {
+        CompressStreams::No
+    };
 
     // `ok_or` (eager) keeps the error construction on the covered happy path;
     // `Error::Missing` is a cheap `&'static str` variant, so no `or_fun_call`.
@@ -4342,7 +4360,7 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
     // children, garbage-collecting a holder reachable only through that edge.
     // The walk drops it the same way. An orphan holder is never an ObjStm member
     // (members are reached via non-`/Length` edges only).
-    let renumber = GenerateRenumber::build(pdf, &groups, true)?;
+    let renumber = GenerateRenumber::build(pdf, &groups, true, &removed_refs)?;
     let new_root = generate_invariant(
         renumber.new_for_original(root_ref),
         "/Root absent from renumber map",
@@ -4449,7 +4467,12 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
         match what {
             Emit::Plain(old) => {
                 let mut object = pdf.resolve(*old)?;
-                renumber_qpdf_refs_in_place(pdf, &mut object, &renumber)?;
+                renumber_qpdf_refs_in_place_with_removed(
+                    pdf,
+                    &mut object,
+                    &renumber,
+                    &removed_refs,
+                )?; // cov:ignore: reachable emitted refs are all present in the completed map
                 match object {
                     Object::Stream(stream) => {
                         let (reencoded, source_filter_is_lone_flate) =
@@ -4476,11 +4499,16 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
                 let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(plan.members.len());
                 for &(old, new) in &plan.members {
                     let mut obj = pdf.resolve(old)?;
-                    renumber_qpdf_refs_in_place(pdf, &mut obj, &renumber)?;
+                    renumber_qpdf_refs_in_place_with_removed(
+                        pdf,
+                        &mut obj,
+                        &renumber,
+                        &removed_refs,
+                    )?; // cov:ignore: planned ObjStm members are all present in the completed map
                     resolved.push((new, obj));
                 }
                 let body = object_streams::emit_objstm_body_from_resolved(&resolved)?;
-                let stream = object_streams::wrap_objstm_body(&body, options.compress_streams)?;
+                let stream = object_streams::wrap_objstm_body(&body, structural_compress)?;
                 // Emit the container dict in qpdf 11.9.0's fixed key order
                 // (`/Type /ObjStm /Length L [/Filter /FlateDecode] /N n /First f`);
                 // the BTreeMap-backed `Object::Stream` serializer would
@@ -4545,7 +4573,11 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
         .unwrap_or(0);
     let widths =
         xref_stream::second_pass_widths(max_offset, 0, max_object_number, max_ostream_index);
-    let payload = xref_stream::encode_payload(&entries, widths);
+    let payload = if structural_filtered {
+        xref_stream::encode_payload(&entries, widths)
+    } else {
+        xref_stream::encode_payload_raw(&entries, widths)
+    };
 
     // Trailer-derived dict entries: /Info (remapped to its new number) and the
     // two-element /ID. /Root is the renumbered catalog. qpdf omits /Index on a
@@ -4566,6 +4598,7 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
         // position so the digest covers the bytes up to the array's `[` —
         // matching `compute_deterministic_id`'s contract on every other path.
         let dict = xref_stream::XrefStreamDict {
+            filtered: structural_filtered,
             widths,
             index: None,
             info: info_ref,
@@ -4608,6 +4641,7 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
             _ => (QPDF_STATIC_ID.to_vec(), QPDF_STATIC_ID.to_vec()), // cov:ignore: /ID is always a 2-string array here
         };
         let dict = xref_stream::XrefStreamDict {
+            filtered: structural_filtered,
             widths,
             index: None,
             info: info_ref,

@@ -199,7 +199,7 @@ fn collect_qpdf_enqueue_refs<R: Read + Seek>(
     }
     match obj {
         Object::Reference(reference) => {
-            if reference.number != 0 && !pdf.object_ref_is_obsolete(*reference) {
+            if reference.number != 0 {
                 found.push(*reference);
             }
         }
@@ -483,6 +483,7 @@ impl GenerateRenumber {
         pdf: &mut Pdf<R>,
         groups: &[Vec<ObjectRef>],
         skip_length: bool,
+        removed_refs: &BTreeSet<ObjectRef>,
     ) -> crate::Result<Self> {
         // member -> group index, and per-group members sorted ascending-source.
         let mut member_to_group: HashMap<ObjectRef, usize> = HashMap::new();
@@ -528,6 +529,7 @@ impl GenerateRenumber {
             // reference yields exactly one seed as before.
             collect_qpdf_enqueue_refs(pdf, &value, 0, skip_length, &mut seeds)?;
         }
+        seeds.retain(|reference| !removed_refs.contains(reference));
 
         for seed in seeds {
             enqueue_gen(
@@ -545,6 +547,7 @@ impl GenerateRenumber {
             let obj = pdf.resolve(cur)?;
             let mut found = Vec::new();
             collect_qpdf_enqueue_refs(pdf, &obj, 0, skip_length, &mut found)?;
+            found.retain(|reference| !removed_refs.contains(reference));
             for reference in found {
                 enqueue_gen(
                     reference,
@@ -706,7 +709,16 @@ pub(crate) fn renumber_qpdf_refs_in_place<R: Read + Seek, M: NewNumberLookup>(
     obj: &mut Object,
     map: &M,
 ) -> crate::Result<()> {
-    rewrite_qpdf(pdf, obj, 0, map)
+    renumber_qpdf_refs_in_place_with_removed(pdf, obj, map, &BTreeSet::new())
+}
+
+pub(crate) fn renumber_qpdf_refs_in_place_with_removed<R: Read + Seek, M: NewNumberLookup>(
+    pdf: &mut Pdf<R>,
+    obj: &mut Object,
+    map: &M,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> crate::Result<()> {
+    rewrite_qpdf(pdf, obj, 0, map, removed_refs)
 }
 
 fn rewrite_qpdf<R: Read + Seek, M: NewNumberLookup>(
@@ -714,6 +726,7 @@ fn rewrite_qpdf<R: Read + Seek, M: NewNumberLookup>(
     obj: &mut Object,
     depth: usize,
     map: &M,
+    removed_refs: &BTreeSet<ObjectRef>,
 ) -> crate::Result<()> {
     if depth > MAX_INLINE_DEPTH {
         return Err(Error::Unsupported(
@@ -724,7 +737,7 @@ fn rewrite_qpdf<R: Read + Seek, M: NewNumberLookup>(
     }
     match obj {
         Object::Reference(reference) => {
-            if reference.number == 0 || pdf.object_ref_is_obsolete(*reference) {
+            if reference.number == 0 || removed_refs.contains(reference) {
                 *obj = Object::Null;
             } else {
                 *reference = map.new_for_original(*reference).ok_or_else(|| {
@@ -737,7 +750,7 @@ fn rewrite_qpdf<R: Read + Seek, M: NewNumberLookup>(
         }
         Object::Array(items) => {
             for item in items {
-                rewrite_qpdf(pdf, item, depth + 1, map)?;
+                rewrite_qpdf(pdf, item, depth + 1, map, removed_refs)?;
             }
         }
         Object::Dictionary(dict) => {
@@ -745,8 +758,10 @@ fn rewrite_qpdf<R: Read + Seek, M: NewNumberLookup>(
             let entries = crate::qpdf_null::visible_entries(pdf, entries)?;
             let mut rewritten = Dictionary::new();
             for (key, mut value) in entries {
-                rewrite_qpdf(pdf, &mut value, depth + 1, map)?;
-                rewritten.insert(key, value);
+                rewrite_qpdf(pdf, &mut value, depth + 1, map, removed_refs)?;
+                if !matches!(value, Object::Null) {
+                    rewritten.insert(key, value);
+                }
             }
             *dict = rewritten;
         }
@@ -766,8 +781,10 @@ fn rewrite_qpdf<R: Read + Seek, M: NewNumberLookup>(
             let entries = crate::qpdf_null::visible_entries(pdf, entries)?;
             let mut rewritten = Dictionary::new();
             for (key, mut value) in entries {
-                rewrite_qpdf(pdf, &mut value, depth + 1, map)?;
-                rewritten.insert(key, value);
+                rewrite_qpdf(pdf, &mut value, depth + 1, map, removed_refs)?;
+                if !matches!(value, Object::Null) {
+                    rewritten.insert(key, value);
+                }
             }
             stream.dict = rewritten;
         }
@@ -1311,7 +1328,7 @@ mod tests {
         // Empty groups: every reachable object is numbered as a plain object, so
         // this isolates the generate walk. With `skip_length = true` the holder
         // (obj 7) is dropped; the page's /Contents stream (obj 4) is still numbered.
-        let map = GenerateRenumber::build(&mut pdf, &[], true).expect("build");
+        let map = GenerateRenumber::build(&mut pdf, &[], true, &BTreeSet::new()).expect("build");
         assert!(map.new_for_original(ObjectRef::new(7, 0)).is_none());
         assert!(map.new_for_original(ObjectRef::new(4, 0)).is_some());
         assert_eq!(map.pairs().count(), 6);

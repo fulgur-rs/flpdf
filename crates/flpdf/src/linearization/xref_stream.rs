@@ -6,8 +6,10 @@
 //! module reproduces it byte-for-byte:
 //!
 //! * the table is `/W [1 2 1]`-style fixed-width rows (type, field-2, field-3),
-//! * the rows are PNG "Up" pre-filtered (`/Predictor 12`, `/Columns Σ/W`) and
-//!   then Flate-compressed, and
+//! * under the effective compress-streams policy, rows are PNG "Up"
+//!   pre-filtered (`/Predictor 12`, `/Columns Σ/W`) and Flate-compressed;
+//!   otherwise the raw `/W` rows are emitted without `/Filter` or
+//!   `/DecodeParms`, and
 //! * the stream dictionary keys are written in qpdf's fixed order
 //!   (`/Type /Length /Filter /DecodeParms /W [/Index] [/Info] [/Root] /Size
 //!   [/Prev] [/ID]`), which is *not* the lexicographic order the generic
@@ -119,6 +121,12 @@ pub(crate) fn encode_payload(entries: &[XrefStreamEntry], widths: XrefWidths) ->
     flate_compress(&png_up_predict(&rows, columns(widths)))
 }
 
+/// Encode the unfiltered cross-reference payload used when qpdf's global
+/// stream-compression policy is disabled.
+pub(crate) fn encode_payload_raw(entries: &[XrefStreamEntry], widths: XrefWidths) -> Vec<u8> {
+    build_rows(entries, widths)
+}
+
 /// PNG-Up-predicted rows WITHOUT Flate — qpdf's pass-1 (`skip_compression`) xref
 /// stream payload. qpdf still declares `/Filter /FlateDecode` on the pass-1
 /// object (an invalid but throwaway buffer used only to size the region and seed
@@ -132,6 +140,8 @@ pub(crate) fn encode_payload_uncompressed(
 
 /// Stream-dictionary metadata for a cross-reference stream, in qpdf key order.
 pub(crate) struct XrefStreamDict<'a> {
+    /// Whether `/Filter /FlateDecode` plus PNG `/Predictor 12` are declared.
+    pub filtered: bool,
     /// `/W` field widths.
     pub widths: XrefWidths,
     /// `/Index [start count]`; `None` omits `/Index` (readers default to
@@ -173,9 +183,11 @@ fn write_object_dict_prefix(
     out.extend_from_slice(format!("{} {} obj\n", object.number, object.generation).as_bytes());
     out.extend_from_slice(b"<< /Type /XRef");
     out.extend_from_slice(format!(" /Length {payload_len}").as_bytes());
-    out.extend_from_slice(b" /Filter /FlateDecode /DecodeParms << /Columns ");
-    out.extend_from_slice(columns(dict.widths).to_string().as_bytes());
-    out.extend_from_slice(b" /Predictor 12 >>");
+    if dict.filtered {
+        out.extend_from_slice(b" /Filter /FlateDecode /DecodeParms << /Columns ");
+        out.extend_from_slice(columns(dict.widths).to_string().as_bytes());
+        out.extend_from_slice(b" /Predictor 12 >>");
+    }
     out.extend_from_slice(
         format!(
             " /W [ {} {} {} ]",
@@ -290,8 +302,9 @@ pub(crate) fn first_pass_widths(
 
 /// PNG-Up-predicted (uncompressed) payload length for `n_entries` rows: each row
 /// is one filter-tag byte plus `Σ/W` (`/Columns`) data bytes.
-fn first_pass_payload_len(n_entries: usize, widths: XrefWidths) -> usize {
-    (1 + columns(widths)) * n_entries
+fn first_pass_payload_len(n_entries: usize, widths: XrefWidths, filtered: bool) -> usize {
+    let row_width = columns(widths) + usize::from(filtered);
+    row_width * n_entries
 }
 
 /// Byte length of the fixed region qpdf reserves for a first-pass xref stream:
@@ -305,7 +318,7 @@ pub(crate) fn first_pass_region_len(
     dict: &XrefStreamDict,
     n_entries: usize,
 ) -> usize {
-    let payload_len = first_pass_payload_len(n_entries, dict.widths);
+    let payload_len = first_pass_payload_len(n_entries, dict.widths, dict.filtered);
     let mut buf = Vec::new();
     write_object(&mut buf, object, dict, &vec![0u8; payload_len]);
     buf.len() + calculate_xref_stream_padding(buf.len())
@@ -507,8 +520,9 @@ mod tests {
     #[test]
     fn first_pass_region_matches_three_page_golden() {
         let widths = first_pass_widths(16, 3, 130);
-        assert_eq!(first_pass_payload_len(11, widths), 77);
+        assert_eq!(first_pass_payload_len(11, widths, true), 77);
         let dict = XrefStreamDict {
+            filtered: true,
             widths,
             index: Some((6, 11)),
             info: Some(ObjectRef::new(15, 0)),
@@ -610,6 +624,7 @@ mod tests {
     #[test]
     fn write_padded_region_pads_to_length() {
         let dict = XrefStreamDict {
+            filtered: true,
             widths: [1, 2, 1],
             index: None,
             info: None,
@@ -629,6 +644,7 @@ mod tests {
     #[test]
     fn write_padded_region_rejects_oversized_object() {
         let dict = XrefStreamDict {
+            filtered: true,
             widths: [1, 2, 1],
             index: None,
             info: None,
@@ -709,6 +725,7 @@ mod tests {
             &mut out,
             ObjectRef::new(7, 0),
             &XrefStreamDict {
+                filtered: true,
                 widths: [1, 2, 1],
                 index: Some((6, 11)),
                 info: Some(ObjectRef::new(15, 0)),
@@ -742,6 +759,7 @@ mod tests {
             &mut out,
             ObjectRef::new(5, 0),
             &XrefStreamDict {
+                filtered: true,
                 widths: [1, 2, 1],
                 index: None,
                 info: None,
@@ -785,6 +803,7 @@ mod tests {
             &mut out,
             ObjectRef::new(7, 0),
             &XrefStreamDict {
+                filtered: true,
                 widths: [1, 2, 1],
                 index: Some((6, 11)),
                 info: Some(ObjectRef::new(15, 0)),
@@ -807,6 +826,7 @@ mod tests {
             &mut out,
             ObjectRef::new(5, 0),
             &XrefStreamDict {
+                filtered: true,
                 widths: [1, 2, 1],
                 index: None,
                 info: None,

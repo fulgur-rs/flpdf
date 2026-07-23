@@ -136,6 +136,12 @@ impl Default for PlannerConfig {
 pub(crate) struct PackingPlan {
     /// Each inner `Vec` is one ObjStm batch, members in deterministic order.
     pub batches: Vec<Vec<ObjectRef>>,
+    /// Exact stale generations removed by qpdf's compressible-object walk.
+    ///
+    /// Standard enqueue does not remove these references. Generate and
+    /// source-ObjStm Preserve carry them into their dedicated serializer so
+    /// array occurrences become inline null and dictionary values disappear.
+    pub removed_refs: BTreeSet<ObjectRef>,
 }
 
 /// Convert public [`WriteOptions`](crate::WriteOptions) into an internal
@@ -189,32 +195,29 @@ pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
             &length_exclusions,
             None,
             Some(config.batch_size_cap),
-            false,
         ),
         ObjectStreamMode::Generate => plan_generate(pdf, config, &ctx, &length_exclusions),
     }
 }
 
 /// Reconstruct Preserve-mode source containers after filtering their members
-/// through the qpdf-null-aware standard reachability walk.
+/// through qpdf's compressible-object walk.
 ///
 /// qpdf's `preserveObjectStreams` intersects the source object-to-container map
-/// with `getCompressibleObjGens`. Only set membership matters here; using the
-/// standard enqueue map gives the same reachable set while also applying the
-/// Task 2 dictionary visibility contract. Container membership and source
-/// member order are retained, and Preserve never applies Generate's 100-member
-/// cap.
+/// with `getCompressibleObjGens`. Container membership and source member order
+/// are retained, and Preserve never applies Generate's 100-member cap. The
+/// traversal's operation-specific stale-generation removals are returned with
+/// the batches for the dedicated serializer.
 pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
 ) -> crate::Result<PackingPlan> {
     let ctx = eligibility_context(pdf)?;
     let length_exclusions = collect_indirect_objstm_length_refs(pdf)?;
-    let reachable: BTreeSet<ObjectRef> =
-        crate::rewrite_renumber::CatalogFirstRenumber::build_qpdf(pdf, true)?
-            .pairs()
-            .map(|(_new, old)| old)
-            .collect();
-    plan_preserve(pdf, &ctx, &length_exclusions, Some(&reachable), None, true)
+    let compressible = compressible_objgens_qpdf_plan(pdf)?;
+    let eligible: BTreeSet<ObjectRef> = compressible.eligible.iter().copied().collect();
+    let mut plan = plan_preserve(pdf, &ctx, &length_exclusions, Some(&eligible), None)?;
+    plan.removed_refs = compressible.removed_refs;
+    Ok(plan)
 }
 
 /// Eligible objects in qpdf's `QPDF::getCompressibleObjGens` order
@@ -231,6 +234,22 @@ pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek
 pub(crate) fn compressible_objgens<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
 ) -> crate::Result<Vec<ObjectRef>> {
+    Ok(compressible_objgens_qpdf_plan(pdf)?.eligible)
+}
+
+/// Generate/source-ObjStm-Preserve traversal result. qpdf removes a stale
+/// generation only while computing compressible objects, then serializes those
+/// exact references as null. Keeping the removed set beside the eligible order
+/// prevents standard enqueue from accidentally inheriting this policy.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CompressiblePlan {
+    pub eligible: Vec<ObjectRef>,
+    pub removed_refs: BTreeSet<ObjectRef>,
+}
+
+pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::reader::Pdf<R>,
+) -> crate::Result<CompressiblePlan> {
     compressible_objgens_with_mode(pdf, CompressibleTraversalMode::QpdfNullAware)
 }
 
@@ -243,7 +262,7 @@ pub(crate) fn compressible_objgens<R: std::io::Read + std::io::Seek>(
 pub(crate) fn compressible_objgens_linearized_legacy<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
 ) -> crate::Result<Vec<ObjectRef>> {
-    compressible_objgens_with_mode(pdf, CompressibleTraversalMode::LegacyLinearized)
+    Ok(compressible_objgens_with_mode(pdf, CompressibleTraversalMode::LegacyLinearized)?.eligible)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -255,14 +274,31 @@ enum CompressibleTraversalMode {
 fn compressible_objgens_with_mode<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
     mode: CompressibleTraversalMode,
-) -> crate::Result<Vec<ObjectRef>> {
+) -> crate::Result<CompressiblePlan> {
     let mut visited: BTreeSet<u32> = BTreeSet::new();
     let mut result: Vec<ObjectRef> = Vec::new();
+    let mut removed_refs = BTreeSet::new();
     let live: BTreeSet<ObjectRef> = if mode == CompressibleTraversalMode::LegacyLinearized {
         pdf.live_object_refs().into_iter().collect()
     } else {
         BTreeSet::new()
     };
+    // qpdf's obj_cache upper_bound test is operation-specific. Build the
+    // highest LIVE generation index once so null edges are O(1), and exclude
+    // free/deleted generations from superseding a lower live object.
+    let highest_live_generation: BTreeMap<u32, u16> =
+        if mode == CompressibleTraversalMode::QpdfNullAware {
+            let mut highest: BTreeMap<u32, u16> = BTreeMap::new();
+            for object_ref in pdf.live_object_refs() {
+                highest
+                    .entry(object_ref.number)
+                    .and_modify(|generation| *generation = (*generation).max(object_ref.generation))
+                    .or_insert(object_ref.generation);
+            }
+            highest
+        } else {
+            BTreeMap::new()
+        };
     // The encryption dictionary is excluded from the result, matching qpdf's
     // `m->trailer.getKey("/Encrypt")` guard (QPDF.cc:2402/2437): it must stay a
     // plain indirect object so the rest of the file can be decrypted. Read it
@@ -281,8 +317,12 @@ fn compressible_objgens_with_mode<R: std::io::Read + std::io::Seek>(
                 if mode == CompressibleTraversalMode::QpdfNullAware && r.number == 0 {
                     continue;
                 }
-                if mode == CompressibleTraversalMode::QpdfNullAware && pdf.object_ref_is_obsolete(r)
+                if mode == CompressibleTraversalMode::QpdfNullAware
+                    && highest_live_generation
+                        .get(&r.number)
+                        .is_some_and(|generation| *generation > r.generation)
                 {
+                    removed_refs.insert(r);
                     continue;
                 }
                 if !visited.insert(r.number) {
@@ -314,7 +354,10 @@ fn compressible_objgens_with_mode<R: std::io::Read + std::io::Seek>(
         }
     }
 
-    Ok(result)
+    Ok(CompressiblePlan {
+        eligible: result,
+        removed_refs,
+    })
 }
 
 /// Distribute `eligible` objects into object-stream groups using qpdf's
@@ -451,7 +494,6 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
     length_exclusions: &BTreeSet<ObjectRef>,
     reachable: Option<&BTreeSet<ObjectRef>>,
     batch_size_cap: Option<NonZeroUsize>,
-    qpdf_preserve_eligibility: bool,
 ) -> crate::Result<PackingPlan> {
     let entries = pdf.source_xref_entries();
 
@@ -487,10 +529,7 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
             if !eligible_for_objstm {
                 continue;
             }
-            let is_signature = qpdf_preserve_eligibility && is_qpdf_signature_dict(pdf, obj_ref)?;
-            if !is_signature {
-                eligible.push(obj_ref);
-            }
+            eligible.push(obj_ref);
         }
 
         if let Some(cap) = batch_size_cap {
@@ -504,7 +543,10 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
         }
     }
 
-    Ok(PackingPlan { batches })
+    Ok(PackingPlan {
+        batches,
+        removed_refs: BTreeSet::new(),
+    })
 }
 
 /// Generate mode: greedily pack all eligible objects in number/generation order.
@@ -556,7 +598,10 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
         batches.push(current_batch);
     }
 
-    Ok(PackingPlan { batches })
+    Ok(PackingPlan {
+        batches,
+        removed_refs: BTreeSet::new(),
+    })
 }
 
 // ── ObjStm body emitter ───────────────────────────────────────────────────────
@@ -807,6 +852,31 @@ mod tests {
             order,
             vec![ref0(1), ref0(2), ref0(5), ref0(4), ref0(3)],
             "eligible objects must be in qpdf depth-first traversal order, not numeric order"
+        );
+    }
+
+    #[test]
+    fn compressible_objgens_does_not_treat_higher_free_generation_as_obsolete() {
+        let bytes = pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /Candidate 4 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (4, b"<< /Current true >>".to_vec()),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        pdf.delete_object(ObjectRef::new(4, 1));
+
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+
+        assert!(
+            eligible.contains(&ref0(4)),
+            "a higher free generation must not make the lower live generation stale"
         );
     }
 
@@ -1159,7 +1229,13 @@ mod tests {
             crate::reader::Pdf::open(std::io::Cursor::new(reverse_kids_pdf(130))).unwrap();
         let eligible = compressible_objgens(&mut pdf).unwrap();
         let groups = even_split_into_streams(&eligible);
-        let rn = crate::rewrite_renumber::GenerateRenumber::build(&mut pdf, &groups, true).unwrap();
+        let rn = crate::rewrite_renumber::GenerateRenumber::build(
+            &mut pdf,
+            &groups,
+            true,
+            &BTreeSet::new(),
+        )
+        .unwrap();
 
         let n = |src: u32| rn.new_for_original(ref0(src)).map(|r| r.number);
         assert_eq!(n(1), Some(2), "Catalog");
