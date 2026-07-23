@@ -2095,6 +2095,19 @@ fn remap_trailer_refs<M: crate::rewrite_renumber::NewNumberLookup>(
     Ok(())
 }
 
+fn remap_qpdf_trailer_refs<R: Read + Seek, M: crate::rewrite_renumber::NewNumberLookup>(
+    pdf: &mut Pdf<R>,
+    trailer: &mut Dictionary,
+    map: &M,
+) -> Result<()> {
+    let mut object = Object::Dictionary(trailer.clone());
+    crate::rewrite_renumber::renumber_qpdf_refs_in_place(pdf, &mut object, map)?;
+    *trailer = object
+        .into_dict()
+        .expect("qpdf trailer rewrite preserves the dictionary variant");
+    Ok(())
+}
+
 fn strip_xref_stream_trailer_keys(trailer: &mut Dictionary) {
     let has_xref_stream_markers = matches!(trailer.get("Type"), Some(Object::Name(type_name)) if type_name.as_slice() == b"XRef")
         || trailer.get("XRefStm").is_some()
@@ -3116,6 +3129,19 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     {
         return write_pdf_generate(pdf, out, options);
     }
+    if matches!(options.object_streams, ObjectStreamMode::Preserve)
+        && options.encrypt.is_none()
+        && options.copy_encryption.is_none()
+        && !options.qdf
+        && pdf.encryption_ref().is_none()
+        && pdf.deleted_object_refs().is_empty()
+    {
+        let config = object_streams::planner_config_from_options(options);
+        let plan = object_streams::plan_object_streams(pdf, &config)?;
+        if !plan.batches.is_empty() {
+            return write_pdf_containerized_qpdf(pdf, out, options, plan.batches, true);
+        }
+    }
 
     let Some(root_ref) = pdf.root_ref() else {
         return Err(crate::Error::Missing("/Root"));
@@ -3132,7 +3158,16 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     // /Length edge is NOT numbered here and disappears cleanly from `renumbered`.
     // In non-QDF mode this is the same behaviour as before.
     use crate::rewrite_renumber::CatalogFirstRenumber;
-    let renumber = CatalogFirstRenumber::build(pdf, true)?;
+    let qpdf_null_visibility = !options.qdf
+        && options.encrypt.is_none()
+        && options.copy_encryption.is_none()
+        && pdf.encryption_ref().is_none()
+        && pdf.deleted_object_refs().is_empty();
+    let renumber = if qpdf_null_visibility {
+        CatalogFirstRenumber::build_qpdf(pdf, true)?
+    } else {
+        CatalogFirstRenumber::build(pdf, true)?
+    };
     // The new /Root reference (always seeded first by the walk, so present).
     let new_root = renumber
         .new_for_original(root_ref)
@@ -3628,6 +3663,8 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         // use qdf_emission_renumber (old→emission); otherwise use the CF renumber.
         if options.qdf {
             crate::rewrite_renumber::renumber_refs_in_place(&mut object, &qdf_emission_renumber)?;
+        } else if qpdf_null_visibility {
+            crate::rewrite_renumber::renumber_qpdf_refs_in_place(pdf, &mut object, &renumber)?;
         } else {
             crate::rewrite_renumber::renumber_refs_in_place(&mut object, &renumber)?;
         }
@@ -3940,6 +3977,8 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             // /Encrypt is handled by apply_encrypt_trailer_entries, so skip both.
             if options.qdf {
                 remap_trailer_refs(&mut trailer, &qdf_emission_renumber, &skip_refs)?;
+            } else if qpdf_null_visibility {
+                remap_qpdf_trailer_refs(pdf, &mut trailer, &renumber)?;
             } else {
                 remap_trailer_refs(&mut trailer, &renumber, &skip_refs)?;
             }
@@ -4096,7 +4135,11 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             // Remap surviving indirect trailer refs (notably /Info) to NEW
             // numbers. /Root is set explicitly to new_root below; /Encrypt is
             // handled by apply_encrypt_trailer_entries.
-            remap_trailer_refs(&mut xref_dict, &renumber, &skip_refs)?;
+            if qpdf_null_visibility {
+                remap_qpdf_trailer_refs(pdf, &mut xref_dict, &renumber)?;
+            } else {
+                remap_trailer_refs(&mut xref_dict, &renumber, &skip_refs)?;
+            }
             // The trailer may carry filter keys from the input's xref stream
             // (e.g. /Filter /FlateDecode). We're emitting freshly built bytes
             // via `Stream::new`, so any stale filter declaration would make
@@ -4236,21 +4279,33 @@ fn generate_invariant<T>(value: Option<T>, what: &str) -> Result<T> {
 /// renumber / encode errors.
 fn write_pdf_generate<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
-    mut out: W,
+    out: W,
     options: &WriteOptions,
 ) -> Result<()> {
-    use crate::rewrite_renumber::{renumber_refs_in_place, GenerateRenumber};
+    // ── object-stream assignment + generate-mode numbering ───────────────────
+    // 1. getCompressibleObjGens DFS from the trailer => eligible list, ordered.
+    let eligible = object_streams::compressible_objgens(pdf)?;
+    // 2. generateObjectStreams even split => one group per container.
+    let groups = object_streams::even_split_into_streams(&eligible);
+    write_pdf_containerized_qpdf(pdf, out, options, groups, false)
+}
+
+fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
+    pdf: &mut Pdf<R>,
+    mut out: W,
+    options: &WriteOptions,
+    groups: Vec<Vec<ObjectRef>>,
+    qpdf_null_visibility: bool,
+) -> Result<()> {
+    use crate::rewrite_renumber::{
+        renumber_qpdf_refs_in_place, renumber_refs_in_place, GenerateRenumber,
+    };
     use std::collections::HashSet;
 
     // `ok_or` (eager) keeps the error construction on the covered happy path;
     // `Error::Missing` is a cheap `&'static str` variant, so no `or_fun_call`.
     let root_ref = pdf.root_ref().ok_or(crate::Error::Missing("/Root"))?;
 
-    // ── object-stream assignment + generate-mode numbering ───────────────────
-    // 1. getCompressibleObjGens DFS from the trailer => eligible list, ordered.
-    let eligible = object_streams::compressible_objgens(pdf)?;
-    // 2. generateObjectStreams even split => one group per container.
-    let groups = object_streams::even_split_into_streams(&eligible);
     // 3. enqueueObject walk with the object-stream branch => container-first
     //    numbering (members ascending-source within each container).
     //
@@ -4260,7 +4315,11 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     // edge. The walk drops it the same way. An orphan holder is never an ObjStm
     // member (members are reached via non-`/Length` edges only), so the even
     // split above is unaffected.
-    let renumber = GenerateRenumber::build(pdf, &groups, true)?;
+    let renumber = if qpdf_null_visibility {
+        GenerateRenumber::build_qpdf(pdf, &groups, true)?
+    } else {
+        GenerateRenumber::build(pdf, &groups, true)?
+    };
     let new_root = generate_invariant(
         renumber.new_for_original(root_ref),
         "/Root absent from renumber map",
@@ -4367,7 +4426,11 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
         match what {
             Emit::Plain(old) => {
                 let mut object = pdf.resolve(*old)?;
-                renumber_refs_in_place(&mut object, &renumber)?;
+                if qpdf_null_visibility {
+                    renumber_qpdf_refs_in_place(pdf, &mut object, &renumber)?;
+                } else {
+                    renumber_refs_in_place(&mut object, &renumber)?;
+                }
                 match object {
                     Object::Stream(stream) => {
                         let (reencoded, source_filter_is_lone_flate) =
@@ -4394,7 +4457,11 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
                 let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(plan.members.len());
                 for &(old, new) in &plan.members {
                     let mut obj = pdf.resolve(old)?;
-                    renumber_refs_in_place(&mut obj, &renumber)?;
+                    if qpdf_null_visibility {
+                        renumber_qpdf_refs_in_place(pdf, &mut obj, &renumber)?;
+                    } else {
+                        renumber_refs_in_place(&mut obj, &renumber)?;
+                    }
                     resolved.push((new, obj));
                 }
                 let body = object_streams::emit_objstm_body_from_resolved(&resolved)?;
@@ -4484,7 +4551,11 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     }
     let mut trailer = pdf.trailer().clone();
     strip_incremental_trailer_keys(&mut trailer);
-    remap_trailer_refs(&mut trailer, &renumber, &skip_refs)?;
+    if qpdf_null_visibility {
+        remap_qpdf_trailer_refs(pdf, &mut trailer, &renumber)?;
+    } else {
+        remap_trailer_refs(&mut trailer, &renumber, &skip_refs)?;
+    }
     let info_ref = match trailer.get("Info") {
         Some(Object::Reference(r)) => Some(*r),
         _ => None,
@@ -4640,6 +4711,14 @@ pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStre
 
     match policy {
         CompressStreams::Yes => {
+            // qpdf declares `/FlateDecode` for a successfully decoded empty
+            // stream but leaves its payload empty instead of emitting zlib's
+            // eight-byte empty wrapper.
+            if decoded.is_empty() {
+                new_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+                new_dict.insert("Length", Object::Integer(0));
+                return Object::Stream(crate::Stream::new(new_dict, Vec::new()));
+            }
             // Re-encode with a minimal FlateDecode dict.  If encoding fails
             // (vanishingly rare for in-memory zlib), keep the original stream
             // verbatim — declaring /FlateDecode on uncompressed bytes would

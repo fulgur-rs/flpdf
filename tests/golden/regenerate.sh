@@ -183,6 +183,165 @@ else
     echo "Skipping missing-trailer-info.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/null-visible-matrix.pdf" ]]; then
+    echo "Generating null-visible-matrix.pdf ..."
+    python3 - "$FIX/null-visible-matrix.pdf" <<'PY'
+import sys
+
+def write_classic(path, objects, size, free_numbers=()):
+    body = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+    offsets = {}
+    for number, object_body in objects:
+        offsets[number] = len(body)
+        body += b"%d 0 obj\n" % number + object_body + b"\nendobj\n"
+    xref = len(body)
+    body += b"xref\n0 %d\n" % (max(max(offsets), max(free_numbers, default=0)) + 1)
+    body += b"0000000000 65535 f \n"
+    for number in range(1, max(max(offsets), max(free_numbers, default=0)) + 1):
+        if number in offsets:
+            body += b"%010d 00000 n \n" % offsets[number]
+        else:
+            body += b"0000000000 00000 f \n"
+    body += (
+        b"trailer\n<< /Size %d /Root 1 0 R >>\n"
+        b"startxref\n%d\n%%%%EOF\n"
+    ) % (size, xref)
+    open(path, "wb").write(body)
+
+matrix_objects = [
+    (1, b"<< /Type /Catalog /Pages 2 0 R /DirectNull null /Zero 0 0 R "
+        b"/Missing 99 0 R /Free 8 0 R /RealNull 5 0 R /Holder 6 0 R "
+        b"/Nested << /Drop 5 0 R /KeepArray [0 0 R 99 0 R 8 0 R 5 0 R 6 0 R] >> "
+        b"/KeepArray [0 0 R 99 0 R 8 0 R 5 0 R 6 0 R] "
+        b"/ArrayDict [<< /Drop 5 0 R /Keep 6 0 R >>] >>"),
+    (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << >> /Contents 4 0 R >>"),
+    (4, b"<< /Length 0 /Drop 5 0 R >>\nstream\n\nendstream"),
+    (5, b"null"),
+    (6, b"5 0 R"),
+]
+
+write_classic(sys.argv[1], matrix_objects, size=100, free_numbers=(7, 8))
+PY
+else
+    echo "Skipping null-visible-matrix.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/null-visible-cycle.pdf" ]]; then
+    echo "Generating null-visible-cycle.pdf ..."
+    python3 - "$FIX/null-visible-cycle.pdf" <<'PY'
+import sys
+
+def write_classic(path, objects, size, free_numbers=()):
+    body = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+    offsets = {}
+    for number, object_body in objects:
+        offsets[number] = len(body)
+        body += b"%d 0 obj\n" % number + object_body + b"\nendobj\n"
+    xref = len(body)
+    body += b"xref\n0 %d\n" % (max(max(offsets), max(free_numbers, default=0)) + 1)
+    body += b"0000000000 65535 f \n"
+    for number in range(1, max(max(offsets), max(free_numbers, default=0)) + 1):
+        if number in offsets:
+            body += b"%010d 00000 n \n" % offsets[number]
+        else:
+            body += b"0000000000 00000 f \n"
+    body += (
+        b"trailer\n<< /Size %d /Root 1 0 R >>\n"
+        b"startxref\n%d\n%%%%EOF\n"
+    ) % (size, xref)
+    open(path, "wb").write(body)
+
+cycle_objects = [
+    (1, b"<< /Type /Catalog /Pages 2 0 R /Cycle 6 0 R >>"),
+    (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << >> /Contents 4 0 R >>"),
+    (4, b"<< /Length 0 >>\nstream\n\nendstream"),
+    (5, b"null"),
+    (6, b"7 0 R"),
+    (7, b"6 0 R"),
+]
+
+write_classic(sys.argv[1], cycle_objects, size=8)
+PY
+else
+    echo "Skipping null-visible-cycle.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/null-visible-matrix-objstm.pdf" ]]; then
+    echo "Generating null-visible-matrix-objstm.pdf ..."
+    python3 - "$FIX/null-visible-matrix-objstm.pdf" <<'PY'
+import sys
+import zlib
+
+matrix_objects = [
+    (1, b"<< /Type /Catalog /Pages 2 0 R /DirectNull null /Zero 0 0 R "
+        b"/Missing 99 0 R /Free 8 0 R /RealNull 5 0 R /Holder 6 0 R "
+        b"/Nested << /Drop 5 0 R /KeepArray [0 0 R 99 0 R 8 0 R 5 0 R 6 0 R] >> "
+        b"/KeepArray [0 0 R 99 0 R 8 0 R 5 0 R 6 0 R] "
+        b"/ArrayDict [<< /Drop 5 0 R /Keep 6 0 R >>] >>"),
+    (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << >> /Contents 4 0 R >>"),
+    (4, b"<< /Length 0 /Drop 5 0 R >>\nstream\n\nendstream"),
+    (5, b"null"),
+    (6, b"5 0 R"),
+]
+
+members = [matrix_objects[i] for i in (0, 1, 2, 4, 5)]
+pair_table = b""
+member_body = b""
+for index, (number, object_body) in enumerate(members):
+    pair_table += b"%d %d " % (number, len(member_body))
+    member_body += object_body
+    if index + 1 < len(members):
+        member_body += b"\n"
+objstm_data = zlib.compress(pair_table + member_body)
+
+body = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n"
+offset4 = len(body)
+body += b"4 0 obj\n" + matrix_objects[3][1] + b"\nendobj\n"
+offset9 = len(body)
+body += (
+    b"9 0 obj\n<< /Type /ObjStm /N 5 /First %d /Length %d "
+    b"/Filter /FlateDecode >>\nstream\n" % (len(pair_table), len(objstm_data))
+)
+body += objstm_data + b"\nendstream\nendobj\n"
+offset10 = len(body)
+
+def append_xref_entry(entries, entry_type, field1, field2):
+    entries.append(entry_type)
+    entries.extend(field1.to_bytes(4, "big"))
+    entries.extend(field2.to_bytes(2, "big"))
+
+xref_entries = bytearray()
+append_xref_entry(xref_entries, 0, 0, 65535)
+append_xref_entry(xref_entries, 2, 9, 0)
+append_xref_entry(xref_entries, 2, 9, 1)
+append_xref_entry(xref_entries, 2, 9, 2)
+append_xref_entry(xref_entries, 1, offset4, 0)
+append_xref_entry(xref_entries, 2, 9, 3)
+append_xref_entry(xref_entries, 2, 9, 4)
+append_xref_entry(xref_entries, 0, 0, 0)
+append_xref_entry(xref_entries, 0, 0, 0)
+append_xref_entry(xref_entries, 1, offset9, 0)
+append_xref_entry(xref_entries, 1, offset10, 0)
+xref_data = zlib.compress(bytes(xref_entries))
+
+body += (
+    b"10 0 obj\n<< /Type /XRef /W [1 4 2] /Index [0 11] /Size 100 "
+    b"/Root 1 0 R /Length %d /Filter /FlateDecode >>\nstream\n" % len(xref_data)
+)
+body += xref_data + b"\nendstream\nendobj\n"
+body += b"startxref\n%d\n%%%%EOF\n" % offset10
+open(sys.argv[1], "wb").write(body)
+PY
+else
+    echo "Skipping null-visible-matrix-objstm.pdf (already exists)"
+fi
+
 if [[ ! -f "$FIX/objstm-lin-split-boundary.pdf" ]]; then
     echo "Generating objstm-lin-split-boundary.pdf ..."
     # flpdf-4vpi / PR #421 Codex review: a real /Info (obj 4) plus 100 missing
@@ -1402,6 +1561,24 @@ mkdir -p \
     "$REF/objstm-gen-nostream-130rev"
 
 echo "=== Generating reference outputs ==="
+
+mkdir -p \
+    "$REF/null-visible-matrix" \
+    "$REF/null-visible-matrix-objstm" \
+    "$REF/null-visible-cycle"
+
+qpdf --object-streams=disable --static-id --warning-exit-0 \
+    "$FIX/null-visible-matrix.pdf" \
+    "$REF/null-visible-matrix/disable.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-matrix-objstm.pdf" \
+    "$REF/null-visible-matrix-objstm/preserve.pdf"
+qpdf --object-streams=disable --static-id --warning-exit-0 \
+    "$FIX/null-visible-cycle.pdf" \
+    "$REF/null-visible-cycle/disable.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-matrix/disable.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-matrix-objstm/preserve.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-cycle/disable.pdf"
 
 # --- one-page: plain, static-id, linearize ---
 qpdf --deterministic-id --warning-exit-0 \
