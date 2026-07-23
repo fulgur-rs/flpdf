@@ -314,6 +314,31 @@ fn is_signature_dict(obj: &Object) -> bool {
     dict_type_is(dict, b"Sig") && dict.get("ByteRange").is_some() && dict.get("Contents").is_some()
 }
 
+/// qpdf Preserve signature eligibility uses `QPDF_Dictionary::hasKey`, whose
+/// value `isNull()` check dereferences indirect objects. A raw dictionary key
+/// whose value is direct null or resolves to null is therefore absent for this
+/// predicate and does not disqualify the dictionary from its source ObjStm.
+fn is_qpdf_preserve_signature_dict<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::reader::Pdf<R>,
+    object_ref: ObjectRef,
+) -> crate::Result<bool> {
+    let object = pdf.resolve(object_ref)?;
+    let Some(dict) = object.as_dict() else {
+        return Ok(false);
+    };
+    if !dict_type_is(dict, b"Sig") {
+        return Ok(false);
+    }
+
+    let key_is_visible = |pdf: &mut crate::reader::Pdf<R>, key: &[u8]| -> crate::Result<bool> {
+        match dict.get(key) {
+            Some(value) => Ok(!crate::qpdf_null::value_is_null(pdf, value)?),
+            None => Ok(false),
+        }
+    };
+    Ok(key_is_visible(pdf, b"ByteRange")? && key_is_visible(pdf, b"Contents")?)
+}
+
 /// Push an object's child values onto the DFS stack so they pop in qpdf's
 /// traversal order: dictionary values in ascending key order, array items in
 /// index order. (A LIFO stack pops in reverse insertion order, so children are
@@ -403,10 +428,16 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
             {
                 continue;
             }
-            let obj = pdf.resolve_borrowed(obj_ref)?;
-            if is_eligible_for_objstm(obj_ref, obj, ctx)
-                && !(qpdf_preserve_eligibility && is_signature_dict(obj))
-            {
+            let eligible_for_objstm = {
+                let obj = pdf.resolve_borrowed(obj_ref)?;
+                is_eligible_for_objstm(obj_ref, obj, ctx)
+            };
+            if !eligible_for_objstm {
+                continue;
+            }
+            let is_signature =
+                qpdf_preserve_eligibility && is_qpdf_preserve_signature_dict(pdf, obj_ref)?;
+            if !is_signature {
                 eligible.push(obj_ref);
             }
         }
@@ -847,6 +878,31 @@ mod tests {
         assert!(
             !order.contains(&ref0(4)),
             "signature dictionary (obj 4) must be excluded from the compressible set; got {order:?}"
+        );
+    }
+
+    /// qpdf's null-aware `hasKey` predicate also treats a missing signature
+    /// field as absent, so an incomplete `/Type /Sig` dictionary is not
+    /// excluded from a preserved source object stream.
+    #[test]
+    fn qpdf_preserve_signature_predicate_requires_both_visible_fields() {
+        let bytes = pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /SigTest 4 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (4, b"<< /Type /Sig /ByteRange [0 10 20 30] >>".to_vec()),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+
+        assert!(
+            !is_qpdf_preserve_signature_dict(&mut pdf, ref0(4)).unwrap(),
+            "missing /Contents is absent under qpdf's hasKey semantics"
         );
     }
 

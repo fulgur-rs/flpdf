@@ -127,6 +127,17 @@ fn preserve_emits_reachable_signature_dictionary_plain() {
 }
 
 #[test]
+fn preserve_keeps_signatures_with_null_fields_compressed_and_hides_fields() {
+    assert_golden(
+        &rewrite_mode(
+            "null-visible-preserve-signature-null-fields.pdf",
+            ObjectStreamMode::Preserve,
+        ),
+        "null-visible-preserve-signature-null-fields/preserve.pdf",
+    );
+}
+
+#[test]
 fn legacy_preserve_fallback_splits_source_container_over_100_members() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/null-visible-preserve-over-100.pdf");

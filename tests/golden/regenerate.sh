@@ -345,13 +345,15 @@ fi
 if [[ ! -f "$FIX/null-visible-preserve-mixed.pdf" || \
       ! -f "$FIX/null-visible-preserve-unreachable.pdf" || \
       ! -f "$FIX/null-visible-preserve-over-100.pdf" || \
-      ! -f "$FIX/null-visible-preserve-signature.pdf" ]]; then
+      ! -f "$FIX/null-visible-preserve-signature.pdf" || \
+      ! -f "$FIX/null-visible-preserve-signature-null-fields.pdf" ]]; then
     echo "Generating Preserve reachability/container-boundary fixtures ..."
     python3 - \
         "$FIX/null-visible-preserve-mixed.pdf" \
         "$FIX/null-visible-preserve-unreachable.pdf" \
         "$FIX/null-visible-preserve-over-100.pdf" \
-        "$FIX/null-visible-preserve-signature.pdf" <<'PY'
+        "$FIX/null-visible-preserve-signature.pdf" \
+        "$FIX/null-visible-preserve-signature-null-fields.pdf" <<'PY'
 import sys
 import zlib
 
@@ -473,6 +475,22 @@ write_objstm(
         (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
             b"/Resources << >> /Contents 4 0 R >>"),
         (5, b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>"),
+    ],
+    container_number=9,
+    xref_number=10,
+)
+
+write_objstm(
+    sys.argv[5],
+    [(4, empty_stream)],
+    [
+        (1, b"<< /Type /Catalog /Pages 2 0 R /Signatures [5 0 R 6 0 R] >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << >> /Contents 4 0 R >>"),
+        (5, b"<< /Type /Sig /ByteRange null /Contents <00> >>"),
+        (6, b"<< /Type /Sig /ByteRange 7 0 R /Contents <00> >>"),
+        (7, b"null"),
     ],
     container_number=9,
     xref_number=10,
@@ -1709,7 +1727,8 @@ mkdir -p \
     "$REF/null-visible-preserve-mixed" \
     "$REF/null-visible-preserve-unreachable" \
     "$REF/null-visible-preserve-over-100" \
-    "$REF/null-visible-preserve-signature"
+    "$REF/null-visible-preserve-signature" \
+    "$REF/null-visible-preserve-signature-null-fields"
 
 qpdf --object-streams=disable --static-id --warning-exit-0 \
     "$FIX/null-visible-matrix.pdf" \
@@ -1735,10 +1754,15 @@ qpdf --object-streams=preserve --static-id --warning-exit-0 \
 qpdf --object-streams=preserve --static-id --warning-exit-0 \
     "$FIX/null-visible-preserve-signature.pdf" \
     "$REF/null-visible-preserve-signature/preserve.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-signature-null-fields.pdf" \
+    "$REF/null-visible-preserve-signature-null-fields/preserve.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-preserve-mixed/preserve.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-preserve-unreachable/preserve.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-preserve-over-100/preserve.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-preserve-signature/preserve.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-preserve-signature-null-fields/preserve.pdf"
 
 # --- one-page: plain, static-id, linearize ---
 qpdf --deterministic-id --warning-exit-0 \
