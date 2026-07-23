@@ -199,7 +199,7 @@ fn collect_qpdf_enqueue_refs<R: Read + Seek>(
     }
     match obj {
         Object::Reference(reference) => {
-            if reference.number != 0 {
+            if reference.number != 0 && !pdf.object_ref_is_obsolete(*reference) {
                 found.push(*reference);
             }
         }
@@ -724,7 +724,7 @@ fn rewrite_qpdf<R: Read + Seek, M: NewNumberLookup>(
     }
     match obj {
         Object::Reference(reference) => {
-            if reference.number == 0 {
+            if reference.number == 0 || pdf.object_ref_is_obsolete(*reference) {
                 *obj = Object::Null;
             } else {
                 *reference = map.new_for_original(*reference).ok_or_else(|| {

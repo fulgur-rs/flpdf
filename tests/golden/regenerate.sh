@@ -183,12 +183,9 @@ else
     echo "Skipping missing-trailer-info.pdf (already exists)"
 fi
 
-if [[ ! -f "$FIX/null-visible-matrix.pdf" || \
-      ! -f "$FIX/null-visible-split-boundary.pdf" ]]; then
-    echo "Generating null-visible matrix/boundary fixtures ..."
-    python3 - \
-        "$FIX/null-visible-matrix.pdf" \
-        "$FIX/null-visible-split-boundary.pdf" <<'PY'
+if [[ ! -f "$FIX/null-visible-matrix.pdf" ]]; then
+    echo "Generating null-visible matrix fixture ..."
+    python3 - "$FIX/null-visible-matrix.pdf" <<'PY'
 import sys
 
 def write_classic(path, objects, size, free_numbers=()):
@@ -226,10 +223,39 @@ matrix_objects = [
 ]
 
 write_classic(sys.argv[1], matrix_objects, size=100, free_numbers=(7, 8))
+PY
+else
+    echo "Skipping null-visible matrix fixture (already exists)"
+fi
+
+if [[ ! -f "$FIX/null-visible-split-boundary.pdf" ]]; then
+    echo "Generating null-visible split-boundary fixture ..."
+    python3 - "$FIX/null-visible-split-boundary.pdf" <<'PY'
+import sys
+
+def write_classic(path, objects, size, free_numbers=()):
+    body = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+    offsets = {}
+    for number, object_body in objects:
+        offsets[number] = len(body)
+        body += b"%d 0 obj\n" % number + object_body + b"\nendobj\n"
+    xref = len(body)
+    body += b"xref\n0 %d\n" % (max(max(offsets), max(free_numbers, default=0)) + 1)
+    body += b"0000000000 65535 f \n"
+    for number in range(1, max(max(offsets), max(free_numbers, default=0)) + 1):
+        if number in offsets:
+            body += b"%010d 00000 n \n" % offsets[number]
+        else:
+            body += b"0000000000 00000 f \n"
+    body += (
+        b"trailer\n<< /Size %d /Root 1 0 R >>\n"
+        b"startxref\n%d\n%%%%EOF\n"
+    ) % (size, xref)
+    open(path, "wb").write(body)
 
 candidate_refs = b" ".join(b"%d 0 R" % number for number in range(5, 107))
 boundary_objects = [
-    (1, b"<< /Type /Catalog /Pages 2 0 R /Drop 4 0 R /Candidates ["
+    (1, b"<< /Type /Catalog /Pages 2 0 R /ADrop 4 0 R /ZCandidates ["
         + candidate_refs + b" 4 0 R] >>"),
     (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
     (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
@@ -239,10 +265,41 @@ boundary_objects.extend(
     (number, b"<< /Candidate %d >>" % number)
     for number in range(5, 107)
 )
-write_classic(sys.argv[2], boundary_objects, size=107)
+write_classic(sys.argv[1], boundary_objects, size=107)
 PY
 else
-    echo "Skipping null-visible matrix/boundary fixtures (already exist)"
+    echo "Skipping null-visible split-boundary fixture (already exists)"
+fi
+
+if [[ ! -f "$FIX/null-visible-stale-generation.pdf" ]]; then
+    echo "Generating null-visible stale-generation fixture ..."
+    python3 - "$FIX/null-visible-stale-generation.pdf" <<'PY'
+import sys
+
+body = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+offsets = {}
+objects = [
+    (1, 0, b"<< /Type /Catalog /Pages 2 0 R /Candidates [4 0 R 4 1 R] >>"),
+    (2, 0, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    (3, 0, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+    (4, 1, b"<< /Current true >>"),
+]
+for number, generation, object_body in objects:
+    offsets[number] = (len(body), generation)
+    body += b"%d %d obj\n" % (number, generation) + object_body + b"\nendobj\n"
+xref = len(body)
+body += b"xref\n0 5\n0000000000 65535 f \n"
+for number in range(1, 5):
+    offset, generation = offsets[number]
+    body += b"%010d %05d n \n" % (offset, generation)
+body += (
+    b"trailer\n<< /Size 5 /Root 1 0 R >>\n"
+    b"startxref\n%d\n%%%%EOF\n"
+) % xref
+open(sys.argv[1], "wb").write(body)
+PY
+else
+    echo "Skipping null-visible stale-generation fixture (already exists)"
 fi
 
 if [[ ! -f "$FIX/null-visible-cycle.pdf" ]]; then
@@ -1740,6 +1797,7 @@ echo "=== Generating reference outputs ==="
 mkdir -p \
     "$REF/null-visible-matrix" \
     "$REF/null-visible-split-boundary" \
+    "$REF/null-visible-stale-generation" \
     "$REF/null-visible-matrix-objstm" \
     "$REF/null-visible-cycle" \
     "$REF/null-visible-preserve-mixed" \
@@ -1757,6 +1815,9 @@ qpdf --object-streams=generate --static-id --warning-exit-0 \
 qpdf --object-streams=generate --static-id --warning-exit-0 \
     "$FIX/null-visible-split-boundary.pdf" \
     "$REF/null-visible-split-boundary/generate.pdf"
+qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/null-visible-stale-generation.pdf" \
+    "$REF/null-visible-stale-generation/generate.pdf"
 qpdf --object-streams=preserve --static-id --warning-exit-0 \
     "$FIX/null-visible-matrix-objstm.pdf" \
     "$REF/null-visible-matrix-objstm/preserve.pdf"
@@ -1767,6 +1828,8 @@ qpdf --check --warning-exit-0 "$REF/null-visible-matrix/disable.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-matrix/generate.pdf"
 qpdf --check --warning-exit-0 \
     "$REF/null-visible-split-boundary/generate.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-stale-generation/generate.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-matrix-objstm/preserve.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-cycle/disable.pdf"
 qpdf --object-streams=preserve --static-id --warning-exit-0 \

@@ -3140,13 +3140,14 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     // containers). That layout differs structurally from this path's
     // Catalog-first + containers-above-max scheme, so route it to the dedicated
     // emitter. Restricted to the plain case: --qdf forces ObjStm off (it always
-    // emits a classic xref table), and --encrypt / --copy-encryption-from keep
-    // the containers-above-max scheme here (their /Encrypt slot allocation
-    // depends on it).
+    // emits a classic xref table), and output encryption, copied encryption, or
+    // source encryption keep the containers-above-max scheme here (their
+    // encryption/traversal state depends on the legacy route).
     if matches!(options.object_streams, ObjectStreamMode::Generate)
         && options.encrypt.is_none()
         && options.copy_encryption.is_none()
         && !options.qdf
+        && pdf.encryption_ref().is_none()
     {
         return write_pdf_generate(pdf, out, options);
     }
@@ -4299,8 +4300,8 @@ fn generate_invariant<T>(value: Option<T>, what: &str) -> Result<T> {
 /// uncompressed objects take the trailing numbers. The cross-reference is emitted
 /// as a stream (type-2 entries require it) with the header floored to 1.5.
 ///
-/// Scope: the plain (non-encrypt / non-copy-encryption / non-qdf) case; the
-/// caller (`write_pdf_full_rewrite`) routes only those here.
+/// Scope: the plain (source-unencrypted / non-encrypt / non-copy-encryption /
+/// non-qdf) case; the caller (`write_pdf_full_rewrite`) routes only those here.
 ///
 /// # Errors
 ///
@@ -8246,6 +8247,48 @@ mod tests {
         assert!(
             ext_dict.get("XYZW").is_some(),
             "non-ADBE developer prefix from indirect /Extensions must survive: {ext_dict:?}"
+        );
+    }
+
+    #[test]
+    fn source_encrypted_generate_keeps_legacy_container_numbering() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
+        let file = std::fs::File::open(fixture).expect("open encrypted fixture");
+        let mut pdf = crate::Pdf::open(std::io::BufReader::new(file))
+            .expect("fixture authenticates with the default empty password");
+        assert!(
+            pdf.encryption_ref().is_some(),
+            "route sentinel requires a source-encrypted PDF"
+        );
+
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            object_streams: ObjectStreamMode::Generate,
+            ..WriteOptions::default()
+        };
+        let mut out = Vec::new();
+        write_pdf_with_options(&mut pdf, &mut out, &options).expect("Generate rewrite");
+
+        let reopened = crate::Pdf::open_mem_owned(out).expect("reopen unencrypted output");
+        let compressed: Vec<(ObjectRef, u32)> = reopened
+            .source_xref_entries()
+            .into_iter()
+            .filter_map(|(member, offset)| match offset {
+                XrefOffset::Compressed { stream, .. } => Some((member, stream)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !compressed.is_empty(),
+            "Generate must still emit an object stream on source-encrypted input"
+        );
+        assert!(
+            compressed
+                .iter()
+                .all(|(member, container)| *container > member.number),
+            "source encryption must keep the legacy containers-above-members route: {compressed:?}"
         );
     }
 }

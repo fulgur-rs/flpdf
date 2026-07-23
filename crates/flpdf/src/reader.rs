@@ -940,6 +940,22 @@ impl<R: Read + Seek> Pdf<R> {
             .collect()
     }
 
+    /// Whether `object_ref` is superseded by a known higher generation of the
+    /// same object number.
+    ///
+    /// qpdf performs this check before marking an object number visited. A
+    /// stale reference therefore resolves as null without hiding the current
+    /// generation when both occur in the same traversal.
+    pub(crate) fn object_ref_is_obsolete(&self, object_ref: ObjectRef) -> bool {
+        use std::ops::Bound::{Excluded, Included};
+
+        let highest_same_number = ObjectRef::new(object_ref.number, u16::MAX);
+        self.cache
+            .entries()
+            .range((Excluded(object_ref), Included(highest_same_number)))
+            .any(|(_candidate, entry)| !matches!(entry, CacheEntry::Missing))
+    }
+
     /// Object refs that the cross-reference table marks as live.
     ///
     /// Excludes:

@@ -231,8 +231,38 @@ pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek
 pub(crate) fn compressible_objgens<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
 ) -> crate::Result<Vec<ObjectRef>> {
+    compressible_objgens_with_mode(pdf, CompressibleTraversalMode::QpdfNullAware)
+}
+
+/// Pre-Task-3 compressible traversal retained exclusively for linearization.
+///
+/// Linearized Generate still appends its separately classified resurrectable
+/// null references after this walk. Keeping the old dictionary visibility and
+/// live-object filter here prevents those refs from being admitted twice until
+/// Task 4 converges the two linearization paths.
+pub(crate) fn compressible_objgens_linearized_legacy<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::reader::Pdf<R>,
+) -> crate::Result<Vec<ObjectRef>> {
+    compressible_objgens_with_mode(pdf, CompressibleTraversalMode::LegacyLinearized)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompressibleTraversalMode {
+    LegacyLinearized,
+    QpdfNullAware,
+}
+
+fn compressible_objgens_with_mode<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::reader::Pdf<R>,
+    mode: CompressibleTraversalMode,
+) -> crate::Result<Vec<ObjectRef>> {
     let mut visited: BTreeSet<u32> = BTreeSet::new();
     let mut result: Vec<ObjectRef> = Vec::new();
+    let live: BTreeSet<ObjectRef> = if mode == CompressibleTraversalMode::LegacyLinearized {
+        pdf.live_object_refs().into_iter().collect()
+    } else {
+        BTreeSet::new()
+    };
     // The encryption dictionary is excluded from the result, matching qpdf's
     // `m->trailer.getKey("/Encrypt")` guard (QPDF.cc:2402/2437): it must stay a
     // plain indirect object so the rest of the file can be decrypted. Read it
@@ -248,27 +278,39 @@ pub(crate) fn compressible_objgens<R: std::io::Read + std::io::Seek>(
     while let Some(obj) = stack.pop() {
         match obj {
             Object::Reference(r) => {
-                if r.number == 0 {
+                if mode == CompressibleTraversalMode::QpdfNullAware && r.number == 0 {
+                    continue;
+                }
+                if mode == CompressibleTraversalMode::QpdfNullAware && pdf.object_ref_is_obsolete(r)
+                {
                     continue;
                 }
                 if !visited.insert(r.number) {
                     continue;
                 }
-                let is_signature = is_qpdf_signature_dict(pdf, r)?;
                 let resolved = pdf.resolve(r)?;
+                let is_signature = match mode {
+                    CompressibleTraversalMode::LegacyLinearized => {
+                        is_legacy_signature_dict(&resolved)
+                    }
+                    CompressibleTraversalMode::QpdfNullAware => is_qpdf_signature_dict(pdf, r)?,
+                };
                 // Streams, signature value dictionaries, and the encryption
                 // dictionary cannot be stored inside an object stream, so they
                 // are excluded from the result — but they are still traversed for
                 // child references (QPDF.cc:2437-2445).
-                if !matches!(resolved, Object::Stream(_)) && !is_signature && Some(r) != encrypt_ref
+                if !matches!(resolved, Object::Stream(_))
+                    && !is_signature
+                    && Some(r) != encrypt_ref
+                    && (mode == CompressibleTraversalMode::QpdfNullAware || live.contains(&r))
                 {
                     result.push(r);
                 }
-                push_children(pdf, &resolved, &mut stack)?;
+                push_children(pdf, &resolved, &mut stack, mode)?;
             }
             // Direct (inline) container: traversed for its children but never
             // contributes a reference (it has no object number of its own).
-            other => push_children(pdf, &other, &mut stack)?,
+            other => push_children(pdf, &other, &mut stack, mode)?,
         }
     }
 
@@ -326,6 +368,14 @@ fn is_qpdf_signature_dict<R: std::io::Read + std::io::Seek>(
     Ok(key_is_visible(pdf, b"ByteRange")? && key_is_visible(pdf, b"Contents")?)
 }
 
+/// Pre-Task-3 raw signature predicate used by the isolated linearized walk.
+fn is_legacy_signature_dict(obj: &Object) -> bool {
+    let Some(dict) = obj.as_dict() else {
+        return false;
+    };
+    dict_type_is(dict, b"Sig") && dict.get("ByteRange").is_some() && dict.get("Contents").is_some()
+}
+
 /// Push an object's child values onto the DFS stack so they pop in qpdf's
 /// traversal order: dictionary values in ascending key order, array items in
 /// index order. (A LIFO stack pops in reverse insertion order, so children are
@@ -334,11 +384,12 @@ fn push_children<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
     obj: &Object,
     stack: &mut Vec<Object>,
+    mode: CompressibleTraversalMode,
 ) -> crate::Result<()> {
     match obj {
-        Object::Dictionary(d) => push_dict_children(pdf, d, stack, false)?,
+        Object::Dictionary(d) => push_dict_children(pdf, d, stack, false, mode)?,
         // A stream is traversed via its dictionary; the data bytes are opaque.
-        Object::Stream(s) => push_dict_children(pdf, &s.dict, stack, true)?,
+        Object::Stream(s) => push_dict_children(pdf, &s.dict, stack, true, mode)?,
         Object::Array(items) => {
             for v in items.iter().rev() {
                 stack.push(v.clone());
@@ -358,9 +409,14 @@ fn push_dict_children<R: std::io::Read + std::io::Seek>(
     dict: &Dictionary,
     stack: &mut Vec<Object>,
     is_stream: bool,
+    mode: CompressibleTraversalMode,
 ) -> crate::Result<()> {
     let entries = crate::qpdf_null::snapshot_entries(dict, is_stream);
-    let entries = crate::qpdf_null::visible_entries(pdf, entries)?;
+    let entries = if mode == CompressibleTraversalMode::QpdfNullAware {
+        crate::qpdf_null::visible_entries(pdf, entries)?
+    } else {
+        entries
+    };
     for (_, value) in entries.into_iter().rev() {
         stack.push(value);
     }
@@ -994,12 +1050,11 @@ mod tests {
         let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
         let eligible = compressible_objgens(&mut pdf).unwrap();
         let groups = even_split_into_streams(&eligible);
-        let expected_first: Vec<ObjectRef> =
-            std::iter::once(ref0(1)).chain((5..=56).map(ref0)).collect();
-        let expected_second: Vec<ObjectRef> = (57..=106)
-            .map(ref0)
-            .chain([ref0(4), ref0(2), ref0(3)])
+        let expected_first: Vec<ObjectRef> = [ref0(1), ref0(2), ref0(3)]
+            .into_iter()
+            .chain((5..=54).map(ref0))
             .collect();
+        let expected_second: Vec<ObjectRef> = (55..=106).map(ref0).chain([ref0(4)]).collect();
 
         assert_eq!(eligible.len(), 106);
         assert_eq!(groups.len(), 2);

@@ -86,6 +86,17 @@ fn generate_null_visibility_split_boundary_is_byte_identical_to_qpdf() {
 }
 
 #[test]
+fn generate_stale_generation_does_not_hide_current_generation() {
+    assert_golden(
+        &rewrite_mode(
+            "null-visible-stale-generation.pdf",
+            ObjectStreamMode::Generate,
+        ),
+        "null-visible-stale-generation/generate.pdf",
+    );
+}
+
+#[test]
 fn generate_keeps_signatures_with_null_fields_compressed_and_hides_fields() {
     assert_golden(
         &rewrite_mode(

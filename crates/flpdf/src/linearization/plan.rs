@@ -2312,7 +2312,7 @@ pub(crate) fn objstm_membership_linearized<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     assigned: &BTreeSet<ObjectRef>,
 ) -> crate::Result<Vec<Vec<ObjectRef>>> {
-    let mut eligible = crate::writer::object_streams::compressible_objgens(pdf)?;
+    let mut eligible = crate::writer::object_streams::compressible_objgens_linearized_legacy(pdf)?;
     // Resurrected null-resolving array refs (flpdf-0gyq): `compressible_objgens`
     // filters to live objects, so it excludes these free/missing refs — but qpdf
     // compresses them as the TRAILING members of the ObjStm. Append them after the
