@@ -13,6 +13,10 @@ first-page-shared containers, then first-page outline containers when
 `/PageMode /UseOutlines` places outlines in the first-page section.
 
 Success requires byte-identical output against qpdf 11.9.0 in both modes.
+The same ordered object-user classification is canonical for all
+linearization parts, so this change also includes its necessary adjacent
+effect: a non-first-page object with a thumbnail user is qpdf Part 9, not
+Part 7.
 
 ## qpdf Behavior
 
@@ -32,6 +36,12 @@ itself using this precedence:
 A container is first-page-private only when its union has a first-page user
 and has no document-other, non-first-page, or thumbnail users. Every other
 first-page container is first-page-shared.
+
+For a non-first-page object or container, qpdf's
+`lc_other_page_private` predicate likewise requires `thumbs == 0`.
+Therefore a union with exactly one non-first-page user but any thumbnail user
+belongs to Part 9 rather than Part 7. This is classification, not a change to
+the Part 7/8/9 placement mechanism or within-part ordering.
 
 qpdf emits the first page dictionary, the
 `lc_first_page_private` set, the `lc_first_page_shared` set, and finally
@@ -68,14 +78,18 @@ No planner-side reclassification or first-member heuristic is added.
 
 ### User signals
 
-`route_objstm_containers` already computes first-page reach, non-first-page
-reach, open-document membership, document-other membership, and outline
-membership.
+Build one qpdf-style ordered object-user map and reuse it in both the classic
+partition and `route_objstm_containers`. For each page, the traversal has one
+shared `visited` set, visits dictionary keys lexically, recursively descends
+direct arrays and dictionaries, and switches from `ou_page` to `ou_thumb`
+while descending the leaf page's `/Thumb` value. Thus indirect descendants of
+a direct `/Thumb` receive thumbnail users, and the first edge to an indirect
+object wins that page's user. Ordinary page and thumbnail membership must
+come from this same traversal; independently computed closures plus post-hoc
+subtraction cannot reproduce qpdf's order.
 
-Extract the existing classic-path thumbnail-user calculation into a private
-helper and reuse it in container routing. The helper must preserve qpdf's
-special rule that a page's `/Thumb` traversal does not add `ou_thumb` to an
-object already visited through that same page's ordinary page closure.
+Continue computing open-document, document-other, and outline membership
+through their existing routes.
 
 For each container, union the signals of all surviving members and apply
 qpdf's precedence exactly once. A first-page container is private only when
@@ -101,6 +115,9 @@ that split order and append them to separate stable buckets:
 
 Concatenate the three first-page buckets in qpdf order. Sorting members within
 each generated container by source object number remains unchanged.
+The second-half bucket placement mechanism and within-part ordering remain
+unchanged; only the canonical ordered-user predicate may classify a
+non-first-page thumbnail union as Part 9 instead of Part 7.
 
 ### Preserve ordering
 
@@ -122,6 +139,9 @@ This change adds no public API or new recoverable error case.
   private/shared classification.
 - First-page-private means the complete union satisfies qpdf's private
   predicate; a single shared member makes the whole container shared.
+- Other-page-private means the complete union has exactly one non-first-page
+  user and no document-other or thumbnail user; a thumbnail user makes it
+  Part 9.
 - Generate and Preserve retain their existing within-container member order.
 - Empty preserved containers remain omitted after eligibility filtering.
 
@@ -140,9 +160,13 @@ Follow red-green-refactor.
    failure in Preserve.
 4. Add focused unit tests for private/shared/outline routing and stable
    private-before-shared batch ordering.
-5. Implement the canonical route and shared thumbnail-user helper.
-6. Verify strict byte identity and structural parity for both new cases.
-7. Run formatting, focused tests, both crate suites, workspace tests,
+5. Add focused RED cases for a direct `/Thumb` descendant and for lexical
+   first-edge-wins when `/Thumb` precedes another edge to the same object.
+6. Implement the canonical route and shared ordered page/thumbnail user map,
+   including the qpdf Part 7 `thumbs == 0` predicate.
+7. Verify strict byte identity and structural parity for Generate and Preserve
+   in the ordering and thumbnail-user cases.
+8. Run formatting, focused tests, both crate suites, workspace tests,
    all-feature clippy, qpdf validation, and committed-HEAD patch coverage.
    Changed-line coverage must be 100%.
 
@@ -153,4 +177,11 @@ same filtered-container classification contract to both.
 
 It does not change non-linearized object-stream writing, compression policy,
 object eligibility, even-split membership, preserved source membership,
-classic non-ObjStm ordering, or second-half container ordering.
+or any part's placement mechanism or within-part ordering.
+
+The user explicitly approved including the adjacent qpdf-canonical
+classification implied by the same ordered user contract: non-first-page
+thumbnail objects and containers that previously satisfied the broad
+one-page route move from Part 7 to Part 9. This is the only second-half
+classification change in scope; it does not reorder objects within Part 7,
+Part 8, or Part 9.

@@ -4,7 +4,7 @@
 
 **Goal:** Make linearized Generate and Preserve output order multiple first-page ObjStm containers byte-identically to qpdf 11.9.0: private, then shared, then first-page outlines.
 
-**Architecture:** Refine the canonical container route so it retains qpdf's first-page private/shared/outline subsection. Reuse one thumbnail-user helper in both the classic partition and ObjStm router, then use stable route buckets in Generate and Preserve so their existing container-number order is preserved within each qpdf subsection.
+**Architecture:** Refine the canonical container route so it retains qpdf's first-page private/shared/outline subsection. Build one qpdf-style ordered per-page object-user map for both the classic partition and ObjStm router, then use stable route buckets in Generate and Preserve so their existing container-number order is preserved within each qpdf subsection. The map also supplies qpdf's canonical `thumbs == 0` gate for Part 7.
 
 **Tech Stack:** Rust 2021, existing `LinearizationPlan` and object-stream writer, Python 3 fixture generator, qpdf 11.9.0 as the byte oracle, `cargo test`, and `scripts/patch-coverage.sh`.
 
@@ -12,7 +12,8 @@
 
 - qpdf 11.9.0 source and observed output are the behavior oracle.
 - Cover both linearized `ObjectStreamMode::Generate` and `ObjectStreamMode::Preserve`.
-- Do not change non-linearized object streams, compression, eligibility, container membership, or second-half ordering.
+- Do not change non-linearized object streams, compression, eligibility, container membership, any part's placement mechanism, or within-part ordering.
+- Include the user-approved adjacent qpdf classification implied by the shared ordered-user contract: a non-first-page thumbnail object/container is Part 9 rather than Part 7. This is not a change to Part 7/8/9 placement or ordering.
 - Preserve source ObjStm membership and member-index order; do not split or repack a preserved container.
 - Generate retains the existing global even split and source-object-number member order.
 - Every changed executable line under `crates/flpdf/src` must have 100% patch coverage from the final committed `HEAD`.
@@ -27,9 +28,12 @@
 - Create `tests/fixtures/compat/objstm-lin-firstpage-private-before-shared-bearing.pdf`: qpdf-derived ObjStm-bearing input for Preserve mode.
 - Create `tests/golden/references/objstm-lin-firstpage-private-before-shared/linearize-objstm.pdf`: qpdf 11.9.0 Generate oracle.
 - Create `tests/golden/references/objstm-lin-firstpage-private-before-shared-bearing/linearize-objstm-preserve.pdf`: qpdf 11.9.0 Preserve oracle.
+- Create `docs/plans/tools/gen_thumbnail_user_order.py`: emit direct-`/Thumb`-descendant and lexical first-edge-wins fixtures.
+- Create `tests/fixtures/compat/objstm-lin-thumb-{direct-descendant,first-edge-wins}.pdf` and their `-bearing.pdf` variants.
+- Create qpdf Generate and Preserve goldens under `tests/golden/references/objstm-lin-thumb-{direct-descendant,first-edge-wins}{-bearing}/`.
 - Modify `tests/golden/regenerate.sh`: deterministically rebuild both fixtures/goldens and validate them.
 - Modify `crates/flpdf/tests/cmp_linearize_objstm_tests.rs`: add structural and strict byte gates for Generate and Preserve.
-- Modify `crates/flpdf/src/linearization/plan.rs`: share thumbnail-user calculation, retain exact first-page routes, and bucket both modes by those routes.
+- Modify `crates/flpdf/src/linearization/plan.rs`: share one ordered page/thumbnail user map, retain exact first-page routes, apply the canonical Part 7 thumbnail gate, and bucket both modes by those routes.
 - Modify `crates/flpdf/src/linearization/writer.rs`: recognize all refined first-half route variants as unreachable in second-half placement.
 
 ---
@@ -318,7 +322,8 @@ Do not commit yet. Keep the RED tests in the worktree for Task 3.
 - Test: `crates/flpdf/tests/cmp_linearize_objstm_tests.rs`
 
 **Interfaces:**
-- Produces: `thumbnail_user_set(...) -> crate::Result<BTreeSet<ObjectRef>>`.
+- Produces: `page_object_users(...) -> crate::Result<PageObjectUsers>`, with
+  exact per-page ordinary and thumbnail membership.
 - Produces: `ContainerPart::{FirstPagePrivate, FirstPageShared, FirstPageOutlines}`.
 - Preserves: `route_objstm_containers(...) -> crate::Result<Vec<ContainerPart>>`.
 
@@ -386,6 +391,13 @@ fn route_objstm_containers_keeps_same_page_self_thumb_private() {
 }
 ```
 
+Also add focused tests that are RED against a post-hoc thumbnail closure:
+
+- a direct `/Thumb` dictionary whose indirect descendant must receive
+  `ou_thumb`;
+- a page where `/Thumb` sorts before `/Zzz` and both reach the same object, so
+  qpdf's shared `visited` set assigns that object only the thumbnail user.
+
 - [ ] **Step 2: Run the focused unit test and verify RED**
 
 Run:
@@ -394,74 +406,50 @@ Run:
 cargo test -p flpdf --lib route_objstm_containers -- --nocapture
 ```
 
-Expected: compilation fails because the three refined variants do not exist.
-This is the focused TDD failure for the production change.
+Expected: the route-variant assertions fail before route refinement. The two
+ordered-thumbnail tests must also fail with the old approximation: a direct
+descendant is missed, and a later ordinary edge incorrectly wins after
+post-hoc closure subtraction.
 
-- [ ] **Step 3: Extract the classic thumbnail-user calculation**
+- [ ] **Step 3: Build one ordered page/thumbnail user map**
 
-Add this private helper near `document_other_set`:
+Add a private `PageObjectUsers` result near `document_other_set`, with ordinary
+and thumbnail sets indexed by page. Implement `page_object_users` to reproduce
+qpdf 11.9.0 `updateObjectMaps`:
 
-```rust
-fn thumbnail_user_set<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_refs: &[ObjectRef],
-    first_page_set: &BTreeSet<ObjectRef>,
-    other_page_closures: &[Vec<ObjectRef>],
-    live: &BTreeSet<ObjectRef>,
-) -> crate::Result<BTreeSet<ObjectRef>> {
-    let page_tree = page_tree_node_refs(pdf)?;
-    let mut thumb_refs = Vec::new();
-    for (page_idx, &page_ref) in page_refs.iter().enumerate() {
-        let thumb = pdf
-            .resolve_borrowed(page_ref)?
-            .as_dict()
-            .and_then(|dict| dict.get("Thumb"))
-            .and_then(|object| object.as_ref_id());
-        thumb_refs.extend(thumb.map(|thumb_ref| (page_idx, thumb_ref)));
-    }
+1. Start a fresh shared `visited` set for each page.
+2. Materialize the leaf page's inherited `/MediaBox`, `/CropBox`,
+   `/Resources`, and `/Rotate` view before walking.
+3. Visit dictionary keys in lexical order and array items in array order.
+4. Recursively traverse direct dictionaries and arrays without losing the
+   active user.
+5. Switch the active user from `ou_page` to `ou_thumb` only while descending
+   the leaf page's `/Thumb`.
+6. Record an indirect object for the first active user that reaches it on that
+   page; the shared `visited` set makes subsequent edges no-ops.
+7. Preserve the existing non-top `/Page` boundary, live/resurrectable-null,
+   inline-depth, and stream `/Length` contracts.
 
-    let mut result = BTreeSet::new();
-    for (page_idx, thumb_ref) in thumb_refs {
-        let closure =
-            closure_from_seeds(pdf, vec![(thumb_ref, false)], &page_tree, live)?;
-        for object_ref in closure {
-            let visited_by_page = if page_idx == 0 {
-                first_page_set.contains(&object_ref)
-            } else {
-                other_page_closures[page_idx - 1].contains(&object_ref)
-            };
-            if !visited_by_page {
-                result.insert(object_ref);
-            }
-        }
-    }
-    Ok(result)
-}
-```
+Compute this map once in `LinearizationPlan::from_pdf`. Filter the classic
+per-page closures through its ordinary page memberships and derive the global
+thumbnail set from its thumbnail memberships. Compute the same map once in
+`route_objstm_containers`; do not reconstruct thumbnail users from a separate
+closure.
 
-Replace the Step 4b inline block in `LinearizationPlan::from_pdf` with:
-
-```rust
-let thumb_shared_set = thumbnail_user_set(
-    pdf,
-    &page_refs,
-    &first_page_set,
-    &other_page_closures,
-    &live,
-)?;
-```
-
-Retain the existing qpdf explanation above the call, but move helper-specific
-details into the helper's rustdoc. This is a mechanical extraction; run the
-existing thumbnail unit and byte tests before changing routing:
+Run the existing and new thumbnail unit/byte tests before changing stable
+bucket assembly:
 
 ```bash
 cargo test -p flpdf --lib thumb_first_page
+cargo test -p flpdf --lib direct_thumb_descendant -- --nocapture
+cargo test -p flpdf --lib thumb_before -- --nocapture
+cargo test -p flpdf --lib first_edge_wins -- --nocapture
 cargo test -p flpdf --features qpdf-zlib-compat \
-  --test cmp_linearize_objstm_tests thumb_firstpage_shared
+  --test cmp_linearize_objstm_tests thumb
 ```
 
-Expected: PASS, proving the extraction did not change classic behavior.
+Expected: PASS, proving existing same-page behavior and both ordered traversal
+cases match qpdf.
 
 - [ ] **Step 4: Refine `ContainerPart`**
 
@@ -482,30 +470,26 @@ Update rustdoc references so no stale `ContainerPart::FirstPage` remains.
 
 - [ ] **Step 5: Make the router compute all qpdf union signals once**
 
-In `route_objstm_containers`, retain each non-first-page closure:
+In `route_objstm_containers`, build the ordered users once and use them for
+both first-page membership and the per-object page map:
 
 ```rust
-let first_page_closure = match page_refs.first() {
-    Some(&first_page) => compute_closure(pdf, first_page, &live, &resurrectable)?,
-    None => Vec::new(),
-};
-let first_page_set: BTreeSet<ObjectRef> =
-    first_page_closure.iter().copied().collect();
-let mut other_page_closures = Vec::new();
-```
+let page_object_users =
+    page_object_users(pdf, &page_refs, &live, &resurrectable)?;
+let first_page_set =
+    page_object_users.page.first().cloned().unwrap_or_default();
 
-Inside the non-first-page loop, insert references into
-`referenced_pages` and then push `closure` into `other_page_closures`.
-After the loop:
-
-```rust
-let thumbnail_user_set = thumbnail_user_set(
-    pdf,
-    &page_refs,
-    &first_page_set,
-    &other_page_closures,
-    &live,
-)?;
+let mut referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>> =
+    BTreeMap::new();
+for (page_idx, users) in page_object_users.page.iter().enumerate() {
+    for &object_ref in users {
+        referenced_pages
+            .entry(object_ref)
+            .or_default()
+            .insert(page_idx as u32);
+    }
+}
+let thumbnail_user_set = page_object_users.thumbnail_set();
 ```
 
 Replace the first-page routing portion with:
@@ -539,7 +523,11 @@ if members.iter().any(|m| first_page_set.contains(m)) {
 }
 ```
 
-Leave the existing Part 7/8/9 logic unchanged.
+Keep the existing Part 7/8/9 placement and within-part ordering, but apply the
+same ordered-user classification to qpdf's `lc_other_page_private` predicate:
+when the union reaches exactly one non-first page, route it to Part 7 only if
+it has neither a document-other nor a thumbnail user. Either signal routes the
+container to Part 9. The Part 8 two-or-more-page case remains unchanged.
 
 - [ ] **Step 6: Use stable first-page route buckets in both modes**
 
@@ -592,16 +580,24 @@ cargo test -p flpdf --features qpdf-zlib-compat \
 cargo test -p flpdf --features qpdf-zlib-compat \
   --test cmp_linearize_objstm_tests thumb_firstpage_shared \
   -- --nocapture
+cargo test -p flpdf --features qpdf-zlib-compat \
+  --test cmp_linearize_objstm_tests thumb_direct_descendant \
+  -- --nocapture
+cargo test -p flpdf --features qpdf-zlib-compat \
+  --test cmp_linearize_objstm_tests thumb_first_edge_wins \
+  -- --nocapture
 ```
 
-Expected: all focused unit tests and all six focused parity tests pass.
+Expected: all six focused route tests and all first-page/thumbnail Generate and
+Preserve parity tests pass.
 
 - [ ] **Step 9: Confirm no stale collapsed route remains**
 
 Run:
 
 ```bash
-rg -n 'ContainerPart::FirstPage\\b|part3_regular|outline_set.*push_routed' \
+rg -n 'fn thumbnail_user_set|thumb_shared_set|ContainerPart::FirstPage\\b|\
+part3_regular|outline_set.*push_routed' \
   crates/flpdf/src crates/flpdf/tests
 ```
 
@@ -612,8 +608,12 @@ Expected: no matches.
 ```bash
 git add crates/flpdf/src/linearization/plan.rs \
   crates/flpdf/src/linearization/writer.rs \
-  crates/flpdf/tests/cmp_linearize_objstm_tests.rs
-git commit -m "fix(linearize): order first-page ObjStm containers like qpdf"
+  crates/flpdf/tests/cmp_linearize_objstm_tests.rs \
+  docs/plans/tools/gen_thumbnail_user_order.py \
+  tests/golden/regenerate.sh \
+  tests/fixtures/compat/objstm-lin-thumb-*.pdf \
+  tests/golden/references/objstm-lin-thumb-*/
+git commit -m "fix(linearize): preserve qpdf thumbnail user order"
 ```
 
 ---
@@ -666,7 +666,7 @@ RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_l
 
 Expected: both commands exit zero with no warnings.
 
-- [ ] **Step 4: Validate both new outputs with qpdf**
+- [ ] **Step 4: Validate all new outputs with qpdf**
 
 Run:
 
@@ -679,9 +679,17 @@ qpdf --check \
   tests/golden/references/objstm-lin-firstpage-private-before-shared/linearize-objstm.pdf
 qpdf --check \
   tests/golden/references/objstm-lin-firstpage-private-before-shared-bearing/linearize-objstm-preserve.pdf
+
+for stem in objstm-lin-thumb-direct-descendant \
+  objstm-lin-thumb-first-edge-wins; do
+    qpdf --check-linearization \
+      "tests/golden/references/$stem/linearize-objstm.pdf"
+    qpdf --check-linearization \
+      "tests/golden/references/${stem}-bearing/linearize-objstm-preserve.pdf"
+done
 ```
 
-Expected: all four checks exit zero.
+Expected: all checks exit zero.
 
 - [ ] **Step 5: Run the authoritative committed-HEAD patch-coverage gate**
 
