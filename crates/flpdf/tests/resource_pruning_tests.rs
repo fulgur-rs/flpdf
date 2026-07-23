@@ -1647,6 +1647,10 @@ fn test_form_own_resources_multi_hop_chain_nested_form_font_kept() {
     let pdf_bytes = build_pdf_raw(&objects);
 
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Reference(ObjectRef::new(8, 0)),
+    );
     remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
 
     let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
@@ -1726,6 +1730,12 @@ fn test_aliased_refs_to_same_terminal_pruned_consistently() {
     let pdf_bytes = build_pdf_raw(&objects);
 
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open aliased-terminal PDF");
+    for holder in [5, 6] {
+        pdf.set_object(
+            ObjectRef::new(holder, 0),
+            Object::Reference(ObjectRef::new(7, 0)),
+        );
+    }
     remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
         .expect("prune must complete");
 
@@ -3041,6 +3051,10 @@ fn test_3x23_xobject_category_holder_chain_form_font_kept() {
     let pdf_bytes = build_pdf_raw(&objects);
 
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Reference(ObjectRef::new(8, 0)),
+    );
     remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
 
     let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
@@ -3113,6 +3127,10 @@ fn test_3x23_xobject_stream_holder_chain_form_font_kept() {
     let pdf_bytes = build_pdf_raw(&objects);
 
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Reference(ObjectRef::new(6, 0)),
+    );
     remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
 
     let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")

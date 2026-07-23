@@ -68,13 +68,24 @@ pub(crate) fn parse_indirect_object_detailed(
     Ok((parsed.object_ref, parsed.object, parsed.indirect_length))
 }
 
-/// qpdf's JSON inspection resolves an empty indirect object as null while
-/// recording a warning. Keep that recovery opt-in so ordinary PDF reads stay
-/// strict. The parsed result records both the byte offset of the `endobj` token
-/// when empty-object recovery was used and the byte offset where qpdf expected
-/// `endobj`.
+/// Parse an indirect object using qpdf's file-object recovery rules. Both the
+/// normal reader and JSON inspection use this path so their shared cache never
+/// depends on call order. The parsed result records both the byte offset of the
+/// `endobj` token when empty-object recovery was used and the byte offset where
+/// qpdf expected `endobj`.
 pub(crate) fn parse_indirect_object_detailed_qpdf(input: &[u8]) -> Result<ParsedIndirectObject> {
     parse_indirect_object_detailed_impl(input, true)
+}
+
+/// Parse one object using qpdf's file-object rules. A bare `N G R` at the
+/// outermost level is recovered as integer `N`; references nested inside
+/// arrays, dictionaries, and stream dictionaries retain their usual meaning.
+/// Object-stream members use this mode without any `endobj` check because an
+/// ObjStm body contains only adjacent direct-object representations.
+pub(crate) fn parse_qpdf_file_object(input: &[u8]) -> Result<Object> {
+    let mut parser = Parser::new(input);
+    parser.top_level_no_reference = true;
+    parser.object()
 }
 
 fn parse_indirect_object_detailed_impl(
@@ -800,6 +811,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 mod stream_length_tests {
     use super::{
         parse_indirect_object, parse_indirect_object_detailed, parse_indirect_object_detailed_qpdf,
+        parse_object,
     };
     use crate::{Object, ObjectRef};
 
@@ -929,5 +941,46 @@ mod stream_length_tests {
         assert_eq!(parsed.expected_endobj_offset, None);
 
         assert!(parse_indirect_object_detailed_qpdf(b"7 0 obj\nendobject\nendobj\n").is_err());
+    }
+
+    #[test]
+    fn qpdf_file_object_mode_integerizes_only_top_level_bare_reference() {
+        let parsed = parse_indirect_object_detailed_qpdf(b"5 0 obj\n6 0 R\nendobj\n")
+            .expect("qpdf file-object recovery");
+        assert_eq!(parsed.object_ref, ObjectRef::new(5, 0));
+        assert_eq!(parsed.object, Object::Integer(6));
+        assert_eq!(parsed.expected_endobj_offset, Some(10));
+
+        let nested =
+            parse_indirect_object_detailed_qpdf(b"5 0 obj\n[6 0 R << /V 7 0 R >>]\nendobj\n")
+                .expect("nested references remain references");
+        let values = nested.object.as_array().expect("array body");
+        assert_eq!(values[0], Object::Reference(ObjectRef::new(6, 0)));
+        assert_eq!(
+            values[1].as_dict().unwrap().get_ref("V"),
+            Some(ObjectRef::new(7, 0))
+        );
+        assert_eq!(nested.expected_endobj_offset, None);
+
+        let stream = parse_indirect_object_detailed_qpdf(
+            b"5 0 obj\n<< /Length 0 /Probe 6 0 R >>\nstream\n\nendstream\nendobj\n",
+        )
+        .expect("stream dictionary reference remains a reference");
+        assert_eq!(
+            stream.object.as_stream().unwrap().dict.get_ref("Probe"),
+            Some(ObjectRef::new(6, 0))
+        );
+        assert_eq!(stream.expected_endobj_offset, None);
+
+        assert_eq!(
+            parse_object(b"6 0 R").expect("strict direct-object API"),
+            Object::Reference(ObjectRef::new(6, 0))
+        );
+        assert_eq!(
+            parse_indirect_object_detailed(b"5 0 obj\n6 0 R\nendobj\n")
+                .expect("strict indirect-object parser")
+                .1,
+            Object::Reference(ObjectRef::new(6, 0))
+        );
     }
 }

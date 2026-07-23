@@ -1654,6 +1654,10 @@ mod tests {
     fn leaf_multi_hop_null_reference_chain_is_treated_as_absent() {
         let bytes = pdf_with_leaf_multi_hop_null_resources();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Reference(ObjectRef::new(7, 0)),
+        );
 
         push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
 
@@ -1956,6 +1960,10 @@ mod tests {
     fn ancestor_multi_hop_null_reference_chain_does_not_shadow_grandparent() {
         let bytes = pdf_with_ancestor_multi_hop_null_resources();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Reference(ObjectRef::new(8, 0)),
+        );
 
         push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
 

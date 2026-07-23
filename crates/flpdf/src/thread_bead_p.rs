@@ -391,7 +391,13 @@ mod tests {
     }
 
     fn open(objs: &BTreeMap<u32, String>) -> Pdf<Cursor<Vec<u8>>> {
-        Pdf::open(Cursor::new(build_pdf(objs))).expect("open fixture")
+        let mut pdf = Pdf::open(Cursor::new(build_pdf(objs))).expect("open fixture");
+        for (&number, body) in objs {
+            if let Ok(Object::Reference(target)) = crate::parse_object(body.as_bytes()) {
+                pdf.set_object(ObjectRef::new(number, 0), Object::Reference(target));
+            }
+        }
+        pdf
     }
 
     /// A `RebuildResult` keeping pages 3 and 5 under their original refs

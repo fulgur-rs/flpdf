@@ -7364,6 +7364,10 @@ mod tests {
     #[test]
     fn ap_holder_chain_preserves_existing_entries() {
         let mut pdf = Pdf::open(Cursor::new(build_ap_holder_chain_pdf())).expect("parse");
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Reference(ObjectRef::new(7, 0)),
+        );
         generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("Tx field handled");
@@ -7440,6 +7444,10 @@ mod tests {
     #[test]
     fn acroform_holder_chain_resolves_default_da() {
         let mut pdf = Pdf::open(Cursor::new(build_acroform_holder_chain_pdf())).expect("parse");
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Reference(ObjectRef::new(7, 0)),
+        );
         let xobj_ref = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("Tx field handled");
@@ -7512,6 +7520,10 @@ mod tests {
     #[test]
     fn dr_holder_chain_resolves_font_basefont() {
         let mut pdf = Pdf::open(Cursor::new(build_dr_holder_chain_pdf())).expect("parse");
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Reference(ObjectRef::new(7, 0)),
+        );
         let xobj_ref = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("Tx field handled");

@@ -372,6 +372,10 @@ fn get_annotations_follows_holder_chain() {
         &[annot4, carrier, annot_array],
     );
     let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(5, 0),
+        Object::Reference(ObjectRef::new(6, 0)),
+    );
     let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
 
     let annots = helper.get_annotations().unwrap();
@@ -417,6 +421,10 @@ fn get_annotations_chain_terminal_not_array_errors() {
         &[carrier, non_array],
     );
     let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(5, 0),
+        Object::Reference(ObjectRef::new(6, 0)),
+    );
     let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
 
     match helper.get_annotations() {

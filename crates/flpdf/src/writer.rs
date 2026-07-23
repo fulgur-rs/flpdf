@@ -3536,9 +3536,10 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                                 }
                             }
                         }
-                        _ => {
+                        Object::Stream(_) => {
                             contents_seq.insert(outer, seq);
                         }
+                        _ => {}
                     },
                     // Direct /Contents Array — refs were already extracted
                     // above (Copy semantics; no Object clone).
