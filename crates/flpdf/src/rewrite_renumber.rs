@@ -484,26 +484,6 @@ impl GenerateRenumber {
         groups: &[Vec<ObjectRef>],
         skip_length: bool,
     ) -> crate::Result<Self> {
-        Self::build_with_visibility(pdf, groups, skip_length, false)
-    }
-
-    /// Build container-first numbering with qpdf's null-aware dictionary
-    /// visibility. Used by plain Preserve output; Generate keeps its existing
-    /// traversal until its own stack layer adopts the same semantics.
-    pub(crate) fn build_qpdf<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        groups: &[Vec<ObjectRef>],
-        skip_length: bool,
-    ) -> crate::Result<Self> {
-        Self::build_with_visibility(pdf, groups, skip_length, true)
-    }
-
-    fn build_with_visibility<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        groups: &[Vec<ObjectRef>],
-        skip_length: bool,
-        qpdf_visibility: bool,
-    ) -> crate::Result<Self> {
         // member -> group index, and per-group members sorted ascending-source.
         let mut member_to_group: HashMap<ObjectRef, usize> = HashMap::new();
         let mut groups_sorted: Vec<Vec<ObjectRef>> = Vec::with_capacity(groups.len());
@@ -521,18 +501,6 @@ impl GenerateRenumber {
         let mut next: u32 = 1;
         let mut queue: VecDeque<ObjectRef> = VecDeque::new();
 
-        // Live xref entries only (excludes Missing / Deleted / Reserved). Used to
-        // drop a *top-level* trailer reference to a non-live (dangling) object
-        // from the seeds below: qpdf rebuilds the generate trailer (so the key
-        // vanishes) and the ref consumes no object number. The exclusion is
-        // deliberately limited to top-level trailer refs — a dangling ref nested
-        // inside a direct dict/array trailer value, or reached from a live
-        // object's body, is still numbered and renumbered in place, so a
-        // malformed body dangling ref does not abort the rewrite. (qpdf drops
-        // those too; flpdf keeps them as plain null objects — tracked in
-        // flpdf-v58c.)
-        let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
-
         // Seeds match the plain Catalog-first walk: `/Root` first, then the
         // remaining indirect trailer entries in lexicographic key order. The
         // skipped keys mirror qpdf's `getTrimmedTrailer` (QPDFWriter.cc), which
@@ -547,11 +515,7 @@ impl GenerateRenumber {
             .ok_or_else(|| Error::Unsupported("generate: trailer has no /Root".to_string()))?;
         let mut seeds: Vec<ObjectRef> = vec![root];
         let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer(), false);
-        let trailer_entries = if qpdf_visibility {
-            crate::qpdf_null::visible_entries(pdf, trailer_entries)?
-        } else {
-            trailer_entries
-        };
+        let trailer_entries = crate::qpdf_null::visible_entries(pdf, trailer_entries)?;
         for (key, value) in trailer_entries {
             if matches!(
                 key.as_slice(),
@@ -559,21 +523,10 @@ impl GenerateRenumber {
             ) {
                 continue;
             }
-            // A top-level trailer reference to a non-live (dangling) object is
-            // dropped, not numbered (see `live` above).
-            if let Object::Reference(r) = &value {
-                if !live.contains(r) {
-                    continue;
-                }
-            }
             // Recurse into direct dict/array trailer values so a nested indirect
             // ref is seeded, matching qpdf's recursive trailer enqueue. A bare
             // reference yields exactly one seed as before.
-            if qpdf_visibility {
-                collect_qpdf_enqueue_refs(pdf, &value, 0, skip_length, &mut seeds)?;
-            } else {
-                collect_refs(&value, 0, skip_length, &mut |r| seeds.push(r))?;
-            }
+            collect_qpdf_enqueue_refs(pdf, &value, 0, skip_length, &mut seeds)?;
         }
 
         for seed in seeds {
@@ -589,34 +542,19 @@ impl GenerateRenumber {
         }
 
         while let Some(cur) = queue.pop_front() {
-            if qpdf_visibility {
-                let obj = pdf.resolve(cur)?;
-                let mut found = Vec::new();
-                collect_qpdf_enqueue_refs(pdf, &obj, 0, skip_length, &mut found)?;
-                for reference in found {
-                    enqueue_gen(
-                        reference,
-                        &member_to_group,
-                        &groups_sorted,
-                        &mut old_to_new,
-                        &mut container_new,
-                        &mut next,
-                        &mut queue,
-                    );
-                }
-            } else {
-                let obj = pdf.resolve_borrowed(cur)?;
-                collect_refs(obj, 0, skip_length, &mut |r| {
-                    enqueue_gen(
-                        r,
-                        &member_to_group,
-                        &groups_sorted,
-                        &mut old_to_new,
-                        &mut container_new,
-                        &mut next,
-                        &mut queue,
-                    );
-                })?;
+            let obj = pdf.resolve(cur)?;
+            let mut found = Vec::new();
+            collect_qpdf_enqueue_refs(pdf, &obj, 0, skip_length, &mut found)?;
+            for reference in found {
+                enqueue_gen(
+                    reference,
+                    &member_to_group,
+                    &groups_sorted,
+                    &mut old_to_new,
+                    &mut container_new,
+                    &mut next,
+                    &mut queue,
+                );
             }
         }
 

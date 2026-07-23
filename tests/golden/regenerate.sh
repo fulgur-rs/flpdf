@@ -183,9 +183,12 @@ else
     echo "Skipping missing-trailer-info.pdf (already exists)"
 fi
 
-if [[ ! -f "$FIX/null-visible-matrix.pdf" ]]; then
-    echo "Generating null-visible-matrix.pdf ..."
-    python3 - "$FIX/null-visible-matrix.pdf" <<'PY'
+if [[ ! -f "$FIX/null-visible-matrix.pdf" || \
+      ! -f "$FIX/null-visible-split-boundary.pdf" ]]; then
+    echo "Generating null-visible matrix/boundary fixtures ..."
+    python3 - \
+        "$FIX/null-visible-matrix.pdf" \
+        "$FIX/null-visible-split-boundary.pdf" <<'PY'
 import sys
 
 def write_classic(path, objects, size, free_numbers=()):
@@ -223,9 +226,23 @@ matrix_objects = [
 ]
 
 write_classic(sys.argv[1], matrix_objects, size=100, free_numbers=(7, 8))
+
+candidate_refs = b" ".join(b"%d 0 R" % number for number in range(5, 107))
+boundary_objects = [
+    (1, b"<< /Type /Catalog /Pages 2 0 R /Drop 4 0 R /Candidates ["
+        + candidate_refs + b" 4 0 R] >>"),
+    (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+    (4, b"null"),
+]
+boundary_objects.extend(
+    (number, b"<< /Candidate %d >>" % number)
+    for number in range(5, 107)
+)
+write_classic(sys.argv[2], boundary_objects, size=107)
 PY
 else
-    echo "Skipping null-visible-matrix.pdf (already exists)"
+    echo "Skipping null-visible matrix/boundary fixtures (already exist)"
 fi
 
 if [[ ! -f "$FIX/null-visible-cycle.pdf" ]]; then
@@ -1722,6 +1739,7 @@ echo "=== Generating reference outputs ==="
 
 mkdir -p \
     "$REF/null-visible-matrix" \
+    "$REF/null-visible-split-boundary" \
     "$REF/null-visible-matrix-objstm" \
     "$REF/null-visible-cycle" \
     "$REF/null-visible-preserve-mixed" \
@@ -1733,6 +1751,12 @@ mkdir -p \
 qpdf --object-streams=disable --static-id --warning-exit-0 \
     "$FIX/null-visible-matrix.pdf" \
     "$REF/null-visible-matrix/disable.pdf"
+qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/null-visible-matrix.pdf" \
+    "$REF/null-visible-matrix/generate.pdf"
+qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/null-visible-split-boundary.pdf" \
+    "$REF/null-visible-split-boundary/generate.pdf"
 qpdf --object-streams=preserve --static-id --warning-exit-0 \
     "$FIX/null-visible-matrix-objstm.pdf" \
     "$REF/null-visible-matrix-objstm/preserve.pdf"
@@ -1740,6 +1764,9 @@ qpdf --object-streams=disable --static-id --warning-exit-0 \
     "$FIX/null-visible-cycle.pdf" \
     "$REF/null-visible-cycle/disable.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-matrix/disable.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-matrix/generate.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-split-boundary/generate.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-matrix-objstm/preserve.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-cycle/disable.pdf"
 qpdf --object-streams=preserve --static-id --warning-exit-0 \
@@ -1757,12 +1784,17 @@ qpdf --object-streams=preserve --static-id --warning-exit-0 \
 qpdf --object-streams=preserve --static-id --warning-exit-0 \
     "$FIX/null-visible-preserve-signature-null-fields.pdf" \
     "$REF/null-visible-preserve-signature-null-fields/preserve.pdf"
+qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-signature-null-fields.pdf" \
+    "$REF/null-visible-preserve-signature-null-fields/generate.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-preserve-mixed/preserve.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-preserve-unreachable/preserve.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-preserve-over-100/preserve.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-preserve-signature/preserve.pdf"
 qpdf --check --warning-exit-0 \
     "$REF/null-visible-preserve-signature-null-fields/preserve.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-preserve-signature-null-fields/generate.pdf"
 
 # --- one-page: plain, static-id, linearize ---
 qpdf --deterministic-id --warning-exit-0 \

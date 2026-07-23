@@ -67,6 +67,36 @@ fn disable_null_visibility_matrix_is_byte_identical_to_qpdf() {
 }
 
 #[test]
+fn generate_null_visibility_matrix_is_byte_identical_to_qpdf() {
+    assert_golden(
+        &rewrite_mode("null-visible-matrix.pdf", ObjectStreamMode::Generate),
+        "null-visible-matrix/generate.pdf",
+    );
+}
+
+#[test]
+fn generate_null_visibility_split_boundary_is_byte_identical_to_qpdf() {
+    assert_golden(
+        &rewrite_mode(
+            "null-visible-split-boundary.pdf",
+            ObjectStreamMode::Generate,
+        ),
+        "null-visible-split-boundary/generate.pdf",
+    );
+}
+
+#[test]
+fn generate_keeps_signatures_with_null_fields_compressed_and_hides_fields() {
+    assert_golden(
+        &rewrite_mode(
+            "null-visible-preserve-signature-null-fields.pdf",
+            ObjectStreamMode::Generate,
+        ),
+        "null-visible-preserve-signature-null-fields/generate.pdf",
+    );
+}
+
+#[test]
 fn preserve_null_visibility_matrix_is_byte_identical_to_qpdf() {
     assert_golden(
         &rewrite_mode("null-visible-matrix-objstm.pdf", ObjectStreamMode::Preserve),

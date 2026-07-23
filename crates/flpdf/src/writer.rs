@@ -3159,7 +3159,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     {
         let plan = object_streams::plan_qpdf_preserve_object_streams(pdf)?;
         if !plan.batches.is_empty() {
-            return write_pdf_containerized_qpdf(pdf, out, options, plan.batches, true);
+            return write_pdf_containerized_qpdf(pdf, out, options, plan.batches);
         }
     }
 
@@ -4317,7 +4317,7 @@ fn write_pdf_generate<R: Read + Seek, W: Write>(
     let eligible = object_streams::compressible_objgens(pdf)?;
     // 2. generateObjectStreams even split => one group per container.
     let groups = object_streams::even_split_into_streams(&eligible);
-    write_pdf_containerized_qpdf(pdf, out, options, groups, false)
+    write_pdf_containerized_qpdf(pdf, out, options, groups)
 }
 
 fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
@@ -4325,11 +4325,8 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
     mut out: W,
     options: &WriteOptions,
     groups: Vec<Vec<ObjectRef>>,
-    qpdf_null_visibility: bool,
 ) -> Result<()> {
-    use crate::rewrite_renumber::{
-        renumber_qpdf_refs_in_place, renumber_refs_in_place, GenerateRenumber,
-    };
+    use crate::rewrite_renumber::{renumber_qpdf_refs_in_place, GenerateRenumber};
     use std::collections::HashSet;
 
     // `ok_or` (eager) keeps the error construction on the covered happy path;
@@ -4339,17 +4336,12 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
     // 3. enqueueObject walk with the object-stream branch => container-first
     //    numbering (members ascending-source within each container).
     //
-    // Generate mode always writes a direct `/Length` (qdf forces object streams
-    // off), so `skip_length = true`: qpdf removes `/Length` before enqueueing a
-    // stream's children, garbage-collecting a holder reachable only through that
-    // edge. The walk drops it the same way. An orphan holder is never an ObjStm
-    // member (members are reached via non-`/Length` edges only), so the even
-    // split above is unaffected.
-    let renumber = if qpdf_null_visibility {
-        GenerateRenumber::build_qpdf(pdf, &groups, true)?
-    } else {
-        GenerateRenumber::build(pdf, &groups, true)?
-    };
+    // This containerized path always writes a direct `/Length`, so
+    // `skip_length = true`: qpdf removes `/Length` before enqueueing a stream's
+    // children, garbage-collecting a holder reachable only through that edge.
+    // The walk drops it the same way. An orphan holder is never an ObjStm member
+    // (members are reached via non-`/Length` edges only).
+    let renumber = GenerateRenumber::build(pdf, &groups, true)?;
     let new_root = generate_invariant(
         renumber.new_for_original(root_ref),
         "/Root absent from renumber map",
@@ -4456,15 +4448,11 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
         match what {
             Emit::Plain(old) => {
                 let mut object = pdf.resolve(*old)?;
-                if qpdf_null_visibility {
-                    renumber_qpdf_refs_in_place(pdf, &mut object, &renumber)?;
-                } else {
-                    renumber_refs_in_place(&mut object, &renumber)?;
-                }
+                renumber_qpdf_refs_in_place(pdf, &mut object, &renumber)?;
                 match object {
                     Object::Stream(stream) => {
                         let (reencoded, source_filter_is_lone_flate) =
-                            reencode_stream_for_compress(stream, options, qpdf_null_visibility);
+                            reencode_stream_for_compress(stream, options, true);
                         write_reencoded_object(
                             &mut bytes,
                             &reencoded,
@@ -4487,11 +4475,7 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
                 let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(plan.members.len());
                 for &(old, new) in &plan.members {
                     let mut obj = pdf.resolve(old)?;
-                    if qpdf_null_visibility {
-                        renumber_qpdf_refs_in_place(pdf, &mut obj, &renumber)?;
-                    } else {
-                        renumber_refs_in_place(&mut obj, &renumber)?;
-                    }
+                    renumber_qpdf_refs_in_place(pdf, &mut obj, &renumber)?;
                     resolved.push((new, obj));
                 }
                 let body = object_streams::emit_objstm_body_from_resolved(&resolved)?;
@@ -4566,26 +4550,9 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
     // two-element /ID. /Root is the renumbered catalog. qpdf omits /Index on a
     // single full-range xref stream.
     //
-    // A trailer reference to a non-live object (a dangling/missing ref with no
-    // xref entry) has no body in the output: qpdf treats it as null and drops the
-    // key. Fold those into the remap skip-set alongside genuinely deleted objects
-    // so the remap drops the key instead of failing on the absent renumber slot.
-    let mut skip_refs = pdf.deleted_object_refs();
-    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
-    for (_key, value) in pdf.trailer().iter() {
-        if let Object::Reference(r) = value {
-            if !live.contains(r) && !skip_refs.contains(r) {
-                skip_refs.push(*r);
-            }
-        }
-    }
     let mut trailer = pdf.trailer().clone();
     strip_incremental_trailer_keys(&mut trailer);
-    if qpdf_null_visibility {
-        remap_qpdf_trailer_refs(pdf, &mut trailer, &renumber)?;
-    } else {
-        remap_trailer_refs(&mut trailer, &renumber, &skip_refs)?;
-    }
+    remap_qpdf_trailer_refs(pdf, &mut trailer, &renumber)?;
     let info_ref = match trailer.get("Info") {
         Some(Object::Reference(r)) => Some(*r),
         _ => None,
