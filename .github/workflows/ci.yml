@@ -172,6 +172,11 @@ jobs:
           # goldens end-to-end (raw-argv pre-split -> WriteOptions -> write path).
           # Gated behind qpdf-zlib-compat; must be run explicitly here.
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_byte_identical_overlay
+          # Pins the `flpdf rewrite --static-id` baseline snapshot vs qpdf
+          # goldens. Gated behind qpdf-zlib-compat so the golden reflects
+          # true qpdf byte-parity; under the default miniz backend the test
+          # is compiled out (the one sanctioned byte deviation).
+          cargo test -p flpdf-cli --features qpdf-zlib-compat --test compat_baseline_static_id -- --nocapture
 
       - name: Compat matrix baselines (Linux amd64)
         if: ${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}
@@ -179,7 +184,6 @@ jobs:
         run: |
           set -euo pipefail
           echo "[ci] Running compat matrix baselines — drift surfaces here as an explicit step"
-          cargo test -p flpdf-cli --test compat_baseline_static_id -- --nocapture
           cargo test -p flpdf-cli --test compat_matrix_baseline -- --nocapture
 
   coverage:
