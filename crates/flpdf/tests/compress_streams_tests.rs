@@ -377,7 +377,7 @@ fn assert_legacy_encoded_empty_payload(
 }
 
 #[test]
-fn generate_route_keeps_encoded_empty_payload() {
+fn generate_route_matches_qpdf_empty_refilter() {
     use flpdf::{write_pdf_with_options, ObjectStreamMode, Pdf, WriteOptions};
     use std::io::Cursor;
 
@@ -391,7 +391,15 @@ fn generate_route_keeps_encoded_empty_payload() {
 
     let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
     let stream = resolve_metadata_stream(&mut reopened);
-    assert_legacy_encoded_empty_payload(&stream, "Generate", Some(8));
+    assert!(
+        stream.data.is_empty(),
+        "qpdf Generate keeps the Flate filter but emits no wrapper bytes for an empty stream"
+    );
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Name(b"FlateDecode".to_vec()))
+    );
+    assert_eq!(stream.dict.get("Length"), Some(&Object::Integer(0)));
 }
 
 #[test]

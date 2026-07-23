@@ -1044,6 +1044,32 @@ mod tests {
     }
 
     #[test]
+    fn compressible_objgens_treats_object_zero_signature_type_as_null() {
+        let bytes = pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /SigTest 4 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (
+                4,
+                b"<< /Type 0 0 R /ByteRange [0 10 20 30] /Contents <00> >>".to_vec(),
+            ),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+
+        assert!(
+            eligible.contains(&ref0(4)),
+            "qpdf resolves object-zero /Type to null, so this is not a /Sig dictionary"
+        );
+    }
+
+    #[test]
     fn null_visible_split_boundary_matches_qpdf_group_sizes() {
         let bytes =
             include_bytes!("../../../../tests/fixtures/compat/null-visible-split-boundary.pdf");
