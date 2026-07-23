@@ -638,6 +638,31 @@ fn top_level_indirect_next_cycle_stops_before_duplicate_root() {
 }
 
 #[test]
+fn nested_indirect_next_cycle_stops_before_duplicate_child() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 5 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Title (Root) /First 6 0 R >>"),
+            (6, "<< /Title (Child A) /Next 7 0 R >>"),
+            (7, "<< /Title (Child B) /Next 6 0 R >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    let root = tree.roots()[0];
+
+    assert_eq!(tree[root].kids.len(), 2);
+    assert_eq!(tree[tree[root].kids[0]].title, "Child A");
+    assert_eq!(tree[tree[root].kids[1]].title, "Child B");
+}
+
+#[test]
 fn child_first_back_to_seen_indirect_ancestor_is_materialized_without_expansion() {
     let bytes = build_pdf(
         &[
