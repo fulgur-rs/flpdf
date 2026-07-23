@@ -375,7 +375,16 @@ fn walk_surviving<R: Read + Seek>(
     if crate::qpdf_null::value_is_null(pdf, obj)? {
         if in_array {
             if let Object::Reference(reference) = obj {
-                if reference.number > 0 {
+                // A higher LIVE generation makes this a stale edge that qpdf
+                // directizes to null without allocating a body. A free xref
+                // entry is different: qpdf still resurrects an array-visible
+                // free reference as a numbered null object.
+                let superseded_by_live_generation =
+                    pdf.live_object_refs().into_iter().any(|candidate| {
+                        candidate.number == reference.number
+                            && candidate.generation > reference.generation
+                    });
+                if reference.number > 0 && !superseded_by_live_generation {
                     result.insert(*reference);
                 }
             }

@@ -5,7 +5,7 @@
 use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
 use flpdf::{
     write_pdf_with_options, NewlineBeforeEndstream, Object, ObjectRef, ObjectStreamMode, Pdf,
-    WriteOptions,
+    StreamDataMode, WriteOptions,
 };
 use std::fs::File;
 use std::io::{BufReader, Cursor};
@@ -27,6 +27,14 @@ fn rewrite_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8> {
 }
 
 fn linearize_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8> {
+    linearize_mode_with_stream_data(fixture, mode, None)
+}
+
+fn linearize_mode_with_stream_data(
+    fixture: &str,
+    mode: ObjectStreamMode,
+    stream_data: Option<StreamDataMode>,
+) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join(fixture);
@@ -39,6 +47,7 @@ fn linearize_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8> {
     let mut pdf = Pdf::open(BufReader::new(File::open(&path).unwrap())).expect("source must parse");
     let mut options = WriteOptions::default();
     options.object_streams = mode;
+    options.stream_data = stream_data;
     options.deterministic_id = true;
     options.newline_before_endstream = NewlineBeforeEndstream::Never;
     let mut document =
@@ -158,6 +167,51 @@ fn linearize_preserve_null_visibility_matrix_is_byte_identical_to_qpdf() {
     assert_golden(
         &linearize_mode("null-visible-matrix-objstm.pdf", ObjectStreamMode::Preserve),
         "null-visible-matrix-objstm/linearize-objstm-preserve.pdf",
+    );
+}
+
+#[test]
+fn linearize_generate_real_null_thumb_first_edge_is_byte_identical_to_qpdf() {
+    assert_golden(
+        &linearize_mode(
+            "null-visible-thumb-first-edge.pdf",
+            ObjectStreamMode::Generate,
+        ),
+        "null-visible-thumb-first-edge/linearize-objstm.pdf",
+    );
+}
+
+#[test]
+fn linearize_preserve_real_null_thumb_first_edge_is_byte_identical_to_qpdf() {
+    assert_golden(
+        &linearize_mode(
+            "null-visible-thumb-first-edge-bearing.pdf",
+            ObjectStreamMode::Preserve,
+        ),
+        "null-visible-thumb-first-edge-bearing/linearize-objstm-preserve.pdf",
+    );
+}
+
+#[test]
+fn linearize_generate_stale_generation_inlines_null_without_body() {
+    assert_golden(
+        &linearize_mode(
+            "null-visible-stale-generation.pdf",
+            ObjectStreamMode::Generate,
+        ),
+        "null-visible-stale-generation/linearize-objstm.pdf",
+    );
+}
+
+#[test]
+fn linearize_preserve_stream_data_directizes_null_length() {
+    assert_golden(
+        &linearize_mode_with_stream_data(
+            "null-visible-stream-null-length.pdf",
+            ObjectStreamMode::Disable,
+            Some(StreamDataMode::Preserve),
+        ),
+        "null-visible-stream-null-length/linearize-preserve.pdf",
     );
 }
 

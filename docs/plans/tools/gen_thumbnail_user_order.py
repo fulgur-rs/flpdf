@@ -34,7 +34,10 @@ def write_pdf(path: Path, objects: dict[int, bytes]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("case", choices=["direct-descendant", "first-edge-wins"])
+    parser.add_argument(
+        "case",
+        choices=["direct-descendant", "first-edge-wins", "null-first-edge-wins"],
+    )
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
 
@@ -65,7 +68,7 @@ def main() -> None:
                 7: stream(b"BT (Page1) Tj ET"),
             },
         )
-    else:
+    elif args.case == "first-edge-wins":
         write_pdf(
             args.output,
             {
@@ -77,6 +80,24 @@ def main() -> None:
                 ),
                 4: content0,
                 5: image,
+            },
+        )
+    else:
+        # `/Thumb` sorts before `/Zzz`, so qpdf assigns object 5 exclusively to
+        # the thumbnail user even though the same REAL-null identity is reached
+        # again from the ordinary page user. The arrays keep the indirect null
+        # identity visible; shared `visited` provides first-edge-wins.
+        write_pdf(
+            args.output,
+            {
+                1: b"<< /Type /Catalog /Pages 2 0 R >>",
+                2: b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+                3: (
+                    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                    b"/Contents 4 0 R /Thumb [5 0 R] /Zzz [5 0 R] >>"
+                ),
+                4: content0,
+                5: b"null",
             },
         )
 

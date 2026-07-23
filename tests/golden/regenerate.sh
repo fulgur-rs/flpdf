@@ -1279,6 +1279,15 @@ qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/objstm-lin-thumb-first-edge-wins.pdf" \
     "$FIX/objstm-lin-thumb-first-edge-wins-bearing.pdf"
 
+python3 "$ROOT/docs/plans/tools/gen_thumbnail_user_order.py" \
+    null-first-edge-wins "$FIX/null-visible-thumb-first-edge.pdf"
+qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-thumb-first-edge.pdf" \
+    "$FIX/null-visible-thumb-first-edge-bearing.pdf"
+
+python3 "$ROOT/docs/plans/tools/gen_od_indirect_length.py" --null-holder \
+    > "$FIX/null-visible-stream-null-length.pdf"
+
 # ObjStm-bearing variant of the cap-boundary-199 fixture (flpdf-ihb.4). The raw
 # gen_shared_fonts.py 199 output has no source ObjStms, so --object-streams=preserve
 # on it yields an empty plan. Re-encoding through --object-streams=generate produces
@@ -2315,6 +2324,34 @@ for stem in objstm-lin-thumb-direct-descendant objstm-lin-thumb-first-edge-wins;
         "$FIX/$bearing.pdf" "$REF/$bearing/linearize-objstm-preserve.pdf"
     qpdf --check-linearization "$REF/$bearing/linearize-objstm-preserve.pdf"
 done
+
+mkdir -p \
+    "$REF/null-visible-thumb-first-edge" \
+    "$REF/null-visible-thumb-first-edge-bearing" \
+    "$REF/null-visible-stream-null-length"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-thumb-first-edge.pdf" \
+    "$REF/null-visible-thumb-first-edge/linearize-objstm.pdf"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-thumb-first-edge-bearing.pdf" \
+    "$REF/null-visible-thumb-first-edge-bearing/linearize-objstm-preserve.pdf"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-stale-generation.pdf" \
+    "$REF/null-visible-stale-generation/linearize-objstm.pdf"
+qpdf --linearize --object-streams=disable --stream-data=preserve \
+    --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-stream-null-length.pdf" \
+    "$REF/null-visible-stream-null-length/linearize-preserve.pdf"
+qpdf --check-linearization \
+    "$REF/null-visible-thumb-first-edge/linearize-objstm.pdf"
+qpdf --check-linearization \
+    "$REF/null-visible-thumb-first-edge-bearing/linearize-objstm-preserve.pdf"
+qpdf --check-linearization \
+    "$REF/null-visible-stale-generation/linearize-objstm.pdf"
+qpdf --check-linearization \
+    "$REF/null-visible-stream-null-length/linearize-preserve.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-stream-null-length/linearize-preserve.pdf"
 
 # Linearized generate-mode >cap goldens (flpdf-g6hb.2). See the fixture block
 # above for each scenario. Compared structurally (and strictly where flpdf

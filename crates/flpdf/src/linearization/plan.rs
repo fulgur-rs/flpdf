@@ -2593,7 +2593,13 @@ fn page_object_users<R: Read + Seek>(
                     if crate::qpdf_null::value_is_null(pdf, &Object::Reference(object_ref))? {
                         // qpdf's dictionary getKeys() hides null-resolving
                         // values, while arrays preserve an indirect null's
-                        // identity as an object user.
+                        // identity as an object user. Indirect identity still
+                        // enters the per-page shared visited set before user
+                        // registration, so `/Thumb` versus ordinary page
+                        // traversal remains first-edge-wins for nulls too.
+                        if !visited.insert(object_ref) {
+                            continue;
+                        }
                         if via_array && object_ref.number > 0 {
                             users.insert(object_ref);
                         }
