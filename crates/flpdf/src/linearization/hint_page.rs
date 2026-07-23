@@ -393,7 +393,7 @@ impl PageOffsetHintTable {
         plan: &LinearizationPlan,
         renumber: &RenumberMap,
         member_to_container: &std::collections::BTreeMap<ObjectRef, (u32, u32)>,
-        container_shared_rank: &std::collections::BTreeMap<u32, u32>,
+        container_shared_sort_key: &std::collections::BTreeMap<u32, (u8, u32)>,
         second_half_container_nums: &std::collections::BTreeSet<u32>,
         open_document_container_nums: &std::collections::BTreeSet<u32>,
     ) -> Self {
@@ -501,27 +501,25 @@ impl PageOffsetHintTable {
         // Order each page's shared identifiers the way qpdf does: by the shared
         // object's number in qpdf's ObjGen-keyed `obj_user_to_objects`
         // (QPDF_linearization.cc:1388-1402). A plain object keeps its source
-        // number; an ObjStm container is ranked by `container_shared_rank`, which
+        // number; an ObjStm container uses `container_shared_sort_key`, which
         // captures the container's pre-renumber object-number order per mode:
         //   * Generate — containers are fresh `makeIndirectObject` objects
         //     allocated AFTER every source object in even-split order, so all
         //     plain shared objects sort before all containers (the `(0, ..)` vs
         //     `(1, ..)` split), containers by even-split rank.
         //   * Preserve — containers reuse the source ObjStm objects (their source
-        //     numbers), so the rank is ascending source-container order.
+        //     numbers), so both plain objects and containers use `(0, source
+        //     object number)`.
         // Without this the identifiers come out in shared-table-index
         // (physical-number) order, which differs when a page references two
         // containers whose pre-renumber order differs from their physical order.
         let shared_sort_key = |shared_idx: u32| -> (u8, u32) {
             let entry = &shared_hints[shared_idx as usize];
             if entry.object_ref.generation == u16::MAX {
-                (
-                    1,
-                    container_shared_rank
-                        .get(&entry.object_ref.number)
-                        .copied()
-                        .unwrap_or(0),
-                )
+                container_shared_sort_key
+                    .get(&entry.object_ref.number)
+                    .copied()
+                    .unwrap_or((1, 0))
             } else {
                 (0, entry.object_ref.number)
             }

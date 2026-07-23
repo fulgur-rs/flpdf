@@ -65,8 +65,8 @@ use crate::linearization::hint_page::{bits_needed, PageOffsetHintTable};
 use crate::linearization::hint_shared::SharedObjectHintTable;
 use crate::linearization::hint_stream::{encode_hint_stream, OutlineHintTable};
 use crate::linearization::part1::{Part1Bytes, Part1Placeholders};
-use crate::linearization::plan::LinearizationPlan;
-use crate::linearization::renumber::{ObjStmRelocation, RenumberMap};
+use crate::linearization::plan::{ContainerPart, LinearizationPlan, RoutedObjStmBatch};
+use crate::linearization::renumber::{ObjStmRelocation, RenumberMap, SecondHalfContainerAnchor};
 use crate::linearization::xref_stream;
 use crate::object::MAX_INLINE_DEPTH;
 use crate::writer::object_streams::{
@@ -168,10 +168,27 @@ impl ObjStmLayout {
                 })
                 .collect()
         };
+        let filter_routed_batches = |batches: Vec<RoutedObjStmBatch>| -> Vec<RoutedObjStmBatch> {
+            batches
+                .into_iter()
+                .filter_map(|batch| {
+                    let members: Vec<ObjectRef> = batch
+                        .members
+                        .into_iter()
+                        .filter(|r| !page_dicts.contains(r))
+                        .collect();
+                    (!members.is_empty()).then_some(RoutedObjStmBatch {
+                        members,
+                        route: batch.route,
+                        source_container_number: batch.source_container_number,
+                    })
+                })
+                .collect()
+        };
         Ok(crate::linearization::plan::ObjStmBatchPlan {
             open_document_batches: filter_batches(batch_plan.open_document_batches),
             part3_batches: filter_batches(batch_plan.part3_batches),
-            part4_batches: filter_batches(batch_plan.part4_batches),
+            part4_batches: filter_routed_batches(batch_plan.part4_batches),
         })
     }
 
@@ -237,6 +254,11 @@ impl ObjStmLayout {
         let mut open_document = Vec::new();
         let mut part3 = Vec::new();
         let mut part4 = Vec::new();
+        let part4_members: Vec<Vec<ObjectRef>> = batch_plan
+            .part4_batches
+            .iter()
+            .map(|batch| batch.members.clone())
+            .collect();
         // Consumption order MUST match `place_objstm_members_per_half`'s
         // `container_numbers` order: open-document, then Part-3, then Part-4.
         take(
@@ -252,7 +274,7 @@ impl ObjStmLayout {
             &mut container_iter,
         )?;
         take(
-            &batch_plan.part4_batches,
+            &part4_members,
             &mut part4,
             &mut member_to_container,
             &mut container_iter,
@@ -2329,41 +2351,43 @@ fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize 
 /// object lacks a probed byte length, or the hint-stream compressed length
 /// fails to converge within the iteration budget.
 ///
-/// For each second-half ObjStm batch, the plain object after which its container
-/// must be emitted so the container lands at its qpdf part position.
+/// For each second-half ObjStm batch, return its insertion point among plain
+/// objects so the container lands at its qpdf part/object-key position.
 ///
-/// qpdf orders the second half as `part7 (page by page) → part8 → part9`, with
-/// each ObjStm container at the END of its part-group (the container's synthetic
-/// object number is the group's highest, so it sorts last in qpdf's ObjGen-keyed
-/// part set). The anchor is the LAST second-half plain object whose part-group
-/// is at or before the container's group; the renumber inserts the container
-/// right after it. Returns `None` for a batch with no such preceding plain object
-/// (the renumber then appends it after all plain objects — the same result when
-/// the container's group is the last one).
+/// qpdf orders the second half as `part7 (page by page) → part8 → part9`.
+/// Generate containers have fresh high object numbers and therefore sort at the
+/// end of their group. Preserve containers retain their source ObjGen and may
+/// precede a plain object in the same group.
 fn second_half_container_anchors(
     plan: &LinearizationPlan,
-    part4_batches: &[Vec<ObjectRef>],
-) -> Vec<Option<ObjectRef>> {
-    let member_set: BTreeSet<ObjectRef> = part4_batches.iter().flatten().copied().collect();
+    part4_batches: &[RoutedObjStmBatch],
+) -> Vec<SecondHalfContainerAnchor> {
+    let member_set: BTreeSet<ObjectRef> = part4_batches
+        .iter()
+        .flat_map(|batch| batch.members.iter().copied())
+        .collect();
 
     // Second-half plain (non-member) objects in qpdf part order, each tagged with
-    // a group rank: part7 page i → (0, i); part8 → (1, 0); part9 → (2, 0).
-    let mut plain_ranked: Vec<(ObjectRef, (u8, usize))> = Vec::new();
+    // a qpdf ordering key. In Part 7 each page dictionary is forced first,
+    // followed by the remaining page-private objects in ObjGen order.
+    let mut plain_ranked: Vec<(ObjectRef, (u8, usize, u8, u32))> = Vec::new();
     for (i, privates) in plan.per_page_private_objects.iter().enumerate().skip(1) {
+        let page_ref = plan.page_hints.get(i).map(|hint| hint.page_ref);
         for &r in privates {
             if !member_set.contains(&r) {
-                plain_ranked.push((r, (0, i)));
+                let page_head_rank = u8::from(Some(r) != page_ref);
+                plain_ranked.push((r, (0, i, page_head_rank, r.number)));
             }
         }
     }
     for &r in &plan.part4_other_pages_shared {
         if !member_set.contains(&r) {
-            plain_ranked.push((r, (1, 0)));
+            plain_ranked.push((r, (1, 0, 0, r.number)));
         }
     }
     for &r in &plan.part4_rest {
         if !member_set.contains(&r) {
-            plain_ranked.push((r, (2, 0)));
+            plain_ranked.push((r, (2, 0, 0, r.number)));
         }
     }
 
@@ -2372,62 +2396,68 @@ fn second_half_container_anchors(
         .iter()
         .map(|v| v.iter().copied().collect())
         .collect();
-    let shared_set: BTreeSet<ObjectRef> = plan.part4_other_pages_shared.iter().copied().collect();
-    let rest_set: BTreeSet<ObjectRef> = plan.part4_rest.iter().copied().collect();
-
     part4_batches
         .iter()
         .map(|batch| {
-            if batch.is_empty() {
-                return None; // cov:ignore: resolve_batches drops empty batches before this point
+            if batch.members.is_empty() {
+                return SecondHalfContainerAnchor::AfterLast; // cov:ignore: resolved batches are non-empty
             }
-            // The container's part is the UNION of its members' page ownership —
-            // the even split can co-locate one page's privates with another's in
-            // a single container, which qpdf then routes to part8 (shared by 2+
-            // pages). So inspect EVERY member, not just the first: any member in
-            // the reach-≥2 shared set, or members spanning two different pages'
-            // private sets, makes the whole container part8.
-            let mut pages: BTreeSet<usize> = BTreeSet::new();
-            let mut shared = false;
-            let mut rest = false;
-            for &m in batch {
-                if shared_set.contains(&m) {
-                    shared = true;
-                } else if let Some(i) =
-                    (1..page_private_sets.len()).find(|&i| page_private_sets[i].contains(&m))
-                {
-                    pages.insert(i);
-                } else if rest_set.contains(&m) {
-                    rest = true;
+            let object_number = batch.source_container_number.unwrap_or(u32::MAX);
+            let batch_rank: (u8, usize, u8, u32) = match batch.route {
+                ContainerPart::OtherPagePrivate => {
+                    let owner = (1..page_private_sets.len())
+                        .find(|&i| {
+                            batch
+                                .members
+                                .iter()
+                                .any(|m| page_private_sets[i].contains(m))
+                        })
+                        .expect("Part-7 ObjStm route must have one non-first-page owner");
+                    (0, owner, 1, object_number)
                 }
-            }
-            let batch_rank: (u8, usize) = if shared || pages.len() >= 2 {
-                (1, 0) // part8 (other-page-shared)
-            } else if let Some(&i) = pages.iter().next().filter(|_| !rest) {
-                // part7 (private to one other page) ONLY when the container's member
-                // union has no document-`others` object. A `rest`-set member (a
-                // Catalog non-open-document key / trailer key = document_other, or
-                // the /Pages tree) makes others>0, so qpdf categorizes the whole
-                // container lc_other (part9), matching `route_objstm_containers`'
-                // others gate (QPDF_linearization.cc:1128). Without this `!rest`
-                // guard the container object would be numbered at a part7 anchor
-                // while its members are numbered in the part9 range — an internally
-                // inconsistent layout that diverges from qpdf.
-                (0, i)
-            } else if rest {
-                (2, 0) // part9 (rest / others-demoted)
-            } else {
-                return None; // cov:ignore: every Part-4 batch member is page-private, shared, or rest
+                ContainerPart::OtherPageShared => (1, 0, 0, object_number),
+                ContainerPart::Rest => (2, 0, 0, object_number),
+                // cov:ignore-start: first-half routes cannot enter resolved second-half batches
+                ContainerPart::OpenDocument | ContainerPart::FirstPage => {
+                    unreachable!("first-half route in second-half ObjStm batches")
+                } // cov:ignore-end
             };
-            // `plain_ranked` is already in ascending rank order, so the last entry
-            // with rank ≤ batch_rank is the container's group's last plain object
-            // (or the previous non-empty group's, when this group has no plain).
-            plain_ranked
+            let previous = plain_ranked
                 .iter()
                 .rfind(|(_, rank)| *rank <= batch_rank)
-                .map(|(r, _)| *r)
+                .map(|(r, _)| *r);
+            match previous {
+                Some(r) => SecondHalfContainerAnchor::After(r),
+                None if plain_ranked.is_empty() => SecondHalfContainerAnchor::AfterLast,
+                None => SecondHalfContainerAnchor::BeforeFirst,
+            }
         })
         .collect()
+}
+
+fn preserved_source_container_number(
+    container: &ObjStmContainer,
+    source_container_by_member: &BTreeMap<ObjectRef, u32>,
+) -> Result<u32> {
+    let source_container_number = container
+        .members
+        .first()
+        .and_then(|(original_ref, _)| source_container_by_member.get(original_ref).copied())
+        .ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "preserved ObjStm container {} has no source container",
+                container.container_new_num
+            ))
+        })?;
+    if container.members.iter().any(|(original_ref, _)| {
+        source_container_by_member.get(original_ref).copied() != Some(source_container_number)
+    }) {
+        return Err(crate::Error::Unsupported(format!(
+            "preserved ObjStm container {} combines multiple source containers",
+            container.container_new_num
+        )));
+    }
+    Ok(source_container_number)
 }
 
 pub fn write_linearized<R: Read + Seek>(
@@ -2557,6 +2587,11 @@ pub fn write_linearized<R: Read + Seek>(
     // container's group is the last one (the single-second-half-container case).
     let second_half_anchors =
         second_half_container_anchors(plan, &resolved_batch_plan.part4_batches);
+    let part4_members: Vec<Vec<ObjectRef>> = resolved_batch_plan
+        .part4_batches
+        .iter()
+        .map(|batch| batch.members.clone())
+        .collect();
     // Part-4 non-member objects (e.g. lc_thumbnail streams, and ineligible
     // outline streams) must be placed AFTER the second-half ObjStm containers in
     // the file, not before.  Compute the set of such objects so
@@ -2567,12 +2602,7 @@ pub fn write_linearized<R: Read + Seek>(
     // `part4_member_set`), but an ineligible outline stream (an Object::Stream
     // reachable from `/Outlines`, e.g. a shared /JS action stream) is emitted
     // plain and qpdf numbers it AFTER the outline container, not before.
-    let part4_member_set: BTreeSet<ObjectRef> = resolved_batch_plan
-        .part4_batches
-        .iter()
-        .flatten()
-        .copied()
-        .collect();
+    let part4_member_set: BTreeSet<ObjectRef> = part4_members.iter().flatten().copied().collect();
     let second_half_post_plain: BTreeSet<ObjectRef> = plan
         .part4_rest
         .iter()
@@ -2612,7 +2642,7 @@ pub fn write_linearized<R: Read + Seek>(
     let relocation = local_renumber.place_objstm_members_per_half(
         &resolved_batch_plan.open_document_batches,
         &resolved_batch_plan.part3_batches,
-        &resolved_batch_plan.part4_batches,
+        &part4_members,
         &second_half_anchors,
         &second_half_post_plain,
         &first_half_post_plain,
@@ -2657,34 +2687,42 @@ pub fn write_linearized<R: Read + Seek>(
     let objstm_layout =
         ObjStmLayout::build_from_batches(&resolved_batch_plan, &container_numbers, renumber)?;
 
-    // Map each ObjStm container's new object number to its even-split allocation
-    // rank (qpdf numbers the container objects' pre-renumber identities in
-    // even-split order via `makeIndirectObject`). The page-offset hint table uses
-    // this to order each page's shared identifiers by pre-renumber object number
-    // (see `PageOffsetHintTable::from_plan`). Re-deriving the even-split here is
-    // deterministic and cheap relative to the convergence loop below.
-    // Rank each first-half ObjStm container by the order qpdf lists it in a
-    // page's shared-identifier table. qpdf builds that order from
+    // Map each ObjStm container's new object number to the key qpdf uses when
+    // ordering a page's shared identifiers. qpdf builds that order from
     // `obj_user_to_objects` (a `std::set<QPDFObjGen>` keyed by object number), so
-    // it is the ascending order of the referenced containers' object numbers at
+    // it is the ascending order of the referenced objects' numbers at
     // linearization time (QPDF_linearization.cc:1388-1402).
     //
     // - Generate: the containers are fresh `makeIndirectObject` objects numbered
-    //   in even-split order, so the rank is that even-split index.
+    //   after every source object in even-split order, hence `(1, split_index)`.
     // - Preserve: the containers reuse the source ObjStm objects and keep their
-    //   source numbers, so the order is ascending source-container number. That
-    //   is exactly the first-half (Part-3) layout order, since
-    //   `objstm_batches_preserve` emits `part3_batches` in ascending
-    //   source-container order. (The Generate even-split rank does NOT apply here:
-    //   `objstm_membership_linearized` recomputes the even split, which mis-orders
-    //   the reused source containers.)
-    let container_shared_rank: std::collections::BTreeMap<u32, u32> = match options.object_streams {
-        crate::writer::ObjectStreamMode::Preserve => objstm_layout
-            .part3
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.container_new_num, i as u32))
-            .collect(),
+    //   source numbers, hence `(0, source_container_number)` in the same key
+    //   space as plain source objects.
+    let container_shared_sort_key: std::collections::BTreeMap<u32, (u8, u32)> = match options
+        .object_streams
+    {
+        crate::writer::ObjectStreamMode::Preserve => {
+            let source_container_by_member: std::collections::BTreeMap<ObjectRef, u32> = pdf
+                .source_xref_entries()
+                .into_iter()
+                .filter_map(|(object_ref, offset)| match offset {
+                    crate::XrefOffset::Compressed { stream, .. } => Some((object_ref, stream)),
+                    _ => None,
+                })
+                .collect();
+            let mut keys = std::collections::BTreeMap::new();
+            for container in objstm_layout
+                .open_document
+                .iter()
+                .chain(&objstm_layout.part3)
+                .chain(&objstm_layout.part4)
+            {
+                let source_container_number =
+                    preserved_source_container_number(container, &source_container_by_member)?;
+                keys.insert(container.container_new_num, (0, source_container_number));
+            }
+            keys
+        }
         _ => {
             use crate::linearization::plan::objstm_membership_linearized;
             let assigned = plan.renumber_assigned_refs();
@@ -2699,7 +2737,7 @@ pub fn write_linearized<R: Read + Seek>(
                 // Only rank containers the Generate layout actually
                 // materialized (members present in `member_to_container`).
                 if let Some(&(container_num, _)) = objstm_layout.member_to_container.get(&first) {
-                    rank.insert(container_num, split_index as u32);
+                    rank.insert(container_num, (1, split_index as u32));
                 }
             }
             rank
@@ -2764,7 +2802,7 @@ pub fn write_linearized<R: Read + Seek>(
         plan,
         renumber,
         &objstm_layout.member_to_container,
-        &container_shared_rank,
+        &container_shared_sort_key,
         &second_half_container_nums,
         &open_document_container_nums,
     );
@@ -3056,7 +3094,7 @@ pub fn write_linearized<R: Read + Seek>(
             plan,
             renumber,
             &objstm_layout.member_to_container,
-            &container_shared_rank,
+            &container_shared_sort_key,
             &second_half_container_nums,
             &open_document_container_nums,
         );
@@ -3533,6 +3571,92 @@ mod tests {
     #[test]
     fn write_linearized_succeeds() {
         let _doc = build_linearized();
+    }
+
+    #[test]
+    fn second_half_anchor_uses_retained_part8_route_for_docother_drift() {
+        let page1_private = ObjectRef::new(10, 0);
+        let document_other = ObjectRef::new(11, 0);
+        let plain_part8 = ObjectRef::new(12, 0);
+        let plain_part9 = ObjectRef::new(13, 0);
+        let plan = LinearizationPlan {
+            per_page_private_objects: vec![vec![], vec![page1_private]],
+            part4_other_pages_shared: vec![plain_part8],
+            part4_rest: vec![document_other, plain_part9],
+            ..Default::default()
+        };
+        let batches = vec![RoutedObjStmBatch {
+            members: vec![page1_private, document_other],
+            route: ContainerPart::OtherPageShared,
+            source_container_number: None,
+        }];
+
+        assert_eq!(
+            second_half_container_anchors(&plan, &batches),
+            vec![SecondHalfContainerAnchor::After(plain_part8)]
+        );
+    }
+
+    #[test]
+    fn second_half_anchor_covers_before_first_and_after_last() {
+        let member = ObjectRef::new(20, 0);
+        let plain = ObjectRef::new(10, 0);
+        let before_first_plan = LinearizationPlan {
+            part4_rest: vec![plain, member],
+            ..Default::default()
+        };
+        let before_first_batch = RoutedObjStmBatch {
+            members: vec![member],
+            route: ContainerPart::Rest,
+            source_container_number: Some(1),
+        };
+        assert_eq!(
+            second_half_container_anchors(&before_first_plan, &[before_first_batch]),
+            vec![SecondHalfContainerAnchor::BeforeFirst]
+        );
+
+        let after_last_plan = LinearizationPlan {
+            part4_rest: vec![member],
+            ..Default::default()
+        };
+        let after_last_batch = RoutedObjStmBatch {
+            members: vec![member],
+            route: ContainerPart::Rest,
+            source_container_number: Some(1),
+        };
+        assert_eq!(
+            second_half_container_anchors(&after_last_plan, &[after_last_batch]),
+            vec![SecondHalfContainerAnchor::AfterLast]
+        );
+    }
+
+    #[test]
+    fn preserved_source_container_number_validates_membership() {
+        let member1 = ObjectRef::new(10, 0);
+        let member2 = ObjectRef::new(11, 0);
+        let container = ObjStmContainer {
+            container_new_num: 20,
+            members: vec![
+                (member1, ObjectRef::new(30, 0)),
+                (member2, ObjectRef::new(31, 0)),
+            ],
+        };
+
+        let valid = BTreeMap::from([(member1, 7), (member2, 7)]);
+        assert_eq!(
+            preserved_source_container_number(&container, &valid).unwrap(),
+            7
+        );
+
+        let missing = BTreeMap::new();
+        let err = preserved_source_container_number(&container, &missing).unwrap_err();
+        assert!(err.to_string().contains("has no source container"));
+
+        let mixed = BTreeMap::from([(member1, 7), (member2, 8)]);
+        let err = preserved_source_container_number(&container, &mixed).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("combines multiple source containers"));
     }
 
     // -----------------------------------------------------------------------

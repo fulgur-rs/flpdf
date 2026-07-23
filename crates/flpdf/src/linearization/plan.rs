@@ -1941,18 +1941,19 @@ impl Default for LinearizationPlan {
 ///   part7/8/9: remaining document objects from `part4_other_pages_private`,
 ///   `part4_other_pages_shared`, and `part4_rest`).
 ///
-/// ObjStm containers can never span a part boundary. `part2_objects`
-/// (first-page closure exclusives) are **never** placed in any batch list —
-/// they stay as plain indirect objects.
+/// Every ObjStm container has one union-derived route. Its members may have
+/// different classic per-object parts, but the container itself is emitted
+/// wholly in that one qpdf-selected part. Page dictionaries and the Catalog
+/// are never placed in any batch list.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ObjStmBatchPlan {
+pub(crate) struct ObjStmBatchPlan {
     /// ObjStm batches for qpdf part4 (open-document objects). Numbered and
     /// emitted in the first half, before the first-page section.
-    pub open_document_batches: Vec<Vec<ObjectRef>>,
+    pub(crate) open_document_batches: Vec<Vec<ObjectRef>>,
     /// ObjStm batches for Part 3 (shared/catalog) objects.
-    pub part3_batches: Vec<Vec<ObjectRef>>,
+    pub(crate) part3_batches: Vec<Vec<ObjectRef>>,
     /// ObjStm batches for Part 4 (rest-of-document) objects.
-    pub part4_batches: Vec<Vec<ObjectRef>>,
+    pub(crate) part4_batches: Vec<RoutedObjStmBatch>,
 }
 
 // These items are consumed by the upcoming ObjStm linearized writer (5.8.2+);
@@ -1967,7 +1968,7 @@ impl LinearizationPlan {
     /// |------|--------|
     /// | `Disable` | Both batch lists are empty (no ObjStms emitted). |
     /// | `Generate` | Eligible Part-3 (first-page shared) objects are packed into `part3_batches`; eligible Part-4 objects are packed into `part4_batches`. The membership is qpdf-canonical by construction (a global even split with the page dictionaries and `/Catalog` erased), so no post-packing reshape is applied. |
-    /// | `Preserve` | The source ObjStm grouping is reproduced verbatim: each source container's eligible members are routed to their linearization part (first half → `part3_batches`, second half → `part4_batches`), and the `/Pages` tree and `/Info` dictionary ride along in whatever source container held them. Members in `part2_objects` or ineligible per [`is_eligible_for_objstm`] are dropped, and the `/Catalog` is excluded (qpdf never compresses it). Members that span the Part-3/Part-4 boundary are split into separate batches per part. There is no fold and no re-chunk across containers. If the source document contained no ObjStms, both batch lists are **empty** — Preserve does **not** fall through to Generate; it mirrors the behaviour of the non-linearized `writer::object_streams::plan_preserve` and qpdf's `--object-streams=preserve` semantics (preserve means "keep what was there", not "invent new ObjStms"). |
+    /// | `Preserve` | Each surviving source ObjStm is retained as one container and routed once from the union of its members' users. Page dictionaries, the `/Catalog`, unassigned objects, and ineligible members are removed; `/Pages` and `/Info` stay with their source container. The configured Generate batch cap is ignored because qpdf Preserve neither splits nor re-chunks source containers. If the source document contained no ObjStms, all batch lists are empty. |
     ///
     /// **Note:** the `/Pages` tree and `/Info` dictionary are not relocated.
     /// qpdf's `preserveObjectStreams` copies the source object->stream
@@ -1979,11 +1980,12 @@ impl LinearizationPlan {
     ///
     /// # Invariants
     ///
-    /// * No ref from `part2_objects` appears in any batch.
+    /// * No page dictionary or Catalog ref appears in any batch.
     /// * Ineligible objects (streams, gen > 0, encryption dict, linearization
     ///   param dict, `/Type /ObjStm`, `/Type /XRef`) are excluded via the
     ///   shared [`is_eligible_for_objstm`] predicate.
-    /// * Cap (`DEFAULT_BATCH_SIZE_CAP`) is applied independently per Part.
+    /// * Generate uses qpdf's fixed even split; Preserve retains source
+    ///   container boundaries regardless of the configured planner cap.
     pub(crate) fn objstm_batches<R: Read + Seek>(
         &self,
         pdf: &mut Pdf<R>,
@@ -2008,40 +2010,11 @@ impl LinearizationPlan {
                 self.objstm_batches_generate(pdf, config, &ctx, &length_exclusions)?
             }
             ObjectStreamMode::Preserve => {
-                let mut plan =
-                    self.objstm_batches_preserve(pdf, config, &ctx, &length_exclusions)?;
-
-                // qpdf's preserveObjectStreams copies the source object->stream
-                // assignment verbatim and the linearized pass only erases the
-                // /Page dicts and the /Catalog (QPDFWriter.cc:1939, 2141-2161).
-                // objstm_batches_preserve already reproduces that grouping: the
-                // /Pages tree and /Info ride along in their source container's
-                // first-half batch, and the /Page dicts are excluded. Only the
-                // /Catalog still needs dropping here — qpdf never compresses it,
-                // but a source ObjStm may have held it, so remove it from Part 4.
-                if let Some(catalog_ref) = self.root_ref {
-                    Self::drop_from_part4_batches(&mut plan, &BTreeSet::from([catalog_ref]));
-                }
-                plan
+                self.objstm_batches_preserve(pdf, config, &ctx, &length_exclusions)?
             }
         };
 
         Ok(plan)
-    }
-
-    /// Remove every ref in `excluded` from each Part-4 ObjStm batch, dropping any
-    /// batch left empty.  An empty `excluded` set is a harmless no-op.
-    fn drop_from_part4_batches(plan: &mut ObjStmBatchPlan, excluded: &BTreeSet<ObjectRef>) {
-        plan.part4_batches = std::mem::take(&mut plan.part4_batches)
-            .into_iter()
-            .filter_map(|batch| {
-                let kept: Vec<ObjectRef> = batch
-                    .into_iter()
-                    .filter(|r| !excluded.contains(r))
-                    .collect();
-                (!kept.is_empty()).then_some(kept)
-            })
-            .collect();
     }
 
     /// Generate mode: reproduce qpdf's linearized `generateObjectStreams`.
@@ -2106,24 +2079,23 @@ impl LinearizationPlan {
         // lc_other sub-order) only have one container each in the fixtures seen so
         // far, so their within-part multi-container order is untested (see flpdf-g1eu
         // follow-up); if such a case ever arises a finer per-part sort may be needed.
-        let mut part4_private: Vec<Vec<ObjectRef>> = Vec::new();
-        let mut part4_shared: Vec<Vec<ObjectRef>> = Vec::new();
-        let mut part4_rest: Vec<Vec<ObjectRef>> = Vec::new();
+        let mut part4_private: Vec<RoutedObjStmBatch> = Vec::new();
+        let mut part4_shared: Vec<RoutedObjStmBatch> = Vec::new();
+        let mut part4_rest: Vec<RoutedObjStmBatch> = Vec::new();
         for (mut members, route) in containers.into_iter().zip(routes) {
             members.sort_unstable_by_key(|r| r.number);
-            match route {
-                ContainerPart::OpenDocument => open_document_batches.push(members),
-                ContainerPart::FirstPage => {
-                    if !outline_set.is_empty() && members.iter().any(|m| outline_set.contains(m)) {
-                        part3_outlines.push(members);
-                    } else {
-                        part3_regular.push(members);
-                    }
-                }
-                ContainerPart::OtherPagePrivate => part4_private.push(members),
-                ContainerPart::OtherPageShared => part4_shared.push(members),
-                ContainerPart::Rest => part4_rest.push(members),
-            }
+            push_routed_objstm_batch(
+                members,
+                route,
+                None,
+                outline_set,
+                &mut open_document_batches,
+                &mut part3_regular,
+                &mut part3_outlines,
+                &mut part4_private,
+                &mut part4_shared,
+                &mut part4_rest,
+            );
         }
         // Concatenate the buckets in part order (part7, part8, part9).
         let mut part4_batches = part4_private;
@@ -2142,17 +2114,16 @@ impl LinearizationPlan {
         })
     }
 
-    /// Preserve mode: reconstruct source ObjStm grouping, splitting cross-boundary batches.
+    /// Preserve mode: retain each surviving source ObjStm and route its member-user union.
     fn objstm_batches_preserve<R: Read + Seek>(
         &self,
         pdf: &mut Pdf<R>,
-        config: &PlannerConfig,
+        _config: &PlannerConfig,
         ctx: &crate::writer::object_streams::EligibilityContext,
         length_exclusions: &BTreeSet<ObjectRef>,
     ) -> crate::Result<ObjStmBatchPlan> {
         use crate::XrefOffset;
 
-        let cap = config.batch_size_cap.get();
         let entries = pdf.source_xref_entries();
 
         // Build source ObjStm groups: container_number → [(index, ref)]
@@ -2163,147 +2134,73 @@ impl LinearizationPlan {
             }
         }
 
-        let part2_set: BTreeSet<ObjectRef> = self.part2_objects.iter().copied().collect();
-        // part6_outline_objects are first-half objects (like Part-3 members) when
-        // UseOutlines is set; include them so ObjStm-compressed outline objects are
-        // batched into first-half containers rather than silently dropped to plain.
-        let part3_set: BTreeSet<ObjectRef> = self
-            .part3_objects
-            .iter()
-            .chain(&self.part6_outline_objects)
-            .copied()
-            .collect();
-        // Only objects actually in the linearization plan's Part-4 set have a
-        // RenumberMap entry. A source ObjStm may carry eligible-but-unplanned
-        // objects (unreachable / trailer-only); batching those would make
-        // ObjStmLayout::build fail with "has no renumber entry". Skip them.
-        // part9_outline_objects are second-half objects; include them for the same
-        // reason as part6 above.
-        let part4_set: BTreeSet<ObjectRef> = self
-            .part4_other_pages_private
-            .iter()
-            .chain(&self.part4_other_pages_shared)
-            .chain(&self.part4_rest)
-            .chain(&self.part9_outline_objects)
-            .copied()
-            .collect();
+        let assigned = self.renumber_assigned_refs();
+        let page_dicts: BTreeSet<ObjectRef> = crate::pages::page_refs(pdf)?.into_iter().collect();
+        let catalog = self.root_ref;
+        let mut containers: Vec<Vec<ObjectRef>> = Vec::new();
+        let mut source_container_numbers: Vec<u32> = Vec::new();
 
-        // Part-4 ownership classification (same rationale as the Generate path):
-        // a batch must not co-locate objects with different page ownership, so
-        // Part-4 members are bucketed by owner — per non-first page private set,
-        // shared (qpdf part8), or rest (qpdf part9) — and chunked per bucket.
-        #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-        enum Owner {
-            Page(usize),
-            Shared,
-            Rest,
-        }
-        let page_private_sets: Vec<BTreeSet<ObjectRef>> = self
-            .per_page_private_objects
-            .iter()
-            .skip(1)
-            .map(|v| v.iter().copied().collect())
-            .collect();
-        let shared_set: BTreeSet<ObjectRef> =
-            self.part4_other_pages_shared.iter().copied().collect();
-        // part9_outline_objects are "rest" objects: not page-private or shared.
-        let rest_set: BTreeSet<ObjectRef> = self
-            .part4_rest
-            .iter()
-            .chain(&self.part9_outline_objects)
-            .copied()
-            .collect();
-        let owner_of = |r: &ObjectRef| -> Option<Owner> {
-            for (i, s) in page_private_sets.iter().enumerate() {
-                if s.contains(r) {
-                    return Some(Owner::Page(i));
-                }
-            }
-            if shared_set.contains(r) {
-                return Some(Owner::Shared);
-            }
-            if rest_set.contains(r) {
-                return Some(Owner::Rest);
-            }
-            None
-        };
-
-        let mut part3_batches: Vec<Vec<ObjectRef>> = Vec::new();
-        let mut part4_batches: Vec<Vec<ObjectRef>> = Vec::new();
-
-        // Iterate containers in ascending container-number order.
-        for (_container_num, mut members) in groups {
+        // Iterate containers in ascending source-container number and retain
+        // their member-index order. qpdf erases page dictionaries and the
+        // Catalog from the source mapping, but otherwise classifies the
+        // surviving container as a unit.
+        for (container_num, mut members) in groups {
             members.sort_by_key(|(idx, _)| *idx);
-
-            // Partition eligible members by destination part, and within Part 4
-            // by owner so cross-page-boundary co-location cannot occur.
-            let mut p3_eligible: Vec<ObjectRef> = Vec::new();
-            let mut p4_by_owner: BTreeMap<Owner, Vec<ObjectRef>> = BTreeMap::new();
-
+            let mut surviving = Vec::new();
             for (_idx, obj_ref) in members {
-                // Part-2 objects must never enter ObjStms.
-                if part2_set.contains(&obj_ref) {
+                if page_dicts.contains(&obj_ref) || Some(obj_ref) == catalog {
                     continue;
                 }
-                if length_exclusions.contains(&obj_ref) {
+                if length_exclusions.contains(&obj_ref) || !assigned.contains(&obj_ref) {
                     continue;
                 }
                 let obj = pdf.resolve_borrowed(obj_ref)?;
-                if !is_eligible_for_objstm(obj_ref, obj, ctx) {
-                    continue;
-                }
-                if Some(obj_ref) == self.pages_tree_ref || Some(obj_ref) == self.info_ref {
-                    // qpdf's preserveObjectStreams copies the source
-                    // object->stream assignment verbatim; the linearized pass
-                    // only erases the /Page dicts and the /Catalog from it
-                    // (QPDFWriter.cc:1939, 2141-2161). It never relocates the
-                    // /Pages tree or /Info, so they ride along in whatever
-                    // source ObjStm container they were in. The planner puts
-                    // both in part4_rest, so the owner gating below would route
-                    // them to a second-half bucket; route them into THIS
-                    // container's first-half (part3) bucket instead so the
-                    // source grouping survives. They carry a valid RenumberMap
-                    // slot via part4_rest (renumber promotes them to the first
-                    // half), so part3 batching is sound.
-                    p3_eligible.push(obj_ref);
-                } else if part3_set.contains(&obj_ref) {
-                    p3_eligible.push(obj_ref);
-                } else if part4_set.contains(&obj_ref) {
-                    // part4_set gates owner bucketing: only objects with a
-                    // linearization-plan slot (RenumberMap entry) may be
-                    // batched. owner_of's page-private set is the raw
-                    // per_page_private list (unfiltered), so an unplanned
-                    // member could otherwise be bucketed and crash
-                    // ObjStmLayout::build with "has no renumber entry".
-                    if let Some(owner) = owner_of(&obj_ref) {
-                        p4_by_owner.entry(owner).or_default().push(obj_ref);
-                    }
-                }
-                // else: eligible but not in any linearization part (no
-                // RenumberMap entry) — leave it as a plain indirect object.
-            }
-
-            // Split into cap-sized batches per part / per owner.
-            for chunk in p3_eligible.chunks(cap) {
-                if !chunk.is_empty() {
-                    part3_batches.push(chunk.to_vec());
+                if is_eligible_for_objstm(obj_ref, obj, ctx) {
+                    surviving.push(obj_ref);
                 }
             }
-            for refs in p4_by_owner.values() {
-                for chunk in refs.chunks(cap) {
-                    if !chunk.is_empty() {
-                        part4_batches.push(chunk.to_vec());
-                    }
-                }
+            if !surviving.is_empty() {
+                source_container_numbers.push(container_num);
+                containers.push(surviving);
             }
         }
 
+        let routes = route_objstm_containers(pdf, &containers)?;
+        let outline_set = &self.outline_first_page_members;
+        let mut open_document_batches = Vec::new();
+        let mut part3_regular = Vec::new();
+        let mut part3_outlines = Vec::new();
+        let mut part4_private = Vec::new();
+        let mut part4_shared = Vec::new();
+        let mut part4_rest = Vec::new();
+
+        for ((members, route), source_container_number) in containers
+            .into_iter()
+            .zip(routes)
+            .zip(source_container_numbers)
+        {
+            push_routed_objstm_batch(
+                members,
+                route,
+                Some(source_container_number),
+                outline_set,
+                &mut open_document_batches,
+                &mut part3_regular,
+                &mut part3_outlines,
+                &mut part4_private,
+                &mut part4_shared,
+                &mut part4_rest,
+            );
+        }
+
+        let mut part3_batches = part3_regular;
+        part3_batches.extend(part3_outlines);
+        let mut part4_batches = part4_private;
+        part4_batches.extend(part4_shared);
+        part4_batches.extend(part4_rest);
+
         Ok(ObjStmBatchPlan {
-            // Preserve mode does not model the open-document category (no such
-            // fixture in the supported corpus); it reconstructs the source
-            // grouping verbatim. Generate mode (`objstm_batches_generate`)
-            // routes open-document containers.
-            open_document_batches: Vec::new(),
+            open_document_batches,
             part3_batches,
             part4_batches,
         })
@@ -2349,6 +2246,68 @@ pub(crate) enum ContainerPart {
     OtherPageShared,
     /// qpdf part 9 — the container reaches no page (trailer-only members).
     Rest,
+}
+
+/// One second-half ObjStm batch paired with qpdf's canonical container route.
+///
+/// Keeping the route beside the members prevents the writer from reclassifying
+/// the container from per-object classic partitions after qpdf's member-user
+/// union has already selected its part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoutedObjStmBatch {
+    pub(crate) members: Vec<ObjectRef>,
+    pub(crate) route: ContainerPart,
+    /// Original ObjStm object number in Preserve mode. Generate mode creates a
+    /// fresh container after the source objects, so it uses `None`.
+    pub(crate) source_container_number: Option<u32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_routed_objstm_batch(
+    members: Vec<ObjectRef>,
+    route: ContainerPart,
+    source_container_number: Option<u32>,
+    outline_set: &[ObjectRef],
+    open_document_batches: &mut Vec<Vec<ObjectRef>>,
+    part3_regular: &mut Vec<Vec<ObjectRef>>,
+    part3_outlines: &mut Vec<Vec<ObjectRef>>,
+    part4_private: &mut Vec<RoutedObjStmBatch>,
+    part4_shared: &mut Vec<RoutedObjStmBatch>,
+    part4_rest: &mut Vec<RoutedObjStmBatch>,
+) {
+    match route {
+        ContainerPart::OpenDocument => open_document_batches.push(members),
+        ContainerPart::FirstPage => {
+            if !outline_set.is_empty() && members.iter().any(|m| outline_set.contains(m)) {
+                part3_outlines.push(members);
+            } else {
+                part3_regular.push(members);
+            }
+        }
+        ContainerPart::OtherPagePrivate => part4_private.push(RoutedObjStmBatch {
+            members,
+            route,
+            source_container_number,
+        }),
+        ContainerPart::OtherPageShared => part4_shared.push(RoutedObjStmBatch {
+            members,
+            route,
+            source_container_number,
+        }),
+        ContainerPart::Rest => part4_rest.push(RoutedObjStmBatch {
+            members,
+            route,
+            source_container_number,
+        }),
+    }
+}
+
+impl std::ops::Deref for RoutedObjStmBatch {
+    type Target = [ObjectRef];
+
+    fn deref(&self) -> &Self::Target {
+        &self.members
+    }
 }
 
 /// Compute the linearized generate-mode ObjStm membership.
@@ -4648,8 +4607,13 @@ mod tests {
         let all_batched: Vec<ObjectRef> = batch_plan
             .part3_batches
             .iter()
-            .chain(&batch_plan.part4_batches)
             .flat_map(|b| b.iter().copied())
+            .chain(
+                batch_plan
+                    .part4_batches
+                    .iter()
+                    .flat_map(|b| b.members.iter().copied()),
+            )
             .collect();
 
         for r in &all_batched {
@@ -4676,8 +4640,13 @@ mod tests {
         let all_batched: Vec<ObjectRef> = batch_plan
             .part3_batches
             .iter()
-            .chain(&batch_plan.part4_batches)
             .flat_map(|b| b.iter().copied())
+            .chain(
+                batch_plan
+                    .part4_batches
+                    .iter()
+                    .flat_map(|b| b.members.iter().copied()),
+            )
             .collect();
 
         for r in &all_batched {
@@ -4706,8 +4675,13 @@ mod tests {
         let all_batched: std::collections::BTreeSet<ObjectRef> = batch_plan
             .part3_batches
             .iter()
-            .chain(&batch_plan.part4_batches)
             .flat_map(|b| b.iter().copied())
+            .chain(
+                batch_plan
+                    .part4_batches
+                    .iter()
+                    .flat_map(|b| b.members.iter().copied()),
+            )
             .collect();
 
         // 6 0 R: content stream (page 1 only) → part2 + stream ineligible
@@ -4921,11 +4895,10 @@ mod tests {
         bytes
     }
 
-    /// Preserve mode with source ObjStms: members are grouped by source ObjStm,
-    /// sorted by source index, split into Part3/Part4, and ineligible + Part2
-    /// members are excluded.
+    /// Preserve mode keeps each source ObjStm intact after qpdf-compatible
+    /// filtering and routes the surviving member-user union once.
     #[test]
-    fn objstm_batches_preserve_source_objstm_grouping_and_part_split() {
+    fn objstm_batches_preserve_source_objstm_grouping_and_union_route() {
         let bytes = two_page_two_objstm_pdf_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("two-ObjStm PDF should parse");
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
@@ -4968,14 +4941,15 @@ mod tests {
             .flat_map(|b| b.iter().copied())
             .collect();
 
-        // ── Invariant 1: Part 2 objects never appear in any batch ──────────
-        let part2_set: BTreeSet<ObjectRef> = plan.part2_objects.iter().copied().collect();
-        for r in all_part3_batched.iter().chain(all_part4_batched.iter()) {
-            assert!(
-                !part2_set.contains(r),
-                "Part-2 object {r} must never appear in any ObjStm batch"
-            );
-        }
+        // ── Invariant 1: page dictionaries never appear in a batch ─────────
+        assert!(
+            !all_part3_batched.contains(&page1_ref) && !all_part4_batched.contains(&page1_ref),
+            "first-page dictionary {page1_ref} must remain standalone"
+        );
+        assert!(
+            !all_part3_batched.contains(&page2_ref) && !all_part4_batched.contains(&page2_ref),
+            "other-page dictionary {page2_ref} must remain standalone"
+        );
 
         // ── Invariant 2: Ineligible object (6 0 R, /Type /XRef dict) excluded ──
         let ineligible_ref = ObjectRef::new(6, 0);
@@ -5003,11 +4977,9 @@ mod tests {
         );
 
         // ── Invariant 4: /Pages tree is routed to the first-half batch ────────
-        // 2 0 R (Pages) is a member of source ObjStm 7 and is routed into that
-        // container's first-half (part3) batch, so it must NOT remain in
-        // part4_batches.  4 0 R (Page 2) is a Part-4 page-private dict and stays
-        // in part4_batches at the planner level (the writer drops it later via
-        // the page-private filter).
+        // 2 0 R (Pages) and 5 0 R (Resources) are members of source ObjStm 7.
+        // Their union route is first-page, so the source container remains
+        // intact in part3. Page dictionary 4 0 R is removed before routing.
         let pages_ref = ObjectRef::new(2, 0);
         assert!(
             all_part3_batched.contains(&pages_ref),
@@ -5018,8 +4990,11 @@ mod tests {
             "the /Pages tree (2 0 R) must NOT remain in part4_batches"
         );
         assert!(
-            all_part4_batched.contains(&page2_ref),
-            "Part-4 eligible object 4 0 R (Page 2) must appear in part4_batches"
+            batch_plan
+                .part3_batches
+                .iter()
+                .any(|batch| batch.contains(&pages_ref) && batch.contains(&resources_ref)),
+            "source ObjStm members 2 0 R and 5 0 R must remain in one first-half batch"
         );
 
         // ── Invariant 5: /Catalog stays standalone ────────────────────────────
@@ -5075,15 +5050,14 @@ mod tests {
         }
     }
 
-    /// Preserve mode with source ObjStms and a small cap: ObjStm members that
-    /// exceed the cap are split into multiple batches per part.
+    /// Preserve mode ignores the Generate planner cap and retains source ObjStm
+    /// boundaries, matching qpdf's `preserveObjectStreams`.
     #[test]
-    fn objstm_batches_preserve_cap_splits_large_groups() {
+    fn objstm_batches_preserve_ignores_generate_cap() {
         // Source ObjStm 7 holds the first-page shared Resources dict (5 0 R) and
         // the /Pages tree (2 0 R), both routed to the first half; ObjStm 8
-        // contributes Page 2 (4 0 R) to part4.  With cap=1 each source
-        // container's first-half members are chunked so each batch holds at most
-        // one member.
+        // contains Page 2 (4 0 R), which qpdf removes from object streams.
+        // Even with cap=1, source ObjStm 7 remains one two-member container.
         let bytes = two_page_two_objstm_pdf_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("two-ObjStm PDF should parse");
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
@@ -5097,25 +5071,27 @@ mod tests {
             .objstm_batches(&mut pdf, &cap1_config)
             .expect("Preserve with cap=1 must succeed");
 
-        // Each batch must have at most 1 member.
-        for batch in batch_plan
-            .part3_batches
-            .iter()
-            .chain(&batch_plan.part4_batches)
-        {
-            assert!(
-                batch.len() <= 1,
-                "with cap=1, each batch must have at most 1 member; got {} members: {batch:?}",
-                batch.len()
-            );
-        }
+        assert!(
+            batch_plan.part3_batches.iter().any(|batch| {
+                batch.contains(&ObjectRef::new(2, 0))
+                    && batch.contains(&ObjectRef::new(5, 0))
+                    && batch.len() == 2
+            }),
+            "cap=1 must not split source ObjStm 7: {:?}",
+            batch_plan.part3_batches
+        );
 
         // All previously expected objects must still appear.
         let all_batched: BTreeSet<ObjectRef> = batch_plan
             .part3_batches
             .iter()
-            .chain(&batch_plan.part4_batches)
             .flat_map(|b| b.iter().copied())
+            .chain(
+                batch_plan
+                    .part4_batches
+                    .iter()
+                    .flat_map(|b| b.members.iter().copied()),
+            )
             .collect();
 
         let resources_ref = ObjectRef::new(5, 0);
@@ -5134,16 +5110,16 @@ mod tests {
             "2 0 R (/Pages tree, routed to the first-half batch) must be batched even with cap=1"
         );
         assert!(
-            all_batched.contains(&page2_ref),
-            "4 0 R must be batched even with cap=1"
+            !all_batched.contains(&page2_ref),
+            "page dictionary 4 0 R must be removed from preserved ObjStms"
         );
     }
 
     /// One source ObjStm whose **two** members both land in Part 4 (they are
     /// eligible plain dicts reachable from neither page-1 nor any other page,
     /// so `from_pdf` keeps them in `part4_rest`).  This is the fixture the
-    /// `chunks(cap)` split path actually needs: a single source ObjStm
-    /// contributing ≥2 eligible members to the *same* part.
+    /// source-container retention path needs: a single source ObjStm
+    /// contributing two eligible members to the same union route.
     ///
     /// The members are referenced from a neutral catalog key (`/Aux`) so they
     /// survive `from_pdf`'s reachability GC (flpdf-phfu) — `/Aux` is neither a
@@ -5214,13 +5190,10 @@ mod tests {
         bytes
     }
 
-    /// Regression for the `chunks(cap)` split path: a single source ObjStm
-    /// contributing two eligible members to the *same* part (Part 4) must be
-    /// split into two separate cap=1 batches, and coalesced into one at cap=2.
-    /// (The pre-existing cap test never had ≥2 same-source/same-part members,
-    /// so a broken `chunks(cap)` would have passed it unnoticed.)
+    /// A source ObjStm with two same-route members remains one container for
+    /// every configured planner cap.
     #[test]
-    fn objstm_batches_preserve_cap_actually_splits_same_source_same_part() {
+    fn objstm_batches_preserve_cap_never_splits_source_container() {
         let bytes = objstm_two_part4_members_pdf_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("fixture should parse");
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
@@ -5241,8 +5214,7 @@ mod tests {
             "fixture invariant: 10 0 R and 11 0 R must both be Part-4"
         );
 
-        // cap=1: the two same-source same-part members must land in DIFFERENT
-        // batches (this is exactly what `chunks(cap)` must do).
+        // cap=1: both members remain in their one source container.
         let cap1 = PlannerConfig {
             mode: crate::writer::object_streams::ObjectStreamMode::Preserve,
             batch_size_cap: std::num::NonZeroUsize::new(1).unwrap(),
@@ -5257,17 +5229,12 @@ mod tests {
             "both members must be batched at cap=1; part4_batches={:?}",
             bp1.part4_batches
         );
-        assert_ne!(
+        assert_eq!(
             b10, b11,
-            "cap=1: 10 0 R and 11 0 R (same source ObjStm, same part) must be \
-             in SEPARATE batches — chunks(cap) split path"
+            "cap=1 must not split 10 0 R and 11 0 R from their source ObjStm"
         );
-        for b in &bp1.part4_batches {
-            assert!(b.len() <= 1, "cap=1 batch over capacity: {b:?}");
-        }
 
-        // cap=2: the same two members must coalesce into ONE batch, proving the
-        // split is cap-driven (not unconditional).
+        // cap=2 produces the identical preserved-container plan.
         let cap2 = PlannerConfig {
             mode: crate::writer::object_streams::ObjectStreamMode::Preserve,
             batch_size_cap: std::num::NonZeroUsize::new(2).unwrap(),
@@ -5283,6 +5250,10 @@ mod tests {
             same_batch,
             "cap=2: 10 0 R and 11 0 R must share one batch; part4_batches={:?}",
             bp2.part4_batches
+        );
+        assert_eq!(
+            bp1, bp2,
+            "Preserve source-container membership must be independent of planner cap"
         );
     }
 
@@ -6955,7 +6926,13 @@ mod tests {
                 .open_document_batches
                 .iter()
                 .chain(&batch_plan.part3_batches)
-                .chain(&batch_plan.part4_batches)
+                .map(Vec::as_slice)
+                .chain(
+                    batch_plan
+                        .part4_batches
+                        .iter()
+                        .map(|batch| batch.members.as_slice()),
+                )
                 .any(|batch| batch.contains(&missing)),
             "missing /Info 99 0 R must not be batched into a generated ObjStm"
         );

@@ -881,6 +881,19 @@ else
     echo "Skipping objstm-lin-cap-boundary-199-bearing.pdf (already exists)"
 fi
 
+# ObjStm-bearing form of the flpdf-w0vu drift fixture. The source container
+# co-locates members with different classic ownership, so linearized Preserve
+# must route the surviving container by qpdf's union of all member users rather
+# than split it back into per-member parts.
+if [[ ! -f "$FIX/objstm-lin-otherpage-shared-docother-bearing.pdf" ]]; then
+    echo "Generating objstm-lin-otherpage-shared-docother-bearing.pdf ..."
+    qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
+        "$FIX/objstm-lin-otherpage-shared-docother.pdf" \
+        "$FIX/objstm-lin-otherpage-shared-docother-bearing.pdf"
+else
+    echo "Skipping objstm-lin-otherpage-shared-docother-bearing.pdf (already exists)"
+fi
+
 # --- hn1g.15: --remove-restrictions == qpdf disableDigitalSignatures fixtures ---
 # All content-stream-free (deflate-independent). Pin the 3 qpdf --remove-restrictions cases:
 #  perms-docmdp : catalog /Perms /DocMDP only (no AcroForm) -> /Perms removed, Sig GC'd
@@ -1872,6 +1885,14 @@ qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
     "$FIX/objstm-lin-cap-boundary-199-bearing.pdf" \
     "$REF/objstm-lin-cap-boundary-199-bearing/linearize-objstm-preserve.pdf"
 echo "objstm-lin-cap-boundary-199-bearing/linearize-objstm-preserve.pdf"
+
+# Preserve must keep the mixed-user source ObjStm intact and classify the
+# container from the union of its member users.
+mkdir -p "$REF/objstm-lin-otherpage-shared-docother-bearing"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-otherpage-shared-docother-bearing.pdf" \
+    "$REF/objstm-lin-otherpage-shared-docother-bearing/linearize-objstm-preserve.pdf"
+echo "objstm-lin-otherpage-shared-docother-bearing/linearize-objstm-preserve.pdf"
 
 # Classic (non-ObjStm) linearize goldens for outline section routing (flpdf-vvjr.2).
 # outlines-80-80: outlines route to part9 (second-half, !UseOutlines).

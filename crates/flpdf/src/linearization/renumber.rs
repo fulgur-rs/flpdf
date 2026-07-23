@@ -102,7 +102,18 @@ const SENTINEL: ObjectRef = ObjectRef {
     generation: 0,
 };
 
-/// Slot numbers reserved by [`RenumberMap::place_objstm_members_per_half`] for
+/// Insertion point for a second-half ObjStm container among plain objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecondHalfContainerAnchor {
+    /// The container precedes every second-half plain object.
+    BeforeFirst,
+    /// The container immediately follows this plain object.
+    After(ObjectRef),
+    /// The container follows every pre-container plain object.
+    AfterLast,
+}
+
+/// Slot numbers reserved by `RenumberMap::place_objstm_members_per_half` for
 /// the split linearized xref-stream layout.
 ///
 /// All zero (the [`Default`]) when there were no ObjStm batches — the writer
@@ -491,12 +502,12 @@ impl RenumberMap {
     ///
     /// Panics if a member ref is not present in the map (a planner / renumber
     /// inconsistency the caller must not paper over).
-    pub fn place_objstm_members_per_half(
+    pub(crate) fn place_objstm_members_per_half(
         &mut self,
         open_document_batches: &[Vec<ObjectRef>],
         first_half_batches: &[Vec<ObjectRef>],
         second_half_batches: &[Vec<ObjectRef>],
-        second_half_anchors: &[Option<ObjectRef>],
+        second_half_anchors: &[SecondHalfContainerAnchor],
         second_half_post_plain: &BTreeSet<ObjectRef>,
         first_half_post_plain: &BTreeSet<ObjectRef>,
     ) -> ObjStmRelocation {
@@ -596,14 +607,10 @@ impl RenumberMap {
         //     INTERLEAVED at its part-group end (type-1). qpdf numbers the
         //     second-half containers AMONG the uncompressed objects — before the
         //     main xref (QPDFWriter.cc:2578-2592 counts containers in
-        //     `second_half_uncompressed`) — AND at their part position: a part7
-        //     container sits at the END of its owning page's group (its synthetic
-        //     ObjGen is the group's highest), so it follows that page's plain
-        //     objects but precedes the next page. `second_half_anchors[bi]` is the
-        //     plain object after which container `bi` is emitted (the group's last
-        //     plain object); `None` means "append after all plain" (the caller's
-        //     default — and the result is identical to interleaving when the
-        //     container's group is the last one).
+        //     `second_half_uncompressed`) — AND at its qpdf part/object-key
+        //     position. Generate containers sort after source objects, while
+        //     Preserve containers retain their source ObjGen and may precede a
+        //     plain object in the same part.
         let mut second_half_container_slot: Vec<Option<u32>> =
             vec![None; second_half_batches.len()];
         let mut emit_container = |bi: usize, table: &mut Vec<ObjectRef>| {
@@ -614,6 +621,11 @@ impl RenumberMap {
             table.push(SENTINEL); // container: a plain indirect, no original
             second_half_container_slot[bi] = Some(container_num);
         };
+        for bi in 0..second_half_batches.len() {
+            if second_half_anchors.get(bi) == Some(&SecondHalfContainerAnchor::BeforeFirst) {
+                emit_container(bi, &mut new_by_new_number);
+            }
+        }
         // lc_thumbnail objects (non-member part4_rest streams) must be emitted
         // AFTER the ObjStm containers, matching qpdf's part9-tail placement.
         // Partition second_half_plain into pre- and post-container groups.
@@ -625,7 +637,8 @@ impl RenumberMap {
             }
             new_by_new_number.push(original);
             for bi in 0..second_half_batches.len() {
-                if second_half_anchors.get(bi).copied().flatten() == Some(original) {
+                if second_half_anchors.get(bi) == Some(&SecondHalfContainerAnchor::After(original))
+                {
                     emit_container(bi, &mut new_by_new_number);
                 }
             }
@@ -1400,6 +1413,24 @@ mod tests {
             "first-page xref slot ({}) must be above every member ({members:?})",
             relocation.first_xref_slot
         );
+    }
+
+    #[test]
+    fn per_half_places_before_first_container_before_plain_objects() {
+        let plan = two_page_plan();
+        let mut rn = RenumberMap::from_plan(&plan);
+        let member = ObjectRef::new(4, 0);
+        let later_plain = ObjectRef::new(7, 0);
+        let relocation = rn.place_objstm_members_per_half(
+            &[],
+            &[],
+            &[vec![member]],
+            &[SecondHalfContainerAnchor::BeforeFirst],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+
+        assert!(relocation.container_numbers[0] < rn.new_for_original(later_plain).unwrap().number);
     }
 
     /// A FIRST-half (Part-3) batch must be numbered LAST within the first half:
