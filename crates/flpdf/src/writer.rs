@@ -2888,7 +2888,7 @@ fn encrypt_stream_payload_for_writer(
 /// The returned bool feeds [`write_reencoded_object`], which only appends a
 /// regenerated `/Filter` (qpdf's re-filtered key order) when the source was NOT
 /// already a lone `/FlateDecode`.
-fn reencode_stream_for_compress(
+pub(crate) fn reencode_stream_for_compress(
     stream: crate::Stream,
     options: &WriteOptions,
     qpdf_plain_empty_refilter: bool,
@@ -4822,16 +4822,6 @@ pub(crate) fn write_stream_to_buf_qpdf_order(
 ) {
     stream.dict.write_pdf_stream(buf, refiltered);
     write_stream_payload(buf, &stream.data, policy);
-}
-
-/// Emit a preserved (verbatim) stream body: the `dict` in qpdf's stream-dict key
-/// order (`/Length` pulled out and written last; no re-filtering) followed by the
-/// raw `data` framed with no newline before `endstream`. Used to emit an
-/// already-lone-/FlateDecode stream without decode + re-encode. The caller is
-/// responsible for setting `dict`'s `/Length` to `data.len()`.
-pub(crate) fn write_preserved_stream(buf: &mut Vec<u8>, dict: &Dictionary, data: &[u8]) {
-    dict.write_pdf_stream(buf, false);
-    write_stream_payload(buf, data, NewlineBeforeEndstream::Never);
 }
 
 /// Emit the `\nstream\n<payload><EOL>endstream` framing shared by

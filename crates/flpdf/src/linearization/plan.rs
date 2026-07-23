@@ -150,11 +150,10 @@ fn collect_direct_refs(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) -> 
 /// Like [`collect_direct_refs`] but tracks whether each ref was discovered
 /// inside an array element (`true`) or a dictionary value (`false`).
 ///
-/// Array-element missing-xref refs survive as `null` in the writer output;
-/// dictionary-value missing-xref refs cause the key to be dropped entirely.
-/// `compute_closure` uses this to restrict resurrectable-null admission to
-/// refs that were actually reached via a surviving array edge rather than
-/// a dropped dict-value edge.
+/// Array-element null-resolving refs survive as `null` in the writer output;
+/// dictionary-value null-resolving refs cause the key to be dropped entirely.
+/// `compute_closure` uses this to restrict resurrectable-null admission to refs
+/// actually reached via a surviving array edge rather than a dropped dict edge.
 fn collect_direct_refs_with_context(
     obj: &Object,
     depth: usize,
@@ -249,20 +248,17 @@ fn compute_closure<R: Read + Seek>(
     // consult all edges discovered so far, not just the one in the current tuple.
     let mut seen_as_array: BTreeSet<ObjectRef> = BTreeSet::new();
 
-    // A reference to object 0 (free-list head / null singleton, ISO 32000-1
-    // §7.3.10) or to a missing-xref object resolves to null. qpdf admits no body
-    // object for such a reference (the holding dict key is dropped / the array
-    // element is inlined as `null` at emission), so it must never receive an
-    // object number here. Keeping it in `visited` but out of `order` mirrors
-    // that: a numbered stray null object would diverge from qpdf and inflate the
-    // first-page object count. `live` is computed once by the caller — the
-    // per-page closure loop would otherwise re-scan the whole xref table O(pages).
+    // Object 0 (free-list head / null singleton, ISO 32000-1 §7.3.10) and all
+    // null-resolving references have no ordinary body here. The holding dict key
+    // is dropped, while an array keeps the indirect null identity only through
+    // the `resurrectable` path below. Keeping other nulls in `visited` but out of
+    // `order` avoids a stray numbered body and an inflated first-page count.
     //
-    // Exception: missing-xref refs reached via a surviving array edge in this
+    // Exception: null-resolving refs reached via a surviving array edge in this
     // page's object graph are resurrectable (see `resurrectable_null_refs`). qpdf
     // classifies them as first-page users when reached from a first-page object,
-    // giving them HIGH object numbers inside Part 2. A missing-xref ref reached
-    // only via a dict value is dropped (not resurrectable), so it stays excluded.
+    // giving them HIGH object numbers inside Part 2. A null ref reached only via
+    // a dict value is dropped (not resurrectable), so it stays excluded.
     let admits_body_object = |r: ObjectRef| -> bool { r.number != 0 && live.contains(&r) };
 
     while let Some((current, via_array)) = queue.pop_front() {
@@ -270,8 +266,8 @@ fn compute_closure<R: Read + Seek>(
             continue;
         }
         if resurrectable.contains(&current) {
-            // Missing-xref ref: the writer survives array-element slots as null
-            // but drops dict-value slots (the key is omitted entirely).  Only
+            // Null-resolving ref: the writer preserves array-element slots as
+            // null but drops dict-value slots (the key is omitted entirely). Only
             // admit to the closure when an array edge exists — a ref reached
             // solely via dict-value edges has no surviving body object in the
             // first-page section, matching qpdf's object-user map which does not
@@ -841,7 +837,7 @@ impl LinearizationPlan {
         // the whole xref table (which would be O(pages × objects)).
         let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
         let page_tree = page_tree_node_refs(pdf)?;
-        let page_object_users = page_object_users(pdf, &page_refs, &live, &resurrectable)?;
+        let page_object_users = page_object_users(pdf, &page_refs)?;
         let mut all_referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>> = BTreeMap::new();
         for (page_idx, users) in page_object_users.page.iter().enumerate() {
             for &object_ref in users {
@@ -852,9 +848,9 @@ impl LinearizationPlan {
             }
         }
         let first_page_users = page_object_users.page.first().cloned().unwrap_or_default();
-        let open_document_set = open_document_set_with_context(pdf, &page_tree, &live)?;
-        let all_outline_refs = outlines_set_with_context(pdf, &page_tree, &live)?;
-        let document_other_set = document_other_set_with_context(pdf, &page_tree, &live)?;
+        let open_document_set = open_document_set_with_context(pdf, &page_tree)?;
+        let all_outline_refs = outlines_set_with_context(pdf, &page_tree)?;
+        let document_other_set = document_other_set_with_context(pdf, &page_tree)?;
         let elig_ctx = if use_generate_objstm {
             Some(eligibility_context(pdf)?)
         } else {
@@ -2312,14 +2308,11 @@ pub(crate) fn objstm_membership_linearized<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     assigned: &BTreeSet<ObjectRef>,
 ) -> crate::Result<Vec<Vec<ObjectRef>>> {
-    let mut eligible = crate::writer::object_streams::compressible_objgens_linearized_legacy(pdf)?;
-    // Resurrected null-resolving array refs (flpdf-0gyq): `compressible_objgens`
-    // filters to live objects, so it excludes these free/missing refs — but qpdf
-    // compresses them as the TRAILING members of the ObjStm. Append them after the
-    // live members (in source-object-number order). They have renumber slots from
-    // the plan's all_refs admission, so they survive the `assigned` retain below.
-    let resurrected = crate::rewrite_renumber::resurrectable_null_refs(pdf)?;
-    eligible.extend(resurrected);
+    // qpdf's DFS already preserves the indirect identity of null-resolving
+    // references reached from arrays. Do not append `resurrectable_null_refs`
+    // here: that set remains a planner/all-refs aid, and appending it would give
+    // array-null objects duplicate ObjStm membership.
+    let mut eligible = crate::writer::object_streams::compressible_objgens(pdf)?;
     // Drop refs without a renumber slot before the split (see doc above).
     eligible.retain(|r| assigned.contains(r));
     let streams = crate::writer::object_streams::even_split_into_streams(&eligible);
@@ -2386,14 +2379,12 @@ const OPEN_DOCUMENT_CATALOG_KEYS: [&[u8]; 5] = [
 #[cfg_attr(not(test), allow(dead_code))]
 fn open_document_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet<ObjectRef>> {
     let page_tree = page_tree_node_refs(pdf)?;
-    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
-    open_document_set_with_context(pdf, &page_tree, &live)
+    open_document_set_with_context(pdf, &page_tree)
 }
 
 fn open_document_set_with_context<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_tree: &BTreeSet<ObjectRef>,
-    live: &BTreeSet<ObjectRef>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
     // Seed refs: the indirect refs inside each open-document key's value, with
     // array-edge context. A ref that is an array ELEMENT of an OD key's value
@@ -2426,7 +2417,7 @@ fn open_document_set_with_context<R: Read + Seek>(
         }
     }
 
-    closure_from_seeds(pdf, seeds, page_tree, live)
+    closure_from_seeds(pdf, seeds, page_tree)
 }
 
 /// Compute the set of objects qpdf categorizes with a non-zero `others` count:
@@ -2458,14 +2449,12 @@ fn open_document_set_with_context<R: Read + Seek>(
 #[cfg_attr(not(test), allow(dead_code))]
 fn document_other_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet<ObjectRef>> {
     let page_tree = page_tree_node_refs(pdf)?;
-    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
-    document_other_set_with_context(pdf, &page_tree, &live)
+    document_other_set_with_context(pdf, &page_tree)
 }
 
 fn document_other_set_with_context<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_tree: &BTreeSet<ObjectRef>,
-    live: &BTreeSet<ObjectRef>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
     let mut seeds: Vec<(ObjectRef, bool)> = Vec::new();
     // Trailer keys except /Root (ou_root, the catalog) and /Encrypt
@@ -2494,7 +2483,7 @@ fn document_other_set_with_context<R: Read + Seek>(
         }
     }
 
-    closure_from_seeds(pdf, seeds, page_tree, live)
+    closure_from_seeds(pdf, seeds, page_tree)
 }
 
 /// The inheritable page attributes (ISO 32000-1 Table 30) that qpdf's
@@ -2562,14 +2551,9 @@ fn page_dictionary_for_user_traversal<R: Read + Seek>(
 /// descended. Stream `/Length` is skipped because the linearized writer
 /// directizes it before qpdf computes object users.
 ///
-/// `live` and `resurrectable` preserve the existing planner's handling of
-/// null-resolving references: live null bodies are users, while an absent ref is
-/// retained only when the same page reaches it through a surviving array edge.
 fn page_object_users<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_refs: &[ObjectRef],
-    live: &BTreeSet<ObjectRef>,
-    resurrectable: &BTreeSet<ObjectRef>,
 ) -> crate::Result<PageObjectUsers> {
     let mut result = PageObjectUsers {
         page: Vec::with_capacity(page_refs.len()),
@@ -2581,9 +2565,7 @@ fn page_object_users<R: Read + Seek>(
         let mut visited = BTreeSet::from([page_ref]);
         let mut page_users = BTreeSet::new();
         let mut thumbnail_users = BTreeSet::new();
-        if live.contains(&page_ref) {
-            page_users.insert(page_ref);
-        }
+        page_users.insert(page_ref);
 
         // (object, active user, top page, immediate array edge, inline depth)
         let mut stack = vec![(
@@ -2593,9 +2575,6 @@ fn page_object_users<R: Read + Seek>(
             false,
             0usize,
         )];
-        let mut tentative_absent = BTreeSet::new();
-        let mut seen_as_array = BTreeSet::new();
-
         while let Some((object, user, top, via_array, depth)) = stack.pop() {
             // cov:ignore-start: reachable_object_set runs before page_object_users in LinearizationPlan::from_pdf and rejects the same MAX_INLINE_DEPTH overflow, so parsed public inputs cannot reach this duplicate defensive bound
             if depth > MAX_INLINE_DEPTH {
@@ -2607,8 +2586,18 @@ fn page_object_users<R: Read + Seek>(
 
             match object {
                 Object::Reference(object_ref) => {
-                    if via_array {
-                        seen_as_array.insert(object_ref);
+                    let users = match user {
+                        PageObjectUser::Page => &mut page_users,
+                        PageObjectUser::Thumbnail => &mut thumbnail_users,
+                    };
+                    if crate::qpdf_null::value_is_null(pdf, &Object::Reference(object_ref))? {
+                        // qpdf's dictionary getKeys() hides null-resolving
+                        // values, while arrays preserve an indirect null's
+                        // identity as an object user.
+                        if via_array && object_ref.number > 0 {
+                            users.insert(object_ref);
+                        }
+                        continue;
                     }
                     let resolved = pdf.resolve(object_ref)?;
                     let is_page = matches!(&resolved, Object::Dictionary(dict)
@@ -2621,19 +2610,7 @@ fn page_object_users<R: Read + Seek>(
                         continue;
                     }
 
-                    let users = match user {
-                        PageObjectUser::Page => &mut page_users,
-                        PageObjectUser::Thumbnail => &mut thumbnail_users,
-                    };
-                    if live.contains(&object_ref) {
-                        users.insert(object_ref);
-                    } else if resurrectable.contains(&object_ref) {
-                        users.insert(object_ref);
-                        tentative_absent.insert((object_ref, user));
-                    } else {
-                        continue;
-                    }
-
+                    users.insert(object_ref);
                     stack.push((resolved, user, top, false, 0));
                 }
                 Object::Array(items) => {
@@ -2648,8 +2625,9 @@ fn page_object_users<R: Read + Seek>(
                         continue;
                     }
                     let mut children = Vec::new();
-                    for (key, value) in dict.iter() {
-                        if matches!(value, Object::Null) || (is_page && key == b"Parent") {
+                    let entries = crate::qpdf_null::snapshot_entries(&dict, false);
+                    for (key, value) in crate::qpdf_null::visible_entries(pdf, entries)? {
+                        if is_page && key == b"Parent" {
                             continue;
                         }
                         let child_user = if is_page && key == b"Thumb" {
@@ -2657,7 +2635,7 @@ fn page_object_users<R: Read + Seek>(
                         } else {
                             user
                         };
-                        children.push((value.clone(), child_user));
+                        children.push((value, child_user));
                     }
                     for (value, child_user) in children.into_iter().rev() {
                         stack.push((value, child_user, false, false, depth + 1));
@@ -2665,10 +2643,9 @@ fn page_object_users<R: Read + Seek>(
                 }
                 Object::Stream(stream) => {
                     let mut children = Vec::new();
-                    for (key, value) in stream.dict.iter() {
-                        if key != b"Length" && !matches!(value, Object::Null) {
-                            children.push(value.clone());
-                        }
+                    let entries = crate::qpdf_null::snapshot_entries(&stream.dict, true);
+                    for (_key, value) in crate::qpdf_null::visible_entries(pdf, entries)? {
+                        children.push(value);
                     }
                     for value in children.into_iter().rev() {
                         stack.push((value, user, false, false, depth + 1));
@@ -2681,19 +2658,6 @@ fn page_object_users<R: Read + Seek>(
                 | Object::RealLiteral { .. }
                 | Object::Name(_)
                 | Object::String(_) => {}
-            }
-        }
-
-        for (object_ref, user) in tentative_absent {
-            if !seen_as_array.contains(&object_ref) {
-                match user {
-                    PageObjectUser::Page => {
-                        page_users.remove(&object_ref);
-                    }
-                    PageObjectUser::Thumbnail => {
-                        thumbnail_users.remove(&object_ref);
-                    }
-                }
             }
         }
         result.page.push(page_users);
@@ -2786,57 +2750,30 @@ fn closure_from_seeds<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     seeds: Vec<(ObjectRef, bool)>,
     page_tree: &BTreeSet<ObjectRef>,
-    live: &BTreeSet<ObjectRef>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
-    // `live` is supplied by the caller (computed once) so the Object::Null guard
-    // below can distinguish xref-absent refs from real live null bodies without
-    // rescanning the xref/cache on every call.
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut out: BTreeSet<ObjectRef> = BTreeSet::new();
-    // Xref-absent nulls added tentatively to `out`; the post-BFS pass below
-    // removes those never reached via any array edge.
-    let mut tentative_absent_nulls: BTreeSet<ObjectRef> = BTreeSet::new();
-    // Every xref-absent ref reached via at least one array edge. Updated
-    // unconditionally (even for already-visited refs) so BFS ordering does not
-    // affect which nulls are admitted — a dict-value edge may be traversed before
-    // the array edge from a later parent, and `visited` would block re-processing.
-    let mut seen_as_array: BTreeSet<ObjectRef> = BTreeSet::new();
-    // Pre-populate seen_as_array from seeds that arrive via array edges. This
-    // covers the case where an xref-absent null IS a direct seed (e.g. Catalog
-    // `/OpenAction [99 0 R]` → ref 99 is an array element of the OD key's value).
-    // Because the null has no children, the in-BFS seen_as_array update would
-    // never fire for it; seeding here ensures the post-BFS cull honours the edge
-    // type recorded when the value was traversed by the caller.
-    for (r, via_array) in &seeds {
-        if *via_array && !live.contains(r) {
-            seen_as_array.insert(*r);
+    let mut queue: VecDeque<(ObjectRef, bool)> = seeds.into();
+    while let Some((r, via_array)) = queue.pop_front() {
+        if crate::qpdf_null::value_is_null(pdf, &Object::Reference(r))? {
+            // qpdf dictionary keys whose values resolve to null are absent.
+            // Arrays preserve the indirect identity as an object user.
+            if via_array && r.number > 0 {
+                out.insert(r);
+            }
+            continue;
         }
-    }
-    let mut queue: VecDeque<ObjectRef> = seeds.into_iter().map(|(r, _)| r).collect();
-    while let Some(r) = queue.pop_front() {
         if !visited.insert(r) {
             continue;
         }
-        let obj = pdf.resolve_borrowed(r)?;
+        let obj = pdf.resolve(r)?;
         let mut children: Vec<(ObjectRef, bool)> = Vec::new();
-        match obj {
+        match &obj {
             // Page boundary: qpdf neither records nor descends a non-top `/Page`
             // leaf reached while tracing a document-level key.
             Object::Dictionary(d) if matches!(d.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Page") =>
             {
                 continue;
-            }
-            // Xref-absent ref: resolves to null but has no live body object.
-            // Dict-value keys whose value is an absent ref are dropped by the
-            // writer, so those must NOT enter open_document_set.  Array elements
-            // whose value is an absent ref ARE kept (resurrectable): the writer
-            // emits a null body, so those MUST enter open_document_set.
-            // Tentatively add the ref to `out`; the post-BFS pass removes it
-            // unless `seen_as_array` records at least one array edge to this ref.
-            // A live null body (`99 0 obj null endobj`) falls through to `out.insert`.
-            Object::Null if !live.contains(&r) => {
-                tentative_absent_nulls.insert(r);
-                // Null has no children; fall through to out.insert.
             }
             // Page-tree interior `/Pages` node: skip the inherited attributes
             // qpdf has stripped, but follow `/Kids` (→ the `/Page` leaves above)
@@ -2850,26 +2787,13 @@ fn closure_from_seeds<R: Read + Seek>(
                     }
                 }
             }
-            _ => collect_direct_refs_with_context(obj, 0, false, &mut children)?,
+            _ => collect_direct_refs_with_context(&obj, 0, false, &mut children)?,
         }
         out.insert(r);
         for (cr, via_array) in children {
-            // Record array-edge reach unconditionally so BFS ordering does not
-            // decide which xref-absent nulls are admitted to open_document_set.
-            if via_array && !live.contains(&cr) {
-                seen_as_array.insert(cr);
-            }
             if !visited.contains(&cr) {
-                queue.push_back(cr);
+                queue.push_back((cr, via_array));
             }
-        }
-    }
-    // Remove xref-absent nulls that were reached only via dict-value edges: the
-    // writer drops those keys, so qpdf records no object user for them and they
-    // must not appear in open_document_set / document_other_set.
-    for r in &tentative_absent_nulls {
-        if !seen_as_array.contains(r) {
-            out.remove(r);
         }
     }
     Ok(out)
@@ -2891,14 +2815,12 @@ fn closure_from_seeds<R: Read + Seek>(
 /// Propagates reader errors from resolving the catalog or any reached object.
 pub(crate) fn outlines_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSet<ObjectRef>> {
     let page_tree = page_tree_node_refs(pdf)?;
-    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
-    outlines_set_with_context(pdf, &page_tree, &live)
+    outlines_set_with_context(pdf, &page_tree)
 }
 
 fn outlines_set_with_context<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_tree: &BTreeSet<ObjectRef>,
-    live: &BTreeSet<ObjectRef>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
     let mut seeds: Vec<(ObjectRef, bool)> = Vec::new();
     let catalog = pdf
@@ -2910,7 +2832,7 @@ fn outlines_set_with_context<R: Read + Seek>(
             collect_direct_refs_with_context(v, 0, false, &mut seeds)?;
         }
     }
-    closure_from_seeds(pdf, seeds, page_tree, live)
+    closure_from_seeds(pdf, seeds, page_tree)
 }
 
 /// Returns `true` when the catalog specifies `/PageMode /UseOutlines` AND has
@@ -3060,6 +2982,28 @@ mod tests {
             &plan.all_referenced_pages,
             containers,
         )
+    }
+
+    #[test]
+    fn null_visible_generate_container_routes_to_rest() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/null-visible-matrix.pdf");
+        let mut pdf =
+            Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
+        let assigned = plan.renumber_assigned_refs();
+        let containers = objstm_membership_linearized(&mut pdf, &assigned).unwrap();
+        let routes = route_with_plan(&plan, &containers);
+        let users = plan.routing_users.as_ref().unwrap();
+
+        assert_eq!(
+            routes,
+            vec![ContainerPart::Rest],
+            "containers={containers:?}, first_page={:?}, document_other={:?}, pages={:?}",
+            users.first_page,
+            users.document_other,
+            plan.all_referenced_pages,
+        );
     }
 
     // -----------------------------------------------------------------------

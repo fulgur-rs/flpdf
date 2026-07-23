@@ -229,12 +229,14 @@ fn collect_qpdf_enqueue_refs<R: Read + Seek>(
 /// matching qpdf's reachability garbage collection of the linearized object
 /// universe.
 ///
-/// Seeds from `/Root` plus every indirect trailer entry — **including
+/// Seeds from `/Root` plus every qpdf-visible trailer entry — **including
 /// `/Encrypt`**, excluding `/Prev`, `/Size`, `/ID` (and `/Root`, already
-/// seeded) — then breadth-first walks via [`collect_refs`]. When `skip_length`
-/// is set (always, for linearize: the linearized writer directizes every
-/// `/Length`), a stream's indirect `/Length` edge is not followed, so an object
-/// reachable ONLY through that dead edge is correctly absent — matching qpdf's
+/// seeded) — then breadth-first walks with qpdf's position-dependent null
+/// visibility. Arrays retain indirect null identities; dictionary and stream
+/// values that resolve to null contribute no edge. When `skip_length` is set
+/// (always, for linearize: the linearized writer directizes every `/Length`), a
+/// stream's indirect `/Length` edge is not followed, so an object reachable
+/// ONLY through that dead edge is correctly absent — matching qpdf's
 /// reachability GC.
 ///
 /// Unlike [`CatalogFirstRenumber`], `/Encrypt` IS part of the seed set: the
@@ -245,7 +247,7 @@ fn collect_qpdf_enqueue_refs<R: Read + Seek>(
 /// # Errors
 ///
 /// Returns [`Error::Unsupported`] when the trailer has no `/Root` or inline
-/// nesting exceeds [`MAX_INLINE_DEPTH`] (via [`collect_refs`]), and propagates
+/// nesting exceeds [`MAX_INLINE_DEPTH`] (via [`collect_qpdf_enqueue_refs`]), and propagates
 /// [`Error::Io`] / [`Error::Parse`] / [`Error::Encrypted`] from resolving
 /// objects during the walk.
 pub(crate) fn reachable_object_set<R: Read + Seek>(
@@ -256,16 +258,17 @@ pub(crate) fn reachable_object_set<R: Read + Seek>(
         .root_ref()
         .ok_or_else(|| Error::Unsupported("reachability: trailer has no /Root".to_string()))?;
     let mut seeds: Vec<ObjectRef> = vec![root];
-    for (key, value) in pdf.trailer().iter() {
+    let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer(), false);
+    for (key, value) in crate::qpdf_null::visible_entries(pdf, trailer_entries)? {
         // /Encrypt is intentionally NOT skipped: it is part of the live universe.
         // /Prev, /Size, /ID, /Root are not object roots of the document graph.
-        if matches!(key, b"ID" | b"Prev" | b"Root" | b"Size") {
+        if matches!(key.as_slice(), b"ID" | b"Prev" | b"Root" | b"Size") {
             continue;
         }
         // Recurse into direct dict/array trailer values so a nested indirect ref
         // (e.g. inside a direct `/Info` dict) is seeded, matching qpdf's recursive
         // trailer enqueue. A bare reference yields exactly one seed as before.
-        collect_refs(value, 0, skip_length, &mut |r| seeds.push(r))?;
+        collect_qpdf_enqueue_refs(pdf, &value, 0, skip_length, &mut seeds)?;
     }
 
     let mut reachable: BTreeSet<ObjectRef> = BTreeSet::new();
@@ -276,20 +279,23 @@ pub(crate) fn reachable_object_set<R: Read + Seek>(
         }
     }
     while let Some(cur) = queue.pop_front() {
-        let obj = pdf.resolve_borrowed(cur)?;
-        collect_refs(obj, 0, skip_length, &mut |r| {
+        let obj = pdf.resolve(cur)?;
+        let mut found = Vec::new();
+        collect_qpdf_enqueue_refs(pdf, &obj, 0, skip_length, &mut found)?;
+        for r in found {
             if reachable.insert(r) {
                 queue.push_back(r);
             }
-        })?;
+        }
     }
     Ok(reachable)
 }
 
 /// Indirect references that qpdf "resurrects" as `null` body objects rather than
-/// dropping: a reference that resolves to null (a missing-xref or free object,
-/// `number > 0`) **reached through a surviving edge** — i.e. as an ARRAY element,
-/// or nested inside a non-null dict/array value.
+/// dropping: a reference that resolves to null (missing, free, real-null, or a
+/// holder chain ending in null, with `number > 0`) **reached through a surviving
+/// edge** — i.e. as an ARRAY element, or nested inside a non-null dict/array
+/// value.
 ///
 /// This is the array half of qpdf's null-resolving normalization (the dict-value
 /// half drops the key). The walk is **drop-aware**: a null-resolving reference
@@ -300,11 +306,15 @@ pub(crate) fn reachable_object_set<R: Read + Seek>(
 ///
 /// # Errors
 ///
+/// This set is used by linearization's all-ref and object-user planning. ObjStm
+/// Generate membership has its own qpdf DFS
+/// ([`crate::writer::object_streams::compressible_objgens`]) and must not append
+/// this set a second time.
+///
 /// Propagates resolve errors and the [`MAX_INLINE_DEPTH`] guard from the walk.
 pub(crate) fn resurrectable_null_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
-    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
     let root = pdf
         .root_ref()
         .ok_or_else(|| Error::Unsupported("resurrectable: trailer has no /Root".to_string()))?;
@@ -313,14 +323,15 @@ pub(crate) fn resurrectable_null_refs<R: Read + Seek>(
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut queue: VecDeque<ObjectRef> = VecDeque::from([root]);
 
-    // Seed from the trailer (dict context): live roots are followed; a
+    // Seed from the trailer (dict context): visible roots are followed; a
     // null-resolving trailer ref is a dropped key, not resurrected.
-    for (key, value) in pdf.trailer().iter() {
-        if matches!(key, b"ID" | b"Prev" | b"Root" | b"Size") {
+    let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer(), false);
+    for (key, value) in trailer_entries {
+        if matches!(key.as_slice(), b"ID" | b"Prev" | b"Root" | b"Size") {
             continue;
         }
         let mut follow: Vec<ObjectRef> = Vec::new();
-        walk_surviving(value, 0, false, &live, &mut follow, &mut result)?;
+        walk_surviving(pdf, &value, 0, false, &mut follow, &mut result)?;
         queue.extend(follow);
     }
 
@@ -328,9 +339,9 @@ pub(crate) fn resurrectable_null_refs<R: Read + Seek>(
         if !visited.insert(cur) {
             continue;
         }
-        let obj = pdf.resolve_borrowed(cur)?;
+        let obj = pdf.resolve(cur)?;
         let mut follow: Vec<ObjectRef> = Vec::new();
-        walk_surviving(obj, 0, false, &live, &mut follow, &mut result)?;
+        walk_surviving(pdf, &obj, 0, false, &mut follow, &mut result)?;
         for r in follow {
             if !visited.contains(&r) {
                 queue.push_back(r);
@@ -342,15 +353,15 @@ pub(crate) fn resurrectable_null_refs<R: Read + Seek>(
 
 /// Drop-aware structural walk for [`resurrectable_null_refs`]. Distinguishes
 /// array position (`in_array`) from dict-value position: a null-resolving
-/// reference (`number > 0`, not in `live`) is collected into `result` only when
-/// it sits in an array (a surviving edge); a dict/stream value that is
-/// null-resolving is skipped entirely (qpdf drops that key). Live references are
-/// pushed to `follow` for the BFS to continue. Object 0 is ignored.
-fn walk_surviving(
+/// reference (`number > 0`) is collected into `result` only when it sits in an
+/// array (a surviving edge); a dict/stream value that is null-resolving is
+/// skipped entirely (qpdf drops that key). Non-null references are pushed to
+/// `follow` for the BFS to continue. Object 0 is ignored.
+fn walk_surviving<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
     obj: &Object,
     depth: usize,
     in_array: bool,
-    live: &BTreeSet<ObjectRef>,
     follow: &mut Vec<ObjectRef>,
     result: &mut BTreeSet<ObjectRef>,
 ) -> crate::Result<()> {
@@ -360,38 +371,35 @@ fn walk_surviving(
                 .to_string(),
         ));
     }
-    let is_null_resolving = |r: &ObjectRef| r.number > 0 && !live.contains(r);
+
+    if crate::qpdf_null::value_is_null(pdf, obj)? {
+        if in_array {
+            if let Object::Reference(reference) = obj {
+                if reference.number > 0 {
+                    result.insert(*reference);
+                }
+            }
+        }
+        return Ok(());
+    }
+
     match obj {
         Object::Reference(r) => {
-            if is_null_resolving(r) {
-                // Reached here only via an array element (dict/stream branches
-                // skip null-resolving values before recursing).
-                if in_array {
-                    result.insert(*r);
-                }
-            } else if live.contains(r) {
-                follow.push(*r);
-            }
+            follow.push(*r);
         }
         Object::Array(elements) => {
             for e in elements {
-                walk_surviving(e, depth + 1, true, live, follow, result)?;
+                walk_surviving(pdf, e, depth + 1, true, follow, result)?;
             }
         }
         Object::Dictionary(dict) => {
             for (_key, value) in dict.iter() {
-                if matches!(value, Object::Reference(r) if is_null_resolving(r)) {
-                    continue; // dropped key
-                }
-                walk_surviving(value, depth + 1, false, live, follow, result)?;
+                walk_surviving(pdf, value, depth + 1, false, follow, result)?;
             }
         }
         Object::Stream(stream) => {
             for (_key, value) in stream.dict.iter() {
-                if matches!(value, Object::Reference(r) if is_null_resolving(r)) {
-                    continue;
-                }
-                walk_surviving(value, depth + 1, false, live, follow, result)?;
+                walk_surviving(pdf, value, depth + 1, false, follow, result)?;
             }
         }
         _ => {}
@@ -960,13 +968,23 @@ mod tests {
         //   /Held 99 0 R                 dict value missing -> dropped, NOT
         //   /Nest << /Inner 97 0 R >>    nested dict value missing -> NOT
         //   /Free [5 0 R]                5 free-within-/Size (array) -> resurrectable
+        //   /Real [4 0 R]                4 live REAL-null (array) -> resurrectable
+        //   /HeldReal 6 0 R              6 live REAL-null (dict) -> dropped
         // Object 10 (a stray, unreferenced) only bumps /Size so 5 is a free gap
         // (<=10) while 97/98/99 are missing (beyond /Size).
         let cat = b"<< /Type /Catalog /Pages 2 0 R /Arr [ 98 0 R 2 0 R 0 0 R ] \
-                    /Held 99 0 R /Nest << /Inner 97 0 R >> /Free [ 5 0 R ] >>";
+                    /Held 99 0 R /Nest << /Inner 97 0 R >> /Free [ 5 0 R ] \
+                    /Real [ 4 0 R ] /HeldReal 6 0 R >>";
         let pages = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
         let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>";
-        let bytes = build_raw_pdf(&[(1, cat), (2, pages), (3, page), (10, b"<< >>")]);
+        let bytes = build_raw_pdf(&[
+            (1, cat),
+            (2, pages),
+            (3, page),
+            (4, b"null"),
+            (6, b"null"),
+            (10, b"<< >>"),
+        ]);
         let mut pdf = Pdf::open_mem(&bytes).expect("open");
         let got = resurrectable_null_refs(&mut pdf).expect("resurrectable");
         let nums: BTreeSet<u32> = got.iter().map(|r| r.number).collect();
@@ -979,12 +997,20 @@ mod tests {
             "free array element 5 must be resurrectable"
         );
         assert!(
+            nums.contains(&4),
+            "REAL-null array element 4 must be resurrectable"
+        );
+        assert!(
             !nums.contains(&99),
             "dict-only missing 99 must NOT be resurrectable"
         );
         assert!(
             !nums.contains(&97),
             "nested dict-value missing 97 must NOT be resurrectable"
+        );
+        assert!(
+            !nums.contains(&6),
+            "dict-only REAL-null 6 must NOT be resurrectable"
         );
         assert!(
             !nums.contains(&2),
@@ -1262,6 +1288,34 @@ mod tests {
         );
         assert!(!reachable.contains(&ObjectRef::new(3, 0)));
         assert!(!reachable.contains(&ObjectRef::new(5, 0)));
+    }
+
+    #[test]
+    fn reachable_object_set_hides_dict_real_null_and_keeps_array_real_null() {
+        let bytes = build_raw_pdf(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /DictNull 4 0 R /Array [5 0 R] >>",
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (4, b"null"),
+            (5, b"null"),
+        ]);
+        let mut pdf = Pdf::open_mem(&bytes).expect("open");
+        let reachable = reachable_object_set(&mut pdf, true).expect("walk");
+
+        assert!(
+            !reachable.contains(&ObjectRef::new(4, 0)),
+            "qpdf hides a dictionary edge whose live body resolves to null"
+        );
+        assert!(
+            reachable.contains(&ObjectRef::new(5, 0)),
+            "qpdf preserves an array null's indirect identity"
+        );
     }
 
     #[test]

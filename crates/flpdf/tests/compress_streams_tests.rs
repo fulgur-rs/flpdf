@@ -403,7 +403,7 @@ fn generate_route_matches_qpdf_empty_refilter() {
 }
 
 #[test]
-fn linearized_route_keeps_encoded_empty_payload() {
+fn linearized_route_matches_qpdf_empty_refilter() {
     use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
     use flpdf::{Pdf, WriteOptions};
     use std::io::Cursor;
@@ -419,7 +419,15 @@ fn linearized_route_keeps_encoded_empty_payload() {
 
     let mut reopened = Pdf::open(Cursor::new(document.bytes)).unwrap();
     let stream = resolve_metadata_stream(&mut reopened);
-    assert_legacy_encoded_empty_payload(&stream, "linearized", Some(8));
+    assert!(
+        stream.data.is_empty(),
+        "qpdf linearization keeps the Flate filter but emits no wrapper bytes for an empty stream"
+    );
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Name(b"FlateDecode".to_vec()))
+    );
+    assert_eq!(stream.dict.get("Length"), Some(&Object::Integer(0)));
 }
 
 #[test]

@@ -2,6 +2,7 @@
 
 #![cfg(feature = "qpdf-zlib-compat")]
 
+use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
 use flpdf::{
     write_pdf_with_options, NewlineBeforeEndstream, Object, ObjectRef, ObjectStreamMode, Pdf,
     WriteOptions,
@@ -23,6 +24,27 @@ fn rewrite_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8> {
     let mut out = Vec::new();
     write_pdf_with_options(&mut pdf, &mut out, &options).unwrap();
     out
+}
+
+fn linearize_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&path).unwrap())).expect("source must parse");
+    let plan =
+        LinearizationPlan::from_pdf(&mut pdf, mode == ObjectStreamMode::Generate).expect("plan");
+    let renumber = RenumberMap::from_plan(&plan);
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&path).unwrap())).expect("source must parse");
+    let mut options = WriteOptions::default();
+    options.object_streams = mode;
+    options.deterministic_id = true;
+    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let mut document =
+        write_linearized(&plan, &renumber, &mut pdf, &options).expect("linearized write");
+    document.back_patch().expect("linearized back-patch");
+    document.bytes
 }
 
 fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
@@ -112,6 +134,30 @@ fn preserve_null_visibility_matrix_is_byte_identical_to_qpdf() {
     assert_golden(
         &rewrite_mode("null-visible-matrix-objstm.pdf", ObjectStreamMode::Preserve),
         "null-visible-matrix-objstm/preserve.pdf",
+    );
+}
+
+#[test]
+fn linearize_disable_null_visibility_matrix_is_byte_identical_to_qpdf() {
+    assert_golden(
+        &linearize_mode("null-visible-matrix.pdf", ObjectStreamMode::Disable),
+        "null-visible-matrix/linearize.pdf",
+    );
+}
+
+#[test]
+fn linearize_generate_null_visibility_matrix_is_byte_identical_to_qpdf() {
+    assert_golden(
+        &linearize_mode("null-visible-matrix.pdf", ObjectStreamMode::Generate),
+        "null-visible-matrix/linearize-objstm.pdf",
+    );
+}
+
+#[test]
+fn linearize_preserve_null_visibility_matrix_is_byte_identical_to_qpdf() {
+    assert_golden(
+        &linearize_mode("null-visible-matrix-objstm.pdf", ObjectStreamMode::Preserve),
+        "null-visible-matrix-objstm/linearize-objstm-preserve.pdf",
     );
 }
 

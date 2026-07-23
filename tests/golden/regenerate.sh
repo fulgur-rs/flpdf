@@ -1821,6 +1821,15 @@ qpdf --object-streams=generate --static-id --warning-exit-0 \
 qpdf --object-streams=preserve --static-id --warning-exit-0 \
     "$FIX/null-visible-matrix-objstm.pdf" \
     "$REF/null-visible-matrix-objstm/preserve.pdf"
+qpdf --linearize --object-streams=disable --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-matrix.pdf" \
+    "$REF/null-visible-matrix/linearize.pdf"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-matrix.pdf" \
+    "$REF/null-visible-matrix/linearize-objstm.pdf"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-matrix-objstm.pdf" \
+    "$REF/null-visible-matrix-objstm/linearize-objstm-preserve.pdf"
 qpdf --object-streams=disable --static-id --warning-exit-0 \
     "$FIX/null-visible-cycle.pdf" \
     "$REF/null-visible-cycle/disable.pdf"
@@ -1831,6 +1840,10 @@ qpdf --check --warning-exit-0 \
 qpdf --check --warning-exit-0 \
     "$REF/null-visible-stale-generation/generate.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-matrix-objstm/preserve.pdf"
+qpdf --check-linearization "$REF/null-visible-matrix/linearize.pdf"
+qpdf --check-linearization "$REF/null-visible-matrix/linearize-objstm.pdf"
+qpdf --check-linearization \
+    "$REF/null-visible-matrix-objstm/linearize-objstm-preserve.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-cycle/disable.pdf"
 qpdf --object-streams=preserve --static-id --warning-exit-0 \
     "$FIX/null-visible-preserve-mixed.pdf" \
