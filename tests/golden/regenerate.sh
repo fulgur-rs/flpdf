@@ -416,6 +416,66 @@ else
     echo "Skipping null-visible-matrix-objstm.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/null-visible-stale-generation-objstm.pdf" ]]; then
+    echo "Generating null-visible stale-generation ObjStm fixture ..."
+    python3 - "$FIX/null-visible-stale-generation-objstm.pdf" <<'PY'
+import sys
+import zlib
+
+members = [
+    (1, b"<< /Type /Catalog /Pages 2 0 R /Candidates [4 0 R 4 1 R] >>"),
+    (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+]
+pair_table = b""
+member_body = b""
+for index, (number, object_body) in enumerate(members):
+    pair_table += b"%d %d " % (number, len(member_body))
+    member_body += object_body
+    if index + 1 < len(members):
+        member_body += b"\n"
+objstm_data = zlib.compress(pair_table + member_body)
+
+body = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n"
+offset4 = len(body)
+body += b"4 1 obj\n<< /Current true >>\nendobj\n"
+offset9 = len(body)
+body += (
+    b"9 0 obj\n<< /Type /ObjStm /N 3 /First %d /Length %d "
+    b"/Filter /FlateDecode >>\nstream\n" % (len(pair_table), len(objstm_data))
+)
+body += objstm_data + b"\nendstream\nendobj\n"
+offset10 = len(body)
+
+def append_xref_entry(entries, entry_type, field1, field2):
+    entries.append(entry_type)
+    entries.extend(field1.to_bytes(4, "big"))
+    entries.extend(field2.to_bytes(2, "big"))
+
+xref_entries = bytearray()
+append_xref_entry(xref_entries, 0, 0, 65535)
+append_xref_entry(xref_entries, 2, 9, 0)
+append_xref_entry(xref_entries, 2, 9, 1)
+append_xref_entry(xref_entries, 2, 9, 2)
+append_xref_entry(xref_entries, 1, offset4, 1)
+for _number in range(5, 9):
+    append_xref_entry(xref_entries, 0, 0, 0)
+append_xref_entry(xref_entries, 1, offset9, 0)
+append_xref_entry(xref_entries, 1, offset10, 0)
+xref_data = zlib.compress(bytes(xref_entries))
+
+body += (
+    b"10 0 obj\n<< /Type /XRef /W [1 4 2] /Index [0 11] /Size 11 "
+    b"/Root 1 0 R /Length %d /Filter /FlateDecode >>\nstream\n" % len(xref_data)
+)
+body += xref_data + b"\nendstream\nendobj\n"
+body += b"startxref\n%d\n%%%%EOF\n" % offset10
+open(sys.argv[1], "wb").write(body)
+PY
+else
+    echo "Skipping null-visible stale-generation ObjStm fixture (already exists)"
+fi
+
 if [[ ! -f "$FIX/null-visible-preserve-mixed.pdf" || \
       ! -f "$FIX/null-visible-preserve-unreachable.pdf" || \
       ! -f "$FIX/null-visible-preserve-over-100.pdf" || \
@@ -1809,6 +1869,7 @@ mkdir -p \
     "$REF/null-visible-matrix" \
     "$REF/null-visible-split-boundary" \
     "$REF/null-visible-stale-generation" \
+    "$REF/null-visible-stale-generation-objstm" \
     "$REF/null-visible-matrix-objstm" \
     "$REF/null-visible-cycle" \
     "$REF/null-visible-preserve-mixed" \
@@ -1829,6 +1890,29 @@ qpdf --object-streams=generate --static-id --warning-exit-0 \
 qpdf --object-streams=generate --static-id --warning-exit-0 \
     "$FIX/null-visible-stale-generation.pdf" \
     "$REF/null-visible-stale-generation/generate.pdf"
+qpdf --object-streams=disable --static-id --warning-exit-0 \
+    "$FIX/null-visible-stale-generation.pdf" \
+    "$REF/null-visible-stale-generation/disable.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-stale-generation.pdf" \
+    "$REF/null-visible-stale-generation/preserve.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-stale-generation-objstm.pdf" \
+    "$REF/null-visible-stale-generation-objstm/preserve.pdf"
+for mode in preserve uncompress compress; do
+    qpdf --object-streams=generate --stream-data="$mode" --static-id --warning-exit-0 \
+        "$FIX/null-visible-stale-generation.pdf" \
+        "$REF/null-visible-stale-generation/stream-$mode.pdf"
+    qpdf --object-streams=preserve --stream-data="$mode" --static-id --warning-exit-0 \
+        "$FIX/null-visible-preserve-signature-null-fields.pdf" \
+        "$REF/null-visible-preserve-signature-null-fields/stream-$mode.pdf"
+done
+qpdf --object-streams=generate --compress-streams=n --static-id --warning-exit-0 \
+    "$FIX/null-visible-stale-generation.pdf" \
+    "$REF/null-visible-stale-generation/compress-streams-n.pdf"
+qpdf --object-streams=preserve --compress-streams=n --static-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-signature-null-fields.pdf" \
+    "$REF/null-visible-preserve-signature-null-fields/compress-streams-n.pdf"
 qpdf --object-streams=preserve --static-id --warning-exit-0 \
     "$FIX/null-visible-matrix-objstm.pdf" \
     "$REF/null-visible-matrix-objstm/preserve.pdf"

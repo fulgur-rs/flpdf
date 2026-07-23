@@ -4,14 +4,23 @@
 
 use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
 use flpdf::{
-    write_pdf_with_options, NewlineBeforeEndstream, Object, ObjectRef, ObjectStreamMode, Pdf,
-    StreamDataMode, WriteOptions,
+    write_pdf_with_options, CompressStreams, NewlineBeforeEndstream, Object, ObjectRef,
+    ObjectStreamMode, Pdf, StreamDataMode, WriteOptions,
 };
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
 
 fn rewrite_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8> {
+    rewrite_mode_with_policy(fixture, mode, None, CompressStreams::Yes)
+}
+
+fn rewrite_mode_with_policy(
+    fixture: &str,
+    mode: ObjectStreamMode,
+    stream_data: Option<StreamDataMode>,
+    compress_streams: CompressStreams,
+) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join(fixture);
@@ -19,6 +28,8 @@ fn rewrite_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8> {
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
     options.object_streams = mode;
+    options.stream_data = stream_data;
+    options.compress_streams = compress_streams;
     options.static_id = true;
     options.newline_before_endstream = NewlineBeforeEndstream::Never;
     let mut out = Vec::new();
@@ -125,6 +136,105 @@ fn generate_stale_generation_does_not_hide_current_generation() {
         ),
         "null-visible-stale-generation/generate.pdf",
     );
+}
+
+#[test]
+fn disable_keeps_stale_generation_identity_like_standard_qpdf_enqueue() {
+    assert_golden(
+        &rewrite_mode(
+            "null-visible-stale-generation.pdf",
+            ObjectStreamMode::Disable,
+        ),
+        "null-visible-stale-generation/disable.pdf",
+    );
+}
+
+#[test]
+fn preserve_without_source_objstm_keeps_stale_generation_identity() {
+    assert_golden(
+        &rewrite_mode(
+            "null-visible-stale-generation.pdf",
+            ObjectStreamMode::Preserve,
+        ),
+        "null-visible-stale-generation/preserve.pdf",
+    );
+}
+
+#[test]
+fn source_objstm_preserve_removes_only_stale_generation() {
+    assert_golden(
+        &rewrite_mode(
+            "null-visible-stale-generation-objstm.pdf",
+            ObjectStreamMode::Preserve,
+        ),
+        "null-visible-stale-generation-objstm/preserve.pdf",
+    );
+}
+
+#[test]
+fn generate_structural_streams_follow_effective_stream_policy() {
+    let cases = [
+        (
+            Some(StreamDataMode::Preserve),
+            CompressStreams::Yes,
+            "stream-preserve.pdf",
+        ),
+        (
+            Some(StreamDataMode::Uncompress),
+            CompressStreams::Yes,
+            "stream-uncompress.pdf",
+        ),
+        (
+            Some(StreamDataMode::Compress),
+            CompressStreams::Yes,
+            "stream-compress.pdf",
+        ),
+        (None, CompressStreams::No, "compress-streams-n.pdf"),
+    ];
+    for (stream_data, compress_streams, golden) in cases {
+        assert_golden(
+            &rewrite_mode_with_policy(
+                "null-visible-stale-generation.pdf",
+                ObjectStreamMode::Generate,
+                stream_data,
+                compress_streams,
+            ),
+            &format!("null-visible-stale-generation/{golden}"),
+        );
+    }
+}
+
+#[test]
+fn source_objstm_preserve_structural_streams_follow_effective_stream_policy() {
+    let cases = [
+        (
+            Some(StreamDataMode::Preserve),
+            CompressStreams::Yes,
+            "stream-preserve.pdf",
+        ),
+        (
+            Some(StreamDataMode::Uncompress),
+            CompressStreams::Yes,
+            "stream-uncompress.pdf",
+        ),
+        (
+            Some(StreamDataMode::Compress),
+            CompressStreams::Yes,
+            "stream-compress.pdf",
+        ),
+        (None, CompressStreams::No, "compress-streams-n.pdf"),
+    ];
+    for (stream_data, compress_streams, golden) in cases {
+        assert_golden(
+            &rewrite_mode_with_policy(
+                "null-visible-preserve-signature-null-fields.pdf",
+                ObjectStreamMode::Preserve,
+                stream_data,
+                compress_streams,
+            ),
+            &format!("null-visible-preserve-signature-null-fields/{golden}"),
+        );
+    }
 }
 
 #[test]
