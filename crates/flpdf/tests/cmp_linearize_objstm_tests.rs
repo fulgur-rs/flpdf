@@ -985,6 +985,33 @@ fn otherpage_shared_docother_drift_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// ObjStm-bearing sibling of the drift fixture. qpdf Preserve keeps each
+// surviving source container intact, folds all member users onto the
+// container, and classifies that union once. flpdf must not split the source
+// container back into member-level classic parts.
+#[test]
+fn otherpage_shared_docother_bearing_preserve_structurally_identical_to_qpdf() {
+    let fixture = "objstm-lin-otherpage-shared-docother-bearing.pdf";
+    let stem = "objstm-lin-otherpage-shared-docother-bearing";
+    let actual = flpdf_linearized_objstm_preserve(fixture);
+    let expected = golden_preserve(stem);
+    report(
+        fixture,
+        &mask_id1(&actual),
+        &mask_id1(&expected),
+        "preserve structural",
+    );
+}
+
+#[test]
+fn otherpage_shared_docother_bearing_preserve_byte_identical_to_qpdf() {
+    let fixture = "objstm-lin-otherpage-shared-docother-bearing.pdf";
+    let stem = "objstm-lin-otherpage-shared-docother-bearing";
+    let actual = flpdf_linearized_objstm_preserve(fixture);
+    let expected = golden_preserve(stem);
+    report(fixture, &actual, &expected, "preserve strict");
+}
+
 // outline-od-shared-stream: a /JS action stream reachable from BOTH the catalog's
 // /OpenAction subtree (in_open_document) AND an outline item's /A (in_outlines).
 // qpdf's canonical classification orders in_outlines ABOVE in_open_document

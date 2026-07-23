@@ -114,8 +114,21 @@ route when members remain. If filtering empties a batch, drop the whole value.
 - Part 9: anchor after the last eligible pre-container Part-9 object, with the
   existing post-container exclusions unchanged.
 
-The renumbering algorithm, compressed-last constraints, xref construction, and
-ObjStm emission order remain unchanged.
+Preserve also retains the source ObjStm number as ordering metadata. qpdf uses
+that original number in two places where Generate uses a freshly allocated
+container number:
+
+- second-half placement among plain objects in the same linearization part;
+- per-page shared-identifier ordering in the page-offset hint table.
+
+Part 7 has one additional qpdf ordering rule: the page dictionary is first in
+its page section even when its source number is greater than a preserved
+container. The anchor model therefore represents before-first, after-object,
+and after-last placement explicitly.
+
+Generate keeps its existing compressed-last ordering because its newly created
+ObjStms are allocated after all source objects. Xref construction and ObjStm
+payload emission remain unchanged.
 
 ## Error Handling and Invariants
 
@@ -157,6 +170,7 @@ This change covers linearized `--object-streams=generate` and
 contract to both modes.
 
 It does not change non-linearized object-stream writing, compression policy,
-object eligibility, hint-table semantics, or general classic-part
-classification except where required to carry an already-computed container
-route.
+object eligibility, or general classic-part classification. Page-offset hint
+table values are unchanged except for Preserve shared-identifier ordering,
+which now uses qpdf's source ObjStm number instead of treating every container
+as newer than every plain object.
