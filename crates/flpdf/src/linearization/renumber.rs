@@ -113,7 +113,7 @@ pub(crate) enum SecondHalfContainerAnchor {
     AfterLast,
 }
 
-/// Slot numbers reserved by [`RenumberMap::place_objstm_members_per_half`] for
+/// Slot numbers reserved by `RenumberMap::place_objstm_members_per_half` for
 /// the split linearized xref-stream layout.
 ///
 /// All zero (the [`Default`]) when there were no ObjStm batches — the writer
