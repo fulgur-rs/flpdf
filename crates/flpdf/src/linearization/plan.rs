@@ -2516,59 +2516,23 @@ impl PageObjectUsers {
     }
 }
 
-/// Clone a page dictionary and materialize its nearest inherited attributes.
+/// Clone the already-materialized leaf dictionary for ordered user traversal.
 ///
-/// qpdf runs `pushInheritedAttributesToPage` before `updateObjectMaps`, so the
-/// ordered user traversal sees `/MediaBox`, `/CropBox`, `/Resources`, and
-/// `/Rotate` on the leaf even when they originate on a `/Pages` ancestor. The
-/// cloned dictionary supplies the same traversal view without mutating `Pdf`.
-fn page_dictionary_with_inherited<R: Read + Seek>(
+/// [`LinearizationPlan::from_pdf`] runs qpdf's real-`/Kids`-tree
+/// `pushInheritedAttributesToPage` equivalent before this function. Following
+/// the leaf's own `/Parent` here would trust a detached or bogus chain that qpdf
+/// explicitly skips in `updateObjectMaps`.
+fn page_dictionary_for_user_traversal<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> crate::Result<crate::Dictionary> {
-    let Object::Dictionary(mut page) = pdf.resolve(page_ref)? else {
+    let Object::Dictionary(page) = pdf.resolve(page_ref)? else {
         // cov:ignore-start: page_refs runs immediately before page_object_users and only yields refs that resolve to dictionaries with /Type /Page; no mutation occurs between the two resolutions
         return Err(crate::Error::Unsupported(format!(
             "linearization plan: page {page_ref} is not a dictionary"
         )));
         // cov:ignore-end
     };
-
-    let mut parent = page.get_ref("Parent");
-    let mut visited = BTreeSet::new();
-    let mut depth = 0usize;
-    while let Some(parent_ref) = parent {
-        if !visited.insert(parent_ref) {
-            break;
-        }
-        if depth >= crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH {
-            return Err(crate::Error::Unsupported(format!(
-                "linearization plan: page tree depth exceeds maximum of {} at {parent_ref}",
-                crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH
-            )));
-        }
-        depth += 1;
-
-        let (parent_object, _) =
-            crate::ref_chain::resolve_ref_chain(pdf, &Object::Reference(parent_ref))?;
-        let Object::Dictionary(parent_dict) = parent_object else {
-            break;
-        };
-        for key in INHERITABLE_PAGE_KEYS {
-            let page_has_key = page
-                .get(key)
-                .is_some_and(|value| !matches!(value, Object::Null));
-            if !page_has_key {
-                if let Some(value) = parent_dict
-                    .get(key)
-                    .filter(|value| !matches!(value, Object::Null))
-                {
-                    page.insert(key, value.clone());
-                }
-            }
-        }
-        parent = parent_dict.get_ref("Parent");
-    }
     Ok(page)
 }
 
@@ -2596,7 +2560,7 @@ fn page_object_users<R: Read + Seek>(
     };
 
     for &page_ref in page_refs {
-        let page_dict = page_dictionary_with_inherited(pdf, page_ref)?;
+        let page_dict = page_dictionary_for_user_traversal(pdf, page_ref)?;
         let mut visited = BTreeSet::from([page_ref]);
         let mut page_users = BTreeSet::new();
         let mut thumbnail_users = BTreeSet::new();
@@ -4553,11 +4517,11 @@ mod tests {
     /// ancestor `/Pages` node (object 5), which carries an inherited
     /// `/Resources`.
     ///
-    /// PDF allows an indirect object to hold a bare reference, so `resolve`
-    /// can legitimately return `Object::Reference`. The `/Parent` walk must
-    /// follow that chain — exactly as the main BFS loop does via
-    /// `collect_direct_refs` — or the inherited resource is silently dropped
-    /// from the closure.
+    /// PDF allows an indirect object to hold a bare reference, so a bogus leaf
+    /// `/Parent` can point through a reference chain to a detached `/Pages`
+    /// dictionary. qpdf's ordered page-user traversal still skips the leaf
+    /// `/Parent`; resources reachable only through this chain are not page
+    /// users.
     fn reference_chain_parent_bytes() -> Vec<u8> {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
@@ -4580,8 +4544,9 @@ mod tests {
         let off4 = pdf.len() as u64;
         pdf.extend_from_slice(b"4 0 obj\n5 0 R\nendobj\n");
 
-        // Object 5: the real ancestor /Pages node, carrying inherited
-        // /Resources that must join the page closure once the chain is walked.
+        // Object 5: a detached /Pages node carrying /Resources. It is not in
+        // the Catalog /Pages -> /Kids tree and is therefore not an inheritance
+        // source for the page-user walk.
         let off5 = pdf.len() as u64;
         pdf.extend_from_slice(b"5 0 obj\n<< /Type /Pages /Resources 6 0 R >>\nendobj\n");
 
@@ -4617,12 +4582,10 @@ mod tests {
         pdf
     }
 
-    /// The `/Parent`-chain walk must follow a parent
-    /// that resolves to a bare `Object::Reference`, mirroring the main BFS
-    /// loop. Otherwise inherited resources reached through a reference-chain
-    /// `/Parent` are silently stranded outside the page closure.
+    /// A detached leaf `/Parent` stays excluded from page users even when its
+    /// first object resolves to another bare `Object::Reference`.
     #[test]
-    fn from_pdf_follows_reference_chain_parent() {
+    fn from_pdf_ignores_reference_chain_leaf_parent_for_page_users() {
         let bytes = reference_chain_parent_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("fixture must parse");
         pdf.set_object(
@@ -4631,16 +4594,16 @@ mod tests {
         );
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
 
-        // Single-page document: the page's whole closure is Part 2.
         let resources_ref = ObjectRef::new(6, 0);
         let font_ref = ObjectRef::new(7, 0);
         assert!(
-            plan.part2_objects.contains(&resources_ref),
-            "/Resources reached through a reference-chain /Parent must join the page closure"
+            !plan.part2_objects.contains(&resources_ref)
+                && !plan.part3_objects.contains(&resources_ref),
+            "detached /Resources reached only through leaf /Parent must not be a page user"
         );
         assert!(
-            plan.part2_objects.contains(&font_ref),
-            "/Font reached transitively via the inherited /Resources must join the closure"
+            !plan.part2_objects.contains(&font_ref) && !plan.part3_objects.contains(&font_ref),
+            "a font below detached /Resources must not be a page user"
         );
     }
 
@@ -6455,6 +6418,18 @@ mod tests {
     }
 
     #[test]
+    fn route_objstm_containers_demotes_one_other_page_plus_thumbnail_to_rest() {
+        let mut pdf =
+            Pdf::open(Cursor::new(one_other_page_plus_thumbnail_user_pdf_bytes())).unwrap();
+        let routes = route_objstm_containers(&mut pdf, &[vec![ObjectRef::new(6, 0)]]).unwrap();
+        assert_eq!(
+            routes,
+            vec![ContainerPart::Rest],
+            "one non-first page user plus one thumbnail user is qpdf Part 9"
+        );
+    }
+
+    #[test]
     fn linearized_routes_trailer_only_container_to_rest() {
         // A container whose members reach no page (here /Info, which is
         // trailer-only and not in any page closure) is qpdf part 9 — lc_other.
@@ -6466,6 +6441,53 @@ mod tests {
         let synthetic = vec![vec![info_ref]];
         let routes = route_objstm_containers(&mut pdf, &synthetic).unwrap();
         assert_eq!(routes, vec![ContainerPart::Rest]);
+    }
+
+    /// Three pages and one synthetic compressible member:
+    ///
+    /// - page 0 does not reach object 6;
+    /// - page 1 reaches object 6 through `/Resources`;
+    /// - page 2 reaches object 6 only through a direct `/Thumb` dictionary.
+    ///
+    /// The member union therefore has exactly `other_pages == 1`, `thumbs == 1`,
+    /// and `others == 0`.
+    fn one_other_page_plus_thumbnail_user_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets = [0u64; 7];
+        let mut push = |number: usize, body: &[u8]| {
+            offsets[number] = pdf.len() as u64;
+            pdf.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"\nendobj\n");
+        };
+        push(1, b"<< /Type /Catalog /Pages 2 0 R >>");
+        push(2, b"<< /Type /Pages /Count 3 /Kids [3 0 R 4 0 R 5 0 R] >>");
+        push(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        );
+        push(
+            4,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 6 0 R >> >> >>",
+        );
+        push(
+            5,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Thumb << /Image 6 0 R >> >>",
+        );
+        push(6, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        for offset in offsets.iter().skip(1) {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
     }
 
     /// Build a two-page PDF whose FIRST page is fontless (no first-page

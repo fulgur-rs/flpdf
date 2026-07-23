@@ -88,6 +88,14 @@ object wins that page's user. Ordinary page and thumbnail membership must
 come from this same traversal; independently computed closures plus post-hoc
 subtraction cannot reproduce qpdf's order.
 
+`LinearizationPlan::from_pdf` first runs the qpdf-compatible inherited-attribute
+push over the catalog's real `/Pages` → `/Kids` tree. The ordered-user walk
+therefore consumes the already materialized leaf dictionary and always skips
+the leaf's `/Parent`. It must not attempt a second inheritance walk through that
+entry: a detached, cyclic, non-dictionary, or arbitrarily deep bogus `/Parent`
+is not part of qpdf's page-user traversal, and attributes found only there must
+not become page users.
+
 Continue computing open-document, document-other, and outline membership
 through their existing routes.
 
@@ -144,6 +152,8 @@ This change adds no public API or new recoverable error case.
   Part 9.
 - Generate and Preserve retain their existing within-container member order.
 - Empty preserved containers remain omitted after eligibility filtering.
+- The page-tree depth bound applies to the real `/Kids` traversal that pushes
+  inherited attributes, not to an unrelated leaf `/Parent` chain.
 
 ## Test Strategy
 
@@ -162,11 +172,18 @@ Follow red-green-refactor.
    private-before-shared batch ordering.
 5. Add focused RED cases for a direct `/Thumb` descendant and for lexical
    first-edge-wins when `/Thumb` precedes another edge to the same object.
-6. Implement the canonical route and shared ordered page/thumbnail user map,
+6. Add a deep bogus leaf-`/Parent` acceptance case and a detached-parent
+   attribute case. Confirm qpdf 11.9.0 linearizes the former, and ensure the
+   latter attribute never becomes a page user.
+7. Add a focused synthetic container whose union has exactly one non-first-page
+   ordinary user plus one thumbnail user, and require `Rest` (Part 9). Add an
+   authored >100-member fixture so this signal alone moves a real container,
+   with strict Generate and Preserve qpdf 11.9.0 goldens.
+8. Implement the canonical route and shared ordered page/thumbnail user map,
    including the qpdf Part 7 `thumbs == 0` predicate.
-7. Verify strict byte identity and structural parity for Generate and Preserve
+9. Verify strict byte identity and structural parity for Generate and Preserve
    in the ordering and thumbnail-user cases.
-8. Run formatting, focused tests, both crate suites, workspace tests,
+10. Run formatting, focused tests, both crate suites, workspace tests,
    all-feature clippy, qpdf validation, and committed-HEAD patch coverage.
    Changed-line coverage must be 100%.
 

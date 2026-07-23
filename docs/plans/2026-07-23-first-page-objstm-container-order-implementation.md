@@ -31,6 +31,13 @@
 - Create `docs/plans/tools/gen_thumbnail_user_order.py`: emit direct-`/Thumb`-descendant and lexical first-edge-wins fixtures.
 - Create `tests/fixtures/compat/objstm-lin-thumb-{direct-descendant,first-edge-wins}.pdf` and their `-bearing.pdf` variants.
 - Create qpdf Generate and Preserve goldens under `tests/golden/references/objstm-lin-thumb-{direct-descendant,first-edge-wins}{-bearing}/`.
+- Create `docs/plans/tools/gen_otherpage_thumbnail_rest.py`: emit a >100-member
+  authored fixture whose high-numbered container has exactly one non-first-page
+  ordinary user plus one thumbnail user and no document-other user.
+- Create `tests/fixtures/compat/objstm-lin-otherpage-thumbnail-rest.pdf` and its
+  `-bearing.pdf` variant.
+- Create strict qpdf Generate and Preserve goldens under
+  `tests/golden/references/objstm-lin-otherpage-thumbnail-rest{,-bearing}/`.
 - Modify `tests/golden/regenerate.sh`: deterministically rebuild both fixtures/goldens and validate them.
 - Modify `crates/flpdf/tests/cmp_linearize_objstm_tests.rs`: add structural and strict byte gates for Generate and Preserve.
 - Modify `crates/flpdf/src/linearization/plan.rs`: share one ordered page/thumbnail user map, retain exact first-page routes, apply the canonical Part 7 thumbnail gate, and bucket both modes by those routes.
@@ -418,8 +425,11 @@ and thumbnail sets indexed by page. Implement `page_object_users` to reproduce
 qpdf 11.9.0 `updateObjectMaps`:
 
 1. Start a fresh shared `visited` set for each page.
-2. Materialize the leaf page's inherited `/MediaBox`, `/CropBox`,
-   `/Resources`, and `/Rotate` view before walking.
+2. Consume the leaf dictionary after `LinearizationPlan::from_pdf` has pushed
+   inherited `/MediaBox`, `/CropBox`, `/Resources`, and `/Rotate` through the
+   catalog's real `/Pages` → `/Kids` tree. Never follow the leaf's `/Parent`;
+   qpdf skips it during `updateObjectMaps`, so a detached or bogus chain is not
+   an inheritance source.
 3. Visit dictionary keys in lexical order and array items in array order.
 4. Recursively traverse direct dictionaries and arrays without losing the
    active user.
@@ -429,6 +439,12 @@ qpdf 11.9.0 `updateObjectMaps`:
    page; the shared `visited` set makes subsequent edges no-ops.
 7. Preserve the existing non-top `/Page` boundary, live/resurrectable-null,
    inline-depth, and stream `/Length` contracts.
+
+Before changing production code, replace the incorrect deep-leaf-`/Parent`
+rejection test with qpdf-parity success and add a focused detached-parent
+attribute test. The former must be RED with the redundant post-push parent walk
+and GREEN when the already materialized leaf is traversed directly; the latter
+must prove detached attributes never enter the page-user set.
 
 Compute this map once in `LinearizationPlan::from_pdf`. Filter the classic
 per-page closures through its ordinary page memberships and derive the global
@@ -615,6 +631,20 @@ git add crates/flpdf/src/linearization/plan.rs \
   tests/golden/references/objstm-lin-thumb-*/
 git commit -m "fix(linearize): preserve qpdf thumbnail user order"
 ```
+
+- [ ] **Step 11: Pin the Part 7 thumbnail gate at the container and byte levels**
+
+Add a synthetic `route_objstm_containers` test whose sole member has exactly
+one non-first-page ordinary user and one thumbnail user. Its expected route is
+`ContainerPart::Rest`, not `OtherPagePrivate`.
+
+Generate the authored `objstm-lin-otherpage-thumbnail-rest` fixture, its
+qpdf-generated ObjStm-bearing input, and qpdf 11.9.0 linearized Generate and
+Preserve goldens. Add structural and strict tests for both modes. Removing only
+the router's `thumbnail_user_set` condition must make the focused route test and
+all four golden tests RED; restoring it must make them GREEN. This proves the
+new strict corpus exercises the thumbnail gate rather than reaching Part 9
+through `document_other_set`.
 
 ---
 

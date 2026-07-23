@@ -870,6 +870,12 @@ qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/objstm-lin-firstpage-private-before-shared.pdf" \
     "$FIX/objstm-lin-firstpage-private-before-shared-bearing.pdf"
 
+python3 "$ROOT/docs/plans/tools/gen_otherpage_thumbnail_rest.py" \
+    "$FIX/objstm-lin-otherpage-thumbnail-rest.pdf"
+qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-otherpage-thumbnail-rest.pdf" \
+    "$FIX/objstm-lin-otherpage-thumbnail-rest-bearing.pdf"
+
 python3 "$ROOT/docs/plans/tools/gen_thumbnail_user_order.py" \
     direct-descendant "$FIX/objstm-lin-thumb-direct-descendant.pdf"
 qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
@@ -1812,6 +1818,21 @@ qpdf --check-linearization \
     "$REF/objstm-lin-firstpage-private-before-shared/linearize-objstm.pdf"
 qpdf --check-linearization \
     "$REF/objstm-lin-firstpage-private-before-shared-bearing/linearize-objstm-preserve.pdf"
+
+mkdir -p "$REF/objstm-lin-otherpage-thumbnail-rest"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-otherpage-thumbnail-rest.pdf" \
+    "$REF/objstm-lin-otherpage-thumbnail-rest/linearize-objstm.pdf"
+
+mkdir -p "$REF/objstm-lin-otherpage-thumbnail-rest-bearing"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-otherpage-thumbnail-rest-bearing.pdf" \
+    "$REF/objstm-lin-otherpage-thumbnail-rest-bearing/linearize-objstm-preserve.pdf"
+
+qpdf --check-linearization \
+    "$REF/objstm-lin-otherpage-thumbnail-rest/linearize-objstm.pdf"
+qpdf --check-linearization \
+    "$REF/objstm-lin-otherpage-thumbnail-rest-bearing/linearize-objstm-preserve.pdf"
 
 for stem in objstm-lin-thumb-direct-descendant objstm-lin-thumb-first-edge-wins; do
     mkdir -p "$REF/$stem"

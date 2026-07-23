@@ -240,7 +240,7 @@ fn thumbnail_user_demotes_other_page_private_object_to_part9() {
 }
 
 #[test]
-fn malformed_page_parent_cycle_terminates_user_traversal() {
+fn bogus_leaf_parent_cycle_is_ignored_by_user_traversal() {
     let bytes = pdf_from_object_bodies(&[
         "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
         "<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_owned(),
@@ -249,11 +249,11 @@ fn malformed_page_parent_cycle_terminates_user_traversal() {
     ]);
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
     LinearizationPlan::from_pdf(&mut pdf, false)
-        .expect("a malformed parent cycle must be bounded after page attributes are pushed");
+        .expect("ordered page-user traversal must skip the leaf /Parent");
 }
 
 #[test]
-fn malformed_page_parent_depth_is_rejected_by_user_traversal() {
+fn deep_bogus_leaf_parent_chain_is_ignored_like_qpdf() {
     let mut bodies = vec![
         "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
         "<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_owned(),
@@ -268,15 +268,36 @@ fn malformed_page_parent_depth_is_rejected_by_user_traversal() {
         bodies.push(format!("<< /Type /Pages{parent} >>"));
     }
     let mut pdf = Pdf::open(Cursor::new(pdf_from_object_bodies(&bodies))).unwrap();
-    let err = LinearizationPlan::from_pdf(&mut pdf, false).unwrap_err();
+    LinearizationPlan::from_pdf(&mut pdf, false)
+        .expect("qpdf ignores a leaf /Parent outside the real /Kids page tree");
+}
+
+#[test]
+fn detached_parent_attributes_do_not_become_page_users() {
+    let bytes = pdf_from_object_bodies(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+        "<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_owned(),
+        "<< /Type /Page /Parent 4 0 R /MediaBox [0 0 612 792] >>".to_owned(),
+        "<< /Type /Pages /Resources << /Font << /Bogus 5 0 R >> >> >>".to_owned(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
+    ]);
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
+    let detached_font = ObjectRef::new(5, 0);
+
     assert!(
-        err.to_string().contains("page tree depth exceeds maximum"),
-        "unexpected error: {err}"
+        !plan.part2_objects.contains(&detached_font)
+            && !plan.part3_objects.contains(&detached_font),
+        "an attribute on a detached leaf /Parent must not become a page user"
+    );
+    assert!(
+        plan.part4_rest.contains(&detached_font),
+        "the reachable detached attribute remains an ordinary Part 9 object"
     );
 }
 
 #[test]
-fn non_dictionary_page_parent_ends_inherited_user_walk() {
+fn non_dictionary_leaf_parent_is_ignored_by_user_traversal() {
     let bytes = pdf_from_object_bodies(&[
         "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
         "<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_owned(),
@@ -285,7 +306,7 @@ fn non_dictionary_page_parent_ends_inherited_user_walk() {
     ]);
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
     LinearizationPlan::from_pdf(&mut pdf, false)
-        .expect("a non-dictionary parent must stop the redundant inherited user walk");
+        .expect("ordered page-user traversal must not resolve the leaf /Parent");
 }
 
 #[test]
@@ -1398,6 +1419,47 @@ fn thumbnail_private_shared_objstm_byte_identical_to_qpdf() {
         "objstm-lin-thumbnail-private-shared.pdf",
         "objstm-lin-thumbnail-private-shared",
     );
+}
+
+// Exactly one non-first-page ordinary user plus one thumbnail user. The
+// high-numbered target font is packed into a generated container whose union
+// has no first-page or document-other user, so qpdf's `thumbs == 0` Part-7 gate
+// alone routes it to Part 9.
+#[test]
+fn otherpage_thumbnail_rest_generate_structurally_byte_identical_to_qpdf() {
+    assert_structural(
+        "objstm-lin-otherpage-thumbnail-rest.pdf",
+        "objstm-lin-otherpage-thumbnail-rest",
+    );
+}
+
+#[test]
+fn otherpage_thumbnail_rest_generate_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-otherpage-thumbnail-rest.pdf",
+        "objstm-lin-otherpage-thumbnail-rest",
+    );
+}
+
+#[test]
+fn otherpage_thumbnail_rest_preserve_structurally_byte_identical_to_qpdf() {
+    let fixture = "objstm-lin-otherpage-thumbnail-rest-bearing.pdf";
+    let actual = flpdf_linearized_objstm_preserve(fixture);
+    let expected = golden_preserve("objstm-lin-otherpage-thumbnail-rest-bearing");
+    report(
+        fixture,
+        &mask_id1(&actual),
+        &mask_id1(&expected),
+        "preserve structural",
+    );
+}
+
+#[test]
+fn otherpage_thumbnail_rest_preserve_byte_identical_to_qpdf() {
+    let fixture = "objstm-lin-otherpage-thumbnail-rest-bearing.pdf";
+    let actual = flpdf_linearized_objstm_preserve(fixture);
+    let expected = golden_preserve("objstm-lin-otherpage-thumbnail-rest-bearing");
+    report(fixture, &actual, &expected, "preserve strict");
 }
 
 // thumb-firstpage-shared (flpdf-hn1g.16): a 2-page fixture where obj 5 (an image)
