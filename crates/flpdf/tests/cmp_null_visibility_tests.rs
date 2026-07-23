@@ -2,9 +2,12 @@
 
 #![cfg(feature = "qpdf-zlib-compat")]
 
-use flpdf::{write_pdf_with_options, NewlineBeforeEndstream, ObjectStreamMode, Pdf, WriteOptions};
+use flpdf::{
+    write_pdf_with_options, NewlineBeforeEndstream, Object, ObjectRef, ObjectStreamMode, Pdf,
+    WriteOptions,
+};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::path::Path;
 
 fn rewrite_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8> {
@@ -109,5 +112,59 @@ fn preserve_keeps_single_source_container_over_100_members() {
             ObjectStreamMode::Preserve,
         ),
         "null-visible-preserve-over-100/preserve.pdf",
+    );
+}
+
+#[test]
+fn preserve_emits_reachable_signature_dictionary_plain() {
+    assert_golden(
+        &rewrite_mode(
+            "null-visible-preserve-signature.pdf",
+            ObjectStreamMode::Preserve,
+        ),
+        "null-visible-preserve-signature/preserve.pdf",
+    );
+}
+
+#[test]
+fn legacy_preserve_fallback_splits_source_container_over_100_members() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/null-visible-preserve-over-100.pdf");
+    let mut pdf = Pdf::open(BufReader::new(File::open(path).unwrap())).unwrap();
+
+    // The source xref stream is structural and unreachable from the document
+    // graph, so deleting it is a behavior-neutral routing sentinel. It makes
+    // `deleted_object_refs` non-empty, bypassing the dedicated plain qpdf
+    // Preserve writer and exercising the shared legacy planner without
+    // changing the 104 reachable source ObjStm members.
+    pdf.delete_object(ObjectRef::new(107, 0));
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Preserve;
+    options.static_id = true;
+    let mut out = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut out, &options).unwrap();
+
+    let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
+    let mut member_counts = Vec::new();
+    for object_ref in reopened.object_refs() {
+        if let Object::Stream(stream) = reopened.resolve(object_ref).unwrap() {
+            if matches!(
+                stream.dict.get("Type"),
+                Some(Object::Name(name)) if name.as_slice() == b"ObjStm"
+            ) {
+                let Some(Object::Integer(count)) = stream.dict.get("N") else {
+                    panic!("ObjStm must carry an integer /N");
+                };
+                member_counts.push(*count);
+            }
+        }
+    }
+    member_counts.sort_unstable();
+    assert_eq!(
+        member_counts,
+        vec![4, 100],
+        "legacy Preserve must retain its pre-Task-2 100-member cap"
     );
 }

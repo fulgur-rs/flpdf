@@ -167,7 +167,7 @@ pub(crate) fn planner_config_from_options(options: &crate::WriteOptions) -> Plan
 ///
 /// - `Disable`  → returns an empty plan (zero batches).
 /// - `Preserve` → reconstructs the source document's ObjStm grouping,
-///   skipping ineligible members without repartitioning source containers.
+///   skipping ineligible members and applying the configured legacy cap.
 /// - `Generate` → greedily packs all eligible objects in
 ///   `(number, generation)` ascending order, cap-delimited.
 pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
@@ -183,7 +183,14 @@ pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
 
     match config.mode {
         ObjectStreamMode::Disable => unreachable!(),
-        ObjectStreamMode::Preserve => plan_preserve(pdf, &ctx, &length_exclusions, None),
+        ObjectStreamMode::Preserve => plan_preserve(
+            pdf,
+            &ctx,
+            &length_exclusions,
+            None,
+            Some(config.batch_size_cap),
+            false,
+        ),
         ObjectStreamMode::Generate => plan_generate(pdf, config, &ctx, &length_exclusions),
     }
 }
@@ -207,7 +214,7 @@ pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek
             .pairs()
             .map(|(_new, old)| old)
             .collect();
-    plan_preserve(pdf, &ctx, &length_exclusions, Some(&reachable))
+    plan_preserve(pdf, &ctx, &length_exclusions, Some(&reachable), None, true)
 }
 
 /// Eligible objects in qpdf's `QPDF::getCompressibleObjGens` order
@@ -366,6 +373,8 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
     ctx: &EligibilityContext,
     length_exclusions: &BTreeSet<ObjectRef>,
     reachable: Option<&BTreeSet<ObjectRef>>,
+    batch_size_cap: Option<NonZeroUsize>,
+    qpdf_preserve_eligibility: bool,
 ) -> crate::Result<PackingPlan> {
     let entries = pdf.source_xref_entries();
 
@@ -395,12 +404,20 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
                 continue;
             }
             let obj = pdf.resolve_borrowed(obj_ref)?;
-            if is_eligible_for_objstm(obj_ref, obj, ctx) {
+            if is_eligible_for_objstm(obj_ref, obj, ctx)
+                && !(qpdf_preserve_eligibility && is_signature_dict(obj))
+            {
                 eligible.push(obj_ref);
             }
         }
 
-        if !eligible.is_empty() {
+        if let Some(cap) = batch_size_cap {
+            for chunk in eligible.chunks(cap.get()) {
+                if !chunk.is_empty() {
+                    batches.push(chunk.to_vec());
+                }
+            }
+        } else if !eligible.is_empty() {
             batches.push(eligible);
         }
     }
