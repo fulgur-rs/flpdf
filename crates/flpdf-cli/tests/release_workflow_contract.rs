@@ -34,7 +34,7 @@ fn job_block(name: &str) -> String {
 
 #[test]
 fn workflow_runs_are_serialized_without_dropping_pending_pushes() {
-    let preamble = workflow_preamble();
+    let preamble = workflow_preamble().replace("\r\n", "\n");
 
     assert!(preamble.contains(
         "\nconcurrency:\n  group: release-plz-${{ github.ref }}\n  cancel-in-progress: false\n  queue: max"
