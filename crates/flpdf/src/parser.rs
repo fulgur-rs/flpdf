@@ -43,10 +43,30 @@ pub(crate) struct IndirectStreamLength {
     pub endstream_pos: Option<usize>,
 }
 
+/// Exact line ending removed from the recovered stream payload immediately
+/// before a line-anchored `endstream`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveredStreamEol {
+    Lf,
+    Cr,
+    CrLf,
+}
+
+impl RecoveredStreamEol {
+    pub(crate) const fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Lf => b"\n",
+            Self::Cr => b"\r",
+            Self::CrLf => b"\r\n",
+        }
+    }
+}
+
 pub(crate) struct ParsedIndirectObject {
     pub(crate) object_ref: ObjectRef,
     pub(crate) object: Object,
     pub(crate) indirect_length: Option<IndirectStreamLength>,
+    pub(crate) recovered_stream_eol: Option<RecoveredStreamEol>,
     pub(crate) empty_offset: Option<usize>,
     pub(crate) expected_endobj_offset: Option<usize>,
 }
@@ -122,6 +142,7 @@ fn parse_indirect_object_detailed_impl(
         ),
         object,
         indirect_length: parser.last_indirect_stream_len,
+        recovered_stream_eol: parser.last_recovered_stream_eol,
         empty_offset: empty_object_offset,
         expected_endobj_offset,
     })
@@ -144,6 +165,8 @@ pub(crate) struct Parser<'a> {
     /// `/Length` is an indirect reference, so [`parse_indirect_object_detailed`]
     /// can surface the payload window for xref-based resolution.
     last_indirect_stream_len: Option<IndirectStreamLength>,
+    /// Exact framing EOL removed by endstream-scan recovery.
+    last_recovered_stream_eol: Option<RecoveredStreamEol>,
     /// Current object-nesting recursion depth, maintained by [`object`](Self::object)
     /// to bound recursion against adversarially deep input.
     depth: usize,
@@ -165,6 +188,7 @@ impl<'a> Parser<'a> {
             no_reference: false,
             top_level_no_reference: false,
             last_indirect_stream_len: None,
+            last_recovered_stream_eol: None,
             depth: 0,
         }
     }
@@ -178,6 +202,7 @@ impl<'a> Parser<'a> {
             no_reference: true,
             top_level_no_reference: false,
             last_indirect_stream_len: None,
+            last_recovered_stream_eol: None,
             depth: 0,
         }
     }
@@ -325,9 +350,13 @@ impl<'a> Parser<'a> {
                         end -= 1;
                         if end > data_start && self.input[end - 1] == b'\r' {
                             end -= 1;
+                            self.last_recovered_stream_eol = Some(RecoveredStreamEol::CrLf);
+                        } else {
+                            self.last_recovered_stream_eol = Some(RecoveredStreamEol::Lf);
                         }
                     } else if end > data_start && self.input[end - 1] == b'\r' {
                         end -= 1;
+                        self.last_recovered_stream_eol = Some(RecoveredStreamEol::Cr);
                     }
                     end - data_start
                 }
@@ -811,7 +840,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 mod stream_length_tests {
     use super::{
         parse_indirect_object, parse_indirect_object_detailed, parse_indirect_object_detailed_qpdf,
-        parse_object,
+        parse_object, RecoveredStreamEol,
     };
     use crate::{Object, ObjectRef};
 
@@ -840,6 +869,23 @@ mod stream_length_tests {
             payload,
             "indirect /Length stream data must come from the endstream boundary"
         );
+    }
+
+    #[test]
+    fn endstream_scan_records_exact_removed_framing_eol() {
+        for (eol, expected) in [
+            (&b"\n"[..], RecoveredStreamEol::Lf),
+            (&b"\r"[..], RecoveredStreamEol::Cr),
+            (&b"\r\n"[..], RecoveredStreamEol::CrLf),
+        ] {
+            let mut bytes = b"3 0 obj\n<< /Length null >>\nstream\npayload".to_vec();
+            bytes.extend_from_slice(eol);
+            bytes.extend_from_slice(b"endstream\nendobj\n");
+            let parsed =
+                parse_indirect_object_detailed_qpdf(&bytes).expect("null length must recover");
+            assert_eq!(parsed.recovered_stream_eol, Some(expected));
+            assert_eq!(parsed.object.as_stream().expect("stream").data, b"payload");
+        }
     }
 
     // Even when an integer is reachable through the reference notation, the

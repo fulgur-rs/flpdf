@@ -64,8 +64,8 @@ pub enum CompressStreams {
 ///
 /// When `WriteOptions::stream_data` is `Some(mode)`, the mode takes precedence
 /// over `WriteOptions::compress_streams` for per-object stream bodies.
-/// Structural streams (xref streams, ObjStm containers) continue to use
-/// `compress_streams` regardless of `stream_data`.
+/// Linearized output also applies the resulting global compression choice to
+/// its generated hint, object, and cross-reference streams, matching qpdf.
 ///
 /// # Interaction with QDF mode
 ///
@@ -4566,6 +4566,7 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
         // position so the digest covers the bytes up to the array's `[` —
         // matching `compute_deterministic_id`'s contract on every other path.
         let dict = xref_stream::XrefStreamDict {
+            filtered: true,
             widths,
             index: None,
             info: info_ref,
@@ -4608,6 +4609,7 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
             _ => (QPDF_STATIC_ID.to_vec(), QPDF_STATIC_ID.to_vec()), // cov:ignore: /ID is always a 2-string array here
         };
         let dict = xref_stream::XrefStreamDict {
+            filtered: true,
             widths,
             index: None,
             info: info_ref,

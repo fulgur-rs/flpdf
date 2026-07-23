@@ -63,6 +63,10 @@ pub struct Pdf<R: Read + Seek> {
     source_xref_offsets: Vec<(ObjectRef, u64)>,
     source_xref_entries: BTreeMap<ObjectRef, XrefOffset>,
     dirty_object_refs: BTreeSet<ObjectRef>,
+    /// Exact source framing EOLs removed by parser recovery for streams whose
+    /// `/Length` resolved to null. Linearized rewriting uses this private
+    /// metadata to reproduce qpdf's recovered raw stream bytes.
+    recovered_null_stream_eols: BTreeMap<ObjectRef, crate::parser::RecoveredStreamEol>,
     /// Valid indirect references discovered while preparing qpdf JSON whose
     /// exact object generation has no live xref/cache target.
     qpdf_dangling_refs: BTreeSet<ObjectRef>,
@@ -93,6 +97,7 @@ struct FileObjectRead {
     object_ref: ObjectRef,
     object: Object,
     indirect_length: Option<crate::parser::IndirectStreamLength>,
+    recovered_stream_eol: Option<crate::parser::RecoveredStreamEol>,
     empty_offset: Option<usize>,
     expected_endobj_offset: Option<usize>,
 }
@@ -356,6 +361,14 @@ impl<R: Read + Seek> Pdf<R> {
             .push(Diagnostic::warning(message, None));
     }
 
+    /// Exact source framing removed while recovering a null-length stream.
+    pub(crate) fn recovered_null_stream_eol(&self, object_ref: ObjectRef) -> Option<&'static [u8]> {
+        self.recovered_null_stream_eols
+            .get(&object_ref)
+            .copied()
+            .map(crate::parser::RecoveredStreamEol::as_bytes)
+    }
+
     /// Whether this document authenticated an `/Encrypt` dictionary while opening.
     pub fn is_encrypted(&self) -> bool {
         self.encryption.is_some()
@@ -543,6 +556,7 @@ impl<R: Read + Seek> Pdf<R> {
             source_xref_offsets,
             source_xref_entries,
             dirty_object_refs: BTreeSet::new(),
+            recovered_null_stream_eols: BTreeMap::new(),
             qpdf_dangling_refs: BTreeSet::new(),
             qpdf_trailer_references: loaded_state.trailer_references,
             qpdf_parsed_xref_streams: loaded_state.parsed_xref_streams,
@@ -857,6 +871,7 @@ impl<R: Read + Seek> Pdf<R> {
         self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
+        self.recovered_null_stream_eols.remove(&object_ref);
         if let Some(CacheEntry::Compressed { stream, index }) =
             self.cache.entry(object_ref).cloned()
         {
@@ -877,6 +892,7 @@ impl<R: Read + Seek> Pdf<R> {
         }
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
+        self.recovered_null_stream_eols.remove(&object_ref);
         if object_ref.number == 0
             || matches!(
                 self.cache.entry(object_ref),
@@ -1154,6 +1170,7 @@ impl<R: Read + Seek> Pdf<R> {
                 object_ref: parsed.object_ref,
                 object: parsed.object,
                 indirect_length: parsed.indirect_length,
+                recovered_stream_eol: parsed.recovered_stream_eol,
                 empty_offset: parsed.empty_offset,
                 expected_endobj_offset: parsed.expected_endobj_offset,
             }),
@@ -1173,6 +1190,7 @@ impl<R: Read + Seek> Pdf<R> {
                         object_ref: parsed.object_ref,
                         object: parsed.object,
                         indirect_length: parsed.indirect_length,
+                        recovered_stream_eol: parsed.recovered_stream_eol,
                         empty_offset: parsed.empty_offset,
                         expected_endobj_offset: parsed.expected_endobj_offset,
                     }),
@@ -1217,6 +1235,12 @@ impl<R: Read + Seek> Pdf<R> {
                     return Ok(false);
                 }
                 let mut object = parsed.object;
+                let mut recovered_from_null = parsed.recovered_stream_eol.is_some()
+                    && matches!(
+                        &object,
+                        Object::Stream(stream)
+                            if matches!(stream.dict.get("Length"), Some(Object::Null))
+                    );
                 // When the stream's /Length is an indirect reference, the parser
                 // had no xref and recorded the payload window instead of a
                 // resolved length. Resolve the holder via the xref and re-slice
@@ -1224,7 +1248,7 @@ impl<R: Read + Seek> Pdf<R> {
                 // decryption: `object`/`bytes` are still ciphertext here, and
                 // `decrypt_resolved_object` decrypts in place afterwards.
                 if let Some(isl) = parsed.indirect_length {
-                    self.apply_indirect_stream_length(
+                    recovered_from_null |= self.apply_indirect_stream_length(
                         object_ref,
                         &mut object,
                         isl,
@@ -1238,6 +1262,11 @@ impl<R: Read + Seek> Pdf<R> {
                 // retry.
                 let object = self.decrypt_resolved_object(object_ref, object)?;
                 self.cache.set_resolved(object_ref, object);
+                if recovered_from_null {
+                    if let Some(eol) = parsed.recovered_stream_eol {
+                        self.recovered_null_stream_eols.insert(object_ref, eol);
+                    }
+                }
                 self.record_file_object_warnings(
                     object_ref,
                     offset,
@@ -1308,7 +1337,7 @@ impl<R: Read + Seek> Pdf<R> {
         isl: crate::parser::IndirectStreamLength,
         bytes: &[u8],
         offset: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let result = self.reslice_indirect_stream_length(object_ref, object, isl, bytes);
         self.cache.set_unresolved(object_ref, offset);
         result
@@ -1323,7 +1352,7 @@ impl<R: Read + Seek> Pdf<R> {
         object: &mut Object,
         isl: crate::parser::IndirectStreamLength,
         bytes: &[u8],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         match isl.endstream_pos {
             // The parser located a line-anchored `endstream` and set a usable
             // `stream.data`; the holder only REFINES it, overriding when the
@@ -1331,6 +1360,7 @@ impl<R: Read + Seek> Pdf<R> {
             // Best-effort: a self-referential, cyclic, unresolvable, or
             // out-of-window holder keeps the parser's endstream-scan value.
             Some(endstream_pos) => {
+                let mut recovered_from_null = false;
                 if isl.holder != object_ref {
                     // Mark this object resolution in-progress before recursing
                     // into the holder: a cyclic length-holder chain (A's /Length
@@ -1341,25 +1371,30 @@ impl<R: Read + Seek> Pdf<R> {
                     // resolution error is likewise non-fatal here: fall back
                     // rather than failing the whole stream.
                     self.cache.set_reserved(object_ref);
-                    if let Ok(Object::Integer(n)) = self.resolve_borrowed(isl.holder) {
-                        if let (Ok(n), Object::Stream(stream)) = (usize::try_from(*n), &mut *object)
-                        {
-                            let auth_end = isl.data_start.saturating_add(n);
-                            // Override whenever the authoritative length lands
-                            // at or before `endstream`. qpdf QDF holders contain
-                            // the logical payload length; `%QDF:
-                            // ignore_newline` accounts for any extra framing LF
-                            // in fix-qdf rather than changing reader semantics.
-                            // A too-large/garbage holder falls back to the safe
-                            // endstream scan.
-                            let within_window = auth_end <= endstream_pos;
-                            if within_window && auth_end <= bytes.len() {
-                                stream.data = bytes[isl.data_start..auth_end].to_vec();
+                    match self.resolve_borrowed(isl.holder) {
+                        Ok(Object::Integer(n)) => {
+                            if let (Ok(n), Object::Stream(stream)) =
+                                (usize::try_from(*n), &mut *object)
+                            {
+                                let auth_end = isl.data_start.saturating_add(n);
+                                // Override whenever the authoritative length lands
+                                // at or before `endstream`. qpdf QDF holders contain
+                                // the logical payload length; `%QDF:
+                                // ignore_newline` accounts for any extra framing LF
+                                // in fix-qdf rather than changing reader semantics.
+                                // A too-large/garbage holder falls back to the safe
+                                // endstream scan.
+                                let within_window = auth_end <= endstream_pos;
+                                if within_window && auth_end <= bytes.len() {
+                                    stream.data = bytes[isl.data_start..auth_end].to_vec();
+                                }
                             }
                         }
+                        Ok(Object::Null) => recovered_from_null = true,
+                        Ok(_) | Err(_) => {}
                     }
                 }
-                Ok(())
+                Ok(recovered_from_null)
             }
             // No line-anchored `endstream` existed: the writer used
             // `NewlineBeforeEndstream::Never` with a non-EOL-ending payload, so
@@ -1394,7 +1429,7 @@ impl<R: Read + Seek> Pdf<R> {
                         // `valid` guarantees `auth_end` is `Some` and in bounds.
                         let end = auth_end.unwrap();
                         stream.data = bytes[isl.data_start..end].to_vec();
-                        Ok(())
+                        Ok(false)
                     }
                     _ => Err(Error::parse(isl.data_start, "stream data exceeds input")),
                 }
@@ -1423,7 +1458,7 @@ impl<R: Read + Seek> Pdf<R> {
                 }
                 let mut object = parsed.object;
                 if let Some(isl) = parsed.indirect_length {
-                    self.apply_indirect_stream_length(
+                    let _ = self.apply_indirect_stream_length(
                         stream_ref,
                         &mut object,
                         isl,

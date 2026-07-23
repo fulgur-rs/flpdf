@@ -1287,6 +1287,8 @@ qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
 
 python3 "$ROOT/docs/plans/tools/gen_od_indirect_length.py" --null-holder \
     > "$FIX/null-visible-stream-null-length.pdf"
+python3 "$ROOT/docs/plans/tools/gen_null_length_framing.py" \
+    "$FIX/null-length-framing-matrix.pdf"
 
 # ObjStm-bearing variant of the cap-boundary-199 fixture (flpdf-ihb.4). The raw
 # gen_shared_fonts.py 199 output has no source ObjStms, so --object-streams=preserve
@@ -2328,13 +2330,24 @@ done
 mkdir -p \
     "$REF/null-visible-thumb-first-edge" \
     "$REF/null-visible-thumb-first-edge-bearing" \
-    "$REF/null-visible-stream-null-length"
+    "$REF/null-visible-stream-null-length" \
+    "$REF/null-length-framing-matrix"
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/null-visible-thumb-first-edge.pdf" \
     "$REF/null-visible-thumb-first-edge/linearize-objstm.pdf"
 qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
     "$FIX/null-visible-thumb-first-edge-bearing.pdf" \
     "$REF/null-visible-thumb-first-edge-bearing/linearize-objstm-preserve.pdf"
+for stream_data in preserve uncompress; do
+    qpdf --linearize --object-streams=generate \
+        --stream-data="$stream_data" --deterministic-id --warning-exit-0 \
+        "$FIX/null-visible-thumb-first-edge.pdf" \
+        "$REF/null-visible-thumb-first-edge/linearize-objstm-stream-$stream_data.pdf"
+    qpdf --linearize --object-streams=preserve \
+        --stream-data="$stream_data" --deterministic-id --warning-exit-0 \
+        "$FIX/null-visible-thumb-first-edge-bearing.pdf" \
+        "$REF/null-visible-thumb-first-edge-bearing/linearize-objstm-stream-$stream_data.pdf"
+done
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/null-visible-stale-generation.pdf" \
     "$REF/null-visible-stale-generation/linearize-objstm.pdf"
@@ -2342,16 +2355,34 @@ qpdf --linearize --object-streams=disable --stream-data=preserve \
     --deterministic-id --warning-exit-0 \
     "$FIX/null-visible-stream-null-length.pdf" \
     "$REF/null-visible-stream-null-length/linearize-preserve.pdf"
+for stream_data in preserve uncompress compress; do
+    qpdf --linearize --object-streams=disable \
+        --stream-data="$stream_data" --deterministic-id --warning-exit-0 \
+        "$FIX/null-length-framing-matrix.pdf" \
+        "$REF/null-length-framing-matrix/linearize-$stream_data.pdf"
+done
 qpdf --check-linearization \
     "$REF/null-visible-thumb-first-edge/linearize-objstm.pdf"
 qpdf --check-linearization \
     "$REF/null-visible-thumb-first-edge-bearing/linearize-objstm-preserve.pdf"
+for stream_data in preserve uncompress; do
+    qpdf --check-linearization \
+        "$REF/null-visible-thumb-first-edge/linearize-objstm-stream-$stream_data.pdf"
+    qpdf --check-linearization \
+        "$REF/null-visible-thumb-first-edge-bearing/linearize-objstm-stream-$stream_data.pdf"
+done
 qpdf --check-linearization \
     "$REF/null-visible-stale-generation/linearize-objstm.pdf"
 qpdf --check-linearization \
     "$REF/null-visible-stream-null-length/linearize-preserve.pdf"
 qpdf --check --warning-exit-0 \
     "$REF/null-visible-stream-null-length/linearize-preserve.pdf"
+for stream_data in preserve uncompress compress; do
+    qpdf --check-linearization \
+        "$REF/null-length-framing-matrix/linearize-$stream_data.pdf"
+    qpdf --check --warning-exit-0 \
+        "$REF/null-length-framing-matrix/linearize-$stream_data.pdf"
+done
 
 # Linearized generate-mode >cap goldens (flpdf-g6hb.2). See the fixture block
 # above for each scenario. Compared structurally (and strictly where flpdf

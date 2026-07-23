@@ -193,6 +193,78 @@ fn linearize_preserve_real_null_thumb_first_edge_is_byte_identical_to_qpdf() {
 }
 
 #[test]
+fn linearize_generate_stream_data_preserve_structural_streams_match_qpdf() {
+    assert_golden(
+        &linearize_mode_with_stream_data(
+            "null-visible-thumb-first-edge.pdf",
+            ObjectStreamMode::Generate,
+            Some(StreamDataMode::Preserve),
+        ),
+        "null-visible-thumb-first-edge/linearize-objstm-stream-preserve.pdf",
+    );
+}
+
+#[test]
+fn linearize_generate_stream_data_uncompress_structural_streams_match_qpdf() {
+    assert_golden(
+        &linearize_mode_with_stream_data(
+            "null-visible-thumb-first-edge.pdf",
+            ObjectStreamMode::Generate,
+            Some(StreamDataMode::Uncompress),
+        ),
+        "null-visible-thumb-first-edge/linearize-objstm-stream-uncompress.pdf",
+    );
+}
+
+#[test]
+fn linearize_generate_stream_data_compress_structural_streams_match_qpdf() {
+    assert_golden(
+        &linearize_mode_with_stream_data(
+            "null-visible-thumb-first-edge.pdf",
+            ObjectStreamMode::Generate,
+            Some(StreamDataMode::Compress),
+        ),
+        "null-visible-thumb-first-edge/linearize-objstm.pdf",
+    );
+}
+
+#[test]
+fn linearize_preserve_stream_data_preserve_structural_streams_match_qpdf() {
+    assert_golden(
+        &linearize_mode_with_stream_data(
+            "null-visible-thumb-first-edge-bearing.pdf",
+            ObjectStreamMode::Preserve,
+            Some(StreamDataMode::Preserve),
+        ),
+        "null-visible-thumb-first-edge-bearing/linearize-objstm-stream-preserve.pdf",
+    );
+}
+
+#[test]
+fn linearize_preserve_stream_data_uncompress_structural_streams_match_qpdf() {
+    assert_golden(
+        &linearize_mode_with_stream_data(
+            "null-visible-thumb-first-edge-bearing.pdf",
+            ObjectStreamMode::Preserve,
+            Some(StreamDataMode::Uncompress),
+        ),
+        "null-visible-thumb-first-edge-bearing/linearize-objstm-stream-uncompress.pdf",
+    );
+}
+
+#[test]
+fn linearize_preserve_stream_data_compress_structural_streams_match_qpdf() {
+    assert_golden(
+        &linearize_mode_with_stream_data(
+            "null-visible-thumb-first-edge-bearing.pdf",
+            ObjectStreamMode::Preserve,
+            Some(StreamDataMode::Compress),
+        ),
+        "null-visible-thumb-first-edge-bearing/linearize-objstm-preserve.pdf",
+    );
+}
+
+#[test]
 fn linearize_generate_stale_generation_inlines_null_without_body() {
     assert_golden(
         &linearize_mode(
@@ -212,6 +284,42 @@ fn linearize_preserve_stream_data_directizes_null_length() {
             Some(StreamDataMode::Preserve),
         ),
         "null-visible-stream-null-length/linearize-preserve.pdf",
+    );
+}
+
+#[test]
+fn linearize_preserve_restores_exact_null_length_framing() {
+    assert_golden(
+        &linearize_mode_with_stream_data(
+            "null-length-framing-matrix.pdf",
+            ObjectStreamMode::Disable,
+            Some(StreamDataMode::Preserve),
+        ),
+        "null-length-framing-matrix/linearize-preserve.pdf",
+    );
+}
+
+#[test]
+fn linearize_uncompress_restores_exact_null_length_framing() {
+    assert_golden(
+        &linearize_mode_with_stream_data(
+            "null-length-framing-matrix.pdf",
+            ObjectStreamMode::Disable,
+            Some(StreamDataMode::Uncompress),
+        ),
+        "null-length-framing-matrix/linearize-uncompress.pdf",
+    );
+}
+
+#[test]
+fn linearize_compress_restores_exact_null_length_framing() {
+    assert_golden(
+        &linearize_mode_with_stream_data(
+            "null-length-framing-matrix.pdf",
+            ObjectStreamMode::Disable,
+            Some(StreamDataMode::Compress),
+        ),
+        "null-length-framing-matrix/linearize-compress.pdf",
     );
 }
 
