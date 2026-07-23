@@ -134,6 +134,7 @@ pub mod pages;
 pub mod parser;
 pub mod permissions;
 pub mod qdf_fix;
+pub(crate) mod qpdf_null;
 pub mod reader;
 pub(crate) mod ref_chain;
 pub mod resources;
