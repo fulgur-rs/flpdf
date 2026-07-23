@@ -863,6 +863,31 @@ for stem in "${!G6HB2_FIX[@]}"; do
     fi
 done
 
+python3 "$ROOT/docs/plans/tools/gen_firstpage_objstm_container_order.py" \
+    "$FIX/objstm-lin-firstpage-private-before-shared.pdf"
+
+qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-firstpage-private-before-shared.pdf" \
+    "$FIX/objstm-lin-firstpage-private-before-shared-bearing.pdf"
+
+python3 "$ROOT/docs/plans/tools/gen_otherpage_thumbnail_rest.py" \
+    "$FIX/objstm-lin-otherpage-thumbnail-rest.pdf"
+qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-otherpage-thumbnail-rest.pdf" \
+    "$FIX/objstm-lin-otherpage-thumbnail-rest-bearing.pdf"
+
+python3 "$ROOT/docs/plans/tools/gen_thumbnail_user_order.py" \
+    direct-descendant "$FIX/objstm-lin-thumb-direct-descendant.pdf"
+qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-thumb-direct-descendant.pdf" \
+    "$FIX/objstm-lin-thumb-direct-descendant-bearing.pdf"
+
+python3 "$ROOT/docs/plans/tools/gen_thumbnail_user_order.py" \
+    first-edge-wins "$FIX/objstm-lin-thumb-first-edge-wins.pdf"
+qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-thumb-first-edge-wins.pdf" \
+    "$FIX/objstm-lin-thumb-first-edge-wins-bearing.pdf"
+
 # ObjStm-bearing variant of the cap-boundary-199 fixture (flpdf-ihb.4). The raw
 # gen_shared_fonts.py 199 output has no source ObjStms, so --object-streams=preserve
 # on it yields an empty plan. Re-encoding through --object-streams=generate produces
@@ -1778,6 +1803,49 @@ qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/shared-stream-objstm.pdf" "$REF/shared-stream-objstm/linearize-objstm.pdf"
 qpdf --check "$REF/shared-stream-objstm/linearize-objstm.pdf" >/dev/null
 echo "shared-stream-objstm/linearize-objstm.pdf"
+
+mkdir -p "$REF/objstm-lin-firstpage-private-before-shared"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-firstpage-private-before-shared.pdf" \
+    "$REF/objstm-lin-firstpage-private-before-shared/linearize-objstm.pdf"
+
+mkdir -p "$REF/objstm-lin-firstpage-private-before-shared-bearing"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-firstpage-private-before-shared-bearing.pdf" \
+    "$REF/objstm-lin-firstpage-private-before-shared-bearing/linearize-objstm-preserve.pdf"
+
+qpdf --check-linearization \
+    "$REF/objstm-lin-firstpage-private-before-shared/linearize-objstm.pdf"
+qpdf --check-linearization \
+    "$REF/objstm-lin-firstpage-private-before-shared-bearing/linearize-objstm-preserve.pdf"
+
+mkdir -p "$REF/objstm-lin-otherpage-thumbnail-rest"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-otherpage-thumbnail-rest.pdf" \
+    "$REF/objstm-lin-otherpage-thumbnail-rest/linearize-objstm.pdf"
+
+mkdir -p "$REF/objstm-lin-otherpage-thumbnail-rest-bearing"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-otherpage-thumbnail-rest-bearing.pdf" \
+    "$REF/objstm-lin-otherpage-thumbnail-rest-bearing/linearize-objstm-preserve.pdf"
+
+qpdf --check-linearization \
+    "$REF/objstm-lin-otherpage-thumbnail-rest/linearize-objstm.pdf"
+qpdf --check-linearization \
+    "$REF/objstm-lin-otherpage-thumbnail-rest-bearing/linearize-objstm-preserve.pdf"
+
+for stem in objstm-lin-thumb-direct-descendant objstm-lin-thumb-first-edge-wins; do
+    mkdir -p "$REF/$stem"
+    qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+        "$FIX/$stem.pdf" "$REF/$stem/linearize-objstm.pdf"
+    qpdf --check-linearization "$REF/$stem/linearize-objstm.pdf"
+
+    bearing="$stem-bearing"
+    mkdir -p "$REF/$bearing"
+    qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+        "$FIX/$bearing.pdf" "$REF/$bearing/linearize-objstm-preserve.pdf"
+    qpdf --check-linearization "$REF/$bearing/linearize-objstm-preserve.pdf"
+done
 
 # Linearized generate-mode >cap goldens (flpdf-g6hb.2). See the fixture block
 # above for each scenario. Compared structurally (and strictly where flpdf
