@@ -88,13 +88,12 @@ if [[ -z "$LCOV" ]]; then
   # We pass `--ignore-run-fail` as a safety net so a pre-existing test miss
   # never blocks the whole coverage run — the gate is the changed-line diff,
   # not the overall test outcome, and other workflows already run the full
-  # test suite with a proper pass/fail gate. Concrete case today:
-  # `compat_matrix_baseline`'s markdown snapshot was blessed against miniz
-  # output, so the `flpdf-sha` and `byte-equal` columns drift under the
-  # required `--features qpdf-zlib-compat` build. (The sibling
-  # `compat_baseline_static_id` used to hit the same trap and has since
-  # been cfg-gated on the feature and re-blessed against zlib output —
-  # flpdf-qrg8.)
+  # test suite with a proper pass/fail gate. No specific known miss remains
+  # under `--features qpdf-zlib-compat`: the historical cases
+  # `compat_baseline_static_id` (flpdf-qrg8) and `compat_matrix_baseline`
+  # (flpdf-u32a) have both been cfg-gated on the feature and re-blessed
+  # against zlib output. Kept as belt-and-suspenders for future
+  # feature-only regressions.
   LCOV_MODE="fresh"
   LCOV="target/patch-cov.lcov"
   echo "[patch-coverage] running 'cargo llvm-cov --workspace --features qpdf-zlib-compat --ignore-run-fail' (slow; pass --lcov <path> to reuse a report)..." >&2

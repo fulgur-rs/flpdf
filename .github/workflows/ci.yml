@@ -177,14 +177,12 @@ jobs:
           # true qpdf byte-parity; under the default miniz backend the test
           # is compiled out (the one sanctioned byte deviation).
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test compat_baseline_static_id -- --nocapture
-
-      - name: Compat matrix baselines (Linux amd64)
-        if: ${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "[ci] Running compat matrix baselines — drift surfaces here as an explicit step"
-          cargo test -p flpdf-cli --test compat_matrix_baseline -- --nocapture
+          # Pins the per-flag matrix snapshot (byte-equal / qpdf-json /
+          # structural verdicts) vs qpdf goldens. Same rationale as the
+          # static-id baseline above: gated behind qpdf-zlib-compat so the
+          # flpdf-sha and byte-equal columns record qpdf byte-parity, not
+          # miniz drift.
+          cargo test -p flpdf-cli --features qpdf-zlib-compat --test compat_matrix_baseline -- --nocapture
 
   coverage:
     name: Coverage

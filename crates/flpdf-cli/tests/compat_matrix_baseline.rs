@@ -11,12 +11,22 @@
 //! - compared byte-for-byte against `tests/golden/compat-matrix.md`, or
 //! - written there when the environment variable `BLESS=1` is set.
 //!
+//! Gated on `qpdf-zlib-compat`: the `flpdf-sha` fingerprint and `byte-equal`
+//! column depend on flpdf's DEFLATE backend, so the matrix records qpdf
+//! byte-parity — which only holds when flpdf runs against classic zlib.
+//! Under the default (miniz_oxide) feature this test is compiled out —
+//! blessing miniz output here would flip byte-equal from a parity signal
+//! into a "miniz drift" snapshot and reintroduce the trap flpdf-qrg8
+//! removed from the sibling `compat_baseline_static_id`.
+//!
 //! Run initial generation with:
-//!   `BLESS=1 cargo test --test compat_matrix_baseline`
+//!   `BLESS=1 cargo test -p flpdf-cli --features qpdf-zlib-compat --test compat_matrix_baseline`
 //!
 //! The entire test is skipped when `qpdf` is not available on PATH (the
 //! `qpdf-json` comparator requires it, and without it the matrix would be
 //! meaningless).
+
+#![cfg(feature = "qpdf-zlib-compat")]
 
 #[allow(dead_code, unused_imports)]
 #[path = "support/mod.rs"]
@@ -523,40 +533,26 @@ fn render_markdown(rows: &[MatrixRow]) -> String {
     out.push_str("so the baseline detects byte-level drift even when every comparator\n");
     out.push_str("verdict stays at `diverge`. The `byte-equal` column likewise compares\n");
     out.push_str("with `/ID` elided.\n\n");
-    out.push_str("## Byte-identity (feature-gated)\n\n");
-    out.push_str("The `byte-equal` column reflects the **default Pure-Rust build** (miniz_oxide\n");
-    out.push_str("deflate) with the CLI's default `--newline-before-endstream=never` framing.\n");
-    out.push_str("Framing now matches qpdf, but miniz's DEFLATE bytes still differ from qpdf's\n");
-    out.push_str(
-        "zlib bytes, so every row whose output carries a deflate stream stays `diverge`\n",
-    );
-    out.push_str("in the default build — it deliberately does **not** chase byte-identity (see\n");
-    out.push_str("`tests/golden/README.md`).\n\n");
-    out.push_str(
-        "Byte-for-byte identity with `qpdf --static-id` **is** achievable, but only as an\n",
-    );
-    out.push_str("opt-in combination, and is verified separately by\n");
-    out.push_str("`crates/flpdf/tests/cmp_diff_zero_tests.rs` (gated on the `qpdf-zlib-compat`\n");
-    out.push_str("feature, run in the Linux amd64 CI job). It requires all of:\n\n");
-    out.push_str("- the `qpdf-zlib-compat` feature (classic libz deflate, matching qpdf), and\n");
-    out.push_str("- `WriteOptions { full_rewrite: true, static_id: true,\n");
-    out.push_str("  newline_before_endstream: NewlineBeforeEndstream::Never, .. }`.\n\n");
-    out.push_str(
-        "Under those conditions `one-page`, `two-page`, and `three-page` plain rewrites\n",
-    );
-    out.push_str(
-        "are `cmp`-diff-0 against the committed `static-id.pdf` goldens. This is kept out\n",
-    );
-    out.push_str("of the default-build matrix on purpose: faking `byte-equal: match` here would\n");
-    out.push_str(
-        "misrepresent the default build. (Byte-identity pins to the linked libz version.)\n\n",
-    );
+    out.push_str("## Backend (feature-gated)\n\n");
+    out.push_str("This matrix is gated on the `qpdf-zlib-compat` feature (classic libz deflate,\n");
+    out.push_str("matching qpdf's `compress2()`). Under the default Pure-Rust build\n");
+    out.push_str("(miniz_oxide) the test is compiled out entirely — miniz's DEFLATE bytes\n");
+    out.push_str("differ from qpdf's zlib bytes, so `flpdf-sha` and `byte-equal` would be a\n");
+    out.push_str("miniz-drift snapshot rather than a qpdf byte-parity signal, which is the\n");
+    out.push_str("one sanctioned deviation the pre-v1.0 mimicry policy tolerates. Byte-parity\n");
+    out.push_str("under miniz is deliberately **not** chased (see `tests/golden/README.md`).\n\n");
+    out.push_str("Framing uses the CLI's default `--newline-before-endstream=never`, which\n");
+    out.push_str("also matches qpdf. `crates/flpdf/tests/cmp_diff_zero_tests.rs` provides the\n");
+    out.push_str("stricter per-fixture assertions of `cmp`-diff-0 against the committed\n");
+    out.push_str("`static-id.pdf` goldens under the same feature.\n\n");
     out.push_str("## Review cadence\n\n");
     out.push_str("Re-bless this file when:\n");
     out.push_str("- qpdf binary is upgraded (qpdf-json comparator may shift)\n");
     out.push_str("- flpdf changes byte / structural output for any covered fixture × flag\n");
     out.push_str("- New fixtures or flags are added to the corpus\n\n");
-    out.push_str("Update via: `BLESS=1 cargo test --test compat_matrix_baseline`\n\n");
+    out.push_str(
+        "Update via: `BLESS=1 cargo test -p flpdf-cli --features qpdf-zlib-compat --test compat_matrix_baseline`\n\n",
+    );
     out.push_str("## Matrix\n\n");
     out.push_str("| fixture | flag | flpdf-sha | byte-equal | qpdf-json | structural |\n");
     out.push_str("|---|---|---|---|---|---|\n");
