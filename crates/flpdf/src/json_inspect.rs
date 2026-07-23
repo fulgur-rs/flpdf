@@ -5813,6 +5813,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn outlines_nested_child_next_cycle_guard_prevents_infinite_loop() {
+        let mut pdf = load_one_page_pdf();
+
+        let outline_root_ref = crate::ObjectRef::new(100, 0);
+        let parent_ref = crate::ObjectRef::new(101, 0);
+        let child_ref = crate::ObjectRef::new(102, 0);
+
+        let mut outline_root = Dictionary::new();
+        outline_root.insert("Type", Object::Name(b"Outlines".to_vec()));
+        outline_root.insert("First", Object::Reference(parent_ref));
+        outline_root.insert("Last", Object::Reference(parent_ref));
+        patch_outline_root(&mut pdf, outline_root_ref, outline_root);
+
+        let mut parent = Dictionary::new();
+        parent.insert("Title", Object::String(b"Parent".to_vec()));
+        parent.insert("Parent", Object::Reference(outline_root_ref));
+        parent.insert("First", Object::Reference(child_ref));
+        parent.insert("Last", Object::Reference(child_ref));
+        parent.insert("Count", Object::Integer(1));
+        pdf.set_object(parent_ref, Object::Dictionary(parent));
+
+        let mut child = Dictionary::new();
+        child.insert("Title", Object::String(b"Loop".to_vec()));
+        child.insert("Parent", Object::Reference(parent_ref));
+        child.insert("Next", Object::Reference(child_ref));
+        pdf.set_object(child_ref, Object::Dictionary(child));
+
+        let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
+        let JsonValue::Array(entries) = &result else {
+            panic!("expected Array"); // cov:ignore: test-shape guard
+        };
+        assert_eq!(entries.len(), 1, "root chain must contain the parent");
+        let JsonValue::Object(parent_entry) = &entries[0] else {
+            panic!("parent entry is not an Object"); // cov:ignore: test-shape guard
+        };
+        let kids = parent_entry
+            .iter()
+            .find(|(key, _)| key == "kids")
+            .map(|(_, value)| value)
+            .expect("parent must contain kids");
+        let JsonValue::Array(kids) = kids else {
+            panic!("kids is not an Array"); // cov:ignore: test-shape guard
+        };
+        assert_eq!(
+            kids.len(),
+            1,
+            "nested /Next cycle guard must stop before a duplicate child"
+        );
+    }
+
     // ── Test 5: Broken /Parent link does not crash ────────────────────────────
 
     #[test]

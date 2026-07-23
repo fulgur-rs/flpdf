@@ -202,6 +202,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             owner: OutlineId,
             next: Option<OutlineCursor>,
             depth: usize,
+            siblings_seen: BTreeSet<ObjectRef>,
         }
 
         let mut frames = Vec::new();
@@ -211,6 +212,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 owner: root,
                 next: first,
                 depth: 2,
+                siblings_seen: BTreeSet::new(),
             });
         }
 
@@ -221,7 +223,15 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 continue;
             };
             let (owner, child_depth) = {
-                let frame = frames.last().expect("outline construction frame exists");
+                let frame = frames
+                    .last_mut()
+                    .expect("outline construction frame exists");
+                if let Some(reference) = cursor.source_ref() {
+                    if !frame.siblings_seen.insert(reference) {
+                        frame.next = None;
+                        continue;
+                    }
+                }
                 (frame.owner, frame.depth)
             };
             let Some(child) = self.materialize_item(cursor, Some(owner), tree)? else {
@@ -251,6 +261,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                         owner: child,
                         next: first,
                         depth: child_depth + 1,
+                        siblings_seen: BTreeSet::new(),
                     });
                 }
             }
