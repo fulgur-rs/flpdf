@@ -537,6 +537,18 @@ fn compute_closure<R: Read + Seek>(
 // LinearizationPlan
 // ---------------------------------------------------------------------------
 
+/// Retained qpdf-style object-user signals for ObjStm routing.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct LinearizationRoutingUsers {
+    first_page: BTreeSet<ObjectRef>,
+    thumbnails: BTreeSet<ObjectRef>,
+    outlines: BTreeSet<ObjectRef>,
+    outlines_in_first_page: bool,
+    open_document: BTreeSet<ObjectRef>,
+    document_other: BTreeSet<ObjectRef>,
+}
+
 /// Partition of a PDF document's objects into the four linearization parts
 /// defined by ISO 32000-1 Annex F, together with the raw inputs for the
 /// page-offset and shared-object hint tables.
@@ -552,17 +564,6 @@ fn compute_closure<R: Read + Seek>(
 /// (shared with other pages), and removes the moved objects from Part 4 so
 /// the invariant is always maintained.  The free-list head at object 0 is
 /// excluded from Part 4 entirely (ISO 32000-1 §7.5.4).
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct LinearizationRoutingUsers {
-    first_page: BTreeSet<ObjectRef>,
-    thumbnails: BTreeSet<ObjectRef>,
-    outlines: BTreeSet<ObjectRef>,
-    outlines_in_first_page: bool,
-    open_document: BTreeSet<ObjectRef>,
-    document_other: BTreeSet<ObjectRef>,
-}
-
 #[derive(Debug, Clone)]
 pub struct LinearizationPlan {
     // ------------------------------------------------------------------
