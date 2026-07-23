@@ -85,11 +85,16 @@ if [[ -z "$LCOV" ]]; then
   # runs under `cargo test`, and coverage under-reports catastrophically
   # (600+ false-positive uncovered lines on flpdf-9hc.34).
   #
-  # We pass `--ignore-run-fail` so a single pre-existing baseline miss (e.g.
-  # `flpdf-hdsz`: `compat_baseline_static_id::static_id_baseline` on
-  # `attachment-two-page.pdf`) does not block the whole coverage run — the
-  # gate is the changed-line diff, not the overall test outcome, and other
-  # workflows already run the full test suite with a proper pass/fail gate.
+  # We pass `--ignore-run-fail` as a safety net so a pre-existing test miss
+  # never blocks the whole coverage run — the gate is the changed-line diff,
+  # not the overall test outcome, and other workflows already run the full
+  # test suite with a proper pass/fail gate. Concrete case today:
+  # `compat_matrix_baseline`'s markdown snapshot was blessed against miniz
+  # output, so the `flpdf-sha` and `byte-equal` columns drift under the
+  # required `--features qpdf-zlib-compat` build. (The sibling
+  # `compat_baseline_static_id` used to hit the same trap and has since
+  # been cfg-gated on the feature and re-blessed against zlib output —
+  # flpdf-qrg8.)
   LCOV_MODE="fresh"
   LCOV="target/patch-cov.lcov"
   echo "[patch-coverage] running 'cargo llvm-cov --workspace --features qpdf-zlib-compat --ignore-run-fail' (slow; pass --lcov <path> to reuse a report)..." >&2

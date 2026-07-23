@@ -9,8 +9,17 @@
 //! - compared byte-for-byte against `tests/golden/baseline-static-id.md`, or
 //! - written there when the environment variable `BLESS=1` is set.
 //!
+//! Gated on `qpdf-zlib-compat`: the baseline records qpdf byte-parity, which
+//! only holds when flpdf's DEFLATE is the classic-zlib backend. Under the
+//! default (miniz_oxide) feature this test is compiled out — miniz output
+//! legitimately differs by a few bytes per fixture (the one sanctioned deviation
+//! per the project's mimicry policy) and blessing miniz output here would
+//! silently mask real qpdf divergence.
+//!
 //! Run initial generation with:
-//!   `BLESS=1 cargo test --test compat_baseline_static_id`
+//!   `BLESS=1 cargo test -p flpdf-cli --features qpdf-zlib-compat --test compat_baseline_static_id`
+
+#![cfg(feature = "qpdf-zlib-compat")]
 
 #[allow(dead_code, unused_imports)]
 #[path = "support/mod.rs"]

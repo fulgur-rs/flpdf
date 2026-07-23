@@ -33,8 +33,14 @@ verdicts emitted by `support::ComparatorResult` in the harness.
 
   ```bash
   BLESS=1 cargo test -p flpdf-cli --test compat_matrix_baseline
-  BLESS=1 cargo test -p flpdf-cli --test compat_baseline_static_id
+  BLESS=1 cargo test -p flpdf-cli --features qpdf-zlib-compat \
+    --test compat_baseline_static_id
   ```
+
+  `compat_baseline_static_id` records qpdf byte-parity and is compiled
+  out under the default (miniz_oxide) build, so its BLESS must run with
+  `--features qpdf-zlib-compat`. `compat_matrix_baseline` is currently
+  still blessed under the default backend.
 
   Re-blessing must be a deliberate act. The PR template's `Compat matrix`
   checkbox exists to make that intention explicit.
@@ -110,8 +116,10 @@ Triage rule:
    transformation of an existing one — see the script's Phase 1 for
    examples).
 3. Run `BLESS=1 cargo test -p flpdf-cli --test compat_matrix_baseline`
-   and `BLESS=1 cargo test -p flpdf-cli --test compat_baseline_static_id`
-   to populate the new rows in the baselines.
+   and `BLESS=1 cargo test -p flpdf-cli --features qpdf-zlib-compat
+   --test compat_baseline_static_id` to populate the new rows in the
+   baselines. The static-id BLESS requires the `qpdf-zlib-compat` feature
+   because that baseline records qpdf byte-parity.
 4. Commit the new fixture, new golden references, and updated baselines
    together.
 
