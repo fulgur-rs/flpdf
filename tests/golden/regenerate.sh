@@ -1348,7 +1348,8 @@ qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
 python3 "$ROOT/docs/plans/tools/gen_od_indirect_length.py" --null-holder \
     > "$FIX/null-visible-stream-null-length.pdf"
 python3 "$ROOT/docs/plans/tools/gen_null_length_framing.py" \
-    "$FIX/null-length-framing-matrix.pdf"
+    "$FIX/null-length-framing-matrix.pdf" \
+    "$FIX/null-length-framing-matrix-objstm.pdf"
 
 # ObjStm-bearing variant of the cap-boundary-199 fixture (flpdf-ihb.4). The raw
 # gen_shared_fonts.py 199 output has no source ObjStms, so --object-streams=preserve
@@ -2415,7 +2416,8 @@ mkdir -p \
     "$REF/null-visible-thumb-first-edge" \
     "$REF/null-visible-thumb-first-edge-bearing" \
     "$REF/null-visible-stream-null-length" \
-    "$REF/null-length-framing-matrix"
+    "$REF/null-length-framing-matrix" \
+    "$REF/null-length-framing-matrix-objstm"
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/null-visible-thumb-first-edge.pdf" \
     "$REF/null-visible-thumb-first-edge/linearize-objstm.pdf"
@@ -2439,7 +2441,25 @@ qpdf --linearize --object-streams=disable --stream-data=preserve \
     --deterministic-id --warning-exit-0 \
     "$FIX/null-visible-stream-null-length.pdf" \
     "$REF/null-visible-stream-null-length/linearize-preserve.pdf"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-signature.pdf" \
+    "$REF/null-visible-preserve-signature/linearize-objstm-preserve.pdf"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-signature-null-fields.pdf" \
+    "$REF/null-visible-preserve-signature-null-fields/linearize-objstm-preserve.pdf"
 for stream_data in preserve uncompress compress; do
+    qpdf --object-streams=disable \
+        --stream-data="$stream_data" --static-id --warning-exit-0 \
+        "$FIX/null-length-framing-matrix.pdf" \
+        "$REF/null-length-framing-matrix/plain-$stream_data.pdf"
+    qpdf --object-streams=generate \
+        --stream-data="$stream_data" --static-id --warning-exit-0 \
+        "$FIX/null-length-framing-matrix.pdf" \
+        "$REF/null-length-framing-matrix/generate-$stream_data.pdf"
+    qpdf --object-streams=preserve \
+        --stream-data="$stream_data" --static-id --warning-exit-0 \
+        "$FIX/null-length-framing-matrix-objstm.pdf" \
+        "$REF/null-length-framing-matrix-objstm/preserve-$stream_data.pdf"
     qpdf --linearize --object-streams=disable \
         --stream-data="$stream_data" --deterministic-id --warning-exit-0 \
         "$FIX/null-length-framing-matrix.pdf" \
@@ -2461,7 +2481,21 @@ qpdf --check-linearization \
     "$REF/null-visible-stream-null-length/linearize-preserve.pdf"
 qpdf --check --warning-exit-0 \
     "$REF/null-visible-stream-null-length/linearize-preserve.pdf"
+qpdf --check-linearization \
+    "$REF/null-visible-preserve-signature/linearize-objstm-preserve.pdf"
+qpdf --check-linearization \
+    "$REF/null-visible-preserve-signature-null-fields/linearize-objstm-preserve.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-preserve-signature/linearize-objstm-preserve.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-preserve-signature-null-fields/linearize-objstm-preserve.pdf"
 for stream_data in preserve uncompress compress; do
+    qpdf --check --warning-exit-0 \
+        "$REF/null-length-framing-matrix/plain-$stream_data.pdf"
+    qpdf --check --warning-exit-0 \
+        "$REF/null-length-framing-matrix/generate-$stream_data.pdf"
+    qpdf --check --warning-exit-0 \
+        "$REF/null-length-framing-matrix-objstm/preserve-$stream_data.pdf"
     qpdf --check-linearization \
         "$REF/null-length-framing-matrix/linearize-$stream_data.pdf"
     qpdf --check --warning-exit-0 \

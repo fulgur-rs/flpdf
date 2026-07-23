@@ -2116,8 +2116,12 @@ impl LinearizationPlan {
                 if length_exclusions.contains(&obj_ref) || !assigned.contains(&obj_ref) {
                     continue;
                 }
-                let obj = pdf.resolve_borrowed(obj_ref)?;
-                if is_eligible_for_objstm(obj_ref, obj, ctx) {
+                let eligible = {
+                    let obj = pdf.resolve_borrowed(obj_ref)?;
+                    is_eligible_for_objstm(obj_ref, obj, ctx)
+                };
+                if eligible && !crate::writer::object_streams::is_qpdf_signature_dict(pdf, obj_ref)?
+                {
                     surviving.push(obj_ref);
                 }
             }

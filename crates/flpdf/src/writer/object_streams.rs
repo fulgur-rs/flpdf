@@ -337,7 +337,7 @@ pub(crate) fn even_split_into_streams(eligible: &[ObjectRef]) -> Vec<Vec<ObjectR
 /// whose value is direct null or resolves to null is therefore absent for this
 /// predicate. This is shared by Generate's `getCompressibleObjGens` port and
 /// Preserve's source-container filtering.
-fn is_qpdf_signature_dict<R: std::io::Read + std::io::Seek>(
+pub(crate) fn is_qpdf_signature_dict<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
     object_ref: ObjectRef,
 ) -> crate::Result<bool> {

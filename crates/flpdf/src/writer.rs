@@ -2873,10 +2873,14 @@ fn encrypt_stream_payload_for_writer(
 /// returning the re-encoded object and whether the **source** filter chain was
 /// already a lone `/FlateDecode`.
 ///
-/// This is the byte-critical choke point shared by `write_pdf_full_rewrite` and
-/// the non-linearized generate emit path (`write_pdf_generate`). Keeping it in
-/// one place prevents the two paths from drifting on qpdf's re-filter rules:
+/// This is the byte-critical choke point shared by `write_pdf_full_rewrite`,
+/// the non-linearized generate emit path (`write_pdf_generate`), and the
+/// linearized body writer. Keeping it in one place prevents those paths from
+/// drifting on qpdf's recovered-stream framing or re-filter rules:
 ///
+/// * `recovered_stream_eol`, when present, is restored exactly once before any
+///   preserve/decode/re-encode decision. The reader records it only while an
+///   `endstream` scan remains authoritative.
 /// * `CompressStreams::Yes` on an already-lone-`/FlateDecode` source (and no
 ///   `/F` external-data entry, no `--recompress-flate`) is **preserved verbatim**
 ///   — qpdf does not decode + re-encode it — with `/Length` normalized to the raw
@@ -2889,10 +2893,14 @@ fn encrypt_stream_payload_for_writer(
 /// regenerated `/Filter` (qpdf's re-filtered key order) when the source was NOT
 /// already a lone `/FlateDecode`.
 pub(crate) fn reencode_stream_for_compress(
-    stream: crate::Stream,
+    mut stream: crate::Stream,
     options: &WriteOptions,
     qpdf_plain_empty_refilter: bool,
+    recovered_stream_eol: Option<&[u8]>,
 ) -> (Object, bool) {
+    if let Some(eol) = recovered_stream_eol {
+        stream.data.extend_from_slice(eol);
+    }
     let source_filter_is_lone_flate = is_lone_flate(stream.dict.get("Filter"));
     let mut reencoded = match effective_stream_policy(options) {
         // qpdf preserves an already-lone-/FlateDecode stream verbatim under the
@@ -3804,8 +3812,12 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             // this path and the generate emit path cannot drift on qpdf's
             // re-filter rules. `reencoded` is owned and `mut` because the
             // encryption step below may rewrite the stream payload in place.
-            let (mut reencoded, source_filter_is_lone_flate) =
-                reencode_stream_for_compress(stream, options, qpdf_null_visibility);
+            let (mut reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
+                stream,
+                options,
+                qpdf_null_visibility,
+                pdf.recovered_stream_eol(*old_ref),
+            );
 
             // flpdf-9hc.4.9: encrypt the stream payload AFTER any filter
             // re-encoding, so the encryption operates on the on-disk bytes.
@@ -4475,8 +4487,12 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
                 )?; // cov:ignore: reachable emitted refs are all present in the completed map
                 match object {
                     Object::Stream(stream) => {
-                        let (reencoded, source_filter_is_lone_flate) =
-                            reencode_stream_for_compress(stream, options, true);
+                        let (reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
+                            stream,
+                            options,
+                            true,
+                            pdf.recovered_stream_eol(*old),
+                        );
                         write_reencoded_object(
                             &mut bytes,
                             &reencoded,

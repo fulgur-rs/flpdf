@@ -434,6 +434,81 @@ fn linearize_compress_restores_exact_null_length_framing() {
 }
 
 #[test]
+fn plain_rewrite_restores_all_length_fallback_framing() {
+    for (mode, name) in [
+        (StreamDataMode::Preserve, "preserve"),
+        (StreamDataMode::Uncompress, "uncompress"),
+        (StreamDataMode::Compress, "compress"),
+    ] {
+        assert_golden(
+            &rewrite_mode_with_policy(
+                "null-length-framing-matrix.pdf",
+                ObjectStreamMode::Disable,
+                Some(mode),
+                CompressStreams::Yes,
+            ),
+            &format!("null-length-framing-matrix/plain-{name}.pdf"),
+        );
+    }
+}
+
+#[test]
+fn generate_restores_all_length_fallback_framing() {
+    for (mode, name) in [
+        (StreamDataMode::Preserve, "preserve"),
+        (StreamDataMode::Uncompress, "uncompress"),
+        (StreamDataMode::Compress, "compress"),
+    ] {
+        assert_golden(
+            &rewrite_mode_with_policy(
+                "null-length-framing-matrix.pdf",
+                ObjectStreamMode::Generate,
+                Some(mode),
+                CompressStreams::Yes,
+            ),
+            &format!("null-length-framing-matrix/generate-{name}.pdf"),
+        );
+    }
+}
+
+#[test]
+fn source_objstm_preserve_restores_all_length_fallback_framing() {
+    for (mode, name) in [
+        (StreamDataMode::Preserve, "preserve"),
+        (StreamDataMode::Uncompress, "uncompress"),
+        (StreamDataMode::Compress, "compress"),
+    ] {
+        assert_golden(
+            &rewrite_mode_with_policy(
+                "null-length-framing-matrix-objstm.pdf",
+                ObjectStreamMode::Preserve,
+                Some(mode),
+                CompressStreams::Yes,
+            ),
+            &format!("null-length-framing-matrix-objstm/preserve-{name}.pdf"),
+        );
+    }
+}
+
+#[test]
+fn linearized_preserve_uses_resolver_aware_signature_eligibility() {
+    assert_golden(
+        &linearize_mode(
+            "null-visible-preserve-signature.pdf",
+            ObjectStreamMode::Preserve,
+        ),
+        "null-visible-preserve-signature/linearize-objstm-preserve.pdf",
+    );
+    assert_golden(
+        &linearize_mode(
+            "null-visible-preserve-signature-null-fields.pdf",
+            ObjectStreamMode::Preserve,
+        ),
+        "null-visible-preserve-signature-null-fields/linearize-objstm-preserve.pdf",
+    );
+}
+
+#[test]
 fn disable_null_visibility_cycle_is_byte_identical_to_qpdf() {
     assert_golden(
         &rewrite_mode("null-visible-cycle.pdf", ObjectStreamMode::Disable),

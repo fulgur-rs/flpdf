@@ -63,10 +63,11 @@ pub struct Pdf<R: Read + Seek> {
     source_xref_offsets: Vec<(ObjectRef, u64)>,
     source_xref_entries: BTreeMap<ObjectRef, XrefOffset>,
     dirty_object_refs: BTreeSet<ObjectRef>,
-    /// Exact source framing EOLs removed by parser recovery for streams whose
-    /// `/Length` resolved to null. Linearized rewriting uses this private
-    /// metadata to reproduce qpdf's recovered raw stream bytes.
-    recovered_null_stream_eols: BTreeMap<ObjectRef, crate::parser::RecoveredStreamEol>,
+    /// Exact source framing EOLs removed while a line-anchored `endstream`
+    /// scan remained authoritative. Rewriting restores this private metadata
+    /// before applying the selected stream policy, matching qpdf's recovered
+    /// raw stream bytes for missing, invalid, and unresolved `/Length` values.
+    recovered_stream_eols: BTreeMap<ObjectRef, crate::parser::RecoveredStreamEol>,
     /// Valid indirect references discovered while preparing qpdf JSON whose
     /// exact object generation has no live xref/cache target.
     qpdf_dangling_refs: BTreeSet<ObjectRef>,
@@ -361,9 +362,9 @@ impl<R: Read + Seek> Pdf<R> {
             .push(Diagnostic::warning(message, None));
     }
 
-    /// Exact source framing removed while recovering a null-length stream.
-    pub(crate) fn recovered_null_stream_eol(&self, object_ref: ObjectRef) -> Option<&'static [u8]> {
-        self.recovered_null_stream_eols
+    /// Exact source framing removed by an authoritative `endstream` scan.
+    pub(crate) fn recovered_stream_eol(&self, object_ref: ObjectRef) -> Option<&'static [u8]> {
+        self.recovered_stream_eols
             .get(&object_ref)
             .copied()
             .map(crate::parser::RecoveredStreamEol::as_bytes)
@@ -556,7 +557,7 @@ impl<R: Read + Seek> Pdf<R> {
             source_xref_offsets,
             source_xref_entries,
             dirty_object_refs: BTreeSet::new(),
-            recovered_null_stream_eols: BTreeMap::new(),
+            recovered_stream_eols: BTreeMap::new(),
             qpdf_dangling_refs: BTreeSet::new(),
             qpdf_trailer_references: loaded_state.trailer_references,
             qpdf_parsed_xref_streams: loaded_state.parsed_xref_streams,
@@ -871,7 +872,7 @@ impl<R: Read + Seek> Pdf<R> {
         self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
-        self.recovered_null_stream_eols.remove(&object_ref);
+        self.recovered_stream_eols.remove(&object_ref);
         if let Some(CacheEntry::Compressed { stream, index }) =
             self.cache.entry(object_ref).cloned()
         {
@@ -892,7 +893,7 @@ impl<R: Read + Seek> Pdf<R> {
         }
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
-        self.recovered_null_stream_eols.remove(&object_ref);
+        self.recovered_stream_eols.remove(&object_ref);
         if object_ref.number == 0
             || matches!(
                 self.cache.entry(object_ref),
@@ -1219,12 +1220,7 @@ impl<R: Read + Seek> Pdf<R> {
                     return Ok(false);
                 }
                 let mut object = parsed.object;
-                let mut recovered_from_null = parsed.recovered_stream_eol.is_some()
-                    && matches!(
-                        &object,
-                        Object::Stream(stream)
-                            if matches!(stream.dict.get("Length"), Some(Object::Null))
-                    );
+                let mut endstream_scan_authoritative = parsed.recovered_stream_eol.is_some();
                 // When the stream's /Length is an indirect reference, the parser
                 // had no xref and recorded the payload window instead of a
                 // resolved length. Resolve the holder via the xref and re-slice
@@ -1232,13 +1228,16 @@ impl<R: Read + Seek> Pdf<R> {
                 // decryption: `object`/`bytes` are still ciphertext here, and
                 // `decrypt_resolved_object` decrypts in place afterwards.
                 if let Some(isl) = parsed.indirect_length {
-                    recovered_from_null |= self.apply_indirect_stream_length(
+                    let used_endstream_scan = self.apply_indirect_stream_length(
                         object_ref,
                         &mut object,
                         isl,
                         &parsed.bytes,
                         offset,
                     )?;
+                    if parsed.recovered_stream_eol.is_some() {
+                        endstream_scan_authoritative = used_endstream_scan;
+                    }
                 }
                 // `apply_indirect_stream_length` already restored the lazy
                 // `Unresolved` entry, so a decryption error here leaves it
@@ -1246,10 +1245,12 @@ impl<R: Read + Seek> Pdf<R> {
                 // retry.
                 let object = self.decrypt_resolved_object(object_ref, object)?;
                 self.cache.set_resolved(object_ref, object);
-                if recovered_from_null {
+                if endstream_scan_authoritative {
                     if let Some(eol) = parsed.recovered_stream_eol {
-                        self.recovered_null_stream_eols.insert(object_ref, eol);
+                        self.recovered_stream_eols.insert(object_ref, eol);
                     }
+                } else {
+                    self.recovered_stream_eols.remove(&object_ref);
                 }
                 self.record_file_object_warnings(
                     object_ref,
@@ -1314,6 +1315,10 @@ impl<R: Read + Seek> Pdf<R> {
     /// Shared by [`resolve_to_cache`](Self::resolve_to_cache) and
     /// [`resolve_compressed_entry`](Self::resolve_compressed_entry) so ObjStm
     /// containers get the same recovery as top-level streams.
+    ///
+    /// Returns `true` only when a line-anchored `endstream` scan remains the
+    /// payload authority; a valid in-window indirect integer re-slice returns
+    /// `false`.
     fn apply_indirect_stream_length(
         &mut self,
         object_ref: ObjectRef,
@@ -1329,7 +1334,8 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Inner half of [`apply_indirect_stream_length`](Self::apply_indirect_stream_length):
     /// performs the holder resolution and re-slice. May leave `object_ref`
-    /// `Reserved`; the wrapper restores the cache entry.
+    /// `Reserved`; the wrapper restores the cache entry. Its boolean has the
+    /// same endstream-scan-authority meaning as the wrapper's return value.
     fn reslice_indirect_stream_length(
         &mut self,
         object_ref: ObjectRef,
@@ -1344,7 +1350,7 @@ impl<R: Read + Seek> Pdf<R> {
             // Best-effort: a self-referential, cyclic, unresolvable, or
             // out-of-window holder keeps the parser's endstream-scan value.
             Some(endstream_pos) => {
-                let mut recovered_from_null = false;
+                let mut endstream_scan_authoritative = true;
                 if isl.holder != object_ref {
                     // Mark this object resolution in-progress before recursing
                     // into the holder: a cyclic length-holder chain (A's /Length
@@ -1355,30 +1361,27 @@ impl<R: Read + Seek> Pdf<R> {
                     // resolution error is likewise non-fatal here: fall back
                     // rather than failing the whole stream.
                     self.cache.set_reserved(object_ref);
-                    match self.resolve_borrowed(isl.holder) {
-                        Ok(Object::Integer(n)) => {
-                            if let (Ok(n), Object::Stream(stream)) =
-                                (usize::try_from(*n), &mut *object)
+                    if let Ok(Object::Integer(n)) = self.resolve_borrowed(isl.holder) {
+                        if let (Ok(n), Object::Stream(stream)) = (usize::try_from(*n), &mut *object)
+                        {
+                            let auth_end = isl.data_start.checked_add(n);
+                            // Override whenever the authoritative length lands
+                            // at or before `endstream`. qpdf QDF holders contain
+                            // the logical payload length; `%QDF:
+                            // ignore_newline` accounts for any extra framing LF
+                            // in fix-qdf rather than changing reader semantics.
+                            // A too-large/garbage holder falls back to the safe
+                            // endstream scan.
+                            if let Some(auth_end) =
+                                auth_end.filter(|&end| end <= endstream_pos && end <= bytes.len())
                             {
-                                let auth_end = isl.data_start.saturating_add(n);
-                                // Override whenever the authoritative length lands
-                                // at or before `endstream`. qpdf QDF holders contain
-                                // the logical payload length; `%QDF:
-                                // ignore_newline` accounts for any extra framing LF
-                                // in fix-qdf rather than changing reader semantics.
-                                // A too-large/garbage holder falls back to the safe
-                                // endstream scan.
-                                let within_window = auth_end <= endstream_pos;
-                                if within_window && auth_end <= bytes.len() {
-                                    stream.data = bytes[isl.data_start..auth_end].to_vec();
-                                }
+                                stream.data = bytes[isl.data_start..auth_end].to_vec();
+                                endstream_scan_authoritative = false;
                             }
                         }
-                        Ok(Object::Null) => recovered_from_null = true,
-                        Ok(_) | Err(_) => {}
                     }
                 }
-                Ok(recovered_from_null)
+                Ok(endstream_scan_authoritative)
             }
             // No line-anchored `endstream` existed: the writer used
             // `NewlineBeforeEndstream::Never` with a non-EOL-ending payload, so
@@ -2548,6 +2551,95 @@ mod tests {
             .as_bytes(),
         );
         pdf
+    }
+
+    fn recovered_stream_fixture(
+        length_entry: &[u8],
+        framing_eol: &[u8],
+        holder_body: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let mut stream_body = b"1 0 obj\n<<".to_vec();
+        if !length_entry.is_empty() {
+            stream_body.push(b' ');
+            stream_body.extend_from_slice(length_entry);
+        }
+        stream_body.extend_from_slice(b" >>\nstream\nabc");
+        stream_body.extend_from_slice(framing_eol);
+        stream_body.extend_from_slice(b"endstream\nendobj\n");
+
+        match holder_body {
+            Some(holder_body) => classic_pdf_with_bodies(
+                &[stream_body.as_slice(), holder_body],
+                ObjectRef::new(1, 0),
+            ),
+            None => classic_pdf_with_bodies(&[stream_body.as_slice()], ObjectRef::new(1, 0)),
+        }
+    }
+
+    #[test]
+    fn endstream_scan_metadata_survives_every_non_authoritative_length() {
+        for (eol, expected) in [
+            (&b"\n"[..], &b"\n"[..]),
+            (&b"\r"[..], &b"\r"[..]),
+            (&b"\r\n"[..], &b"\r\n"[..]),
+        ] {
+            for length_entry in [&b""[..], &b"/Length /Bad"[..], &b"/Length null"[..]] {
+                let bytes = recovered_stream_fixture(length_entry, eol, None);
+                let mut pdf = Pdf::open_mem_owned(bytes).expect("open direct-length fixture");
+                let object_ref = ObjectRef::new(1, 0);
+                let stream = pdf.resolve(object_ref).expect("resolve recovered stream");
+                assert_eq!(stream.as_stream().unwrap().data, b"abc");
+                assert_eq!(pdf.recovered_stream_eol(object_ref), Some(expected));
+            }
+        }
+
+        for (holder_ref, holder_body, delete_holder) in [
+            (
+                b"2 0 R".as_slice(),
+                Some(b"2 0 obj\nnull\nendobj\n".as_slice()),
+                false,
+            ),
+            (
+                b"2 0 R".as_slice(),
+                Some(b"2 0 obj\n/Bad\nendobj\n".as_slice()),
+                false,
+            ),
+            (
+                b"2 0 R".as_slice(),
+                Some(b"2 0 obj\n99\nendobj\n".as_slice()),
+                false,
+            ),
+            (b"2 0 R".as_slice(), Some(b"2 0 obj\n<<".as_slice()), false),
+            (b"99 0 R".as_slice(), None, false),
+            (
+                b"2 0 R".as_slice(),
+                Some(b"2 0 obj\n3\nendobj\n".as_slice()),
+                true,
+            ),
+        ] {
+            let mut length_entry = b"/Length ".to_vec();
+            length_entry.extend_from_slice(holder_ref);
+            let bytes = recovered_stream_fixture(&length_entry, b"\n", holder_body);
+            let mut pdf = Pdf::open_mem_owned(bytes).expect("open indirect-length fixture");
+            if delete_holder {
+                pdf.delete_object(ObjectRef::new(2, 0));
+            }
+            let object_ref = ObjectRef::new(1, 0);
+            let stream = pdf.resolve(object_ref).expect("resolve recovered stream");
+            assert_eq!(stream.as_stream().unwrap().data, b"abc");
+            assert_eq!(pdf.recovered_stream_eol(object_ref), Some(&b"\n"[..]));
+        }
+    }
+
+    #[test]
+    fn valid_indirect_stream_length_clears_endstream_scan_metadata() {
+        let bytes =
+            recovered_stream_fixture(b"/Length 2 0 R", b"\n", Some(b"2 0 obj\n3\nendobj\n"));
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open valid indirect-length fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let stream = pdf.resolve(object_ref).expect("resolve recovered stream");
+        assert_eq!(stream.as_stream().unwrap().data, b"abc");
+        assert_eq!(pdf.recovered_stream_eol(object_ref), None);
     }
 
     #[test]

@@ -362,12 +362,13 @@ pub struct LinearizedOffsets {
     /// corresponds to `/H[0]` in the param dict.
     pub hint_stream_offset: usize,
 
-    /// Byte length of the hint stream's encoded data — corresponds to
+    /// Full byte length of the hint stream indirect object — corresponds to
     /// `/H[1]` in the param dict.
     ///
-    /// This is the payload length inside the `stream … endstream` envelope,
-    /// compressed or raw according to the effective stream-data policy, and is
-    /// the value of the hint stream object's own `/Length` key.
+    /// This spans the complete `N 0 obj … endobj` representation, including
+    /// the object header, stream dictionary, encoded payload, stream framing,
+    /// and `endobj`. It is distinct from the hint stream dictionary's
+    /// `/Length`, which counts only the encoded payload.
     pub hint_stream_length: usize,
 
     /// New object number assigned to the first-page page object — corresponds
@@ -558,18 +559,8 @@ fn append_body_object(
     };
 
     let policy = effective_stream_policy(options);
-    let mut source = stream.clone();
-    if let Some(eol) = recovered_stream_eol {
-        // qpdf's null `/Length` recovery includes the entire source EOL before
-        // `endstream` in the raw stream data. The public Stream value keeps its
-        // long-standing logical payload semantics; only linearized body
-        // emission reconstructs those source bytes before applying the selected
-        // preserve/uncompress/compress policy.
-        source.data.extend_from_slice(eol);
-    }
-
     let (reencoded, source_filter_is_lone_flate) =
-        reencode_stream_for_compress(source, options, true);
+        reencode_stream_for_compress(stream.clone(), options, true, recovered_stream_eol);
 
     // `apply_stream_compress_policy` always returns `Object::Stream` (every arm
     // constructs one), so this destructuring never fails.
@@ -1876,7 +1867,7 @@ fn do_write_pass<R: Read + Seek>(
             "planner invariant: /Catalog is never an ObjStm member"
         );
         let object = pdf.resolve(catalog_orig)?;
-        let recovered_eol = pdf.recovered_null_stream_eol(catalog_orig);
+        let recovered_eol = pdf.recovered_stream_eol(catalog_orig);
         let renumbered = renumber_object(pdf, &object, 0, renumber)?;
         let offset = append_body_object(
             &mut bytes,
@@ -1909,7 +1900,7 @@ fn do_write_pass<R: Read + Seek>(
         };
         // cov:ignore-end
         let object = pdf.resolve(*original_ref)?;
-        let recovered_eol = pdf.recovered_null_stream_eol(*original_ref);
+        let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered = renumber_object(pdf, &object, 0, renumber)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
         xref_offsets.insert(new_ref.number, offset);
@@ -1980,7 +1971,7 @@ fn do_write_pass<R: Read + Seek>(
             )));
         };
         let object = pdf.resolve(*original_ref)?;
-        let recovered_eol = pdf.recovered_null_stream_eol(*original_ref);
+        let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered = renumber_object(pdf, &object, 0, renumber)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
         xref_offsets.insert(new_ref.number, offset);
@@ -2010,7 +2001,7 @@ fn do_write_pass<R: Read + Seek>(
             )));
         };
         let object = pdf.resolve(*original_ref)?;
-        let recovered_eol = pdf.recovered_null_stream_eol(*original_ref);
+        let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered = renumber_object(pdf, &object, 0, renumber)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
         xref_offsets.insert(new_ref.number, offset);
@@ -2049,7 +2040,7 @@ fn do_write_pass<R: Read + Seek>(
             // cov:ignore-end
         };
         let object = pdf.resolve(*original_ref)?;
-        let recovered_eol = pdf.recovered_null_stream_eol(*original_ref);
+        let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered = renumber_object(pdf, &object, 0, renumber)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
         xref_offsets.insert(new_ref.number, offset);
@@ -2114,7 +2105,7 @@ fn do_write_pass<R: Read + Seek>(
                     .new_for_original(*original_ref)
                     .expect("part4 plain object renumber entry checked above");
                 let object = pdf.resolve(*original_ref)?;
-                let recovered_eol = pdf.recovered_null_stream_eol(*original_ref);
+                let recovered_eol = pdf.recovered_stream_eol(*original_ref);
                 let renumbered = renumber_object(pdf, &object, 0, renumber)?;
                 let offset =
                     append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
