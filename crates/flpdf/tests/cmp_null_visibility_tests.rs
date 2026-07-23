@@ -20,6 +20,16 @@ fn rewrite_mode_with_policy(
     stream_data: Option<StreamDataMode>,
     compress_streams: CompressStreams,
 ) -> Vec<u8> {
+    rewrite_mode_with_policy_and_id(fixture, mode, stream_data, compress_streams, false)
+}
+
+fn rewrite_mode_with_policy_and_id(
+    fixture: &str,
+    mode: ObjectStreamMode,
+    stream_data: Option<StreamDataMode>,
+    compress_streams: CompressStreams,
+    deterministic_id: bool,
+) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join(fixture);
@@ -29,7 +39,8 @@ fn rewrite_mode_with_policy(
     options.object_streams = mode;
     options.stream_data = stream_data;
     options.compress_streams = compress_streams;
-    options.static_id = true;
+    options.static_id = !deterministic_id;
+    options.deterministic_id = deterministic_id;
     options.newline_before_endstream = NewlineBeforeEndstream::Never;
     let mut out = Vec::new();
     write_pdf_with_options(&mut pdf, &mut out, &options).unwrap();
@@ -252,6 +263,31 @@ fn preserve_drops_fully_unreachable_source_container() {
             ObjectStreamMode::Preserve,
         ),
         "null-visible-preserve-unreachable/preserve.pdf",
+    );
+}
+
+#[test]
+fn preserve_empty_source_batches_keeps_generation_removals() {
+    assert_golden(
+        &rewrite_mode(
+            "null-visible-preserve-empty-removed.pdf",
+            ObjectStreamMode::Preserve,
+        ),
+        "null-visible-preserve-empty-removed/preserve.pdf",
+    );
+}
+
+#[test]
+fn preserve_empty_source_batches_keeps_deterministic_id_parity() {
+    assert_golden(
+        &rewrite_mode_with_policy_and_id(
+            "null-visible-preserve-empty-removed.pdf",
+            ObjectStreamMode::Preserve,
+            None,
+            CompressStreams::Yes,
+            true,
+        ),
+        "null-visible-preserve-empty-removed/deterministic-id.pdf",
     );
 }
 

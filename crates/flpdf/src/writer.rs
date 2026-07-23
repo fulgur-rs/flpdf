@@ -3158,8 +3158,14 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         && pdf.encryption_ref().is_none()
         && pdf.deleted_object_refs().is_empty()
     {
+        let source_had_compressed_objects = pdf
+            .source_xref_entries()
+            .iter()
+            .any(|(_reference, offset)| matches!(offset, XrefOffset::Compressed { .. }));
         let plan = object_streams::plan_qpdf_preserve_object_streams(pdf)?;
-        if !plan.batches.is_empty() {
+        if !plan.batches.is_empty()
+            || (source_had_compressed_objects && !plan.removed_refs.is_empty())
+        {
             return write_pdf_containerized_qpdf(
                 pdf,
                 out,
@@ -4527,6 +4533,54 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
         }
         bytes.extend_from_slice(b"\nendobj\n");
         offsets.insert(number, emit_offset);
+    }
+
+    // Preserve may remove every source ObjStm while still producing
+    // `removed_refs`: getCompressibleObjGens has already directized a stale
+    // generation before reachability filtering empties the container plan.
+    // qpdf keeps the source 1.5 header but falls back to a classic xref table
+    // when no compressed member survives. Keep this path on GenerateRenumber
+    // (so removed refs remain direct null) while reproducing that table form.
+    if groups.is_empty() {
+        let xref_offset = bytes.len();
+        let max_object_number = offsets.keys().next_back().copied().unwrap_or(0);
+        let object_count = max_object_number.checked_add(1).ok_or_else(|| {
+            crate::Error::Unsupported(
+                "containerized rewrite: object count overflows u32".to_string(),
+            )
+        })?; // cov:ignore: requires u32::MAX emitted objects
+        bytes.extend_from_slice(format!("xref\n0 {object_count}\n").as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for number in 1..object_count {
+            let offset = generate_invariant(
+                offsets.get(&number).copied(),
+                "empty-container preserve numbering is not contiguous",
+            )?; // cov:ignore: GenerateRenumber assigns a contiguous range
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+
+        let mut trailer = pdf.trailer().clone();
+        strip_incremental_trailer_keys(&mut trailer);
+        remap_qpdf_trailer_refs(pdf, &mut trailer, &renumber)?;
+        trailer.insert("Size", Object::Integer(i64::from(object_count)));
+        trailer.insert("Root", Object::Reference(new_root));
+        apply_encrypt_trailer_entries(&mut trailer, pdf, options, None, options.deterministic_id);
+        bytes.extend_from_slice(b"trailer ");
+        if options.deterministic_id {
+            let mut id_writer = |out: &mut Vec<u8>| {
+                write_deterministic_id_inline(
+                    out,
+                    &det_id_info_suffix,
+                    det_id_source_id0.as_deref(),
+                )
+            };
+            trailer.write_pdf_trailer(&mut bytes, Some(&mut id_writer));
+        } else {
+            trailer.write_pdf_trailer(&mut bytes, None);
+        }
+        bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        out.write_all(&bytes)?;
+        return Ok(());
     }
 
     // ── cross-reference stream ───────────────────────────────────────────────

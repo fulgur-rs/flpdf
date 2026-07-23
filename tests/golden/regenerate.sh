@@ -478,6 +478,7 @@ fi
 
 if [[ ! -f "$FIX/null-visible-preserve-mixed.pdf" || \
       ! -f "$FIX/null-visible-preserve-unreachable.pdf" || \
+      ! -f "$FIX/null-visible-preserve-empty-removed.pdf" || \
       ! -f "$FIX/null-visible-preserve-over-100.pdf" || \
       ! -f "$FIX/null-visible-preserve-signature.pdf" || \
       ! -f "$FIX/null-visible-preserve-signature-null-fields.pdf" ]]; then
@@ -487,7 +488,8 @@ if [[ ! -f "$FIX/null-visible-preserve-mixed.pdf" || \
         "$FIX/null-visible-preserve-unreachable.pdf" \
         "$FIX/null-visible-preserve-over-100.pdf" \
         "$FIX/null-visible-preserve-signature.pdf" \
-        "$FIX/null-visible-preserve-signature-null-fields.pdf" <<'PY'
+        "$FIX/null-visible-preserve-signature-null-fields.pdf" \
+        "$FIX/null-visible-preserve-empty-removed.pdf" <<'PY'
 import sys
 import zlib
 
@@ -629,6 +631,94 @@ write_objstm(
     container_number=9,
     xref_number=10,
 )
+
+# The source ObjStm is fully unreachable, so Preserve retains zero containers.
+# During the same getCompressibleObjGens walk qpdf sees 4 0 R before the current
+# 4 1 R, removes the stale generation, and serializes that array slot as direct
+# null. Object 7's xref entry is free at generation 2 while the array names
+# 7 1 R; it controls that a higher FREE generation does not enter removed_refs
+# (the free reference keeps qpdf's ordinary indirect-null resurrection path).
+def write_empty_preserve_removed(path):
+    def append_entry(entries, entry_type, field1, field2):
+        entries.append(entry_type)
+        entries.extend(field1.to_bytes(4, "big"))
+        entries.extend(field2.to_bytes(2, "big"))
+
+    plain_objects = [
+        (
+            1,
+            0,
+            b"<< /Type /Catalog /Pages 2 0 R "
+            b"/Candidates [4 0 R 4 1 R 7 1 R] >>",
+        ),
+        (2, 0, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            0,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ),
+        (4, 1, b"<< /Current true >>"),
+    ]
+    members = [
+        (5, b"<< /Next 6 0 R /Label (unreachable root) >>"),
+        (6, b"<< /Label (unreachable child) >>"),
+    ]
+    pair_table = b""
+    member_body = b""
+    for index, (number, object_body) in enumerate(members):
+        pair_table += b"%d %d " % (number, len(member_body))
+        member_body += object_body
+        if index + 1 < len(members):
+            member_body += b"\n"
+    objstm_data = zlib.compress(pair_table + member_body)
+
+    body = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n"
+    offsets = {}
+    generations = {}
+    for number, generation, object_body in plain_objects:
+        offsets[number] = len(body)
+        generations[number] = generation
+        body += (
+            b"%d %d obj\n" % (number, generation)
+            + object_body
+            + b"\nendobj\n"
+        )
+    offsets[9] = len(body)
+    body += (
+        b"9 0 obj\n<< /Type /ObjStm /N 2 /First %d /Length %d "
+        b"/Filter /FlateDecode >>\nstream\n"
+        % (len(pair_table), len(objstm_data))
+    )
+    body += objstm_data + b"\nendstream\nendobj\n"
+    offsets[10] = len(body)
+
+    member_indices = {number: index for index, (number, _body) in enumerate(members)}
+    xref_entries = bytearray()
+    for number in range(11):
+        if number == 0:
+            append_entry(xref_entries, 0, 0, 65535)
+        elif number in member_indices:
+            append_entry(xref_entries, 2, 9, member_indices[number])
+        elif number == 7:
+            append_entry(xref_entries, 0, 0, 2)
+        elif number in offsets:
+            append_entry(
+                xref_entries, 1, offsets[number], generations.get(number, 0)
+            )
+        else:
+            append_entry(xref_entries, 0, 0, 0)
+    xref_data = zlib.compress(bytes(xref_entries))
+    body += (
+        b"10 0 obj\n<< /Type /XRef /W [1 4 2] /Index [0 11] /Size 11 "
+        b"/Root 1 0 R /Length %d /Filter /FlateDecode >>\nstream\n"
+        % len(xref_data)
+    )
+    body += xref_data + b"\nendstream\nendobj\n"
+    body += b"startxref\n%d\n%%%%EOF\n" % offsets[10]
+    open(path, "wb").write(body)
+
+
+write_empty_preserve_removed(sys.argv[6])
 PY
 else
     echo "Skipping Preserve reachability/container-boundary fixtures (already exist)"
@@ -1863,6 +1953,7 @@ mkdir -p \
     "$REF/null-visible-cycle" \
     "$REF/null-visible-preserve-mixed" \
     "$REF/null-visible-preserve-unreachable" \
+    "$REF/null-visible-preserve-empty-removed" \
     "$REF/null-visible-preserve-over-100" \
     "$REF/null-visible-preserve-signature" \
     "$REF/null-visible-preserve-signature-null-fields"
@@ -1923,6 +2014,12 @@ qpdf --object-streams=preserve --static-id --warning-exit-0 \
     "$FIX/null-visible-preserve-unreachable.pdf" \
     "$REF/null-visible-preserve-unreachable/preserve.pdf"
 qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-empty-removed.pdf" \
+    "$REF/null-visible-preserve-empty-removed/preserve.pdf"
+qpdf --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-empty-removed.pdf" \
+    "$REF/null-visible-preserve-empty-removed/deterministic-id.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
     "$FIX/null-visible-preserve-over-100.pdf" \
     "$REF/null-visible-preserve-over-100/preserve.pdf"
 qpdf --object-streams=preserve --static-id --warning-exit-0 \
@@ -1936,6 +2033,9 @@ qpdf --object-streams=generate --static-id --warning-exit-0 \
     "$REF/null-visible-preserve-signature-null-fields/generate.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-preserve-mixed/preserve.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-preserve-unreachable/preserve.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-preserve-empty-removed/preserve.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-preserve-empty-removed/deterministic-id.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-preserve-over-100/preserve.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-preserve-signature/preserve.pdf"
 qpdf --check --warning-exit-0 \
