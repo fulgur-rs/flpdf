@@ -2417,10 +2417,10 @@ fn second_half_container_anchors(
                 }
                 ContainerPart::OtherPageShared => (1, 0, 0, object_number),
                 ContainerPart::Rest => (2, 0, 0, object_number),
+                // cov:ignore-start: first-half routes cannot enter resolved second-half batches
                 ContainerPart::OpenDocument | ContainerPart::FirstPage => {
                     unreachable!("first-half route in second-half ObjStm batches")
-                    // cov:ignore: routed batch invariant
-                }
+                } // cov:ignore-end
             };
             let previous = plain_ranked
                 .iter()
