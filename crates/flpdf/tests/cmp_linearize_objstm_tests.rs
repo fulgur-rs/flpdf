@@ -293,6 +293,51 @@ fn catalog_firstpage_shared_two_page_objstm_byte_identical_to_qpdf() {
     );
 }
 
+// flpdf-19ac: qpdf classifies the generated ObjStm container union, not each
+// member independently. The earlier even-split container contains obj 4,
+// which is first-page-shared through Catalog /Ref2. The later container is
+// first-page-private, so qpdf emits the later private container first.
+#[test]
+fn firstpage_private_container_precedes_shared_generate_structurally() {
+    assert_structural(
+        "objstm-lin-firstpage-private-before-shared.pdf",
+        "objstm-lin-firstpage-private-before-shared",
+    );
+}
+
+#[test]
+fn firstpage_private_container_precedes_shared_generate_byte_identical_to_qpdf() {
+    assert_strict(
+        "objstm-lin-firstpage-private-before-shared.pdf",
+        "objstm-lin-firstpage-private-before-shared",
+    );
+}
+
+// Preserve applies the same filtered-container classification but orders
+// within each subsection by source ObjStm number.
+#[test]
+fn firstpage_private_container_precedes_shared_preserve_structurally() {
+    let fixture = "objstm-lin-firstpage-private-before-shared-bearing.pdf";
+    let stem = "objstm-lin-firstpage-private-before-shared-bearing";
+    let actual = flpdf_linearized_objstm_preserve(fixture);
+    let expected = golden_preserve(stem);
+    report(
+        fixture,
+        &mask_id1(&actual),
+        &mask_id1(&expected),
+        "preserve structural",
+    );
+}
+
+#[test]
+fn firstpage_private_container_precedes_shared_preserve_byte_identical_to_qpdf() {
+    let fixture = "objstm-lin-firstpage-private-before-shared-bearing.pdf";
+    let stem = "objstm-lin-firstpage-private-before-shared-bearing";
+    let actual = flpdf_linearized_objstm_preserve(fixture);
+    let expected = golden_preserve(stem);
+    report(fixture, &actual, &expected, "preserve strict");
+}
+
 // flpdf-0gyq: under --object-streams=generate the resurrected null body object is
 // compressed as the TRAILING ObjStm member (qpdf compresses it last). free and
 // missing variants must both match.

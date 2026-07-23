@@ -946,47 +946,13 @@ impl LinearizationPlan {
         // (QPDF_linearization.cc:1124-1127). compute_closure skips /Thumb, so neither
         // shared_page_indices nor document_other_set captures this; recover the set
         // here. Object-stream-mode independent, like open_document/outlines/others.
-        let thumb_page_tree = page_tree_node_refs(pdf)?;
-        let mut thumb_refs: Vec<(usize, ObjectRef)> = Vec::new();
-        for (page_idx, &page_ref) in page_refs.iter().enumerate() {
-            // Accessor chain (not a nested `if let`) so every line runs for a
-            // /Thumb-less page too. A direct inline /Thumb dict yields no
-            // ObjectRef (`as_ref_id` -> None) and is skipped, matching qpdf: only
-            // indirect objects become `ou_thumb` users (QPDF_optimization.cc:317-324).
-            let thumb = pdf
-                .resolve_borrowed(page_ref)?
-                .as_dict()
-                .and_then(|d| d.get("Thumb"))
-                .and_then(|o| o.as_ref_id());
-            thumb_refs.extend(thumb.map(|r| (page_idx, r)));
-        }
-        let mut thumb_shared_set: BTreeSet<ObjectRef> = BTreeSet::new();
-        for (page_idx, thumb_ref) in thumb_refs {
-            // Reuse the `live` set computed once above: closure_from_seeds is called
-            // once per thumbnail, so recomputing pdf.live_object_refs() inside it
-            // would reintroduce the O(pages * objects) rescan the page-closure loop
-            // deliberately avoids for /Thumb-heavy documents.
-            let closure =
-                closure_from_seeds(pdf, vec![(thumb_ref, false)], &thumb_page_tree, &live)?;
-            // Subtract the same page's ou_page closure: qpdf traverses /Thumb AFTER the
-            // page's other ref-bearing keys (alphabetical getKeys order) with a shared
-            // `visited`, so an object already reached by that page's ou_page walk never
-            // also receives ou_thumb from the same page (verified against qpdf 11.9.0:
-            // a page0 self-thumb of its own resource stays lc_first_page_private).
-            // Membership is tested against the already-built `first_page_set` (page 0)
-            // or the page's closure Vec directly (small contiguous Copy slice), avoiding
-            // a fresh BTreeSet allocation per thumbnail.
-            for r in closure {
-                let is_own = if page_idx == 0 {
-                    first_page_set.contains(&r)
-                } else {
-                    other_page_closures[page_idx - 1].contains(&r)
-                };
-                if !is_own {
-                    thumb_shared_set.insert(r);
-                }
-            }
-        }
+        let thumb_shared_set = thumbnail_user_set(
+            pdf,
+            &page_refs,
+            &first_page_set,
+            &other_page_closures,
+            &live,
+        )?;
 
         // ----------------------------------------------------------------
         // Step 5: partition into Part 2 (exclusive) and Part 3 (shared)
@@ -2023,7 +1989,9 @@ impl LinearizationPlan {
     /// ([`objstm_membership_linearized`]), with the page dictionaries + root
     /// Catalog erased, then each container routed to a linearization part by the
     /// union of its members' page users ([`route_objstm_containers`]). Containers
-    /// routed to part 6 ([`ContainerPart::FirstPage`]) become first-half
+    /// routed to part 6 ([`ContainerPart::FirstPagePrivate`],
+    /// [`ContainerPart::FirstPageShared`], or
+    /// [`ContainerPart::FirstPageOutlines`]) become first-half
     /// (`part3_batches`); every other container becomes second-half
     /// (`part4_batches`). Within a container, members are ordered by ascending
     /// source object number (qpdf's `object_stream_to_objects` is a
@@ -2054,14 +2022,11 @@ impl LinearizationPlan {
         let containers = objstm_membership_linearized(pdf, &assigned)?;
         let routes = route_objstm_containers(pdf, &containers)?;
 
-        let outline_set = &self.outline_first_page_members;
-
         let mut open_document_batches: Vec<Vec<ObjectRef>> = Vec::new();
-        // Separate first-page containers into regular (fonts/shared) and
-        // outline-routed.  qpdf places outline containers AFTER the regular
-        // first-page containers in the first half, so regular go first and
-        // outline containers are appended last (QPDF_linearization.cc:1031-1043).
-        let mut part3_regular: Vec<Vec<ObjectRef>> = Vec::new();
+        // qpdf part 6 is private, shared, then outline containers. Preserve
+        // first-encounter order within each bucket.
+        let mut part3_private: Vec<Vec<ObjectRef>> = Vec::new();
+        let mut part3_shared: Vec<Vec<ObjectRef>> = Vec::new();
         let mut part3_outlines: Vec<Vec<ObjectRef>> = Vec::new();
         // Second-half containers, grouped by part so they can be emitted in qpdf's
         // strict part order (part7, then part8, then part9 — QPDF_linearization.cc:1342).
@@ -2088,9 +2053,9 @@ impl LinearizationPlan {
                 members,
                 route,
                 None,
-                outline_set,
                 &mut open_document_batches,
-                &mut part3_regular,
+                &mut part3_private,
+                &mut part3_shared,
                 &mut part3_outlines,
                 &mut part4_private,
                 &mut part4_shared,
@@ -2102,9 +2067,9 @@ impl LinearizationPlan {
         part4_batches.extend(part4_shared);
         part4_batches.extend(part4_rest);
 
-        // Regular first-page containers numbered before outline containers so
-        // that outline ObjStms get higher golden object numbers (matching qpdf).
-        let mut part3_batches = part3_regular;
+        // qpdf part 6 order: private, shared, then outlines.
+        let mut part3_batches = part3_private;
+        part3_batches.extend(part3_shared);
         part3_batches.extend(part3_outlines);
 
         Ok(ObjStmBatchPlan {
@@ -2166,9 +2131,9 @@ impl LinearizationPlan {
         }
 
         let routes = route_objstm_containers(pdf, &containers)?;
-        let outline_set = &self.outline_first_page_members;
         let mut open_document_batches = Vec::new();
-        let mut part3_regular = Vec::new();
+        let mut part3_private = Vec::new();
+        let mut part3_shared = Vec::new();
         let mut part3_outlines = Vec::new();
         let mut part4_private = Vec::new();
         let mut part4_shared = Vec::new();
@@ -2183,9 +2148,9 @@ impl LinearizationPlan {
                 members,
                 route,
                 Some(source_container_number),
-                outline_set,
                 &mut open_document_batches,
-                &mut part3_regular,
+                &mut part3_private,
+                &mut part3_shared,
                 &mut part3_outlines,
                 &mut part4_private,
                 &mut part4_shared,
@@ -2193,7 +2158,8 @@ impl LinearizationPlan {
             );
         }
 
-        let mut part3_batches = part3_regular;
+        let mut part3_batches = part3_private;
+        part3_batches.extend(part3_shared);
         part3_batches.extend(part3_outlines);
         let mut part4_batches = part4_private;
         part4_batches.extend(part4_shared);
@@ -2223,12 +2189,11 @@ impl LinearizationPlan {
 /// Linearization part a generate-mode ObjStm container is routed to, by the
 /// union of its members' object users.
 ///
-/// `OpenDocument` is qpdf part 4 (open-document objects, first half), `FirstPage`
-/// part 6 (first-page section), `OtherPagePrivate` part 7, `OtherPageShared`
-/// part 8, and `Rest` part 9. qpdf checks `in_open_document` *before*
-/// `in_first_page`, so [`route_objstm_containers`] tests it first. The outline
-/// and thumbnail categories qpdf also checks before `in_first_page` are not yet
-/// modeled (see [`route_objstm_containers`]).
+/// `OpenDocument` is qpdf part 4 (open-document objects, first half), the three
+/// `FirstPage*` variants are part 6 (first-page section),
+/// `OtherPagePrivate` is part 7, `OtherPageShared` is part 8, and `Rest` is part
+/// 9. qpdf checks outlines, open-document objects, and first-page objects in
+/// that precedence order; [`route_objstm_containers`] retains it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContainerPart {
     /// qpdf part 4 — the container holds at least one open-document object
@@ -2236,8 +2201,14 @@ pub(crate) enum ContainerPart {
     /// `/ViewerPreferences`, `/PageMode`, `/Threads`, or the trailer's
     /// `/Encrypt`). Takes precedence over every page category.
     OpenDocument,
-    /// qpdf part 6 — the container holds at least one first-page object.
-    FirstPage,
+    /// qpdf part 6 — every container member user is compatible with
+    /// `lc_first_page_private`.
+    FirstPagePrivate,
+    /// qpdf part 6 — the container reaches the first page and also has a
+    /// document-other, non-first-page, or thumbnail user.
+    FirstPageShared,
+    /// qpdf part 6 — an outline container when `/PageMode /UseOutlines`.
+    FirstPageOutlines,
     /// qpdf part 7 — the container's members are private to exactly one
     /// non-first page.
     OtherPagePrivate,
@@ -2267,9 +2238,9 @@ fn push_routed_objstm_batch(
     members: Vec<ObjectRef>,
     route: ContainerPart,
     source_container_number: Option<u32>,
-    outline_set: &[ObjectRef],
     open_document_batches: &mut Vec<Vec<ObjectRef>>,
-    part3_regular: &mut Vec<Vec<ObjectRef>>,
+    part3_private: &mut Vec<Vec<ObjectRef>>,
+    part3_shared: &mut Vec<Vec<ObjectRef>>,
     part3_outlines: &mut Vec<Vec<ObjectRef>>,
     part4_private: &mut Vec<RoutedObjStmBatch>,
     part4_shared: &mut Vec<RoutedObjStmBatch>,
@@ -2277,13 +2248,9 @@ fn push_routed_objstm_batch(
 ) {
     match route {
         ContainerPart::OpenDocument => open_document_batches.push(members),
-        ContainerPart::FirstPage => {
-            if !outline_set.is_empty() && members.iter().any(|m| outline_set.contains(m)) {
-                part3_outlines.push(members);
-            } else {
-                part3_regular.push(members);
-            }
-        }
+        ContainerPart::FirstPagePrivate => part3_private.push(members),
+        ContainerPart::FirstPageShared => part3_shared.push(members),
+        ContainerPart::FirstPageOutlines => part3_outlines.push(members),
         ContainerPart::OtherPagePrivate => part4_private.push(RoutedObjStmBatch {
             members,
             route,
@@ -2508,6 +2475,57 @@ fn document_other_set<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<BTreeSe
     let page_tree = page_tree_node_refs(pdf)?;
     let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
     closure_from_seeds(pdf, seeds, &page_tree, &live)
+}
+
+/// Compute objects that receive qpdf's separate `ou_thumb` user.
+///
+/// A direct inline `/Thumb` dictionary has no indirect object reference and is
+/// skipped. For each indirect thumbnail, the same page's ordinary page closure
+/// is subtracted because qpdf visits `/Thumb` after the page's other
+/// reference-bearing keys with one shared `visited` set. Thus a page's
+/// self-thumbnail stays first-page-private, while a first-page object used as a
+/// different page's thumbnail becomes first-page-shared.
+///
+/// `live` is supplied by the caller so thumbnail-heavy documents do not rescan
+/// the xref table once per thumbnail.
+///
+/// # Errors
+///
+/// Propagates reader errors from resolving page dictionaries or thumbnail
+/// closures.
+fn thumbnail_user_set<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_refs: &[ObjectRef],
+    first_page_set: &BTreeSet<ObjectRef>,
+    other_page_closures: &[Vec<ObjectRef>],
+    live: &BTreeSet<ObjectRef>,
+) -> crate::Result<BTreeSet<ObjectRef>> {
+    let page_tree = page_tree_node_refs(pdf)?;
+    let mut thumb_refs = Vec::new();
+    for (page_idx, &page_ref) in page_refs.iter().enumerate() {
+        let thumb = pdf
+            .resolve_borrowed(page_ref)?
+            .as_dict()
+            .and_then(|dict| dict.get("Thumb"))
+            .and_then(|object| object.as_ref_id());
+        thumb_refs.extend(thumb.map(|thumb_ref| (page_idx, thumb_ref)));
+    }
+
+    let mut result = BTreeSet::new();
+    for (page_idx, thumb_ref) in thumb_refs {
+        let closure = closure_from_seeds(pdf, vec![(thumb_ref, false)], &page_tree, live)?;
+        for object_ref in closure {
+            let visited_by_page = if page_idx == 0 {
+                first_page_set.contains(&object_ref)
+            } else {
+                other_page_closures[page_idx - 1].contains(&object_ref)
+            };
+            if !visited_by_page {
+                result.insert(object_ref);
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// The inheritable page attributes (ISO 32000-1 Table 30) that qpdf's
@@ -2754,12 +2772,13 @@ fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::
 /// Mirrors qpdf's `filterCompressedObjects` (the container inherits the union of
 /// every member's obj_users) followed by the `lc_*` categorization. In qpdf's
 /// precedence order: a container holding any outline object is part 6
-/// ([`ContainerPart::FirstPage`]) when `/PageMode /UseOutlines` is set, or
-/// part 9 ([`ContainerPart::Rest`]) otherwise; a container holding any
-/// [`open_document_set`] object is part 4 ([`ContainerPart::OpenDocument`]);
-/// otherwise a container holding any first-page object is part 6
-/// ([`ContainerPart::FirstPage`]); otherwise it is part 7 / part 8 / part 9 by
-/// the number of *distinct non-first* pages its members reach (one →
+/// ([`ContainerPart::FirstPageOutlines`]) when `/PageMode /UseOutlines` is set,
+/// or part 9 ([`ContainerPart::Rest`]) otherwise; a container holding any
+/// [`open_document_set`] object is part 4 ([`ContainerPart::OpenDocument`]).
+/// A remaining container holding a first-page object is private only when its
+/// union has no non-first-page, document-other, or thumbnail user; otherwise it
+/// is shared. Containers without a first-page object route to part 7 / part 8 /
+/// part 9 by the number of *distinct non-first* pages their members reach (one →
 /// [`ContainerPart::OtherPagePrivate`], two or more →
 /// [`ContainerPart::OtherPageShared`], none → [`ContainerPart::Rest`]). The
 /// one-page case is part 7 ONLY when the member union has no document-level
@@ -2779,10 +2798,7 @@ fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::
 /// same DFS / even-split order that this function preserves.  The ordering is
 /// therefore byte-identical to qpdf for ≥2 open-document containers; verified
 /// with `objstm-lin-openaction-multi-od` (two OD containers whose min-member
-/// numbers are non-ascending in DFS order).  Thumbnail categories are handled
-/// implicitly: `compute_closure` skips `/Thumb`, so thumbnail objects have
-/// page_reach 0 and any container holding only thumbnail members already maps
-/// to [`ContainerPart::Rest`] via the `other_pages.len() == 0` branch.
+/// numbers are non-ascending in DFS order).
 ///
 /// # Errors
 ///
@@ -2817,28 +2833,38 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
     let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
     let resurrectable = crate::rewrite_renumber::resurrectable_null_refs(pdf)?;
 
-    let first_page_set: BTreeSet<ObjectRef> = match page_refs.first() {
-        Some(&first_page) => compute_closure(pdf, first_page, &live, &resurrectable)?
-            .into_iter()
-            .collect(),
+    let first_page_closure = match page_refs.first() {
+        Some(&first_page) => compute_closure(pdf, first_page, &live, &resurrectable)?,
         // A linearizable document always has at least one page, so the page-less
         // branch never fires on the generate-mode call path.
-        None => BTreeSet::new(), // cov:ignore: page-less catalog unreachable here
+        None => Vec::new(), // cov:ignore: page-less catalog unreachable here
     };
+    let first_page_set: BTreeSet<ObjectRef> = first_page_closure.iter().copied().collect();
 
     // obj_user page map: object -> set of page indices whose closure reaches it.
     let mut referenced_pages: BTreeMap<ObjectRef, BTreeSet<u32>> = BTreeMap::new();
-    for &r in &first_page_set {
+    for &r in &first_page_closure {
         referenced_pages.entry(r).or_default().insert(0);
     }
+    let mut other_page_closures = Vec::new();
     for (page_idx, &page_ref) in page_refs.iter().enumerate().skip(1) {
-        for r in compute_closure(pdf, page_ref, &live, &resurrectable)? {
+        let closure = compute_closure(pdf, page_ref, &live, &resurrectable)?;
+        for &r in &closure {
             referenced_pages
                 .entry(r)
                 .or_default()
                 .insert(page_idx as u32);
         }
+        other_page_closures.push(closure);
     }
+
+    let thumbnail_user_set = thumbnail_user_set(
+        pdf,
+        &page_refs,
+        &first_page_set,
+        &other_page_closures,
+        &live,
+    )?;
 
     Ok(containers
         .iter()
@@ -2846,7 +2872,7 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
             // in_outlines is checked first (QPDF_linearization.cc:1118-1122).
             if !outline_set.is_empty() && members.iter().any(|m| outline_set.contains(m)) {
                 return if outlines_first_page {
-                    ContainerPart::FirstPage
+                    ContainerPart::FirstPageOutlines
                 } else {
                     ContainerPart::Rest
                 };
@@ -2856,7 +2882,18 @@ pub(crate) fn route_objstm_containers<R: Read + Seek>(
                 return ContainerPart::OpenDocument;
             }
             if members.iter().any(|m| first_page_set.contains(m)) {
-                return ContainerPart::FirstPage;
+                let has_other_page = members.iter().any(|member| {
+                    referenced_pages
+                        .get(member)
+                        .is_some_and(|pages| pages.iter().any(|&page| page != 0))
+                });
+                let has_document_other = members.iter().any(|m| document_other_set.contains(m));
+                let has_thumbnail = members.iter().any(|m| thumbnail_user_set.contains(m));
+                return if has_other_page || has_document_other || has_thumbnail {
+                    ContainerPart::FirstPageShared
+                } else {
+                    ContainerPart::FirstPagePrivate
+                };
             }
             let mut other_pages: BTreeSet<u32> = BTreeSet::new();
             for m in members {
@@ -6058,7 +6095,10 @@ mod tests {
         let routes = route_objstm_containers(&mut pdf, &containers).unwrap();
         assert_eq!(
             routes,
-            vec![ContainerPart::FirstPage, ContainerPart::OtherPagePrivate]
+            vec![
+                ContainerPart::FirstPageShared,
+                ContainerPart::OtherPagePrivate
+            ]
         );
     }
 
@@ -6074,8 +6114,35 @@ mod tests {
         let routes = route_objstm_containers(&mut pdf, &containers).unwrap();
         assert_eq!(
             routes,
-            vec![ContainerPart::FirstPage, ContainerPart::OtherPageShared]
+            vec![
+                ContainerPart::FirstPageShared,
+                ContainerPart::OtherPageShared
+            ]
         );
+    }
+
+    #[test]
+    fn route_objstm_containers_distinguishes_first_page_private_and_shared() {
+        let mut pdf = Pdf::open(Cursor::new(thumb_first_page_shared_pdf_bytes())).unwrap();
+        let routes = route_objstm_containers(
+            &mut pdf,
+            &[vec![ObjectRef::new(6, 0)], vec![ObjectRef::new(5, 0)]],
+        )
+        .unwrap();
+        assert_eq!(
+            routes,
+            vec![
+                ContainerPart::FirstPagePrivate,
+                ContainerPart::FirstPageShared,
+            ]
+        );
+    }
+
+    #[test]
+    fn route_objstm_containers_keeps_same_page_self_thumb_private() {
+        let mut pdf = Pdf::open(Cursor::new(self_thumb_first_page_private_pdf_bytes())).unwrap();
+        let routes = route_objstm_containers(&mut pdf, &[vec![ObjectRef::new(5, 0)]]).unwrap();
+        assert_eq!(routes, vec![ContainerPart::FirstPagePrivate]);
     }
 
     #[test]
@@ -6531,7 +6598,7 @@ mod tests {
 
     #[test]
     fn route_objstm_containers_outlines_first_page_routes_to_first_page() {
-        // Outline container routes to FirstPage when /PageMode /UseOutlines is set.
+        // Outline container routes to FirstPageOutlines when /PageMode /UseOutlines is set.
         // Object 5 = outline dict, object 6 = outline item in outlines_pdf_bytes.
         let mut pdf = Pdf::open(Cursor::new(outlines_pdf_bytes_with_page_mode(
             b"UseOutlines",
@@ -6542,8 +6609,8 @@ mod tests {
         let routes = route_objstm_containers(&mut pdf, &synthetic).unwrap();
         assert_eq!(
             routes,
-            vec![ContainerPart::FirstPage],
-            "outline container must route to FirstPage when /PageMode /UseOutlines"
+            vec![ContainerPart::FirstPageOutlines],
+            "outline container must route to FirstPageOutlines when /PageMode /UseOutlines"
         );
     }
 
