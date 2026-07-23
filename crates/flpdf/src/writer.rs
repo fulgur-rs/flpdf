@@ -2888,9 +2888,13 @@ fn encrypt_stream_payload_for_writer(
 /// The returned bool feeds [`write_reencoded_object`], which only appends a
 /// regenerated `/Filter` (qpdf's re-filtered key order) when the source was NOT
 /// already a lone `/FlateDecode`.
-fn reencode_stream_for_compress(stream: crate::Stream, options: &WriteOptions) -> (Object, bool) {
+fn reencode_stream_for_compress(
+    stream: crate::Stream,
+    options: &WriteOptions,
+    qpdf_plain_empty_refilter: bool,
+) -> (Object, bool) {
     let source_filter_is_lone_flate = is_lone_flate(stream.dict.get("Filter"));
-    let reencoded = match effective_stream_policy(options) {
+    let mut reencoded = match effective_stream_policy(options) {
         // qpdf preserves an already-lone-/FlateDecode stream verbatim under the
         // compress policy (no decode + re-encode) unless recompression is
         // explicitly requested. Normalize /Length to the raw data length (a
@@ -2926,6 +2930,23 @@ fn reencode_stream_for_compress(stream: crate::Stream, options: &WriteOptions) -
             Object::Stream(stream)
         }
     };
+    if qpdf_plain_empty_refilter
+        && !source_filter_is_lone_flate
+        && matches!(effective_stream_policy(options), Some(CompressStreams::Yes))
+    {
+        let reencoded_stream = reencoded
+            .as_stream_mut()
+            .expect("stream compression always returns a stream");
+        if filters::decode_stream_data(&reencoded_stream.dict, &reencoded_stream.data)
+            .is_ok_and(|decoded| decoded.is_empty())
+        {
+            reencoded_stream.data.clear();
+            reencoded_stream
+                .dict
+                .insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+            reencoded_stream.dict.insert("Length", Object::Integer(0));
+        }
+    }
     (reencoded, source_filter_is_lone_flate)
 }
 
@@ -3136,8 +3157,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         && pdf.encryption_ref().is_none()
         && pdf.deleted_object_refs().is_empty()
     {
-        let config = object_streams::planner_config_from_options(options);
-        let plan = object_streams::plan_object_streams(pdf, &config)?;
+        let plan = object_streams::plan_qpdf_preserve_object_streams(pdf)?;
         if !plan.batches.is_empty() {
             return write_pdf_containerized_qpdf(pdf, out, options, plan.batches, true);
         }
@@ -3273,7 +3293,17 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     // classic xref table.  An empty plan respects the source form, so a
     // Disable-mode rewrite of a Table-form input still produces a classic
     // xref table.
-    let mut effective_xref_form = if plan.batches.is_empty() {
+    let source_had_compressed_objects = pdf
+        .source_xref_entries()
+        .iter()
+        .any(|(_reference, offset)| matches!(offset, XrefOffset::Compressed { .. }));
+    let qpdf_preserve_dropped_all_containers = qpdf_null_visibility
+        && matches!(options.object_streams, ObjectStreamMode::Preserve)
+        && source_had_compressed_objects
+        && plan.batches.is_empty();
+    let mut effective_xref_form = if qpdf_preserve_dropped_all_containers {
+        XrefForm::Table
+    } else if plan.batches.is_empty() {
         pdf.last_xref_form()
     } else {
         XrefForm::Stream
@@ -3768,7 +3798,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             // re-filter rules. `reencoded` is owned and `mut` because the
             // encryption step below may rewrite the stream payload in place.
             let (mut reencoded, source_filter_is_lone_flate) =
-                reencode_stream_for_compress(stream, options);
+                reencode_stream_for_compress(stream, options, qpdf_null_visibility);
 
             // flpdf-9hc.4.9: encrypt the stream payload AFTER any filter
             // re-encoding, so the encryption operates on the on-disk bytes.
@@ -4434,7 +4464,7 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
                 match object {
                     Object::Stream(stream) => {
                         let (reencoded, source_filter_is_lone_flate) =
-                            reencode_stream_for_compress(stream, options);
+                            reencode_stream_for_compress(stream, options, qpdf_null_visibility);
                         write_reencoded_object(
                             &mut bytes,
                             &reencoded,
@@ -4711,14 +4741,6 @@ pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStre
 
     match policy {
         CompressStreams::Yes => {
-            // qpdf declares `/FlateDecode` for a successfully decoded empty
-            // stream but leaves its payload empty instead of emitting zlib's
-            // eight-byte empty wrapper.
-            if decoded.is_empty() {
-                new_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-                new_dict.insert("Length", Object::Integer(0));
-                return Object::Stream(crate::Stream::new(new_dict, Vec::new()));
-            }
             // Re-encode with a minimal FlateDecode dict.  If encoding fails
             // (vanishingly rare for in-memory zlib), keep the original stream
             // verbatim — declaring /FlateDecode on uncompressed bytes would

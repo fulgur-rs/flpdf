@@ -78,3 +78,36 @@ fn disable_null_visibility_cycle_is_byte_identical_to_qpdf() {
         "null-visible-cycle/disable.pdf",
     );
 }
+
+#[test]
+fn preserve_filters_unreachable_sibling_from_source_container() {
+    assert_golden(
+        &rewrite_mode(
+            "null-visible-preserve-mixed.pdf",
+            ObjectStreamMode::Preserve,
+        ),
+        "null-visible-preserve-mixed/preserve.pdf",
+    );
+}
+
+#[test]
+fn preserve_drops_fully_unreachable_source_container() {
+    assert_golden(
+        &rewrite_mode(
+            "null-visible-preserve-unreachable.pdf",
+            ObjectStreamMode::Preserve,
+        ),
+        "null-visible-preserve-unreachable/preserve.pdf",
+    );
+}
+
+#[test]
+fn preserve_keeps_single_source_container_over_100_members() {
+    assert_golden(
+        &rewrite_mode(
+            "null-visible-preserve-over-100.pdf",
+            ObjectStreamMode::Preserve,
+        ),
+        "null-visible-preserve-over-100/preserve.pdf",
+    );
+}

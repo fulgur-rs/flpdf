@@ -342,6 +342,130 @@ else
     echo "Skipping null-visible-matrix-objstm.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/null-visible-preserve-mixed.pdf" || \
+      ! -f "$FIX/null-visible-preserve-unreachable.pdf" || \
+      ! -f "$FIX/null-visible-preserve-over-100.pdf" ]]; then
+    echo "Generating Preserve reachability/container-boundary fixtures ..."
+    python3 - \
+        "$FIX/null-visible-preserve-mixed.pdf" \
+        "$FIX/null-visible-preserve-unreachable.pdf" \
+        "$FIX/null-visible-preserve-over-100.pdf" <<'PY'
+import sys
+import zlib
+
+def write_objstm(path, plain_objects, members, container_number, xref_number):
+    pair_table = b""
+    member_body = b""
+    for index, (number, object_body) in enumerate(members):
+        pair_table += b"%d %d " % (number, len(member_body))
+        member_body += object_body
+        if index + 1 < len(members):
+            member_body += b"\n"
+    objstm_data = zlib.compress(pair_table + member_body)
+
+    body = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n"
+    offsets = {}
+    for number, object_body in plain_objects:
+        offsets[number] = len(body)
+        body += b"%d 0 obj\n" % number + object_body + b"\nendobj\n"
+    offsets[container_number] = len(body)
+    body += (
+        b"%d 0 obj\n<< /Type /ObjStm /N %d /First %d /Length %d "
+        b"/Filter /FlateDecode >>\nstream\n"
+        % (container_number, len(members), len(pair_table), len(objstm_data))
+    )
+    body += objstm_data + b"\nendstream\nendobj\n"
+    offsets[xref_number] = len(body)
+
+    member_indices = {
+        number: index for index, (number, _object_body) in enumerate(members)
+    }
+
+    def append_xref_entry(entries, entry_type, field1, field2):
+        entries.append(entry_type)
+        entries.extend(field1.to_bytes(4, "big"))
+        entries.extend(field2.to_bytes(2, "big"))
+
+    size = xref_number + 1
+    xref_entries = bytearray()
+    for number in range(size):
+        if number == 0:
+            append_xref_entry(xref_entries, 0, 0, 65535)
+        elif number in member_indices:
+            append_xref_entry(
+                xref_entries, 2, container_number, member_indices[number]
+            )
+        elif number in offsets:
+            append_xref_entry(xref_entries, 1, offsets[number], 0)
+        else:
+            append_xref_entry(xref_entries, 0, 0, 0)
+    xref_data = zlib.compress(bytes(xref_entries))
+
+    body += (
+        b"%d 0 obj\n<< /Type /XRef /W [1 4 2] /Index [0 %d] /Size %d "
+        b"/Root 1 0 R /Length %d /Filter /FlateDecode >>\nstream\n"
+        % (xref_number, size, size, len(xref_data))
+    )
+    body += xref_data + b"\nendstream\nendobj\n"
+    body += b"startxref\n%d\n%%%%EOF\n" % offsets[xref_number]
+    open(path, "wb").write(body)
+
+empty_stream = b"<< /Length 0 >>\nstream\n\nendstream"
+
+write_objstm(
+    sys.argv[1],
+    [(4, empty_stream)],
+    [
+        (1, b"<< /Type /Catalog /Pages 2 0 R /Reachable 5 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << >> /Contents 4 0 R >>"),
+        (5, b"<< /Label (reachable) >>"),
+        (6, b"<< /Label (unreachable sibling) >>"),
+    ],
+    container_number=9,
+    xref_number=10,
+)
+
+write_objstm(
+    sys.argv[2],
+    [
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << >> /Contents 4 0 R >>"),
+        (4, empty_stream),
+    ],
+    [
+        (5, b"<< /Next 6 0 R /Label (unreachable root) >>"),
+        (6, b"<< /Label (unreachable child) >>"),
+    ],
+    container_number=9,
+    xref_number=10,
+)
+
+many_refs = b" ".join(b"%d 0 R" % number for number in range(5, 106))
+many_members = [
+    (1, b"<< /Type /Catalog /Pages 2 0 R /Many [" + many_refs + b"] >>"),
+    (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << >> /Contents 4 0 R >>"),
+]
+many_members.extend(
+    (number, b"<< /Ordinal %d >>" % number) for number in range(5, 106)
+)
+write_objstm(
+    sys.argv[3],
+    [(4, empty_stream)],
+    many_members,
+    container_number=106,
+    xref_number=107,
+)
+PY
+else
+    echo "Skipping Preserve reachability/container-boundary fixtures (already exist)"
+fi
+
 if [[ ! -f "$FIX/objstm-lin-split-boundary.pdf" ]]; then
     echo "Generating objstm-lin-split-boundary.pdf ..."
     # flpdf-4vpi / PR #421 Codex review: a real /Info (obj 4) plus 100 missing
@@ -1565,7 +1689,10 @@ echo "=== Generating reference outputs ==="
 mkdir -p \
     "$REF/null-visible-matrix" \
     "$REF/null-visible-matrix-objstm" \
-    "$REF/null-visible-cycle"
+    "$REF/null-visible-cycle" \
+    "$REF/null-visible-preserve-mixed" \
+    "$REF/null-visible-preserve-unreachable" \
+    "$REF/null-visible-preserve-over-100"
 
 qpdf --object-streams=disable --static-id --warning-exit-0 \
     "$FIX/null-visible-matrix.pdf" \
@@ -1579,6 +1706,18 @@ qpdf --object-streams=disable --static-id --warning-exit-0 \
 qpdf --check --warning-exit-0 "$REF/null-visible-matrix/disable.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-matrix-objstm/preserve.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-cycle/disable.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-mixed.pdf" \
+    "$REF/null-visible-preserve-mixed/preserve.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-unreachable.pdf" \
+    "$REF/null-visible-preserve-unreachable/preserve.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-over-100.pdf" \
+    "$REF/null-visible-preserve-over-100/preserve.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-preserve-mixed/preserve.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-preserve-unreachable/preserve.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-preserve-over-100/preserve.pdf"
 
 # --- one-page: plain, static-id, linearize ---
 qpdf --deterministic-id --warning-exit-0 \

@@ -167,7 +167,7 @@ pub(crate) fn planner_config_from_options(options: &crate::WriteOptions) -> Plan
 ///
 /// - `Disable`  → returns an empty plan (zero batches).
 /// - `Preserve` → reconstructs the source document's ObjStm grouping,
-///   skipping ineligible members and splitting batches that exceed the cap.
+///   skipping ineligible members without repartitioning source containers.
 /// - `Generate` → greedily packs all eligible objects in
 ///   `(number, generation)` ascending order, cap-delimited.
 pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
@@ -183,9 +183,31 @@ pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
 
     match config.mode {
         ObjectStreamMode::Disable => unreachable!(),
-        ObjectStreamMode::Preserve => plan_preserve(pdf, config, &ctx, &length_exclusions),
+        ObjectStreamMode::Preserve => plan_preserve(pdf, &ctx, &length_exclusions, None),
         ObjectStreamMode::Generate => plan_generate(pdf, config, &ctx, &length_exclusions),
     }
+}
+
+/// Reconstruct Preserve-mode source containers after filtering their members
+/// through the qpdf-null-aware standard reachability walk.
+///
+/// qpdf's `preserveObjectStreams` intersects the source object-to-container map
+/// with `getCompressibleObjGens`. Only set membership matters here; using the
+/// standard enqueue map gives the same reachable set while also applying the
+/// Task 2 dictionary visibility contract. Container membership and source
+/// member order are retained, and Preserve never applies Generate's 100-member
+/// cap.
+pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::reader::Pdf<R>,
+) -> crate::Result<PackingPlan> {
+    let ctx = eligibility_context(pdf)?;
+    let length_exclusions = collect_indirect_objstm_length_refs(pdf)?;
+    let reachable: BTreeSet<ObjectRef> =
+        crate::rewrite_renumber::CatalogFirstRenumber::build_qpdf(pdf, true)?
+            .pairs()
+            .map(|(_new, old)| old)
+            .collect();
+    plan_preserve(pdf, &ctx, &length_exclusions, Some(&reachable))
 }
 
 /// Eligible objects in qpdf's `QPDF::getCompressibleObjGens` order
@@ -341,9 +363,9 @@ pub(crate) fn collect_indirect_objstm_length_refs<R: std::io::Read + std::io::Se
 /// Preserve mode: reconstruct source ObjStm grouping.
 fn plan_preserve<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
-    config: &PlannerConfig,
     ctx: &EligibilityContext,
     length_exclusions: &BTreeSet<ObjectRef>,
+    reachable: Option<&BTreeSet<ObjectRef>>,
 ) -> crate::Result<PackingPlan> {
     let entries = pdf.source_xref_entries();
 
@@ -357,7 +379,6 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
         }
     }
 
-    let cap = config.batch_size_cap.get();
     let mut batches: Vec<Vec<ObjectRef>> = Vec::new();
 
     // Iterate containers in ascending container-number order.
@@ -368,7 +389,9 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
         // Filter ineligible members.
         let mut eligible: Vec<ObjectRef> = Vec::new();
         for (_idx, obj_ref) in members {
-            if length_exclusions.contains(&obj_ref) {
+            if length_exclusions.contains(&obj_ref)
+                || reachable.is_some_and(|reachable| !reachable.contains(&obj_ref))
+            {
                 continue;
             }
             let obj = pdf.resolve_borrowed(obj_ref)?;
@@ -377,11 +400,8 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
             }
         }
 
-        // Split into cap-sized batches (preserving order, same container slot).
-        for chunk in eligible.chunks(cap) {
-            if !chunk.is_empty() {
-                batches.push(chunk.to_vec());
-            }
+        if !eligible.is_empty() {
+            batches.push(eligible);
         }
     }
 
