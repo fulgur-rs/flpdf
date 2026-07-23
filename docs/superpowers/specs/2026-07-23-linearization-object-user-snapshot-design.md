@@ -205,8 +205,8 @@ The completed implementation must pass:
 
 - `cargo fmt --all -- --check`;
 - focused linearization plan and ObjStm tests;
-- `cargo test -p flpdf --test cmp_linearize_objstm_tests`;
-- `cargo test -p flpdf --test linearize_objstm_generate_tests`;
+- `cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_objstm_tests`;
+- `cargo test -p flpdf --features qpdf-zlib-compat --test linearize_objstm_generate_tests`;
 - `cargo test -p flpdf`;
 - `cargo test`;
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`;

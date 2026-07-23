@@ -544,7 +544,7 @@ Expected: all tests pass with the checked-in qpdf 11.9.0 goldens unchanged.
 Validate every checked-in strict linearized ObjStm golden:
 
 ```bash
-find tests/fixtures/compat/golden -type f \
+find tests/golden/references -type f \
   \( -name 'linearize-objstm.pdf' -o -name 'linearize-objstm-preserve.pdf' \) \
   -print0 | xargs -0 -n1 qpdf --check-linearization
 ```
