@@ -27,6 +27,15 @@ on:
   # run still pauses on the `release` environment approval before publishing.
   workflow_dispatch:
 
+# Serialize complete runs so a later ordinary main push cannot run release-pr
+# while an earlier release is waiting for approval or publishing. `queue: max`
+# retains pending runs; the default single pending slot could replace the run
+# responsible for publishing.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
+
 env:
   CARGO_TERM_COLOR: always
 

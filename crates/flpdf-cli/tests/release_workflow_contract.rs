@@ -1,5 +1,12 @@
 const RELEASE_WORKFLOW: &str = include_str!("../../../.github/workflows/release-plz.yml");
 
+fn workflow_preamble() -> &'static str {
+    RELEASE_WORKFLOW
+        .split_once("\njobs:")
+        .map(|(preamble, _)| preamble)
+        .expect("release-plz.yml must contain a top-level jobs mapping")
+}
+
 fn job_block(name: &str) -> String {
     let marker = format!("  {name}:");
     let mut found = false;
@@ -23,6 +30,15 @@ fn job_block(name: &str) -> String {
 
     assert!(found, "job {name:?} is absent from release-plz.yml");
     block.join("\n")
+}
+
+#[test]
+fn workflow_runs_are_serialized_without_dropping_pending_pushes() {
+    let preamble = workflow_preamble();
+
+    assert!(preamble.contains(
+        "\nconcurrency:\n  group: release-plz-${{ github.ref }}\n  cancel-in-progress: false\n  queue: max"
+    ));
 }
 
 #[test]
