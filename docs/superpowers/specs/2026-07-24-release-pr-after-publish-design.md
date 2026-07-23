@@ -7,6 +7,12 @@ When a release-plz Release PR is merged, the `release-pr` and `release` jobs in
 version in `main` with crates.io before `release` has published that version, so
 it immediately opens a new Release PR for the version that was just merged.
 
+Ordering those jobs within one workflow run is necessary but not sufficient.
+While that release run is waiting for environment approval or publishing, a
+later ordinary push starts another workflow run. Its `release` job is skipped,
+so its `release-pr` job can still read the stale crates.io version. Job `needs`
+edges do not order jobs across workflow runs.
+
 The v0.3.0 release run demonstrated the race:
 
 - `release-pr` observed local v0.3.0 and registry v0.2.1.
@@ -16,27 +22,43 @@ The v0.3.0 release run demonstrated the race:
 
 ## Considered Approaches
 
-### 1. Run `release-pr` after `release` when publishing
+### 1. Serialize complete workflow runs and preserve the in-run dependency
 
-Make `release-pr` depend on both `check-releases` and `release`. Use an explicit
-job condition so ordinary pushes still run `release-pr` when `release` is
-skipped, while release pushes wait for a successful publish.
+Keep `release-pr` dependent on both `check-releases` and `release`, and add
+workflow-level concurrency keyed by ref. Set `queue: max` so later pushes wait
+instead of replacing an already-pending release run.
 
-This is the selected approach. It keeps the next Release PR available
-immediately after a successful release and changes only job orchestration.
+This is the selected approach. It serializes detection, approval, publishing,
+and next-PR maintenance across runs without dropping queued pushes.
 
-### 2. Skip `release-pr` on release pushes
+### 2. Put only `release` and `release-pr` in a shared job concurrency group
 
-This removes the race, but leaves no next Release PR until another commit lands
-on `main`. It is simpler but unnecessarily delays release preparation.
+This avoids blocking `check-releases`, but job readiness can differ across runs.
+A later ordinary run's `release-pr` may enter the group before an earlier
+release run's publish job, so it does not provide the required ordering.
 
-### 3. Trigger a separate workflow after publishing
+### 3. Poll workflow or deployment state before `release-pr`
 
-A `release: published` or `workflow_run` workflow can create the next Release
-PR, but introduces another workflow, token-trigger behavior, and cross-workflow
-failure handling for a dependency that can be expressed within the current run.
+An API-based wait can detect an active publish, but requires extra permissions,
+runner time while approvals are pending, timeout policy, and protection against
+check-then-act races. Native workflow concurrency is smaller and more reliable.
 
-## Selected Job Semantics
+## Selected Workflow Semantics
+
+The workflow uses one concurrency group per ref:
+
+```yaml
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
+```
+
+`queue: max` is required. The default single pending slot replaces an existing
+pending run when another push arrives, which could discard the run responsible
+for publishing a release. Main pushes and main `workflow_dispatch` runs share a
+group; a non-main manual dispatch uses a different group and remains unable to
+publish or create a Release PR because of the existing main-ref guards.
 
 `release` continues to depend only on `check-releases`; publishing must never
 depend on maintenance of the next Release PR.
@@ -51,15 +73,19 @@ depend on maintenance of the next Release PR.
 | Failed or rejected release | `failure` or `cancelled` | Skip |
 | Non-`main` manual dispatch | any | Skip |
 
-The release environment approval therefore blocks only a real release and the
-dependent next-PR maintenance. Ordinary pushes do not wait for an approval.
+Within a run, the release environment approval still occurs only for a real
+release. At the workflow level, later ordinary pushes intentionally wait behind
+that real release so none can inspect crates.io while publication is pending.
 
 ## Failure Handling
 
 If `check-releases` fails, `release-pr` must not run because its release-state
 input is unknown. If a real release fails or is rejected, `release-pr` must not
-run because crates.io may still be behind `main`. The existing `release`
-concurrency group and `release-pr` concurrency group remain unchanged.
+run because crates.io may still be behind `main`. Queued workflow runs proceed
+after the failed run completes; persistent recovery from a failed publication
+remains an operator concern and is outside the pending-publication race fixed
+here. The existing job-level `release` and `release-pr` concurrency groups
+remain unchanged as defense in depth.
 
 ## Verification
 
@@ -70,8 +96,9 @@ dependency and condition contract:
 - Its condition permits an ordinary push with a skipped release.
 - Its condition requires a successful release when `has_releases` is true.
 - `release` still needs only `check-releases`.
+- The complete workflow is serialized per ref without cancelling running work.
+- Multiple pending runs are retained with `queue: max`.
 
 Also run a YAML parser/action linter if one is already available in the
 repository, then run formatting and the workspace tests required by the
 repository gates.
-
