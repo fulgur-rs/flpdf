@@ -121,13 +121,25 @@ jobs:
   release-pr:
     name: Release-plz PR
     runs-on: ubuntu-latest
-    # Only maintain the Release PR from main. `push` only ever fires on main, but
-    # workflow_dispatch can be launched from any ref — and `release-plz
-    # release-pr` opens its PR against the default branch from the CHECKED-OUT
-    # ref, so a manual run off a feature branch could bundle not-yet-merged
-    # commits into the `release-plz-*` Release PR. Guard so release-pr prepares
-    # only what has actually landed on main.
-    if: github.ref == 'refs/heads/main'
+    # release-pr compares main's version with crates.io. On a real release push,
+    # wait for publishing so it cannot recreate the just-merged version while
+    # the registry is still behind. On ordinary pushes `release` is skipped;
+    # always() lets this condition inspect that skipped result and run normally.
+    #
+    # workflow_dispatch can be launched from any ref, so retain the main guard:
+    # release-pr must never bundle not-yet-merged commits from another ref.
+    needs: [check-releases, release]
+    if: >-
+      ${{
+        always() &&
+        !cancelled() &&
+        github.ref == 'refs/heads/main' &&
+        needs.check-releases.result == 'success' &&
+        (
+          needs.check-releases.outputs.has_releases != 'true' ||
+          needs.release.result == 'success'
+        )
+      }}
     permissions:
       contents: write        # push the Release PR branch
       pull-requests: write   # create/update the Release PR
@@ -183,9 +195,9 @@ jobs:
     # Depend ONLY on the detector, not on release-pr. Publishing the
     # already-approved, already-merged version must not be blocked by a failure
     # in the (independent) maintenance of the NEXT Release PR — otherwise main
-    # would be bumped while crates.io stays behind. The two release-plz commands
-    # touch different refs (release-pr → PR branch, release → main tag), so they
-    # run concurrently without racing.
+    # would be bumped while crates.io stays behind. The inverse dependency is
+    # intentional: on real release pushes, release-pr waits for this job so it
+    # reads the newly published registry version instead of recreating it.
     needs: [check-releases]
     # Only run — and thus only hit the `release` approval gate — on an actual
     # release. See check-releases above (this is what keeps ordinary merges to
