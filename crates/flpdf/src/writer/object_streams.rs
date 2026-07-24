@@ -247,6 +247,20 @@ pub(crate) struct CompressiblePlan {
     pub removed_refs: BTreeSet<ObjectRef>,
 }
 
+/// Snapshot a resolved object without retaining opaque stream payload bytes.
+///
+/// The traversal only follows stream dictionaries, so cloning their data would
+/// add memory proportional to the largest stream for no semantic benefit.
+fn snapshot_traversal_object(object: &Object) -> Object {
+    match object {
+        Object::Stream(stream) => Object::Stream(crate::Stream {
+            dict: stream.dict.clone(),
+            data: Vec::new(),
+        }),
+        other => other.clone(),
+    }
+}
+
 pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
 ) -> crate::Result<CompressiblePlan> {
@@ -291,7 +305,10 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
                 if !visited.insert(r.number) {
                     continue;
                 }
-                let resolved = pdf.resolve(r)?;
+                let resolved = {
+                    let object = pdf.resolve_borrowed(r)?;
+                    snapshot_traversal_object(object)
+                };
                 let is_signature = is_qpdf_signature_dict(pdf, r)?;
                 // Streams, signature value dictionaries, and the encryption
                 // dictionary cannot be stored inside an object stream, so they
@@ -341,29 +358,42 @@ pub(crate) fn is_qpdf_signature_dict<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
     object_ref: ObjectRef,
 ) -> crate::Result<bool> {
-    let object = pdf.resolve(object_ref)?;
-    let Some(dict) = object.as_dict() else {
-        return Ok(false);
+    let (mut type_value, byte_range, contents) = {
+        let object = pdf.resolve_borrowed(object_ref)?;
+        let Object::Dictionary(dict) = object else {
+            return Ok(false);
+        };
+        (
+            dict.get("Type")
+                .map(snapshot_traversal_object)
+                .unwrap_or(Object::Null),
+            dict.get("ByteRange").map(snapshot_traversal_object),
+            dict.get("Contents").map(snapshot_traversal_object),
+        )
     };
-    let mut type_value = dict.get("Type").cloned().unwrap_or(Object::Null);
     let mut type_refs = BTreeSet::new();
     while let Object::Reference(reference) = type_value {
         if reference.number == 0 || !type_refs.insert(reference) {
             return Ok(false);
         }
-        type_value = pdf.resolve(reference)?;
+        type_value = match pdf.resolve_borrowed(reference)? {
+            Object::Reference(next) => Object::Reference(*next),
+            Object::Name(name) => Object::Name(name.clone()),
+            _ => return Ok(false),
+        };
     }
     if !matches!(type_value, Object::Name(name) if name.as_slice() == b"Sig") {
         return Ok(false);
     }
 
-    let key_is_visible = |pdf: &mut crate::reader::Pdf<R>, key: &[u8]| -> crate::Result<bool> {
-        match dict.get(key) {
-            Some(value) => Ok(!crate::qpdf_null::value_is_null(pdf, value)?),
-            None => Ok(false),
-        }
-    };
-    Ok(key_is_visible(pdf, b"ByteRange")? && key_is_visible(pdf, b"Contents")?)
+    let key_is_visible =
+        |pdf: &mut crate::reader::Pdf<R>, value: Option<&Object>| -> crate::Result<bool> {
+            match value {
+                Some(value) => Ok(!crate::qpdf_null::value_is_null(pdf, value)?),
+                None => Ok(false),
+            }
+        };
+    Ok(key_is_visible(pdf, byte_range.as_ref())? && key_is_visible(pdf, contents.as_ref())?)
 }
 
 /// Push an object's child values onto the DFS stack so they pop in qpdf's
@@ -1043,14 +1073,46 @@ mod tests {
                 4,
                 b"<< /Type 5 0 R /ByteRange [0 10 20 30] /Contents <00> >>".to_vec(),
             ),
-            (5, b"/Sig".to_vec()),
+            (5, b"null".to_vec()),
+            (6, b"/Sig".to_vec()),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        // qpdf-compatible file-object recovery parses a top-level bare
+        // reference as an integer. Seed the holder as a reference so this test
+        // exercises the shared chained-reference predicate.
+        pdf.set_object(ref0(5), Object::Reference(ref0(6)));
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+
+        assert!(
+            !eligible.contains(&ref0(4)),
+            "qpdf isDictionaryOfType dereferences a chained indirect /Type"
+        );
+    }
+
+    #[test]
+    fn compressible_objgens_keeps_signature_with_non_name_indirect_type() {
+        let bytes = pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /SigTest 4 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (
+                4,
+                b"<< /Type 5 0 R /ByteRange [0 10 20 30] /Contents <00> >>".to_vec(),
+            ),
+            (5, b"null".to_vec()),
         ]);
         let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
         let eligible = compressible_objgens(&mut pdf).unwrap();
 
         assert!(
-            !eligible.contains(&ref0(4)),
-            "qpdf isDictionaryOfType dereferences an indirect /Type"
+            eligible.contains(&ref0(4)),
+            "a non-name indirect /Type does not identify a signature dictionary"
         );
     }
 
@@ -1228,6 +1290,52 @@ mod tests {
     fn stream_object_is_ineligible() {
         let obj = Object::Stream(Stream::new(Dictionary::new(), vec![]));
         assert!(!is_eligible_for_objstm(ref0(1), &obj, &no_ctx()));
+    }
+
+    #[test]
+    fn traversal_snapshot_replaces_stream_payload_with_dictionary() {
+        let mut dict = Dictionary::new();
+        dict.insert("Child", Object::Reference(ref0(7)));
+        let obj = Object::Stream(Stream::new(dict.clone(), vec![0x5a; 1024 * 1024]));
+
+        let snapshot = snapshot_traversal_object(&obj);
+
+        assert_eq!(
+            snapshot,
+            Object::Stream(Stream::new(dict, Vec::new())),
+            "stream traversal snapshot must retain its kind without payload bytes"
+        );
+    }
+
+    #[test]
+    fn compressible_walk_follows_stream_dictionary_without_payload_snapshot() {
+        let payload = vec![0x5a; 1024 * 1024];
+        let mut stream_body =
+            format!("<< /Length {} /Child 5 0 R >>\nstream\n", payload.len()).into_bytes();
+        stream_body.extend_from_slice(&payload);
+        stream_body.extend_from_slice(b"\nendstream");
+        let bytes = pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /Payload 4 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (4, stream_body),
+            (5, b"<< /Marker true >>".to_vec()),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+
+        assert!(!eligible.contains(&ref0(4)), "streams are not compressible");
+        assert!(
+            eligible.contains(&ref0(5)),
+            "the stream dictionary remains part of the object graph"
+        );
     }
 
     #[test]

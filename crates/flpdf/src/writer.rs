@@ -2100,8 +2100,25 @@ fn remap_qpdf_trailer_refs<R: Read + Seek, M: crate::rewrite_renumber::NewNumber
     trailer: &mut Dictionary,
     map: &M,
 ) -> Result<()> {
+    remap_qpdf_trailer_refs_with_removed(pdf, trailer, map, &BTreeSet::new())
+}
+
+fn remap_qpdf_trailer_refs_with_removed<
+    R: Read + Seek,
+    M: crate::rewrite_renumber::NewNumberLookup,
+>(
+    pdf: &mut Pdf<R>,
+    trailer: &mut Dictionary,
+    map: &M,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
     let mut object = Object::Dictionary(trailer.clone());
-    crate::rewrite_renumber::renumber_qpdf_refs_in_place(pdf, &mut object, map)?;
+    crate::rewrite_renumber::renumber_qpdf_refs_in_place_with_removed(
+        pdf,
+        &mut object,
+        map,
+        removed_refs,
+    )?;
     *trailer = object
         .into_dict()
         .expect("qpdf trailer rewrite preserves the dictionary variant");
@@ -4562,7 +4579,7 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
 
         let mut trailer = pdf.trailer().clone();
         strip_incremental_trailer_keys(&mut trailer);
-        remap_qpdf_trailer_refs(pdf, &mut trailer, &renumber)?;
+        remap_qpdf_trailer_refs_with_removed(pdf, &mut trailer, &renumber, &removed_refs)?;
         trailer.insert("Size", Object::Integer(i64::from(object_count)));
         trailer.insert("Root", Object::Reference(new_root));
         apply_encrypt_trailer_entries(&mut trailer, pdf, options, None, options.deterministic_id);
@@ -4640,7 +4657,7 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
     //
     let mut trailer = pdf.trailer().clone();
     strip_incremental_trailer_keys(&mut trailer);
-    remap_qpdf_trailer_refs(pdf, &mut trailer, &renumber)?;
+    remap_qpdf_trailer_refs_with_removed(pdf, &mut trailer, &renumber, &removed_refs)?;
     // The specialized xref-stream writer adds the generated `/Root`, `/Size`,
     // and `/ID` entries itself. Keep every other trimmed/remapped trailer entry
     // — including a direct `/Info` dictionary — for sorted emission after `/W`.

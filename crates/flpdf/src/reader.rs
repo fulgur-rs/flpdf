@@ -1219,6 +1219,25 @@ impl<R: Read + Seek> Pdf<R> {
             .unwrap_or(Object::Null))
     }
 
+    /// Resolve a qpdf-visible object without cloning its cached value.
+    ///
+    /// Unlike [`Self::resolve_borrowed`], this retains the historical xref-stream
+    /// fallback used by qpdf JSON preparation when the object is absent from the
+    /// live object cache.
+    pub(crate) fn resolve_qpdf_json_object_borrowed(
+        &mut self,
+        object_ref: ObjectRef,
+    ) -> Result<&Object> {
+        self.resolve_to_cache(object_ref)?;
+        match self.cache.entry(object_ref) {
+            Some(CacheEntry::Resolved(object)) => Ok(object),
+            _ => Ok(self
+                .qpdf_parsed_xref_streams
+                .get(&object_ref)
+                .unwrap_or(&NULL_OBJECT)),
+        }
+    }
+
     /// Offset of the first recorded object that starts strictly after `offset`,
     /// or `None` when `offset` belongs to the last object in the file.
     fn next_object_offset(&self, offset: u64) -> Option<u64> {
@@ -3175,6 +3194,55 @@ mod tests {
         );
         let mut pdf = Pdf::open_mem_owned(invalid_length).expect("open invalid-length fixture");
         assert!(pdf.resolve_qpdf_json_object(ObjectRef::new(1, 0)).is_err());
+    }
+
+    #[test]
+    fn borrowed_qpdf_resolution_preserves_historical_stream_fallback_without_clone() {
+        let mut pdf = Pdf::open_mem_owned(top_level_bare_reference_pdf()).expect("open fixture");
+        let live_ref = ObjectRef::new(8, 0);
+        pdf.set_object(
+            live_ref,
+            Object::Stream(Stream::new(Dictionary::new(), vec![0x41; 1024 * 1024])),
+        );
+        let live_payload_ptr = pdf
+            .resolve_borrowed(live_ref)
+            .expect("resolve seeded live stream")
+            .as_stream()
+            .expect("seeded live object is a stream")
+            .data
+            .as_ptr();
+        let resolved_live = pdf
+            .resolve_qpdf_json_object_borrowed(live_ref)
+            .expect("resolve live stream");
+        assert_eq!(
+            resolved_live
+                .as_stream()
+                .expect("live object is a stream")
+                .data
+                .as_ptr(),
+            live_payload_ptr
+        );
+
+        let historical_ref = ObjectRef::new(9, 0);
+        pdf.qpdf_parsed_xref_streams.insert(
+            historical_ref,
+            Object::Stream(Stream::new(Dictionary::new(), vec![0x5a; 1024 * 1024])),
+        );
+        let payload_ptr = pdf
+            .qpdf_parsed_xref_streams
+            .get(&historical_ref)
+            .and_then(Object::as_stream)
+            .expect("seeded historical stream")
+            .data
+            .as_ptr();
+
+        let resolved = pdf
+            .resolve_qpdf_json_object_borrowed(historical_ref)
+            .expect("resolve historical stream");
+        let stream = resolved.as_stream().expect("historical object is a stream");
+
+        assert_eq!(stream.data.as_ptr(), payload_ptr);
+        assert_eq!(stream.data.len(), 1024 * 1024);
     }
 
     fn top_level_bare_reference_pdf() -> Vec<u8> {

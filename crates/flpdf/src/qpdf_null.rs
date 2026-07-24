@@ -19,9 +19,9 @@ pub(crate) fn reference_is_null<R: Read + Seek>(
         if !visited.insert(current) {
             return Ok(true);
         }
-        match pdf.resolve_qpdf_json_object(current)? {
+        match pdf.resolve_qpdf_json_object_borrowed(current)? {
             Object::Null => return Ok(true),
-            Object::Reference(next) => current = next,
+            Object::Reference(next) => current = *next,
             _ => return Ok(false),
         }
     }

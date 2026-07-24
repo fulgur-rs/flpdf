@@ -271,6 +271,39 @@ fn generate_stale_generation_does_not_hide_current_generation() {
 }
 
 #[test]
+fn generate_direct_trailer_array_rewrites_removed_generation_to_null() {
+    let source = include_bytes!("../../../tests/fixtures/compat/null-visible-stale-generation.pdf");
+    let trailer = b"<< /Size 5 /Root 1 0 R >>";
+    let trailer_offset = source
+        .windows(trailer.len())
+        .position(|window| window == trailer)
+        .expect("fixture trailer");
+    let mut fixture = source[..trailer_offset].to_vec();
+    fixture.extend_from_slice(b"<< /Size 5 /Root 1 0 R /Extra [4 0 R 4 1 R] >>");
+    fixture.extend_from_slice(&source[trailer_offset + trailer.len()..]);
+
+    let mut pdf = Pdf::open(Cursor::new(fixture)).expect("fixture must open");
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Generate;
+    options.static_id = true;
+    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options)
+        .expect("generate rewrite must remap direct trailer values");
+    let rewritten = Pdf::open(Cursor::new(output)).expect("generated output must reopen");
+
+    assert!(matches!(
+        rewritten.trailer().get("Extra"),
+        Some(Object::Array(values))
+            if matches!(
+                values.as_slice(),
+                [Object::Null, Object::Reference(_)]
+            )
+    ));
+}
+
+#[test]
 fn disable_keeps_stale_generation_identity_like_standard_qpdf_enqueue() {
     assert_golden(
         &rewrite_mode(
