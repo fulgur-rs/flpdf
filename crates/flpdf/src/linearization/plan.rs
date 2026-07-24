@@ -696,6 +696,11 @@ pub struct LinearizationPlan {
     /// preserved ObjStm containers without re-reading the PDF.
     pub(crate) routing_users: Option<LinearizationRoutingUsers>,
 
+    /// Live source generations that qpdf drops while planning generated or
+    /// preserved object streams. References to these objects are rewritten as
+    /// qpdf-null values even though the source xref entry itself is live.
+    pub(crate) removed_refs: BTreeSet<ObjectRef>,
+
     /// Object-stream mode whose traversal and stale-generation rules produced
     /// this plan. The writer reconciles a legacy boolean plan with its final
     /// [`WriteOptions`](crate::WriteOptions) mode before using the plan's
@@ -846,6 +851,7 @@ impl LinearizationPlan {
         } else {
             BTreeSet::new()
         };
+        all_refs.retain(|reference| !removed_refs.contains(reference));
         let resurrectable =
             crate::rewrite_renumber::resurrectable_null_refs_excluding(pdf, &removed_refs)?;
         let mut resurrected: Vec<ObjectRef> = resurrectable
@@ -1445,6 +1451,7 @@ impl LinearizationPlan {
             part9_outline_objects,
             part6_outline_objects,
             object_stream_mode,
+            removed_refs,
             routing_users: Some(LinearizationRoutingUsers {
                 first_page: first_page_users,
                 thumbnails: thumbnail_user_set,
@@ -1905,6 +1912,7 @@ impl Default for LinearizationPlan {
             part9_outline_objects: Vec::new(),
             part6_outline_objects: Vec::new(),
             routing_users: None,
+            removed_refs: BTreeSet::new(),
             object_stream_mode: crate::writer::ObjectStreamMode::Disable,
         }
     }

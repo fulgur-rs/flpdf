@@ -551,6 +551,26 @@ fn linearize_generate_stale_generation_inlines_null_without_body() {
 }
 
 #[test]
+fn linearize_generate_drops_stale_live_generation_from_plan() {
+    let source = include_bytes!("../../../tests/fixtures/compat/null-visible-stale-generation.pdf");
+    let mut pdf = Pdf::open(Cursor::new(source.as_slice())).expect("fixture must open");
+    pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(Default::default()));
+
+    let plan =
+        LinearizationPlan::from_pdf_with_object_stream_mode(&mut pdf, ObjectStreamMode::Generate)
+            .expect("generate plan");
+    let renumber = RenumberMap::from_plan(&plan);
+    let mut options = WriteOptions::default();
+    options.object_streams = ObjectStreamMode::Generate;
+    options.deterministic_id = true;
+    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+
+    let mut document = write_linearized(&plan, &renumber, &mut pdf, &options)
+        .expect("stale live generation must be directized before duplicate-generation rejection");
+    document.back_patch().expect("back-patch linearized output");
+}
+
+#[test]
 fn linearize_standard_modes_reject_multiple_live_generations_like_qpdf() {
     const QPDF_ERROR: &str = "cannot currently linearize files that contain multiple objects \
         with the same object ID and different generations";

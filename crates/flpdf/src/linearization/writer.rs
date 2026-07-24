@@ -298,12 +298,13 @@ fn append_objstm_container_object<R: Read + Seek>(
     container: &ObjStmContainer,
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
+    removed_refs: &BTreeSet<ObjectRef>,
     filtered: bool,
 ) -> Result<usize> {
     let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(container.members.len());
     for &(orig, new_ref) in &container.members {
         let object = pdf.resolve(orig)?;
-        let renumbered = renumber_object(pdf, &object, 0, renumber)?;
+        let renumbered = renumber_object_with_removed(pdf, &object, 0, renumber, removed_refs)?;
         resolved.push((new_ref, renumbered));
     }
     let body = emit_objstm_body_from_resolved(&resolved)?;
@@ -445,11 +446,22 @@ pub(crate) const PREV_PLACEHOLDER_WIDTH: usize = 22;
 /// describe, silently corrupting the linearized output.
 ///
 /// Stream data bytes are **not** inspected — they are opaque binary blobs.
+#[cfg(test)]
 fn renumber_object<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     object: &Object,
     depth: usize,
     renumber: &RenumberMap,
+) -> Result<Object> {
+    renumber_object_with_removed(pdf, object, depth, renumber, &BTreeSet::new())
+}
+
+fn renumber_object_with_removed<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object: &Object,
+    depth: usize,
+    renumber: &RenumberMap,
+    removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<Object> {
     if depth > MAX_INLINE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
@@ -457,6 +469,7 @@ fn renumber_object<R: Read + Seek>(
         )));
     }
     match object {
+        Object::Reference(r) if removed_refs.contains(r) => Ok(Object::Null),
         Object::Reference(r) => match renumber.new_for_original(*r) {
             Some(new_ref) => Ok(Object::Reference(new_ref)),
             None if crate::qpdf_null::value_is_null(pdf, object)? => {
@@ -476,7 +489,13 @@ fn renumber_object<R: Read + Seek>(
         Object::Array(elements) => {
             let mut renumbered = Vec::with_capacity(elements.len());
             for e in elements {
-                renumbered.push(renumber_object(pdf, e, depth + 1, renumber)?);
+                renumbered.push(renumber_object_with_removed(
+                    pdf,
+                    e,
+                    depth + 1,
+                    renumber,
+                    removed_refs,
+                )?);
             }
             Ok(Object::Array(renumbered))
         }
@@ -484,7 +503,11 @@ fn renumber_object<R: Read + Seek>(
             let mut new_dict = Dictionary::new();
             let entries = crate::qpdf_null::snapshot_entries(dict, false);
             for (key, value) in crate::qpdf_null::visible_entries(pdf, entries)? {
-                new_dict.insert(&key, renumber_object(pdf, &value, depth + 1, renumber)?);
+                let value =
+                    renumber_object_with_removed(pdf, &value, depth + 1, renumber, removed_refs)?;
+                if !matches!(value, Object::Null) {
+                    new_dict.insert(&key, value);
+                }
             }
             Ok(Object::Dictionary(new_dict))
         }
@@ -499,7 +522,11 @@ fn renumber_object<R: Read + Seek>(
             let mut new_dict = Dictionary::new();
             let entries = crate::qpdf_null::snapshot_entries(&stream.dict, true);
             for (key, value) in crate::qpdf_null::visible_entries(pdf, entries)? {
-                new_dict.insert(&key, renumber_object(pdf, &value, depth + 1, renumber)?);
+                let value =
+                    renumber_object_with_removed(pdf, &value, depth + 1, renumber, removed_refs)?;
+                if !matches!(value, Object::Null) {
+                    new_dict.insert(&key, value);
+                }
             }
             new_dict.insert(
                 "Length",
@@ -1872,7 +1899,8 @@ fn do_write_pass<R: Read + Seek>(
         );
         let object = pdf.resolve(catalog_orig)?;
         let recovered_eol = pdf.recovered_stream_eol(catalog_orig);
-        let renumbered = renumber_object(pdf, &object, 0, renumber)?;
+        let renumbered =
+            renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
         let offset = append_body_object(
             &mut bytes,
             catalog_new_ref,
@@ -1905,7 +1933,8 @@ fn do_write_pass<R: Read + Seek>(
         // cov:ignore-end
         let object = pdf.resolve(*original_ref)?;
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
-        let renumbered = renumber_object(pdf, &object, 0, renumber)?;
+        let renumbered =
+            renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -1923,6 +1952,7 @@ fn do_write_pass<R: Read + Seek>(
             container,
             renumber,
             pdf,
+            &plan.removed_refs,
             structural_streams_filtered,
         )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
         xref_offsets.insert(container.container_new_num, offset);
@@ -1976,7 +2006,8 @@ fn do_write_pass<R: Read + Seek>(
         };
         let object = pdf.resolve(*original_ref)?;
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
-        let renumbered = renumber_object(pdf, &object, 0, renumber)?;
+        let renumbered =
+            renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -2006,7 +2037,8 @@ fn do_write_pass<R: Read + Seek>(
         };
         let object = pdf.resolve(*original_ref)?;
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
-        let renumbered = renumber_object(pdf, &object, 0, renumber)?;
+        let renumbered =
+            renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -2021,6 +2053,7 @@ fn do_write_pass<R: Read + Seek>(
             container,
             renumber,
             pdf,
+            &plan.removed_refs,
             structural_streams_filtered,
         )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
         xref_offsets.insert(container.container_new_num, offset);
@@ -2045,7 +2078,8 @@ fn do_write_pass<R: Read + Seek>(
         };
         let object = pdf.resolve(*original_ref)?;
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
-        let renumbered = renumber_object(pdf, &object, 0, renumber)?;
+        let renumbered =
+            renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
         let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -2110,7 +2144,8 @@ fn do_write_pass<R: Read + Seek>(
                     .expect("part4 plain object renumber entry checked above");
                 let object = pdf.resolve(*original_ref)?;
                 let recovered_eol = pdf.recovered_stream_eol(*original_ref);
-                let renumbered = renumber_object(pdf, &object, 0, renumber)?;
+                let renumbered =
+                    renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
                 let offset =
                     append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
                 xref_offsets.insert(new_ref.number, offset);
@@ -2121,6 +2156,7 @@ fn do_write_pass<R: Read + Seek>(
                     container,
                     renumber,
                     pdf,
+                    &plan.removed_refs,
                     structural_streams_filtered,
                 )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
                 xref_offsets.insert(container.container_new_num, offset);
