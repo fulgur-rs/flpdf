@@ -352,6 +352,63 @@ fn preserves_recovery_diagnostics_from_previous_xref_streams() {
     }));
 }
 
+#[test]
+fn preserves_previous_xref_diagnostics_through_linear_scan_fallback() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let obj1_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let bad_prev = bytes.len() as u64;
+    bytes.extend_from_slice(b"not-an-xref-section\n");
+
+    let previous_xref_offset = bytes.len() as u64;
+    let previous_entries =
+        build_encoded_xref_stream_entries(&[(0, 0, 0), (1, obj1_offset, 0), (0, 0, 0)]);
+    bytes.extend_from_slice(&make_xref_stream_object_with_declared_length(
+        2,
+        3,
+        Some(bad_prev),
+        1,
+        &previous_entries,
+        previous_entries.len() + 10,
+    ));
+
+    let latest_xref_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 3\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{obj1_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{previous_xref_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 3 /Root 1 0 R /Prev {previous_xref_offset} >>\nstartxref\n{latest_xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    let messages: Vec<_> = loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(messages.len(), 6, "diagnostics must be preserved once");
+    assert!(messages[0].ends_with("expected endstream"));
+    assert!(messages[1].ends_with("attempting to recover stream length"));
+    assert!(messages[2].ends_with(&format!(
+        "recovered stream length: {}",
+        previous_entries.len() + 1
+    )));
+    assert_eq!(
+        &messages[3..],
+        [
+            "file is damaged",
+            "expected integer",
+            "Attempting to reconstruct cross-reference table",
+        ]
+    );
+}
+
 fn build_encoded_xref_stream_entries(entries: &[(u8, u64, u64)]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(entries.len() * 7);
     for &(entry_type, field1, field2) in entries {
