@@ -1912,9 +1912,11 @@ fn apply_explicit_crypt_filters(
     encryption: &EncryptionState,
     recovered_stream_eol: Option<&[u8]>,
 ) -> Result<()> {
-    let Some(filter) = stream.dict.get("Filter").cloned() else {
-        return Ok(());
-    };
+    let filter = stream
+        .dict
+        .get("Filter")
+        .cloned()
+        .expect("caller checked for an explicit /Crypt filter");
     let mut decode_params = stream.dict.get("DecodeParms").cloned();
     if let Some(eol) = recovered_stream_eol {
         stream.data.extend_from_slice(eol);
@@ -1933,11 +1935,9 @@ fn apply_explicit_crypt_filters(
         return Ok(());
     }
 
-    let Object::Array(mut filters) = filter else {
-        return Err(Error::Unsupported(
-            "unsupported stream filter type: expected name or array".to_string(),
-        ));
-    };
+    let mut filters = filter
+        .into_array()
+        .expect("explicit /Crypt filter is either a name or an array");
     let mut framing = recovered_stream_eol;
 
     while let Some(crypt_index) = filters
@@ -2651,6 +2651,198 @@ mod tests {
 
         assert_eq!(object, sentinel);
         assert!(!stream_payload_decrypted);
+    }
+
+    fn explicit_rc4_encryption_state() -> EncryptionState {
+        EncryptionState {
+            file_key: vec![0x11, 0x22, 0x33, 0x44, 0x55],
+            stream_mode: EncryptionMode::Identity,
+            string_mode: EncryptionMode::Identity,
+            crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), EncryptionMode::Rc4)]),
+            encrypt_metadata: true,
+            encrypt_ref: None,
+            weak_crypto: true,
+            permissions: Permissions::new(-4),
+            user_password_matched: true,
+            owner_password_matched: false,
+        }
+    }
+
+    fn rc4_ciphertext(
+        object_ref: ObjectRef,
+        plaintext: &[u8],
+        encryption: &EncryptionState,
+    ) -> Vec<u8> {
+        let mut ciphertext = plaintext.to_vec();
+        decrypt_stream_bytes(
+            object_ref,
+            &mut ciphertext,
+            EncryptionMode::Rc4,
+            &encryption.file_key,
+        )
+        .expect("RC4 encryption");
+        ciphertext
+    }
+
+    fn flate_encoded(plaintext: &[u8]) -> Vec<u8> {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        crate::filters::encode_stream_data(&dict, plaintext).expect("Flate encode")
+    }
+
+    fn crypt_params(name: &[u8]) -> Object {
+        let mut params = Dictionary::new();
+        params.insert("Name", Object::Name(name.to_vec()));
+        Object::Dictionary(params)
+    }
+
+    #[test]
+    fn explicit_named_crypt_removes_recovered_framing_before_rc4() {
+        let object_ref = ObjectRef::new(4, 0);
+        let encryption = explicit_rc4_encryption_state();
+        let plaintext = b"named explicit crypt";
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"Crypt".to_vec()));
+        dict.insert("DecodeParms", crypt_params(b"StdCF"));
+        let mut stream = Stream::new(dict, rc4_ciphertext(object_ref, plaintext, &encryption));
+
+        apply_explicit_crypt_filters(object_ref, &mut stream, &encryption, Some(b"\n"))
+            .expect("remove named Crypt");
+
+        assert_eq!(stream.data, plaintext);
+        assert_eq!(stream.dict.get("Filter"), None);
+        assert_eq!(stream.dict.get("DecodeParms"), None);
+    }
+
+    #[test]
+    fn explicit_crypt_first_removes_recovered_framing_before_rc4() {
+        let object_ref = ObjectRef::new(4, 0);
+        let encryption = explicit_rc4_encryption_state();
+        let plaintext = b"array explicit crypt";
+        let compressed = flate_encoded(plaintext);
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"Crypt".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![crypt_params(b"StdCF"), Object::Null]),
+        );
+        let mut stream = Stream::new(dict, rc4_ciphertext(object_ref, &compressed, &encryption));
+
+        apply_explicit_crypt_filters(object_ref, &mut stream, &encryption, Some(b"\n"))
+            .expect("remove first Crypt");
+
+        assert_eq!(
+            crate::filters::decode_stream_data(&stream.dict, &stream.data)
+                .expect("decode remaining Flate"),
+            plaintext
+        );
+        assert_eq!(
+            stream.dict.get("Filter"),
+            Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]))
+        );
+        assert_eq!(
+            stream.dict.get("DecodeParms"),
+            Some(&Object::Array(vec![Object::Null]))
+        );
+    }
+
+    #[test]
+    fn singleton_explicit_crypt_array_removes_filter_entries() {
+        let encryption = explicit_rc4_encryption_state();
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![Object::Name(b"Crypt".to_vec())]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![crypt_params(b"Identity")]),
+        );
+        let mut stream = Stream::new(dict, b"identity".to_vec());
+
+        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &encryption, None)
+            .expect("remove singleton Crypt");
+
+        assert_eq!(stream.data, b"identity");
+        assert_eq!(stream.dict.get("Filter"), None);
+        assert_eq!(stream.dict.get("DecodeParms"), None);
+    }
+
+    #[test]
+    fn explicit_crypt_array_without_decode_params_keeps_remaining_filter() {
+        let encryption = explicit_rc4_encryption_state();
+        let plaintext = b"no decode params";
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"Crypt".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        let mut stream = Stream::new(dict, flate_encoded(plaintext));
+
+        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &encryption, None)
+            .expect("remove Crypt without DecodeParms");
+
+        assert_eq!(
+            crate::filters::decode_stream_data(&stream.dict, &stream.data)
+                .expect("decode remaining Flate"),
+            plaintext
+        );
+        assert_eq!(stream.dict.get("DecodeParms"), None);
+    }
+
+    #[test]
+    fn explicit_crypt_preserves_short_decode_params_array() {
+        let encryption = explicit_rc4_encryption_state();
+        let plaintext = b"short decode params";
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"Crypt".to_vec()),
+            ]),
+        );
+        dict.insert("DecodeParms", Object::Array(vec![Object::Null]));
+        let mut stream = Stream::new(dict, flate_encoded(plaintext));
+
+        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &encryption, None)
+            .expect("remove Crypt with short DecodeParms");
+
+        assert_eq!(
+            crate::filters::decode_stream_data(&stream.dict, &stream.data)
+                .expect("decode remaining Flate"),
+            plaintext
+        );
+        assert_eq!(
+            stream.dict.get("DecodeParms"),
+            Some(&Object::Array(vec![Object::Null]))
+        );
+    }
+
+    #[test]
+    fn explicit_crypt_helpers_apply_dictionary_decode_params_to_prefix() {
+        let params = crypt_params(b"Identity");
+        assert_eq!(decode_params_at(Some(&params), 7), Some(&params));
+
+        let filters = vec![
+            Object::Name(b"FlateDecode".to_vec()),
+            Object::Name(b"Crypt".to_vec()),
+        ];
+        let prefix = filter_prefix_dict(&filters, Some(&params), 1);
+        assert_eq!(
+            prefix.get("Filter"),
+            Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]))
+        );
+        assert_eq!(prefix.get("DecodeParms"), Some(&params));
     }
 
     /// Minimal valid single-page PDF used across `open_mem` tests.

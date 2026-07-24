@@ -3092,13 +3092,8 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         options
     };
 
-    // Run every library-level option preflight before the specialized Generate
-    // or Preserve emitters below can return early.
-    if options.deterministic_id && options.static_id {
-        return Err(crate::Error::Unsupported(
-            "deterministic_id and static_id are mutually exclusive".to_string(),
-        ));
-    }
+    // Run every remaining library-level option preflight before the specialized
+    // Generate or Preserve emitters below can return early.
     if options.encrypt.is_some() && options.copy_encryption.is_some() {
         return Err(crate::Error::Unsupported(
             "encrypt and copy_encryption are mutually exclusive".to_string(),
