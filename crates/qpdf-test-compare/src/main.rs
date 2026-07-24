@@ -2,10 +2,10 @@ use std::env;
 use std::fs::File;
 use std::process::ExitCode;
 
-// `dump_file_to_stdout` gets called from the compare orchestrator in a later
-// task; wire the module now so the binary and library share one copy.
-#[allow(dead_code)]
-mod output;
+// Shared helpers live in the library crate; the binary reaches them via
+// `use qpdf_test_compare::...` when it starts calling them (Task 10+).
+// Duplicating them with `mod output;` here would compile them twice into the
+// binary and add dead-code the compiler can rightly warn about.
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
