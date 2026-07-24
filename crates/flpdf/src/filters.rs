@@ -16,6 +16,16 @@ use std::io::{Read, Write};
 /// The encode path (writer output, not untrusted) is not capped.
 const MAX_FILTER_CHAIN_LEN: usize = 16;
 
+pub(crate) fn validate_filter_chain_len(filters: &[Object]) -> Result<()> {
+    if filters.len() > MAX_FILTER_CHAIN_LEN {
+        return Err(Error::Unsupported(format!(
+            "filter chain length {} exceeds maximum of {MAX_FILTER_CHAIN_LEN}",
+            filters.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Return a human-readable codec label if `filter_name` is an image/binary
 /// passthrough codec that flpdf does not decode.
 ///
@@ -132,23 +142,6 @@ pub(crate) fn decode_stream_data_with_decryption(
     decode_stream_data(dict, &decrypted)
 }
 
-pub(crate) fn decode_stream_data_with_crypt_filter<F>(
-    dict: &Dictionary,
-    stream_data: &[u8],
-    mut decrypt_crypt: F,
-) -> Result<Vec<u8>>
-where
-    F: FnMut(Option<&Object>, &[u8]) -> Result<Vec<u8>>,
-{
-    decode_stream_data_with_filters_and_crypt(
-        dict.get("Filter"),
-        dict.get("DecodeParms"),
-        stream_data,
-        DecodeLimits::default(),
-        &mut decrypt_crypt,
-    )
-}
-
 /// Encode `stream_data` by applying the stream dictionary's `/Filter` chain,
 /// the inverse of [`decode_stream_data`].
 ///
@@ -207,12 +200,7 @@ where
             }
 
             if let Some(filters) = filter.as_array() {
-                if filters.len() > MAX_FILTER_CHAIN_LEN {
-                    return Err(Error::Unsupported(format!(
-                        "filter chain length {} exceeds maximum of {MAX_FILTER_CHAIN_LEN}",
-                        filters.len()
-                    )));
-                }
+                validate_filter_chain_len(filters)?;
                 let mut decoded = stream_data.to_vec();
                 for (index, filter) in filters.iter().enumerate() {
                     let Some(filter_name) = filter.as_name() else {

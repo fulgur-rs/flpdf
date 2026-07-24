@@ -12,7 +12,7 @@
 //! Part 1       | header + linearization param dict (`renumber.param_dict_ref()`)
 //!              | with placeholders + Part 1 xref subsection (param-dict obj only)
 //!              | + trailer
-//! Part 2       | hint stream object (compressed, with /Filter /FlateDecode /S …)
+//! Part 2       | hint stream object (filtered according to stream-data policy)
 //! Part 3       | first-page body — Plan.part2_objects with renumbered refs
 //! Part 4       | shared/catalog/info — Plan.part3_objects with renumbered refs
 //! Part 5       | remaining body — `Plan.part4_objects()` (derived view of
@@ -47,8 +47,8 @@
 //! 2. **Patch hint tables**: use the probed lengths to fill in
 //!    `page_length_minus_least`, `least_page_length`, `location_of_first_page`,
 //!    shared object lengths, and `location`.
-//! 3. **Re-encode** the hint stream with the patched tables.  If the compressed
-//!    length is the same as the placeholder, convergence is reached.  Otherwise
+//! 3. **Encode** the hint stream with the patched tables. If the selected
+//!    payload length is the same as the placeholder, convergence is reached. Otherwise
 //!    repeat from step 1 with the new length.
 //! 4. **Final pass**: write the file using the converged hint stream.
 //!
@@ -73,7 +73,7 @@ use crate::writer::object_streams::{
     emit_objstm_body_from_resolved, planner_config_from_options, wrap_objstm_body,
 };
 use crate::writer::{
-    apply_stream_compress_policy, effective_pdf_version, effective_stream_policy, is_lone_flate,
+    effective_pdf_version, effective_stream_policy, is_lone_flate, reencode_stream_for_compress,
     write_stream_to_buf_qpdf_order, CompressStreams, NewlineBeforeEndstream, WriteOptions,
     QPDF_STATIC_ID,
 };
@@ -290,25 +290,30 @@ impl ObjStmLayout {
     }
 }
 
-/// Build (and FlateDecode-wrap) the ObjStm container stream object for one
-/// scheduled container, resolving + renumbering each member from `pdf`.
+/// Build the ObjStm container stream object for one scheduled container,
+/// resolving + renumbering each member from `pdf` and applying qpdf's global
+/// structural-stream compression policy.
 fn append_objstm_container_object<R: Read + Seek>(
     bytes: &mut Vec<u8>,
     container: &ObjStmContainer,
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
-    live: &BTreeSet<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    filtered: bool,
 ) -> Result<usize> {
     let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(container.members.len());
     for &(orig, new_ref) in &container.members {
-        let object = pdf.resolve_borrowed(orig)?;
-        let renumbered = renumber_object(object, 0, renumber, live)?;
+        let object = pdf.resolve(orig)?;
+        let renumbered = renumber_object_with_removed(pdf, &object, 0, renumber, removed_refs)?;
         resolved.push((new_ref, renumbered));
     }
     let body = emit_objstm_body_from_resolved(&resolved)?;
-    // Linearized output always uses FlateDecode for ObjStm containers —
-    // the linearization writer does not expose a CompressStreams knob.
-    let stream = wrap_objstm_body(&body, crate::writer::CompressStreams::Yes)?;
+    let compress = if filtered {
+        CompressStreams::Yes
+    } else {
+        CompressStreams::No
+    };
+    let stream = wrap_objstm_body(&body, compress)?;
 
     // Emit the container dict in qpdf 11.9.0's fixed key order
     // (`/Type /ObjStm /Length /Filter /N /First`); the generic `BTreeMap`-backed
@@ -318,11 +323,17 @@ fn append_objstm_container_object<R: Read + Seek>(
     // Write the header directly into `bytes` to avoid temporary `String`
     // allocations from `format!`.
     use std::io::Write as _;
+    let filter_key = if filtered {
+        " /Filter /FlateDecode"
+    } else {
+        ""
+    };
     let _ = write!(
         bytes,
-        "{} 0 obj\n<< /Type /ObjStm /Length {} /Filter /FlateDecode /N {} /First {} >>\nstream\n",
+        "{} 0 obj\n<< /Type /ObjStm /Length {}{} /N {} /First {} >>\nstream\n",
         container.container_new_num,
         stream.data.len(),
+        filter_key,
         body.n_members,
         body.first_offset,
     );
@@ -352,12 +363,13 @@ pub struct LinearizedOffsets {
     /// corresponds to `/H[0]` in the param dict.
     pub hint_stream_offset: usize,
 
-    /// Byte length of the hint stream's compressed data — corresponds to
+    /// Full byte length of the hint stream indirect object — corresponds to
     /// `/H[1]` in the param dict.
     ///
-    /// Note: this is the length of the *compressed* (FlateDecode) byte
-    /// sequence inside the `stream … endstream` envelope, i.e. the value of
-    /// the hint stream object's own `/Length` key.
+    /// This spans the complete `N 0 obj … endobj` representation, including
+    /// the object header, stream dictionary, encoded payload, stream framing,
+    /// and `endobj`. It is distinct from the hint stream dictionary's
+    /// `/Length`, which counts only the encoded payload.
     pub hint_stream_length: usize,
 
     /// New object number assigned to the first-page page object — corresponds
@@ -434,11 +446,22 @@ pub(crate) const PREV_PLACEHOLDER_WIDTH: usize = 22;
 /// describe, silently corrupting the linearized output.
 ///
 /// Stream data bytes are **not** inspected — they are opaque binary blobs.
-fn renumber_object(
+#[cfg(test)]
+fn renumber_object<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
     object: &Object,
     depth: usize,
     renumber: &RenumberMap,
-    live: &BTreeSet<ObjectRef>,
+) -> Result<Object> {
+    renumber_object_with_removed(pdf, object, depth, renumber, &BTreeSet::new())
+}
+
+fn renumber_object_with_removed<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object: &Object,
+    depth: usize,
+    renumber: &RenumberMap,
+    removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<Object> {
     if depth > MAX_INLINE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
@@ -446,14 +469,15 @@ fn renumber_object(
         )));
     }
     match object {
+        Object::Reference(r) if removed_refs.contains(r) => Ok(Object::Null),
         Object::Reference(r) => match renumber.new_for_original(*r) {
             Some(new_ref) => Ok(Object::Reference(new_ref)),
-            None if is_null_resolving_ref(*r, live) => {
+            None if crate::qpdf_null::value_is_null(pdf, object)? => {
                 // A reference to object 0 (free-list head / null singleton,
-                // ISO 32000-1 §7.3.10) or to a missing-xref object resolves to
-                // null and receives no body object. Reached here as an array
-                // element (or a bare-ref body); qpdf inlines `null` in that
-                // position. Dict/stream values are dropped one level up.
+                // ISO 32000-1 §7.3.10) or another unmapped qpdf-null object
+                // resolves to null and receives no body object. Reached here as
+                // an array element (or a bare-ref body), qpdf inlines `null` in
+                // that position. Dict/stream values are dropped one level up.
                 Ok(Object::Null)
             }
             None => Err(crate::Error::Unsupported(format!(
@@ -465,64 +489,54 @@ fn renumber_object(
         Object::Array(elements) => {
             let mut renumbered = Vec::with_capacity(elements.len());
             for e in elements {
-                renumbered.push(renumber_object(e, depth + 1, renumber, live)?);
+                renumbered.push(renumber_object_with_removed(
+                    pdf,
+                    e,
+                    depth + 1,
+                    renumber,
+                    removed_refs,
+                )?);
             }
             Ok(Object::Array(renumbered))
         }
         Object::Dictionary(dict) => {
             let mut new_dict = Dictionary::new();
-            for (key, value) in dict.iter() {
-                if is_null_resolving_value(value, live) {
-                    // qpdf treats a dict key whose value resolves to null as
-                    // absent (ISO 32000-1 §7.3.7), so the key is dropped.
-                    continue;
+            let entries = crate::qpdf_null::snapshot_entries(dict, false);
+            for (key, value) in crate::qpdf_null::visible_entries(pdf, entries)? {
+                let value =
+                    renumber_object_with_removed(pdf, &value, depth + 1, renumber, removed_refs)?;
+                if !matches!(value, Object::Null) {
+                    new_dict.insert(&key, value);
                 }
-                new_dict.insert(key, renumber_object(value, depth + 1, renumber, live)?);
             }
             Ok(Object::Dictionary(new_dict))
         }
         Object::Stream(stream) => {
             // Renumber the dictionary; leave the stream data bytes alone.
+            // `/Length` is a writer-owned stream parameter: qpdf removes the
+            // source key before ordinary null-filtered dictionary traversal and
+            // appends the raw on-disk byte count as a direct integer. Excluding
+            // it from visibility first is essential when an indirect holder
+            // resolves to null — the replacement must not disappear with the
+            // source key.
             let mut new_dict = Dictionary::new();
-            for (key, value) in stream.dict.iter() {
-                // A stream's `/Length` is rewritten to a direct integer at
-                // emission time. When it is an indirect reference whose holder
-                // was dropped as an orphan (the reachability walk does not follow
-                // the dead `/Length` edge), that holder has no renumber entry;
-                // substitute a direct length (the raw stored byte count) so the
-                // dangling reference never reaches output. A holder still present
-                // in the map is renumbered normally.
-                let dropped_length_holder = key == b"Length"
-                    && matches!(value, Object::Reference(r) if renumber.new_for_original(*r).is_none());
-                if dropped_length_holder {
-                    new_dict.insert(key, Object::Integer(stream.data.len() as i64));
-                } else if is_null_resolving_value(value, live) {
-                    // Same null-valued-key elision as plain dictionaries.
-                    continue;
-                } else {
-                    new_dict.insert(key, renumber_object(value, depth + 1, renumber, live)?);
+            let entries = crate::qpdf_null::snapshot_entries(&stream.dict, true);
+            for (key, value) in crate::qpdf_null::visible_entries(pdf, entries)? {
+                let value =
+                    renumber_object_with_removed(pdf, &value, depth + 1, renumber, removed_refs)?;
+                if !matches!(value, Object::Null) {
+                    new_dict.insert(&key, value);
                 }
             }
+            new_dict.insert(
+                "Length",
+                Object::Integer(i64::try_from(stream.data.len()).unwrap_or(i64::MAX)),
+            );
             Ok(Object::Stream(Stream::new(new_dict, stream.data.clone())))
         }
         // Scalar types contain no references — clone unchanged.
         _ => Ok(object.clone()),
     }
-}
-
-/// A reference resolves to null — so it receives no body object — when it
-/// targets object 0 (free-list head / null singleton, ISO 32000-1 §7.3.10) or a
-/// missing-xref object absent from the live set (referenced but never written to
-/// any cross-reference section).
-fn is_null_resolving_ref(r: ObjectRef, live: &BTreeSet<ObjectRef>) -> bool {
-    r.number == 0 || !live.contains(&r)
-}
-
-/// A dict/stream value whose presence qpdf elides: an indirect reference that
-/// resolves to null (see [`is_null_resolving_ref`]). A real direct `null`
-/// literal is left untouched — that is a distinct concern from a dangling ref.
-fn is_null_resolving_value(value: &Object, live: &BTreeSet<ObjectRef>) -> bool {
-    matches!(value, Object::Reference(r) if is_null_resolving_ref(*r, live))
 }
 
 /// Append `N G obj\n<object>\nendobj\n` to `bytes` and return the offset of the
@@ -565,52 +579,15 @@ fn append_body_object(
     new_ref: ObjectRef,
     object: &Object,
     options: &WriteOptions,
+    recovered_stream_eol: Option<&[u8]>,
 ) -> usize {
     let Object::Stream(stream) = object else {
         return append_object(bytes, new_ref, object);
     };
 
-    // Preserve mode (no decode/re-encode) keeps the verbatim layout, so the
-    // generic serializer is correct there too.
-    let Some(policy) = effective_stream_policy(options) else {
-        return append_object(bytes, new_ref, object);
-    };
-
-    // qpdf re-filters (decode + re-encode to a single regenerated
-    // `/FlateDecode`, emitting `/Length` before the new `/Filter`) only for
-    // streams whose source filter chain is NOT already a lone `/FlateDecode`;
-    // an already-Flate source is preserved with `/Length` last. Capture the
-    // source decision before the policy rewrites the dict.
-    let source_filter_is_lone_flate = is_lone_flate(stream.dict.get("Filter"));
-
-    // qpdf preserves an already-lone-/FlateDecode stream verbatim under the
-    // compress policy (no decode + re-encode) unless recompression is requested.
-    // Emit the dict (lexicographic, /Length last — `refiltered = false`) with
-    // /Length normalized to the raw data length, then the data verbatim. Clone
-    // only the (small) dict, never the stream data.
-    //
-    // Exclude external streams (`/F`): their in-body bytes are not authoritative,
-    // so they fall through to `apply_stream_compress_policy`, which embeds the
-    // decoded data and strips `/F` / `/FFilter` / `/FDecodeParms` (matches the
-    // plain full-rewrite path).
-    if matches!(policy, CompressStreams::Yes)
-        && source_filter_is_lone_flate
-        && !options.recompress_flate
-        && stream.dict.get("F").is_none()
-    {
-        let offset = bytes.len();
-        bytes.extend_from_slice(
-            format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes(),
-        );
-        let mut dict = stream.dict.clone();
-        let len = i64::try_from(stream.data.len()).unwrap_or(i64::MAX);
-        dict.insert("Length", Object::Integer(len));
-        crate::writer::write_preserved_stream(bytes, &dict, &stream.data);
-        bytes.extend_from_slice(b"\nendobj\n");
-        return offset;
-    }
-
-    let reencoded = apply_stream_compress_policy(stream, policy);
+    let policy = effective_stream_policy(options);
+    let (reencoded, source_filter_is_lone_flate) =
+        reencode_stream_for_compress(stream.clone(), options, true, recovered_stream_eol);
 
     // `apply_stream_compress_policy` always returns `Object::Stream` (every arm
     // constructs one), so this destructuring never fails.
@@ -628,7 +605,7 @@ fn append_body_object(
     //  - the source was NOT already a lone `/FlateDecode`, and
     //  - the *final* dict carries a lone `/FlateDecode` (so a decode/encode
     //    failure that kept a fallback filter is not silently re-filtered).
-    let refiltered = matches!(policy, CompressStreams::Yes)
+    let refiltered = matches!(policy, Some(CompressStreams::Yes))
         && !source_filter_is_lone_flate
         && is_lone_flate(s.dict.get("Filter"));
     // The linearized writer targets byte-identical qpdf output.  qpdf writes
@@ -956,9 +933,9 @@ struct FirstPageXrefPatch {
     /// Fixed byte region reserved for the object (qpdf's pass-1 sizing). The
     /// object header sits at `region.start` — the value the main xref's `/Prev`
     /// and the file's trailing `startxref` point at. [`patch_first_page_xref`]
-    /// overwrites the whole region with the real compressed object plus trailing
-    /// space padding, so the next object's offset is independent of the
-    /// compressed length and the hint-stream convergence loop is unaffected.
+    /// overwrites the whole region with the real encoded object plus trailing
+    /// space padding, so the next object's offset is independent of the payload
+    /// length and the hint-stream convergence loop is unaffected.
     region: std::ops::Range<usize>,
     /// `/Root` reference for the rebuilt dict.
     catalog_new_ref: ObjectRef,
@@ -973,6 +950,8 @@ struct FirstPageXrefPatch {
     max_id: u32,
     /// Largest object-stream member index (sizes field 3 of `/W`).
     max_ostream_index: u64,
+    /// Whether the generated xref stream uses predictor + Flate filtering.
+    filtered: bool,
 }
 
 /// Compute the linearized output's `/ID` **once per save**.
@@ -1138,8 +1117,8 @@ fn patch_linearized_deterministic_id(
 /// forced (`1 << 25`), the region is independent of the hint length, so it stays
 /// constant across the convergence loop and the hint stream remains the sole
 /// degree of freedom. A space placeholder of exactly that length is written here;
-/// [`patch_first_page_xref`] overwrites it with the real compressed object (qpdf
-/// `/W [1 2 1]`, `/Predictor 12`) plus trailing space padding once every
+/// [`patch_first_page_xref`] overwrites it with the real encoded object (qpdf
+/// `/W [1 2 1]`, with `/Predictor 12` when filtered) plus trailing space padding once every
 /// downstream offset (and the main xref offset for `/Prev`) is known — the region
 /// length never changes, so no later byte shifts.
 ///
@@ -1156,6 +1135,7 @@ fn write_first_page_xref_stream(
     info_new_ref: Option<ObjectRef>,
     source_trailer: &Dictionary,
     max_ostream_index: u64,
+    filtered: bool,
 ) -> Result<FirstPageXrefPatch> {
     let final_size = total_count;
     let first_xref_num = relocation.first_xref_slot;
@@ -1185,12 +1165,14 @@ fn write_first_page_xref_stream(
     // shifts.
     let region_len = {
         let dict = xref_stream::XrefStreamDict {
+            filtered,
             widths: xref_stream::first_pass_widths(max_id, max_ostream_index, 0),
             index: Some((index_start, index_count)),
             info: info_new_ref,
             root: Some(catalog_new_ref),
             size: final_size,
             prev: Some(0),
+            trailer: None,
             id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
         };
         xref_stream::first_pass_region_len(obj_ref, &dict, index_count as usize)
@@ -1220,6 +1202,7 @@ fn write_first_page_xref_stream(
         id,
         max_id,
         max_ostream_index,
+        filtered,
     })
 }
 
@@ -1236,12 +1219,13 @@ fn xref_id_bytes(source_trailer: &Dictionary) -> Option<(Vec<u8>, Vec<u8>)> {
     }
 }
 
-/// Overwrite the first-page xref stream's reserved region with the real
-/// compressed object once every downstream offset (and the main xref offset for
-/// `/Prev`) is known.
+/// Overwrite the first-page xref stream's reserved region with the real encoded
+/// object once every downstream offset (and the main xref offset for `/Prev`)
+/// is known.
 ///
 /// The object is rebuilt from scratch — entries from `xref_offsets` /
-/// `member_new`, qpdf-matching `/W` widths, PNG-`/Predictor 12` + Flate payload,
+/// `member_new`, qpdf-matching `/W` widths, and policy-selected raw or
+/// PNG-`/Predictor 12` + Flate payload,
 /// `/Prev → main xref` — then space-padded to the region's fixed byte length
 /// ([`xref_stream::write_padded_region`]). Because the region length is fixed
 /// (qpdf's pass-1 sizing), this shifts no later offset and the hint-stream
@@ -1281,7 +1265,11 @@ fn patch_first_page_xref(
             patch.index_count,
         );
         let widths = xref_stream::first_pass_widths(patch.max_id, patch.max_ostream_index, 0);
-        let payload = xref_stream::encode_payload_uncompressed(&entries, widths);
+        let payload = if patch.filtered {
+            xref_stream::encode_payload_uncompressed(&entries, widths)
+        } else {
+            xref_stream::encode_payload_raw(&entries, widths)
+        };
         (widths, payload, 0u64)
     } else {
         let entries =
@@ -1292,21 +1280,27 @@ fn patch_first_page_xref(
             patch.max_id,
             patch.max_ostream_index,
         );
-        let payload = xref_stream::encode_payload(&entries, widths);
+        let payload = if patch.filtered {
+            xref_stream::encode_payload(&entries, widths)
+        } else {
+            xref_stream::encode_payload_raw(&entries, widths)
+        };
         (widths, payload, main_xref_offset as u64)
     };
     let dict = xref_stream::XrefStreamDict {
+        filtered: patch.filtered,
         widths,
         index: Some((patch.index_start, patch.index_count)),
         info: patch.info_new_ref,
         root: Some(patch.catalog_new_ref),
         size: patch.size,
         prev: Some(prev),
+        trailer: None,
         id: patch.id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
     };
     // cov:ignore: the `?` below never fires — write_padded_region errors only if
-    // the object exceeds its region, but the pass-1 (uncompressed, wider) region
-    // always exceeds the pass-2 compressed object on the linearized objstm path.
+    // the object exceeds its pass-1-sized region. Filtered final payloads fit
+    // inside the wider predicted region; raw payloads retain the same size.
     let region = xref_stream::write_padded_region(
         ObjectRef::new(patch.first_xref_num, 0),
         &dict,
@@ -1353,6 +1347,7 @@ fn write_main_xref_stream_and_trailer(
     first_page_obj_offset: usize,
     max_ostream_index: u64,
     pass1: bool,
+    filtered: bool,
 ) -> Result<(usize, usize)> {
     let final_size = total_count;
     let first_xref_num = relocation.first_xref_slot;
@@ -1377,9 +1372,12 @@ fn write_main_xref_stream_and_trailer(
         max_id,
         max_ostream_index,
     );
-    // Pass 1 (deterministic-/ID digest) writes the uncompressed PNG-predicted
-    // payload (qpdf's `skip_compression`); the final pass Flate-compresses it.
-    let payload = if pass1 {
+    // With compression enabled, pass 1 writes the uncompressed PNG-predicted
+    // payload (qpdf's `skip_compression`) and the final pass Flate-compresses
+    // it. With compression disabled, both passes write raw `/W` rows.
+    let payload = if !filtered {
+        xref_stream::encode_payload_raw(&entries, widths)
+    } else if pass1 {
         xref_stream::encode_payload_uncompressed(&entries, widths)
     } else {
         xref_stream::encode_payload(&entries, widths)
@@ -1391,12 +1389,14 @@ fn write_main_xref_stream_and_trailer(
     // the omitted `/Index` defaults to `[0, main_count)` — exactly the objects
     // this stream covers (qpdf's `second_trailer_size`).
     let dict = xref_stream::XrefStreamDict {
+        filtered,
         widths,
         index: None,
         info: None,
         root: None,
         size: main_count,
         prev: None,
+        trailer: None,
         id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
     };
 
@@ -1408,12 +1408,14 @@ fn write_main_xref_stream_and_trailer(
     let main_obj_ref = ObjectRef::new(main_xref_num, 0);
     let region_len = {
         let p1_dict = xref_stream::XrefStreamDict {
+            filtered,
             widths,
             index: None,
             info: None,
             root: None,
             size: main_count,
             prev: None,
+            trailer: None,
             id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
         };
         xref_stream::first_pass_region_len(main_obj_ref, &p1_dict, main_count as usize)
@@ -1434,7 +1436,8 @@ fn write_main_xref_stream_and_trailer(
 }
 
 /// Serialize the hint-stream object dictionary + `stream\n` opener exactly as
-/// qpdf 11.9.0 orders it: `/Filter /FlateDecode /S {s}[ /O {o}] /Length {len}`.
+/// qpdf 11.9.0 orders it: an optional `/Filter /FlateDecode`, followed by
+/// `/S {s}[ /O {o}] /Length {len}`.
 /// qpdf emits `/O` between `/S` and `/Length`, and only when the document has
 /// outlines (`if (O)`, QPDFWriter.cc:2307); `/S` carries the shared-object
 /// section offset, `/O` the outlines section offset (both within the
@@ -1447,53 +1450,65 @@ fn hint_stream_dict_prefix(
     shared_section_offset: usize,
     outline_section_offset: Option<usize>,
     payload_len: usize,
+    filtered: bool,
 ) -> String {
+    let filter_key = if filtered {
+        "/Filter /FlateDecode "
+    } else {
+        ""
+    };
     let outline_key = match outline_section_offset {
         Some(o) => format!(" /O {o}"),
         None => String::new(),
     };
-    format!("<< /Filter /FlateDecode /S {shared_section_offset}{outline_key} /Length {payload_len} >>\nstream\n")
+    format!(
+        "<< {filter_key}/S {shared_section_offset}{outline_key} /Length {payload_len} >>\nstream\n"
+    )
 }
 
 /// Variable byte length of the hint-stream object across convergence passes:
 /// the dict prefix (whose `/S`, `/O`, `/Length` decimal widths track the
-/// back-patched offsets), the compressed payload, and the conditional newline
+/// back-patched offsets), the selected payload, and the conditional newline
 /// before `endstream`. The fixed scaffolding (`N G obj\n`, `endstream\nendobj\n`)
 /// is constant — the object number is pre-allocated — so it cancels in an
 /// equality and is omitted. Used as the convergence key so a digit-width change
 /// in any dict value (not just the payload length) is detected before the final
 /// pass bakes `/H[1]`-relative offsets against it.
 fn hint_stream_convergence_len(
-    compressed_payload: &[u8],
+    payload: &[u8],
     shared_section_offset: usize,
     outline_section_offset: Option<usize>,
+    filtered: bool,
 ) -> usize {
     hint_stream_dict_prefix(
         shared_section_offset,
         outline_section_offset,
-        compressed_payload.len(),
+        payload.len(),
+        filtered,
     )
     .len()
-        + compressed_payload.len()
-        + usize::from(compressed_payload.last() != Some(&b'\n'))
+        + payload.len()
+        + usize::from(payload.last() != Some(&b'\n'))
 }
 
 /// Emit the primary hint-stream object and return its start byte offset.
 ///
 /// qpdf 11.9.0 serializes the hint-stream object dict in the key order
-/// `/Filter /S /Length` (observed against its `--check-linearization` golden
-/// output), which the generic `BTreeMap`-ordered [`Object::Stream`] serializer
-/// cannot reproduce. This emitter writes the dict literal by hand (via
-/// [`hint_stream_dict_prefix`]) to match that order; the surrounding framing
-/// (`N G obj\n` … `\nstream\n` … `\nendstream\nendobj\n`) is byte-identical to
-/// [`append_object`]. The newline before `endstream` is written only when the
-/// payload does not already end in one (qpdf, QPDFWriter.cc:2327).
+/// optional `/Filter`, then `/S`, `/O` when present, and `/Length` (observed
+/// against its `--check-linearization` golden output), which the generic
+/// `BTreeMap`-ordered [`Object::Stream`] serializer cannot reproduce. This
+/// emitter writes the dict literal by hand (via [`hint_stream_dict_prefix`]) to
+/// match that order; the surrounding framing (`N G obj\n` … `\nstream\n` …
+/// `\nendstream\nendobj\n`) is byte-identical to [`append_object`]. The newline
+/// before `endstream` is written only when the payload does not already end in
+/// one (qpdf, QPDFWriter.cc:2327).
 fn append_hint_stream_object(
     bytes: &mut Vec<u8>,
     new_ref: ObjectRef,
-    compressed_payload: &[u8],
+    payload: &[u8],
     shared_section_offset: usize,
     outline_section_offset: Option<usize>,
+    filtered: bool,
 ) -> usize {
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
@@ -1501,17 +1516,18 @@ fn append_hint_stream_object(
         hint_stream_dict_prefix(
             shared_section_offset,
             outline_section_offset,
-            compressed_payload.len(),
+            payload.len(),
+            filtered,
         )
         .as_bytes(),
     );
-    bytes.extend_from_slice(compressed_payload);
+    bytes.extend_from_slice(payload);
     // qpdf writes the newline before `endstream` only when the stream payload
     // does not already end in one (QPDFWriter.cc:2327: `if (last_char != '\n')`).
     // The hint payload is FlateDecode output, whose final byte is data-dependent;
     // when it happens to be `\n` (e.g. with an Outlines hint table present) the
     // unconditional newline would add a spurious byte and diverge from qpdf.
-    if compressed_payload.last() != Some(&b'\n') {
+    if payload.last() != Some(&b'\n') {
         bytes.extend_from_slice(b"\n");
     }
     bytes.extend_from_slice(b"endstream\nendobj\n");
@@ -1689,7 +1705,9 @@ fn build_pass1_part1(part1: &Part1Bytes) -> Part1Bytes {
 ///           end_of_first_page_offset, last_xref_offset, last_xref_first_entry_offset,
 ///           first_trailer_prev_range)`.
 ///
-/// `hint_compressed` is the compressed payload to use for the hint stream object.
+/// `hint_payload` is the raw or compressed payload to use for the hint stream
+/// object; `structural_streams_filtered` controls the hint, ObjStm, and xref
+/// stream filters and payload encodings.
 /// `hint_shared_section_offset` is the `/S` value (offset within the uncompressed stream).
 ///
 /// When `pass1_digest` is set, the buffer reproduces qpdf's *first* write pass —
@@ -1710,18 +1728,14 @@ fn do_write_pass<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
-    // Live object set (object 0 / missing-xref refs excluded); computed once by
-    // the caller and shared across all probe + final passes, since the source
-    // document is immutable here. Threaded into `renumber_object` so it can drop
-    // null-resolving dict keys / inline `null` array elements.
-    live: &BTreeSet<ObjectRef>,
     part1: &Part1Bytes,
     catalog_new_ref: ObjectRef,
     hint_stream_new_num: u32,
     total_count: u32,
     info_new_ref: Option<ObjectRef>,
     _first_page_object_new_num: u32,
-    hint_compressed: &[u8],
+    hint_payload: &[u8],
+    structural_streams_filtered: bool,
     hint_shared_section_offset: usize,
     hint_outline_section_offset: Option<usize>,
     source_trailer: &Dictionary,
@@ -1855,6 +1869,7 @@ fn do_write_pass<R: Read + Seek>(
             info_new_ref,
             source_trailer,
             max_ostream_index,
+            structural_streams_filtered,
         )?;
         // First-page xref stream object carries one `/ID` (the main xref
         // stream below carries the second).  `patch_first_page_xref` later
@@ -1882,9 +1897,17 @@ fn do_write_pass<R: Read + Seek>(
                 .contains_key(&catalog_orig),
             "planner invariant: /Catalog is never an ObjStm member"
         );
-        let object = pdf.resolve_borrowed(catalog_orig)?;
-        let renumbered = renumber_object(object, 0, renumber, live)?;
-        let offset = append_body_object(&mut bytes, catalog_new_ref, &renumbered, options);
+        let object = pdf.resolve(catalog_orig)?;
+        let recovered_eol = pdf.recovered_stream_eol(catalog_orig);
+        let renumbered =
+            renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
+        let offset = append_body_object(
+            &mut bytes,
+            catalog_new_ref,
+            &renumbered,
+            options,
+            recovered_eol,
+        );
         xref_offsets.insert(catalog_new_ref.number, offset);
         catalog_emitted_early = true;
     }
@@ -1908,9 +1931,11 @@ fn do_write_pass<R: Read + Seek>(
             ));
         };
         // cov:ignore-end
-        let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, 0, renumber, live)?;
-        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
+        let object = pdf.resolve(*original_ref)?;
+        let recovered_eol = pdf.recovered_stream_eol(*original_ref);
+        let renumbered =
+            renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
+        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -1922,7 +1947,14 @@ fn do_write_pass<R: Read + Seek>(
     // indirect object; its compressed members are emitted nowhere else (skipped
     // in every plain loop via `member_to_container`).
     for container in &objstm_layout.open_document {
-        let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf, live)?;
+        let offset = append_objstm_container_object(
+            &mut bytes,
+            container,
+            renumber,
+            pdf,
+            &plan.removed_refs,
+            structural_streams_filtered,
+        )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
         xref_offsets.insert(container.container_new_num, offset);
     }
 
@@ -1940,9 +1972,10 @@ fn do_write_pass<R: Read + Seek>(
         let emitted_offset = append_hint_stream_object(
             &mut bytes,
             hint_new_ref,
-            hint_compressed,
+            hint_payload,
             hint_shared_section_offset,
             hint_outline_section_offset,
+            structural_streams_filtered,
         );
         debug_assert_eq!(emitted_offset, hint_stream_offset);
         xref_offsets.insert(hint_stream_new_num, emitted_offset);
@@ -1971,9 +2004,11 @@ fn do_write_pass<R: Read + Seek>(
                 original_ref
             )));
         };
-        let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, 0, renumber, live)?;
-        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
+        let object = pdf.resolve(*original_ref)?;
+        let recovered_eol = pdf.recovered_stream_eol(*original_ref);
+        let renumbered =
+            renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
+        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2000,9 +2035,11 @@ fn do_write_pass<R: Read + Seek>(
                 original_ref
             )));
         };
-        let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, 0, renumber, live)?;
-        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
+        let object = pdf.resolve(*original_ref)?;
+        let recovered_eol = pdf.recovered_stream_eol(*original_ref);
+        let renumbered =
+            renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
+        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2011,7 +2048,14 @@ fn do_write_pass<R: Read + Seek>(
     // qpdf 11.9 /E placement, which includes the Part-3 ObjStm) stays
     // consistent.  The container itself is a plain indirect object.
     for container in &objstm_layout.part3 {
-        let offset = append_objstm_container_object(&mut bytes, container, renumber, pdf, live)?;
+        let offset = append_objstm_container_object(
+            &mut bytes,
+            container,
+            renumber,
+            pdf,
+            &plan.removed_refs,
+            structural_streams_filtered,
+        )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
         xref_offsets.insert(container.container_new_num, offset);
     }
 
@@ -2032,9 +2076,11 @@ fn do_write_pass<R: Read + Seek>(
             )));
             // cov:ignore-end
         };
-        let object = pdf.resolve_borrowed(*original_ref)?;
-        let renumbered = renumber_object(object, 0, renumber, live)?;
-        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
+        let object = pdf.resolve(*original_ref)?;
+        let recovered_eol = pdf.recovered_stream_eol(*original_ref);
+        let renumbered =
+            renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
+        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2096,14 +2142,23 @@ fn do_write_pass<R: Read + Seek>(
                 let new_ref = renumber
                     .new_for_original(*original_ref)
                     .expect("part4 plain object renumber entry checked above");
-                let object = pdf.resolve_borrowed(*original_ref)?;
-                let renumbered = renumber_object(object, 0, renumber, live)?;
-                let offset = append_body_object(&mut bytes, new_ref, &renumbered, options);
+                let object = pdf.resolve(*original_ref)?;
+                let recovered_eol = pdf.recovered_stream_eol(*original_ref);
+                let renumbered =
+                    renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
+                let offset =
+                    append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
                 xref_offsets.insert(new_ref.number, offset);
             }
             Part4Emit::Container(container) => {
-                let offset =
-                    append_objstm_container_object(&mut bytes, container, renumber, pdf, live)?;
+                let offset = append_objstm_container_object(
+                    &mut bytes,
+                    container,
+                    renumber,
+                    pdf,
+                    &plan.removed_refs,
+                    structural_streams_filtered,
+                )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
                 xref_offsets.insert(container.container_new_num, offset);
             }
         }
@@ -2207,6 +2262,7 @@ fn do_write_pass<R: Read + Seek>(
             first_page_obj_offset,
             max_ostream_index,
             pass1_digest,
+            structural_streams_filtered,
         )?;
         // Main xref stream object is the second (and last) `/ID` site on the
         // ObjStm path.  Its span extends through the trailing
@@ -2215,7 +2271,7 @@ fn do_write_pass<R: Read + Seek>(
         id_ranges.push(main_section_start..bytes.len());
 
         // Every downstream object offset is now known, so rebuild the first-page
-        // xref's reserved region with the real compressed object and `/Prev →
+        // xref's reserved region with the real encoded object and `/Prev →
         // main xref`. The region's byte length is fixed (qpdf's pass-1 sizing),
         // so this shifts no bytes and the hint-stream convergence loop is
         // unaffected.  `result.0` is the main xref offset.
@@ -2463,6 +2519,24 @@ fn preserved_source_container_number(
     Ok(source_container_number)
 }
 
+fn reject_multiple_generations(plan: &LinearizationPlan) -> Result<()> {
+    let mut previous_number = None;
+    for object_ref in plan.renumber_assigned_refs() {
+        if previous_number == Some(object_ref.number) {
+            return Err(crate::Error::Unsupported(
+                "QPDF cannot currently linearize files that contain multiple objects with the \
+                 same object ID and different generations.  If you see this error message, \
+                 please file a bug report and attach the file if possible.  As a workaround, \
+                 first convert the file with qpdf without linearizing, and then linearize the \
+                 result of that conversion."
+                    .to_string(),
+            ));
+        }
+        previous_number = Some(object_ref.number);
+    }
+    Ok(())
+}
+
 pub fn write_linearized<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
@@ -2508,53 +2582,54 @@ pub fn write_linearized<R: Read + Seek>(
     // error without mutating the caller's `Pdf` first.
     crate::linearization::inherited_attrs::push_inherited_attributes_to_pages(pdf)?;
 
-    // Live object set (object 0 / missing-xref refs excluded). The source
-    // document is immutable across the probe + final passes, so compute it once
-    // here and share it with every `do_write_pass` rather than re-scanning the
-    // whole xref table on each pass.
-    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
-
-    // A forced sub-1.5 header suppresses object-stream generation: object and
+    // Reconcile the caller-built plan/renumber pair with the writer's effective
+    // object-stream mode. The historical `from_pdf(bool)` API maps `false` to
+    // Disable, while `WriteOptions::default()` is Preserve; source-ObjStm
+    // Preserve has different stale-generation and container-routing rules, so
+    // reusing the Disable partitions can reject or mis-layout the file. Rebuild
+    // both structures together whenever their recorded planning mode differs.
+    //
+    // A forced sub-1.5 header also makes the effective mode Disable: object and
     // cross-reference streams are PDF 1.5 features and qpdf will not emit them
     // under a forced version it must not exceed (observed on qpdf 11.9.0:
     // `--linearize --object-streams=generate --force-version=1.4` yields no
-    // `/ObjStm` and a classic xref table at header 1.4, identical to disable
-    // mode). Reconcile fully to the disable layout, not just the batch plan:
-    // the caller builds `plan`/`renumber` BEFORE calling here, and a generate
-    // -mode plan peels first-page open-document objects (e.g. `/AcroForm`,
-    // `/OpenAction`) out of Part 2/3 — a placement difference that would leak
-    // generate-mode ordering into the suppressed classic output. So rebuild the
-    // plan (and renumber) in disable mode and normalize the options to Disable.
-    // `from_pdf(.., false)` is the same call the non-suppressed disable path
-    // makes; the extra walk only happens in the rare suppression case. show.rs /
-    // check.rs callers pass `false` + default options, so this never fires there.
-    //
-    // Fires for Generate AND Preserve (anything but Disable): Preserve on an
-    // ObjStm SOURCE would otherwise keep the inherited ObjStm, so drop it too.
-    // For Preserve the caller already built a `use_generate=false` plan
-    // (`use_generate = mode == Generate`), so the `from_pdf(.., false)` rebuild
-    // is a no-op there — what matters is the `options -> Disable` normalization
-    // (empty batch plan -> classic Part-6 table). Linearization is plaintext
-    // only (encryption is rejected above), so there is no encrypted exception
-    // like the non-linearized rewrite path has.
-    let rebuilt_plan;
-    let rebuilt_renumber;
-    let suppressed_options;
-    let (plan, renumber, options) = if crate::writer::force_version_below_1_5(options)
-        && !matches!(
-            options.object_streams,
-            crate::writer::ObjectStreamMode::Disable
-        ) {
-        rebuilt_plan = LinearizationPlan::from_pdf(pdf, false)?;
-        rebuilt_renumber = RenumberMap::from_plan(&rebuilt_plan);
-        suppressed_options = WriteOptions {
-            object_streams: crate::writer::ObjectStreamMode::Disable,
-            ..options.clone()
-        };
-        (&rebuilt_plan, &rebuilt_renumber, &suppressed_options)
+    // `/ObjStm` and a classic xref table at header 1.4). In that case normalize
+    // the write options too, so plan, renumbering, and physical output all use
+    // the same classic layout.
+    let effective_object_stream_mode = if crate::writer::force_version_below_1_5(options) {
+        crate::writer::ObjectStreamMode::Disable
     } else {
-        (plan, renumber, options)
+        options.object_streams
     };
+    let must_rebuild_plan = plan.object_stream_mode != effective_object_stream_mode;
+    let rebuilt = if must_rebuild_plan {
+        let rebuilt_plan =
+            LinearizationPlan::from_pdf_with_object_stream_mode(pdf, effective_object_stream_mode)?;
+        let rebuilt_renumber = RenumberMap::from_plan(&rebuilt_plan);
+        Some((rebuilt_plan, rebuilt_renumber))
+    } else {
+        None
+    };
+    let must_normalize_options = options.object_streams != effective_object_stream_mode;
+    let normalized_options = if must_normalize_options {
+        Some(WriteOptions {
+            object_streams: effective_object_stream_mode,
+            ..options.clone()
+        })
+    } else {
+        None
+    };
+    let (plan, renumber) = match rebuilt.as_ref() {
+        Some((rebuilt_plan, rebuilt_renumber)) => (rebuilt_plan, rebuilt_renumber),
+        None => (plan, renumber),
+    };
+    let options = normalized_options.as_ref().unwrap_or(options);
+
+    // qpdf's linearization maps discard generations only after asserting that
+    // every surviving object number is unique. Generate, and Preserve on an
+    // ObjStm source, have already removed stale generations while planning;
+    // standard Disable/Preserve retain them and must reject the file here.
+    reject_multiple_generations(plan)?;
 
     // ------------------------------------------------------------------
     // Pre-compute values that do not change across iterations.
@@ -2835,7 +2910,16 @@ pub fn write_linearized<R: Read + Seek>(
     // would leave the error-propagation region uncovered (the `?` never errs).
     let oi = outline_initial.as_ref();
     let hint_bytes_initial = encode_hint_stream(&po_table_initial, &so_table_initial, oi)?;
-    let mut current_hint_compressed = hint_bytes_initial.compressed;
+    // qpdf routes the primary hint stream through its global stream-compression
+    // setting as well: Preserve and Uncompress emit the raw bit-packed table
+    // without `/Filter`; Compress emits `/FlateDecode`.
+    let structural_streams_filtered =
+        matches!(effective_stream_policy(options), Some(CompressStreams::Yes));
+    let mut current_hint_payload = if structural_streams_filtered {
+        hint_bytes_initial.compressed
+    } else {
+        hint_bytes_initial.uncompressed
+    };
     let mut current_hint_shared_s = hint_bytes_initial.shared_section_offset_in_uncompressed;
     let mut current_hint_outline_o = hint_bytes_initial.outline_section_offset_in_uncompressed;
 
@@ -2893,7 +2977,6 @@ pub fn write_linearized<R: Read + Seek>(
             plan,
             renumber,
             pdf,
-            &live,
             &pass1_part1,
             catalog_new_ref,
             hint_stream_new_num,
@@ -2903,6 +2986,7 @@ pub fn write_linearized<R: Read + Seek>(
             // The hint stream is absent in pass 1, so its payload / `/S` / `/O`
             // offsets are never emitted; pass empty / zero / none placeholders.
             &[],
+            structural_streams_filtered,
             0,
             None,
             &source_trailer,
@@ -2954,14 +3038,14 @@ pub fn write_linearized<R: Read + Seek>(
             plan,
             renumber,
             pdf,
-            &live,
             &part1,
             catalog_new_ref,
             hint_stream_new_num,
             total_count,
             info_new_ref,
             first_page_object_new_num,
-            &current_hint_compressed,
+            &current_hint_payload,
+            structural_streams_filtered,
             current_hint_shared_s,
             current_hint_outline_o,
             &source_trailer,
@@ -3323,7 +3407,11 @@ pub fn write_linearized<R: Read + Seek>(
 
         // Re-encode hint stream with patched tables.
         let new_hint_bytes = encode_hint_stream(&po_table, &so_table, outline_table.as_ref())?;
-        let new_compressed = new_hint_bytes.compressed;
+        let new_hint_payload = if structural_streams_filtered {
+            new_hint_bytes.compressed
+        } else {
+            new_hint_bytes.uncompressed
+        };
         let new_shared_s = new_hint_bytes.shared_section_offset_in_uncompressed;
         let new_outline_o = new_hint_bytes.outline_section_offset_in_uncompressed;
 
@@ -3350,22 +3438,27 @@ pub fn write_linearized<R: Read + Seek>(
         // `hint_stream_convergence_len` captures every variable component, so
         // convergence forces ΔL=0 — the final pass's `/H[1]` exactly matches the
         // offsets baked into the payload (the constant scaffolding cancels).
-        let converged = hint_stream_convergence_len(&new_compressed, new_shared_s, new_outline_o)
-            == hint_stream_convergence_len(
-                &current_hint_compressed,
-                current_hint_shared_s,
-                current_hint_outline_o,
-            );
+        let converged = hint_stream_convergence_len(
+            &new_hint_payload,
+            new_shared_s,
+            new_outline_o,
+            structural_streams_filtered,
+        ) == hint_stream_convergence_len(
+            &current_hint_payload,
+            current_hint_shared_s,
+            current_hint_outline_o,
+            structural_streams_filtered,
+        );
 
         // Promote the freshly-patched stream as the next iteration input.
-        current_hint_compressed = new_compressed;
+        current_hint_payload = new_hint_payload;
         current_hint_shared_s = new_shared_s;
         current_hint_outline_o = new_outline_o;
 
-        // Risk 1 (convergence): the ObjStm container FlateDecode lengths are
+        // Risk 1 (convergence): the ObjStm container payload lengths are
         // *stable* across iterations (the contained, renumbered objects do
         // not change and the container numbers are pre-allocated), so only
-        // the hint stream's own compressed length can still oscillate — the
+        // the hint stream's own selected payload length can still oscillate — the
         // same single degree of freedom the non-ObjStm path already had.  If
         // it has not stabilised by the final iteration we must not silently
         // emit a file whose Page-Offset Hint Table was computed against a
@@ -3424,14 +3517,14 @@ pub fn write_linearized<R: Read + Seek>(
                 plan,
                 renumber,
                 pdf,
-                &live,
                 &part1,
                 catalog_new_ref,
                 hint_stream_new_num,
                 total_count,
                 info_new_ref,
                 first_page_object_new_num,
-                &current_hint_compressed,
+                &current_hint_payload,
+                structural_streams_filtered,
                 current_hint_shared_s,
                 current_hint_outline_o,
                 &source_trailer,
@@ -3559,6 +3652,19 @@ mod tests {
         Pdf::open(Cursor::new(tiny_pdf_bytes())).expect("tiny PDF should parse")
     }
 
+    fn pdf_without_root() -> Pdf<Cursor<Vec<u8>>> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 2 >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+        );
+        Pdf::open(Cursor::new(pdf)).expect("rootless PDF should parse")
+    }
+
     fn build_linearized() -> LinearizedDocument {
         let mut pdf = open_tiny_pdf();
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
@@ -3574,6 +3680,26 @@ mod tests {
     #[test]
     fn write_linearized_succeeds() {
         let _doc = build_linearized();
+    }
+
+    #[test]
+    fn suppressed_object_stream_plan_rebuild_propagates_missing_root() {
+        let mut planning_pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut planning_pdf, true).expect("valid plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            force_version: Some("1.4".to_string()),
+            object_streams: crate::writer::ObjectStreamMode::Generate,
+            ..WriteOptions::default()
+        };
+        let mut write_pdf = pdf_without_root();
+
+        let err = write_linearized(&plan, &renumber, &mut write_pdf, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref message)
+                if message == "reachability: trailer has no /Root"),
+            "suppressed plan rebuild must propagate its missing-root error; got {err:?}"
+        );
     }
 
     #[test]
@@ -4613,6 +4739,11 @@ mod tests {
             "compress mode must emit a re-filtered /FlateDecode content stream \
              in qpdf key order"
         );
+        let filtered_hint: &[u8] = b"<< /Filter /FlateDecode /S ";
+        assert!(
+            out.windows(filtered_hint.len()).any(|w| w == filtered_hint),
+            "compress mode must FlateDecode the primary hint stream"
+        );
         crate::linearization::check_linearization_bytes(&out)
             .expect("compress-mode linearized output must pass the checker");
         // The output reparses and the re-encoded content decodes back to the
@@ -4637,10 +4768,10 @@ mod tests {
     }
 
     /// Preserve mode (`StreamDataMode::Preserve`) must NOT recompress body
-    /// content streams: the source dict + raw payload pass through verbatim.
-    /// This exercises [`append_body_object`]'s early return when
-    /// [`effective_stream_policy`] yields `None` (the only non-recompressing
-    /// branch on the linearized body path).
+    /// content streams: the source dict + raw payload pass through unchanged.
+    /// This exercises [`append_body_object`] when [`effective_stream_policy`]
+    /// yields `None` (the only non-recompressing branch on the linearized body
+    /// path).
     #[test]
     fn linearized_preserve_mode_emits_body_stream_verbatim() {
         // Use an UNCOMPRESSED body content stream (no /Filter) so the raw payload
@@ -4665,6 +4796,30 @@ mod tests {
         );
         crate::linearization::check_linearization_bytes(&out)
             .expect("preserve-mode linearized output must pass the checker");
+    }
+
+    /// Uncompress mode applies to qpdf's generated primary hint stream too:
+    /// emit the bit-packed table directly and omit `/Filter`.
+    #[test]
+    fn linearized_uncompress_mode_emits_raw_hint_stream() {
+        let src = tiny_pdf_with_placeholder_in_content();
+        let out = linearize_with(&src, |o| {
+            o.deterministic_id = true;
+            o.stream_data = Some(crate::writer::StreamDataMode::Uncompress);
+        });
+
+        let raw_hint: &[u8] = b"<< /S ";
+        assert!(
+            out.windows(raw_hint.len()).any(|w| w == raw_hint),
+            "uncompress mode must emit an unfiltered primary hint stream"
+        );
+        let filtered_hint: &[u8] = b"<< /Filter /FlateDecode /S ";
+        assert!(
+            !out.windows(filtered_hint.len()).any(|w| w == filtered_hint),
+            "uncompress mode must omit /Filter from the primary hint stream"
+        );
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("uncompress-mode linearized output must pass the checker");
     }
 
     /// Build a linearizable single-page PDF whose Catalog `/Metadata` points at
@@ -5019,9 +5174,7 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
 
-        // No references, so the live set is never consulted (empty is fine).
-        let live = BTreeSet::new();
-        let err = renumber_object(&nested_arrays(MAX_INLINE_DEPTH + 5), 0, &renumber, &live);
+        let err = renumber_object(&mut pdf, &nested_arrays(MAX_INLINE_DEPTH + 5), 0, &renumber);
         assert!(matches!(err, Err(crate::Error::Unsupported(_))));
     }
 
@@ -5044,11 +5197,10 @@ mod tests {
         for _ in 0..(MAX_INLINE_DEPTH - 1) {
             obj = Object::Array(vec![obj]);
         }
-        // The buried reference (1 0 R) is in the plan, so it is renumbered via the
-        // map before the live set is consulted; an empty live set is fine here.
-        let live = BTreeSet::new();
+        // The buried reference (1 0 R) is in the plan, so it is renumbered via
+        // the map before null resolution is consulted.
         let out =
-            renumber_object(&obj, 0, &renumber, &live).expect("in-limit nesting must succeed");
+            renumber_object(&mut pdf, &obj, 0, &renumber).expect("in-limit nesting must succeed");
 
         // Unwrap the nested arrays down to the deepest element and confirm the
         // in-limit Reference was renumbered to its mapped target.
@@ -5065,10 +5217,10 @@ mod tests {
     }
 
     #[test]
-    fn renumber_object_errors_on_live_ref_absent_from_map() {
-        // Safety net: a reference to a LIVE object that the planner failed to map
-        // is a real inconsistency (it would emit a mixed old/new number), so it
-        // must error — NOT be silently dropped like a dangling/object-0 ref.
+    fn renumber_object_errors_on_non_null_ref_absent_from_map() {
+        // Safety net: a reference to a non-null object that the planner failed
+        // to map is a real inconsistency (it would emit a mixed old/new number),
+        // so it must error — NOT be silently dropped like a qpdf-null ref.
         let mut pdf = open_tiny_pdf();
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
@@ -5078,28 +5230,26 @@ mod tests {
             renumber.new_for_original(ghost).is_none(),
             "test premise: ghost is not in the map"
         );
-        let mut live = BTreeSet::new();
-        live.insert(ghost); // declared live but unmapped
+        pdf.set_object(ghost, Object::Integer(99));
         let obj = Object::Array(vec![Object::Reference(ghost)]);
-        let err = renumber_object(&obj, 0, &renumber, &live);
+        let err = renumber_object(&mut pdf, &obj, 0, &renumber);
         assert!(
             matches!(err, Err(crate::Error::Unsupported(_))),
-            "a live, unmapped reference must error, got {err:?}"
+            "a non-null, unmapped reference must error, got {err:?}"
         );
     }
 
     #[test]
     fn renumber_object_inlines_null_for_missing_ref_in_array() {
-        // Boundary opposite the safety net: a non-live (missing-xref) reference in
-        // an array becomes inline `null` rather than erroring.
+        // Boundary opposite the safety net: a missing-xref reference in an
+        // array becomes inline `null` rather than erroring.
         let mut pdf = open_tiny_pdf();
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
 
         let missing = ObjectRef::new(99, 0);
-        let live = BTreeSet::new(); // `missing` is absent => not live
         let obj = Object::Array(vec![Object::Reference(missing)]);
-        let out = renumber_object(&obj, 0, &renumber, &live);
+        let out = renumber_object(&mut pdf, &obj, 0, &renumber);
         assert!(
             matches!(&out, Ok(Object::Array(items)) if matches!(items.as_slice(), [Object::Null])),
             "missing-xref array element must inline null, got {out:?}"
@@ -5326,17 +5476,17 @@ mod tests {
             .expect("deterministic-id without encryption must succeed");
     }
 
-    /// The primary hint-stream object must serialize its dict in qpdf's key
-    /// order `/Filter /S /Length` (so `/S` precedes `/Length`), with framing
-    /// byte-identical to the generic object serializer. Asserts the complete
-    /// object bytes — not just the dict substring — so a newline regression in
-    /// the `stream`/`endstream`/`endobj` framing is also caught.
+    /// The primary hint-stream object must serialize its filtered dict in
+    /// qpdf's key order `/Filter /S /Length` (so `/S` precedes `/Length`), with
+    /// framing byte-identical to the generic object serializer. Asserts the
+    /// complete object bytes — not just the dict substring — so a newline
+    /// regression in the `stream`/`endstream`/`endobj` framing is also caught.
     #[test]
     fn append_hint_stream_object_emits_qpdf_key_order() {
         let payload = vec![0u8; 53];
         let mut bytes = Vec::new();
         let offset =
-            append_hint_stream_object(&mut bytes, ObjectRef::new(9, 0), &payload, 46, None);
+            append_hint_stream_object(&mut bytes, ObjectRef::new(9, 0), &payload, 46, None, true);
         assert_eq!(offset, 0, "emitter returns its start offset");
 
         let mut expected = Vec::new();
@@ -5345,6 +5495,27 @@ mod tests {
         expected.extend_from_slice(&payload);
         expected.extend_from_slice(b"\nendstream\nendobj\n");
         assert_eq!(bytes, expected, "hint-stream object framing + key order");
+    }
+
+    /// qpdf omits `/Filter` from the primary hint stream when stream
+    /// compression is disabled (`--stream-data=preserve` or `uncompress`).
+    #[test]
+    fn append_hint_stream_object_omits_filter_for_raw_payload() {
+        let payload = b"\x00\x01\n";
+        let mut bytes = Vec::new();
+        append_hint_stream_object(
+            &mut bytes,
+            ObjectRef::new(9, 0),
+            payload,
+            46,
+            Some(51),
+            false,
+        );
+
+        assert_eq!(
+            bytes,
+            b"9 0 obj\n<< /S 46 /O 51 /Length 3 >>\nstream\n\x00\x01\nendstream\nendobj\n"
+        );
     }
 
     // -----------------------------------------------------------------------

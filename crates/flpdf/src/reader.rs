@@ -63,6 +63,18 @@ pub struct Pdf<R: Read + Seek> {
     source_xref_offsets: Vec<(ObjectRef, u64)>,
     source_xref_entries: BTreeMap<ObjectRef, XrefOffset>,
     dirty_object_refs: BTreeSet<ObjectRef>,
+    /// Exact source framing EOLs removed while a line-anchored `endstream`
+    /// scan remained authoritative. Rewriting restores this private metadata
+    /// before applying the selected stream policy, matching qpdf's recovered
+    /// raw stream bytes for missing, invalid, and unresolved `/Length` values.
+    recovered_stream_eols: BTreeMap<ObjectRef, crate::parser::RecoveredStreamEol>,
+    /// Streams whose cached representation has already accounted for source
+    /// framing. This includes actual decryption and selective explicit
+    /// `/Crypt` removal. Recovered framing must not be appended later in either
+    /// case: ciphertext framing is not plaintext, while explicit-filter
+    /// framing is consumed while transforming the declared chain. Metadata and
+    /// document-level Identity streams remain source-represented and absent.
+    transformed_stream_refs: BTreeSet<ObjectRef>,
     /// Valid indirect references discovered while preparing qpdf JSON whose
     /// exact object generation has no live xref/cache target.
     qpdf_dangling_refs: BTreeSet<ObjectRef>,
@@ -93,6 +105,7 @@ struct FileObjectRead {
     object_ref: ObjectRef,
     object: Object,
     indirect_length: Option<crate::parser::IndirectStreamLength>,
+    recovered_stream_eol: Option<crate::parser::RecoveredStreamEol>,
     empty_offset: Option<usize>,
     expected_endobj_offset: Option<usize>,
 }
@@ -356,6 +369,23 @@ impl<R: Read + Seek> Pdf<R> {
             .push(Diagnostic::warning(message, None));
     }
 
+    /// Exact source framing removed by an authoritative `endstream` scan.
+    pub(crate) fn recovered_stream_eol(&self, object_ref: ObjectRef) -> Option<&'static [u8]> {
+        // The recovery scan runs against source bytes. When THIS stream's
+        // payload was decrypted, the byte belongs to ciphertext framing rather
+        // than to the plaintext returned by `resolve`. Document-wide
+        // encryption is not sufficient: metadata under `/EncryptMetadata
+        // false`, `/StmF /Identity`, and explicit `/Crypt /Identity` streams
+        // keep plaintext source bytes and therefore retain the recovered EOL.
+        if self.transformed_stream_refs.contains(&object_ref) {
+            return None;
+        }
+        self.recovered_stream_eols
+            .get(&object_ref)
+            .copied()
+            .map(crate::parser::RecoveredStreamEol::as_bytes)
+    }
+
     /// Whether this document authenticated an `/Encrypt` dictionary while opening.
     pub fn is_encrypted(&self) -> bool {
         self.encryption.is_some()
@@ -543,6 +573,8 @@ impl<R: Read + Seek> Pdf<R> {
             source_xref_offsets,
             source_xref_entries,
             dirty_object_refs: BTreeSet::new(),
+            recovered_stream_eols: BTreeMap::new(),
+            transformed_stream_refs: BTreeSet::new(),
             qpdf_dangling_refs: BTreeSet::new(),
             qpdf_trailer_references: loaded_state.trailer_references,
             qpdf_parsed_xref_streams: loaded_state.parsed_xref_streams,
@@ -857,6 +889,8 @@ impl<R: Read + Seek> Pdf<R> {
         self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
+        self.recovered_stream_eols.remove(&object_ref);
+        self.transformed_stream_refs.remove(&object_ref);
         if let Some(CacheEntry::Compressed { stream, index }) =
             self.cache.entry(object_ref).cloned()
         {
@@ -877,6 +911,8 @@ impl<R: Read + Seek> Pdf<R> {
         }
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
+        self.recovered_stream_eols.remove(&object_ref);
+        self.transformed_stream_refs.remove(&object_ref);
         if object_ref.number == 0
             || matches!(
                 self.cache.entry(object_ref),
@@ -1138,6 +1174,7 @@ impl<R: Read + Seek> Pdf<R> {
                 object_ref: parsed.object_ref,
                 object: parsed.object,
                 indirect_length: parsed.indirect_length,
+                recovered_stream_eol: parsed.recovered_stream_eol,
                 empty_offset: parsed.empty_offset,
                 expected_endobj_offset: parsed.expected_endobj_offset,
             }),
@@ -1157,6 +1194,7 @@ impl<R: Read + Seek> Pdf<R> {
                         object_ref: parsed.object_ref,
                         object: parsed.object,
                         indirect_length: parsed.indirect_length,
+                        recovered_stream_eol: parsed.recovered_stream_eol,
                         empty_offset: parsed.empty_offset,
                         expected_endobj_offset: parsed.expected_endobj_offset,
                     }),
@@ -1181,6 +1219,25 @@ impl<R: Read + Seek> Pdf<R> {
             .unwrap_or(Object::Null))
     }
 
+    /// Resolve a qpdf-visible object without cloning its cached value.
+    ///
+    /// Unlike [`Self::resolve_borrowed`], this retains the historical xref-stream
+    /// fallback used by qpdf JSON preparation when the object is absent from the
+    /// live object cache.
+    pub(crate) fn resolve_qpdf_json_object_borrowed(
+        &mut self,
+        object_ref: ObjectRef,
+    ) -> Result<&Object> {
+        self.resolve_to_cache(object_ref)?;
+        match self.cache.entry(object_ref) {
+            Some(CacheEntry::Resolved(object)) => Ok(object),
+            _ => Ok(self
+                .qpdf_parsed_xref_streams
+                .get(&object_ref)
+                .unwrap_or(&NULL_OBJECT)),
+        }
+    }
+
     /// Offset of the first recorded object that starts strictly after `offset`,
     /// or `None` when `offset` belongs to the last object in the file.
     fn next_object_offset(&self, offset: u64) -> Option<u64> {
@@ -1201,6 +1258,7 @@ impl<R: Read + Seek> Pdf<R> {
                     return Ok(false);
                 }
                 let mut object = parsed.object;
+                let mut endstream_scan_authoritative = parsed.recovered_stream_eol.is_some();
                 // When the stream's /Length is an indirect reference, the parser
                 // had no xref and recorded the payload window instead of a
                 // resolved length. Resolve the holder via the xref and re-slice
@@ -1208,20 +1266,40 @@ impl<R: Read + Seek> Pdf<R> {
                 // decryption: `object`/`bytes` are still ciphertext here, and
                 // `decrypt_resolved_object` decrypts in place afterwards.
                 if let Some(isl) = parsed.indirect_length {
-                    self.apply_indirect_stream_length(
+                    let used_endstream_scan = self.apply_indirect_stream_length(
                         object_ref,
                         &mut object,
                         isl,
                         &parsed.bytes,
                         offset,
                     )?;
+                    if parsed.recovered_stream_eol.is_some() {
+                        endstream_scan_authoritative = used_endstream_scan;
+                    }
                 }
                 // `apply_indirect_stream_length` already restored the lazy
                 // `Unresolved` entry, so a decryption error here leaves it
                 // `Unresolved` (not `Reserved`) and the failure stays loud on a
                 // retry.
-                let object = self.decrypt_resolved_object(object_ref, object)?;
+                let recovered_eol = endstream_scan_authoritative
+                    .then_some(parsed.recovered_stream_eol)
+                    .flatten()
+                    .map(crate::parser::RecoveredStreamEol::as_bytes);
+                let (object, stream_payload_transformed) =
+                    self.decrypt_resolved_object(object_ref, object, recovered_eol)?;
                 self.cache.set_resolved(object_ref, object);
+                if stream_payload_transformed {
+                    self.transformed_stream_refs.insert(object_ref);
+                } else {
+                    self.transformed_stream_refs.remove(&object_ref);
+                }
+                if endstream_scan_authoritative {
+                    if let Some(eol) = parsed.recovered_stream_eol {
+                        self.recovered_stream_eols.insert(object_ref, eol);
+                    }
+                } else {
+                    self.recovered_stream_eols.remove(&object_ref);
+                }
                 self.record_file_object_warnings(
                     object_ref,
                     offset,
@@ -1285,6 +1363,10 @@ impl<R: Read + Seek> Pdf<R> {
     /// Shared by [`resolve_to_cache`](Self::resolve_to_cache) and
     /// [`resolve_compressed_entry`](Self::resolve_compressed_entry) so ObjStm
     /// containers get the same recovery as top-level streams.
+    ///
+    /// Returns `true` only when a line-anchored `endstream` scan remains the
+    /// payload authority; a valid in-window indirect integer re-slice returns
+    /// `false`.
     fn apply_indirect_stream_length(
         &mut self,
         object_ref: ObjectRef,
@@ -1292,7 +1374,7 @@ impl<R: Read + Seek> Pdf<R> {
         isl: crate::parser::IndirectStreamLength,
         bytes: &[u8],
         offset: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let result = self.reslice_indirect_stream_length(object_ref, object, isl, bytes);
         self.cache.set_unresolved(object_ref, offset);
         result
@@ -1300,14 +1382,15 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Inner half of [`apply_indirect_stream_length`](Self::apply_indirect_stream_length):
     /// performs the holder resolution and re-slice. May leave `object_ref`
-    /// `Reserved`; the wrapper restores the cache entry.
+    /// `Reserved`; the wrapper restores the cache entry. Its boolean has the
+    /// same endstream-scan-authority meaning as the wrapper's return value.
     fn reslice_indirect_stream_length(
         &mut self,
         object_ref: ObjectRef,
         object: &mut Object,
         isl: crate::parser::IndirectStreamLength,
         bytes: &[u8],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         match isl.endstream_pos {
             // The parser located a line-anchored `endstream` and set a usable
             // `stream.data`; the holder only REFINES it, overriding when the
@@ -1315,6 +1398,7 @@ impl<R: Read + Seek> Pdf<R> {
             // Best-effort: a self-referential, cyclic, unresolvable, or
             // out-of-window holder keeps the parser's endstream-scan value.
             Some(endstream_pos) => {
+                let mut endstream_scan_authoritative = true;
                 if isl.holder != object_ref {
                     // Mark this object resolution in-progress before recursing
                     // into the holder: a cyclic length-holder chain (A's /Length
@@ -1328,7 +1412,7 @@ impl<R: Read + Seek> Pdf<R> {
                     if let Ok(Object::Integer(n)) = self.resolve_borrowed(isl.holder) {
                         if let (Ok(n), Object::Stream(stream)) = (usize::try_from(*n), &mut *object)
                         {
-                            let auth_end = isl.data_start.saturating_add(n);
+                            let auth_end = isl.data_start.checked_add(n);
                             // Override whenever the authoritative length lands
                             // at or before `endstream`. qpdf QDF holders contain
                             // the logical payload length; `%QDF:
@@ -1336,14 +1420,16 @@ impl<R: Read + Seek> Pdf<R> {
                             // in fix-qdf rather than changing reader semantics.
                             // A too-large/garbage holder falls back to the safe
                             // endstream scan.
-                            let within_window = auth_end <= endstream_pos;
-                            if within_window && auth_end <= bytes.len() {
+                            if let Some(auth_end) =
+                                auth_end.filter(|&end| end <= endstream_pos && end <= bytes.len())
+                            {
                                 stream.data = bytes[isl.data_start..auth_end].to_vec();
+                                endstream_scan_authoritative = false;
                             }
                         }
                     }
                 }
-                Ok(())
+                Ok(endstream_scan_authoritative)
             }
             // No line-anchored `endstream` existed: the writer used
             // `NewlineBeforeEndstream::Never` with a non-EOL-ending payload, so
@@ -1378,7 +1464,7 @@ impl<R: Read + Seek> Pdf<R> {
                         // `valid` guarantees `auth_end` is `Some` and in bounds.
                         let end = auth_end.unwrap();
                         stream.data = bytes[isl.data_start..end].to_vec();
-                        Ok(())
+                        Ok(false)
                     }
                     _ => Err(Error::parse(isl.data_start, "stream data exceeds input")),
                 }
@@ -1406,19 +1492,33 @@ impl<R: Read + Seek> Pdf<R> {
                     return Ok(false);
                 }
                 let mut object = parsed.object;
+                let mut endstream_scan_authoritative = parsed.recovered_stream_eol.is_some();
                 if let Some(isl) = parsed.indirect_length {
-                    self.apply_indirect_stream_length(
+                    let used_endstream_scan = self.apply_indirect_stream_length(
                         stream_ref,
                         &mut object,
                         isl,
                         &parsed.bytes,
                         offset,
                     )?;
+                    if parsed.recovered_stream_eol.is_some() {
+                        endstream_scan_authoritative = used_endstream_scan;
+                    }
                 }
                 // `apply_indirect_stream_length` already restored the lazy entry,
                 // so a decryption error here leaves it `Unresolved`.
-                let object = self.decrypt_resolved_object(stream_ref, object)?;
+                let recovered_eol = endstream_scan_authoritative
+                    .then_some(parsed.recovered_stream_eol)
+                    .flatten()
+                    .map(crate::parser::RecoveredStreamEol::as_bytes);
+                let (object, stream_payload_transformed) =
+                    self.decrypt_resolved_object(stream_ref, object, recovered_eol)?;
                 self.cache.set_resolved(stream_ref, object.clone());
+                if stream_payload_transformed {
+                    self.transformed_stream_refs.insert(stream_ref);
+                } else {
+                    self.transformed_stream_refs.remove(&stream_ref);
+                }
                 self.record_file_object_warnings(
                     stream_ref,
                     offset,
@@ -1442,19 +1542,25 @@ impl<R: Read + Seek> Pdf<R> {
 
         let (parent_ref, parent_index, object) =
             self.parse_object_stream_chain_entry(stream_ref, &stream_object, index)?;
-        let object = self.decrypt_resolved_object(object_ref, object)?;
+        let (object, _stream_payload_transformed) =
+            self.decrypt_resolved_object(object_ref, object, None)?;
         self.compressed_member_parents
             .insert(object_ref, (parent_ref, parent_index));
         self.cache.set_resolved(object_ref, object);
         Ok(true)
     }
 
-    fn decrypt_resolved_object(&self, object_ref: ObjectRef, mut object: Object) -> Result<Object> {
+    fn decrypt_resolved_object(
+        &self,
+        object_ref: ObjectRef,
+        mut object: Object,
+        recovered_stream_eol: Option<&[u8]>,
+    ) -> Result<(Object, bool)> {
         let Some(encryption) = &self.encryption else {
-            return Ok(object);
+            return Ok((object, false));
         };
         if Some(object_ref) == encryption.encrypt_ref {
-            return Ok(object);
+            return Ok((object, false));
         }
 
         decrypt_object_strings(
@@ -1464,12 +1570,13 @@ impl<R: Read + Seek> Pdf<R> {
             &encryption.file_key,
             encryption.encrypt_ref,
         )?;
+        let mut stream_payload_transformed = false;
         if let Object::Stream(stream) = &mut object {
             if !encryption.encrypt_metadata && is_metadata_stream(&stream.dict) {
-                return Ok(object);
-            }
-            if stream_has_explicit_crypt_filter(&stream.dict) {
-                apply_explicit_crypt_filters(object_ref, stream, encryption)?;
+                return Ok((object, false));
+            } else if stream_has_explicit_crypt_filter(&stream.dict) {
+                apply_explicit_crypt_filters(object_ref, stream, encryption, recovered_stream_eol)?;
+                stream_payload_transformed = true;
             } else {
                 decrypt_stream_bytes(
                     object_ref,
@@ -1477,9 +1584,10 @@ impl<R: Read + Seek> Pdf<R> {
                     encryption.stream_mode,
                     &encryption.file_key,
                 )?;
+                stream_payload_transformed = encryption.stream_mode != EncryptionMode::Identity;
             }
         }
-        Ok(object)
+        Ok((object, stream_payload_transformed))
     }
 
     fn parse_object_stream_chain_entry(
@@ -1821,21 +1929,113 @@ fn apply_explicit_crypt_filters(
     object_ref: ObjectRef,
     stream: &mut crate::Stream,
     encryption: &EncryptionState,
+    recovered_stream_eol: Option<&[u8]>,
 ) -> Result<()> {
-    let decoded = crate::filters::decode_stream_data_with_crypt_filter(
-        &stream.dict,
-        &stream.data,
-        |decode_params, bytes| {
-            let mode = explicit_crypt_mode(encryption, decode_params)?;
-            let mut decrypted = bytes.to_vec();
-            decrypt_stream_bytes(object_ref, &mut decrypted, mode, &encryption.file_key)?;
-            Ok(decrypted)
-        },
-    )?;
-    stream.data = decoded;
-    stream.dict.remove("Filter");
-    stream.dict.remove("DecodeParms");
+    let filter = stream
+        .dict
+        .get("Filter")
+        .cloned()
+        .expect("caller checked for an explicit /Crypt filter");
+    let mut decode_params = stream.dict.get("DecodeParms").cloned();
+    if let Some(filters) = filter.as_array() {
+        crate::filters::validate_filter_chain_len(filters)?;
+    }
+    if let Some(eol) = recovered_stream_eol {
+        stream.data.extend_from_slice(eol);
+    }
+
+    if matches!(filter, Object::Name(ref name) if name.as_slice() == b"Crypt") {
+        let mode = explicit_crypt_mode(encryption, decode_params.as_ref())?;
+        if mode != EncryptionMode::Identity {
+            if let Some(eol) = recovered_stream_eol {
+                stream.data.truncate(stream.data.len() - eol.len());
+            }
+            decrypt_stream_bytes(object_ref, &mut stream.data, mode, &encryption.file_key)?;
+        }
+        stream.dict.remove("Filter");
+        stream.dict.remove("DecodeParms");
+        return Ok(());
+    }
+
+    let mut filters = filter
+        .into_array()
+        .expect("explicit /Crypt filter is either a name or an array");
+    let mut framing = recovered_stream_eol;
+
+    while let Some(crypt_index) = filters
+        .iter()
+        .position(|filter| matches!(filter, Object::Name(name) if name.as_slice() == b"Crypt"))
+    {
+        let crypt_params = decode_params_at(decode_params.as_ref(), crypt_index).cloned();
+        let mode = explicit_crypt_mode(encryption, crypt_params.as_ref())?;
+
+        if mode != EncryptionMode::Identity {
+            let prefix_dict = filter_prefix_dict(&filters, decode_params.as_ref(), crypt_index);
+            let mut encoded = stream.data.clone();
+            if crypt_index == 0 {
+                if let Some(eol) = framing.take() {
+                    encoded.truncate(encoded.len() - eol.len());
+                }
+            }
+            let mut decoded_prefix = crate::filters::decode_stream_data(&prefix_dict, &encoded)?;
+            decrypt_stream_bytes(object_ref, &mut decoded_prefix, mode, &encryption.file_key)?;
+            stream.data = crate::filters::encode_stream_data(&prefix_dict, &decoded_prefix)?;
+        }
+
+        // The endstream-scan EOL has now been accounted for in the source
+        // representation and must not be appended again by the writer.
+        // Identity keeps those exact recovered raw bytes.
+        framing = None;
+        filters.remove(crypt_index);
+        if let Some(Object::Array(params)) = &mut decode_params {
+            if crypt_index < params.len() {
+                params.remove(crypt_index);
+            }
+        }
+    }
+
+    if filters.is_empty() {
+        stream.dict.remove("Filter");
+        stream.dict.remove("DecodeParms");
+    } else {
+        stream.dict.insert("Filter", Object::Array(filters));
+        match decode_params {
+            Some(params) => stream.dict.insert("DecodeParms", params),
+            None => {
+                stream.dict.remove("DecodeParms");
+            }
+        };
+    }
     Ok(())
+}
+
+fn decode_params_at(decode_params: Option<&Object>, index: usize) -> Option<&Object> {
+    let params = decode_params?;
+    if params.as_dict().is_some() {
+        Some(params)
+    } else {
+        params.as_array()?.get(index)
+    }
+}
+
+fn filter_prefix_dict(
+    filters: &[Object],
+    decode_params: Option<&Object>,
+    prefix_len: usize,
+) -> Dictionary {
+    let mut prefix = Dictionary::new();
+    if prefix_len == 0 {
+        return prefix;
+    }
+    prefix.insert("Filter", Object::Array(filters[..prefix_len].to_vec()));
+    if let Some(params) = decode_params {
+        let params = match params {
+            Object::Array(params) => Object::Array(params[..prefix_len.min(params.len())].to_vec()),
+            params => params.clone(),
+        };
+        prefix.insert("DecodeParms", params);
+    }
+    prefix
 }
 
 fn explicit_crypt_mode(
@@ -2458,6 +2658,302 @@ mod tests {
         assert!(!stream_end_boundary_at(b"xendstream\nendobj", 0));
     }
 
+    #[test]
+    fn decrypt_resolved_object_never_decrypts_the_encrypt_dictionary() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
+        let file = std::fs::File::open(path).expect("encrypted fixture");
+        let pdf = Pdf::open(std::io::BufReader::new(file)).expect("authenticate fixture");
+        let encrypt_ref = pdf.encryption_ref().expect("indirect /Encrypt");
+        let sentinel = Object::Integer(42);
+
+        let (object, stream_payload_decrypted) = pdf
+            .decrypt_resolved_object(encrypt_ref, sentinel.clone(), None)
+            .expect("/Encrypt bypass");
+
+        assert_eq!(object, sentinel);
+        assert!(!stream_payload_decrypted);
+    }
+
+    fn explicit_rc4_encryption_state() -> EncryptionState {
+        EncryptionState {
+            file_key: vec![0x11, 0x22, 0x33, 0x44, 0x55],
+            stream_mode: EncryptionMode::Identity,
+            string_mode: EncryptionMode::Identity,
+            crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), EncryptionMode::Rc4)]),
+            encrypt_metadata: true,
+            encrypt_ref: None,
+            weak_crypto: true,
+            permissions: Permissions::new(-4),
+            user_password_matched: true,
+            owner_password_matched: false,
+        }
+    }
+
+    fn rc4_ciphertext(
+        object_ref: ObjectRef,
+        plaintext: &[u8],
+        encryption: &EncryptionState,
+    ) -> Vec<u8> {
+        let mut ciphertext = plaintext.to_vec();
+        decrypt_stream_bytes(
+            object_ref,
+            &mut ciphertext,
+            EncryptionMode::Rc4,
+            &encryption.file_key,
+        )
+        .expect("RC4 encryption");
+        ciphertext
+    }
+
+    fn flate_encoded(plaintext: &[u8]) -> Vec<u8> {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        crate::filters::encode_stream_data(&dict, plaintext).expect("Flate encode")
+    }
+
+    fn crypt_params(name: &[u8]) -> Object {
+        let mut params = Dictionary::new();
+        params.insert("Name", Object::Name(name.to_vec()));
+        Object::Dictionary(params)
+    }
+
+    fn explicit_identity_crypt_chain(chain_len: usize) -> Stream {
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![Object::Name(b"Crypt".to_vec()); chain_len]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![crypt_params(b"Identity"); chain_len]),
+        );
+        Stream::new(dict, b"identity".to_vec())
+    }
+
+    #[test]
+    fn explicit_crypt_rejects_overlong_identity_chain_before_mutation() {
+        let encryption = explicit_rc4_encryption_state();
+        let mut stream = explicit_identity_crypt_chain(17);
+        let original = stream.clone();
+
+        let err = apply_explicit_crypt_filters(
+            ObjectRef::new(4, 0),
+            &mut stream,
+            &encryption,
+            Some(b"\n"),
+        )
+        .expect_err("17 explicit Crypt filters must exceed the shared decode cap");
+
+        assert!(
+            matches!(
+                err,
+                Error::Unsupported(ref message)
+                    if message == "filter chain length 17 exceeds maximum of 16"
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            stream, original,
+            "the chain cap must reject before recovered framing or filters are mutated"
+        );
+    }
+
+    #[test]
+    fn explicit_crypt_accepts_max_length_identity_chain() {
+        let encryption = explicit_rc4_encryption_state();
+        let mut stream = explicit_identity_crypt_chain(16);
+
+        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &encryption, None)
+            .expect("16 explicit Crypt filters are within the shared decode cap");
+
+        assert_eq!(stream.data, b"identity");
+        assert_eq!(stream.dict.get("Filter"), None);
+        assert_eq!(stream.dict.get("DecodeParms"), None);
+    }
+
+    #[test]
+    fn explicit_crypt_within_limit_still_rejects_malformed_name_param() {
+        let encryption = explicit_rc4_encryption_state();
+        let mut malformed = Dictionary::new();
+        malformed.insert("Name", Object::Integer(1));
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![Object::Name(b"Crypt".to_vec())]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![Object::Dictionary(malformed)]),
+        );
+        let mut stream = Stream::new(dict, b"ciphertext".to_vec());
+
+        let err =
+            apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &encryption, None)
+                .expect_err("malformed /Crypt /Name remains an error");
+
+        assert!(
+            matches!(
+                err,
+                Error::Encrypted(EncryptedError::Malformed { ref reason })
+                    if reason == "/Crypt /DecodeParms /Name is not a name"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_named_crypt_removes_recovered_framing_before_rc4() {
+        let object_ref = ObjectRef::new(4, 0);
+        let encryption = explicit_rc4_encryption_state();
+        let plaintext = b"named explicit crypt";
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"Crypt".to_vec()));
+        dict.insert("DecodeParms", crypt_params(b"StdCF"));
+        let mut stream = Stream::new(dict, rc4_ciphertext(object_ref, plaintext, &encryption));
+
+        apply_explicit_crypt_filters(object_ref, &mut stream, &encryption, Some(b"\n"))
+            .expect("remove named Crypt");
+
+        assert_eq!(stream.data, plaintext);
+        assert_eq!(stream.dict.get("Filter"), None);
+        assert_eq!(stream.dict.get("DecodeParms"), None);
+    }
+
+    #[test]
+    fn explicit_crypt_first_removes_recovered_framing_before_rc4() {
+        let object_ref = ObjectRef::new(4, 0);
+        let encryption = explicit_rc4_encryption_state();
+        let plaintext = b"array explicit crypt";
+        let compressed = flate_encoded(plaintext);
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"Crypt".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![crypt_params(b"StdCF"), Object::Null]),
+        );
+        let mut stream = Stream::new(dict, rc4_ciphertext(object_ref, &compressed, &encryption));
+
+        apply_explicit_crypt_filters(object_ref, &mut stream, &encryption, Some(b"\n"))
+            .expect("remove first Crypt");
+
+        assert_eq!(
+            crate::filters::decode_stream_data(&stream.dict, &stream.data)
+                .expect("decode remaining Flate"),
+            plaintext
+        );
+        assert_eq!(
+            stream.dict.get("Filter"),
+            Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]))
+        );
+        assert_eq!(
+            stream.dict.get("DecodeParms"),
+            Some(&Object::Array(vec![Object::Null]))
+        );
+    }
+
+    #[test]
+    fn singleton_explicit_crypt_array_removes_filter_entries() {
+        let encryption = explicit_rc4_encryption_state();
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![Object::Name(b"Crypt".to_vec())]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![crypt_params(b"Identity")]),
+        );
+        let mut stream = Stream::new(dict, b"identity".to_vec());
+
+        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &encryption, None)
+            .expect("remove singleton Crypt");
+
+        assert_eq!(stream.data, b"identity");
+        assert_eq!(stream.dict.get("Filter"), None);
+        assert_eq!(stream.dict.get("DecodeParms"), None);
+    }
+
+    #[test]
+    fn explicit_crypt_array_without_decode_params_keeps_remaining_filter() {
+        let encryption = explicit_rc4_encryption_state();
+        let plaintext = b"no decode params";
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"Crypt".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        let mut stream = Stream::new(dict, flate_encoded(plaintext));
+
+        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &encryption, None)
+            .expect("remove Crypt without DecodeParms");
+
+        assert_eq!(
+            crate::filters::decode_stream_data(&stream.dict, &stream.data)
+                .expect("decode remaining Flate"),
+            plaintext
+        );
+        assert_eq!(stream.dict.get("DecodeParms"), None);
+    }
+
+    #[test]
+    fn explicit_crypt_preserves_short_decode_params_array() {
+        let encryption = explicit_rc4_encryption_state();
+        let plaintext = b"short decode params";
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"Crypt".to_vec()),
+            ]),
+        );
+        dict.insert("DecodeParms", Object::Array(vec![Object::Null]));
+        let mut stream = Stream::new(dict, flate_encoded(plaintext));
+
+        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &encryption, None)
+            .expect("remove Crypt with short DecodeParms");
+
+        assert_eq!(
+            crate::filters::decode_stream_data(&stream.dict, &stream.data)
+                .expect("decode remaining Flate"),
+            plaintext
+        );
+        assert_eq!(
+            stream.dict.get("DecodeParms"),
+            Some(&Object::Array(vec![Object::Null]))
+        );
+    }
+
+    #[test]
+    fn explicit_crypt_helpers_apply_dictionary_decode_params_to_prefix() {
+        let params = crypt_params(b"Identity");
+        assert_eq!(decode_params_at(Some(&params), 7), Some(&params));
+
+        let filters = vec![
+            Object::Name(b"FlateDecode".to_vec()),
+            Object::Name(b"Crypt".to_vec()),
+        ];
+        let prefix = filter_prefix_dict(&filters, Some(&params), 1);
+        assert_eq!(
+            prefix.get("Filter"),
+            Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]))
+        );
+        assert_eq!(prefix.get("DecodeParms"), Some(&params));
+
+        let prefix_without_params = filter_prefix_dict(&filters, None, 1);
+        assert_eq!(prefix_without_params.get("DecodeParms"), None);
+    }
+
     /// Minimal valid single-page PDF used across `open_mem` tests.
     ///
     /// Structure:
@@ -2513,6 +3009,95 @@ mod tests {
             .as_bytes(),
         );
         pdf
+    }
+
+    fn recovered_stream_fixture(
+        length_entry: &[u8],
+        framing_eol: &[u8],
+        holder_body: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let mut stream_body = b"1 0 obj\n<<".to_vec();
+        if !length_entry.is_empty() {
+            stream_body.push(b' ');
+            stream_body.extend_from_slice(length_entry);
+        }
+        stream_body.extend_from_slice(b" >>\nstream\nabc");
+        stream_body.extend_from_slice(framing_eol);
+        stream_body.extend_from_slice(b"endstream\nendobj\n");
+
+        match holder_body {
+            Some(holder_body) => classic_pdf_with_bodies(
+                &[stream_body.as_slice(), holder_body],
+                ObjectRef::new(1, 0),
+            ),
+            None => classic_pdf_with_bodies(&[stream_body.as_slice()], ObjectRef::new(1, 0)),
+        }
+    }
+
+    #[test]
+    fn endstream_scan_metadata_survives_every_non_authoritative_length() {
+        for (eol, expected) in [
+            (&b"\n"[..], &b"\n"[..]),
+            (&b"\r"[..], &b"\r"[..]),
+            (&b"\r\n"[..], &b"\r\n"[..]),
+        ] {
+            for length_entry in [&b""[..], &b"/Length /Bad"[..], &b"/Length null"[..]] {
+                let bytes = recovered_stream_fixture(length_entry, eol, None);
+                let mut pdf = Pdf::open_mem_owned(bytes).expect("open direct-length fixture");
+                let object_ref = ObjectRef::new(1, 0);
+                let stream = pdf.resolve(object_ref).expect("resolve recovered stream");
+                assert_eq!(stream.as_stream().unwrap().data, b"abc");
+                assert_eq!(pdf.recovered_stream_eol(object_ref), Some(expected));
+            }
+        }
+
+        for (holder_ref, holder_body, delete_holder) in [
+            (
+                b"2 0 R".as_slice(),
+                Some(b"2 0 obj\nnull\nendobj\n".as_slice()),
+                false,
+            ),
+            (
+                b"2 0 R".as_slice(),
+                Some(b"2 0 obj\n/Bad\nendobj\n".as_slice()),
+                false,
+            ),
+            (
+                b"2 0 R".as_slice(),
+                Some(b"2 0 obj\n99\nendobj\n".as_slice()),
+                false,
+            ),
+            (b"2 0 R".as_slice(), Some(b"2 0 obj\n<<".as_slice()), false),
+            (b"99 0 R".as_slice(), None, false),
+            (
+                b"2 0 R".as_slice(),
+                Some(b"2 0 obj\n3\nendobj\n".as_slice()),
+                true,
+            ),
+        ] {
+            let mut length_entry = b"/Length ".to_vec();
+            length_entry.extend_from_slice(holder_ref);
+            let bytes = recovered_stream_fixture(&length_entry, b"\n", holder_body);
+            let mut pdf = Pdf::open_mem_owned(bytes).expect("open indirect-length fixture");
+            if delete_holder {
+                pdf.delete_object(ObjectRef::new(2, 0));
+            }
+            let object_ref = ObjectRef::new(1, 0);
+            let stream = pdf.resolve(object_ref).expect("resolve recovered stream");
+            assert_eq!(stream.as_stream().unwrap().data, b"abc");
+            assert_eq!(pdf.recovered_stream_eol(object_ref), Some(&b"\n"[..]));
+        }
+    }
+
+    #[test]
+    fn valid_indirect_stream_length_clears_endstream_scan_metadata() {
+        let bytes =
+            recovered_stream_fixture(b"/Length 2 0 R", b"\n", Some(b"2 0 obj\n3\nendobj\n"));
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open valid indirect-length fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let stream = pdf.resolve(object_ref).expect("resolve recovered stream");
+        assert_eq!(stream.as_stream().unwrap().data, b"abc");
+        assert_eq!(pdf.recovered_stream_eol(object_ref), None);
     }
 
     #[test]
@@ -2609,6 +3194,55 @@ mod tests {
         );
         let mut pdf = Pdf::open_mem_owned(invalid_length).expect("open invalid-length fixture");
         assert!(pdf.resolve_qpdf_json_object(ObjectRef::new(1, 0)).is_err());
+    }
+
+    #[test]
+    fn borrowed_qpdf_resolution_preserves_historical_stream_fallback_without_clone() {
+        let mut pdf = Pdf::open_mem_owned(top_level_bare_reference_pdf()).expect("open fixture");
+        let live_ref = ObjectRef::new(8, 0);
+        pdf.set_object(
+            live_ref,
+            Object::Stream(Stream::new(Dictionary::new(), vec![0x41; 1024 * 1024])),
+        );
+        let live_payload_ptr = pdf
+            .resolve_borrowed(live_ref)
+            .expect("resolve seeded live stream")
+            .as_stream()
+            .expect("seeded live object is a stream")
+            .data
+            .as_ptr();
+        let resolved_live = pdf
+            .resolve_qpdf_json_object_borrowed(live_ref)
+            .expect("resolve live stream");
+        assert_eq!(
+            resolved_live
+                .as_stream()
+                .expect("live object is a stream")
+                .data
+                .as_ptr(),
+            live_payload_ptr
+        );
+
+        let historical_ref = ObjectRef::new(9, 0);
+        pdf.qpdf_parsed_xref_streams.insert(
+            historical_ref,
+            Object::Stream(Stream::new(Dictionary::new(), vec![0x5a; 1024 * 1024])),
+        );
+        let payload_ptr = pdf
+            .qpdf_parsed_xref_streams
+            .get(&historical_ref)
+            .and_then(Object::as_stream)
+            .expect("seeded historical stream")
+            .data
+            .as_ptr();
+
+        let resolved = pdf
+            .resolve_qpdf_json_object_borrowed(historical_ref)
+            .expect("resolve historical stream");
+        let stream = resolved.as_stream().expect("historical object is a stream");
+
+        assert_eq!(stream.data.as_ptr(), payload_ptr);
+        assert_eq!(stream.data.len(), 1024 * 1024);
     }
 
     fn top_level_bare_reference_pdf() -> Vec<u8> {

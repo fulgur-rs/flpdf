@@ -15,11 +15,15 @@ Usage:
     gen_od_indirect_length.py            # JS stream is uncompressed
     gen_od_indirect_length.py --flate    # JS stream is a lone /FlateDecode (the
                                          # writer's verbatim-preserve path)
+    gen_od_indirect_length.py --null-holder
+                                        # the indirect /Length resolves to null;
+                                        # readers recover by scanning endstream
 """
 import sys
 import zlib
 
 flate = "--flate" in sys.argv[1:]
+null_holder = "--null-holder" in sys.argv[1:]
 
 js_plain = b"app.alert('hi');"
 content = b"BT ET"
@@ -29,10 +33,10 @@ content = b"BT ET"
 if flate:
     js = zlib.compress(js_plain, 9)
     stream6 = b"<< /Length 7 0 R /Filter /FlateDecode >>\nstream\n" + js + b"\nendstream"
-    holder_value = len(js)
+    holder_body = b"null" if null_holder else b"%d" % len(js)
 else:
     stream6 = b"<< /Length 7 0 R >>\nstream\n" + js_plain + b"\nendstream"
-    holder_value = len(js_plain)
+    holder_body = b"null" if null_holder else b"%d" % len(js_plain)
 
 objs = {
     1: b"<< /Type /Catalog /Pages 2 0 R /OpenAction 5 0 R >>",
@@ -42,7 +46,7 @@ objs = {
     4: b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
     5: b"<< /Type /Action /S /JavaScript /JS 6 0 R >>",
     6: stream6,
-    7: b"%d" % holder_value,
+    7: holder_body,
 }
 
 out = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")

@@ -6,12 +6,15 @@
 //! module reproduces it byte-for-byte:
 //!
 //! * the table is `/W [1 2 1]`-style fixed-width rows (type, field-2, field-3),
-//! * the rows are PNG "Up" pre-filtered (`/Predictor 12`, `/Columns Σ/W`) and
-//!   then Flate-compressed, and
+//! * under the effective compress-streams policy, rows are PNG "Up"
+//!   pre-filtered (`/Predictor 12`, `/Columns Σ/W`) and Flate-compressed;
+//!   otherwise the raw `/W` rows are emitted without `/Filter` or
+//!   `/DecodeParms`, and
 //! * the stream dictionary keys are written in qpdf's fixed order
-//!   (`/Type /Length /Filter /DecodeParms /W [/Index] [/Info] [/Root] /Size
-//!   [/Prev] [/ID]`), which is *not* the lexicographic order the generic
-//!   dictionary serializer would produce — so the dictionary is built directly.
+//!   (`/Type /Length /Filter /DecodeParms /W [/Index]`, then sorted trimmed
+//!   trailer entries, then `/ID`), which is *not* the lexicographic order the
+//!   generic dictionary serializer would produce — so the dictionary is built
+//!   directly.
 //!
 //! Byte-identity of the compressed payload depends on the deflate backend: it
 //! matches qpdf only when flate2 links classic zlib (the `qpdf-zlib-compat`
@@ -24,7 +27,7 @@ use std::io::Write as _;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 
-use crate::object::ObjectRef;
+use crate::object::{Dictionary, Object, ObjectRef};
 use crate::Result;
 
 /// One cross-reference stream entry — a single `/W`-formatted row.
@@ -119,6 +122,12 @@ pub(crate) fn encode_payload(entries: &[XrefStreamEntry], widths: XrefWidths) ->
     flate_compress(&png_up_predict(&rows, columns(widths)))
 }
 
+/// Encode the unfiltered cross-reference payload used when qpdf's global
+/// stream-compression policy is disabled.
+pub(crate) fn encode_payload_raw(entries: &[XrefStreamEntry], widths: XrefWidths) -> Vec<u8> {
+    build_rows(entries, widths)
+}
+
 /// PNG-Up-predicted rows WITHOUT Flate — qpdf's pass-1 (`skip_compression`) xref
 /// stream payload. qpdf still declares `/Filter /FlateDecode` on the pass-1
 /// object (an invalid but throwaway buffer used only to size the region and seed
@@ -132,6 +141,8 @@ pub(crate) fn encode_payload_uncompressed(
 
 /// Stream-dictionary metadata for a cross-reference stream, in qpdf key order.
 pub(crate) struct XrefStreamDict<'a> {
+    /// Whether `/Filter /FlateDecode` plus PNG `/Predictor 12` are declared.
+    pub filtered: bool,
     /// `/W` field widths.
     pub widths: XrefWidths,
     /// `/Index [start count]`; `None` omits `/Index` (readers default to
@@ -147,6 +158,10 @@ pub(crate) struct XrefStreamDict<'a> {
     /// `/Prev` byte offset of the previous xref stream (left-justified in a
     /// [`PREV_FIELD_WIDTH`] field); `None` on the chain's final (main) stream.
     pub prev: Option<u64>,
+    /// Additional entries from qpdf's trimmed source trailer. These are merged
+    /// with `/Info`, `/Root`, and `/Size` and written in sorted key order after
+    /// `/W`/`/Index`, before the generated `/ID`.
+    pub trailer: Option<&'a Dictionary>,
     /// Trailer `/ID` as two raw byte strings, serialized as `<hex><hex>`.
     pub id: Option<(&'a [u8], &'a [u8])>,
 }
@@ -162,8 +177,9 @@ fn push_hex(out: &mut Vec<u8>, bytes: &[u8]) {
 
 /// Write the xref-stream object header and every dictionary key up to (but not
 /// including) `/ID`, in qpdf's fixed order: `/Type /Length /Filter /DecodeParms
-/// /W [/Index] [/Info] [/Root] /Size [/Prev]`. The caller appends `/ID` (concrete
-/// or inline-written) and the ` >>\nstream\n…` framing.
+/// /W [/Index]`, then the sorted trimmed trailer entries (including generated
+/// `/Root` and `/Size`, with `/Prev` immediately after `/Size`). The caller
+/// appends `/ID` (concrete or inline-written) and the ` >>\nstream\n…` framing.
 fn write_object_dict_prefix(
     out: &mut Vec<u8>,
     object: ObjectRef,
@@ -173,9 +189,11 @@ fn write_object_dict_prefix(
     out.extend_from_slice(format!("{} {} obj\n", object.number, object.generation).as_bytes());
     out.extend_from_slice(b"<< /Type /XRef");
     out.extend_from_slice(format!(" /Length {payload_len}").as_bytes());
-    out.extend_from_slice(b" /Filter /FlateDecode /DecodeParms << /Columns ");
-    out.extend_from_slice(columns(dict.widths).to_string().as_bytes());
-    out.extend_from_slice(b" /Predictor 12 >>");
+    if dict.filtered {
+        out.extend_from_slice(b" /Filter /FlateDecode /DecodeParms << /Columns ");
+        out.extend_from_slice(columns(dict.widths).to_string().as_bytes());
+        out.extend_from_slice(b" /Predictor 12 >>");
+    }
     out.extend_from_slice(
         format!(
             " /W [ {} {} {} ]",
@@ -186,15 +204,24 @@ fn write_object_dict_prefix(
     if let Some((start, count)) = dict.index {
         out.extend_from_slice(format!(" /Index [ {start} {count} ]").as_bytes());
     }
+    let mut trailer = dict.trailer.cloned().unwrap_or_default();
     if let Some(info) = dict.info {
-        out.extend_from_slice(format!(" /Info {} {} R", info.number, info.generation).as_bytes());
+        trailer.insert("Info", Object::Reference(info));
     }
     if let Some(root) = dict.root {
-        out.extend_from_slice(format!(" /Root {} {} R", root.number, root.generation).as_bytes());
+        trailer.insert("Root", Object::Reference(root));
     }
-    out.extend_from_slice(format!(" /Size {}", dict.size).as_bytes());
-    if let Some(prev) = dict.prev {
-        out.extend_from_slice(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes());
+    trailer.insert("Size", Object::Integer(i64::from(dict.size)));
+    for (key, value) in trailer.iter() {
+        out.extend_from_slice(b" /");
+        crate::object::write_name_escaped(out, key);
+        out.push(b' ');
+        value.write_pdf(out);
+        if key == b"Size" {
+            if let Some(prev) = dict.prev {
+                out.extend_from_slice(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes());
+            }
+        }
     }
 }
 
@@ -290,8 +317,9 @@ pub(crate) fn first_pass_widths(
 
 /// PNG-Up-predicted (uncompressed) payload length for `n_entries` rows: each row
 /// is one filter-tag byte plus `Σ/W` (`/Columns`) data bytes.
-fn first_pass_payload_len(n_entries: usize, widths: XrefWidths) -> usize {
-    (1 + columns(widths)) * n_entries
+fn first_pass_payload_len(n_entries: usize, widths: XrefWidths, filtered: bool) -> usize {
+    let row_width = columns(widths) + usize::from(filtered);
+    row_width * n_entries
 }
 
 /// Byte length of the fixed region qpdf reserves for a first-pass xref stream:
@@ -305,7 +333,7 @@ pub(crate) fn first_pass_region_len(
     dict: &XrefStreamDict,
     n_entries: usize,
 ) -> usize {
-    let payload_len = first_pass_payload_len(n_entries, dict.widths);
+    let payload_len = first_pass_payload_len(n_entries, dict.widths, dict.filtered);
     let mut buf = Vec::new();
     write_object(&mut buf, object, dict, &vec![0u8; payload_len]);
     buf.len() + calculate_xref_stream_padding(buf.len())
@@ -507,8 +535,9 @@ mod tests {
     #[test]
     fn first_pass_region_matches_three_page_golden() {
         let widths = first_pass_widths(16, 3, 130);
-        assert_eq!(first_pass_payload_len(11, widths), 77);
+        assert_eq!(first_pass_payload_len(11, widths, true), 77);
         let dict = XrefStreamDict {
+            filtered: true,
             widths,
             index: Some((6, 11)),
             info: Some(ObjectRef::new(15, 0)),
@@ -517,6 +546,7 @@ mod tests {
             // `/Prev` and `/ID` are space-/fixed-width fields, so only their
             // widths (not values) affect the region size.
             prev: Some(2356),
+            trailer: None,
             id: Some((&ID0, &ID1)),
         };
         assert_eq!(first_pass_region_len(ObjectRef::new(7, 0), &dict, 11), 391);
@@ -610,12 +640,14 @@ mod tests {
     #[test]
     fn write_padded_region_pads_to_length() {
         let dict = XrefStreamDict {
+            filtered: true,
             widths: [1, 2, 1],
             index: None,
             info: None,
             root: None,
             size: 6,
             prev: None,
+            trailer: None,
             id: Some((&ID0, &ID1)),
         };
         let region = write_padded_region(ObjectRef::new(5, 0), &dict, b"PAYLOAD", 400).unwrap();
@@ -629,12 +661,14 @@ mod tests {
     #[test]
     fn write_padded_region_rejects_oversized_object() {
         let dict = XrefStreamDict {
+            filtered: true,
             widths: [1, 2, 1],
             index: None,
             info: None,
             root: None,
             size: 6,
             prev: None,
+            trailer: None,
             id: Some((&ID0, &ID1)),
         };
         // A 10-byte region cannot hold the object; the writer must error rather
@@ -709,12 +743,14 @@ mod tests {
             &mut out,
             ObjectRef::new(7, 0),
             &XrefStreamDict {
+                filtered: true,
                 widths: [1, 2, 1],
                 index: Some((6, 11)),
                 info: Some(ObjectRef::new(15, 0)),
                 root: Some(ObjectRef::new(8, 0)),
                 size: 17,
                 prev: Some(2226),
+                trailer: None,
                 id: Some((&ID0, &ID1)),
             },
             b"PAYLOAD",
@@ -734,6 +770,35 @@ mod tests {
         assert!(text.ends_with(" >>\nstream\nPAYLOAD\nendstream\nendobj\n"));
     }
 
+    #[test]
+    fn trimmed_trailer_extras_are_sorted_before_generated_id() {
+        let mut trailer = Dictionary::new();
+        trailer.insert("Info", Object::Dictionary(Dictionary::new()));
+        trailer.insert("Foo", Object::Integer(7));
+        let mut out = Vec::new();
+        write_object(
+            &mut out,
+            ObjectRef::new(7, 0),
+            &XrefStreamDict {
+                filtered: true,
+                widths: [1, 2, 1],
+                index: None,
+                info: None,
+                root: Some(ObjectRef::new(1, 0)),
+                size: 8,
+                prev: None,
+                trailer: Some(&trailer),
+                id: Some((&ID0, &ID1)),
+            },
+            b"X",
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("/W [ 1 2 1 ] /Foo 7 /Info << >> /Root 1 0 R /Size 8 /ID [<"),
+            "trimmed trailer entries must retain qpdf's sorted writeTrailer order: {text}"
+        );
+    }
+
     /// The main xref stream omits /Index, /Info, /Root, and /Prev.
     #[test]
     fn main_xref_dict_omits_chain_and_root_keys() {
@@ -742,12 +807,14 @@ mod tests {
             &mut out,
             ObjectRef::new(5, 0),
             &XrefStreamDict {
+                filtered: true,
                 widths: [1, 2, 1],
                 index: None,
                 info: None,
                 root: None,
                 size: 6,
                 prev: None,
+                trailer: None,
                 id: Some((&ID0, &ID1)),
             },
             b"X",
@@ -785,12 +852,14 @@ mod tests {
             &mut out,
             ObjectRef::new(7, 0),
             &XrefStreamDict {
+                filtered: true,
                 widths: [1, 2, 1],
                 index: Some((6, 11)),
                 info: Some(ObjectRef::new(15, 0)),
                 root: Some(ObjectRef::new(8, 0)),
                 size: 17,
                 prev: Some(2226),
+                trailer: None,
                 id: Some((&ID0, &ID1)),
             },
             &payload,
@@ -807,12 +876,14 @@ mod tests {
             &mut out,
             ObjectRef::new(5, 0),
             &XrefStreamDict {
+                filtered: true,
                 widths: [1, 2, 1],
                 index: None,
                 info: None,
                 root: None,
                 size: 6,
                 prev: None,
+                trailer: None,
                 id: Some((&ID0, &ID1)),
             },
             &payload,

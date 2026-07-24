@@ -45,6 +45,74 @@ else
     echo "Skipping encrypted-r4-three-page.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/encrypted-recovered-eol-valid.pdf" || \
+      ! -f "$FIX/encrypted-recovered-eol.pdf" ]]; then
+    echo "Generating encrypted-recovered-eol.pdf ..."
+    TMPDIR_ENC_EOL="$(mktemp -d)"
+    trap 'rm -rf "$TMPDIR_ENC_EOL"' EXIT
+    python3 - "$TMPDIR_ENC_EOL/plain.pdf" <<'PY'
+import sys
+
+payload = b"q\n" + (b" " * 12341) + b"Q\n"
+assert len(payload) == 12345
+
+def obj(number, body):
+    return b"%d 0 obj\n" % number + body + b"\nendobj\n"
+
+objects = [
+    obj(1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+    obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    obj(
+        3,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << >> /Contents 4 0 R >>",
+    ),
+    obj(
+        4,
+        b"<< /Length 12345 >>\nstream\n"
+        + payload
+        + b"\nendstream",
+    ),
+]
+body = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+offsets = []
+for object_bytes in objects:
+    offsets.append(len(body))
+    body += object_bytes
+xref_offset = len(body)
+body += b"xref\n0 5\n0000000000 65535 f \n"
+for offset in offsets:
+    body += b"%010d 00000 n \n" % offset
+body += (
+    b"trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+    % xref_offset
+)
+open(sys.argv[1], "wb").write(body)
+PY
+    qpdf --object-streams=disable --stream-data=preserve \
+        --newline-before-endstream \
+        --static-id --static-aes-iv \
+        --encrypt "" "" 128 --use-aes=y --force-V4 -- \
+        --warning-exit-0 \
+        "$TMPDIR_ENC_EOL/plain.pdf" "$TMPDIR_ENC_EOL/encrypted.pdf"
+    cp -f "$TMPDIR_ENC_EOL/encrypted.pdf" \
+        "$FIX/encrypted-recovered-eol-valid.pdf"
+    python3 - "$TMPDIR_ENC_EOL/encrypted.pdf" "$FIX/encrypted-recovered-eol.pdf" <<'PY'
+import sys
+
+source = open(sys.argv[1], "rb").read()
+needle = b"/Length 12368"
+replacement = b"/Length 9 0 R"
+assert len(needle) == len(replacement)
+assert source.count(needle) == 1
+open(sys.argv[2], "wb").write(source.replace(needle, replacement, 1))
+PY
+    trap - EXIT
+    rm -rf "$TMPDIR_ENC_EOL"
+else
+    echo "Skipping encrypted-recovered-eol.pdf (already exists)"
+fi
+
 # ObjStm-bearing input (flpdf-zbf9): a cross-reference-stream + object-stream
 # input, used to verify the linearized writer drops the source's structural
 # containers (/Type /ObjStm, /Type /XRef) instead of leaking them.
@@ -181,6 +249,547 @@ open(sys.argv[1], "wb").write(body)
 PY
 else
     echo "Skipping missing-trailer-info.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/null-visible-matrix.pdf" ]]; then
+    echo "Generating null-visible matrix fixture ..."
+    python3 - "$FIX/null-visible-matrix.pdf" <<'PY'
+import sys
+
+def write_classic(path, objects, size, free_numbers=()):
+    body = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+    offsets = {}
+    for number, object_body in objects:
+        offsets[number] = len(body)
+        body += b"%d 0 obj\n" % number + object_body + b"\nendobj\n"
+    xref = len(body)
+    body += b"xref\n0 %d\n" % (max(max(offsets), max(free_numbers, default=0)) + 1)
+    body += b"0000000000 65535 f \n"
+    for number in range(1, max(max(offsets), max(free_numbers, default=0)) + 1):
+        if number in offsets:
+            body += b"%010d 00000 n \n" % offsets[number]
+        else:
+            body += b"0000000000 00000 f \n"
+    body += (
+        b"trailer\n<< /Size %d /Root 1 0 R >>\n"
+        b"startxref\n%d\n%%%%EOF\n"
+    ) % (size, xref)
+    open(path, "wb").write(body)
+
+matrix_objects = [
+    (1, b"<< /Type /Catalog /Pages 2 0 R /DirectNull null /Zero 0 0 R "
+        b"/Missing 99 0 R /Free 8 0 R /RealNull 5 0 R /Holder 6 0 R "
+        b"/Nested << /Drop 5 0 R /KeepArray [0 0 R 99 0 R 8 0 R 5 0 R 6 0 R] >> "
+        b"/KeepArray [0 0 R 99 0 R 8 0 R 5 0 R 6 0 R] "
+        b"/ArrayDict [<< /Drop 5 0 R /Keep 6 0 R >>] >>"),
+    (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << >> /Contents 4 0 R >>"),
+    (4, b"<< /Length 0 /Drop 5 0 R >>\nstream\n\nendstream"),
+    (5, b"null"),
+    (6, b"5 0 R"),
+]
+
+write_classic(sys.argv[1], matrix_objects, size=100, free_numbers=(7, 8))
+PY
+else
+    echo "Skipping null-visible matrix fixture (already exists)"
+fi
+
+if [[ ! -f "$FIX/null-visible-split-boundary.pdf" ]]; then
+    echo "Generating null-visible split-boundary fixture ..."
+    python3 - "$FIX/null-visible-split-boundary.pdf" <<'PY'
+import sys
+
+def write_classic(path, objects, size, free_numbers=()):
+    body = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+    offsets = {}
+    for number, object_body in objects:
+        offsets[number] = len(body)
+        body += b"%d 0 obj\n" % number + object_body + b"\nendobj\n"
+    xref = len(body)
+    body += b"xref\n0 %d\n" % (max(max(offsets), max(free_numbers, default=0)) + 1)
+    body += b"0000000000 65535 f \n"
+    for number in range(1, max(max(offsets), max(free_numbers, default=0)) + 1):
+        if number in offsets:
+            body += b"%010d 00000 n \n" % offsets[number]
+        else:
+            body += b"0000000000 00000 f \n"
+    body += (
+        b"trailer\n<< /Size %d /Root 1 0 R >>\n"
+        b"startxref\n%d\n%%%%EOF\n"
+    ) % (size, xref)
+    open(path, "wb").write(body)
+
+candidate_refs = b" ".join(b"%d 0 R" % number for number in range(5, 107))
+boundary_objects = [
+    (1, b"<< /Type /Catalog /Pages 2 0 R /ADrop 4 0 R /ZCandidates ["
+        + candidate_refs + b" 4 0 R] >>"),
+    (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+    (4, b"null"),
+]
+boundary_objects.extend(
+    (number, b"<< /Candidate %d >>" % number)
+    for number in range(5, 107)
+)
+write_classic(sys.argv[1], boundary_objects, size=107)
+PY
+else
+    echo "Skipping null-visible split-boundary fixture (already exists)"
+fi
+
+if [[ ! -f "$FIX/null-visible-stale-generation.pdf" ]]; then
+    echo "Generating null-visible stale-generation fixture ..."
+    python3 - "$FIX/null-visible-stale-generation.pdf" <<'PY'
+import sys
+
+body = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+offsets = {}
+objects = [
+    (1, 0, b"<< /Type /Catalog /Pages 2 0 R /Candidates [4 0 R 4 1 R] >>"),
+    (2, 0, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    (3, 0, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+    (4, 1, b"<< /Current true >>"),
+]
+for number, generation, object_body in objects:
+    offsets[number] = (len(body), generation)
+    body += b"%d %d obj\n" % (number, generation) + object_body + b"\nendobj\n"
+xref = len(body)
+body += b"xref\n0 5\n0000000000 65535 f \n"
+for number in range(1, 5):
+    offset, generation = offsets[number]
+    body += b"%010d %05d n \n" % (offset, generation)
+body += (
+    b"trailer\n<< /Size 5 /Root 1 0 R >>\n"
+    b"startxref\n%d\n%%%%EOF\n"
+) % xref
+open(sys.argv[1], "wb").write(body)
+PY
+else
+    echo "Skipping null-visible stale-generation fixture (already exists)"
+fi
+
+if [[ ! -f "$FIX/null-visible-cycle.pdf" ]]; then
+    echo "Generating null-visible-cycle.pdf ..."
+    python3 - "$FIX/null-visible-cycle.pdf" <<'PY'
+import sys
+
+def write_classic(path, objects, size, free_numbers=()):
+    body = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+    offsets = {}
+    for number, object_body in objects:
+        offsets[number] = len(body)
+        body += b"%d 0 obj\n" % number + object_body + b"\nendobj\n"
+    xref = len(body)
+    body += b"xref\n0 %d\n" % (max(max(offsets), max(free_numbers, default=0)) + 1)
+    body += b"0000000000 65535 f \n"
+    for number in range(1, max(max(offsets), max(free_numbers, default=0)) + 1):
+        if number in offsets:
+            body += b"%010d 00000 n \n" % offsets[number]
+        else:
+            body += b"0000000000 00000 f \n"
+    body += (
+        b"trailer\n<< /Size %d /Root 1 0 R >>\n"
+        b"startxref\n%d\n%%%%EOF\n"
+    ) % (size, xref)
+    open(path, "wb").write(body)
+
+cycle_objects = [
+    (1, b"<< /Type /Catalog /Pages 2 0 R /Cycle 6 0 R >>"),
+    (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << >> /Contents 4 0 R >>"),
+    (4, b"<< /Length 0 >>\nstream\n\nendstream"),
+    (5, b"null"),
+    (6, b"7 0 R"),
+    (7, b"6 0 R"),
+]
+
+write_classic(sys.argv[1], cycle_objects, size=8)
+PY
+else
+    echo "Skipping null-visible-cycle.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/null-visible-matrix-objstm.pdf" ]]; then
+    echo "Generating null-visible-matrix-objstm.pdf ..."
+    python3 - "$FIX/null-visible-matrix-objstm.pdf" <<'PY'
+import sys
+import zlib
+
+matrix_objects = [
+    (1, b"<< /Type /Catalog /Pages 2 0 R /DirectNull null /Zero 0 0 R "
+        b"/Missing 99 0 R /Free 8 0 R /RealNull 5 0 R /Holder 6 0 R "
+        b"/Nested << /Drop 5 0 R /KeepArray [0 0 R 99 0 R 8 0 R 5 0 R 6 0 R] >> "
+        b"/KeepArray [0 0 R 99 0 R 8 0 R 5 0 R 6 0 R] "
+        b"/ArrayDict [<< /Drop 5 0 R /Keep 6 0 R >>] >>"),
+    (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << >> /Contents 4 0 R >>"),
+    (4, b"<< /Length 0 /Drop 5 0 R >>\nstream\n\nendstream"),
+    (5, b"null"),
+    (6, b"5 0 R"),
+]
+
+members = [matrix_objects[i] for i in (0, 1, 2, 4, 5)]
+pair_table = b""
+member_body = b""
+for index, (number, object_body) in enumerate(members):
+    pair_table += b"%d %d " % (number, len(member_body))
+    member_body += object_body
+    if index + 1 < len(members):
+        member_body += b"\n"
+objstm_data = zlib.compress(pair_table + member_body)
+
+body = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n"
+offset4 = len(body)
+body += b"4 0 obj\n" + matrix_objects[3][1] + b"\nendobj\n"
+offset9 = len(body)
+body += (
+    b"9 0 obj\n<< /Type /ObjStm /N 5 /First %d /Length %d "
+    b"/Filter /FlateDecode >>\nstream\n" % (len(pair_table), len(objstm_data))
+)
+body += objstm_data + b"\nendstream\nendobj\n"
+offset10 = len(body)
+
+def append_xref_entry(entries, entry_type, field1, field2):
+    entries.append(entry_type)
+    entries.extend(field1.to_bytes(4, "big"))
+    entries.extend(field2.to_bytes(2, "big"))
+
+xref_entries = bytearray()
+append_xref_entry(xref_entries, 0, 0, 65535)
+append_xref_entry(xref_entries, 2, 9, 0)
+append_xref_entry(xref_entries, 2, 9, 1)
+append_xref_entry(xref_entries, 2, 9, 2)
+append_xref_entry(xref_entries, 1, offset4, 0)
+append_xref_entry(xref_entries, 2, 9, 3)
+append_xref_entry(xref_entries, 2, 9, 4)
+append_xref_entry(xref_entries, 0, 0, 0)
+append_xref_entry(xref_entries, 0, 0, 0)
+append_xref_entry(xref_entries, 1, offset9, 0)
+append_xref_entry(xref_entries, 1, offset10, 0)
+xref_data = zlib.compress(bytes(xref_entries))
+
+body += (
+    b"10 0 obj\n<< /Type /XRef /W [1 4 2] /Index [0 11] /Size 100 "
+    b"/Root 1 0 R /Length %d /Filter /FlateDecode >>\nstream\n" % len(xref_data)
+)
+body += xref_data + b"\nendstream\nendobj\n"
+body += b"startxref\n%d\n%%%%EOF\n" % offset10
+open(sys.argv[1], "wb").write(body)
+PY
+else
+    echo "Skipping null-visible-matrix-objstm.pdf (already exists)"
+fi
+
+if [[ ! -f "$FIX/null-visible-stale-generation-objstm.pdf" ]]; then
+    echo "Generating null-visible stale-generation ObjStm fixture ..."
+    python3 - "$FIX/null-visible-stale-generation-objstm.pdf" <<'PY'
+import sys
+import zlib
+
+members = [
+    (1, b"<< /Type /Catalog /Pages 2 0 R /Candidates [4 0 R 4 1 R] >>"),
+    (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+]
+pair_table = b""
+member_body = b""
+for index, (number, object_body) in enumerate(members):
+    pair_table += b"%d %d " % (number, len(member_body))
+    member_body += object_body
+    if index + 1 < len(members):
+        member_body += b"\n"
+objstm_data = zlib.compress(pair_table + member_body)
+
+body = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n"
+offset4 = len(body)
+body += b"4 1 obj\n<< /Current true >>\nendobj\n"
+offset9 = len(body)
+body += (
+    b"9 0 obj\n<< /Type /ObjStm /N 3 /First %d /Length %d "
+    b"/Filter /FlateDecode >>\nstream\n" % (len(pair_table), len(objstm_data))
+)
+body += objstm_data + b"\nendstream\nendobj\n"
+offset10 = len(body)
+
+def append_xref_entry(entries, entry_type, field1, field2):
+    entries.append(entry_type)
+    entries.extend(field1.to_bytes(4, "big"))
+    entries.extend(field2.to_bytes(2, "big"))
+
+xref_entries = bytearray()
+append_xref_entry(xref_entries, 0, 0, 65535)
+append_xref_entry(xref_entries, 2, 9, 0)
+append_xref_entry(xref_entries, 2, 9, 1)
+append_xref_entry(xref_entries, 2, 9, 2)
+append_xref_entry(xref_entries, 1, offset4, 1)
+for _number in range(5, 9):
+    append_xref_entry(xref_entries, 0, 0, 0)
+append_xref_entry(xref_entries, 1, offset9, 0)
+append_xref_entry(xref_entries, 1, offset10, 0)
+xref_data = zlib.compress(bytes(xref_entries))
+
+body += (
+    b"10 0 obj\n<< /Type /XRef /W [1 4 2] /Index [0 11] /Size 11 "
+    b"/Root 1 0 R /Length %d /Filter /FlateDecode >>\nstream\n" % len(xref_data)
+)
+body += xref_data + b"\nendstream\nendobj\n"
+body += b"startxref\n%d\n%%%%EOF\n" % offset10
+open(sys.argv[1], "wb").write(body)
+PY
+else
+    echo "Skipping null-visible stale-generation ObjStm fixture (already exists)"
+fi
+
+if [[ ! -f "$FIX/null-visible-preserve-mixed.pdf" || \
+      ! -f "$FIX/null-visible-preserve-unreachable.pdf" || \
+      ! -f "$FIX/null-visible-preserve-empty-removed.pdf" || \
+      ! -f "$FIX/null-visible-preserve-over-100.pdf" || \
+      ! -f "$FIX/null-visible-preserve-signature.pdf" || \
+      ! -f "$FIX/null-visible-preserve-signature-null-fields.pdf" ]]; then
+    echo "Generating Preserve reachability/container-boundary fixtures ..."
+    python3 - \
+        "$FIX/null-visible-preserve-mixed.pdf" \
+        "$FIX/null-visible-preserve-unreachable.pdf" \
+        "$FIX/null-visible-preserve-over-100.pdf" \
+        "$FIX/null-visible-preserve-signature.pdf" \
+        "$FIX/null-visible-preserve-signature-null-fields.pdf" \
+        "$FIX/null-visible-preserve-empty-removed.pdf" <<'PY'
+import sys
+import zlib
+
+def write_objstm(path, plain_objects, members, container_number, xref_number):
+    pair_table = b""
+    member_body = b""
+    for index, (number, object_body) in enumerate(members):
+        pair_table += b"%d %d " % (number, len(member_body))
+        member_body += object_body
+        if index + 1 < len(members):
+            member_body += b"\n"
+    objstm_data = zlib.compress(pair_table + member_body)
+
+    body = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n"
+    offsets = {}
+    for number, object_body in plain_objects:
+        offsets[number] = len(body)
+        body += b"%d 0 obj\n" % number + object_body + b"\nendobj\n"
+    offsets[container_number] = len(body)
+    body += (
+        b"%d 0 obj\n<< /Type /ObjStm /N %d /First %d /Length %d "
+        b"/Filter /FlateDecode >>\nstream\n"
+        % (container_number, len(members), len(pair_table), len(objstm_data))
+    )
+    body += objstm_data + b"\nendstream\nendobj\n"
+    offsets[xref_number] = len(body)
+
+    member_indices = {
+        number: index for index, (number, _object_body) in enumerate(members)
+    }
+
+    def append_xref_entry(entries, entry_type, field1, field2):
+        entries.append(entry_type)
+        entries.extend(field1.to_bytes(4, "big"))
+        entries.extend(field2.to_bytes(2, "big"))
+
+    size = xref_number + 1
+    xref_entries = bytearray()
+    for number in range(size):
+        if number == 0:
+            append_xref_entry(xref_entries, 0, 0, 65535)
+        elif number in member_indices:
+            append_xref_entry(
+                xref_entries, 2, container_number, member_indices[number]
+            )
+        elif number in offsets:
+            append_xref_entry(xref_entries, 1, offsets[number], 0)
+        else:
+            append_xref_entry(xref_entries, 0, 0, 0)
+    xref_data = zlib.compress(bytes(xref_entries))
+
+    body += (
+        b"%d 0 obj\n<< /Type /XRef /W [1 4 2] /Index [0 %d] /Size %d "
+        b"/Root 1 0 R /Length %d /Filter /FlateDecode >>\nstream\n"
+        % (xref_number, size, size, len(xref_data))
+    )
+    body += xref_data + b"\nendstream\nendobj\n"
+    body += b"startxref\n%d\n%%%%EOF\n" % offsets[xref_number]
+    open(path, "wb").write(body)
+
+empty_stream = b"<< /Length 0 >>\nstream\n\nendstream"
+
+write_objstm(
+    sys.argv[1],
+    [(4, empty_stream)],
+    [
+        (1, b"<< /Type /Catalog /Pages 2 0 R /Reachable 5 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << >> /Contents 4 0 R >>"),
+        (5, b"<< /Label (reachable) >>"),
+        (6, b"<< /Label (unreachable sibling) >>"),
+    ],
+    container_number=9,
+    xref_number=10,
+)
+
+write_objstm(
+    sys.argv[2],
+    [
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << >> /Contents 4 0 R >>"),
+        (4, empty_stream),
+    ],
+    [
+        (5, b"<< /Next 6 0 R /Label (unreachable root) >>"),
+        (6, b"<< /Label (unreachable child) >>"),
+    ],
+    container_number=9,
+    xref_number=10,
+)
+
+many_refs = b" ".join(b"%d 0 R" % number for number in range(5, 106))
+many_members = [
+    (1, b"<< /Type /Catalog /Pages 2 0 R /Many [" + many_refs + b"] >>"),
+    (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << >> /Contents 4 0 R >>"),
+]
+many_members.extend(
+    (number, b"<< /Ordinal %d >>" % number) for number in range(5, 106)
+)
+write_objstm(
+    sys.argv[3],
+    [(4, empty_stream)],
+    many_members,
+    container_number=106,
+    xref_number=107,
+)
+
+write_objstm(
+    sys.argv[4],
+    [(4, empty_stream)],
+    [
+        (1, b"<< /Type /Catalog /Pages 2 0 R /Signature 5 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << >> /Contents 4 0 R >>"),
+        (5, b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>"),
+    ],
+    container_number=9,
+    xref_number=10,
+)
+
+write_objstm(
+    sys.argv[5],
+    [(4, empty_stream)],
+    [
+        (1, b"<< /Type /Catalog /Pages 2 0 R /Signatures [5 0 R 6 0 R] >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << >> /Contents 4 0 R >>"),
+        (5, b"<< /Type /Sig /ByteRange null /Contents <00> >>"),
+        (6, b"<< /Type /Sig /ByteRange 7 0 R /Contents <00> >>"),
+        (7, b"null"),
+    ],
+    container_number=9,
+    xref_number=10,
+)
+
+# The source ObjStm is fully unreachable, so Preserve retains zero containers.
+# During the same getCompressibleObjGens walk qpdf sees 4 0 R before the current
+# 4 1 R, removes the stale generation, and serializes that array slot as direct
+# null. Object 7's xref entry is free at generation 2 while the array names
+# 7 1 R; it controls that a higher FREE generation does not enter removed_refs
+# (the free reference keeps qpdf's ordinary indirect-null resurrection path).
+def write_empty_preserve_removed(path):
+    def append_entry(entries, entry_type, field1, field2):
+        entries.append(entry_type)
+        entries.extend(field1.to_bytes(4, "big"))
+        entries.extend(field2.to_bytes(2, "big"))
+
+    plain_objects = [
+        (
+            1,
+            0,
+            b"<< /Type /Catalog /Pages 2 0 R "
+            b"/Candidates [4 0 R 4 1 R 7 1 R] >>",
+        ),
+        (2, 0, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            0,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ),
+        (4, 1, b"<< /Current true >>"),
+    ]
+    members = [
+        (5, b"<< /Next 6 0 R /Label (unreachable root) >>"),
+        (6, b"<< /Label (unreachable child) >>"),
+    ]
+    pair_table = b""
+    member_body = b""
+    for index, (number, object_body) in enumerate(members):
+        pair_table += b"%d %d " % (number, len(member_body))
+        member_body += object_body
+        if index + 1 < len(members):
+            member_body += b"\n"
+    objstm_data = zlib.compress(pair_table + member_body)
+
+    body = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n"
+    offsets = {}
+    generations = {}
+    for number, generation, object_body in plain_objects:
+        offsets[number] = len(body)
+        generations[number] = generation
+        body += (
+            b"%d %d obj\n" % (number, generation)
+            + object_body
+            + b"\nendobj\n"
+        )
+    offsets[9] = len(body)
+    body += (
+        b"9 0 obj\n<< /Type /ObjStm /N 2 /First %d /Length %d "
+        b"/Filter /FlateDecode >>\nstream\n"
+        % (len(pair_table), len(objstm_data))
+    )
+    body += objstm_data + b"\nendstream\nendobj\n"
+    offsets[10] = len(body)
+
+    member_indices = {number: index for index, (number, _body) in enumerate(members)}
+    xref_entries = bytearray()
+    for number in range(11):
+        if number == 0:
+            append_entry(xref_entries, 0, 0, 65535)
+        elif number in member_indices:
+            append_entry(xref_entries, 2, 9, member_indices[number])
+        elif number == 7:
+            append_entry(xref_entries, 0, 0, 2)
+        elif number in offsets:
+            append_entry(
+                xref_entries, 1, offsets[number], generations.get(number, 0)
+            )
+        else:
+            append_entry(xref_entries, 0, 0, 0)
+    xref_data = zlib.compress(bytes(xref_entries))
+    body += (
+        b"10 0 obj\n<< /Type /XRef /W [1 4 2] /Index [0 11] /Size 11 "
+        b"/Root 1 0 R /Length %d /Filter /FlateDecode >>\nstream\n"
+        % len(xref_data)
+    )
+    body += xref_data + b"\nendstream\nendobj\n"
+    body += b"startxref\n%d\n%%%%EOF\n" % offsets[10]
+    open(path, "wb").write(body)
+
+
+write_empty_preserve_removed(sys.argv[6])
+PY
+else
+    echo "Skipping Preserve reachability/container-boundary fixtures (already exist)"
 fi
 
 if [[ ! -f "$FIX/objstm-lin-split-boundary.pdf" ]]; then
@@ -888,6 +1497,18 @@ qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/objstm-lin-thumb-first-edge-wins.pdf" \
     "$FIX/objstm-lin-thumb-first-edge-wins-bearing.pdf"
 
+python3 "$ROOT/docs/plans/tools/gen_thumbnail_user_order.py" \
+    null-first-edge-wins "$FIX/null-visible-thumb-first-edge.pdf"
+qpdf --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-thumb-first-edge.pdf" \
+    "$FIX/null-visible-thumb-first-edge-bearing.pdf"
+
+python3 "$ROOT/docs/plans/tools/gen_od_indirect_length.py" --null-holder \
+    > "$FIX/null-visible-stream-null-length.pdf"
+python3 "$ROOT/docs/plans/tools/gen_null_length_framing.py" \
+    "$FIX/null-length-framing-matrix.pdf" \
+    "$FIX/null-length-framing-matrix-objstm.pdf"
+
 # ObjStm-bearing variant of the cap-boundary-199 fixture (flpdf-ihb.4). The raw
 # gen_shared_fonts.py 199 output has no source ObjStms, so --object-streams=preserve
 # on it yields an empty plan. Re-encoding through --object-streams=generate produces
@@ -1395,6 +2016,7 @@ mkdir -p \
     "$REF/three-page" \
     "$REF/linearized-one-page" \
     "$REF/encrypted-r4-three-page" \
+    "$REF/encrypted-recovered-eol" \
     "$REF/attachment-two-page" \
     "$REF/lone-flate-l9" \
     "$REF/qdf-contents-ref-array" \
@@ -1402,6 +2024,123 @@ mkdir -p \
     "$REF/objstm-gen-nostream-130rev"
 
 echo "=== Generating reference outputs ==="
+
+mkdir -p \
+    "$REF/null-visible-matrix" \
+    "$REF/null-visible-split-boundary" \
+    "$REF/null-visible-stale-generation" \
+    "$REF/null-visible-stale-generation-objstm" \
+    "$REF/null-visible-matrix-objstm" \
+    "$REF/null-visible-cycle" \
+    "$REF/null-visible-preserve-mixed" \
+    "$REF/null-visible-preserve-unreachable" \
+    "$REF/null-visible-preserve-empty-removed" \
+    "$REF/null-visible-preserve-over-100" \
+    "$REF/null-visible-preserve-signature" \
+    "$REF/null-visible-preserve-signature-null-fields"
+
+qpdf --object-streams=disable --static-id --warning-exit-0 \
+    "$FIX/null-visible-matrix.pdf" \
+    "$REF/null-visible-matrix/disable.pdf"
+qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/null-visible-matrix.pdf" \
+    "$REF/null-visible-matrix/generate.pdf"
+qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/null-visible-split-boundary.pdf" \
+    "$REF/null-visible-split-boundary/generate.pdf"
+qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/null-visible-stale-generation.pdf" \
+    "$REF/null-visible-stale-generation/generate.pdf"
+qpdf --object-streams=disable --static-id --warning-exit-0 \
+    "$FIX/null-visible-stale-generation.pdf" \
+    "$REF/null-visible-stale-generation/disable.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-stale-generation.pdf" \
+    "$REF/null-visible-stale-generation/preserve.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-stale-generation-objstm.pdf" \
+    "$REF/null-visible-stale-generation-objstm/preserve.pdf"
+for mode in preserve uncompress compress; do
+    qpdf --object-streams=generate --stream-data="$mode" --static-id --warning-exit-0 \
+        "$FIX/null-visible-stale-generation.pdf" \
+        "$REF/null-visible-stale-generation/stream-$mode.pdf"
+    qpdf --object-streams=preserve --stream-data="$mode" --static-id --warning-exit-0 \
+        "$FIX/null-visible-preserve-signature-null-fields.pdf" \
+        "$REF/null-visible-preserve-signature-null-fields/stream-$mode.pdf"
+done
+qpdf --object-streams=generate --compress-streams=n --static-id --warning-exit-0 \
+    "$FIX/null-visible-stale-generation.pdf" \
+    "$REF/null-visible-stale-generation/compress-streams-n.pdf"
+qpdf --object-streams=preserve --compress-streams=n --static-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-signature-null-fields.pdf" \
+    "$REF/null-visible-preserve-signature-null-fields/compress-streams-n.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-matrix-objstm.pdf" \
+    "$REF/null-visible-matrix-objstm/preserve.pdf"
+qpdf --linearize --object-streams=disable --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-matrix.pdf" \
+    "$REF/null-visible-matrix/linearize.pdf"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-matrix.pdf" \
+    "$REF/null-visible-matrix/linearize-objstm.pdf"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-matrix-objstm.pdf" \
+    "$REF/null-visible-matrix-objstm/linearize-objstm-preserve.pdf"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-stale-generation-objstm.pdf" \
+    "$REF/null-visible-stale-generation-objstm/linearize-objstm-preserve.pdf"
+qpdf --object-streams=disable --static-id --warning-exit-0 \
+    "$FIX/null-visible-cycle.pdf" \
+    "$REF/null-visible-cycle/disable.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-matrix/disable.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-matrix/generate.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-split-boundary/generate.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-stale-generation/generate.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-matrix-objstm/preserve.pdf"
+qpdf --check-linearization "$REF/null-visible-matrix/linearize.pdf"
+qpdf --check-linearization "$REF/null-visible-matrix/linearize-objstm.pdf"
+qpdf --check-linearization \
+    "$REF/null-visible-matrix-objstm/linearize-objstm-preserve.pdf"
+qpdf --check-linearization \
+    "$REF/null-visible-stale-generation-objstm/linearize-objstm-preserve.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-cycle/disable.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-mixed.pdf" \
+    "$REF/null-visible-preserve-mixed/preserve.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-unreachable.pdf" \
+    "$REF/null-visible-preserve-unreachable/preserve.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-empty-removed.pdf" \
+    "$REF/null-visible-preserve-empty-removed/preserve.pdf"
+qpdf --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-empty-removed.pdf" \
+    "$REF/null-visible-preserve-empty-removed/deterministic-id.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-over-100.pdf" \
+    "$REF/null-visible-preserve-over-100/preserve.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-signature.pdf" \
+    "$REF/null-visible-preserve-signature/preserve.pdf"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-signature-null-fields.pdf" \
+    "$REF/null-visible-preserve-signature-null-fields/preserve.pdf"
+qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-signature-null-fields.pdf" \
+    "$REF/null-visible-preserve-signature-null-fields/generate.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-preserve-mixed/preserve.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-preserve-unreachable/preserve.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-preserve-empty-removed/preserve.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-preserve-empty-removed/deterministic-id.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-preserve-over-100/preserve.pdf"
+qpdf --check --warning-exit-0 "$REF/null-visible-preserve-signature/preserve.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-preserve-signature-null-fields/preserve.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-preserve-signature-null-fields/generate.pdf"
 
 # --- one-page: plain, static-id, linearize ---
 qpdf --deterministic-id --warning-exit-0 \
@@ -1775,6 +2514,22 @@ qpdf --decrypt --static-id --warning-exit-0 \
     "$FIX/encrypted-r4-three-page.pdf" "$REF/encrypted-r4-three-page/plain.pdf"
 echo "encrypted-r4-three-page/plain.pdf"
 
+# --- encrypted recovered-stream EOL: source encryption framing must not be
+# appended to the decrypted plaintext payload. Both paths use unfiltered stream
+# data so a stray LF is directly observable in the byte oracle.
+qpdf --decrypt --linearize --object-streams=disable --stream-data=preserve \
+    --deterministic-id --warning-exit-0 \
+    "$FIX/encrypted-recovered-eol-valid.pdf" \
+    "$REF/encrypted-recovered-eol/linearize-disable.pdf"
+qpdf --decrypt --linearize --object-streams=generate --stream-data=preserve \
+    --deterministic-id --warning-exit-0 \
+    "$FIX/encrypted-recovered-eol-valid.pdf" \
+    "$REF/encrypted-recovered-eol/linearize-objstm.pdf"
+qpdf --check-linearization \
+    "$REF/encrypted-recovered-eol/linearize-disable.pdf"
+qpdf --check-linearization \
+    "$REF/encrypted-recovered-eol/linearize-objstm.pdf"
+
 # --- attachment-two-page: plain, static-id ---
 qpdf --deterministic-id --warning-exit-0 \
     "$FIX/attachment-two-page.pdf" "$REF/attachment-two-page/plain.pdf"
@@ -1845,6 +2600,96 @@ for stem in objstm-lin-thumb-direct-descendant objstm-lin-thumb-first-edge-wins;
     qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
         "$FIX/$bearing.pdf" "$REF/$bearing/linearize-objstm-preserve.pdf"
     qpdf --check-linearization "$REF/$bearing/linearize-objstm-preserve.pdf"
+done
+
+mkdir -p \
+    "$REF/null-visible-thumb-first-edge" \
+    "$REF/null-visible-thumb-first-edge-bearing" \
+    "$REF/null-visible-stream-null-length" \
+    "$REF/null-length-framing-matrix" \
+    "$REF/null-length-framing-matrix-objstm"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-thumb-first-edge.pdf" \
+    "$REF/null-visible-thumb-first-edge/linearize-objstm.pdf"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-thumb-first-edge-bearing.pdf" \
+    "$REF/null-visible-thumb-first-edge-bearing/linearize-objstm-preserve.pdf"
+for stream_data in preserve uncompress; do
+    qpdf --linearize --object-streams=generate \
+        --stream-data="$stream_data" --deterministic-id --warning-exit-0 \
+        "$FIX/null-visible-thumb-first-edge.pdf" \
+        "$REF/null-visible-thumb-first-edge/linearize-objstm-stream-$stream_data.pdf"
+    qpdf --linearize --object-streams=preserve \
+        --stream-data="$stream_data" --deterministic-id --warning-exit-0 \
+        "$FIX/null-visible-thumb-first-edge-bearing.pdf" \
+        "$REF/null-visible-thumb-first-edge-bearing/linearize-objstm-stream-$stream_data.pdf"
+done
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-stale-generation.pdf" \
+    "$REF/null-visible-stale-generation/linearize-objstm.pdf"
+qpdf --linearize --object-streams=disable --stream-data=preserve \
+    --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-stream-null-length.pdf" \
+    "$REF/null-visible-stream-null-length/linearize-preserve.pdf"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-signature.pdf" \
+    "$REF/null-visible-preserve-signature/linearize-objstm-preserve.pdf"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-preserve-signature-null-fields.pdf" \
+    "$REF/null-visible-preserve-signature-null-fields/linearize-objstm-preserve.pdf"
+for stream_data in preserve uncompress compress; do
+    qpdf --object-streams=disable \
+        --stream-data="$stream_data" --static-id --warning-exit-0 \
+        "$FIX/null-length-framing-matrix.pdf" \
+        "$REF/null-length-framing-matrix/plain-$stream_data.pdf"
+    qpdf --object-streams=generate \
+        --stream-data="$stream_data" --static-id --warning-exit-0 \
+        "$FIX/null-length-framing-matrix.pdf" \
+        "$REF/null-length-framing-matrix/generate-$stream_data.pdf"
+    qpdf --object-streams=preserve \
+        --stream-data="$stream_data" --static-id --warning-exit-0 \
+        "$FIX/null-length-framing-matrix-objstm.pdf" \
+        "$REF/null-length-framing-matrix-objstm/preserve-$stream_data.pdf"
+    qpdf --linearize --object-streams=disable \
+        --stream-data="$stream_data" --deterministic-id --warning-exit-0 \
+        "$FIX/null-length-framing-matrix.pdf" \
+        "$REF/null-length-framing-matrix/linearize-$stream_data.pdf"
+done
+qpdf --check-linearization \
+    "$REF/null-visible-thumb-first-edge/linearize-objstm.pdf"
+qpdf --check-linearization \
+    "$REF/null-visible-thumb-first-edge-bearing/linearize-objstm-preserve.pdf"
+for stream_data in preserve uncompress; do
+    qpdf --check-linearization \
+        "$REF/null-visible-thumb-first-edge/linearize-objstm-stream-$stream_data.pdf"
+    qpdf --check-linearization \
+        "$REF/null-visible-thumb-first-edge-bearing/linearize-objstm-stream-$stream_data.pdf"
+done
+qpdf --check-linearization \
+    "$REF/null-visible-stale-generation/linearize-objstm.pdf"
+qpdf --check-linearization \
+    "$REF/null-visible-stream-null-length/linearize-preserve.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-stream-null-length/linearize-preserve.pdf"
+qpdf --check-linearization \
+    "$REF/null-visible-preserve-signature/linearize-objstm-preserve.pdf"
+qpdf --check-linearization \
+    "$REF/null-visible-preserve-signature-null-fields/linearize-objstm-preserve.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-preserve-signature/linearize-objstm-preserve.pdf"
+qpdf --check --warning-exit-0 \
+    "$REF/null-visible-preserve-signature-null-fields/linearize-objstm-preserve.pdf"
+for stream_data in preserve uncompress compress; do
+    qpdf --check --warning-exit-0 \
+        "$REF/null-length-framing-matrix/plain-$stream_data.pdf"
+    qpdf --check --warning-exit-0 \
+        "$REF/null-length-framing-matrix/generate-$stream_data.pdf"
+    qpdf --check --warning-exit-0 \
+        "$REF/null-length-framing-matrix-objstm/preserve-$stream_data.pdf"
+    qpdf --check-linearization \
+        "$REF/null-length-framing-matrix/linearize-$stream_data.pdf"
+    qpdf --check --warning-exit-0 \
+        "$REF/null-length-framing-matrix/linearize-$stream_data.pdf"
 done
 
 # Linearized generate-mode >cap goldens (flpdf-g6hb.2). See the fixture block

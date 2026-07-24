@@ -3033,8 +3033,8 @@ fn run_rewrite(
         } else {
             false
         };
-        let use_generate = options.object_streams == ObjectStreamMode::Generate;
-        let plan = LinearizationPlan::from_pdf(&mut pdf, use_generate)?;
+        let plan =
+            LinearizationPlan::from_pdf_with_object_stream_mode(&mut pdf, options.object_streams)?;
         let renumber = RenumberMap::from_plan(&plan);
 
         // Re-open the PDF so `write_linearized` can seek/read objects independently.

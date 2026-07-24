@@ -72,6 +72,26 @@ fn compress_yes_adds_flate_to_unfiltered_stream() {
     );
 }
 
+#[test]
+fn shared_compress_yes_keeps_encoded_empty_payload() {
+    let stream = make_stream(None, Vec::new());
+
+    let result = apply_stream_compress_policy(&stream, CompressStreams::Yes);
+    let Object::Stream(out) = result else {
+        panic!("expected Object::Stream");
+    };
+    let expected = flate_encode(&[]);
+
+    assert_eq!(
+        out.data, expected,
+        "shared Generate/linearized/encryption compression must retain its encoded empty payload"
+    );
+    assert_eq!(
+        out.dict.get("Length"),
+        Some(&Object::Integer(out.data.len() as i64))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // (b) No: FlateDecode stream → raw output, /Filter absent, data correct
 // ---------------------------------------------------------------------------
@@ -288,6 +308,32 @@ fn build_minimal_pdf_with_flate_stream() -> (Vec<u8>, Vec<u8>) {
     (bytes, raw)
 }
 
+fn build_minimal_pdf_with_empty_stream() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+
+    let catalog_offset = bytes.len();
+    bytes
+        .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n");
+    let pages_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [4 0 R] >>\nendobj\n");
+    let stream_offset = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n");
+    let page_offset = bytes.len();
+    bytes.extend_from_slice(
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    );
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 5\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in [catalog_offset, pages_offset, stream_offset, page_offset] {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(b"trailer\n<< /Size 5 /Root 1 0 R >>\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
 /// Resolve the content stream that the Catalog references via `/Metadata`.
 ///
 /// Full-rewrite output is renumbered Catalog-first, so the stream's object
@@ -306,6 +352,115 @@ fn resolve_metadata_stream<R: std::io::Read + std::io::Seek>(pdf: &mut flpdf::Pd
         Object::Stream(s) => s,
         other => panic!("/Metadata must be a stream, got {other:?}"),
     }
+}
+
+fn assert_legacy_encoded_empty_payload(
+    stream: &Stream,
+    route: &str,
+    expected_stored_length: Option<i64>,
+) {
+    let expected = flate_encode(&[]);
+    assert_eq!(
+        stream.data, expected,
+        "{route} must retain the shared 8-byte encoded empty payload"
+    );
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Name(b"FlateDecode".to_vec()))
+    );
+    if let Some(expected_stored_length) = expected_stored_length {
+        assert_eq!(
+            stream.dict.get("Length"),
+            Some(&Object::Integer(expected_stored_length))
+        );
+    }
+}
+
+#[test]
+fn generate_route_matches_qpdf_empty_refilter() {
+    use flpdf::{write_pdf_with_options, ObjectStreamMode, Pdf, WriteOptions};
+    use std::io::Cursor;
+
+    let mut pdf = Pdf::open(Cursor::new(build_minimal_pdf_with_empty_stream())).unwrap();
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Generate;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
+    let stream = resolve_metadata_stream(&mut reopened);
+    assert!(
+        stream.data.is_empty(),
+        "qpdf Generate keeps the Flate filter but emits no wrapper bytes for an empty stream"
+    );
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Name(b"FlateDecode".to_vec()))
+    );
+    assert_eq!(stream.dict.get("Length"), Some(&Object::Integer(0)));
+}
+
+#[test]
+fn linearized_route_matches_qpdf_empty_refilter() {
+    use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
+    use flpdf::{Pdf, WriteOptions};
+    use std::io::Cursor;
+
+    let source = build_minimal_pdf_with_empty_stream();
+    let mut plan_pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
+    let plan = LinearizationPlan::from_pdf(&mut plan_pdf, false).unwrap();
+    let renumber = RenumberMap::from_plan(&plan);
+    let mut write_pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let mut document =
+        write_linearized(&plan, &renumber, &mut write_pdf, &WriteOptions::default()).unwrap();
+    document.back_patch().unwrap();
+
+    let mut reopened = Pdf::open(Cursor::new(document.bytes)).unwrap();
+    let stream = resolve_metadata_stream(&mut reopened);
+    assert!(
+        stream.data.is_empty(),
+        "qpdf linearization keeps the Flate filter but emits no wrapper bytes for an empty stream"
+    );
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Name(b"FlateDecode".to_vec()))
+    );
+    assert_eq!(stream.dict.get("Length"), Some(&Object::Integer(0)));
+}
+
+#[test]
+fn output_encryption_route_keeps_encoded_empty_payload() {
+    use flpdf::{write_pdf_with_options, EncryptParams, Pdf, PdfOpenOptions, WriteOptions};
+    use std::io::Cursor;
+
+    let mut pdf = Pdf::open(Cursor::new(build_minimal_pdf_with_empty_stream())).unwrap();
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.static_id = true;
+    options.static_aes_iv = true;
+    options.encrypt = Some(EncryptParams::v4_aes128(
+        b"user".to_vec(),
+        b"owner".to_vec(),
+    ));
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let mut reopened = Pdf::open_with_options(
+        Cursor::new(output),
+        PdfOpenOptions {
+            password: b"user".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+    let stream = resolve_metadata_stream(&mut reopened);
+    // The reader decrypts `stream.data` but retains the on-disk encrypted
+    // `/Length` (32 bytes: zero IV + padded ciphertext), so only the decrypted
+    // compression payload is asserted for this route.
+    assert_legacy_encoded_empty_payload(&stream, "output encryption", None);
 }
 
 #[test]

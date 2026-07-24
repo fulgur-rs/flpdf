@@ -357,42 +357,13 @@ fn dict_to_json(dict: &Dictionary) -> Result<JsonValue, ConvertError> {
     Ok(JsonValue::Object(pairs))
 }
 
-fn qpdf_reference_is_valid(reference: ObjectRef) -> bool {
-    reference.number > 0 && reference.generation < u16::MAX
-}
-
-fn qpdf_reference_resolves_to_null<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    reference: ObjectRef,
-) -> Result<bool, ConvertError> {
-    if !qpdf_reference_is_valid(reference) {
-        return Ok(true);
-    }
-    let mut current = reference;
-    let mut visited = std::collections::BTreeSet::new();
-    loop {
-        if !visited.insert(current) {
-            return Ok(true);
-        }
-        match pdf.resolve_qpdf_json_object(current)? {
-            Object::Null => return Ok(true),
-            Object::Reference(next) => current = next,
-            _ => return Ok(false),
-        }
-    }
-}
-
 fn qpdf_dict_to_json<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dict: &Dictionary,
 ) -> Result<JsonValue, ConvertError> {
     let mut pairs = Vec::new();
     for (raw_key, value) in dict.iter() {
-        let omit = match value {
-            Object::Null => true,
-            Object::Reference(reference) => qpdf_reference_resolves_to_null(pdf, *reference)?,
-            _ => false,
-        };
+        let omit = crate::qpdf_null::value_is_null(pdf, value)?;
         if omit {
             continue;
         }
@@ -410,7 +381,9 @@ fn qpdf_pdf_object_to_json<R: Read + Seek>(
     object: &Object,
 ) -> Result<JsonValue, ConvertError> {
     match object {
-        Object::Reference(reference) if !qpdf_reference_is_valid(*reference) => Ok(JsonValue::Null),
+        Object::Reference(reference) if !crate::qpdf_null::reference_is_valid(*reference) => {
+            Ok(JsonValue::Null)
+        }
         Object::Reference(reference) => Ok(JsonValue::String(format!(
             "{} {} R",
             reference.number, reference.generation
@@ -5255,7 +5228,7 @@ mod tests {
         pdf.set_object(first, Object::Reference(second));
         pdf.set_object(second, Object::Reference(first));
 
-        assert!(qpdf_reference_resolves_to_null(&mut pdf, first).unwrap());
+        assert!(crate::qpdf_null::reference_is_null(&mut pdf, first).unwrap());
         assert_eq!(
             qpdf_resolve_top_level_object(&mut pdf, first).unwrap(),
             Object::Null

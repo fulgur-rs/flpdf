@@ -136,6 +136,12 @@ impl Default for PlannerConfig {
 pub(crate) struct PackingPlan {
     /// Each inner `Vec` is one ObjStm batch, members in deterministic order.
     pub batches: Vec<Vec<ObjectRef>>,
+    /// Exact stale generations removed by qpdf's compressible-object walk.
+    ///
+    /// Standard enqueue does not remove these references. Generate and
+    /// source-ObjStm Preserve carry them into their dedicated serializer so
+    /// array occurrences become inline null and dictionary values disappear.
+    pub removed_refs: BTreeSet<ObjectRef>,
 }
 
 /// Convert public [`WriteOptions`](crate::WriteOptions) into an internal
@@ -167,7 +173,7 @@ pub(crate) fn planner_config_from_options(options: &crate::WriteOptions) -> Plan
 ///
 /// - `Disable`  → returns an empty plan (zero batches).
 /// - `Preserve` → reconstructs the source document's ObjStm grouping,
-///   skipping ineligible members and splitting batches that exceed the cap.
+///   skipping ineligible members and applying the configured legacy cap.
 /// - `Generate` → greedily packs all eligible objects in
 ///   `(number, generation)` ascending order, cap-delimited.
 pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
@@ -183,9 +189,35 @@ pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
 
     match config.mode {
         ObjectStreamMode::Disable => unreachable!(),
-        ObjectStreamMode::Preserve => plan_preserve(pdf, config, &ctx, &length_exclusions),
+        ObjectStreamMode::Preserve => plan_preserve(
+            pdf,
+            &ctx,
+            &length_exclusions,
+            None,
+            Some(config.batch_size_cap),
+        ),
         ObjectStreamMode::Generate => plan_generate(pdf, config, &ctx, &length_exclusions),
     }
+}
+
+/// Reconstruct Preserve-mode source containers after filtering their members
+/// through qpdf's compressible-object walk.
+///
+/// qpdf's `preserveObjectStreams` intersects the source object-to-container map
+/// with `getCompressibleObjGens`. Container membership and source member order
+/// are retained, and Preserve never applies Generate's 100-member cap. The
+/// traversal's operation-specific stale-generation removals are returned with
+/// the batches for the dedicated serializer.
+pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::reader::Pdf<R>,
+) -> crate::Result<PackingPlan> {
+    let ctx = eligibility_context(pdf)?;
+    let length_exclusions = collect_indirect_objstm_length_refs(pdf)?;
+    let compressible = compressible_objgens_qpdf_plan(pdf)?;
+    let eligible: BTreeSet<ObjectRef> = compressible.eligible.iter().copied().collect();
+    let mut plan = plan_preserve(pdf, &ctx, &length_exclusions, Some(&eligible), None)?;
+    plan.removed_refs = compressible.removed_refs;
+    Ok(plan)
 }
 
 /// Eligible objects in qpdf's `QPDF::getCompressibleObjGens` order
@@ -195,23 +227,56 @@ pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
 /// in a generated object stream when more than one container is needed, so the
 /// port must reproduce it exactly.
 ///
-/// Returns each reachable indirect object's reference in first-visit order. A
-/// reference with no live cross-reference entry (a dangling/missing ref that
-/// resolves to `Null` only because the object is absent) is excluded: qpdf
-/// treats such a ref as null, so it never enters the compressible set.
+/// Returns each reachable indirect object's reference in first-visit order.
+/// qpdf hides dictionary entries whose values resolve to null, but retains
+/// indirect identities reached from arrays even when they are missing, free,
+/// or real-null objects.
 pub(crate) fn compressible_objgens<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
 ) -> crate::Result<Vec<ObjectRef>> {
+    Ok(compressible_objgens_qpdf_plan(pdf)?.eligible)
+}
+
+/// Generate/source-ObjStm-Preserve traversal result. qpdf removes a stale
+/// generation only while computing compressible objects, then serializes those
+/// exact references as null. Keeping the removed set beside the eligible order
+/// prevents standard enqueue from accidentally inheriting this policy.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CompressiblePlan {
+    pub eligible: Vec<ObjectRef>,
+    pub removed_refs: BTreeSet<ObjectRef>,
+}
+
+/// Snapshot a resolved object without retaining opaque stream payload bytes.
+///
+/// The traversal only follows stream dictionaries, so cloning their data would
+/// add memory proportional to the largest stream for no semantic benefit.
+fn snapshot_traversal_object(object: &Object) -> Object {
+    match object {
+        Object::Stream(stream) => Object::Stream(crate::Stream {
+            dict: stream.dict.clone(),
+            data: Vec::new(),
+        }),
+        other => other.clone(),
+    }
+}
+
+pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::reader::Pdf<R>,
+) -> crate::Result<CompressiblePlan> {
     let mut visited: BTreeSet<u32> = BTreeSet::new();
     let mut result: Vec<ObjectRef> = Vec::new();
-    // Live xref entries only (excludes Missing / Deleted / Reserved). A reached
-    // ref outside this set is a dangling reference qpdf would treat as null, so
-    // it is dropped. A *live* object that resolves to null (a real
-    // `n 0 obj null endobj`) stays eligible here — flpdf keeps it as an ObjStm
-    // member, whereas qpdf drops every null-resolving object. That residual
-    // divergence is out of scope for this filter (which targets only
-    // missing/dangling refs) and is tracked separately (flpdf-v58c).
-    let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+    let mut removed_refs = BTreeSet::new();
+    // qpdf's obj_cache upper_bound test is operation-specific. Build the
+    // highest LIVE generation index once so null edges are O(1), and exclude
+    // free/deleted generations from superseding a lower live object.
+    let mut highest_live_generation: BTreeMap<u32, u16> = BTreeMap::new();
+    for object_ref in pdf.live_object_refs() {
+        highest_live_generation
+            .entry(object_ref.number)
+            .and_modify(|generation| *generation = (*generation).max(object_ref.generation))
+            .or_insert(object_ref.generation);
+    }
     // The encryption dictionary is excluded from the result, matching qpdf's
     // `m->trailer.getKey("/Encrypt")` guard (QPDF.cc:2402/2437): it must stay a
     // plain indirect object so the rest of the file can be decrypted. Read it
@@ -227,34 +292,44 @@ pub(crate) fn compressible_objgens<R: std::io::Read + std::io::Seek>(
     while let Some(obj) = stack.pop() {
         match obj {
             Object::Reference(r) => {
+                if r.number == 0 {
+                    continue;
+                }
+                if highest_live_generation
+                    .get(&r.number)
+                    .is_some_and(|generation| *generation > r.generation)
+                {
+                    removed_refs.insert(r);
+                    continue;
+                }
                 if !visited.insert(r.number) {
                     continue;
                 }
-                // Borrow (do not clone) the resolved object: it is only read
-                // within this iteration to test eligibility and push its
-                // children, so cloning would needlessly copy a stream's entire
-                // data payload (potentially megabytes).
-                let resolved = pdf.resolve_borrowed(r)?;
+                let resolved = {
+                    let object = pdf.resolve_borrowed(r)?;
+                    snapshot_traversal_object(object)
+                };
+                let is_signature = is_qpdf_signature_dict(pdf, r)?;
                 // Streams, signature value dictionaries, and the encryption
                 // dictionary cannot be stored inside an object stream, so they
                 // are excluded from the result — but they are still traversed for
                 // child references (QPDF.cc:2437-2445).
-                if !matches!(resolved, Object::Stream(_))
-                    && !is_signature_dict(resolved)
-                    && Some(r) != encrypt_ref
-                    && live.contains(&r)
+                if !matches!(resolved, Object::Stream(_)) && !is_signature && Some(r) != encrypt_ref
                 {
                     result.push(r);
                 }
-                push_children(resolved, &mut stack);
+                push_children(pdf, &resolved, &mut stack)?;
             }
             // Direct (inline) container: traversed for its children but never
             // contributes a reference (it has no object number of its own).
-            other => push_children(&other, &mut stack),
+            other => push_children(pdf, &other, &mut stack)?,
         }
     }
 
-    Ok(result)
+    Ok(CompressiblePlan {
+        eligible: result,
+        removed_refs,
+    })
 }
 
 /// Distribute `eligible` objects into object-stream groups using qpdf's
@@ -274,26 +349,66 @@ pub(crate) fn even_split_into_streams(eligible: &[ObjectRef]) -> Vec<Vec<ObjectR
     eligible.chunks(n_per).map(|chunk| chunk.to_vec()).collect()
 }
 
-/// Returns `true` for a signature value dictionary: `/Type /Sig` carrying both
-/// `/ByteRange` and `/Contents` (matching qpdf's `isDictionaryOfType("/Sig")`
-/// guard at QPDF.cc:2440). The signed byte range must stay outside any object
-/// stream.
-fn is_signature_dict(obj: &Object) -> bool {
-    let Some(dict) = obj.as_dict() else {
-        return false; // cov:ignore: callers gate on non-stream resolved dicts
+/// qpdf signature eligibility uses `QPDF_Dictionary::hasKey`, whose
+/// value `isNull()` check dereferences indirect objects. A raw dictionary key
+/// whose value is direct null or resolves to null is therefore absent for this
+/// predicate. This is shared by Generate's `getCompressibleObjGens` port and
+/// Preserve's source-container filtering.
+pub(crate) fn is_qpdf_signature_dict<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::reader::Pdf<R>,
+    object_ref: ObjectRef,
+) -> crate::Result<bool> {
+    let (mut type_value, byte_range, contents) = {
+        let object = pdf.resolve_borrowed(object_ref)?;
+        let Object::Dictionary(dict) = object else {
+            return Ok(false);
+        };
+        (
+            dict.get("Type")
+                .map(snapshot_traversal_object)
+                .unwrap_or(Object::Null),
+            dict.get("ByteRange").map(snapshot_traversal_object),
+            dict.get("Contents").map(snapshot_traversal_object),
+        )
     };
-    dict_type_is(dict, b"Sig") && dict.get("ByteRange").is_some() && dict.get("Contents").is_some()
+    let mut type_refs = BTreeSet::new();
+    while let Object::Reference(reference) = type_value {
+        if reference.number == 0 || !type_refs.insert(reference) {
+            return Ok(false);
+        }
+        type_value = match pdf.resolve_borrowed(reference)? {
+            Object::Reference(next) => Object::Reference(*next),
+            Object::Name(name) => Object::Name(name.clone()),
+            _ => return Ok(false),
+        };
+    }
+    if !matches!(type_value, Object::Name(name) if name.as_slice() == b"Sig") {
+        return Ok(false);
+    }
+
+    let key_is_visible =
+        |pdf: &mut crate::reader::Pdf<R>, value: Option<&Object>| -> crate::Result<bool> {
+            match value {
+                Some(value) => Ok(!crate::qpdf_null::value_is_null(pdf, value)?),
+                None => Ok(false),
+            }
+        };
+    Ok(key_is_visible(pdf, byte_range.as_ref())? && key_is_visible(pdf, contents.as_ref())?)
 }
 
 /// Push an object's child values onto the DFS stack so they pop in qpdf's
 /// traversal order: dictionary values in ascending key order, array items in
 /// index order. (A LIFO stack pops in reverse insertion order, so children are
 /// pushed reversed.)
-fn push_children(obj: &Object, stack: &mut Vec<Object>) {
+fn push_children<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::reader::Pdf<R>,
+    obj: &Object,
+    stack: &mut Vec<Object>,
+) -> crate::Result<()> {
     match obj {
-        Object::Dictionary(d) => push_dict_children(d, stack, false),
+        Object::Dictionary(d) => push_dict_children(pdf, d, stack, false)?,
         // A stream is traversed via its dictionary; the data bytes are opaque.
-        Object::Stream(s) => push_dict_children(&s.dict, stack, true),
+        Object::Stream(s) => push_dict_children(pdf, &s.dict, stack, true)?,
         Object::Array(items) => {
             for v in items.iter().rev() {
                 stack.push(v.clone());
@@ -301,20 +416,25 @@ fn push_children(obj: &Object, stack: &mut Vec<Object>) {
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Push a dictionary's values onto the DFS stack in ascending-key pop order.
 /// For a stream dictionary (`is_stream`), `/Length` is omitted from the
 /// traversal, matching qpdf (QPDF.cc:2451): an indirect length holder must not
 /// be pulled into the compressible set via the stream.
-fn push_dict_children(d: &Dictionary, stack: &mut Vec<Object>, is_stream: bool) {
-    let entries: Vec<(&[u8], &Object)> = d.iter().collect();
-    for (key, value) in entries.into_iter().rev() {
-        if is_stream && key == b"Length" {
-            continue;
-        }
-        stack.push(value.clone());
+fn push_dict_children<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::reader::Pdf<R>,
+    dict: &Dictionary,
+    stack: &mut Vec<Object>,
+    is_stream: bool,
+) -> crate::Result<()> {
+    let entries = crate::qpdf_null::snapshot_entries(dict, is_stream);
+    let entries = crate::qpdf_null::visible_entries(pdf, entries)?;
+    for (_, value) in entries.into_iter().rev() {
+        stack.push(value);
     }
+    Ok(())
 }
 
 /// Collect the set of ObjectRefs that serve as indirect /Length targets of any
@@ -341,9 +461,10 @@ pub(crate) fn collect_indirect_objstm_length_refs<R: std::io::Read + std::io::Se
 /// Preserve mode: reconstruct source ObjStm grouping.
 fn plan_preserve<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::reader::Pdf<R>,
-    config: &PlannerConfig,
     ctx: &EligibilityContext,
     length_exclusions: &BTreeSet<ObjectRef>,
+    reachable: Option<&BTreeSet<ObjectRef>>,
+    batch_size_cap: Option<NonZeroUsize>,
 ) -> crate::Result<PackingPlan> {
     let entries = pdf.source_xref_entries();
 
@@ -357,7 +478,6 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
         }
     }
 
-    let cap = config.batch_size_cap.get();
     let mut batches: Vec<Vec<ObjectRef>> = Vec::new();
 
     // Iterate containers in ascending container-number order.
@@ -368,24 +488,36 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
         // Filter ineligible members.
         let mut eligible: Vec<ObjectRef> = Vec::new();
         for (_idx, obj_ref) in members {
-            if length_exclusions.contains(&obj_ref) {
+            if length_exclusions.contains(&obj_ref)
+                || reachable.is_some_and(|reachable| !reachable.contains(&obj_ref))
+            {
                 continue;
             }
-            let obj = pdf.resolve_borrowed(obj_ref)?;
-            if is_eligible_for_objstm(obj_ref, obj, ctx) {
-                eligible.push(obj_ref);
+            let eligible_for_objstm = {
+                let obj = pdf.resolve_borrowed(obj_ref)?;
+                is_eligible_for_objstm(obj_ref, obj, ctx)
+            };
+            if !eligible_for_objstm {
+                continue;
             }
+            eligible.push(obj_ref);
         }
 
-        // Split into cap-sized batches (preserving order, same container slot).
-        for chunk in eligible.chunks(cap) {
-            if !chunk.is_empty() {
-                batches.push(chunk.to_vec());
+        if let Some(cap) = batch_size_cap {
+            for chunk in eligible.chunks(cap.get()) {
+                if !chunk.is_empty() {
+                    batches.push(chunk.to_vec());
+                }
             }
+        } else if !eligible.is_empty() {
+            batches.push(eligible);
         }
     }
 
-    Ok(PackingPlan { batches })
+    Ok(PackingPlan {
+        batches,
+        removed_refs: BTreeSet::new(),
+    })
 }
 
 /// Generate mode: greedily pack all eligible objects in number/generation order.
@@ -437,7 +569,10 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
         batches.push(current_batch);
     }
 
-    Ok(PackingPlan { batches })
+    Ok(PackingPlan {
+        batches,
+        removed_refs: BTreeSet::new(),
+    })
 }
 
 // ── ObjStm body emitter ───────────────────────────────────────────────────────
@@ -691,6 +826,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compressible_objgens_does_not_treat_higher_free_generation_as_obsolete() {
+        let bytes = pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /Candidate 4 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (4, b"<< /Current true >>".to_vec()),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        pdf.delete_object(ObjectRef::new(4, 1));
+
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+
+        assert!(
+            eligible.contains(&ref0(4)),
+            "a higher free generation must not make the lower live generation stale"
+        );
+    }
+
     /// Build a classic-xref PDF from pre-formatted object bodies (the bytes
     /// between `N 0 obj\n` and `\nendobj`), `/Root 1 0 R`. Object numbers must be
     /// `1..=bodies.len()` and supplied in ascending order.
@@ -813,6 +973,198 @@ mod tests {
         );
     }
 
+    /// qpdf's null-aware `hasKey` predicate also treats a missing signature
+    /// field as absent, so an incomplete `/Type /Sig` dictionary is not
+    /// excluded from a preserved source object stream.
+    #[test]
+    fn qpdf_preserve_signature_predicate_requires_both_visible_fields() {
+        let bytes = pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /SigTest 4 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (4, b"<< /Type /Sig /ByteRange [0 10 20 30] >>".to_vec()),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+
+        assert!(
+            !is_qpdf_signature_dict(&mut pdf, ref0(4)).unwrap(),
+            "missing /Contents is absent under qpdf's hasKey semantics"
+        );
+    }
+
+    #[test]
+    fn compressible_objgens_uses_qpdf_null_visibility_and_array_identity() {
+        let bytes = pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /DictOnly 4 0 R \
+                  /Array [5 0 R 99 0 R] >>"
+                    .to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (4, b"null".to_vec()),
+            (5, b"null".to_vec()),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let dict_only_real_null = ref0(4);
+        let array_real_null = ref0(5);
+        let array_missing = ref0(99);
+
+        assert_eq!(
+            eligible,
+            vec![ref0(1), array_real_null, array_missing, ref0(2), ref0(3)]
+        );
+        assert!(!eligible.contains(&dict_only_real_null));
+        assert!(eligible.contains(&array_real_null));
+        assert!(eligible.contains(&array_missing));
+    }
+
+    #[test]
+    fn compressible_objgens_keeps_signature_with_null_fields() {
+        let bytes = pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /SigTest 4 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (
+                4,
+                b"<< /Type /Sig /ByteRange 5 0 R /Contents <00> >>".to_vec(),
+            ),
+            (5, b"null".to_vec()),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+
+        assert!(
+            eligible.contains(&ref0(4)),
+            "null-resolving /ByteRange is absent under qpdf hasKey semantics"
+        );
+    }
+
+    #[test]
+    fn compressible_objgens_resolves_indirect_signature_type() {
+        let bytes = pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /SigTest 4 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (
+                4,
+                b"<< /Type 5 0 R /ByteRange [0 10 20 30] /Contents <00> >>".to_vec(),
+            ),
+            (5, b"null".to_vec()),
+            (6, b"/Sig".to_vec()),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        // qpdf-compatible file-object recovery parses a top-level bare
+        // reference as an integer. Seed the holder as a reference so this test
+        // exercises the shared chained-reference predicate.
+        pdf.set_object(ref0(5), Object::Reference(ref0(6)));
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+
+        assert!(
+            !eligible.contains(&ref0(4)),
+            "qpdf isDictionaryOfType dereferences a chained indirect /Type"
+        );
+    }
+
+    #[test]
+    fn compressible_objgens_keeps_signature_with_non_name_indirect_type() {
+        let bytes = pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /SigTest 4 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (
+                4,
+                b"<< /Type 5 0 R /ByteRange [0 10 20 30] /Contents <00> >>".to_vec(),
+            ),
+            (5, b"null".to_vec()),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+
+        assert!(
+            eligible.contains(&ref0(4)),
+            "a non-name indirect /Type does not identify a signature dictionary"
+        );
+    }
+
+    #[test]
+    fn compressible_objgens_treats_object_zero_signature_type_as_null() {
+        let bytes = pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /SigTest 4 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (
+                4,
+                b"<< /Type 0 0 R /ByteRange [0 10 20 30] /Contents <00> >>".to_vec(),
+            ),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+
+        assert!(
+            eligible.contains(&ref0(4)),
+            "qpdf resolves object-zero /Type to null, so this is not a /Sig dictionary"
+        );
+    }
+
+    #[test]
+    fn null_visible_split_boundary_matches_qpdf_group_sizes() {
+        let bytes =
+            include_bytes!("../../../../tests/fixtures/compat/null-visible-split-boundary.pdf");
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let groups = even_split_into_streams(&eligible);
+        let expected_first: Vec<ObjectRef> = [ref0(1), ref0(2), ref0(3)]
+            .into_iter()
+            .chain((5..=54).map(ref0))
+            .collect();
+        let expected_second: Vec<ObjectRef> = (55..=106).map(ref0).chain([ref0(4)]).collect();
+
+        assert_eq!(eligible.len(), 106);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![53, 53]
+        );
+        assert_eq!(groups[0], expected_first);
+        assert_eq!(groups[1], expected_second);
+    }
+
     /// qpdf's `generateObjectStreams` (QPDFWriter.cc:1981) picks
     /// `ceil(n/100)` streams then spreads objects evenly
     /// (`n_per = ceil(n/streams)`), never greedily filling 100 then spilling.
@@ -880,7 +1232,13 @@ mod tests {
             crate::reader::Pdf::open(std::io::Cursor::new(reverse_kids_pdf(130))).unwrap();
         let eligible = compressible_objgens(&mut pdf).unwrap();
         let groups = even_split_into_streams(&eligible);
-        let rn = crate::rewrite_renumber::GenerateRenumber::build(&mut pdf, &groups, true).unwrap();
+        let rn = crate::rewrite_renumber::GenerateRenumber::build(
+            &mut pdf,
+            &groups,
+            true,
+            &BTreeSet::new(),
+        )
+        .unwrap();
 
         let n = |src: u32| rn.new_for_original(ref0(src)).map(|r| r.number);
         assert_eq!(n(1), Some(2), "Catalog");
@@ -932,6 +1290,52 @@ mod tests {
     fn stream_object_is_ineligible() {
         let obj = Object::Stream(Stream::new(Dictionary::new(), vec![]));
         assert!(!is_eligible_for_objstm(ref0(1), &obj, &no_ctx()));
+    }
+
+    #[test]
+    fn traversal_snapshot_replaces_stream_payload_with_dictionary() {
+        let mut dict = Dictionary::new();
+        dict.insert("Child", Object::Reference(ref0(7)));
+        let obj = Object::Stream(Stream::new(dict.clone(), vec![0x5a; 1024 * 1024]));
+
+        let snapshot = snapshot_traversal_object(&obj);
+
+        assert_eq!(
+            snapshot,
+            Object::Stream(Stream::new(dict, Vec::new())),
+            "stream traversal snapshot must retain its kind without payload bytes"
+        );
+    }
+
+    #[test]
+    fn compressible_walk_follows_stream_dictionary_without_payload_snapshot() {
+        let payload = vec![0x5a; 1024 * 1024];
+        let mut stream_body =
+            format!("<< /Length {} /Child 5 0 R >>\nstream\n", payload.len()).into_bytes();
+        stream_body.extend_from_slice(&payload);
+        stream_body.extend_from_slice(b"\nendstream");
+        let bytes = pdf_from_bodies(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /Payload 4 0 R >>".to_vec(),
+            ),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (4, stream_body),
+            (5, b"<< /Marker true >>".to_vec()),
+        ]);
+        let mut pdf = crate::reader::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+
+        let eligible = compressible_objgens(&mut pdf).unwrap();
+
+        assert!(!eligible.contains(&ref0(4)), "streams are not compressible");
+        assert!(
+            eligible.contains(&ref0(5)),
+            "the stream dictionary remains part of the object graph"
+        );
     }
 
     #[test]
