@@ -2479,6 +2479,24 @@ fn preserved_source_container_number(
     Ok(source_container_number)
 }
 
+fn reject_multiple_generations(plan: &LinearizationPlan) -> Result<()> {
+    let mut previous_number = None;
+    for object_ref in plan.renumber_assigned_refs() {
+        if previous_number == Some(object_ref.number) {
+            return Err(crate::Error::Unsupported(
+                "QPDF cannot currently linearize files that contain multiple objects with the \
+                 same object ID and different generations.  If you see this error message, \
+                 please file a bug report and attach the file if possible.  As a workaround, \
+                 first convert the file with qpdf without linearizing, and then linearize the \
+                 result of that conversion."
+                    .to_string(),
+            ));
+        }
+        previous_number = Some(object_ref.number);
+    }
+    Ok(())
+}
+
 pub fn write_linearized<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
@@ -2535,9 +2553,10 @@ pub fn write_linearized<R: Read + Seek>(
     // `/OpenAction`) out of Part 2/3 — a placement difference that would leak
     // generate-mode ordering into the suppressed classic output. So rebuild the
     // plan (and renumber) in disable mode and normalize the options to Disable.
-    // `from_pdf(.., false)` is the same call the non-suppressed disable path
-    // makes; the extra walk only happens in the rare suppression case. show.rs /
-    // check.rs callers pass `false` + default options, so this never fires there.
+    // The explicit Disable call below is the same mode the non-suppressed
+    // disable path uses; the extra walk only happens in the rare suppression
+    // case. show.rs / check.rs callers use default Disable options, so this
+    // never fires there.
     //
     // Fires for Generate AND Preserve (anything but Disable): Preserve on an
     // ObjStm SOURCE would otherwise keep the inherited ObjStm, so drop it too.
@@ -2555,7 +2574,10 @@ pub fn write_linearized<R: Read + Seek>(
             options.object_streams,
             crate::writer::ObjectStreamMode::Disable
         ) {
-        rebuilt_plan = LinearizationPlan::from_pdf(pdf, false)?;
+        rebuilt_plan = LinearizationPlan::from_pdf_with_object_stream_mode(
+            pdf,
+            crate::writer::ObjectStreamMode::Disable,
+        )?;
         rebuilt_renumber = RenumberMap::from_plan(&rebuilt_plan);
         suppressed_options = WriteOptions {
             object_streams: crate::writer::ObjectStreamMode::Disable,
@@ -2565,6 +2587,12 @@ pub fn write_linearized<R: Read + Seek>(
     } else {
         (plan, renumber, options)
     };
+
+    // qpdf's linearization maps discard generations only after asserting that
+    // every surviving object number is unique. Generate, and Preserve on an
+    // ObjStm source, have already removed stale generations while planning;
+    // standard Disable/Preserve retain them and must reject the file here.
+    reject_multiple_generations(plan)?;
 
     // ------------------------------------------------------------------
     // Pre-compute values that do not change across iterations.

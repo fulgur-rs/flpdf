@@ -729,6 +729,28 @@ impl LinearizationPlan {
         pdf: &mut Pdf<R>,
         use_generate_objstm: bool,
     ) -> crate::Result<Self> {
+        let mode = if use_generate_objstm {
+            crate::writer::ObjectStreamMode::Generate
+        } else {
+            crate::writer::ObjectStreamMode::Disable
+        };
+        Self::from_pdf_with_object_stream_mode(pdf, mode)
+    }
+
+    /// Construct a mode-aware linearization plan.
+    ///
+    /// Unlike the historical boolean API, this distinguishes standard
+    /// Preserve from source-ObjStm Preserve. qpdf runs its
+    /// `getCompressibleObjGens` stale-generation removal only for Generate and
+    /// when Preserve actually consumes source object streams.
+    pub fn from_pdf_with_object_stream_mode<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        object_stream_mode: crate::writer::ObjectStreamMode,
+    ) -> crate::Result<Self> {
+        let use_generate_objstm = matches!(
+            object_stream_mode,
+            crate::writer::ObjectStreamMode::Generate
+        );
         // Push inherited page attributes (/MediaBox /CropBox /Resources
         // /Rotate) down to /Page leaves and strip them from interior /Pages
         // nodes, mirroring qpdf's pushInheritedAttributesToPage — this always
@@ -802,7 +824,24 @@ impl LinearizationPlan {
         // qpdf classifies them as first-page section objects (Part 2) when reached
         // from the first page, giving them HIGH object numbers. Without this, they
         // land in part4_rest with LOW numbers (flpdf-o9im).
-        let resurrectable = crate::rewrite_renumber::resurrectable_null_refs(pdf)?;
+        let source_had_compressed_objects =
+            pdf.source_xref_entries()
+                .iter()
+                .any(|(_reference, offset)| {
+                    matches!(offset, crate::xref::XrefOffset::Compressed { .. })
+                });
+        let operation_removes_stale_generations = use_generate_objstm
+            || (matches!(
+                object_stream_mode,
+                crate::writer::ObjectStreamMode::Preserve
+            ) && source_had_compressed_objects);
+        let removed_refs = if operation_removes_stale_generations {
+            crate::writer::object_streams::compressible_objgens_qpdf_plan(pdf)?.removed_refs
+        } else {
+            BTreeSet::new()
+        };
+        let resurrectable =
+            crate::rewrite_renumber::resurrectable_null_refs_excluding(pdf, &removed_refs)?;
         let mut resurrected: Vec<ObjectRef> = resurrectable
             .iter()
             .filter(|r| all_refs.binary_search(r).is_err())

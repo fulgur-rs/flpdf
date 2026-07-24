@@ -1154,7 +1154,7 @@ fn linearize_mode_force_version(fixture: &str, mode: ObjectStreamMode, force: &s
 
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf, mode == ObjectStreamMode::Generate).unwrap();
+    let plan = LinearizationPlan::from_pdf_with_object_stream_mode(&mut pdf, mode).unwrap();
     let renumber = RenumberMap::from_plan(&plan);
 
     let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));

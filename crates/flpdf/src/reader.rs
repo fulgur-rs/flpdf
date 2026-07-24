@@ -364,6 +364,13 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Exact source framing removed by an authoritative `endstream` scan.
     pub(crate) fn recovered_stream_eol(&self, object_ref: ObjectRef) -> Option<&'static [u8]> {
+        // The recovery scan runs against source bytes. For encrypted streams,
+        // that means this byte belongs to the ciphertext framing, not to the
+        // plaintext returned by `resolve`. Passing it to a rewrite encoder
+        // after decryption would append a spurious byte to the decoded stream.
+        if self.encryption.is_some() {
+            return None;
+        }
         self.recovered_stream_eols
             .get(&object_ref)
             .copied()

@@ -5,7 +5,7 @@
 use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
 use flpdf::{
     write_pdf_with_options, CompressStreams, NewlineBeforeEndstream, Object, ObjectRef,
-    ObjectStreamMode, Pdf, StreamDataMode, WriteOptions,
+    ObjectStreamMode, Pdf, PdfOpenOptions, StreamDataMode, WriteOptions,
 };
 use std::fs::File;
 use std::io::{BufReader, Cursor};
@@ -57,19 +57,51 @@ fn linearize_mode_with_stream_data(
     mode: ObjectStreamMode,
     stream_data: Option<StreamDataMode>,
 ) -> Vec<u8> {
+    linearize_mode_result(fixture, mode, stream_data).expect("linearized write")
+}
+
+fn linearize_mode_result(
+    fixture: &str,
+    mode: ObjectStreamMode,
+    stream_data: Option<StreamDataMode>,
+) -> flpdf::Result<Vec<u8>> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join(fixture);
 
-    let mut pdf = Pdf::open(BufReader::new(File::open(&path).unwrap())).expect("source must parse");
-    let plan =
-        LinearizationPlan::from_pdf(&mut pdf, mode == ObjectStreamMode::Generate).expect("plan");
+    let mut pdf = Pdf::open(BufReader::new(File::open(&path).unwrap()))?;
+    let plan = LinearizationPlan::from_pdf_with_object_stream_mode(&mut pdf, mode)?;
     let renumber = RenumberMap::from_plan(&plan);
 
-    let mut pdf = Pdf::open(BufReader::new(File::open(&path).unwrap())).expect("source must parse");
+    let mut pdf = Pdf::open(BufReader::new(File::open(&path).unwrap()))?;
     let mut options = WriteOptions::default();
     options.object_streams = mode;
     options.stream_data = stream_data;
+    options.deterministic_id = true;
+    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let mut document = write_linearized(&plan, &renumber, &mut pdf, &options)?;
+    document.back_patch()?;
+    Ok(document.bytes)
+}
+
+fn linearize_encrypted_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let open_options = PdfOpenOptions::default();
+    let mut pdf = Pdf::open_with_options(
+        BufReader::new(File::open(&path).unwrap()),
+        open_options.clone(),
+    )
+    .expect("encrypted source must authenticate");
+    let plan = LinearizationPlan::from_pdf_with_object_stream_mode(&mut pdf, mode).expect("plan");
+    let renumber = RenumberMap::from_plan(&plan);
+
+    let mut pdf = Pdf::open_with_options(BufReader::new(File::open(&path).unwrap()), open_options)
+        .expect("encrypted source must authenticate");
+    let mut options = WriteOptions::default();
+    options.object_streams = mode;
+    options.stream_data = Some(StreamDataMode::Preserve);
     options.deterministic_id = true;
     options.newline_before_endstream = NewlineBeforeEndstream::Never;
     let mut document =
@@ -394,6 +426,48 @@ fn linearize_generate_stale_generation_inlines_null_without_body() {
         ),
         "null-visible-stale-generation/linearize-objstm.pdf",
     );
+}
+
+#[test]
+fn linearize_standard_modes_reject_multiple_live_generations_like_qpdf() {
+    const QPDF_ERROR: &str = "cannot currently linearize files that contain multiple objects \
+        with the same object ID and different generations";
+    for mode in [ObjectStreamMode::Disable, ObjectStreamMode::Preserve] {
+        let error = linearize_mode_result("null-visible-stale-generation.pdf", mode, None)
+            .expect_err("standard qpdf linearization must reject duplicate generations");
+        assert!(
+            error.to_string().contains(QPDF_ERROR),
+            "{mode:?}: unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn linearize_preserve_source_objstm_removes_only_stale_generation() {
+    assert_golden(
+        &linearize_mode(
+            "null-visible-stale-generation-objstm.pdf",
+            ObjectStreamMode::Preserve,
+        ),
+        "null-visible-stale-generation-objstm/linearize-objstm-preserve.pdf",
+    );
+}
+
+#[test]
+fn linearize_encrypted_recovered_eol_is_not_appended_to_plaintext() {
+    for (mode, golden) in [
+        (
+            ObjectStreamMode::Disable,
+            "encrypted-recovered-eol/linearize-disable.pdf",
+        ),
+        (
+            ObjectStreamMode::Generate,
+            "encrypted-recovered-eol/linearize-objstm.pdf",
+        ),
+    ] {
+        let actual = linearize_encrypted_mode("encrypted-recovered-eol.pdf", mode);
+        assert_golden(&actual, golden);
+    }
 }
 
 #[test]

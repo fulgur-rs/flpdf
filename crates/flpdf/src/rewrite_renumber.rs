@@ -312,8 +312,16 @@ pub(crate) fn reachable_object_set<R: Read + Seek>(
 /// this set a second time.
 ///
 /// Propagates resolve errors and the [`MAX_INLINE_DEPTH`] guard from the walk.
-pub(crate) fn resurrectable_null_refs<R: Read + Seek>(
+/// Null-resolving references to retain, minus any identities removed by the
+/// current qpdf operation's compressible-object walk.
+///
+/// `removed_refs` is the exact stale-generation set returned by
+/// `getCompressibleObjGens` parity logic. Checking this once-built set during
+/// the null-edge walk avoids the former O(null edges × live refs) rescan while
+/// preserving standard enqueue semantics when the set is empty.
+pub(crate) fn resurrectable_null_refs_excluding<R: Read + Seek>(
     pdf: &mut Pdf<R>,
+    removed_refs: &BTreeSet<ObjectRef>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
     let root = pdf
         .root_ref()
@@ -331,7 +339,15 @@ pub(crate) fn resurrectable_null_refs<R: Read + Seek>(
             continue;
         }
         let mut follow: Vec<ObjectRef> = Vec::new();
-        walk_surviving(pdf, &value, 0, false, &mut follow, &mut result)?;
+        walk_surviving(
+            pdf,
+            &value,
+            0,
+            false,
+            &mut follow,
+            &mut result,
+            removed_refs,
+        )?;
         queue.extend(follow);
     }
 
@@ -341,7 +357,7 @@ pub(crate) fn resurrectable_null_refs<R: Read + Seek>(
         }
         let obj = pdf.resolve(cur)?;
         let mut follow: Vec<ObjectRef> = Vec::new();
-        walk_surviving(pdf, &obj, 0, false, &mut follow, &mut result)?;
+        walk_surviving(pdf, &obj, 0, false, &mut follow, &mut result, removed_refs)?;
         for r in follow {
             if !visited.contains(&r) {
                 queue.push_back(r);
@@ -351,7 +367,8 @@ pub(crate) fn resurrectable_null_refs<R: Read + Seek>(
     Ok(result)
 }
 
-/// Drop-aware structural walk for [`resurrectable_null_refs`]. Distinguishes
+/// Drop-aware structural walk for [`resurrectable_null_refs_excluding`].
+/// Distinguishes
 /// array position (`in_array`) from dict-value position: a null-resolving
 /// reference (`number > 0`) is collected into `result` only when it sits in an
 /// array (a surviving edge); a dict/stream value that is null-resolving is
@@ -364,6 +381,7 @@ fn walk_surviving<R: Read + Seek>(
     in_array: bool,
     follow: &mut Vec<ObjectRef>,
     result: &mut BTreeSet<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
 ) -> crate::Result<()> {
     if depth > MAX_INLINE_DEPTH {
         return Err(Error::Unsupported(
@@ -375,16 +393,11 @@ fn walk_surviving<R: Read + Seek>(
     if crate::qpdf_null::value_is_null(pdf, obj)? {
         if in_array {
             if let Object::Reference(reference) = obj {
-                // A higher LIVE generation makes this a stale edge that qpdf
-                // directizes to null without allocating a body. A free xref
-                // entry is different: qpdf still resurrects an array-visible
-                // free reference as a numbered null object.
-                let superseded_by_live_generation =
-                    pdf.live_object_refs().into_iter().any(|candidate| {
-                        candidate.number == reference.number
-                            && candidate.generation > reference.generation
-                    });
-                if reference.number > 0 && !superseded_by_live_generation {
+                // Generate and source-ObjStm Preserve directize only refs the
+                // operation's compressible walk removed. Standard enqueue
+                // passes an empty set and retains the stale identity until the
+                // linearization duplicate-generation guard rejects it.
+                if reference.number > 0 && !removed_refs.contains(reference) {
                     result.insert(*reference);
                 }
             }
@@ -398,17 +411,17 @@ fn walk_surviving<R: Read + Seek>(
         }
         Object::Array(elements) => {
             for e in elements {
-                walk_surviving(pdf, e, depth + 1, true, follow, result)?;
+                walk_surviving(pdf, e, depth + 1, true, follow, result, removed_refs)?;
             }
         }
         Object::Dictionary(dict) => {
             for (_key, value) in dict.iter() {
-                walk_surviving(pdf, value, depth + 1, false, follow, result)?;
+                walk_surviving(pdf, value, depth + 1, false, follow, result, removed_refs)?;
             }
         }
         Object::Stream(stream) => {
             for (_key, value) in stream.dict.iter() {
-                walk_surviving(pdf, value, depth + 1, false, follow, result)?;
+                walk_surviving(pdf, value, depth + 1, false, follow, result, removed_refs)?;
             }
         }
         _ => {}
@@ -1012,7 +1025,8 @@ mod tests {
             (10, b"<< >>"),
         ]);
         let mut pdf = Pdf::open_mem(&bytes).expect("open");
-        let got = resurrectable_null_refs(&mut pdf).expect("resurrectable");
+        let got =
+            resurrectable_null_refs_excluding(&mut pdf, &BTreeSet::new()).expect("resurrectable");
         let nums: BTreeSet<u32> = got.iter().map(|r| r.number).collect();
         assert!(
             nums.contains(&98),
@@ -1049,6 +1063,31 @@ mod tests {
     }
 
     #[test]
+    fn resurrectable_excludes_only_operation_removed_generation() {
+        let bytes =
+            include_bytes!("../../../tests/fixtures/compat/null-visible-stale-generation.pdf");
+        let stale = ObjectRef::new(4, 0);
+
+        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let standard = resurrectable_null_refs_excluding(&mut pdf, &BTreeSet::new())
+            .expect("standard resurrectable");
+        assert!(
+            standard.contains(&stale),
+            "standard enqueue retains the stale identity for the linearization guard"
+        );
+
+        let mut removed = BTreeSet::new();
+        removed.insert(stale);
+        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let filtered =
+            resurrectable_null_refs_excluding(&mut pdf, &removed).expect("filtered resurrectable");
+        assert!(
+            !filtered.contains(&stale),
+            "the operation-specific removed set directizes the stale reference"
+        );
+    }
+
+    #[test]
     fn resurrectable_errors_on_excessive_array_nesting() {
         // A `/Deep` value nested deeper than MAX_INLINE_DEPTH must make the
         // drop-aware walk refuse rather than silently stop (leaving refs in the
@@ -1070,7 +1109,7 @@ mod tests {
         let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>";
         let bytes = build_raw_pdf(&[(1, &cat), (2, pages), (3, page)]);
         let mut pdf = Pdf::open_mem(&bytes).expect("open");
-        let got = resurrectable_null_refs(&mut pdf);
+        let got = resurrectable_null_refs_excluding(&mut pdf, &BTreeSet::new());
         assert!(
             matches!(got, Err(crate::Error::Unsupported(_))),
             "over-deep nesting must error, not silently truncate"

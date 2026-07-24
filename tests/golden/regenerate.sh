@@ -45,6 +45,74 @@ else
     echo "Skipping encrypted-r4-three-page.pdf (already exists)"
 fi
 
+if [[ ! -f "$FIX/encrypted-recovered-eol-valid.pdf" || \
+      ! -f "$FIX/encrypted-recovered-eol.pdf" ]]; then
+    echo "Generating encrypted-recovered-eol.pdf ..."
+    TMPDIR_ENC_EOL="$(mktemp -d)"
+    trap 'rm -rf "$TMPDIR_ENC_EOL"' EXIT
+    python3 - "$TMPDIR_ENC_EOL/plain.pdf" <<'PY'
+import sys
+
+payload = b"q\n" + (b" " * 12341) + b"Q\n"
+assert len(payload) == 12345
+
+def obj(number, body):
+    return b"%d 0 obj\n" % number + body + b"\nendobj\n"
+
+objects = [
+    obj(1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+    obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    obj(
+        3,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << >> /Contents 4 0 R >>",
+    ),
+    obj(
+        4,
+        b"<< /Length 12345 >>\nstream\n"
+        + payload
+        + b"\nendstream",
+    ),
+]
+body = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+offsets = []
+for object_bytes in objects:
+    offsets.append(len(body))
+    body += object_bytes
+xref_offset = len(body)
+body += b"xref\n0 5\n0000000000 65535 f \n"
+for offset in offsets:
+    body += b"%010d 00000 n \n" % offset
+body += (
+    b"trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+    % xref_offset
+)
+open(sys.argv[1], "wb").write(body)
+PY
+    qpdf --object-streams=disable --stream-data=preserve \
+        --newline-before-endstream \
+        --static-id --static-aes-iv \
+        --encrypt "" "" 128 --use-aes=y --force-V4 -- \
+        --warning-exit-0 \
+        "$TMPDIR_ENC_EOL/plain.pdf" "$TMPDIR_ENC_EOL/encrypted.pdf"
+    cp -f "$TMPDIR_ENC_EOL/encrypted.pdf" \
+        "$FIX/encrypted-recovered-eol-valid.pdf"
+    python3 - "$TMPDIR_ENC_EOL/encrypted.pdf" "$FIX/encrypted-recovered-eol.pdf" <<'PY'
+import sys
+
+source = open(sys.argv[1], "rb").read()
+needle = b"/Length 12368"
+replacement = b"/Length 9 0 R"
+assert len(needle) == len(replacement)
+assert source.count(needle) == 1
+open(sys.argv[2], "wb").write(source.replace(needle, replacement, 1))
+PY
+    trap - EXIT
+    rm -rf "$TMPDIR_ENC_EOL"
+else
+    echo "Skipping encrypted-recovered-eol.pdf (already exists)"
+fi
+
 # ObjStm-bearing input (flpdf-zbf9): a cross-reference-stream + object-stream
 # input, used to verify the linearized writer drops the source's structural
 # containers (/Type /ObjStm, /Type /XRef) instead of leaking them.
@@ -1948,6 +2016,7 @@ mkdir -p \
     "$REF/three-page" \
     "$REF/linearized-one-page" \
     "$REF/encrypted-r4-three-page" \
+    "$REF/encrypted-recovered-eol" \
     "$REF/attachment-two-page" \
     "$REF/lone-flate-l9" \
     "$REF/qdf-contents-ref-array" \
@@ -2017,6 +2086,9 @@ qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
 qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
     "$FIX/null-visible-matrix-objstm.pdf" \
     "$REF/null-visible-matrix-objstm/linearize-objstm-preserve.pdf"
+qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
+    "$FIX/null-visible-stale-generation-objstm.pdf" \
+    "$REF/null-visible-stale-generation-objstm/linearize-objstm-preserve.pdf"
 qpdf --object-streams=disable --static-id --warning-exit-0 \
     "$FIX/null-visible-cycle.pdf" \
     "$REF/null-visible-cycle/disable.pdf"
@@ -2031,6 +2103,8 @@ qpdf --check-linearization "$REF/null-visible-matrix/linearize.pdf"
 qpdf --check-linearization "$REF/null-visible-matrix/linearize-objstm.pdf"
 qpdf --check-linearization \
     "$REF/null-visible-matrix-objstm/linearize-objstm-preserve.pdf"
+qpdf --check-linearization \
+    "$REF/null-visible-stale-generation-objstm/linearize-objstm-preserve.pdf"
 qpdf --check --warning-exit-0 "$REF/null-visible-cycle/disable.pdf"
 qpdf --object-streams=preserve --static-id --warning-exit-0 \
     "$FIX/null-visible-preserve-mixed.pdf" \
@@ -2439,6 +2513,22 @@ echo "linearized-one-page/linearize.pdf"
 qpdf --decrypt --static-id --warning-exit-0 \
     "$FIX/encrypted-r4-three-page.pdf" "$REF/encrypted-r4-three-page/plain.pdf"
 echo "encrypted-r4-three-page/plain.pdf"
+
+# --- encrypted recovered-stream EOL: source encryption framing must not be
+# appended to the decrypted plaintext payload. Both paths use unfiltered stream
+# data so a stray LF is directly observable in the byte oracle.
+qpdf --decrypt --linearize --object-streams=disable --stream-data=preserve \
+    --deterministic-id --warning-exit-0 \
+    "$FIX/encrypted-recovered-eol-valid.pdf" \
+    "$REF/encrypted-recovered-eol/linearize-disable.pdf"
+qpdf --decrypt --linearize --object-streams=generate --stream-data=preserve \
+    --deterministic-id --warning-exit-0 \
+    "$FIX/encrypted-recovered-eol-valid.pdf" \
+    "$REF/encrypted-recovered-eol/linearize-objstm.pdf"
+qpdf --check-linearization \
+    "$REF/encrypted-recovered-eol/linearize-disable.pdf"
+qpdf --check-linearization \
+    "$REF/encrypted-recovered-eol/linearize-objstm.pdf"
 
 # --- attachment-two-page: plain, static-id ---
 qpdf --deterministic-id --warning-exit-0 \
