@@ -6,7 +6,9 @@
 //! matching qpdf's throw-on-decode-failure semantics, which the CLI turns
 //! into a stderr message + exit 2 with NO stdout dump.
 
-use flpdf::{Dictionary, Object};
+use std::io::{Read, Seek};
+
+use flpdf::{Dictionary, Object, Pdf};
 
 /// Compare two resolved [`Object`]s the way qpdf's `qpdf-test-compare` does.
 ///
@@ -20,6 +22,13 @@ use flpdf::{Dictionary, Object};
 /// `getStreamData()` and is caught by `main()` as an exit-2 error printed
 /// to stderr (with no stdout output).
 ///
+/// `actual_pdf` / `expected_pdf` are the source documents each object came
+/// from; the stream branch needs them to resolve indirect `/Filter`,
+/// `/DecodeParms`, and `/Type` values (qpdf's `QPDFObjectHandle::isName`
+/// auto-dereferences, so a filter chain given as `/Filter 4 0 R` — where
+/// object `4 0` is `/FlateDecode` — must still route through decompress).
+/// The non-stream branch ignores them.
+///
 /// Non-stream objects are compared by their [`Object::write_pdf`] bytes,
 /// which is the equivalent of qpdf's `unparseResolved()` on an already-
 /// resolved handle: nested [`Object::Reference`]s render as `N G R` and are
@@ -31,12 +40,22 @@ use flpdf::{Dictionary, Object};
 /// stripped, then (b) their data — skipped when `/Type == /XRef`,
 /// decompressed via [`flpdf::filters::decode_stream_data`] when
 /// `/FlateDecode` appears in `/Filter`, otherwise raw.
-pub fn compare_objects(label: &str, act: &Object, exp: &Object) -> flpdf::Result<String> {
+pub fn compare_objects<A, E>(
+    label: &str,
+    act: &Object,
+    exp: &Object,
+    actual_pdf: &mut Pdf<A>,
+    expected_pdf: &mut Pdf<E>,
+) -> flpdf::Result<String>
+where
+    A: Read + Seek,
+    E: Read + Seek,
+{
     if type_code(act) != type_code(exp) {
         return Ok(format!("{label}: different types"));
     }
     if let (Object::Stream(a_s), Object::Stream(e_s)) = (act, exp) {
-        return compare_streams(label, a_s, e_s);
+        return compare_streams(label, a_s, e_s, actual_pdf, expected_pdf);
     }
     let mut a = Vec::new();
     act.write_pdf(&mut a);
@@ -48,7 +67,17 @@ pub fn compare_objects(label: &str, act: &Object, exp: &Object) -> flpdf::Result
     Ok(String::new())
 }
 
-fn compare_streams(label: &str, a_s: &flpdf::Stream, e_s: &flpdf::Stream) -> flpdf::Result<String> {
+fn compare_streams<A, E>(
+    label: &str,
+    a_s: &flpdf::Stream,
+    e_s: &flpdf::Stream,
+    actual_pdf: &mut Pdf<A>,
+    expected_pdf: &mut Pdf<E>,
+) -> flpdf::Result<String>
+where
+    A: Read + Seek,
+    E: Read + Seek,
+{
     // Strip /Length before dict compare (Length necessarily differs between
     // two runs whose compressed payload differs — even for identical decoded
     // content). Cloning the dict is unavoidable (we need &mut Dictionary to
@@ -59,15 +88,23 @@ fn compare_streams(label: &str, a_s: &flpdf::Stream, e_s: &flpdf::Stream) -> flp
     a_dict.remove(b"Length");
     e_dict.remove(b"Length");
 
+    // Resolve one-level indirect refs for the keys the stream comparison
+    // actually inspects (/Filter, /DecodeParms, /Type). qpdf's
+    // `QPDFObjectHandle::isName()` and `getStreamData()` auto-dereference;
+    // flpdf's accessors and `filters::decode_stream_data` do not, so we
+    // resolve here to keep the detect-then-decode pipeline consistent.
+    resolve_stream_keys(&mut a_dict, actual_pdf)?;
+    resolve_stream_keys(&mut e_dict, expected_pdf)?;
+
     // Detect /XRef and /FlateDecode against `&a_dict` BEFORE moving it into
     // Object::Dictionary for serialization — avoids a second clone.
     let is_xref = is_xref_stream(&a_dict);
     let uncompress = filter_uses_flatedecode(&a_dict);
 
     let mut a_dict_bytes = Vec::new();
-    Object::Dictionary(a_dict).write_pdf(&mut a_dict_bytes);
+    Object::Dictionary(a_dict.clone()).write_pdf(&mut a_dict_bytes);
     let mut e_dict_bytes = Vec::new();
-    Object::Dictionary(e_dict).write_pdf(&mut e_dict_bytes);
+    Object::Dictionary(e_dict.clone()).write_pdf(&mut e_dict_bytes);
     if a_dict_bytes != e_dict_bytes {
         return Ok(format!("{label}: stream dictionaries differ"));
     }
@@ -86,11 +123,16 @@ fn compare_streams(label: &str, a_s: &flpdf::Stream, e_s: &flpdf::Stream) -> flp
     // exit 2 with stderr text and NO stdout output; propagating the error
     // via `?` here achieves the same shape (the orchestrator's `?` reaches
     // main's `Err(e) => eprintln!(...)` branch, which never dumps a file).
+    //
+    // Feeding decode_stream_data the *resolved* clones (a_dict / e_dict)
+    // rather than the raw `a_s.dict` is what makes the indirect-/Filter
+    // path decode correctly — flpdf::filters::decode_stream_data itself
+    // does not resolve references.
     let decoded_a: Vec<u8>;
     let decoded_e: Vec<u8>;
     let (a_slice, e_slice): (&[u8], &[u8]) = if uncompress {
-        decoded_a = flpdf::filters::decode_stream_data(&a_s.dict, &a_s.data)?;
-        decoded_e = flpdf::filters::decode_stream_data(&e_s.dict, &e_s.data)?;
+        decoded_a = flpdf::filters::decode_stream_data(&a_dict, &a_s.data)?;
+        decoded_e = flpdf::filters::decode_stream_data(&e_dict, &e_s.data)?;
         (&decoded_a, &decoded_e)
     } else {
         (&a_s.data, &e_s.data)
@@ -104,16 +146,29 @@ fn compare_streams(label: &str, a_s: &flpdf::Stream, e_s: &flpdf::Stream) -> flp
     Ok(String::new())
 }
 
-// Direct match on /Type without resolving through the pdf. This mirrors
-// qpdf's `isNameAndEquals` and stays consistent with
-// `flpdf::filters::decode_stream_data`, which also reads `dict.get("Filter")`
-// without resolving. A detector that resolved indirect refs while the
-// decoder did not would diverge from the decode path this predicate gates.
+// One-level dereference of the stream-relevant keys in `dict`, mutating in
+// place. If a key holds an `Object::Reference`, replace it with the
+// resolved Object (single hop — nested references inside the resolved
+// object are left as-is, matching qpdf's own one-shot `isName()` deref).
+// A missing key is left missing; a non-Reference value is left as-is.
+fn resolve_stream_keys<R: Read + Seek>(
+    dict: &mut Dictionary,
+    pdf: &mut Pdf<R>,
+) -> flpdf::Result<()> {
+    for key in [b"Filter".as_ref(), b"DecodeParms", b"Type"] {
+        if let Some(Object::Reference(r)) = dict.get(key) {
+            let r = *r;
+            let resolved = pdf.resolve(r)?;
+            dict.insert(key, resolved);
+        }
+    }
+    Ok(())
+}
+
 fn is_xref_stream(d: &Dictionary) -> bool {
     matches!(d.get(b"Type"), Some(Object::Name(n)) if n.as_slice() == b"XRef")
 }
 
-// Same rationale as `is_xref_stream`: no indirect-ref resolution here.
 fn filter_uses_flatedecode(d: &Dictionary) -> bool {
     match d.get(b"Filter") {
         Some(Object::Name(n)) => n.as_slice() == b"FlateDecode",
@@ -150,14 +205,29 @@ mod tests {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use flpdf::{ObjectRef, Stream};
-    use std::io::Write;
+    use std::io::{Cursor, Write};
+
+    // Reuse the flpdf-authored minimal fixture used elsewhere in the tree —
+    // hand-computed xref offsets in a `const &[u8]` are too error-prone.
+    // `include_bytes!` bakes the file into the test binary so the test does
+    // not depend on runtime working directory. Tests with *direct* filter
+    // names never exercise `resolve_stream_keys` so the Pdf's contents are
+    // immaterial for those — they just need a well-formed Pdf handle.
+    const MINIMAL_PDF: &[u8] = include_bytes!("../../../tests/fixtures/minimal.pdf");
+
+    fn dummy_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        Pdf::open_mem_owned(MINIMAL_PDF.to_vec()).expect("open dummy PDF")
+    }
 
     /// Test helper: unwrap the `flpdf::Result<String>` from `compare_objects`.
     /// Decode failures are exercised through a dedicated Err-path test rather
     /// than every match/diff assertion, so unwrapping here is safe and keeps
     /// the assertions readable.
     fn cmp(label: &str, a: &Object, e: &Object) -> String {
-        compare_objects(label, a, e).expect("no decode failure in this scenario")
+        let mut a_pdf = dummy_pdf();
+        let mut e_pdf = dummy_pdf();
+        compare_objects(label, a, e, &mut a_pdf, &mut e_pdf)
+            .expect("no decode failure in this scenario")
     }
 
     #[test]
@@ -409,6 +479,40 @@ mod tests {
     }
 
     #[test]
+    fn indirect_flate_filter_reference_routes_through_decompress() {
+        // Regression: qpdf's `QPDFObjectHandle::isName()` auto-dereferences,
+        // so `/Filter 1 0 R` (where object 1 0 is `/FlateDecode`) still
+        // routes through `getStreamData()`. Our detector must do the same,
+        // otherwise two streams whose /Filter is the SAME reference but
+        // whose zlib bytes differ would be reported as "stream data size
+        // differs" instead of matching.
+        let source = b"hello indirect filter world";
+        let make = |data: Vec<u8>| {
+            let mut d = Dictionary::new();
+            d.insert(b"Filter", Object::Reference(ObjectRef::new(1, 0)));
+            d.insert(b"Length", Object::Integer(0));
+            Object::Stream(Stream::new(d, data))
+        };
+        let a = make(zlib(source, Compression::none()));
+        let e = make(zlib(source, Compression::best()));
+
+        // Both dummy pdfs have object 1 0 (the Catalog in MINIMAL_PDF).
+        // Overwrite the cached value so `resolve` returns Name("FlateDecode")
+        // — this is fine here because we never write the pdf out.
+        let mut a_pdf = dummy_pdf();
+        a_pdf.set_object(ObjectRef::new(1, 0), Object::Name(b"FlateDecode".to_vec()));
+        let mut e_pdf = dummy_pdf();
+        e_pdf.set_object(ObjectRef::new(1, 0), Object::Name(b"FlateDecode".to_vec()));
+
+        assert_eq!(
+            compare_objects("indirect", &a, &e, &mut a_pdf, &mut e_pdf)
+                .expect("resolution + decode must succeed"),
+            "",
+            "indirect /Filter reference must resolve to Name and decode"
+        );
+    }
+
+    #[test]
     fn flate_decode_failure_propagates_as_err() {
         // Both sides claim /FlateDecode but the payload is not a valid zlib
         // stream, so `decode_stream_data` returns Err. Our `compare_objects`
@@ -426,7 +530,9 @@ mod tests {
         let bogus = b"\x00\x01\x02not zlib\xff\xff\xff".to_vec();
         let a = make(bogus.clone());
         let e = make(bogus);
-        assert!(compare_objects("8 0", &a, &e).is_err());
+        let mut a_pdf = dummy_pdf();
+        let mut e_pdf = dummy_pdf();
+        assert!(compare_objects("8 0", &a, &e, &mut a_pdf, &mut e_pdf).is_err());
     }
 
     #[test]

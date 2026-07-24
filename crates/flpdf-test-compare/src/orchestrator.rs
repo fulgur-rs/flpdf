@@ -64,6 +64,8 @@ pub fn compare_files(
         "trailer",
         &Object::Dictionary(act_trailer),
         &Object::Dictionary(exp_trailer),
+        &mut actual,
+        &mut expected,
     )?;
     if !trailer_diff.is_empty() {
         return Ok(Some(trailer_diff));
@@ -88,7 +90,7 @@ pub fn compare_files(
         // `ObjectRef::Display` emits "N G R". Format explicitly to mirror
         // qpdf so per-object labels match the oracle byte-for-byte.
         let label = format!("{} {}", a_ref.number, a_ref.generation);
-        let diff = compare_objects(&label, &a_obj, &e_obj)?;
+        let diff = compare_objects(&label, &a_obj, &e_obj, &mut actual, &mut expected)?;
         if !diff.is_empty() {
             return Ok(Some(diff));
         }
