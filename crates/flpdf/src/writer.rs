@@ -3047,6 +3047,12 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     mut out: W,
     options: &WriteOptions,
 ) -> Result<()> {
+    if options.deterministic_id && options.static_id {
+        return Err(crate::Error::Unsupported(
+            "deterministic_id and static_id are mutually exclusive".to_string(),
+        ));
+    }
+
     // A forced sub-1.5 header suppresses object-stream generation: object
     // streams are a PDF 1.5 feature and qpdf will not emit them under a forced
     // version it must not exceed (observed on qpdf 11.9.0; `--object-streams=generate
@@ -3157,8 +3163,12 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         && pdf.encryption_ref().is_none()
         && pdf.deleted_object_refs().is_empty()
     {
+        let source_had_compressed_objects = pdf
+            .source_xref_entries()
+            .iter()
+            .any(|(_reference, offset)| matches!(offset, XrefOffset::Compressed { .. }));
         let plan = object_streams::plan_qpdf_preserve_object_streams(pdf)?;
-        if !plan.batches.is_empty() {
+        if source_had_compressed_objects {
             return write_pdf_containerized_qpdf(pdf, out, options, plan.batches, true);
         }
     }
@@ -3192,12 +3202,6 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     let new_root = renumber
         .new_for_original(root_ref)
         .ok_or_else(|| crate::Error::Unsupported("renumber: /Root absent from map".to_string()))?;
-
-    if options.deterministic_id && options.static_id {
-        return Err(crate::Error::Unsupported(
-            "deterministic_id and static_id are mutually exclusive".to_string(),
-        ));
-    }
 
     // Pass `false` here because full-rewrite ObjStm emission is only known
     // after planning. The required PDF 1.5 floor is applied below from the
@@ -4516,6 +4520,52 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
         offsets.insert(number, emit_offset);
     }
 
+    // A source ObjStm may have no qpdf-preservable members (for example, when
+    // its only reachable member is a signature dictionary). The empty qpdf
+    // Preserve plan is authoritative: keep the null-aware renumbering above,
+    // emit the excluded member plain, and use a classic xref table because no
+    // compressed entries survive.
+    if groups.is_empty() && matches!(options.object_streams, ObjectStreamMode::Preserve) {
+        let xref_offset = bytes.len();
+        let max_object_number = offsets.keys().next_back().copied().unwrap_or(0);
+        let object_count = generate_invariant(
+            max_object_number.checked_add(1),
+            "empty-container preserve xref size overflows u32",
+        )?; // cov:ignore: requires u32::MAX emitted objects
+        bytes.extend_from_slice(format!("xref\n0 {object_count}\n").as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for number in 1..object_count {
+            let offset = generate_invariant(
+                offsets.get(&number).copied(),
+                "empty-container preserve numbering is not contiguous",
+            )?; // cov:ignore: GenerateRenumber assigns a contiguous range
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+
+        let mut trailer = pdf.trailer().clone();
+        strip_incremental_trailer_keys(&mut trailer);
+        remap_qpdf_trailer_refs(pdf, &mut trailer, &renumber)?;
+        trailer.insert("Size", Object::Integer(i64::from(object_count)));
+        trailer.insert("Root", Object::Reference(new_root));
+        apply_encrypt_trailer_entries(&mut trailer, pdf, options, None, options.deterministic_id);
+        bytes.extend_from_slice(b"trailer ");
+        if options.deterministic_id {
+            let mut id_writer = |out: &mut Vec<u8>| {
+                write_deterministic_id_inline(
+                    out,
+                    &det_id_info_suffix,
+                    det_id_source_id0.as_deref(),
+                )
+            };
+            trailer.write_pdf_trailer(&mut bytes, Some(&mut id_writer));
+        } else {
+            trailer.write_pdf_trailer(&mut bytes, None);
+        }
+        bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        out.write_all(&bytes)?;
+        return Ok(());
+    }
+
     // ── cross-reference stream ───────────────────────────────────────────────
     // qpdf emits a PNG-Up-predicted (`/Predictor 12`), minimal-`/W`,
     // fixed-key-order xref stream. Reuse the linearized encoder, which already
@@ -4586,10 +4636,13 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
     } else {
         remap_trailer_refs(&mut trailer, &renumber, &skip_refs)?;
     }
-    let info_ref = match trailer.get("Info") {
-        Some(Object::Reference(r)) => Some(*r),
-        _ => None,
-    };
+    // The specialized xref-stream writer adds the generated `/Root`, `/Size`,
+    // and `/ID` entries itself. Keep every other trimmed/remapped trailer entry
+    // — including a direct `/Info` dictionary — for sorted emission after `/W`.
+    trailer.remove("Root");
+    trailer.remove("Size");
+    trailer.remove("ID");
+    trailer.remove("Encrypt");
 
     let xref_ref = ObjectRef::new(xref_object_number, 0);
     if options.deterministic_id {
@@ -4600,10 +4653,11 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
         let dict = xref_stream::XrefStreamDict {
             widths,
             index: None,
-            info: info_ref,
+            info: None,
             root: Some(new_root),
             size,
             prev: None,
+            trailer: Some(&trailer),
             id: None,
         };
         let mut id_writer = |out: &mut Vec<u8>| {
@@ -4642,10 +4696,11 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
         let dict = xref_stream::XrefStreamDict {
             widths,
             index: None,
-            info: info_ref,
+            info: None,
             root: Some(new_root),
             size,
             prev: None,
+            trailer: Some(&trailer),
             id: Some((&id0, &id1)),
         };
         xref_stream::write_object(&mut bytes, xref_ref, &dict, &payload);
