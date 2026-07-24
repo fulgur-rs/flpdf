@@ -18,6 +18,40 @@ pub(crate) enum RecoveryPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolvedStreamLength {
+    Missing,
+    Invalid,
+    Integer(i64),
+}
+
+/// A framing EOL observed immediately before a recovered terminator that is
+/// still included in [`FileObjectRead::object`]'s raw stream data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IncludedStreamDataEol {
+    Lf,
+    Cr,
+    CrLf,
+}
+
+impl IncludedStreamDataEol {
+    const fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Lf => b"\n",
+            Self::Cr => b"\r",
+            Self::CrLf => b"\r\n",
+        }
+    }
+
+    const fn as_removed(self) -> RecoveredStreamEol {
+        match self {
+            Self::Lf => RecoveredStreamEol::Lf,
+            Self::Cr => RecoveredStreamEol::Cr,
+            Self::CrLf => RecoveredStreamEol::CrLf,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamStartEol {
     Lf,
     CrLf,
@@ -28,7 +62,8 @@ pub(crate) enum StreamStartEol {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FileObjectDiagnosticKind {
     EmptyObject,
-    StreamLineEnding,
+    StreamCarriageReturnOnly,
+    StreamMissingLineTerminator,
     MissingStreamLength,
     InvalidStreamLength,
     NegativeStreamLength,
@@ -70,7 +105,33 @@ pub(crate) struct FileObjectRead {
     pub(crate) object_ref: ObjectRef,
     pub(crate) object: Object,
     pub(crate) diagnostics: Vec<FileObjectDiagnostic>,
-    pub(crate) recovered_stream_eol: Option<RecoveredStreamEol>,
+    pub(crate) included_recovery_eol: Option<IncludedStreamDataEol>,
+}
+
+impl FileObjectRead {
+    /// Remove a recovery EOL that is still part of raw stream data and convert
+    /// it to the legacy "removed EOL" type expected by decryption and writing.
+    ///
+    /// Layer 3 must call this exactly once immediately before
+    /// `decrypt_resolved_object`. Exact-length streams and recovery without a
+    /// preceding EOL return `None`.
+    pub(crate) fn remove_included_recovery_eol_for_decryption(
+        &mut self,
+    ) -> Option<RecoveredStreamEol> {
+        let included = self.included_recovery_eol?;
+        let stream = self
+            .object
+            .as_stream_mut()
+            .expect("included recovery EOL belongs to a stream");
+        let eol = included.as_bytes();
+        assert!(
+            stream.data.ends_with(eol),
+            "included recovery EOL must remain in raw stream data"
+        );
+        stream.data.truncate(stream.data.len() - eol.len());
+        self.included_recovery_eol = None;
+        Some(included.as_removed())
+    }
 }
 
 pub(crate) fn parse_file_object_syntax(input: &[u8]) -> Result<PendingFileObject> {
@@ -98,9 +159,15 @@ pub(crate) fn parse_file_object_syntax(input: &[u8]) -> Result<PendingFileObject
         let stream_pos = skip_pdf_ws(input, next_offset);
         if let Some(after_stream) = keyword_token_end(input, stream_pos, b"stream") {
             let (data_start, start_eol) = consume_stream_start_eol(input, after_stream);
-            if matches!(start_eol, StreamStartEol::Cr | StreamStartEol::Missing) {
+            if let Some(kind) = match start_eol {
+                StreamStartEol::Cr => Some(FileObjectDiagnosticKind::StreamCarriageReturnOnly),
+                StreamStartEol::Missing => {
+                    Some(FileObjectDiagnosticKind::StreamMissingLineTerminator)
+                }
+                StreamStartEol::Lf | StreamStartEol::CrLf => None,
+            } {
                 diagnostics.push(FileObjectDiagnostic {
-                    kind: FileObjectDiagnosticKind::StreamLineEnding,
+                    kind,
                     relative_offset: after_stream,
                 });
             }
@@ -137,7 +204,7 @@ pub(crate) fn parse_file_object_syntax(input: &[u8]) -> Result<PendingFileObject
 pub(crate) fn finish_file_object(
     input: &[u8],
     pending: PendingFileObject,
-    resolved_indirect_length: Option<usize>,
+    resolved_indirect_length: Option<ResolvedStreamLength>,
     policy: RecoveryPolicy,
 ) -> Result<FileObjectRead> {
     let PendingFileObject {
@@ -156,7 +223,7 @@ pub(crate) fn finish_file_object(
                 object_ref,
                 object,
                 diagnostics,
-                recovered_stream_eol: None,
+                included_recovery_eol: None,
             })
         }
         PendingBody::Stream {
@@ -178,27 +245,39 @@ fn finish_stream(
     object_ref: ObjectRef,
     dict: Dictionary,
     data_start: usize,
-    resolved_indirect_length: Option<usize>,
+    resolved_indirect_length: Option<ResolvedStreamLength>,
     policy: RecoveryPolicy,
     mut diagnostics: Vec<FileObjectDiagnostic>,
 ) -> Result<FileObjectRead> {
-    let (length, invalid_length) = match dict.get("Length") {
-        Some(Object::Integer(value)) if *value < 0 => {
+    let resolved_length = match dict.get("Length") {
+        Some(Object::Integer(value)) => ResolvedStreamLength::Integer(*value),
+        Some(Object::Reference(_)) => {
+            resolved_indirect_length.unwrap_or(ResolvedStreamLength::Missing)
+        }
+        None => ResolvedStreamLength::Missing,
+        Some(_) => ResolvedStreamLength::Invalid,
+    };
+    let (length, invalid_length) = match resolved_length {
+        ResolvedStreamLength::Integer(value) if value < 0 => {
             diagnostics.push(FileObjectDiagnostic {
                 kind: FileObjectDiagnosticKind::NegativeStreamLength,
                 relative_offset: 0,
             });
             (Some(0), None)
         }
-        Some(Object::Integer(value)) => (usize::try_from(*value).ok(), None),
-        Some(Object::Reference(_)) => (
-            resolved_indirect_length,
-            resolved_indirect_length
+        ResolvedStreamLength::Integer(value) => {
+            let length = usize::try_from(value).ok();
+            let invalid = length
                 .is_none()
-                .then_some(FileObjectDiagnosticKind::MissingStreamLength),
-        ),
-        None => (None, Some(FileObjectDiagnosticKind::MissingStreamLength)),
-        Some(_) => (None, Some(FileObjectDiagnosticKind::InvalidStreamLength)),
+                .then_some(FileObjectDiagnosticKind::InvalidStreamLength);
+            (length, invalid)
+        }
+        ResolvedStreamLength::Missing => {
+            (None, Some(FileObjectDiagnosticKind::MissingStreamLength))
+        }
+        ResolvedStreamLength::Invalid => {
+            (None, Some(FileObjectDiagnosticKind::InvalidStreamLength))
+        }
     };
     let exact_end = length.and_then(|length| data_start.checked_add(length));
     let exact_terminator = exact_end.filter(|&end| end <= input.len()).and_then(|end| {
@@ -206,8 +285,8 @@ fn finish_stream(
         keyword_token_end(input, terminator, b"endstream").map(|after| (end, after))
     });
 
-    let (data_end, after_endstream) = match exact_terminator {
-        Some((end, after)) => (end, after),
+    let (data_end, after_endstream, included_recovery_eol) = match exact_terminator {
+        Some((end, after)) => (end, after, None),
         None if policy == RecoveryPolicy::Bounded => {
             if let Some(kind) = invalid_length.as_ref() {
                 diagnostics.push(FileObjectDiagnostic {
@@ -220,7 +299,8 @@ fn finish_stream(
                     relative_offset: exact_end.unwrap_or(data_start),
                 });
             }
-            recover_stream_boundary(input, data_start, &mut diagnostics)
+            let (end, after) = recover_stream_boundary(input, data_start, &mut diagnostics);
+            (end, after, included_stream_data_eol(input, data_start, end))
         }
         None => {
             let error_offset = if invalid_length.is_some() {
@@ -242,7 +322,7 @@ fn finish_stream(
         object_ref,
         object: Object::Stream(Stream::new(dict, input[data_start..data_end].to_vec())),
         diagnostics,
-        recovered_stream_eol: None,
+        included_recovery_eol,
     })
 }
 
@@ -319,11 +399,30 @@ fn find_recovery_terminator(input: &[u8], start: usize) -> Option<RecoveryTermin
     })
 }
 
+fn included_stream_data_eol(
+    input: &[u8],
+    data_start: usize,
+    data_end: usize,
+) -> Option<IncludedStreamDataEol> {
+    if data_end >= data_start + 2 && input.get(data_end - 2..data_end) == Some(&b"\r\n"[..]) {
+        Some(IncludedStreamDataEol::CrLf)
+    } else if data_end > data_start && input.get(data_end - 1) == Some(&b'\n') {
+        Some(IncludedStreamDataEol::Lf)
+    } else if data_end > data_start && input.get(data_end - 1) == Some(&b'\r') {
+        Some(IncludedStreamDataEol::Cr)
+    } else {
+        None
+    }
+}
+
 impl FileObjectDiagnosticKind {
     pub(crate) fn message(&self) -> String {
         match self {
             Self::EmptyObject => "empty object treated as null".into(),
-            Self::StreamLineEnding => {
+            Self::StreamCarriageReturnOnly => {
+                "stream keyword followed by carriage return only".into()
+            }
+            Self::StreamMissingLineTerminator => {
                 "stream keyword not followed by proper line terminator".into()
             }
             Self::MissingStreamLength => "stream dictionary lacks /Length key".into(),
@@ -431,11 +530,19 @@ mod tests {
 
     #[test]
     fn syntax_classifies_every_stream_start_line_ending() {
-        for (suffix, expected, warns) in [
-            (&b"\nabc"[..], StreamStartEol::Lf, false),
-            (&b"\r\nabc"[..], StreamStartEol::CrLf, false),
-            (&b"\rabc"[..], StreamStartEol::Cr, true),
-            (&b" abc"[..], StreamStartEol::Missing, true),
+        for (suffix, expected, diagnostic) in [
+            (&b"\nabc"[..], StreamStartEol::Lf, None),
+            (&b"\r\nabc"[..], StreamStartEol::CrLf, None),
+            (
+                &b"\rabc"[..],
+                StreamStartEol::Cr,
+                Some(FileObjectDiagnosticKind::StreamCarriageReturnOnly),
+            ),
+            (
+                &b" abc"[..],
+                StreamStartEol::Missing,
+                Some(FileObjectDiagnosticKind::StreamMissingLineTerminator),
+            ),
         ] {
             let mut input = b"1 0 obj\n<< /Length 3 >>\nstream".to_vec();
             input.extend_from_slice(suffix);
@@ -449,8 +556,117 @@ mod tests {
                 pending
                     .diagnostics
                     .iter()
-                    .any(|d| d.kind == FileObjectDiagnosticKind::StreamLineEnding),
-                warns
+                    .map(|diagnostic| diagnostic.kind.clone())
+                    .collect::<Vec<_>>(),
+                diagnostic.into_iter().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn direct_and_indirect_length_states_preserve_qpdf_semantics() {
+        struct Case {
+            length_entry: &'static [u8],
+            resolved: Option<ResolvedStreamLength>,
+            payload: &'static [u8],
+            expected_data: &'static [u8],
+            expected_kinds: Vec<FileObjectDiagnosticKind>,
+        }
+
+        for case in [
+            Case {
+                length_entry: b"",
+                resolved: None,
+                payload: b"abc\n",
+                expected_data: b"abc\n",
+                expected_kinds: vec![
+                    FileObjectDiagnosticKind::MissingStreamLength,
+                    FileObjectDiagnosticKind::AttemptingStreamLengthRecovery,
+                    FileObjectDiagnosticKind::RecoveredStreamLength { length: 4 },
+                ],
+            },
+            Case {
+                length_entry: b"/Length /Bad",
+                resolved: None,
+                payload: b"abc\n",
+                expected_data: b"abc\n",
+                expected_kinds: vec![
+                    FileObjectDiagnosticKind::InvalidStreamLength,
+                    FileObjectDiagnosticKind::AttemptingStreamLengthRecovery,
+                    FileObjectDiagnosticKind::RecoveredStreamLength { length: 4 },
+                ],
+            },
+            Case {
+                length_entry: b"/Length -1",
+                resolved: None,
+                payload: b"\n",
+                expected_data: b"",
+                expected_kinds: vec![FileObjectDiagnosticKind::NegativeStreamLength],
+            },
+            Case {
+                length_entry: b"/Length 3",
+                resolved: None,
+                payload: b"abc",
+                expected_data: b"abc",
+                expected_kinds: vec![],
+            },
+            Case {
+                length_entry: b"/Length 9 0 R",
+                resolved: Some(ResolvedStreamLength::Missing),
+                payload: b"abc\n",
+                expected_data: b"abc\n",
+                expected_kinds: vec![
+                    FileObjectDiagnosticKind::MissingStreamLength,
+                    FileObjectDiagnosticKind::AttemptingStreamLengthRecovery,
+                    FileObjectDiagnosticKind::RecoveredStreamLength { length: 4 },
+                ],
+            },
+            Case {
+                length_entry: b"/Length 9 0 R",
+                resolved: Some(ResolvedStreamLength::Invalid),
+                payload: b"abc\n",
+                expected_data: b"abc\n",
+                expected_kinds: vec![
+                    FileObjectDiagnosticKind::InvalidStreamLength,
+                    FileObjectDiagnosticKind::AttemptingStreamLengthRecovery,
+                    FileObjectDiagnosticKind::RecoveredStreamLength { length: 4 },
+                ],
+            },
+            Case {
+                length_entry: b"/Length 9 0 R",
+                resolved: Some(ResolvedStreamLength::Integer(-1)),
+                payload: b"\n",
+                expected_data: b"",
+                expected_kinds: vec![FileObjectDiagnosticKind::NegativeStreamLength],
+            },
+            Case {
+                length_entry: b"/Length 9 0 R",
+                resolved: Some(ResolvedStreamLength::Integer(3)),
+                payload: b"abc",
+                expected_data: b"abc",
+                expected_kinds: vec![],
+            },
+        ] {
+            let mut input = b"1 0 obj\n<< ".to_vec();
+            input.extend_from_slice(case.length_entry);
+            input.extend_from_slice(b" >>\nstream\n");
+            input.extend_from_slice(case.payload);
+            input.extend_from_slice(b"endstream\nendobj\n");
+            let pending = parse_file_object_syntax(&input).unwrap();
+            let completed =
+                finish_file_object(&input, pending, case.resolved, RecoveryPolicy::Bounded)
+                    .unwrap();
+            assert_eq!(
+                completed.object.as_stream().unwrap().data,
+                case.expected_data
+            );
+            assert_eq!(
+                completed
+                    .diagnostics
+                    .into_iter()
+                    .map(|diagnostic| diagnostic.kind)
+                    .collect::<Vec<_>>(),
+                case.expected_kinds
             );
         }
     }
@@ -469,7 +685,9 @@ mod tests {
             let completed = finish_file_object(
                 &input,
                 pending,
-                Some(payload.len()),
+                Some(ResolvedStreamLength::Integer(
+                    i64::try_from(payload.len()).unwrap(),
+                )),
                 RecoveryPolicy::Bounded,
             )
             .unwrap();
@@ -526,7 +744,7 @@ mod tests {
         .unwrap();
         assert!(matches!(completed.object, Object::Array(_)));
         assert!(completed.diagnostics.is_empty());
-        assert_eq!(completed.recovered_stream_eol, None);
+        assert_eq!(completed.included_recovery_eol, None);
 
         let missing = b"4 0 obj\n[6 0 R]\nnot-endobj\n";
         let completed = finish_file_object(
@@ -612,8 +830,59 @@ mod tests {
                     .collect::<Vec<_>>(),
                 case.kinds
             );
-            assert_eq!(completed.recovered_stream_eol, None);
+            assert_eq!(
+                completed.included_recovery_eol,
+                included_stream_data_eol(case.recovered, 0, case.recovered.len())
+            );
         }
+    }
+
+    #[test]
+    fn recovered_raw_eol_is_typed_as_included_and_consumed_before_decryption() {
+        for (eol, included, removed) in [
+            (
+                &b"\n"[..],
+                IncludedStreamDataEol::Lf,
+                RecoveredStreamEol::Lf,
+            ),
+            (
+                &b"\r"[..],
+                IncludedStreamDataEol::Cr,
+                RecoveredStreamEol::Cr,
+            ),
+            (
+                &b"\r\n"[..],
+                IncludedStreamDataEol::CrLf,
+                RecoveredStreamEol::CrLf,
+            ),
+        ] {
+            let mut input = b"1 0 obj\n<< /Length /Bad >>\nstream\nabc".to_vec();
+            input.extend_from_slice(eol);
+            input.extend_from_slice(b"endstream\nendobj\n");
+            let pending = parse_file_object_syntax(&input).unwrap();
+            let mut completed =
+                finish_file_object(&input, pending, None, RecoveryPolicy::Bounded).unwrap();
+
+            let stream = completed.object.as_stream().unwrap();
+            assert_eq!(stream.data, [b"abc".as_slice(), eol].concat());
+            assert_eq!(completed.included_recovery_eol, Some(included));
+
+            assert_eq!(
+                completed.remove_included_recovery_eol_for_decryption(),
+                Some(removed)
+            );
+            assert_eq!(completed.object.as_stream().unwrap().data, b"abc");
+            assert_eq!(completed.included_recovery_eol, None);
+        }
+    }
+
+    #[test]
+    fn exact_payload_eol_is_not_recovery_metadata() {
+        let input = b"1 0 obj\n<< /Length 4 >>\nstream\nabc\nendstream\nendobj\n";
+        let pending = parse_file_object_syntax(input).unwrap();
+        let completed = finish_file_object(input, pending, None, RecoveryPolicy::Bounded).unwrap();
+        assert_eq!(completed.object.as_stream().unwrap().data, b"abc\n");
+        assert_eq!(completed.included_recovery_eol, None);
     }
 
     #[test]
@@ -751,7 +1020,11 @@ mod tests {
                 "empty object treated as null".to_string(),
             ),
             (
-                FileObjectDiagnosticKind::StreamLineEnding,
+                FileObjectDiagnosticKind::StreamCarriageReturnOnly,
+                "stream keyword followed by carriage return only".to_string(),
+            ),
+            (
+                FileObjectDiagnosticKind::StreamMissingLineTerminator,
                 "stream keyword not followed by proper line terminator".to_string(),
             ),
             (

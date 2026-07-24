@@ -79,7 +79,8 @@ pub(crate) enum StreamStartEol {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FileObjectDiagnosticKind {
     EmptyObject,
-    StreamLineEnding,
+    StreamCarriageReturnOnly,
+    StreamMissingLineTerminator,
     MissingStreamLength,
     InvalidStreamLength,
     NegativeStreamLength,
@@ -321,11 +322,19 @@ mod tests {
 
     #[test]
     fn syntax_classifies_every_stream_start_line_ending() {
-        for (suffix, expected, warns) in [
-            (&b"\nabc"[..], StreamStartEol::Lf, false),
-            (&b"\r\nabc"[..], StreamStartEol::CrLf, false),
-            (&b"\rabc"[..], StreamStartEol::Cr, true),
-            (&b" abc"[..], StreamStartEol::Missing, true),
+        for (suffix, expected, diagnostic) in [
+            (&b"\nabc"[..], StreamStartEol::Lf, None),
+            (&b"\r\nabc"[..], StreamStartEol::CrLf, None),
+            (
+                &b"\rabc"[..],
+                StreamStartEol::Cr,
+                Some(FileObjectDiagnosticKind::StreamCarriageReturnOnly),
+            ),
+            (
+                &b" abc"[..],
+                StreamStartEol::Missing,
+                Some(FileObjectDiagnosticKind::StreamMissingLineTerminator),
+            ),
         ] {
             let mut input = b"1 0 obj\n<< /Length 3 >>\nstream".to_vec();
             input.extend_from_slice(suffix);
@@ -339,8 +348,9 @@ mod tests {
                 pending
                     .diagnostics
                     .iter()
-                    .any(|d| d.kind == FileObjectDiagnosticKind::StreamLineEnding),
-                warns
+                    .map(|entry| entry.kind.clone())
+                    .collect::<Vec<_>>(),
+                diagnostic.into_iter().collect::<Vec<_>>()
             );
         }
     }
@@ -397,9 +407,17 @@ pub(crate) fn parse_file_object_syntax(input: &[u8]) -> Result<PendingFileObject
         let stream_pos = skip_pdf_ws(input, next_offset);
         if let Some(after_stream) = keyword_token_end(input, stream_pos, b"stream") {
             let (data_start, start_eol) = consume_stream_start_eol(input, after_stream);
-            if matches!(start_eol, StreamStartEol::Cr | StreamStartEol::Missing) {
+            if let Some(kind) = match start_eol {
+                StreamStartEol::Cr => {
+                    Some(FileObjectDiagnosticKind::StreamCarriageReturnOnly)
+                }
+                StreamStartEol::Missing => {
+                    Some(FileObjectDiagnosticKind::StreamMissingLineTerminator)
+                }
+                StreamStartEol::Lf | StreamStartEol::CrLf => None,
+            } {
                 diagnostics.push(FileObjectDiagnostic {
-                    kind: FileObjectDiagnosticKind::StreamLineEnding,
+                    kind,
                     relative_offset: after_stream,
                 });
             }
@@ -507,18 +525,40 @@ pub(crate) enum RecoveryPolicy {
     Bounded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolvedStreamLength {
+    Missing,
+    Invalid,
+    Integer(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IncludedStreamDataEol {
+    Lf,
+    Cr,
+    CrLf,
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) struct FileObjectRead {
     pub(crate) object_ref: ObjectRef,
     pub(crate) object: Object,
     pub(crate) diagnostics: Vec<FileObjectDiagnostic>,
-    pub(crate) recovered_stream_eol: Option<RecoveredStreamEol>,
+    // This EOL remains in the raw stream data until the consuming layer
+    // explicitly removes it immediately before decryption/filter decoding.
+    pub(crate) included_recovery_eol: Option<IncludedStreamDataEol>,
+}
+
+impl FileObjectRead {
+    pub(crate) fn remove_included_recovery_eol_for_decryption(
+        &mut self,
+    ) -> Option<RecoveredStreamEol>;
 }
 
 pub(crate) fn finish_file_object(
     input: &[u8],
     pending: PendingFileObject,
-    resolved_indirect_length: Option<usize>,
+    resolved_indirect_length: Option<ResolvedStreamLength>,
     policy: RecoveryPolicy,
 ) -> Result<FileObjectRead>;
 
@@ -542,6 +582,18 @@ impl FileObjectDiagnosticKind {
 - Missing recovery terminators return an empty stream with
   `unable to recover stream data; treating stream as empty`; they are not a parse
   error.
+- Direct and indirect lengths retain `Missing`, `Invalid`, and signed `Integer`
+  state through completion. Negative direct and indirect integers therefore both
+  take qpdf's warning-plus-exact-zero path instead of being collapsed into a
+  missing/invalid recovery.
+- CR-only and absent stream-start terminators remain separate diagnostics with
+  qpdf's exact messages.
+- `included_recovery_eol` describes an EOL still present in qpdf-raw
+  `Stream::data`. Consumers must call
+  `remove_included_recovery_eol_for_decryption` exactly once before decryption or
+  filter decoding; the returned legacy `RecoveredStreamEol` is then passed to
+  existing decryption/writer metadata paths. This prevents both encrypted-EOL
+  input and double append.
 
 - [ ] **Step 1: Create and claim the Layer 2 branch/Beads child**
 
@@ -573,9 +625,13 @@ fn exact_lengths_accept_eol_and_adjacent_endstream_payloads() {
         input.extend_from_slice(payload);
         input.extend_from_slice(tail);
         let pending = parse_file_object_syntax(&input).unwrap();
-        let completed =
-            finish_file_object(&input, pending, Some(payload.len()), RecoveryPolicy::Bounded)
-                .unwrap();
+        let completed = finish_file_object(
+            &input,
+            pending,
+            Some(ResolvedStreamLength::Integer(payload.len() as i64)),
+            RecoveryPolicy::Bounded,
+        )
+        .unwrap();
         assert_eq!(completed.object.as_stream().unwrap().data, payload);
         assert!(!completed
             .diagnostics
@@ -641,7 +697,7 @@ use crate::Stream;
 pub(crate) fn finish_file_object(
     input: &[u8],
     pending: PendingFileObject,
-    resolved_indirect_length: Option<usize>,
+    resolved_indirect_length: Option<ResolvedStreamLength>,
     policy: RecoveryPolicy,
 ) -> Result<FileObjectRead> {
     let PendingFileObject {
@@ -660,7 +716,7 @@ pub(crate) fn finish_file_object(
                 object_ref,
                 object,
                 diagnostics,
-                recovered_stream_eol: None,
+                included_recovery_eol: None,
             })
         }
         PendingBody::Stream {
@@ -684,27 +740,39 @@ fn finish_stream(
     object_ref: ObjectRef,
     dict: Dictionary,
     data_start: usize,
-    resolved_indirect_length: Option<usize>,
+    resolved_indirect_length: Option<ResolvedStreamLength>,
     policy: RecoveryPolicy,
     mut diagnostics: Vec<FileObjectDiagnostic>,
 ) -> Result<FileObjectRead> {
-    let (length, invalid_length) = match dict.get("Length") {
-        Some(Object::Integer(value)) if *value < 0 => {
+    let resolved_length = match dict.get("Length") {
+        Some(Object::Integer(value)) => ResolvedStreamLength::Integer(*value),
+        Some(Object::Reference(_)) => {
+            resolved_indirect_length.unwrap_or(ResolvedStreamLength::Missing)
+        }
+        None => ResolvedStreamLength::Missing,
+        Some(_) => ResolvedStreamLength::Invalid,
+    };
+    let (length, invalid_length) = match resolved_length {
+        ResolvedStreamLength::Integer(value) if value < 0 => {
             diagnostics.push(FileObjectDiagnostic {
                 kind: FileObjectDiagnosticKind::NegativeStreamLength,
                 relative_offset: 0,
             });
             (Some(0), None)
         }
-        Some(Object::Integer(value)) => (usize::try_from(*value).ok(), None),
-        Some(Object::Reference(_)) => (
-            resolved_indirect_length,
-            resolved_indirect_length
+        ResolvedStreamLength::Integer(value) => {
+            let length = usize::try_from(value).ok();
+            let invalid = length
                 .is_none()
-                .then_some(FileObjectDiagnosticKind::MissingStreamLength),
-        ),
-        None => (None, Some(FileObjectDiagnosticKind::MissingStreamLength)),
-        Some(_) => (None, Some(FileObjectDiagnosticKind::InvalidStreamLength)),
+                .then_some(FileObjectDiagnosticKind::InvalidStreamLength);
+            (length, invalid)
+        }
+        ResolvedStreamLength::Missing => {
+            (None, Some(FileObjectDiagnosticKind::MissingStreamLength))
+        }
+        ResolvedStreamLength::Invalid => {
+            (None, Some(FileObjectDiagnosticKind::InvalidStreamLength))
+        }
     };
     let exact_end = length.and_then(|length| data_start.checked_add(length));
     let exact_terminator = exact_end
@@ -714,8 +782,8 @@ fn finish_stream(
             keyword_token_end(input, terminator, b"endstream").map(|after| (end, after))
         });
 
-    let (data_end, after_endstream) = match exact_terminator {
-        Some((end, after)) => (end, after),
+    let (data_end, after_endstream, included_recovery_eol) = match exact_terminator {
+        Some((end, after)) => (end, after, None),
         None if policy == RecoveryPolicy::Bounded => {
             if let Some(kind) = invalid_length.as_ref() {
                 diagnostics.push(FileObjectDiagnostic {
@@ -728,7 +796,9 @@ fn finish_stream(
                     relative_offset: exact_end.unwrap_or(data_start),
                 });
             }
-            recover_stream_boundary(input, data_start, &mut diagnostics)
+            let (end, after) =
+                recover_stream_boundary(input, data_start, &mut diagnostics);
+            (end, after, included_stream_data_eol(input, data_start, end))
         }
         None => {
             let error_offset = if invalid_length.is_some() {
@@ -750,7 +820,7 @@ fn finish_stream(
         object_ref,
         object: Object::Stream(Stream::new(dict, input[data_start..data_end].to_vec())),
         diagnostics,
-        recovered_stream_eol: None,
+        included_recovery_eol,
     })
 }
 
@@ -995,7 +1065,10 @@ impl FileObjectDiagnosticKind {
     pub(crate) fn message(&self) -> String {
         match self {
             Self::EmptyObject => "empty object treated as null".into(),
-            Self::StreamLineEnding => {
+            Self::StreamCarriageReturnOnly => {
+                "stream keyword followed by carriage return only".into()
+            }
+            Self::StreamMissingLineTerminator => {
                 "stream keyword not followed by proper line terminator".into()
             }
             Self::MissingStreamLength => "stream dictionary lacks /Length key".into(),
@@ -1083,7 +1156,7 @@ fn resolve_pending_stream_length(
     expected_ref: ObjectRef,
     pending: &file_object::PendingFileObject,
     offset: u64,
-) -> Result<Option<usize>>;
+) -> Result<Option<file_object::ResolvedStreamLength>>;
 fn record_file_object_diagnostics(
     &mut self,
     object_ref: ObjectRef,
@@ -1272,7 +1345,7 @@ Import:
 ```rust
 use self::file_object::{
     finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, PendingFileObject,
-    RecoveryPolicy,
+    RecoveryPolicy, ResolvedStreamLength,
 };
 ```
 
@@ -1298,24 +1371,32 @@ fn resolve_pending_stream_length(
     expected_ref: ObjectRef,
     pending: &PendingFileObject,
     offset: u64,
-) -> Result<Option<usize>> {
+) -> Result<Option<ResolvedStreamLength>> {
     let Some(holder) = pending.indirect_length_ref() else {
         return Ok(None);
     };
     if holder == pending.object_ref {
-        return Ok(None);
+        return Ok(Some(ResolvedStreamLength::Missing));
     }
     self.cache.set_reserved(expected_ref);
     let resolved = match self.resolve_borrowed(holder) {
-        Ok(Object::Integer(value)) => usize::try_from(*value).ok(),
-        Ok(_) => None,
+        Ok(Object::Integer(value)) => ResolvedStreamLength::Integer(*value),
+        Ok(Object::Null)
+            if matches!(
+                self.cache.entry(holder),
+                None | Some(CacheEntry::Missing | CacheEntry::Deleted)
+            ) =>
+        {
+            ResolvedStreamLength::Missing
+        }
+        Ok(_) => ResolvedStreamLength::Invalid,
         Err(err) => {
             self.cache.set_unresolved(expected_ref, offset);
             return Err(err);
         }
     };
     self.cache.set_unresolved(expected_ref, offset);
-    Ok(resolved)
+    Ok(Some(resolved))
 }
 
 fn read_object_at_qpdf(
@@ -1358,20 +1439,21 @@ When implementing the final error preference, retain the existing contract: retu
 Replace its read call with:
 
 ```rust
-let parsed = self.read_object_at_qpdf(object_ref, offset)?;
+let mut parsed = self.read_object_at_qpdf(object_ref, offset)?;
 if parsed.object_ref != object_ref {
     return Ok(false);
 }
-let recovered_eol = parsed.recovered_stream_eol.map(RecoveredStreamEol::as_bytes);
+let recovered_eol = parsed.remove_included_recovery_eol_for_decryption();
+let recovered_eol_bytes = recovered_eol.map(RecoveredStreamEol::as_bytes);
 let (object, stream_payload_transformed) =
-    self.decrypt_resolved_object(object_ref, parsed.object, recovered_eol)?;
+    self.decrypt_resolved_object(object_ref, parsed.object, recovered_eol_bytes)?;
 self.cache.set_resolved(object_ref, object);
 if stream_payload_transformed {
     self.transformed_stream_refs.insert(object_ref);
 } else {
     self.transformed_stream_refs.remove(&object_ref);
 }
-if let Some(eol) = parsed.recovered_stream_eol {
+if let Some(eol) = recovered_eol {
     self.recovered_stream_eols.insert(object_ref, eol);
 } else {
     self.recovered_stream_eols.remove(&object_ref);
@@ -1573,20 +1655,21 @@ Expected: the ObjStm test exposes the old placeholder/endobj ordering or fails t
 Rename `read_object_at_qpdf` to `read_object_at`, delete the old function with that name, and replace the `resolve_compressed_entry` unresolved-container arm with the same completion/decrypt/cache/diagnostic sequence used by `resolve_to_cache`:
 
 ```rust
-let parsed = self.read_object_at(stream_ref, offset)?;
+let mut parsed = self.read_object_at(stream_ref, offset)?;
 if parsed.object_ref != stream_ref {
     return Ok(false);
 }
-let recovered_eol = parsed.recovered_stream_eol.map(RecoveredStreamEol::as_bytes);
+let recovered_eol = parsed.remove_included_recovery_eol_for_decryption();
+let recovered_eol_bytes = recovered_eol.map(RecoveredStreamEol::as_bytes);
 let (object, stream_payload_transformed) =
-    self.decrypt_resolved_object(stream_ref, parsed.object, recovered_eol)?;
+    self.decrypt_resolved_object(stream_ref, parsed.object, recovered_eol_bytes)?;
 self.cache.set_resolved(stream_ref, object.clone());
 if stream_payload_transformed {
     self.transformed_stream_refs.insert(stream_ref);
 } else {
     self.transformed_stream_refs.remove(&stream_ref);
 }
-if let Some(eol) = parsed.recovered_stream_eol {
+if let Some(eol) = recovered_eol {
     self.recovered_stream_eols.insert(stream_ref, eol);
 } else {
     self.recovered_stream_eols.remove(&stream_ref);
@@ -1620,8 +1703,11 @@ Replace the old parse call in `parse_xref_stream`:
 let pending =
     parse_file_object_syntax(tail).map_err(|err| err.rebase_offset(xref_pos))?;
 let object_ref = pending.object_ref;
-let completed = finish_file_object(tail, pending, None, RecoveryPolicy::Bounded)
+let mut completed = finish_file_object(tail, pending, None, RecoveryPolicy::Bounded)
     .map_err(|err| err.rebase_offset(xref_pos))?;
+// Xref streams are not encrypted, but filter decoding still requires the
+// logical payload rather than qpdf's raw recovery EOL.
+let _recovered_eol = completed.remove_included_recovery_eol_for_decryption();
 let object = completed.object;
 let mut repair_diagnostics = Diagnostics::default();
 for diagnostic in completed.diagnostics {
@@ -1654,7 +1740,11 @@ fn xref_file_object_diagnostic(
 }
 ```
 
-Put `repair_diagnostics` into the returned `LoadedXref` instead of `Diagnostics::default()`. A direct integer `/Length` is authoritative; an unresolved indirect length passes `None` and therefore uses bounded recovery. Do not introduce an xref-only stream scanner.
+Put `repair_diagnostics` into the returned `LoadedXref` instead of
+`Diagnostics::default()`. A direct integer `/Length` is authoritative; an
+unresolved indirect length passes `Some(ResolvedStreamLength::Missing)` and
+therefore uses bounded recovery. Remove any included recovery EOL before filter
+decoding. Do not introduce an xref-only stream scanner.
 
 - [ ] **Step 6: Delete superseded parser and reader machinery**
 
