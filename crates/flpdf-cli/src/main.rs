@@ -1436,7 +1436,8 @@ fn main() {
     // repeated occurrences and lose the per-group boundaries and declaration
     // order that byte-identical composition relies on. The residual argv (with
     // those groups removed) is what clap sees.
-    let (residual_args, overlay_specs) = match extract_overlay_groups(std::env::args().collect()) {
+    let rewritten_args = rewrite_qpdf_single_dash(std::env::args().collect());
+    let (residual_args, overlay_specs) = match extract_overlay_groups(rewritten_args) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("flpdf: {error}");
@@ -3626,6 +3627,64 @@ fn parse_overlay_segment(kind: OverlayKind, tokens: &[String]) -> CliResult<Over
     })
 }
 
+/// Rewrite qpdf-style single-dash long options into their double-dash form.
+///
+/// qpdf's CLI accepts `-foo` and `--foo` interchangeably for every long option
+/// (`qpdf -qdf`, `qpdf --qdf`, `qpdf -object-streams=generate`, etc.). clap
+/// parses `-qdf` as the bundled short flags `-q -d -f` and errors out because
+/// none of them are declared. This pre-clap pass converts `-foo[=…]` into
+/// `--foo[=…]` so the qpdf-shape .test scripts (and users typing the qpdf
+/// spelling) work against flpdf-cli without change.
+///
+/// Rewriting is skipped for:
+/// * The bare `-` (stdin sentinel) and bare `--` (options terminator).
+/// * Anything after the first `--` token (positional passthrough).
+/// * Tokens whose first non-dash character is an ASCII digit (`-1`, `-0.5`);
+///   these are negative-number positionals, not options.
+/// * The known flpdf short flags: `-h`, `-o`, `-h=…`, `-o=…`. Every other
+///   single-character `-X` token is treated as a (malformed) long option and
+///   rewritten to `--X`; clap then rejects it with a proper diagnostic
+///   instead of a misleading "bundled shorts" tip.
+fn rewrite_qpdf_single_dash(args: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut past_terminator = false;
+    for arg in args {
+        if past_terminator {
+            out.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            past_terminator = true;
+            out.push(arg);
+            continue;
+        }
+        if arg == "-" || arg.starts_with("--") || !arg.starts_with('-') {
+            out.push(arg);
+            continue;
+        }
+        let after_dash = &arg[1..];
+        if after_dash
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
+            out.push(arg);
+            continue;
+        }
+        let name = after_dash.split('=').next().unwrap_or(after_dash);
+        if name == "h" || name == "o" {
+            out.push(arg);
+            continue;
+        }
+        let mut rewritten = String::with_capacity(arg.len() + 1);
+        rewritten.push('-');
+        rewritten.push_str(&arg);
+        out.push(rewritten);
+    }
+    out
+}
+
 /// Split the `--overlay`/`--underlay` groups out of the raw argument vector,
 /// preserving their declaration order and per-group boundaries.
 ///
@@ -5766,6 +5825,58 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("duplicate --password="), "got: {err}");
+    }
+
+    // --- rewrite_qpdf_single_dash ---------------------------------------
+
+    #[test]
+    fn single_dash_long_becomes_double_dash() {
+        let out = rewrite_qpdf_single_dash(strs(&["flpdf", "-qdf", "-static-id", "in.pdf"]));
+        assert_eq!(out, strs(&["flpdf", "--qdf", "--static-id", "in.pdf"]));
+    }
+
+    #[test]
+    fn single_dash_long_with_equals_becomes_double_dash() {
+        let out = rewrite_qpdf_single_dash(strs(&["flpdf", "-object-streams=generate"]));
+        assert_eq!(out, strs(&["flpdf", "--object-streams=generate"]));
+    }
+
+    #[test]
+    fn double_dash_long_is_untouched() {
+        let out = rewrite_qpdf_single_dash(strs(&["flpdf", "--qdf", "--static-id"]));
+        assert_eq!(out, strs(&["flpdf", "--qdf", "--static-id"]));
+    }
+
+    #[test]
+    fn known_short_flags_untouched() {
+        // -o and -h are the only shorts flpdf declares; they must not be
+        // rewritten to `--o`/`--h`.
+        let out = rewrite_qpdf_single_dash(strs(&["flpdf", "-o", "path", "-h"]));
+        assert_eq!(out, strs(&["flpdf", "-o", "path", "-h"]));
+    }
+
+    #[test]
+    fn stdin_sentinel_and_options_terminator_untouched() {
+        let out = rewrite_qpdf_single_dash(strs(&["flpdf", "-", "--"]));
+        assert_eq!(out, strs(&["flpdf", "-", "--"]));
+    }
+
+    #[test]
+    fn tokens_after_options_terminator_untouched() {
+        // A positional value that starts with `-` must survive verbatim.
+        let out =
+            rewrite_qpdf_single_dash(strs(&["flpdf", "in.pdf", "--", "-qdf", "-not-an-option"]));
+        assert_eq!(
+            out,
+            strs(&["flpdf", "in.pdf", "--", "-qdf", "-not-an-option"])
+        );
+    }
+
+    #[test]
+    fn negative_number_positional_untouched() {
+        // -1 / -0.5 are numeric positionals, never options.
+        let out = rewrite_qpdf_single_dash(strs(&["flpdf", "-1", "-0.5"]));
+        assert_eq!(out, strs(&["flpdf", "-1", "-0.5"]));
     }
 
     // --- extract_overlay_groups -----------------------------------------
