@@ -3086,6 +3086,31 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         options
     };
 
+    // Run every library-level option preflight before the specialized Generate
+    // or Preserve emitters below can return early.
+    if options.deterministic_id && options.static_id {
+        return Err(crate::Error::Unsupported(
+            "deterministic_id and static_id are mutually exclusive".to_string(),
+        ));
+    }
+    if options.encrypt.is_some() && options.copy_encryption.is_some() {
+        return Err(crate::Error::Unsupported(
+            "encrypt and copy_encryption are mutually exclusive".to_string(),
+        ));
+    }
+    if options.deterministic_id && encrypting {
+        return Err(crate::Error::Unsupported(
+            "the deterministic-id option is incompatible with encrypted output files".to_string(),
+        ));
+    }
+    if encrypting && options.qdf {
+        return Err(crate::Error::Unsupported(
+            "--encrypt / --copy-encryption-from cannot be combined with --qdf \
+             (flpdf-9hc.4.9 walking skeleton)"
+                .to_string(),
+        ));
+    }
+
     // ── ObjStm-routing overview ───────────────────────────────────────────────
     // 1. Run the planner to decide which objects belong in ObjStm batches.
     // 2. Build a member→(container_num, index_in_batch) lookup.
@@ -3171,9 +3196,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             .iter()
             .any(|(_reference, offset)| matches!(offset, XrefOffset::Compressed { .. }));
         let plan = object_streams::plan_qpdf_preserve_object_streams(pdf)?;
-        if !plan.batches.is_empty()
-            || (source_had_compressed_objects && !plan.removed_refs.is_empty())
-        {
+        if source_had_compressed_objects || !plan.batches.is_empty() {
             return write_pdf_containerized_qpdf(
                 pdf,
                 out,
@@ -3214,12 +3237,6 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         .new_for_original(root_ref)
         .ok_or_else(|| crate::Error::Unsupported("renumber: /Root absent from map".to_string()))?;
 
-    if options.deterministic_id && options.static_id {
-        return Err(crate::Error::Unsupported(
-            "deterministic_id and static_id are mutually exclusive".to_string(),
-        ));
-    }
-
     // Pass `false` here because full-rewrite ObjStm emission is only known
     // after planning. The required PDF 1.5 floor is applied below from the
     // final xref form, which becomes `Stream` when ObjStm batches are emitted.
@@ -3234,30 +3251,8 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     // Invariant: at most ONE of encrypt / copy_encryption is set.  The CLI
     // enforces this via conflicts_with; guard here too so a library caller
     // that passes both gets a recoverable error rather than a panic.
-    if options.encrypt.is_some() && options.copy_encryption.is_some() {
-        return Err(crate::Error::Unsupported(
-            "encrypt and copy_encryption are mutually exclusive".to_string(),
-        ));
-    }
     // `encrypting` was computed once at the top (the force<1.5 gate consults it);
     // encrypt / copy_encryption are never mutated, so it is still authoritative.
-
-    if options.deterministic_id && encrypting {
-        // qpdf rejects this combination: the /ID feeds the encryption key, so a
-        // content-derived /ID cannot be computed before the encrypted bytes
-        // exist. Mirror qpdf's user-facing wording.
-        return Err(crate::Error::Unsupported(
-            "the deterministic-id option is incompatible with encrypted output files".to_string(),
-        ));
-    }
-
-    if encrypting && options.qdf {
-        return Err(crate::Error::Unsupported(
-            "--encrypt / --copy-encryption-from cannot be combined with --qdf \
-             (flpdf-9hc.4.9 walking skeleton)"
-                .to_string(),
-        ));
-    }
 
     // Capture qpdf's deterministic-`/ID` seed inputs from the ORIGINAL trailer
     // before the emission loop borrows `pdf`: the permanent identifier `/ID[0]`
@@ -4655,10 +4650,10 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
     let mut trailer = pdf.trailer().clone();
     strip_incremental_trailer_keys(&mut trailer);
     remap_qpdf_trailer_refs(pdf, &mut trailer, &renumber)?;
-    let info_ref = match trailer.get("Info") {
-        Some(Object::Reference(r)) => Some(*r),
-        _ => None,
-    };
+    trailer.remove("ID");
+    trailer.remove("Encrypt");
+    trailer.insert("Root", Object::Reference(new_root));
+    trailer.insert("Size", Object::Integer(i64::from(size)));
 
     let xref_ref = ObjectRef::new(xref_object_number, 0);
     if options.deterministic_id {
@@ -4670,11 +4665,12 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
             filtered: structural_filtered,
             widths,
             index: None,
-            info: info_ref,
-            root: Some(new_root),
+            info: None,
+            root: None,
             size,
             prev: None,
             id: None,
+            trailer: Some(&trailer),
         };
         let mut id_writer = |out: &mut Vec<u8>| {
             write_deterministic_id_inline(out, &det_id_info_suffix, det_id_source_id0.as_deref())
@@ -4713,11 +4709,12 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
             filtered: structural_filtered,
             widths,
             index: None,
-            info: info_ref,
-            root: Some(new_root),
+            info: None,
+            root: None,
             size,
             prev: None,
             id: Some((&id0, &id1)),
+            trailer: Some(&trailer),
         };
         xref_stream::write_object(&mut bytes, xref_ref, &dict, &payload);
     }

@@ -68,12 +68,13 @@ pub struct Pdf<R: Read + Seek> {
     /// before applying the selected stream policy, matching qpdf's recovered
     /// raw stream bytes for missing, invalid, and unresolved `/Length` values.
     recovered_stream_eols: BTreeMap<ObjectRef, crate::parser::RecoveredStreamEol>,
-    /// Streams whose source payload bytes were actually decrypted while being
-    /// resolved. Recovered framing belongs to the ciphertext for these streams
-    /// and must not be appended to the plaintext rewrite. Identity crypt
-    /// filters and `/EncryptMetadata false` metadata streams are deliberately
-    /// absent: their recovered framing is already plaintext and is restored.
-    decrypted_stream_refs: BTreeSet<ObjectRef>,
+    /// Streams whose cached payload no longer uses the source representation.
+    /// This includes actual decryption and explicit `/Crypt` filter-chain
+    /// decoding. Recovered framing must not be appended later in either case:
+    /// ciphertext framing is not plaintext, while explicit-filter framing is
+    /// consumed before decoding. Metadata and document-level Identity streams
+    /// remain source-represented and therefore absent.
+    transformed_stream_refs: BTreeSet<ObjectRef>,
     /// Valid indirect references discovered while preparing qpdf JSON whose
     /// exact object generation has no live xref/cache target.
     qpdf_dangling_refs: BTreeSet<ObjectRef>,
@@ -376,7 +377,7 @@ impl<R: Read + Seek> Pdf<R> {
         // encryption is not sufficient: metadata under `/EncryptMetadata
         // false`, `/StmF /Identity`, and explicit `/Crypt /Identity` streams
         // keep plaintext source bytes and therefore retain the recovered EOL.
-        if self.decrypted_stream_refs.contains(&object_ref) {
+        if self.transformed_stream_refs.contains(&object_ref) {
             return None;
         }
         self.recovered_stream_eols
@@ -573,7 +574,7 @@ impl<R: Read + Seek> Pdf<R> {
             source_xref_entries,
             dirty_object_refs: BTreeSet::new(),
             recovered_stream_eols: BTreeMap::new(),
-            decrypted_stream_refs: BTreeSet::new(),
+            transformed_stream_refs: BTreeSet::new(),
             qpdf_dangling_refs: BTreeSet::new(),
             qpdf_trailer_references: loaded_state.trailer_references,
             qpdf_parsed_xref_streams: loaded_state.parsed_xref_streams,
@@ -889,7 +890,7 @@ impl<R: Read + Seek> Pdf<R> {
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         self.recovered_stream_eols.remove(&object_ref);
-        self.decrypted_stream_refs.remove(&object_ref);
+        self.transformed_stream_refs.remove(&object_ref);
         if let Some(CacheEntry::Compressed { stream, index }) =
             self.cache.entry(object_ref).cloned()
         {
@@ -911,7 +912,7 @@ impl<R: Read + Seek> Pdf<R> {
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         self.recovered_stream_eols.remove(&object_ref);
-        self.decrypted_stream_refs.remove(&object_ref);
+        self.transformed_stream_refs.remove(&object_ref);
         if object_ref.number == 0
             || matches!(
                 self.cache.entry(object_ref),
@@ -1261,13 +1262,17 @@ impl<R: Read + Seek> Pdf<R> {
                 // `Unresolved` entry, so a decryption error here leaves it
                 // `Unresolved` (not `Reserved`) and the failure stays loud on a
                 // retry.
-                let (object, stream_payload_decrypted) =
-                    self.decrypt_resolved_object(object_ref, object)?;
+                let recovered_eol = endstream_scan_authoritative
+                    .then_some(parsed.recovered_stream_eol)
+                    .flatten()
+                    .map(crate::parser::RecoveredStreamEol::as_bytes);
+                let (object, stream_payload_transformed) =
+                    self.decrypt_resolved_object(object_ref, object, recovered_eol)?;
                 self.cache.set_resolved(object_ref, object);
-                if stream_payload_decrypted {
-                    self.decrypted_stream_refs.insert(object_ref);
+                if stream_payload_transformed {
+                    self.transformed_stream_refs.insert(object_ref);
                 } else {
-                    self.decrypted_stream_refs.remove(&object_ref);
+                    self.transformed_stream_refs.remove(&object_ref);
                 }
                 if endstream_scan_authoritative {
                     if let Some(eol) = parsed.recovered_stream_eol {
@@ -1468,24 +1473,32 @@ impl<R: Read + Seek> Pdf<R> {
                     return Ok(false);
                 }
                 let mut object = parsed.object;
+                let mut endstream_scan_authoritative = parsed.recovered_stream_eol.is_some();
                 if let Some(isl) = parsed.indirect_length {
-                    let _ = self.apply_indirect_stream_length(
+                    let used_endstream_scan = self.apply_indirect_stream_length(
                         stream_ref,
                         &mut object,
                         isl,
                         &parsed.bytes,
                         offset,
                     )?;
+                    if parsed.recovered_stream_eol.is_some() {
+                        endstream_scan_authoritative = used_endstream_scan;
+                    }
                 }
                 // `apply_indirect_stream_length` already restored the lazy entry,
                 // so a decryption error here leaves it `Unresolved`.
-                let (object, stream_payload_decrypted) =
-                    self.decrypt_resolved_object(stream_ref, object)?;
+                let recovered_eol = endstream_scan_authoritative
+                    .then_some(parsed.recovered_stream_eol)
+                    .flatten()
+                    .map(crate::parser::RecoveredStreamEol::as_bytes);
+                let (object, stream_payload_transformed) =
+                    self.decrypt_resolved_object(stream_ref, object, recovered_eol)?;
                 self.cache.set_resolved(stream_ref, object.clone());
-                if stream_payload_decrypted {
-                    self.decrypted_stream_refs.insert(stream_ref);
+                if stream_payload_transformed {
+                    self.transformed_stream_refs.insert(stream_ref);
                 } else {
-                    self.decrypted_stream_refs.remove(&stream_ref);
+                    self.transformed_stream_refs.remove(&stream_ref);
                 }
                 self.record_file_object_warnings(
                     stream_ref,
@@ -1510,8 +1523,8 @@ impl<R: Read + Seek> Pdf<R> {
 
         let (parent_ref, parent_index, object) =
             self.parse_object_stream_chain_entry(stream_ref, &stream_object, index)?;
-        let (object, _stream_payload_decrypted) =
-            self.decrypt_resolved_object(object_ref, object)?;
+        let (object, _stream_payload_transformed) =
+            self.decrypt_resolved_object(object_ref, object, None)?;
         self.compressed_member_parents
             .insert(object_ref, (parent_ref, parent_index));
         self.cache.set_resolved(object_ref, object);
@@ -1522,6 +1535,7 @@ impl<R: Read + Seek> Pdf<R> {
         &self,
         object_ref: ObjectRef,
         mut object: Object,
+        recovered_stream_eol: Option<&[u8]>,
     ) -> Result<(Object, bool)> {
         let Some(encryption) = &self.encryption else {
             return Ok((object, false));
@@ -1537,13 +1551,13 @@ impl<R: Read + Seek> Pdf<R> {
             &encryption.file_key,
             encryption.encrypt_ref,
         )?;
-        let mut stream_payload_decrypted = false;
+        let mut stream_payload_transformed = false;
         if let Object::Stream(stream) = &mut object {
             if !encryption.encrypt_metadata && is_metadata_stream(&stream.dict) {
                 return Ok((object, false));
             } else if stream_has_explicit_crypt_filter(&stream.dict) {
-                stream_payload_decrypted =
-                    apply_explicit_crypt_filters(object_ref, stream, encryption)?;
+                apply_explicit_crypt_filters(object_ref, stream, encryption, recovered_stream_eol)?;
+                stream_payload_transformed = true;
             } else {
                 decrypt_stream_bytes(
                     object_ref,
@@ -1551,10 +1565,10 @@ impl<R: Read + Seek> Pdf<R> {
                     encryption.stream_mode,
                     &encryption.file_key,
                 )?;
-                stream_payload_decrypted = encryption.stream_mode != EncryptionMode::Identity;
+                stream_payload_transformed = encryption.stream_mode != EncryptionMode::Identity;
             }
         }
-        Ok((object, stream_payload_decrypted))
+        Ok((object, stream_payload_transformed))
     }
 
     fn parse_object_stream_chain_entry(
@@ -1896,14 +1910,21 @@ fn apply_explicit_crypt_filters(
     object_ref: ObjectRef,
     stream: &mut crate::Stream,
     encryption: &EncryptionState,
-) -> Result<bool> {
-    let mut payload_decrypted = false;
+    recovered_stream_eol: Option<&[u8]>,
+) -> Result<()> {
+    // The authoritative endstream scan removed framing from the RAW source
+    // representation. Restore it before any declared filters are decoded, so a
+    // trailing source byte is consumed (or ignored) by that pipeline instead
+    // of being appended later to the decoded payload.
+    let mut source_data = stream.data.clone();
+    if let Some(eol) = recovered_stream_eol {
+        source_data.extend_from_slice(eol);
+    }
     let decoded = crate::filters::decode_stream_data_with_crypt_filter(
         &stream.dict,
-        &stream.data,
+        &source_data,
         |decode_params, bytes| {
             let mode = explicit_crypt_mode(encryption, decode_params)?;
-            payload_decrypted |= mode != EncryptionMode::Identity;
             let mut decrypted = bytes.to_vec();
             decrypt_stream_bytes(object_ref, &mut decrypted, mode, &encryption.file_key)?;
             Ok(decrypted)
@@ -1912,7 +1933,7 @@ fn apply_explicit_crypt_filters(
     stream.data = decoded;
     stream.dict.remove("Filter");
     stream.dict.remove("DecodeParms");
-    Ok(payload_decrypted)
+    Ok(())
 }
 
 fn explicit_crypt_mode(
@@ -2545,7 +2566,7 @@ mod tests {
         let sentinel = Object::Integer(42);
 
         let (object, stream_payload_decrypted) = pdf
-            .decrypt_resolved_object(encrypt_ref, sentinel.clone())
+            .decrypt_resolved_object(encrypt_ref, sentinel.clone(), None)
             .expect("/Encrypt bypass");
 
         assert_eq!(object, sentinel);

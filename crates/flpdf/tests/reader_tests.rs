@@ -800,6 +800,45 @@ fn explicit_identity_crypt_filter_rewrite_restores_plaintext_recovered_eol() {
     );
 }
 
+fn assert_explicit_identity_filter_chain_does_not_append_decoded_eol(crypt_after_flate: bool) {
+    let bytes =
+        encrypted_v4_explicit_crypt_filter_fixture_with_length(true, crypt_after_flate, false);
+    let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).expect("encrypted source");
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Disable;
+    options.stream_data = Some(StreamDataMode::Preserve);
+    options.compress_streams = CompressStreams::No;
+    options.static_id = true;
+    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).expect("plaintext rewrite");
+
+    let mut rewritten = Pdf::open(std::io::Cursor::new(output)).expect("rewritten output");
+    let root = rewritten.root_ref().expect("root");
+    let Object::Dictionary(catalog) = rewritten.resolve(root).expect("catalog") else {
+        panic!("root must resolve to catalog");
+    };
+    let stream_ref = catalog.get_ref("Data").expect("stream reference");
+    let Object::Stream(stream) = rewritten.resolve(stream_ref).expect("stream") else {
+        panic!("Data must resolve to a stream");
+    };
+    assert_eq!(
+        stream.data, b"explicit crypt stream",
+        "the source framing EOL must be consumed before the remaining filter chain is decoded"
+    );
+}
+
+#[test]
+fn explicit_identity_before_flate_consumes_recovered_eol_in_source_representation() {
+    assert_explicit_identity_filter_chain_does_not_append_decoded_eol(false);
+}
+
+#[test]
+fn explicit_identity_after_flate_consumes_recovered_eol_in_source_representation() {
+    assert_explicit_identity_filter_chain_does_not_append_decoded_eol(true);
+}
+
 #[test]
 fn r5_and_r6_reject_malformed_encrypt_metadata() {
     for revision in [5, 6] {
@@ -1279,6 +1318,14 @@ fn encrypted_v4_rc4_cf_fixture() -> Vec<u8> {
 }
 
 fn encrypted_v4_explicit_crypt_filter_fixture(identity: bool, crypt_after_flate: bool) -> Vec<u8> {
+    encrypted_v4_explicit_crypt_filter_fixture_with_length(identity, crypt_after_flate, true)
+}
+
+fn encrypted_v4_explicit_crypt_filter_fixture_with_length(
+    identity: bool,
+    crypt_after_flate: bool,
+    valid_length: bool,
+) -> Vec<u8> {
     let id0 = decode_hex_fixture("000102030405060708090a0b0c0d0e0f");
     let o = [0x42u8; 32];
     let p = -3904i32;
@@ -1287,16 +1334,20 @@ fn encrypted_v4_explicit_crypt_filter_fixture(identity: bool, crypt_after_flate:
 
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let obj1_offset = bytes.len();
-    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Data 4 0 R >>\nendobj\n");
     let obj2_offset = bytes.len();
     bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n");
 
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     let stream_key = aes128_object_key(&per_object_aes_key(&file_key, 4, 0));
     let stream_data = if crypt_after_flate {
-        let encrypted =
-            aes128_cbc_encrypt_with_iv(&stream_key, &[0x22; 16], b"explicit crypt stream");
-        encoder.write_all(&encrypted).unwrap();
+        if identity {
+            encoder.write_all(b"explicit crypt stream").unwrap();
+        } else {
+            let encrypted =
+                aes128_cbc_encrypt_with_iv(&stream_key, &[0x22; 16], b"explicit crypt stream");
+            encoder.write_all(&encrypted).unwrap();
+        }
         encoder.finish().unwrap()
     } else {
         encoder.write_all(b"explicit crypt stream").unwrap();
@@ -1320,10 +1371,14 @@ fn encrypted_v4_explicit_crypt_filter_fixture(identity: bool, crypt_after_flate:
         )
     };
     let obj4_offset = bytes.len();
+    let length = if valid_length {
+        stream_data.len().to_string()
+    } else {
+        "[]".to_string()
+    };
     bytes.extend_from_slice(
         format!(
-            "4 0 obj\n<< /Length {} /Filter {filters} /DecodeParms {decode_parms_array} >>\nstream\n",
-            stream_data.len()
+            "4 0 obj\n<< /Length {length} /Filter {filters} /DecodeParms {decode_parms_array} >>\nstream\n"
         )
         .as_bytes(),
     );

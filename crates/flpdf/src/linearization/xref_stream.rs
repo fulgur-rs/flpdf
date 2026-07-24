@@ -26,7 +26,7 @@ use std::io::Write as _;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 
-use crate::object::ObjectRef;
+use crate::object::{Dictionary, Object, ObjectRef};
 use crate::Result;
 
 /// One cross-reference stream entry — a single `/W`-formatted row.
@@ -159,6 +159,10 @@ pub(crate) struct XrefStreamDict<'a> {
     pub prev: Option<u64>,
     /// Trailer `/ID` as two raw byte strings, serialized as `<hex><hex>`.
     pub id: Option<(&'a [u8], &'a [u8])>,
+    /// Complete trimmed trailer entries for a non-linearized xref stream.
+    /// When present, these replace the dedicated Info/Root/Size/Prev fields and
+    /// are serialized in dictionary key order before the separately written ID.
+    pub trailer: Option<&'a Dictionary>,
 }
 
 /// Append two lowercase hex digits per byte of `bytes` to `out`.
@@ -198,15 +202,28 @@ fn write_object_dict_prefix(
     if let Some((start, count)) = dict.index {
         out.extend_from_slice(format!(" /Index [ {start} {count} ]").as_bytes());
     }
-    if let Some(info) = dict.info {
-        out.extend_from_slice(format!(" /Info {} {} R", info.number, info.generation).as_bytes());
-    }
-    if let Some(root) = dict.root {
-        out.extend_from_slice(format!(" /Root {} {} R", root.number, root.generation).as_bytes());
-    }
-    out.extend_from_slice(format!(" /Size {}", dict.size).as_bytes());
-    if let Some(prev) = dict.prev {
-        out.extend_from_slice(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes());
+    if let Some(trailer) = dict.trailer {
+        for (key, value) in trailer.iter() {
+            out.push(b' ');
+            Object::Name(key.to_vec()).write_pdf(out);
+            out.push(b' ');
+            value.write_pdf(out);
+        }
+    } else {
+        if let Some(info) = dict.info {
+            out.extend_from_slice(
+                format!(" /Info {} {} R", info.number, info.generation).as_bytes(),
+            );
+        }
+        if let Some(root) = dict.root {
+            out.extend_from_slice(
+                format!(" /Root {} {} R", root.number, root.generation).as_bytes(),
+            );
+        }
+        out.extend_from_slice(format!(" /Size {}", dict.size).as_bytes());
+        if let Some(prev) = dict.prev {
+            out.extend_from_slice(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes());
+        }
     }
 }
 
@@ -532,6 +549,7 @@ mod tests {
             // widths (not values) affect the region size.
             prev: Some(2356),
             id: Some((&ID0, &ID1)),
+            trailer: None,
         };
         assert_eq!(first_pass_region_len(ObjectRef::new(7, 0), &dict, 11), 391);
     }
@@ -632,6 +650,7 @@ mod tests {
             size: 6,
             prev: None,
             id: Some((&ID0, &ID1)),
+            trailer: None,
         };
         let region = write_padded_region(ObjectRef::new(5, 0), &dict, b"PAYLOAD", 400).unwrap();
         assert_eq!(region.len(), 400);
@@ -652,6 +671,7 @@ mod tests {
             size: 6,
             prev: None,
             id: Some((&ID0, &ID1)),
+            trailer: None,
         };
         // A 10-byte region cannot hold the object; the writer must error rather
         // than silently overflow the reserved region.
@@ -733,6 +753,7 @@ mod tests {
                 size: 17,
                 prev: Some(2226),
                 id: Some((&ID0, &ID1)),
+                trailer: None,
             },
             b"PAYLOAD",
         );
@@ -767,6 +788,7 @@ mod tests {
                 size: 6,
                 prev: None,
                 id: Some((&ID0, &ID1)),
+                trailer: None,
             },
             b"X",
         );
@@ -811,6 +833,7 @@ mod tests {
                 size: 17,
                 prev: Some(2226),
                 id: Some((&ID0, &ID1)),
+                trailer: None,
             },
             &payload,
         );
@@ -834,6 +857,7 @@ mod tests {
                 size: 6,
                 prev: None,
                 id: Some((&ID0, &ID1)),
+                trailer: None,
             },
             &payload,
         );

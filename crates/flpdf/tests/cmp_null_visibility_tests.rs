@@ -11,6 +11,71 @@ use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
 
+fn push_compact_xref_row(rows: &mut Vec<u8>, kind: u8, field1: u32, field2: u16) {
+    rows.push(kind);
+    rows.extend_from_slice(&field1.to_be_bytes());
+    rows.extend_from_slice(&field2.to_be_bytes());
+}
+
+fn one_compressed_object_pdf(member: &[u8], trailer_additions: &str) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+    let catalog_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Held 5 0 R >>\nendobj\n");
+    let pages_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+
+    let objstm_offset = bytes.len();
+    let mut objstm_data = b"5 0 ".to_vec();
+    objstm_data.extend_from_slice(member);
+    bytes.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n",
+            objstm_data.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&objstm_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = bytes.len();
+    let mut rows = Vec::new();
+    push_compact_xref_row(&mut rows, 0, 0, u16::MAX);
+    push_compact_xref_row(&mut rows, 1, catalog_offset as u32, 0);
+    push_compact_xref_row(&mut rows, 1, pages_offset as u32, 0);
+    push_compact_xref_row(&mut rows, 0, 0, 0);
+    push_compact_xref_row(&mut rows, 1, objstm_offset as u32, 0);
+    push_compact_xref_row(&mut rows, 2, 4, 0);
+    push_compact_xref_row(&mut rows, 1, xref_offset as u32, 0);
+    bytes.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /XRef /Size 7 /Root 1 0 R {trailer_additions}\
+             /W [1 4 2] /Length {} >>\nstream\n",
+            rows.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&rows);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+fn rewrite_generated_preserve(
+    source: &[u8],
+    configure: impl FnOnce(&mut WriteOptions),
+) -> flpdf::Result<Vec<u8>> {
+    let mut pdf = Pdf::open(Cursor::new(source))?;
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Preserve;
+    options.static_id = true;
+    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+    configure(&mut options);
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options)?;
+    Ok(output)
+}
+
 fn rewrite_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8> {
     rewrite_mode_with_policy(fixture, mode, None, CompressStreams::Yes)
 }
@@ -727,6 +792,88 @@ fn preserve_keeps_signatures_with_null_fields_compressed_and_hides_fields() {
             ObjectStreamMode::Preserve,
         ),
         "null-visible-preserve-signature-null-fields/preserve.pdf",
+    );
+}
+
+#[test]
+fn preserve_empty_qpdf_plan_keeps_signature_plain() {
+    let source =
+        one_compressed_object_pdf(b"<< /Type /Sig /ByteRange [0 0 0 0] /Contents <00> >>", "");
+    let output = rewrite_generated_preserve(&source, |_| {}).expect("preserve rewrite");
+    let mut pdf = Pdf::open(Cursor::new(output)).expect("reopen output");
+    let mut found_signature = false;
+
+    for object_ref in pdf.object_refs() {
+        match pdf.resolve(object_ref).expect("resolve output object") {
+            Object::Dictionary(ref dict)
+                if matches!(
+                    dict.get("Type"),
+                    Some(Object::Name(name)) if name.as_slice() == b"Sig"
+                ) =>
+            {
+                found_signature = true;
+            }
+            Object::Stream(ref stream)
+                if matches!(
+                    stream.dict.get("Type"),
+                    Some(Object::Name(name)) if name.as_slice() == b"ObjStm"
+                ) =>
+            {
+                panic!(
+                    "the authoritative empty Preserve plan must not repack /Sig (found {object_ref:?})"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        found_signature,
+        "the signature dictionary must remain reachable"
+    );
+}
+
+#[test]
+fn preserve_fast_path_runs_common_id_preflight() {
+    let source = one_compressed_object_pdf(b"<< /Kind /Ordinary >>", "");
+    let error = rewrite_generated_preserve(&source, |options| {
+        options.deterministic_id = true;
+    })
+    .expect_err("static-id plus deterministic-id must be rejected");
+
+    assert!(
+        matches!(error, flpdf::Error::Unsupported(ref message)
+            if message.contains("mutually exclusive")),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn preserve_xref_stream_keeps_direct_trailer_values() {
+    let source = one_compressed_object_pdf(
+        b"<< /Kind /Ordinary >>",
+        "/Foo << /Held 2 0 R >> /Info << /Producer (direct-info) >> ",
+    );
+    let output = rewrite_generated_preserve(&source, |_| {}).expect("preserve rewrite");
+    let pdf = Pdf::open(Cursor::new(output)).expect("reopen output");
+
+    assert!(
+        matches!(
+            pdf.trailer().get("Foo"),
+            Some(Object::Dictionary(dict))
+                if matches!(dict.get("Held"), Some(Object::Reference(_)))
+        ),
+        "direct /Foo and its remapped nested reference must survive"
+    );
+    assert!(
+        matches!(
+            pdf.trailer().get("Info"),
+            Some(Object::Dictionary(dict))
+                if matches!(
+                    dict.get("Producer"),
+                    Some(Object::String(value)) if value == b"direct-info"
+                )
+        ),
+        "direct /Info must survive"
     );
 }
 
