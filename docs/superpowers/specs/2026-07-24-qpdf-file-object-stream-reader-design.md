@@ -107,6 +107,37 @@ The file-object mode retains the existing qpdf-compatible special cases:
 Public `parse_object`, strict indirect-object parsing, and ObjStm member parsing
 retain their current behavior.
 
+### Review remediation: compatibility entry points and ObjStm repair
+
+The word "strict" describes the direct-object grammar and indirect-object
+framing, not a requirement that every stream have a directly usable integer
+`/Length`. Before this refactor, both public `parse_object` and strict
+indirect-object parsing recovered a stream boundary from a token-bounded
+`endstream` when `/Length` was indirect, missing, or non-integer. The shared
+completion engine must preserve that compatibility contract.
+
+Layer 1 therefore keeps the strict entry points on the strict grammar while
+allowing the shared, bounded stream-boundary recovery used by the former
+parser. They still reject an empty strict indirect-object body, preserve a
+top-level `N G R` as a reference, reject a missing `endstream`, and reject
+trailing bytes in public `parse_object`. They do not resolve an indirect
+length through an xref; when no resolved value is available, token-bounded
+`endstream` recovery supplies the same lexical boundary as before.
+
+This lower-layer contract also restores Layer 4 best-effort xref repair.
+`try_recover_objstm_in` may parse an ObjStm while no live xref exists, so an
+indirect `/Length` must not prevent the container from being decoded and its
+compressed entries from being reconstructed. Layer 4 adds an end-to-end
+regression fixture for that path. No xref-specific stream scanner or duplicate
+completion implementation is introduced.
+
+The rejected alternatives are:
+
+- changing only `try_recover_objstm_in`, which would leave the public and
+  strict-parser compatibility regressions in place;
+- restoring the removed parser-owned stream machinery, which would duplicate
+  the shared completion engine and allow the two paths to drift again.
+
 ### `reader/file_object.rs`: file-object framing
 
 The new module corresponds to qpdf's `QPDF::readObject` and
