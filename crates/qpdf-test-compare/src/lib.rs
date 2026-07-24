@@ -1,3 +1,2 @@
-// Public modules are added in later tasks. This stub keeps `cargo build`
-// happy while the crate scaffold lands independently of the compare/clean
-// logic.
+// Public modules the binary re-uses. Additional modules land in later tasks.
+pub mod output;

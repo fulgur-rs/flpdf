@@ -1,5 +1,11 @@
 use std::env;
+use std::fs::File;
 use std::process::ExitCode;
+
+// `dump_file_to_stdout` gets called from the compare orchestrator in a later
+// task; wire the module now so the binary and library share one copy.
+#[allow(dead_code)]
+mod output;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -22,9 +28,20 @@ fn run(args: &[String]) -> ExitCode {
         usage(whoami);
         return ExitCode::from(2);
     }
-    // Real logic lands in later tasks. Exit 2 (qpdf's default error code for
-    // compare-for-test) so any accidental invocation of the stub fails loud.
-    ExitCode::from(2)
+    let actual_path = args[1].as_str();
+    // Scaffold for later tasks: touch the actual file so a missing-input error
+    // exercises the panic-free reporting path. The real compare pipeline
+    // replaces this in a follow-up task.
+    match File::open(actual_path) {
+        Ok(_) => {
+            eprintln!("{whoami}: comparison not yet implemented");
+            ExitCode::from(2)
+        }
+        Err(err) => {
+            eprintln!("{whoami}: {err}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 fn program_name(argv0: &str) -> &str {
