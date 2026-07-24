@@ -1918,6 +1918,9 @@ fn apply_explicit_crypt_filters(
         .cloned()
         .expect("caller checked for an explicit /Crypt filter");
     let mut decode_params = stream.dict.get("DecodeParms").cloned();
+    if let Some(filters) = filter.as_array() {
+        crate::filters::validate_filter_chain_len(filters)?;
+    }
     if let Some(eol) = recovered_stream_eol {
         stream.data.extend_from_slice(eol);
     }
@@ -2694,6 +2697,90 @@ mod tests {
         let mut params = Dictionary::new();
         params.insert("Name", Object::Name(name.to_vec()));
         Object::Dictionary(params)
+    }
+
+    fn explicit_identity_crypt_chain(chain_len: usize) -> Stream {
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![Object::Name(b"Crypt".to_vec()); chain_len]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![crypt_params(b"Identity"); chain_len]),
+        );
+        Stream::new(dict, b"identity".to_vec())
+    }
+
+    #[test]
+    fn explicit_crypt_rejects_overlong_identity_chain_before_mutation() {
+        let encryption = explicit_rc4_encryption_state();
+        let mut stream = explicit_identity_crypt_chain(17);
+        let original = stream.clone();
+
+        let err = apply_explicit_crypt_filters(
+            ObjectRef::new(4, 0),
+            &mut stream,
+            &encryption,
+            Some(b"\n"),
+        )
+        .expect_err("17 explicit Crypt filters must exceed the shared decode cap");
+
+        assert!(
+            matches!(
+                err,
+                Error::Unsupported(ref message)
+                    if message == "filter chain length 17 exceeds maximum of 16"
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            stream, original,
+            "the chain cap must reject before recovered framing or filters are mutated"
+        );
+    }
+
+    #[test]
+    fn explicit_crypt_accepts_max_length_identity_chain() {
+        let encryption = explicit_rc4_encryption_state();
+        let mut stream = explicit_identity_crypt_chain(16);
+
+        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &encryption, None)
+            .expect("16 explicit Crypt filters are within the shared decode cap");
+
+        assert_eq!(stream.data, b"identity");
+        assert_eq!(stream.dict.get("Filter"), None);
+        assert_eq!(stream.dict.get("DecodeParms"), None);
+    }
+
+    #[test]
+    fn explicit_crypt_within_limit_still_rejects_malformed_name_param() {
+        let encryption = explicit_rc4_encryption_state();
+        let mut malformed = Dictionary::new();
+        malformed.insert("Name", Object::Integer(1));
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![Object::Name(b"Crypt".to_vec())]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![Object::Dictionary(malformed)]),
+        );
+        let mut stream = Stream::new(dict, b"ciphertext".to_vec());
+
+        let err =
+            apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &encryption, None)
+                .expect_err("malformed /Crypt /Name remains an error");
+
+        assert!(
+            matches!(
+                err,
+                Error::Encrypted(EncryptedError::Malformed { ref reason })
+                    if reason == "/Crypt /DecodeParms /Name is not a name"
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
