@@ -5091,6 +5091,28 @@ mod tests {
         assert!(matches!(err, crate::Error::Unsupported(_)));
     }
 
+    #[test]
+    fn remap_qpdf_trailer_refs_propagates_unmapped_nested_live_ref() {
+        let fixture = build_partition_fixture();
+        let mut pdf = crate::Pdf::open_mem(&fixture).expect("fixture must open");
+        let map = CatalogFirstRenumber::from_pairs_for_test(&[(
+            ObjectRef::new(1, 0),
+            ObjectRef::new(1, 0),
+        )]);
+        let mut trailer = Dictionary::new();
+        trailer.insert(
+            "Extra",
+            Object::Array(vec![Object::Reference(ObjectRef::new(3, 0))]),
+        );
+
+        let err =
+            remap_qpdf_trailer_refs_with_removed(&mut pdf, &mut trailer, &map, &BTreeSet::new())
+                .unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+                if message.contains("reference 3 0 R absent from renumber map")));
+    }
+
     fn id_array(d: &Dictionary) -> Vec<Object> {
         match d.get("ID") {
             Some(Object::Array(v)) => v.clone(),
