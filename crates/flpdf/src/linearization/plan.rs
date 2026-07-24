@@ -695,6 +695,12 @@ pub struct LinearizationPlan {
     /// Retained qpdf-style object-user signals used to route generated and
     /// preserved ObjStm containers without re-reading the PDF.
     pub(crate) routing_users: Option<LinearizationRoutingUsers>,
+
+    /// Object-stream mode whose traversal and stale-generation rules produced
+    /// this plan. The writer reconciles a legacy boolean plan with its final
+    /// [`WriteOptions`](crate::WriteOptions) mode before using the plan's
+    /// partitions and renumbering.
+    pub(crate) object_stream_mode: crate::writer::ObjectStreamMode,
 }
 
 impl LinearizationPlan {
@@ -1438,6 +1444,7 @@ impl LinearizationPlan {
             outline_first_page_members,
             part9_outline_objects,
             part6_outline_objects,
+            object_stream_mode,
             routing_users: Some(LinearizationRoutingUsers {
                 first_page: first_page_users,
                 thumbnails: thumbnail_user_set,
@@ -1898,6 +1905,7 @@ impl Default for LinearizationPlan {
             part9_outline_objects: Vec::new(),
             part6_outline_objects: Vec::new(),
             routing_users: None,
+            object_stream_mode: crate::writer::ObjectStreamMode::Disable,
         }
     }
 }

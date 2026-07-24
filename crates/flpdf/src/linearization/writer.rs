@@ -2542,51 +2542,48 @@ pub fn write_linearized<R: Read + Seek>(
     // error without mutating the caller's `Pdf` first.
     crate::linearization::inherited_attrs::push_inherited_attributes_to_pages(pdf)?;
 
-    // A forced sub-1.5 header suppresses object-stream generation: object and
+    // Reconcile the caller-built plan/renumber pair with the writer's effective
+    // object-stream mode. The historical `from_pdf(bool)` API maps `false` to
+    // Disable, while `WriteOptions::default()` is Preserve; source-ObjStm
+    // Preserve has different stale-generation and container-routing rules, so
+    // reusing the Disable partitions can reject or mis-layout the file. Rebuild
+    // both structures together whenever their recorded planning mode differs.
+    //
+    // A forced sub-1.5 header also makes the effective mode Disable: object and
     // cross-reference streams are PDF 1.5 features and qpdf will not emit them
     // under a forced version it must not exceed (observed on qpdf 11.9.0:
     // `--linearize --object-streams=generate --force-version=1.4` yields no
-    // `/ObjStm` and a classic xref table at header 1.4, identical to disable
-    // mode). Reconcile fully to the disable layout, not just the batch plan:
-    // the caller builds `plan`/`renumber` BEFORE calling here, and a generate
-    // -mode plan peels first-page open-document objects (e.g. `/AcroForm`,
-    // `/OpenAction`) out of Part 2/3 — a placement difference that would leak
-    // generate-mode ordering into the suppressed classic output. So rebuild the
-    // plan (and renumber) in disable mode and normalize the options to Disable.
-    // The explicit Disable call below is the same mode the non-suppressed
-    // disable path uses; the extra walk only happens in the rare suppression
-    // case. show.rs / check.rs callers use default Disable options, so this
-    // never fires there.
-    //
-    // Fires for Generate AND Preserve (anything but Disable): Preserve on an
-    // ObjStm SOURCE would otherwise keep the inherited ObjStm, so drop it too.
-    // For Preserve the caller already built a `use_generate=false` plan
-    // (`use_generate = mode == Generate`), so the `from_pdf(.., false)` rebuild
-    // is a no-op there — what matters is the `options -> Disable` normalization
-    // (empty batch plan -> classic Part-6 table). Linearization is plaintext
-    // only (encryption is rejected above), so there is no encrypted exception
-    // like the non-linearized rewrite path has.
-    let rebuilt_plan;
-    let rebuilt_renumber;
-    let suppressed_options;
-    let (plan, renumber, options) = if crate::writer::force_version_below_1_5(options)
-        && !matches!(
-            options.object_streams,
-            crate::writer::ObjectStreamMode::Disable
-        ) {
-        rebuilt_plan = LinearizationPlan::from_pdf_with_object_stream_mode(
-            pdf,
-            crate::writer::ObjectStreamMode::Disable,
-        )?;
-        rebuilt_renumber = RenumberMap::from_plan(&rebuilt_plan);
-        suppressed_options = WriteOptions {
-            object_streams: crate::writer::ObjectStreamMode::Disable,
-            ..options.clone()
-        };
-        (&rebuilt_plan, &rebuilt_renumber, &suppressed_options)
+    // `/ObjStm` and a classic xref table at header 1.4). In that case normalize
+    // the write options too, so plan, renumbering, and physical output all use
+    // the same classic layout.
+    let effective_object_stream_mode = if crate::writer::force_version_below_1_5(options) {
+        crate::writer::ObjectStreamMode::Disable
     } else {
-        (plan, renumber, options)
+        options.object_streams
     };
+    let must_rebuild_plan = plan.object_stream_mode != effective_object_stream_mode;
+    let rebuilt = if must_rebuild_plan {
+        let rebuilt_plan =
+            LinearizationPlan::from_pdf_with_object_stream_mode(pdf, effective_object_stream_mode)?;
+        let rebuilt_renumber = RenumberMap::from_plan(&rebuilt_plan);
+        Some((rebuilt_plan, rebuilt_renumber))
+    } else {
+        None
+    };
+    let must_normalize_options = options.object_streams != effective_object_stream_mode;
+    let normalized_options = if must_normalize_options {
+        Some(WriteOptions {
+            object_streams: effective_object_stream_mode,
+            ..options.clone()
+        })
+    } else {
+        None
+    };
+    let (plan, renumber) = match rebuilt.as_ref() {
+        Some((rebuilt_plan, rebuilt_renumber)) => (rebuilt_plan, rebuilt_renumber),
+        None => (plan, renumber),
+    };
+    let options = normalized_options.as_ref().unwrap_or(options);
 
     // qpdf's linearization maps discard generations only after asserting that
     // every surviving object number is unique. Generate, and Preserve on an

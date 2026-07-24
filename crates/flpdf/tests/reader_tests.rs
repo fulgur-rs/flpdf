@@ -4,7 +4,11 @@ use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
 use cbc::Encryptor;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use flpdf::{parse_object, EncryptedError, Error, Object, ObjectRef, Pdf, PdfOpenOptions};
+use flpdf::{
+    parse_object, write_pdf_with_options, CompressStreams, EncryptedError, Error,
+    NewlineBeforeEndstream, Object, ObjectRef, ObjectStreamMode, Pdf, PdfOpenOptions,
+    StreamDataMode, WriteOptions,
+};
 use md5::{Digest, Md5};
 use std::fs::File;
 use std::io::BufReader;
@@ -742,6 +746,60 @@ fn v4_encrypt_metadata_false_leaves_metadata_stream_plaintext() {
     assert_eq!(stream.data, b"<xmpmeta>plain</xmpmeta>".to_vec());
 }
 
+fn assert_encrypted_plaintext_stream_rewrite_restores_recovered_eol(
+    bytes: Vec<u8>,
+    catalog_key: &str,
+) {
+    let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).expect("encrypted source");
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Disable;
+    options.stream_data = Some(StreamDataMode::Preserve);
+    options.compress_streams = CompressStreams::No;
+    options.static_id = true;
+    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).expect("plaintext rewrite");
+
+    let mut rewritten = Pdf::open(std::io::Cursor::new(output)).expect("rewritten output");
+    let root = rewritten.root_ref().expect("root");
+    let Object::Dictionary(catalog) = rewritten.resolve(root).expect("catalog") else {
+        panic!("root must resolve to catalog");
+    };
+    let stream_ref = catalog.get_ref(catalog_key).expect("stream reference");
+    let Object::Stream(stream) = rewritten.resolve(stream_ref).expect("stream") else {
+        panic!("{catalog_key} must resolve to a stream");
+    };
+    assert_eq!(
+        stream.data, b"A\n",
+        "the plaintext stream's recovered LF is part of qpdf's rewritten payload"
+    );
+}
+
+#[test]
+fn encrypt_metadata_false_rewrite_restores_plaintext_recovered_eol() {
+    assert_encrypted_plaintext_stream_rewrite_restores_recovered_eol(
+        encrypted_v4_plaintext_metadata_recovered_eol_fixture(),
+        "Metadata",
+    );
+}
+
+#[test]
+fn document_identity_stream_filter_rewrite_restores_plaintext_recovered_eol() {
+    assert_encrypted_plaintext_stream_rewrite_restores_recovered_eol(
+        encrypted_v4_identity_recovered_eol_fixture(false),
+        "Data",
+    );
+}
+
+#[test]
+fn explicit_identity_crypt_filter_rewrite_restores_plaintext_recovered_eol() {
+    assert_encrypted_plaintext_stream_rewrite_restores_recovered_eol(
+        encrypted_v4_identity_recovered_eol_fixture(true),
+        "Data",
+    );
+}
+
 #[test]
 fn r5_and_r6_reject_malformed_encrypt_metadata() {
     for revision in [5, 6] {
@@ -1287,6 +1345,17 @@ fn encrypted_v4_explicit_crypt_filter_fixture(identity: bool, crypt_after_flate:
 }
 
 fn encrypted_v4_plaintext_metadata_stream_fixture() -> Vec<u8> {
+    encrypted_v4_plaintext_metadata_stream_fixture_with_body(b"<xmpmeta>plain</xmpmeta>", true)
+}
+
+fn encrypted_v4_plaintext_metadata_recovered_eol_fixture() -> Vec<u8> {
+    encrypted_v4_plaintext_metadata_stream_fixture_with_body(b"A", false)
+}
+
+fn encrypted_v4_plaintext_metadata_stream_fixture_with_body(
+    metadata: &[u8],
+    valid_length: bool,
+) -> Vec<u8> {
     let id0 = decode_hex_fixture("000102030405060708090a0b0c0d0e0f");
     let o = [0x42u8; 32];
     let p = -3904i32;
@@ -1299,14 +1368,15 @@ fn encrypted_v4_plaintext_metadata_stream_fixture() -> Vec<u8> {
         .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>\nendobj\n");
     let obj2_offset = bytes.len();
     bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n");
-    let metadata = b"<xmpmeta>plain</xmpmeta>";
     let obj3_offset = bytes.len();
+    let length = if valid_length {
+        metadata.len().to_string()
+    } else {
+        "[]".to_string()
+    };
     bytes.extend_from_slice(
-        format!(
-            "3 0 obj\n<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n",
-            metadata.len()
-        )
-        .as_bytes(),
+        format!("3 0 obj\n<< /Type /Metadata /Subtype /XML /Length {length} >>\nstream\n")
+            .as_bytes(),
     );
     bytes.extend_from_slice(metadata);
     bytes.extend_from_slice(b"\nendstream\nendobj\n");
@@ -1315,6 +1385,47 @@ fn encrypted_v4_plaintext_metadata_stream_fixture() -> Vec<u8> {
     bytes.extend_from_slice(
         format!(
             "xref\n0 4\n0000000000 65535 f \n{obj1_offset:010} 00000 n \n{obj2_offset:010} 00000 n \n{obj3_offset:010} 00000 n \ntrailer\n<< /Size 4 /Root 1 0 R /Encrypt << /Filter /Standard /V 4 /R 4 /Length 128 /P {p} /O <{}> /U <{}> /EncryptMetadata false /CF << /StdCF << /CFM /AESV2 /Length 128 >> >> /StmF /StdCF /StrF /StdCF >> /ID [<{}><{}>] >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            hex_string(&o),
+            hex_string(&u),
+            hex_string(&id0),
+            hex_string(&id0)
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+fn encrypted_v4_identity_recovered_eol_fixture(explicit_crypt_identity: bool) -> Vec<u8> {
+    let id0 = decode_hex_fixture("000102030405060708090a0b0c0d0e0f");
+    let o = [0x42u8; 32];
+    let p = -3904i32;
+    let file_key = r4_file_key(b"", &o, p, &id0);
+    let u = r4_user_key(&file_key, &id0);
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Data 4 0 R >>\nendobj\n");
+    let obj2_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n");
+    let obj4_offset = bytes.len();
+    let stream_dict = if explicit_crypt_identity {
+        "<< /Length [] /Filter /Crypt /DecodeParms << /Name /Identity >> >>"
+    } else {
+        "<< /Length [] >>"
+    };
+    bytes.extend_from_slice(
+        format!("4 0 obj\n{stream_dict}\nstream\nA\nendstream\nendobj\n").as_bytes(),
+    );
+
+    let stream_filter = if explicit_crypt_identity {
+        "StdCF"
+    } else {
+        "Identity"
+    };
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 5\n0000000000 65535 f \n{obj1_offset:010} 00000 n \n{obj2_offset:010} 00000 n \n0000000000 65535 f \n{obj4_offset:010} 00000 n \ntrailer\n<< /Size 5 /Root 1 0 R /Encrypt << /Filter /Standard /V 4 /R 4 /Length 128 /P {p} /O <{}> /U <{}> /CF << /StdCF << /CFM /AESV2 /Length 128 >> >> /StmF /{stream_filter} /StrF /Identity >> /ID [<{}><{}>] >>\nstartxref\n{xref_offset}\n%%EOF\n",
             hex_string(&o),
             hex_string(&u),
             hex_string(&id0),

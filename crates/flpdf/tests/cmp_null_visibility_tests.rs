@@ -84,6 +84,30 @@ fn linearize_mode_result(
     Ok(document.bytes)
 }
 
+fn linearize_legacy_bool_result(
+    fixture: &str,
+    use_generate_objstm: bool,
+    writer_mode: Option<ObjectStreamMode>,
+) -> flpdf::Result<Vec<u8>> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let mut pdf = Pdf::open(BufReader::new(File::open(&path)?))?;
+    let plan = LinearizationPlan::from_pdf(&mut pdf, use_generate_objstm)?;
+    let renumber = RenumberMap::from_plan(&plan);
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&path)?))?;
+    let mut options = WriteOptions::default();
+    if let Some(mode) = writer_mode {
+        options.object_streams = mode;
+    }
+    options.deterministic_id = true;
+    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let mut document = write_linearized(&plan, &renumber, &mut pdf, &options)?;
+    document.back_patch()?;
+    Ok(document.bytes)
+}
+
 fn linearize_encrypted_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
@@ -451,6 +475,31 @@ fn linearize_preserve_source_objstm_removes_only_stale_generation() {
         ),
         "null-visible-stale-generation-objstm/linearize-objstm-preserve.pdf",
     );
+}
+
+#[test]
+fn legacy_disable_plan_with_default_preserve_rebuilds_to_qpdf_layout() {
+    let actual =
+        linearize_legacy_bool_result("null-visible-stale-generation-objstm.pdf", false, None)
+            .expect("writer must reconcile the legacy disable plan with default Preserve");
+    assert_golden(
+        &actual,
+        "null-visible-stale-generation-objstm/linearize-objstm-preserve.pdf",
+    );
+}
+
+#[test]
+fn legacy_bool_plans_matching_explicit_writer_modes_remain_stable() {
+    for (use_generate, mode) in [
+        (false, ObjectStreamMode::Disable),
+        (true, ObjectStreamMode::Generate),
+    ] {
+        let actual =
+            linearize_legacy_bool_result("three-page-objstm.pdf", use_generate, Some(mode))
+                .expect("legacy plan with matching writer mode");
+        let expected = linearize_mode("three-page-objstm.pdf", mode);
+        assert_eq!(actual, expected, "{mode:?} legacy/mode-aware drift");
+    }
 }
 
 #[test]
