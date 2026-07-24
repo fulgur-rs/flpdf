@@ -300,7 +300,7 @@ fn finish_stream(
                     relative_offset: exact_end.unwrap_or(data_start),
                 });
             }
-            match recover_stream_boundary(input, data_start, &mut diagnostics) {
+            match recover_stream_boundary(input, data_start, policy, &mut diagnostics) {
                 Some((end, after)) => {
                     (end, after, included_stream_data_eol(input, data_start, end))
                 }
@@ -347,6 +347,7 @@ fn check_endobj(input: &[u8], after_body: usize, diagnostics: &mut Vec<FileObjec
 fn recover_stream_boundary(
     input: &[u8],
     data_start: usize,
+    policy: RecoveryPolicy,
     diagnostics: &mut Vec<FileObjectDiagnostic>,
 ) -> Option<(usize, usize)> {
     diagnostics.push(FileObjectDiagnostic {
@@ -354,7 +355,15 @@ fn recover_stream_boundary(
         relative_offset: data_start,
     });
 
-    if let Some(terminator) = find_recovery_terminator(input, data_start) {
+    let terminator = match policy {
+        RecoveryPolicy::RequireTerminator => {
+            find_line_anchored_recovery_terminator(input, data_start)
+        }
+        RecoveryPolicy::Strict | RecoveryPolicy::Bounded => {
+            find_recovery_terminator(input, data_start)
+        }
+    };
+    if let Some(terminator) = terminator {
         let data_end = terminator.position();
         let length = data_end - data_start;
         diagnostics.push(FileObjectDiagnostic {
@@ -405,6 +414,24 @@ fn find_recovery_terminator(input: &[u8], start: usize) -> Option<RecoveryTermin
                     .map(|_| RecoveryTerminator::Endobj { position })
             })
     })
+}
+
+fn find_line_anchored_recovery_terminator(
+    input: &[u8],
+    start: usize,
+) -> Option<RecoveryTerminator> {
+    (start..input.len())
+        .filter(|&position| {
+            position == start || matches!(input.get(position - 1), Some(b'\n' | b'\r'))
+        })
+        .find_map(|position| {
+            keyword_token_end(input, position, b"endstream")
+                .map(|after| RecoveryTerminator::Endstream { position, after })
+                .or_else(|| {
+                    keyword_token_end(input, position, b"endobj")
+                        .map(|_| RecoveryTerminator::Endobj { position })
+                })
+        })
 }
 
 fn included_stream_data_eol(
@@ -735,6 +762,22 @@ mod tests {
         let completed =
             finish_file_object(input, pending, None, RecoveryPolicy::RequireTerminator).unwrap();
         assert_eq!(completed.object.as_stream().unwrap().data, b"abc\n");
+        assert_eq!(
+            completed.included_recovery_eol,
+            Some(IncludedStreamDataEol::Lf)
+        );
+    }
+
+    #[test]
+    fn require_terminator_policy_ignores_inline_endstream_tokens() {
+        let input = b"1 0 obj\n<< /Length 9 0 R >>\nstream\nabc endstream def\nendstream\nendobj\n";
+        let pending = parse_file_object_syntax(input).unwrap();
+        let completed =
+            finish_file_object(input, pending, None, RecoveryPolicy::RequireTerminator).unwrap();
+        assert_eq!(
+            completed.object.as_stream().unwrap().data,
+            b"abc endstream def\n"
+        );
         assert_eq!(
             completed.included_recovery_eol,
             Some(IncludedStreamDataEol::Lf)
