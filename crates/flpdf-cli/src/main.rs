@@ -3638,7 +3638,6 @@ fn parse_overlay_segment(kind: OverlayKind, tokens: &[String]) -> CliResult<Over
 ///
 /// Rewriting is skipped for:
 /// * The bare `-` (stdin sentinel) and bare `--` (options terminator).
-/// * Anything after the first `--` token (positional passthrough).
 /// * Tokens whose first non-dash character is an ASCII digit (`-1`, `-0.5`);
 ///   these are negative-number positionals, not options.
 /// * The known flpdf short flags: `-h`, `-o`, `-h=…`, `-o=…`. Every other
@@ -3647,17 +3646,7 @@ fn parse_overlay_segment(kind: OverlayKind, tokens: &[String]) -> CliResult<Over
 ///   instead of a misleading "bundled shorts" tip.
 fn rewrite_qpdf_single_dash(args: Vec<String>) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
-    let mut past_terminator = false;
     for arg in args {
-        if past_terminator {
-            out.push(arg);
-            continue;
-        }
-        if arg == "--" {
-            past_terminator = true;
-            out.push(arg);
-            continue;
-        }
         if arg == "-" || arg.starts_with("--") || !arg.starts_with('-') {
             out.push(arg);
             continue;
@@ -5862,13 +5851,12 @@ mod tests {
     }
 
     #[test]
-    fn tokens_after_options_terminator_untouched() {
-        // A positional value that starts with `-` must survive verbatim.
+    fn single_dash_long_after_section_terminator_is_rewritten() {
         let out =
             rewrite_qpdf_single_dash(strs(&["flpdf", "in.pdf", "--", "-qdf", "-not-an-option"]));
         assert_eq!(
             out,
-            strs(&["flpdf", "in.pdf", "--", "-qdf", "-not-an-option"])
+            strs(&["flpdf", "in.pdf", "--", "--qdf", "--not-an-option"])
         );
     }
 
