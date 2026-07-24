@@ -3615,6 +3615,19 @@ mod tests {
         Pdf::open(Cursor::new(tiny_pdf_bytes())).expect("tiny PDF should parse")
     }
 
+    fn pdf_without_root() -> Pdf<Cursor<Vec<u8>>> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 2 >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+        );
+        Pdf::open(Cursor::new(pdf)).expect("rootless PDF should parse")
+    }
+
     fn build_linearized() -> LinearizedDocument {
         let mut pdf = open_tiny_pdf();
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
@@ -3630,6 +3643,26 @@ mod tests {
     #[test]
     fn write_linearized_succeeds() {
         let _doc = build_linearized();
+    }
+
+    #[test]
+    fn suppressed_object_stream_plan_rebuild_propagates_missing_root() {
+        let mut planning_pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut planning_pdf, true).expect("valid plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            force_version: Some("1.4".to_string()),
+            object_streams: crate::writer::ObjectStreamMode::Generate,
+            ..WriteOptions::default()
+        };
+        let mut write_pdf = pdf_without_root();
+
+        let err = write_linearized(&plan, &renumber, &mut write_pdf, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref message)
+                if message == "reachability: trailer has no /Root"),
+            "suppressed plan rebuild must propagate its missing-root error; got {err:?}"
+        );
     }
 
     #[test]

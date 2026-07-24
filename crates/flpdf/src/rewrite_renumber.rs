@@ -910,6 +910,10 @@ mod tests {
     /// non-contiguous; the xref sizes itself to the highest number. Used to build
     /// hand-crafted graphs for the renumber/reachability walks.
     fn build_raw_pdf(bodies: &[(u32, &[u8])]) -> Vec<u8> {
+        build_raw_pdf_with_trailer_extra(bodies, b"")
+    }
+
+    fn build_raw_pdf_with_trailer_extra(bodies: &[(u32, &[u8])], trailer_extra: &[u8]) -> Vec<u8> {
         let mut out: Vec<u8> = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
         let max_num = bodies.iter().map(|(n, _)| *n).max().unwrap_or(0);
         let size = max_num + 1;
@@ -931,7 +935,9 @@ mod tests {
                 out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
             }
         }
-        out.extend_from_slice(format!("trailer\n<< /Size {size} /Root 1 0 R >>\n").as_bytes());
+        out.extend_from_slice(format!("trailer\n<< /Size {size} /Root 1 0 R ").as_bytes());
+        out.extend_from_slice(trailer_extra);
+        out.extend_from_slice(b" >>\n");
         out.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
         out
     }
@@ -1113,6 +1119,33 @@ mod tests {
         assert!(
             matches!(got, Err(crate::Error::Unsupported(_))),
             "over-deep nesting must error, not silently truncate"
+        );
+    }
+
+    #[test]
+    fn resurrectable_propagates_excessive_nesting_from_trailer_entry() {
+        let mut deep = b"99 0 R".to_vec();
+        for _ in 0..(MAX_INLINE_DEPTH + 2) {
+            let mut wrapped = b"[ ".to_vec();
+            wrapped.extend_from_slice(&deep);
+            wrapped.extend_from_slice(b" ]");
+            deep = wrapped;
+        }
+        let mut trailer_extra = b"/Deep ".to_vec();
+        trailer_extra.extend_from_slice(&deep);
+        let catalog = b"<< /Type /Catalog /Pages 2 0 R >>";
+        let pages = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
+        let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>";
+        let bytes = build_raw_pdf_with_trailer_extra(
+            &[(1, catalog), (2, pages), (3, page)],
+            &trailer_extra,
+        );
+        let mut pdf = Pdf::open_mem(&bytes).expect("open");
+
+        let got = resurrectable_null_refs_excluding(&mut pdf, &BTreeSet::new());
+        assert!(
+            matches!(got, Err(crate::Error::Unsupported(_))),
+            "over-deep trailer entry must propagate the walk error"
         );
     }
 
