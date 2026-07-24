@@ -180,6 +180,7 @@ fn check_reader_inner_with_options<R: Read + Seek>(
     };
 
     let mut diagnostics = pdf.repair_diagnostics().clone();
+    let repair_diagnostics_start = pdf.repair_diagnostics().entries().len();
     if pdf.uses_weak_crypto() {
         diagnostics.push(Diagnostic::warning(
             "encrypted PDF uses weak crypto; processing continued",
@@ -215,6 +216,15 @@ fn check_reader_inner_with_options<R: Read + Seek>(
     // a full-document audit, the one place flpdf's lazy-load discipline is
     // intentionally relaxed.
     check_content_streams(&mut pdf, &mut diagnostics, limits);
+    for diagnostic in pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .skip(repair_diagnostics_start)
+        .cloned()
+    {
+        diagnostics.push(diagnostic);
+    }
 
     let summary = CheckSummary {
         version: pdf.version().to_string(),

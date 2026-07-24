@@ -1231,15 +1231,25 @@ impl<R: Read + Seek> Pdf<R> {
             }
         }
 
-        match self.parse_and_finish_file_object(expected_ref, &bytes, offset) {
+        let window_policy = if next.is_some() {
+            RecoveryPolicy::RequireTokenTerminator
+        } else {
+            RecoveryPolicy::Bounded
+        };
+        match self.parse_and_finish_file_object(expected_ref, &bytes, offset, window_policy) {
             Ok(parsed) => Ok(parsed),
             Err(window_err) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
                 self.resolution_fallbacks_remaining -= 1;
                 self.reader.seek(SeekFrom::Start(offset))?;
                 let mut full = Vec::new();
                 self.reader.read_to_end(&mut full)?;
-                self.parse_and_finish_file_object(expected_ref, &full, offset)
-                    .or(Err(window_err))
+                self.parse_and_finish_file_object(
+                    expected_ref,
+                    &full,
+                    offset,
+                    RecoveryPolicy::Bounded,
+                )
+                .or(Err(window_err))
             }
             Err(err) => Err(err),
         }
@@ -1250,10 +1260,11 @@ impl<R: Read + Seek> Pdf<R> {
         expected_ref: ObjectRef,
         bytes: &[u8],
         offset: u64,
+        policy: RecoveryPolicy,
     ) -> Result<file_object::FileObjectRead> {
         let pending = parse_file_object_syntax(bytes)?;
         let resolved_length = self.resolve_pending_stream_length(expected_ref, &pending, offset)?;
-        let result = finish_file_object(bytes, pending, resolved_length, RecoveryPolicy::Bounded);
+        let result = finish_file_object(bytes, pending, resolved_length, policy);
         self.cache.set_unresolved(expected_ref, offset);
         result
     }
@@ -3563,6 +3574,44 @@ mod tests {
         );
         assert_eq!(json_first.resolve(object_ref).unwrap(), Object::Integer(3));
         assert_eq!(json_first.repair_diagnostics().entries().len(), 1);
+    }
+
+    #[test]
+    fn normal_resolution_retries_when_bounded_window_ends_inside_stream_payload() {
+        let payload = b"before\n9 0 obj\nafter\n";
+        let mut stream_body = b"2 0 obj\n<< /Length 3 0 R >>\nstream\n".to_vec();
+        stream_body.extend_from_slice(payload);
+        stream_body.extend_from_slice(b"endstream\nendobj\n");
+        let length_body = format!("3 0 obj\n{}\nendobj\n", payload.len());
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog /Probe 2 0 R >>\nendobj\n",
+                &stream_body,
+                length_body.as_bytes(),
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let false_next_offset = bytes
+            .windows(b"9 0 obj".len())
+            .position(|window| window == b"9 0 obj")
+            .expect("header-like stream payload") as u64;
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fallback fixture");
+        pdf.sorted_object_offsets.push(false_next_offset);
+        pdf.sorted_object_offsets.sort_unstable();
+        let initial_budget = pdf.resolution_fallbacks_remaining;
+
+        let object = pdf
+            .resolve(ObjectRef::new(2, 0))
+            .expect("bounded stream must retry against EOF");
+        assert_eq!(
+            object.as_stream().map(|stream| stream.data.as_slice()),
+            Some(payload.as_slice())
+        );
+        assert_eq!(
+            pdf.resolution_fallbacks_remaining,
+            initial_budget.saturating_sub(1)
+        );
     }
 
     #[test]
