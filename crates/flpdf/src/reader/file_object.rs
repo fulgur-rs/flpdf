@@ -9,6 +9,7 @@ pub(crate) enum RecoveryPolicy {
     Strict,
     Bounded,
     RequireTerminator,
+    RequireTokenTerminator,
     RequireEndstream,
 }
 
@@ -384,7 +385,13 @@ fn complete_stream(
 
     let (data_end, after_endstream, included_recovery_eol) = match exact_terminator {
         Some((end, after)) => (end, after, None),
-        None if policy == RecoveryPolicy::RequireTerminator && directly_usable_length => {
+        None if matches!(
+            policy,
+            RecoveryPolicy::RequireTerminator
+                | RecoveryPolicy::RequireTokenTerminator
+                | RecoveryPolicy::RequireEndstream
+        ) && directly_usable_length =>
+        {
             return Err(Error::parse(
                 exact_end.expect("usable stream length has an exact boundary"),
                 "expected endstream",
@@ -408,7 +415,9 @@ fn complete_stream(
                 }
                 None if matches!(
                     policy,
-                    RecoveryPolicy::RequireTerminator | RecoveryPolicy::RequireEndstream
+                    RecoveryPolicy::RequireTerminator
+                        | RecoveryPolicy::RequireTokenTerminator
+                        | RecoveryPolicy::RequireEndstream
                 ) =>
                 {
                     return Err(Error::parse(data_start, "stream data exceeds input"));
@@ -467,9 +476,9 @@ fn recover_stream_boundary(
         RecoveryPolicy::RequireEndstream => {
             find_line_anchored_endstream_terminator(input, data_start)
         }
-        RecoveryPolicy::Strict | RecoveryPolicy::Bounded => {
-            find_recovery_terminator(input, data_start)
-        }
+        RecoveryPolicy::Strict
+        | RecoveryPolicy::Bounded
+        | RecoveryPolicy::RequireTokenTerminator => find_recovery_terminator(input, data_start),
     };
     if let Some(terminator) = terminator {
         let data_end = terminator.position();
@@ -723,7 +732,7 @@ mod tests {
         let error = finish_strict_direct_object(trailing_dict, parsed).unwrap_err();
         assert!(matches!(error, Error::Parse { offset: 11, .. }));
 
-        let missing_length = b"<< >>\nstream\nabcendstream";
+        let missing_length = b"<< >>\nstream\nabc\nendstream";
         let parsed = crate::parser::parse_strict_direct_object(missing_length).unwrap();
         assert_eq!(
             finish_strict_direct_object(missing_length, parsed)
@@ -733,6 +742,10 @@ mod tests {
                 .data,
             b"abc"
         );
+
+        let adjacent_missing_length = b"<< >>\nstream\nabcendstream";
+        let parsed = crate::parser::parse_strict_direct_object(adjacent_missing_length).unwrap();
+        assert!(finish_strict_direct_object(adjacent_missing_length, parsed).is_err());
     }
 
     #[test]

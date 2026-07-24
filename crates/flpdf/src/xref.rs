@@ -112,16 +112,17 @@ pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
         Err(_) => return Err(Error::parse(0, "startxref does not fit usize")),
     };
 
-    let mut loaded = match parse_xref_from_start(&bytes, xref_pos, startxref, &version) {
-        Ok(loaded) => loaded,
-        Err(error) if allow_repair => {
-            // Report the first recorded failure; this parse error is only the
-            // trigger when the startxref stage itself succeeded.
-            let trigger = parse_errors.into_iter().next().unwrap_or(error);
-            return recover_xref_from_linear_scan(&bytes, version, startxref, trigger, None);
-        }
-        Err(error) => return Err(error),
-    };
+    let mut loaded =
+        match parse_xref_from_start(&bytes, xref_pos, startxref, &version, allow_repair) {
+            Ok(loaded) => loaded,
+            Err(error) if allow_repair => {
+                // Report the first recorded failure; this parse error is only the
+                // trigger when the startxref stage itself succeeded.
+                let trigger = parse_errors.into_iter().next().unwrap_or(error);
+                return recover_xref_from_linear_scan(&bytes, version, startxref, trigger, None);
+            }
+            Err(error) => return Err(error),
+        };
 
     if let Err(error) = merge_previous_xref_sections(
         &bytes,
@@ -130,6 +131,7 @@ pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
         &loaded.loaded.trailer,
         &mut loaded.trailer_references,
         &mut loaded.parsed_xref_streams,
+        allow_repair,
     ) {
         if allow_repair {
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
@@ -157,6 +159,7 @@ fn parse_xref_from_start(
     xref_pos: usize,
     startxref: u64,
     version: &str,
+    allow_repair: bool,
 ) -> Result<LoadedXrefState> {
     if bytes
         .get(xref_pos..)
@@ -179,7 +182,13 @@ fn parse_xref_from_start(
         });
     }
 
-    parse_xref_stream(bytes, xref_pos, startxref, version.to_string())
+    parse_xref_stream(
+        bytes,
+        xref_pos,
+        startxref,
+        version.to_string(),
+        allow_repair,
+    )
 }
 
 fn merge_previous_xref_sections(
@@ -189,6 +198,7 @@ fn merge_previous_xref_sections(
     trailer: &Dictionary,
     trailer_references: &mut BTreeSet<ObjectRef>,
     parsed_xref_streams: &mut BTreeMap<ObjectRef, Object>,
+    allow_repair: bool,
 ) -> Result<()> {
     let mut visited = HashSet::new();
     let mut previous_offset = parse_previous_xref_offset(trailer);
@@ -201,7 +211,7 @@ fn merge_previous_xref_sections(
             return Err(Error::parse(0, "loop detected following xref tables"));
         }
 
-        let previous = parse_xref_from_start(bytes, previous_pos, offset, version)?;
+        let previous = parse_xref_from_start(bytes, previous_pos, offset, version, allow_repair)?;
         trailer_references.extend(previous.trailer_references.iter().copied());
         for (object_ref, object) in previous.parsed_xref_streams {
             let newer_live = matches!(
@@ -748,6 +758,7 @@ fn parse_xref_stream(
     xref_pos: usize,
     startxref: u64,
     version: String,
+    allow_repair: bool,
 ) -> Result<LoadedXrefState> {
     let tail = bytes
         .get(xref_pos..)
@@ -758,9 +769,13 @@ fn parse_xref_stream(
     let unresolved_length = pending
         .indirect_length_ref()
         .map(|_| ResolvedStreamLength::Missing);
-    let mut completed =
-        finish_file_object(tail, pending, unresolved_length, RecoveryPolicy::Bounded)
-            .map_err(|err| err.rebase_offset(xref_pos))?;
+    let policy = if allow_repair {
+        RecoveryPolicy::Bounded
+    } else {
+        RecoveryPolicy::RequireEndstream
+    };
+    let mut completed = finish_file_object(tail, pending, unresolved_length, policy)
+        .map_err(|err| err.rebase_offset(xref_pos))?;
     // Xref streams are not encrypted, but filter decoding still requires the
     // logical payload rather than qpdf's raw recovery EOL.
     let _recovered_eol = completed.remove_included_recovery_eol_for_decryption();

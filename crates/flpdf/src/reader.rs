@@ -1155,6 +1155,15 @@ impl<R: Read + Seek> Pdf<R> {
         expected_ref: ObjectRef,
         offset: u64,
     ) -> Result<file_object::FileObjectRead> {
+        self.read_object_at_with_policy(expected_ref, offset, RecoveryPolicy::Bounded)
+    }
+
+    fn read_object_at_with_policy(
+        &mut self,
+        expected_ref: ObjectRef,
+        offset: u64,
+        policy: RecoveryPolicy,
+    ) -> Result<file_object::FileObjectRead> {
         let next = self.next_object_offset(offset);
         self.reader.seek(SeekFrom::Start(offset))?;
         let mut bytes = Vec::new();
@@ -1170,14 +1179,14 @@ impl<R: Read + Seek> Pdf<R> {
             }
         }
 
-        match self.parse_and_finish_file_object(expected_ref, &bytes, offset) {
+        match self.parse_and_finish_file_object(expected_ref, &bytes, offset, policy) {
             Ok(parsed) => Ok(parsed),
             Err(window_err) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
                 self.resolution_fallbacks_remaining -= 1;
                 self.reader.seek(SeekFrom::Start(offset))?;
                 let mut full = Vec::new();
                 self.reader.read_to_end(&mut full)?;
-                self.parse_and_finish_file_object(expected_ref, &full, offset)
+                self.parse_and_finish_file_object(expected_ref, &full, offset, policy)
                     .or(Err(window_err))
             }
             Err(err) => Err(err),
@@ -1189,10 +1198,11 @@ impl<R: Read + Seek> Pdf<R> {
         expected_ref: ObjectRef,
         bytes: &[u8],
         offset: u64,
+        policy: RecoveryPolicy,
     ) -> Result<file_object::FileObjectRead> {
         let pending = parse_file_object_syntax(bytes)?;
         let resolved_length = self.resolve_pending_stream_length(expected_ref, &pending, offset)?;
-        let result = finish_file_object(bytes, pending, resolved_length, RecoveryPolicy::Bounded);
+        let result = finish_file_object(bytes, pending, resolved_length, policy);
         self.cache.set_unresolved(expected_ref, offset);
         result
     }
@@ -1349,7 +1359,8 @@ impl<R: Read + Seek> Pdf<R> {
         let stream_object = match self.cache.entry(stream_ref).cloned() {
             Some(CacheEntry::Resolved(object)) => object,
             Some(CacheEntry::Unresolved { offset }) => {
-                let mut parsed = self.read_object_at(stream_ref, offset)?;
+                let policy = RecoveryPolicy::RequireTokenTerminator;
+                let mut parsed = self.read_object_at_with_policy(stream_ref, offset, policy)?;
                 if parsed.object_ref != stream_ref {
                     return Ok(false);
                 }
@@ -3140,6 +3151,54 @@ mod tests {
         assert!(matches!(
             pdf.cache.entry(ObjectRef::new(2, 0)),
             Some(CacheEntry::Unresolved { offset }) if *offset == malformed_offset
+        ));
+    }
+
+    #[test]
+    fn compressed_entry_retries_objstm_when_bounded_window_ends_inside_payload() {
+        let payload = b"7 0 << /Value 1 >>\n9 0 obj\nnull\nendobj\n";
+        let mut body = format!(
+            "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n",
+            payload.len()
+        )
+        .into_bytes();
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"endstream\nendobj\n");
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n", &body],
+            ObjectRef::new(1, 0),
+        );
+        let objstm_offset = bytes
+            .windows(b"4 0 obj".len())
+            .position(|window| window == b"4 0 obj")
+            .unwrap() as u64;
+        let false_next_offset = bytes
+            .windows(b"9 0 obj".len())
+            .position(|window| window == b"9 0 obj")
+            .unwrap() as u64;
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open ObjStm fallback fixture");
+        pdf.cache
+            .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
+        pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
+        pdf.sorted_object_offsets.push(false_next_offset);
+        pdf.sorted_object_offsets.sort_unstable();
+        let initial_budget = pdf.resolution_fallbacks_remaining;
+
+        let object = pdf
+            .resolve_qpdf_json_object(ObjectRef::new(7, 0))
+            .expect("bounded ObjStm must retry against EOF");
+        assert_eq!(
+            object.as_dict().and_then(|dict| dict.get("Value")),
+            Some(&Object::Integer(1))
+        );
+        assert_eq!(
+            pdf.resolution_fallbacks_remaining,
+            initial_budget.saturating_sub(1)
+        );
+        assert!(matches!(
+            pdf.cache.entry(ObjectRef::new(4, 0)),
+            Some(CacheEntry::Resolved(Object::Stream(_)))
         ));
     }
 

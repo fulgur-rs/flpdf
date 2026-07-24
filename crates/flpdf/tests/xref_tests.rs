@@ -100,6 +100,29 @@ fn xref_stream_direct_length_accepts_payload_adjacent_endstream_without_diagnost
 }
 
 #[test]
+fn strict_xref_stream_rejects_endobj_as_a_stream_terminator() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        b"1 0 obj\n<< /Type /XRef /Size 1 /W [1 1 1] /Index [0 1] /Length 3 >>\nstream\n",
+    );
+    bytes.extend_from_slice(&[0, 0, 0]);
+    bytes.extend_from_slice(b"endobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    let err = load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
+        .expect_err("strict xref bootstrap must require endstream");
+    assert!(
+        matches!(err, Error::Parse { ref message, .. } if message.contains("endstream")),
+        "unexpected error: {err}"
+    );
+
+    let loaded = load_xref_and_trailer_with_repair(&mut Cursor::new(bytes), true)
+        .expect("repair mode may recover at endobj");
+    assert_eq!(loaded.last_xref_form, XrefForm::Stream);
+}
+
+#[test]
 fn xref_stream_unavailable_indirect_length_uses_bounded_recovery_diagnostics() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let xref_offset = bytes.len();

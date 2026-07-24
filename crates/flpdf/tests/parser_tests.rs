@@ -17,6 +17,22 @@ fn public_parser_recovers_indirect_stream_length() {
 }
 
 #[test]
+fn public_parser_accepts_a_comment_before_the_stream_keyword() {
+    assert_eq!(
+        parsed_stream_data(b"<< /Length 3 >> % comment\r\nstream\nabcendstream"),
+        b"abc"
+    );
+}
+
+#[test]
+fn public_parser_ignores_inline_endstream_tokens_during_recovery() {
+    assert_eq!(
+        parsed_stream_data(b"<< /Length 9 0 R >>\nstream\nabc endstream def\nendstream"),
+        b"abc endstream def"
+    );
+}
+
+#[test]
 fn public_parser_rejects_truncated_stream_with_indirect_length() {
     let err = parse_object(b"<< /Length 9 0 R >>\nstream\nabc")
         .expect_err("truncated stream with an indirect length must error");
