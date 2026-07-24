@@ -887,8 +887,9 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod stream_length_tests {
     use super::{
-        parse_indirect_object, parse_indirect_object_detailed, parse_indirect_object_detailed_qpdf,
-        parse_object, parse_qpdf_direct_object, RecoveredStreamEol,
+        keyword_token_end, parse_indirect_object, parse_indirect_object_detailed,
+        parse_indirect_object_detailed_qpdf, parse_object, parse_qpdf_direct_object,
+        RecoveredStreamEol,
     };
     use crate::{Object, ObjectRef};
 
@@ -1093,14 +1094,15 @@ mod stream_length_tests {
 
     #[test]
     fn qpdf_direct_object_preserves_top_level_and_nested_reference_rules() {
+        assert_eq!(keyword_token_end(b"endobj", 0, b"endobj"), Some(6));
+        assert_eq!(keyword_token_end(b"endobjx", 0, b"endobj"), None);
+
         let bare = parse_qpdf_direct_object(b"6 0 R\nendobj").unwrap();
         assert_eq!(bare.object, Object::Integer(6));
         assert_eq!(&b"6 0 R\nendobj"[bare.next_offset..], b"0 R\nendobj");
 
         let nested = parse_qpdf_direct_object(b"[6 0 R << /V 7 0 R >>]\nendobj").unwrap();
-        let Object::Array(values) = nested.object else {
-            panic!("expected array");
-        };
+        let values = nested.object.as_array().expect("expected array");
         assert_eq!(values[0], Object::Reference(ObjectRef::new(6, 0)));
         assert_eq!(
             values[1].as_dict().unwrap().get_ref("V"),
