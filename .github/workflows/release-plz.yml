@@ -27,15 +27,6 @@ on:
   # run still pauses on the `release` environment approval before publishing.
   workflow_dispatch:
 
-# Serialize complete runs so a later ordinary main push cannot run release-pr
-# while an earlier release is waiting for approval or publishing. `queue: max`
-# retains pending runs; the default single pending slot could replace the run
-# responsible for publishing.
-concurrency:
-  group: release-plz-${{ github.ref }}
-  cancel-in-progress: false
-  queue: max
-
 env:
   CARGO_TERM_COLOR: always
 
@@ -127,57 +118,6 @@ jobs:
 
           emit false "no release markers"
 
-  # GitHub does not guarantee FIFO ordering for queued concurrency runs. If a
-  # later run becomes active first, make it yield before release-pr so the
-  # oldest queued run gets the next chance to publish or inspect crates.io.
-  check-release-pr-turn:
-    name: Check Release PR queue order
-    runs-on: ubuntu-latest
-    needs: [check-releases, release]
-    if: >-
-      ${{
-        always() &&
-        !cancelled() &&
-        github.ref == 'refs/heads/main' &&
-        needs.check-releases.result == 'success' &&
-        (
-          needs.check-releases.outputs.has_releases != 'true' ||
-          needs.release.result == 'success'
-        )
-      }}
-    permissions:
-      actions: read
-    outputs:
-      should_run: ${{ steps.turn.outputs.should_run }}
-    steps:
-      - name: Yield to an older queued workflow run
-        id: turn
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.ref_name }}
-          CURRENT_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          set -euo pipefail
-
-          queued_runs="$RUNNER_TEMP/release-plz-queued-runs.json"
-          gh api \
-            "repos/$REPO/actions/workflows/release-plz.yml/runs?branch=$BRANCH&status=queued&per_page=100" \
-            > "$queued_runs"
-          older_queued_count=$(
-            jq --argjson current "$CURRENT_RUN_NUMBER" \
-              '[.workflow_runs[] | select(.run_number < $current)] | length' \
-              "$queued_runs"
-          )
-
-          if [ "$older_queued_count" -gt 0 ]; then
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
-            echo "Yielding release-pr to $older_queued_count older queued run(s)"
-          else
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-            echo "No older queued run; release-pr may proceed"
-          fi
-
   release-pr:
     name: Release-plz PR
     runs-on: ubuntu-latest
@@ -188,15 +128,13 @@ jobs:
     #
     # workflow_dispatch can be launched from any ref, so retain the main guard:
     # release-pr must never bundle not-yet-merged commits from another ref.
-    needs: [check-releases, release, check-release-pr-turn]
+    needs: [check-releases, release]
     if: >-
       ${{
         always() &&
         !cancelled() &&
         github.ref == 'refs/heads/main' &&
         needs.check-releases.result == 'success' &&
-        needs.check-release-pr-turn.result == 'success' &&
-        needs.check-release-pr-turn.outputs.should_run == 'true' &&
         (
           needs.check-releases.outputs.has_releases != 'true' ||
           needs.release.result == 'success'
