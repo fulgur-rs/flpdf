@@ -232,6 +232,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/fulgur-rs/flpdf/compare/v0.3.0...v0.4.0) - 2026-07-24
+
+### Fixed
+
+- *(linearize)* drop stale live generations
+- *(writer)* remap removed refs in generate trailer
+- *(writer)* avoid cloning stream payloads in ObjStm walk
+- *(writer)* address preserve review findings
+- *(writer)* resolve qpdf signature key visibility
+- *(writer)* isolate qpdf preserve eligibility
+- *(writer)* constrain qpdf preserve object streams
+- *(writer)* port qpdf null-aware standard enqueue
+- *(linearize)* retain exact page users for objstm routing
+- *(linearize)* address final object user review
+- *(linearize)* preserve qpdf thumbnail user order
+- preserve first-page ObjStm container order
+- *(linearize)* match qpdf preserved ObjStm union routing
+- match qpdf file object parsing
+
+### Other
+
+- Merge commit '95f37c93' into refactor/flpdf-9hc-41-linearize-null-walk
+- Merge commit '9d1e73f9' into refactor/flpdf-9hc-41-linearize-null-walk
+- *(linearize)* complete merged xref fixture
+- Merge updated null traversal base into generate layer
+- *(writer)* cover empty preserve ID path
+- *(qpdf-null)* cover dictionary visibility helpers
+- *(writer)* share qpdf null resolution
+- *(linearize)* reuse object-user routing snapshot
+- *(linearize)* fix routing snapshot documentation
+- *(linearize)* retain object-user routing snapshot
+- Merge pull request #521 from fulgur-rs/fix/flpdf-19ac-firstpage-objstm-order
+- *(linearize)* cover thumbnail user routing
+- *(linearize)* avoid private rustdoc link
+- *(linearize)* annotate unreachable route invariant
+- *(linearize)* cover qpdf container placement invariants
+- *(linearize)* retain qpdf ObjStm container routes
+- Match qpdf QDF ignore_newline semantics
+- *(flpdf-10de)* pin indirect QDF contents array parity
+
 ## [0.3.0](https://github.com/fulgur-rs/flpdf/compare/v0.2.1...v0.3.0) - 2026-07-22
 
 ### Added

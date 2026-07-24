@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "flpdf"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes",
  "cbc",
@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "flpdf-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "assert_cmd",
  "clap",
