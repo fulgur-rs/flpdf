@@ -132,8 +132,16 @@ import sys
 lcov_path, diff_path, repo_root = sys.argv[1], sys.argv[2], sys.argv[3]
 lcov_mode = sys.argv[4] if len(sys.argv) > 4 else "fresh"
 
-GATE_PREFIX = "crates/flpdf/src/"        # 100% gate
-REPORT_PREFIX = "crates/flpdf-cli/src/"  # report-only
+GATE_PREFIX = "crates/flpdf/src/"                 # 100% gate
+# Report-only crates: any src/ tree under one of these prefixes gets a
+# coverage report but is not gated. flpdf-cli is release-shipped tooling
+# whose UI wiring is hard to unit-cover; flpdf-test-compare is test-only
+# tooling (publish = false) whose binary shape is validated by its own
+# integration tests, so the same lightweight treatment applies.
+REPORT_PREFIXES = (
+    "crates/flpdf-cli/src/",
+    "crates/flpdf-test-compare/src/",
+)
 
 # 1. lcov -> {relpath: {line: hits}}.  Only lines with a DA record are
 #    executable; a changed line without one (blank, comment, brace, decl) is
@@ -322,7 +330,7 @@ missing_cov = []  # gated files with (non-excluded) added lines never measured
 for relpath, lines in added.items():
     if relpath.startswith(GATE_PREFIX):
         grp = "gate"
-    elif relpath.startswith(REPORT_PREFIX):
+    elif any(relpath.startswith(p) for p in REPORT_PREFIXES):
         grp = "report"
     else:
         continue
@@ -387,7 +395,9 @@ def render(label, grp, gated):
 
 print("== patch coverage (changed lines vs tests) ==")
 gate_uncov = render("flpdf", "gate", gated=True)
-render("flpdf-cli", "report", gated=False)
+# Rendering one row for the report group; per-file paths are shown under it
+# so the flpdf-cli vs qpdf-test-compare distribution is still visible.
+render("report", "report", gated=False)
 
 if gate_uncov:
     print()

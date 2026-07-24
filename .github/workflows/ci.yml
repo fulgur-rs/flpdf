@@ -183,6 +183,10 @@ jobs:
           # flpdf-sha and byte-equal columns record qpdf byte-parity, not
           # miniz drift.
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test compat_matrix_baseline -- --nocapture
+          # flpdf-test-compare's flate-compression-tolerance e2e is gated
+          # behind qpdf-zlib-compat (mirrors the flpdf-cli byte-identical
+          # tests above); the default `cargo test` above cfgs it out.
+          cargo test -p flpdf-test-compare --features qpdf-zlib-compat --test e2e
 
   coverage:
     name: Coverage

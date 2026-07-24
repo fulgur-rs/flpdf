@@ -345,6 +345,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "flpdf-test-compare"
+version = "0.0.0"
+dependencies = [
+ "assert_cmd",
+ "flate2",
+ "flpdf",
+ "predicates",
+ "tempfile",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
