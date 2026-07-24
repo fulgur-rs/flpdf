@@ -16,6 +16,12 @@ fn run(args: &[String]) -> ExitCode {
         println!("{whoami} from flpdf version {}", flpdf::version());
         return ExitCode::from(0);
     }
+    // Accept exactly `actual expected` or `actual expected password`. Anything
+    // else prints the usage block and exits 2 (matching qpdf's oracle).
+    if args.len() < 3 || args.len() > 4 {
+        usage(whoami);
+        return ExitCode::from(2);
+    }
     // Real logic lands in later tasks. Exit 2 (qpdf's default error code for
     // compare-for-test) so any accidental invocation of the stub fails loud.
     ExitCode::from(2)
@@ -23,4 +29,17 @@ fn run(args: &[String]) -> ExitCode {
 
 fn program_name(argv0: &str) -> &str {
     argv0.rsplit('/').next().unwrap_or(argv0)
+}
+
+fn usage(whoami: &str) {
+    // Wording copied verbatim from qpdf's compare-for-test/qpdf-test-compare
+    // so the harness behaves identically when scripts scrape stderr.
+    eprintln!("Usage: {whoami} actual expected");
+    eprintln!(r#"Where "actual" is the actual output and "expected" is the expected"#);
+    eprintln!("output of a test, compare the two PDF files. The files are considered");
+    eprintln!("to match if all their objects are identical except that, if a stream is");
+    eprintln!("compressed with FlateDecode, the uncompressed data must match.");
+    eprintln!();
+    eprintln!("If the files match, the output is the expected file. Otherwise, it is");
+    eprintln!("the actual file. Read comments in the code for rationale.");
 }
