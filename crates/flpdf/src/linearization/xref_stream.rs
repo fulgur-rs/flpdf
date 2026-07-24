@@ -780,6 +780,7 @@ mod tests {
             &mut out,
             ObjectRef::new(7, 0),
             &XrefStreamDict {
+                filtered: true,
                 widths: [1, 2, 1],
                 index: None,
                 info: None,
