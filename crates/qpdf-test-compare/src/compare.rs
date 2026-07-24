@@ -3,8 +3,9 @@
 //!
 //! Returns the empty string when the two objects match, or a diff-reason
 //! string prefixed with `label` (matching qpdf's exact wording) otherwise.
-//! The stream limb is added by Task 8; this file starts with the non-stream
-//! branch and the type-code gate.
+//! Covers the non-stream branch (type-code gate, then `write_pdf`-bytes
+//! compare) and the stream branch (`/Length`-stripped dict compare,
+//! `/XRef` data skip, `/FlateDecode` decompress-and-compare).
 
 use flpdf::{Dictionary, Object};
 
