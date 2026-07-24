@@ -26,11 +26,11 @@ fn identical_files_emit_expected_and_exit_zero() {
     fs::write(&a, &src_bytes).unwrap();
     fs::write(&b, &src_bytes).unwrap();
 
-    let output = Command::cargo_bin("qpdf-test-compare")
+    let output = Command::cargo_bin("flpdf-test-compare")
         .unwrap()
         .args([a.to_str().unwrap(), b.to_str().unwrap()])
         .output()
-        .expect("spawn qpdf-test-compare");
+        .expect("spawn flpdf-test-compare");
 
     assert!(
         output.status.success(),

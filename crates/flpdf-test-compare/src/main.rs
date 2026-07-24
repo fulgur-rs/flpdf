@@ -2,7 +2,7 @@ use std::env;
 use std::process::ExitCode;
 
 // Shared helpers live in the library crate; the binary reaches them via
-// `use qpdf_test_compare::...`. Duplicating them with `mod output;` here would
+// `use flpdf_test_compare::...`. Duplicating them with `mod output;` here would
 // compile them twice into the binary and add dead-code the compiler can
 // rightly warn about.
 
@@ -15,7 +15,7 @@ fn run(args: &[String]) -> ExitCode {
     let whoami = program_name(
         args.first()
             .map(String::as_str)
-            .unwrap_or("qpdf-test-compare"),
+            .unwrap_or("flpdf-test-compare"),
     );
     if args.len() == 2 && args[1] == "--version" {
         println!("{whoami} from flpdf version {}", flpdf::version());
@@ -53,7 +53,7 @@ fn run(args: &[String]) -> ExitCode {
         }
     };
 
-    let diff = match qpdf_test_compare::compare_files(&actual_bytes, &expected_bytes, password) {
+    let diff = match flpdf_test_compare::compare_files(&actual_bytes, &expected_bytes, password) {
         Ok(d) => d,
         Err(err) => {
             // qpdf's `main()` catches `std::exception` from `compare()` (e.g.
@@ -78,7 +78,7 @@ fn run(args: &[String]) -> ExitCode {
         }
     };
 
-    if let Err(err) = qpdf_test_compare::output::dump_file_to_stdout(to_output) {
+    if let Err(err) = flpdf_test_compare::output::dump_file_to_stdout(to_output) {
         eprintln!("{whoami}: {err}");
         return ExitCode::from(2);
     }

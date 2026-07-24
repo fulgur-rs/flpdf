@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate the qpdf-test-compare end-to-end fixture set from flpdf-authored
+# Regenerate the flpdf-test-compare end-to-end fixture set from flpdf-authored
 # sources. All output PDFs in this directory are flpdf-authored derivative
 # works and inherit the flpdf repository's Apache-2.0/MIT license. NO file
 # in this directory is copied from qpdf-qtest/vendor/qpdf-qtest/ (Artistic
@@ -194,7 +194,7 @@ write("flate_zlib.pdf", build_flate_fixture(compressed_high))
 # obj 2 as "2 0: object contents differ".
 #
 # This is a byte-copy of the MINIMAL_PDF / MINIMAL_PDF_COUNT1 constants in
-# crates/qpdf-test-compare/tests/orchestrator.rs, promoted to a fixture
+# crates/flpdf-test-compare/tests/orchestrator.rs, promoted to a fixture
 # file so the CLI test can prove the "diff -> cat actual" branch dumps the
 # actual file byte-verbatim.
 # --------------------------------------------------------------------------
@@ -234,7 +234,7 @@ PYEOF
 check_fixture_bytes() {
     # Each pair is checked with qpdf --check to confirm the file parses. The
     # semantic pass/fail assertions (exit 0 vs exit 2) live in the Rust e2e
-    # test suite, which exercises the actual qpdf-test-compare binary.
+    # test suite, which exercises the actual flpdf-test-compare binary.
     for f in \
         id_differs_a.pdf id_differs_b.pdf \
         flate_miniz.pdf flate_zlib.pdf \

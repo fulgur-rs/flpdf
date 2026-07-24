@@ -1,4 +1,4 @@
-//! End-to-end scenarios for the `qpdf-test-compare` binary.
+//! End-to-end scenarios for the `flpdf-test-compare` binary.
 //!
 //! The unit tests in `src/clean.rs`, `src/compare.rs`, and the integration
 //! tests in `tests/orchestrator.rs` cover the algorithm at the library
@@ -40,11 +40,11 @@ mod match_paths {
         let b = fixture_path("tests/fixtures/compare_for_test/id_differs_b.pdf");
         let expected_bytes = fs::read(&b).expect("read id_differs_b.pdf");
 
-        let output = Command::cargo_bin("qpdf-test-compare")
+        let output = Command::cargo_bin("flpdf-test-compare")
             .unwrap()
             .args([a.to_str().unwrap(), b.to_str().unwrap()])
             .output()
-            .expect("spawn qpdf-test-compare");
+            .expect("spawn flpdf-test-compare");
 
         assert!(
             output.status.success(),
@@ -89,11 +89,11 @@ mod match_paths {
             "premise: fixture pair must differ on disk",
         );
 
-        let output = Command::cargo_bin("qpdf-test-compare")
+        let output = Command::cargo_bin("flpdf-test-compare")
             .unwrap()
             .args([a.to_str().unwrap(), b.to_str().unwrap()])
             .output()
-            .expect("spawn qpdf-test-compare");
+            .expect("spawn flpdf-test-compare");
 
         assert!(
             output.status.success(),
@@ -114,11 +114,11 @@ mod match_paths {
         let path = fixture_path("tests/fixtures/encrypted/v5-aes-256-r6.pdf");
         let expected_bytes = fs::read(&path).expect("read v5-aes-256-r6.pdf");
 
-        let output = Command::cargo_bin("qpdf-test-compare")
+        let output = Command::cargo_bin("flpdf-test-compare")
             .unwrap()
             .args([path.to_str().unwrap(), path.to_str().unwrap(), "user-v5-r6"])
             .output()
-            .expect("spawn qpdf-test-compare");
+            .expect("spawn flpdf-test-compare");
 
         assert!(
             output.status.success(),
@@ -153,11 +153,11 @@ mod differ_paths {
         let b = fixture_path("tests/fixtures/compare_for_test/differ_body_b.pdf");
         let actual_bytes = fs::read(&a).expect("read differ_body_a.pdf");
 
-        let output = Command::cargo_bin("qpdf-test-compare")
+        let output = Command::cargo_bin("flpdf-test-compare")
             .unwrap()
             .args([a.to_str().unwrap(), b.to_str().unwrap()])
             .output()
-            .expect("spawn qpdf-test-compare");
+            .expect("spawn flpdf-test-compare");
 
         assert_eq!(
             output.status.code(),
@@ -177,7 +177,7 @@ mod differ_paths {
     }
 
     /// Wrong password → `Pdf::open_mem_owned_with_options` returns Err →
-    /// `main()`'s Err branch prints `"qpdf-test-compare: <err>"` to stderr,
+    /// `main()`'s Err branch prints `"flpdf-test-compare: <err>"` to stderr,
     /// dumps nothing to stdout, and exits 2. Proves the compare-files Err
     /// arm reaches the stderr-only exit and does NOT fall through to the
     /// actual-file dump.
@@ -185,7 +185,7 @@ mod differ_paths {
     fn wrong_password_reports_stderr_no_stdout() {
         let path = fixture_path("tests/fixtures/encrypted/v5-aes-256-r6.pdf");
 
-        let output = Command::cargo_bin("qpdf-test-compare")
+        let output = Command::cargo_bin("flpdf-test-compare")
             .unwrap()
             .args([
                 path.to_str().unwrap(),
@@ -193,7 +193,7 @@ mod differ_paths {
                 "wrong-password",
             ])
             .output()
-            .expect("spawn qpdf-test-compare");
+            .expect("spawn flpdf-test-compare");
 
         assert_eq!(
             output.status.code(),
@@ -208,8 +208,8 @@ mod differ_paths {
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("qpdf-test-compare:"),
-            "expected 'qpdf-test-compare:' prefix on stderr; got {stderr:?}",
+            stderr.contains("flpdf-test-compare:"),
+            "expected 'flpdf-test-compare:' prefix on stderr; got {stderr:?}",
         );
     }
 }

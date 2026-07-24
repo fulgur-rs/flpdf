@@ -79,12 +79,12 @@ fn compare_why_prints_reason_and_skips_output() {
     fs::write(&a, DIFFER_A_PDF).unwrap();
     fs::write(&b, DIFFER_B_PDF).unwrap();
 
-    let output = Command::cargo_bin("qpdf-test-compare")
+    let output = Command::cargo_bin("flpdf-test-compare")
         .unwrap()
         .env("QPDF_COMPARE_WHY", "1")
         .args([a.to_str().unwrap(), b.to_str().unwrap()])
         .output()
-        .expect("spawn qpdf-test-compare");
+        .expect("spawn flpdf-test-compare");
 
     assert_eq!(
         output.status.code(),
@@ -132,12 +132,12 @@ fn compare_why_does_not_affect_match_path() {
     fs::write(&a, &src_bytes).unwrap();
     fs::write(&b, &src_bytes).unwrap();
 
-    let output = Command::cargo_bin("qpdf-test-compare")
+    let output = Command::cargo_bin("flpdf-test-compare")
         .unwrap()
         .env("QPDF_COMPARE_WHY", "1")
         .args([a.to_str().unwrap(), b.to_str().unwrap()])
         .output()
-        .expect("spawn qpdf-test-compare");
+        .expect("spawn flpdf-test-compare");
 
     assert!(
         output.status.success(),

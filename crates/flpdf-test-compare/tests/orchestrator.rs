@@ -1,4 +1,4 @@
-//! Integration tests for [`qpdf_test_compare::compare_files`].
+//! Integration tests for [`flpdf_test_compare::compare_files`].
 //!
 //! Fixtures are byte constants declared inline. `MINIMAL_PDF` is the
 //! 2-object Catalog + Pages document shipped at `tests/fixtures/minimal.pdf`
@@ -6,7 +6,7 @@
 //! The variants layered on top vary a single field so the branch under
 //! test is the one that fires.
 
-use qpdf_test_compare::compare_files;
+use flpdf_test_compare::compare_files;
 
 // -------- fixtures --------
 

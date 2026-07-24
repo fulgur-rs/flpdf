@@ -3,7 +3,7 @@ use predicates::str::contains;
 
 #[test]
 fn zero_args_prints_usage_and_exits_two() {
-    Command::cargo_bin("qpdf-test-compare")
+    Command::cargo_bin("flpdf-test-compare")
         .unwrap()
         .assert()
         .failure()
@@ -14,7 +14,7 @@ fn zero_args_prints_usage_and_exits_two() {
 
 #[test]
 fn too_many_args_prints_usage_and_exits_two() {
-    Command::cargo_bin("qpdf-test-compare")
+    Command::cargo_bin("flpdf-test-compare")
         .unwrap()
         .args(["a", "b", "c", "d"])
         .assert()

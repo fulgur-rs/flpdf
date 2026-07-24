@@ -1,5 +1,5 @@
 [package]
-name = "qpdf-test-compare"
+name = "flpdf-test-compare"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
@@ -7,11 +7,11 @@ publish = false
 description = "Rust port of qpdf's compare-for-test/qpdf-test-compare, for the flpdf-qtest harness."
 
 [[bin]]
-name = "qpdf-test-compare"
+name = "flpdf-test-compare"
 path = "src/main.rs"
 
 [lib]
-name = "qpdf_test_compare"
+name = "flpdf_test_compare"
 path = "src/lib.rs"
 
 [features]

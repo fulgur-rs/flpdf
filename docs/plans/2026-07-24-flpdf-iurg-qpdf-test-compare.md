@@ -1,10 +1,10 @@
-# qpdf-test-compare Rust Implementation Plan
+# flpdf-test-compare Rust Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Add `crates/qpdf-test-compare` — a Rust reimplementation of qpdf's `compare-for-test/qpdf-test-compare.cc` (v11.9.0), used by the flpdf-qtest harness's "check output" step to compare two PDFs semantically (tolerating FlateDecode compression differences).
+**Goal:** Add `crates/flpdf-test-compare` — a Rust reimplementation of qpdf's `compare-for-test/qpdf-test-compare.cc` (v11.9.0), used by the flpdf-qtest harness's "check output" step to compare two PDFs semantically (tolerating FlateDecode compression differences).
 
-**Architecture:** New workspace crate `crates/qpdf-test-compare` (`publish = false`) with a single `qpdf-test-compare` binary. Faithful port of qpdf's algorithm: clean trailer → compare trailer → clean encryption → compare all objects in obj-num order; stream data compared raw unless `/FlateDecode` is present (then compared decoded). Because both inputs go through the same flpdf parser, unparse output need not match qpdf byte-for-byte — only be internally deterministic.
+**Architecture:** New workspace crate `crates/flpdf-test-compare` (`publish = false`) with a single `flpdf-test-compare` binary. Faithful port of qpdf's algorithm: clean trailer → compare trailer → clean encryption → compare all objects in obj-num order; stream data compared raw unless `/FlateDecode` is present (then compared decoded). Because both inputs go through the same flpdf parser, unparse output need not match qpdf byte-for-byte — only be internally deterministic.
 
 **Tech Stack:** Rust workspace (existing), `flpdf` (path dep) for parsing/decoding, `std::env`/`std::fs`/`std::io` for CLI I/O. No new external deps.
 
@@ -18,9 +18,9 @@
 
 - **qpdf oracle mandate**: the compare algorithm's semantics and ordering must mirror qpdf exactly. Deviations require a 1-line justification in the PR body.
 - **Review patterns**: consult `.claude/rules/pdf-rust-review-patterns.md` before writing code (no unnecessary `.clone()`, resolve indirect refs, verify signed→unsigned casts, bound graph traversals).
-- **Doc patterns**: for anything under `crates/qpdf-test-compare/src/` that ends up in `cargo doc`, follow `.claude/rules/pdf-rust-doc-review-patterns.md` (English, no beads IDs in `///`, `# Errors`/`# Panics` where relevant). Since this crate is `publish = false`, doc surface is small — internal doc comments (`///` on private items) are fine in either language.
+- **Doc patterns**: for anything under `crates/flpdf-test-compare/src/` that ends up in `cargo doc`, follow `.claude/rules/pdf-rust-doc-review-patterns.md` (English, no beads IDs in `///`, `# Errors`/`# Panics` where relevant). Since this crate is `publish = false`, doc surface is small — internal doc comments (`///` on private items) are fine in either language.
 - **Test coverage**: this crate is test tooling; it will be added to `patch-coverage.sh` as **report-only** (like flpdf-cli), not gated. We still aim for meaningful coverage of every branch.
-- **No qpdf-qtest fixtures**: never vendor content from `flpdf-qtest/vendor/qpdf-qtest/` (Artistic 2.0). Fixtures live in `crates/qpdf-test-compare/tests/fixtures/` and are either hand-authored PDFs or generated via a local `regenerate.sh` (qpdf-as-tool pattern).
+- **No qpdf-qtest fixtures**: never vendor content from `flpdf-qtest/vendor/qpdf-qtest/` (Artistic 2.0). Fixtures live in `crates/flpdf-test-compare/tests/fixtures/` and are either hand-authored PDFs or generated via a local `regenerate.sh` (qpdf-as-tool pattern).
 - **Commit cadence**: commit after each Task's tests are green.
 
 ---
@@ -44,16 +44,16 @@ No API additions required. Proceed directly to Task 1.
 ## Task 1: Bootstrap the crate
 
 **Files:**
-- Create: `crates/qpdf-test-compare/Cargo.toml`
-- Create: `crates/qpdf-test-compare/src/main.rs`
+- Create: `crates/flpdf-test-compare/Cargo.toml`
+- Create: `crates/flpdf-test-compare/src/main.rs`
 - Modify: `Cargo.toml` (workspace `members`)
 
 **Step 1.1: Add crate directory + `Cargo.toml`.**
 
 ```toml
-# crates/qpdf-test-compare/Cargo.toml
+# crates/flpdf-test-compare/Cargo.toml
 [package]
-name = "qpdf-test-compare"
+name = "flpdf-test-compare"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
@@ -61,7 +61,7 @@ publish = false
 description = "Rust port of qpdf's compare-for-test/qpdf-test-compare, for the flpdf-qtest harness."
 
 [[bin]]
-name = "qpdf-test-compare"
+name = "flpdf-test-compare"
 path = "src/main.rs"
 
 [features]
@@ -84,25 +84,25 @@ tempfile.workspace = true
 ```rust
 fn main() {
     // Implemented in later tasks. Exit 2 so any accidental invocation is a
-    // loud failure, matching qpdf-test-compare's default error exit code.
+    // loud failure, matching flpdf-test-compare's default error exit code.
     std::process::exit(2);
 }
 ```
 
 **Step 1.3: Add to workspace `members`.**
 
-Edit `Cargo.toml` (workspace root) — add `"crates/qpdf-test-compare"` to `members`.
+Edit `Cargo.toml` (workspace root) — add `"crates/flpdf-test-compare"` to `members`.
 
 **Step 1.4: Verify build.**
 
-Run: `cargo build -p qpdf-test-compare`
+Run: `cargo build -p flpdf-test-compare`
 Expected: succeeds. Also: `cargo check --workspace` succeeds.
 
 **Step 1.5: Commit.**
 
 ```bash
-git add crates/qpdf-test-compare Cargo.toml
-git commit -m "chore(qpdf-test-compare): bootstrap crate skeleton"
+git add crates/flpdf-test-compare Cargo.toml
+git commit -m "chore(flpdf-test-compare): bootstrap crate skeleton"
 ```
 
 ---
@@ -110,8 +110,8 @@ git commit -m "chore(qpdf-test-compare): bootstrap crate skeleton"
 ## Task 2: `--version` command
 
 **Files:**
-- Create: `crates/qpdf-test-compare/tests/cli_version.rs`
-- Modify: `crates/qpdf-test-compare/src/main.rs`
+- Create: `crates/flpdf-test-compare/tests/cli_version.rs`
+- Modify: `crates/flpdf-test-compare/src/main.rs`
 
 **Step 2.1: Write failing test.**
 
@@ -122,18 +122,18 @@ use predicates::str::contains;
 
 #[test]
 fn version_prints_and_exits_zero() {
-    Command::cargo_bin("qpdf-test-compare")
+    Command::cargo_bin("flpdf-test-compare")
         .unwrap()
         .arg("--version")
         .assert()
         .success()
-        .stdout(contains("qpdf-test-compare from flpdf version "));
+        .stdout(contains("flpdf-test-compare from flpdf version "));
 }
 ```
 
 **Step 2.2: Run test → FAIL.**
 
-Run: `cargo test -p qpdf-test-compare --test cli_version`
+Run: `cargo test -p flpdf-test-compare --test cli_version`
 Expected: fail (exit 2, no stdout match).
 
 **Step 2.3: Implement.**
@@ -150,7 +150,7 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &[String]) -> ExitCode {
-    let whoami = program_name(args.first().map(String::as_str).unwrap_or("qpdf-test-compare"));
+    let whoami = program_name(args.first().map(String::as_str).unwrap_or("flpdf-test-compare"));
     if args.len() == 2 && args[1] == "--version" {
         println!("{whoami} from flpdf version {}", flpdf::VERSION);
         return ExitCode::from(0);
@@ -167,12 +167,12 @@ Verify `flpdf::VERSION` exists (search `crates/flpdf/src/lib.rs`); if the crate 
 
 **Step 2.4: Run test → PASS.**
 
-Run: `cargo test -p qpdf-test-compare --test cli_version`
+Run: `cargo test -p flpdf-test-compare --test cli_version`
 
 **Step 2.5: Commit.**
 
 ```bash
-git commit -am "feat(qpdf-test-compare): --version prints program name and flpdf version"
+git commit -am "feat(flpdf-test-compare): --version prints program name and flpdf version"
 ```
 
 ---
@@ -180,8 +180,8 @@ git commit -am "feat(qpdf-test-compare): --version prints program name and flpdf
 ## Task 3: Usage / arg validation
 
 **Files:**
-- Create: `crates/qpdf-test-compare/tests/cli_usage.rs`
-- Modify: `crates/qpdf-test-compare/src/main.rs`
+- Create: `crates/flpdf-test-compare/tests/cli_usage.rs`
+- Modify: `crates/flpdf-test-compare/src/main.rs`
 
 **Step 3.1: Write failing tests.**
 
@@ -192,7 +192,7 @@ use predicates::str::contains;
 
 #[test]
 fn zero_args_prints_usage_and_exits_two() {
-    Command::cargo_bin("qpdf-test-compare")
+    Command::cargo_bin("flpdf-test-compare")
         .unwrap()
         .assert()
         .failure()
@@ -203,7 +203,7 @@ fn zero_args_prints_usage_and_exits_two() {
 
 #[test]
 fn too_many_args_prints_usage_and_exits_two() {
-    Command::cargo_bin("qpdf-test-compare")
+    Command::cargo_bin("flpdf-test-compare")
         .unwrap()
         .args(["a", "b", "c", "d"])
         .assert()
@@ -215,7 +215,7 @@ fn too_many_args_prints_usage_and_exits_two() {
 
 **Step 3.2: Run tests → FAIL.**
 
-Run: `cargo test -p qpdf-test-compare --test cli_usage`
+Run: `cargo test -p flpdf-test-compare --test cli_usage`
 Expected: fails (no stderr).
 
 **Step 3.3: Implement usage handling.**
@@ -242,7 +242,7 @@ Match qpdf's exact wording for the usage block (copy from oracle file, minus `st
 **Step 3.5: Commit.**
 
 ```bash
-git commit -am "feat(qpdf-test-compare): usage handling for missing / excess args (exit 2)"
+git commit -am "feat(flpdf-test-compare): usage handling for missing / excess args (exit 2)"
 ```
 
 ---
@@ -250,9 +250,9 @@ git commit -am "feat(qpdf-test-compare): usage handling for missing / excess arg
 ## Task 4: File I/O + panic-free error handling scaffold
 
 **Files:**
-- Create: `crates/qpdf-test-compare/src/output.rs` (helpers)
-- Modify: `crates/qpdf-test-compare/src/main.rs`
-- Create: `crates/qpdf-test-compare/tests/cli_bad_input.rs`
+- Create: `crates/flpdf-test-compare/src/output.rs` (helpers)
+- Modify: `crates/flpdf-test-compare/src/main.rs`
+- Create: `crates/flpdf-test-compare/tests/cli_bad_input.rs`
 
 **Step 4.1: Write failing test — non-existent input file emits `whoami: <err>` and exits 2.**
 
@@ -263,14 +263,14 @@ use predicates::str::{contains, is_empty};
 
 #[test]
 fn missing_actual_file_reports_error_no_panic() {
-    Command::cargo_bin("qpdf-test-compare")
+    Command::cargo_bin("flpdf-test-compare")
         .unwrap()
         .args(["/no/such/actual.pdf", "/no/such/expected.pdf"])
         .assert()
         .failure()
         .code(2)
         .stdout(is_empty())
-        .stderr(contains("qpdf-test-compare:"));
+        .stderr(contains("flpdf-test-compare:"));
 }
 ```
 
@@ -303,7 +303,7 @@ In `main.rs`, wrap the future compare/emit call in a `Result` and print `eprintl
 **Step 4.5: Commit.**
 
 ```bash
-git commit -am "feat(qpdf-test-compare): panic-free error reporting scaffold + stdout dumper"
+git commit -am "feat(flpdf-test-compare): panic-free error reporting scaffold + stdout dumper"
 ```
 
 ---
@@ -311,8 +311,8 @@ git commit -am "feat(qpdf-test-compare): panic-free error reporting scaffold + s
 ## Task 5: `clean_trailer`
 
 **Files:**
-- Create: `crates/qpdf-test-compare/src/clean.rs`
-- Modify: `crates/qpdf-test-compare/src/main.rs` (mod)
+- Create: `crates/flpdf-test-compare/src/clean.rs`
+- Modify: `crates/flpdf-test-compare/src/main.rs` (mod)
 
 **Step 5.1: Write failing unit tests (inline in `clean.rs`).**
 
@@ -352,19 +352,19 @@ pub fn clean_trailer(trailer: &mut Dictionary) {
 
 **Step 5.2: Run → FAIL (the module doesn't exist yet).**
 
-Run: `cargo test -p qpdf-test-compare clean::`
+Run: `cargo test -p flpdf-test-compare clean::`
 
 **Step 5.3: Wire the module + verify tests pass.**
 
 Add `mod clean;` in `main.rs`.
 
-Run: `cargo test -p qpdf-test-compare clean::`
+Run: `cargo test -p flpdf-test-compare clean::`
 Expected: all 6 cases pass.
 
 **Step 5.4: Commit.**
 
 ```bash
-git commit -am "feat(qpdf-test-compare): clean_trailer (strip /Length, blank /ID halves)"
+git commit -am "feat(flpdf-test-compare): clean_trailer (strip /Length, blank /ID halves)"
 ```
 
 ---
@@ -372,7 +372,7 @@ git commit -am "feat(qpdf-test-compare): clean_trailer (strip /Length, blank /ID
 ## Task 6: `clean_encryption`
 
 **Files:**
-- Modify: `crates/qpdf-test-compare/src/clean.rs`
+- Modify: `crates/flpdf-test-compare/src/clean.rs`
 
 **Step 6.1: Write failing unit tests.**
 
@@ -397,12 +397,12 @@ pub fn clean_encryption<R: std::io::Read + std::io::Seek>(pdf: &mut flpdf::Pdf<R
 
 **Step 6.3: Run tests → PASS.**
 
-Run: `cargo test -p qpdf-test-compare clean::`
+Run: `cargo test -p flpdf-test-compare clean::`
 
 **Step 6.4: Commit.**
 
 ```bash
-git commit -am "feat(qpdf-test-compare): clean_encryption (strip /O /OE /U /UE /Perms)"
+git commit -am "feat(flpdf-test-compare): clean_encryption (strip /O /OE /U /UE /Perms)"
 ```
 
 ---
@@ -410,7 +410,7 @@ git commit -am "feat(qpdf-test-compare): clean_encryption (strip /O /OE /U /UE /
 ## Task 7: `compare_objects` — non-stream branch
 
 **Files:**
-- Create: `crates/qpdf-test-compare/src/compare.rs`
+- Create: `crates/flpdf-test-compare/src/compare.rs`
 
 **Step 7.1: Write failing unit tests.**
 
@@ -469,7 +469,7 @@ fn type_code(o: &Object) -> u8 {
 **Step 7.4: Commit.**
 
 ```bash
-git commit -am "feat(qpdf-test-compare): compare_objects non-stream branch"
+git commit -am "feat(flpdf-test-compare): compare_objects non-stream branch"
 ```
 
 ---
@@ -477,7 +477,7 @@ git commit -am "feat(qpdf-test-compare): compare_objects non-stream branch"
 ## Task 8: `compare_objects` — stream branch
 
 **Files:**
-- Modify: `crates/qpdf-test-compare/src/compare.rs`
+- Modify: `crates/flpdf-test-compare/src/compare.rs`
 
 **Step 8.1: Write failing unit tests.**
 
@@ -591,7 +591,7 @@ if a_slice != e_slice { return "...data differs".into(); }
 **Step 8.5: Commit.**
 
 ```bash
-git commit -am "feat(qpdf-test-compare): compare_objects stream branch (/XRef skip, FlateDecode uncompress, size+data)"
+git commit -am "feat(flpdf-test-compare): compare_objects stream branch (/XRef skip, FlateDecode uncompress, size+data)"
 ```
 
 ---
@@ -599,9 +599,9 @@ git commit -am "feat(qpdf-test-compare): compare_objects stream branch (/XRef sk
 ## Task 9: `compare` orchestrator
 
 **Files:**
-- Create: `crates/qpdf-test-compare/src/lib.rs` (mod exports)
-- Modify: `crates/qpdf-test-compare/src/main.rs`
-- Create: `crates/qpdf-test-compare/src/orchestrator.rs`
+- Create: `crates/flpdf-test-compare/src/lib.rs` (mod exports)
+- Modify: `crates/flpdf-test-compare/src/main.rs`
+- Create: `crates/flpdf-test-compare/src/orchestrator.rs`
 
 **Step 9.1: Write failing integration tests using in-memory PDFs.**
 
@@ -674,7 +674,7 @@ pub fn compare_files(actual: &[u8], expected: &[u8], password: &[u8]) -> flpdf::
 
 qpdf's `QPDFObjGen::unparse()` produces `N G` (no `R`). Verify what flpdf's `ObjectRef::to_string()` emits (Task 0.3) and, if it emits `N G R`, strip the `R` here or add a dedicated `format!("{} {}", n, g)` helper.
 
-**Step 9.4: Wire lib.rs so tests can `use qpdf_test_compare::compare_files`.**
+**Step 9.4: Wire lib.rs so tests can `use flpdf_test_compare::compare_files`.**
 
 ```rust
 // src/lib.rs
@@ -684,16 +684,16 @@ pub mod orchestrator;
 pub use orchestrator::compare_files;
 ```
 
-Cargo.toml: add `[lib] name = "qpdf_test_compare" path = "src/lib.rs"` alongside the existing `[[bin]]`.
+Cargo.toml: add `[lib] name = "flpdf_test_compare" path = "src/lib.rs"` alongside the existing `[[bin]]`.
 
 **Step 9.5: Run tests → PASS.**
 
-Run: `cargo test -p qpdf-test-compare orchestrator::`
+Run: `cargo test -p flpdf-test-compare orchestrator::`
 
 **Step 9.6: Commit.**
 
 ```bash
-git commit -am "feat(qpdf-test-compare): compare orchestrator (trailer→encryption→per-object)"
+git commit -am "feat(flpdf-test-compare): compare orchestrator (trailer→encryption→per-object)"
 ```
 
 ---
@@ -701,8 +701,8 @@ git commit -am "feat(qpdf-test-compare): compare orchestrator (trailer→encrypt
 ## Task 10: main() wiring — full CLI integration
 
 **Files:**
-- Modify: `crates/qpdf-test-compare/src/main.rs`
-- Create: `crates/qpdf-test-compare/tests/fixtures/README.md` (explains "no vendored qpdf fixtures")
+- Modify: `crates/flpdf-test-compare/src/main.rs`
+- Create: `crates/flpdf-test-compare/tests/fixtures/README.md` (explains "no vendored qpdf fixtures")
 
 **Step 10.1: Write failing integration test.**
 
@@ -720,7 +720,7 @@ fn identical_files_emit_expected_and_exit_zero() {
     let dir = TempDir::new().unwrap();
     let a = dir.path().join("a.pdf"); fs::write(&a, TINY_PDF).unwrap();
     let b = dir.path().join("b.pdf"); fs::write(&b, TINY_PDF).unwrap();
-    let out = Command::cargo_bin("qpdf-test-compare").unwrap()
+    let out = Command::cargo_bin("flpdf-test-compare").unwrap()
         .args([a.to_str().unwrap(), b.to_str().unwrap()])
         .assert().success().get_output().clone();
     assert_eq!(out.stdout, TINY_PDF);  // cat expected
@@ -773,7 +773,7 @@ Note: we read the file for parsing (via `fs::read`) and then re-read for stdout 
 **Step 10.5: Commit.**
 
 ```bash
-git commit -am "feat(qpdf-test-compare): main() wired — cats expected on match, actual on diff"
+git commit -am "feat(flpdf-test-compare): main() wired — cats expected on match, actual on diff"
 ```
 
 ---
@@ -781,7 +781,7 @@ git commit -am "feat(qpdf-test-compare): main() wired — cats expected on match
 ## Task 11: `QPDF_COMPARE_WHY` env
 
 **Files:**
-- Create: `crates/qpdf-test-compare/tests/cli_compare_why.rs`
+- Create: `crates/flpdf-test-compare/tests/cli_compare_why.rs`
 
 **Step 11.1: Write test.**
 
@@ -793,7 +793,7 @@ fn compare_why_prints_reason_and_skips_output() {
     let b = dir.path().join("b.pdf");
     fs::write(&a, TINY_PDF).unwrap();
     fs::write(&b, TINY_PDF_ALT).unwrap();  // differs in one object
-    let out = Command::cargo_bin("qpdf-test-compare").unwrap()
+    let out = Command::cargo_bin("flpdf-test-compare").unwrap()
         .env("QPDF_COMPARE_WHY", "1")
         .args([a.to_str().unwrap(), b.to_str().unwrap()])
         .assert().failure().code(2).get_output().clone();
@@ -814,7 +814,7 @@ If Task 10 already implemented the `show_why` branch, this test should already p
 **Step 11.4: Commit.**
 
 ```bash
-git commit -am "test(qpdf-test-compare): QPDF_COMPARE_WHY end-to-end coverage"
+git commit -am "test(flpdf-test-compare): QPDF_COMPARE_WHY end-to-end coverage"
 ```
 
 ---
@@ -822,9 +822,9 @@ git commit -am "test(qpdf-test-compare): QPDF_COMPARE_WHY end-to-end coverage"
 ## Task 12: Fixture regenerate script
 
 **Files:**
-- Create: `crates/qpdf-test-compare/tests/fixtures/regenerate.sh`
-- Create: `crates/qpdf-test-compare/tests/fixtures/README.md`
-- Create: `crates/qpdf-test-compare/tests/fixtures/*.pdf` (hand-authored or regenerated)
+- Create: `crates/flpdf-test-compare/tests/fixtures/regenerate.sh`
+- Create: `crates/flpdf-test-compare/tests/fixtures/README.md`
+- Create: `crates/flpdf-test-compare/tests/fixtures/*.pdf` (hand-authored or regenerated)
 
 **Step 12.1: Determine fixture set.**
 
@@ -853,9 +853,9 @@ Content: "These fixtures are generated locally via `regenerate.sh` from flpdf-au
 **Step 12.4: Run the script; commit outputs.**
 
 ```bash
-bash crates/qpdf-test-compare/tests/fixtures/regenerate.sh
-git add crates/qpdf-test-compare/tests/fixtures/
-git commit -m "test(qpdf-test-compare): flpdf-authored fixtures + regenerate.sh (no qpdf-qtest vendoring)"
+bash crates/flpdf-test-compare/tests/fixtures/regenerate.sh
+git add crates/flpdf-test-compare/tests/fixtures/
+git commit -m "test(flpdf-test-compare): flpdf-authored fixtures + regenerate.sh (no qpdf-qtest vendoring)"
 ```
 
 ---
@@ -863,7 +863,7 @@ git commit -m "test(qpdf-test-compare): flpdf-authored fixtures + regenerate.sh 
 ## Task 13: End-to-end integration tests (all Section 6 scenarios)
 
 **Files:**
-- Create: `crates/qpdf-test-compare/tests/e2e.rs`
+- Create: `crates/flpdf-test-compare/tests/e2e.rs`
 
 **Step 13.1: Write one test per scenario in the design's Section 6.**
 
@@ -896,18 +896,18 @@ mod differ_paths {
 
 **Step 13.2: Run → PASS on default features.**
 
-Run: `cargo test -p qpdf-test-compare --test e2e`
+Run: `cargo test -p flpdf-test-compare --test e2e`
 
 **Step 13.3: Run with qpdf-zlib-compat.**
 
-Run: `cargo test -p qpdf-test-compare --features qpdf-zlib-compat --test e2e`
+Run: `cargo test -p flpdf-test-compare --features qpdf-zlib-compat --test e2e`
 
 The `flate_compressed_bytes_differ_but_decoded_match` test should now pass (miniz vs zlib compressed goldens).
 
 **Step 13.4: Commit.**
 
 ```bash
-git commit -am "test(qpdf-test-compare): end-to-end scenarios for match and differ paths"
+git commit -am "test(flpdf-test-compare): end-to-end scenarios for match and differ paths"
 ```
 
 ---
@@ -928,7 +928,7 @@ REPORT_PREFIX = "crates/flpdf-cli/src/"
 to:
 
 ```python
-REPORT_PREFIXES = ("crates/flpdf-cli/src/", "crates/qpdf-test-compare/src/")
+REPORT_PREFIXES = ("crates/flpdf-cli/src/", "crates/flpdf-test-compare/src/")
 ```
 
 Update the `render(...)` calls and any string-prefix checks to iterate over `REPORT_PREFIXES`. The gate (`GATE_PREFIX`) stays a single string.
@@ -936,16 +936,16 @@ Update the `render(...)` calls and any string-prefix checks to iterate over `REP
 **Step 14.2: Verify the script still errors on flpdf gap and reports on the new crate.**
 
 ```bash
-# Introduce a temporary uncovered line in qpdf-test-compare/src/main.rs, then:
+# Introduce a temporary uncovered line in flpdf-test-compare/src/main.rs, then:
 bash scripts/patch-coverage.sh --base origin/main
-# Expected: FAIL only if flpdf has uncovered lines; qpdf-test-compare uncovered lines are reported (not gated).
+# Expected: FAIL only if flpdf has uncovered lines; flpdf-test-compare uncovered lines are reported (not gated).
 # Revert the tweak.
 ```
 
 **Step 14.3: Commit.**
 
 ```bash
-git commit -am "chore(patch-coverage): report (not gate) crates/qpdf-test-compare/src"
+git commit -am "chore(patch-coverage): report (not gate) crates/flpdf-test-compare/src"
 ```
 
 ---
@@ -961,7 +961,7 @@ git commit -am "chore(patch-coverage): report (not gate) crates/qpdf-test-compar
 grep -nE "qpdf-zlib-compat|--features|cargo test" .github/workflows/ci.yml | head -30
 ```
 
-`cargo test --workspace` in the standard job should already build & test `qpdf-test-compare` for default features. The `qpdf-zlib-compat` gated tests (Task 13.3) need to be explicitly listed if CI uses a curated test-list for feature-gated tests (per bd memory `flpdf-ci-bytes-identical-explicit-test-list`).
+`cargo test --workspace` in the standard job should already build & test `flpdf-test-compare` for default features. The `qpdf-zlib-compat` gated tests (Task 13.3) need to be explicitly listed if CI uses a curated test-list for feature-gated tests (per bd memory `flpdf-ci-bytes-identical-explicit-test-list`).
 
 **Step 15.2: Add feature-gated test entry.**
 
@@ -977,7 +977,7 @@ cargo test --workspace --features qpdf-zlib-compat
 **Step 15.4: Commit.**
 
 ```bash
-git commit -am "ci: run qpdf-test-compare e2e under qpdf-zlib-compat feature"
+git commit -am "ci: run flpdf-test-compare e2e under qpdf-zlib-compat feature"
 ```
 
 ---
@@ -1002,7 +1002,7 @@ Fix any lints. Commit fixes.
 **Step 16.3: Doc build (public API shape).**
 
 ```bash
-cargo doc -p qpdf-test-compare --no-deps
+cargo doc -p flpdf-test-compare --no-deps
 ```
 
 Confirm no broken intra-doc links. Given `publish = false`, this is a light check.
@@ -1013,21 +1013,21 @@ Confirm no broken intra-doc links. Given `publish = false`, this is a light chec
 scripts/patch-coverage.sh --base origin/main
 ```
 
-Ensure `flpdf` gate is green (no changed lines under `crates/flpdf/src/` — we don't touch flpdf). Note `qpdf-test-compare` uncovered lines if any, and add tests to close any gaps that reasonably can be closed. Document ignored lines with `// cov:ignore: <reason>` in a PR-description line.
+Ensure `flpdf` gate is green (no changed lines under `crates/flpdf/src/` — we don't touch flpdf). Note `flpdf-test-compare` uncovered lines if any, and add tests to close any gaps that reasonably can be closed. Document ignored lines with `// cov:ignore: <reason>` in a PR-description line.
 
 **Step 16.5: Push branch.**
 
 ```bash
-git push -u origin feat/flpdf-iurg-qpdf-test-compare
+git push -u origin feat/flpdf-iurg-flpdf-test-compare
 ```
 
 **Step 16.6: Open PR.**
 
 ```bash
-gh pr create --title "feat(qpdf-test-compare): Rust port of qpdf-test-compare (flpdf-iurg)" \
+gh pr create --title "feat(flpdf-test-compare): Rust port of flpdf-test-compare (flpdf-iurg)" \
   --body "$(cat <<'EOF'
 ## Summary
-- New `crates/qpdf-test-compare` crate (`publish = false`) reimplementing qpdf v11.9.0's `compare-for-test/qpdf-test-compare.cc` in Rust
+- New `crates/flpdf-test-compare` crate (`publish = false`) reimplementing qpdf v11.9.0's `compare-for-test/qpdf-test-compare.cc` in Rust
 - Semantic compare of two PDFs, tolerating FlateDecode compression differences
 - Consumers: the flpdf-qtest harness's "check output" step (shim wiring is a separate follow-up issue)
 
@@ -1039,8 +1039,8 @@ Full design in `bd show flpdf-iurg` (`design` field). Key points:
 - patch-coverage treats the crate as report-only (matches flpdf-cli)
 
 ## Test plan
-- [ ] `cargo test -p qpdf-test-compare` (default features)
-- [ ] `cargo test -p qpdf-test-compare --features qpdf-zlib-compat`
+- [ ] `cargo test -p flpdf-test-compare` (default features)
+- [ ] `cargo test -p flpdf-test-compare --features qpdf-zlib-compat`
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo fmt --all --check`
 - [ ] `scripts/patch-coverage.sh --base origin/main` — flpdf gate green
@@ -1067,12 +1067,12 @@ bd close flpdf-iurg --reason="merged in PR #<n>"
 
 ## Rollback / abort
 
-- All commits are new (never amending). To abandon: `git worktree remove .worktrees/flpdf-iurg-qpdf-test-compare --force` from the main repo, then `git branch -D feat/flpdf-iurg-qpdf-test-compare`.
+- All commits are new (never amending). To abandon: `git worktree remove .worktrees/flpdf-iurg-flpdf-test-compare --force` from the main repo, then `git branch -D feat/flpdf-iurg-flpdf-test-compare`.
 - The design remains in bd (recoverable via `bd show flpdf-iurg`).
 
 ## Post-completion
 
 After merge, the follow-up work:
 
-1. File a bd issue: "flpdf-qtest: PATH shim wiring for qpdf-test-compare" as a child of `flpdf-n9t0`.
+1. File a bd issue: "flpdf-qtest: PATH shim wiring for flpdf-test-compare" as a child of `flpdf-n9t0`.
 2. If `--password` path uncovered, file a bd issue to cover it against a small encrypted fixture.
