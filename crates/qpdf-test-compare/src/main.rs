@@ -1,11 +1,10 @@
 use std::env;
-use std::fs::File;
 use std::process::ExitCode;
 
 // Shared helpers live in the library crate; the binary reaches them via
-// `use qpdf_test_compare::...` when it starts calling them (Task 10+).
-// Duplicating them with `mod output;` here would compile them twice into the
-// binary and add dead-code the compiler can rightly warn about.
+// `use qpdf_test_compare::...`. Duplicating them with `mod output;` here would
+// compile them twice into the binary and add dead-code the compiler can
+// rightly warn about.
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -29,18 +28,64 @@ fn run(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     let actual_path = args[1].as_str();
-    // Scaffold for later tasks: touch the actual file so a missing-input error
-    // exercises the panic-free reporting path. The real compare pipeline
-    // replaces this in a follow-up task.
-    match File::open(actual_path) {
-        Ok(_) => {
-            eprintln!("{whoami}: comparison not yet implemented");
-            ExitCode::from(2)
-        }
+    let expected_path = args[2].as_str();
+    let password: &[u8] = args.get(3).map(|s| s.as_bytes()).unwrap_or(b"");
+    // qpdf's `QPDF_COMPARE_WHY` env: when set, print the diff reason to
+    // stderr and skip the actual-file stdout dump. Presence is enough — the
+    // value is ignored (matches `getenv` != nullptr).
+    let show_why = env::var_os("QPDF_COMPARE_WHY").is_some();
+
+    // qpdf's oracle reads the file twice: once via QPDF for parsing, then
+    // again as a raw byte stream for the stdout dump. We do the same — the
+    // second read guarantees stdout is byte-verbatim (no re-serialization).
+    let actual_bytes = match std::fs::read(actual_path) {
+        Ok(b) => b,
         Err(err) => {
             eprintln!("{whoami}: {err}");
-            ExitCode::from(2)
+            return ExitCode::from(2);
         }
+    };
+    let expected_bytes = match std::fs::read(expected_path) {
+        Ok(b) => b,
+        Err(err) => {
+            eprintln!("{whoami}: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let diff = match qpdf_test_compare::compare_files(&actual_bytes, &expected_bytes, password) {
+        Ok(d) => d,
+        Err(err) => {
+            // qpdf's `main()` catches `std::exception` from `compare()` (e.g.
+            // parse errors, decode failures) and exits 2 with stderr text and
+            // NO stdout output. Match that shape.
+            eprintln!("{whoami}: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let (to_output, is_diff) = match diff {
+        // difference.empty() -> cat the expected file verbatim, exit 0.
+        None => (expected_path, false),
+        Some(reason) => {
+            if show_why {
+                // WHY mode: reason to stderr, skip the stdout dump entirely.
+                eprintln!("{reason}");
+                return ExitCode::from(2);
+            }
+            // Default: cat the actual file verbatim, then exit 2.
+            (actual_path, true)
+        }
+    };
+
+    if let Err(err) = qpdf_test_compare::output::dump_file_to_stdout(to_output) {
+        eprintln!("{whoami}: {err}");
+        return ExitCode::from(2);
+    }
+    if is_diff {
+        ExitCode::from(2)
+    } else {
+        ExitCode::from(0)
     }
 }
 
