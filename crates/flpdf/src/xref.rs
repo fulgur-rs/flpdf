@@ -124,15 +124,7 @@ pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
             Err(error) => return Err(error),
         };
 
-    if let Err(error) = merge_previous_xref_sections(
-        &bytes,
-        &version,
-        &mut loaded.loaded.entries,
-        &loaded.loaded.trailer,
-        &mut loaded.trailer_references,
-        &mut loaded.parsed_xref_streams,
-        allow_repair,
-    ) {
+    if let Err(error) = merge_previous_xref_sections(&bytes, &version, &mut loaded, allow_repair) {
         if allow_repair {
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
             let recovered = recover_xref_from_linear_scan(
@@ -194,14 +186,11 @@ fn parse_xref_from_start(
 fn merge_previous_xref_sections(
     bytes: &[u8],
     version: &str,
-    entries: &mut BTreeMap<ObjectRef, XrefOffset>,
-    trailer: &Dictionary,
-    trailer_references: &mut BTreeSet<ObjectRef>,
-    parsed_xref_streams: &mut BTreeMap<ObjectRef, Object>,
+    loaded: &mut LoadedXrefState,
     allow_repair: bool,
 ) -> Result<()> {
     let mut visited = HashSet::new();
-    let mut previous_offset = parse_previous_xref_offset(trailer);
+    let mut previous_offset = parse_previous_xref_offset(&loaded.loaded.trailer);
 
     while let Some(offset) = previous_offset {
         let previous_pos = usize::try_from(offset)
@@ -212,23 +201,33 @@ fn merge_previous_xref_sections(
         }
 
         let previous = parse_xref_from_start(bytes, previous_pos, offset, version, allow_repair)?;
-        trailer_references.extend(previous.trailer_references.iter().copied());
+        for diagnostic in previous.loaded.repair_diagnostics.entries() {
+            loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+        }
+        loaded
+            .trailer_references
+            .extend(previous.trailer_references.iter().copied());
         for (object_ref, object) in previous.parsed_xref_streams {
             let newer_live = matches!(
-                entries.get(&object_ref),
+                loaded.loaded.entries.get(&object_ref),
                 Some(XrefOffset::Offset(_) | XrefOffset::Compressed { .. })
             );
             if !newer_live {
-                parsed_xref_streams.entry(object_ref).or_insert(object);
+                loaded
+                    .parsed_xref_streams
+                    .entry(object_ref)
+                    .or_insert(object);
             }
         }
 
         for (object_ref, xref_offset) in previous.loaded.entries {
-            if !entries
+            if !loaded
+                .loaded
+                .entries
                 .keys()
                 .any(|entry_ref| entry_ref.number == object_ref.number)
             {
-                entries.insert(object_ref, xref_offset);
+                loaded.loaded.entries.insert(object_ref, xref_offset);
             }
         }
 
@@ -287,6 +286,11 @@ fn merge_recovered_qpdf_state(
     mut recovered: LoadedXrefState,
     mut accumulated: LoadedXrefState,
 ) -> LoadedXrefState {
+    let mut repair_diagnostics = std::mem::take(&mut accumulated.loaded.repair_diagnostics);
+    for diagnostic in recovered.loaded.repair_diagnostics.entries() {
+        repair_diagnostics.push(diagnostic.clone());
+    }
+    recovered.loaded.repair_diagnostics = repair_diagnostics;
     recovered
         .trailer_references
         .extend(accumulated.trailer_references);

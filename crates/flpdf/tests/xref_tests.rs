@@ -311,6 +311,47 @@ fn loads_latest_xref_stream_free_entries_over_previous_live_entries() {
     );
 }
 
+#[test]
+fn preserves_recovery_diagnostics_from_previous_xref_streams() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let obj1_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let previous_xref_offset = bytes.len() as u64;
+    let previous_entries =
+        build_encoded_xref_stream_entries(&[(0, 0, 0), (1, obj1_offset, 0), (0, 0, 0)]);
+    bytes.extend_from_slice(&make_xref_stream_object_with_declared_length(
+        2,
+        3,
+        None,
+        1,
+        &previous_entries,
+        previous_entries.len() + 10,
+    ));
+
+    let latest_xref_offset = bytes.len() as u64;
+    let latest_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 0),
+        (1, obj1_offset, 0),
+        (1, previous_xref_offset, 0),
+        (1, latest_xref_offset, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_object(
+        3,
+        4,
+        Some(previous_xref_offset),
+        1,
+        &latest_entries,
+    ));
+    bytes.extend_from_slice(format!("startxref\n{latest_xref_offset}\n%%EOF\n").as_bytes());
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert!(loaded.repair_diagnostics.entries().iter().any(|entry| {
+        entry.message.contains("recovered stream length") && entry.message.contains("(object 2 0,")
+    }));
+}
+
 fn build_encoded_xref_stream_entries(entries: &[(u8, u64, u64)]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(entries.len() * 7);
     for &(entry_type, field1, field2) in entries {
@@ -328,15 +369,30 @@ fn make_xref_stream_object(
     root_ref_number: u32,
     entries: &[u8],
 ) -> Vec<u8> {
+    make_xref_stream_object_with_declared_length(
+        object_number,
+        size,
+        prev_offset,
+        root_ref_number,
+        entries,
+        entries.len(),
+    )
+}
+
+fn make_xref_stream_object_with_declared_length(
+    object_number: u32,
+    size: u32,
+    prev_offset: Option<u64>,
+    root_ref_number: u32,
+    entries: &[u8],
+    declared_length: usize,
+) -> Vec<u8> {
     let prev = prev_offset
         .map(|offset| format!(" /Prev {offset}"))
         .unwrap_or_default();
 
     let mut object = format!(
-        "{} 0 obj\n<< /Type /XRef /Size {size} /Root {root_ref_number} 0 R /W [1 4 2] /Index [0 {size}] /Length {}{} >>\nstream\n",
-        object_number,
-        entries.len(),
-        prev
+        "{object_number} 0 obj\n<< /Type /XRef /Size {size} /Root {root_ref_number} 0 R /W [1 4 2] /Index [0 {size}] /Length {declared_length}{prev} >>\nstream\n",
     )
     .into_bytes();
     object.extend_from_slice(entries);
