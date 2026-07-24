@@ -2,6 +2,7 @@
 members = [
     "crates/flpdf",
     "crates/flpdf-cli",
+    "crates/qpdf-test-compare",
 ]
 # `fuzz/` is a standalone cargo-fuzz workspace (its own `[workspace]` table). It
 # requires a nightly toolchain (libFuzzer / `-Zsanitizer`) and must never be
