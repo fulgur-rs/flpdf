@@ -16,6 +16,7 @@ pub(crate) enum RecoveryPolicy {
     Strict,
     Bounded,
     RequireTerminator,
+    RequireEndstream,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,7 +305,11 @@ fn finish_stream(
                 Some((end, after)) => {
                     (end, after, included_stream_data_eol(input, data_start, end))
                 }
-                None if policy == RecoveryPolicy::RequireTerminator => {
+                None if matches!(
+                    policy,
+                    RecoveryPolicy::RequireTerminator | RecoveryPolicy::RequireEndstream
+                ) =>
+                {
                     return Err(Error::parse(data_start, "stream data exceeds input"));
                 }
                 None => (data_start, input.len(), None),
@@ -358,6 +363,9 @@ fn recover_stream_boundary(
     let terminator = match policy {
         RecoveryPolicy::RequireTerminator => {
             find_line_anchored_recovery_terminator(input, data_start)
+        }
+        RecoveryPolicy::RequireEndstream => {
+            find_line_anchored_endstream_terminator(input, data_start)
         }
         RecoveryPolicy::Strict | RecoveryPolicy::Bounded => {
             find_recovery_terminator(input, data_start)
@@ -431,6 +439,20 @@ fn find_line_anchored_recovery_terminator(
                     keyword_token_end(input, position, b"endobj")
                         .map(|_| RecoveryTerminator::Endobj { position })
                 })
+        })
+}
+
+fn find_line_anchored_endstream_terminator(
+    input: &[u8],
+    start: usize,
+) -> Option<RecoveryTerminator> {
+    (start..input.len())
+        .filter(|&position| {
+            position == start || matches!(input.get(position - 1), Some(b'\n' | b'\r'))
+        })
+        .find_map(|position| {
+            keyword_token_end(input, position, b"endstream")
+                .map(|after| RecoveryTerminator::Endstream { position, after })
         })
 }
 
@@ -790,6 +812,15 @@ mod tests {
         let pending = parse_file_object_syntax(input).unwrap();
         assert!(
             finish_file_object(input, pending, None, RecoveryPolicy::RequireTerminator).is_err()
+        );
+    }
+
+    #[test]
+    fn require_endstream_policy_rejects_endobj_recovery() {
+        let input = b"1 0 obj\n<< /Length 9 0 R >>\nstream\nabc\nendobj\n";
+        let pending = parse_file_object_syntax(input).unwrap();
+        assert!(
+            finish_file_object(input, pending, None, RecoveryPolicy::RequireEndstream).is_err()
         );
     }
 
