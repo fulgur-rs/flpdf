@@ -8,6 +8,7 @@ use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
 pub(crate) enum RecoveryPolicy {
     Strict,
     Bounded,
+    RequireTerminator,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,7 +369,7 @@ fn complete_stream(
 
     let (data_end, after_endstream, included_recovery_eol) = match exact_terminator {
         Some((end, after)) => (end, after, None),
-        None if policy == RecoveryPolicy::Bounded => {
+        None if policy != RecoveryPolicy::Strict => {
             if let Some(kind) = invalid_length.as_ref() {
                 diagnostics.push(FileObjectDiagnostic {
                     kind: kind.clone(),
@@ -380,8 +381,15 @@ fn complete_stream(
                     relative_offset: exact_end.unwrap_or(data_start),
                 });
             }
-            let (end, after) = recover_stream_boundary(input, data_start, &mut diagnostics);
-            (end, after, included_stream_data_eol(input, data_start, end))
+            match recover_stream_boundary(input, data_start, &mut diagnostics) {
+                Some((end, after)) => {
+                    (end, after, included_stream_data_eol(input, data_start, end))
+                }
+                None if policy == RecoveryPolicy::RequireTerminator => {
+                    return Err(Error::parse(data_start, "stream data exceeds input"));
+                }
+                None => (data_start, input.len(), None),
+            }
         }
         None => {
             let error_offset = if invalid_length.is_some() {
@@ -420,7 +428,7 @@ fn recover_stream_boundary(
     input: &[u8],
     data_start: usize,
     diagnostics: &mut Vec<FileObjectDiagnostic>,
-) -> (usize, usize) {
+) -> Option<(usize, usize)> {
     diagnostics.push(FileObjectDiagnostic {
         kind: FileObjectDiagnosticKind::AttemptingStreamLengthRecovery,
         relative_offset: data_start,
@@ -437,14 +445,14 @@ fn recover_stream_boundary(
             },
             relative_offset: data_start,
         });
-        return (data_end, terminator.after_body());
+        return Some((data_end, terminator.after_body()));
     }
 
     diagnostics.push(FileObjectDiagnostic {
         kind: FileObjectDiagnosticKind::EmptyRecoveredStream,
         relative_offset: data_start,
     });
-    (data_start, input.len())
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -843,6 +851,28 @@ mod tests {
                 .iter()
                 .any(|d| d.kind == FileObjectDiagnosticKind::ExpectedEndobj));
         }
+    }
+
+    #[test]
+    fn require_terminator_policy_recovers_unresolved_length() {
+        let input = b"1 0 obj\n<< /Length 9 0 R >>\nstream\nabc\nendstream\nendobj\n";
+        let pending = parse_file_object_syntax(input).unwrap();
+        let completed =
+            finish_file_object(input, pending, None, RecoveryPolicy::RequireTerminator).unwrap();
+        assert_eq!(completed.object.as_stream().unwrap().data, b"abc\n");
+        assert_eq!(
+            completed.included_recovery_eol,
+            Some(IncludedStreamDataEol::Lf)
+        );
+    }
+
+    #[test]
+    fn require_terminator_policy_rejects_truncated_stream() {
+        let input = b"1 0 obj\n<< /Length 9 0 R >>\nstream\nabc";
+        let pending = parse_file_object_syntax(input).unwrap();
+        assert!(
+            finish_file_object(input, pending, None, RecoveryPolicy::RequireTerminator).is_err()
+        );
     }
 
     #[test]
