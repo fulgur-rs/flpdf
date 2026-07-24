@@ -2100,8 +2100,25 @@ fn remap_qpdf_trailer_refs<R: Read + Seek, M: crate::rewrite_renumber::NewNumber
     trailer: &mut Dictionary,
     map: &M,
 ) -> Result<()> {
+    remap_qpdf_trailer_refs_with_removed(pdf, trailer, map, &BTreeSet::new())
+}
+
+fn remap_qpdf_trailer_refs_with_removed<
+    R: Read + Seek,
+    M: crate::rewrite_renumber::NewNumberLookup,
+>(
+    pdf: &mut Pdf<R>,
+    trailer: &mut Dictionary,
+    map: &M,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
     let mut object = Object::Dictionary(trailer.clone());
-    crate::rewrite_renumber::renumber_qpdf_refs_in_place(pdf, &mut object, map)?;
+    crate::rewrite_renumber::renumber_qpdf_refs_in_place_with_removed(
+        pdf,
+        &mut object,
+        map,
+        removed_refs,
+    )?;
     *trailer = object
         .into_dict()
         .expect("qpdf trailer rewrite preserves the dictionary variant");
@@ -4548,7 +4565,7 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
 
         let mut trailer = pdf.trailer().clone();
         strip_incremental_trailer_keys(&mut trailer);
-        remap_qpdf_trailer_refs(pdf, &mut trailer, &renumber)?;
+        remap_qpdf_trailer_refs_with_removed(pdf, &mut trailer, &renumber, &removed_refs)?;
         trailer.insert("Size", Object::Integer(i64::from(object_count)));
         trailer.insert("Root", Object::Reference(new_root));
         apply_encrypt_trailer_entries(&mut trailer, pdf, options, None, options.deterministic_id);
@@ -4626,7 +4643,7 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
     //
     let mut trailer = pdf.trailer().clone();
     strip_incremental_trailer_keys(&mut trailer);
-    remap_qpdf_trailer_refs(pdf, &mut trailer, &renumber)?;
+    remap_qpdf_trailer_refs_with_removed(pdf, &mut trailer, &renumber, &removed_refs)?;
     // The specialized xref-stream writer adds the generated `/Root`, `/Size`,
     // and `/ID` entries itself. Keep every other trimmed/remapped trailer entry
     // — including a direct `/Info` dictionary — for sorted emission after `/W`.
@@ -5068,6 +5085,28 @@ mod tests {
         trailer.insert("Info", Object::Reference(ObjectRef::new(99, 0)));
         let err = remap_trailer_refs(&mut trailer, &map, &[]).unwrap_err();
         assert!(matches!(err, crate::Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn remap_qpdf_trailer_refs_propagates_unmapped_nested_live_ref() {
+        let fixture = build_partition_fixture();
+        let mut pdf = crate::Pdf::open_mem(&fixture).expect("fixture must open");
+        let map = CatalogFirstRenumber::from_pairs_for_test(&[(
+            ObjectRef::new(1, 0),
+            ObjectRef::new(1, 0),
+        )]);
+        let mut trailer = Dictionary::new();
+        trailer.insert(
+            "Extra",
+            Object::Array(vec![Object::Reference(ObjectRef::new(3, 0))]),
+        );
+
+        let err =
+            remap_qpdf_trailer_refs_with_removed(&mut pdf, &mut trailer, &map, &BTreeSet::new())
+                .unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+                if message.contains("reference 3 0 R absent from renumber map")));
     }
 
     fn id_array(d: &Dictionary) -> Vec<Object> {
