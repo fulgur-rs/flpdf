@@ -17,6 +17,17 @@ fn public_parser_recovers_indirect_stream_length() {
 }
 
 #[test]
+fn public_parser_rejects_truncated_stream_with_indirect_length() {
+    let err = parse_object(b"<< /Length 9 0 R >>\nstream\nabc")
+        .expect_err("truncated stream with an indirect length must error");
+
+    assert!(
+        matches!(err, Error::Parse { .. }),
+        "expected Error::Parse, got {err:?}"
+    );
+}
+
+#[test]
 fn public_parser_recovers_missing_stream_length() {
     assert_eq!(parsed_stream_data(b"<< >>\nstream\nabc\nendstream"), b"abc");
 }
