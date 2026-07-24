@@ -6337,6 +6337,32 @@ mod tests {
     }
 
     #[test]
+    fn encrypt_and_copy_encryption_are_mutually_exclusive() {
+        let fixture = build_partition_fixture();
+        let mut pdf = crate::Pdf::open_mem(&fixture).expect("fixture must open");
+        let opts = WriteOptions {
+            full_rewrite: true,
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                b"user".to_vec(),
+                b"owner".to_vec(),
+            )),
+            copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
+                encrypt_dict: Dictionary::new(),
+                file_key: Vec::new(),
+                id0: Vec::new(),
+                object_key_alg: crate::ObjectKeyAlg::Aes,
+            }),
+            ..WriteOptions::default()
+        };
+        let err = write_pdf_with_options(&mut pdf, &mut Vec::new(), &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m == "encrypt and copy_encryption are mutually exclusive"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
     fn deterministic_id_rejected_with_encryption() {
         let fixture = build_partition_fixture();
         let mut pdf = crate::Pdf::open_mem(&fixture).expect("fixture must open");
