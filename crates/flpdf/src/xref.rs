@@ -1,6 +1,11 @@
+use crate::diagnostics::Diagnostic;
 use crate::object::collect_qpdf_object_references;
 use crate::parser::{parse_indirect_object, Parser};
-use crate::{filters, Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, Result};
+use crate::reader::file_object::{
+    finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, RecoveryPolicy,
+    ResolvedStreamLength,
+};
+use crate::{filters, Diagnostics, Dictionary, Error, Object, ObjectRef, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 
@@ -748,8 +753,26 @@ fn parse_xref_stream(
         .get(xref_pos..)
         .filter(|slice| !slice.is_empty())
         .ok_or_else(|| Error::parse(xref_pos, "xref stream offset is beyond end of file"))?;
-    let (object_ref, object) =
-        parse_indirect_object(tail).map_err(|err| err.rebase_offset(xref_pos))?;
+    let pending = parse_file_object_syntax(tail).map_err(|err| err.rebase_offset(xref_pos))?;
+    let object_ref = pending.object_ref;
+    let unresolved_length = pending
+        .indirect_length_ref()
+        .map(|_| ResolvedStreamLength::Missing);
+    let mut completed =
+        finish_file_object(tail, pending, unresolved_length, RecoveryPolicy::Bounded)
+            .map_err(|err| err.rebase_offset(xref_pos))?;
+    // Xref streams are not encrypted, but filter decoding still requires the
+    // logical payload rather than qpdf's raw recovery EOL.
+    let _recovered_eol = completed.remove_included_recovery_eol_for_decryption();
+    let object = completed.object;
+    let mut repair_diagnostics = Diagnostics::default();
+    for diagnostic in completed.diagnostics {
+        repair_diagnostics.push(xref_file_object_diagnostic(
+            object_ref,
+            xref_pos as u64,
+            diagnostic,
+        ));
+    }
     let stream = match &object {
         Object::Stream(stream) => stream,
         _ => return Err(Error::parse(xref_pos, "xref not found")),
@@ -780,11 +803,28 @@ fn parse_xref_stream(
             entries,
             trailer,
             last_xref_form: XrefForm::Stream,
-            repair_diagnostics: Diagnostics::default(),
+            repair_diagnostics,
         },
         trailer_references,
         parsed_xref_streams,
     })
+}
+
+fn xref_file_object_diagnostic(
+    object_ref: ObjectRef,
+    offset: u64,
+    diagnostic: FileObjectDiagnostic,
+) -> Diagnostic {
+    Diagnostic::warning(
+        format!(
+            "(object {} {}, offset {}): {}",
+            object_ref.number,
+            object_ref.generation,
+            offset.saturating_add(diagnostic.relative_offset as u64),
+            diagnostic.kind.message()
+        ),
+        Some(offset.saturating_add(diagnostic.relative_offset as u64)),
+    )
 }
 
 type XrefWidths = (usize, usize, usize);

@@ -84,6 +84,62 @@ fn loads_xref_stream_and_trailer() {
 }
 
 #[test]
+fn xref_stream_direct_length_accepts_payload_adjacent_endstream_without_diagnostics() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        b"1 0 obj\n<< /Type /XRef /Size 1 /W [1 1 1] /Index [0 1] /Length 3 >>\nstream\n",
+    );
+    bytes.extend_from_slice(&[0, 0, 0]);
+    bytes.extend_from_slice(b"endstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(loaded.last_xref_form, XrefForm::Stream);
+    assert!(loaded.repair_diagnostics.entries().is_empty());
+}
+
+#[test]
+fn xref_stream_unavailable_indirect_length_uses_bounded_recovery_diagnostics() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        b"1 0 obj\n<< /Type /XRef /Size 1 /W [1 1 1] /Index [0 1] /Length 9 0 R >>\nstream\n",
+    );
+    let payload_offset = bytes.len();
+    bytes.extend_from_slice(&[0, 0, 0]);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(loaded.last_xref_form, XrefForm::Stream);
+    assert_eq!(
+        loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| (diagnostic.message.clone(), diagnostic.offset))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                format!("(object 1 0, offset {xref_offset}): stream dictionary lacks /Length key"),
+                Some(xref_offset as u64),
+            ),
+            (
+                format!(
+                    "(object 1 0, offset {payload_offset}): attempting to recover stream length"
+                ),
+                Some(payload_offset as u64),
+            ),
+            (
+                format!("(object 1 0, offset {payload_offset}): recovered stream length: 4"),
+                Some(payload_offset as u64),
+            ),
+        ]
+    );
+}
+
+#[test]
 fn loads_xref_stream_without_index_uses_size_range() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 

@@ -417,17 +417,32 @@ fn objstm_with_indirect_length_adjacent_endstream_reads_members() {
     }
 }
 
-/// (3b) When an ObjStm container's indirect `/Length` is unrecoverable (here the
-/// holder resolves to a non-integer), the error must propagate out of the
-/// compressed-object resolution path rather than yield a silently-empty
-/// container.
+/// (3b) An unusable indirect `/Length` on an ObjStm container takes the same
+/// bounded recovery path as a normal indirect object. The recovered container
+/// still yields its member and records the qpdf-compatible warning sequence.
 #[test]
-fn objstm_with_unrecoverable_indirect_length_errors() {
+fn objstm_with_unusable_indirect_length_recovers_members_with_warnings() {
     let bytes = build_objstm_pdf(b"/NotALength");
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    let result = pdf.resolve(ObjectRef::new(2, 0));
-    assert!(
-        result.is_err(),
-        "an ObjStm with an unrecoverable indirect /Length must error; got {result:?}"
+
+    let pages_obj = pdf
+        .resolve(ObjectRef::new(2, 0))
+        .expect("bounded recovery must preserve the compressed member");
+    assert_eq!(
+        pages_obj.as_dict().and_then(|dict| dict.get("Type")),
+        Some(&Object::Name(b"Pages".to_vec()))
+    );
+
+    assert_eq!(
+        pdf.repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "(object 3 0, offset 58): /Length key in stream dictionary is not an integer",
+            "(object 3 0, offset 121): attempting to recover stream length",
+            "(object 3 0, offset 121): recovered stream length: 40",
+        ]
     );
 }

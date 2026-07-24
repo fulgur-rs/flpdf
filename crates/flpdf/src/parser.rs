@@ -1,4 +1,4 @@
-use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
+use crate::{Dictionary, Error, Object, ObjectRef, Result};
 
 /// Parse a single PDF object from `input`, which must contain nothing but
 /// that object (apart from trailing whitespace).
@@ -10,37 +10,8 @@ use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
 /// - Returns [`Error::Parse`] with `"trailing bytes after object"` if any
 ///   non-whitespace bytes remain after the object has been parsed.
 pub fn parse_object(input: &[u8]) -> Result<Object> {
-    let mut parser = Parser::new(input);
-    let object = parser.object()?;
-    parser.skip_ws();
-    if parser.pos != parser.input.len() {
-        return Err(Error::parse(parser.pos, "trailing bytes after object"));
-    }
-    Ok(object)
-}
-
-/// A stream object whose `/Length` is an indirect reference `M G R`. The
-/// parser cannot resolve `M` (it has no xref); it locates the payload window
-/// via the spec `endstream`-scan recovery and records these bounds so the
-/// reader — which *does* have the xref — can re-slice to the authoritative
-/// length.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct IndirectStreamLength {
-    /// The `/Length M G R` holder object reference.
-    pub holder: ObjectRef,
-    /// Byte offset of the first stream payload byte (just past the `stream`
-    /// keyword's EOL), relative to the `parse_indirect_object` input slice.
-    pub data_start: usize,
-    /// Byte offset of the `endstream` keyword (the syntactic upper bound; the
-    /// authoritative length is clamped to not exceed this), when a line-anchored
-    /// `endstream` was located. `None` when no line-anchored `endstream` exists
-    /// — the only writer path that produces this is
-    /// [`NewlineBeforeEndstream::Never`](crate::NewlineBeforeEndstream::Never)
-    /// with a payload whose last byte is not an EOL, so `endstream` sits
-    /// immediately after the final content byte and is not line-anchored. In
-    /// that case the holder is the EXACT content length and the reader is
-    /// authoritative (there is no syntactic bound to clamp against).
-    pub endstream_pos: Option<usize>,
+    let parsed = parse_strict_direct_object(input)?;
+    crate::reader::file_object::finish_strict_direct_object(input, parsed)
 }
 
 /// Exact line ending removed from the recovered stream payload immediately
@@ -62,39 +33,15 @@ impl RecoveredStreamEol {
     }
 }
 
-pub(crate) struct ParsedIndirectObject {
-    pub(crate) object_ref: ObjectRef,
-    pub(crate) object: Object,
-    pub(crate) indirect_length: Option<IndirectStreamLength>,
-    pub(crate) recovered_stream_eol: Option<RecoveredStreamEol>,
-    pub(crate) empty_offset: Option<usize>,
-    pub(crate) expected_endobj_offset: Option<usize>,
-}
-
 pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)> {
-    let (object_ref, object, _) = parse_indirect_object_detailed(input)?;
-    Ok((object_ref, object))
-}
-
-/// Like [`parse_indirect_object`] but also returns
-/// [`IndirectStreamLength`] bounds when the parsed object is a stream whose
-/// `/Length` is an indirect reference. Used by the reader to resolve the
-/// authoritative length via the xref; all other callers use
-/// the plain [`parse_indirect_object`] wrapper.
-pub(crate) fn parse_indirect_object_detailed(
-    input: &[u8],
-) -> Result<(ObjectRef, Object, Option<IndirectStreamLength>)> {
-    let parsed = parse_indirect_object_detailed_impl(input, false)?;
-    Ok((parsed.object_ref, parsed.object, parsed.indirect_length))
-}
-
-/// Parse an indirect object using qpdf's file-object recovery rules. Both the
-/// normal reader and JSON inspection use this path so their shared cache never
-/// depends on call order. The parsed result records both the byte offset of the
-/// `endobj` token when empty-object recovery was used and the byte offset where
-/// qpdf expected `endobj`.
-pub(crate) fn parse_indirect_object_detailed_qpdf(input: &[u8]) -> Result<ParsedIndirectObject> {
-    parse_indirect_object_detailed_impl(input, true)
+    let pending = crate::reader::file_object::parse_strict_file_object_syntax(input)?;
+    let completed = crate::reader::file_object::finish_file_object(
+        input,
+        pending,
+        None,
+        crate::reader::file_object::RecoveryPolicy::Strict,
+    )?;
+    Ok((completed.object_ref, completed.object))
 }
 
 /// Parse one object using qpdf's file-object rules. A bare `N G R` at the
@@ -118,7 +65,6 @@ pub(crate) struct ParsedDirectObject {
 pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObject> {
     let mut parser = Parser::new(input);
     parser.top_level_no_reference = true;
-    parser.parse_streams = false;
     parser.skip_ws();
 
     let empty_offset = keyword_token_end(input, parser.pos, b"endobj").map(|_| parser.pos);
@@ -139,43 +85,15 @@ pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObjec
     })
 }
 
-fn parse_indirect_object_detailed_impl(
-    input: &[u8],
-    allow_empty_object: bool,
-) -> Result<ParsedIndirectObject> {
+pub(crate) fn parse_strict_direct_object(input: &[u8]) -> Result<ParsedDirectObject> {
     let mut parser = Parser::new(input);
-    let number = parser.integer_for_indirect()?;
-    let generation = parser.integer_for_indirect()?;
-    parser.expect_keyword_for_indirect(b"obj")?;
     parser.skip_ws();
-    let empty_object_offset = if allow_empty_object && parser.take_keyword_token(b"endobj") {
-        Some(parser.pos - b"endobj".len())
-    } else {
-        None
-    };
-    let object = if empty_object_offset.is_some() {
-        Object::Null
-    } else {
-        parser.top_level_no_reference = allow_empty_object;
-        parser.object()?
-    };
-    let expected_endobj_offset = if allow_empty_object && empty_object_offset.is_none() {
-        parser.skip_ws();
-        (!parser.take_keyword_token(b"endobj")).then_some(parser.pos)
-    } else {
-        None
-    };
-    Ok(ParsedIndirectObject {
-        object_ref: ObjectRef::new(
-            u32::try_from(number).map_err(|_| Error::parse(0, "invalid indirect object number"))?,
-            u16::try_from(generation)
-                .map_err(|_| Error::parse(0, "invalid indirect generation"))?,
-        ),
+    let object = parser.object()?;
+    parser.skip_ws();
+    Ok(ParsedDirectObject {
         object,
-        indirect_length: parser.last_indirect_stream_len,
-        recovered_stream_eol: parser.last_recovered_stream_eol,
-        empty_offset: empty_object_offset,
-        expected_endobj_offset,
+        next_offset: parser.pos,
+        empty_offset: None,
     })
 }
 
@@ -192,15 +110,6 @@ pub(crate) struct Parser<'a> {
     /// `endobj` was expected at the generation number. References nested in an
     /// array, dictionary, or stream dictionary remain valid.
     top_level_no_reference: bool,
-    /// When `false`, dictionaries stop before stream framing and return as
-    /// direct dictionary objects.
-    parse_streams: bool,
-    /// Set by [`stream_from_dict`](Self::stream_from_dict) when a stream's
-    /// `/Length` is an indirect reference, so [`parse_indirect_object_detailed`]
-    /// can surface the payload window for xref-based resolution.
-    last_indirect_stream_len: Option<IndirectStreamLength>,
-    /// Exact framing EOL removed by endstream-scan recovery.
-    last_recovered_stream_eol: Option<RecoveredStreamEol>,
     /// Current object-nesting recursion depth, maintained by [`object`](Self::object)
     /// to bound recursion against adversarially deep input.
     depth: usize,
@@ -221,9 +130,6 @@ impl<'a> Parser<'a> {
             pos: 0,
             no_reference: false,
             top_level_no_reference: false,
-            parse_streams: true,
-            last_indirect_stream_len: None,
-            last_recovered_stream_eol: None,
             depth: 0,
         }
     }
@@ -236,9 +142,6 @@ impl<'a> Parser<'a> {
             pos: 0,
             no_reference: true,
             top_level_no_reference: false,
-            parse_streams: true,
-            last_indirect_stream_len: None,
-            last_recovered_stream_eol: None,
             depth: 0,
         }
     }
@@ -306,139 +209,12 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             if self.starts_with(b">>") {
                 self.pos += 2;
-                self.skip_ws();
-                if self.parse_streams && self.starts_with(b"stream") {
-                    return self.stream_from_dict(dict);
-                }
                 return Ok(Object::Dictionary(dict));
             }
             let key = self.name()?;
             let value = self.object()?;
             dict.insert(key, value);
         }
-    }
-
-    fn stream_from_dict(&mut self, dict: Dictionary) -> Result<Object> {
-        // A usable DIRECT /Length is a non-negative Integer; everything else
-        // — an indirect `M G R` reference (the form flpdf's own QDF writer now
-        // emits; a common real-world shape, valid per ISO 32000-1 §7.3.8.2), an
-        // ABSENT /Length, or any otherwise-unusable value — falls through to
-        // the spec-sanctioned `endstream`-scan recovery path. The DIRECT fast
-        // path must stay byte-identical so no currently-parsing PDF regresses.
-        let direct_length = match dict.get("Length") {
-            Some(Object::Integer(value)) if *value >= 0 => u64::try_from(*value).ok(),
-            _ => None,
-        };
-        // An indirect `/Length M G R`: the parser cannot resolve M, but the
-        // reader can (flpdf-9hc.27). Record the holder so the recovery branch
-        // below can surface the payload window for xref-based resolution.
-        let length_ref = match dict.get("Length") {
-            Some(Object::Reference(r)) => Some(*r),
-            _ => None,
-        };
-
-        self.expect_keyword_for_indirect(b"stream")?;
-        if self.peek() == Some(b'\r') {
-            self.pos += 1;
-            if self.peek() == Some(b'\n') {
-                self.pos += 1;
-            }
-        } else if self.peek() == Some(b'\n') {
-            self.pos += 1;
-        }
-
-        let data_start = self.pos;
-        let length = match direct_length.and_then(|n| usize::try_from(n).ok()) {
-            // `checked_add` so a malformed huge direct /Length cannot overflow
-            // the bounds check (debug panic / release wrap-then-OOB-slice on
-            // untrusted input); on overflow fall through to endstream-scan.
-            Some(length)
-                if data_start
-                    .checked_add(length)
-                    .is_some_and(|end| end <= self.input.len()) =>
-            {
-                length
-            }
-            // Indirect / missing / invalid / out-of-range /Length: recover the
-            // payload boundary by locating the line-anchored `endstream`
-            // keyword (what qpdf and conformant readers do). The indirect
-            // holder value is advisory; `endstream` is authoritative.
-            _ => match find_line_anchored_keyword(self.input, b"endstream", data_start) {
-                Some(endstream_pos) => {
-                    // For an indirect /Length, surface the payload window so the
-                    // reader can re-slice to the xref-resolved authoritative
-                    // length. The endstream-scan result here is only the
-                    // last-resort fallback when the holder is unresolvable.
-                    if let Some(holder) = length_ref {
-                        self.last_indirect_stream_len = Some(IndirectStreamLength {
-                            holder,
-                            data_start,
-                            endstream_pos: Some(endstream_pos),
-                        });
-                    }
-                    // Exclude exactly ONE framing EOL marker that the writer
-                    // placed between the payload and `endstream`, so
-                    // `stream.data` is the logical content. The writer then
-                    // re-adds exactly one EOL, keeping QDF round-trip /
-                    // idempotence byte-stable.
-                    let mut end = endstream_pos;
-                    if end > data_start && self.input[end - 1] == b'\n' {
-                        end -= 1;
-                        if end > data_start && self.input[end - 1] == b'\r' {
-                            end -= 1;
-                            self.last_recovered_stream_eol = Some(RecoveredStreamEol::CrLf);
-                        } else {
-                            self.last_recovered_stream_eol = Some(RecoveredStreamEol::Lf);
-                        }
-                    } else if end > data_start && self.input[end - 1] == b'\r' {
-                        end -= 1;
-                        self.last_recovered_stream_eol = Some(RecoveredStreamEol::Cr);
-                    }
-                    end - data_start
-                }
-                // No line-anchored `endstream` anywhere from `data_start`. The
-                // only writer path that produces this is
-                // `NewlineBeforeEndstream::Never` with a non-EOL-ending payload:
-                // `endstream` follows the last CONTENT byte directly, so it is
-                // not line-anchored and the byte-level scan cannot delimit the
-                // payload. (A naive non-anchored scan is wrong — the literal
-                // bytes "endstream" can occur inside the payload.)
-                None => match length_ref {
-                    // Indirect /Length AND a non-anchored `endstream` token
-                    // exists: this is the adjacent-`endstream` case. The holder
-                    // — which the reader resolves via the xref — is the EXACT
-                    // content length. Surface it with `endstream_pos: None` to
-                    // flag the authoritative path; `data` is an empty placeholder
-                    // the reader replaces. The presence gate keeps a genuinely
-                    // truncated stream (no `endstream` at all) on the error path
-                    // below; the reader, not this gate, fixes the boundary.
-                    Some(holder)
-                        if contains_keyword_token(self.input, b"endstream", data_start) =>
-                    {
-                        self.last_indirect_stream_len = Some(IndirectStreamLength {
-                            holder,
-                            data_start,
-                            endstream_pos: None,
-                        });
-                        return Ok(Object::Stream(Stream::new(dict, Vec::new())));
-                    }
-                    // No `endstream` anywhere (truncated), or no holder to
-                    // recover the boundary from: fail loudly. ISO 32000-1
-                    // §7.3.8.1 mandates the EOL before `endstream` precisely so a
-                    // direct/absent-length stream stays parseable; its absence
-                    // here is unrecoverable.
-                    _ => return Err(Error::parse(self.pos, "stream data exceeds input")),
-                },
-            },
-        };
-
-        let data = self.input[data_start..data_start + length].to_vec();
-        self.pos = data_start + length;
-
-        self.skip_ws();
-        self.expect_keyword_for_indirect(b"endstream")?;
-
-        Ok(Object::Stream(Stream::new(dict, data)))
     }
 
     fn hex_string(&mut self) -> Result<Vec<u8>> {
@@ -759,18 +535,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn take_keyword_token(&mut self, keyword: &[u8]) -> bool {
-        if !self.starts_with(keyword) {
-            return false;
-        }
-        let following = self.input.get(self.pos + keyword.len()).copied();
-        if following.is_some_and(|byte| !is_ws(byte) && !is_delimiter(byte)) {
-            return false;
-        }
-        self.pos += keyword.len();
-        true
-    }
-
     fn expect_byte(&mut self, expected: u8) -> Result<()> {
         if self.peek() == Some(expected) {
             self.pos += 1;
@@ -796,60 +560,6 @@ impl<'a> Parser<'a> {
     fn peek(&self) -> Option<u8> {
         self.input.get(self.pos).copied()
     }
-}
-
-/// Locate the FIRST line-anchored `keyword` at or after `from`.
-///
-/// A match counts only when the keyword starts a line (preceding byte is a
-/// `\n`/`\r` EOL or it is the start of the buffer) AND is followed by
-/// EOF/whitespace/EOL/delimiter. This mirrors the line-anchored finder used by
-/// the QDF fix layer so we never match an `endstream` byte sequence that is
-/// merely incidental binary content rather than the stream terminator. Kept
-/// local to the parser so it carries no dependency on writer-side modules.
-fn find_line_anchored_keyword(input: &[u8], keyword: &[u8], from: usize) -> Option<usize> {
-    let mut i = from;
-    while i + keyword.len() <= input.len() {
-        if &input[i..i + keyword.len()] == keyword {
-            let at_line_start = i == 0 || input[i - 1] == b'\n' || input[i - 1] == b'\r';
-            let after_ok = match input.get(i + keyword.len()) {
-                None => true,
-                Some(&c) => is_ws(c) || is_delimiter(c),
-            };
-            if at_line_start && after_ok {
-                return Some(i);
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-/// True when `keyword` appears anywhere in `input` at or after `from`, followed
-/// by EOF/whitespace/delimiter (a keyword-token boundary), WITHOUT requiring a
-/// line start.
-///
-/// Used ONLY as a presence gate to tell the adjacent-`endstream` case
-/// (`NewlineBeforeEndstream::Never`, non-EOL-ending payload — a non-anchored
-/// `endstream` exists, so the reader can resolve the indirect holder
-/// authoritatively) apart from a genuinely truncated stream (no `endstream` at
-/// all → unrecoverable). It never determines a payload boundary, so an
-/// `endstream` byte sequence that is merely incidental binary content cannot
-/// mis-slice the data.
-fn contains_keyword_token(input: &[u8], keyword: &[u8], from: usize) -> bool {
-    let mut i = from;
-    while i + keyword.len() <= input.len() {
-        if &input[i..i + keyword.len()] == keyword {
-            let after_ok = match input.get(i + keyword.len()) {
-                None => true,
-                Some(&c) => is_ws(c) || is_delimiter(c),
-            };
-            if after_ok {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
 }
 
 pub(crate) fn is_ws(byte: u8) -> bool {
@@ -887,14 +597,24 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod stream_length_tests {
     use super::{
-        parse_indirect_object, parse_indirect_object_detailed, parse_indirect_object_detailed_qpdf,
-        parse_object, parse_qpdf_direct_object, RecoveredStreamEol,
+        parse_indirect_object, parse_object, parse_qpdf_direct_object, RecoveredStreamEol,
+    };
+    use crate::reader::file_object::{
+        finish_file_object, parse_file_object_syntax, FileObjectDiagnosticKind, FileObjectRead,
+        RecoveryPolicy,
     };
     use crate::{Object, ObjectRef};
 
+    fn read_qpdf_file_object(bytes: &[u8]) -> FileObjectRead {
+        let pending = parse_file_object_syntax(bytes).expect("file object syntax must parse");
+        finish_file_object(bytes, pending, None, RecoveryPolicy::Bounded)
+            .expect("file object must complete")
+    }
+
     fn parse_stream(bytes: &[u8]) -> crate::Stream {
-        let (_, object) = parse_indirect_object(bytes).expect("indirect object must parse");
-        match object {
+        let mut completed = read_qpdf_file_object(bytes);
+        let _recovered_eol = completed.remove_included_recovery_eol_for_decryption();
+        match completed.object {
             Object::Stream(stream) => stream,
             other => panic!("expected a stream, got {other:?}"),
         }
@@ -929,10 +649,15 @@ mod stream_length_tests {
             let mut bytes = b"3 0 obj\n<< /Length null >>\nstream\npayload".to_vec();
             bytes.extend_from_slice(eol);
             bytes.extend_from_slice(b"endstream\nendobj\n");
-            let parsed =
-                parse_indirect_object_detailed_qpdf(&bytes).expect("null length must recover");
-            assert_eq!(parsed.recovered_stream_eol, Some(expected));
-            assert_eq!(parsed.object.as_stream().expect("stream").data, b"payload");
+            let mut completed = read_qpdf_file_object(&bytes);
+            assert_eq!(
+                completed.remove_included_recovery_eol_for_decryption(),
+                Some(expected)
+            );
+            assert_eq!(
+                completed.object.as_stream().expect("stream").data,
+                b"payload"
+            );
         }
     }
 
@@ -958,11 +683,11 @@ mod stream_length_tests {
         );
     }
 
-    // Binary payload containing the literal bytes `endstream` mid-content but
-    // NOT line-anchored must not terminate early.
+    // Binary payload containing the literal prefix `endstream` in a longer
+    // regular token must not terminate early.
     #[test]
-    fn non_line_anchored_endstream_in_payload_is_ignored() {
-        let payload = b"xx endstream yy\x00\x01rest";
+    fn non_token_bounded_endstream_in_payload_is_ignored() {
+        let payload = b"xx endstreamX yy\x00\x01rest";
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"4 0 obj\n<< /Length 8 0 R >>\nstream\n");
         bytes.extend_from_slice(payload);
@@ -972,7 +697,7 @@ mod stream_length_tests {
         assert_eq!(
             stream.data.as_slice(),
             payload,
-            "an `endstream` substring not at a line start must not terminate the stream"
+            "an `endstream` prefix without a token boundary must not terminate the stream"
         );
     }
 
@@ -1010,68 +735,89 @@ mod stream_length_tests {
     }
 
     #[test]
-    fn contains_keyword_token_boundaries() {
-        use super::contains_keyword_token;
+    fn keyword_token_boundaries() {
         // Token at EOF (nothing after the keyword) counts.
-        assert!(contains_keyword_token(b"xxendstream", b"endstream", 0));
+        assert_eq!(
+            super::keyword_token_end(b"xxendstream", 2, b"endstream"),
+            Some(11)
+        );
         // Token followed by whitespace counts.
-        assert!(contains_keyword_token(b"endstream\n", b"endstream", 0));
+        assert_eq!(
+            super::keyword_token_end(b"endstream\n", 0, b"endstream"),
+            Some(9)
+        );
         // No boundary after the keyword (a longer run of regular chars) does not.
-        assert!(!contains_keyword_token(b"endstreamX", b"endstream", 0));
+        assert_eq!(
+            super::keyword_token_end(b"endstreamX", 0, b"endstream"),
+            None
+        );
         // Absent keyword does not.
-        assert!(!contains_keyword_token(b"no keyword here", b"endstream", 0));
+        assert_eq!(
+            super::keyword_token_end(b"no keyword here", 0, b"endstream"),
+            None
+        );
     }
 
     #[test]
     fn empty_indirect_object_recovery_is_qpdf_only_and_token_bounded() {
         let empty = b"7 0 obj\n  endobj\n";
-        assert!(parse_indirect_object_detailed(empty).is_err());
+        assert!(parse_indirect_object(empty).is_err());
 
-        let parsed = parse_indirect_object_detailed_qpdf(empty).expect("qpdf empty recovery");
+        let pending = parse_file_object_syntax(empty).expect("qpdf empty recovery syntax");
+        assert!(pending.indirect_length_ref().is_none());
+        let parsed = finish_file_object(empty, pending, None, RecoveryPolicy::Bounded).unwrap();
         assert_eq!(parsed.object_ref, ObjectRef::new(7, 0));
         assert_eq!(parsed.object, Object::Null);
-        assert!(parsed.indirect_length.is_none());
-        assert_eq!(parsed.empty_offset, Some(10));
-        assert_eq!(parsed.expected_endobj_offset, None);
+        assert_eq!(
+            parsed
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (&diagnostic.kind, diagnostic.relative_offset))
+                .collect::<Vec<_>>(),
+            vec![(&FileObjectDiagnosticKind::EmptyObject, 10)]
+        );
 
-        assert!(parse_indirect_object_detailed_qpdf(b"7 0 obj\nendobject\nendobj\n").is_err());
+        assert!(parse_file_object_syntax(b"7 0 obj\nendobject\nendobj\n").is_err());
     }
 
     #[test]
     fn qpdf_file_object_mode_integerizes_only_top_level_bare_reference() {
-        let parsed = parse_indirect_object_detailed_qpdf(b"5 0 obj\n6 0 R\nendobj\n")
-            .expect("qpdf file-object recovery");
+        let parsed = read_qpdf_file_object(b"5 0 obj\n6 0 R\nendobj\n");
         assert_eq!(parsed.object_ref, ObjectRef::new(5, 0));
         assert_eq!(parsed.object, Object::Integer(6));
-        assert_eq!(parsed.expected_endobj_offset, Some(10));
+        assert_eq!(
+            parsed
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (&diagnostic.kind, diagnostic.relative_offset))
+                .collect::<Vec<_>>(),
+            vec![(&FileObjectDiagnosticKind::ExpectedEndobj, 10)]
+        );
 
-        let nested =
-            parse_indirect_object_detailed_qpdf(b"5 0 obj\n[6 0 R << /V 7 0 R >>]\nendobj\n")
-                .expect("nested references remain references");
+        let nested = read_qpdf_file_object(b"5 0 obj\n[6 0 R << /V 7 0 R >>]\nendobj\n");
         let values = nested.object.as_array().expect("array body");
         assert_eq!(values[0], Object::Reference(ObjectRef::new(6, 0)));
         assert_eq!(
             values[1].as_dict().unwrap().get_ref("V"),
             Some(ObjectRef::new(7, 0))
         );
-        assert_eq!(nested.expected_endobj_offset, None);
+        assert!(nested.diagnostics.is_empty());
 
-        let stream = parse_indirect_object_detailed_qpdf(
+        let stream = read_qpdf_file_object(
             b"5 0 obj\n<< /Length 0 /Probe 6 0 R >>\nstream\n\nendstream\nendobj\n",
-        )
-        .expect("stream dictionary reference remains a reference");
+        );
         assert_eq!(
             stream.object.as_stream().unwrap().dict.get_ref("Probe"),
             Some(ObjectRef::new(6, 0))
         );
-        assert_eq!(stream.expected_endobj_offset, None);
+        assert!(stream.diagnostics.is_empty());
 
         assert_eq!(
             parse_object(b"6 0 R").expect("strict direct-object API"),
             Object::Reference(ObjectRef::new(6, 0))
         );
         assert_eq!(
-            parse_indirect_object_detailed(b"5 0 obj\n6 0 R\nendobj\n")
+            parse_indirect_object(b"5 0 obj\n6 0 R\nendobj\n")
                 .expect("strict indirect-object parser")
                 .1,
             Object::Reference(ObjectRef::new(6, 0))
@@ -1119,5 +865,15 @@ mod stream_length_tests {
             &input[parsed.next_offset..parsed.next_offset + 6],
             b"endobj"
         );
+    }
+
+    #[test]
+    fn strict_direct_object_rejects_empty_and_preserves_top_level_reference() {
+        assert!(super::parse_strict_direct_object(b" \nendobj\n").is_err());
+
+        let parsed = super::parse_strict_direct_object(b"6 0 R\nendobj").unwrap();
+        assert_eq!(parsed.object, Object::Reference(ObjectRef::new(6, 0)));
+        assert_eq!(&b"6 0 R\nendobj"[parsed.next_offset..], b"endobj");
+        assert_eq!(parsed.empty_offset, None);
     }
 }

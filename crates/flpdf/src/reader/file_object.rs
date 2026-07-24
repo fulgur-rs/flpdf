@@ -1,13 +1,6 @@
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Layer 1 and 2 are intentionally pending production reader routing."
-    )
-)]
-
 use crate::parser::{
-    is_ws, keyword_token_end, parse_qpdf_direct_object, Parser, RecoveredStreamEol,
+    is_ws, keyword_token_end, parse_qpdf_direct_object, parse_strict_direct_object,
+    ParsedDirectObject, Parser, RecoveredStreamEol,
 };
 use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
 
@@ -135,13 +128,24 @@ impl FileObjectRead {
 }
 
 pub(crate) fn parse_file_object_syntax(input: &[u8]) -> Result<PendingFileObject> {
+    parse_file_object_syntax_impl(input, parse_qpdf_direct_object)
+}
+
+pub(crate) fn parse_strict_file_object_syntax(input: &[u8]) -> Result<PendingFileObject> {
+    parse_file_object_syntax_impl(input, parse_strict_direct_object)
+}
+
+fn parse_file_object_syntax_impl(
+    input: &[u8],
+    parse_direct: fn(&[u8]) -> Result<ParsedDirectObject>,
+) -> Result<PendingFileObject> {
     let mut header = Parser::new(input);
     let number = header.integer_for_indirect()?;
     let generation = header.integer_for_indirect()?;
     header.expect_keyword_for_indirect(b"obj")?;
     header.skip_ws();
     let body_start = header.position();
-    let parsed = parse_qpdf_direct_object(&input[body_start..])?;
+    let parsed = parse_direct(&input[body_start..])?;
     let object_ref = ObjectRef::new(
         u32::try_from(number).map_err(|_| Error::parse(0, "invalid indirect object number"))?,
         u16::try_from(generation).map_err(|_| Error::parse(0, "invalid indirect generation"))?,
@@ -201,6 +205,50 @@ pub(crate) fn parse_file_object_syntax(input: &[u8]) -> Result<PendingFileObject
     })
 }
 
+pub(crate) fn finish_strict_direct_object(
+    input: &[u8],
+    parsed: ParsedDirectObject,
+) -> Result<Object> {
+    let ParsedDirectObject {
+        object,
+        next_offset,
+        empty_offset,
+    } = parsed;
+    debug_assert!(empty_offset.is_none());
+
+    if let Object::Dictionary(dict) = object {
+        let stream_pos = skip_pdf_ws(input, next_offset);
+        if let Some(after_stream) = keyword_token_end(input, stream_pos, b"stream") {
+            let (data_start, _) = consume_stream_start_eol(input, after_stream);
+            let completed = complete_stream(
+                input,
+                dict,
+                data_start,
+                None,
+                RecoveryPolicy::Strict,
+                Vec::new(),
+            )?;
+            let trailing = skip_pdf_ignorable(input, completed.after_endstream);
+            if trailing != input.len() {
+                return Err(Error::parse(trailing, "trailing bytes after object"));
+            }
+            return Ok(completed.object);
+        }
+
+        let trailing = skip_pdf_ignorable(input, next_offset);
+        if trailing != input.len() {
+            return Err(Error::parse(trailing, "trailing bytes after object"));
+        }
+        return Ok(Object::Dictionary(dict));
+    }
+
+    let trailing = skip_pdf_ignorable(input, next_offset);
+    if trailing != input.len() {
+        return Err(Error::parse(trailing, "trailing bytes after object"));
+    }
+    Ok(object)
+}
+
 pub(crate) fn finish_file_object(
     input: &[u8],
     pending: PendingFileObject,
@@ -247,8 +295,40 @@ fn finish_stream(
     data_start: usize,
     resolved_indirect_length: Option<ResolvedStreamLength>,
     policy: RecoveryPolicy,
-    mut diagnostics: Vec<FileObjectDiagnostic>,
+    diagnostics: Vec<FileObjectDiagnostic>,
 ) -> Result<FileObjectRead> {
+    let mut completed = complete_stream(
+        input,
+        dict,
+        data_start,
+        resolved_indirect_length,
+        policy,
+        diagnostics,
+    )?;
+    check_endobj(input, completed.after_endstream, &mut completed.diagnostics);
+    Ok(FileObjectRead {
+        object_ref,
+        object: completed.object,
+        diagnostics: completed.diagnostics,
+        included_recovery_eol: completed.included_recovery_eol,
+    })
+}
+
+struct CompletedStream {
+    object: Object,
+    diagnostics: Vec<FileObjectDiagnostic>,
+    included_recovery_eol: Option<IncludedStreamDataEol>,
+    after_endstream: usize,
+}
+
+fn complete_stream(
+    input: &[u8],
+    dict: Dictionary,
+    data_start: usize,
+    resolved_indirect_length: Option<ResolvedStreamLength>,
+    policy: RecoveryPolicy,
+    mut diagnostics: Vec<FileObjectDiagnostic>,
+) -> Result<CompletedStream> {
     let resolved_length = match dict.get("Length") {
         Some(Object::Integer(value)) => ResolvedStreamLength::Integer(*value),
         Some(Object::Reference(_)) => {
@@ -317,12 +397,11 @@ fn finish_stream(
         }
     };
 
-    check_endobj(input, after_endstream, &mut diagnostics);
-    Ok(FileObjectRead {
-        object_ref,
+    Ok(CompletedStream {
         object: Object::Stream(Stream::new(dict, input[data_start..data_end].to_vec())),
         diagnostics,
         included_recovery_eol,
+        after_endstream,
     })
 }
 
@@ -507,6 +586,22 @@ mod tests {
                 relative_offset: 8,
             }]
         );
+    }
+
+    #[test]
+    fn strict_syntax_does_not_apply_qpdf_empty_or_bare_reference_recovery() {
+        assert!(parse_strict_file_object_syntax(b"5 0 obj\nendobj\n").is_err());
+
+        let pending = parse_strict_file_object_syntax(b"5 0 obj\n6 0 R\nendobj\n").unwrap();
+        assert_eq!(pending.object_ref, ObjectRef::new(5, 0));
+        assert!(matches!(
+            pending.body,
+            PendingBody::Direct {
+                object: Object::Reference(reference),
+                ..
+            } if reference == ObjectRef::new(6, 0)
+        ));
+        assert!(pending.diagnostics.is_empty());
     }
 
     #[test]

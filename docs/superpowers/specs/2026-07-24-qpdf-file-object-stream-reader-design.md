@@ -64,6 +64,11 @@ The new implementation lives in
 moving file-object framing and stream completion out of the already large
 reader implementation.
 
+The completed stack routes normal objects, ObjStm containers, and xref-stream
+bootstrap through this implementation. The former parser-owned placeholder,
+indirect-length reslice, and combined stream/endobj boundary path have been
+removed.
+
 ## Component boundaries
 
 ### `parser.rs`: direct-object syntax
@@ -84,6 +89,12 @@ ParsedDirectObject {
 
 `next_offset` is the first byte after the parsed direct object. This entry
 point does not consume `stream`, stream data, `endstream`, or `endobj`.
+
+There are separate qpdf and strict direct-object entry points. They share the
+same object grammar, but the strict entry point rejects an empty body and keeps
+a top-level `N G R` as a reference. Strict indirect-object parsing composes the
+strict syntax entry point with strict file-object completion; it does not reuse
+qpdf's empty-object or top-level bare-reference recovery.
 
 The file-object mode retains the existing qpdf-compatible special cases:
 
@@ -302,6 +313,11 @@ Each layer is independently green.
 - Keep ObjStm member parsing on the direct-object parser.
 - Delete old stream placeholder, reslice, and combined-boundary helpers.
 - Run final workspace, differential, qtest, and coverage gates.
+
+The final layer also removes a recovered framing EOL exactly once before
+decrypting an ObjStm container or decoding xref filters. Xref bootstrap treats a
+direct integer `/Length` as authoritative and uses the same bounded recovery
+diagnostics when an indirect length is unavailable.
 
 The design document commit may be included in the bottom stack layer. Before
 implementation, create and claim the four Beads children and record their
