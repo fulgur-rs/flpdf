@@ -108,6 +108,37 @@ pub(crate) fn parse_qpdf_file_object(input: &[u8]) -> Result<Object> {
     parser.object()
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) struct ParsedDirectObject {
+    pub(crate) object: Object,
+    pub(crate) next_offset: usize,
+    pub(crate) empty_offset: Option<usize>,
+}
+
+pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObject> {
+    let mut parser = Parser::new(input);
+    parser.top_level_no_reference = true;
+    parser.parse_streams = false;
+    parser.skip_ws();
+
+    let empty_offset = keyword_token_end(input, parser.pos, b"endobj").map(|_| parser.pos);
+    if let Some(empty_offset) = empty_offset {
+        return Ok(ParsedDirectObject {
+            object: Object::Null,
+            next_offset: empty_offset,
+            empty_offset: Some(empty_offset),
+        });
+    }
+
+    let object = parser.object()?;
+    parser.skip_ws();
+    Ok(ParsedDirectObject {
+        object,
+        next_offset: parser.pos,
+        empty_offset: None,
+    })
+}
+
 fn parse_indirect_object_detailed_impl(
     input: &[u8],
     allow_empty_object: bool,
@@ -161,6 +192,9 @@ pub(crate) struct Parser<'a> {
     /// `endobj` was expected at the generation number. References nested in an
     /// array, dictionary, or stream dictionary remain valid.
     top_level_no_reference: bool,
+    /// When `false`, dictionaries stop before stream framing and return as
+    /// direct dictionary objects.
+    parse_streams: bool,
     /// Set by [`stream_from_dict`](Self::stream_from_dict) when a stream's
     /// `/Length` is an indirect reference, so [`parse_indirect_object_detailed`]
     /// can surface the payload window for xref-based resolution.
@@ -187,6 +221,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             no_reference: false,
             top_level_no_reference: false,
+            parse_streams: true,
             last_indirect_stream_len: None,
             last_recovered_stream_eol: None,
             depth: 0,
@@ -201,6 +236,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             no_reference: true,
             top_level_no_reference: false,
+            parse_streams: true,
             last_indirect_stream_len: None,
             last_recovered_stream_eol: None,
             depth: 0,
@@ -271,7 +307,7 @@ impl<'a> Parser<'a> {
             if self.starts_with(b">>") {
                 self.pos += 2;
                 self.skip_ws();
-                if self.starts_with(b"stream") {
+                if self.parse_streams && self.starts_with(b"stream") {
                     return self.stream_from_dict(dict);
                 }
                 return Ok(Object::Dictionary(dict));
@@ -827,6 +863,18 @@ pub(crate) fn is_delimiter(byte: u8) -> bool {
     )
 }
 
+pub(crate) fn keyword_token_end(input: &[u8], pos: usize, keyword: &[u8]) -> Option<usize> {
+    let end = pos.checked_add(keyword.len())?;
+    if input.get(pos..end)? != keyword {
+        return None;
+    }
+    match input.get(end) {
+        None => Some(end),
+        Some(&byte) if is_ws(byte) || is_delimiter(byte) => Some(end),
+        Some(_) => None,
+    }
+}
+
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -840,7 +888,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 mod stream_length_tests {
     use super::{
         parse_indirect_object, parse_indirect_object_detailed, parse_indirect_object_detailed_qpdf,
-        parse_object, RecoveredStreamEol,
+        parse_object, parse_qpdf_direct_object, RecoveredStreamEol,
     };
     use crate::{Object, ObjectRef};
 
@@ -1027,6 +1075,49 @@ mod stream_length_tests {
                 .expect("strict indirect-object parser")
                 .1,
             Object::Reference(ObjectRef::new(6, 0))
+        );
+    }
+
+    #[test]
+    fn qpdf_direct_object_stops_before_stream_framing() {
+        let input = b"<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n";
+        let parsed = parse_qpdf_direct_object(input).unwrap();
+        let dict = parsed.object.into_dict().expect("dictionary");
+        assert_eq!(dict.get("Length"), Some(&Object::Integer(3)));
+        assert_eq!(
+            &input[parsed.next_offset..parsed.next_offset + 6],
+            b"stream"
+        );
+        assert_eq!(parsed.empty_offset, None);
+    }
+
+    #[test]
+    fn qpdf_direct_object_preserves_top_level_and_nested_reference_rules() {
+        let bare = parse_qpdf_direct_object(b"6 0 R\nendobj").unwrap();
+        assert_eq!(bare.object, Object::Integer(6));
+        assert_eq!(&b"6 0 R\nendobj"[bare.next_offset..], b"0 R\nendobj");
+
+        let nested = parse_qpdf_direct_object(b"[6 0 R << /V 7 0 R >>]\nendobj").unwrap();
+        let Object::Array(values) = nested.object else {
+            panic!("expected array");
+        };
+        assert_eq!(values[0], Object::Reference(ObjectRef::new(6, 0)));
+        assert_eq!(
+            values[1].as_dict().unwrap().get_ref("V"),
+            Some(ObjectRef::new(7, 0))
+        );
+    }
+
+    #[test]
+    fn qpdf_direct_object_reports_empty_body_without_consuming_endobj() {
+        let input = b" \nendobj\n";
+        let parsed = parse_qpdf_direct_object(input).unwrap();
+        assert_eq!(parsed.object, Object::Null);
+        assert_eq!(parsed.empty_offset, Some(2));
+        assert_eq!(parsed.next_offset, 2);
+        assert_eq!(
+            &input[parsed.next_offset..parsed.next_offset + 6],
+            b"endobj"
         );
     }
 }

@@ -1,3 +1,5 @@
+pub(crate) mod file_object;
+
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
