@@ -80,7 +80,9 @@ pub(crate) enum StreamStartEol {
 pub(crate) enum FileObjectDiagnosticKind {
     EmptyObject,
     StreamLineEnding,
+    MissingStreamLength,
     InvalidStreamLength,
+    NegativeStreamLength,
     ExpectedEndstream,
     AttemptingStreamLengthRecovery,
     RecoveredStreamLength { length: usize },
@@ -525,6 +527,22 @@ impl FileObjectDiagnosticKind {
 }
 ```
 
+**qpdf 11.9.0 oracle correction (2026-07-25):**
+
+- Recovery length is the raw byte distance from the stream offset to the recovered
+  `endstream` or `endobj`; a preceding LF/CR/CRLF remains in `Stream::data`.
+- A negative integer `/Length` warns
+  `unsigned value request for negative number; returning 0` and then uses exact
+  length zero. It is not an invalid-length recovery case.
+- Exact completion tokenizes after the declared length, so whitespace and comments
+  before `endstream` are accepted.
+- Recovery chooses the first right-token-bounded `endstream` or `endobj` in the
+  supplied object slice. Like qpdf's `findFirst("end", ...)`, it does not require a
+  left token boundary.
+- Missing recovery terminators return an empty stream with
+  `unable to recover stream data; treating stream as empty`; they are not a parse
+  error.
+
 - [ ] **Step 1: Create and claim the Layer 2 branch/Beads child**
 
 Resolve the child by its exact title and claim it:
@@ -584,6 +602,20 @@ fn exact_boundary_rejects_endstream_substring_without_token_end() {
     let input = b"1 0 obj\n<< /Length 3 >>\nstream\nabcendstreamX\nendobj\n";
     let pending = parse_file_object_syntax(input).unwrap();
     assert!(finish_file_object(input, pending, None, RecoveryPolicy::Strict).is_err());
+}
+
+#[test]
+fn exact_length_allows_tokenizer_ignorable_bytes_before_terminators() {
+    for endstream_prefix in [&b"\n"[..], &b"% framing comment\r\n"[..]] {
+        let mut input = b"1 0 obj\n<< /Length 3 >>\nstream\nabc".to_vec();
+        input.extend_from_slice(endstream_prefix);
+        input.extend_from_slice(b"endstream% separator\nendobj\n");
+        let pending = parse_file_object_syntax(&input).unwrap();
+        let completed =
+            finish_file_object(&input, pending, None, RecoveryPolicy::Strict).unwrap();
+        assert_eq!(completed.object.as_stream().unwrap().data, b"abc");
+        assert!(completed.diagnostics.is_empty());
+    }
 }
 ```
 
@@ -656,25 +688,59 @@ fn finish_stream(
     policy: RecoveryPolicy,
     mut diagnostics: Vec<FileObjectDiagnostic>,
 ) -> Result<FileObjectRead> {
-    let length = match dict.get("Length") {
-        Some(Object::Integer(value)) => usize::try_from(*value).ok(),
-        Some(Object::Reference(_)) => resolved_indirect_length,
-        _ => None,
+    let (length, invalid_length) = match dict.get("Length") {
+        Some(Object::Integer(value)) if *value < 0 => {
+            diagnostics.push(FileObjectDiagnostic {
+                kind: FileObjectDiagnosticKind::NegativeStreamLength,
+                relative_offset: 0,
+            });
+            (Some(0), None)
+        }
+        Some(Object::Integer(value)) => (usize::try_from(*value).ok(), None),
+        Some(Object::Reference(_)) => (
+            resolved_indirect_length,
+            resolved_indirect_length
+                .is_none()
+                .then_some(FileObjectDiagnosticKind::MissingStreamLength),
+        ),
+        None => (None, Some(FileObjectDiagnosticKind::MissingStreamLength)),
+        Some(_) => (None, Some(FileObjectDiagnosticKind::InvalidStreamLength)),
     };
     let exact_end = length.and_then(|length| data_start.checked_add(length));
     let exact_terminator = exact_end
         .filter(|&end| end <= input.len())
-        .and_then(|end| keyword_token_end(input, end, b"endstream").map(|after| (end, after)));
+        .and_then(|end| {
+            let terminator = skip_pdf_ignorable(input, end);
+            keyword_token_end(input, terminator, b"endstream").map(|after| (end, after))
+        });
 
-    let (data_end, after_endstream, recovered_stream_eol) = match exact_terminator {
-        Some((end, after)) => (end, after, None),
+    let (data_end, after_endstream) = match exact_terminator {
+        Some((end, after)) => (end, after),
         None if policy == RecoveryPolicy::Bounded => {
-            recover_stream_boundary(input, data_start, exact_end, &mut diagnostics)?
+            if let Some(kind) = invalid_length.as_ref() {
+                diagnostics.push(FileObjectDiagnostic {
+                    kind: kind.clone(),
+                    relative_offset: 0,
+                });
+            } else {
+                diagnostics.push(FileObjectDiagnostic {
+                    kind: FileObjectDiagnosticKind::ExpectedEndstream,
+                    relative_offset: exact_end.unwrap_or(data_start),
+                });
+            }
+            recover_stream_boundary(input, data_start, &mut diagnostics)
         }
         None => {
+            let error_offset = if invalid_length.is_some() {
+                0
+            } else {
+                exact_end.unwrap_or(data_start)
+            };
             return Err(Error::parse(
-                exact_end.unwrap_or(data_start),
-                "expected endstream",
+                error_offset,
+                invalid_length
+                    .as_ref()
+                    .map_or_else(|| "expected endstream".into(), |kind| kind.message()),
             ));
         }
     };
@@ -684,7 +750,7 @@ fn finish_stream(
         object_ref,
         object: Object::Stream(Stream::new(dict, input[data_start..data_end].to_vec())),
         diagnostics,
-        recovered_stream_eol,
+        recovered_stream_eol: None,
     })
 }
 
@@ -693,12 +759,24 @@ fn check_endobj(
     after_body: usize,
     diagnostics: &mut Vec<FileObjectDiagnostic>,
 ) {
-    let expected = skip_pdf_ws(input, after_body);
+    let expected = skip_pdf_ignorable(input, after_body);
     if keyword_token_end(input, expected, b"endobj").is_none() {
         diagnostics.push(FileObjectDiagnostic {
             kind: FileObjectDiagnosticKind::ExpectedEndobj,
             relative_offset: expected,
         });
+    }
+}
+
+fn skip_pdf_ignorable(input: &[u8], mut pos: usize) -> usize {
+    loop {
+        pos = skip_pdf_ws(input, pos);
+        if input.get(pos) != Some(&b'%') {
+            return pos;
+        }
+        while !matches!(input.get(pos), None | Some(b'\n' | b'\r')) {
+            pos += 1;
+        }
     }
 }
 ```
@@ -712,7 +790,7 @@ cargo test -p flpdf reader::file_object::tests::exact_ -- --nocapture
 cargo test -p flpdf reader::file_object::tests::endstream_and_endobj -- --nocapture
 ```
 
-Expected: the three exact-boundary tests pass.
+Expected: all exact-boundary tests pass.
 
 - [ ] **Step 6: Write failing bounded-recovery and diagnostic-order tests**
 
@@ -733,11 +811,11 @@ fn recovery_matrix_is_bounded_token_aware_and_ordered() {
             length: b"/Length /Bad",
             payload: b"abc\n",
             terminator: b"endstream\nendobj\n",
-            recovered: b"abc",
+            recovered: b"abc\n",
             kinds: vec![
                 FileObjectDiagnosticKind::InvalidStreamLength,
                 FileObjectDiagnosticKind::AttemptingStreamLengthRecovery,
-                FileObjectDiagnosticKind::RecoveredStreamLength { length: 3 },
+                FileObjectDiagnosticKind::RecoveredStreamLength { length: 4 },
             ],
         },
         Case {
@@ -745,33 +823,28 @@ fn recovery_matrix_is_bounded_token_aware_and_ordered() {
             payload: b"\n",
             terminator: b"endstream\nendobj\n",
             recovered: b"",
-            kinds: vec![
-                FileObjectDiagnosticKind::InvalidStreamLength,
-                FileObjectDiagnosticKind::AttemptingStreamLengthRecovery,
-                FileObjectDiagnosticKind::RecoveredStreamLength { length: 0 },
-                FileObjectDiagnosticKind::EmptyRecoveredStream,
-            ],
+            kinds: vec![FileObjectDiagnosticKind::NegativeStreamLength],
         },
         Case {
             length: b"/Length 2",
             payload: b"abc\r\n",
             terminator: b"endstream\nendobj\n",
-            recovered: b"abc",
+            recovered: b"abc\r\n",
             kinds: vec![
                 FileObjectDiagnosticKind::ExpectedEndstream,
                 FileObjectDiagnosticKind::AttemptingStreamLengthRecovery,
-                FileObjectDiagnosticKind::RecoveredStreamLength { length: 3 },
+                FileObjectDiagnosticKind::RecoveredStreamLength { length: 5 },
             ],
         },
         Case {
             length: b"/Length 99",
             payload: b"abc\n",
             terminator: b"endstream\nendobj\n",
-            recovered: b"abc",
+            recovered: b"abc\n",
             kinds: vec![
                 FileObjectDiagnosticKind::ExpectedEndstream,
                 FileObjectDiagnosticKind::AttemptingStreamLengthRecovery,
-                FileObjectDiagnosticKind::RecoveredStreamLength { length: 3 },
+                FileObjectDiagnosticKind::RecoveredStreamLength { length: 4 },
             ],
         },
     ];
@@ -805,23 +878,39 @@ fn recovery_ignores_keyword_substrings_inside_payload() {
         finish_file_object(input, pending, None, RecoveryPolicy::Bounded).unwrap();
     assert_eq!(
         completed.object.as_stream().unwrap().data,
-        b"AendstreamXB endobjY C"
+        b"AendstreamXB endobjY C\n"
     );
 }
 
 #[test]
-fn missing_endstream_can_recover_at_token_bounded_endobj() {
+fn missing_endstream_recovers_at_endobj_without_an_extra_expected_warning() {
     let input = b"1 0 obj\n<< /Length /Bad >>\nstream\nabc\nendobj\n";
     let pending = parse_file_object_syntax(input).unwrap();
     let completed =
         finish_file_object(input, pending, None, RecoveryPolicy::Bounded).unwrap();
-    assert_eq!(completed.object.as_stream().unwrap().data, b"abc");
-    assert!(completed
-        .diagnostics
-        .iter()
-        .any(|d| d.kind == FileObjectDiagnosticKind::ExpectedEndstream));
+    assert_eq!(completed.object.as_stream().unwrap().data, b"abc\n");
+    assert_eq!(
+        completed
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            FileObjectDiagnosticKind::InvalidStreamLength,
+            FileObjectDiagnosticKind::AttemptingStreamLengthRecovery,
+            FileObjectDiagnosticKind::RecoveredStreamLength { length: 4 },
+        ]
+    );
 }
 ```
+
+Also cover qpdf's first-terminator ordering, right-bound-only recovery scan,
+empty-stream fallback, missing/unresolved `/Length`, and strict diagnostic text
+with the unit tests
+`recovery_uses_the_first_end_token_and_qpdfs_right_boundary_rule` and
+`unrecoverable_and_zero_length_recovery_return_qpdf_empty_streams`,
+`missing_and_unresolved_lengths_use_the_missing_length_diagnostic`, and
+`strict_invalid_length_returns_the_qpdf_diagnostic_text`.
 
 - [ ] **Step 7: Run recovery tests and verify they fail**
 
@@ -842,91 +931,80 @@ Add:
 fn recover_stream_boundary(
     input: &[u8],
     data_start: usize,
-    exact_end: Option<usize>,
     diagnostics: &mut Vec<FileObjectDiagnostic>,
-) -> Result<(usize, usize, Option<RecoveredStreamEol>)> {
-    diagnostics.push(FileObjectDiagnostic {
-        kind: if exact_end.is_some() {
-            FileObjectDiagnosticKind::ExpectedEndstream
-        } else {
-            FileObjectDiagnosticKind::InvalidStreamLength
-        },
-        relative_offset: exact_end.unwrap_or(data_start).min(input.len()),
-    });
+) -> (usize, usize) {
     diagnostics.push(FileObjectDiagnostic {
         kind: FileObjectDiagnosticKind::AttemptingStreamLengthRecovery,
         relative_offset: data_start,
     });
 
-    if let Some(endstream_pos) = find_bounded_keyword(input, data_start, b"endstream") {
-        let (data_end, recovered_eol) = trim_one_framing_eol(input, data_start, endstream_pos);
+    if let Some(terminator) = find_recovery_terminator(input, data_start) {
+        let data_end = terminator.position();
         let length = data_end - data_start;
         diagnostics.push(FileObjectDiagnostic {
-            kind: FileObjectDiagnosticKind::RecoveredStreamLength { length },
-            relative_offset: endstream_pos,
-        });
-        if length == 0 {
-            diagnostics.push(FileObjectDiagnostic {
-                kind: FileObjectDiagnosticKind::EmptyRecoveredStream,
-                relative_offset: data_start,
-            });
-        }
-        let after = keyword_token_end(input, endstream_pos, b"endstream")
-            .expect("bounded keyword finder returns a token");
-        return Ok((data_end, after, recovered_eol));
-    }
-
-    if let Some(endobj_pos) = find_bounded_keyword(input, data_start, b"endobj") {
-        let (data_end, recovered_eol) = trim_one_framing_eol(input, data_start, endobj_pos);
-        diagnostics.push(FileObjectDiagnostic {
-            kind: FileObjectDiagnosticKind::ExpectedEndstream,
-            relative_offset: endobj_pos,
-        });
-        diagnostics.push(FileObjectDiagnostic {
-            kind: FileObjectDiagnosticKind::RecoveredStreamLength {
-                length: data_end - data_start,
+            kind: if length == 0 {
+                FileObjectDiagnosticKind::EmptyRecoveredStream
+            } else {
+                FileObjectDiagnosticKind::RecoveredStreamLength { length }
             },
-            relative_offset: endobj_pos,
+            relative_offset: data_start,
         });
-        return Ok((data_end, endobj_pos, recovered_eol));
+        return (data_end, terminator.after_body());
     }
 
-    Err(Error::parse(data_start, "unable to recover stream length"))
+    diagnostics.push(FileObjectDiagnostic {
+        kind: FileObjectDiagnosticKind::EmptyRecoveredStream,
+        relative_offset: data_start,
+    });
+    (data_start, input.len())
 }
 
-fn find_bounded_keyword(input: &[u8], start: usize, keyword: &[u8]) -> Option<usize> {
-    let last = input.len().checked_sub(keyword.len())?;
-    (start..=last).find(|&pos| {
-        let left_bounded = pos == start
-            || input
-                .get(pos.wrapping_sub(1))
-                .is_some_and(|&byte| is_ws(byte) || crate::parser::is_delimiter(byte));
-        left_bounded && keyword_token_end(input, pos, keyword).is_some()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryTerminator {
+    Endstream { position: usize, after: usize },
+    Endobj { position: usize },
+}
+
+impl RecoveryTerminator {
+    const fn position(self) -> usize {
+        match self {
+            Self::Endstream { position, .. } | Self::Endobj { position } => position,
+        }
+    }
+
+    const fn after_body(self) -> usize {
+        match self {
+            Self::Endstream { after, .. } => after,
+            Self::Endobj { position } => position,
+        }
+    }
+}
+
+fn find_recovery_terminator(input: &[u8], start: usize) -> Option<RecoveryTerminator> {
+    (start..input.len()).find_map(|position| {
+        keyword_token_end(input, position, b"endstream")
+            .map(|after| RecoveryTerminator::Endstream { position, after })
+            .or_else(|| {
+                keyword_token_end(input, position, b"endobj")
+                    .map(|_| RecoveryTerminator::Endobj { position })
+            })
     })
-}
-
-fn trim_one_framing_eol(
-    input: &[u8],
-    data_start: usize,
-    terminator: usize,
-) -> (usize, Option<RecoveredStreamEol>) {
-    if terminator >= data_start + 2 && &input[terminator - 2..terminator] == b"\r\n" {
-        (terminator - 2, Some(RecoveredStreamEol::CrLf))
-    } else if terminator > data_start && input[terminator - 1] == b'\n' {
-        (terminator - 1, Some(RecoveredStreamEol::Lf))
-    } else if terminator > data_start && input[terminator - 1] == b'\r' {
-        (terminator - 1, Some(RecoveredStreamEol::Cr))
-    } else {
-        (terminator, None)
-    }
 }
 
 impl FileObjectDiagnosticKind {
     pub(crate) fn message(&self) -> String {
         match self {
             Self::EmptyObject => "empty object treated as null".into(),
-            Self::StreamLineEnding => "stream keyword not followed by proper line ending".into(),
-            Self::InvalidStreamLength => "stream length is not a non-negative integer".into(),
+            Self::StreamLineEnding => {
+                "stream keyword not followed by proper line terminator".into()
+            }
+            Self::MissingStreamLength => "stream dictionary lacks /Length key".into(),
+            Self::InvalidStreamLength => {
+                "/Length key in stream dictionary is not an integer".into()
+            }
+            Self::NegativeStreamLength => {
+                "unsigned value request for negative number; returning 0".into()
+            }
             Self::ExpectedEndstream => "expected endstream".into(),
             Self::AttemptingStreamLengthRecovery => {
                 "attempting to recover stream length".into()
@@ -934,7 +1012,9 @@ impl FileObjectDiagnosticKind {
             Self::RecoveredStreamLength { length } => {
                 format!("recovered stream length: {length}")
             }
-            Self::EmptyRecoveredStream => "recovered empty stream".into(),
+            Self::EmptyRecoveredStream => {
+                "unable to recover stream data; treating stream as empty".into()
+            }
             Self::ExpectedEndobj => "expected endobj".into(),
         }
     }
