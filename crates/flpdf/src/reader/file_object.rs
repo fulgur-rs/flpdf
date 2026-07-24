@@ -579,6 +579,24 @@ mod tests {
         ));
         assert!(direct.diagnostics.is_empty());
 
+        let dict_input = b"6 0 obj\n<< /A 1 >> \nendobj\n";
+        let direct_dict = parse_file_object_syntax(dict_input).unwrap();
+        assert_eq!(direct_dict.indirect_length_ref(), None);
+        let mut expected_dict = Dictionary::new();
+        expected_dict.insert("A", Object::Integer(1));
+        let next_offset = dict_input
+            .windows(6)
+            .position(|window| window == b"endobj")
+            .unwrap();
+        assert_eq!(
+            direct_dict.body,
+            PendingBody::Direct {
+                object: Object::Dictionary(expected_dict),
+                next_offset,
+            }
+        );
+        assert_eq!(skip_pdf_ws(b" \nX", 0), 2);
+
         let empty = parse_file_object_syntax(b"5 0 obj\nendobj\n").unwrap();
         assert_eq!(
             empty.diagnostics,

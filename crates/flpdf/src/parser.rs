@@ -597,7 +597,8 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod stream_length_tests {
     use super::{
-        parse_indirect_object, parse_object, parse_qpdf_direct_object, RecoveredStreamEol,
+        keyword_token_end, parse_indirect_object, parse_object, parse_qpdf_direct_object,
+        RecoveredStreamEol,
     };
     use crate::reader::file_object::{
         finish_file_object, parse_file_object_syntax, FileObjectDiagnosticKind, FileObjectRead,
@@ -839,6 +840,9 @@ mod stream_length_tests {
 
     #[test]
     fn qpdf_direct_object_preserves_top_level_and_nested_reference_rules() {
+        assert_eq!(keyword_token_end(b"endobj", 0, b"endobj"), Some(6));
+        assert_eq!(keyword_token_end(b"endobjx", 0, b"endobj"), None);
+
         let bare = parse_qpdf_direct_object(b"6 0 R\nendobj").unwrap();
         assert_eq!(bare.object, Object::Integer(6));
         assert_eq!(&b"6 0 R\nendobj"[bare.next_offset..], b"0 R\nendobj");
