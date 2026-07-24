@@ -879,7 +879,7 @@ mod tests {
         assert_eq!(
             report.diagnostics.entries(),
             &[Diagnostic::warning(
-                "could not enumerate pages for content-stream check: parse error at byte 101: expected byte 47",
+                "could not enumerate pages for content-stream check: parse error at byte 109: expected byte 47",
                 None,
             )]
         );

@@ -145,7 +145,8 @@ fn parse_file_object_syntax_impl(
     header.expect_keyword_for_indirect(b"obj")?;
     header.skip_ws();
     let body_start = header.position();
-    let parsed = parse_direct(&input[body_start..])?;
+    let parsed =
+        parse_direct(&input[body_start..]).map_err(|error| error.rebase_offset(body_start))?;
     let object_ref = ObjectRef::new(
         u32::try_from(number).map_err(|_| Error::parse(0, "invalid indirect object number"))?,
         u16::try_from(generation).map_err(|_| Error::parse(0, "invalid indirect generation"))?,

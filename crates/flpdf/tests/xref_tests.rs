@@ -436,6 +436,27 @@ fn xref_stream_parse_error_offset_is_absolute() {
 }
 
 #[test]
+fn xref_stream_body_parse_error_offset_includes_indirect_header() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let xref_pos = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /XRef /Size ");
+    let body_error_pos = bytes.len();
+    bytes.extend_from_slice(b"] >>\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_pos}\n%%EOF\n").as_bytes());
+
+    let mut reader = Cursor::new(bytes);
+    let err = load_xref_and_trailer(&mut reader)
+        .expect_err("invalid xref stream body syntax should error");
+    let Error::Parse { offset, .. } = err else {
+        panic!("expected Error::Parse, got {err:?}");
+    };
+    assert_eq!(
+        offset, body_error_pos,
+        "body parse error offset must include both xref_pos and the indirect header"
+    );
+}
+
+#[test]
 fn rejects_startxref_offset_exactly_at_eof_without_panic() {
     // Boundary companion to the test above: when `startxref` equals the file
     // length exactly, `bytes.get(xref_pos..)` yields an empty slice rather than

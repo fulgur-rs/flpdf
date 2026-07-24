@@ -1166,7 +1166,7 @@ fn test_direct_stream_form_xobject_is_rejected_as_malformed_file_object() {
     let flpdf::Error::Parse { offset, message } = err else {
         panic!("expected parse error, got {err:?}");
     };
-    assert_eq!(offset, 108);
+    assert_eq!(offset, 116);
     assert_eq!(message, "expected byte 47");
 }
 
@@ -1211,7 +1211,7 @@ fn test_direct_stream_form_self_recursion_is_rejected_without_dos() {
     let flpdf::Error::Parse { offset, message } = err else {
         panic!("expected parse error, got {err:?}");
     };
-    assert_eq!(offset, 86);
+    assert_eq!(offset, 94);
     assert_eq!(message, "expected byte 47");
 }
 
