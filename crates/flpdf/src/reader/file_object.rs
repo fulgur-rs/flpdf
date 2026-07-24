@@ -102,6 +102,24 @@ pub(crate) struct FileObjectRead {
     pub(crate) included_recovery_eol: Option<IncludedStreamDataEol>,
 }
 
+fn remove_included_recovery_eol(
+    object: &mut Object,
+    included_recovery_eol: &mut Option<IncludedStreamDataEol>,
+) -> Option<RecoveredStreamEol> {
+    let included = (*included_recovery_eol)?;
+    let stream = object
+        .as_stream_mut()
+        .expect("included recovery EOL belongs to a stream");
+    let eol = included.as_bytes();
+    assert!(
+        stream.data.ends_with(eol),
+        "included recovery EOL must remain in raw stream data"
+    );
+    stream.data.truncate(stream.data.len() - eol.len());
+    *included_recovery_eol = None;
+    Some(included.as_removed())
+}
+
 impl FileObjectRead {
     /// Remove a recovery EOL that is still part of raw stream data and convert
     /// it to the legacy "removed EOL" type expected by decryption and writing.
@@ -112,19 +130,7 @@ impl FileObjectRead {
     pub(crate) fn remove_included_recovery_eol_for_decryption(
         &mut self,
     ) -> Option<RecoveredStreamEol> {
-        let included = self.included_recovery_eol?;
-        let stream = self
-            .object
-            .as_stream_mut()
-            .expect("included recovery EOL belongs to a stream");
-        let eol = included.as_bytes();
-        assert!(
-            stream.data.ends_with(eol),
-            "included recovery EOL must remain in raw stream data"
-        );
-        stream.data.truncate(stream.data.len() - eol.len());
-        self.included_recovery_eol = None;
-        Some(included.as_removed())
+        remove_included_recovery_eol(&mut self.object, &mut self.included_recovery_eol)
     }
 }
 
@@ -222,18 +228,22 @@ pub(crate) fn finish_strict_direct_object(
         let stream_pos = skip_pdf_ws(input, next_offset);
         if let Some(after_stream) = keyword_token_end(input, stream_pos, b"stream") {
             let (data_start, _) = consume_stream_start_eol(input, after_stream);
-            let completed = complete_stream(
+            let mut completed = complete_stream(
                 input,
                 dict,
                 data_start,
                 None,
-                RecoveryPolicy::Strict,
+                RecoveryPolicy::RequireTerminator,
                 Vec::new(),
             )?;
             let trailing = skip_pdf_ignorable(input, completed.after_endstream);
             if trailing != input.len() {
                 return Err(Error::parse(trailing, "trailing bytes after object"));
             }
+            let _ = remove_included_recovery_eol(
+                &mut completed.object,
+                &mut completed.included_recovery_eol,
+            );
             return Ok(completed.object);
         }
 
@@ -656,8 +666,14 @@ mod tests {
 
         let missing_length = b"<< >>\nstream\nabcendstream";
         let parsed = crate::parser::parse_strict_direct_object(missing_length).unwrap();
-        let error = finish_strict_direct_object(missing_length, parsed).unwrap_err();
-        assert!(matches!(error, Error::Parse { .. }));
+        assert_eq!(
+            finish_strict_direct_object(missing_length, parsed)
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .data,
+            b"abc"
+        );
     }
 
     #[test]

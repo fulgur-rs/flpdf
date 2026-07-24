@@ -1,5 +1,34 @@
 use flpdf::{parse_object, Dictionary, Error, Object, ObjectRef};
 
+fn parsed_stream_data(input: &[u8]) -> Vec<u8> {
+    parse_object(input)
+        .expect("stream must parse")
+        .into_stream()
+        .expect("expected stream")
+        .data
+}
+
+#[test]
+fn public_parser_recovers_indirect_stream_length() {
+    assert_eq!(
+        parsed_stream_data(b"<< /Length 9 0 R >>\nstream\nabc\nendstream"),
+        b"abc"
+    );
+}
+
+#[test]
+fn public_parser_recovers_missing_stream_length() {
+    assert_eq!(parsed_stream_data(b"<< >>\nstream\nabc\nendstream"), b"abc");
+}
+
+#[test]
+fn public_parser_recovers_non_integer_stream_length() {
+    assert_eq!(
+        parsed_stream_data(b"<< /Length /Bad >>\nstream\nabc\nendstream"),
+        b"abc"
+    );
+}
+
 #[test]
 fn parses_dictionary_with_reference() {
     let object = parse_object(b"<< /Type /Catalog /Pages 2 0 R >>").unwrap();

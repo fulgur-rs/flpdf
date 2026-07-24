@@ -35,12 +35,13 @@ impl RecoveredStreamEol {
 
 pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)> {
     let pending = crate::reader::file_object::parse_strict_file_object_syntax(input)?;
-    let completed = crate::reader::file_object::finish_file_object(
+    let mut completed = crate::reader::file_object::finish_file_object(
         input,
         pending,
         None,
-        crate::reader::file_object::RecoveryPolicy::Strict,
+        crate::reader::file_object::RecoveryPolicy::RequireTerminator,
     )?;
+    let _ = completed.remove_included_recovery_eol_for_decryption();
     Ok((completed.object_ref, completed.object))
 }
 
@@ -610,6 +611,16 @@ mod stream_length_tests {
         let pending = parse_file_object_syntax(bytes).expect("file object syntax must parse");
         finish_file_object(bytes, pending, None, RecoveryPolicy::Bounded)
             .expect("file object must complete")
+    }
+
+    #[test]
+    fn strict_indirect_parser_recovers_unresolved_indirect_length() {
+        let input = b"3 0 obj\n<< /Length 9 0 R >>\nstream\nstrict payload\nendstream\nendobj\n";
+        let (_, object) = parse_indirect_object(input).expect("strict indirect stream must parse");
+        assert_eq!(
+            object.as_stream().expect("expected stream").data,
+            b"strict payload"
+        );
     }
 
     fn parse_stream(bytes: &[u8]) -> crate::Stream {

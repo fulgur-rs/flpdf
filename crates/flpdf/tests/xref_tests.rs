@@ -569,6 +569,42 @@ fn best_effort_recovers_objstm_compressed_entries() {
     );
 }
 
+#[test]
+fn best_effort_recovers_objstm_with_indirect_length() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let objstm_data = b"7 0 <</Foo 1>>";
+    let objstm_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"5 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 6 0 R >>\nstream\n");
+    bytes.extend_from_slice(objstm_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("6 0 obj\n{}\nendobj\n", objstm_data.len()).as_bytes());
+
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+    bytes[start_xref + 2] = b'z';
+
+    load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
+        .expect_err("corrupt xref must fail strict loading");
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(5, 0)),
+        Some(&XrefOffset::Offset(objstm_offset))
+    );
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(7, 0)),
+        Some(&XrefOffset::Compressed {
+            stream: 5,
+            index: 0,
+        })
+    );
+}
+
 /// An ObjStm whose stream payload contains a header-like line (`9 0 obj`) makes
 /// the linear scan record a spurious object *inside* the stream, whose offset
 /// would truncate the ObjStm's recovery window before its declared `/Length`.
