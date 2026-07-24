@@ -1199,7 +1199,7 @@ endobj
 << /Type /Pages /Kids [3 0 R] /Count 1 >>
 endobj
 3 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] /Contents 4 0 R >>
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] /Resources << >> /Contents 4 0 R >>
 endobj
 4 0 obj
 << /Length 5 0 R >>
@@ -1215,16 +1215,16 @@ xref
 0000000009 00000 n
 0000000058 00000 n
 0000000115 00000 n
-0000000200 00000 n
-0000000270 00000 n
+0000000217 00000 n
+0000000287 00000 n
 trailer
 << /Size 6 /Root 1 0 R >>
 startxref
-288
+305
 %%EOF
 ```
 
-The offsets above are verified for those exact LF bytes: objects start at 9, 58, 115, 200, and 270; xref starts at 288. Run:
+The offsets above are verified for those exact LF bytes: objects start at 9, 58, 115, 217, and 287; xref starts at 305. The empty page resources dictionary keeps newer qpdf versions from repairing an unrelated page-tree omission before the QDF object-body comparison. Run:
 
 ```bash
 qpdf --check tests/fixtures/compat/good14-shaped-indirect-length-adjacent-endstream.pdf

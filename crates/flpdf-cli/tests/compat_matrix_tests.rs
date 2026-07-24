@@ -20,15 +20,7 @@ fn qpdf_good14_shaped_qdf_object_body_matches_qpdf_11_9() {
     let tmp = tempdir().unwrap();
     let qpdf_out = tmp.path().join("qpdf.pdf");
     let flpdf_out = tmp.path().join("flpdf.pdf");
-    // qpdf 11.9.0 is quiet for this fixture. Newer qpdf versions may repair
-    // its missing page resources with a warning, but still produce the QDF
-    // artifact needed for the object-body comparison.
-    run_qpdf_with_args(&[
-        "--warning-exit-0",
-        "--qdf",
-        input.to_str().unwrap(),
-        qpdf_out.to_str().unwrap(),
-    ]);
+    run_qpdf_with_args(&["--qdf", input.to_str().unwrap(), qpdf_out.to_str().unwrap()]);
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
