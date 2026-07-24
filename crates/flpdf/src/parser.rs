@@ -844,9 +844,7 @@ mod stream_length_tests {
         assert_eq!(&b"6 0 R\nendobj"[bare.next_offset..], b"0 R\nendobj");
 
         let nested = parse_qpdf_direct_object(b"[6 0 R << /V 7 0 R >>]\nendobj").unwrap();
-        let Object::Array(values) = nested.object else {
-            panic!("expected array");
-        };
+        let values = nested.object.as_array().expect("expected array");
         assert_eq!(values[0], Object::Reference(ObjectRef::new(6, 0)));
         assert_eq!(
             values[1].as_dict().unwrap().get_ref("V"),

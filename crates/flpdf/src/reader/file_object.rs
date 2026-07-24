@@ -605,22 +605,54 @@ mod tests {
     }
 
     #[test]
+    fn strict_direct_completion_parses_stream_and_rejects_trailing_bytes() {
+        let stream_input = b"<< /Length 3 >>\nstream\nabcendstream";
+        let parsed = crate::parser::parse_strict_direct_object(stream_input).unwrap();
+        assert_eq!(
+            finish_strict_direct_object(stream_input, parsed)
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .data,
+            b"abc"
+        );
+
+        let trailing_stream = b"<< /Length 3 >>\nstream\nabcendstream junk";
+        let parsed = crate::parser::parse_strict_direct_object(trailing_stream).unwrap();
+        let error = finish_strict_direct_object(trailing_stream, parsed).unwrap_err();
+        assert!(matches!(error, Error::Parse { offset: 36, .. }));
+
+        let trailing_dict = b"<< /A 1 >> junk";
+        let parsed = crate::parser::parse_strict_direct_object(trailing_dict).unwrap();
+        let error = finish_strict_direct_object(trailing_dict, parsed).unwrap_err();
+        assert!(matches!(error, Error::Parse { offset: 11, .. }));
+
+        let missing_length = b"<< >>\nstream\nabcendstream";
+        let parsed = crate::parser::parse_strict_direct_object(missing_length).unwrap();
+        let error = finish_strict_direct_object(missing_length, parsed).unwrap_err();
+        assert!(matches!(error, Error::Parse { .. }));
+    }
+
+    #[test]
     fn syntax_returns_pending_stream_without_reading_payload() {
         let input = b"7 0 obj\n<< /Length 9 0 R >>\nstream\nabcendstream\nendobj\n";
         let pending = parse_file_object_syntax(input).unwrap();
         assert_eq!(pending.object_ref, ObjectRef::new(7, 0));
         assert_eq!(pending.indirect_length_ref(), Some(ObjectRef::new(9, 0)));
-        let PendingBody::Stream {
-            dict,
-            data_start,
-            start_eol,
-        } = pending.body
-        else {
-            panic!("expected pending stream");
-        };
-        assert_eq!(dict.get_ref("Length"), Some(ObjectRef::new(9, 0)));
-        assert_eq!(&input[data_start..data_start + 3], b"abc");
-        assert_eq!(start_eol, StreamStartEol::Lf);
+        let mut expected_dict = Dictionary::new();
+        expected_dict.insert("Length", Object::Reference(ObjectRef::new(9, 0)));
+        let data_start = input
+            .windows(3)
+            .position(|window| window == b"abc")
+            .unwrap();
+        assert_eq!(
+            pending.body,
+            PendingBody::Stream {
+                dict: expected_dict,
+                data_start,
+                start_eol: StreamStartEol::Lf,
+            }
+        );
     }
 
     #[test]

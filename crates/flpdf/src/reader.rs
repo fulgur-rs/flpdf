@@ -3404,8 +3404,8 @@ mod tests {
     fn objstm_container_uses_qpdf_completion_but_members_remain_direct_objects() {
         let bytes = classic_pdf_with_bodies(
             &[
-                b"1 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 2 0 R >>\nstream\n7 0 6 0 Rendstream\nendobj\n",
-                b"2 0 obj\n9\nendobj\n",
+                b"1 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 2 0 R >>\nstream\n7 0 6 0 R\nendstream\nendobj\n",
+                b"2 0 obj\n/Bad\nendobj\n",
             ],
             ObjectRef::new(1, 0),
         );
@@ -3414,6 +3414,10 @@ mod tests {
         assert_eq!(
             pdf.resolve(ObjectRef::new(7, 0)).unwrap(),
             Object::Integer(6)
+        );
+        assert_eq!(
+            pdf.recovered_stream_eol(ObjectRef::new(1, 0)),
+            Some(&b"\n"[..])
         );
         assert!(pdf
             .repair_diagnostics()
