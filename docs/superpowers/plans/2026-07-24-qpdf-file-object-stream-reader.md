@@ -1131,8 +1131,13 @@ Expected: 100% patch coverage relative to Layer 1 and a draft PR based on the La
 
 **Files:**
 - Modify: `crates/flpdf/src/reader.rs:103-111, 1144-1425, 2630-3380`
+- Modify: `crates/flpdf/src/check.rs` qpdf-warning expectation for invalid direct streams
+- Modify: `crates/flpdf/src/linearization/plan.rs` recovered parent-stream regression
+- Modify: `crates/flpdf/tests/indirect_length_adjacent_endstream_tests.rs` qpdf bounded-recovery matrix
+- Modify: `crates/flpdf/tests/resource_pruning_tests.rs` unrecoverable nested-stream syntax expectations
 - Modify: `crates/flpdf-cli/tests/cli_tests.rs:540-620` and test helpers
 - Modify: `crates/flpdf-cli/tests/compat_matrix_tests.rs`
+- Modify: `docs/superpowers/plans/2026-07-24-qpdf-file-object-stream-reader.md`
 - Create: `tests/fixtures/compat/good14-shaped-indirect-length-adjacent-endstream.pdf`
 
 **Interfaces:**
@@ -1338,6 +1343,25 @@ cargo test -p flpdf-cli --test cli_tests qdf_adjacent_endstream_with_indirect_le
 
 Expected: the reader test finds an `expected endobj` diagnostic and the CLI test exits 3 with the same warning.
 
+qpdf 11.9.0 oracle clarification recorded during Layer 3: an oversized direct
+or resolved-indirect `/Length` recovers at both line-anchored and
+payload-adjacent `endstream`; a malformed, non-integer, or missing length holder
+also enters bounded recovery. Existing tests that required these cases to
+return `Err` must instead assert the recovered object plus the exact ordered
+warning messages and offsets, including one-time cache registration. Direct
+inline streams remain invalid PDF syntax, but `qpdf --check` reports structural
+warnings and succeeds with warnings rather than reporting a decoded content
+stream error. A stale holder that lands on an interior token-valid `endstream`
+is authoritative in qpdf (truncation plus `ExpectedEndobj`); if `endstream`
+lacks a token boundary but the immediately following `endobj` has one, bounded
+recovery stops at that `endobj`. I/O, decryption, unrecoverable file-object
+syntax, and exhausted bounded-window fallbacks remain errors.
+The two resource-pruning fixtures that embed a direct stream inside an indirect
+resources dictionary exercise that unrecoverable-syntax boundary: the normal
+file-object parser returns the exact `Error::Parse` before Form traversal, so
+the self-recursive fixture still proves prompt termination without relying on
+the legacy parser's direct-stream extension.
+
 - [ ] **Step 5: Add the new normal-object read path and preserve fallback bounds**
 
 Import:
@@ -1379,9 +1403,16 @@ fn resolve_pending_stream_length(
         return Ok(Some(ResolvedStreamLength::Missing));
     }
     self.cache.set_reserved(expected_ref);
-    let resolved = match self.resolve_borrowed(holder) {
-        Ok(Object::Integer(value)) => ResolvedStreamLength::Integer(*value),
-        Ok(Object::Null)
+    let resolved_object = match self.resolve_borrowed(holder) {
+        Ok(Object::Integer(value)) => Ok(Some(ResolvedStreamLength::Integer(*value))),
+        Ok(Object::Null) => Ok(None),
+        Ok(_) => Ok(Some(ResolvedStreamLength::Invalid)),
+        Err(Error::Parse { .. }) => Ok(Some(ResolvedStreamLength::Invalid)),
+        Err(err) => Err(err),
+    };
+    let resolved = match resolved_object {
+        Ok(Some(resolved)) => resolved,
+        Ok(None)
             if matches!(
                 self.cache.entry(holder),
                 None | Some(CacheEntry::Missing | CacheEntry::Deleted)
@@ -1389,7 +1420,7 @@ fn resolve_pending_stream_length(
         {
             ResolvedStreamLength::Missing
         }
-        Ok(_) => ResolvedStreamLength::Invalid,
+        Ok(None) => ResolvedStreamLength::Invalid,
         Err(err) => {
             self.cache.set_unresolved(expected_ref, offset);
             return Err(err);
@@ -1492,7 +1523,7 @@ Run:
 cargo fmt --all -- --check
 cargo test -p flpdf qpdf_reader_ -- --nocapture
 cargo test -p flpdf normal_and_json_resolution_share_qpdf_file_object_value_and_warning -- --nocapture
-cargo test -p flpdf qpdf_object_read_uses_bounded_fallback_and_preserves_strict_errors -- --nocapture
+cargo test -p flpdf qpdf_object_read_uses_bounded_fallback_and_preserves_unrecoverable_errors -- --nocapture
 cargo test -p flpdf encryption -- --nocapture
 cargo test -p flpdf-cli --test cli_tests qdf_adjacent_endstream_with_indirect_length_is_silent -- --nocapture
 cargo test -p flpdf

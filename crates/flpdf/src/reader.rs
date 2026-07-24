@@ -1,5 +1,9 @@
 pub(crate) mod file_object;
 
+use self::file_object::{
+    finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, PendingFileObject,
+    RecoveryPolicy, ResolvedStreamLength,
+};
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
@@ -1207,6 +1211,94 @@ impl<R: Read + Seek> Pdf<R> {
         }
     }
 
+    fn read_object_at_qpdf(
+        &mut self,
+        expected_ref: ObjectRef,
+        offset: u64,
+    ) -> Result<file_object::FileObjectRead> {
+        let next = self.next_object_offset(offset);
+        self.reader.seek(SeekFrom::Start(offset))?;
+        let mut bytes = Vec::new();
+        match next {
+            Some(next) => {
+                self.reader
+                    .by_ref()
+                    .take(next.saturating_sub(offset))
+                    .read_to_end(&mut bytes)?;
+            }
+            None => {
+                self.reader.read_to_end(&mut bytes)?;
+            }
+        }
+
+        match self.parse_and_finish_file_object(expected_ref, &bytes, offset) {
+            Ok(parsed) => Ok(parsed),
+            Err(window_err) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
+                self.resolution_fallbacks_remaining -= 1;
+                self.reader.seek(SeekFrom::Start(offset))?;
+                let mut full = Vec::new();
+                self.reader.read_to_end(&mut full)?;
+                self.parse_and_finish_file_object(expected_ref, &full, offset)
+                    .or(Err(window_err))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn parse_and_finish_file_object(
+        &mut self,
+        expected_ref: ObjectRef,
+        bytes: &[u8],
+        offset: u64,
+    ) -> Result<file_object::FileObjectRead> {
+        let pending = parse_file_object_syntax(bytes)?;
+        let resolved_length = self.resolve_pending_stream_length(expected_ref, &pending, offset)?;
+        let result = finish_file_object(bytes, pending, resolved_length, RecoveryPolicy::Bounded);
+        self.cache.set_unresolved(expected_ref, offset);
+        result
+    }
+
+    fn resolve_pending_stream_length(
+        &mut self,
+        expected_ref: ObjectRef,
+        pending: &PendingFileObject,
+        offset: u64,
+    ) -> Result<Option<ResolvedStreamLength>> {
+        let Some(holder) = pending.indirect_length_ref() else {
+            return Ok(None);
+        };
+        if holder == pending.object_ref {
+            return Ok(Some(ResolvedStreamLength::Missing));
+        }
+
+        self.cache.set_reserved(expected_ref);
+        let resolved_object = match self.resolve_borrowed(holder) {
+            Ok(Object::Integer(value)) => Ok(Some(ResolvedStreamLength::Integer(*value))),
+            Ok(Object::Null) => Ok(None),
+            Ok(_) => Ok(Some(ResolvedStreamLength::Invalid)),
+            Err(Error::Parse { .. }) => Ok(Some(ResolvedStreamLength::Invalid)),
+            Err(err) => Err(err),
+        };
+        let resolved = match resolved_object {
+            Ok(Some(resolved)) => resolved,
+            Ok(None)
+                if matches!(
+                    self.cache.entry(holder),
+                    None | Some(CacheEntry::Missing | CacheEntry::Deleted)
+                ) =>
+            {
+                ResolvedStreamLength::Missing
+            }
+            Ok(None) => ResolvedStreamLength::Invalid,
+            Err(err) => {
+                self.cache.set_unresolved(expected_ref, offset);
+                return Err(err);
+            }
+        };
+        self.cache.set_unresolved(expected_ref, offset);
+        Ok(Some(resolved))
+    }
+
     pub(crate) fn resolve_qpdf_json_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
         if self.resolve_to_cache(object_ref)? {
             if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
@@ -1255,59 +1347,27 @@ impl<R: Read + Seek> Pdf<R> {
 
         match entry.cloned() {
             Some(CacheEntry::Unresolved { offset }) => {
-                let parsed = self.read_object_at(offset)?;
+                let mut parsed = self.read_object_at_qpdf(object_ref, offset)?;
                 if parsed.object_ref != object_ref {
                     return Ok(false);
                 }
-                let mut object = parsed.object;
-                let mut endstream_scan_authoritative = parsed.recovered_stream_eol.is_some();
-                // When the stream's /Length is an indirect reference, the parser
-                // had no xref and recorded the payload window instead of a
-                // resolved length. Resolve the holder via the xref and re-slice
-                // to the authoritative length. This MUST happen before
-                // decryption: `object`/`bytes` are still ciphertext here, and
-                // `decrypt_resolved_object` decrypts in place afterwards.
-                if let Some(isl) = parsed.indirect_length {
-                    let used_endstream_scan = self.apply_indirect_stream_length(
-                        object_ref,
-                        &mut object,
-                        isl,
-                        &parsed.bytes,
-                        offset,
-                    )?;
-                    if parsed.recovered_stream_eol.is_some() {
-                        endstream_scan_authoritative = used_endstream_scan;
-                    }
-                }
-                // `apply_indirect_stream_length` already restored the lazy
-                // `Unresolved` entry, so a decryption error here leaves it
-                // `Unresolved` (not `Reserved`) and the failure stays loud on a
-                // retry.
-                let recovered_eol = endstream_scan_authoritative
-                    .then_some(parsed.recovered_stream_eol)
-                    .flatten()
-                    .map(crate::parser::RecoveredStreamEol::as_bytes);
+                let recovered_eol = parsed.remove_included_recovery_eol_for_decryption();
+                let recovered_eol_bytes =
+                    recovered_eol.map(crate::parser::RecoveredStreamEol::as_bytes);
                 let (object, stream_payload_transformed) =
-                    self.decrypt_resolved_object(object_ref, object, recovered_eol)?;
+                    self.decrypt_resolved_object(object_ref, parsed.object, recovered_eol_bytes)?;
                 self.cache.set_resolved(object_ref, object);
                 if stream_payload_transformed {
                     self.transformed_stream_refs.insert(object_ref);
                 } else {
                     self.transformed_stream_refs.remove(&object_ref);
                 }
-                if endstream_scan_authoritative {
-                    if let Some(eol) = parsed.recovered_stream_eol {
-                        self.recovered_stream_eols.insert(object_ref, eol);
-                    }
+                if let Some(eol) = recovered_eol {
+                    self.recovered_stream_eols.insert(object_ref, eol);
                 } else {
                     self.recovered_stream_eols.remove(&object_ref);
                 }
-                self.record_file_object_warnings(
-                    object_ref,
-                    offset,
-                    parsed.empty_offset,
-                    parsed.expected_endobj_offset,
-                );
+                self.record_file_object_diagnostics(object_ref, offset, parsed.diagnostics);
                 Ok(true)
             }
             Some(CacheEntry::Compressed { stream, index }) => {
@@ -1320,6 +1380,23 @@ impl<R: Read + Seek> Pdf<R> {
                 | CacheEntry::Reserved,
             )
             | None => Ok(false),
+        }
+    }
+
+    fn record_file_object_diagnostics(
+        &mut self,
+        object_ref: ObjectRef,
+        offset: u64,
+        diagnostics: Vec<FileObjectDiagnostic>,
+    ) {
+        for diagnostic in diagnostics {
+            self.push_warning(format!(
+                "(object {} {}, offset {}): {}",
+                object_ref.number,
+                object_ref.generation,
+                offset.saturating_add(diagnostic.relative_offset as u64),
+                diagnostic.kind.message()
+            ));
         }
     }
 
@@ -1362,9 +1439,8 @@ impl<R: Read + Seek> Pdf<R> {
     /// therefore needs no manual cache restore on its own later error paths
     /// (e.g. decryption).
     ///
-    /// Shared by [`resolve_to_cache`](Self::resolve_to_cache) and
-    /// [`resolve_compressed_entry`](Self::resolve_compressed_entry) so ObjStm
-    /// containers get the same recovery as top-level streams.
+    /// Retained for [`resolve_compressed_entry`](Self::resolve_compressed_entry)
+    /// until the ObjStm routing layer adopts the qpdf file-object path.
     ///
     /// Returns `true` only when a line-anchored `endstream` scan remains the
     /// payload authority; a valid in-window indirect integer re-slice returns
@@ -1484,11 +1560,9 @@ impl<R: Read + Seek> Pdf<R> {
         let stream_object = match self.cache.entry(stream_ref).cloned() {
             Some(CacheEntry::Resolved(object)) => object,
             Some(CacheEntry::Unresolved { offset }) => {
-                // Use the detailed parser (via `read_object_at`) so an ObjStm
-                // container whose own /Length is an indirect reference (including
-                // the adjacent no-EOL `endstream` case) goes through the same
-                // authoritative re-slice as top-level streams; otherwise its
-                // compressed members would be unreadable.
+                // Keep ObjStm containers on the legacy detailed-parser path in
+                // this layer. A later routing layer switches this call site to
+                // the qpdf file-object path.
                 let parsed = self.read_object_at(offset)?;
                 if parsed.object_ref != stream_ref {
                     return Ok(false);
@@ -2634,6 +2708,35 @@ mod tests {
     use crate::pages::page_refs;
     use crate::Stream;
 
+    struct ReadFailingCursor {
+        inner: Cursor<Vec<u8>>,
+        fail_reads: bool,
+    }
+
+    impl ReadFailingCursor {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                fail_reads: false,
+            }
+        }
+    }
+
+    impl Read for ReadFailingCursor {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.fail_reads {
+                return Err(std::io::Error::other("injected holder read failure"));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for ReadFailingCursor {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
     #[test]
     fn keyword_token_at_requires_token_boundary() {
         // Keyword at EOF (nothing after) is a valid token.
@@ -3069,7 +3172,6 @@ mod tests {
                 Some(b"2 0 obj\n99\nendobj\n".as_slice()),
                 false,
             ),
-            (b"2 0 R".as_slice(), Some(b"2 0 obj\n<<".as_slice()), false),
             (b"99 0 R".as_slice(), None, false),
             (
                 b"2 0 R".as_slice(),
@@ -3092,6 +3194,64 @@ mod tests {
     }
 
     #[test]
+    fn qpdf_reader_recovers_malformed_length_holder_as_invalid_once() {
+        let bytes = recovered_stream_fixture(b"/Length 2 0 R", b"\n", Some(b"2 0 obj\n<<"));
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open malformed-holder fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        assert_eq!(
+            pdf.resolve(object_ref)
+                .expect("recover target stream")
+                .as_stream()
+                .unwrap()
+                .data,
+            b"abc"
+        );
+        assert_eq!(pdf.recovered_stream_eol(object_ref), Some(&b"\n"[..]));
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "(object 1 0, offset 9): /Length key in stream dictionary is not an integer",
+                "(object 1 0, offset 44): attempting to recover stream length",
+                "(object 1 0, offset 44): recovered stream length: 4",
+            ]
+        );
+        assert_eq!(
+            pdf.resolve(object_ref).unwrap().as_stream().unwrap().data,
+            b"abc"
+        );
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 3);
+    }
+
+    #[test]
+    fn qpdf_reader_restores_target_cache_after_length_holder_io_error() {
+        let bytes =
+            recovered_stream_fixture(b"/Length 2 0 R", b"\n", Some(b"2 0 obj\n3\nendobj\n"));
+        let mut pdf =
+            Pdf::open(ReadFailingCursor::new(bytes)).expect("open readable holder fixture");
+        let target = ObjectRef::new(1, 0);
+        let target_offset = 9;
+        let pending = parse_file_object_syntax(
+            b"1 0 obj\n<< /Length 2 0 R >>\nstream\nabc\nendstream\nendobj\n",
+        )
+        .expect("parse pending target stream");
+
+        pdf.reader.fail_reads = true;
+        let err = pdf
+            .resolve_pending_stream_length(target, &pending, target_offset)
+            .expect_err("holder I/O errors must remain unrecoverable");
+
+        assert!(matches!(err, Error::Io(_)), "got {err:?}");
+        assert!(matches!(
+            pdf.cache.entry(target),
+            Some(CacheEntry::Unresolved { offset }) if *offset == target_offset
+        ));
+    }
+
+    #[test]
     fn valid_indirect_stream_length_clears_endstream_scan_metadata() {
         let bytes =
             recovered_stream_fixture(b"/Length 2 0 R", b"\n", Some(b"2 0 obj\n3\nendobj\n"));
@@ -3103,7 +3263,75 @@ mod tests {
     }
 
     #[test]
-    fn qpdf_object_read_uses_bounded_fallback_and_preserves_strict_errors() {
+    fn qpdf_reader_completes_adjacent_endstream_before_endobj_check() {
+        let bytes = recovered_stream_fixture(b"/Length 2 0 R", b"", Some(b"2 0 obj\n3\nendobj\n"));
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+        let object_ref = ObjectRef::new(1, 0);
+        assert_eq!(
+            pdf.resolve(object_ref).unwrap().as_stream().unwrap().data,
+            b"abc"
+        );
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("expected endobj")));
+    }
+
+    #[test]
+    fn qpdf_reader_registers_file_object_diagnostics_once_after_cache_commit() {
+        let mut pdf = Pdf::open_mem_owned(top_level_bare_reference_pdf()).unwrap();
+        let object_ref = ObjectRef::new(4, 0);
+        assert_eq!(pdf.resolve(object_ref).unwrap(), Object::Integer(3));
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(object_ref).unwrap(),
+            Object::Integer(3)
+        );
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .filter(|entry| entry.message.contains("expected endobj"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn qpdf_reader_bounds_unusable_indirect_length_recovery() {
+        let cases = [
+            classic_pdf_with_bodies(
+                &[b"1 0 obj\n<< /Length 1 0 R >>\nstream\nabc\nendstream\nendobj\n"],
+                ObjectRef::new(1, 0),
+            ),
+            classic_pdf_with_bodies(
+                &[b"1 0 obj\n<< /Length 99 0 R >>\nstream\nabc\nendstream\nendobj\n"],
+                ObjectRef::new(1, 0),
+            ),
+            classic_pdf_with_bodies(
+                &[
+                    b"1 0 obj\n<< /Length 2 0 R >>\nstream\nabc\nendstream\nendobj\n",
+                    b"2 0 obj\n<< /Length 1 0 R >>\nstream\nxyz\nendstream\nendobj\n",
+                ],
+                ObjectRef::new(1, 0),
+            ),
+        ];
+
+        for bytes in cases {
+            let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+            assert_eq!(
+                pdf.resolve(ObjectRef::new(1, 0))
+                    .unwrap()
+                    .as_stream()
+                    .unwrap()
+                    .data,
+                b"abc"
+            );
+        }
+    }
+
+    #[test]
+    fn qpdf_object_read_uses_bounded_fallback_and_preserves_unrecoverable_errors() {
         let stream_body =
             b"1 0 obj\n<< /Length 2 0 R >>\nstream\n9 0 obj\nnull\nendobj\nendstream\nendobj\n";
         let length_body = b"2 0 obj\n19\nendobj\n";
@@ -3112,19 +3340,24 @@ mod tests {
             .windows(b"1 0 obj".len())
             .position(|window| window == b"1 0 obj")
             .unwrap() as u64;
-        let embedded_offset = bytes
-            .windows(b"9 0 obj".len())
-            .position(|window| window == b"9 0 obj")
-            .unwrap() as u64;
+        let false_next_offset = stream_offset + b"1 0 obj\n<< /Length 2".len() as u64;
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open fallback fixture");
-        pdf.sorted_object_offsets.push(embedded_offset);
+        pdf.sorted_object_offsets.push(false_next_offset);
         pdf.sorted_object_offsets.sort_unstable();
 
+        let initial_budget = pdf.resolution_fallbacks_remaining;
         let parsed = pdf
-            .read_object_at(stream_offset)
+            .read_object_at_qpdf(ObjectRef::new(1, 0), stream_offset)
             .expect("full read fallback must recover stream");
         assert_eq!(parsed.object_ref, ObjectRef::new(1, 0));
-        assert!(parsed.object.as_stream().is_some());
+        assert_eq!(
+            parsed.object.as_stream().unwrap().data,
+            b"9 0 obj\nnull\nendobj"
+        );
+        assert_eq!(
+            pdf.resolution_fallbacks_remaining,
+            initial_budget.saturating_sub(1)
+        );
 
         let malformed = classic_pdf_with_bodies(
             &[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n", b"2 0 obj\n<<"],
@@ -3135,10 +3368,26 @@ mod tests {
             .position(|window| window == b"2 0 obj")
             .unwrap() as u64;
         let mut pdf = Pdf::open_mem_owned(malformed).expect("open malformed lazy object");
-        assert!(pdf.read_object_at(malformed_offset).is_err());
+        assert!(pdf
+            .read_object_at_qpdf(ObjectRef::new(2, 0), malformed_offset)
+            .is_err());
         pdf.sorted_object_offsets.push(malformed_offset + 5);
         pdf.sorted_object_offsets.sort_unstable();
-        assert!(pdf.read_object_at(malformed_offset).is_err());
+        pdf.resolution_fallbacks_remaining = 1;
+        let window_error = pdf
+            .read_object_at_qpdf(ObjectRef::new(2, 0), malformed_offset)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(pdf.resolution_fallbacks_remaining, 0);
+        let exhausted_error = pdf
+            .read_object_at_qpdf(ObjectRef::new(2, 0), malformed_offset)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(window_error, exhausted_error);
+        assert!(matches!(
+            pdf.cache.entry(ObjectRef::new(2, 0)),
+            Some(CacheEntry::Unresolved { offset }) if *offset == malformed_offset
+        ));
     }
 
     #[test]
@@ -3195,7 +3444,36 @@ mod tests {
             ObjectRef::new(1, 0),
         );
         let mut pdf = Pdf::open_mem_owned(invalid_length).expect("open invalid-length fixture");
-        assert!(pdf.resolve_qpdf_json_object(ObjectRef::new(1, 0)).is_err());
+        let object_ref = ObjectRef::new(1, 0);
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(object_ref)
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .data,
+            b"abc"
+        );
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "(object 1 0, offset 143): expected endstream",
+                "(object 1 0, offset 44): attempting to recover stream length",
+                "(object 1 0, offset 44): recovered stream length: 3",
+            ]
+        );
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(object_ref)
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .data,
+            b"abc"
+        );
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 3);
     }
 
     #[test]

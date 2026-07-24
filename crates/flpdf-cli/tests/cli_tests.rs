@@ -574,6 +574,24 @@ fn qdf_subcommand_rewrites_output() {
 }
 
 #[test]
+fn qdf_adjacent_endstream_with_indirect_length_is_silent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("good14-shaped-qdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--qdf",
+            "../../tests/fixtures/compat/good14-shaped-indirect-length-adjacent-endstream.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .code(0)
+        .stderr(predicate::str::is_empty());
+    assert!(output.exists());
+}
+
+#[test]
 fn qdf_subcommand_dumps_all_reachable_objects() {
     let temp = tempfile::tempdir().unwrap();
     let fixture = fixture_with_orphan_object();

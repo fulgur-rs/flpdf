@@ -870,14 +870,19 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_inline_content_stream_is_error() {
-        // The direct inline-stream path yields a `None` terminal ref, so the
-        // diagnostic names "inline content stream" rather than an object ref.
+    fn direct_inline_content_stream_is_a_qpdf_style_structural_warning() {
+        // qpdf 11.9.0 treats this spec-invalid direct stream as malformed page
+        // syntax, emits object/page warnings, and completes `--check` with
+        // warnings rather than reporting a corrupt decoded content stream.
         let report = check_reader_strict(Cursor::new(corrupt_inline_content_pdf())).unwrap();
-        assert!(!report.valid);
-        assert!(report.diagnostics.entries().iter().any(|d| {
-            d.severity == Severity::Error && d.message.contains("inline content stream")
-        }));
+        assert!(report.valid);
+        assert_eq!(
+            report.diagnostics.entries(),
+            &[Diagnostic::warning(
+                "could not enumerate pages for content-stream check: parse error at byte 101: expected byte 47",
+                None,
+            )]
+        );
     }
 
     #[test]

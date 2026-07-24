@@ -1091,7 +1091,7 @@ fn test_roborev1_shared_indirect_font_subdict_auto_protected() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Direct-stream Form XObject → conservatively retain the page (flpdf-u79t)
+// Direct-stream Form XObject → reject as malformed file-object syntax (flpdf-u79t)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // Setup: the /XObject sub-dict in the page /Resources contains a *direct*
@@ -1107,13 +1107,12 @@ fn test_roborev1_shared_indirect_font_subdict_auto_protected() {
 // inline stream as a Form (it tokenises `stream` as a stray string and mangles
 // the surrounding dictionary), so there is no byte-identical target here.
 //
-// flpdf therefore refuses to recurse into a direct-stream Form and reports the
-// page as incomplete, conservatively retaining ALL of the page's resources.
-// That avoids both the DoS and dropping /F1 (which the Form genuinely uses under
-// flpdf's more-lenient parse): nothing is pruned, so /F1 and /F2 both survive.
+// The qpdf-style file-object parser does not admit nested stream syntax either:
+// resolving the resources object fails before resource traversal begins. This
+// is an unrecoverable object-syntax error, not a stream-length recovery case.
 
 #[test]
-fn test_direct_stream_form_xobject_page_conservatively_retained() {
+fn test_direct_stream_form_xobject_is_rejected_as_malformed_file_object() {
     // Form XObject content: uses /F1 via Tf.
     // The Form has no /Resources — it inherits the page's scope.
     let form_content = b"BT /F1 10 Tf (direct form) Tj ET";
@@ -1162,32 +1161,13 @@ fn test_direct_stream_form_xobject_page_conservatively_retained() {
     let pdf_bytes = build_pdf_raw(&objects);
 
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open PDF with direct-stream Form");
-    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
-
-    // The page contains a direct-stream Form → flpdf cannot safely analyse its
-    // resource usage, so it retains the whole page. Both /F1 and /F2 survive.
-    let res_obj = pdf
-        .resolve(ObjectRef::new(5, 0))
-        .expect("resolve resources");
-    let Object::Dictionary(res_dict) = res_obj else {
-        panic!("5 0 R is not a dictionary");
+    let err = remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect_err("nested stream syntax must not be recovered as a file object");
+    let flpdf::Error::Parse { offset, message } = err else {
+        panic!("expected parse error, got {err:?}");
     };
-    let font_entry = res_dict.get("Font").expect("/Font key must exist");
-    let Object::Dictionary(font_dict) = font_entry else {
-        panic!("/Font is not a dict");
-    };
-    let keys: Vec<String> = font_dict
-        .iter()
-        .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
-        .collect();
-    assert!(
-        keys.contains(&"F1".to_string()),
-        "direct-stream Form: /F1 must be kept (page conservatively retained): {keys:?}"
-    );
-    assert!(
-        keys.contains(&"F2".to_string()),
-        "direct-stream Form: /F2 must also be kept — the page is retained, not pruned: {keys:?}"
-    );
+    assert_eq!(offset, 108);
+    assert_eq!(message, "expected byte 47");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1198,10 +1178,11 @@ fn test_direct_stream_form_xobject_page_conservatively_retained() {
 // (A) Direct-stream Form self-recursion via inherited resources. The page maps
 // /Fm0 to a direct stream whose content is `/Fm0 Do /Fm0 Do`; with no ObjectRef
 // identity the old stack-pop guard could not dedup it, so branching recursion
-// blew up to 2^depth. The fix refuses to recurse into direct-stream Forms, so
-// pruning must complete promptly (the test harness would otherwise hang).
+// blew up to 2^depth. The file-object parser now rejects the nested stream
+// before traversal, so pruning must fail promptly (the harness would otherwise
+// hang).
 #[test]
-fn test_direct_stream_form_self_recursion_no_dos() {
+fn test_direct_stream_form_self_recursion_is_rejected_without_dos() {
     let form_content = b"/Fm0 Do /Fm0 Do";
     let res_obj_body = format!(
         "<< /Font << /F1 << /Type /Font >> >> \
@@ -1225,22 +1206,13 @@ fn test_direct_stream_form_self_recursion_no_dos() {
     let pdf_bytes = build_pdf_raw(&objects);
 
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open recursive direct-stream Form PDF");
-    // Must return promptly rather than recursing exponentially.
-    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
-        .expect("prune must complete without exponential recursion");
-
-    // Direct-stream Form ⇒ page conservatively retained ⇒ /F1 kept.
-    let Object::Dictionary(res_dict) = pdf.resolve(ObjectRef::new(5, 0)).expect("resolve res")
-    else {
-        panic!("5 0 R is not a dictionary");
+    let err = remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect_err("nested recursive stream syntax must fail before traversal");
+    let flpdf::Error::Parse { offset, message } = err else {
+        panic!("expected parse error, got {err:?}");
     };
-    let Some(Object::Dictionary(font_dict)) = res_dict.get("Font") else {
-        panic!("/Font key must exist");
-    };
-    assert!(
-        font_dict.get("F1").is_some(),
-        "direct-stream self-recursion: page retained, /F1 kept"
-    );
+    assert_eq!(offset, 86);
+    assert_eq!(message, "expected byte 47");
 }
 
 // (B) Indirect-reference DAG: Fm(i)'s content is `/Fm(i+1) Do /Fm(i+1) Do`, a

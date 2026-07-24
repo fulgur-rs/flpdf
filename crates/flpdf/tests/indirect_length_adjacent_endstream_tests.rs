@@ -8,12 +8,12 @@
 //! (the writer can only produce the happy path):
 //!   (1) a correct holder re-slices the exact content, even when the payload
 //!       itself contains the bytes `endstream`;
-//!   (2) a corrupt holder pointing at an `endstream` token INSIDE the payload is
-//!       rejected (must error, not silently truncate);
+//!   (2) an unusable or stale holder enters qpdf's bounded recovery, including
+//!       qpdf's truncation at an interior `endstream`/`endobj` token;
 //!   (3) an ObjStm container with an indirect `/Length` + adjacent `endstream`
 //!       still has its compressed members read.
 
-use flpdf::{Object, ObjectRef, Pdf};
+use flpdf::{Object, ObjectRef, Pdf, Severity};
 use std::io::Cursor;
 
 /// Build a PDF-1.4 (xref table) with one content stream (obj 3) carrying
@@ -94,6 +94,46 @@ fn metadata_stream_result<R: std::io::Read + std::io::Seek>(
     pdf.resolve(metadata_ref)
 }
 
+fn assert_metadata_stream_and_warnings<R: std::io::Read + std::io::Seek>(
+    pdf: &mut Pdf<R>,
+    expected_data: &[u8],
+    expected_messages: &[&str],
+) {
+    assert_eq!(
+        metadata_stream_result(pdf)
+            .expect("qpdf-style stream recovery")
+            .as_stream()
+            .unwrap()
+            .data,
+        expected_data
+    );
+    let diagnostics = pdf.repair_diagnostics().entries();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|entry| entry.message.as_str())
+            .collect::<Vec<_>>(),
+        expected_messages
+    );
+    assert!(diagnostics
+        .iter()
+        .all(|entry| entry.severity == Severity::Warning && entry.offset.is_none()));
+
+    assert_eq!(
+        metadata_stream_result(pdf)
+            .expect("cached stream recovery")
+            .as_stream()
+            .unwrap()
+            .data,
+        expected_data
+    );
+    assert_eq!(
+        pdf.repair_diagnostics().entries().len(),
+        expected_messages.len(),
+        "cached resolution must not register warnings twice"
+    );
+}
+
 /// (1) A correct holder re-slices the exact content even though the payload
 /// itself contains the literal bytes `endstream` (followed by a space, so a
 /// naive token scan would stop there).
@@ -113,39 +153,39 @@ fn correct_holder_reslices_payload_containing_endstream_bytes() {
     }
 }
 
-/// (2) A corrupt holder pointing at the `endstream` token INSIDE the payload
-/// must be rejected. The interior token sits at offset 4 (`AAAA|endstream`), so
-/// a holder of 4 lands on it; because it is not followed by the `endobj` object
-/// terminator, the boundary check fails and the reader errors instead of
-/// truncating the stream to `"AAAA"`.
+/// (2) qpdf 11.9.0 accepts the `endstream` token at the stale holder boundary,
+/// truncates to `AAAA`, and warns because the following `BBBB` is not `endobj`.
 #[test]
-fn corrupt_holder_pointing_at_interior_endstream_errors() {
+fn stale_holder_pointing_at_interior_endstream_matches_qpdf() {
     let payload: &[u8] = b"AAAAendstream BBBB";
     let bytes = build_pdf_indirect_len_adjacent(payload, 4);
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    let result = metadata_stream_result(&mut pdf);
-    assert!(
-        result.is_err(),
-        "a holder pointing at an interior endstream must error, not truncate; got {result:?}"
+    assert_metadata_stream_and_warnings(
+        &mut pdf,
+        b"AAAA",
+        &["(object 3 0, offset 175): expected endobj"],
     );
 }
 
-/// (2b) A corrupt holder landing on `endstreamendobj` INSIDE the payload (no
-/// separator between the keywords) must be rejected. Without a token-boundary
-/// check after each keyword, the raw byte match would accept this interior
-/// sequence as the terminator and truncate the stream.
+/// (2b) `endstreamendobj` has no boundary after `endstream`, so qpdf rejects
+/// that exact boundary, then bounded recovery stops at the interior token-valid
+/// `endobj`, returning the preceding 13 bytes with ordered warnings.
 #[test]
-fn corrupt_holder_pointing_at_interior_endstreamendobj_errors() {
+fn stale_holder_pointing_at_interior_endstreamendobj_matches_qpdf() {
     // The bytes `endstreamendobj` start at offset 4 (`AAAA|endstreamendobj`).
     let payload: &[u8] = b"AAAAendstreamendobj CCCC";
     let bytes = build_pdf_indirect_len_adjacent(payload, 4);
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    let result = metadata_stream_result(&mut pdf);
-    assert!(
-        result.is_err(),
-        "a holder pointing at an interior `endstreamendobj` (no token boundary) must error; got {result:?}"
+    assert_metadata_stream_and_warnings(
+        &mut pdf,
+        b"AAAAendstream",
+        &[
+            "(object 3 0, offset 165): expected endstream",
+            "(object 3 0, offset 161): attempting to recover stream length",
+            "(object 3 0, offset 161): recovered stream length: 13",
+        ],
     );
 }
 
@@ -163,33 +203,39 @@ fn correct_holder_reslices_payload_containing_endstreamendobj_bytes() {
     }
 }
 
-/// (2d) A self-referential `/Length 3 0 R` (the stream's own ref) with an
-/// adjacent `endstream` is unrecoverable — the holder cannot be resolved without
-/// the very length it provides — and must error, not surface the empty
-/// placeholder the parser returned.
+/// (2d) qpdf 11.9.0 detects a self-referential holder loop, treats the length as
+/// missing, and recovers the adjacent stream boundary.
 #[test]
-fn self_referential_holder_adjacent_endstream_errors() {
+fn self_referential_holder_adjacent_endstream_recovers_like_qpdf() {
     let bytes = build_pdf(b"AAAABBBB", b"3 0 R", b"", None);
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    let result = metadata_stream_result(&mut pdf);
-    assert!(
-        result.is_err(),
-        "a self-referential indirect /Length with adjacent endstream must error; got {result:?}"
+    assert_metadata_stream_and_warnings(
+        &mut pdf,
+        b"AAAABBBB",
+        &[
+            "(object 3 0, offset 126): stream dictionary lacks /Length key",
+            "(object 3 0, offset 161): attempting to recover stream length",
+            "(object 3 0, offset 161): recovered stream length: 8",
+        ],
     );
 }
 
-/// (2e) An indirect `/Length` holder that resolves to a NON-integer (here a
-/// name) for an adjacent `endstream` cannot yield a length and must error.
+/// (2e) A non-integer indirect holder is an invalid length and enters qpdf's
+/// bounded adjacent-`endstream` recovery.
 #[test]
-fn non_integer_holder_adjacent_endstream_errors() {
+fn non_integer_holder_adjacent_endstream_recovers_like_qpdf() {
     let bytes = build_pdf(b"AAAABBBB", b"4 0 R", b"", Some(b"/NotALength"));
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    let result = metadata_stream_result(&mut pdf);
-    assert!(
-        result.is_err(),
-        "a non-integer indirect /Length holder with adjacent endstream must error; got {result:?}"
+    assert_metadata_stream_and_warnings(
+        &mut pdf,
+        b"AAAABBBB",
+        &[
+            "(object 3 0, offset 126): /Length key in stream dictionary is not an integer",
+            "(object 3 0, offset 161): attempting to recover stream length",
+            "(object 3 0, offset 161): recovered stream length: 8",
+        ],
     );
 }
 
@@ -220,12 +266,11 @@ fn crlf_framed_indirect_length_round_trips() {
     }
 }
 
-/// (2f) When resolving the indirect `/Length` holder itself fails (here the
-/// holder's xref offset points into another object's dictionary, so parsing it
-/// errors), the adjacent-`endstream` path must PROPAGATE that error rather than
-/// mask it as the generic "stream data exceeds input" parse error.
+/// (2f) qpdf repairs this malformed holder xref; the Layer 3 normal path has no
+/// xref reconstruction at lazy resolution time, so it classifies the holder's
+/// parse failure as an invalid length and returns the same recovered payload.
 #[test]
-fn holder_resolution_error_propagates() {
+fn malformed_holder_resolution_recovers_target_stream() {
     // Build the normal adjacent fixture, then corrupt object 4's xref offset to
     // point at the Catalog's `<<` (8 bytes past `1 0 obj\n`), which is not a
     // valid `N G obj` header, so resolving `4 0 R` errors.
@@ -251,10 +296,14 @@ fn holder_resolution_error_propagates() {
     assert!(bytes.windows(needle.len()).any(|w| w == needle));
 
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    let result = metadata_stream_result(&mut pdf);
-    assert!(
-        result.is_err(),
-        "a holder whose own resolution errors must propagate the error; got {result:?}"
+    assert_metadata_stream_and_warnings(
+        &mut pdf,
+        b"AAAABBBB",
+        &[
+            "(object 3 0, offset 126): /Length key in stream dictionary is not an integer",
+            "(object 3 0, offset 161): attempting to recover stream length",
+            "(object 3 0, offset 161): recovered stream length: 8",
+        ],
     );
 }
 

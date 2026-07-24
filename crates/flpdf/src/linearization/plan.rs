@@ -4480,9 +4480,9 @@ mod tests {
     ///
     /// `page_refs` walks `/Kids` downward only, so it never resolves object 4;
     /// the only code path that resolves it is the `/Parent`-chain walk inside
-    /// `compute_closure`. Resolving object 4 yields a genuine parse error
-    /// (not `Ok(Null)`), so a correct walker must surface that error.
-    fn page_parent_resolve_error_bytes() -> Vec<u8> {
+    /// `compute_closure`. qpdf 11.9.0 recovers object 4 at `endstream` with
+    /// ordered warnings, so the normal object reader must do the same.
+    fn page_parent_recovered_stream_bytes() -> Vec<u8> {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
 
@@ -4501,8 +4501,9 @@ mod tests {
             b"3 0 obj\n<< /Type /Page /Parent 4 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
         );
 
-        // Object 4: a stream whose /Length (9) overshoots the 2-byte payload,
-        // so parse_indirect_object_detailed rejects it and resolve returns Err.
+        // Object 4: a stream whose /Length (9) overshoots the 2-byte payload.
+        // qpdf recovers the raw `ab\n` window and removes its framing LF before
+        // exposing `ab` as the stream payload.
         let off4 = pdf.len() as u64;
         pdf.extend_from_slice(b"4 0 obj\n<< /Length 9 >>\nstream\nab\nendstream\nendobj\n");
 
@@ -4527,21 +4528,39 @@ mod tests {
         pdf
     }
 
-    /// `compute_closure`'s `/Parent`-chain walk must
-    /// propagate `pdf.resolve` errors rather than swallowing them with
-    /// `let Ok(..) else { continue }`. A swallowed error lets `from_pdf`
-    /// return a degraded plan (truncated closure / hint tables) for a
-    /// malformed document, which a downstream writer would then emit as an
-    /// invalid linearized PDF.
+    /// `compute_closure`'s `/Parent`-chain walk uses qpdf's bounded stream
+    /// recovery and registers its diagnostics only on the first cache commit.
     #[test]
-    fn from_pdf_propagates_parent_chain_resolve_error() {
-        let bytes = page_parent_resolve_error_bytes();
+    fn from_pdf_recovers_parent_stream_length_like_qpdf() {
+        let bytes = page_parent_recovered_stream_bytes();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("fixture xref/trailer must parse");
-        let result = LinearizationPlan::from_pdf(&mut pdf, false);
-        assert!(
-            result.is_err(),
-            "from_pdf must propagate a /Parent-chain resolve error, got Ok"
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("qpdf-style recovery");
+        assert!(plan.part4_rest.contains(&ObjectRef::new(4, 0)));
+        assert_eq!(
+            pdf.resolve(ObjectRef::new(4, 0))
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .data,
+            b"ab"
         );
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "(object 4 0, offset 226): expected endstream",
+                "(object 4 0, offset 217): attempting to recover stream length",
+                "(object 4 0, offset 217): recovered stream length: 3",
+            ]
+        );
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .all(|entry| entry.severity == crate::Severity::Warning && entry.offset.is_none()));
     }
 
     /// Build a single-page PDF whose page `/Parent` indirects through a plain
