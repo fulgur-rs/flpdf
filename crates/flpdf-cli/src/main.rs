@@ -5993,6 +5993,26 @@ mod tests {
     }
 
     #[test]
+    fn each_segment_kind_recognizes_its_sub_options() {
+        assert!(QpdfArgSegment::Encrypt.accepts("use-aes"));
+        assert!(QpdfArgSegment::Pages.accepts("range"));
+        assert!(QpdfArgSegment::AddAttachment.accepts("replace"));
+        assert!(QpdfArgSegment::CopyAttachments.accepts("prefix"));
+    }
+
+    #[test]
+    fn collect_clap_long_options_includes_aliases() {
+        let command = clap::Command::new("test")
+            .arg(clap::Arg::new("mode").long("mode").alias("legacy-mode"));
+        let mut names = HashSet::new();
+
+        collect_clap_long_options(&command, &mut names);
+
+        assert!(names.contains("mode"));
+        assert!(names.contains("legacy-mode"));
+    }
+
+    #[test]
     fn legacy_encrypt_password_is_not_rewritten() {
         let out =
             rewrite_qpdf_single_dash(strs(&["flpdf", "-encrypt", "-user", "owner", "128", "--"]));
