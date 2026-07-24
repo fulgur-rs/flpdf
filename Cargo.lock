@@ -595,6 +595,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qpdf-test-compare"
+version = "0.0.0"
+dependencies = [
+ "assert_cmd",
+ "flpdf",
+ "predicates",
+ "tempfile",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
