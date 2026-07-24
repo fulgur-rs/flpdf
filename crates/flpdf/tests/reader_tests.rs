@@ -647,9 +647,18 @@ fn v4_explicit_crypt_filter_decrypts_at_filter_slot_before_flate() {
         panic!("expected stream");
     };
 
-    assert_eq!(stream.data, b"explicit crypt stream".to_vec());
-    assert_eq!(stream.dict.get("Filter"), None);
-    assert_eq!(stream.dict.get("DecodeParms"), None);
+    assert_eq!(
+        flpdf::filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+        b"explicit crypt stream"
+    );
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]))
+    );
+    assert_eq!(
+        stream.dict.get("DecodeParms"),
+        Some(&Object::Array(vec![Object::Null]))
+    );
 }
 
 #[test]
@@ -663,7 +672,18 @@ fn v4_explicit_crypt_filter_decrypts_at_filter_slot_after_flate() {
         panic!("expected stream");
     };
 
-    assert_eq!(stream.data, b"explicit crypt stream".to_vec());
+    assert_eq!(
+        flpdf::filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+        b"explicit crypt stream"
+    );
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]))
+    );
+    assert_eq!(
+        stream.dict.get("DecodeParms"),
+        Some(&Object::Array(vec![Object::Null]))
+    );
 }
 
 #[test]
@@ -677,7 +697,18 @@ fn v4_explicit_identity_crypt_filter_is_noop_before_flate() {
         panic!("expected stream");
     };
 
-    assert_eq!(stream.data, b"explicit crypt stream".to_vec());
+    assert_eq!(
+        flpdf::filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+        b"explicit crypt stream"
+    );
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]))
+    );
+    assert_eq!(
+        stream.dict.get("DecodeParms"),
+        Some(&Object::Array(vec![Object::Null]))
+    );
 }
 
 #[test]
@@ -749,6 +780,8 @@ fn v4_encrypt_metadata_false_leaves_metadata_stream_plaintext() {
 fn assert_encrypted_plaintext_stream_rewrite_restores_recovered_eol(
     bytes: Vec<u8>,
     catalog_key: &str,
+    expected_payload: &[u8],
+    expect_unfiltered: bool,
 ) {
     let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).expect("encrypted source");
     let mut options = WriteOptions::default();
@@ -771,9 +804,17 @@ fn assert_encrypted_plaintext_stream_rewrite_restores_recovered_eol(
         panic!("{catalog_key} must resolve to a stream");
     };
     assert_eq!(
-        stream.data, b"A\n",
-        "the plaintext stream's recovered LF is part of qpdf's rewritten payload"
+        stream.data, expected_payload,
+        "rewritten payload must match qpdf's recovered-framing contract"
     );
+    if expect_unfiltered {
+        assert_eq!(stream.dict.get("Filter"), None);
+        assert_eq!(stream.dict.get("DecodeParms"), None);
+        assert_eq!(
+            stream.dict.get("Length"),
+            Some(&Object::Integer(expected_payload.len() as i64))
+        );
+    }
 }
 
 #[test]
@@ -781,6 +822,8 @@ fn encrypt_metadata_false_rewrite_restores_plaintext_recovered_eol() {
     assert_encrypted_plaintext_stream_rewrite_restores_recovered_eol(
         encrypted_v4_plaintext_metadata_recovered_eol_fixture(),
         "Metadata",
+        b"A\n",
+        false,
     );
 }
 
@@ -789,14 +832,18 @@ fn document_identity_stream_filter_rewrite_restores_plaintext_recovered_eol() {
     assert_encrypted_plaintext_stream_rewrite_restores_recovered_eol(
         encrypted_v4_identity_recovered_eol_fixture(false),
         "Data",
+        b"A\n",
+        false,
     );
 }
 
 #[test]
-fn explicit_identity_crypt_filter_rewrite_restores_plaintext_recovered_eol() {
+fn single_explicit_identity_crypt_filter_keeps_unfiltered_raw_payload() {
     assert_encrypted_plaintext_stream_rewrite_restores_recovered_eol(
         encrypted_v4_identity_recovered_eol_fixture(true),
         "Data",
+        b"A\n",
+        true,
     );
 }
 
@@ -814,6 +861,48 @@ fn assert_explicit_identity_filter_chain_does_not_append_decoded_eol(crypt_after
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).expect("plaintext rewrite");
 
+    // qpdf 11.9.0 removes only the explicit /Crypt slot. Even though /Length
+    // was invalid and the source payload came from the endstream fallback, the
+    // remaining one-element Flate chain and its raw encoded bytes survive.
+    let stream_marker = find_subslice(&output, b"\nstream\n").expect("output stream marker");
+    let dict_start = output[..stream_marker]
+        .windows(2)
+        .rposition(|window| window == b"<<")
+        .expect("output stream dictionary");
+    let Object::Dictionary(raw_dict) =
+        parse_object(&output[dict_start..stream_marker]).expect("parse raw stream dictionary")
+    else {
+        panic!("raw stream prefix must be a dictionary");
+    };
+    assert_eq!(
+        raw_dict.get("Filter"),
+        Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())])),
+        "qpdf preserves the remaining filter as a one-element array"
+    );
+    assert_eq!(
+        raw_dict.get("DecodeParms"),
+        Some(&Object::Array(vec![Object::Null])),
+        "qpdf removes only the DecodeParms slot paired with /Crypt"
+    );
+    let expected_raw = {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"explicit crypt stream").unwrap();
+        let mut raw = encoder.finish().unwrap();
+        raw.push(b'\n');
+        raw
+    };
+    assert_eq!(
+        raw_dict.get("Length"),
+        Some(&Object::Integer(expected_raw.len() as i64)),
+        "qpdf rewrites /Length to the preserved Flate representation"
+    );
+    let raw_start = stream_marker + b"\nstream\n".len();
+    assert_eq!(
+        &output[raw_start..raw_start + expected_raw.len()],
+        expected_raw,
+        "qpdf preserves the exact recovered Flate representation after removing Identity /Crypt"
+    );
+
     let mut rewritten = Pdf::open(std::io::Cursor::new(output)).expect("rewritten output");
     let root = rewritten.root_ref().expect("root");
     let Object::Dictionary(catalog) = rewritten.resolve(root).expect("catalog") else {
@@ -823,8 +912,10 @@ fn assert_explicit_identity_filter_chain_does_not_append_decoded_eol(crypt_after
     let Object::Stream(stream) = rewritten.resolve(stream_ref).expect("stream") else {
         panic!("Data must resolve to a stream");
     };
+    let decoded = flpdf::filters::decode_stream_data(&stream.dict, &stream.data)
+        .expect("decode output stream");
     assert_eq!(
-        stream.data, b"explicit crypt stream",
+        decoded, b"explicit crypt stream",
         "the source framing EOL must be consumed before the remaining filter chain is decoded"
     );
 }

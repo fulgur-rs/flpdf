@@ -132,23 +132,6 @@ pub(crate) fn decode_stream_data_with_decryption(
     decode_stream_data(dict, &decrypted)
 }
 
-pub(crate) fn decode_stream_data_with_crypt_filter<F>(
-    dict: &Dictionary,
-    stream_data: &[u8],
-    mut decrypt_crypt: F,
-) -> Result<Vec<u8>>
-where
-    F: FnMut(Option<&Object>, &[u8]) -> Result<Vec<u8>>,
-{
-    decode_stream_data_with_filters_and_crypt(
-        dict.get("Filter"),
-        dict.get("DecodeParms"),
-        stream_data,
-        DecodeLimits::default(),
-        &mut decrypt_crypt,
-    )
-}
-
 /// Encode `stream_data` by applying the stream dictionary's `/Filter` chain,
 /// the inverse of [`decode_stream_data`].
 ///

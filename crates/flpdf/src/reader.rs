@@ -68,12 +68,12 @@ pub struct Pdf<R: Read + Seek> {
     /// before applying the selected stream policy, matching qpdf's recovered
     /// raw stream bytes for missing, invalid, and unresolved `/Length` values.
     recovered_stream_eols: BTreeMap<ObjectRef, crate::parser::RecoveredStreamEol>,
-    /// Streams whose cached payload no longer uses the source representation.
-    /// This includes actual decryption and explicit `/Crypt` filter-chain
-    /// decoding. Recovered framing must not be appended later in either case:
-    /// ciphertext framing is not plaintext, while explicit-filter framing is
-    /// consumed before decoding. Metadata and document-level Identity streams
-    /// remain source-represented and therefore absent.
+    /// Streams whose cached representation has already accounted for source
+    /// framing. This includes actual decryption and selective explicit
+    /// `/Crypt` removal. Recovered framing must not be appended later in either
+    /// case: ciphertext framing is not plaintext, while explicit-filter
+    /// framing is consumed while transforming the declared chain. Metadata and
+    /// document-level Identity streams remain source-represented and absent.
     transformed_stream_refs: BTreeSet<ObjectRef>,
     /// Valid indirect references discovered while preparing qpdf JSON whose
     /// exact object generation has no live xref/cache target.
@@ -1912,28 +1912,108 @@ fn apply_explicit_crypt_filters(
     encryption: &EncryptionState,
     recovered_stream_eol: Option<&[u8]>,
 ) -> Result<()> {
-    // The authoritative endstream scan removed framing from the RAW source
-    // representation. Restore it before any declared filters are decoded, so a
-    // trailing source byte is consumed (or ignored) by that pipeline instead
-    // of being appended later to the decoded payload.
-    let mut source_data = stream.data.clone();
+    let Some(filter) = stream.dict.get("Filter").cloned() else {
+        return Ok(());
+    };
+    let mut decode_params = stream.dict.get("DecodeParms").cloned();
     if let Some(eol) = recovered_stream_eol {
-        source_data.extend_from_slice(eol);
+        stream.data.extend_from_slice(eol);
     }
-    let decoded = crate::filters::decode_stream_data_with_crypt_filter(
-        &stream.dict,
-        &source_data,
-        |decode_params, bytes| {
-            let mode = explicit_crypt_mode(encryption, decode_params)?;
-            let mut decrypted = bytes.to_vec();
-            decrypt_stream_bytes(object_ref, &mut decrypted, mode, &encryption.file_key)?;
-            Ok(decrypted)
-        },
-    )?;
-    stream.data = decoded;
-    stream.dict.remove("Filter");
-    stream.dict.remove("DecodeParms");
+
+    if matches!(filter, Object::Name(ref name) if name.as_slice() == b"Crypt") {
+        let mode = explicit_crypt_mode(encryption, decode_params.as_ref())?;
+        if mode != EncryptionMode::Identity {
+            if let Some(eol) = recovered_stream_eol {
+                stream.data.truncate(stream.data.len() - eol.len());
+            }
+            decrypt_stream_bytes(object_ref, &mut stream.data, mode, &encryption.file_key)?;
+        }
+        stream.dict.remove("Filter");
+        stream.dict.remove("DecodeParms");
+        return Ok(());
+    }
+
+    let Object::Array(mut filters) = filter else {
+        return Err(Error::Unsupported(
+            "unsupported stream filter type: expected name or array".to_string(),
+        ));
+    };
+    let mut framing = recovered_stream_eol;
+
+    while let Some(crypt_index) = filters
+        .iter()
+        .position(|filter| matches!(filter, Object::Name(name) if name.as_slice() == b"Crypt"))
+    {
+        let crypt_params = decode_params_at(decode_params.as_ref(), crypt_index).cloned();
+        let mode = explicit_crypt_mode(encryption, crypt_params.as_ref())?;
+
+        if mode != EncryptionMode::Identity {
+            let prefix_dict = filter_prefix_dict(&filters, decode_params.as_ref(), crypt_index);
+            let mut encoded = stream.data.clone();
+            if crypt_index == 0 {
+                if let Some(eol) = framing.take() {
+                    encoded.truncate(encoded.len() - eol.len());
+                }
+            }
+            let mut decoded_prefix = crate::filters::decode_stream_data(&prefix_dict, &encoded)?;
+            decrypt_stream_bytes(object_ref, &mut decoded_prefix, mode, &encryption.file_key)?;
+            stream.data = crate::filters::encode_stream_data(&prefix_dict, &decoded_prefix)?;
+        }
+
+        // The endstream-scan EOL has now been accounted for in the source
+        // representation and must not be appended again by the writer.
+        // Identity keeps those exact recovered raw bytes.
+        framing = None;
+        filters.remove(crypt_index);
+        if let Some(Object::Array(params)) = &mut decode_params {
+            if crypt_index < params.len() {
+                params.remove(crypt_index);
+            }
+        }
+    }
+
+    if filters.is_empty() {
+        stream.dict.remove("Filter");
+        stream.dict.remove("DecodeParms");
+    } else {
+        stream.dict.insert("Filter", Object::Array(filters));
+        match decode_params {
+            Some(params) => stream.dict.insert("DecodeParms", params),
+            None => {
+                stream.dict.remove("DecodeParms");
+            }
+        };
+    }
     Ok(())
+}
+
+fn decode_params_at(decode_params: Option<&Object>, index: usize) -> Option<&Object> {
+    let params = decode_params?;
+    if params.as_dict().is_some() {
+        Some(params)
+    } else {
+        params.as_array()?.get(index)
+    }
+}
+
+fn filter_prefix_dict(
+    filters: &[Object],
+    decode_params: Option<&Object>,
+    prefix_len: usize,
+) -> Dictionary {
+    let mut prefix = Dictionary::new();
+    if prefix_len == 0 {
+        return prefix;
+    }
+    prefix.insert("Filter", Object::Array(filters[..prefix_len].to_vec()));
+    if let Some(params) = decode_params {
+        let params = match params {
+            Object::Array(params) => Object::Array(params[..prefix_len.min(params.len())].to_vec()),
+            params => params.clone(),
+        };
+        prefix.insert("DecodeParms", params);
+    }
+    prefix
 }
 
 fn explicit_crypt_mode(
