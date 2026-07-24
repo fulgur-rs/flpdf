@@ -41,6 +41,21 @@ fn public_parser_recovers_non_integer_stream_length() {
 }
 
 #[test]
+fn public_parser_rejects_mismatched_usable_direct_stream_length() {
+    for input in [
+        &b"<< /Length 1 >>\nstream\nabc\nendstream"[..],
+        &b"<< /Length 5 >>\nstream\nabc\nendstream"[..],
+    ] {
+        let err =
+            parse_object(input).expect_err("a usable direct /Length must define the boundary");
+        assert!(
+            matches!(err, Error::Parse { .. }),
+            "expected Error::Parse, got {err:?}"
+        );
+    }
+}
+
+#[test]
 fn parses_dictionary_with_reference() {
     let object = parse_object(b"<< /Type /Catalog /Pages 2 0 R >>").unwrap();
 

@@ -372,6 +372,10 @@ fn complete_stream(
         }
     };
     let exact_end = length.and_then(|length| data_start.checked_add(length));
+    let directly_usable_length = matches!(
+        dict.get("Length"),
+        Some(Object::Integer(value)) if *value >= 0
+    ) && exact_end.is_some_and(|end| end <= input.len());
     let exact_terminator = exact_end.filter(|&end| end <= input.len()).and_then(|end| {
         let terminator = skip_pdf_ignorable(input, end);
         keyword_token_end(input, terminator, b"endstream").map(|after| (end, after))
@@ -379,6 +383,12 @@ fn complete_stream(
 
     let (data_end, after_endstream, included_recovery_eol) = match exact_terminator {
         Some((end, after)) => (end, after, None),
+        None if policy == RecoveryPolicy::RequireTerminator && directly_usable_length => {
+            return Err(Error::parse(
+                exact_end.expect("usable stream length has an exact boundary"),
+                "expected endstream",
+            ));
+        }
         None if policy != RecoveryPolicy::Strict => {
             if let Some(kind) = invalid_length.as_ref() {
                 diagnostics.push(FileObjectDiagnostic {

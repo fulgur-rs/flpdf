@@ -623,6 +623,19 @@ mod stream_length_tests {
         );
     }
 
+    #[test]
+    fn strict_indirect_parser_rejects_mismatched_usable_direct_stream_length() {
+        for input in [
+            &b"3 0 obj\n<< /Length 1 >>\nstream\nabc\nendstream\nendobj\n"[..],
+            &b"3 0 obj\n<< /Length 5 >>\nstream\nabc\nendstream\nendobj\n"[..],
+        ] {
+            assert!(
+                parse_indirect_object(input).is_err(),
+                "a usable direct /Length must define the boundary"
+            );
+        }
+    }
+
     fn parse_stream(bytes: &[u8]) -> crate::Stream {
         let mut completed = read_qpdf_file_object(bytes);
         let _recovered_eol = completed.remove_included_recovery_eol_for_decryption();
