@@ -25,43 +25,19 @@
 
 ---
 
-## Task 0: Confirm remaining flpdf API gaps
+## Task 0: Confirm remaining flpdf API gaps (COMPLETED inline before dispatch)
 
-**Purpose:** Two unverified assumptions from the design that, if wrong, change the plan.
+**Findings (verified 2026-07-24, results captured here so implementer subagents don't need to redo them):**
 
-**Files:** none (investigation only)
+- **0.1 live_object_refs order** — ✅ `Pdf::live_object_refs()` iterates `self.cache.entries()` which is `&BTreeMap<ObjectRef, CacheEntry>`. `ObjectRef` derives `Ord` on `(number, generation)`, so the returned `Vec<ObjectRef>` is already in `(number, generation)` ascending order. Matches qpdf's `getAllObjects()` semantics closely enough that no post-sort is needed.
+- **0.2 empty String → `()`** — ✅ `write_literal_string` (`crates/flpdf/src/object.rs:627`) writes `(` + escaped body + `)`. Empty → `()`.
+- **0.3 ObjectRef Display** — ⚠️ Displays as `"{number} {generation} R"` (includes the trailing ` R`). qpdf's `QPDFObjGen::unparse()` returns `"{number} {generation}"` (no `R`). **In `compare` orchestrator (Task 9), format labels as `format!("{} {}", r.number, r.generation)` rather than `r.to_string()`.**
+- **0.4 PdfOpenOptions default** — ✅ Derives `Default`; default `password: Vec<u8>` is empty, no error on unencrypted input.
+- **0.5 decode_stream_data** — ✅ `flpdf::filters::decode_stream_data(&dict, &raw) -> Result<Vec<u8>>` walks `/Filter` in dict order (Name or Array) and applies each filter's decoder. Handles `/FlateDecode` chain and `/DecodeParms` internally.
+- **0.6 CRITICAL — Dictionary key convention** — ⚠️ flpdf's `Dictionary` keys and `Object::Name` bytes are stored **WITHOUT the leading `/`**. `dict.get("Filter")` (not `dict.get("/Filter")`). `Object::Name(b"FlateDecode".to_vec())` (not `b"/FlateDecode"`). `write_pdf` (re)inserts the `/` on emission. All code snippets in this plan already use the no-leading-`/` form; when reviewing implementer output, watch for accidental `/` prefixes.
+- **0.7 Memory APIs** — ✅ `Pdf::open_mem_owned_with_options(bytes: Vec<u8>, opts: PdfOpenOptions)` and `Dictionary::get_ref(key) -> Option<ObjectRef>` both exist and are used in later tasks.
 
-**Step 0.1: Confirm `live_object_refs()` returns objs in `(number, gen)` ascending order.**
-
-Run: `grep -nA 15 "pub fn live_object_refs" crates/flpdf/src/reader.rs`
-Verify that `self.cache.entries()` yields entries in `BTreeMap` key order (i.e., ObjectRef ordering). If not, add a `.sorted_by_key(|r| (r.number, r.generation))` in the caller.
-
-**Step 0.2: Confirm `Object::String(vec![])` unparses to `()`.**
-
-Already verified in this plan's prep: `write_literal_string` at `crates/flpdf/src/object.rs:627-639` outputs `(` + escaped body + `)`. For empty input → `()`. No action.
-
-**Step 0.3: Confirm `ObjectRef::to_string()` renders as `N G R`.**
-
-Run: `grep -nB 2 -A 15 "impl.*Display.*ObjectRef\|fn to_string" crates/flpdf/src/object.rs | head`
-Verify the produced format is `<number> <generation> R`. If not, adjust the label formatting in `compare_objects`.
-
-**Step 0.4: Confirm `Pdf::open_with_options` accepts empty password gracefully (no password case).**
-
-Run: `grep -nA 5 "PdfOpenOptions::default" crates/flpdf/src/reader.rs | head`
-Check the default `PdfOpenOptions` has an empty `password: Vec<u8>` and does not error when the file is unencrypted.
-
-**Step 0.5: Confirm `filters::decode_stream_data(dict, raw)` handles /FlateDecode chain, /Predictor, and multi-filter arrays.**
-
-Run: `grep -nA 30 "pub fn decode_stream_data" crates/flpdf/src/filters.rs | head -40`
-Verify it returns `Result<Vec<u8>>` and applies all filters in `/Filter` order. This matches qpdf's `getStreamData()` semantics (fully decoded).
-
-**Step 0.6: Report findings.**
-
-If any check fails or reveals an API gap, stop and add a Task 0.5 to add/adjust flpdf API surface before continuing.
-
-**Step 0.7: Commit any notes.**
-
-No code changes expected. Skip commit.
+No API additions required. Proceed directly to Task 1.
 
 ---
 
@@ -354,8 +330,11 @@ Cases (small, in-memory `Dictionary` construction; no PDF parsing needed):
 use flpdf::{Dictionary, Object};
 
 pub fn clean_trailer(trailer: &mut Dictionary) {
-    trailer.remove(b"/Length");
-    let Some(id_obj) = trailer.get(b"/ID") else { return; };
+    // NB: flpdf Dictionary keys and Object::Name bytes are stored WITHOUT the
+    // leading `/`. `write_pdf` reinserts the `/` on emission. So "PDF name /X"
+    // is `b"X"` here.
+    trailer.remove(b"Length");
+    let Some(id_obj) = trailer.get(b"ID") else { return; };
     let Some(items) = id_obj.as_array() else { return; };
     if items.len() != 2 { return; }
     let mut id0_bytes = Vec::new();
@@ -367,7 +346,7 @@ pub fn clean_trailer(trailer: &mut Dictionary) {
     let mut new_items = items.to_vec();
     new_items[1] = Object::String(Vec::new());
     if equal { new_items[0] = Object::String(Vec::new()); }
-    trailer.insert(b"/ID", Object::Array(new_items));
+    trailer.insert(b"ID", Object::Array(new_items));
 }
 ```
 
@@ -407,10 +386,10 @@ Cases (using an in-memory Pdf via `Pdf::open_mem_owned` on a fixture — small e
 
 ```rust
 pub fn clean_encryption<R: std::io::Read + std::io::Seek>(pdf: &mut flpdf::Pdf<R>) -> flpdf::Result<()> {
-    let Some(encrypt_obj_ref) = pdf.trailer().get_ref(b"/Encrypt") else { return Ok(()); };
+    let Some(encrypt_obj_ref) = pdf.trailer().get_ref(b"Encrypt") else { return Ok(()); };
     let mut enc = pdf.resolve(encrypt_obj_ref)?;
     let Some(dict) = enc.as_dict_mut() else { return Ok(()); };
-    for k in [b"/O".as_ref(), b"/OE", b"/U", b"/UE", b"/Perms"] { dict.remove(k); }
+    for k in [b"O".as_ref(), b"OE", b"U", b"UE", b"Perms"] { dict.remove(k); }
     pdf.set_object(encrypt_obj_ref, enc);
     Ok(())
 }
@@ -525,8 +504,8 @@ pub fn compare_objects(label: &str, act: &Object, exp: &Object) -> String {
         // Compare dicts with /Length stripped.
         let mut a_dict = a_s.dict.clone();
         let mut e_dict = e_s.dict.clone();
-        a_dict.remove(b"/Length");
-        e_dict.remove(b"/Length");
+        a_dict.remove(b"Length");
+        e_dict.remove(b"Length");
         let mut a_dict_bytes = Vec::new();
         Object::Dictionary(a_dict.clone()).write_pdf(&mut a_dict_bytes);
         let mut e_dict_bytes = Vec::new();
@@ -571,16 +550,16 @@ pub fn compare_objects(label: &str, act: &Object, exp: &Object) -> String {
 }
 
 fn is_xref_stream(d: &flpdf::Dictionary) -> bool {
-    matches!(d.get(b"/Type"), Some(Object::Name(n)) if n.as_slice() == b"/XRef")
+    matches!(d.get(b"Type"), Some(Object::Name(n)) if n.as_slice() == b"XRef")
     // Note: /Type in trailer/xref-stream is unlikely to be an indirect ref,
     // but if pdf-rust-review-patterns.md rule 2 bites us here we should
     // resolve. For now, mirror qpdf's direct isNameAndEquals check.
 }
 
 fn filter_uses_flatedecode(d: &flpdf::Dictionary) -> bool {
-    match d.get(b"/Filter") {
-        Some(Object::Name(n)) => n.as_slice() == b"/FlateDecode",
-        Some(Object::Array(items)) => items.iter().any(|it| matches!(it, Object::Name(n) if n.as_slice() == b"/FlateDecode")),
+    match d.get(b"Filter") {
+        Some(Object::Name(n)) => n.as_slice() == b"FlateDecode",
+        Some(Object::Array(items)) => items.iter().any(|it| matches!(it, Object::Name(n) if n.as_slice() == b"FlateDecode")),
         _ => false,
     }
 }
