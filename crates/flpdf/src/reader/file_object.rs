@@ -155,6 +155,24 @@ mod tests {
         ));
         assert!(direct.diagnostics.is_empty());
 
+        let dict_input = b"6 0 obj\n<< /A 1 >> \nendobj\n";
+        let direct_dict = parse_file_object_syntax(dict_input).unwrap();
+        assert_eq!(direct_dict.indirect_length_ref(), None);
+        let mut expected_dict = Dictionary::new();
+        expected_dict.insert("A", Object::Integer(1));
+        let next_offset = dict_input
+            .windows(6)
+            .position(|window| window == b"endobj")
+            .unwrap();
+        assert_eq!(
+            direct_dict.body,
+            PendingBody::Direct {
+                object: Object::Dictionary(expected_dict),
+                next_offset,
+            }
+        );
+        assert_eq!(skip_pdf_ws(b" \nX", 0), 2);
+
         let empty = parse_file_object_syntax(b"5 0 obj\nendobj\n").unwrap();
         assert_eq!(
             empty.diagnostics,
@@ -171,17 +189,20 @@ mod tests {
         let pending = parse_file_object_syntax(input).unwrap();
         assert_eq!(pending.object_ref, ObjectRef::new(7, 0));
         assert_eq!(pending.indirect_length_ref(), Some(ObjectRef::new(9, 0)));
-        let PendingBody::Stream {
-            dict,
-            data_start,
-            start_eol,
-        } = pending.body
-        else {
-            panic!("expected pending stream");
-        };
-        assert_eq!(dict.get_ref("Length"), Some(ObjectRef::new(9, 0)));
-        assert_eq!(&input[data_start..data_start + 3], b"abc");
-        assert_eq!(start_eol, StreamStartEol::Lf);
+        let mut expected_dict = Dictionary::new();
+        expected_dict.insert("Length", Object::Reference(ObjectRef::new(9, 0)));
+        let data_start = input
+            .windows(3)
+            .position(|window| window == b"abc")
+            .unwrap();
+        assert_eq!(
+            pending.body,
+            PendingBody::Stream {
+                dict: expected_dict,
+                data_start,
+                start_eol: StreamStartEol::Lf,
+            }
+        );
     }
 
     #[test]
