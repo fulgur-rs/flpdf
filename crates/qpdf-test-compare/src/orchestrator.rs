@@ -29,8 +29,12 @@ use crate::compare::compare_objects;
 /// # Errors
 ///
 /// Propagates any [`flpdf::Error`] from parsing either input (invalid PDF
-/// structure, wrong password, corrupt object stream, etc.) or from
-/// resolving individual objects during the per-object walk.
+/// structure, wrong password, corrupt object stream, etc.), from resolving
+/// individual objects during the per-object walk, or from decoding a
+/// `/FlateDecode` payload in the stream branch. Decode failures reach the
+/// same exit-2-with-stderr-only path as parse failures — mirroring qpdf's
+/// oracle, whose `getStreamData()` exception is caught by `main()` and
+/// printed as an error with no stdout dump.
 pub fn compare_files(
     actual_bytes: &[u8],
     expected_bytes: &[u8],
@@ -60,7 +64,7 @@ pub fn compare_files(
         "trailer",
         &Object::Dictionary(act_trailer),
         &Object::Dictionary(exp_trailer),
-    );
+    )?;
     if !trailer_diff.is_empty() {
         return Ok(Some(trailer_diff));
     }
@@ -84,7 +88,7 @@ pub fn compare_files(
         // `ObjectRef::Display` emits "N G R". Format explicitly to mirror
         // qpdf so per-object labels match the oracle byte-for-byte.
         let label = format!("{} {}", a_ref.number, a_ref.generation);
-        let diff = compare_objects(&label, &a_obj, &e_obj);
+        let diff = compare_objects(&label, &a_obj, &e_obj)?;
         if !diff.is_empty() {
             return Ok(Some(diff));
         }

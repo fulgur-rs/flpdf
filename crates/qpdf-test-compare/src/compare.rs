@@ -1,20 +1,24 @@
 //! Per-object semantic comparison matching qpdf v11.9.0's
 //! `compareObjects(label, act, exp)` from `compare-for-test/qpdf-test-compare.cc`.
 //!
-//! Returns the empty string when the two objects match, or a diff-reason
-//! string prefixed with `label` (matching qpdf's exact wording) otherwise.
-//! Covers the non-stream branch (type-code gate, then `write_pdf`-bytes
-//! compare) and the stream branch (`/Length`-stripped dict compare,
-//! `/XRef` data skip, `/FlateDecode` decompress-and-compare).
+//! Returns `Ok("")` when the two objects match, `Ok("<label>: <reason>")`
+//! when they differ, or `Err(flpdf::Error)` when a stream decode fails —
+//! matching qpdf's throw-on-decode-failure semantics, which the CLI turns
+//! into a stderr message + exit 2 with NO stdout dump.
 
 use flpdf::{Dictionary, Object};
 
 /// Compare two resolved [`Object`]s the way qpdf's `qpdf-test-compare` does.
 ///
-/// Returns `""` when they match, or `"<label>: <reason>"` when they differ.
-/// `reason` is one of qpdf's fixed set: `different types`, `object contents
-/// differ`, `stream dictionaries differ`, `stream data size differs`,
-/// `stream data differs`.
+/// Returns `Ok("")` when they match, `Ok("<label>: <reason>")` when they
+/// differ. `reason` is one of qpdf's fixed set: `different types`, `object
+/// contents differ`, `stream dictionaries differ`, `stream data size
+/// differs`, `stream data differs`.
+///
+/// Returns `Err` when the stream branch fails to decode a `/FlateDecode`
+/// payload on either side — mirroring qpdf's oracle, which throws from
+/// `getStreamData()` and is caught by `main()` as an exit-2 error printed
+/// to stderr (with no stdout output).
 ///
 /// Non-stream objects are compared by their [`Object::write_pdf`] bytes,
 /// which is the equivalent of qpdf's `unparseResolved()` on an already-
@@ -27,9 +31,9 @@ use flpdf::{Dictionary, Object};
 /// stripped, then (b) their data — skipped when `/Type == /XRef`,
 /// decompressed via [`flpdf::filters::decode_stream_data`] when
 /// `/FlateDecode` appears in `/Filter`, otherwise raw.
-pub fn compare_objects(label: &str, act: &Object, exp: &Object) -> String {
+pub fn compare_objects(label: &str, act: &Object, exp: &Object) -> flpdf::Result<String> {
     if type_code(act) != type_code(exp) {
-        return format!("{label}: different types");
+        return Ok(format!("{label}: different types"));
     }
     if let (Object::Stream(a_s), Object::Stream(e_s)) = (act, exp) {
         return compare_streams(label, a_s, e_s);
@@ -39,12 +43,12 @@ pub fn compare_objects(label: &str, act: &Object, exp: &Object) -> String {
     let mut e = Vec::new();
     exp.write_pdf(&mut e);
     if a != e {
-        return format!("{label}: object contents differ");
+        return Ok(format!("{label}: object contents differ"));
     }
-    String::new()
+    Ok(String::new())
 }
 
-fn compare_streams(label: &str, a_s: &flpdf::Stream, e_s: &flpdf::Stream) -> String {
+fn compare_streams(label: &str, a_s: &flpdf::Stream, e_s: &flpdf::Stream) -> flpdf::Result<String> {
     // Strip /Length before dict compare (Length necessarily differs between
     // two runs whose compressed payload differs — even for identical decoded
     // content). Cloning the dict is unavoidable (we need &mut Dictionary to
@@ -65,45 +69,39 @@ fn compare_streams(label: &str, a_s: &flpdf::Stream, e_s: &flpdf::Stream) -> Str
     let mut e_dict_bytes = Vec::new();
     Object::Dictionary(e_dict).write_pdf(&mut e_dict_bytes);
     if a_dict_bytes != e_dict_bytes {
-        return format!("{label}: stream dictionaries differ");
+        return Ok(format!("{label}: stream dictionaries differ"));
     }
 
     // qpdf skips the data body for xref streams: same dict is enough,
     // because both writers will have derived the xref-body bytes from the
     // (matching) live object set.
     if is_xref {
-        return String::new();
+        return Ok(String::new());
     }
 
     // Compare payload as `&[u8]` slices — never clone the raw bytes. When
     // /FlateDecode is present, decompress both sides through flpdf's filter
-    // chain (which honors /DecodeParms / Predictor). qpdf's oracle
-    // propagates decode failures as thrown exceptions caught by main() and
-    // printed as the exit-2 error. Our `compare_objects` returns String and
-    // can't itself Err, so a decode failure surfaces as a diff string that
-    // reaches the same exit-2 path in the CLI. Documented deviation.
+    // chain (which honors /DecodeParms / Predictor). qpdf's oracle throws
+    // from `getStreamData()` on decode failure and is caught by `main()` as
+    // exit 2 with stderr text and NO stdout output; propagating the error
+    // via `?` here achieves the same shape (the orchestrator's `?` reaches
+    // main's `Err(e) => eprintln!(...)` branch, which never dumps a file).
     let decoded_a: Vec<u8>;
     let decoded_e: Vec<u8>;
     let (a_slice, e_slice): (&[u8], &[u8]) = if uncompress {
-        decoded_a = match flpdf::filters::decode_stream_data(&a_s.dict, &a_s.data) {
-            Ok(v) => v,
-            Err(err) => return format!("{label}: decode error: {err}"),
-        };
-        decoded_e = match flpdf::filters::decode_stream_data(&e_s.dict, &e_s.data) {
-            Ok(v) => v,
-            Err(err) => return format!("{label}: decode error: {err}"),
-        };
+        decoded_a = flpdf::filters::decode_stream_data(&a_s.dict, &a_s.data)?;
+        decoded_e = flpdf::filters::decode_stream_data(&e_s.dict, &e_s.data)?;
         (&decoded_a, &decoded_e)
     } else {
         (&a_s.data, &e_s.data)
     };
     if a_slice.len() != e_slice.len() {
-        return format!("{label}: stream data size differs");
+        return Ok(format!("{label}: stream data size differs"));
     }
     if a_slice != e_slice {
-        return format!("{label}: stream data differs");
+        return Ok(format!("{label}: stream data differs"));
     }
-    String::new()
+    Ok(String::new())
 }
 
 // Direct match on /Type without resolving through the pdf. This mirrors
@@ -154,18 +152,23 @@ mod tests {
     use flpdf::{ObjectRef, Stream};
     use std::io::Write;
 
+    /// Test helper: unwrap the `flpdf::Result<String>` from `compare_objects`.
+    /// Decode failures are exercised through a dedicated Err-path test rather
+    /// than every match/diff assertion, so unwrapping here is safe and keeps
+    /// the assertions readable.
+    fn cmp(label: &str, a: &Object, e: &Object) -> String {
+        compare_objects(label, a, e).expect("no decode failure in this scenario")
+    }
+
     #[test]
     fn identical_integers_match() {
-        assert_eq!(
-            compare_objects("obj", &Object::Integer(42), &Object::Integer(42)),
-            ""
-        );
+        assert_eq!(cmp("obj", &Object::Integer(42), &Object::Integer(42)), "");
     }
 
     #[test]
     fn different_integers_report_object_contents_differ() {
         assert_eq!(
-            compare_objects("obj", &Object::Integer(1), &Object::Integer(2)),
+            cmp("obj", &Object::Integer(1), &Object::Integer(2)),
             "obj: object contents differ"
         );
     }
@@ -173,7 +176,7 @@ mod tests {
     #[test]
     fn different_type_codes_report_different_types() {
         assert_eq!(
-            compare_objects("obj", &Object::Integer(1), &Object::Name(b"n".to_vec())),
+            cmp("obj", &Object::Integer(1), &Object::Name(b"n".to_vec())),
             "obj: different types"
         );
     }
@@ -190,7 +193,7 @@ mod tests {
             d.insert(b"Version", Object::Name(b"1.7".to_vec()));
             Object::Dictionary(d)
         };
-        assert_eq!(compare_objects("obj", &build(), &build()), "");
+        assert_eq!(cmp("obj", &build(), &build()), "");
     }
 
     #[test]
@@ -206,7 +209,7 @@ mod tests {
         b.insert(b"A", Object::Integer(1));
         b.insert(b"B", Object::Integer(2));
         assert_eq!(
-            compare_objects("obj", &Object::Dictionary(a), &Object::Dictionary(b)),
+            cmp("obj", &Object::Dictionary(a), &Object::Dictionary(b)),
             ""
         );
     }
@@ -214,7 +217,7 @@ mod tests {
     #[test]
     fn reference_vs_integer_report_different_types() {
         assert_eq!(
-            compare_objects(
+            cmp(
                 "obj",
                 &Object::Reference(ObjectRef::new(3, 0)),
                 &Object::Integer(3),
@@ -226,7 +229,7 @@ mod tests {
     #[test]
     fn equal_strings_match() {
         assert_eq!(
-            compare_objects(
+            cmp(
                 "obj",
                 &Object::String(b"hello".to_vec()),
                 &Object::String(b"hello".to_vec()),
@@ -255,7 +258,7 @@ mod tests {
 
         // Both are PDF reals → same type_code → falls into the write-bytes
         // compare path, which reports no diff.
-        assert_eq!(compare_objects("obj", &real, &real_literal), "");
+        assert_eq!(cmp("obj", &real, &real_literal), "");
     }
 
     // ---------- stream branch ----------
@@ -276,7 +279,7 @@ mod tests {
     fn identical_streams_match() {
         let a = Object::Stream(raw_stream(10, b"0123456789".to_vec()));
         let e = Object::Stream(raw_stream(10, b"0123456789".to_vec()));
-        assert_eq!(compare_objects("1 0", &a, &e), "");
+        assert_eq!(cmp("1 0", &a, &e), "");
     }
 
     #[test]
@@ -288,7 +291,7 @@ mod tests {
         // whole point of stripping it.)
         let a = Object::Stream(raw_stream(1, b"same".to_vec()));
         let e = Object::Stream(raw_stream(999, b"same".to_vec()));
-        assert_eq!(compare_objects("2 0", &a, &e), "");
+        assert_eq!(cmp("2 0", &a, &e), "");
     }
 
     #[test]
@@ -301,10 +304,7 @@ mod tests {
         ed.insert(b"Type", Object::Name(b"Bar".to_vec()));
         let a = Object::Stream(Stream::new(ad, b"abc".to_vec()));
         let e = Object::Stream(Stream::new(ed, b"abc".to_vec()));
-        assert_eq!(
-            compare_objects("3 0", &a, &e),
-            "3 0: stream dictionaries differ"
-        );
+        assert_eq!(cmp("3 0", &a, &e), "3 0: stream dictionaries differ");
     }
 
     #[test]
@@ -322,7 +322,7 @@ mod tests {
         };
         let a = make(b"totally different bytes".to_vec());
         let e = make(b"and yet still matches".to_vec());
-        assert_eq!(compare_objects("4 0", &a, &e), "");
+        assert_eq!(cmp("4 0", &a, &e), "");
     }
 
     #[test]
@@ -348,7 +348,7 @@ mod tests {
         };
         let a = make(compressed_a);
         let e = make(compressed_e);
-        assert_eq!(compare_objects("5 0", &a, &e), "");
+        assert_eq!(cmp("5 0", &a, &e), "");
     }
 
     #[test]
@@ -405,7 +405,28 @@ mod tests {
         // downstream is tempted to decode them).
         let a = make(b"41 42 43>".to_vec());
         let e = make(b"44 45 46>".to_vec());
-        assert_eq!(compare_objects("6 0", &a, &e), "6 0: stream data differs");
+        assert_eq!(cmp("6 0", &a, &e), "6 0: stream data differs");
+    }
+
+    #[test]
+    fn flate_decode_failure_propagates_as_err() {
+        // Both sides claim /FlateDecode but the payload is not a valid zlib
+        // stream, so `decode_stream_data` returns Err. Our `compare_objects`
+        // must propagate the Err (matching qpdf's throw-and-catch → stderr +
+        // exit 2 with NO stdout dump). If we swallowed it into a diff string,
+        // main would cat the actual file to stdout, which could be mistaken
+        // for a genuine mismatch of the actual file.
+        let make = |data: Vec<u8>| {
+            let mut d = Dictionary::new();
+            d.insert(b"Filter", Object::Name(b"FlateDecode".to_vec()));
+            d.insert(b"Length", Object::Integer(data.len() as i64));
+            Object::Stream(Stream::new(d, data))
+        };
+        // Not a zlib stream — the decoder must reject.
+        let bogus = b"\x00\x01\x02not zlib\xff\xff\xff".to_vec();
+        let a = make(bogus.clone());
+        let e = make(bogus);
+        assert!(compare_objects("8 0", &a, &e).is_err());
     }
 
     #[test]
@@ -418,9 +439,6 @@ mod tests {
         ed.insert(b"Length", Object::Integer(4));
         let a = Object::Stream(Stream::new(ad, b"abc".to_vec()));
         let e = Object::Stream(Stream::new(ed, b"abcd".to_vec()));
-        assert_eq!(
-            compare_objects("7 0", &a, &e),
-            "7 0: stream data size differs"
-        );
+        assert_eq!(cmp("7 0", &a, &e), "7 0: stream data size differs");
     }
 }
