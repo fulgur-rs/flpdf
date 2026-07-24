@@ -3047,6 +3047,12 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     mut out: W,
     options: &WriteOptions,
 ) -> Result<()> {
+    if options.deterministic_id && options.static_id {
+        return Err(crate::Error::Unsupported(
+            "deterministic_id and static_id are mutually exclusive".to_string(),
+        ));
+    }
+
     // A forced sub-1.5 header suppresses object-stream generation: object
     // streams are a PDF 1.5 feature and qpdf will not emit them under a forced
     // version it must not exceed (observed on qpdf 11.9.0; `--object-streams=generate
@@ -3163,9 +3169,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             .iter()
             .any(|(_reference, offset)| matches!(offset, XrefOffset::Compressed { .. }));
         let plan = object_streams::plan_qpdf_preserve_object_streams(pdf)?;
-        if !plan.batches.is_empty()
-            || (source_had_compressed_objects && !plan.removed_refs.is_empty())
-        {
+        if source_had_compressed_objects || !plan.batches.is_empty() {
             return write_pdf_containerized_qpdf(
                 pdf,
                 out,
@@ -3205,12 +3209,6 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     let new_root = renumber
         .new_for_original(root_ref)
         .ok_or_else(|| crate::Error::Unsupported("renumber: /Root absent from map".to_string()))?;
-
-    if options.deterministic_id && options.static_id {
-        return Err(crate::Error::Unsupported(
-            "deterministic_id and static_id are mutually exclusive".to_string(),
-        ));
-    }
 
     // Pass `false` here because full-rewrite ObjStm emission is only known
     // after planning. The required PDF 1.5 floor is applied below from the
@@ -3306,17 +3304,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     // classic xref table.  An empty plan respects the source form, so a
     // Disable-mode rewrite of a Table-form input still produces a classic
     // xref table.
-    let source_had_compressed_objects = pdf
-        .source_xref_entries()
-        .iter()
-        .any(|(_reference, offset)| matches!(offset, XrefOffset::Compressed { .. }));
-    let qpdf_preserve_dropped_all_containers = qpdf_null_visibility
-        && matches!(options.object_streams, ObjectStreamMode::Preserve)
-        && source_had_compressed_objects
-        && plan.batches.is_empty();
-    let mut effective_xref_form = if qpdf_preserve_dropped_all_containers {
-        XrefForm::Table
-    } else if plan.batches.is_empty() {
+    let mut effective_xref_form = if plan.batches.is_empty() {
         pdf.last_xref_form()
     } else {
         XrefForm::Stream
@@ -4541,7 +4529,7 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
     // qpdf keeps the source 1.5 header but falls back to a classic xref table
     // when no compressed member survives. Keep this path on GenerateRenumber
     // (so removed refs remain direct null) while reproducing that table form.
-    if groups.is_empty() {
+    if groups.is_empty() && matches!(options.object_streams, ObjectStreamMode::Preserve) {
         let xref_offset = bytes.len();
         let max_object_number = offsets.keys().next_back().copied().unwrap_or(0);
         let object_count = generate_invariant(
@@ -4639,10 +4627,13 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
     let mut trailer = pdf.trailer().clone();
     strip_incremental_trailer_keys(&mut trailer);
     remap_qpdf_trailer_refs(pdf, &mut trailer, &renumber)?;
-    let info_ref = match trailer.get("Info") {
-        Some(Object::Reference(r)) => Some(*r),
-        _ => None,
-    };
+    // The specialized xref-stream writer adds the generated `/Root`, `/Size`,
+    // and `/ID` entries itself. Keep every other trimmed/remapped trailer entry
+    // — including a direct `/Info` dictionary — for sorted emission after `/W`.
+    trailer.remove("Root");
+    trailer.remove("Size");
+    trailer.remove("ID");
+    trailer.remove("Encrypt");
 
     let xref_ref = ObjectRef::new(xref_object_number, 0);
     if options.deterministic_id {
@@ -4654,10 +4645,11 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
             filtered: structural_filtered,
             widths,
             index: None,
-            info: info_ref,
+            info: None,
             root: Some(new_root),
             size,
             prev: None,
+            trailer: Some(&trailer),
             id: None,
         };
         let mut id_writer = |out: &mut Vec<u8>| {
@@ -4697,10 +4689,11 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
             filtered: structural_filtered,
             widths,
             index: None,
-            info: info_ref,
+            info: None,
             root: Some(new_root),
             size,
             prev: None,
+            trailer: Some(&trailer),
             id: Some((&id0, &id1)),
         };
         xref_stream::write_object(&mut bytes, xref_ref, &dict, &payload);
