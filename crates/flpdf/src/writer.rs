@@ -3297,17 +3297,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     // classic xref table.  An empty plan respects the source form, so a
     // Disable-mode rewrite of a Table-form input still produces a classic
     // xref table.
-    let source_had_compressed_objects = pdf
-        .source_xref_entries()
-        .iter()
-        .any(|(_reference, offset)| matches!(offset, XrefOffset::Compressed { .. }));
-    let qpdf_preserve_dropped_all_containers = qpdf_null_visibility
-        && matches!(options.object_streams, ObjectStreamMode::Preserve)
-        && source_had_compressed_objects
-        && plan.batches.is_empty();
-    let mut effective_xref_form = if qpdf_preserve_dropped_all_containers {
-        XrefForm::Table
-    } else if plan.batches.is_empty() {
+    let mut effective_xref_form = if plan.batches.is_empty() {
         pdf.last_xref_form()
     } else {
         XrefForm::Stream

@@ -264,6 +264,30 @@ fn preserve_fast_path_rejects_conflicting_id_modes() {
 }
 
 #[test]
+fn preserve_empty_qpdf_plan_supports_deterministic_id() {
+    let fixture =
+        single_member_objstm_fixture(b"<< /Type /Sig /ByteRange [0 1 2 3] /Contents <00> >>", "");
+    let write = || {
+        preserve_fixture(&fixture, |options| {
+            options.static_id = false;
+            options.deterministic_id = true;
+        })
+        .unwrap()
+    };
+    let first = write();
+    let second = write();
+
+    assert_eq!(
+        first, second,
+        "empty-plan Preserve output must honor deterministic ID"
+    );
+    assert!(
+        first.windows(b"\nxref\n".len()).any(|w| w == b"\nxref\n"),
+        "deterministic ID must retain the empty-plan classic xref form"
+    );
+}
+
+#[test]
 fn preserve_fast_path_retains_direct_trailer_extras() {
     let fixture = single_member_objstm_fixture(
         b"<< /Kind /Ordinary >>",
