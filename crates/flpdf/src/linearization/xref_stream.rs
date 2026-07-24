@@ -11,9 +11,10 @@
 //!   otherwise the raw `/W` rows are emitted without `/Filter` or
 //!   `/DecodeParms`, and
 //! * the stream dictionary keys are written in qpdf's fixed order
-//!   (`/Type /Length [/Filter /DecodeParms] /W [/Index] [/Info] [/Root] /Size
-//!   [/Prev] [/ID]`), which is *not* the lexicographic order the generic
-//!   dictionary serializer would produce — so the dictionary is built directly.
+//!   (`/Type /Length /Filter /DecodeParms /W [/Index]`, then sorted trimmed
+//!   trailer entries, then `/ID`), which is *not* the lexicographic order the
+//!   generic dictionary serializer would produce — so the dictionary is built
+//!   directly.
 //!
 //! Byte-identity of the compressed payload depends on the deflate backend: it
 //! matches qpdf only when flate2 links classic zlib (the `qpdf-zlib-compat`
@@ -157,12 +158,12 @@ pub(crate) struct XrefStreamDict<'a> {
     /// `/Prev` byte offset of the previous xref stream (left-justified in a
     /// [`PREV_FIELD_WIDTH`] field); `None` on the chain's final (main) stream.
     pub prev: Option<u64>,
+    /// Additional entries from qpdf's trimmed source trailer. These are merged
+    /// with `/Info`, `/Root`, and `/Size` and written in sorted key order after
+    /// `/W`/`/Index`, before the generated `/ID`.
+    pub trailer: Option<&'a Dictionary>,
     /// Trailer `/ID` as two raw byte strings, serialized as `<hex><hex>`.
     pub id: Option<(&'a [u8], &'a [u8])>,
-    /// Complete trimmed trailer entries for a non-linearized xref stream.
-    /// When present, these replace the dedicated Info/Root/Size/Prev fields and
-    /// are serialized in dictionary key order before the separately written ID.
-    pub trailer: Option<&'a Dictionary>,
 }
 
 /// Append two lowercase hex digits per byte of `bytes` to `out`.
@@ -176,8 +177,9 @@ fn push_hex(out: &mut Vec<u8>, bytes: &[u8]) {
 
 /// Write the xref-stream object header and every dictionary key up to (but not
 /// including) `/ID`, in qpdf's fixed order: `/Type /Length /Filter /DecodeParms
-/// /W [/Index] [/Info] [/Root] /Size [/Prev]`. The caller appends `/ID` (concrete
-/// or inline-written) and the ` >>\nstream\n…` framing.
+/// /W [/Index]`, then the sorted trimmed trailer entries (including generated
+/// `/Root` and `/Size`, with `/Prev` immediately after `/Size`). The caller
+/// appends `/ID` (concrete or inline-written) and the ` >>\nstream\n…` framing.
 fn write_object_dict_prefix(
     out: &mut Vec<u8>,
     object: ObjectRef,
@@ -202,27 +204,23 @@ fn write_object_dict_prefix(
     if let Some((start, count)) = dict.index {
         out.extend_from_slice(format!(" /Index [ {start} {count} ]").as_bytes());
     }
-    if let Some(trailer) = dict.trailer {
-        for (key, value) in trailer.iter() {
-            out.push(b' ');
-            Object::Name(key.to_vec()).write_pdf(out);
-            out.push(b' ');
-            value.write_pdf(out);
-        }
-    } else {
-        if let Some(info) = dict.info {
-            out.extend_from_slice(
-                format!(" /Info {} {} R", info.number, info.generation).as_bytes(),
-            );
-        }
-        if let Some(root) = dict.root {
-            out.extend_from_slice(
-                format!(" /Root {} {} R", root.number, root.generation).as_bytes(),
-            );
-        }
-        out.extend_from_slice(format!(" /Size {}", dict.size).as_bytes());
-        if let Some(prev) = dict.prev {
-            out.extend_from_slice(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes());
+    let mut trailer = dict.trailer.cloned().unwrap_or_default();
+    if let Some(info) = dict.info {
+        trailer.insert("Info", Object::Reference(info));
+    }
+    if let Some(root) = dict.root {
+        trailer.insert("Root", Object::Reference(root));
+    }
+    trailer.insert("Size", Object::Integer(i64::from(dict.size)));
+    for (key, value) in trailer.iter() {
+        out.extend_from_slice(b" /");
+        crate::object::write_name_escaped(out, key);
+        out.push(b' ');
+        value.write_pdf(out);
+        if key == b"Size" {
+            if let Some(prev) = dict.prev {
+                out.extend_from_slice(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes());
+            }
         }
     }
 }
@@ -548,8 +546,8 @@ mod tests {
             // `/Prev` and `/ID` are space-/fixed-width fields, so only their
             // widths (not values) affect the region size.
             prev: Some(2356),
-            id: Some((&ID0, &ID1)),
             trailer: None,
+            id: Some((&ID0, &ID1)),
         };
         assert_eq!(first_pass_region_len(ObjectRef::new(7, 0), &dict, 11), 391);
     }
@@ -649,8 +647,8 @@ mod tests {
             root: None,
             size: 6,
             prev: None,
-            id: Some((&ID0, &ID1)),
             trailer: None,
+            id: Some((&ID0, &ID1)),
         };
         let region = write_padded_region(ObjectRef::new(5, 0), &dict, b"PAYLOAD", 400).unwrap();
         assert_eq!(region.len(), 400);
@@ -670,8 +668,8 @@ mod tests {
             root: None,
             size: 6,
             prev: None,
-            id: Some((&ID0, &ID1)),
             trailer: None,
+            id: Some((&ID0, &ID1)),
         };
         // A 10-byte region cannot hold the object; the writer must error rather
         // than silently overflow the reserved region.
@@ -752,8 +750,8 @@ mod tests {
                 root: Some(ObjectRef::new(8, 0)),
                 size: 17,
                 prev: Some(2226),
-                id: Some((&ID0, &ID1)),
                 trailer: None,
+                id: Some((&ID0, &ID1)),
             },
             b"PAYLOAD",
         );
@@ -772,6 +770,35 @@ mod tests {
         assert!(text.ends_with(" >>\nstream\nPAYLOAD\nendstream\nendobj\n"));
     }
 
+    #[test]
+    fn trimmed_trailer_extras_are_sorted_before_generated_id() {
+        let mut trailer = Dictionary::new();
+        trailer.insert("Info", Object::Dictionary(Dictionary::new()));
+        trailer.insert("Foo", Object::Integer(7));
+        let mut out = Vec::new();
+        write_object(
+            &mut out,
+            ObjectRef::new(7, 0),
+            &XrefStreamDict {
+                filtered: true,
+                widths: [1, 2, 1],
+                index: None,
+                info: None,
+                root: Some(ObjectRef::new(1, 0)),
+                size: 8,
+                prev: None,
+                trailer: Some(&trailer),
+                id: Some((&ID0, &ID1)),
+            },
+            b"X",
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("/W [ 1 2 1 ] /Foo 7 /Info << >> /Root 1 0 R /Size 8 /ID [<"),
+            "trimmed trailer entries must retain qpdf's sorted writeTrailer order: {text}"
+        );
+    }
+
     /// The main xref stream omits /Index, /Info, /Root, and /Prev.
     #[test]
     fn main_xref_dict_omits_chain_and_root_keys() {
@@ -787,8 +814,8 @@ mod tests {
                 root: None,
                 size: 6,
                 prev: None,
-                id: Some((&ID0, &ID1)),
                 trailer: None,
+                id: Some((&ID0, &ID1)),
             },
             b"X",
         );
@@ -832,8 +859,8 @@ mod tests {
                 root: Some(ObjectRef::new(8, 0)),
                 size: 17,
                 prev: Some(2226),
-                id: Some((&ID0, &ID1)),
                 trailer: None,
+                id: Some((&ID0, &ID1)),
             },
             &payload,
         );
@@ -856,8 +883,8 @@ mod tests {
                 root: None,
                 size: 6,
                 prev: None,
-                id: Some((&ID0, &ID1)),
                 trailer: None,
+                id: Some((&ID0, &ID1)),
             },
             &payload,
         );

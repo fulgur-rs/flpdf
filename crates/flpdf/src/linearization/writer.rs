@@ -1145,8 +1145,8 @@ fn write_first_page_xref_stream(
             root: Some(catalog_new_ref),
             size: final_size,
             prev: Some(0),
-            id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
             trailer: None,
+            id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
         };
         xref_stream::first_pass_region_len(obj_ref, &dict, index_count as usize)
     };
@@ -1268,8 +1268,8 @@ fn patch_first_page_xref(
         root: Some(patch.catalog_new_ref),
         size: patch.size,
         prev: Some(prev),
-        id: patch.id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
         trailer: None,
+        id: patch.id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
     };
     // cov:ignore: the `?` below never fires — write_padded_region errors only if
     // the object exceeds its pass-1-sized region. Filtered final payloads fit
@@ -1369,8 +1369,8 @@ fn write_main_xref_stream_and_trailer(
         root: None,
         size: main_count,
         prev: None,
-        id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
         trailer: None,
+        id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
     };
 
     // Pad the object to its fixed pass-1 region (qpdf's writePad), then a newline
@@ -1388,8 +1388,8 @@ fn write_main_xref_stream_and_trailer(
             root: None,
             size: main_count,
             prev: None,
-            id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
             trailer: None,
+            id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
         };
         xref_stream::first_pass_region_len(main_obj_ref, &p1_dict, main_count as usize)
     };
