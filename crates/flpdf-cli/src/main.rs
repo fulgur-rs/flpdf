@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use clap::{ArgGroup, Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, ValueEnum};
 use flpdf::disable_digital_signatures;
 use flpdf::filespec_helper::ascii_filename_fallback;
 use flpdf::{
@@ -36,6 +36,7 @@ use flpdf::{
     copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list,
     insert_embedded_file, list_attachment_info, remove_attachment, FileParamDates, FileSpecBuilder,
 };
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -1436,7 +1437,8 @@ fn main() {
     // repeated occurrences and lose the per-group boundaries and declaration
     // order that byte-identical composition relies on. The residual argv (with
     // those groups removed) is what clap sees.
-    let (residual_args, overlay_specs) = match extract_overlay_groups(std::env::args().collect()) {
+    let rewritten_args = rewrite_qpdf_single_dash(std::env::args().collect());
+    let (residual_args, overlay_specs) = match extract_overlay_groups(rewritten_args) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("flpdf: {error}");
@@ -2663,6 +2665,14 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
         )
         .into());
     }
+    for token in &tokens[..3] {
+        if token.starts_with("-") {
+            return Err(format!(
+                "unrecognized argument {token} (encryption options must be terminated with --)"
+            )
+            .into());
+        }
+    }
     let user_pw = tokens[0].as_bytes().to_vec();
     let owner_pw = tokens[1].as_bytes().to_vec();
     let key_len: u32 = tokens[2].parse().map_err(|_| {
@@ -3624,6 +3634,142 @@ fn parse_overlay_segment(kind: OverlayKind, tokens: &[String]) -> CliResult<Over
         to,
         repeat,
     })
+}
+
+/// A qpdf value-terminated option table that temporarily changes which
+/// single-dash option names are recognized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QpdfArgSegment {
+    Encrypt,
+    Pages,
+    AddAttachment,
+    CopyAttachments,
+    Overlay,
+}
+
+impl QpdfArgSegment {
+    fn from_option_name(name: &str) -> Option<Self> {
+        match name {
+            "encrypt" => Some(Self::Encrypt),
+            "pages" => Some(Self::Pages),
+            "add-attachment" => Some(Self::AddAttachment),
+            "copy-attachments-from" => Some(Self::CopyAttachments),
+            "overlay" | "underlay" => Some(Self::Overlay),
+            _ => None,
+        }
+    }
+
+    fn accepts(self, name: &str) -> bool {
+        match self {
+            Self::Encrypt => matches!(
+                name,
+                "use-aes"
+                    | "force-V4"
+                    | "force-R5"
+                    | "allow-insecure"
+                    | "print"
+                    | "modify"
+                    | "extract"
+                    | "annotate"
+                    | "form"
+                    | "assemble"
+                    | "accessibility"
+                    | "cleartext-metadata"
+            ),
+            Self::Pages => matches!(name, "file" | "password" | "range"),
+            Self::AddAttachment => matches!(
+                name,
+                "key"
+                    | "filename"
+                    | "mimetype"
+                    | "description"
+                    | "creationdate"
+                    | "moddate"
+                    | "afrelationship"
+                    | "replace"
+            ),
+            Self::CopyAttachments => matches!(name, "password" | "prefix"),
+            Self::Overlay => matches!(name, "file" | "password" | "to" | "from" | "repeat"),
+        }
+    }
+}
+
+fn collect_clap_long_options(command: &clap::Command, names: &mut HashSet<String>) {
+    for arg in command.get_arguments() {
+        if let Some(long) = arg.get_long() {
+            names.insert(long.to_string());
+        }
+        if let Some(aliases) = arg.get_all_aliases() {
+            names.extend(aliases.into_iter().map(str::to_string));
+        }
+    }
+    for subcommand in command.get_subcommands() {
+        collect_clap_long_options(subcommand, names);
+    }
+}
+
+fn long_option_name(arg: &str) -> Option<&str> {
+    arg.strip_prefix("--")
+        .filter(|rest| !rest.is_empty())
+        .and_then(|rest| rest.split("=").next())
+}
+
+fn single_dash_option_name(arg: &str) -> Option<&str> {
+    if arg == "-" || arg.starts_with("--") {
+        return None;
+    }
+    let rest = arg.strip_prefix("-")?;
+    if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    rest.split("=").next()
+}
+
+/// Rewrite recognized qpdf-style single-dash long options into double-dash form.
+///
+/// Recognition follows the clap command tree at top level. Within qpdf
+/// value-terminated segments, only that segment sub-options are recognized;
+/// unknown dash-prefixed tokens remain operands. A bare `--` closes an active
+/// segment and resumes top-level option recognition. Outside a segment, `--`
+/// is the real clap end-of-options marker and leaves every later token untouched.
+fn rewrite_qpdf_single_dash(args: Vec<String>) -> Vec<String> {
+    let mut known_long_options = HashSet::new();
+    collect_clap_long_options(&Cli::command(), &mut known_long_options);
+
+    let mut out = Vec::with_capacity(args.len());
+    let mut active_segment = None;
+    let mut passthrough = false;
+
+    for mut arg in args {
+        if passthrough {
+            out.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            out.push(arg);
+            if active_segment.take().is_none() {
+                passthrough = true;
+            }
+            continue;
+        }
+
+        if let Some(name) = single_dash_option_name(&arg) {
+            let recognized = active_segment
+                .map(|segment: QpdfArgSegment| segment.accepts(name))
+                .unwrap_or_else(|| known_long_options.contains(name));
+            if recognized {
+                arg = format!("-{arg}");
+            }
+        }
+
+        if active_segment.is_none() {
+            if let Some(name) = long_option_name(&arg) {
+                active_segment = QpdfArgSegment::from_option_name(name);
+            }
+        }
+        out.push(arg);
+    }
+    out
 }
 
 /// Split the `--overlay`/`--underlay` groups out of the raw argument vector,
@@ -5766,6 +5912,129 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("duplicate --password="), "got: {err}");
+    }
+
+    // --- rewrite_qpdf_single_dash ---------------------------------------
+
+    #[test]
+    fn single_dash_long_becomes_double_dash() {
+        let out = rewrite_qpdf_single_dash(strs(&["flpdf", "-qdf", "-static-id", "in.pdf"]));
+        assert_eq!(out, strs(&["flpdf", "--qdf", "--static-id", "in.pdf"]));
+    }
+
+    #[test]
+    fn single_dash_long_with_equals_becomes_double_dash() {
+        let out = rewrite_qpdf_single_dash(strs(&["flpdf", "-object-streams=generate"]));
+        assert_eq!(out, strs(&["flpdf", "--object-streams=generate"]));
+    }
+
+    #[test]
+    fn double_dash_long_is_untouched() {
+        let out = rewrite_qpdf_single_dash(strs(&["flpdf", "--qdf", "--static-id"]));
+        assert_eq!(out, strs(&["flpdf", "--qdf", "--static-id"]));
+    }
+
+    #[test]
+    fn known_short_flags_untouched() {
+        // -o and -h are the only shorts flpdf declares; they must not be
+        // rewritten to `--o`/`--h`.
+        let out = rewrite_qpdf_single_dash(strs(&["flpdf", "-o", "path", "-h"]));
+        assert_eq!(out, strs(&["flpdf", "-o", "path", "-h"]));
+    }
+
+    #[test]
+    fn stdin_sentinel_and_options_terminator_untouched() {
+        let out = rewrite_qpdf_single_dash(strs(&["flpdf", "-", "--"]));
+        assert_eq!(out, strs(&["flpdf", "-", "--"]));
+    }
+
+    #[test]
+    fn single_dash_long_after_section_terminator_is_rewritten() {
+        let out = rewrite_qpdf_single_dash(strs(&[
+            "flpdf",
+            "-pages",
+            ".",
+            "--",
+            "-qdf",
+            "-not-an-option",
+        ]));
+        assert_eq!(
+            out,
+            strs(&["flpdf", "--pages", ".", "--", "--qdf", "-not-an-option",])
+        );
+    }
+
+    #[test]
+    fn top_level_terminator_preserves_remaining_tokens() {
+        let out = rewrite_qpdf_single_dash(strs(&["flpdf", "--", "-in.pdf", "-qdf"]));
+        assert_eq!(out, strs(&["flpdf", "--", "-in.pdf", "-qdf"]));
+    }
+
+    #[test]
+    fn attached_short_output_is_untouched() {
+        let out = rewrite_qpdf_single_dash(strs(&["flpdf", "-o/tmp/out"]));
+        assert_eq!(out, strs(&["flpdf", "-o/tmp/out"]));
+    }
+
+    #[test]
+    fn hyphenated_segment_operand_is_untouched() {
+        let out = rewrite_qpdf_single_dash(strs(&["flpdf", "-add-attachment", "-note.txt", "--"]));
+        assert_eq!(out, strs(&["flpdf", "--add-attachment", "-note.txt", "--"]));
+    }
+
+    #[test]
+    fn single_dash_segment_sub_option_is_rewritten() {
+        let out =
+            rewrite_qpdf_single_dash(strs(&["flpdf", "-overlay", "stamp.pdf", "-to=1", "--"]));
+        assert_eq!(
+            out,
+            strs(&["flpdf", "--overlay", "stamp.pdf", "--to=1", "--",])
+        );
+    }
+
+    #[test]
+    fn each_segment_kind_recognizes_its_sub_options() {
+        assert!(QpdfArgSegment::Encrypt.accepts("use-aes"));
+        assert!(QpdfArgSegment::Pages.accepts("range"));
+        assert!(QpdfArgSegment::AddAttachment.accepts("replace"));
+        assert!(QpdfArgSegment::CopyAttachments.accepts("prefix"));
+    }
+
+    #[test]
+    fn collect_clap_long_options_includes_aliases() {
+        let command = clap::Command::new("test")
+            .arg(clap::Arg::new("mode").long("mode").alias("legacy-mode"));
+        let mut names = HashSet::new();
+
+        collect_clap_long_options(&command, &mut names);
+
+        assert!(names.contains("mode"));
+        assert!(names.contains("legacy-mode"));
+    }
+
+    #[test]
+    fn legacy_encrypt_password_is_not_rewritten() {
+        let out =
+            rewrite_qpdf_single_dash(strs(&["flpdf", "-encrypt", "-user", "owner", "128", "--"]));
+        assert_eq!(
+            out,
+            strs(&["flpdf", "--encrypt", "-user", "owner", "128", "--",])
+        );
+    }
+
+    #[test]
+    fn legacy_encrypt_password_starting_with_dash_is_rejected() {
+        let err = parse_encrypt_segment(&strs(&["-user", "owner", "128"]), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unrecognized argument -user"), "got: {err}");
+    }
+
+    #[test]
+    fn negative_number_positional_untouched() {
+        // -1 / -0.5 are numeric positionals, never options.
+        let out = rewrite_qpdf_single_dash(strs(&["flpdf", "-1", "-0.5"]));
+        assert_eq!(out, strs(&["flpdf", "-1", "-0.5"]));
     }
 
     // --- extract_overlay_groups -----------------------------------------
