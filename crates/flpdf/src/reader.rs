@@ -2535,6 +2535,23 @@ mod tests {
         assert!(!stream_end_boundary_at(b"xendstream\nendobj", 0));
     }
 
+    #[test]
+    fn decrypt_resolved_object_never_decrypts_the_encrypt_dictionary() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
+        let file = std::fs::File::open(path).expect("encrypted fixture");
+        let pdf = Pdf::open(std::io::BufReader::new(file)).expect("authenticate fixture");
+        let encrypt_ref = pdf.encryption_ref().expect("indirect /Encrypt");
+        let sentinel = Object::Integer(42);
+
+        let (object, stream_payload_decrypted) = pdf
+            .decrypt_resolved_object(encrypt_ref, sentinel.clone())
+            .expect("/Encrypt bypass");
+
+        assert_eq!(object, sentinel);
+        assert!(!stream_payload_decrypted);
+    }
+
     /// Minimal valid single-page PDF used across `open_mem` tests.
     ///
     /// Structure:
