@@ -3304,7 +3304,7 @@ fn run_rewrite(
         // (exit 0, valid output, no diagnostic) — nothing was restricted,
         // matching qpdf's lenient handling of --remove-restrictions on
         // unencrypted files.
-        finish_write_warnings(&input, &pdf, diagnostics_start)?;
+        finish_lazy_warnings(&input, &pdf, diagnostics_start)?;
     }
     Ok(())
 }
@@ -4493,7 +4493,7 @@ fn run_qdf(
     options.full_rewrite = true;
     let mut out = File::create(output)?;
     write_pdf_with_options(&mut pdf, &mut out, &options)?;
-    finish_write_warnings(&input, &pdf, diagnostics_start)
+    finish_lazy_warnings(&input, &pdf, diagnostics_start)
 }
 
 /// `qdf-fix` (qpdf `fix-qdf` equivalent): repair stream `/Length`, xref
@@ -4527,88 +4527,97 @@ fn run_dump_object(
     let object_ref = ObjectRef::parse(object_ref)?;
 
     let mut pdf = open_pdf(&input, repair, password)?;
-    let object = pdf.resolve_borrowed(object_ref)?;
+    let diagnostics_start = pdf.repair_diagnostics().entries().len();
+    {
+        let object = pdf.resolve_borrowed(object_ref)?;
 
-    if matches!(object, Object::Null) {
-        return Err(format!(
-            "object {} {} R not found",
-            object_ref.number, object_ref.generation
-        )
-        .into());
+        if matches!(object, Object::Null) {
+            return Err(format!(
+                "object {} {} R not found",
+                object_ref.number, object_ref.generation
+            )
+            .into());
+        }
+
+        let mut out = Vec::new();
+        object.write_pdf(&mut out);
+        println!("{}", String::from_utf8_lossy(&out));
     }
 
-    let mut out = Vec::new();
-    object.write_pdf(&mut out);
-    println!("{}", String::from_utf8_lossy(&out));
-    Ok(())
+    finish_lazy_warnings(&input, &pdf, diagnostics_start)
 }
 
 fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
     let object_ref = ObjectRef::parse(&cmd.object_ref)?;
     let mut pdf = open_pdf(&cmd.input, cmd.repair, &cmd.password)?;
-    let object = pdf.resolve_borrowed(object_ref)?;
+    let diagnostics_start = pdf.repair_diagnostics().entries().len();
+    let operation = (|| -> CliResult<()> {
+        let object = pdf.resolve_borrowed(object_ref)?;
 
-    if matches!(object, Object::Null) {
-        return Err(format!(
-            "object {} {} R not found",
-            object_ref.number, object_ref.generation
-        )
-        .into());
-    }
+        if matches!(object, Object::Null) {
+            return Err(format!(
+                "object {} {} R not found",
+                object_ref.number, object_ref.generation
+            )
+            .into());
+        }
 
-    let Object::Stream(stream) = object else {
-        return Err(format!(
-            "object {} {} R is not a stream",
-            object_ref.number, object_ref.generation
-        )
-        .into());
-    };
+        let Object::Stream(stream) = object else {
+            return Err(format!(
+                "object {} {} R is not a stream",
+                object_ref.number, object_ref.generation
+            )
+            .into());
+        };
 
-    if cmd.raw {
-        if let Some(path) = cmd.out {
-            std::fs::write(path, &stream.data)?;
+        if cmd.raw {
+            if let Some(path) = cmd.out.as_ref() {
+                std::fs::write(path, &stream.data)?;
+            } else {
+                std::io::stdout().write_all(&stream.data)?;
+                std::io::stdout().flush()?;
+            }
+            return Ok(());
+        }
+
+        // For a single passthrough codec (DCTDecode, JBIG2Decode, JPXDecode,
+        // CCITTFaxDecode) emit a human-readable marker instead of dumping binary.
+        // The codec may be stored either as a direct name (`/Filter /DCTDecode`) or
+        // as a single-element array (`/Filter [/DCTDecode]`); both are equivalent
+        // per PDF spec. Multi-element filter chains fall through to the decode path
+        // (scope: flpdf-9hc.7.5).
+        let passthrough_label = stream.dict.get("Filter").and_then(|filter| {
+            let name = filter.as_name().or_else(|| match filter.as_array() {
+                Some([single]) => single.as_name(),
+                _ => None,
+            })?;
+            filters::passthrough_codec_label(name)
+        });
+        if let Some(label) = passthrough_label {
+            // These codecs are not decodable. With `--out`, write the raw stored
+            // bytes (the only available representation — e.g. the embedded JPEG for
+            // DCTDecode) and report the marker on stderr. Without `--out`, print the
+            // marker to stdout instead of dumping binary to the terminal.
+            if let Some(path) = cmd.out.as_ref() {
+                std::fs::write(path, &stream.data)?;
+                eprintln!("<binary, {} bytes, codec {}>", stream.data.len(), label);
+            } else {
+                println!("<binary, {} bytes, codec {}>", stream.data.len(), label);
+            }
+            return Ok(());
+        }
+
+        let bytes = filters::decode_stream_data(&stream.dict, &stream.data)?;
+        if let Some(path) = cmd.out.as_ref() {
+            std::fs::write(path, bytes)?;
         } else {
-            std::io::stdout().write_all(&stream.data)?;
+            std::io::stdout().write_all(&bytes)?;
             std::io::stdout().flush()?;
         }
-        return Ok(());
-    }
-
-    // For a single passthrough codec (DCTDecode, JBIG2Decode, JPXDecode,
-    // CCITTFaxDecode) emit a human-readable marker instead of dumping binary.
-    // The codec may be stored either as a direct name (`/Filter /DCTDecode`) or
-    // as a single-element array (`/Filter [/DCTDecode]`); both are equivalent
-    // per PDF spec. Multi-element filter chains fall through to the decode path
-    // (scope: flpdf-9hc.7.5).
-    let passthrough_label = stream.dict.get("Filter").and_then(|filter| {
-        let name = filter.as_name().or_else(|| match filter.as_array() {
-            Some([single]) => single.as_name(),
-            _ => None,
-        })?;
-        filters::passthrough_codec_label(name)
-    });
-    if let Some(label) = passthrough_label {
-        // These codecs are not decodable. With `--out`, write the raw stored
-        // bytes (the only available representation — e.g. the embedded JPEG for
-        // DCTDecode) and report the marker on stderr. Without `--out`, print the
-        // marker to stdout instead of dumping binary to the terminal.
-        if let Some(path) = cmd.out {
-            std::fs::write(path, &stream.data)?;
-            eprintln!("<binary, {} bytes, codec {}>", stream.data.len(), label);
-        } else {
-            println!("<binary, {} bytes, codec {}>", stream.data.len(), label);
-        }
-        return Ok(());
-    }
-
-    let bytes = filters::decode_stream_data(&stream.dict, &stream.data)?;
-    if let Some(path) = cmd.out {
-        std::fs::write(path, bytes)?;
-    } else {
-        std::io::stdout().write_all(&bytes)?;
-        std::io::stdout().flush()?;
-    }
-    Ok(())
+        Ok(())
+    })();
+    operation?;
+    finish_lazy_warnings(&cmd.input, &pdf, diagnostics_start)
 }
 
 fn run_show_info(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
@@ -5206,10 +5215,10 @@ fn emit_warnings_since<R: Read + Seek>(path: &Path, pdf: &Pdf<R>, start: usize) 
     }
 }
 
-/// Finish a successful rewrite that accumulated lazy object-recovery warnings.
-/// The writer has already completed the output before this is called; qpdf
-/// likewise leaves the resulting file in place and reports exit 3.
-fn finish_write_warnings<R: Read + Seek>(
+/// Finish a successful operation that accumulated lazy object-recovery
+/// warnings. Any requested output has already been emitted before this is
+/// called; qpdf likewise leaves the output in place and reports exit 3.
+fn finish_lazy_warnings<R: Read + Seek>(
     input: &Path,
     pdf: &Pdf<R>,
     diagnostics_start: usize,
