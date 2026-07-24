@@ -2843,6 +2843,9 @@ mod tests {
             Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]))
         );
         assert_eq!(prefix.get("DecodeParms"), Some(&params));
+
+        let prefix_without_params = filter_prefix_dict(&filters, None, 1);
+        assert_eq!(prefix_without_params.get("DecodeParms"), None);
     }
 
     /// Minimal valid single-page PDF used across `open_mem` tests.
