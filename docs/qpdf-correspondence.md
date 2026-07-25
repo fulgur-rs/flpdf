@@ -2,7 +2,8 @@
 
 **Oracle:** qpdf 11.9.0 (`v11.9.0`) — `libqpdf/`
 （`scripts/fetch-qpdf-source.sh` で取得。パスは `--print-path` で解決する。
-本表のファイル名・行数はすべてこのツリーに対するもの）
+本表のファイル名・行数はすべてこのツリーに対するもの。将来 v12 に追従する際は
+`git log v11.9.0..v12.0.0 -- libqpdf/` が移植差分になる）
 **調査日:** 2026-07-25
 **関連:** `flpdf-qxba`（部品積み上げによる責務分割）/
 [設計書](superpowers/specs/2026-07-25-qpdf-component-bottom-up-refactor-design.md)

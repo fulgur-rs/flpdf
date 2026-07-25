@@ -38,8 +38,11 @@
   - `cargo run --bin flpdf -- --check tests/fixtures/minimal.pdf`
   - `cargo run --bin flpdf -- tests/fixtures/minimal.pdf /tmp/out.pdf`
 - qpdf oracle source (for `libqpdf/X.cc:NNN` citations in docs and module docs):
-  - `scripts/fetch-qpdf-source.sh` installs the sha256-pinned qpdf 11.9.0 tree.
-  - `scripts/fetch-qpdf-source.sh --print-path` resolves it; do not re-download into `/tmp`.
+  - `scripts/fetch-qpdf-source.sh` clones qpdf pinned at the 11.9.0 commit — the version
+    that matches the packaged `/usr/bin/qpdf` used as the behavioural oracle.
+  - `scripts/fetch-qpdf-source.sh --print-path` resolves it; do not re-clone into `/tmp`.
+  - It is a full clone, so `git log`/`git blame` over `libqpdf/` are available for
+    establishing *why* qpdf behaves a given way.
 
 ## 5) Test fixtures / helpers
 - Use real fixtures under `tests/fixtures/` and compatibility data under `tests/fixtures/compat` + `tests/fixtures/compat/golden`.

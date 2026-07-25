@@ -8,40 +8,51 @@
 # Those citations only mean something against one exact tree. This script
 # materialises that tree at a stable path so the references stay resolvable.
 #
-# Pinned to the qpdf 11.9.0 release tarball (tag v11.9.0). The SHA-256 below is
-# the value upstream publishes in the release's own `qpdf-11.9.0.sha256`
-# manifest (verified 2026-07-25). The release tarball is preferred over the
-# GitHub tag archive precisely because it carries that published checksum.
+# Pinned to qpdf 11.9.0 by COMMIT, not by tag: tags are mutable, commit SHAs are
+# content-addressed. `v11.9.0` is expected to point at the pinned commit and the
+# script warns if upstream ever retags.
+#
+# 11.9.0 is not an arbitrary choice — it is the version packaged for the Ubuntu
+# used in development, i.e. the `/usr/bin/qpdf` that serves as the behavioural
+# oracle. Source and binary must agree or every observed-behaviour comparison is
+# unsound, so the script warns when the installed qpdf reports another version.
+# Moving the pin (e.g. to v12) is a three-constant edit below; the install path
+# carries the version, so older citations keep resolving against the old tree.
+#
+# A full clone, not a tarball or a shallow clone: `git log`/`git blame` over
+# libqpdf is what tells us *why* qpdf does something, and `git log v11.9.0..v12.0.0
+# -- libqpdf/` is what a future oracle bump will be planned from. The v11.9.0
+# tree here is byte-identical to the release tarball (verified 2026-07-25:
+# libqpdf/ and include/qpdf/ diff clean), so the extra history costs ~34 MB and
+# changes nothing about the sources being cited.
 #
 # Install location (first match wins):
 #   $FLPDF_QPDF_SRC
 #   ${XDG_CACHE_HOME:-$HOME/.cache}/flpdf/qpdf-11.9.0
 #
 # A user-level cache rather than a repo path: one tree serves every clone and
-# every git worktree, and ~80 MB of C++ stays out of the working tree. The
-# version is part of the directory name, so a future oracle bump can coexist
-# and today's line-number citations keep resolving.
+# every git worktree, and ~114 MB of C++ stays out of the working tree.
 #
 # Usage:
-#   scripts/fetch-qpdf-source.sh               Fetch, verify, extract. Idempotent:
-#                                              a matching tree short-circuits.
+#   scripts/fetch-qpdf-source.sh               Clone, verify the pin, check out.
+#                                              Idempotent: a tree already at the
+#                                              pinned commit short-circuits.
 #   scripts/fetch-qpdf-source.sh --print-path  Print the install path and exit.
-#                                              Never downloads; exits 1 if the
-#                                              tree is missing or incomplete.
-#   scripts/fetch-qpdf-source.sh --force       Re-fetch even when already present.
+#                                              Never clones; exits 1 if the tree
+#                                              is missing or not at the pin.
+#   scripts/fetch-qpdf-source.sh --force       Re-clone even when already present.
 set -euo pipefail
 
 QPDF_VERSION="11.9.0"
 QPDF_TAG="v${QPDF_VERSION}"
-QPDF_SHA256="9f5d6335bb7292cc24a7194d281fc77be2bbf86873e8807b85aeccfbff66082f"
-QPDF_URL="https://github.com/qpdf/qpdf/releases/download/${QPDF_TAG}/qpdf-${QPDF_VERSION}.tar.gz"
+QPDF_COMMIT="3b97c9bd266b7c32ea36d3536e22dab77412886d"
+QPDF_REPO="https://github.com/qpdf/qpdf.git"
 
 # Any file that must exist for the tree to be usable; also the guard against
 # overwriting a directory that is not ours.
 SENTINEL="libqpdf/QPDFWriter.cc"
 
 DEST="${FLPDF_QPDF_SRC:-${XDG_CACHE_HOME:-$HOME/.cache}/flpdf/qpdf-${QPDF_VERSION}}"
-STAMP="${DEST}/.flpdf-qpdf-src-sha256"
 
 PRINT_PATH=0
 FORCE=0
@@ -61,24 +72,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# sha256sum on Linux, shasum -a 256 on macOS.
-sha256_of() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | cut -d' ' -f1
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | cut -d' ' -f1
-  else
-    echo "fetch-qpdf-source.sh: need sha256sum or shasum to verify the download" >&2
-    exit 1
-  fi
-}
-
-# A tree counts as installed only when the stamp records the pinned checksum AND
-# the sentinel file is there — so a half-extracted tree is never mistaken for a
-# good one.
+# A tree counts as installed only when git reports the pinned commit AND the
+# sentinel is there — so an interrupted clone is never mistaken for a good tree.
 installed() {
-  [[ -f "$STAMP" && -f "${DEST}/${SENTINEL}" ]] || return 1
-  [[ "$(cat "$STAMP")" == "$QPDF_SHA256" ]]
+  [[ -d "${DEST}/.git" && -f "${DEST}/${SENTINEL}" ]] || return 1
+  [[ "$(git -C "$DEST" rev-parse HEAD 2>/dev/null)" == "$QPDF_COMMIT" ]]
 }
 
 if (( PRINT_PATH )); then
@@ -92,10 +90,10 @@ if (( PRINT_PATH )); then
 fi
 
 # Only ever replace something we recognise as a qpdf source tree (or a leftover
-# of a previous run). Checked before the download so a misdirected
-# FLPDF_QPDF_SRC fails fast, and again right before the move.
+# of a previous run). Checked before the clone so a misdirected FLPDF_QPDF_SRC
+# fails fast, and again right before the move.
 assert_dest_replaceable() {
-  if [[ -e "$DEST" && ! -f "${DEST}/${SENTINEL}" && ! -f "$STAMP" ]]; then
+  if [[ -e "$DEST" && ! -f "${DEST}/${SENTINEL}" && ! -d "${DEST}/.git" ]]; then
     echo "fetch-qpdf-source.sh: ${DEST} exists but is not a qpdf source tree; refusing to replace it" >&2
     exit 1
   fi
@@ -108,38 +106,39 @@ fi
 
 assert_dest_replaceable
 
-if ! command -v curl >/dev/null 2>&1; then
-  echo "fetch-qpdf-source.sh: curl is required to download ${QPDF_URL}" >&2
+if ! command -v git >/dev/null 2>&1; then
+  echo "fetch-qpdf-source.sh: git is required to clone ${QPDF_REPO}" >&2
   exit 1
 fi
 
 # Scratch space next to the destination, not under $TMPDIR: same filesystem by
-# construction, so the install below is a rename(2) rather than an 80 MB
+# construction, so the install below is a rename(2) rather than a ~114 MB
 # copy+unlink that could be interrupted half-way.
 mkdir -p "$(dirname "$DEST")"
 TMP="$(mktemp -d "$(dirname "$DEST")/.flpdf-qpdf-src.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
-TARBALL="${TMP}/qpdf-${QPDF_VERSION}.tar.gz"
-echo "Downloading ${QPDF_URL}"
-curl -fsSL --retry 3 --retry-delay 2 -o "$TARBALL" "$QPDF_URL"
+echo "Cloning ${QPDF_REPO} (full history)"
+git clone --quiet "$QPDF_REPO" "${TMP}/tree"
 
-ACTUAL="$(sha256_of "$TARBALL")"
-if [[ "$ACTUAL" != "$QPDF_SHA256" ]]; then
-  echo "fetch-qpdf-source.sh: checksum mismatch for qpdf-${QPDF_VERSION}.tar.gz" >&2
-  echo "  expected ${QPDF_SHA256}" >&2
-  echo "  actual   ${ACTUAL}" >&2
+# The pin is the commit. If upstream ever rewrote history so that it is gone, we
+# want a hard failure, not a silently different tree.
+if ! git -C "${TMP}/tree" rev-parse --verify --quiet "${QPDF_COMMIT}^{commit}" >/dev/null; then
+  echo "fetch-qpdf-source.sh: pinned commit ${QPDF_COMMIT} not present in ${QPDF_REPO}" >&2
   exit 1
 fi
-echo "SHA-256 verified: ${QPDF_SHA256}"
 
-# Extract to a scratch tree first; the destination is only touched once the
-# extraction has succeeded, and the stamp is written last.
-mkdir -p "${TMP}/tree"
-tar xzf "$TARBALL" -C "${TMP}/tree" --strip-components=1
+TAG_COMMIT="$(git -C "${TMP}/tree" rev-parse --verify --quiet "${QPDF_TAG}^{commit}" || true)"
+if [[ "$TAG_COMMIT" != "$QPDF_COMMIT" ]]; then
+  echo "fetch-qpdf-source.sh: warning: ${QPDF_TAG} no longer points at the pinned commit" >&2
+  echo "                      pinned ${QPDF_COMMIT}, ${QPDF_TAG} -> ${TAG_COMMIT:-<missing>}" >&2
+  echo "                      installing the pinned commit; re-verify the pin before trusting it" >&2
+fi
+
+git -C "${TMP}/tree" -c advice.detachedHead=false checkout --quiet "$QPDF_COMMIT"
 
 if [[ ! -f "${TMP}/tree/${SENTINEL}" ]]; then
-  echo "fetch-qpdf-source.sh: extracted tree has no ${SENTINEL}; refusing to install" >&2
+  echo "fetch-qpdf-source.sh: checked-out tree has no ${SENTINEL}; refusing to install" >&2
   exit 1
 fi
 
@@ -149,6 +148,17 @@ if [[ -e "$DEST" ]]; then
 fi
 
 mv -f "${TMP}/tree" "$DEST"
-printf '%s\n' "$QPDF_SHA256" > "$STAMP"
 
-echo "qpdf ${QPDF_VERSION} source installed: ${DEST}"
+echo "qpdf ${QPDF_VERSION} source installed: ${DEST} (${QPDF_COMMIT})"
+
+# The oracle binary and the oracle source have to be the same version, or the
+# observed-behaviour comparisons the docs rely on are comparing two qpdfs.
+if command -v qpdf >/dev/null 2>&1; then
+  BIN_VERSION="$(qpdf --version 2>/dev/null | head -1 | awk '{print $3}')"
+  if [[ "$BIN_VERSION" != "$QPDF_VERSION" ]]; then
+    echo "fetch-qpdf-source.sh: warning: installed qpdf is ${BIN_VERSION:-unknown}, pinned source is ${QPDF_VERSION}" >&2
+    echo "                      behavioural comparisons against \$(command -v qpdf) will not match this tree" >&2
+  fi
+else
+  echo "fetch-qpdf-source.sh: note: no qpdf on PATH; the binary oracle is unavailable" >&2
+fi
