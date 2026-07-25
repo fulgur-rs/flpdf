@@ -997,16 +997,15 @@ fn preserve_fast_path_retains_direct_trailer_extras() {
 }
 
 #[test]
-fn legacy_preserve_fallback_splits_source_container_over_100_members() {
+fn preserve_explicit_structural_deletion_keeps_source_container_over_100_members() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/null-visible-preserve-over-100.pdf");
     let mut pdf = Pdf::open(BufReader::new(File::open(path).unwrap())).unwrap();
 
     // The source xref stream is structural and unreachable from the document
-    // graph, so deleting it is a behavior-neutral routing sentinel. It makes
-    // `deleted_object_refs` non-empty, bypassing the dedicated plain qpdf
-    // Preserve writer and exercising the shared legacy planner without
-    // changing the 104 reachable source ObjStm members.
+    // graph, so deleting it is behavior-neutral. Explicit deletions now stay on
+    // the shared Preserve pipeline without changing the 104 reachable source
+    // ObjStm members.
     pdf.delete_object(ObjectRef::new(107, 0));
 
     let mut options = WriteOptions::default();
@@ -1034,7 +1033,7 @@ fn legacy_preserve_fallback_splits_source_container_over_100_members() {
     member_counts.sort_unstable();
     assert_eq!(
         member_counts,
-        vec![4, 100],
-        "legacy Preserve must retain its pre-Task-2 100-member cap"
+        vec![104],
+        "Preserve must retain the source container without Generate's 100-member cap"
     );
 }

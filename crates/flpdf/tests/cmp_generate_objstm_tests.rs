@@ -166,6 +166,16 @@ fn three_page_generate_force_version_1_4_suppressed_is_byte_identical_to_qpdf() 
 // emit (container body, then plain bodies) and the GenerateRenumber plain-object
 // BFS ordering.
 #[test]
+fn one_page_generate_is_byte_identical_to_qpdf() {
+    assert_cmp_diff_zero("one-page.pdf", "one-page");
+}
+
+#[test]
+fn two_page_generate_is_byte_identical_to_qpdf() {
+    assert_cmp_diff_zero("two-page.pdf", "two-page");
+}
+
+#[test]
 fn three_page_generate_is_byte_identical_to_qpdf() {
     assert_cmp_diff_zero("three-page.pdf", "three-page");
 }

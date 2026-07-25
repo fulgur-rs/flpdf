@@ -142,20 +142,18 @@ fn plain_full_rewrite_does_not_emit_deleted_object_as_body() {
         !contains_subslice(&output, b"/Unreferenced 3"),
         "plain full rewrite must not emit the deleted object's body"
     );
-    // The deleted object was reachable from /Root, so it received a new number
-    // during the renumber walk but was skipped at emission. Its slot therefore
-    // survives as a free `f` row, leaving a single non-zero gap in the rebuilt
-    // table (object 4's body is still emitted under its new number).
+    // The shared plain plan excludes explicit deletions before its qpdf-shaped
+    // renumber walk. The surviving objects therefore receive contiguous output
+    // numbers rather than retaining a legacy non-zero free gap.
     let latest_entries = parse_last_xref_entries(&output);
     let free_nonzero: Vec<u32> = latest_entries
         .iter()
         .filter(|(num, kind)| **num != 0 && **kind == b'f')
         .map(|(num, _)| *num)
         .collect();
-    assert_eq!(
-        free_nonzero.len(),
-        1,
-        "exactly one non-zero free xref slot must mark the deleted object \
+    assert!(
+        free_nonzero.is_empty(),
+        "pre-renumber deletion must leave no non-zero free xref gap \
          (entries: {latest_entries:?})"
     );
     // The surviving reachable object (obj 4's `/Unreferenced 4`) must still be
@@ -3463,8 +3461,18 @@ fn full_rewrite_xref_stream_compress_yes_produces_valid_flate_xref() {
         Some(&Object::Name(b"FlateDecode".to_vec())),
         "CompressStreams::Yes xref stream must declare /Filter /FlateDecode"
     );
-    // Keys that must never appear (only stale external-file refs / decode parms).
-    for key in ["DecodeParms", "F", "FFilter", "FDecodeParms"] {
+    // The qpdf-shaped structural encoder deliberately uses PNG prediction.
+    // This is newly constructed policy, not stale source `/DecodeParms`.
+    assert!(
+        matches!(
+            loaded.trailer.get("DecodeParms"),
+            Some(Object::Dictionary(params))
+                if params.get("Predictor") == Some(&Object::Integer(12))
+        ),
+        "rebuilt filtered xref stream must carry predictor-12 /DecodeParms"
+    );
+    // External-file filter keys must never leak from the source dictionary.
+    for key in ["F", "FFilter", "FDecodeParms"] {
         assert!(
             loaded.trailer.get(key).is_none(),
             "rebuilt xref stream must not carry /{key}"

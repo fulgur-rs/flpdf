@@ -23,13 +23,20 @@
 #![cfg(feature = "qpdf-zlib-compat")]
 
 use flpdf::{
-    write_pdf_with_options, NewlineBeforeEndstream, ObjectStreamMode, Pdf, StreamDataMode,
-    WriteOptions,
+    load_xref_and_trailer, write_pdf_with_options, NewlineBeforeEndstream, Object, ObjectRef,
+    ObjectStreamMode, Pdf, StreamDataMode, WriteOptions, XrefOffset,
 };
+use std::io::Cursor;
 use std::path::Path;
 
 /// Full-rewrite `fixture` with the qpdf-matching option set and return the bytes.
 fn rewrite_qpdf_equivalent(fixture: &str) -> Vec<u8> {
+    rewrite_qpdf_equivalent_mode(fixture, ObjectStreamMode::Disable)
+}
+
+/// Full-rewrite `fixture` with an explicit object-stream mode and the
+/// qpdf-matching option set.
+fn rewrite_qpdf_equivalent_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join(fixture);
@@ -38,6 +45,7 @@ fn rewrite_qpdf_equivalent(fixture: &str) -> Vec<u8> {
 
     let mut opts = WriteOptions::default();
     opts.full_rewrite = true;
+    opts.object_streams = mode;
     opts.static_id = true;
     // qpdf's default output writes no newline before endstream.
     opts.newline_before_endstream = NewlineBeforeEndstream::Never;
@@ -85,6 +93,15 @@ fn assert_cmp_diff_zero(fixture: &str, stem: &str) {
             &expected[lo..(off + 16).min(expected.len())],
         );
     }
+}
+
+fn assert_cmp_diff_zero_mode_named(fixture: &str, mode: ObjectStreamMode, stem: &str, name: &str) {
+    let actual = rewrite_qpdf_equivalent_mode(fixture, mode);
+    assert_cmp_diff_zero_named(&actual, stem, name);
+}
+
+fn assert_mode_cmp_diff_zero(fixture: &str, mode: ObjectStreamMode) {
+    assert_cmp_diff_zero_mode_named(&format!("{fixture}.pdf"), mode, fixture, "static-id.pdf");
 }
 
 /// Full-rewrite `fixture` with an explicit object-stream `mode` + forced version
@@ -185,18 +202,88 @@ fn force_below_1_5_downgrades_xref_stream_source_byte_identical_to_qpdf() {
 }
 
 #[test]
-fn one_page_plain_rewrite_is_byte_identical_to_qpdf_static_id() {
-    assert_cmp_diff_zero("one-page.pdf", "one-page");
+fn one_two_three_page_mode_matrix_is_byte_identical_to_qpdf() {
+    for fixture in ["one-page", "two-page", "three-page"] {
+        for mode in [ObjectStreamMode::Disable, ObjectStreamMode::Preserve] {
+            assert_mode_cmp_diff_zero(fixture, mode);
+        }
+    }
 }
 
 #[test]
-fn two_page_plain_rewrite_is_byte_identical_to_qpdf_static_id() {
-    assert_cmp_diff_zero("two-page.pdf", "two-page");
+fn preserve_object_stream_mode_is_byte_identical_to_qpdf_static_id_matrix() {
+    let cases = [
+        ("three-page-objstm.pdf", "three-page-objstm", "preserve.pdf"),
+        (
+            "objstm-lin-od-indirect-length.pdf",
+            "objstm-lin-od-indirect-length",
+            "static-id.pdf",
+        ),
+        (
+            "objstm-lin-od-indirect-length-flate.pdf",
+            "objstm-lin-od-indirect-length-flate",
+            "static-id.pdf",
+        ),
+        (
+            "kept-indirect-length.pdf",
+            "kept-indirect-length",
+            "static-id.pdf",
+        ),
+    ];
+    for (fixture, stem, name) in cases {
+        assert_cmp_diff_zero_mode_named(fixture, ObjectStreamMode::Preserve, stem, name);
+    }
 }
 
 #[test]
-fn three_page_plain_rewrite_is_byte_identical_to_qpdf_static_id() {
-    assert_cmp_diff_zero("three-page.pdf", "three-page");
+fn preserve_nonmonotonic_source_indices_match_qpdf_source_number_order() {
+    let fixture = "nonmonotonic-objstm-index.pdf";
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let source = std::fs::read(path).unwrap();
+    let source_xref = load_xref_and_trailer(&mut Cursor::new(&source)).unwrap();
+    assert_eq!(
+        source_xref.entries.get(&ObjectRef::new(3, 0)),
+        Some(&XrefOffset::Compressed {
+            stream: 4,
+            index: 0,
+        })
+    );
+    assert_eq!(
+        source_xref.entries.get(&ObjectRef::new(2, 0)),
+        Some(&XrefOffset::Compressed {
+            stream: 4,
+            index: 1,
+        })
+    );
+
+    let actual = rewrite_qpdf_equivalent_mode(fixture, ObjectStreamMode::Preserve);
+    assert_cmp_diff_zero_named(&actual, "nonmonotonic-objstm-index", "preserve.pdf");
+
+    let output_xref = load_xref_and_trailer(&mut Cursor::new(&actual)).unwrap();
+    assert_eq!(
+        output_xref.entries.get(&ObjectRef::new(3, 0)),
+        Some(&XrefOffset::Compressed {
+            stream: 2,
+            index: 0,
+        })
+    );
+    assert_eq!(
+        output_xref.entries.get(&ObjectRef::new(4, 0)),
+        Some(&XrefOffset::Compressed {
+            stream: 2,
+            index: 1,
+        })
+    );
+
+    let mut rewritten = Pdf::open(Cursor::new(actual)).unwrap();
+    let catalog = rewritten.resolve(rewritten.root_ref().unwrap()).unwrap();
+    assert!(matches!(catalog, Object::Dictionary(ref dictionary)
+            if dictionary.get("Pages")
+                == Some(&Object::Reference(ObjectRef::new(3, 0)))
+                && dictionary.get("Extra")
+                    == Some(&Object::Reference(ObjectRef::new(4, 0)))));
 }
 
 #[test]

@@ -2450,6 +2450,21 @@ echo "three-page/linearize-objstm-force14.pdf"
 # linearization of the ObjStm-bearing input (NOT identical to three-page's,
 # since qpdf preserves each stream's input dict key order).
 mkdir -p "$REF/three-page-objstm"
+
+# Plain Preserve references. The script-level version gate above pins these
+# byte-sensitive outputs to qpdf 11.9.0; validate each regenerated file before
+# allowing the corpus update to continue.
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/three-page-objstm.pdf" "$REF/three-page-objstm/preserve.pdf"
+echo "three-page-objstm/preserve.pdf"
+qpdf --check --warning-exit-0 "$REF/three-page-objstm/preserve.pdf"
+
+mkdir -p "$REF/nonmonotonic-objstm-index"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/nonmonotonic-objstm-index.pdf" "$REF/nonmonotonic-objstm-index/preserve.pdf"
+echo "nonmonotonic-objstm-index/preserve.pdf"
+qpdf --check --warning-exit-0 "$REF/nonmonotonic-objstm-index/preserve.pdf"
+
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/three-page-objstm.pdf" "$REF/three-page-objstm/linearize-objstm.pdf"
 echo "three-page-objstm/linearize-objstm.pdf"
@@ -2466,6 +2481,14 @@ qpdf --linearize --object-streams=preserve --force-version=1.4 --deterministic-i
     "$FIX/three-page-objstm.pdf" "$REF/three-page-objstm/linearize-downgrade-force14.pdf"
 echo "three-page-objstm/linearize-downgrade-force14.pdf"
 
+# NON-linearized --object-streams=preserve on the same ObjStm/xref-stream source,
+# with the header left alone: qpdf reuses the source ObjStm membership and keeps
+# the inherited cross-reference stream. This anchors the Preserve row of
+# cmp_diff_zero_tests' static-id matrix.
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/three-page-objstm.pdf" "$REF/three-page-objstm/preserve.pdf"
+echo "three-page-objstm/preserve.pdf"
+
 # NON-linearized --object-streams=generate (cross-reference *stream* form, header
 # floored to 1.5). --static-id keeps /ID byte-stable: /ID[0] is the preserved
 # source identifier (or the pi constant when the source has none) and /ID[1] is
@@ -2473,6 +2496,14 @@ echo "three-page-objstm/linearize-downgrade-force14.pdf"
 # masking). Gated on qpdf-zlib-compat (flpdf-g6hb.1). three-page interleaves
 # plain content streams with the ObjStm container; the no-stream fixtures isolate
 # the numbering.
+qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/one-page.pdf" "$REF/one-page/generate.pdf"
+echo "one-page/generate.pdf"
+
+qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/two-page.pdf" "$REF/two-page/generate.pdf"
+echo "two-page/generate.pdf"
+
 qpdf --object-streams=generate --static-id --warning-exit-0 \
     "$FIX/three-page.pdf" "$REF/three-page/generate.pdf"
 echo "three-page/generate.pdf"

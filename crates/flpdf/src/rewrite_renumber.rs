@@ -107,7 +107,7 @@ impl CatalogFirstRenumber {
         pdf: &mut Pdf<R>,
         skip_length: bool,
     ) -> crate::Result<Self> {
-        Self::build_with_visibility(pdf, skip_length, false)
+        Self::build_with_visibility(pdf, skip_length, false, &BTreeSet::new())
     }
 
     /// Compute Catalog-first numbering with qpdf's null-aware dictionary
@@ -116,13 +116,24 @@ impl CatalogFirstRenumber {
         pdf: &mut Pdf<R>,
         skip_length: bool,
     ) -> crate::Result<Self> {
-        Self::build_with_visibility(pdf, skip_length, true)
+        Self::build_qpdf_excluding(pdf, skip_length, &BTreeSet::new())
+    }
+
+    /// Compute qpdf-visible Catalog-first numbering while directizing the
+    /// operation's explicitly removed identities before they enter the queue.
+    pub(crate) fn build_qpdf_excluding<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        skip_length: bool,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> crate::Result<Self> {
+        Self::build_with_visibility(pdf, skip_length, true, removed_refs)
     }
 
     fn build_with_visibility<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         skip_length: bool,
         qpdf_visibility: bool,
+        removed_refs: &BTreeSet<ObjectRef>,
     ) -> crate::Result<Self> {
         let mut old_to_new: HashMap<ObjectRef, ObjectRef> = HashMap::new();
         let mut order: Vec<ObjectRef> = Vec::new();
@@ -160,7 +171,9 @@ impl CatalogFirstRenumber {
         }
 
         for seed in seeds {
-            enqueue(seed, &mut old_to_new, &mut order, &mut queue);
+            if !removed_refs.contains(&seed) {
+                enqueue(seed, &mut old_to_new, &mut order, &mut queue);
+            }
         }
 
         while let Some(cur) = queue.pop_front() {
@@ -169,12 +182,16 @@ impl CatalogFirstRenumber {
                 let mut found = Vec::new();
                 collect_qpdf_enqueue_refs(pdf, &obj, 0, skip_length, &mut found)?;
                 for reference in found {
-                    enqueue(reference, &mut old_to_new, &mut order, &mut queue);
+                    if !removed_refs.contains(&reference) {
+                        enqueue(reference, &mut old_to_new, &mut order, &mut queue);
+                    }
                 }
             } else {
                 let obj = pdf.resolve_borrowed(cur)?;
                 collect_refs(obj, 0, skip_length, &mut |r| {
-                    enqueue(r, &mut old_to_new, &mut order, &mut queue);
+                    if !removed_refs.contains(&r) {
+                        enqueue(r, &mut old_to_new, &mut order, &mut queue);
+                    }
                 })?;
             }
         }

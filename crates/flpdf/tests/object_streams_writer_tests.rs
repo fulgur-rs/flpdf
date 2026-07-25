@@ -9,7 +9,10 @@
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::ObjectStreamMode;
-use flpdf::{check_reader, write_pdf_with_options, Object, ObjectRef, Pdf, WriteOptions};
+use flpdf::{
+    check_reader, load_xref_and_trailer, write_pdf_with_options, Object, ObjectRef, Pdf,
+    WriteOptions, XrefOffset,
+};
 use std::io::{Cursor, Write};
 
 // ── Fixture builders ─────────────────────────────────────────────────────────
@@ -214,6 +217,188 @@ fn roundtrip_disable_mode_emits_no_objstm() {
         }
         other => panic!("Object 2 should be a Dictionary, got {:?}", other),
     }
+}
+
+#[test]
+fn nostream_130_generate_has_two_66_member_containers_with_dense_indices() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/objstm-gen-nostream-130rev.pdf");
+    let file = std::fs::File::open(&path).unwrap_or_else(|error| panic!("open {path:?}: {error}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Generate;
+    options.static_id = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut containers = Vec::new();
+    for reference in reopened.object_refs() {
+        if let Ok(Object::Stream(stream)) = reopened.resolve(reference) {
+            if matches!(
+                stream.dict.get("Type"),
+                Some(Object::Name(name)) if name.as_slice() == b"ObjStm"
+            ) {
+                assert_eq!(
+                    stream.dict.get("N"),
+                    Some(&Object::Integer(66)),
+                    "container {reference} must declare exactly 66 members"
+                );
+                containers.push(reference.number);
+            }
+        }
+    }
+    assert_eq!(
+        containers.len(),
+        2,
+        "Generate must even-split 132 eligible objects into two containers"
+    );
+
+    let xref = load_xref_and_trailer(&mut Cursor::new(&output)).unwrap();
+    for container in containers {
+        let mut indices: Vec<u32> = xref
+            .entries
+            .values()
+            .filter_map(|entry| match entry {
+                XrefOffset::Compressed { stream, index } if *stream == container => Some(*index),
+                _ => None,
+            })
+            .collect();
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            (0..66).collect::<Vec<_>>(),
+            "container {container} must use dense type-2 xref indices 0..65"
+        );
+    }
+}
+
+#[test]
+fn plain_plan_failure_leaves_caller_writer_untouched() {
+    let mut source = build_xref_table_pdf();
+    let root_entry = b"/Root 1 0 R";
+    let offset = source
+        .windows(root_entry.len())
+        .position(|window| window == root_entry)
+        .expect("fixture trailer must contain /Root");
+    source[offset..offset + root_entry.len()].fill(b' ');
+    for mode in [ObjectStreamMode::Disable, ObjectStreamMode::Preserve] {
+        let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
+        let mut options = WriteOptions::default();
+        options.full_rewrite = true;
+        options.object_streams = mode;
+        let mut output = b"caller-prefix".to_vec();
+
+        let error = write_pdf_with_options(&mut pdf, &mut output, &options).unwrap_err();
+
+        assert!(
+            matches!(error, flpdf::Error::Missing("/Root")),
+            "expected the plain planner's missing-root error, got {error:?}"
+        );
+        assert_eq!(
+            output, b"caller-prefix",
+            "planning failure must not write any bytes to the caller's writer"
+        );
+    }
+}
+
+#[test]
+fn preserve_empty_surviving_container_uses_table_without_dangling_entries() {
+    let source = build_xref_stream_pdf_with_objstm();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    pdf.delete_object(ObjectRef::new(2, 0));
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Preserve;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    assert!(
+        output
+            .windows(b"\nxref\n".len())
+            .any(|bytes| bytes == b"\nxref\n"),
+        "an empty surviving source container must fall back to a classic xref table"
+    );
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "rewritten output must be valid: {:?}",
+        report.diagnostics.entries()
+    );
+    let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
+    for reference in reopened.object_refs() {
+        assert!(
+            !matches!(
+                reopened.resolve(reference),
+                Ok(Object::Stream(ref stream))
+                    if matches!(stream.dict.get("Type"), Some(Object::Name(name))
+                        if name.as_slice() == b"ObjStm")
+            ),
+            "an empty source container must not be emitted"
+        );
+    }
+    let catalog = reopened.resolve(reopened.root_ref().unwrap()).unwrap();
+    assert!(
+        matches!(catalog, Object::Dictionary(ref dictionary)
+            if dictionary.get("Pages").is_none()),
+        "a dictionary entry that references the deleted source member must disappear"
+    );
+}
+
+#[test]
+fn preserve_explicit_deleted_member_becomes_null_without_dangling_xref() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page-objstm.pdf");
+    let mut pdf = Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+    pdf.delete_object(ObjectRef::new(4, 0));
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Preserve;
+    options.static_id = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "rewritten output must be valid: {:?}",
+        report.diagnostics.entries()
+    );
+    let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
+    let catalog = reopened.resolve(reopened.root_ref().unwrap()).unwrap();
+    let pages_ref = match catalog {
+        Object::Dictionary(dictionary) => match dictionary.get("Pages") {
+            Some(Object::Reference(reference)) => *reference,
+            other => panic!("catalog /Pages must be an indirect reference, got {other:?}"),
+        },
+        other => panic!("catalog must be a dictionary, got {other:?}"),
+    };
+    let pages = reopened.resolve(pages_ref).unwrap();
+    assert!(
+        matches!(pages, Object::Dictionary(ref dictionary)
+            if matches!(dictionary.get("Kids"), Some(Object::Array(kids))
+                if kids.first() == Some(&Object::Null))),
+        "the deleted page's surviving /Kids occurrence must become null"
+    );
+    let mut found_objstm = false;
+    for reference in reopened.object_refs() {
+        let object = reopened
+            .resolve(reference)
+            .unwrap_or_else(|error| panic!("xref entry {reference} must resolve: {error}"));
+        if matches!(
+            object,
+            Object::Stream(ref stream)
+                if matches!(stream.dict.get("Type"), Some(Object::Name(name))
+                    if name.as_slice() == b"ObjStm")
+        ) {
+            found_objstm = true;
+        }
+    }
+    assert!(found_objstm, "surviving source members must keep an ObjStm");
 }
 
 // ── c. Generate mode packs eligible objects ───────────────────────────────────
