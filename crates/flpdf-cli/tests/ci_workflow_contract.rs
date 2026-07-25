@@ -4,6 +4,23 @@ use std::path::Path;
 const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
 const WHOLE_FILE_ZLIB_GATE: &str = "#![cfg(feature = \"qpdf-zlib-compat\")]";
 
+fn workflow_contains_test_command(workflow: &str, command: &str) -> bool {
+    workflow.lines().map(str::trim).any(|line| {
+        let Some(suffix) = line.strip_prefix(command) else {
+            return false;
+        };
+        suffix.is_empty() || suffix.chars().next().is_some_and(char::is_whitespace)
+    })
+}
+
+#[test]
+fn workflow_command_match_does_not_accept_longer_test_name() {
+    let command = "cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_byte_identical";
+    let workflow = format!("{command}_overlay");
+
+    assert!(!workflow_contains_test_command(&workflow, command));
+}
+
 #[test]
 fn ci_runs_every_whole_file_qpdf_zlib_compat_test() {
     let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -41,7 +58,7 @@ fn ci_runs_every_whole_file_qpdf_zlib_compat_test() {
             let command = format!(
                 "cargo test -p {crate_name} --features qpdf-zlib-compat --test {test_name}"
             );
-            if !CI_WORKFLOW.contains(&command) {
+            if !workflow_contains_test_command(CI_WORKFLOW, &command) {
                 missing.push(format!("{crate_name}/{test_name}"));
             }
         }
