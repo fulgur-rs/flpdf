@@ -1,5 +1,8 @@
 #[path = "writer/object_streams.rs"]
 pub(crate) mod object_streams;
+#[path = "writer/plain/mod.rs"]
+#[allow(dead_code)] // Wired into production by the later plain-writer routing layer.
+pub(crate) mod plain;
 #[path = "writer/serialize.rs"]
 pub(crate) mod serialize;
 pub use object_streams::ObjectStreamMode;
