@@ -1,5 +1,76 @@
 use flpdf::{parse_object, Dictionary, Error, Object, ObjectRef};
 
+fn parsed_stream_data(input: &[u8]) -> Vec<u8> {
+    parse_object(input)
+        .expect("stream must parse")
+        .into_stream()
+        .expect("expected stream")
+        .data
+}
+
+#[test]
+fn public_parser_recovers_indirect_stream_length() {
+    assert_eq!(
+        parsed_stream_data(b"<< /Length 9 0 R >>\nstream\nabc\nendstream"),
+        b"abc"
+    );
+}
+
+#[test]
+fn public_parser_accepts_a_comment_before_the_stream_keyword() {
+    assert_eq!(
+        parsed_stream_data(b"<< /Length 3 >> % comment\r\nstream\nabcendstream"),
+        b"abc"
+    );
+}
+
+#[test]
+fn public_parser_ignores_inline_endstream_tokens_during_recovery() {
+    assert_eq!(
+        parsed_stream_data(b"<< /Length 9 0 R >>\nstream\nabc endstream def\nendstream"),
+        b"abc endstream def"
+    );
+}
+
+#[test]
+fn public_parser_rejects_truncated_stream_with_indirect_length() {
+    let err = parse_object(b"<< /Length 9 0 R >>\nstream\nabc")
+        .expect_err("truncated stream with an indirect length must error");
+
+    assert!(
+        matches!(err, Error::Parse { .. }),
+        "expected Error::Parse, got {err:?}"
+    );
+}
+
+#[test]
+fn public_parser_recovers_missing_stream_length() {
+    assert_eq!(parsed_stream_data(b"<< >>\nstream\nabc\nendstream"), b"abc");
+}
+
+#[test]
+fn public_parser_recovers_non_integer_stream_length() {
+    assert_eq!(
+        parsed_stream_data(b"<< /Length /Bad >>\nstream\nabc\nendstream"),
+        b"abc"
+    );
+}
+
+#[test]
+fn public_parser_rejects_mismatched_usable_direct_stream_length() {
+    for input in [
+        &b"<< /Length 1 >>\nstream\nabc\nendstream"[..],
+        &b"<< /Length 5 >>\nstream\nabc\nendstream"[..],
+    ] {
+        let err =
+            parse_object(input).expect_err("a usable direct /Length must define the boundary");
+        assert!(
+            matches!(err, Error::Parse { .. }),
+            "expected Error::Parse, got {err:?}"
+        );
+    }
+}
+
 #[test]
 fn parses_dictionary_with_reference() {
     let object = parse_object(b"<< /Type /Catalog /Pages 2 0 R >>").unwrap();

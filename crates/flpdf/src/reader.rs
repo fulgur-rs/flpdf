@@ -1,7 +1,13 @@
+pub(crate) mod file_object;
+
+use self::file_object::{
+    finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, PendingFileObject,
+    RecoveryPolicy, ResolvedStreamLength,
+};
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
-use crate::parser::{parse_indirect_object_detailed_qpdf, parse_qpdf_file_object, Parser};
+use crate::parser::{parse_qpdf_file_object, Parser};
 use crate::security::password::{normalize_password, PasswordMode};
 use crate::security::standard::{
     check_owner_password, check_owner_password_r5, check_owner_password_r6,
@@ -98,16 +104,6 @@ pub struct Pdf<R: Read + Seek> {
 pub(crate) struct QpdfPreparedObjects {
     pub(crate) refs: Vec<ObjectRef>,
     pub(crate) max_object_id: u32,
-}
-
-struct FileObjectRead {
-    bytes: Vec<u8>,
-    object_ref: ObjectRef,
-    object: Object,
-    indirect_length: Option<crate::parser::IndirectStreamLength>,
-    recovered_stream_eol: Option<crate::parser::RecoveredStreamEol>,
-    empty_offset: Option<usize>,
-    expected_endobj_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -1154,55 +1150,113 @@ impl<R: Read + Seek> Pdf<R> {
     /// stream data during repair) — it falls back to reading to EOF, but only
     /// while [`Self::resolution_fallbacks_remaining`] permits, so a flood of such
     /// objects cannot revive the quadratic cost.
-    fn read_object_at(&mut self, offset: u64) -> Result<FileObjectRead> {
+    fn read_object_at(
+        &mut self,
+        expected_ref: ObjectRef,
+        offset: u64,
+    ) -> Result<file_object::FileObjectRead> {
+        self.read_object_at_with_policy(
+            expected_ref,
+            offset,
+            RecoveryPolicy::RequireTokenTerminator,
+            RecoveryPolicy::Bounded,
+        )
+    }
+
+    fn read_object_at_with_policy(
+        &mut self,
+        expected_ref: ObjectRef,
+        offset: u64,
+        window_policy: RecoveryPolicy,
+        full_policy: RecoveryPolicy,
+    ) -> Result<file_object::FileObjectRead> {
         let next = self.next_object_offset(offset);
         self.reader.seek(SeekFrom::Start(offset))?;
         let mut bytes = Vec::new();
         match next {
             Some(next) => {
-                let len = next.saturating_sub(offset);
-                self.reader.by_ref().take(len).read_to_end(&mut bytes)?;
+                self.reader
+                    .by_ref()
+                    .take(next.saturating_sub(offset))
+                    .read_to_end(&mut bytes)?;
             }
             None => {
                 self.reader.read_to_end(&mut bytes)?;
             }
         }
 
-        match parse_indirect_object_detailed_qpdf(&bytes) {
-            Ok(parsed) => Ok(FileObjectRead {
-                bytes,
-                object_ref: parsed.object_ref,
-                object: parsed.object,
-                indirect_length: parsed.indirect_length,
-                recovered_stream_eol: parsed.recovered_stream_eol,
-                empty_offset: parsed.empty_offset,
-                expected_endobj_offset: parsed.expected_endobj_offset,
-            }),
-            // The window stopped short of a complete object. Only a bounded
-            // window (`next` is `Some`) can do this; if we already read to EOF,
-            // the input itself is the limit and the error is real.
+        let initial_policy = if next.is_some() {
+            window_policy
+        } else {
+            full_policy
+        };
+        match self.parse_and_finish_file_object(expected_ref, &bytes, offset, initial_policy) {
+            Ok(parsed) => Ok(parsed),
             Err(window_err) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
                 self.resolution_fallbacks_remaining -= 1;
                 self.reader.seek(SeekFrom::Start(offset))?;
                 let mut full = Vec::new();
                 self.reader.read_to_end(&mut full)?;
-                // Prefer the full parse, but keep the window error if even the
-                // full read cannot parse (so the failure stays the parser's).
-                match parse_indirect_object_detailed_qpdf(&full) {
-                    Ok(parsed) => Ok(FileObjectRead {
-                        bytes: full,
-                        object_ref: parsed.object_ref,
-                        object: parsed.object,
-                        indirect_length: parsed.indirect_length,
-                        recovered_stream_eol: parsed.recovered_stream_eol,
-                        empty_offset: parsed.empty_offset,
-                        expected_endobj_offset: parsed.expected_endobj_offset,
-                    }),
-                    Err(_) => Err(window_err),
-                }
+                self.parse_and_finish_file_object(expected_ref, &full, offset, full_policy)
+                    .or(Err(window_err))
             }
-            Err(window_err) => Err(window_err),
+            Err(err) => Err(err),
         }
+    }
+
+    fn parse_and_finish_file_object(
+        &mut self,
+        expected_ref: ObjectRef,
+        bytes: &[u8],
+        offset: u64,
+        policy: RecoveryPolicy,
+    ) -> Result<file_object::FileObjectRead> {
+        let pending = parse_file_object_syntax(bytes)?;
+        let resolved_length = self.resolve_pending_stream_length(expected_ref, &pending, offset)?;
+        let result = finish_file_object(bytes, pending, resolved_length, policy);
+        self.cache.set_unresolved(expected_ref, offset);
+        result
+    }
+
+    fn resolve_pending_stream_length(
+        &mut self,
+        expected_ref: ObjectRef,
+        pending: &PendingFileObject,
+        offset: u64,
+    ) -> Result<Option<ResolvedStreamLength>> {
+        let Some(holder) = pending.indirect_length_ref() else {
+            return Ok(None);
+        };
+        if holder == pending.object_ref {
+            return Ok(Some(ResolvedStreamLength::Missing));
+        }
+
+        self.cache.set_reserved(expected_ref);
+        let resolved_object = match self.resolve_borrowed(holder) {
+            Ok(Object::Integer(value)) => Ok(Some(ResolvedStreamLength::Integer(*value))),
+            Ok(Object::Null) => Ok(None),
+            Ok(_) => Ok(Some(ResolvedStreamLength::Invalid)),
+            Err(Error::Parse { .. }) => Ok(Some(ResolvedStreamLength::Invalid)),
+            Err(err) => Err(err),
+        };
+        let resolved = match resolved_object {
+            Ok(Some(resolved)) => resolved,
+            Ok(None)
+                if matches!(
+                    self.cache.entry(holder),
+                    None | Some(CacheEntry::Missing | CacheEntry::Deleted)
+                ) =>
+            {
+                ResolvedStreamLength::Missing
+            }
+            Ok(None) => ResolvedStreamLength::Invalid,
+            Err(err) => {
+                self.cache.set_unresolved(expected_ref, offset);
+                return Err(err);
+            }
+        };
+        self.cache.set_unresolved(expected_ref, offset);
+        Ok(Some(resolved))
     }
 
     pub(crate) fn resolve_qpdf_json_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
@@ -1253,59 +1307,27 @@ impl<R: Read + Seek> Pdf<R> {
 
         match entry.cloned() {
             Some(CacheEntry::Unresolved { offset }) => {
-                let parsed = self.read_object_at(offset)?;
+                let mut parsed = self.read_object_at(object_ref, offset)?;
                 if parsed.object_ref != object_ref {
                     return Ok(false);
                 }
-                let mut object = parsed.object;
-                let mut endstream_scan_authoritative = parsed.recovered_stream_eol.is_some();
-                // When the stream's /Length is an indirect reference, the parser
-                // had no xref and recorded the payload window instead of a
-                // resolved length. Resolve the holder via the xref and re-slice
-                // to the authoritative length. This MUST happen before
-                // decryption: `object`/`bytes` are still ciphertext here, and
-                // `decrypt_resolved_object` decrypts in place afterwards.
-                if let Some(isl) = parsed.indirect_length {
-                    let used_endstream_scan = self.apply_indirect_stream_length(
-                        object_ref,
-                        &mut object,
-                        isl,
-                        &parsed.bytes,
-                        offset,
-                    )?;
-                    if parsed.recovered_stream_eol.is_some() {
-                        endstream_scan_authoritative = used_endstream_scan;
-                    }
-                }
-                // `apply_indirect_stream_length` already restored the lazy
-                // `Unresolved` entry, so a decryption error here leaves it
-                // `Unresolved` (not `Reserved`) and the failure stays loud on a
-                // retry.
-                let recovered_eol = endstream_scan_authoritative
-                    .then_some(parsed.recovered_stream_eol)
-                    .flatten()
-                    .map(crate::parser::RecoveredStreamEol::as_bytes);
+                let recovered_eol = parsed.remove_included_recovery_eol_for_decryption();
+                let recovered_eol_bytes =
+                    recovered_eol.map(crate::parser::RecoveredStreamEol::as_bytes);
                 let (object, stream_payload_transformed) =
-                    self.decrypt_resolved_object(object_ref, object, recovered_eol)?;
+                    self.decrypt_resolved_object(object_ref, parsed.object, recovered_eol_bytes)?;
                 self.cache.set_resolved(object_ref, object);
                 if stream_payload_transformed {
                     self.transformed_stream_refs.insert(object_ref);
                 } else {
                     self.transformed_stream_refs.remove(&object_ref);
                 }
-                if endstream_scan_authoritative {
-                    if let Some(eol) = parsed.recovered_stream_eol {
-                        self.recovered_stream_eols.insert(object_ref, eol);
-                    }
+                if let Some(eol) = recovered_eol {
+                    self.recovered_stream_eols.insert(object_ref, eol);
                 } else {
                     self.recovered_stream_eols.remove(&object_ref);
                 }
-                self.record_file_object_warnings(
-                    object_ref,
-                    offset,
-                    parsed.empty_offset,
-                    parsed.expected_endobj_offset,
-                );
+                self.record_file_object_diagnostics(object_ref, offset, parsed.diagnostics);
                 Ok(true)
             }
             Some(CacheEntry::Compressed { stream, index }) => {
@@ -1321,154 +1343,20 @@ impl<R: Read + Seek> Pdf<R> {
         }
     }
 
-    fn record_file_object_warnings(
+    fn record_file_object_diagnostics(
         &mut self,
         object_ref: ObjectRef,
         offset: u64,
-        empty_offset: Option<usize>,
-        expected_endobj_offset: Option<usize>,
+        diagnostics: Vec<FileObjectDiagnostic>,
     ) {
-        if let Some(relative_offset) = empty_offset {
+        for diagnostic in diagnostics {
             self.push_warning(format!(
-                "(object {} {}, offset {}): empty object treated as null",
+                "(object {} {}, offset {}): {}",
                 object_ref.number,
                 object_ref.generation,
-                offset.saturating_add(relative_offset as u64)
+                offset.saturating_add(diagnostic.relative_offset as u64),
+                diagnostic.kind.message()
             ));
-        }
-        if let Some(relative_offset) = expected_endobj_offset {
-            self.push_warning(format!(
-                "(object {} {}, offset {}): expected endobj",
-                object_ref.number,
-                object_ref.generation,
-                offset.saturating_add(relative_offset as u64)
-            ));
-        }
-    }
-
-    /// Apply a parser-recorded indirect `/Length` ([`crate::parser::IndirectStreamLength`]) to a
-    /// freshly parsed stream `object`, re-slicing `stream.data` to the
-    /// xref-resolved authoritative length read from `bytes` (the raw object
-    /// bytes).
-    ///
-    /// The re-slice resolves the holder, which may mark `object_ref` `Reserved`
-    /// to guard against a cyclic length-holder chain. This wrapper ALWAYS
-    /// restores the lazy `Unresolved { offset }` entry afterwards, on both
-    /// success and error: on success the caller immediately overwrites it with
-    /// the resolved object; on error the failure stays loud on a retry (a
-    /// lingering `Reserved` entry would otherwise resolve to `Null`). The caller
-    /// therefore needs no manual cache restore on its own later error paths
-    /// (e.g. decryption).
-    ///
-    /// Shared by [`resolve_to_cache`](Self::resolve_to_cache) and
-    /// [`resolve_compressed_entry`](Self::resolve_compressed_entry) so ObjStm
-    /// containers get the same recovery as top-level streams.
-    ///
-    /// Returns `true` only when a line-anchored `endstream` scan remains the
-    /// payload authority; a valid in-window indirect integer re-slice returns
-    /// `false`.
-    fn apply_indirect_stream_length(
-        &mut self,
-        object_ref: ObjectRef,
-        object: &mut Object,
-        isl: crate::parser::IndirectStreamLength,
-        bytes: &[u8],
-        offset: u64,
-    ) -> Result<bool> {
-        let result = self.reslice_indirect_stream_length(object_ref, object, isl, bytes);
-        self.cache.set_unresolved(object_ref, offset);
-        result
-    }
-
-    /// Inner half of [`apply_indirect_stream_length`](Self::apply_indirect_stream_length):
-    /// performs the holder resolution and re-slice. May leave `object_ref`
-    /// `Reserved`; the wrapper restores the cache entry. Its boolean has the
-    /// same endstream-scan-authority meaning as the wrapper's return value.
-    fn reslice_indirect_stream_length(
-        &mut self,
-        object_ref: ObjectRef,
-        object: &mut Object,
-        isl: crate::parser::IndirectStreamLength,
-        bytes: &[u8],
-    ) -> Result<bool> {
-        match isl.endstream_pos {
-            // The parser located a line-anchored `endstream` and set a usable
-            // `stream.data`; the holder only REFINES it, overriding when the
-            // authoritative length lands within the syntactic window.
-            // Best-effort: a self-referential, cyclic, unresolvable, or
-            // out-of-window holder keeps the parser's endstream-scan value.
-            Some(endstream_pos) => {
-                let mut endstream_scan_authoritative = true;
-                if isl.holder != object_ref {
-                    // Mark this object resolution in-progress before recursing
-                    // into the holder: a cyclic length-holder chain (A's /Length
-                    // -> B -> ... -> A) would otherwise recurse forever
-                    // (resolve() does not otherwise mark in-progress). The cyclic
-                    // re-entry hits the `Reserved => Null` arm and the holder
-                    // reads as non-Integer -> endstream-scan fallback. A holder
-                    // resolution error is likewise non-fatal here: fall back
-                    // rather than failing the whole stream.
-                    self.cache.set_reserved(object_ref);
-                    if let Ok(Object::Integer(n)) = self.resolve_borrowed(isl.holder) {
-                        if let (Ok(n), Object::Stream(stream)) = (usize::try_from(*n), &mut *object)
-                        {
-                            let auth_end = isl.data_start.checked_add(n);
-                            // Override whenever the authoritative length lands
-                            // at or before `endstream`. qpdf QDF holders contain
-                            // the logical payload length; `%QDF:
-                            // ignore_newline` accounts for any extra framing LF
-                            // in fix-qdf rather than changing reader semantics.
-                            // A too-large/garbage holder falls back to the safe
-                            // endstream scan.
-                            if let Some(auth_end) =
-                                auth_end.filter(|&end| end <= endstream_pos && end <= bytes.len())
-                            {
-                                stream.data = bytes[isl.data_start..auth_end].to_vec();
-                                endstream_scan_authoritative = false;
-                            }
-                        }
-                    }
-                }
-                Ok(endstream_scan_authoritative)
-            }
-            // No line-anchored `endstream` existed: the writer used
-            // `NewlineBeforeEndstream::Never` with a non-EOL-ending payload, so
-            // `endstream` is adjacent to the last content byte and the parser
-            // could not delimit the payload (it returned an empty placeholder).
-            // The holder is the SOLE authority and the EXACT content length — it
-            // must resolve to a non-negative integer whose endpoint lands on a
-            // well-formed stream terminator (`endstream` ... `endobj`). Anything
-            // else (self-referential, unresolvable, out of bounds, or a holder
-            // pointing at an `endstream` byte sequence inside the payload) is
-            // unrecoverable: fail loudly rather than surface the empty
-            // placeholder or truncated data.
-            None => {
-                let resolved = if isl.holder == object_ref {
-                    None
-                } else {
-                    self.cache.set_reserved(object_ref);
-                    match self.resolve_borrowed(isl.holder) {
-                        Ok(Object::Integer(n)) => usize::try_from(*n).ok(),
-                        Ok(_) => None,
-                        // A genuine resolution error (I/O, decryption, …) is more
-                        // informative than the generic parse error below — the
-                        // wrapper restores the cache entry, so just propagate it.
-                        Err(err) => return Err(err),
-                    }
-                };
-                let auth_end = resolved.and_then(|n| isl.data_start.checked_add(n));
-                let valid = auth_end
-                    .is_some_and(|end| end <= bytes.len() && stream_end_boundary_at(bytes, end));
-                match (valid, &mut *object) {
-                    (true, Object::Stream(stream)) => {
-                        // `valid` guarantees `auth_end` is `Some` and in bounds.
-                        let end = auth_end.unwrap();
-                        stream.data = bytes[isl.data_start..end].to_vec();
-                        Ok(false)
-                    }
-                    _ => Err(Error::parse(isl.data_start, "stream data exceeds input")),
-                }
-            }
         }
     }
 
@@ -1482,49 +1370,29 @@ impl<R: Read + Seek> Pdf<R> {
         let stream_object = match self.cache.entry(stream_ref).cloned() {
             Some(CacheEntry::Resolved(object)) => object,
             Some(CacheEntry::Unresolved { offset }) => {
-                // Use the detailed parser (via `read_object_at`) so an ObjStm
-                // container whose own /Length is an indirect reference (including
-                // the adjacent no-EOL `endstream` case) goes through the same
-                // authoritative re-slice as top-level streams; otherwise its
-                // compressed members would be unreadable.
-                let parsed = self.read_object_at(offset)?;
+                let policy = RecoveryPolicy::RequireTokenTerminator;
+                let mut parsed =
+                    self.read_object_at_with_policy(stream_ref, offset, policy, policy)?;
                 if parsed.object_ref != stream_ref {
                     return Ok(false);
                 }
-                let mut object = parsed.object;
-                let mut endstream_scan_authoritative = parsed.recovered_stream_eol.is_some();
-                if let Some(isl) = parsed.indirect_length {
-                    let used_endstream_scan = self.apply_indirect_stream_length(
-                        stream_ref,
-                        &mut object,
-                        isl,
-                        &parsed.bytes,
-                        offset,
-                    )?;
-                    if parsed.recovered_stream_eol.is_some() {
-                        endstream_scan_authoritative = used_endstream_scan;
-                    }
-                }
-                // `apply_indirect_stream_length` already restored the lazy entry,
-                // so a decryption error here leaves it `Unresolved`.
-                let recovered_eol = endstream_scan_authoritative
-                    .then_some(parsed.recovered_stream_eol)
-                    .flatten()
-                    .map(crate::parser::RecoveredStreamEol::as_bytes);
+                let recovered_eol = parsed.remove_included_recovery_eol_for_decryption();
+                let recovered_eol_bytes =
+                    recovered_eol.map(crate::parser::RecoveredStreamEol::as_bytes);
                 let (object, stream_payload_transformed) =
-                    self.decrypt_resolved_object(stream_ref, object, recovered_eol)?;
+                    self.decrypt_resolved_object(stream_ref, parsed.object, recovered_eol_bytes)?;
                 self.cache.set_resolved(stream_ref, object.clone());
                 if stream_payload_transformed {
                     self.transformed_stream_refs.insert(stream_ref);
                 } else {
                     self.transformed_stream_refs.remove(&stream_ref);
                 }
-                self.record_file_object_warnings(
-                    stream_ref,
-                    offset,
-                    parsed.empty_offset,
-                    parsed.expected_endobj_offset,
-                );
+                if let Some(eol) = recovered_eol {
+                    self.recovered_stream_eols.insert(stream_ref, eol);
+                } else {
+                    self.recovered_stream_eols.remove(&stream_ref);
+                }
+                self.record_file_object_diagnostics(stream_ref, offset, parsed.diagnostics);
                 object
             }
             Some(
@@ -1797,48 +1665,6 @@ fn resolve_object_value<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Opti
         Object::Reference(reference) => pdf.resolve(reference).ok(),
         other => Some(other),
     }
-}
-
-/// `bytes[pos..]` matches `keyword` AND the byte after it is a PDF token
-/// boundary (whitespace, a delimiter, or EOF). Returns the offset just past the
-/// keyword. The boundary check prevents matching a prefix of a longer run of
-/// regular characters (e.g. `endstreamendobj`, `endobjXX`) as the keyword token.
-fn keyword_token_at(bytes: &[u8], pos: usize, keyword: &[u8]) -> Option<usize> {
-    let end = pos.checked_add(keyword.len())?;
-    if bytes.get(pos..end) != Some(keyword) {
-        return None;
-    }
-    match bytes.get(end) {
-        None => Some(end),
-        Some(&c) if crate::parser::is_ws(c) || crate::parser::is_delimiter(c) => Some(end),
-        Some(_) => None,
-    }
-}
-
-/// True when a well-formed stream terminator begins exactly at `pos` in `bytes`:
-/// the `endstream` keyword token, optional whitespace, then the `endobj` keyword
-/// token.
-///
-/// Used to validate an indirect `/Length` holder before trusting it as the
-/// authoritative payload boundary for the adjacent-`endstream` case
-/// (`NewlineBeforeEndstream::Never`, non-EOL-ending payload), where the parser
-/// could not delimit the stream syntactically. `pos` is the holder-derived end
-/// of the content; by construction of that case there is no EOL before
-/// `endstream` (otherwise it would have been line-anchored and taken the other
-/// branch), so `endstream` must sit at `pos` directly. Requiring the trailing
-/// `endobj` — the indirect object terminator that always follows a stream's
-/// `endstream` — plus a PDF token boundary after each keyword rejects a corrupt
-/// holder that points at an `endstream`/`endobj` byte sequence occurring INSIDE
-/// the payload (e.g. `endstreamendobj`), which would otherwise truncate the data.
-fn stream_end_boundary_at(bytes: &[u8], pos: usize) -> bool {
-    let Some(mut p) = keyword_token_at(bytes, pos, b"endstream") else {
-        return false;
-    };
-    // Whitespace between `endstream` and the `endobj` object terminator.
-    while bytes.get(p).is_some_and(|&c| crate::parser::is_ws(c)) {
-        p += 1;
-    }
-    keyword_token_at(bytes, p, b"endobj").is_some()
 }
 
 fn decrypt_object_strings(
@@ -2632,30 +2458,85 @@ mod tests {
     use crate::pages::page_refs;
     use crate::Stream;
 
-    #[test]
-    fn keyword_token_at_requires_token_boundary() {
-        // Keyword at EOF (nothing after) is a valid token.
-        assert_eq!(keyword_token_at(b"endobj", 0, b"endobj"), Some(6));
-        // Followed by whitespace / a delimiter is a valid token.
-        assert_eq!(keyword_token_at(b"endobj\n", 0, b"endobj"), Some(6));
-        assert_eq!(keyword_token_at(b"endobj/", 0, b"endobj"), Some(6));
-        // A longer run of regular chars (no boundary) is NOT the keyword token.
-        assert_eq!(keyword_token_at(b"endobjX", 0, b"endobj"), None);
-        // Non-match.
-        assert_eq!(keyword_token_at(b"endstream", 0, b"endobj"), None);
+    struct ReadFailingCursor {
+        inner: Cursor<Vec<u8>>,
+        fail_reads: bool,
+    }
+
+    impl ReadFailingCursor {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                fail_reads: false,
+            }
+        }
+    }
+
+    impl Read for ReadFailingCursor {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.fail_reads {
+                return Err(std::io::Error::other("injected holder read failure"));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for ReadFailingCursor {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
     }
 
     #[test]
-    fn stream_end_boundary_at_validates_terminator() {
-        // `endstream` + whitespace + `endobj`, then EOF/boundary: valid.
-        assert!(stream_end_boundary_at(b"endstream\nendobj", 0));
-        assert!(stream_end_boundary_at(b"endstream endobj\n", 0));
-        // `endstreamendobj` with no separator after `endstream`: rejected.
-        assert!(!stream_end_boundary_at(b"endstreamendobj", 0));
-        // `endstream` without the trailing `endobj`: rejected.
-        assert!(!stream_end_boundary_at(b"endstream more", 0));
-        // Not positioned on `endstream`: rejected.
-        assert!(!stream_end_boundary_at(b"xendstream\nendobj", 0));
+    fn keyword_token_at_requires_token_boundary() {
+        // Keyword at EOF (nothing after) is a valid token.
+        assert_eq!(
+            crate::parser::keyword_token_end(b"endobj", 0, b"endobj"),
+            Some(6)
+        );
+        // Followed by whitespace / a delimiter is a valid token.
+        assert_eq!(
+            crate::parser::keyword_token_end(b"endobj\n", 0, b"endobj"),
+            Some(6)
+        );
+        assert_eq!(
+            crate::parser::keyword_token_end(b"endobj/", 0, b"endobj"),
+            Some(6)
+        );
+        // A longer run of regular chars (no boundary) is NOT the keyword token.
+        assert_eq!(
+            crate::parser::keyword_token_end(b"endobjX", 0, b"endobj"),
+            None
+        );
+        // Non-match.
+        assert_eq!(
+            crate::parser::keyword_token_end(b"endstream", 0, b"endobj"),
+            None
+        );
+    }
+
+    #[test]
+    fn endstream_and_endobj_tokens_are_validated_separately() {
+        assert_eq!(
+            crate::parser::keyword_token_end(b"endstream\nendobj", 0, b"endstream"),
+            Some(9)
+        );
+        assert_eq!(
+            crate::parser::keyword_token_end(b"endstream\nendobj", 10, b"endobj"),
+            Some(16)
+        );
+        assert_eq!(
+            crate::parser::keyword_token_end(b"endstreamendobj", 0, b"endstream"),
+            None
+        );
+        assert_eq!(
+            crate::parser::keyword_token_end(b"endstream more", 10, b"endobj"),
+            None
+        );
+        assert_eq!(
+            crate::parser::keyword_token_end(b"xendstream\nendobj", 0, b"endstream"),
+            None
+        );
     }
 
     #[test]
@@ -3067,7 +2948,6 @@ mod tests {
                 Some(b"2 0 obj\n99\nendobj\n".as_slice()),
                 false,
             ),
-            (b"2 0 R".as_slice(), Some(b"2 0 obj\n<<".as_slice()), false),
             (b"99 0 R".as_slice(), None, false),
             (
                 b"2 0 R".as_slice(),
@@ -3090,6 +2970,64 @@ mod tests {
     }
 
     #[test]
+    fn qpdf_reader_recovers_malformed_length_holder_as_invalid_once() {
+        let bytes = recovered_stream_fixture(b"/Length 2 0 R", b"\n", Some(b"2 0 obj\n<<"));
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open malformed-holder fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        assert_eq!(
+            pdf.resolve(object_ref)
+                .expect("recover target stream")
+                .as_stream()
+                .unwrap()
+                .data,
+            b"abc"
+        );
+        assert_eq!(pdf.recovered_stream_eol(object_ref), Some(&b"\n"[..]));
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "(object 1 0, offset 9): /Length key in stream dictionary is not an integer",
+                "(object 1 0, offset 44): attempting to recover stream length",
+                "(object 1 0, offset 44): recovered stream length: 4",
+            ]
+        );
+        assert_eq!(
+            pdf.resolve(object_ref).unwrap().as_stream().unwrap().data,
+            b"abc"
+        );
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 3);
+    }
+
+    #[test]
+    fn qpdf_reader_restores_target_cache_after_length_holder_io_error() {
+        let bytes =
+            recovered_stream_fixture(b"/Length 2 0 R", b"\n", Some(b"2 0 obj\n3\nendobj\n"));
+        let mut pdf =
+            Pdf::open(ReadFailingCursor::new(bytes)).expect("open readable holder fixture");
+        let target = ObjectRef::new(1, 0);
+        let target_offset = 9;
+        let pending = parse_file_object_syntax(
+            b"1 0 obj\n<< /Length 2 0 R >>\nstream\nabc\nendstream\nendobj\n",
+        )
+        .expect("parse pending target stream");
+
+        pdf.reader.fail_reads = true;
+        let err = pdf
+            .resolve_pending_stream_length(target, &pending, target_offset)
+            .expect_err("holder I/O errors must remain unrecoverable");
+
+        assert!(matches!(err, Error::Io(_)), "got {err:?}");
+        assert!(matches!(
+            pdf.cache.entry(target),
+            Some(CacheEntry::Unresolved { offset }) if *offset == target_offset
+        ));
+    }
+
+    #[test]
     fn valid_indirect_stream_length_clears_endstream_scan_metadata() {
         let bytes =
             recovered_stream_fixture(b"/Length 2 0 R", b"\n", Some(b"2 0 obj\n3\nendobj\n"));
@@ -3098,6 +3036,74 @@ mod tests {
         let stream = pdf.resolve(object_ref).expect("resolve recovered stream");
         assert_eq!(stream.as_stream().unwrap().data, b"abc");
         assert_eq!(pdf.recovered_stream_eol(object_ref), None);
+    }
+
+    #[test]
+    fn qpdf_reader_completes_adjacent_endstream_before_endobj_check() {
+        let bytes = recovered_stream_fixture(b"/Length 2 0 R", b"", Some(b"2 0 obj\n3\nendobj\n"));
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+        let object_ref = ObjectRef::new(1, 0);
+        assert_eq!(
+            pdf.resolve(object_ref).unwrap().as_stream().unwrap().data,
+            b"abc"
+        );
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("expected endobj")));
+    }
+
+    #[test]
+    fn qpdf_reader_registers_file_object_diagnostics_once_after_cache_commit() {
+        let mut pdf = Pdf::open_mem_owned(top_level_bare_reference_pdf()).unwrap();
+        let object_ref = ObjectRef::new(4, 0);
+        assert_eq!(pdf.resolve(object_ref).unwrap(), Object::Integer(3));
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(object_ref).unwrap(),
+            Object::Integer(3)
+        );
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .filter(|entry| entry.message.contains("expected endobj"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn qpdf_reader_bounds_unusable_indirect_length_recovery() {
+        let cases = [
+            classic_pdf_with_bodies(
+                &[b"1 0 obj\n<< /Length 1 0 R >>\nstream\nabc\nendstream\nendobj\n"],
+                ObjectRef::new(1, 0),
+            ),
+            classic_pdf_with_bodies(
+                &[b"1 0 obj\n<< /Length 99 0 R >>\nstream\nabc\nendstream\nendobj\n"],
+                ObjectRef::new(1, 0),
+            ),
+            classic_pdf_with_bodies(
+                &[
+                    b"1 0 obj\n<< /Length 2 0 R >>\nstream\nabc\nendstream\nendobj\n",
+                    b"2 0 obj\n<< /Length 1 0 R >>\nstream\nxyz\nendstream\nendobj\n",
+                ],
+                ObjectRef::new(1, 0),
+            ),
+        ];
+
+        for bytes in cases {
+            let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+            assert_eq!(
+                pdf.resolve(ObjectRef::new(1, 0))
+                    .unwrap()
+                    .as_stream()
+                    .unwrap()
+                    .data,
+                b"abc"
+            );
+        }
     }
 
     #[test]
@@ -3110,19 +3116,24 @@ mod tests {
             .windows(b"1 0 obj".len())
             .position(|window| window == b"1 0 obj")
             .unwrap() as u64;
-        let embedded_offset = bytes
-            .windows(b"9 0 obj".len())
-            .position(|window| window == b"9 0 obj")
-            .unwrap() as u64;
+        let false_next_offset = stream_offset + b"1 0 obj\n<< /Length 2".len() as u64;
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open fallback fixture");
-        pdf.sorted_object_offsets.push(embedded_offset);
+        pdf.sorted_object_offsets.push(false_next_offset);
         pdf.sorted_object_offsets.sort_unstable();
 
+        let initial_budget = pdf.resolution_fallbacks_remaining;
         let parsed = pdf
-            .read_object_at(stream_offset)
+            .read_object_at(ObjectRef::new(1, 0), stream_offset)
             .expect("full read fallback must recover stream");
         assert_eq!(parsed.object_ref, ObjectRef::new(1, 0));
-        assert!(parsed.object.as_stream().is_some());
+        assert_eq!(
+            parsed.object.as_stream().unwrap().data,
+            b"9 0 obj\nnull\nendobj"
+        );
+        assert_eq!(
+            pdf.resolution_fallbacks_remaining,
+            initial_budget.saturating_sub(1)
+        );
 
         let malformed = classic_pdf_with_bodies(
             &[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n", b"2 0 obj\n<<"],
@@ -3133,10 +3144,74 @@ mod tests {
             .position(|window| window == b"2 0 obj")
             .unwrap() as u64;
         let mut pdf = Pdf::open_mem_owned(malformed).expect("open malformed lazy object");
-        assert!(pdf.read_object_at(malformed_offset).is_err());
+        assert!(pdf
+            .read_object_at(ObjectRef::new(2, 0), malformed_offset)
+            .is_err());
         pdf.sorted_object_offsets.push(malformed_offset + 5);
         pdf.sorted_object_offsets.sort_unstable();
-        assert!(pdf.read_object_at(malformed_offset).is_err());
+        pdf.resolution_fallbacks_remaining = 1;
+        let window_error = pdf
+            .read_object_at(ObjectRef::new(2, 0), malformed_offset)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(pdf.resolution_fallbacks_remaining, 0);
+        let exhausted_error = pdf
+            .read_object_at(ObjectRef::new(2, 0), malformed_offset)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(window_error, exhausted_error);
+        assert!(matches!(
+            pdf.cache.entry(ObjectRef::new(2, 0)),
+            Some(CacheEntry::Unresolved { offset }) if *offset == malformed_offset
+        ));
+    }
+
+    #[test]
+    fn compressed_entry_retries_objstm_when_bounded_window_ends_inside_payload() {
+        let payload = b"7 0 << /Value 1 >>\n9 0 obj\nnull\nendobj\n";
+        let mut body = format!(
+            "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n",
+            payload.len()
+        )
+        .into_bytes();
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"endstream\nendobj\n");
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n", &body],
+            ObjectRef::new(1, 0),
+        );
+        let objstm_offset = bytes
+            .windows(b"4 0 obj".len())
+            .position(|window| window == b"4 0 obj")
+            .unwrap() as u64;
+        let false_next_offset = bytes
+            .windows(b"9 0 obj".len())
+            .position(|window| window == b"9 0 obj")
+            .unwrap() as u64;
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open ObjStm fallback fixture");
+        pdf.cache
+            .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
+        pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
+        pdf.sorted_object_offsets.push(false_next_offset);
+        pdf.sorted_object_offsets.sort_unstable();
+        let initial_budget = pdf.resolution_fallbacks_remaining;
+
+        let object = pdf
+            .resolve_qpdf_json_object(ObjectRef::new(7, 0))
+            .expect("bounded ObjStm must retry against EOF");
+        assert_eq!(
+            object.as_dict().and_then(|dict| dict.get("Value")),
+            Some(&Object::Integer(1))
+        );
+        assert_eq!(
+            pdf.resolution_fallbacks_remaining,
+            initial_budget.saturating_sub(1)
+        );
+        assert!(matches!(
+            pdf.cache.entry(ObjectRef::new(4, 0)),
+            Some(CacheEntry::Resolved(Object::Stream(_)))
+        ));
     }
 
     #[test]
@@ -3193,7 +3268,36 @@ mod tests {
             ObjectRef::new(1, 0),
         );
         let mut pdf = Pdf::open_mem_owned(invalid_length).expect("open invalid-length fixture");
-        assert!(pdf.resolve_qpdf_json_object(ObjectRef::new(1, 0)).is_err());
+        let object_ref = ObjectRef::new(1, 0);
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(object_ref)
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .data,
+            b"abc"
+        );
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "(object 1 0, offset 143): expected endstream",
+                "(object 1 0, offset 44): attempting to recover stream length",
+                "(object 1 0, offset 44): recovered stream length: 3",
+            ]
+        );
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(object_ref)
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .data,
+            b"abc"
+        );
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 3);
     }
 
     #[test]
@@ -3286,6 +3390,44 @@ mod tests {
     }
 
     #[test]
+    fn normal_resolution_retries_when_bounded_window_ends_inside_stream_payload() {
+        let payload = b"before\n9 0 obj\nafter\n";
+        let mut stream_body = b"2 0 obj\n<< /Length 3 0 R >>\nstream\n".to_vec();
+        stream_body.extend_from_slice(payload);
+        stream_body.extend_from_slice(b"endstream\nendobj\n");
+        let length_body = format!("3 0 obj\n{}\nendobj\n", payload.len());
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog /Probe 2 0 R >>\nendobj\n",
+                &stream_body,
+                length_body.as_bytes(),
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let false_next_offset = bytes
+            .windows(b"9 0 obj".len())
+            .position(|window| window == b"9 0 obj")
+            .expect("header-like stream payload") as u64;
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fallback fixture");
+        pdf.sorted_object_offsets.push(false_next_offset);
+        pdf.sorted_object_offsets.sort_unstable();
+        let initial_budget = pdf.resolution_fallbacks_remaining;
+
+        let object = pdf
+            .resolve(ObjectRef::new(2, 0))
+            .expect("bounded stream must retry against EOF");
+        assert_eq!(
+            object.as_stream().map(|stream| stream.data.as_slice()),
+            Some(payload.as_slice())
+        );
+        assert_eq!(
+            pdf.resolution_fallbacks_remaining,
+            initial_budget.saturating_sub(1)
+        );
+    }
+
+    #[test]
     fn normal_resolution_recovers_empty_file_object_once() {
         let bytes = classic_pdf_with_bodies(
             &[
@@ -3365,6 +3507,32 @@ mod tests {
             .into_dict()
             .expect("dictionary member");
         assert_eq!(dictionary.get_ref("V"), Some(ObjectRef::new(6, 0)));
+    }
+
+    #[test]
+    fn objstm_container_uses_qpdf_completion_but_members_remain_direct_objects() {
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 2 0 R >>\nstream\n7 0 6 0 R\nendstream\nendobj\n",
+                b"2 0 obj\n/Bad\nendobj\n",
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+        pdf.cache.set_compressed(ObjectRef::new(7, 0), 1, 0);
+        assert_eq!(
+            pdf.resolve(ObjectRef::new(7, 0)).unwrap(),
+            Object::Integer(6)
+        );
+        assert_eq!(
+            pdf.recovered_stream_eol(ObjectRef::new(1, 0)),
+            Some(&b"\n"[..])
+        );
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .all(|entry| !entry.message.contains("expected endobj")));
     }
 
     /// Build a minimal PDF whose object `(1, 0)` is a linearization

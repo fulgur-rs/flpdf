@@ -1,6 +1,11 @@
+use crate::diagnostics::Diagnostic;
 use crate::object::collect_qpdf_object_references;
 use crate::parser::{parse_indirect_object, Parser};
-use crate::{filters, Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, Result};
+use crate::reader::file_object::{
+    finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, RecoveryPolicy,
+    ResolvedStreamLength,
+};
+use crate::{filters, Diagnostics, Dictionary, Error, Object, ObjectRef, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 
@@ -107,25 +112,19 @@ pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
         Err(_) => return Err(Error::parse(0, "startxref does not fit usize")),
     };
 
-    let mut loaded = match parse_xref_from_start(&bytes, xref_pos, startxref, &version) {
-        Ok(loaded) => loaded,
-        Err(error) if allow_repair => {
-            // Report the first recorded failure; this parse error is only the
-            // trigger when the startxref stage itself succeeded.
-            let trigger = parse_errors.into_iter().next().unwrap_or(error);
-            return recover_xref_from_linear_scan(&bytes, version, startxref, trigger, None);
-        }
-        Err(error) => return Err(error),
-    };
+    let mut loaded =
+        match parse_xref_from_start(&bytes, xref_pos, startxref, &version, allow_repair) {
+            Ok(loaded) => loaded,
+            Err(error) if allow_repair => {
+                // Report the first recorded failure; this parse error is only the
+                // trigger when the startxref stage itself succeeded.
+                let trigger = parse_errors.into_iter().next().unwrap_or(error);
+                return recover_xref_from_linear_scan(&bytes, version, startxref, trigger, None);
+            }
+            Err(error) => return Err(error),
+        };
 
-    if let Err(error) = merge_previous_xref_sections(
-        &bytes,
-        &version,
-        &mut loaded.loaded.entries,
-        &loaded.loaded.trailer,
-        &mut loaded.trailer_references,
-        &mut loaded.parsed_xref_streams,
-    ) {
+    if let Err(error) = merge_previous_xref_sections(&bytes, &version, &mut loaded, allow_repair) {
         if allow_repair {
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
             let recovered = recover_xref_from_linear_scan(
@@ -152,6 +151,7 @@ fn parse_xref_from_start(
     xref_pos: usize,
     startxref: u64,
     version: &str,
+    allow_repair: bool,
 ) -> Result<LoadedXrefState> {
     if bytes
         .get(xref_pos..)
@@ -174,19 +174,23 @@ fn parse_xref_from_start(
         });
     }
 
-    parse_xref_stream(bytes, xref_pos, startxref, version.to_string())
+    parse_xref_stream(
+        bytes,
+        xref_pos,
+        startxref,
+        version.to_string(),
+        allow_repair,
+    )
 }
 
 fn merge_previous_xref_sections(
     bytes: &[u8],
     version: &str,
-    entries: &mut BTreeMap<ObjectRef, XrefOffset>,
-    trailer: &Dictionary,
-    trailer_references: &mut BTreeSet<ObjectRef>,
-    parsed_xref_streams: &mut BTreeMap<ObjectRef, Object>,
+    loaded: &mut LoadedXrefState,
+    allow_repair: bool,
 ) -> Result<()> {
     let mut visited = HashSet::new();
-    let mut previous_offset = parse_previous_xref_offset(trailer);
+    let mut previous_offset = parse_previous_xref_offset(&loaded.loaded.trailer);
 
     while let Some(offset) = previous_offset {
         let previous_pos = usize::try_from(offset)
@@ -196,24 +200,34 @@ fn merge_previous_xref_sections(
             return Err(Error::parse(0, "loop detected following xref tables"));
         }
 
-        let previous = parse_xref_from_start(bytes, previous_pos, offset, version)?;
-        trailer_references.extend(previous.trailer_references.iter().copied());
+        let previous = parse_xref_from_start(bytes, previous_pos, offset, version, allow_repair)?;
+        for diagnostic in previous.loaded.repair_diagnostics.entries() {
+            loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+        }
+        loaded
+            .trailer_references
+            .extend(previous.trailer_references.iter().copied());
         for (object_ref, object) in previous.parsed_xref_streams {
             let newer_live = matches!(
-                entries.get(&object_ref),
+                loaded.loaded.entries.get(&object_ref),
                 Some(XrefOffset::Offset(_) | XrefOffset::Compressed { .. })
             );
             if !newer_live {
-                parsed_xref_streams.entry(object_ref).or_insert(object);
+                loaded
+                    .parsed_xref_streams
+                    .entry(object_ref)
+                    .or_insert(object);
             }
         }
 
         for (object_ref, xref_offset) in previous.loaded.entries {
-            if !entries
+            if !loaded
+                .loaded
+                .entries
                 .keys()
                 .any(|entry_ref| entry_ref.number == object_ref.number)
             {
-                entries.insert(object_ref, xref_offset);
+                loaded.loaded.entries.insert(object_ref, xref_offset);
             }
         }
 
@@ -272,6 +286,11 @@ fn merge_recovered_qpdf_state(
     mut recovered: LoadedXrefState,
     mut accumulated: LoadedXrefState,
 ) -> LoadedXrefState {
+    let mut repair_diagnostics = std::mem::take(&mut accumulated.loaded.repair_diagnostics);
+    for diagnostic in recovered.loaded.repair_diagnostics.entries() {
+        repair_diagnostics.push(diagnostic.clone());
+    }
+    recovered.loaded.repair_diagnostics = repair_diagnostics;
     recovered
         .trailer_references
         .extend(accumulated.trailer_references);
@@ -743,13 +762,36 @@ fn parse_xref_stream(
     xref_pos: usize,
     startxref: u64,
     version: String,
+    allow_repair: bool,
 ) -> Result<LoadedXrefState> {
     let tail = bytes
         .get(xref_pos..)
         .filter(|slice| !slice.is_empty())
         .ok_or_else(|| Error::parse(xref_pos, "xref stream offset is beyond end of file"))?;
-    let (object_ref, object) =
-        parse_indirect_object(tail).map_err(|err| err.rebase_offset(xref_pos))?;
+    let pending = parse_file_object_syntax(tail).map_err(|err| err.rebase_offset(xref_pos))?;
+    let object_ref = pending.object_ref;
+    let unresolved_length = pending
+        .indirect_length_ref()
+        .map(|_| ResolvedStreamLength::Missing);
+    let policy = if allow_repair {
+        RecoveryPolicy::Bounded
+    } else {
+        RecoveryPolicy::RequireEndstream
+    };
+    let mut completed = finish_file_object(tail, pending, unresolved_length, policy)
+        .map_err(|err| err.rebase_offset(xref_pos))?;
+    // Xref streams are not encrypted, but filter decoding still requires the
+    // logical payload rather than qpdf's raw recovery EOL.
+    let _recovered_eol = completed.remove_included_recovery_eol_for_decryption();
+    let object = completed.object;
+    let mut repair_diagnostics = Diagnostics::default();
+    for diagnostic in completed.diagnostics {
+        repair_diagnostics.push(xref_file_object_diagnostic(
+            object_ref,
+            xref_pos as u64,
+            diagnostic,
+        ));
+    }
     let stream = match &object {
         Object::Stream(stream) => stream,
         _ => return Err(Error::parse(xref_pos, "xref not found")),
@@ -780,11 +822,28 @@ fn parse_xref_stream(
             entries,
             trailer,
             last_xref_form: XrefForm::Stream,
-            repair_diagnostics: Diagnostics::default(),
+            repair_diagnostics,
         },
         trailer_references,
         parsed_xref_streams,
     })
+}
+
+fn xref_file_object_diagnostic(
+    object_ref: ObjectRef,
+    offset: u64,
+    diagnostic: FileObjectDiagnostic,
+) -> Diagnostic {
+    Diagnostic::warning(
+        format!(
+            "(object {} {}, offset {}): {}",
+            object_ref.number,
+            object_ref.generation,
+            offset.saturating_add(diagnostic.relative_offset as u64),
+            diagnostic.kind.message()
+        ),
+        Some(offset.saturating_add(diagnostic.relative_offset as u64)),
+    )
 }
 
 type XrefWidths = (usize, usize, usize);

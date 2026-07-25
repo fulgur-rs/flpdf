@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use flpdf::{load_xref_and_trailer, write_pdf, Object, ObjectRef, Pdf, XrefForm};
+use predicates::prelude::*;
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
@@ -9,6 +10,33 @@ use std::process::Command as ShellCommand;
 use tempfile::tempdir;
 
 const COMPAT_FIXTURE_DIR: &str = "../../tests/fixtures/compat";
+
+#[test]
+fn qpdf_good14_shaped_qdf_object_body_matches_qpdf_11_9() {
+    if !is_qpdf_available() {
+        return;
+    }
+    let input = fixture_path("good14-shaped-indirect-length-adjacent-endstream.pdf");
+    let tmp = tempdir().unwrap();
+    let qpdf_out = tmp.path().join("qpdf.pdf");
+    let flpdf_out = tmp.path().join("flpdf.pdf");
+    run_qpdf_with_args(&["--qdf", input.to_str().unwrap(), qpdf_out.to_str().unwrap()]);
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--qdf",
+            input.to_str().unwrap(),
+            flpdf_out.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .code(0)
+        .stderr(predicate::str::is_empty());
+    assert_eq!(
+        qdf_object_body(&fs::read(qpdf_out).unwrap()),
+        qdf_object_body(&fs::read(flpdf_out).unwrap())
+    );
+}
 
 #[test]
 fn qpdf_inspect_pages_matrix_matches_golden() {
@@ -328,6 +356,18 @@ fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(COMPAT_FIXTURE_DIR)
         .join(name)
+}
+
+fn qdf_object_body(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .windows(b"%QDF-1.0".len())
+        .position(|window| window == b"%QDF-1.0")
+        .expect("QDF marker");
+    let end = bytes
+        .windows(b"\nxref\n".len())
+        .position(|window| window == b"\nxref\n")
+        .expect("classic xref");
+    &bytes[start..end]
 }
 
 fn is_qpdf_available() -> bool {

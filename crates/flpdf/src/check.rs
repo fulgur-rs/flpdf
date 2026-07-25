@@ -180,6 +180,7 @@ fn check_reader_inner_with_options<R: Read + Seek>(
     };
 
     let mut diagnostics = pdf.repair_diagnostics().clone();
+    let repair_diagnostics_start = pdf.repair_diagnostics().entries().len();
     if pdf.uses_weak_crypto() {
         diagnostics.push(Diagnostic::warning(
             "encrypted PDF uses weak crypto; processing continued",
@@ -215,6 +216,15 @@ fn check_reader_inner_with_options<R: Read + Seek>(
     // a full-document audit, the one place flpdf's lazy-load discipline is
     // intentionally relaxed.
     check_content_streams(&mut pdf, &mut diagnostics, limits);
+    for diagnostic in pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .skip(repair_diagnostics_start)
+        .cloned()
+    {
+        diagnostics.push(diagnostic);
+    }
 
     let summary = CheckSummary {
         version: pdf.version().to_string(),
@@ -870,14 +880,19 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_inline_content_stream_is_error() {
-        // The direct inline-stream path yields a `None` terminal ref, so the
-        // diagnostic names "inline content stream" rather than an object ref.
+    fn direct_inline_content_stream_is_a_qpdf_style_structural_warning() {
+        // qpdf 11.9.0 treats this spec-invalid direct stream as malformed page
+        // syntax, emits object/page warnings, and completes `--check` with
+        // warnings rather than reporting a corrupt decoded content stream.
         let report = check_reader_strict(Cursor::new(corrupt_inline_content_pdf())).unwrap();
-        assert!(!report.valid);
-        assert!(report.diagnostics.entries().iter().any(|d| {
-            d.severity == Severity::Error && d.message.contains("inline content stream")
-        }));
+        assert!(report.valid);
+        assert_eq!(
+            report.diagnostics.entries(),
+            &[Diagnostic::warning(
+                "could not enumerate pages for content-stream check: parse error at byte 109: expected byte 47",
+                None,
+            )]
+        );
     }
 
     #[test]

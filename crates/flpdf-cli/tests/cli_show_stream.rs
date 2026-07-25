@@ -68,6 +68,19 @@ fn show_stream_unknown_object_reports_clear_error() {
 }
 
 #[test]
+fn dump_object_unknown_object_reports_clear_error() {
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "dump-object",
+        "99 0",
+        "../../tests/fixtures/compat/one-page.pdf",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("not found"));
+}
+
+#[test]
 fn show_stream_writes_to_out_file() {
     let temp = tempfile::tempdir().unwrap();
     let out_path = temp.path().join("stream.txt");
@@ -90,6 +103,22 @@ fn show_stream_writes_to_out_file() {
         "expected 'Fixture page 1' in output file, got: {:?}",
         &contents[..contents.len().min(200)]
     );
+}
+
+#[test]
+fn show_stream_raw_writes_to_out_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let out_path = temp.path().join("stream.raw");
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["show-stream", "--raw", "--out"])
+        .arg(&out_path)
+        .args(["7 0", "../../tests/fixtures/compat/one-page.pdf"])
+        .assert()
+        .success()
+        .stdout(predicate::function(|out: &[u8]| out.is_empty()));
+
+    assert!(std::fs::read(out_path).unwrap().starts_with(b"GapQh0E"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -223,6 +252,63 @@ fn build_pdf_with_filter_literal(filter_literal: &str, stream_data: &[u8]) -> Ve
     bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
 
     bytes
+}
+
+fn build_pdf_with_stale_length_stream(stream_data: &[u8]) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+
+    let cat_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    let stream_offset = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n<< /Length 99 >>\nstream\n");
+    bytes.extend_from_slice(stream_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{cat_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{stream_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+#[test]
+fn show_stream_surfaces_lazy_recovery_warnings() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(temp.path(), build_pdf_with_stale_length_stream(b"payload")).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["show-stream", "3 0"])
+        .arg(temp.path())
+        .assert()
+        .code(3)
+        .stdout(predicate::eq(b"payload".as_slice()))
+        .stderr(predicate::str::contains("expected endstream"))
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings",
+        ));
+}
+
+#[test]
+fn dump_object_surfaces_lazy_recovery_warnings() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(temp.path(), build_pdf_with_stale_length_stream(b"payload")).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["dump-object", "3 0"])
+        .arg(temp.path())
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("stream\npayload"))
+        .stderr(predicate::str::contains("expected endstream"))
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings",
+        ));
 }
 
 /// A single-element filter array `/Filter [/DCTDecode]` is equivalent to the

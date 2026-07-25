@@ -140,6 +140,37 @@ fn corrupt_content_stream_pdf_bytes() -> Vec<u8> {
     pdf
 }
 
+/// A valid page whose content stream has a stale direct `/Length`. Opening the
+/// document is clean; resolving `/Contents` during `--check` performs the
+/// recovery and must surface those lazy diagnostics as warnings.
+fn recovered_content_stream_pdf_bytes() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+
+    let off1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+    );
+    let off4 = pdf.len();
+    pdf.extend_from_slice(b"4 0 obj\n<< /Length 99 >>\nstream\nq\nQ\nendstream\nendobj\n");
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
 /// A structurally valid single-page PDF whose page `/Contents 4 0 R` is a
 /// *valid* FlateDecode stream that inflates to `decoded_len` bytes (small
 /// compressed, large inflated). Exercises the opt-in `--decode-memory-limit`
@@ -492,6 +523,27 @@ fn check_corrupt_content_stream_exits_2_without_clean_note() {
         .stdout(predicate::str::contains("No syntax or stream encoding errors found").not())
         .stderr(predicate::str::contains(
             "errors while decoding content stream",
+        ));
+}
+
+#[test]
+fn check_surfaces_lazy_content_stream_recovery_warnings() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&recovered_content_stream_pdf_bytes()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", f.path().to_str().unwrap()])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("No syntax or stream encoding errors found").not())
+        .stderr(predicate::str::contains("expected endstream"))
+        .stderr(predicate::str::contains(
+            "attempting to recover stream length",
+        ))
+        .stderr(predicate::str::contains("recovered stream length"))
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings",
         ));
 }
 

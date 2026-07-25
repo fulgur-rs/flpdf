@@ -84,6 +84,85 @@ fn loads_xref_stream_and_trailer() {
 }
 
 #[test]
+fn xref_stream_direct_length_accepts_payload_adjacent_endstream_without_diagnostics() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        b"1 0 obj\n<< /Type /XRef /Size 1 /W [1 1 1] /Index [0 1] /Length 3 >>\nstream\n",
+    );
+    bytes.extend_from_slice(&[0, 0, 0]);
+    bytes.extend_from_slice(b"endstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(loaded.last_xref_form, XrefForm::Stream);
+    assert!(loaded.repair_diagnostics.entries().is_empty());
+}
+
+#[test]
+fn strict_xref_stream_rejects_endobj_as_a_stream_terminator() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        b"1 0 obj\n<< /Type /XRef /Size 1 /W [1 1 1] /Index [0 1] /Length 3 >>\nstream\n",
+    );
+    bytes.extend_from_slice(&[0, 0, 0]);
+    bytes.extend_from_slice(b"endobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    let err = load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
+        .expect_err("strict xref bootstrap must require endstream");
+    assert!(
+        matches!(err, Error::Parse { ref message, .. } if message.contains("endstream")),
+        "unexpected error: {err}"
+    );
+
+    let loaded = load_xref_and_trailer_with_repair(&mut Cursor::new(bytes), true)
+        .expect("repair mode may recover at endobj");
+    assert_eq!(loaded.last_xref_form, XrefForm::Stream);
+}
+
+#[test]
+fn xref_stream_unavailable_indirect_length_uses_bounded_recovery_diagnostics() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        b"1 0 obj\n<< /Type /XRef /Size 1 /W [1 1 1] /Index [0 1] /Length 9 0 R >>\nstream\n",
+    );
+    let payload_offset = bytes.len();
+    bytes.extend_from_slice(&[0, 0, 0]);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(loaded.last_xref_form, XrefForm::Stream);
+    assert_eq!(
+        loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| (diagnostic.message.clone(), diagnostic.offset))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                format!("(object 1 0, offset {xref_offset}): stream dictionary lacks /Length key"),
+                Some(xref_offset as u64),
+            ),
+            (
+                format!(
+                    "(object 1 0, offset {payload_offset}): attempting to recover stream length"
+                ),
+                Some(payload_offset as u64),
+            ),
+            (
+                format!("(object 1 0, offset {payload_offset}): recovered stream length: 4"),
+                Some(payload_offset as u64),
+            ),
+        ]
+    );
+}
+
+#[test]
 fn loads_xref_stream_without_index_uses_size_range() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
@@ -232,6 +311,104 @@ fn loads_latest_xref_stream_free_entries_over_previous_live_entries() {
     );
 }
 
+#[test]
+fn preserves_recovery_diagnostics_from_previous_xref_streams() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let obj1_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let previous_xref_offset = bytes.len() as u64;
+    let previous_entries =
+        build_encoded_xref_stream_entries(&[(0, 0, 0), (1, obj1_offset, 0), (0, 0, 0)]);
+    bytes.extend_from_slice(&make_xref_stream_object_with_declared_length(
+        2,
+        3,
+        None,
+        1,
+        &previous_entries,
+        previous_entries.len() + 10,
+    ));
+
+    let latest_xref_offset = bytes.len() as u64;
+    let latest_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 0),
+        (1, obj1_offset, 0),
+        (1, previous_xref_offset, 0),
+        (1, latest_xref_offset, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_object(
+        3,
+        4,
+        Some(previous_xref_offset),
+        1,
+        &latest_entries,
+    ));
+    bytes.extend_from_slice(format!("startxref\n{latest_xref_offset}\n%%EOF\n").as_bytes());
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert!(loaded.repair_diagnostics.entries().iter().any(|entry| {
+        entry.message.contains("recovered stream length") && entry.message.contains("(object 2 0,")
+    }));
+}
+
+#[test]
+fn preserves_previous_xref_diagnostics_through_linear_scan_fallback() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let obj1_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let bad_prev = bytes.len() as u64;
+    bytes.extend_from_slice(b"not-an-xref-section\n");
+
+    let previous_xref_offset = bytes.len() as u64;
+    let previous_entries =
+        build_encoded_xref_stream_entries(&[(0, 0, 0), (1, obj1_offset, 0), (0, 0, 0)]);
+    bytes.extend_from_slice(&make_xref_stream_object_with_declared_length(
+        2,
+        3,
+        Some(bad_prev),
+        1,
+        &previous_entries,
+        previous_entries.len() + 10,
+    ));
+
+    let latest_xref_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 3\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{obj1_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{previous_xref_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 3 /Root 1 0 R /Prev {previous_xref_offset} >>\nstartxref\n{latest_xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    let messages: Vec<_> = loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(messages.len(), 6, "diagnostics must be preserved once");
+    assert!(messages[0].ends_with("expected endstream"));
+    assert!(messages[1].ends_with("attempting to recover stream length"));
+    assert!(messages[2].ends_with(&format!(
+        "recovered stream length: {}",
+        previous_entries.len() + 1
+    )));
+    assert_eq!(
+        &messages[3..],
+        [
+            "file is damaged",
+            "expected integer",
+            "Attempting to reconstruct cross-reference table",
+        ]
+    );
+}
+
 fn build_encoded_xref_stream_entries(entries: &[(u8, u64, u64)]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(entries.len() * 7);
     for &(entry_type, field1, field2) in entries {
@@ -249,15 +426,30 @@ fn make_xref_stream_object(
     root_ref_number: u32,
     entries: &[u8],
 ) -> Vec<u8> {
+    make_xref_stream_object_with_declared_length(
+        object_number,
+        size,
+        prev_offset,
+        root_ref_number,
+        entries,
+        entries.len(),
+    )
+}
+
+fn make_xref_stream_object_with_declared_length(
+    object_number: u32,
+    size: u32,
+    prev_offset: Option<u64>,
+    root_ref_number: u32,
+    entries: &[u8],
+    declared_length: usize,
+) -> Vec<u8> {
     let prev = prev_offset
         .map(|offset| format!(" /Prev {offset}"))
         .unwrap_or_default();
 
     let mut object = format!(
-        "{} 0 obj\n<< /Type /XRef /Size {size} /Root {root_ref_number} 0 R /W [1 4 2] /Index [0 {size}] /Length {}{} >>\nstream\n",
-        object_number,
-        entries.len(),
-        prev
+        "{object_number} 0 obj\n<< /Type /XRef /Size {size} /Root {root_ref_number} 0 R /W [1 4 2] /Index [0 {size}] /Length {declared_length}{prev} >>\nstream\n",
     )
     .into_bytes();
     object.extend_from_slice(entries);
@@ -380,6 +572,27 @@ fn xref_stream_parse_error_offset_is_absolute() {
 }
 
 #[test]
+fn xref_stream_body_parse_error_offset_includes_indirect_header() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let xref_pos = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /XRef /Size ");
+    let body_error_pos = bytes.len();
+    bytes.extend_from_slice(b"] >>\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_pos}\n%%EOF\n").as_bytes());
+
+    let mut reader = Cursor::new(bytes);
+    let err = load_xref_and_trailer(&mut reader)
+        .expect_err("invalid xref stream body syntax should error");
+    let Error::Parse { offset, .. } = err else {
+        panic!("expected Error::Parse, got {err:?}");
+    };
+    assert_eq!(
+        offset, body_error_pos,
+        "body parse error offset must include both xref_pos and the indirect header"
+    );
+}
+
+#[test]
 fn rejects_startxref_offset_exactly_at_eof_without_panic() {
     // Boundary companion to the test above: when `startxref` equals the file
     // length exactly, `bytes.get(xref_pos..)` yields an empty slice rather than
@@ -489,6 +702,42 @@ fn best_effort_recovers_objstm_compressed_entries() {
             .values()
             .any(|entry| matches!(entry, XrefOffset::Compressed { stream, .. } if *stream == objstm_obj_number)),
         "expected at least one compressed entry referencing the ObjStm"
+    );
+}
+
+#[test]
+fn best_effort_recovers_objstm_with_indirect_length() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let objstm_data = b"7 0 <</Foo 1>>";
+    let objstm_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"5 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 6 0 R >>\nstream\n");
+    bytes.extend_from_slice(objstm_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("6 0 obj\n{}\nendobj\n", objstm_data.len()).as_bytes());
+
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+    bytes[start_xref + 2] = b'z';
+
+    load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
+        .expect_err("corrupt xref must fail strict loading");
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(5, 0)),
+        Some(&XrefOffset::Offset(objstm_offset))
+    );
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(7, 0)),
+        Some(&XrefOffset::Compressed {
+            stream: 5,
+            index: 0,
+        })
     );
 }
 
