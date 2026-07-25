@@ -44,6 +44,19 @@ For `<010 203 0004056>`, qpdf produces:
 
 qpdf successfully rewrites and checks good13 with exit status 0.
 
+The source comparison also exposes two normal-mode lexical differences that
+would otherwise appear immediately after the first hex-string fix:
+
+- good13 uses `/ (legal)`, where `/` is an empty name. qpdf emits an empty
+  name token; flpdf currently rejects it.
+- qpdf's number state changes to a word when a non-delimiter other than `.`
+  follows a number. Therefore `1e3` is a word, not a real token. flpdf
+  currently accepts it as a real.
+
+The tokenizer extraction must follow qpdf for the whole normal pull mode, not
+freeze parser-local divergences merely because existing flpdf tests encode
+them.
+
 ## Goals
 
 - Add an internal tokenizer component corresponding to qpdf 11.9.0's
@@ -55,6 +68,8 @@ qpdf successfully rewrites and checks good13 with exit status 0.
   whitespace and odd-nibble zero padding.
 - Preserve source offsets, real-number spellings, nesting limits, strict API
   behavior, and the existing file-object recovery boundary.
+- Correct normal-mode lexical classifications that differ from
+  `QPDFTokenizer`, including empty names and exponent-looking words.
 - Make good13 readable by the CLI without vendoring the upstream qtest fixture.
 
 ## Non-goals
@@ -115,8 +130,8 @@ The initial token kinds correspond to the qpdf kinds needed for object syntax:
 
 Each token carries its semantic value where applicable plus its source span.
 Real tokens retain access to their raw spelling so `Object::RealLiteral`
-continues to preserve `.4`, `0.400`, exponents, and other qpdf-visible source
-forms.
+continues to preserve qpdf real forms such as `.4`, `0.400`, `1.`, and
+`+.25`. Exponent-looking input such as `1e3` is a word token, matching qpdf.
 
 Comments and whitespace are skipped in the normal mode delivered here. They
 are not emitted as tokens until `flpdf-n9t0.1` adds qpdf's
@@ -185,6 +200,9 @@ framing operations, not ordinary lexical pulls.
 
 - Valid hex strings with whitespace or an odd digit count succeed exactly as
   qpdf does.
+- An empty name token (`/` followed by a delimiter or EOF) is valid.
+- Normal-mode number/word classification follows qpdf's state transitions;
+  exponent notation is not a PDF real token.
 - Invalid hex bytes remain parse errors at the offending byte.
 - Unterminated literal/hex strings, arrays, and dictionaries retain an error
   rather than silently consuming the rest of the input. A name may terminate
@@ -209,7 +227,9 @@ Follow red-green-refactor.
    - invalid hex;
    - unterminated hex;
    - escaped names and nested literal strings;
-   - integer, real, word, boolean, null, and delimiters.
+   - empty names;
+   - integer, qpdf-valid real forms, exponent-looking words, boolean, null,
+     and delimiters.
 3. Refactor the parser to consume the tokenizer while keeping the existing
    parser, content-stream, reader, xref, and writer tests green.
 4. Run the external qpdf 11.9.0 good13 fixture through the release CLI:
