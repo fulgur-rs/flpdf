@@ -63,7 +63,7 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDF.cc` | 2667 | `reader.rs`(2454) + `reader/file_object.rs`(650) + `xref.rs`(1129) + `object_copy.rs`(184: `copyForeignObject`) + `cache.rs`(102: xref 由来の `ObjectCache` / `CacheEntry`。消費者は `reader.rs`) + `writer/object_streams.rs`(207-237: `compressible_objgens_qpdf_plan` = `getCompressibleObjGens`、`QPDF.cc:2392-2445`)  + `signatures.rs`(245-: `removeSecurityRestrictions`) + `page_closure.rs`(207: `page_object_closure`。`object_copy.rs` は pre-closed な集合しか受け取らず、両者で `copyForeignObject` 相当を構成する) | 🔀 |
+| `QPDF.cc` | 2667 | `reader.rs`(2454) + `reader/file_object.rs`(650) + `xref.rs`(1129) + `object_copy.rs`(184: `copyForeignObject`) + `cache.rs`(102: xref 由来の `ObjectCache` / `CacheEntry`。消費者は `reader.rs`) + `writer/object_streams.rs`(207-237: `compressible_objgens_qpdf_plan` = `getCompressibleObjGens`、`QPDF.cc:2392-2445`)  + `signatures.rs`(245-: `removeSecurityRestrictions`) + `page_closure.rs`(207: `page_object_closure`。`object_copy.rs` は pre-closed な集合しか受け取らず、両者で `copyForeignObject` 相当を構成する) + `ref_chain.rs`(77: `resolve_ref_chain` / `terminal_ref_of_chain` / `MAX_REF_CHAIN_DEPTH` — 深さ上限付き間接参照解決の共有プリミティブ。20 モジュールが使用) | 🔀 |
 | `QPDFParser.cc` | 519 | `parser.rs`(905) の `Parser<'a>`(101) | 🔀 型は存在し `content_stream.rs` も再利用している。qpdf API との差分は未精査 |
 | `QPDFTokenizer.cc` | 965 | `tokenizer.rs`（normal mode / PR #549）+ `content_stream.rs`(484) に二重実装 | 🔀 → **T1-1**（`flpdf-n9t0.1`） |
 | `InputSource` 系 5 ファイル | 625 | `Read + Seek` ジェネリクスで代替 | ⚪ |
@@ -105,7 +105,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDF_encryption.cc` | 1410 | `security/standard.rs`(1879) + `writer.rs` の encryption context(~700) + `encrypt_setup.rs`(213) + `permissions.rs`(206) | 🔀 |
+| `QPDF_encryption.cc` | 1410 | `security/standard.rs`(1879) + `writer.rs` の encryption context(~700) + `encrypt_setup.rs`(213) + `permissions.rs`(206) + `security/password.rs`(100: `normalize_password` — auto/bytes/hex-bytes/unicode、SASLprep、revision 依存の切り詰め。`PasswordMode` は `lib.rs:233` から re-export され CLI の `--password-mode` が選択、`reader.rs:604` が呼ぶ) | 🔀 |
 | `rijndael.cc` / `AES_PDF_native` / `RC4_native` / `MD5_native` / `SHA2_native` | 1716 | `security/primitives.rs`(188)（外部 crate） | ⚪ |
 | `QPDFCryptoProvider.cc` / `QPDFCrypto_*` | 774 | provider 抽象が無い | ⚪ |
 | ランダム源 3 ファイル | 185 | `writer.rs` の `fresh_id_bytes` 等に散在 | 🔀 |
@@ -237,7 +237,7 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 | `signatures.rs` の**検査 API のみ** | — | 署名の読み取り検査。qpdf に相当機能なし |
 | `qdf_fix.rs` | 764 | qpdf では `qpdf/fix-qdf.cc`（libqpdf 外の別バイナリ） |
 | `fonts.rs` | 192 | `--show-fonts` の実体（`font_entries`(30) / `font_entries_with_max_depth`(43)）。qpdf にフォント一覧機能は無い（`qpdf --help=all` に font 関連の記載なし） |
-| `ref_chain.rs` | 77 | |
+
 
 `object_copy.rs`(184) は `QPDF.cc` の `copyForeignObject` に相当するため
 [§2 パース / 読み取り](#2-パース--読み取り) の `QPDF.cc` 行に移した。

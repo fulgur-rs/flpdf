@@ -367,7 +367,7 @@ have_pinned_commit() {
 # ref that is never refreshed would keep matching a pin that upstream has since
 # moved or deleted — silently defeating the retag warning.
 echo "Fetching ${QPDF_REPO}"
-if ! git -C "$MIRROR" fetch --quiet --prune --tags --force origin; then
+if ! git -C "$MIRROR" fetch --quiet --prune --prune-tags --tags --force origin; then
   # Offline or upstream unreachable. Continue only if the pin is already
   # present; the retag check then runs against possibly stale refs, so say so.
   if have_pinned_commit; then
