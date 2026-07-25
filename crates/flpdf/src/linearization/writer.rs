@@ -67,15 +67,14 @@ use crate::linearization::hint_stream::{encode_hint_stream, OutlineHintTable};
 use crate::linearization::part1::{Part1Bytes, Part1Placeholders};
 use crate::linearization::plan::{ContainerPart, LinearizationPlan, RoutedObjStmBatch};
 use crate::linearization::renumber::{ObjStmRelocation, RenumberMap, SecondHalfContainerAnchor};
-use crate::linearization::xref_stream;
 use crate::object::MAX_INLINE_DEPTH;
 use crate::writer::object_streams::{
     emit_objstm_body_from_resolved, planner_config_from_options, wrap_objstm_body,
 };
 use crate::writer::{
     effective_pdf_version, effective_stream_policy, is_lone_flate, reencode_stream_for_compress,
-    write_stream_to_buf_qpdf_order, CompressStreams, NewlineBeforeEndstream, WriteOptions,
-    QPDF_STATIC_ID,
+    serialize::write_qpdf_stream as write_stream_to_buf_qpdf_order, serialize::xref_stream,
+    CompressStreams, NewlineBeforeEndstream, WriteOptions, QPDF_STATIC_ID,
 };
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result, Stream};
 

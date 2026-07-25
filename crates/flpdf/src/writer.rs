@@ -1,6 +1,14 @@
 #[path = "writer/object_streams.rs"]
 pub(crate) mod object_streams;
+#[path = "writer/serialize.rs"]
+pub(crate) mod serialize;
 pub use object_streams::ObjectStreamMode;
+pub use serialize::write_stream_to_buf;
+use serialize::{
+    framing_adds_newline as stream_framing_adds_newline,
+    write_qpdf_stream as write_stream_to_buf_qpdf_order, write_stream_payload,
+    write_stream_with_id_writer as write_stream_to_buf_with_id_writer,
+};
 
 use crate::parser::Parser;
 use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefForm, XrefOffset};
@@ -4533,21 +4541,12 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
                     resolved.push((new, obj));
                 }
                 let body = object_streams::emit_objstm_body_from_resolved(&resolved)?;
-                let stream = object_streams::wrap_objstm_body(&body, structural_compress)?;
-                // Emit the container dict in qpdf 11.9.0's fixed key order
-                // (`/Type /ObjStm /Length L [/Filter /FlateDecode] /N n /First f`);
-                // the BTreeMap-backed `Object::Stream` serializer would
-                // alphabetize the keys instead. `/Filter` is present iff the body
-                // was compressed (`CompressStreams::Yes`).
-                bytes.extend_from_slice(b"<< /Type /ObjStm /Length ");
-                bytes.extend_from_slice(stream.data.len().to_string().as_bytes());
-                if stream.dict.get("Filter").is_some() {
-                    bytes.extend_from_slice(b" /Filter /FlateDecode");
-                }
-                bytes.extend_from_slice(
-                    format!(" /N {} /First {} >>", body.n_members, body.first_offset).as_bytes(),
-                );
-                write_stream_payload(&mut bytes, &stream.data, options.newline_before_endstream);
+                serialize::write_objstm_stream(
+                    &mut bytes,
+                    &body,
+                    structural_compress,
+                    options.newline_before_endstream,
+                )?;
             }
         }
         bytes.extend_from_slice(b"\nendobj\n");
@@ -4606,7 +4605,7 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
     // fixed-key-order xref stream. Reuse the linearized encoder, which already
     // reproduces that shape byte-for-byte (the generic `build_xref_stream_bytes`
     // uses `/W [1 8 4]` without a predictor and is NOT byte-identical to qpdf).
-    use crate::linearization::xref_stream;
+    use crate::writer::serialize::xref_stream;
     let xref_offset = bytes.len();
     // Highest object number across plain bodies, containers, AND compressed
     // members. Numbering is contiguous `1..=M`; the xref stream itself takes
@@ -4864,99 +4863,6 @@ pub(crate) fn is_lone_flate(filter: Option<&Object>) -> bool {
             matches!(items.as_slice(), [Object::Name(name)] if name.as_slice() == b"FlateDecode")
         }
         _ => false,
-    }
-}
-
-/// Write a PDF stream to `buf`, applying the [`NewlineBeforeEndstream`] policy.
-///
-/// This is the **single choke-point** through which all stream emission in the
-/// full-rewrite writer paths flows.  It mirrors the layout that
-/// `Object::Stream::write_pdf` produces, but gives the caller control over
-/// the newline before `endstream`.
-///
-/// # Layout
-///
-/// ```text
-/// <stream-dict>\nstream\n<payload><EOL>endstream
-/// ```
-///
-/// where `<EOL>` is:
-/// - `NewlineBeforeEndstream::Yes`: always `b'\n'` (one byte, unconditionally).
-/// - `NewlineBeforeEndstream::No`: empty when payload ends with exactly `\n`;
-///   otherwise `b'\n'` (one byte, for ISO 32000-1 parseability). Bare `\r`
-///   or `\r\n` endings still receive an added `\n`, matching qpdf's
-///   `(last_char != '\n')` check.
-///
-/// # /Length invariant
-///
-/// The helper **does not** modify the stream dictionary.  Callers are
-/// responsible for setting `/Length` to `stream.data.len()` before calling
-/// (i.e., the raw payload byte count, not including the EOL byte).
-pub fn write_stream_to_buf(
-    buf: &mut Vec<u8>,
-    stream: &crate::Stream,
-    policy: NewlineBeforeEndstream,
-) {
-    stream.dict.write_pdf(buf);
-    write_stream_payload(buf, &stream.data, policy);
-}
-
-/// Like [`write_stream_to_buf`] but serializes the stream dictionary via
-/// [`crate::object::Dictionary::write_pdf_with_id_writer`], so the `/ID` value
-/// (at its lexicographic position in the dictionary) can be produced by
-/// `id_writer` from the bytes written so far. With `id_writer = None` the output
-/// is byte-identical to [`write_stream_to_buf`]. Used by the cross-reference
-/// stream path to direct-write the deterministic `/ID` inline instead of
-/// emitting a placeholder and byte-searching for it afterwards.
-pub(crate) fn write_stream_to_buf_with_id_writer(
-    buf: &mut Vec<u8>,
-    stream: &crate::Stream,
-    policy: NewlineBeforeEndstream,
-    id_writer: Option<crate::object::TrailerIdWriter>,
-) {
-    stream.dict.write_pdf_with_id_writer(buf, id_writer);
-    write_stream_payload(buf, &stream.data, policy);
-}
-
-/// Like [`write_stream_to_buf`] but serializes the stream dictionary in qpdf's
-/// stream-dictionary key order (see [`crate::object::Dictionary::write_pdf_stream`]):
-/// `/Length` is pulled out and written after the other (sorted) keys, and when
-/// `refiltered` is set, `/Filter`/`/DecodeParms` are dropped from the iteration
-/// and `/Filter /FlateDecode` is re-appended after `/Length`. Used by the
-/// full-rewrite path so re-encoded content streams match `qpdf --static-id`
-/// byte-for-byte (modulo the deflate-backend-dependent `/Length` value).
-pub(crate) fn write_stream_to_buf_qpdf_order(
-    buf: &mut Vec<u8>,
-    stream: &crate::Stream,
-    policy: NewlineBeforeEndstream,
-    refiltered: bool,
-) {
-    stream.dict.write_pdf_stream(buf, refiltered);
-    write_stream_payload(buf, &stream.data, policy);
-}
-
-/// Emit the `\nstream\n<payload><EOL>endstream` framing shared by
-/// [`write_stream_to_buf`] and [`write_stream_to_buf_qpdf_order`], applying the
-/// [`NewlineBeforeEndstream`] policy. The dictionary must already be written.
-fn write_stream_payload(buf: &mut Vec<u8>, data: &[u8], policy: NewlineBeforeEndstream) {
-    buf.extend_from_slice(b"\nstream\n");
-    buf.extend_from_slice(data);
-
-    if stream_framing_adds_newline(data, policy) {
-        buf.push(b'\n');
-    }
-
-    buf.extend_from_slice(b"endstream");
-}
-
-/// Whether stream framing adds one LF before `endstream` for this payload.
-/// This mirrors qpdf's `added_newline` state and is shared by the byte emitter
-/// and QDF marker decision so they cannot drift.
-fn stream_framing_adds_newline(data: &[u8], policy: NewlineBeforeEndstream) -> bool {
-    match policy {
-        NewlineBeforeEndstream::Yes => true,
-        NewlineBeforeEndstream::No => data.last() != Some(&b'\n'),
-        NewlineBeforeEndstream::Never => false,
     }
 }
 
