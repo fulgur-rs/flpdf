@@ -2466,6 +2466,14 @@ qpdf --linearize --object-streams=preserve --force-version=1.4 --deterministic-i
     "$FIX/three-page-objstm.pdf" "$REF/three-page-objstm/linearize-downgrade-force14.pdf"
 echo "three-page-objstm/linearize-downgrade-force14.pdf"
 
+# NON-linearized --object-streams=preserve on the same ObjStm/xref-stream source,
+# with the header left alone: qpdf reuses the source ObjStm membership and keeps
+# the inherited cross-reference stream. This anchors the Preserve row of
+# cmp_diff_zero_tests' static-id matrix.
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/three-page-objstm.pdf" "$REF/three-page-objstm/preserve.pdf"
+echo "three-page-objstm/preserve.pdf"
+
 # NON-linearized --object-streams=generate (cross-reference *stream* form, header
 # floored to 1.5). --static-id keeps /ID byte-stable: /ID[0] is the preserved
 # source identifier (or the pi constant when the source has none) and /ID[1] is
