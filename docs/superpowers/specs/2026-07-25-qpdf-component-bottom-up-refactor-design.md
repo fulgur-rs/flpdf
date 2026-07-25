@@ -260,20 +260,22 @@ D2 の対象:
 支配せず旧経路が並存する。**`json.rs` / `json_inspect.rs` / CLI 呼び出し元の 3 つを
 すべて移行スコープに含めること。**
 
-**Pipeline 依存の扱い（着手前に決着させること）**: `JSON.cc` は依存ゼロではなく、
+**Pipeline 依存の扱い（方針改訂により解決）**: `JSON.cc` は依存ゼロではなく、
 `Pl_Base64` / `Pl_Concatenate` / `Pl_String` の 3 つの Pipeline sink を使う。
-対応表は `Pipeline` を ❌ missing に分類しているため、このままでは T0-3 を
-「独立に完成できる部品」として扱えない。取りうる道は 2 つ。
 
-1. **sink 代替を逸脱として明示承認する**（推奨）— この 3 つはいずれも対応表の
-   ⚪ 逸脱候補「汎用 `Pl_*` → `Vec<u8>` / `Write`」に既に含まれており、出力バイトへの
-   影響は無い。`CLAUDE.md` の「逸脱は必ず明示」に従い、承認を得たうえで
-   `json/` の doc に逸脱理由を 1 行残す。この場合 T0-3 は Tier 0 のまま
-2. **`pipeline.rs` を先に作る** — T0-3 を Tier 1 相当に降格し、`pipeline.rs` の
-   後ろに置く。逸脱を増やさないが、後回しにした部品を前倒しすることになる
+`CLAUDE.md` の逸脱条項が 2 分類に改訂され、「(B) 出力バイトを変えない内部構造の
+代替」の枠ができた。この 3 sink はすべて (B) に該当するため、`base64` crate と
+`Write` / `Vec<u8>` で代替してよい。`pipeline.rs` の先行は不要で、T0-3 は
+Tier 0 のまま進められる。
 
-**承認が得られるまで T0-3 は着手しない。** 未承認のまま `Write` で代替すると、
-`CLAUDE.md` が禁じる「暗黙の逸脱」になる。
+ただし (B) は無条件ではない。着手時に次を満たすこと。
+
+1. **出力バイトに影響しないことを検証する** — base64 は `JSON.cc:184-191` の
+   `writeBlob` が改行挿入なし・標準アルファベットのみであることを確認済み。
+   `json/` の出力を守る gated byte テストが無ければ先に追加する
+2. **逐次出力の順序は qpdf のまま** — sink を差し替えても
+   `writeDictionaryOpen` 等の呼び出し順を変えない
+3. **記録する** — `json/` の doc に逸脱理由を 1 行、対応表の ⚪ 行に記載
 
 解錠するもの: `--json-input` 経路、`flpdf-iquk`、`flpdf-q28i`。
 
@@ -408,9 +410,10 @@ flpdf-qxba.1, .2      （小・独立、いつでも）
    ├─> T0-1 pdf_version.rs  (.4)  DoD と D4 足場の確立
    └─> T0-2 matrix.rs       (.5)  5 モジュールの重複を吸収
 
-T0-3 json/ (.6)  ⛔ ブロック中
-   前提: Pipeline sink 代替の逸脱承認、または pipeline.rs の完成。
-   どちらも未了のうちは着手しない（本文「Pipeline 依存の扱い」参照）。
+T0-3 json/ (.6)  着手可（Tier 0）
+   Pipeline sink は CLAUDE.md (B) の枠で代替可。ただし着手時に
+   出力バイト非影響の検証と gated byte gate の有無確認を行うこと。
+   規模は T0-1/T0-2 と二桁違う（json_inspect.rs の push 型転換を含む）。
 
 PR #549 merge ──> T1-1 tokenizer 全モード (flpdf-n9t0.1)
                        │
