@@ -14,7 +14,10 @@ keywords = ["pdf", "qpdf", "cli", "linearization"]
 categories = ["command-line-utilities"]
 # This contract reads a workspace-level GitHub Actions file that is not part of
 # the published crate archive.
-exclude = ["tests/release_workflow_contract.rs"]
+exclude = [
+    "tests/ci_workflow_contract.rs",
+    "tests/release_workflow_contract.rs",
+]
 
 [[bin]]
 name = "flpdf"
