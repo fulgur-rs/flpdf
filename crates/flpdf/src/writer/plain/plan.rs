@@ -166,6 +166,7 @@ impl PlainWritePlan {
                 PlannedIndirectObject::Source { source, output } => {
                     require_unique_output(&mut outputs, *output)?;
                     require_unique_source(&mut sources, *source)?;
+                    require_matching_mapping(&self.old_to_new, *source, *output)?;
                 }
                 PlannedIndirectObject::ObjectStream { output, members } => {
                     has_object_stream = true;
@@ -178,6 +179,7 @@ impl PlainWritePlan {
                             )));
                         }
                         require_unique_source(&mut sources, member.source)?;
+                        require_matching_mapping(&self.old_to_new, member.source, member.output)?;
                         if !outputs.insert(member.output.number) {
                             return Err(crate::Error::Unsupported(format!(
                                 "plain writer plan: output object {} has multiple placements",
@@ -189,10 +191,31 @@ impl PlainWritePlan {
             }
         }
 
+        if let Some(extra) = self
+            .old_to_new
+            .keys()
+            .find(|source| !sources.contains(source))
+        {
+            return Err(crate::Error::Unsupported(format!(
+                "plain writer plan: source {} {} R has no placement",
+                extra.number, extra.generation
+            )));
+        }
+
         if !self.old_to_new.values().any(|&output| output == self.root) {
             return Err(crate::Error::Unsupported(format!(
                 "plain writer plan: root {} {} R is absent from old-to-new map",
                 self.root.number, self.root.generation
+            )));
+        }
+
+        if self.trailer.root != self.root {
+            return Err(crate::Error::Unsupported(format!(
+                "plain writer plan: trailer root {} {} R differs from plan root {} {} R",
+                self.trailer.root.number,
+                self.trailer.root.generation,
+                self.root.number,
+                self.root.generation
             )));
         }
 
@@ -366,6 +389,29 @@ fn require_unique_source(
     }
 }
 
+fn require_matching_mapping(
+    old_to_new: &HashMap<ObjectRef, ObjectRef>,
+    source: ObjectRef,
+    output: ObjectRef,
+) -> crate::Result<()> {
+    match old_to_new.get(&source) {
+        Some(mapped) if *mapped == output => Ok(()),
+        Some(mapped) => Err(crate::Error::Unsupported(format!(
+            "plain writer plan: source {} {} R maps to {} {} R but is placed at {} {} R",
+            source.number,
+            source.generation,
+            mapped.number,
+            mapped.generation,
+            output.number,
+            output.generation
+        ))),
+        None => Err(crate::Error::Unsupported(format!(
+            "plain writer plan: source {} {} R is absent from old-to-new map",
+            source.number, source.generation
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,7 +458,42 @@ mod tests {
 
         let legacy = Pdf::open(std::io::Cursor::new(output)).unwrap();
         assert_eq!(legacy.root_ref(), Some(plan.root));
+        assert_eq!(legacy.version(), plan.version);
+        assert_eq!(legacy.last_xref_form(), plan.trailer.form);
         let entries = legacy.source_xref_entries();
+        let mut planned_active: BTreeSet<u32> = plan
+            .objects
+            .iter()
+            .flat_map(|object| match object {
+                PlannedIndirectObject::Source { output, .. } => vec![output.number],
+                PlannedIndirectObject::ObjectStream { output, members } => {
+                    std::iter::once(output.number)
+                        .chain(members.iter().map(|member| member.output.number))
+                        .collect()
+                }
+            })
+            .collect();
+        if plan.trailer.form == XrefForm::Stream {
+            let xref_number = planned_active
+                .last()
+                .copied()
+                .unwrap_or(0)
+                .checked_add(1)
+                .unwrap();
+            planned_active.insert(xref_number);
+        }
+        let legacy_active: BTreeSet<u32> = entries
+            .iter()
+            .filter_map(|(reference, offset)| {
+                matches!(
+                    offset,
+                    XrefOffset::Offset(_) | XrefOffset::Compressed { .. }
+                )
+                .then_some(reference.number)
+            })
+            .collect();
+        assert_eq!(legacy_active, planned_active);
+
         for object in &plan.objects {
             match object {
                 PlannedIndirectObject::Source { output, .. } => {
@@ -498,6 +579,63 @@ mod tests {
         let err = plan.validate().unwrap_err();
         assert!(matches!(err, crate::Error::Unsupported(ref message)
             if message.contains("7 1 R")));
+    }
+
+    #[test]
+    fn validation_rejects_source_missing_from_old_to_new() {
+        let plan = plan_for_test(vec![source(1, 1), source(2, 2)]);
+        let err = plan.validate().unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("source 2 0 R is absent from old-to-new map")));
+    }
+
+    #[test]
+    fn validation_rejects_source_mapping_that_differs_from_placement() {
+        let mut plan = plan_for_test(vec![source(1, 1), source(2, 2)]);
+        plan.old_to_new
+            .insert(ObjectRef::new(2, 0), ObjectRef::new(3, 0));
+        let err = plan.validate().unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("source 2 0 R maps to 3 0 R but is placed at 2 0 R")));
+    }
+
+    #[test]
+    fn validation_rejects_member_mapping_that_differs_from_placement() {
+        let member = PlannedMember {
+            source: ObjectRef::new(7, 0),
+            output: ObjectRef::new(2, 0),
+        };
+        let mut plan = plan_for_test(vec![
+            source(1, 1),
+            PlannedIndirectObject::ObjectStream {
+                output: ObjectRef::new(3, 0),
+                members: vec![member],
+            },
+        ]);
+        plan.old_to_new
+            .insert(ObjectRef::new(7, 0), ObjectRef::new(4, 0));
+        let err = plan.validate().unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("source 7 0 R maps to 4 0 R but is placed at 2 0 R")));
+    }
+
+    #[test]
+    fn validation_rejects_extra_old_to_new_entry() {
+        let mut plan = plan_for_test(vec![source(1, 1)]);
+        plan.old_to_new
+            .insert(ObjectRef::new(2, 0), ObjectRef::new(2, 0));
+        let err = plan.validate().unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("source 2 0 R has no placement")));
+    }
+
+    #[test]
+    fn validation_rejects_trailer_root_that_differs_from_plan_root() {
+        let mut plan = plan_for_test(vec![source(1, 1)]);
+        plan.trailer.root = ObjectRef::new(2, 0);
+        let err = plan.validate().unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("trailer root 2 0 R differs from plan root 1 0 R")));
     }
 
     #[test]
