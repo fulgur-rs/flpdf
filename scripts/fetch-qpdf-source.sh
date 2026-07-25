@@ -113,9 +113,10 @@ modified_tracked() {
 }
 
 refuse_modified() {
-  echo "fetch-qpdf-source.sh: ${DEST} is at the pinned commit but has local edits:" >&2
+  echo "fetch-qpdf-source.sh: ${DEST} has local edits to tracked files:" >&2
   git -C "$DEST" status --porcelain --untracked-files=no >&2
-  echo "                      file/line citations against it are no longer reliable" >&2
+  echo "                      it no longer matches the commit it is checked out at," >&2
+  echo "                      so file/line citations against it are unreliable" >&2
   if owned; then
     echo "                      restore it:    git -C ${DEST} checkout -- ." >&2
     echo "                      or re-create:  scripts/fetch-qpdf-source.sh --force" >&2
@@ -138,8 +139,23 @@ warn_on_binary_drift() {
     echo "fetch-qpdf-source.sh: note: no qpdf on PATH; the binary oracle is unavailable" >&2
     return 0
   fi
-  local bin_version
-  bin_version="$(qpdf --version 2>/dev/null | head -1 | awk '{print $3}')"
+  # Capture the whole output and split it in the shell rather than piping into
+  # `head`/`awk`. `qpdf --version` prints two lines, so a `| head -1` lets the
+  # reader exit first and the writer take SIGPIPE: measured at status 141 on
+  # roughly 1 in 100 runs with a perfectly healthy qpdf, which under `pipefail`
+  # would either kill the script (`set -e`) or silently blank the version. A
+  # binary that genuinely cannot run (a missing shared library, say) lands in
+  # the same empty-value branch.
+  local raw first bin_version
+  local -a fields
+  raw="$(qpdf --version 2>/dev/null)" || raw=""
+  first="${raw%%$'\n'*}"
+  read -r -a fields <<<"$first" || true
+  bin_version="${fields[2]:-}"
+  if [[ -z "$bin_version" ]]; then
+    echo "fetch-qpdf-source.sh: note: qpdf on PATH did not report a version; the binary oracle is unavailable" >&2
+    return 0
+  fi
   if [[ "$bin_version" != "$QPDF_VERSION" ]]; then
     echo "fetch-qpdf-source.sh: warning: installed qpdf is ${bin_version:-unknown}, pinned source is ${QPDF_VERSION}" >&2
     echo "                      behavioural comparisons against \$(command -v qpdf) will not match this tree" >&2
@@ -171,7 +187,15 @@ owned() {
     [[ "$(resolve_path "$common")" == "$(resolve_path "$MIRROR")" ]] && return 0
   fi
   gitdir="$(head -n 1 "${DEST}/.git")"
-  [[ "$gitdir" == "gitdir: ${MIRROR}/worktrees/"* ]]
+  [[ "$gitdir" == "gitdir: ${MIRROR}/worktrees/"* ]] && return 0
+  # git records the mirror's real path while $MIRROR may be spelled through a
+  # symlink, and with the mirror gone `resolve_path "$MIRROR"` cannot bridge the
+  # two. Its parent is still resolvable, so rebuild the canonical spelling from
+  # there — otherwise the deleted-mirror recovery this fallback exists for is
+  # exactly what breaks under a symlinked cache root.
+  local canonical_parent
+  canonical_parent="$(resolve_path "$(dirname "$MIRROR")")"
+  [[ "$gitdir" == "gitdir: ${canonical_parent}/$(basename "$MIRROR")/worktrees/"* ]]
 }
 
 if (( PRINT_PATH )); then
@@ -206,6 +230,15 @@ if [[ -e "$DEST" ]] && ! owned; then
   echo "                      so it cannot be used as the oracle as-is" >&2
   echo "                      move it aside, or unset/redirect \$FLPDF_QPDF_SRC" >&2
   exit 1
+fi
+
+# Reaching here means $DEST is about to be replaced by `worktree remove --force`,
+# which is irreversible. The guards above only cover a dirty tree that still
+# satisfies `installed`; an owned worktree checked out elsewhere, or with its
+# sentinel deleted, is dirty too and would otherwise be wiped silently. Discard
+# only when explicitly asked.
+if (( ! FORCE )) && [[ -e "$DEST" ]] && modified_tracked; then
+  refuse_modified
 fi
 
 if ! command -v git >/dev/null 2>&1; then
