@@ -1,3 +1,7 @@
+use std::collections::VecDeque;
+
+pub(crate) use crate::tokenizer::{is_delimiter, is_ws};
+use crate::tokenizer::{Token, TokenType, Tokenizer};
 use crate::{Dictionary, Error, Object, ObjectRef, Result};
 
 /// Parse a single PDF object from `input`, which must contain nothing but
@@ -66,10 +70,9 @@ pub(crate) struct ParsedDirectObject {
 pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObject> {
     let mut parser = Parser::new(input);
     parser.top_level_no_reference = true;
-    parser.skip_ws();
-
-    let empty_offset = keyword_token_end(input, parser.pos, b"endobj").map(|_| parser.pos);
-    if let Some(empty_offset) = empty_offset {
+    let token = parser.peek_token();
+    if token.token_type == TokenType::Word && token.value.as_ref() == b"endobj" {
+        let empty_offset = token.start;
         return Ok(ParsedDirectObject {
             object: Object::Null,
             next_offset: empty_offset,
@@ -78,29 +81,28 @@ pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObjec
     }
 
     let object = parser.object()?;
-    parser.skip_ws();
+    parser.skip_ignorable()?;
     Ok(ParsedDirectObject {
         object,
-        next_offset: parser.pos,
+        next_offset: parser.position(),
         empty_offset: None,
     })
 }
 
 pub(crate) fn parse_strict_direct_object(input: &[u8]) -> Result<ParsedDirectObject> {
     let mut parser = Parser::new(input);
-    parser.skip_ws();
     let object = parser.object()?;
-    parser.skip_ws();
+    parser.skip_ignorable()?;
     Ok(ParsedDirectObject {
         object,
-        next_offset: parser.pos,
+        next_offset: parser.position(),
         empty_offset: None,
     })
 }
 
 pub(crate) struct Parser<'a> {
-    input: &'a [u8],
-    pos: usize,
+    tokenizer: Tokenizer<'a>,
+    buffered: VecDeque<Token<'a>>,
     /// When `true`, `N G R` is *not* recognised as an indirect reference;
     /// the first integer is returned and `G R` are left unconsumed. Content
     /// streams never contain indirect references, so the tokenizer sets this
@@ -127,8 +129,8 @@ const MAX_PARSE_DEPTH: usize = 500;
 impl<'a> Parser<'a> {
     pub(crate) fn new(input: &'a [u8]) -> Self {
         Self {
-            input,
-            pos: 0,
+            tokenizer: Tokenizer::new(input),
+            buffered: VecDeque::new(),
             no_reference: false,
             top_level_no_reference: false,
             depth: 0,
@@ -139,8 +141,8 @@ impl<'a> Parser<'a> {
     /// disabled (see [`Parser::no_reference`]).
     pub(crate) fn new_no_reference(input: &'a [u8]) -> Self {
         Self {
-            input,
-            pos: 0,
+            tokenizer: Tokenizer::new(input),
+            buffered: VecDeque::new(),
             no_reference: true,
             top_level_no_reference: false,
             depth: 0,
@@ -148,7 +150,9 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn position(&self) -> usize {
-        self.pos
+        self.buffered
+            .front()
+            .map_or_else(|| self.tokenizer.position(), |token| token.start)
     }
 
     /// Parse a single direct object at the current position (after leading
@@ -169,7 +173,7 @@ impl<'a> Parser<'a> {
         self.depth += 1;
         if self.depth > MAX_PARSE_DEPTH {
             self.depth -= 1;
-            return Err(Error::parse(self.pos, "object nesting too deep"));
+            return Err(Error::parse(self.position(), "object nesting too deep"));
         }
         let result = self.object_inner();
         self.depth -= 1;
@@ -177,401 +181,170 @@ impl<'a> Parser<'a> {
     }
 
     fn object_inner(&mut self) -> Result<Object> {
-        self.skip_ws();
-        if self.starts_with(b"<<") {
-            return self.dictionary();
-        }
-        match self.peek() {
-            Some(b'[') => self.array(),
-            Some(b'/') => self.name().map(Object::Name),
-            Some(b'(') => self.literal_string().map(Object::String),
-            Some(b'<') => self.hex_string().map(Object::String),
-            Some(b'.') => self.real(),
-            Some(b'-' | b'+')
-                if self
-                    .input
-                    .get(self.pos + 1)
-                    .is_some_and(|byte| *byte == b'.') =>
-            {
-                self.real()
-            }
-            Some(b't') if self.take_keyword(b"true") => Ok(Object::Boolean(true)),
-            Some(b'f') if self.take_keyword(b"false") => Ok(Object::Boolean(false)),
-            Some(b'n') if self.take_keyword(b"null") => Ok(Object::Null),
-            Some(b'-' | b'+' | b'0'..=b'9') => self.number_or_ref(),
-            _ => Err(Error::parse(self.pos, "expected PDF object")),
+        let token = self.next_token();
+        match token.token_type {
+            TokenType::DictOpen => self.dictionary(),
+            TokenType::ArrayOpen => self.array(),
+            TokenType::Name => Ok(Object::Name(token.value.as_ref()[1..].to_vec())),
+            TokenType::String => Ok(Object::String(token.value.into_owned())),
+            TokenType::Bool => Ok(Object::Boolean(token.value.as_ref() == b"true")),
+            TokenType::Null => Ok(Object::Null),
+            TokenType::Integer => self.integer_or_ref(token),
+            TokenType::Real => self.real_object(token),
+            TokenType::Bad => Err(Error::parse(
+                token.start,
+                token
+                    .error_message
+                    .unwrap_or_else(|| "bad token".to_string()),
+            )),
+            TokenType::Eof => Err(Error::parse(token.start, "unexpected EOF")),
+            _ => Err(Error::parse(token.start, "expected PDF object")),
         }
     }
 
     fn dictionary(&mut self) -> Result<Object> {
-        self.expect_bytes(b"<<")?;
         let mut dict = Dictionary::new();
         loop {
-            self.skip_ws();
-            if self.starts_with(b">>") {
-                self.pos += 2;
+            let token = self.next_token();
+            if token.token_type == TokenType::DictClose {
                 return Ok(Object::Dictionary(dict));
             }
-            let key = self.name()?;
+            if token.token_type != TokenType::Name {
+                return Err(Error::parse(
+                    token.start,
+                    match token.token_type {
+                        TokenType::Eof => "unexpected EOF in dictionary",
+                        _ => "expected dictionary key",
+                    },
+                ));
+            }
+            let key = token.value.as_ref()[1..].to_vec();
             let value = self.object()?;
             dict.insert(key, value);
         }
     }
 
-    fn hex_string(&mut self) -> Result<Vec<u8>> {
-        self.expect_byte(b'<')?;
-        let mut value = Vec::new();
-        let mut first_nibble: Option<u8> = None;
-
-        while let Some(byte) = self.peek() {
-            if byte == b'>' {
-                self.pos += 1;
-                if first_nibble.is_some() {
-                    return Err(Error::parse(self.pos, "hex string has odd length"));
-                }
-                return Ok(value);
-            }
-
-            let nibble = match hex_value(byte) {
-                Some(byte) => byte,
-                None => return Err(Error::parse(self.pos, "invalid hex string")),
-            };
-
-            self.pos += 1;
-
-            if let Some(high) = first_nibble {
-                value.push((high << 4) | nibble);
-                first_nibble = None;
-            } else {
-                first_nibble = Some(nibble);
-            }
-        }
-
-        Err(Error::parse(self.pos, "unterminated hex string"))
-    }
-
     fn array(&mut self) -> Result<Object> {
-        self.expect_byte(b'[')?;
         let mut values = Vec::new();
         loop {
-            self.skip_ws();
-            if self.peek() == Some(b']') {
-                self.pos += 1;
+            let token = self.peek_token();
+            if token.token_type == TokenType::ArrayClose {
+                self.next_token();
                 return Ok(Object::Array(values));
+            }
+            if token.token_type == TokenType::Eof {
+                return Err(Error::parse(token.start, "unexpected EOF in array"));
             }
             values.push(self.object()?);
         }
     }
 
-    fn number_or_ref(&mut self) -> Result<Object> {
-        let start = self.pos;
-        let first = self.integer()?;
-        let saved = self.pos;
-        if self.peek() == Some(b'.') {
-            return self.real_with_integer_prefix(start);
-        }
-        if matches!(self.peek(), Some(b'e' | b'E')) {
-            return self.parse_real_exponent(start);
-        }
+    fn integer_or_ref(&mut self, first_token: Token<'a>) -> Result<Object> {
+        let first = parse_integer_token(&first_token)?;
         if self.no_reference || (self.top_level_no_reference && self.depth == 1) {
-            self.pos = saved;
             return Ok(Object::Integer(first));
         }
-        self.skip_ws();
-        if let Ok(second) = self.integer() {
-            self.skip_ws();
-            if self.peek() == Some(b'R') {
-                self.pos += 1;
-                let number = u32::try_from(first)
-                    .map_err(|_| Error::parse(saved, "invalid object number"))?;
-                let generation = u16::try_from(second)
-                    .map_err(|_| Error::parse(saved, "invalid generation number"))?;
-                return Ok(Object::Reference(ObjectRef::new(number, generation)));
-            }
+
+        let second_token = self.next_token();
+        if second_token.token_type != TokenType::Integer {
+            self.unread_token(second_token);
+            return Ok(Object::Integer(first));
         }
-        self.pos = saved;
+        let second = parse_integer_token(&second_token)?;
+        let third_token = self.next_token();
+        if third_token.token_type == TokenType::Word && third_token.value.as_ref() == b"R" {
+            let number = u32::try_from(first)
+                .map_err(|_| Error::parse(first_token.start, "invalid object number"))?;
+            let generation = u16::try_from(second)
+                .map_err(|_| Error::parse(second_token.start, "invalid generation number"))?;
+            return Ok(Object::Reference(ObjectRef::new(number, generation)));
+        }
+        self.unread_token(third_token);
+        self.unread_token(second_token);
         Ok(Object::Integer(first))
     }
 
-    fn real(&mut self) -> Result<Object> {
-        let start = self.pos;
-        if matches!(self.peek(), Some(b'+' | b'-')) {
-            self.pos += 1;
-        }
-        if self.peek() != Some(b'.') {
-            return Err(Error::parse(start, "expected real number"));
-        }
-        self.pos += 1;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
-        }
-        self.parse_real_exponent(start)
-    }
-
-    fn real_with_integer_prefix(&mut self, start: usize) -> Result<Object> {
-        if self.peek() != Some(b'.') {
-            return Err(Error::parse(start, "expected decimal point"));
-        }
-        self.pos += 1;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
-        }
-        self.parse_real_exponent(start)
-    }
-
-    fn parse_real_exponent(&mut self, start: usize) -> Result<Object> {
-        if matches!(self.peek(), Some(b'e' | b'E')) {
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.pos += 1;
-            }
-            let exponent_start = self.pos;
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-            if exponent_start == self.pos {
-                return Err(Error::parse(start, "invalid real"));
-            }
-        }
-
-        let bytes = &self.input[start..self.pos];
-        let text =
-            std::str::from_utf8(bytes).map_err(|_| Error::parse(start, "real is not utf-8"))?;
+    fn real_object(&self, token: Token<'a>) -> Result<Object> {
+        let text = std::str::from_utf8(token.value.as_ref())
+            .map_err(|_| Error::parse(token.start, "real is not utf-8"))?;
         let value = text
             .parse::<f64>()
-            .map_err(|_| Error::parse(start, "invalid real"))?;
+            .map_err(|_| Error::parse(token.start, "invalid real"))?;
         // Preserve the source literal when `value.to_string()` cannot
         // reproduce it byte-for-byte (e.g. `.4`, `0.400`, `1.0`) — required
         // for byte-identical parity with qpdf's QPDF_Real (which re-emits the
         // parsed string verbatim). When the literal already matches Rust's
         // shortest round-trip, the plain `Real(f64)` is smaller and equivalent.
-        if value.to_string().as_bytes() == bytes {
+        if value.to_string().as_bytes() == token.raw {
             Ok(Object::Real(value))
         } else {
             Ok(Object::RealLiteral {
                 value,
-                literal: bytes.to_vec(),
+                literal: token.raw.to_vec(),
             })
         }
     }
 
-    fn integer(&mut self) -> Result<i64> {
-        self.skip_ws();
-        let start = self.pos;
-        if matches!(self.peek(), Some(b'-' | b'+')) {
-            self.pos += 1;
-        }
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
-        }
-        if start == self.pos
-            || matches!(self.input.get(start), Some(b'-' | b'+')) && start + 1 == self.pos
-        {
-            return Err(Error::parse(start, "expected integer"));
-        }
-        let text = std::str::from_utf8(&self.input[start..self.pos])
-            .map_err(|_| Error::parse(start, "integer is not utf-8"))?;
-        text.parse::<i64>()
-            .map_err(|_| Error::parse(start, "invalid integer"))
+    fn next_token(&mut self) -> Token<'a> {
+        self.buffered
+            .pop_front()
+            .unwrap_or_else(|| self.tokenizer.next_token())
     }
 
+    fn unread_token(&mut self, token: Token<'a>) {
+        self.buffered.push_front(token);
+    }
+
+    fn peek_token(&mut self) -> Token<'a> {
+        let token = self.next_token();
+        self.unread_token(token.clone());
+        token
+    }
+
+    fn skip_ignorable(&mut self) -> Result<()> {
+        if self.buffered.is_empty() {
+            self.tokenizer.skip_ignorable()
+        } else {
+            Ok(())
+        }
+    }
+
+    // Transitional wrappers for the ObjStm and file-object lexical callers.
+    // Task 3 routes those callers directly through `Tokenizer` and removes
+    // these parser-owned forwarding methods.
     pub(crate) fn integer_for_indirect(&mut self) -> Result<i64> {
-        self.integer()
+        if let Some(token) = self.buffered.pop_front() {
+            parse_integer_token(&token)
+        } else {
+            self.tokenizer.next_integer()
+        }
     }
 
     pub(crate) fn expect_keyword_for_indirect(&mut self, keyword: &[u8]) -> Result<()> {
-        self.skip_ws();
-        if self.starts_with(keyword) {
-            self.pos += keyword.len();
-            Ok(())
-        } else {
-            Err(Error::parse(self.pos, "expected indirect object keyword"))
-        }
-    }
-
-    fn name(&mut self) -> Result<Vec<u8>> {
-        self.expect_byte(b'/')?;
-        let mut value = Vec::new();
-        while let Some(byte) = self.peek() {
-            if is_delimiter(byte) || is_ws(byte) {
-                break;
-            }
-            if byte == b'#' {
-                let pos = self.pos;
-                self.pos += 1;
-                let high = self
-                    .peek()
-                    .and_then(hex_value)
-                    .ok_or_else(|| Error::parse(pos, "invalid name escape"))?;
-                self.pos += 1;
-                let low = self
-                    .peek()
-                    .and_then(hex_value)
-                    .ok_or_else(|| Error::parse(pos, "invalid name escape"))?;
-                self.pos += 1;
-                value.push((high << 4) | low);
+        if let Some(token) = self.buffered.pop_front() {
+            if token.token_type == TokenType::Word && token.value.as_ref() == keyword {
+                Ok(())
             } else {
-                value.push(byte);
-                self.pos += 1;
+                Err(Error::parse(
+                    token.start,
+                    "expected indirect object keyword",
+                ))
             }
+        } else {
+            self.tokenizer.expect_word(keyword)
         }
-        if value.is_empty() {
-            return Err(Error::parse(self.pos, "empty name"));
-        }
-        Ok(value)
-    }
-
-    fn literal_string(&mut self) -> Result<Vec<u8>> {
-        self.expect_byte(b'(')?;
-        let mut value = Vec::new();
-        let mut depth = 0;
-        while let Some(byte) = self.peek() {
-            if byte == b'(' {
-                depth += 1;
-                value.push(byte);
-                self.pos += 1;
-                continue;
-            }
-
-            if byte == b')' {
-                if depth == 0 {
-                    self.pos += 1;
-                    return Ok(value);
-                }
-                depth -= 1;
-                value.push(byte);
-                self.pos += 1;
-                continue;
-            }
-
-            if byte == b'\\' {
-                self.pos += 1;
-                match self.peek() {
-                    Some(b'n') => {
-                        value.push(b'\n');
-                        self.pos += 1;
-                    }
-                    Some(b'r') => {
-                        value.push(b'\r');
-                        self.pos += 1;
-                    }
-                    Some(b't') => {
-                        value.push(b'\t');
-                        self.pos += 1;
-                    }
-                    Some(b'b') => {
-                        value.push(0x08);
-                        self.pos += 1;
-                    }
-                    Some(b'f') => {
-                        value.push(0x0c);
-                        self.pos += 1;
-                    }
-                    Some(b'(' | b')' | b'\\') => {
-                        value.push(self.peek().unwrap_or_default());
-                        self.pos += 1;
-                    }
-                    Some(b'\r') => {
-                        self.pos += 1;
-                        if self.peek() == Some(b'\n') {
-                            self.pos += 1;
-                        }
-                    }
-                    Some(b'\n') => {
-                        self.pos += 1;
-                    }
-                    Some(byte @ b'0'..=b'7') => {
-                        let first = byte;
-                        let mut value_byte = first - b'0';
-                        self.pos += 1;
-                        for _ in 0..2 {
-                            if let Some(next) = self.peek() {
-                                if matches!(next, b'0'..=b'7') {
-                                    value_byte = (value_byte << 3) | (next - b'0');
-                                    self.pos += 1;
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
-                        value.push(value_byte);
-                    }
-                    Some(_) => {
-                        value.push(self.peek().unwrap_or_default());
-                        self.pos += 1;
-                    }
-                    None => return Err(Error::parse(self.pos, "unterminated literal string")),
-                }
-                continue;
-            }
-
-            self.pos += 1;
-            value.push(byte);
-        }
-
-        Err(Error::parse(self.pos, "unterminated literal string"))
     }
 
     pub(crate) fn skip_ws(&mut self) {
-        loop {
-            while matches!(self.peek(), Some(byte) if is_ws(byte)) {
-                self.pos += 1;
-            }
-            if self.peek() == Some(b'%') {
-                while !matches!(self.peek(), None | Some(b'\n' | b'\r')) {
-                    self.pos += 1;
-                }
-                continue;
-            }
-            break;
-        }
-    }
-
-    fn take_keyword(&mut self, keyword: &[u8]) -> bool {
-        if self.starts_with(keyword) {
-            self.pos += keyword.len();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn expect_byte(&mut self, expected: u8) -> Result<()> {
-        if self.peek() == Some(expected) {
-            self.pos += 1;
-            Ok(())
-        } else {
-            Err(Error::parse(self.pos, format!("expected byte {expected}")))
-        }
-    }
-
-    fn expect_bytes(&mut self, expected: &[u8]) -> Result<()> {
-        if self.starts_with(expected) {
-            self.pos += expected.len();
-            Ok(())
-        } else {
-            Err(Error::parse(self.pos, "expected token"))
-        }
-    }
-
-    fn starts_with(&self, bytes: &[u8]) -> bool {
-        self.input[self.pos..].starts_with(bytes)
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.input.get(self.pos).copied()
+        let _ = self.skip_ignorable();
     }
 }
 
-pub(crate) fn is_ws(byte: u8) -> bool {
-    matches!(byte, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
-}
-
-pub(crate) fn is_delimiter(byte: u8) -> bool {
-    matches!(
-        byte,
-        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
-    )
+fn parse_integer_token(token: &Token<'_>) -> Result<i64> {
+    std::str::from_utf8(token.value.as_ref())
+        .ok()
+        .and_then(|text| text.parse::<i64>().ok())
+        .ok_or_else(|| Error::parse(token.start, "invalid integer"))
 }
 
 pub(crate) fn keyword_token_end(input: &[u8], pos: usize, keyword: &[u8]) -> Option<usize> {
@@ -583,15 +356,6 @@ pub(crate) fn keyword_token_end(input: &[u8], pos: usize, keyword: &[u8]) -> Opt
         None => Some(end),
         Some(&byte) if is_ws(byte) || is_delimiter(byte) => Some(end),
         Some(_) => None,
-    }
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
     }
 }
 

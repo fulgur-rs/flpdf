@@ -100,14 +100,14 @@ fn parses_array_and_strings() {
 
 #[test]
 fn parses_real_numbers() {
-    let object = parse_object(b"[0 0 595.28 841.89 -0.5 .75 1.  +.25 -1.5 1e3]").unwrap();
+    let object = parse_object(b"[0 0 595.28 841.89 -0.5 .75 1.  +.25 -1.5]").unwrap();
 
     let Object::Array(values) = object else {
         panic!("expected array")
     };
 
     // Non-canonical source literals (leading dot, trailing dot, explicit `+`,
-    // scientific notation) round-trip through [`Object::RealLiteral`] which
+    // explicit signs) round-trip through [`Object::RealLiteral`] which
     // preserves the source bytes verbatim; canonical forms (`595.28`,
     // `841.89`, `-0.5`, `-1.5`) stay as [`Object::Real`].
     let lit = |v: f64, s: &[u8]| Object::RealLiteral {
@@ -123,7 +123,61 @@ fn parses_real_numbers() {
     assert_eq!(values[6], lit(1.0, b"1."));
     assert_eq!(values[7], lit(0.25, b"+.25"));
     assert_eq!(values[8], Object::Real(-1.5));
-    assert_eq!(values[9], lit(1000.0, b"1e3"));
+}
+
+#[test]
+fn parses_qpdf_good13_shaped_nesting_strings_and_names() {
+    let object = parse_object(
+        br#"<<
+          /strings [(one) ($\242) () (()) (\() (\)) (a\f\b\t\r\nb) (A\000B)]
+          /hex#20strings [<506F7461746f> <010 203 0004056> <41
+42>]
+          /n#65sting <<
+            /a [1 2 << /x (y) >> [(z)]]
+            /b <</a [1 2] / (legal)>>
+          >>
+          /names [/n#65sting /hex#20strings /text#2fplain]
+        >>"#,
+    )
+    .unwrap();
+    let dict = object.as_dict().unwrap();
+    assert_eq!(
+        dict.get("hex strings"),
+        Some(&Object::Array(vec![
+            Object::String(b"Potato".to_vec()),
+            Object::String(b"\x01\x02\x03\x00\x04\x05\x60".to_vec()),
+            Object::String(b"AB".to_vec()),
+        ]))
+    );
+    assert_eq!(
+        dict.get("names"),
+        Some(&Object::Array(vec![
+            Object::Name(b"nesting".to_vec()),
+            Object::Name(b"hex strings".to_vec()),
+            Object::Name(b"text/plain".to_vec()),
+        ]))
+    );
+    let nesting = dict.get("nesting").unwrap().as_dict().unwrap();
+    let b_dict = nesting.get("b").unwrap().as_dict().unwrap();
+    assert_eq!(b_dict.get(""), Some(&Object::String(b"legal".to_vec())));
+}
+
+#[test]
+fn qpdf_empty_name_is_valid() {
+    assert_eq!(parse_object(b"/").unwrap(), Object::Name(Vec::new()));
+}
+
+#[test]
+fn qpdf_literal_string_normalizes_unescaped_line_endings() {
+    assert_eq!(
+        parse_object(b"(a\rb\r\nc)").unwrap(),
+        Object::String(b"a\nb\nc".to_vec())
+    );
+}
+
+#[test]
+fn qpdf_exponent_looking_token_is_not_a_real() {
+    assert!(parse_object(b"1e3").is_err());
 }
 
 #[test]
