@@ -18,7 +18,11 @@ This file provides instructions and context for AI coding agents working on this
 - **逸脱は必ず明示**: byte-identical を達成できない／しない箇所は、PR・コミット・beads
   issue に理由を 1 行残す。暗黙の逸脱を作らない。
 
-### 唯一の許容された逸脱: DEFLATE 実装（Pure Rust 維持）
+### 逸脱の 2 分類
+
+逸脱は「**出力バイトを変えるか**」で厳密に区別する。
+
+#### (A) 出力バイトを変える逸脱 — DEFLATE 実装のみ（唯一）
 
 flate2 は **Pure Rust を維持し zlib（C ライブラリ）に依存しない**ため、zlib バックエンドは
 feature flag（`qpdf-zlib-compat`）に隔離してある。デフォルトは miniz_oxide（Pure Rust）で、
@@ -29,6 +33,30 @@ feature flag（`qpdf-zlib-compat`）に隔離してある。デフォルトは m
 - **この 1 点が唯一の例外**。これ以外で byte-identical を崩す逸脱は認めない。
 - 関連の運用注意: llvm-cov / patch-coverage は `qpdf-zlib-compat` なしで回す
   （compat baseline は miniz 固定のため、feature を付けた計測は失敗する）。
+
+#### (B) 出力バイトを変えない内部構造の代替 — 条件付きで許容
+
+qpdf の C++ 固有の足場を Rust の標準的な仕組みで置き換えることは、**出力バイトに
+一切影響しない場合に限り**許容する。該当例: `InputSource` 階層 → `Read + Seek`
+ジェネリクス、汎用 `Pl_*` シンク → `Write` / `Vec<u8>`、crypto provider 抽象 →
+外部 crate の直接利用、`QPDFArgParser` → clap。
+
+許容の条件（すべて満たすこと）:
+
+1. **出力バイトに影響しないこと。** 証明責任は提案側にある。既存の
+   `qpdf-zlib-compat` gated byte テストが該当経路を守っていることを示すか、
+   守っていなければ先にゲートを追加する。
+2. **アルゴリズムと処理順序は qpdf のまま。** 代替してよいのは「入れ物」だけで、
+   ロジック・データ構造の意味・処理順序を変えてはならない。
+   （例: base64 のエンコード結果は同一。JSON の逐次出力順は qpdf のまま）
+3. **明示的に記録すること。** 当該モジュールの doc に逸脱理由を 1 行、
+   [`docs/qpdf-correspondence.md`](docs/qpdf-correspondence.md) の ⚪ 行に該当箇所を
+   記載する。暗黙の逸脱を作らない。
+
+(B) は「qpdf のやり方を尊重しつつ Rust として不自然な移植を避ける」ための枠であり、
+**qpdf の設計が気に入らないという理由での逸脱は pre-v1.0 では認めない**。
+v1.0 以降は想定 consumer の要件に応じて qpdf 完全トレースを離れる領域が出る想定だが、
+それは別途判断する。
 
 この方針の bd メモリ版（`bd prime` で自動注入）: `bd recall pre-v1-0-qpdf-byte-identical-qtest-parity`。
 
