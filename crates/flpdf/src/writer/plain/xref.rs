@@ -68,7 +68,12 @@ pub(crate) fn append_xref_and_trailer(
     layout.validate()?;
 
     match trailer.form {
-        XrefForm::Table => append_classic_xref_and_trailer(bytes, layout, trailer),
+        XrefForm::Table if layout.compressed.is_empty() => {
+            append_classic_xref_and_trailer(bytes, layout, trailer)
+        }
+        XrefForm::Table => Err(crate::Error::Unsupported(
+            "plain writer classic xref cannot represent compressed objects".into(),
+        )),
         XrefForm::Stream => append_xref_stream_and_trailer(bytes, layout, trailer),
     }
 }
@@ -218,6 +223,11 @@ fn append_classic_xref_and_trailer(
     let mut dictionary = trailer.dictionary.clone();
     dictionary.insert("Root", Object::Reference(trailer.root));
     dictionary.insert("Size", Object::Integer(i64::from(size)));
+    if matches!(&trailer.id, IdPlan::Deterministic { .. }) {
+        // `write_pdf_trailer` calls its ID writer only when this key exists.
+        // The inline writer replaces this placeholder with the real array.
+        dictionary.insert("ID", Object::Array(Vec::new()));
+    }
     bytes.extend_from_slice(b"trailer ");
     match &trailer.id {
         IdPlan::Materialized => dictionary.write_pdf_trailer(bytes, None),
@@ -317,5 +327,42 @@ mod tests {
         append_xref_and_trailer(&mut bytes, &layout, &trailer).unwrap();
 
         assert!(String::from_utf8_lossy(&bytes).contains("/ID [<"));
+    }
+
+    #[test]
+    fn deterministic_classic_xref_writes_id_without_materialized_source_id() {
+        let mut bytes = b"BODY".to_vec();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 0));
+        let mut trailer = trailer(XrefForm::Table);
+        trailer.id = IdPlan::Deterministic {
+            source_id0: None,
+            info_suffix: Vec::new(),
+        };
+
+        append_xref_and_trailer(&mut bytes, &layout, &trailer).unwrap();
+
+        assert!(String::from_utf8_lossy(&bytes).contains("/ID [<"));
+    }
+
+    #[test]
+    fn classic_xref_rejects_compressed_layout_before_mutating_bytes() {
+        let mut bytes = b"BODY".to_vec();
+        let original = bytes.clone();
+        let mut layout = BodyLayout::default();
+        layout.compressed.insert(
+            2,
+            CompressedLocation {
+                container: 1,
+                index: 0,
+            },
+        );
+
+        let err =
+            append_xref_and_trailer(&mut bytes, &layout, &trailer(XrefForm::Table)).unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("classic xref")));
+        assert_eq!(bytes, original);
     }
 }
