@@ -238,18 +238,20 @@ if (( PRINT_PATH )); then
     echo "fetch-qpdf-source.sh: run scripts/fetch-qpdf-source.sh first" >&2
     exit 1
   fi
-  if [[ "$(tracked_state)" == "dirty" ]]; then
-    refuse_modified
-  fi
+  case "$(tracked_state)" in
+    dirty) refuse_modified ;;
+    unknown) refuse_unverifiable ;;
+  esac
   warn_on_binary_drift
   printf '%s\n' "$DEST"
   exit 0
 fi
 
 if (( ! FORCE )) && installed; then
-  if [[ "$(tracked_state)" == "dirty" ]]; then
-    refuse_modified
-  fi
+  case "$(tracked_state)" in
+    dirty) refuse_modified ;;
+    unknown) refuse_unverifiable ;;
+  esac
   echo "qpdf ${QPDF_VERSION} source already present: ${DEST}"
   warn_on_binary_drift
   exit 0
@@ -342,10 +344,18 @@ have_pinned_commit() {
   git -C "$MIRROR" rev-parse --verify --quiet "${QPDF_COMMIT}^{commit}" >/dev/null
 }
 
-# An existing mirror predating a pin bump will not have the commit yet.
-if ! have_pinned_commit; then
-  echo "Fetching ${QPDF_REPO}"
-  git -C "$MIRROR" fetch --quiet origin
+# Always refresh before validating. Having the pinned commit locally is not
+# enough: the retag check below compares $QPDF_TAG against the pin, and a tag
+# ref that is never refreshed would keep matching a pin that upstream has since
+# moved or deleted — silently defeating the retag warning.
+echo "Fetching ${QPDF_REPO}"
+if ! git -C "$MIRROR" fetch --quiet --prune --tags --force origin; then
+  # Offline or upstream unreachable. Continue only if the pin is already
+  # present; the retag check then runs against possibly stale refs, so say so.
+  if have_pinned_commit; then
+    echo "fetch-qpdf-source.sh: warning: could not reach ${QPDF_REPO}" >&2
+    echo "                      using local refs; ${QPDF_TAG} may be stale" >&2
+  fi
 fi
 
 # The pin is the commit. If it is not upstream at all, fail hard rather than

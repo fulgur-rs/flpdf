@@ -230,7 +230,7 @@ D2 の対象: `[f64; 6]` 生配列が散在し、`IDENTITY` 定数・行列積�
 | モジュール | 実装（全数） |
 |---|---|
 | `overlay.rs` | `IDENTITY_MATRIX`(82), `qpdf_concat`(87), `qpdf_scale`(101), `qpdf_translate`(106), `matrix_unparse`(123), `matrix_or_identity`(996), `transform_bbox`(1013) |
-| `overlay_annotations.rs` | `concat_matrices`(1284), `IDENTITY`(1297), `transform_rect_by_cm`(1338), `apply_matrix_to_point`(1365) — doc に `QPDFMatrix` 相当と明記されている |
+| `overlay_annotations.rs` | `matrix_to_object`(1256), `qpdf_real`(1272), `concat_matrices`(1284), `IDENTITY`(1297), `transform_rect_by_cm`(1338), `apply_matrix_to_point`(1365) — doc に `QPDFMatrix` 相当と明記されている |
 | `page_rotate.rs` | `type Mat`(306), `apply_matrix`(309), `mat_mul`(314), `translate`(326), `rotate_origin`(333), `rotation_matrix`(345), `transform_box`(355), `wrap_content_with_matrix`(463) |
 | `page_form_xobject.rs` | `transformation_matrix`(503), `matrix_objects`(533) |
 | `page_annotation_flatten.rs` | `apply_matrix`(306), `read_xobj_bbox_and_matrix`(454) |
@@ -330,6 +330,7 @@ D2 を満たさない。
 | `read_name_tree` / `read_number_tree` | `name_number_tree.rs`(38, 76) | 読み取り |
 | `build_name_tree` / `build_number_tree` | `name_number_tree.rs`(125, 201) | `/Kids` リーフへの**分割**を含む |
 | `insert_name_tree_dest` | `name_tree_dests.rs`(116) | 上記 builder 経由の再構築による**挿入** |
+| `delete_name_tree_dest` | `name_tree_dests.rs`(149) | 同じ read/rebuild 経路による**削除**。`lib.rs`(193) から re-export |
 
 いずれも `lib.rs` から re-export されている。
 
@@ -394,7 +395,7 @@ qtest +9 の実測値は順序を前倒しする根拠にしない。
 
 byte gate の新設は Phase 2 着手時の前提として持ち越す。ただし QDF は**既に部分的な
 カバレッジがある**（`writer_tests.rs:2170,2201` の qpdf golden 完全一致、
-`qdf_tests.rs:1300` の `/ID` 行を除く完全一致、`overlay::byte_gate` の QDF 3 件。
+`qdf_tests.rs:1300` の `/ID` 行を除く完全一致、`overlay::byte_gate` の QDF 12 件（library）と `cli_byte_identical_overlay.rs` の 3 件（CLI）。
 前 2 者と `overlay::byte_gate` は CI 列挙済み）。
 
 **QDF × ObjStm / QDF × 暗号 / QDF × linearize は穴になりえない。** QDF はこれらと
