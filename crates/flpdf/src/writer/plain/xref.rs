@@ -333,6 +333,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn xref_stream_rejects_object_number_overflow_before_mutating_bytes() {
+        let mut bytes = b"BODY".to_vec();
+        let original = bytes.clone();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(u32::MAX, (0, 0));
+
+        let err =
+            append_xref_and_trailer(&mut bytes, &layout, &trailer(XrefForm::Stream)).unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("object number")));
+        assert_eq!(bytes, original);
+    }
+
+    #[test]
+    fn structurally_filtered_xref_stream_encodes_its_payload() {
+        let mut bytes = b"BODY".to_vec();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 0));
+        let mut trailer = trailer(XrefForm::Stream);
+        trailer.structural_filtered = true;
+
+        append_xref_and_trailer(&mut bytes, &layout, &trailer).unwrap();
+
+        assert!(String::from_utf8_lossy(&bytes).contains("/Filter /FlateDecode"));
+    }
+
+    #[test]
+    fn materialized_id_accepts_exactly_two_strings() {
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(
+            "ID",
+            Object::Array(vec![
+                Object::String(b"first".to_vec()),
+                Object::String(b"second".to_vec()),
+            ]),
+        );
+
+        assert_eq!(
+            materialized_id(&dictionary).unwrap(),
+            Some((b"first".to_vec(), b"second".to_vec()))
+        );
+    }
+
+    #[test]
+    fn materialized_id_rejects_wrong_array_shape() {
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("ID", Object::Array(vec![Object::String(b"only".to_vec())]));
+
+        let err = materialized_id(&dictionary).unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("two strings")));
+    }
+
+    #[test]
+    fn materialized_id_rejects_non_array() {
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("ID", Object::Integer(1));
+
+        let err = materialized_id(&dictionary).unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("must be an array")));
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn classic_xref_rejects_offsets_that_exceed_ten_digits_before_mutating_bytes() {
@@ -368,6 +435,21 @@ mod tests {
         assert!(!text.contains("/Index"));
         assert!(text.contains("/Root 1 0 R /Size 4"));
         assert!(text.ends_with("startxref\n4\n%%EOF\n"));
+    }
+
+    #[test]
+    fn classic_xref_emits_free_entries_for_layout_holes() {
+        let mut bytes = b"BODY".to_vec();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(2, (0, 0));
+
+        append_xref_and_trailer(&mut bytes, &layout, &trailer(XrefForm::Table)).unwrap();
+
+        assert!(String::from_utf8_lossy(&bytes).contains(
+            "0000000000 65535 f \n\
+             0000000000 00000 f \n\
+             0000000000 00000 n \n"
+        ));
     }
 
     #[test]
