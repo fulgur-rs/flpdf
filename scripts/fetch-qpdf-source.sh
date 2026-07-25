@@ -113,7 +113,11 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/flpdf-qpdf-src.XXXXXX")"
+# Scratch space next to the destination, not under $TMPDIR: same filesystem by
+# construction, so the install below is a rename(2) rather than an 80 MB
+# copy+unlink that could be interrupted half-way.
+mkdir -p "$(dirname "$DEST")"
+TMP="$(mktemp -d "$(dirname "$DEST")/.flpdf-qpdf-src.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 TARBALL="${TMP}/qpdf-${QPDF_VERSION}.tar.gz"
@@ -144,7 +148,6 @@ if [[ -e "$DEST" ]]; then
   mv -f "$DEST" "${TMP}/previous"
 fi
 
-mkdir -p "$(dirname "$DEST")"
 mv -f "${TMP}/tree" "$DEST"
 printf '%s\n' "$QPDF_SHA256" > "$STAMP"
 
