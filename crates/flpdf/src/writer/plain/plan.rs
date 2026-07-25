@@ -68,7 +68,8 @@ impl PlainWritePlan {
                 }
                 packing.batches.retain(|batch| !batch.is_empty());
                 if packing.batches.is_empty() && !source_had_compressed_objects {
-                    let renumber = CatalogFirstRenumber::build_qpdf(pdf, true)?;
+                    let renumber =
+                        CatalogFirstRenumber::build_qpdf_excluding(pdf, true, &explicitly_removed)?;
                     let mut placement = build_sources_from_catalog_first(renumber);
                     placement.removed_refs = explicitly_removed;
                     placement
@@ -960,6 +961,26 @@ mod tests {
             PlannedIndirectObject::ObjectStream { members, .. } =>
                 members.iter().all(|member| member.source != deleted),
             PlannedIndirectObject::Source { source, .. } => *source != deleted,
+        }));
+    }
+
+    #[test]
+    fn preserve_classic_fallback_excludes_explicit_deletion_before_placement() {
+        let path = fixture_path("null-visible-matrix.pdf");
+        let mut pdf =
+            Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+        let deleted = ObjectRef::new(5, 0);
+        pdf.delete_object(deleted);
+
+        let plan =
+            PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Preserve)).unwrap();
+
+        assert!(plan.removed_refs.contains(&deleted));
+        assert!(!plan.old_to_new.contains_key(&deleted));
+        assert!(plan.objects.iter().all(|object| match object {
+            PlannedIndirectObject::Source { source, .. } => *source != deleted,
+            PlannedIndirectObject::ObjectStream { members, .. } =>
+                members.iter().all(|member| member.source != deleted),
         }));
     }
 
