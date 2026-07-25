@@ -88,7 +88,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                     &body,
                     structural_compress,
                     options.newline_before_endstream,
-                )?;
+                )?; // cov:ignore: error arm requires an in-memory zlib encoder failure
                 bytes.extend_from_slice(b"\nendobj\n");
                 layout
                     .uncompressed
@@ -185,5 +185,39 @@ mod tests {
             assert!(planned_members > 0);
             assert_eq!(layout.compressed.len(), planned_members);
         }
+    }
+
+    #[test]
+    fn source_emission_propagates_reference_rewrite_failure() {
+        let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
+        let mut pdf = Pdf::open_mem(fixture).unwrap();
+        let options = WriteOptions {
+            object_streams: ObjectStreamMode::Disable,
+            ..WriteOptions::default()
+        };
+        let mut plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
+        plan.old_to_new.remove(&crate::ObjectRef::new(2, 0));
+
+        let error = emit_bodies(&mut pdf, &options, &plan).unwrap_err();
+
+        assert!(matches!(error, crate::Error::Unsupported(ref message)
+            if message.contains("reference 2 0 R absent from renumber map")));
+    }
+
+    #[test]
+    fn object_stream_emission_propagates_reference_rewrite_failure() {
+        let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
+        let mut pdf = Pdf::open_mem(fixture).unwrap();
+        let options = WriteOptions {
+            object_streams: ObjectStreamMode::Generate,
+            ..WriteOptions::default()
+        };
+        let mut plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
+        plan.old_to_new.remove(&crate::ObjectRef::new(2, 0));
+
+        let error = emit_bodies(&mut pdf, &options, &plan).unwrap_err();
+
+        assert!(matches!(error, crate::Error::Unsupported(ref message)
+            if message.contains("reference 2 0 R absent from renumber map")));
     }
 }
