@@ -239,12 +239,16 @@ impl<'a> Tokenizer<'a> {
 
             loop {
                 let Some(first) = self.take_byte() else {
-                    error_message.get_or_insert_with(|| "invalid character in name escape".into());
+                    error_message.get_or_insert_with(|| {
+                        "name with stray # will not work with PDF >= 1.2".into()
+                    });
                     decoded.push(0);
                     break;
                 };
                 let Some(high) = hex_value(first) else {
-                    error_message.get_or_insert_with(|| "invalid character in name escape".into());
+                    error_message.get_or_insert_with(|| {
+                        "name with stray # will not work with PDF >= 1.2".into()
+                    });
                     decoded.push(0);
                     if is_ws(first) || is_delimiter(first) {
                         self.pos -= 1;
@@ -256,13 +260,17 @@ impl<'a> Tokenizer<'a> {
                     break;
                 };
                 let Some(second) = self.take_byte() else {
-                    error_message.get_or_insert_with(|| "invalid character in name escape".into());
+                    error_message.get_or_insert_with(|| {
+                        "name with stray # will not work with PDF >= 1.2".into()
+                    });
                     decoded.push(0);
                     decoded.push(first);
                     break;
                 };
                 let Some(low) = hex_value(second) else {
-                    error_message.get_or_insert_with(|| "invalid character in name escape".into());
+                    error_message.get_or_insert_with(|| {
+                        "name with stray # will not work with PDF >= 1.2".into()
+                    });
                     decoded.push(0);
                     decoded.push(first);
                     if is_ws(second) || is_delimiter(second) {
@@ -278,7 +286,7 @@ impl<'a> Tokenizer<'a> {
                 if value == 0 {
                     bad = true;
                     error_message
-                        .get_or_insert_with(|| "null character not allowed in name".into());
+                        .get_or_insert_with(|| "null character not allowed in name token".into());
                     decoded.extend_from_slice(b"#00");
                 } else {
                     decoded.push(value);
@@ -540,7 +548,7 @@ mod tests {
         assert_eq!(null.value.as_ref(), b"/a#00b");
         assert_eq!(
             null.error_message.as_deref(),
-            Some("null character not allowed in name")
+            Some("null character not allowed in name token")
         );
 
         let stray = Tokenizer::new(b"/a#1x").next_token();
@@ -548,8 +556,44 @@ mod tests {
         assert_eq!(stray.value.as_ref(), b"/a\0\x31x");
         assert_eq!(
             stray.error_message.as_deref(),
-            Some("invalid character in name escape")
+            Some("name with stray # will not work with PDF >= 1.2")
         );
+    }
+
+    #[test]
+    fn incomplete_name_escapes_follow_qpdf_state_recovery() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"/a#", b"/a\0"),
+            (b"/a#x", b"/a\0x"),
+            (b"/a##x", b"/a\0\0x"),
+            (b"/a#1", b"/a\0\x31"),
+            (b"/a#1#x", b"/a\0\x31\0x"),
+        ];
+
+        for &(input, expected) in cases {
+            let token = Tokenizer::new(input).next_token();
+            assert_eq!(token.token_type, TokenType::Name);
+            assert_eq!(token.value.as_ref(), expected);
+            assert_eq!(
+                token.error_message.as_deref(),
+                Some("name with stray # will not work with PDF >= 1.2")
+            );
+        }
+    }
+
+    #[test]
+    fn name_escape_delimiters_are_left_for_the_next_token() {
+        let mut first_nibble = Tokenizer::new(b"/a#/tail");
+        let name = first_nibble.next_token();
+        assert_eq!(name.token_type, TokenType::Name);
+        assert_eq!(name.value.as_ref(), b"/a\0");
+        assert_eq!(first_nibble.next_token().value.as_ref(), b"/tail");
+
+        let mut second_nibble = Tokenizer::new(b"/a#1/tail");
+        let name = second_nibble.next_token();
+        assert_eq!(name.token_type, TokenType::Name);
+        assert_eq!(name.value.as_ref(), b"/a\0\x31");
+        assert_eq!(second_nibble.next_token().value.as_ref(), b"/tail");
     }
 
     #[test]
