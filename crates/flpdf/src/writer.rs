@@ -6660,6 +6660,32 @@ mod tests {
         }
     }
 
+    /// A malformed source header is preserved by `effective_pdf_version`, so
+    /// the full-rewrite encryption floor remains responsible for repairing the
+    /// emitted header. Keep this recovery path covered while version handling
+    /// is routed through `PdfVersion`.
+    #[test]
+    fn encryption_repairs_unparseable_source_header() {
+        use crate::encrypt_setup::EncryptParams;
+        use std::io::Cursor;
+
+        let mut fixture = build_partition_fixture();
+        assert!(fixture.starts_with(b"%PDF-1.4"));
+        fixture[..8].copy_from_slice(b"%PDF-x.y");
+
+        let mut pdf = Pdf::open(Cursor::new(fixture)).expect("open malformed-version fixture");
+        let mut out = Vec::new();
+        let options = WriteOptions {
+            full_rewrite: true,
+            encrypt: Some(EncryptParams::v5_r6(b"u".to_vec(), b"o".to_vec())),
+            ..WriteOptions::default()
+        };
+
+        write_pdf_with_options(&mut pdf, &mut out, &options)
+            .expect("encrypted full rewrite repairs the header");
+        assert!(out.starts_with(b"%PDF-1.7"));
+    }
+
     /// A minimal PDF whose `/Catalog` references a `/Metadata` XMP stream
     /// (obj 4), carrying a recognizable marker.
     fn build_metadata_fixture() -> Vec<u8> {
