@@ -211,6 +211,16 @@ fn one_two_three_page_mode_matrix_is_byte_identical_to_qpdf() {
 }
 
 #[test]
+fn disable_xref_stream_source_downgrades_to_classic_table_byte_identical_to_qpdf() {
+    assert_cmp_diff_zero_mode_named(
+        "null-visible-matrix-objstm.pdf",
+        ObjectStreamMode::Disable,
+        "null-visible-matrix-objstm",
+        "disable.pdf",
+    );
+}
+
+#[test]
 fn preserve_object_stream_mode_is_byte_identical_to_qpdf_static_id_matrix() {
     let cases = [
         ("three-page-objstm.pdf", "three-page-objstm", "preserve.pdf"),
