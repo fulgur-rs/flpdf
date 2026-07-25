@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek};
 
+use crate::pdf_version::{parse_pdf_version, PDF_1_5};
 use crate::rewrite_renumber::{CatalogFirstRenumber, GenerateRenumber, NewNumberLookup};
 use crate::writer::object_streams::{self, ObjectStreamMode};
 use crate::writer::plain::xref::{IdPlan, TrailerPlan};
@@ -126,7 +127,7 @@ impl PlainWritePlan {
         // header to that floor exactly as the full-rewrite path does, keeping an
         // input the previous route rewrote successfully out of the error arm.
         if form == XrefForm::Stream
-            && crate::writer::parse_pdf_version(&version).is_none_or(|v| v < (1, 5))
+            && parse_pdf_version(&version).is_none_or(|current| current < PDF_1_5)
         {
             version = "1.5".to_string();
         }
@@ -266,13 +267,13 @@ impl PlainWritePlan {
         } // cov:ignore: a valid plan always places the mapped root, so outputs is nonempty
 
         if has_object_stream || self.trailer.form == XrefForm::Stream {
-            let version = crate::writer::parse_pdf_version(&self.version).ok_or_else(|| {
+            let version = parse_pdf_version(&self.version).ok_or_else(|| {
                 crate::Error::Unsupported(format!(
                     "plain writer plan: invalid PDF version {}",
                     self.version
                 ))
             })?;
-            if version < (1, 5) {
+            if version < PDF_1_5 {
                 return Err(crate::Error::Unsupported(format!(
                     "plain writer plan: PDF {} cannot contain object or xref streams",
                     self.version

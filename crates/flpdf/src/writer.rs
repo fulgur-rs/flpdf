@@ -13,6 +13,7 @@ use serialize::{
 };
 
 use crate::parser::Parser;
+use crate::pdf_version::{parse_pdf_version, PdfVersion, PDF_1_2, PDF_1_5};
 use crate::tokenizer::Tokenizer;
 use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefForm, XrefOffset};
 use std::collections::{BTreeMap, BTreeSet};
@@ -446,17 +447,6 @@ pub struct WriteOptions {
     pub copy_encryption: Option<crate::encrypt_setup::CopyEncryptionSource>,
 }
 
-/// Parse a PDF version string of the form `"M.m"` into `(major, minor)`.
-///
-/// Returns `None` for any string that does not match `digit+ '.' digit+`.
-/// Only `1.x` documents are common in practice; `2.0` uses the same syntax.
-pub fn parse_pdf_version(v: &str) -> Option<(u8, u8)> {
-    let (major, minor) = v.split_once('.')?;
-    let major: u8 = major.parse().ok()?;
-    let minor: u8 = minor.parse().ok()?;
-    Some((major, minor))
-}
-
 /// True when `--force-version` pins the output header below PDF 1.5.
 ///
 /// Object streams and cross-reference streams were both introduced in PDF 1.5.
@@ -471,7 +461,7 @@ pub(crate) fn force_version_below_1_5(options: &WriteOptions) -> bool {
         .force_version
         .as_deref()
         .and_then(parse_pdf_version)
-        .is_some_and(|v| v < (1, 5))
+        .is_some_and(|version| version < PDF_1_5)
 }
 
 /// Compute the effective PDF version to write given the source version, the
@@ -543,26 +533,20 @@ pub fn effective_pdf_version<'a>(
     // (R=4), RC4-128 (R=3, or R=4 without AES), RC4-40 (R<3) each require a
     // minimum header version.
     let enc_floor = encryption_version_floor(options);
-    if let Some((enc_ver, _)) = enc_floor {
-        if enc_ver > best {
-            best = enc_ver;
+    if let Some(encryption_floor) = enc_floor {
+        if encryption_floor > best {
+            best = encryption_floor;
         }
     }
 
     // Apply object-stream floor (object streams require >= 1.5).
-    if object_streams {
-        let objstm_floor = (1u8, 5u8);
-        if objstm_floor > best {
-            best = objstm_floor;
-        }
+    if object_streams && PDF_1_5 > best {
+        best = PDF_1_5;
     }
 
     // Apply linearize floor (PDF spec requires >= 1.2).
-    if linearize {
-        let lin_floor = (1u8, 2u8);
-        if lin_floor > best {
-            best = lin_floor;
-        }
+    if linearize && PDF_1_2 > best {
+        best = PDF_1_2;
     }
 
     // If best == source parsed, return the original source slice to avoid an
@@ -579,15 +563,15 @@ pub fn effective_pdf_version<'a>(
     // cov:ignore-start: inner-if closing braces are llvm-cov region artifacts;
     // the `return` inside is exercised by
     // effective_pdf_version_folds_each_encryption_floor_arm.
-    if let Some((enc_ver, _)) = enc_floor {
-        if enc_ver == best {
-            return static_version_string(best);
+    if let Some(encryption_floor) = enc_floor {
+        if encryption_floor == best {
+            return best.static_version_str().unwrap_or("1.7");
         }
     }
     // cov:ignore-end
     // Object-stream floor "1.5" — reached when best == (1,5) and neither source
     // nor min_version nor encryption floor matched.
-    if best == (1u8, 5u8) {
+    if best == PDF_1_5 {
         return "1.5";
     }
     // Linearize floor "1.2" — only reached when best == (1,2) and neither
@@ -613,42 +597,22 @@ pub fn effective_pdf_version<'a>(
 /// `copy_encryption` only supports V=4 AES-128 donors in the current release
 /// (see [`crate::encrypt_setup::CopyEncryptionSource`] docs), so the copy path
 /// returns the AES-128 floor unconditionally.
-fn encryption_version_floor(options: &WriteOptions) -> Option<((u8, u8), i64)> {
+fn encryption_version_floor(options: &WriteOptions) -> Option<PdfVersion> {
     use crate::encrypt_setup::EncryptMethod;
     if let Some(ref enc) = options.encrypt {
         return Some(match enc.method {
-            EncryptMethod::V5R6Aes256 => ((1, 7), 8),
-            EncryptMethod::V5R5Aes256 => ((1, 7), 3),
-            EncryptMethod::V4Aes128 => ((1, 6), 0),
-            EncryptMethod::V4Rc4128 => ((1, 5), 0),
-            EncryptMethod::V2Rc4128 => ((1, 4), 0),
-            EncryptMethod::V1Rc440 => ((1, 3), 0),
+            EncryptMethod::V5R6Aes256 => PdfVersion::new(1, 7, 8),
+            EncryptMethod::V5R5Aes256 => PdfVersion::new(1, 7, 3),
+            EncryptMethod::V4Aes128 => PdfVersion::new(1, 6, 0),
+            EncryptMethod::V4Rc4128 => PdfVersion::new(1, 5, 0),
+            EncryptMethod::V2Rc4128 => PdfVersion::new(1, 4, 0),
+            EncryptMethod::V1Rc440 => PdfVersion::new(1, 3, 0),
         });
     }
     if options.copy_encryption.is_some() {
-        return Some(((1, 6), 0));
+        return Some(PdfVersion::new(1, 6, 0));
     }
     None
-}
-
-/// Static PDF-version string for a `(major, minor)` pair. Reached from
-/// [`effective_pdf_version`] when the encryption floor wins the version race
-/// without the source or min_version matching, so a non-borrowed `&'static str`
-/// is needed for the return slot. Only the versions [`encryption_version_floor`]
-/// can return are handled.
-fn static_version_string(v: (u8, u8)) -> &'static str {
-    match v {
-        (1, 3) => "1.3",
-        (1, 4) => "1.4",
-        (1, 5) => "1.5",
-        (1, 6) => "1.6",
-        (1, 7) => "1.7",
-        // cov:ignore-start: encryption_version_floor only returns (1, 3..=7).
-        // Any other pair would indicate a code bug and 1.7 is the safest
-        // header fallback (no reader treats it as an under-specification).
-        _ => "1.7",
-        // cov:ignore-end
-    }
 }
 
 /// Compute the effective (PDF version, Adobe extension level) pair to write,
@@ -703,10 +667,12 @@ pub fn effective_pdf_version_and_ext<'a>(
     let enc_floor = encryption_version_floor(options);
     let source_contributes = !forced && ver_parsed.is_some() && ver_parsed == source_parsed;
     let min_contributes = !forced && ver_parsed.is_some() && ver_parsed == min_parsed;
-    let enc_contributes =
-        !forced && ver_parsed.is_some() && enc_floor.map(|(v, _)| v) == ver_parsed;
+    let enc_contributes = !forced
+        && ver_parsed.is_some()
+        && enc_floor.map(|version| PdfVersion::new(version.major(), version.minor(), 0))
+            == ver_parsed;
     let min_ext = options.min_extension_level.unwrap_or(0);
-    let enc_ext = enc_floor.map(|(_, e)| e).unwrap_or(0);
+    let enc_ext = enc_floor.map(PdfVersion::extension_level).unwrap_or(0);
     // Whichever inputs tie with the effective version each contribute their ext;
     // an input that was outbid contributes nothing. Multiple ties combine via
     // `max` — qpdf-equivalent when multiple setMinimumPDFVersion calls arrive
@@ -3341,7 +3307,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     // already been downgraded to Table just above, so this clamp now fires only
     // for the encrypted paths or a >=1.5 forced/source version.)
     if matches!(effective_xref_form, XrefForm::Stream)
-        && parse_pdf_version(&version).is_none_or(|v| v < (1, 5))
+        && parse_pdf_version(&version).is_none_or(|current| current < PDF_1_5)
     {
         version = "1.5".to_string();
     }
@@ -3356,19 +3322,19 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     if let Some(params) = options.encrypt.as_ref() {
         use crate::encrypt_setup::EncryptMethod;
         let floor = match params.method {
-            EncryptMethod::V1Rc440 => (1, 1),
-            EncryptMethod::V2Rc4128 => (1, 4),
-            EncryptMethod::V4Aes128 | EncryptMethod::V4Rc4128 => (1, 5),
-            EncryptMethod::V5R6Aes256 | EncryptMethod::V5R5Aes256 => (1, 7),
+            EncryptMethod::V1Rc440 => PdfVersion::new(1, 1, 0),
+            EncryptMethod::V2Rc4128 => PdfVersion::new(1, 4, 0),
+            EncryptMethod::V4Aes128 | EncryptMethod::V4Rc4128 => PDF_1_5,
+            EncryptMethod::V5R6Aes256 | EncryptMethod::V5R5Aes256 => PdfVersion::new(1, 7, 0),
         };
-        if parse_pdf_version(&version).is_none_or(|v| v < floor) {
-            version = format!("{}.{}", floor.0, floor.1);
+        if parse_pdf_version(&version).is_none_or(|current| current < floor) {
+            version = floor.get_version().0;
         }
     } else if options.copy_encryption.is_some() {
         // --copy-encryption-from only supports V=4 AES-128 donors today, which
         // carry /V 4 and therefore require the same >= 1.5 header floor as the
         // --encrypt V=4 path. (encrypt / copy_encryption are mutually exclusive.)
-        if parse_pdf_version(&version).is_none_or(|v| v < (1, 5)) {
+        if parse_pdf_version(&version).is_none_or(|current| current < PDF_1_5) {
             version = "1.5".to_string();
         }
     }
@@ -6691,6 +6657,32 @@ mod tests {
         }
     }
 
+    /// A malformed source header is preserved by `effective_pdf_version`, so
+    /// the full-rewrite encryption floor remains responsible for repairing the
+    /// emitted header. Keep this recovery path covered while version handling
+    /// is routed through `PdfVersion`.
+    #[test]
+    fn encryption_repairs_unparseable_source_header() {
+        use crate::encrypt_setup::EncryptParams;
+        use std::io::Cursor;
+
+        let mut fixture = build_partition_fixture();
+        assert!(fixture.starts_with(b"%PDF-1.4"));
+        fixture[..8].copy_from_slice(b"%PDF-x.y");
+
+        let mut pdf = Pdf::open(Cursor::new(fixture)).expect("open malformed-version fixture");
+        let mut out = Vec::new();
+        let options = WriteOptions {
+            full_rewrite: true,
+            encrypt: Some(EncryptParams::v5_r6(b"u".to_vec(), b"o".to_vec())),
+            ..WriteOptions::default()
+        };
+
+        write_pdf_with_options(&mut pdf, &mut out, &options)
+            .expect("encrypted full rewrite repairs the header");
+        assert!(out.starts_with(b"%PDF-1.7"));
+    }
+
     /// A minimal PDF whose `/Catalog` references a `/Metadata` XMP stream
     /// (obj 4), carrying a recognizable marker.
     fn build_metadata_fixture() -> Vec<u8> {
@@ -6895,12 +6887,12 @@ mod tests {
     fn encryption_version_floor_matches_qpdf_table() {
         use crate::encrypt_setup::{EncryptMethod, EncryptParams};
         for (method, expected) in [
-            (EncryptMethod::V5R6Aes256, ((1, 7), 8)),
-            (EncryptMethod::V5R5Aes256, ((1, 7), 3)),
-            (EncryptMethod::V4Aes128, ((1, 6), 0)),
-            (EncryptMethod::V4Rc4128, ((1, 5), 0)),
-            (EncryptMethod::V2Rc4128, ((1, 4), 0)),
-            (EncryptMethod::V1Rc440, ((1, 3), 0)),
+            (EncryptMethod::V5R6Aes256, PdfVersion::new(1, 7, 8)),
+            (EncryptMethod::V5R5Aes256, PdfVersion::new(1, 7, 3)),
+            (EncryptMethod::V4Aes128, PdfVersion::new(1, 6, 0)),
+            (EncryptMethod::V4Rc4128, PdfVersion::new(1, 5, 0)),
+            (EncryptMethod::V2Rc4128, PdfVersion::new(1, 4, 0)),
+            (EncryptMethod::V1Rc440, PdfVersion::new(1, 3, 0)),
         ] {
             let mut params = EncryptParams::v4_aes128(vec![], vec![]);
             params.method = method;
@@ -6919,7 +6911,7 @@ mod tests {
     #[test]
     fn effective_pdf_version_folds_each_encryption_floor_arm() {
         // Below-floor source for each encryption method — exercises every
-        // static_version_string arm reachable from the encryption floor race.
+        // PdfVersion::static_version_str arm reachable from the encryption floor race.
         use crate::encrypt_setup::{EncryptMethod, EncryptParams};
         for (method, expected) in [
             (EncryptMethod::V1Rc440, "1.3"),
@@ -6936,7 +6928,7 @@ mod tests {
                 ..WriteOptions::default()
             };
             // "1.0" is below every encryption floor, so the returned string
-            // comes from the encryption-floor branch (via static_version_string).
+            // comes from the encryption-floor branch (via PdfVersion::static_version_str).
             assert_eq!(
                 effective_pdf_version("1.0", &options, false, false),
                 expected,

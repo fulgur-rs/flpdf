@@ -512,11 +512,11 @@ fn linearize_static_id_emits_id_key() {
 
 #[test]
 fn parse_pdf_version_valid() {
-    use flpdf::parse_pdf_version;
-    assert_eq!(parse_pdf_version("1.3"), Some((1, 3)));
-    assert_eq!(parse_pdf_version("1.7"), Some((1, 7)));
-    assert_eq!(parse_pdf_version("2.0"), Some((2, 0)));
-    assert_eq!(parse_pdf_version("1.10"), Some((1, 10)));
+    use flpdf::{parse_pdf_version, PdfVersion};
+    assert_eq!(parse_pdf_version("1.3"), Some(PdfVersion::new(1, 3, 0)));
+    assert_eq!(parse_pdf_version("1.7"), Some(PdfVersion::new(1, 7, 0)));
+    assert_eq!(parse_pdf_version("2.0"), Some(PdfVersion::new(2, 0, 0)));
+    assert_eq!(parse_pdf_version("1.10"), Some(PdfVersion::new(1, 10, 0)));
     assert_eq!(parse_pdf_version("invalid"), None);
     assert_eq!(parse_pdf_version(""), None);
 }
