@@ -55,7 +55,11 @@
 #                                              Never clones; exits 1 if the tree
 #                                              is missing or not at the pin.
 #   scripts/fetch-qpdf-source.sh --force       Re-create the worktree even when
-#                                              already present.
+#                                              already present. The only way to
+#                                              discard local edits to the tree.
+#
+# Both of the first two forms refuse to hand back a tree whose tracked files
+# have been edited, and warn when the qpdf on PATH is a different version.
 set -euo pipefail
 
 QPDF_VERSION="11.9.0"
@@ -100,6 +104,40 @@ installed() {
   [[ "$(git -C "$DEST" rev-parse HEAD 2>/dev/null)" == "$QPDF_COMMIT" ]]
 }
 
+# A matching HEAD is not enough: editing a tracked file leaves HEAD alone while
+# changing the very bytes the citations address, so the tree would still look
+# pinned while `libqpdf/X.cc:NNN` had quietly moved. Untracked files (an in-tree
+# build directory, say) shift no line numbers and are ignored.
+modified_tracked() {
+  [[ -n "$(git -C "$DEST" status --porcelain --untracked-files=no 2>/dev/null)" ]]
+}
+
+refuse_modified() {
+  echo "fetch-qpdf-source.sh: ${DEST} is at the pinned commit but has local edits:" >&2
+  git -C "$DEST" status --porcelain --untracked-files=no >&2
+  echo "                      file/line citations against it are no longer reliable" >&2
+  echo "                      restore it:    git -C ${DEST} checkout -- ." >&2
+  echo "                      or re-create:  scripts/fetch-qpdf-source.sh --force" >&2
+  exit 1
+}
+
+# The oracle binary and the oracle source have to be the same version, or the
+# observed-behaviour comparisons the docs rely on are comparing two qpdfs. This
+# runs on every path, not just a fresh install: qpdf can be upgraded, or PATH
+# changed, long after the tree was put in place.
+warn_on_binary_drift() {
+  if ! command -v qpdf >/dev/null 2>&1; then
+    echo "fetch-qpdf-source.sh: note: no qpdf on PATH; the binary oracle is unavailable" >&2
+    return 0
+  fi
+  local bin_version
+  bin_version="$(qpdf --version 2>/dev/null | head -1 | awk '{print $3}')"
+  if [[ "$bin_version" != "$QPDF_VERSION" ]]; then
+    echo "fetch-qpdf-source.sh: warning: installed qpdf is ${bin_version:-unknown}, pinned source is ${QPDF_VERSION}" >&2
+    echo "                      behavioural comparisons against \$(command -v qpdf) will not match this tree" >&2
+  fi
+}
+
 # True only for a worktree of OUR mirror: `.git` is a file whose gitdir points
 # into ${MIRROR}/worktrees/. Read as text rather than asked of git, so a mirror
 # that has gone missing still leaves the worktree recognisable as ours.
@@ -116,12 +154,20 @@ if (( PRINT_PATH )); then
     echo "fetch-qpdf-source.sh: run scripts/fetch-qpdf-source.sh first" >&2
     exit 1
   fi
+  if modified_tracked; then
+    refuse_modified
+  fi
+  warn_on_binary_drift
   printf '%s\n' "$DEST"
   exit 0
 fi
 
 if (( ! FORCE )) && installed; then
+  if modified_tracked; then
+    refuse_modified
+  fi
   echo "qpdf ${QPDF_VERSION} source already present: ${DEST}"
+  warn_on_binary_drift
   exit 0
 fi
 
@@ -201,15 +247,4 @@ if [[ ! -f "${DEST}/${SENTINEL}" ]]; then
 fi
 
 echo "qpdf ${QPDF_VERSION} source installed: ${DEST} (${QPDF_COMMIT})"
-
-# The oracle binary and the oracle source have to be the same version, or the
-# observed-behaviour comparisons the docs rely on are comparing two qpdfs.
-if command -v qpdf >/dev/null 2>&1; then
-  BIN_VERSION="$(qpdf --version 2>/dev/null | head -1 | awk '{print $3}')"
-  if [[ "$BIN_VERSION" != "$QPDF_VERSION" ]]; then
-    echo "fetch-qpdf-source.sh: warning: installed qpdf is ${BIN_VERSION:-unknown}, pinned source is ${QPDF_VERSION}" >&2
-    echo "                      behavioural comparisons against \$(command -v qpdf) will not match this tree" >&2
-  fi
-else
-  echo "fetch-qpdf-source.sh: note: no qpdf on PATH; the binary oracle is unavailable" >&2
-fi
+warn_on_binary_drift
