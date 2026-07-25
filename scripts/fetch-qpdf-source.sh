@@ -116,8 +116,16 @@ refuse_modified() {
   echo "fetch-qpdf-source.sh: ${DEST} is at the pinned commit but has local edits:" >&2
   git -C "$DEST" status --porcelain --untracked-files=no >&2
   echo "                      file/line citations against it are no longer reliable" >&2
-  echo "                      restore it:    git -C ${DEST} checkout -- ." >&2
-  echo "                      or re-create:  scripts/fetch-qpdf-source.sh --force" >&2
+  if owned; then
+    echo "                      restore it:    git -C ${DEST} checkout -- ." >&2
+    echo "                      or re-create:  scripts/fetch-qpdf-source.sh --force" >&2
+  else
+    # Never suggest discarding work in a tree we did not create. The edits are
+    # most likely a deliberate experiment in someone's own qpdf checkout.
+    echo "                      this tree was not created by this script, so the edits are left alone" >&2
+    echo "                      commit or stash them, or point \$FLPDF_QPDF_SRC elsewhere" >&2
+    echo "                      (unset to use ${CACHE_ROOT}/qpdf-${QPDF_VERSION})" >&2
+  fi
   exit 1
 }
 
@@ -138,12 +146,30 @@ warn_on_binary_drift() {
   fi
 }
 
-# True only for a worktree of OUR mirror: `.git` is a file whose gitdir points
-# into ${MIRROR}/worktrees/. Read as text rather than asked of git, so a mirror
-# that has gone missing still leaves the worktree recognisable as ours.
+# Resolve symlinks without depending on GNU realpath.
+resolve_path() {
+  if [[ -d "$1" ]]; then
+    (cd "$1" && pwd -P) 2>/dev/null || printf '%s' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# True only for a worktree of OUR mirror. An ordinary clone has a `.git`
+# directory, so the file test alone already excludes one.
+#
+# Ask git for the mirror this worktree belongs to and compare resolved paths:
+# worktree bookkeeping records the mirror's real path, while $MIRROR may name
+# the same directory through a symlink (a symlinked $HOME or $XDG_CACHE_HOME),
+# and a plain string compare would then disown our own worktree. Fall back to
+# reading the pointer as text so a worktree whose mirror has been deleted is
+# still recognisable as ours.
 owned() {
   [[ -f "${DEST}/.git" ]] || return 1
-  local gitdir
+  local common gitdir
+  if common="$(git -C "$DEST" rev-parse --git-common-dir 2>/dev/null)" && [[ -n "$common" ]]; then
+    [[ "$(resolve_path "$common")" == "$(resolve_path "$MIRROR")" ]] && return 0
+  fi
   gitdir="$(head -n 1 "${DEST}/.git")"
   [[ "$gitdir" == "gitdir: ${MIRROR}/worktrees/"* ]]
 }
