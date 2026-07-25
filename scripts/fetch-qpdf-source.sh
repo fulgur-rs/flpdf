@@ -2,6 +2,13 @@
 #
 # fetch-qpdf-source.sh — materialise the pinned qpdf oracle source tree.
 #
+# SCOPE: a local developer convenience. It fetches read-only reference source
+# into a cache directory. It is not shipped, runs no CI gate, and never touches
+# PDF output. The bar is "hands out the right tree, and never destroys work the
+# developer cares about" — not production-grade concurrency hardening. Guards
+# beyond that (exotic lock races, unreadable git metadata) are deliberately out
+# of scope; do not add them.
+#
 # flpdf's pre-v1.0 goal is byte-identical qpdf reproduction (CLAUDE.md), so the
 # design docs and module docs cite qpdf by file and line
 # (`libqpdf/QPDFWriter.cc:1491`, `//! Mirrors qpdf 11.9.0 libqpdf/X.cc`).
