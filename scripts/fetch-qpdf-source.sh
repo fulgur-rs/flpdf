@@ -309,6 +309,17 @@ until mkdir "$LOCK" 2>/dev/null; do
 done
 LOCK_HELD=1
 
+# Re-validate after the lock. The guard above ran before we queued, and queuing
+# can take up to 600s — long enough for the tree to be edited meanwhile. Without
+# this, a non-`--force` run would fall through to `worktree remove --force`
+# below and discard those edits.
+if (( ! FORCE )) && [[ -e "$DEST" ]]; then
+  case "$(tracked_state)" in
+    dirty)   refuse_modified ;;
+    unknown) refuse_unverifiable ;;
+  esac
+fi
+
 # Another run may have completed the install while we queued for the lock.
 if (( ! FORCE )) && installed && [[ "$(tracked_state)" == "clean" ]]; then
   echo "qpdf ${QPDF_VERSION} source already present: ${DEST}"

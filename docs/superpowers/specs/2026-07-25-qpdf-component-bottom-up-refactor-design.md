@@ -334,9 +334,15 @@ D2 を満たさない。
 
 いずれも `lib.rs` から re-export されている。
 
+**`outline_document_helper.rs` は単なる呼び出し元ではない。** 私的な NNTree 実装を
+production で持っている: `find_name_tree_value`(573: qpdf 流の targeted lookup と
+二分探索)、`name_tree_begin_preflight`(657)、`enumerate_name_tree_entries`(937)、
+`repair_name_tree`(1039)。上記 API だけを移行すると**第 2 の NNTree 実装が production に
+残る**ため、この私的経路も列挙して統合すること。
+
 D2 の対象: 上記 API と、その呼び出し元である `embedded_files.rs` /
-`page_label_document_helper.rs` / `outline_document_helper.rs` / `json_inspect.rs` の
-**すべて**。qpdf の iterator / insert / split を既存 production 経路の**隣に**追加すると
+`page_label_document_helper.rs` / `outline_document_helper.rs`（上記の私的実装を含む）/
+`json_inspect.rs` の**すべて**。qpdf の iterator / insert / split を既存 production 経路の**隣に**追加すると
 D2 を満たさない。
 
 D1 の対象: iterator / insert / split / repair（qpdf 側との差分は着手時に精査する）。

@@ -51,7 +51,7 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFObjectHandle.cc` | 2601 | `object.rs`(1301) + `qpdf_null.rs`(9-37: `reference_is_null` / `value_is_null` = `isNull` の間接参照解決) | 🔀 アクセサが各所に散在（`flpdf-mfir`） |
+| `QPDFObjectHandle.cc` | 2601 | `object.rs`(1301) + `qpdf_null.rs`(9-37: `reference_is_null` / `value_is_null` = `isNull` の間接参照解決) + `overlay_annotations.rs`(1685-1737: `merge_resources_shallow` = `mergeResources`) + `overlay_appearance_stream.rs`（段階的 conflict merge の再現） | 🔀 アクセサが各所に散在（`flpdf-mfir`） |
 | `QPDF_Array/Dictionary/Stream/String/Name/Real/Integer/Bool/Null/InlineImage/Operator/Reserved/Unresolved/Destroyed.cc` | 1814 | `object.rs` の `Object` enum に統合 | 🔀 |
 | `QPDFObject.cc` / `QPDFValue.cc` | 79 | `object.rs` の `Object` | ✅ |
 | `QPDFObjGen.cc` | 68 | `object.rs` の `ObjectRef` | ✅ |
@@ -63,11 +63,11 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDF.cc` | 2667 | `reader.rs`(2454) + `reader/file_object.rs`(650) + `xref.rs`(1129) + `object_copy.rs`(184: `copyForeignObject`) + `cache.rs`(102: xref 由来の `ObjectCache` / `CacheEntry`。消費者は `reader.rs`) + `writer/object_streams.rs`(207-237: `compressible_objgens_qpdf_plan` = `getCompressibleObjGens`、`QPDF.cc:2392-2445`)  + `signatures.rs`(245-: `removeSecurityRestrictions`) | 🔀 |
+| `QPDF.cc` | 2667 | `reader.rs`(2454) + `reader/file_object.rs`(650) + `xref.rs`(1129) + `object_copy.rs`(184: `copyForeignObject`) + `cache.rs`(102: xref 由来の `ObjectCache` / `CacheEntry`。消費者は `reader.rs`) + `writer/object_streams.rs`(207-237: `compressible_objgens_qpdf_plan` = `getCompressibleObjGens`、`QPDF.cc:2392-2445`)  + `signatures.rs`(245-: `removeSecurityRestrictions`) + `page_closure.rs`(207: `page_object_closure`。`object_copy.rs` は pre-closed な集合しか受け取らず、両者で `copyForeignObject` 相当を構成する) | 🔀 |
 | `QPDFParser.cc` | 519 | `parser.rs`(905) の `Parser<'a>`(101) | 🔀 型は存在し `content_stream.rs` も再利用している。qpdf API との差分は未精査 |
 | `QPDFTokenizer.cc` | 965 | `tokenizer.rs`（normal mode / PR #549）+ `content_stream.rs`(484) に二重実装 | 🔀 → **T1-1**（`flpdf-n9t0.1`） |
 | `InputSource` 系 5 ファイル | 625 | `Read + Seek` ジェネリクスで代替 | ⚪ |
-| `QPDF_pages.cc` | 319 | `pages.rs`(741) + `page_tree_rebuild.rs`(390) | 🔀 |
+| `QPDF_pages.cc` | 319 | `pages.rs`(741) + `page_tree_rebuild.rs`(390) + `linearization/inherited_attrs.rs`(575: `QPDF_pages.cc:39-138` の `getAllPagesInternal` 修復を移植。`linearization/plan.rs:773` と `linearization/writer.rs:2582` から呼ばれる) | 🔀 |
 | `QPDFExc.cc` / `QPDFSystemError.cc` | 123 | `error.rs`(125) | ✅ |
 
 ## 3. 書き込み — 最大の smear
@@ -160,7 +160,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFJob.cc` | 3116 | `flpdf-cli/src/main.rs`(6491) + `overlay*.rs` + `page_merge.rs`(1117) + `check.rs`(360) + `attachment_list.rs`(306: `--list-attachments` の整形出力) + page 操作群 | 🔀 |
+| `QPDFJob.cc` | 3116 | `flpdf-cli/src/main.rs`(6491) + `overlay*.rs` + `page_merge.rs`(1117) + `check.rs`(360) + `attachment_list.rs`(306: `--list-attachments` の整形出力) + `acroform_field_prune.rs`(497: `QPDFJob.cc:2610-2632` の "Remove unreferenced form fields"。`prune_acroform_after_subset` が CLI から呼ばれる) + page 操作群 | 🔀 |
 | `QPDFJob_config` / `_argv` / `_json` / `QPDFArgParser` / `QPDFUsage` | 3164 | clap で代替 | ⚪ |
 | `QPDFLogger.cc` | 255 | `diagnostics.rs`(80) | 🔀 |
 
@@ -237,7 +237,7 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 | `signatures.rs` の**検査 API のみ** | — | 署名の読み取り検査。qpdf に相当機能なし |
 | `qdf_fix.rs` | 764 | qpdf では `qpdf/fix-qdf.cc`（libqpdf 外の別バイナリ） |
 | `fonts.rs` | 192 | `--show-fonts` の実体（`font_entries`(30) / `font_entries_with_max_depth`(43)）。qpdf にフォント一覧機能は無い（`qpdf --help=all` に font 関連の記載なし） |
-| `page_closure.rs` / `ref_chain.rs` | 284 | |
+| `ref_chain.rs` | 77 | |
 
 `object_copy.rs`(184) は `QPDF.cc` の `copyForeignObject` に相当するため
 [§2 パース / 読み取り](#2-パース--読み取り) の `QPDF.cc` 行に移した。
