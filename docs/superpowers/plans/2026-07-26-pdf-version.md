@@ -288,7 +288,7 @@ Run:
 
 ```bash
 cargo llvm-cov clean --workspace
-cargo llvm-cov --workspace --all-features --lcov --output-path /tmp/flpdf-qxba-4.lcov
+cargo llvm-cov --workspace --features qpdf-zlib-compat --ignore-run-fail --lcov --output-path /tmp/flpdf-qxba-4.lcov
 scripts/patch-coverage.sh --base origin/main --lcov /tmp/flpdf-qxba-4.lcov
 ```
 
