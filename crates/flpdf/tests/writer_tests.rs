@@ -1707,7 +1707,7 @@ fn rewrites_pdf_with_real_number_fixture() {
     };
     // Fixture literals preserved verbatim by [`Object::RealLiteral`] when the
     // source string is not Rust's shortest round-trip for the value
-    // (`1e3` vs `1000`, `.75` vs `0.75`, `1.` vs `1`, `+.25` vs `0.25`).
+    // (`1.0` vs `1`, `.75` vs `0.75`, `1.` vs `1`, `+.25` vs `0.25`).
     let lit = |v: f64, s: &[u8]| Object::RealLiteral {
         value: v,
         literal: s.to_vec(),
@@ -1717,7 +1717,7 @@ fn rewrites_pdf_with_real_number_fixture() {
         Some(&Object::Array(vec![
             Object::Integer(0),
             Object::Integer(0),
-            lit(1000.0, b"1e3"),
+            lit(1.0, b"1.0"),
             lit(0.75, b".75"),
         ]))
     );
