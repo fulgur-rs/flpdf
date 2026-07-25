@@ -60,6 +60,8 @@
 #
 # Both of the first two forms refuse to hand back a tree whose tracked files
 # have been edited, and warn when the qpdf on PATH is a different version.
+# Installation takes a lock under the cache root so that concurrent runs — one
+# per agent or checkout on a shared $HOME — queue instead of colliding.
 set -euo pipefail
 
 QPDF_VERSION="11.9.0"
@@ -75,6 +77,20 @@ CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/flpdf"
 # worktree: it is shared by every pinned version.
 MIRROR="${CACHE_ROOT}/qpdf.git"
 DEST="${FLPDF_QPDF_SRC:-${CACHE_ROOT}/qpdf-${QPDF_VERSION}}"
+# `git -C "$MIRROR" worktree add "$DEST"` runs as if started in the mirror, so a
+# relative $FLPDF_QPDF_SRC would land the worktree inside the mirror while every
+# other check here reads it relative to the caller. Anchor it once, up front.
+case "$DEST" in
+  /*) ;;
+  *)  DEST="${PWD}/${DEST}" ;;
+esac
+
+# Serialises mirror creation and worktree replacement against a concurrent run
+# sharing this cache (parallel agents, several checkouts on one machine). mkdir
+# is the portable atomic test-and-set; flock is not on every platform.
+LOCK="${CACHE_ROOT}/.lock"
+LOCK_HELD=0
+SCRATCH=""
 
 PRINT_PATH=0
 FORCE=0
@@ -108,8 +124,26 @@ installed() {
 # changing the very bytes the citations address, so the tree would still look
 # pinned while `libqpdf/X.cc:NNN` had quietly moved. Untracked files (an in-tree
 # build directory, say) shift no line numbers and are ignored.
-modified_tracked() {
-  [[ -n "$(git -C "$DEST" status --porcelain --untracked-files=no 2>/dev/null)" ]]
+#
+# Prints clean / dirty / unknown. The third state is not pedantry: with the
+# mirror deleted, `git status` inside the worktree fails, and folding that into
+# "clean" would let the replacement path delete a tree full of edits without
+# --force. Not being able to check is a reason to stop, not to proceed.
+tracked_state() {
+  local out
+  if out="$(git -C "$DEST" status --porcelain --untracked-files=no 2>/dev/null)"; then
+    if [[ -n "$out" ]]; then printf 'dirty'; else printf 'clean'; fi
+  else
+    printf 'unknown'
+  fi
+}
+
+refuse_unverifiable() {
+  echo "fetch-qpdf-source.sh: cannot determine whether ${DEST} has local edits" >&2
+  echo "                      (git could not read it — its mirror is missing or damaged)" >&2
+  echo "                      refusing to replace a tree that might hold uncommitted work" >&2
+  echo "                      discard it explicitly: scripts/fetch-qpdf-source.sh --force" >&2
+  exit 1
 }
 
 refuse_modified() {
@@ -204,7 +238,7 @@ if (( PRINT_PATH )); then
     echo "fetch-qpdf-source.sh: run scripts/fetch-qpdf-source.sh first" >&2
     exit 1
   fi
-  if modified_tracked; then
+  if [[ "$(tracked_state)" == "dirty" ]]; then
     refuse_modified
   fi
   warn_on_binary_drift
@@ -213,7 +247,7 @@ if (( PRINT_PATH )); then
 fi
 
 if (( ! FORCE )) && installed; then
-  if modified_tracked; then
+  if [[ "$(tracked_state)" == "dirty" ]]; then
     refuse_modified
   fi
   echo "qpdf ${QPDF_VERSION} source already present: ${DEST}"
@@ -232,13 +266,16 @@ if [[ -e "$DEST" ]] && ! owned; then
   exit 1
 fi
 
-# Reaching here means $DEST is about to be replaced by `worktree remove --force`,
-# which is irreversible. The guards above only cover a dirty tree that still
-# satisfies `installed`; an owned worktree checked out elsewhere, or with its
-# sentinel deleted, is dirty too and would otherwise be wiped silently. Discard
-# only when explicitly asked.
-if (( ! FORCE )) && [[ -e "$DEST" ]] && modified_tracked; then
-  refuse_modified
+# Reaching here means $DEST is about to be replaced by `worktree remove --force`
+# (or `rm -rf`), which is irreversible. The guards above only cover a dirty tree
+# that still satisfies `installed`; an owned worktree checked out elsewhere, or
+# with its sentinel deleted, is dirty too and would otherwise be wiped silently.
+# Discard only when explicitly asked.
+if (( ! FORCE )) && [[ -e "$DEST" ]]; then
+  case "$(tracked_state)" in
+    dirty)   refuse_modified ;;
+    unknown) refuse_unverifiable ;;
+  esac
 fi
 
 if ! command -v git >/dev/null 2>&1; then
@@ -247,12 +284,49 @@ if ! command -v git >/dev/null 2>&1; then
 fi
 
 mkdir -p "$CACHE_ROOT"
+
+cleanup() {
+  [[ -n "$SCRATCH" ]] && rm -rf "$SCRATCH"
+  (( LOCK_HELD )) && rmdir "$LOCK" 2>/dev/null
+  :
+}
+trap cleanup EXIT
+
+waited=0
+until mkdir "$LOCK" 2>/dev/null; do
+  if (( waited == 0 )); then
+    echo "Waiting for another fetch-qpdf-source.sh to release ${LOCK}" >&2
+  fi
+  if (( waited >= 600 )); then
+    echo "fetch-qpdf-source.sh: timed out waiting for ${LOCK}" >&2
+    echo "                      if no other run is active it is stale: rmdir ${LOCK}" >&2
+    exit 1
+  fi
+  sleep 1
+  waited=$((waited + 1))
+done
+LOCK_HELD=1
+
+# Another run may have completed the install while we queued for the lock.
+if (( ! FORCE )) && installed && [[ "$(tracked_state)" == "clean" ]]; then
+  echo "qpdf ${QPDF_VERSION} source already present: ${DEST}"
+  warn_on_binary_drift
+  exit 0
+fi
+
 SCRATCH="$(mktemp -d "${CACHE_ROOT}/.flpdf-qpdf-src.XXXXXX")"
-trap 'rm -rf "$SCRATCH"' EXIT
 
 if [[ -e "$MIRROR" ]]; then
   if ! git -C "$MIRROR" rev-parse --git-dir >/dev/null 2>&1; then
     echo "fetch-qpdf-source.sh: ${MIRROR} exists but is not a git repository" >&2
+    echo "                      move it aside and re-run" >&2
+    exit 1
+  fi
+  # A non-bare checkout here would still accept `worktree add`, but its worktrees
+  # point at ${MIRROR}/.git — a path `owned()` does not recognise — so the very
+  # next run would disown the tree this one just created.
+  if [[ "$(git -C "$MIRROR" rev-parse --is-bare-repository 2>/dev/null)" != "true" ]]; then
+    echo "fetch-qpdf-source.sh: ${MIRROR} is a git repository but not a bare mirror" >&2
     echo "                      move it aside and re-run" >&2
     exit 1
   fi

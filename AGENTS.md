@@ -45,6 +45,8 @@
     `git log`/`git blame` over `libqpdf/` are available for establishing *why* qpdf
     behaves a given way. Inspect other revisions without moving HEAD (`git show
     v12.0.0:libqpdf/X.cc`), or the worktree falls off the pin.
+  - The tree is treated as read-only: a tracked-file edit makes both forms refuse, since
+    citations against an edited tree are wrong. `--force` is the only path that discards.
 
 ## 5) Test fixtures / helpers
 - Use real fixtures under `tests/fixtures/` and compatibility data under `tests/fixtures/compat` + `tests/fixtures/compat/golden`.
