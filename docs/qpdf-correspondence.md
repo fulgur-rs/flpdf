@@ -9,7 +9,14 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 どこまで対応しているかのスナップショット。`flpdf-qxba` の work-list であり、Phase 1
 完了後に再測する。
 
-規模比較: qpdf `libqpdf/*.cc` = 41,459 行 / flpdf 実装部（`#[cfg(test)]` 以降を除く）= 61,792 行
+規模比較: qpdf `libqpdf/*.cc` = 41,459 行 / flpdf 実装部 = **68,504 行**
+
+**行数の計測方法**: 末尾の `#[cfg(test)] mod tests` より前を production とする。
+「最初の `#[cfg(test)]` まで」で数えてはならない。Rust は item 単位の `#[cfg(test)]`
+ヘルパーの**後に production コードが再開する**ため、大幅な過小評価になる
+（例: `linearization/writer.rs` は 448 行目に test helper があり、terminal
+`mod tests` は 3604 行目。誤った方法では 447 行、正しくは 3,603 行で 8.1 倍の差）。
+なお item 単位の test helper（各数行）は本計測に含まれたままである。
 
 | 記号 | 意味 |
 |---|---|
@@ -25,20 +32,20 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFObjectHandle.cc` | 2601 | `object.rs`(929) | 🔀 アクセサが各所に散在（`flpdf-mfir`） |
+| `QPDFObjectHandle.cc` | 2601 | `object.rs`(1301) | 🔀 アクセサが各所に散在（`flpdf-mfir`） |
 | `QPDF_Array/Dictionary/Stream/String/Name/Real/Integer/Bool/Null/InlineImage/Operator/Reserved/Unresolved/Destroyed.cc` | 1814 | `object.rs` の `Object` enum に統合 | 🔀 |
 | `QPDFObject.cc` / `QPDFValue.cc` | 79 | `object.rs` / `cache.rs`(102) | ✅ |
 | `QPDFObjGen.cc` | 68 | `object.rs` の `ObjectRef` | ✅ |
 | `QPDFXRefEntry.cc` | 51 | `xref.rs`(1129) の一部 | ✅ |
 | `PDFVersion.cc` | 68 | `writer.rs` の `parse_pdf_version` / `static_version_string` | 🔀 → **T0-1** |
-| `QPDFMatrix.cc` | 140 | `overlay.rs` / `page_form_xobject.rs` / `page_annotation_flatten.rs` に `[f64; 6]` 生配列で散在 | 🔀 → **T0-2** |
+| `QPDFMatrix.cc` | 140 | `overlay.rs`(82-123: `IDENTITY_MATRIX` / `qpdf_concat` / `qpdf_scale` / `qpdf_translate` / `matrix_unparse`) + `overlay_annotations.rs`(1284-1365) + `page_form_xobject.rs`(503,533) + `page_annotation_flatten.rs`(306,454) + `page_rotate.rs`(306-355) に `[f64; 6]` 生配列で散在 | 🔀 → **T0-2** |
 
 ## 2. パース / 読み取り
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
 | `QPDF.cc` | 2667 | `reader.rs`(2454) + `reader/file_object.rs`(650) + `xref.rs`(1129) + `object_copy.rs`(184: `copyForeignObject`) | 🔀 |
-| `QPDFParser.cc` | 519 | `parser.rs`(597) の `Parser<'a>`(101) | 🔀 型は存在し `content_stream.rs` も再利用している。qpdf API との差分は未精査 |
+| `QPDFParser.cc` | 519 | `parser.rs`(905) の `Parser<'a>`(101) | 🔀 型は存在し `content_stream.rs` も再利用している。qpdf API との差分は未精査 |
 | `QPDFTokenizer.cc` | 965 | `tokenizer.rs`（normal mode / PR #549）+ `content_stream.rs`(484) に二重実装 | 🔀 → **T1-1**（`flpdf-n9t0.1`） |
 | `InputSource` 系 5 ファイル | 625 | `Read + Seek` ジェネリクスで代替 | ⚪ |
 | `QPDF_pages.cc` | 319 | `pages.rs`(741) + `page_tree_rebuild.rs`(390) | 🔀 |
@@ -48,7 +55,7 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFWriter.cc` | 3044 | `writer.rs`(4492) + `writer/serialize.rs`(1008) + `writer/object_streams.rs`(739) + `writer/plain/{plan,body,xref}.rs`(898) + `linearization/writer.rs`(447) + `linearization/part1.rs`(370) + `linearization/back_patch.rs`(324) + `linearization/renumber.rs`(850) + `rewrite_renumber.rs`(448) = **9,576 行 / 10 ファイル** | 🔀 |
+| `QPDFWriter.cc` | 3044 | `writer.rs`(4492) + `writer/serialize.rs`(1008) + `writer/object_streams.rs`(739) + `writer/plain/{plan,body,xref}.rs`(898) + `linearization/writer.rs`(3603) + `linearization/part1.rs`(370) + `linearization/back_patch.rs`(324) + `linearization/renumber.rs`(850) + `rewrite_renumber.rs`(893) = **13,177 行 / 11 ファイル** | 🔀 |
 
 qpdf は 1 クラスで standard / linearized / encrypted / objstm を統一的に扱う。flpdf は
 経路ごとに分岐しており **xref 出力が 3 箇所**に分かれる。byte-parity の修正が片方の
@@ -95,7 +102,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `Pl_ASCIIHexDecoder` | 96 | `ascii_hex.rs`(85) | ✅ |
 | `Pl_RunLength` | 146 | `run_length.rs`(140) | ✅ |
 | `Pl_AES_PDF` / `Pl_RC4` | 243 | `writer.rs` の `encrypt_stream_payload_for_writer` に埋没 | 🔀 |
-| `Pl_QPDFTokenizer.cc` / `ContentNormalizer.cc` | 141 | 無し | ❌ → **T2-1** |
+| `Pl_QPDFTokenizer.cc` / `ContentNormalizer.cc` | 141 | `content_stream.rs`(439-475: `normalize_content_stream`) | 🔀 → **T2-1** 独自実装が既に production にあり CLI から使われている（doc に既知のバイト差の記載あり）。T2-1 は「解錠」ではなく**置き換え** |
 | `QPDFStreamFilter.cc` | 19 | filter 登録機構が無い | ❌ |
 | `Pl_DCT.cc` | 326 | 無し | ❌ |
 | `Pl_Base64` / `Pl_Concatenate` / `Pl_Discard` / `Pl_Function` / `Pl_OStream` / `Pl_StdioFile` / `Pl_String` / `Pl_SHA2` / `Pl_Buffer` | 632 | Rust の `Write` で代替 | ⚪ |
@@ -109,15 +116,15 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFAcroFormDocumentHelper.cc` | 1047 | `acroform_document_helper.rs`(1096) + `overlay_annotations.rs`(474: `transformAnnotations` / `addAndRenameFormFields`) + `overlay_appearance_stream.rs`(720: `adjustAppearanceStream`) | 🔀 |
-| `QPDFPageObjectHelper.cc` | 1039 | `page_object_helper.rs`(766) + `page_form_xobject.rs`(637) + `resources.rs`(1229) + `page_annotation_flatten.rs`(596) + `overlay.rs`(2228: `placeFormXObject`) + `overlay_annotations.rs`(474: `copyAnnotations`) | 🔀 |
+| `QPDFAcroFormDocumentHelper.cc` | 1047 | `acroform_document_helper.rs`(1096) + `overlay_annotations.rs`(2263: `transformAnnotations` / `addAndRenameFormFields`) + `overlay_appearance_stream.rs`(720: `adjustAppearanceStream`) | 🔀 |
+| `QPDFPageObjectHelper.cc` | 1039 | `page_object_helper.rs`(766) + `page_form_xobject.rs`(637) + `resources.rs`(1229) + `page_annotation_flatten.rs`(596) + `overlay.rs`(2228: `placeFormXObject`) + `overlay_annotations.rs`(2263: `copyAnnotations`) | 🔀 |
 | `QPDFFormFieldObjectHelper.cc` | 852 | `annotation_helper.rs`(748) + `appearance.rs`(2022) + `default_appearance.rs`(167) | 🔀 |
 | `QPDFPageDocumentHelper.cc` | 158 | `page_document_helper.rs`(236) | ✅ |
 | `QPDFAnnotationObjectHelper.cc` | 226 | `annotation_helper.rs` + `page_annotation_enum.rs`(249) | 🔀 |
-| `QPDFOutlineDocumentHelper` / `QPDFOutlineObjectHelper` | 198 | `outline_document_helper.rs`(1408) + `outline.rs`(145) | ✅ |
+| `QPDFOutlineDocumentHelper` / `QPDFOutlineObjectHelper` | 198 | `outline_document_helper.rs`(1499) + `outline.rs`(145) | ✅ |
 | `QPDFPageLabelDocumentHelper.cc` | 134 | `page_label_document_helper.rs`(934) | ✅ |
 | `QPDFNameTreeObjectHelper` / `QPDFNumberTreeObjectHelper` / `NNTree.cc` | 1394 | `name_number_tree.rs`(364) + `name_tree_dests.rs`(286) | 🔀 → **T2-2** |
-| `QPDFEmbeddedFileDocumentHelper.cc` | 122 | `embedded_files.rs`(188) + `attachment_list.rs`(306) | ✅ |
+| `QPDFEmbeddedFileDocumentHelper.cc` | 122 | `embedded_files.rs`(678) + `attachment_list.rs`(306) | ✅ |
 | `QPDFFileSpecObjectHelper` / `QPDFEFStreamObjectHelper` | 280 | `filespec_helper.rs`(1324) | ✅ |
 | `ResourceFinder.cc` | 56 | `overlay_annotations.rs`(967-1111: オペレータ表) + `overlay_appearance_stream.rs`(2-3: `ResourceReplacer` / `ResourceFinder` token filter) | 🔀 `resources.rs` には実装が無い |
 | `QPDFDocumentHelper.cc` / `QPDFObjectHelper.cc` | 12 | 基底トレイトが無い | ⚪ |
@@ -249,8 +256,20 @@ byte golden の無い書き込み経路は安全に移動できない。🔀 行
 | `qdf_tests.rs:1300` | `qdf_golden_minimal_is_byte_identical_to_qpdf_modulo_id` — `tests/fixtures/qdf-golden/minimal.qdf` に対し trailer `/ID` 行を除いて完全一致 | 既定テストに含まれる |
 | `overlay::byte_gate` | `three-page-overlay-one-page-qdf.pdf` ほか QDF 出力 3 件の byte-identical | ✅ `--lib overlay::byte_gate` で列挙済み |
 
-**残る穴**: QDF × ObjStm、QDF × 暗号、QDF × linearize の組み合わせ。Phase 2 で
-null 可視性を QDF 経路に広げる際に必要になるのはこれらであって、QDF 全体ではない。
+### QDF で「穴」になりえない組み合わせ
+
+QDF は他の出力モードと**排他**であり、次の組み合わせに byte gate を作っても
+意図した writer 経路を通らない。
+
+| 組み合わせ | 排他の実装箇所 |
+|---|---|
+| QDF × ObjStm | `qdf_tests.rs:734` `qdf_overrides_generate_mode_no_objstm` — QDF が `Generate` を上書きし ObjStm を出さない |
+| QDF × linearize | `flpdf-cli/src/main.rs:1466` `--qdf and --linearize cannot be used together` |
+| QDF × 暗号化出力 | `writer.rs:3135` `--encrypt / --copy-encryption-from cannot be combined with --qdf` |
+
+**残る有効な穴**: 暗号化された**入力**からの QDF 出力（復号 → QDF）、および
+現状 fixture が無い QDF オプションの組み合わせ。Phase 2 で null 可視性を QDF 経路に
+広げる際に必要になるのはこちら。
 
 gated テストは `.github/workflows/ci.yml` の bytes-identical ジョブに手で列挙しないと
 CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れている。

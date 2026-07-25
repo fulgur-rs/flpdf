@@ -13,7 +13,7 @@ pre-v1.0 の唯一のゴールは qpdf 出力の byte-identical 再現（`CLAUDE
 
 対応表の実測がこれを裏付けている。
 
-- `QPDFWriter.cc`(3,044 行) が flpdf 側では **10 ファイル 9,576 行**に分散し、
+- `QPDFWriter.cc`(3,044 行) が flpdf 側では **11 ファイル 13,177 行**に分散し、
   xref 出力だけで 3 箇所ある。byte-parity の修正が片方の経路にしか入らない
 - `QPDF_optimization.cc`(381 行) は独立モジュールが無く `linearization/plan.rs`(3,032 行)
   に埋没している
@@ -178,9 +178,10 @@ D2 の対象: `[f64; 6]` 生配列が散在し、`IDENTITY` 定数・行列積�
 | `page_annotation_flatten.rs` | `apply_matrix`(306), `read_xobj_bbox_and_matrix`(454) |
 | `overlay_annotations.rs` | `concat_matrices`(1284), `IDENTITY`(1297), `transform_rect_by_cm`(1338), `apply_matrix_to_point`(1365) — doc に `QPDFMatrix` 相当と明記されている |
 | `page_rotate.rs` | `type Mat`(306), `translate`(326), `transform_box`(355) |
-| `overlay.rs` | 行列の受け渡し |
+| `overlay.rs` | `IDENTITY_MATRIX`(82), `qpdf_concat`(87), `qpdf_scale`(101), `qpdf_translate`(106), `matrix_unparse`(123) |
 
-`overlay_annotations.rs` と `page_rotate.rs` を落とすと重複実装が残り、D2 を満たさない。
+`overlay.rs` / `overlay_annotations.rs` / `page_rotate.rs` を落とすと重複実装が残り、D2 を満たさない。
+**5 モジュールすべてとその呼び出し元**を移行対象に含めること。
 
 #### T0-3 `json/` ← `JSON.cc`(1,401) + `JSONHandler.cc`(189) — `flpdf-qxba.6`
 
@@ -189,6 +190,11 @@ PDF オブジェクトモデルには非依存。規模は大きいが機械的�
 現状 `json.rs`(159) は emitter のみで parser も schema validator も無い。
 
 D1 の対象: JSON 値モデル / parse / schema check / Base64 / writer。
+
+D2 の対象: `json_inspect.rs` に既存の `base64_encode`(542-563) があり、inline JSON
+stream data の出力（695 行）で使われている。これを新モジュール側へ寄せないと
+Base64 実装が 2 つ残り D2 を満たさない。`json_inspect.rs` の inline-stream 経路も
+移行対象に含めること。
 
 **Pipeline 依存の扱い（着手前に決着させること）**: `JSON.cc` は依存ゼロではなく、
 `Pl_Base64` / `Pl_Concatenate` / `Pl_String` の 3 つの Pipeline sink を使う。
@@ -222,7 +228,17 @@ D2 の対象: `content_stream.rs`(484) の二重実装。
 依存: T1-1（`flpdf-n9t0.1`）。qpdf 側で `ContentNormalizer` は
 `QPDFObjectHandle::TokenFilter` を継承するため tokenizer が完成していないと閉じられない。
 
-解錠するもの: `--normalize-content`（`flpdf-w5ny`）。
+**これは「解錠」ではなく「置き換え」**: `--normalize-content` は既に実装済みである。
+`content_stream.rs`(439-475) の `normalize_content_stream` が production にあり、
+`flpdf-cli/src/main.rs`(1050, 2204, 2260) から配線されている。その doc には qpdf との
+既知のバイト差が列挙されている。
+
+D2 の対象: ライブラリ関数（`normalize_content_stream`）と CLI 呼び出し元の**両方**を
+新モジュールへ移行する。新モジュールを足すだけでは CLI が乖離した旧実装を使い続け、
+D2 を満たさない。
+
+なお beads の `flpdf-w5ny` と epic `flpdf-n9t0` は `--normalize-content` を「未実装」と
+記載しているが、これは stale。
 
 #### T2-2 `nntree.rs` ← `NNTree.cc`(954) — `flpdf-qxba.8`
 
@@ -257,7 +273,7 @@ Phase 1 完了後に着手する。着手時点で対応表を**再測**する�
   分ける。**objstm 経路の解錠は無い**（qpdf でも `optimize()` の呼び出し元は
   `QPDF_linearization.cc:495` と `QPDFWriter.cc:2553`＝`writeLinearized()` 内のみ。
   `flpdf-g6hb` が要る `getCompressibleObjGens` は `QPDF.cc:2393` の別物）
-- `QPDFWriter.cc` 系（flpdf 側 10 ファイル 9,576 行）
+- `QPDFWriter.cc` 系（flpdf 側 11 ファイル 13,177 行）
 - `QPDFObjectHandle` アクセサ（`flpdf-mfir`）
 - `ResourceFinder` / `QPDFLogger`
 
@@ -280,9 +296,16 @@ qtest +9 の実測値は順序を前倒しする根拠にしない。
 byte gate の新設は Phase 2 着手時の前提として持ち越す。ただし QDF は**既に部分的な
 カバレッジがある**（`writer_tests.rs:2170,2201` の qpdf golden 完全一致、
 `qdf_tests.rs:1300` の `/ID` 行を除く完全一致、`overlay::byte_gate` の QDF 3 件。
-前 2 者と `overlay::byte_gate` は CI 列挙済み）。新設が必要なのは QDF 全体ではなく
-**QDF × ObjStm / QDF × 暗号 / QDF × linearize の組み合わせと、暗号・incremental
-単体**。詳細は対応表の「QDF の既存カバレッジ」節。
+前 2 者と `overlay::byte_gate` は CI 列挙済み）。
+
+**QDF × ObjStm / QDF × 暗号 / QDF × linearize は穴になりえない。** QDF はこれらと
+排他だからである（`qdf_tests.rs:734` で QDF が `Generate` を上書き、
+`flpdf-cli/src/main.rs:1466` が `--qdf --linearize` を拒否、`writer.rs:3135` が
+`--encrypt` との併用を拒否）。gate を作っても意図した writer 経路を通らない。
+
+新設が必要なのは**暗号化された入力からの QDF 出力（復号 → QDF）**、fixture の無い
+QDF オプションの組み合わせ、および**暗号・incremental 単体**。詳細は対応表の
+「QDF の既存カバレッジ」節。
 
 ## 推奨順
 
@@ -290,8 +313,11 @@ byte gate の新設は Phase 2 着手時の前提として持ち越す。ただ�
 flpdf-qxba.1, .2      （小・独立、いつでも）
    │
    ├─> T0-1 pdf_version.rs  (.4)  DoD と D4 足場の確立
-   ├─> T0-2 matrix.rs       (.5)  3 ファイルの重複を吸収
-   └─> T0-3 json/           (.6)  依存ゼロ、並行可
+   └─> T0-2 matrix.rs       (.5)  5 モジュールの重複を吸収
+
+T0-3 json/ (.6)  ⛔ ブロック中
+   前提: Pipeline sink 代替の逸脱承認、または pipeline.rs の完成。
+   どちらも未了のうちは着手しない（本文「Pipeline 依存の扱い」参照）。
 
 PR #549 merge ──> T1-1 tokenizer 全モード (flpdf-n9t0.1)
                        │
