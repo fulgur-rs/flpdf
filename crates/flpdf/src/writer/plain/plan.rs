@@ -105,13 +105,23 @@ impl PlainWritePlan {
         } else {
             pdf.last_xref_form()
         };
-        let version = crate::writer::effective_pdf_version(
+        let mut version = crate::writer::effective_pdf_version(
             pdf.version(),
             options,
             false,
             has_object_stream || form == XrefForm::Stream,
         )
         .to_string();
+        // `effective_pdf_version` returns an unparseable source version verbatim,
+        // so a malformed header such as `%PDF-x.y` would survive into a plan that
+        // `validate` then rejects. PDF 1.5 introduced xref streams, so repair the
+        // header to that floor exactly as the full-rewrite path does, keeping an
+        // input the previous route rewrote successfully out of the error arm.
+        if form == XrefForm::Stream
+            && crate::writer::parse_pdf_version(&version).is_none_or(|v| v < (1, 5))
+        {
+            version = "1.5".to_string();
+        }
 
         let mut dictionary = pdf.trailer().clone();
         crate::writer::strip_incremental_trailer_keys(&mut dictionary);
@@ -625,6 +635,22 @@ mod tests {
             .objects
             .iter()
             .all(|object| matches!(object, PlannedIndirectObject::Source { .. })));
+    }
+
+    #[test]
+    fn build_repairs_unparseable_header_for_xref_stream_output() {
+        let mut bytes = std::fs::read(fixture_path("three-page-objstm.pdf")).unwrap();
+        bytes[5] = b'x';
+        bytes[7] = b'y';
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+        assert_eq!(pdf.version(), "x.y");
+
+        let plan =
+            PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap();
+
+        assert_eq!(plan.version, "1.5");
+        assert_eq!(plan.trailer.form, XrefForm::Stream);
+        plan.validate().unwrap();
     }
 
     #[test]
