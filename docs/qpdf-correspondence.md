@@ -32,7 +32,7 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFObjectHandle.cc` | 2601 | `object.rs`(1301) | 🔀 アクセサが各所に散在（`flpdf-mfir`） |
+| `QPDFObjectHandle.cc` | 2601 | `object.rs`(1301) + `qpdf_null.rs`(9-37: `reference_is_null` / `value_is_null` = `isNull` の間接参照解決) | 🔀 アクセサが各所に散在（`flpdf-mfir`） |
 | `QPDF_Array/Dictionary/Stream/String/Name/Real/Integer/Bool/Null/InlineImage/Operator/Reserved/Unresolved/Destroyed.cc` | 1814 | `object.rs` の `Object` enum に統合 | 🔀 |
 | `QPDFObject.cc` / `QPDFValue.cc` | 79 | `object.rs` / `cache.rs`(102) | ✅ |
 | `QPDFObjGen.cc` | 68 | `object.rs` の `ObjectRef` | ✅ |
@@ -55,7 +55,7 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFWriter.cc` | 3044 | `writer.rs`(4492) + `writer/serialize.rs`(1008) + `writer/object_streams.rs`(739) + `writer/plain/{plan,body,xref}.rs`(898) + `linearization/writer.rs`(3603) + `linearization/part1.rs`(370) + `linearization/back_patch.rs`(324) + `linearization/renumber.rs`(850) + `rewrite_renumber.rs`(893) = **13,177 行 / 11 ファイル** | 🔀 |
+| `QPDFWriter.cc` | 3044 | `writer.rs`(4492) + `writer/serialize.rs`(1008) + `writer/object_streams.rs`(739) + `writer/plain/{plan,body,xref}.rs`(898) + `linearization/writer.rs`(3603) + `linearization/part1.rs`(370) + `linearization/back_patch.rs`(324) + `linearization/renumber.rs`(850) + `rewrite_renumber.rs`(893) = **13,177 行 / 11 ファイル**。加えて `qpdf_null.rs`(38-57: `visible_entries` = `QPDFWriter.cc:1491` の null 値 dict キー抑制) | 🔀 |
 
 qpdf は 1 クラスで standard / linearized / encrypted / objstm を統一的に扱う。flpdf は
 経路ごとに分岐しており **xref 出力が 3 箇所**に分かれる。byte-parity の修正が片方の
@@ -95,7 +95,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `Pipeline.cc` + `Pl_*.cc`（21 ファイル） | ~2,400 | 積層シンク抽象が無い。`Vec<u8>` バッファ + `out.len()` 直参照 | ❌ |
+| `Pipeline.cc`（積層シンク基盤のみ。個々の `Pl_*` は下記の各行で個別に分類） | 114 | 抽象が無い。`Vec<u8>` バッファ + `out.len()` 直参照 | ❌ |
 | `Pl_Count.cc` / `Pl_MD5.cc` | 114 | 無し（バッファから同等の値は取得可能） | ❌ |
 | `Pl_Flate` / `Pl_LZWDecoder` / `Pl_PNGFilter` / `Pl_TIFFPredictor` / `SF_FlateLzwDecode` | 946 | `filters.rs`(859) | 🔀 |
 | `Pl_ASCII85Decoder` | 108 | `ascii85.rs`(163) | ✅ |
@@ -124,7 +124,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `QPDFOutlineDocumentHelper` / `QPDFOutlineObjectHelper` | 198 | `outline_document_helper.rs`(1499) + `outline.rs`(145) | ✅ |
 | `QPDFPageLabelDocumentHelper.cc` | 134 | `page_label_document_helper.rs`(934) | ✅ |
 | `QPDFNameTreeObjectHelper` / `QPDFNumberTreeObjectHelper` / `NNTree.cc` | 1394 | `name_number_tree.rs`(364) + `name_tree_dests.rs`(286) | 🔀 → **T2-2** |
-| `QPDFEmbeddedFileDocumentHelper.cc` | 122 | `embedded_files.rs`(678) + `attachment_list.rs`(306) | ✅ |
+| `QPDFEmbeddedFileDocumentHelper.cc` | 122 | `embedded_files.rs`(678) | ✅ |
 | `QPDFFileSpecObjectHelper` / `QPDFEFStreamObjectHelper` | 280 | `filespec_helper.rs`(1324) | ✅ |
 | `ResourceFinder.cc` | 56 | `overlay_annotations.rs`(967-1111: オペレータ表) + `overlay_appearance_stream.rs`(2-3: `ResourceReplacer` / `ResourceFinder` token filter) | 🔀 `resources.rs` には実装が無い |
 | `QPDFDocumentHelper.cc` / `QPDFObjectHelper.cc` | 12 | 基底トレイトが無い | ⚪ |
@@ -141,7 +141,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFJob.cc` | 3116 | `flpdf-cli/src/main.rs`(6491) + `overlay*.rs`(3422) + `page_merge.rs`(1117) + `check.rs`(360) + page 操作群 | 🔀 |
+| `QPDFJob.cc` | 3116 | `flpdf-cli/src/main.rs`(6491) + `overlay*.rs` + `page_merge.rs`(1117) + `check.rs`(360) + `attachment_list.rs`(306: `--list-attachments` の整形出力) + page 操作群 | 🔀 |
 | `QPDFJob_config` / `_argv` / `_json` / `QPDFArgParser` / `QPDFUsage` | 3164 | clap で代替 | ⚪ |
 | `QPDFLogger.cc` | 255 | `diagnostics.rs`(80) | 🔀 |
 
@@ -217,7 +217,7 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 | `standard_font_metrics.rs` | 4,633 | qpdf にフォント幅テーブルは存在しない（`grep -rl Helvetica libqpdf/` が 0 件） |
 | `signatures.rs` | 1,338 | 電子署名検査。qpdf に相当機能なし |
 | `qdf_fix.rs` | 764 | qpdf では `qpdf/fix-qdf.cc`（libqpdf 外の別バイナリ） |
-| `page_closure.rs` / `ref_chain.rs` / `qpdf_null.rs` | 341 | |
+| `page_closure.rs` / `ref_chain.rs` | 284 | |
 
 `object_copy.rs`(184) は `QPDF.cc` の `copyForeignObject` に相当するため
 [§2 パース / 読み取り](#2-パース--読み取り) の `QPDF.cc` 行に移した。
@@ -296,10 +296,15 @@ CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れてい
 
 ## 集計
 
-| 状態 | qpdf 側の該当行数 |
-|---|---|
-| ✅ mirrors | 約 4,000 |
-| 🔀 smeared | 約 22,000 |
-| ❌ missing | 約 4,300 |
-| ⚪ 逸脱候補 | 約 6,900 |
-| ➖ 対象外 | 約 2,200 |
+| 状態 | qpdf 側の該当行数 | 内訳 |
+|---|---|---|
+| ✅ mirrors | 約 4,000 | |
+| 🔀 smeared | 約 22,000 | 再配置の主対象 |
+| ❌ missing | 約 2,000 | `Pipeline.cc`(114) / `Pl_Count`+`Pl_MD5`(114) / `QPDFStreamFilter`(19) / `Pl_DCT`(326) / `QTC`(50) / `JSON` の parser・schema（`JSON.cc` 1,401 と `JSONHandler.cc` 189 の一部） |
+| ⚪ 逸脱候補 | 約 6,900 | 要承認 |
+| ➖ 対象外 | 約 2,200 | C API |
+
+**❌ の数え方**: 以前は `Pipeline.cc` + `Pl_*.cc` 21 ファイル計 ~2,400 行を丸ごと
+missing として傘で数えていたが、個々の `Pl_*` は下の各行で mirrors / smeared /
+逸脱候補として個別に分類されており**二重計上**だった。傘の行を `Pipeline.cc`
+本体（114 行）に限定し、真に未マップな qpdf 行だけを ❌ に数えるよう改めた。

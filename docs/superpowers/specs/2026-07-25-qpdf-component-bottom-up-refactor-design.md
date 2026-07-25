@@ -99,6 +99,21 @@ qtest pass 数は各部品の完了時に before/after を**報告する**指標
 この設計が解消しようとしている状態そのものを再生産する。移植しきれない部品は
 「未完成」のまま残し、issue を分割して残りを追跡する。
 
+### D2 スコープは着手時に全数棚卸しする
+
+本書の各部品に書いた D2 の対象は、**T0-1 を除き暫定**である。PR #550 の Codex
+レビューは 3 巡にわたり、毎回「既存 production 実装とその呼び出し元の見落とし」を
+指摘した（`ResourceFinder` / `Parser` / `normalize_content_stream` / `base64_encode` /
+`overlay.rs` の行列 / `json.rs` の値モデル / `name_number_tree` の builder）。
+ファイル名からの推測で D2 スコープを書くと必ず漏れる。
+
+各部品の着手時に、次を機械的に出してから実装計画を確定すること。
+
+1. 対象責務に関わる `pub` / `pub(crate)` 定義の全列挙（`lib.rs` の re-export を含む）
+2. その全呼び出し元（他クレート・CLI・テストを含む）
+
+T0-1 はこの手順を適用済み（下記）。他の部品は着手時に同じ手順を踏む。
+
 ## 命名規則
 
 **`QPDF` 接頭辞は C++ の名前空間なので落とす。それ以外はそのまま snake_case にする。**
@@ -135,15 +150,51 @@ crate 内で意味が曖昧になる名前は避ける（`version.rs` は crate 
 D1 の対象: コンストラクタ（major/minor/extension）、`operator<`、`operator==`、
 `updateIfGreater`、`getVersion`、`getMajor`/`getMinor`/`getExtensionLevel`。
 
-D2 の対象:
+#### T0-1 の D2 棚卸し（全数）
 
-- `writer.rs` の `parse_pdf_version`(452) / `static_version_string`(638)
-- `writer/plain/plan.rs` の `parse_pdf_version` 呼び出しと生タプル比較（129, 269, 275 行。
-  `v < (1, 5)` / `version < (1, 5)`）
-- `(u8, u8)` 生タプル（`writer.rs` / `overlay.rs` / `flpdf-cli/src/main.rs`）
+過去 3 巡の Codex レビューは毎回「既存 production 実装とその呼び出し元の見落とし」を
+指摘した。同じ誤りを繰り返さないため、T0-1 については機械的に全数を出す。
 
-`writer/plain/plan.rs` を落とすと第 2 のバージョン表現と `PdfVersion` 外の呼び出し元が
-残り、D2 を満たさない。
+**既存の version 関連定義**
+
+| 定義 | 位置 | 可視性 |
+|---|---|---|
+| `parse_pdf_version` | `writer.rs:452` | **`pub`**（`lib.rs:249` から re-export） |
+| `effective_pdf_version` | `writer.rs:511` | **`pub`**（`lib.rs:249` から re-export） |
+| `effective_pdf_version_and_ext` | `writer.rs:666` | `pub` |
+| `force_version_below_1_5` | `writer.rs:468` | `pub(crate)` |
+| `encryption_version_floor` | `writer.rs:615` | private |
+| `static_version_string` | `writer.rs:638` | private |
+
+`lib.rs:259` の `pub fn version()` は crate バージョンであり無関係（`pdf_version.rs`
+という名前にした理由でもある）。
+
+**`parse_pdf_version` の呼び出し元（production のみ）**
+
+| ファイル | 行 |
+|---|---|
+| `writer.rs`（内部） | 472, 521, 527, 533, 569, 573, 685, 686, 687, 700, 3343, 3363, 3370 |
+| `writer/plain/plan.rs` | 129, 269 |
+| `overlay.rs` | 2087, 2088 |
+| `flpdf-cli/src/main.rs` | 29（import）, 2101, 2107, 3226, 3229, 3247, 4235, 4238, 4246 |
+
+**`effective_pdf_version` / `_and_ext` の呼び出し元（production のみ）**
+
+| ファイル | 行 |
+|---|---|
+| `writer.rs` | 674, 3166, 3236 |
+| `writer/plain/plan.rs` | 116 |
+| `linearization/writer.rs` | 75（import）, 2737 |
+
+**公開 API への影響**: `parse_pdf_version` と `effective_pdf_version` は
+`lib.rs` から re-export されている公開 API である。`(u8, u8)` を `PdfVersion` に
+置き換えると公開シグネチャが変わる。pre-1.0 では後方互換を考慮しない方針
+（`CLAUDE.md`）なので進めてよいが、**T0-1 は公開 API 変更を伴う**ことを認識しておく。
+`flpdf-cli/tests/cli_linearize.rs`(514-585) が両関数の公開 API を直接テストしている。
+
+**D2 の完了条件**: 上表のすべての呼び出し元が `PdfVersion` を通ること。
+`writer.rs` 内部の 13 箇所だけを直しても、`overlay.rs` / `writer/plain/plan.rs` /
+CLI の 8 箇所が生タプルのまま残れば D2 未達。
 
 **スコープ境界** — qpdf は値型とポリシーを分けている。ポリシー側は writer に残す。
 
@@ -191,10 +242,19 @@ PDF オブジェクトモデルには非依存。規模は大きいが機械的�
 
 D1 の対象: JSON 値モデル / parse / schema check / Base64 / writer。
 
-D2 の対象: `json_inspect.rs` に既存の `base64_encode`(542-563) があり、inline JSON
-stream data の出力（695 行）で使われている。これを新モジュール側へ寄せないと
-Base64 実装が 2 つ残り D2 を満たさない。`json_inspect.rs` の inline-stream 経路も
-移行対象に含めること。
+D2 の対象:
+
+| 既存実装 | 位置 | 備考 |
+|---|---|---|
+| `JsonValue` 値モデル + `write` シリアライザ | `json.rs`(16-159) | **production の JSON 出力経路そのもの** |
+| `base64_encode` | `json_inspect.rs`(542-563) | inline JSON stream data の出力（695 行）で使用 |
+| `JsonValue` の利用 | `json_inspect.rs`(7: `use crate::json::JsonValue`) | |
+| `flpdf::json::write` の呼び出し | `flpdf-cli/src/main.rs`(1939, 1943) | `--json` 出力の実体 |
+| `flpdf::json::JsonValue` の利用 | `flpdf-cli/src/main.rs`(2005-2006) | |
+
+`json.rs` 本体と CLI 呼び出し元を移行対象から外すと、移植した writer が CLI 出力を
+支配せず旧経路が並存する。**`json.rs` / `json_inspect.rs` / CLI 呼び出し元の 3 つを
+すべて移行スコープに含めること。**
 
 **Pipeline 依存の扱い（着手前に決着させること）**: `JSON.cc` は依存ゼロではなく、
 `Pl_Base64` / `Pl_Concatenate` / `Pl_String` の 3 つの Pipeline sink を使う。
@@ -242,10 +302,24 @@ D2 を満たさない。
 
 #### T2-2 `nntree.rs` ← `NNTree.cc`(954) — `flpdf-qxba.8`
 
-依存: `QPDF` 全体（reader）。現状 `name_number_tree.rs`(364) +
-`name_tree_dests.rs`(286) に分かれ、挿入 / 分割ロジックが未移植。
+依存: `QPDF` 全体（reader）。
 
-D1 の対象: iterator / insert / split / repair。
+**「挿入 / 分割が未移植」は誤り。** 既に production 実装がある。
+
+| 既存 API | 位置 | 備考 |
+|---|---|---|
+| `read_name_tree` / `read_number_tree` | `name_number_tree.rs`(38, 76) | 読み取り |
+| `build_name_tree` / `build_number_tree` | `name_number_tree.rs`(125, 201) | `/Kids` リーフへの**分割**を含む |
+| `insert_name_tree_dest` | `name_tree_dests.rs`(116) | 上記 builder 経由の再構築による**挿入** |
+
+いずれも `lib.rs` から re-export されている。
+
+D2 の対象: 上記 API と、その呼び出し元である `embedded_files.rs` /
+`page_label_document_helper.rs` / `outline_document_helper.rs` / `json_inspect.rs` の
+**すべて**。qpdf の iterator / insert / split を既存 production 経路の**隣に**追加すると
+D2 を満たさない。
+
+D1 の対象: iterator / insert / split / repair（qpdf 側との差分は着手時に精査する）。
 
 ### 後回し
 
