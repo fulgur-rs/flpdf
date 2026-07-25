@@ -274,3 +274,38 @@ instead of absorbing `flpdf-n9t0.1` into this issue.
 
 At completion, close `flpdf-h8kt`, push Beads with `bd dolt push`, and push the
 Git branch. Do not close `flpdf-n9t0.1`.
+
+## Delivery status
+
+Implemented on `fix/flpdf-h8kt-qpdf-tokenizer` in the following reviewable
+steps:
+
+- `3530f8c3` added the qpdf-shaped normal object tokenizer;
+- `a19a6c26` routed object parsing through tokenizer tokens;
+- `6b5ffffe` preserved the existing integer diagnostics;
+- `66d75c70` aligned the real-number fixture with qpdf number tokens;
+- `5dedc8a0` routed lexical reader and object-stream headers through the
+  tokenizer;
+- `2a8076dd` matched qpdf JSON v2 name projection;
+- `708535b3` and `f5f970a6` covered edge states and qpdf name-escape recovery.
+
+The qpdf 11.9.0 `good13.pdf` fixture now rewrites successfully with
+`--static-id --qdf`, and `qpdf --check` reports no syntax or stream encoding
+errors. The sorted JSON v2 value for object 7 is byte-identical between qpdf
+and flpdf (662 bytes on each side).
+
+The flpdf-qtest `basic-parsing` run against the release binary reports:
+
+```text
+basic-parsing 37 (nesting, strings, names)                     ... PASSED
+basic-parsing 38 (create qdf)                                  ... PASSED
+basic-parsing 39 (check output)                                ... PASSED
+```
+
+The broader `basic-parsing` aggregate still contains pre-existing,
+out-of-scope informational failures.
+
+Final verification passed for `cargo fmt --all -- --check`, the full workspace
+`cargo test`, clippy with all targets/features and warnings denied, and strict
+private-item rustdoc. Committed-HEAD patch coverage is 575/575 changed
+executable lines (100%).
