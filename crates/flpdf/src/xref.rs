@@ -5,6 +5,7 @@ use crate::reader::file_object::{
     finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, RecoveryPolicy,
     ResolvedStreamLength,
 };
+use crate::tokenizer::Tokenizer;
 use crate::{filters, Diagnostics, Dictionary, Error, Object, ObjectRef, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -446,9 +447,9 @@ fn recover_compressed_offsets_from_objstm(
             Err(_) => return,
         };
 
-    let mut cursor = Parser::new(&decoded_data);
+    let mut tokenizer = Tokenizer::new(&decoded_data);
     for index in 0..object_count {
-        let number = match cursor.integer_for_indirect() {
+        let number = match tokenizer.next_integer() {
             Ok(number) => match parse_non_negative_i64(number, "ObjStm object number") {
                 Ok(number) => number,
                 Err(_) => return,
@@ -460,7 +461,7 @@ fn recover_compressed_offsets_from_objstm(
             Err(_) => return,
         };
 
-        match cursor.integer_for_indirect() {
+        match tokenizer.next_integer() {
             Ok(offset) => {
                 if parse_non_negative_i64(offset, "ObjStm object offset").is_err() {
                     return;

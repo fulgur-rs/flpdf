@@ -81,6 +81,14 @@ fn graphics_cm_q_q_rectangle_fill() {
 }
 
 #[test]
+fn numeric_looking_words_are_operators() {
+    assert_eq!(
+        tokens(b"5 1e3 12abc"),
+        vec![op(vec![Object::Integer(5)], b"1e3"), op(vec![], b"12abc"),]
+    );
+}
+
+#[test]
 fn path_with_starred_and_quote_operators() {
     // W*, f*, single-quote and double-quote operators must tokenize.
     let toks = tokens(b"10 20 m 30 40 l W* n (line) ' 1 2 (q) \"");

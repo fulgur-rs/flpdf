@@ -55,7 +55,7 @@
 //! Running [`fix_qdf`] on an already-valid QDF file is a no-op, and the
 //! function is idempotent: `fix_qdf(fix_qdf(x)) == fix_qdf(x)`.
 
-use crate::parser::{is_delimiter, is_ws};
+use crate::tokenizer::{is_delimiter, is_ws};
 use crate::{Error, Result};
 
 /// One parsed `N G obj ... endobj` body in the input.

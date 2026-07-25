@@ -13,6 +13,7 @@ use serialize::{
 };
 
 use crate::parser::Parser;
+use crate::tokenizer::Tokenizer;
 use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefForm, XrefOffset};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, Write};
@@ -1295,18 +1296,18 @@ fn rebuild_object_stream<R: Read + Seek>(
         crate::Error::Unsupported("Object stream /First does not fit usize".to_string())
     })?;
 
-    let mut header_parser = Parser::new(&stream_data);
+    let mut tokenizer = Tokenizer::new(&stream_data);
     let mut members = Vec::with_capacity(object_count);
     for _ in 0..object_count {
         let number = u32::try_from(parse_non_negative_i64_value(
-            header_parser.integer_for_indirect()?,
+            tokenizer.next_integer()?,
             "object stream object number",
         )?)
         .map_err(|_| {
             crate::Error::Unsupported("object stream object number does not fit u32".to_string())
         })?;
         let offset = usize::try_from(parse_non_negative_i64_value(
-            header_parser.integer_for_indirect()?,
+            tokenizer.next_integer()?,
             "object stream object offset",
         )?)
         .map_err(|_| {

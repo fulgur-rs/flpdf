@@ -24,7 +24,8 @@
 use std::io::{Read, Seek};
 
 use crate::overlay_annotations::DrMap;
-use crate::parser::{is_delimiter, is_ws, Parser};
+use crate::parser::Parser;
+use crate::tokenizer::{is_delimiter, is_ws, starts_number_token};
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
 
 /// Resource category for a content-stream operator that consumes a resource
@@ -148,7 +149,8 @@ pub(crate) fn resource_replacer(content: &[u8], dr_map: &DrMap) -> Vec<u8> {
             || byte == b'('
             || byte == b'<'
             || byte == b'['
-            || matches!(byte, b'+' | b'-' | b'.' | b'0'..=b'9')
+            || (matches!(byte, b'+' | b'-' | b'.' | b'0'..=b'9')
+                && starts_number_token(&content[pos..]))
         {
             // Operand: delegate to the shared object lexer (numbers,
             // strings, names, arrays, dictionaries), matching how
@@ -321,7 +323,8 @@ fn ei_lookahead_passes(rest: &[u8]) -> bool {
             || byte == b'('
             || byte == b'<'
             || byte == b'['
-            || matches!(byte, b'+' | b'-' | b'.' | b'0'..=b'9')
+            || (matches!(byte, b'+' | b'-' | b'.' | b'0'..=b'9')
+                && starts_number_token(&rest[pos..]))
         {
             let mut parser = Parser::new_no_reference(&rest[pos..]);
             match parser.parse_one_object() {
@@ -842,6 +845,13 @@ mod tests {
             resource_replacer(b"/GS1 gs", &dr_map),
             b"/GS1_1 gs".to_vec()
         );
+    }
+
+    #[test]
+    fn resource_replacer_does_not_split_numeric_looking_operator() {
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        let content: &[u8] = b"/F1 12Tf";
+        assert_eq!(resource_replacer(content, &dr_map), content);
     }
 
     #[test]

@@ -34,7 +34,8 @@ use std::io::{Read, Seek};
 
 use crate::acroform_document_helper::{collect_reachable_refs, collect_refs_in_object};
 use crate::overlay_appearance_stream::adjust_appearance_stream;
-use crate::parser::{is_delimiter, is_ws, Parser};
+use crate::parser::Parser;
+use crate::tokenizer::{is_delimiter, is_ws, starts_number_token};
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 
 /// Bound field-tree /Parent walks (widget → top-level field). Mirrors the
@@ -1034,7 +1035,7 @@ fn adjust_default_appearance(
             || byte == b'('
             || byte == b'<'
             || byte == b'['
-            || matches!(byte, b'+' | b'-' | b'.' | b'0'..=b'9')
+            || (matches!(byte, b'+' | b'-' | b'.' | b'0'..=b'9') && starts_number_token(&da[pos..]))
         {
             // Operand: delegate to the shared object lexer (numbers,
             // strings, names, arrays, dictionaries) that
@@ -3144,6 +3145,17 @@ mod tests {
         assert_eq!(
             adjust_default_appearance(da, &dr_map, &resources),
             b"0 0.4 0 rg /F1_1 18 Tf".to_vec()
+        );
+    }
+
+    #[test]
+    fn adjust_default_appearance_does_not_split_numeric_looking_operator() {
+        let dr_map = category_dr_map(b"Font", &[("F1", "F1_1")]);
+        let resources = font_resources_map(&["F1", "F1_1"]);
+        let da: &[u8] = b"/F1 12Tf";
+        assert_eq!(
+            adjust_default_appearance(da, &dr_map, &resources),
+            da.to_vec()
         );
     }
 

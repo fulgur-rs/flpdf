@@ -306,48 +306,48 @@ fn pdf_string_to_json_string(bytes: &[u8]) -> String {
     out
 }
 
-/// Encode a PDF name byte sequence into a `/NAME` JSON string using the
-/// PDF/qpdf `#XX` escape rules (ISO 32000-1 §7.3.5).
+/// Convert flpdf's decoded name bytes to qpdf JSON v2's name representation.
 ///
-/// Every byte outside printable ASCII (`0x21..=0x7E`) — and every PDF
-/// delimiter (`( ) < > [ ] { } / %`) and the `#` character itself — is
-/// emitted as `#hh` with lowercase hex. This is lossless: round-tripping
-/// the result back through the PDF name parser yields the original bytes.
-fn encode_pdf_name_bytes(bytes: &[u8]) -> String {
-    fn is_safe(b: u8) -> bool {
-        if !(0x21..=0x7E).contains(&b) {
-            return false;
-        }
-        !matches!(
-            b,
-            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%' | b'#'
-        )
+/// qpdf emits a valid UTF-8 name directly, including the leading slash. The
+/// JSON writer itself escapes controls and quotes. Only a name that is not
+/// valid UTF-8 gets the `n:` prefix and PDF `#xx` normalization.
+fn qpdf_name_to_json_string(bytes: &[u8]) -> String {
+    let mut raw = Vec::with_capacity(bytes.len() + 1);
+    raw.push(b'/');
+    raw.extend_from_slice(bytes);
+    if let Ok(name) = String::from_utf8(raw) {
+        return name;
     }
 
-    let mut out = String::with_capacity(bytes.len() + 1);
-    out.push('/');
-    for &b in bytes {
-        if is_safe(b) {
-            out.push(b as char);
-        } else {
+    let mut normalized = String::with_capacity(bytes.len() + 3);
+    normalized.push_str("n:/");
+    for &byte in bytes {
+        if byte == 0 {
+            normalized.push('#');
+        } else if !(33..=126).contains(&byte)
+            || matches!(
+                byte,
+                b'#' | b'/' | b'(' | b')' | b'{' | b'}' | b'<' | b'>' | b'[' | b']' | b'%'
+            )
+        {
             use std::fmt::Write as _;
-            // safe to unwrap: write! to String is infallible
-            let _ = write!(out, "#{b:02x}");
+            let _ = write!(normalized, "#{byte:02x}");
+        } else {
+            normalized.push(char::from(byte));
         }
     }
-    out
+    normalized
 }
 
 /// Convert a PDF [`Dictionary`] to a JSON object, with keys sorted alphabetically
 /// (with the `/` prefix included in the sort key).
 fn dict_to_json(dict: &Dictionary) -> Result<JsonValue, ConvertError> {
     // Dictionary::iter() already yields entries in lexicographic order of raw
-    // bytes (BTreeMap). We encode each key losslessly using the PDF name
-    // escape rules so that names containing delimiters, whitespace, `#`, or
-    // non-UTF8 bytes round-trip without information loss.
+    // bytes (BTreeMap). qpdf JSON v2 emits valid UTF-8 names directly and uses
+    // an `n:`-prefixed normalized form for non-UTF8 names.
     let mut pairs = Vec::new();
     for (raw_key, value) in dict.iter() {
-        let key_str = encode_pdf_name_bytes(raw_key);
+        let key_str = qpdf_name_to_json_string(raw_key);
         let json_val = pdf_object_to_json(value)?;
         pairs.push((key_str, json_val));
     }
@@ -368,7 +368,7 @@ fn qpdf_dict_to_json<R: Read + Seek>(
             continue;
         }
         pairs.push((
-            encode_pdf_name_bytes(raw_key),
+            qpdf_name_to_json_string(raw_key),
             qpdf_pdf_object_to_json(pdf, value)?,
         ));
     }
@@ -472,7 +472,7 @@ pub fn pdf_object_to_json(obj: &Object) -> Result<JsonValue, ConvertError> {
             }
             Ok(JsonValue::Float(*f))
         }
-        Object::Name(bytes) => Ok(JsonValue::String(encode_pdf_name_bytes(bytes))),
+        Object::Name(bytes) => Ok(JsonValue::String(qpdf_name_to_json_string(bytes))),
         Object::String(bytes) => Ok(JsonValue::String(pdf_string_to_json_string(bytes))),
         Object::Reference(r) => Ok(JsonValue::String(format!(
             "{} {} R",
@@ -3406,18 +3406,26 @@ mod tests {
         // /A followed by 0xFF — invalid UTF-8 in the raw name bytes.
         let obj = Object::Name(b"A\xffB".to_vec());
         let json = pdf_object_to_json(&obj).unwrap();
-        assert_eq!(json, JsonValue::String("/A#ffB".to_string()));
+        assert_eq!(json, JsonValue::String("n:/A#ffB".to_string()));
     }
 
     #[test]
-    fn pdf_object_to_json_name_with_delimiters_escapes_them() {
-        // Each PDF delimiter / whitespace / `#` must be emitted as #XX.
+    fn pdf_object_to_json_non_utf8_name_restores_tokenizer_null_marker() {
+        let obj = Object::Name(vec![0, 0xff]);
+        let json = pdf_object_to_json(&obj).unwrap();
+        assert_eq!(json, JsonValue::String("n:/##ff".to_string()));
+    }
+
+    #[test]
+    fn pdf_object_to_json_valid_utf8_name_uses_decoded_bytes() {
+        // qpdf JSON v2 emits decoded valid UTF-8 name bytes directly. JSON
+        // escaping, rather than PDF #xx escaping, protects delimiters.
         let obj = Object::Name(b"a b#(c)".to_vec());
         let json = pdf_object_to_json(&obj).unwrap();
         assert_eq!(
             json,
-            JsonValue::String("/a#20b#23#28c#29".to_string()),
-            "space, #, (, ) must all be hex-escaped"
+            JsonValue::String("/a b#(c)".to_string()),
+            "valid UTF-8 name bytes must stay decoded"
         );
     }
 
@@ -3439,16 +3447,17 @@ mod tests {
             panic!("expected Object");
         };
         assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0].0, "/K#ffey");
+        assert_eq!(pairs[0].0, "n:/K#ffey");
         assert_eq!(pairs[0].1, JsonValue::Integer(7));
     }
 
     #[test]
     fn pdf_object_to_json_name_with_control_byte_escapes() {
-        // Control bytes (here, 0x01) are not printable and must be hex-escaped.
+        // Control bytes are valid UTF-8; JsonValue retains the byte and the
+        // final JSON serializer emits the required JSON escape.
         let obj = Object::Name(b"x\x01y".to_vec());
         let json = pdf_object_to_json(&obj).unwrap();
-        assert_eq!(json, JsonValue::String("/x#01y".to_string()));
+        assert_eq!(json, JsonValue::String("/x\u{1}y".to_string()));
     }
 
     // ── 25. Pdf::live_object_refs() unit check ────────────────────────────────

@@ -28,7 +28,8 @@
 //! }
 //! ```
 
-use crate::parser::{is_delimiter, is_ws, Parser};
+use crate::parser::Parser;
+use crate::tokenizer::{is_delimiter, is_ws, starts_number_token};
 use crate::{Dictionary, Error, Object, Result};
 
 /// One lexical unit of a content stream.
@@ -171,7 +172,7 @@ impl<'a> ContentStreamParser<'a> {
             Some(byte) => match byte {
                 b'/' | b'(' | b'[' => true,
                 b'<' => true, // hex string or `<<` dictionary
-                b'+' | b'-' | b'.' | b'0'..=b'9' => true,
+                b'+' | b'-' | b'.' | b'0'..=b'9' => starts_number_token(&self.input[self.pos..]),
                 b't' => self.keyword_operand(b"true"),
                 b'f' => self.keyword_operand(b"false"),
                 b'n' => self.keyword_operand(b"null"),

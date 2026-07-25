@@ -7,7 +7,7 @@ use self::file_object::{
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
-use crate::parser::{parse_qpdf_file_object, Parser};
+use crate::parser::parse_qpdf_file_object;
 use crate::security::password::{normalize_password, PasswordMode};
 use crate::security::standard::{
     check_owner_password, check_owner_password_r5, check_owner_password_r6,
@@ -15,6 +15,7 @@ use crate::security::standard::{
     check_user_password_v4, decrypt_cipher_bytes, decrypt_strings_in_object, per_object_key,
     ObjectKeyAlg, StandardHandlerInputs, StandardHandlerR5Inputs, StringCipher,
 };
+use crate::tokenizer::Tokenizer;
 use crate::xref::load_xref_state_with_repair;
 use crate::{
     Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, Result, XrefForm, XrefOffset,
@@ -1408,13 +1409,18 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(false);
         };
 
-        let (parent_ref, parent_index, object) =
+        let (parent_ref, parent_index, parsed) =
             self.parse_object_stream_chain_entry(stream_ref, &stream_object, index)?;
+        let ParsedObjectStreamEntry {
+            object,
+            diagnostics,
+        } = parsed;
         let (object, _stream_payload_transformed) =
             self.decrypt_resolved_object(object_ref, object, None)?;
         self.compressed_member_parents
             .insert(object_ref, (parent_ref, parent_index));
         self.cache.set_resolved(object_ref, object);
+        self.record_object_stream_diagnostics(parent_ref, object_ref, diagnostics);
         Ok(true)
     }
 
@@ -1463,11 +1469,29 @@ impl<R: Read + Seek> Pdf<R> {
         stream_ref: ObjectRef,
         stream_object: &crate::Stream,
         target_index: u32,
-    ) -> Result<(ObjectRef, u32, Object)> {
+    ) -> Result<(ObjectRef, u32, ParsedObjectStreamEntry)> {
         let (member_stream_ref, member_index, member_stream) =
             self.object_stream_chain_member(stream_ref, stream_object, target_index)?;
-        let object = parse_object_stream_entry(&member_stream, member_index)?;
-        Ok((member_stream_ref, member_index, object))
+        let parsed = parse_object_stream_entry(&member_stream, member_index)?;
+        Ok((member_stream_ref, member_index, parsed))
+    }
+
+    fn record_object_stream_diagnostics(
+        &mut self,
+        stream_ref: ObjectRef,
+        object_ref: ObjectRef,
+        diagnostics: Vec<crate::parser::ParserDiagnostic>,
+    ) {
+        for diagnostic in diagnostics {
+            self.push_warning(format!(
+                "object stream {} (object {} {}, offset {}): {}",
+                stream_ref.number,
+                object_ref.number,
+                object_ref.generation,
+                diagnostic.relative_offset,
+                diagnostic.message
+            ));
+        }
     }
 
     fn compressed_parent_for_entry(
@@ -1926,7 +1950,7 @@ fn aes128_object_key(key: &[u8]) -> Result<[u8; 16]> {
 pub(crate) fn parse_object_stream_entry(
     stream_object: &crate::Stream,
     target_index: u32,
-) -> Result<Object> {
+) -> Result<ParsedObjectStreamEntry> {
     let stream_data = crate::filters::decode_stream_data(&stream_object.dict, &stream_object.data)?;
 
     let stream_object_count = object_stream_count(stream_object)?;
@@ -1942,17 +1966,13 @@ pub(crate) fn parse_object_stream_entry(
     let first = usize::try_from(stream_data_first)
         .map_err(|_| Error::parse(0, "Object stream /First does not fit usize"))?;
 
-    let mut header_parser = Parser::new(&stream_data);
+    let mut tokenizer = Tokenizer::new(&stream_data);
     let mut object_offsets = Vec::with_capacity(object_count);
     for _ in 0..object_count {
-        let _object_number = parse_non_negative_u64(
-            header_parser.integer_for_indirect()?,
-            "object stream object number",
-        )?;
-        let object_offset = parse_non_negative_u64(
-            header_parser.integer_for_indirect()?,
-            "object stream object offset",
-        )?;
+        let _object_number =
+            parse_non_negative_u64(tokenizer.next_integer()?, "object stream object number")?;
+        let object_offset =
+            parse_non_negative_u64(tokenizer.next_integer()?, "object stream object offset")?;
         object_offsets.push(object_offset);
     }
 
@@ -1976,7 +1996,19 @@ pub(crate) fn parse_object_stream_entry(
         return Err(Error::parse(0, "compressed object offset out of range"));
     }
 
-    parse_qpdf_file_object(&stream_data[start..])
+    let (object, mut diagnostics) = parse_qpdf_file_object(&stream_data[start..])?;
+    for diagnostic in &mut diagnostics {
+        diagnostic.relative_offset += start;
+    }
+    Ok(ParsedObjectStreamEntry {
+        object,
+        diagnostics,
+    })
+}
+
+pub(crate) struct ParsedObjectStreamEntry {
+    pub(crate) object: Object,
+    diagnostics: Vec<crate::parser::ParserDiagnostic>,
 }
 
 fn standard_handler_inputs<'a>(
@@ -3003,6 +3035,65 @@ mod tests {
     }
 
     #[test]
+    fn qpdf_reader_reports_recoverable_name_warning_once() {
+        let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n/a#1x\nendobj\n"], ObjectRef::new(1, 0));
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stray-name fixture");
+        let object_ref = ObjectRef::new(1, 0);
+
+        assert_eq!(
+            pdf.resolve(object_ref).expect("recover stray name"),
+            Object::Name(b"a\0\x31x".to_vec())
+        );
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["(object 1 0, offset 17): name with stray # will not work with PDF >= 1.2"]
+        );
+
+        assert_eq!(
+            pdf.resolve(object_ref).unwrap(),
+            Object::Name(b"a\0\x31x".to_vec())
+        );
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
+    }
+
+    #[test]
+    fn qpdf_reader_reports_compressed_member_name_warning_once() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 9 >>\nstream\n7 0 /a#1x\nendstream\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open compressed stray-name fixture");
+        let object_ref = ObjectRef::new(7, 0);
+        pdf.cache.set_compressed(object_ref, 1, 0);
+
+        assert_eq!(
+            pdf.resolve(object_ref)
+                .expect("recover compressed stray name"),
+            Object::Name(b"a\0\x31x".to_vec())
+        );
+        let diagnostics = pdf.repair_diagnostics().entries();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "object stream 1 (object 7 0, offset 4): name with stray # will not work with PDF >= 1.2"
+            ]
+        );
+
+        assert_eq!(
+            pdf.resolve(object_ref).unwrap(),
+            Object::Name(b"a\0\x31x".to_vec())
+        );
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
+    }
+
+    #[test]
     fn qpdf_reader_restores_target_cache_after_length_holder_io_error() {
         let bytes =
             recovered_stream_fixture(b"/Length 2 0 R", b"\n", Some(b"2 0 obj\n3\nendobj\n"));
@@ -3495,15 +3586,16 @@ mod tests {
         let stream = Stream::new(dict, b"7 0 8 6 9 14 6 0 R [6 0 R] << /V 6 0 R >>".to_vec());
 
         assert_eq!(
-            parse_object_stream_entry(&stream, 0).unwrap(),
+            parse_object_stream_entry(&stream, 0).unwrap().object,
             Object::Integer(6)
         );
         assert_eq!(
-            parse_object_stream_entry(&stream, 1).unwrap(),
+            parse_object_stream_entry(&stream, 1).unwrap().object,
             Object::Array(vec![Object::Reference(ObjectRef::new(6, 0))])
         );
         let dictionary = parse_object_stream_entry(&stream, 2)
             .unwrap()
+            .object
             .into_dict()
             .expect("dictionary member");
         assert_eq!(dictionary.get_ref("V"), Some(ObjectRef::new(6, 0)));
