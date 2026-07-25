@@ -23,9 +23,10 @@
 #![cfg(feature = "qpdf-zlib-compat")]
 
 use flpdf::{
-    write_pdf_with_options, NewlineBeforeEndstream, ObjectStreamMode, Pdf, StreamDataMode,
-    WriteOptions,
+    load_xref_and_trailer, write_pdf_with_options, NewlineBeforeEndstream, Object, ObjectRef,
+    ObjectStreamMode, Pdf, StreamDataMode, WriteOptions, XrefOffset,
 };
+use std::io::Cursor;
 use std::path::Path;
 
 /// Full-rewrite `fixture` with the qpdf-matching option set and return the bytes.
@@ -237,6 +238,57 @@ fn preserve_object_stream_mode_is_byte_identical_to_qpdf_static_id_matrix() {
     for (fixture, stem, name) in cases {
         assert_cmp_diff_zero_mode_named(fixture, ObjectStreamMode::Preserve, stem, name);
     }
+}
+
+#[test]
+fn preserve_nonmonotonic_source_indices_match_qpdf_source_number_order() {
+    let fixture = "nonmonotonic-objstm-index.pdf";
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let source = std::fs::read(path).unwrap();
+    let source_xref = load_xref_and_trailer(&mut Cursor::new(&source)).unwrap();
+    assert_eq!(
+        source_xref.entries.get(&ObjectRef::new(3, 0)),
+        Some(&XrefOffset::Compressed {
+            stream: 4,
+            index: 0,
+        })
+    );
+    assert_eq!(
+        source_xref.entries.get(&ObjectRef::new(2, 0)),
+        Some(&XrefOffset::Compressed {
+            stream: 4,
+            index: 1,
+        })
+    );
+
+    let actual = rewrite_qpdf_equivalent_mode(fixture, ObjectStreamMode::Preserve);
+    assert_cmp_diff_zero_named(&actual, "nonmonotonic-objstm-index", "preserve.pdf");
+
+    let output_xref = load_xref_and_trailer(&mut Cursor::new(&actual)).unwrap();
+    assert_eq!(
+        output_xref.entries.get(&ObjectRef::new(3, 0)),
+        Some(&XrefOffset::Compressed {
+            stream: 2,
+            index: 0,
+        })
+    );
+    assert_eq!(
+        output_xref.entries.get(&ObjectRef::new(4, 0)),
+        Some(&XrefOffset::Compressed {
+            stream: 2,
+            index: 1,
+        })
+    );
+
+    let mut rewritten = Pdf::open(Cursor::new(actual)).unwrap();
+    let catalog = rewritten.resolve(rewritten.root_ref().unwrap()).unwrap();
+    assert!(matches!(catalog, Object::Dictionary(ref dictionary)
+            if dictionary.get("Pages")
+                == Some(&Object::Reference(ObjectRef::new(3, 0)))
+                && dictionary.get("Extra")
+                    == Some(&Object::Reference(ObjectRef::new(4, 0)))));
 }
 
 #[test]

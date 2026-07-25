@@ -1,0 +1,21 @@
+%PDF-1.5
+% non-monotonic ObjStm source index fixture
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /Extra 3 0 R >>
+endobj
+4 0 obj
+<< /Type /ObjStm /N 2 /First 9 /Length 64 >>
+stream
+3 0 2 19 << /Kind /Extra >>
+<< /Type /Pages /Count 0 /Kids [] >>
+endstream
+endobj
+5 0 obj
+<< /Type /XRef /Size 6 /Root 1 0 R /W [1 4 2] /Index [0 6] /Filter /ASCIIHexDecode /Length 85 >>
+stream
+0000000000ffff0100000035000002000000040001020000000400000100000073000001000001010000>
+endstream
+endobj
+startxref
+257
+%%EOF
