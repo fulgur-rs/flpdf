@@ -799,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_member_with_nonzero_generation() {
+    fn validation_rejects_objstm_output_with_nonzero_generation() {
         let member = PlannedMember {
             source: ObjectRef::new(7, 1),
             output: ObjectRef::new(2, 1),
@@ -811,6 +811,19 @@ mod tests {
         let err = plan.validate().unwrap_err();
         assert!(matches!(err, crate::Error::Unsupported(ref message)
             if message.contains("7 1 R")));
+    }
+
+    #[test]
+    fn validation_allows_objstm_source_with_nonzero_generation() {
+        let member = PlannedMember {
+            source: ObjectRef::new(7, 1),
+            output: ObjectRef::new(2, 0),
+        };
+        let plan = plan_for_test(vec![PlannedIndirectObject::ObjectStream {
+            output: ObjectRef::new(1, 0),
+            members: vec![member],
+        }]);
+        plan.validate().unwrap();
     }
 }
 ```
@@ -864,10 +877,10 @@ for object in &self.objects {
         PlannedIndirectObject::ObjectStream { output, members } => {
             require_unique_output(&mut outputs, *output)?;
             for member in members {
-                if member.source.generation != 0 || member.output.generation != 0 {
+                if member.output.generation != 0 {
                     return Err(crate::Error::Unsupported(format!(
-                        "plain writer plan: ObjStm member {} {} R must have generation 0",
-                        member.source.number, member.source.generation
+                        "plain writer plan: ObjStm member output {} {} R must have generation 0",
+                        member.output.number, member.output.generation
                     )));
                 }
                 require_unique_source(&mut sources, member.source)?;
