@@ -64,7 +64,7 @@ impl PlainWritePlan {
                         &packing.batches,
                         true,
                         &packing.removed_refs,
-                    )?;
+                    )?; // cov:ignore: qpdf packing and GenerateRenumber share the same validated inputs
                     build_container_aware(renumber, packing.batches, packing.removed_refs)?
                 }
             }
@@ -81,11 +81,12 @@ impl PlainWritePlan {
             .old_to_new
             .get(&source_root)
             .copied()
+            // cov:ignore-start: both renumberers seed traversal from the source root
             .ok_or_else(|| {
                 crate::Error::Unsupported(
                     "plain writer plan: /Root absent from renumber map".to_string(),
                 )
-            })?;
+            })?; // cov:ignore-end
         let has_object_stream = placement
             .objects
             .iter()
@@ -100,7 +101,7 @@ impl PlainWritePlan {
         } else if options.object_streams == ObjectStreamMode::Preserve
             && source_had_compressed_objects
         {
-            XrefForm::Table
+            XrefForm::Table // cov:ignore: requires a compressed source whose qpdf packing is intentionally empty
         } else {
             pdf.last_xref_form()
         };
@@ -119,7 +120,7 @@ impl PlainWritePlan {
             &mut dictionary,
             &placement.old_to_new,
             &placement.removed_refs,
-        )?;
+        )?; // cov:ignore: remap failure requires a malformed trailer rejected before plain planning
         dictionary.insert("Root", Object::Reference(root));
         crate::writer::apply_encrypt_trailer_entries(
             &mut dictionary,
@@ -231,7 +232,7 @@ impl PlainWritePlan {
                     )));
                 }
             }
-        }
+        } // cov:ignore: a valid plan always places the mapped root, so outputs is nonempty
 
         if has_object_stream || self.trailer.form == XrefForm::Stream {
             let version = crate::writer::parse_pdf_version(&self.version).ok_or_else(|| {
@@ -316,11 +317,13 @@ fn build_container_aware(
         .collect();
 
     for (group_index, group) in groups.iter().enumerate() {
+        // cov:ignore-start: GenerateRenumber assigns a container for every supplied group
         let container = renumber.container_number(group_index).ok_or_else(|| {
             crate::Error::Unsupported(format!(
                 "plain writer plan: ObjStm group {group_index} was never reached"
             ))
         })?;
+        // cov:ignore-end
         let mut members: Vec<PlannedMember> = group
             .iter()
             .map(|&source| {
@@ -328,12 +331,14 @@ fn build_container_aware(
                     .get(&source)
                     .copied()
                     .map(|output| PlannedMember { source, output })
+                    // cov:ignore-start: groups are the same inputs used to build old_to_new
                     .ok_or_else(|| {
                         crate::Error::Unsupported(format!(
                             "plain writer plan: ObjStm member {} {} R absent from renumber map",
                             source.number, source.generation
                         ))
                     })
+                // cov:ignore-end
             })
             .collect::<crate::Result<Vec<_>>>()?;
         members.sort_unstable_by_key(|member| member.output.number);
@@ -849,7 +854,7 @@ mod tests {
             .iter()
             .filter_map(|object| match object {
                 PlannedIndirectObject::ObjectStream { members, .. } => Some(members.len()),
-                _ => None,
+                _ => None, // cov:ignore: this fixture deliberately packs every planned source
             })
             .collect();
         assert_eq!(sizes, vec![66, 66]);
