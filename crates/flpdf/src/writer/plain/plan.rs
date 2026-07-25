@@ -879,11 +879,10 @@ mod tests {
 
         assert!(plan.removed_refs.contains(&deleted));
         assert!(!plan.old_to_new.contains_key(&deleted));
-        assert!(plan.objects.iter().all(|object| match object {
-            PlannedIndirectObject::Source { source, .. } => *source != deleted,
-            PlannedIndirectObject::ObjectStream { members, .. } =>
-                members.iter().all(|member| member.source != deleted),
-        }));
+        assert!(plan.objects.iter().all(
+            |object| matches!(object, PlannedIndirectObject::Source { source, .. }
+                if *source != deleted)
+        ));
     }
 
     #[test]
