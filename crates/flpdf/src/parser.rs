@@ -53,10 +53,11 @@ pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)>
 /// arrays, dictionaries, and stream dictionaries retain their usual meaning.
 /// Object-stream members use this mode without any `endobj` check because an
 /// ObjStm body contains only adjacent direct-object representations.
-pub(crate) fn parse_qpdf_file_object(input: &[u8]) -> Result<Object> {
+pub(crate) fn parse_qpdf_file_object(input: &[u8]) -> Result<(Object, Vec<ParserDiagnostic>)> {
     let mut parser = Parser::new(input);
     parser.top_level_no_reference = true;
-    parser.object()
+    let object = parser.object()?;
+    Ok((object, parser.diagnostics))
 }
 
 #[derive(Debug, PartialEq)]
