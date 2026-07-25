@@ -4546,7 +4546,7 @@ fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
                     &body,
                     structural_compress,
                     options.newline_before_endstream,
-                )?;
+                )?; // cov:ignore: ObjStm wrapping only fails when in-memory deflate encoding fails
             }
         }
         bytes.extend_from_slice(b"\nendobj\n");
