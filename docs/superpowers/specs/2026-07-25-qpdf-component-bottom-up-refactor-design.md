@@ -3,6 +3,8 @@
 **Issue:** flpdf-qxba
 **Date:** 2026-07-25
 **Oracle:** qpdf 11.9.0 (`v11.9.0`) — `libqpdf/`
+**Oracle の取得:** `scripts/fetch-qpdf-source.sh`（sha256 pin / パスは `--print-path`）。
+本書および各モジュール doc の qpdf 行番号引用はすべてこのツリーに対するもの。
 **対応表:** [`docs/qpdf-correspondence.md`](../../qpdf-correspondence.md)
 
 ## Problem

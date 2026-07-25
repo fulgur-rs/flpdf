@@ -37,6 +37,9 @@
 - Quick integration smoke:
   - `cargo run --bin flpdf -- --check tests/fixtures/minimal.pdf`
   - `cargo run --bin flpdf -- tests/fixtures/minimal.pdf /tmp/out.pdf`
+- qpdf oracle source (for `libqpdf/X.cc:NNN` citations in docs and module docs):
+  - `scripts/fetch-qpdf-source.sh` installs the sha256-pinned qpdf 11.9.0 tree.
+  - `scripts/fetch-qpdf-source.sh --print-path` resolves it; do not re-download into `/tmp`.
 
 ## 5) Test fixtures / helpers
 - Use real fixtures under `tests/fixtures/` and compatibility data under `tests/fixtures/compat` + `tests/fixtures/compat/golden`.

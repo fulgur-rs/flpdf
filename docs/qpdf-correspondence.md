@@ -1,6 +1,8 @@
 # flpdf ↔ qpdf 責務対応表
 
 **Oracle:** qpdf 11.9.0 (`v11.9.0`) — `libqpdf/`
+（`scripts/fetch-qpdf-source.sh` で取得。パスは `--print-path` で解決する。
+本表のファイル名・行数はすべてこのツリーに対するもの）
 **調査日:** 2026-07-25
 **関連:** `flpdf-qxba`（部品積み上げによる責務分割）/
 [設計書](superpowers/specs/2026-07-25-qpdf-component-bottom-up-refactor-design.md)
