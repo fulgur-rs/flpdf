@@ -223,13 +223,17 @@ D1 の対象: `concat` / `scale` / `translate` / `rotatex90` / `transform` /
 D2 の対象: `[f64; 6]` 生配列が散在し、`IDENTITY` 定数・行列積・点/矩形変換が
 複数箇所で重複実装されている。
 
-| モジュール | 実装 |
+| モジュール | 実装（全数） |
 |---|---|
+| `overlay.rs` | `IDENTITY_MATRIX`(82), `qpdf_concat`(87), `qpdf_scale`(101), `qpdf_translate`(106), `matrix_unparse`(123), `matrix_or_identity`(996), `transform_bbox`(1013) |
+| `overlay_annotations.rs` | `concat_matrices`(1284), `IDENTITY`(1297), `transform_rect_by_cm`(1338), `apply_matrix_to_point`(1365) — doc に `QPDFMatrix` 相当と明記されている |
+| `page_rotate.rs` | `type Mat`(306), `apply_matrix`(309), `mat_mul`(314), `translate`(326), `rotate_origin`(333), `rotation_matrix`(345), `transform_box`(355), `wrap_content_with_matrix`(463) |
 | `page_form_xobject.rs` | `transformation_matrix`(503), `matrix_objects`(533) |
 | `page_annotation_flatten.rs` | `apply_matrix`(306), `read_xobj_bbox_and_matrix`(454) |
-| `overlay_annotations.rs` | `concat_matrices`(1284), `IDENTITY`(1297), `transform_rect_by_cm`(1338), `apply_matrix_to_point`(1365) — doc に `QPDFMatrix` 相当と明記されている |
-| `page_rotate.rs` | `type Mat`(306), `translate`(326), `transform_box`(355) |
-| `overlay.rs` | `IDENTITY_MATRIX`(82), `qpdf_concat`(87), `qpdf_scale`(101), `qpdf_translate`(106), `matrix_unparse`(123) |
+
+同じプリミティブ（恒等行列・行列積・点変換・矩形変換・シリアライズ）が
+**5 モジュールに 4〜7 重に実装されている**。関数単位で漏れなく移行しないと、
+5 ファイルすべてに触れても D2 未達になる。
 
 `overlay.rs` / `overlay_annotations.rs` / `page_rotate.rs` を落とすと重複実装が残り、D2 を満たさない。
 **5 モジュールすべてとその呼び出し元**を移行対象に含めること。
@@ -327,7 +331,13 @@ D1 の対象: iterator / insert / split / repair（qpdf 側との差分は着手
 |---|---|
 | `pipeline.rs` ← `Pipeline.cc` + `Pl_*` | 依存は少ないが払いが小さい。`/ID` は既に byte-parity 済みで、原因はアルゴリズム（2 段階 MD5）であって抽象の欠落ではない。Tier 0 が片付いてから再評価 |
 | `qtc.rs` ← `QTC.cc`(50) | qtest の coverage 突き合わせが必要になった時点で |
-| `Pl_DCT` | 現状どの経路からも要求されていない |
+| `Pl_DCT` | **消費者は既にいる**。`json_inspect.rs:758` の `DecodeLevel::All` は doc で
+「lossy filter（`DCTDecode` / `JPXDecode` 等）を含めて全ストリームをデコードする」と
+約束しているが、`stream_payload_for_decode_level`(795-801) は `All` を
+`Generalized` / `Specialized` と同一に扱い、DCT 未対応のため encoded JPEG バイトへ
+フォールバックする（`json_inspect.rs:788` の doc と 8397 行のテストコメントに記載）。
+**T0-3 / decode 系の作業と一緒にスケジュールするか、`DecodeLevel::All` の doc と
+API を実態に合わせて狭めるか**を決めること。「消費者がいない」を理由に後回しにはできない |
 
 **`QPDFJob.cc` 本体は後回しにしない。** 対応表が示すとおり `QPDFJob.cc` は overlay /
 page 操作 / check / オーケストレーションに対応しており、`overlay.rs` のように出力

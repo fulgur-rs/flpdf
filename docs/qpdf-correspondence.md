@@ -36,7 +36,7 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 | `QPDF_Array/Dictionary/Stream/String/Name/Real/Integer/Bool/Null/InlineImage/Operator/Reserved/Unresolved/Destroyed.cc` | 1814 | `object.rs` の `Object` enum に統合 | 🔀 |
 | `QPDFObject.cc` / `QPDFValue.cc` | 79 | `object.rs` / `cache.rs`(102) | ✅ |
 | `QPDFObjGen.cc` | 68 | `object.rs` の `ObjectRef` | ✅ |
-| `QPDFXRefEntry.cc` | 51 | `xref.rs`(1129) の一部 | ✅ |
+| `QPDFXRefEntry.cc` | 51 | `xref.rs`(1129) の一部 | 🔀 独立した型境界が無く `xref.rs` に埋没 |
 | `PDFVersion.cc` | 68 | `writer.rs` の `parse_pdf_version` / `static_version_string` | 🔀 → **T0-1** |
 | `QPDFMatrix.cc` | 140 | `overlay.rs`(82-123: `IDENTITY_MATRIX` / `qpdf_concat` / `qpdf_scale` / `qpdf_translate` / `matrix_unparse`) + `overlay_annotations.rs`(1284-1365) + `page_form_xobject.rs`(503,533) + `page_annotation_flatten.rs`(306,454) + `page_rotate.rs`(306-355) に `[f64; 6]` 生配列で散在 | 🔀 → **T0-2** |
 
@@ -104,7 +104,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `Pl_AES_PDF` / `Pl_RC4` | 243 | `writer.rs` の `encrypt_stream_payload_for_writer` に埋没 | 🔀 |
 | `Pl_QPDFTokenizer.cc` / `ContentNormalizer.cc` | 141 | `content_stream.rs`(439-475: `normalize_content_stream`) | 🔀 → **T2-1** 独自実装が既に production にあり CLI から使われている（doc に既知のバイト差の記載あり）。T2-1 は「解錠」ではなく**置き換え** |
 | `QPDFStreamFilter.cc` | 19 | filter 登録機構が無い | ❌ |
-| `Pl_DCT.cc` | 326 | 無し | ❌ |
+| `Pl_DCT.cc` | 326 | 無し。`json_inspect.rs` の `DecodeLevel::All`(758) が DCT デコードを doc で約束しつつ encoded バイトへフォールバックしている | ❌ 消費者あり |
 | `Pl_Base64` / `Pl_Concatenate` / `Pl_Discard` / `Pl_Function` / `Pl_OStream` / `Pl_StdioFile` / `Pl_String` / `Pl_SHA2` / `Pl_Buffer` | 632 | Rust の `Write` で代替 | ⚪ |
 
 `/ID` が qpdf と非 parity だった原因は **アルゴリズム**（qpdf は 2 段階 MD5 で seed を
@@ -133,7 +133,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `JSON.cc` | 1401 | `json.rs`(159) | ❌ emitter のみ → **T0-3** |
+| `JSON.cc` | 1401 | `json.rs`(159: `JsonValue` + `write`。production の JSON 出力経路) | 🔀 → **T0-3** 値モデルと writer は実装済み。parse / checkSchema / 逐次 writer が未移植 |
 | `JSONHandler.cc` | 189 | 無し | ❌ → **T0-3** |
 | `QPDF_json.cc` | 946 | `json_inspect.rs`(2661) の一部 | 🔀 |
 
@@ -217,6 +217,7 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 | `standard_font_metrics.rs` | 4,633 | qpdf にフォント幅テーブルは存在しない（`grep -rl Helvetica libqpdf/` が 0 件） |
 | `signatures.rs` | 1,338 | 電子署名検査。qpdf に相当機能なし |
 | `qdf_fix.rs` | 764 | qpdf では `qpdf/fix-qdf.cc`（libqpdf 外の別バイナリ） |
+| `fonts.rs` | 192 | `--show-fonts` の実体（`font_entries`(30) / `font_entries_with_max_depth`(43)）。qpdf にフォント一覧機能は無い（`qpdf --help=all` に font 関連の記載なし） |
 | `page_closure.rs` / `ref_chain.rs` | 284 | |
 
 `object_copy.rs`(184) は `QPDF.cc` の `copyForeignObject` に相当するため
@@ -298,11 +299,15 @@ CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れてい
 
 | 状態 | qpdf 側の該当行数 | 内訳 |
 |---|---|---|
-| ✅ mirrors | 約 4,000 | |
-| 🔀 smeared | 約 22,000 | 再配置の主対象 |
-| ❌ missing | 約 2,000 | `Pipeline.cc`(114) / `Pl_Count`+`Pl_MD5`(114) / `QPDFStreamFilter`(19) / `Pl_DCT`(326) / `QTC`(50) / `JSON` の parser・schema（`JSON.cc` 1,401 と `JSONHandler.cc` 189 の一部） |
-| ⚪ 逸脱候補 | 約 6,900 | 要承認 |
-| ➖ 対象外 | 約 2,200 | C API |
+| ✅ mirrors | 1,512 | 責務境界も一致。触らない |
+| 🔀 smeared | 29,551 | 再配置の主対象 |
+| ❌ missing | 812 | `Pipeline.cc`(114) / `Pl_Count`+`Pl_MD5`(114) / `QPDFStreamFilter`(19) / `Pl_DCT`(326) / `QTC`(50) / `JSONHandler`(189) 等 |
+| ⚪ 逸脱候補 | 7,224 | 要承認 |
+| ➖ 対象外 | 2,237 | C API |
+| **合計** | **41,336** | qpdf `libqpdf/*.cc` は 41,459 行（差分は複数行に跨る行の重複計上分） |
+
+上表は本文の各行を機械的に集計した値である（`状態` 列の記号ごとに `行` 列を合算）。
+分類を変更したら必ず再集計すること。
 
 **❌ の数え方**: 以前は `Pipeline.cc` + `Pl_*.cc` 21 ファイル計 ~2,400 行を丸ごと
 missing として傘で数えていたが、個々の `Pl_*` は下の各行で mirrors / smeared /
