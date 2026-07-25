@@ -103,16 +103,26 @@ fn append_xref_stream_and_trailer(
         .iter()
         .map(|(&number, location)| (number, (location.container, location.index)))
         .collect();
-    let entries = xref_stream::build_entries(&offsets, &members, 0, size);
+    let mut entries = xref_stream::build_entries(&offsets, &members, 0, size);
+    for (&number, &(generation, _)) in &layout.uncompressed {
+        entries[number as usize].field3 = u64::from(generation);
+    }
+    let max_generation = layout
+        .uncompressed
+        .values()
+        .map(|&(generation, _)| u64::from(generation))
+        .max()
+        .unwrap_or(0);
+    let max_member_index = members
+        .values()
+        .map(|&(_, index)| u64::from(index))
+        .max()
+        .unwrap_or(0);
     let widths = xref_stream::second_pass_widths(
         xref_stream::max_entry_offset(&entries),
         0,
         max_number,
-        members
-            .values()
-            .map(|&(_, index)| u64::from(index))
-            .max()
-            .unwrap_or(0),
+        max_generation.max(max_member_index),
     );
     let payload = if trailer.structural_filtered {
         xref_stream::encode_payload(&entries, widths)
@@ -209,6 +219,15 @@ fn append_classic_xref_and_trailer(
         .max_number()
         .checked_add(1)
         .ok_or_else(|| crate::Error::Unsupported("plain writer /Size overflows u32".into()))?;
+    if layout
+        .uncompressed
+        .values()
+        .any(|&(_, offset)| offset as u64 >= 10_000_000_000)
+    {
+        return Err(crate::Error::Unsupported(
+            "plain writer classic xref offset exceeds ten digits".into(),
+        ));
+    }
 
     bytes.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
     bytes.extend_from_slice(b"0000000000 65535 f \n");
@@ -289,6 +308,45 @@ mod tests {
         let err = layout.validate().unwrap_err();
         assert!(matches!(err, crate::Error::Unsupported(ref message)
             if message.contains("object 4")));
+    }
+
+    #[test]
+    fn xref_stream_preserves_uncompressed_generation() {
+        let mut bytes = b"BODY".to_vec();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (2, 0));
+
+        append_xref_and_trailer(&mut bytes, &layout, &trailer(XrefForm::Stream)).unwrap();
+
+        let stream_start = bytes
+            .windows(b"stream\n".len())
+            .position(|window| window == b"stream\n")
+            .unwrap()
+            + b"stream\n".len();
+        let stream_end = bytes
+            .windows(b"\nendstream".len())
+            .position(|window| window == b"\nendstream")
+            .unwrap();
+        assert_eq!(
+            &bytes[stream_start..stream_end],
+            &[0, 0, 0, 1, 0, 2, 1, 4, 0]
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn classic_xref_rejects_offsets_that_exceed_ten_digits_before_mutating_bytes() {
+        let mut bytes = b"BODY".to_vec();
+        let original = bytes.clone();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 10_000_000_000));
+
+        let err =
+            append_xref_and_trailer(&mut bytes, &layout, &trailer(XrefForm::Table)).unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("offset")));
+        assert_eq!(bytes, original);
     }
 
     #[test]
