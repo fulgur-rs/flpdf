@@ -45,7 +45,7 @@ use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
 use crate::pages::{resolve_inherited_resources, DEFAULT_MAX_PAGE_TREE_DEPTH};
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
+use crate::{Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Result, Stream};
 
 /// Maximum reference-chain depth when collecting a Form XObject's reachable
 /// object closure. Mirrors the page-tree depth guard used elsewhere; bounds the
@@ -100,7 +100,16 @@ pub(crate) fn page_to_form_xobject<R: Read + Seek>(
     dict.insert("BBox", Object::Array(bbox));
     if transform.rotate_present || transform.uu_present {
         let matrix = transformation_matrix(&transform, bbox_w, bbox_h, false);
-        dict.insert("Matrix", Object::Array(matrix_objects(&matrix)));
+        dict.insert(
+            "Matrix",
+            Object::Array(
+                matrix
+                    .get_as_matrix()
+                    .into_iter()
+                    .map(Object::Real)
+                    .collect(),
+            ),
+        );
     }
     if let Some(res) = resources {
         dict.insert("Resources", Object::Dictionary(res));
@@ -505,33 +514,25 @@ pub(crate) fn transformation_matrix(
     width: f64,
     height: f64,
     invert: bool,
-) -> [f64; 6] {
-    const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+) -> Matrix {
     if !(t.rotate_present || t.uu_present) {
-        return IDENTITY;
+        return Matrix::default();
     }
     let mut scale = t.scale;
     let mut rotate = t.rotate;
     if invert {
         if scale == 0.0 {
-            return IDENTITY;
+            return Matrix::default();
         }
         scale = 1.0 / scale;
         rotate = 360 - rotate;
     }
     match rotate {
-        90 => [0.0, -scale, scale, 0.0, 0.0, width * scale],
-        180 => [-scale, 0.0, 0.0, -scale, width * scale, height * scale],
-        270 => [0.0, scale, -scale, 0.0, height * scale, 0.0],
-        _ => [scale, 0.0, 0.0, scale, 0.0, 0.0],
+        90 => Matrix::new(0.0, -scale, scale, 0.0, 0.0, width * scale),
+        180 => Matrix::new(-scale, 0.0, 0.0, -scale, width * scale, height * scale),
+        270 => Matrix::new(0.0, scale, -scale, 0.0, height * scale, 0.0),
+        _ => Matrix::new(scale, 0.0, 0.0, scale, 0.0, 0.0),
     }
-}
-
-/// Convert a `[f64; 6]` matrix to a PDF array of [`Object::Real`], mirroring
-/// qpdf's `QPDFObjectHandle::newReal`; whole values serialize without a decimal
-/// point.
-fn matrix_objects(m: &[f64; 6]) -> Vec<Object> {
-    m.iter().map(|&x| Object::Real(x)).collect()
 }
 
 /// Read the page dictionary's `/Group` value with qpdf `shallowCopy` semantics:
@@ -1399,7 +1400,7 @@ mod tests {
         };
         assert_eq!(
             transformation_matrix(&t, 612.0, 792.0, true),
-            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+            Matrix::default()
         );
     }
 }

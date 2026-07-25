@@ -35,7 +35,9 @@
 //!   there is no qpdf oracle; correctness is asserted via invariants in tests.
 
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
-use crate::{Dictionary, Error, Object, ObjectRef, PageBox, Pdf, Result, Stream};
+use crate::{
+    Dictionary, Error, Matrix, Object, ObjectRef, PageBox, Pdf, Rectangle, Result, Stream,
+};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
@@ -298,78 +300,39 @@ pub fn apply_rotate_to_pages<R: Read + Seek>(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Affine matrix primitives for /Rotate flattening (flpdf-9hc.9.9)
-// ---------------------------------------------------------------------------
-// Row-vector convention: a point [x y 1] maps to
-//   (a*x + c*y + e, b*x + d*y + f)  for matrix [a b c d e f].
-type Mat = [f64; 6];
-
-/// Apply matrix `m` to point (x, y).
-fn apply_matrix(m: Mat, x: f64, y: f64) -> (f64, f64) {
-    (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
-}
-
-/// Compose A then B for a row vector: result == (p * A) * B.
-fn mat_mul(a: Mat, b: Mat) -> Mat {
-    [
-        a[0] * b[0] + a[1] * b[2],
-        a[0] * b[1] + a[1] * b[3],
-        a[2] * b[0] + a[3] * b[2],
-        a[2] * b[1] + a[3] * b[3],
-        a[4] * b[0] + a[5] * b[2] + b[4],
-        a[4] * b[1] + a[5] * b[3] + b[5],
-    ]
-}
-
-/// Pure translation matrix.
-fn translate(tx: f64, ty: f64) -> Mat {
-    [1.0, 0.0, 0.0, 1.0, tx, ty]
-}
-
 /// Origin-0 rotation matrix for a box of width `w`, height `h`. `r` must be one
 /// of {90,180,270}; any other value yields identity (callers normalize first and
 /// skip r==0).
-fn rotate_origin(r: i32, w: f64, h: f64) -> Mat {
+fn rotate_origin(r: i32, w: f64, h: f64) -> Matrix {
     match r {
-        90 => [0.0, -1.0, 1.0, 0.0, 0.0, w],
-        180 => [-1.0, 0.0, 0.0, -1.0, w, h],
-        270 => [0.0, 1.0, -1.0, 0.0, h, 0.0],
-        _ => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        90 => Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, w),
+        180 => Matrix::new(-1.0, 0.0, 0.0, -1.0, w, h),
+        270 => Matrix::new(0.0, 1.0, -1.0, 0.0, h, 0.0),
+        _ => Matrix::default(),
     }
 }
 
 /// Build the flatten matrix `M` for normalized rotation `r` and the page's
 /// MediaBox: translate the box lower-left to origin, rotate, translate back so
 /// the transformed box's lower-left returns to (llx, lly).
-fn rotation_matrix(r: i32, mb: PageBox) -> Mat {
+fn rotation_matrix(r: i32, mb: PageBox) -> Matrix {
     let w = mb.urx - mb.llx;
     let h = mb.ury - mb.lly;
-    mat_mul(
-        mat_mul(translate(-mb.llx, -mb.lly), rotate_origin(r, w, h)),
-        translate(mb.llx, mb.lly),
-    )
+    let mut matrix = Matrix::new(1.0, 0.0, 0.0, 1.0, mb.llx, mb.lly);
+    matrix.concat(rotate_origin(r, w, h));
+    matrix.concat(Matrix::new(1.0, 0.0, 0.0, 1.0, -mb.llx, -mb.lly));
+    matrix
 }
 
 /// Map the 4 corners of `b` through `m` and return their axis-aligned bbox.
-fn transform_box(m: Mat, b: PageBox) -> PageBox {
-    let corners = [
-        apply_matrix(m, b.llx, b.lly),
-        apply_matrix(m, b.urx, b.lly),
-        apply_matrix(m, b.urx, b.ury),
-        apply_matrix(m, b.llx, b.ury),
-    ];
-    let llx = corners.iter().map(|c| c.0).fold(f64::INFINITY, f64::min);
-    let lly = corners.iter().map(|c| c.1).fold(f64::INFINITY, f64::min);
-    let urx = corners
-        .iter()
-        .map(|c| c.0)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let ury = corners
-        .iter()
-        .map(|c| c.1)
-        .fold(f64::NEG_INFINITY, f64::max);
-    PageBox::new(llx, lly, urx, ury)
+fn transform_box(m: Matrix, b: PageBox) -> PageBox {
+    let transformed = m.transform_rectangle(Rectangle::new(b.llx, b.lly, b.urx, b.ury));
+    PageBox::new(
+        transformed.llx,
+        transformed.lly,
+        transformed.urx,
+        transformed.ury,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -460,15 +423,15 @@ fn format_matrix_number(v: f64) -> String {
 
 /// Wrap `inner` content bytes as `q\n{a b c d e f} cm\n{inner}\nQ\n`.
 /// Whitespace at both seams prevents token merges (e.g. `ET`+`Q` -> `ETQ`).
-fn wrap_content_with_matrix(m: Mat, inner: &[u8]) -> Vec<u8> {
+fn wrap_content_with_matrix(m: Matrix, inner: &[u8]) -> Vec<u8> {
     let cm = format!(
         "q\n{} {} {} {} {} {} cm\n",
-        format_matrix_number(m[0]),
-        format_matrix_number(m[1]),
-        format_matrix_number(m[2]),
-        format_matrix_number(m[3]),
-        format_matrix_number(m[4]),
-        format_matrix_number(m[5]),
+        format_matrix_number(m.a),
+        format_matrix_number(m.b),
+        format_matrix_number(m.c),
+        format_matrix_number(m.d),
+        format_matrix_number(m.e),
+        format_matrix_number(m.f),
     );
     let mut out = Vec::with_capacity(cm.len() + inner.len() + 3);
     out.extend_from_slice(cm.as_bytes());
@@ -577,7 +540,7 @@ pub fn flatten_rotation_on_pages<R: Read + Seek>(
 fn flatten_annotation_rects<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_dict: &Dictionary,
-    m: Mat,
+    m: Matrix,
 ) -> Result<()> {
     // `/Annots` may be a direct array or an indirect reference to one; resolve
     // the reference before treating it as an array.
@@ -644,21 +607,19 @@ mod tests {
     #[test]
     fn rotation_matrix_origin0_constants() {
         let mb = PageBox::new(0.0, 0.0, 200.0, 300.0); // W=200 H=300
-        assert_eq!(rotation_matrix(90, mb), [0.0, -1.0, 1.0, 0.0, 0.0, 200.0]);
+        assert_eq!(
+            rotation_matrix(90, mb),
+            Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, 200.0)
+        );
         assert_eq!(
             rotation_matrix(180, mb),
-            [-1.0, 0.0, 0.0, -1.0, 200.0, 300.0]
+            Matrix::new(-1.0, 0.0, 0.0, -1.0, 200.0, 300.0)
         );
-        assert_eq!(rotation_matrix(270, mb), [0.0, 1.0, -1.0, 0.0, 300.0, 0.0]);
-    }
-
-    #[test]
-    fn apply_matrix_maps_points() {
-        // 90deg: (x,y) -> (y, W - x), W=200
-        let m = [0.0, -1.0, 1.0, 0.0, 0.0, 200.0];
-        assert_eq!(apply_matrix(m, 0.0, 0.0), (0.0, 200.0));
-        assert_eq!(apply_matrix(m, 200.0, 0.0), (0.0, 0.0));
-        assert_eq!(apply_matrix(m, 0.0, 300.0), (300.0, 200.0));
+        assert_eq!(
+            rotation_matrix(270, mb),
+            Matrix::new(0.0, 1.0, -1.0, 0.0, 300.0, 0.0)
+        );
+        assert_eq!(rotation_matrix(0, mb), Matrix::default());
     }
 
     #[test]
@@ -755,7 +716,7 @@ mod tests {
 
     #[test]
     fn wrap_content_has_safe_seams_and_cm() {
-        let m = [0.0, -1.0, 1.0, 0.0, 0.0, 200.0];
+        let m = Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, 200.0);
         let inner = b"BT /F1 12 Tf (hi) Tj ET";
         let out = wrap_content_with_matrix(m, inner);
         let s = String::from_utf8(out).unwrap();
