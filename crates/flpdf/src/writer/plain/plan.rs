@@ -671,6 +671,108 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_duplicate_source_placement() {
+        let plan = plan_for_test(vec![source(1, 1), source(1, 2)]);
+
+        let err = plan.validate().unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("source 1 0 R has multiple placements")));
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_objstm_member_output() {
+        let mut plan = plan_for_test(vec![
+            source(1, 1),
+            PlannedIndirectObject::ObjectStream {
+                output: ObjectRef::new(3, 0),
+                members: vec![
+                    PlannedMember {
+                        source: ObjectRef::new(7, 0),
+                        output: ObjectRef::new(2, 0),
+                    },
+                    PlannedMember {
+                        source: ObjectRef::new(8, 0),
+                        output: ObjectRef::new(2, 0),
+                    },
+                ],
+            },
+        ]);
+        plan.old_to_new
+            .insert(ObjectRef::new(7, 0), ObjectRef::new(2, 0));
+        plan.old_to_new
+            .insert(ObjectRef::new(8, 0), ObjectRef::new(2, 0));
+
+        let err = plan.validate().unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("output object 2 has multiple placements")));
+    }
+
+    #[test]
+    fn validation_rejects_root_absent_from_old_to_new_values() {
+        let mut plan = plan_for_test(vec![source(1, 1)]);
+        plan.root = ObjectRef::new(2, 0);
+        plan.trailer.root = plan.root;
+
+        let err = plan.validate().unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("root 2 0 R is absent from old-to-new map")));
+    }
+
+    #[test]
+    fn validation_rejects_output_number_holes() {
+        let mut plan = plan_for_test(vec![source(1, 1), source(2, 3)]);
+        plan.old_to_new
+            .insert(ObjectRef::new(2, 0), ObjectRef::new(3, 0));
+
+        let err = plan.validate().unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("output object 2 has no placement")));
+    }
+
+    #[test]
+    fn validation_rejects_invalid_version_for_xref_stream() {
+        let mut plan = plan_for_test(vec![source(1, 1)]);
+        plan.version = "invalid".to_string();
+        plan.trailer.form = XrefForm::Stream;
+
+        let err = plan.validate().unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("invalid PDF version invalid")));
+    }
+
+    #[test]
+    fn validation_rejects_version_below_1_5_for_xref_stream() {
+        let mut plan = plan_for_test(vec![source(1, 1)]);
+        plan.version = "1.4".to_string();
+        plan.trailer.form = XrefForm::Stream;
+
+        let err = plan.validate().unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("PDF 1.4 cannot contain object or xref streams")));
+    }
+
+    #[test]
+    fn lookup_helpers_return_mapping_and_skip_source_objects() {
+        let plan = plan_for_test(vec![source(1, 1)]);
+
+        assert_eq!(
+            plan.new_for_original(ObjectRef::new(1, 0)),
+            Some(ObjectRef::new(1, 0))
+        );
+        assert_eq!(
+            <PlainWritePlan as NewNumberLookup>::new_for_original(&plan, ObjectRef::new(1, 0)),
+            Some(ObjectRef::new(1, 0))
+        );
+        assert_eq!(plan.compressed_location(ObjectRef::new(1, 0)), None);
+    }
+
+    #[test]
     fn validation_rejects_trailer_root_that_differs_from_plan_root() {
         let mut plan = plan_for_test(vec![source(1, 1)]);
         plan.trailer.root = ObjectRef::new(2, 0);
@@ -688,6 +790,44 @@ mod tests {
             .all(|object| matches!(object, PlannedIndirectObject::Source { .. })));
         assert_eq!(plan.trailer.form, XrefForm::Table);
         plan.validate().unwrap();
+    }
+
+    #[test]
+    fn preserve_without_source_objstm_uses_catalog_first_placement() {
+        let plan = build("three-page.pdf", ObjectStreamMode::Preserve);
+
+        assert!(plan
+            .objects
+            .iter()
+            .all(|object| matches!(object, PlannedIndirectObject::Source { .. })));
+        assert!(plan.trailer.form == XrefForm::Table);
+    }
+
+    #[test]
+    fn build_materializes_deterministic_id_plan() {
+        let path = fixture_path("three-page.pdf");
+        let mut pdf =
+            Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+        let mut options = write_options(ObjectStreamMode::Disable);
+        options.deterministic_id = true;
+
+        let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
+
+        assert!(matches!(plan.trailer.id, IdPlan::Deterministic { .. }));
+    }
+
+    #[test]
+    fn forced_version_below_1_5_selects_classic_xref() {
+        let path = fixture_path("three-page-objstm.pdf");
+        let mut pdf =
+            Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+        let mut options = write_options(ObjectStreamMode::Disable);
+        options.force_version = Some("1.4".to_string());
+
+        let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
+
+        assert_eq!(plan.version, "1.4");
+        assert_eq!(plan.trailer.form, XrefForm::Table);
     }
 
     #[test]
