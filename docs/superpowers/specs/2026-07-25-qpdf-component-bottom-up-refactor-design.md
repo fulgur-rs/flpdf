@@ -444,6 +444,12 @@ Phase 2: 対応表を再測 → optimization / writer 系 / null 可視性
 - allowlist スコープの pass 数
 - 旧実装の削除行数（D2 の証拠）
 
+**行数は維持対象ではない。** 対応表・本書に記載した行数は調査時点のスナップショットで、
+コードが変われば即座にずれる。追随コストに見合わないため、ずれ自体は不具合として
+扱わない（[`docs/qpdf-correspondence.md`](../../qpdf-correspondence.md) の
+「行数の位置づけ」参照）。維持するのは**分類と対応先モジュール**であり、これらは
+work-list の実体なので誤ると着手判断を誤らせる。
+
 救済可能な qtest FAIL 20 件のうち本バックログが直接担当するのは
 `content_normalizer`（good7/good15 = 4 件）程度であり、残りは `flpdf-oq7g` /
 `flpdf-w5ny` 等で別途追跡する。**このバックログを「完了すれば qtest が埋まる」とは
