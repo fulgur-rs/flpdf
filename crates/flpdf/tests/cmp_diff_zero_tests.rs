@@ -100,6 +100,10 @@ fn assert_cmp_diff_zero_mode_named(fixture: &str, mode: ObjectStreamMode, stem: 
     assert_cmp_diff_zero_named(&actual, stem, name);
 }
 
+fn assert_mode_cmp_diff_zero(fixture: &str, mode: ObjectStreamMode) {
+    assert_cmp_diff_zero_mode_named(&format!("{fixture}.pdf"), mode, fixture, "static-id.pdf");
+}
+
 /// Full-rewrite `fixture` with an explicit object-stream `mode` + forced version
 /// (qpdf-matching options).
 fn rewrite_mode_force_qpdf_equivalent(
@@ -198,26 +202,17 @@ fn force_below_1_5_downgrades_xref_stream_source_byte_identical_to_qpdf() {
 }
 
 #[test]
-fn one_page_plain_rewrite_is_byte_identical_to_qpdf_static_id() {
-    assert_cmp_diff_zero("one-page.pdf", "one-page");
-}
-
-#[test]
-fn two_page_plain_rewrite_is_byte_identical_to_qpdf_static_id() {
-    assert_cmp_diff_zero("two-page.pdf", "two-page");
-}
-
-#[test]
-fn three_page_plain_rewrite_is_byte_identical_to_qpdf_static_id() {
-    assert_cmp_diff_zero("three-page.pdf", "three-page");
+fn one_two_three_page_mode_matrix_is_byte_identical_to_qpdf() {
+    for fixture in ["one-page", "two-page", "three-page"] {
+        for mode in [ObjectStreamMode::Disable, ObjectStreamMode::Preserve] {
+            assert_mode_cmp_diff_zero(fixture, mode);
+        }
+    }
 }
 
 #[test]
 fn preserve_object_stream_mode_is_byte_identical_to_qpdf_static_id_matrix() {
     let cases = [
-        ("one-page.pdf", "one-page", "static-id.pdf"),
-        ("two-page.pdf", "two-page", "static-id.pdf"),
-        ("three-page.pdf", "three-page", "static-id.pdf"),
         ("three-page-objstm.pdf", "three-page-objstm", "preserve.pdf"),
         (
             "objstm-lin-od-indirect-length.pdf",

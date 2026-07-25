@@ -9,7 +9,10 @@
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::ObjectStreamMode;
-use flpdf::{check_reader, write_pdf_with_options, Object, ObjectRef, Pdf, WriteOptions};
+use flpdf::{
+    check_reader, load_xref_and_trailer, write_pdf_with_options, Object, ObjectRef, Pdf,
+    WriteOptions, XrefOffset,
+};
 use std::io::{Cursor, Write};
 
 // ── Fixture builders ─────────────────────────────────────────────────────────
@@ -213,6 +216,62 @@ fn roundtrip_disable_mode_emits_no_objstm() {
             );
         }
         other => panic!("Object 2 should be a Dictionary, got {:?}", other),
+    }
+}
+
+#[test]
+fn nostream_130_generate_has_two_66_member_containers_with_dense_indices() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/objstm-gen-nostream-130rev.pdf");
+    let file = std::fs::File::open(&path).unwrap_or_else(|error| panic!("open {path:?}: {error}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Generate;
+    options.static_id = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut containers = Vec::new();
+    for reference in reopened.object_refs() {
+        if let Ok(Object::Stream(stream)) = reopened.resolve(reference) {
+            if matches!(
+                stream.dict.get("Type"),
+                Some(Object::Name(name)) if name.as_slice() == b"ObjStm"
+            ) {
+                assert_eq!(
+                    stream.dict.get("N"),
+                    Some(&Object::Integer(66)),
+                    "container {reference} must declare exactly 66 members"
+                );
+                containers.push(reference.number);
+            }
+        }
+    }
+    assert_eq!(
+        containers.len(),
+        2,
+        "Generate must even-split 132 eligible objects into two containers"
+    );
+
+    let xref = load_xref_and_trailer(&mut Cursor::new(&output)).unwrap();
+    for container in containers {
+        let mut indices: Vec<u32> = xref
+            .entries
+            .values()
+            .filter_map(|entry| match entry {
+                XrefOffset::Compressed { stream, index } if *stream == container => Some(*index),
+                _ => None,
+            })
+            .collect();
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            (0..66).collect::<Vec<_>>(),
+            "container {container} must use dense type-2 xref indices 0..65"
+        );
     }
 }
 

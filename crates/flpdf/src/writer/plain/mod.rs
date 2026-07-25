@@ -35,8 +35,7 @@ pub(crate) fn eligible(
     options: &WriteOptions,
     mode: ObjectStreamMode,
 ) -> bool {
-    matches!(mode, ObjectStreamMode::Disable | ObjectStreamMode::Preserve)
-        && mode == options.object_streams
+    mode == options.object_streams
         && !options.qdf
         && options.encrypt.is_none()
         && options.copy_encryption.is_none()
@@ -65,8 +64,12 @@ mod tests {
     }
 
     #[test]
-    fn preserve_and_disable_route_through_the_new_pipeline() {
-        for object_streams in [ObjectStreamMode::Disable, ObjectStreamMode::Preserve] {
+    fn all_plain_modes_route_through_the_new_pipeline() {
+        for object_streams in [
+            ObjectStreamMode::Disable,
+            ObjectStreamMode::Preserve,
+            ObjectStreamMode::Generate,
+        ] {
             reset_pipeline_calls();
             write_with(&WriteOptions {
                 full_rewrite: true,
@@ -77,16 +80,11 @@ mod tests {
             assert_eq!(pipeline_calls(), 1);
         }
 
-        reset_pipeline_calls();
-        write_with(&WriteOptions {
-            full_rewrite: true,
-            object_streams: ObjectStreamMode::Generate,
-            static_id: true,
-            ..WriteOptions::default()
-        });
-        assert_eq!(pipeline_calls(), 0);
-
-        for object_streams in [ObjectStreamMode::Disable, ObjectStreamMode::Preserve] {
+        for object_streams in [
+            ObjectStreamMode::Disable,
+            ObjectStreamMode::Preserve,
+            ObjectStreamMode::Generate,
+        ] {
             reset_pipeline_calls();
             write_with(&WriteOptions {
                 full_rewrite: true,
@@ -111,6 +109,18 @@ mod tests {
             });
             assert_eq!(pipeline_calls(), 0);
         }
+    }
+
+    #[test]
+    fn generate_uses_shared_plain_pipeline() {
+        reset_pipeline_calls();
+        write_with(&WriteOptions {
+            full_rewrite: true,
+            object_streams: ObjectStreamMode::Generate,
+            static_id: true,
+            ..WriteOptions::default()
+        });
+        assert_eq!(pipeline_calls(), 1);
     }
 
     #[test]
@@ -150,7 +160,11 @@ mod tests {
 
     #[test]
     fn eligibility_excludes_copy_and_source_encryption() {
-        for mode in [ObjectStreamMode::Disable, ObjectStreamMode::Preserve] {
+        for mode in [
+            ObjectStreamMode::Disable,
+            ObjectStreamMode::Preserve,
+            ObjectStreamMode::Generate,
+        ] {
             let options = WriteOptions {
                 object_streams: mode,
                 ..WriteOptions::default()

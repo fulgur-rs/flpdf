@@ -1,15 +1,11 @@
 //! Logical object placements for the qpdf-shaped plain writer pipeline.
 
-// Production routing moves to this plan in a later layer. Layer 3 builds and
-// validates the plan in shadow tests without replacing the legacy emitters.
-#![allow(dead_code)]
-
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek};
 
 use crate::rewrite_renumber::{CatalogFirstRenumber, GenerateRenumber, NewNumberLookup};
 use crate::writer::object_streams::{self, ObjectStreamMode};
-use crate::writer::plain::xref::{CompressedLocation, IdPlan, TrailerPlan};
+use crate::writer::plain::xref::{IdPlan, TrailerPlan};
 use crate::{CompressStreams, Object, ObjectRef, Pdf, WriteOptions, XrefForm, XrefOffset};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -280,24 +276,6 @@ impl PlainWritePlan {
     pub(crate) fn new_for_original(&self, source: ObjectRef) -> Option<ObjectRef> {
         self.old_to_new.get(&source).copied()
     }
-
-    pub(crate) fn compressed_location(&self, output: ObjectRef) -> Option<CompressedLocation> {
-        self.objects.iter().find_map(|object| match object {
-            PlannedIndirectObject::ObjectStream {
-                output: container,
-                members,
-            } => members
-                .iter()
-                .position(|member| member.output == output)
-                .and_then(|index| {
-                    u32::try_from(index).ok().map(|index| CompressedLocation {
-                        container: container.number,
-                        index,
-                    })
-                }),
-            PlannedIndirectObject::Source { .. } => None,
-        })
-    }
 }
 
 struct PlacementPlan {
@@ -452,9 +430,7 @@ mod tests {
 
     use crate::writer::object_streams::ObjectStreamMode;
     use crate::writer::plain::xref::{IdPlan, TrailerPlan};
-    use crate::{
-        Dictionary, NewlineBeforeEndstream, ObjectRef, Pdf, WriteOptions, XrefForm, XrefOffset,
-    };
+    use crate::{Dictionary, NewlineBeforeEndstream, ObjectRef, Pdf, WriteOptions, XrefForm};
 
     fn fixture_path(fixture: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -478,91 +454,6 @@ mod tests {
             Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
         let options = write_options(mode);
         PlainWritePlan::build(&mut pdf, &options).unwrap()
-    }
-
-    fn assert_plan_matches_legacy_xref(fixture: &str, mode: ObjectStreamMode) {
-        let plan = build(fixture, mode);
-
-        let mut source = Pdf::open(std::io::BufReader::new(
-            std::fs::File::open(fixture_path(fixture)).unwrap(),
-        ))
-        .unwrap();
-        let mut output = Vec::new();
-        crate::write_pdf_with_options(&mut source, &mut output, &write_options(mode)).unwrap();
-
-        let legacy = Pdf::open(std::io::Cursor::new(output)).unwrap();
-        assert_eq!(legacy.root_ref(), Some(plan.root));
-        assert_eq!(legacy.version(), plan.version);
-        assert_eq!(legacy.last_xref_form(), plan.trailer.form);
-        let entries = legacy.source_xref_entries();
-        let mut planned_active: BTreeSet<u32> = plan
-            .objects
-            .iter()
-            .flat_map(|object| match object {
-                PlannedIndirectObject::Source { output, .. } => vec![output.number],
-                PlannedIndirectObject::ObjectStream { output, members } => {
-                    std::iter::once(output.number)
-                        .chain(members.iter().map(|member| member.output.number))
-                        .collect()
-                }
-            })
-            .collect();
-        if plan.trailer.form == XrefForm::Stream {
-            let xref_number = planned_active
-                .last()
-                .copied()
-                .unwrap_or(0)
-                .checked_add(1)
-                .unwrap();
-            planned_active.insert(xref_number);
-        }
-        let legacy_active: BTreeSet<u32> = entries
-            .iter()
-            .filter_map(|(reference, offset)| {
-                matches!(
-                    offset,
-                    XrefOffset::Offset(_) | XrefOffset::Compressed { .. }
-                )
-                .then_some(reference.number)
-            })
-            .collect();
-        assert_eq!(legacy_active, planned_active);
-
-        for object in &plan.objects {
-            match object {
-                PlannedIndirectObject::Source { output, .. } => {
-                    assert!(
-                        matches!(entries.get(output), Some(XrefOffset::Offset(_))),
-                        "planned source {output} is not uncompressed in legacy output"
-                    );
-                }
-                PlannedIndirectObject::ObjectStream { output, members } => {
-                    assert!(
-                        matches!(entries.get(output), Some(XrefOffset::Offset(_))),
-                        "planned ObjStm {output} is not uncompressed in legacy output"
-                    );
-                    for (index, member) in members.iter().enumerate() {
-                        let index = u32::try_from(index).unwrap();
-                        assert_eq!(
-                            plan.compressed_location(member.output),
-                            Some(CompressedLocation {
-                                container: output.number,
-                                index,
-                            })
-                        );
-                        assert_eq!(
-                            entries.get(&member.output),
-                            Some(&XrefOffset::Compressed {
-                                stream: output.number,
-                                index,
-                            }),
-                            "planned member {} has a different legacy location",
-                            member.output
-                        );
-                    }
-                }
-            }
-        }
     }
 
     fn source(source: u32, output: u32) -> PlannedIndirectObject {
@@ -910,12 +801,8 @@ mod tests {
             .collect();
         assert_eq!(containers.len(), 1);
         assert!(!containers[0].1.is_empty());
-        for (index, member) in containers[0].1.iter().enumerate() {
+        for member in &containers[0].1 {
             assert_eq!(member.output.generation, 0);
-            assert_eq!(
-                index as u32,
-                plan.compressed_location(member.output).unwrap().index
-            );
         }
         assert_eq!(plan.trailer.form, XrefForm::Stream);
         plan.validate().unwrap();
@@ -996,23 +883,5 @@ mod tests {
             .collect();
         assert_eq!(sizes, vec![66, 66]);
         plan.validate().unwrap();
-    }
-
-    #[test]
-    fn disable_plan_matches_legacy_xref() {
-        assert_plan_matches_legacy_xref("three-page.pdf", ObjectStreamMode::Disable);
-    }
-
-    #[test]
-    fn preserve_plan_matches_legacy_xref() {
-        assert_plan_matches_legacy_xref("three-page-objstm.pdf", ObjectStreamMode::Preserve);
-    }
-
-    #[test]
-    fn generate_plan_matches_legacy_xref() {
-        assert_plan_matches_legacy_xref(
-            "objstm-gen-nostream-130rev.pdf",
-            ObjectStreamMode::Generate,
-        );
     }
 }

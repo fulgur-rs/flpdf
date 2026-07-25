@@ -1,7 +1,6 @@
 #[path = "writer/object_streams.rs"]
 pub(crate) mod object_streams;
 #[path = "writer/plain/mod.rs"]
-#[allow(dead_code)] // Preserve/Generate production routing lands in later layers.
 pub(crate) mod plain;
 #[path = "writer/serialize.rs"]
 pub(crate) mod serialize;
@@ -2901,10 +2900,10 @@ fn encrypt_stream_payload_for_writer(
 /// returning the re-encoded object and whether the **source** filter chain was
 /// already a lone `/FlateDecode`.
 ///
-/// This is the byte-critical choke point shared by `write_pdf_full_rewrite`,
-/// the non-linearized generate emit path (`write_pdf_generate`), and the
-/// linearized body writer. Keeping it in one place prevents those paths from
-/// drifting on qpdf's recovered-stream framing or re-filter rules:
+/// This is the byte-critical choke point shared by the legacy excluded-mode
+/// full-rewrite path, the plain body writer, and the linearized body writer.
+/// Keeping it in one place prevents those paths from drifting on qpdf's
+/// recovered-stream framing or re-filter rules:
 ///
 /// * `recovered_stream_eol`, when present, is restored exactly once before any
 ///   preserve/decode/re-encode decision. The reader records it only while an
@@ -2992,7 +2991,7 @@ pub(crate) fn reencode_stream_for_compress(
 /// re-encoded a source that was NOT already a lone `/FlateDecode`
 /// (`write_stream_to_buf_qpdf_order`); an already-Flate or preserved source keeps
 /// its lexicographic order with `/Length` last. Non-stream objects serialize
-/// normally. Shared by `write_pdf_full_rewrite` and `write_pdf_generate`.
+/// normally. Shared by the legacy excluded-mode writer and the plain pipeline.
 fn write_reencoded_object(
     bytes: &mut Vec<u8>,
     reencoded: &Object,
@@ -3141,25 +3140,15 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         ));
     }
 
-    // ── ObjStm-routing overview ───────────────────────────────────────────────
-    // 1. Run the planner to decide which objects belong in ObjStm batches.
-    // 2. Build a member→(container_num, index_in_batch) lookup.
-    // 3. Allocate container object numbers above the highest input number.
-    // 4. Emission loop: skip members (they'll be emitted via containers).
-    // 5. After the loop: emit each container as a stream object.
-    // 6. xref: for Stream form, insert Compressed entries for members.
-    //    For Table form with non-empty batches: return Err (5.7 guard).
-    // ─────────────────────────────────────────────────────────────────────────
-
     // flpdf-9hc.16.8: propagate the Adobe extension level into the destination
-    // Catalog BEFORE any downstream dispatch (e.g. the generate emitter below),
-    // so every path within write_pdf_full_rewrite sees the injected Catalog.
+    // Catalog BEFORE any downstream dispatch, so every full-rewrite route sees
+    // the injected Catalog.
     // When WriteOptions::min_extension_level requests an ext >= 1 (or the
     // source Catalog already carries one that survives the pairwise rule)
     // inject
     //   /Extensions << /ADBE << /BaseVersion /<ver> /ExtensionLevel <lvl> >> >>
-    // so it becomes part of the Catalog the renumber walk / generate emitter
-    // sees. A source indirect /Extensions ref, if any, is inlined here and
+    // so it becomes part of the Catalog the selected writer sees. A source
+    // indirect /Extensions ref, if any, is inlined here and
     // drops out of the reachable graph — mirroring qpdf's QPDFWriter behaviour.
     {
         let source_ver = pdf.version().to_string();
@@ -3168,9 +3157,8 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         // ObjStm emission, so the pairwise pairwise-contribution logic in
         // `effective_pdf_version_and_ext` sees the same version race that
         // the header writer will apply. Generate mode always emits ObjStm
-        // (via the Generate dispatch below or, when it falls through due to
-        // encrypt / copy_encryption, via the full-rewrite planner). `--qdf`
-        // forces ObjStm off. `Preserve` and `Disable` skip the floor here;
+        // through either the shared plain pipeline or this legacy excluded-mode
+        // planner. `--qdf` forces ObjStm off. `Preserve` and `Disable` skip the floor here;
         // Preserve+source-has-ObjStm remains a latent edge case (walking
         // the source for eligibility would be expensive).
         let will_emit_objstm =
@@ -3205,23 +3193,10 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         return plain::write_plain(pdf, out, options);
     }
 
-    // Non-linearized --object-streams=generate is byte-identical to qpdf only
-    // with qpdf's generate-mode numbering (container numbered immediately before
-    // its members, members ascending-source, even split into ceil(n/100)
-    // containers). That layout differs structurally from this path's
-    // Catalog-first + containers-above-max scheme, so route it to the dedicated
-    // emitter. Restricted to the plain case: --qdf forces ObjStm off (it always
-    // emits a classic xref table), and output encryption, copied encryption, or
-    // source encryption keep the containers-above-max scheme here (their
-    // encryption/traversal state depends on the legacy route).
-    if matches!(options.object_streams, ObjectStreamMode::Generate)
-        && options.encrypt.is_none()
-        && options.copy_encryption.is_none()
-        && !options.qdf
-        && pdf.encryption_ref().is_none()
-    {
-        return write_pdf_generate(pdf, out, options);
-    }
+    // Only specialized modes reach the legacy coordinator below: QDF, output or
+    // copied encryption, source-encrypted input, and requested Preserve/Generate
+    // suppressed to Disable by a forced version below 1.5. Its container planner
+    // and generic xref emitter remain live for those explicitly excluded modes.
     let Some(root_ref) = pdf.root_ref() else {
         return Err(crate::Error::Missing("/Root"));
     };
@@ -3237,6 +3212,9 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     // /Length edge is NOT numbered here and disappears cleanly from `renumbered`.
     // In non-QDF mode this is the same behaviour as before.
     use crate::rewrite_renumber::CatalogFirstRenumber;
+    // The unencrypted/non-QDF case can reach this legacy path only when a
+    // requested Preserve or Generate mode was suppressed to Disable by
+    // force-version < 1.5. Keep its qpdf null-visibility behavior byte-stable.
     let qpdf_null_visibility = !options.qdf
         && options.encrypt.is_none()
         && options.copy_encryption.is_none()
@@ -3815,7 +3793,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             // so the output ordering tracks qpdf's re-filter decision rather
             // than flpdf's unconditional decode/re-encode.
             // Re-encode per the compress policy via the shared choke point so
-            // this path and the generate emit path cannot drift on qpdf's
+            // excluded modes and the plain pipeline cannot drift on qpdf's
             // re-filter rules. `reencoded` is owned and `mut` because the
             // encryption step below may rewrite the stream payload in place.
             let (mut reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
@@ -3902,8 +3880,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                 }
             } else {
                 // Non-qdf: shared choke point — qpdf's re-filtered key order for
-                // re-encoded streams, lexicographic order otherwise. Identical to
-                // the generate emit path (`write_pdf_generate`).
+                // re-encoded streams, lexicographic order otherwise.
                 write_reencoded_object(
                     &mut bytes,
                     &reencoded,
@@ -4299,425 +4276,6 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
         }
     }
-
-    out.write_all(&bytes)?;
-    Ok(())
-}
-
-/// Resolve a `generate`-path internal invariant or fail with a
-/// `generate:`-prefixed [`crate::Error::Unsupported`]. The `None` arm is
-/// unreachable for well-formed input — the generate pipeline (DFS eligibility +
-/// even split + `GenerateRenumber`) maintains each invariant — but returning a
-/// diagnostic beats a panic if a future change breaks one. Keeping it a helper
-/// makes every call site a single (covered) expression instead of a multi-line
-/// `ok_or_else` closure whose error body would never execute.
-fn generate_invariant<T>(value: Option<T>, what: &str) -> Result<T> {
-    value.ok_or_else(|| crate::Error::Unsupported(format!("generate: {what}")))
-}
-
-/// Non-linearized `--object-streams=generate`, byte-identical to qpdf 11.9.0.
-///
-/// qpdf assigns object streams up front (`QPDF::getCompressibleObjGens` DFS +
-/// `QPDFWriter::generateObjectStreams` even split into `ceil(n/100)` containers),
-/// then renumbers so each container is numbered immediately before its members,
-/// members serialize in ascending source-object order, and reachable
-/// uncompressed objects take the trailing numbers. The cross-reference is emitted
-/// as a stream (type-2 entries require it) with the header floored to 1.5.
-///
-/// Scope: the plain (source-unencrypted / non-encrypt / non-copy-encryption /
-/// non-qdf) case; the caller (`write_pdf_full_rewrite`) routes only those here.
-///
-/// # Errors
-///
-/// Returns [`crate::Error::Missing`] when the trailer has no `/Root`, refuses
-/// signed inputs (a full rewrite invalidates signatures), and propagates load /
-/// renumber / encode errors.
-fn write_pdf_generate<R: Read + Seek, W: Write>(
-    pdf: &mut Pdf<R>,
-    out: W,
-    options: &WriteOptions,
-) -> Result<()> {
-    // ── object-stream assignment + generate-mode numbering ───────────────────
-    // 1. getCompressibleObjGens DFS from the trailer => eligible list, ordered.
-    let compressible = object_streams::compressible_objgens_qpdf_plan(pdf)?;
-    // 2. generateObjectStreams even split => one group per container.
-    let groups = object_streams::even_split_into_streams(&compressible.eligible);
-    write_pdf_containerized_qpdf(pdf, out, options, groups, compressible.removed_refs)
-}
-
-fn write_pdf_containerized_qpdf<R: Read + Seek, W: Write>(
-    pdf: &mut Pdf<R>,
-    mut out: W,
-    options: &WriteOptions,
-    groups: Vec<Vec<ObjectRef>>,
-    removed_refs: BTreeSet<ObjectRef>,
-) -> Result<()> {
-    use crate::rewrite_renumber::{renumber_qpdf_refs_in_place_with_removed, GenerateRenumber};
-    use std::collections::HashSet;
-
-    // qpdf applies one global compression decision to structural streams it
-    // creates. Preserve and Uncompress both mean raw ObjStm/xref payloads;
-    // Compress means Flate plus the xref PNG predictor.
-    let structural_filtered =
-        matches!(effective_stream_policy(options), Some(CompressStreams::Yes));
-    let structural_compress = if structural_filtered {
-        CompressStreams::Yes
-    } else {
-        CompressStreams::No
-    };
-
-    // `ok_or` (eager) keeps the error construction on the covered happy path;
-    // `Error::Missing` is a cheap `&'static str` variant, so no `or_fun_call`.
-    let root_ref = pdf.root_ref().ok_or(crate::Error::Missing("/Root"))?;
-
-    // 3. enqueueObject walk with the object-stream branch => container-first
-    //    numbering (members ascending-source within each container).
-    //
-    // This containerized path always writes a direct `/Length`, so
-    // `skip_length = true`: qpdf removes `/Length` before enqueueing a stream's
-    // children, garbage-collecting a holder reachable only through that edge.
-    // The walk drops it the same way. An orphan holder is never an ObjStm member
-    // (members are reached via non-`/Length` edges only).
-    let renumber = GenerateRenumber::build(pdf, &groups, true, &removed_refs)?;
-    let new_root = generate_invariant(
-        renumber.new_for_original(root_ref),
-        "/Root absent from renumber map",
-    )?; // cov:ignore: error arm is an unreachable internal invariant
-
-    // ── per-container member tables + type-2 xref entries ────────────────────
-    /// One ObjStm container: its assigned object number and its members as
-    /// `(original, new)` ref pairs in ascending-NEW (= ascending-source) order.
-    struct ContainerPlan {
-        number: u32,
-        members: Vec<(ObjectRef, ObjectRef)>,
-    }
-    // Member original refs (skipped from plain emission — they serialize inside
-    // their container) and NEW member number -> (container number, index).
-    let mut member_set: HashSet<ObjectRef> = HashSet::new();
-    let mut member_xref: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
-    let mut containers: Vec<ContainerPlan> = Vec::with_capacity(groups.len());
-    for (gi, group) in groups.iter().enumerate() {
-        let number = generate_invariant(
-            renumber.container_number(gi),
-            "ObjStm container group was never reached",
-        )?; // cov:ignore: error arm is an unreachable internal invariant
-            // Resolve each member's NEW ref once. qpdf serializes a container's
-            // members in ascending source-object order (`std::set<QPDFObjGen>`), and
-            // the generate-mode numbering assigns new numbers in that same order — so
-            // sorting by the NEW number reproduces it.
-        let mut members: Vec<(ObjectRef, ObjectRef)> = group
-            .iter()
-            .map(|&old| {
-                let new = generate_invariant(
-                    renumber.new_for_original(old),
-                    "ObjStm member absent from renumber map",
-                )?; // cov:ignore: error arm is an unreachable internal invariant
-                Ok((old, new))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        members.sort_by_key(|&(_, new)| new.number);
-        for (index, &(old, new)) in members.iter().enumerate() {
-            member_set.insert(old);
-            // A single ObjStm holds at most 100 members, so `index` fits u32.
-            let index = u32::try_from(index).unwrap_or(u32::MAX);
-            member_xref.insert(new.number, (number, index));
-        }
-        containers.push(ContainerPlan { number, members });
-    }
-
-    // Emission dispatch keyed on NEW object number: a container body or a plain
-    // (uncompressed) object. Compressed members are skipped here. qpdf writes
-    // objects in ascending new number, so iterating the BTreeMap drives the body
-    // order directly.
-    enum Emit {
-        Container(usize),
-        Plain(ObjectRef),
-    }
-    let mut emit: BTreeMap<u32, Emit> = BTreeMap::new();
-    for (new, old) in renumber.pairs() {
-        if member_set.contains(&old) {
-            continue;
-        }
-        emit.insert(new.number, Emit::Plain(old));
-    }
-    for (gi, c) in containers.iter().enumerate() {
-        // Container and plain-object numbers are disjoint by construction (members
-        // are excluded above), so the insert never clobbers; `then_some` turns a
-        // (would-be) clobber into the helper's diagnostic instead of a panic.
-        generate_invariant(
-            emit.insert(c.number, Emit::Container(gi))
-                .is_none()
-                .then_some(()),
-            "container object number collides with a plain object",
-        )?; // cov:ignore: error arm is an unreachable internal invariant
-    }
-
-    // ── header ───────────────────────────────────────────────────────────────
-    // Pass `object_streams = true`: xref streams require PDF 1.5, and
-    // `effective_pdf_version` applies that floor (above any lower source /
-    // --force-version), so no separate clamp is needed here.
-    let version = effective_pdf_version(pdf.version(), options, false, true).to_owned();
-
-    // deterministic-/ID seed inputs, captured from the ORIGINAL trailer before
-    // the emit loop borrows `pdf` (qpdf reads these from the source trailer).
-    let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
-        if options.deterministic_id {
-            (
-                source_permanent_id(pdf.trailer()),
-                deterministic_id_info_suffix(pdf),
-            )
-        } else {
-            (None, Vec::new())
-        };
-
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(format!("%PDF-{version}\n").as_bytes());
-    bytes.extend_from_slice(QPDF_BINARY_MARKER);
-
-    // ── bodies in ascending new number ───────────────────────────────────────
-    // `offsets` records the byte offset of every emitted body (containers and
-    // plain objects). Members are absent (they live inside containers) and get
-    // type-2 xref entries from `member_xref` instead.
-    let mut offsets: BTreeMap<u32, usize> = BTreeMap::new();
-    for (&number, what) in &emit {
-        let emit_offset = bytes.len();
-        bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
-        match what {
-            Emit::Plain(old) => {
-                let mut object = pdf.resolve(*old)?;
-                renumber_qpdf_refs_in_place_with_removed(
-                    pdf,
-                    &mut object,
-                    &renumber,
-                    &removed_refs,
-                )?; // cov:ignore: reachable emitted refs are all present in the completed map
-                match object {
-                    Object::Stream(stream) => {
-                        let (reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
-                            stream,
-                            options,
-                            true,
-                            pdf.recovered_stream_eol(*old),
-                        );
-                        write_reencoded_object(
-                            &mut bytes,
-                            &reencoded,
-                            source_filter_is_lone_flate,
-                            options,
-                        );
-                    }
-                    // cov:ignore-start: every reachable non-stream object is
-                    // ObjStm-eligible (a container member), so a plain object —
-                    // one not routed into a container — is always a stream.
-                    other => other.write_pdf(&mut bytes),
-                    // cov:ignore-end
-                }
-            }
-            Emit::Container(gi) => {
-                // Resolve each member, rewrite its internal references to NEW
-                // numbers, and pair with its (precomputed) NEW ref so the ObjStm
-                // pair table records the renumbered member number.
-                let plan = &containers[*gi];
-                let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(plan.members.len());
-                for &(old, new) in &plan.members {
-                    let mut obj = pdf.resolve(old)?;
-                    renumber_qpdf_refs_in_place_with_removed(
-                        pdf,
-                        &mut obj,
-                        &renumber,
-                        &removed_refs,
-                    )?; // cov:ignore: planned ObjStm members are all present in the completed map
-                    resolved.push((new, obj));
-                }
-                let body = object_streams::emit_objstm_body_from_resolved(&resolved)?;
-                serialize::write_objstm_stream(
-                    &mut bytes,
-                    &body,
-                    structural_compress,
-                    options.newline_before_endstream,
-                )?; // cov:ignore: ObjStm wrapping only fails when in-memory deflate encoding fails
-            }
-        }
-        bytes.extend_from_slice(b"\nendobj\n");
-        offsets.insert(number, emit_offset);
-    }
-
-    // Preserve may remove every source ObjStm while still producing
-    // `removed_refs`: getCompressibleObjGens has already directized a stale
-    // generation before reachability filtering empties the container plan.
-    // qpdf keeps the source 1.5 header but falls back to a classic xref table
-    // when no compressed member survives. Keep this path on GenerateRenumber
-    // (so removed refs remain direct null) while reproducing that table form.
-    if groups.is_empty() && matches!(options.object_streams, ObjectStreamMode::Preserve) {
-        let xref_offset = bytes.len();
-        let max_object_number = offsets.keys().next_back().copied().unwrap_or(0);
-        let object_count = generate_invariant(
-            max_object_number.checked_add(1),
-            "empty-container preserve xref size overflows u32",
-        )?; // cov:ignore: requires u32::MAX emitted objects
-        bytes.extend_from_slice(format!("xref\n0 {object_count}\n").as_bytes());
-        bytes.extend_from_slice(b"0000000000 65535 f \n");
-        for number in 1..object_count {
-            let offset = generate_invariant(
-                offsets.get(&number).copied(),
-                "empty-container preserve numbering is not contiguous",
-            )?; // cov:ignore: GenerateRenumber assigns a contiguous range
-            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-        }
-
-        let mut trailer = pdf.trailer().clone();
-        strip_incremental_trailer_keys(&mut trailer);
-        remap_qpdf_trailer_refs_with_removed(pdf, &mut trailer, &renumber, &removed_refs)?;
-        trailer.insert("Size", Object::Integer(i64::from(object_count)));
-        trailer.insert("Root", Object::Reference(new_root));
-        apply_encrypt_trailer_entries(&mut trailer, pdf, options, None, options.deterministic_id);
-        bytes.extend_from_slice(b"trailer ");
-        if options.deterministic_id {
-            let mut id_writer = |out: &mut Vec<u8>| {
-                write_deterministic_id_inline(
-                    out,
-                    &det_id_info_suffix,
-                    det_id_source_id0.as_deref(),
-                )
-            };
-            trailer.write_pdf_trailer(&mut bytes, Some(&mut id_writer));
-        } else {
-            trailer.write_pdf_trailer(&mut bytes, None);
-        }
-        bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
-        out.write_all(&bytes)?;
-        return Ok(());
-    }
-
-    // ── cross-reference stream ───────────────────────────────────────────────
-    // qpdf emits a PNG-Up-predicted (`/Predictor 12`), minimal-`/W`,
-    // fixed-key-order xref stream. Reuse the linearized encoder, which already
-    // reproduces that shape byte-for-byte (the generic `build_xref_stream_bytes`
-    // uses `/W [1 8 4]` without a predictor and is NOT byte-identical to qpdf).
-    use crate::writer::serialize::xref_stream;
-    let xref_offset = bytes.len();
-    // Highest object number across plain bodies, containers, AND compressed
-    // members. Numbering is contiguous `1..=M`; the xref stream itself takes
-    // `M + 1` and `/Size` is `M + 2`.
-    let max_object_number = offsets
-        .keys()
-        .chain(member_xref.keys())
-        .copied()
-        .max()
-        .unwrap_or(0);
-    // Both overflows need ~u32::MAX live objects (a multi-GB PDF); unreachable
-    // for any real input, but surfaced as a diagnostic rather than a panic.
-    let xref_object_number = generate_invariant(
-        max_object_number.checked_add(1),
-        "xref stream number overflows u32",
-    )?; // cov:ignore: error arm needs ~u32::MAX objects — a multi-GB PDF
-    let size = generate_invariant(
-        xref_object_number.checked_add(1),
-        "xref /Size overflows u32",
-    )?; // cov:ignore: error arm needs ~u32::MAX objects — a multi-GB PDF
-
-    // The xref stream object describes itself with a type-1 entry at its own
-    // offset; add it to the offset map so `build_entries` emits that row.
-    let mut offs = offsets;
-    offs.insert(xref_object_number, xref_offset);
-
-    let entries = xref_stream::build_entries(&offs, &member_xref, 0, size);
-    // Minimal `/W` widths: field 2 sizes the largest type-1 byte offset (no hint
-    // stream, so `hint_length = 0`), field 3 the largest ObjStm member index.
-    // Single xref => no `/Prev` chain and no two-pass padding.
-    let max_offset = xref_stream::max_entry_offset(&entries);
-    let max_ostream_index = member_xref
-        .values()
-        .map(|&(_, index)| u64::from(index))
-        .max()
-        .unwrap_or(0);
-    let widths =
-        xref_stream::second_pass_widths(max_offset, 0, max_object_number, max_ostream_index);
-    let payload = if structural_filtered {
-        xref_stream::encode_payload(&entries, widths)
-    } else {
-        xref_stream::encode_payload_raw(&entries, widths)
-    };
-
-    // Trailer-derived dict entries: /Info (remapped to its new number) and the
-    // two-element /ID. /Root is the renumbered catalog. qpdf omits /Index on a
-    // single full-range xref stream.
-    //
-    let mut trailer = pdf.trailer().clone();
-    strip_incremental_trailer_keys(&mut trailer);
-    remap_qpdf_trailer_refs_with_removed(pdf, &mut trailer, &renumber, &removed_refs)?;
-    // The specialized xref-stream writer adds the generated `/Root`, `/Size`,
-    // and `/ID` entries itself. Keep every other trimmed/remapped trailer entry
-    // — including a direct `/Info` dictionary — for sorted emission after `/W`.
-    trailer.remove("Root");
-    trailer.remove("Size");
-    trailer.remove("ID");
-    trailer.remove("Encrypt");
-
-    let xref_ref = ObjectRef::new(xref_object_number, 0);
-    if options.deterministic_id {
-        // qpdf does not produce byte-parity output for xref-stream form, but the
-        // content-derived /ID must be self-stable. Write it INLINE at the /ID
-        // position so the digest covers the bytes up to the array's `[` —
-        // matching `compute_deterministic_id`'s contract on every other path.
-        let dict = xref_stream::XrefStreamDict {
-            filtered: structural_filtered,
-            widths,
-            index: None,
-            info: None,
-            root: Some(new_root),
-            size,
-            prev: None,
-            trailer: Some(&trailer),
-            id: None,
-        };
-        let mut id_writer = |out: &mut Vec<u8>| {
-            write_deterministic_id_inline(out, &det_id_info_suffix, det_id_source_id0.as_deref())
-        };
-        xref_stream::write_object_with_id_writer(
-            &mut bytes,
-            xref_ref,
-            &dict,
-            &payload,
-            &mut id_writer,
-        );
-    } else {
-        // static => preserved source /ID[0] (or the pi constant when absent) + pi
-        // /ID[1]; random otherwise. Both flow through
-        // `apply_encrypt_trailer_entries`, so this path and the full-rewrite path
-        // agree on the /ID bytes.
-        let mut id_trailer = Dictionary::new();
-        if let Some(id) = pdf.trailer().get("ID") {
-            id_trailer.insert("ID", id.clone());
-        }
-        apply_encrypt_trailer_entries(&mut id_trailer, pdf, options, None, false);
-        // `apply_encrypt_trailer_entries` always sets /ID to a two-element array
-        // of strings here (apply_static_id / apply_random_id), so the non-String
-        // / non-pair fallbacks below are defensive only.
-        let (id0, id1): (Vec<u8>, Vec<u8>) = match id_trailer.get("ID") {
-            Some(Object::Array(arr)) if arr.len() == 2 => {
-                let take = |o: &Object| match o {
-                    Object::String(s) => s.clone(),
-                    _ => QPDF_STATIC_ID.to_vec(), // cov:ignore: /ID elements are always strings here
-                };
-                (take(&arr[0]), take(&arr[1]))
-            }
-            _ => (QPDF_STATIC_ID.to_vec(), QPDF_STATIC_ID.to_vec()), // cov:ignore: /ID is always a 2-string array here
-        };
-        let dict = xref_stream::XrefStreamDict {
-            filtered: structural_filtered,
-            widths,
-            index: None,
-            info: None,
-            root: Some(new_root),
-            size,
-            prev: None,
-            trailer: Some(&trailer),
-            id: Some((&id0, &id1)),
-        };
-        xref_stream::write_object(&mut bytes, xref_ref, &dict, &payload);
-    }
-    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
 
     out.write_all(&bytes)?;
     Ok(())
@@ -6163,10 +5721,9 @@ mod tests {
     #[test]
     fn deterministic_id_preserve_xref_stream_form_is_self_stable() {
         // A cross-reference-stream INPUT written with --object-streams=preserve
-        // stays in `write_pdf_full_rewrite`'s `XrefForm::Stream` arm (Preserve is
-        // not delegated to the generate emitter, and a stream-form input keeps
-        // Stream form even with no ObjStm batches). The deterministic `/ID` is
-        // direct-written inline at the xref-stream dict's sorted `/ID` position;
+        // keeps Stream form even with no surviving ObjStm batches. The
+        // deterministic `/ID` is direct-written inline at the xref-stream dict's
+        // sorted `/ID` position;
         // qpdf does not byte-match xref-stream form here, but the identifier must
         // be self-stable and `/ID[1]` must equal the two-level reconstruction.
         let fixture = build_xref_stream_fixture();
@@ -7918,15 +7475,9 @@ mod tests {
 
     #[test]
     fn write_pdf_full_rewrite_generate_mode_still_injects_extensions_adbe() {
-        // Regression for the write_pdf_generate dispatch race: the generate
-        // emitter (--object-streams=generate on an unencrypted, non-QDF full
-        // rewrite) branches out of write_pdf_full_rewrite before the Catalog
-        // renumber walk. The ADBE injection must fire BEFORE the dispatch so
-        // that the generate emitter sees the mutated Catalog. Without this the
-        // /Extensions dictionary would be silently missing from generate-mode
-        // output. Generate mode packs the Catalog into a FlateDecoded object
-        // stream, so we verify structurally by re-opening the output and
-        // asking for adobe_extension_level() rather than grepping raw bytes.
+        // The output-only ADBE mutation must happen before the shared plain plan
+        // snapshots and renumbers the Catalog. Generate packs the Catalog into a
+        // FlateDecoded object stream, so verify structurally after reopening.
         let src = build_ext_injection_source();
         let options = WriteOptions {
             full_rewrite: true,

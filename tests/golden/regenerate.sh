@@ -2482,6 +2482,14 @@ echo "three-page-objstm/preserve.pdf"
 # plain content streams with the ObjStm container; the no-stream fixtures isolate
 # the numbering.
 qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/one-page.pdf" "$REF/one-page/generate.pdf"
+echo "one-page/generate.pdf"
+
+qpdf --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/two-page.pdf" "$REF/two-page/generate.pdf"
+echo "two-page/generate.pdf"
+
+qpdf --object-streams=generate --static-id --warning-exit-0 \
     "$FIX/three-page.pdf" "$REF/three-page/generate.pdf"
 echo "three-page/generate.pdf"
 
