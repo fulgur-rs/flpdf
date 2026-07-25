@@ -9,6 +9,9 @@ pub struct PdfVersion {
     extension_level: i64,
 }
 
+pub(crate) const PDF_1_2: PdfVersion = PdfVersion::new(1, 2, 0);
+pub(crate) const PDF_1_5: PdfVersion = PdfVersion::new(1, 5, 0);
+
 impl PdfVersion {
     /// Creates a PDF version value.
     pub const fn new(major: u8, minor: u8, extension_level: i64) -> Self {

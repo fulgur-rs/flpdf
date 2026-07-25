@@ -13,14 +13,11 @@ use serialize::{
 };
 
 use crate::parser::Parser;
-use crate::pdf_version::{parse_pdf_version, PdfVersion};
+use crate::pdf_version::{parse_pdf_version, PdfVersion, PDF_1_2, PDF_1_5};
 use crate::tokenizer::Tokenizer;
 use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefForm, XrefOffset};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, Write};
-
-const PDF_1_2: PdfVersion = PdfVersion::new(1, 2, 0);
-const PDF_1_5: PdfVersion = PdfVersion::new(1, 5, 0);
 
 /// Controls whether the full-rewrite path applies FlateDecode compression to
 /// output streams.

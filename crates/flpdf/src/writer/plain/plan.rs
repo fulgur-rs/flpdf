@@ -3,13 +3,11 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek};
 
-use crate::pdf_version::{parse_pdf_version, PdfVersion};
+use crate::pdf_version::{parse_pdf_version, PDF_1_5};
 use crate::rewrite_renumber::{CatalogFirstRenumber, GenerateRenumber, NewNumberLookup};
 use crate::writer::object_streams::{self, ObjectStreamMode};
 use crate::writer::plain::xref::{IdPlan, TrailerPlan};
 use crate::{CompressStreams, Object, ObjectRef, Pdf, WriteOptions, XrefForm, XrefOffset};
-
-const PDF_1_5: PdfVersion = PdfVersion::new(1, 5, 0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlannedMember {
