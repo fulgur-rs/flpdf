@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 
-pub(crate) use crate::tokenizer::{is_delimiter, is_ws};
-use crate::tokenizer::{Token, TokenType, Tokenizer};
+use crate::tokenizer::{is_delimiter, is_ws, Token, TokenType, Tokenizer};
 use crate::{Dictionary, Error, Object, ObjectRef, Result};
 
 /// Parse a single PDF object from `input`, which must contain nothing but
@@ -210,13 +209,7 @@ impl<'a> Parser<'a> {
                 return Ok(Object::Dictionary(dict));
             }
             if token.token_type != TokenType::Name {
-                return Err(Error::parse(
-                    token.start,
-                    match token.token_type {
-                        TokenType::Eof => "unexpected EOF in dictionary",
-                        _ => "expected dictionary key",
-                    },
-                ));
+                return Err(Error::parse(token.start, "expected byte 47"));
             }
             let key = token.value.as_ref()[1..].to_vec();
             let value = self.object()?;
@@ -307,36 +300,6 @@ impl<'a> Parser<'a> {
         } else {
             Ok(())
         }
-    }
-
-    // Transitional wrappers for the ObjStm and file-object lexical callers.
-    // Task 3 routes those callers directly through `Tokenizer` and removes
-    // these parser-owned forwarding methods.
-    pub(crate) fn integer_for_indirect(&mut self) -> Result<i64> {
-        if let Some(token) = self.buffered.pop_front() {
-            parse_integer_token(&token)
-        } else {
-            self.tokenizer.next_integer()
-        }
-    }
-
-    pub(crate) fn expect_keyword_for_indirect(&mut self, keyword: &[u8]) -> Result<()> {
-        if let Some(token) = self.buffered.pop_front() {
-            if token.token_type == TokenType::Word && token.value.as_ref() == keyword {
-                Ok(())
-            } else {
-                Err(Error::parse(
-                    token.start,
-                    "expected indirect object keyword",
-                ))
-            }
-        } else {
-            self.tokenizer.expect_word(keyword)
-        }
-    }
-
-    pub(crate) fn skip_ws(&mut self) {
-        let _ = self.skip_ignorable();
     }
 }
 

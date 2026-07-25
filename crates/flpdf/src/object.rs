@@ -556,7 +556,7 @@ fn real_literal_is_safe(literal: &[u8], value: f64) -> bool {
 /// bytes pass through unchanged.
 ///
 /// `Object::Name` always holds *decoded* bytes (the parser unescapes
-/// `#XX` on read — see `Parser::name`), so escaping on write keeps the
+/// `#XX` on read — see the object tokenizer), so escaping on write keeps the
 /// read/write pair symmetric: `Name(b"application/pdf")` serializes to
 /// `/application#2fpdf` and round-trips back to `application/pdf`.
 /// Conventional names (`Type`, `Page`, `FlateDecode`, …) contain no

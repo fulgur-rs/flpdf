@@ -34,7 +34,8 @@ use std::io::{Read, Seek};
 
 use crate::acroform_document_helper::{collect_reachable_refs, collect_refs_in_object};
 use crate::overlay_appearance_stream::adjust_appearance_stream;
-use crate::parser::{is_delimiter, is_ws, Parser};
+use crate::parser::Parser;
+use crate::tokenizer::{is_delimiter, is_ws};
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 
 /// Bound field-tree /Parent walks (widget → top-level field). Mirrors the

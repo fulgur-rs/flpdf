@@ -1,7 +1,8 @@
 use crate::parser::{
-    is_ws, keyword_token_end, parse_qpdf_direct_object, parse_strict_direct_object,
-    ParsedDirectObject, Parser, RecoveredStreamEol,
+    keyword_token_end, parse_qpdf_direct_object, parse_strict_direct_object, ParsedDirectObject,
+    RecoveredStreamEol,
 };
+use crate::tokenizer::{is_ws, Tokenizer};
 use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,12 +149,12 @@ fn parse_file_object_syntax_impl(
     input: &[u8],
     parse_direct: fn(&[u8]) -> Result<ParsedDirectObject>,
 ) -> Result<PendingFileObject> {
-    let mut header = Parser::new(input);
-    let number = header.integer_for_indirect()?;
-    let generation = header.integer_for_indirect()?;
-    header.expect_keyword_for_indirect(b"obj")?;
-    header.skip_ws();
-    let body_start = header.position();
+    let mut tokenizer = Tokenizer::new(input);
+    let number = tokenizer.next_integer()?;
+    let generation = tokenizer.next_integer()?;
+    tokenizer.expect_word(b"obj")?;
+    tokenizer.skip_ignorable()?;
+    let body_start = tokenizer.position();
     let parsed =
         parse_direct(&input[body_start..]).map_err(|error| error.rebase_offset(body_start))?;
     let object_ref = ObjectRef::new(

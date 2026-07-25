@@ -7,7 +7,7 @@ use self::file_object::{
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
-use crate::parser::{parse_qpdf_file_object, Parser};
+use crate::parser::parse_qpdf_file_object;
 use crate::security::password::{normalize_password, PasswordMode};
 use crate::security::standard::{
     check_owner_password, check_owner_password_r5, check_owner_password_r6,
@@ -15,6 +15,7 @@ use crate::security::standard::{
     check_user_password_v4, decrypt_cipher_bytes, decrypt_strings_in_object, per_object_key,
     ObjectKeyAlg, StandardHandlerInputs, StandardHandlerR5Inputs, StringCipher,
 };
+use crate::tokenizer::Tokenizer;
 use crate::xref::load_xref_state_with_repair;
 use crate::{
     Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, Result, XrefForm, XrefOffset,
@@ -1942,17 +1943,13 @@ pub(crate) fn parse_object_stream_entry(
     let first = usize::try_from(stream_data_first)
         .map_err(|_| Error::parse(0, "Object stream /First does not fit usize"))?;
 
-    let mut header_parser = Parser::new(&stream_data);
+    let mut tokenizer = Tokenizer::new(&stream_data);
     let mut object_offsets = Vec::with_capacity(object_count);
     for _ in 0..object_count {
-        let _object_number = parse_non_negative_u64(
-            header_parser.integer_for_indirect()?,
-            "object stream object number",
-        )?;
-        let object_offset = parse_non_negative_u64(
-            header_parser.integer_for_indirect()?,
-            "object stream object offset",
-        )?;
+        let _object_number =
+            parse_non_negative_u64(tokenizer.next_integer()?, "object stream object number")?;
+        let object_offset =
+            parse_non_negative_u64(tokenizer.next_integer()?, "object stream object offset")?;
         object_offsets.push(object_offset);
     }
 

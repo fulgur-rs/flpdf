@@ -28,7 +28,8 @@
 //! }
 //! ```
 
-use crate::parser::{is_delimiter, is_ws, Parser};
+use crate::parser::Parser;
+use crate::tokenizer::{is_delimiter, is_ws};
 use crate::{Dictionary, Error, Object, Result};
 
 /// One lexical unit of a content stream.

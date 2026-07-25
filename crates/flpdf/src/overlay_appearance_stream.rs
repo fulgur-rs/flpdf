@@ -24,7 +24,8 @@
 use std::io::{Read, Seek};
 
 use crate::overlay_annotations::DrMap;
-use crate::parser::{is_delimiter, is_ws, Parser};
+use crate::parser::Parser;
+use crate::tokenizer::{is_delimiter, is_ws};
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
 
 /// Resource category for a content-stream operator that consumes a resource
