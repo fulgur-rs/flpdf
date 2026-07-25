@@ -38,6 +38,7 @@ fn rewrite_qpdf_equivalent(fixture: &str) -> Vec<u8> {
 
     let mut opts = WriteOptions::default();
     opts.full_rewrite = true;
+    opts.object_streams = ObjectStreamMode::Disable;
     opts.static_id = true;
     // qpdf's default output writes no newline before endstream.
     opts.newline_before_endstream = NewlineBeforeEndstream::Never;

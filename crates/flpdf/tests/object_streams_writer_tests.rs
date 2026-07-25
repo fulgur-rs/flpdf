@@ -216,6 +216,33 @@ fn roundtrip_disable_mode_emits_no_objstm() {
     }
 }
 
+#[test]
+fn disable_plan_failure_leaves_caller_writer_untouched() {
+    let mut source = build_xref_table_pdf();
+    let root_entry = b"/Root 1 0 R";
+    let offset = source
+        .windows(root_entry.len())
+        .position(|window| window == root_entry)
+        .expect("fixture trailer must contain /Root");
+    source[offset..offset + root_entry.len()].fill(b' ');
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Disable;
+    let mut output = b"caller-prefix".to_vec();
+
+    let error = write_pdf_with_options(&mut pdf, &mut output, &options).unwrap_err();
+
+    assert!(
+        matches!(error, flpdf::Error::Missing("/Root")),
+        "expected the plain planner's missing-root error, got {error:?}"
+    );
+    assert_eq!(
+        output, b"caller-prefix",
+        "planning failure must not write any bytes to the caller's writer"
+    );
+}
+
 // ── c. Generate mode packs eligible objects ───────────────────────────────────
 
 #[test]

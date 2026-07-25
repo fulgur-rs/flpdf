@@ -1,7 +1,7 @@
 #[path = "writer/object_streams.rs"]
 pub(crate) mod object_streams;
 #[path = "writer/plain/mod.rs"]
-#[allow(dead_code)] // Wired into production by the later plain-writer routing layer.
+#[allow(dead_code)] // Preserve/Generate production routing lands in later layers.
 pub(crate) mod plain;
 #[path = "writer/serialize.rs"]
 pub(crate) mod serialize;
@@ -3194,6 +3194,14 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             // developer prefixes intact.
             strip_adbe_extension(pdf)?;
         }
+    }
+
+    if plain::eligible(
+        pdf.encryption_ref().is_some(),
+        options,
+        options.object_streams,
+    ) {
+        return plain::write_plain(pdf, out, options);
     }
 
     // Non-linearized --object-streams=generate is byte-identical to qpdf only
@@ -7592,6 +7600,7 @@ mod tests {
         let src = build_ext_injection_source();
         let options = WriteOptions {
             full_rewrite: true,
+            object_streams: ObjectStreamMode::Disable,
             static_id: true,
             min_version: Some("1.7".into()),
             min_extension_level: Some(8),
@@ -7692,6 +7701,7 @@ mod tests {
 
         let options = WriteOptions {
             full_rewrite: true,
+            object_streams: ObjectStreamMode::Disable,
             static_id: true,
             min_version: Some("1.7".into()),
             min_extension_level: Some(8),
@@ -7750,6 +7760,7 @@ mod tests {
 
         let options = WriteOptions {
             full_rewrite: true,
+            object_streams: ObjectStreamMode::Disable,
             static_id: true,
             min_version: Some("1.7".into()),
             min_extension_level: Some(8),
@@ -7973,6 +7984,7 @@ mod tests {
 
         let options = WriteOptions {
             full_rewrite: true,
+            object_streams: ObjectStreamMode::Disable,
             static_id: true,
             min_version: Some("1.7".into()),
             min_extension_level: Some(8),
@@ -8025,6 +8037,7 @@ mod tests {
 
         let options = WriteOptions {
             full_rewrite: true,
+            object_streams: ObjectStreamMode::Disable,
             static_id: true,
             min_version: Some("1.7".into()),
             min_extension_level: Some(8),
@@ -8060,6 +8073,7 @@ mod tests {
 
         let options = WriteOptions {
             full_rewrite: true,
+            object_streams: ObjectStreamMode::Disable,
             static_id: true,
             min_version: Some("1.7".into()),
             min_extension_level: Some(8),
