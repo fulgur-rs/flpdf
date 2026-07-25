@@ -3000,6 +3000,32 @@ mod tests {
     }
 
     #[test]
+    fn qpdf_reader_reports_recoverable_name_warning_once() {
+        let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n/a#1x\nendobj\n"], ObjectRef::new(1, 0));
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stray-name fixture");
+        let object_ref = ObjectRef::new(1, 0);
+
+        assert_eq!(
+            pdf.resolve(object_ref).expect("recover stray name"),
+            Object::Name(b"a\0\x31x".to_vec())
+        );
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["(object 1 0, offset 17): name with stray # will not work with PDF >= 1.2"]
+        );
+
+        assert_eq!(
+            pdf.resolve(object_ref).unwrap(),
+            Object::Name(b"a\0\x31x".to_vec())
+        );
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
+    }
+
+    #[test]
     fn qpdf_reader_restores_target_cache_after_length_holder_io_error() {
         let bytes =
             recovered_stream_fixture(b"/Length 2 0 R", b"\n", Some(b"2 0 obj\n3\nendobj\n"));

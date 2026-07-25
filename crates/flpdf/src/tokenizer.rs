@@ -439,6 +439,14 @@ pub(crate) fn is_delimiter(byte: u8) -> bool {
     )
 }
 
+pub(crate) fn starts_number_token(input: &[u8]) -> bool {
+    let mut tokenizer = Tokenizer::new(input);
+    matches!(
+        tokenizer.next_token().token_type,
+        TokenType::Integer | TokenType::Real
+    )
+}
+
 fn token_description(token: &Token<'_>) -> String {
     if token.token_type == TokenType::Eof {
         "EOF".into()

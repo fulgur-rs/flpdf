@@ -69,6 +69,7 @@ pub(crate) enum FileObjectDiagnosticKind {
     RecoveredStreamLength { length: usize },
     EmptyRecoveredStream,
     ExpectedEndobj,
+    TokenizerWarning { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,16 +162,30 @@ fn parse_file_object_syntax_impl(
         u32::try_from(number).map_err(|_| Error::parse(0, "invalid indirect object number"))?,
         u16::try_from(generation).map_err(|_| Error::parse(0, "invalid indirect generation"))?,
     );
-    let next_offset = body_start + parsed.next_offset;
-    let mut diagnostics = Vec::new();
-    if let Some(empty_offset) = parsed.empty_offset {
+    let ParsedDirectObject {
+        object,
+        next_offset,
+        empty_offset,
+        diagnostics: parser_diagnostics,
+    } = parsed;
+    let next_offset = body_start + next_offset;
+    let mut diagnostics = parser_diagnostics
+        .into_iter()
+        .map(|diagnostic| FileObjectDiagnostic {
+            kind: FileObjectDiagnosticKind::TokenizerWarning {
+                message: diagnostic.message,
+            },
+            relative_offset: body_start + diagnostic.relative_offset,
+        })
+        .collect::<Vec<_>>();
+    if let Some(empty_offset) = empty_offset {
         diagnostics.push(FileObjectDiagnostic {
             kind: FileObjectDiagnosticKind::EmptyObject,
             relative_offset: body_start + empty_offset,
         });
     }
 
-    if let Object::Dictionary(dict) = parsed.object {
+    if let Object::Dictionary(dict) = object {
         let stream_pos = skip_pdf_ws(input, next_offset);
         if let Some(after_stream) = keyword_token_end(input, stream_pos, b"stream") {
             let (data_start, start_eol) = consume_stream_start_eol(input, after_stream);
@@ -209,7 +224,7 @@ fn parse_file_object_syntax_impl(
     Ok(PendingFileObject {
         object_ref,
         body: PendingBody::Direct {
-            object: parsed.object,
+            object,
             next_offset,
         },
         diagnostics,
@@ -224,6 +239,7 @@ pub(crate) fn finish_strict_direct_object(
         object,
         next_offset,
         empty_offset,
+        diagnostics: _,
     } = parsed;
     debug_assert!(empty_offset.is_none());
 
@@ -608,6 +624,7 @@ impl FileObjectDiagnosticKind {
                 "unable to recover stream data; treating stream as empty".into()
             }
             Self::ExpectedEndobj => "expected endobj".into(),
+            Self::TokenizerWarning { message } => message.clone(),
         }
     }
 }

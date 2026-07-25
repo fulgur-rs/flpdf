@@ -64,6 +64,13 @@ pub(crate) struct ParsedDirectObject {
     pub(crate) object: Object,
     pub(crate) next_offset: usize,
     pub(crate) empty_offset: Option<usize>,
+    pub(crate) diagnostics: Vec<ParserDiagnostic>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ParserDiagnostic {
+    pub(crate) relative_offset: usize,
+    pub(crate) message: String,
 }
 
 pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObject> {
@@ -76,6 +83,7 @@ pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObjec
             object: Object::Null,
             next_offset: empty_offset,
             empty_offset: Some(empty_offset),
+            diagnostics: parser.diagnostics,
         });
     }
 
@@ -85,6 +93,7 @@ pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObjec
         object,
         next_offset: parser.position(),
         empty_offset: None,
+        diagnostics: parser.diagnostics,
     })
 }
 
@@ -96,6 +105,7 @@ pub(crate) fn parse_strict_direct_object(input: &[u8]) -> Result<ParsedDirectObj
         object,
         next_offset: parser.position(),
         empty_offset: None,
+        diagnostics: parser.diagnostics,
     })
 }
 
@@ -115,6 +125,7 @@ pub(crate) struct Parser<'a> {
     /// Current object-nesting recursion depth, maintained by [`object`](Self::object)
     /// to bound recursion against adversarially deep input.
     depth: usize,
+    diagnostics: Vec<ParserDiagnostic>,
 }
 
 // Maximum object-nesting depth the recursive-descent parser will accept before
@@ -133,6 +144,7 @@ impl<'a> Parser<'a> {
             no_reference: false,
             top_level_no_reference: false,
             depth: 0,
+            diagnostics: Vec::new(),
         }
     }
 
@@ -145,6 +157,7 @@ impl<'a> Parser<'a> {
             no_reference: true,
             top_level_no_reference: false,
             depth: 0,
+            diagnostics: Vec::new(),
         }
     }
 
@@ -279,9 +292,19 @@ impl<'a> Parser<'a> {
     }
 
     fn next_token(&mut self) -> Token<'a> {
-        self.buffered
-            .pop_front()
-            .unwrap_or_else(|| self.tokenizer.next_token())
+        if let Some(token) = self.buffered.pop_front() {
+            return token;
+        }
+        let token = self.tokenizer.next_token();
+        if token.token_type != TokenType::Bad {
+            if let Some(message) = token.error_message.clone() {
+                self.diagnostics.push(ParserDiagnostic {
+                    relative_offset: token.start,
+                    message,
+                });
+            }
+        }
+        token
     }
 
     fn unread_token(&mut self, token: Token<'a>) {
