@@ -217,7 +217,7 @@ fn roundtrip_disable_mode_emits_no_objstm() {
 }
 
 #[test]
-fn disable_plan_failure_leaves_caller_writer_untouched() {
+fn plain_plan_failure_leaves_caller_writer_untouched() {
     let mut source = build_xref_table_pdf();
     let root_entry = b"/Root 1 0 R";
     let offset = source
@@ -225,22 +225,121 @@ fn disable_plan_failure_leaves_caller_writer_untouched() {
         .position(|window| window == root_entry)
         .expect("fixture trailer must contain /Root");
     source[offset..offset + root_entry.len()].fill(b' ');
+    for mode in [ObjectStreamMode::Disable, ObjectStreamMode::Preserve] {
+        let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
+        let mut options = WriteOptions::default();
+        options.full_rewrite = true;
+        options.object_streams = mode;
+        let mut output = b"caller-prefix".to_vec();
+
+        let error = write_pdf_with_options(&mut pdf, &mut output, &options).unwrap_err();
+
+        assert!(
+            matches!(error, flpdf::Error::Missing("/Root")),
+            "expected the plain planner's missing-root error, got {error:?}"
+        );
+        assert_eq!(
+            output, b"caller-prefix",
+            "planning failure must not write any bytes to the caller's writer"
+        );
+    }
+}
+
+#[test]
+fn preserve_empty_surviving_container_uses_table_without_dangling_entries() {
+    let source = build_xref_stream_pdf_with_objstm();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    pdf.delete_object(ObjectRef::new(2, 0));
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
-    options.object_streams = ObjectStreamMode::Disable;
-    let mut output = b"caller-prefix".to_vec();
+    options.object_streams = ObjectStreamMode::Preserve;
 
-    let error = write_pdf_with_options(&mut pdf, &mut output, &options).unwrap_err();
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
     assert!(
-        matches!(error, flpdf::Error::Missing("/Root")),
-        "expected the plain planner's missing-root error, got {error:?}"
+        output
+            .windows(b"\nxref\n".len())
+            .any(|bytes| bytes == b"\nxref\n"),
+        "an empty surviving source container must fall back to a classic xref table"
     );
-    assert_eq!(
-        output, b"caller-prefix",
-        "planning failure must not write any bytes to the caller's writer"
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "rewritten output must be valid: {:?}",
+        report.diagnostics.entries()
     );
+    let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
+    for reference in reopened.object_refs() {
+        assert!(
+            !matches!(
+                reopened.resolve(reference),
+                Ok(Object::Stream(ref stream))
+                    if matches!(stream.dict.get("Type"), Some(Object::Name(name))
+                        if name.as_slice() == b"ObjStm")
+            ),
+            "an empty source container must not be emitted"
+        );
+    }
+    let catalog = reopened.resolve(reopened.root_ref().unwrap()).unwrap();
+    assert!(
+        matches!(catalog, Object::Dictionary(ref dictionary)
+            if dictionary.get("Pages").is_none()),
+        "a dictionary entry that references the deleted source member must disappear"
+    );
+}
+
+#[test]
+fn preserve_explicit_deleted_member_becomes_null_without_dangling_xref() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page-objstm.pdf");
+    let mut pdf = Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+    pdf.delete_object(ObjectRef::new(4, 0));
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Preserve;
+    options.static_id = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let report = check_reader(Cursor::new(&output)).unwrap();
+    assert!(
+        report.valid,
+        "rewritten output must be valid: {:?}",
+        report.diagnostics.entries()
+    );
+    let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
+    let catalog = reopened.resolve(reopened.root_ref().unwrap()).unwrap();
+    let pages_ref = match catalog {
+        Object::Dictionary(dictionary) => match dictionary.get("Pages") {
+            Some(Object::Reference(reference)) => *reference,
+            other => panic!("catalog /Pages must be an indirect reference, got {other:?}"),
+        },
+        other => panic!("catalog must be a dictionary, got {other:?}"),
+    };
+    let pages = reopened.resolve(pages_ref).unwrap();
+    assert!(
+        matches!(pages, Object::Dictionary(ref dictionary)
+            if matches!(dictionary.get("Kids"), Some(Object::Array(kids))
+                if kids.first() == Some(&Object::Null))),
+        "the deleted page's surviving /Kids occurrence must become null"
+    );
+    let mut found_objstm = false;
+    for reference in reopened.object_refs() {
+        let object = reopened
+            .resolve(reference)
+            .unwrap_or_else(|error| panic!("xref entry {reference} must resolve: {error}"));
+        if matches!(
+            object,
+            Object::Stream(ref stream)
+                if matches!(stream.dict.get("Type"), Some(Object::Name(name))
+                    if name.as_slice() == b"ObjStm")
+        ) {
+            found_objstm = true;
+        }
+    }
+    assert!(found_objstm, "surviving source members must keep an ObjStm");
 }
 
 // ── c. Generate mode packs eligible objects ───────────────────────────────────

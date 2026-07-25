@@ -30,6 +30,12 @@ use std::path::Path;
 
 /// Full-rewrite `fixture` with the qpdf-matching option set and return the bytes.
 fn rewrite_qpdf_equivalent(fixture: &str) -> Vec<u8> {
+    rewrite_qpdf_equivalent_mode(fixture, ObjectStreamMode::Disable)
+}
+
+/// Full-rewrite `fixture` with an explicit object-stream mode and the
+/// qpdf-matching option set.
+fn rewrite_qpdf_equivalent_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join(fixture);
@@ -38,7 +44,7 @@ fn rewrite_qpdf_equivalent(fixture: &str) -> Vec<u8> {
 
     let mut opts = WriteOptions::default();
     opts.full_rewrite = true;
-    opts.object_streams = ObjectStreamMode::Disable;
+    opts.object_streams = mode;
     opts.static_id = true;
     // qpdf's default output writes no newline before endstream.
     opts.newline_before_endstream = NewlineBeforeEndstream::Never;
@@ -86,6 +92,11 @@ fn assert_cmp_diff_zero(fixture: &str, stem: &str) {
             &expected[lo..(off + 16).min(expected.len())],
         );
     }
+}
+
+fn assert_cmp_diff_zero_mode_named(fixture: &str, mode: ObjectStreamMode, stem: &str, name: &str) {
+    let actual = rewrite_qpdf_equivalent_mode(fixture, mode);
+    assert_cmp_diff_zero_named(&actual, stem, name);
 }
 
 /// Full-rewrite `fixture` with an explicit object-stream `mode` + forced version
@@ -198,6 +209,34 @@ fn two_page_plain_rewrite_is_byte_identical_to_qpdf_static_id() {
 #[test]
 fn three_page_plain_rewrite_is_byte_identical_to_qpdf_static_id() {
     assert_cmp_diff_zero("three-page.pdf", "three-page");
+}
+
+#[test]
+fn preserve_object_stream_mode_is_byte_identical_to_qpdf_static_id_matrix() {
+    let cases = [
+        ("one-page.pdf", "one-page", "static-id.pdf"),
+        ("two-page.pdf", "two-page", "static-id.pdf"),
+        ("three-page.pdf", "three-page", "static-id.pdf"),
+        ("three-page-objstm.pdf", "three-page-objstm", "preserve.pdf"),
+        (
+            "objstm-lin-od-indirect-length.pdf",
+            "objstm-lin-od-indirect-length",
+            "static-id.pdf",
+        ),
+        (
+            "objstm-lin-od-indirect-length-flate.pdf",
+            "objstm-lin-od-indirect-length-flate",
+            "static-id.pdf",
+        ),
+        (
+            "kept-indirect-length.pdf",
+            "kept-indirect-length",
+            "static-id.pdf",
+        ),
+    ];
+    for (fixture, stem, name) in cases {
+        assert_cmp_diff_zero_mode_named(fixture, ObjectStreamMode::Preserve, stem, name);
+    }
 }
 
 #[test]

@@ -3222,29 +3222,6 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     {
         return write_pdf_generate(pdf, out, options);
     }
-    if matches!(options.object_streams, ObjectStreamMode::Preserve)
-        && options.encrypt.is_none()
-        && options.copy_encryption.is_none()
-        && !options.qdf
-        && pdf.encryption_ref().is_none()
-        && pdf.deleted_object_refs().is_empty()
-    {
-        let source_had_compressed_objects = pdf
-            .source_xref_entries()
-            .iter()
-            .any(|(_reference, offset)| matches!(offset, XrefOffset::Compressed { .. }));
-        let plan = object_streams::plan_qpdf_preserve_object_streams(pdf)?;
-        if source_had_compressed_objects || !plan.batches.is_empty() {
-            return write_pdf_containerized_qpdf(
-                pdf,
-                out,
-                options,
-                plan.batches,
-                plan.removed_refs,
-            );
-        }
-    }
-
     let Some(root_ref) = pdf.root_ref() else {
         return Err(crate::Error::Missing("/Root"));
     };

@@ -35,7 +35,8 @@ pub(crate) fn eligible(
     options: &WriteOptions,
     mode: ObjectStreamMode,
 ) -> bool {
-    mode == ObjectStreamMode::Disable
+    matches!(mode, ObjectStreamMode::Disable | ObjectStreamMode::Preserve)
+        && mode == options.object_streams
         && !options.qdf
         && options.encrypt.is_none()
         && options.copy_encryption.is_none()
@@ -64,17 +65,8 @@ mod tests {
     }
 
     #[test]
-    fn only_plain_disable_routes_through_the_new_pipeline() {
-        reset_pipeline_calls();
-        write_with(&WriteOptions {
-            full_rewrite: true,
-            object_streams: ObjectStreamMode::Disable,
-            static_id: true,
-            ..WriteOptions::default()
-        });
-        assert_eq!(pipeline_calls(), 1);
-
-        for object_streams in [ObjectStreamMode::Preserve, ObjectStreamMode::Generate] {
+    fn preserve_and_disable_route_through_the_new_pipeline() {
+        for object_streams in [ObjectStreamMode::Disable, ObjectStreamMode::Preserve] {
             reset_pipeline_calls();
             write_with(&WriteOptions {
                 full_rewrite: true,
@@ -82,32 +74,43 @@ mod tests {
                 static_id: true,
                 ..WriteOptions::default()
             });
-            assert_eq!(pipeline_calls(), 0);
+            assert_eq!(pipeline_calls(), 1);
         }
 
         reset_pipeline_calls();
         write_with(&WriteOptions {
             full_rewrite: true,
-            object_streams: ObjectStreamMode::Disable,
-            qdf: true,
+            object_streams: ObjectStreamMode::Generate,
             static_id: true,
             ..WriteOptions::default()
         });
         assert_eq!(pipeline_calls(), 0);
 
-        reset_pipeline_calls();
-        write_with(&WriteOptions {
-            full_rewrite: true,
-            object_streams: ObjectStreamMode::Disable,
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
-                b"user".to_vec(),
-                b"owner".to_vec(),
-            )),
-            static_id: true,
-            static_aes_iv: true,
-            ..WriteOptions::default()
-        });
-        assert_eq!(pipeline_calls(), 0);
+        for object_streams in [ObjectStreamMode::Disable, ObjectStreamMode::Preserve] {
+            reset_pipeline_calls();
+            write_with(&WriteOptions {
+                full_rewrite: true,
+                object_streams,
+                qdf: true,
+                static_id: true,
+                ..WriteOptions::default()
+            });
+            assert_eq!(pipeline_calls(), 0);
+
+            reset_pipeline_calls();
+            write_with(&WriteOptions {
+                full_rewrite: true,
+                object_streams,
+                encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                    b"user".to_vec(),
+                    b"owner".to_vec(),
+                )),
+                static_id: true,
+                static_aes_iv: true,
+                ..WriteOptions::default()
+            });
+            assert_eq!(pipeline_calls(), 0);
+        }
     }
 
     #[test]
@@ -147,23 +150,25 @@ mod tests {
 
     #[test]
     fn eligibility_excludes_copy_and_source_encryption() {
-        let options = WriteOptions {
-            object_streams: ObjectStreamMode::Disable,
-            ..WriteOptions::default()
-        };
-        assert!(eligible(false, &options, ObjectStreamMode::Disable));
-        assert!(!eligible(true, &options, ObjectStreamMode::Disable));
+        for mode in [ObjectStreamMode::Disable, ObjectStreamMode::Preserve] {
+            let options = WriteOptions {
+                object_streams: mode,
+                ..WriteOptions::default()
+            };
+            assert!(eligible(false, &options, mode));
+            assert!(!eligible(true, &options, mode));
 
-        let copy_options = WriteOptions {
-            object_streams: ObjectStreamMode::Disable,
-            copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
-                encrypt_dict: crate::Dictionary::new(),
-                file_key: Vec::new(),
-                id0: Vec::new(),
-                object_key_alg: crate::ObjectKeyAlg::Aes,
-            }),
-            ..WriteOptions::default()
-        };
-        assert!(!eligible(false, &copy_options, ObjectStreamMode::Disable));
+            let copy_options = WriteOptions {
+                object_streams: mode,
+                copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
+                    encrypt_dict: crate::Dictionary::new(),
+                    file_key: Vec::new(),
+                    id0: Vec::new(),
+                    object_key_alg: crate::ObjectKeyAlg::Aes,
+                }),
+                ..WriteOptions::default()
+            };
+            assert!(!eligible(false, &copy_options, mode));
+        }
     }
 }

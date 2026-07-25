@@ -59,10 +59,19 @@ impl PlainWritePlan {
                 placement
             }
             ObjectStreamMode::Preserve => {
-                let packing = object_streams::plan_qpdf_preserve_object_streams(pdf)?;
+                let mut packing = object_streams::plan_qpdf_preserve_object_streams(pdf)?;
+                packing
+                    .removed_refs
+                    .extend(explicitly_removed.iter().copied());
+                for batch in &mut packing.batches {
+                    batch.retain(|member| !packing.removed_refs.contains(member));
+                }
+                packing.batches.retain(|batch| !batch.is_empty());
                 if packing.batches.is_empty() && !source_had_compressed_objects {
                     let renumber = CatalogFirstRenumber::build_qpdf(pdf, true)?;
-                    build_sources_from_catalog_first(renumber)
+                    let mut placement = build_sources_from_catalog_first(renumber);
+                    placement.removed_refs = explicitly_removed;
+                    placement
                 } else {
                     let renumber = GenerateRenumber::build(
                         pdf,
@@ -376,7 +385,7 @@ fn build_container_aware(
     })
 }
 
-fn source_has_compressed_entries<R: Read + Seek>(pdf: &Pdf<R>) -> bool {
+pub(crate) fn source_has_compressed_entries<R: Read + Seek>(pdf: &Pdf<R>) -> bool {
     pdf.source_xref_entries()
         .values()
         .any(|offset| matches!(offset, XrefOffset::Compressed { .. }))
@@ -886,14 +895,72 @@ mod tests {
     }
 
     #[test]
-    fn preserve_plan_keeps_source_objstm_members_together() {
+    fn preserve_source_objstm_members_keep_one_container_and_indices() {
         let plan = build("three-page-objstm.pdf", ObjectStreamMode::Preserve);
-        assert!(plan.objects.iter().any(
-            |object| matches!(object, PlannedIndirectObject::ObjectStream { members, .. }
-                if !members.is_empty())
-        ));
+        let containers: Vec<_> = plan
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                PlannedIndirectObject::ObjectStream { output, members } => {
+                    Some((*output, members.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(containers.len(), 1);
+        assert!(!containers[0].1.is_empty());
+        for (index, member) in containers[0].1.iter().enumerate() {
+            assert_eq!(member.output.generation, 0);
+            assert_eq!(
+                index as u32,
+                plan.compressed_location(member.output).unwrap().index
+            );
+        }
         assert_eq!(plan.trailer.form, XrefForm::Stream);
         plan.validate().unwrap();
+    }
+
+    #[test]
+    fn preserve_without_source_objstm_uses_catalog_first_sources() {
+        let plan = build("three-page.pdf", ObjectStreamMode::Preserve);
+        assert!(plan
+            .objects
+            .iter()
+            .all(|object| matches!(object, PlannedIndirectObject::Source { .. })));
+    }
+
+    #[test]
+    fn preserve_stale_generation_is_removed_from_membership() {
+        let plan = build(
+            "null-visible-stale-generation-objstm.pdf",
+            ObjectStreamMode::Preserve,
+        );
+        let stale = ObjectRef::new(4, 0);
+        assert!(plan.removed_refs.contains(&stale));
+        assert!(plan.objects.iter().all(|object| match object {
+            PlannedIndirectObject::ObjectStream { members, .. } =>
+                members.iter().all(|member| member.source != stale),
+            PlannedIndirectObject::Source { source, .. } => *source != stale,
+        }));
+    }
+
+    #[test]
+    fn preserve_explicit_deletion_is_removed_from_membership() {
+        let path = fixture_path("three-page-objstm.pdf");
+        let mut pdf =
+            Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+        let deleted = ObjectRef::new(4, 0);
+        pdf.delete_object(deleted);
+
+        let plan =
+            PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Preserve)).unwrap();
+
+        assert!(plan.removed_refs.contains(&deleted));
+        assert!(plan.objects.iter().all(|object| match object {
+            PlannedIndirectObject::ObjectStream { members, .. } =>
+                members.iter().all(|member| member.source != deleted),
+            PlannedIndirectObject::Source { source, .. } => *source != deleted,
+        }));
     }
 
     #[test]
