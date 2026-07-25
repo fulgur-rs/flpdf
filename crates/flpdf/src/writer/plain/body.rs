@@ -28,11 +28,14 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
     for planned in &plan.objects {
         match planned {
             PlannedIndirectObject::Source { source, output } => {
+                let mut object = pdf.resolve(*source)?;
+                if crate::writer::is_source_structural_container(&object) {
+                    continue;
+                }
                 let offset = bytes.len();
                 bytes.extend_from_slice(
                     format!("{} {} obj\n", output.number, output.generation).as_bytes(),
                 );
-                let mut object = pdf.resolve(*source)?;
                 renumber_qpdf_refs_in_place_with_removed(
                     pdf,
                     &mut object,
@@ -113,7 +116,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::writer::plain::plan::PlannedIndirectObject;
-    use crate::{NewlineBeforeEndstream, ObjectStreamMode};
+    use crate::{NewlineBeforeEndstream, ObjectRef, ObjectStreamMode};
 
     #[test]
     fn disable_emission_records_every_planned_source_offset() {
@@ -202,6 +205,30 @@ mod tests {
 
         assert!(matches!(error, crate::Error::Unsupported(ref message)
             if message.contains("reference 2 0 R absent from renumber map")));
+    }
+
+    #[test]
+    fn disable_emission_does_not_serialize_reachable_source_objstm_container() {
+        let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page-objstm.pdf");
+        let mut pdf = Pdf::open_mem(fixture).unwrap();
+        let root = pdf.root_ref().unwrap();
+        let mut catalog = pdf.resolve(root).unwrap().into_dict().unwrap();
+        let source_objstm = ObjectRef::new(1, 0);
+        catalog.insert("ReachableStructural", Object::Reference(source_objstm));
+        pdf.set_object(root, Object::Dictionary(catalog));
+        let options = WriteOptions {
+            object_streams: ObjectStreamMode::Disable,
+            ..WriteOptions::default()
+        };
+        let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
+        let output_objstm = plan.new_for_original(source_objstm).unwrap();
+
+        let (bytes, layout) = emit_bodies(&mut pdf, &options, &plan).unwrap();
+
+        assert!(!layout.uncompressed.contains_key(&output_objstm.number));
+        assert!(!bytes
+            .windows(b"/Type /ObjStm".len())
+            .any(|window| window == b"/Type /ObjStm"));
     }
 
     #[test]

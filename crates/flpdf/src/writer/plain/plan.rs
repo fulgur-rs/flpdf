@@ -47,11 +47,16 @@ impl PlainWritePlan {
     ) -> crate::Result<Self> {
         let source_root = pdf.root_ref().ok_or(crate::Error::Missing("/Root"))?;
         let source_had_compressed_objects = source_has_compressed_entries(pdf);
+        let explicitly_removed: BTreeSet<ObjectRef> =
+            pdf.deleted_object_refs().into_iter().collect();
 
         let placement = match options.object_streams {
             ObjectStreamMode::Disable => {
-                let renumber = CatalogFirstRenumber::build_qpdf(pdf, true)?;
-                build_sources_from_catalog_first(renumber)
+                let renumber =
+                    CatalogFirstRenumber::build_qpdf_excluding(pdf, true, &explicitly_removed)?;
+                let mut placement = build_sources_from_catalog_first(renumber);
+                placement.removed_refs = explicitly_removed;
+                placement
             }
             ObjectStreamMode::Preserve => {
                 let packing = object_streams::plan_qpdf_preserve_object_streams(pdf)?;
@@ -859,6 +864,26 @@ mod tests {
 
         assert_eq!(plan.version, "1.4");
         assert_eq!(plan.trailer.form, XrefForm::Table);
+    }
+
+    #[test]
+    fn disable_explicit_deletion_is_excluded_before_placement() {
+        let path = fixture_path("null-visible-matrix.pdf");
+        let mut pdf =
+            Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+        let deleted = ObjectRef::new(5, 0);
+        pdf.delete_object(deleted);
+
+        let plan =
+            PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap();
+
+        assert!(plan.removed_refs.contains(&deleted));
+        assert!(!plan.old_to_new.contains_key(&deleted));
+        assert!(plan.objects.iter().all(|object| match object {
+            PlannedIndirectObject::Source { source, .. } => *source != deleted,
+            PlannedIndirectObject::ObjectStream { members, .. } =>
+                members.iter().all(|member| member.source != deleted),
+        }));
     }
 
     #[test]
