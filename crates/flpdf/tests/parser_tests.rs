@@ -181,6 +181,11 @@ fn qpdf_exponent_looking_token_is_not_a_real() {
 }
 
 #[test]
+fn unterminated_array_reports_an_error() {
+    assert!(parse_object(b"[1").is_err());
+}
+
+#[test]
 fn dictionary_type_is_exported_for_downstream_code() {
     let dict = Dictionary::new();
     assert_eq!(dict.iter().count(), 0);

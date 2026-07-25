@@ -3410,6 +3410,13 @@ mod tests {
     }
 
     #[test]
+    fn pdf_object_to_json_non_utf8_name_restores_tokenizer_null_marker() {
+        let obj = Object::Name(vec![0, 0xff]);
+        let json = pdf_object_to_json(&obj).unwrap();
+        assert_eq!(json, JsonValue::String("n:/##ff".to_string()));
+    }
+
+    #[test]
     fn pdf_object_to_json_valid_utf8_name_uses_decoded_bytes() {
         // qpdf JSON v2 emits decoded valid UTF-8 name bytes directly. JSON
         // escaping, rather than PDF #xx escaping, protects delimiters.

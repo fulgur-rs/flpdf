@@ -237,24 +237,53 @@ impl<'a> Tokenizer<'a> {
                 continue;
             }
 
-            let first = self.take_byte();
-            let second = self.take_byte();
-            match (first.and_then(hex_value), second.and_then(hex_value)) {
-                (Some(high), Some(low)) => {
-                    let value = (high << 4) | low;
-                    if value == 0 {
-                        bad = true;
-                        error_message
-                            .get_or_insert_with(|| "null character not allowed in name".into());
-                        decoded.extend_from_slice(b"#00");
-                    } else {
-                        decoded.push(value);
-                    }
-                }
-                _ => {
+            loop {
+                let Some(first) = self.take_byte() else {
                     error_message.get_or_insert_with(|| "invalid character in name escape".into());
                     decoded.push(0);
+                    break;
+                };
+                let Some(high) = hex_value(first) else {
+                    error_message.get_or_insert_with(|| "invalid character in name escape".into());
+                    decoded.push(0);
+                    if is_ws(first) || is_delimiter(first) {
+                        self.pos -= 1;
+                    } else if first == b'#' {
+                        continue;
+                    } else {
+                        decoded.push(first);
+                    }
+                    break;
+                };
+                let Some(second) = self.take_byte() else {
+                    error_message.get_or_insert_with(|| "invalid character in name escape".into());
+                    decoded.push(0);
+                    decoded.push(first);
+                    break;
+                };
+                let Some(low) = hex_value(second) else {
+                    error_message.get_or_insert_with(|| "invalid character in name escape".into());
+                    decoded.push(0);
+                    decoded.push(first);
+                    if is_ws(second) || is_delimiter(second) {
+                        self.pos -= 1;
+                    } else if second == b'#' {
+                        continue;
+                    } else {
+                        decoded.push(second);
+                    }
+                    break;
+                };
+                let value = (high << 4) | low;
+                if value == 0 {
+                    bad = true;
+                    error_message
+                        .get_or_insert_with(|| "null character not allowed in name".into());
+                    decoded.extend_from_slice(b"#00");
+                } else {
+                    decoded.push(value);
                 }
+                break;
             }
         }
 
@@ -483,6 +512,55 @@ mod tests {
         assert_eq!(
             comment.error_message.as_deref(),
             Some("EOF while reading token")
+        );
+    }
+
+    #[test]
+    fn unexpected_close_angle_and_literal_escape_edges_are_qpdf_tokens() {
+        let unexpected = Tokenizer::new(b">").next_token();
+        assert_eq!(unexpected.token_type, TokenType::Bad);
+        assert_eq!(unexpected.error_message.as_deref(), Some("unexpected >"));
+
+        let literal = Tokenizer::new(b"(a\\\r\nb\\7x\\q)").next_token();
+        assert_eq!(literal.token_type, TokenType::String);
+        assert_eq!(literal.value.as_ref(), b"ab\x07xq");
+
+        let trailing_escape = Tokenizer::new(b"(abc\\").next_token();
+        assert_eq!(trailing_escape.token_type, TokenType::Bad);
+        assert_eq!(
+            trailing_escape.error_message.as_deref(),
+            Some("EOF while reading token")
+        );
+    }
+
+    #[test]
+    fn name_null_and_stray_hashes_preserve_qpdf_recovery_values() {
+        let null = Tokenizer::new(b"/a#00b").next_token();
+        assert_eq!(null.token_type, TokenType::Bad);
+        assert_eq!(null.value.as_ref(), b"/a#00b");
+        assert_eq!(
+            null.error_message.as_deref(),
+            Some("null character not allowed in name")
+        );
+
+        let stray = Tokenizer::new(b"/a#1x").next_token();
+        assert_eq!(stray.token_type, TokenType::Name);
+        assert_eq!(stray.value.as_ref(), b"/a\0\x31x");
+        assert_eq!(
+            stray.error_message.as_deref(),
+            Some("invalid character in name escape")
+        );
+    }
+
+    #[test]
+    fn empty_number_classification_and_eof_word_description_are_bounded() {
+        assert_eq!(super::classify_number(b""), TokenType::Word);
+
+        let mut tokenizer = Tokenizer::new(b"");
+        let error = tokenizer.expect_word(b"obj").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "parse error at byte 0: expected word obj, found EOF"
         );
     }
 
