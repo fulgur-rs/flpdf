@@ -30,7 +30,7 @@ use crate::page_form_xobject::{page_to_form_xobject, read_page_transform, transf
 use crate::page_object_helper::{PageBox, PageObjectHelper};
 use crate::page_range::PageRange;
 use crate::pages::page_refs;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
+use crate::{Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result, Stream};
 
 /// Whether a source page is drawn beneath (`Underlay`) or above (`Overlay`) the
 /// destination page's own content.
@@ -60,71 +60,6 @@ pub(crate) struct OverlaySource {
     pub annot_template: Option<crate::overlay_annotations::AnnotationCopyTemplate>,
 }
 
-/// Format `v` like qpdf's `QUtil::double_to_string` with five decimal places:
-/// round to `%.5f`, then strip trailing zeros and a trailing `.`.
-///
-/// Examples: `1.0 -> "1"`, `0.0 -> "0"`, `155.5 -> "155.5"`,
-/// `0.181818… -> "0.18182"`, `94.36364 -> "94.36364"`. Negative zero formats as
-/// `"0"` (qpdf normalizes `-0`).
-fn fmt_number(v: f64) -> String {
-    // `%.5f` rounding. `format!("{:.5}", -0.0)` yields "-0.00000", which would
-    // strip to "-0"; normalize the sign so a rounded-to-zero value is "0".
-    let mut s = format!("{v:.5}");
-    if s.starts_with("-0.00000") {
-        s = "0.00000".to_string();
-    }
-    // Strip trailing zeros, then a trailing '.' if the fraction was all zeros.
-    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-    trimmed.to_string()
-}
-
-/// The identity transformation matrix `[1 0 0 1 0 0]`.
-const IDENTITY_MATRIX: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-
-/// Multiply two transformation matrices, mirroring qpdf's `QPDFMatrix::concat`
-/// (`this.concat(other)`) byte-for-byte so the floating-point result matches
-/// qpdf's exactly.
-fn qpdf_concat(this: [f64; 6], other: [f64; 6]) -> [f64; 6] {
-    let [a, b, c, d, e, f] = this;
-    let [oa, ob, oc, od, oe, of] = other;
-    [
-        a * oa + c * ob,
-        b * oa + d * ob,
-        a * oc + c * od,
-        b * oc + d * od,
-        a * oe + c * of + e,
-        b * oe + d * of + f,
-    ]
-}
-
-/// `this.scale(sx, sy)` — qpdf concatenates a scaling matrix on the right.
-fn qpdf_scale(this: [f64; 6], sx: f64, sy: f64) -> [f64; 6] {
-    qpdf_concat(this, [sx, 0.0, 0.0, sy, 0.0, 0.0])
-}
-
-/// `this.translate(tx, ty)` — qpdf concatenates a translation matrix on the right.
-fn qpdf_translate(this: [f64; 6], tx: f64, ty: f64) -> [f64; 6] {
-    qpdf_concat(this, [1.0, 0.0, 0.0, 1.0, tx, ty])
-}
-
-/// Round a matrix component the way qpdf's `QPDFMatrix::unparse` does before
-/// formatting: values in `(-0.00001, 0.00001)` collapse to `0.0`.
-fn fix_rounding(d: f64) -> f64 {
-    if d > -0.00001 && d < 0.00001 {
-        0.0
-    } else {
-        d
-    }
-}
-
-/// Serialize a transformation matrix the way qpdf's `QPDFMatrix::unparse` does:
-/// `fix_rounding` each of the six components, then format with [`fmt_number`]
-/// (qpdf's `QUtil::double_to_string(..., 5)`), space-separated.
-fn matrix_unparse(m: [f64; 6]) -> String {
-    let parts: Vec<String> = m.iter().map(|&x| fmt_number(fix_rounding(x))).collect();
-    parts.join(" ")
-}
-
 /// Compute the placement matrix that lands the Form XObject (`/BBox` `fo_bbox`,
 /// `/Matrix` `fo_matrix`) inside `rect`, mirroring qpdf's
 /// `getMatrixForFormXObjectPlacement` (qpdf 11.9.0) exactly.
@@ -138,27 +73,27 @@ fn matrix_unparse(m: [f64; 6]) -> String {
 /// Returns `None` when the matrix-transformed `/BBox` is degenerate (zero width
 /// or height); the caller substitutes the identity, matching qpdf's `{}`.
 fn matrix_for_form_xobject_placement(
-    fo_bbox: [f64; 4],
-    fo_matrix: [f64; 6],
-    rect: [f64; 4],
-    tmatrix: [f64; 6],
+    fo_bbox: Rectangle,
+    fo_matrix: Matrix,
+    rect: Rectangle,
+    tmatrix: Matrix,
     allow_shrink: bool,
     allow_expand: bool,
-) -> Option<[f64; 6]> {
+) -> Option<Matrix> {
     // wmatrix = I.concat(tmatrix).concat(fmatrix). tmatrix is identity (a no-op)
     // when the dest page has no transform; fmatrix is identity when the fo has no
     // /Matrix — both still concatenated, matching qpdf.
-    let wmatrix = qpdf_concat(qpdf_concat(IDENTITY_MATRIX, tmatrix), fo_matrix);
-    let t = transform_bbox(fo_bbox, wmatrix);
-    let [t_llx, t_lly, t_urx, t_ury] = t;
-    if t_urx == t_llx || t_ury == t_lly {
+    let mut wmatrix = Matrix::default();
+    wmatrix.concat(tmatrix);
+    wmatrix.concat(fo_matrix);
+    let t = wmatrix.transform_rectangle(fo_bbox);
+    if t.urx == t.llx || t.ury == t.lly {
         return None;
     }
-    let [rllx, rlly, rurx, rury] = rect;
-    let rect_w = rurx - rllx;
-    let rect_h = rury - rlly;
-    let t_w = t_urx - t_llx;
-    let t_h = t_ury - t_lly;
+    let rect_w = rect.urx - rect.llx;
+    let rect_h = rect.ury - rect.lly;
+    let t_w = t.urx - t.llx;
+    let t_h = t.ury - t.lly;
     let xscale = rect_w / t_w;
     let yscale = rect_h / t_h;
     let mut scale = if xscale < yscale { xscale } else { yscale };
@@ -171,25 +106,24 @@ fn matrix_for_form_xobject_placement(
     }
 
     // Re-measure the scaled box to find the centring translation.
-    let wmatrix = qpdf_concat(
-        qpdf_concat(qpdf_scale(IDENTITY_MATRIX, scale, scale), tmatrix),
-        fo_matrix,
-    );
-    let t = transform_bbox(fo_bbox, wmatrix);
-    let [t_llx, t_lly, t_urx, t_ury] = t;
-    let t_cx = (t_llx + t_urx) / 2.0;
-    let t_cy = (t_lly + t_ury) / 2.0;
-    let r_cx = (rllx + rurx) / 2.0;
-    let r_cy = (rlly + rury) / 2.0;
+    let mut wmatrix = Matrix::default();
+    wmatrix.scale(scale, scale);
+    wmatrix.concat(tmatrix);
+    wmatrix.concat(fo_matrix);
+    let t = wmatrix.transform_rectangle(fo_bbox);
+    let t_cx = (t.llx + t.urx) / 2.0;
+    let t_cy = (t.lly + t.ury) / 2.0;
+    let r_cx = (rect.llx + rect.urx) / 2.0;
+    let r_cy = (rect.lly + rect.ury) / 2.0;
     let tx = r_cx - t_cx;
     let ty = r_cy - t_cy;
 
     // cm = I.translate(tx, ty).scale(scale, scale).concat(tmatrix). The fmatrix is
     // deliberately absent: the PDF interpreter applies the fo's /Matrix itself.
-    let cm = qpdf_concat(
-        qpdf_scale(qpdf_translate(IDENTITY_MATRIX, tx, ty), scale, scale),
-        tmatrix,
-    );
+    let mut cm = Matrix::default();
+    cm.translate(tx, ty);
+    cm.scale(scale, scale);
+    cm.concat(tmatrix);
     Some(cm)
 }
 
@@ -200,18 +134,18 @@ fn matrix_for_form_xobject_placement(
 ///
 /// Returns `(fragment, cm)`: the fragment is exactly
 /// `"q\n" + cm + " cm\n/" + name + " Do\nQ\n"` (with `cm` formatted by
-/// [`matrix_unparse`]); `cm` is the same six-component matrix used to place the
+/// [`Matrix::unparse`]); `cm` is the same six-component matrix used to place the
 /// XObject. Callers that transform per-placement annotations (qpdf's
 /// `copyAnnotations(from_page, cm, …)`) use the returned `cm` unchanged.
 fn place_form_xobject(
-    fo_bbox: [f64; 4],
-    fo_matrix: [f64; 6],
-    rect: [f64; 4],
-    tmatrix: [f64; 6],
+    fo_bbox: Rectangle,
+    fo_matrix: Matrix,
+    rect: Rectangle,
+    tmatrix: Matrix,
     allow_shrink: bool,
     allow_expand: bool,
     name: &str,
-) -> (String, [f64; 6]) {
+) -> (String, Matrix) {
     let cm = matrix_for_form_xobject_placement(
         fo_bbox,
         fo_matrix,
@@ -220,8 +154,8 @@ fn place_form_xobject(
         allow_shrink,
         allow_expand,
     )
-    .unwrap_or(IDENTITY_MATRIX);
-    let fragment = format!("q\n{} cm\n/{} Do\nQ\n", matrix_unparse(cm), name);
+    .unwrap_or_default();
+    let fragment = format!("q\n{} cm\n/{} Do\nQ\n", cm.unparse(), name);
     (fragment, cm)
 }
 
@@ -296,9 +230,9 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     // output no-op that no byte-gate can isolate. It is kept to reproduce qpdf's
     // computation faithfully, NOT for an observable byte difference (do not "dead
     // code" it away).
-    let [n_llx, n_lly, n_urx, n_ury] = normalize_rectangle(page_box_array(&trim_box));
-    let trim_w = n_urx - n_llx;
-    let trim_h = n_ury - n_lly;
+    let normalized_trim = normalize_rectangle(trim_box);
+    let trim_w = normalized_trim.urx - normalized_trim.llx;
+    let trim_h = normalized_trim.ury - normalized_trim.lly;
     let tmatrix = transformation_matrix(&dest_transform, trim_w, trim_h, true);
 
     // 1. Convert the destination page itself to Form XObject /Fx0.
@@ -344,8 +278,8 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     //    (with +N rename on FQN collision) once at the end.
     // Placement rects mirror qpdf's getTrimBox()/getMediaBox().getArrayAsRectangle()
     // in doUnderOverlayForPage: corners normalized before scaling/centring.
-    let trim_rect = normalize_rectangle(page_box_array(&trim_box));
-    let media_rect = normalize_rectangle(page_box_array(&media_box));
+    let trim_rect = normalize_rectangle(trim_box);
+    let media_rect = normalize_rectangle(media_box);
     let mut content = String::new();
     let mut new_top_fields: Vec<ObjectRef> = Vec::new();
     let mut dest_acroform_dr: Option<ObjectRef> = None;
@@ -964,20 +898,19 @@ fn page_box_or_err<R: Read + Seek>(
     })
 }
 
-/// Convert a [`PageBox`] to the `[llx lly urx ury]` array `place_form_xobject`
-/// consumes.
-fn page_box_array(b: &PageBox) -> [f64; 4] {
-    [b.llx, b.lly, b.urx, b.ury]
-}
-
 /// Normalize a rectangle's corners the way qpdf's
 /// `QPDFObjectHandle::getArrayAsRectangle` does: `llx = min(x0, x2)`,
 /// `lly = min(x1, x3)`, `urx = max(x0, x2)`, `ury = max(x1, x3)`. qpdf reads all
 /// box geometry for placement through this accessor, so a page with a reversed box
 /// (`llx > urx` or `lly > ury`) still yields a non-negative width/height and places
 /// identically to its ordered form.
-fn normalize_rectangle([x0, x1, x2, x3]: [f64; 4]) -> [f64; 4] {
-    [x0.min(x2), x1.min(x3), x0.max(x2), x1.max(x3)]
+fn normalize_rectangle(rectangle: PageBox) -> Rectangle {
+    Rectangle::new(
+        rectangle.llx.min(rectangle.urx),
+        rectangle.lly.min(rectangle.ury),
+        rectangle.llx.max(rectangle.urx),
+        rectangle.lly.max(rectangle.ury),
+    )
 }
 
 /// Coerce a PDF numeric object to `f64`, matching qpdf's numeric coercion
@@ -993,39 +926,18 @@ fn as_f64(o: &Object) -> f64 {
 /// the identity when `/Matrix` is absent or not a 6+ element array. The Form
 /// XObjects built by [`page_to_form_xobject`] always carry a direct `/Matrix`
 /// array, so no indirect-reference resolution is needed here.
-fn matrix_or_identity(dict: &Dictionary) -> [f64; 6] {
+fn matrix_or_identity(dict: &Dictionary) -> Matrix {
     match dict.get("Matrix").and_then(Object::as_array) {
-        Some(m) if m.len() >= 6 => [
+        Some(m) if m.len() >= 6 => Matrix::new(
             as_f64(&m[0]),
             as_f64(&m[1]),
             as_f64(&m[2]),
             as_f64(&m[3]),
             as_f64(&m[4]),
             as_f64(&m[5]),
-        ],
-        _ => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        ),
+        _ => Matrix::default(),
     }
-}
-
-/// Apply PDF matrix `m = [a b c d e f]` to the four corners of `bbox` and return
-/// the axis-aligned bounding rectangle `[llx lly urx ury]` of the result. A
-/// point `(x, y)` maps to `(a*x + c*y + e, b*x + d*y + f)`.
-fn transform_bbox(bbox: [f64; 4], m: [f64; 6]) -> [f64; 4] {
-    let [llx, lly, urx, ury] = bbox;
-    let [a, b, c, d, e, f] = m;
-    let pt = |x: f64, y: f64| (a * x + c * y + e, b * x + d * y + f);
-    let corners = [pt(llx, lly), pt(urx, lly), pt(urx, ury), pt(llx, ury)];
-    let mut min_x = corners[0].0;
-    let mut max_x = corners[0].0;
-    let mut min_y = corners[0].1;
-    let mut max_y = corners[0].1;
-    for &(x, y) in &corners[1..] {
-        min_x = min_x.min(x);
-        max_x = max_x.max(x);
-        min_y = min_y.min(y);
-        max_y = max_y.max(y);
-    }
-    [min_x, min_y, max_x, max_y]
 }
 
 /// Read an imported Form XObject's raw `/BBox` (`[llx lly urx ury]`) and `/Matrix`
@@ -1040,7 +952,7 @@ fn transform_bbox(bbox: [f64; 4], m: [f64; 6]) -> [f64; 4] {
 fn fo_bbox_and_matrix<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     xobject_ref: ObjectRef,
-) -> Result<([f64; 4], [f64; 6])> {
+) -> Result<(Rectangle, Matrix)> {
     let obj = pdf.resolve(xobject_ref)?;
     let dict = match &obj {
         Object::Stream(s) => &s.dict,
@@ -1070,12 +982,12 @@ fn fo_bbox_and_matrix<R: Read + Seek>(
             arr.len()
         )));
     }
-    let bbox = [
+    let bbox = Rectangle::new(
         as_f64(&arr[0]),
         as_f64(&arr[1]),
         as_f64(&arr[2]),
         as_f64(&arr[3]),
-    ];
+    );
     Ok((bbox, matrix))
 }
 
@@ -2236,64 +2148,18 @@ mod byte_gate {
 mod tests {
     use super::*;
 
-    // ---- fmt_number -------------------------------------------------------
-
-    #[test]
-    fn fmt_number_matches_qpdf_double_to_string() {
-        assert_eq!(fmt_number(1.0), "1");
-        assert_eq!(fmt_number(0.0), "0");
-        assert_eq!(fmt_number(155.5), "155.5");
-        assert_eq!(fmt_number(0.181818_1818), "0.18182");
-        assert_eq!(fmt_number(94.363_636_36), "94.36364");
-    }
-
-    #[test]
-    fn fmt_number_normalizes_negative_zero() {
-        assert_eq!(fmt_number(-0.0), "0");
-        // A small negative value that rounds to zero at 5dp also normalizes.
-        assert_eq!(fmt_number(-0.000001), "0");
-    }
-
-    // ---- qpdf matrix primitives ------------------------------------------
-
-    #[test]
-    fn qpdf_concat_matches_qpdf_arithmetic() {
-        // this=[2 0 0 2 0 0] (scale 2) concat other=[1 0 0 1 5 7] (translate):
-        // ap=2; bp=0; cp=0; dp=2; ep=2*5+0*7+0=10; fp=0*5+2*7+0=14.
-        assert_eq!(
-            qpdf_concat(
-                [2.0, 0.0, 0.0, 2.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0, 1.0, 5.0, 7.0]
-            ),
-            [2.0, 0.0, 0.0, 2.0, 10.0, 14.0]
-        );
-    }
-
-    #[test]
-    fn matrix_unparse_applies_fix_rounding_and_trims() {
-        // fix_rounding zeroes a sub-0.00001 component before formatting.
-        assert_eq!(
-            matrix_unparse([0.000_004, 1.0, 0.0, 1.0, 0.0, 0.0]),
-            "0 1 0 1 0 0"
-        );
-        assert_eq!(
-            matrix_unparse([0.772_73, 0.0, 0.0, 0.772_73, 0.0, 159.545_45]),
-            "0.77273 0 0 0.77273 0 159.54545"
-        );
-    }
-
     // ---- place_form_xobject ----------------------------------------------
 
     /// The identity transformation matrix `[1 0 0 1 0 0]`.
-    const ID: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    const ID: Matrix = Matrix::new(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
 
     #[test]
     fn place_identity_when_same_size() {
         // BBox == rect (612x792 at origin), no fo/dest transform -> identity, centred.
         let (frag, _cm) = place_form_xobject(
-            [0.0, 0.0, 612.0, 792.0],
+            [0.0, 0.0, 612.0, 792.0].into(),
             ID,
-            [0.0, 0.0, 612.0, 792.0],
+            [0.0, 0.0, 612.0, 792.0].into(),
             ID,
             true,
             false,
@@ -2307,9 +2173,9 @@ mod tests {
         // 300x144 source into 612x792 dest: no scale-up; centred at
         // tx = 306 - 150 = 156, ty = 396 - 72 = 324.
         let (frag, _cm) = place_form_xobject(
-            [0.0, 0.0, 300.0, 144.0],
+            [0.0, 0.0, 300.0, 144.0].into(),
             ID,
-            [0.0, 0.0, 612.0, 792.0],
+            [0.0, 0.0, 612.0, 792.0].into(),
             ID,
             true,
             false,
@@ -2323,9 +2189,9 @@ mod tests {
         // 612x792 source into 300x144 dest with allow_shrink: scale = min(300/612,
         // 144/792) = 0.18182 (5dp). tx -> "94.36364", ty -> "0".
         let (frag, _cm) = place_form_xobject(
-            [0.0, 0.0, 612.0, 792.0],
+            [0.0, 0.0, 612.0, 792.0].into(),
             ID,
-            [0.0, 0.0, 300.0, 144.0],
+            [0.0, 0.0, 300.0, 144.0].into(),
             ID,
             true,
             false,
@@ -2340,9 +2206,9 @@ mod tests {
         // would-be <1 scale is clamped to 1 and the bbox is centred unscaled.
         // scale 1; t_cx=306, t_cy=396; r_cx=150, r_cy=72; tx=-156, ty=-324.
         let (frag, _cm) = place_form_xobject(
-            [0.0, 0.0, 612.0, 792.0],
+            [0.0, 0.0, 612.0, 792.0].into(),
             ID,
-            [0.0, 0.0, 300.0, 144.0],
+            [0.0, 0.0, 300.0, 144.0].into(),
             ID,
             false,
             false,
@@ -2356,9 +2222,9 @@ mod tests {
         // 301x145 source into 612x792 dest: no scale; tx = 306 - 150.5 = 155.5,
         // ty = 396 - 72.5 = 323.5.
         let (frag, _cm) = place_form_xobject(
-            [0.0, 0.0, 301.0, 145.0],
+            [0.0, 0.0, 301.0, 145.0].into(),
             ID,
-            [0.0, 0.0, 612.0, 792.0],
+            [0.0, 0.0, 612.0, 792.0].into(),
             ID,
             true,
             false,
@@ -2373,9 +2239,9 @@ mod tests {
         // rectangle, so getMatrixForFormXObjectPlacement returns the identity
         // (NOT a centred scale-1 placement). Mirrors qpdf 11.9.0.
         let (frag, _cm) = place_form_xobject(
-            [0.0, 0.0, 0.0, 100.0],
+            [0.0, 0.0, 0.0, 100.0].into(),
             ID,
-            [0.0, 0.0, 200.0, 200.0],
+            [0.0, 0.0, 200.0, 200.0].into(),
             ID,
             true,
             false,
@@ -2390,9 +2256,9 @@ mod tests {
         // BBox [10 10 510 610] -> w=500 h=600 into rect [0 0 612 792].
         // scale = min(612/500, 792/600) -> clamped to 1; tx=46, ty=86.
         let (frag, _cm) = place_form_xobject(
-            [10.0, 10.0, 510.0, 610.0],
+            [10.0, 10.0, 510.0, 610.0].into(),
             ID,
-            [0.0, 0.0, 612.0, 792.0],
+            [0.0, 0.0, 612.0, 792.0].into(),
             ID,
             true,
             false,
@@ -2410,11 +2276,11 @@ mod tests {
         // The resulting cm un-rotates the page: [0 1 -1 0 612 0]. The nonzero b/c
         // (impossible for the old axis-aligned placement) prove the dest inverse
         // transform is folded in.
-        let tmatrix = [0.0, 1.0, -1.0, 0.0, 792.0, 0.0];
+        let tmatrix = Matrix::new(0.0, 1.0, -1.0, 0.0, 792.0, 0.0);
         let (frag, _cm) = place_form_xobject(
-            [0.0, 0.0, 612.0, 792.0],
-            [0.0, -1.0, 1.0, 0.0, 0.0, 612.0],
-            [0.0, 0.0, 612.0, 792.0],
+            [0.0, 0.0, 612.0, 792.0].into(),
+            Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, 612.0),
+            [0.0, 0.0, 612.0, 792.0].into(),
             tmatrix,
             false,
             false,
@@ -2428,12 +2294,12 @@ mod tests {
         // Reversed box [612 792 0 0] -> [0 0 612 792]; an already-ordered box is
         // unchanged (qpdf getArrayAsRectangle = min/max of paired corners).
         assert_eq!(
-            normalize_rectangle([612.0, 792.0, 0.0, 0.0]),
-            [0.0, 0.0, 612.0, 792.0]
+            normalize_rectangle(PageBox::new(612.0, 792.0, 0.0, 0.0)),
+            Rectangle::new(0.0, 0.0, 612.0, 792.0)
         );
         assert_eq!(
-            normalize_rectangle([0.0, 0.0, 612.0, 792.0]),
-            [0.0, 0.0, 612.0, 792.0]
+            normalize_rectangle(PageBox::new(0.0, 0.0, 612.0, 792.0)),
+            Rectangle::new(0.0, 0.0, 612.0, 792.0)
         );
     }
 
@@ -2827,7 +2693,7 @@ mod tests {
         let r = next_object_ref(&pdf).unwrap();
         pdf.set_object(r, Object::Stream(Stream::new(dict, Vec::new())));
         let (bbox, _matrix) = fo_bbox_and_matrix(&mut pdf, r).unwrap();
-        assert_eq!(bbox, [0.0, 1.5, 300.0, 144.0]);
+        assert_eq!(bbox, Rectangle::new(0.0, 1.5, 300.0, 144.0));
     }
 
     #[test]
@@ -2883,8 +2749,8 @@ mod tests {
         let r = next_object_ref(&pdf).unwrap();
         pdf.set_object(r, Object::Dictionary(d));
         let (bbox, matrix) = fo_bbox_and_matrix(&mut pdf, r).unwrap();
-        assert_eq!(bbox, [0.0, 0.0, 10.0, 20.0]);
-        assert_eq!(matrix, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(bbox, Rectangle::new(0.0, 0.0, 10.0, 20.0));
+        assert_eq!(matrix, Matrix::default());
     }
 
     #[test]
@@ -2907,7 +2773,7 @@ mod tests {
         let r = next_object_ref(&pdf).unwrap();
         pdf.set_object(r, Object::Dictionary(d));
         let (bbox, _matrix) = fo_bbox_and_matrix(&mut pdf, r).unwrap();
-        assert_eq!(bbox, [0.0, 0.0, 10.0, 20.0]);
+        assert_eq!(bbox, Rectangle::new(0.0, 0.0, 10.0, 20.0));
     }
 
     #[test]
@@ -2919,26 +2785,6 @@ mod tests {
             page_dictionary(&mut pdf, r),
             Err(Error::Unsupported(_))
         ));
-    }
-
-    #[test]
-    fn transform_bbox_identity_is_unchanged() {
-        let id = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-        assert_eq!(
-            transform_bbox([10.0, 20.0, 300.0, 400.0], id),
-            [10.0, 20.0, 300.0, 400.0]
-        );
-    }
-
-    #[test]
-    fn transform_bbox_rotate_90_swaps_extent() {
-        // qpdf's getMatrixForTransformations for a +90 page is [0 -1 1 0 0 w].
-        // Mapping (x,y) -> (y, w - x) turns a 612x792 box into a 792x612 box.
-        let m90 = [0.0, -1.0, 1.0, 0.0, 0.0, 612.0];
-        assert_eq!(
-            transform_bbox([0.0, 0.0, 612.0, 792.0], m90),
-            [0.0, 0.0, 792.0, 612.0]
-        );
     }
 
     #[test]
@@ -2958,20 +2804,17 @@ mod tests {
         );
         assert_eq!(
             matrix_or_identity(&present),
-            [0.0, -1.0, 1.0, 0.0, 0.0, 612.0]
+            Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, 612.0)
         );
         // Absent /Matrix falls back to the identity.
-        assert_eq!(
-            matrix_or_identity(&Dictionary::new()),
-            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
-        );
+        assert_eq!(matrix_or_identity(&Dictionary::new()), Matrix::default());
         // A /Matrix with fewer than six elements falls back to the identity.
         let mut short = Dictionary::new();
         short.insert(
             "Matrix",
             Object::Array(vec![Object::Integer(1), Object::Integer(0)]),
         );
-        assert_eq!(matrix_or_identity(&short), [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(matrix_or_identity(&short), Matrix::default());
     }
 
     #[test]
@@ -2983,9 +2826,9 @@ mod tests {
         // The fo /Matrix affects scale/translation but does NOT appear in the cm
         // (the PDF interpreter applies it automatically), so b/c stay 0.
         let (frag, _cm) = place_form_xobject(
-            [0.0, 0.0, 612.0, 792.0],
-            [0.0, -1.0, 1.0, 0.0, 0.0, 612.0],
-            [0.0, 0.0, 612.0, 792.0],
+            [0.0, 0.0, 612.0, 792.0].into(),
+            Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, 612.0),
+            [0.0, 0.0, 612.0, 792.0].into(),
             ID,
             true,
             false,
@@ -3023,8 +2866,8 @@ mod tests {
         let r = next_object_ref(&pdf).unwrap();
         pdf.set_object(r, Object::Dictionary(d));
         let (bbox, matrix) = fo_bbox_and_matrix(&mut pdf, r).unwrap();
-        assert_eq!(bbox, [0.0, 0.0, 612.0, 792.0]);
-        assert_eq!(matrix, [0.0, -1.0, 1.0, 0.0, 0.0, 612.0]);
+        assert_eq!(bbox, Rectangle::new(0.0, 0.0, 612.0, 792.0));
+        assert_eq!(matrix, Matrix::new(0.0, -1.0, 1.0, 0.0, 0.0, 612.0));
     }
 
     // ---- map_overlay_pages (pure) ----------------------------------------

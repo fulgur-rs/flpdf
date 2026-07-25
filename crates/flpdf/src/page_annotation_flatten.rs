@@ -35,7 +35,7 @@
 
 use crate::page_annotation_enum::enumerate_page_annotations;
 use crate::pages::{coalesce_page_contents, page_content_bytes, resolve_inherited_resources};
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
+use crate::{Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result, Stream};
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
@@ -89,7 +89,7 @@ pub fn flatten_annotations_on_page<R: Read + Seek>(
     // ── Step 2: for each annotation, decide eligibility and collect data ───
     struct AnnotData {
         xobj_ref: ObjectRef, // the Form XObject to place
-        matrix_a: [f64; 6],  // placement matrix A
+        matrix_a: Matrix,    // placement matrix A
     }
 
     let mut to_flatten: Vec<AnnotData> = Vec::new();
@@ -150,22 +150,11 @@ pub fn flatten_annotations_on_page<R: Read + Seek>(
         };
 
         // Transform the 4 corners of /BBox by /Matrix to get the transformed bbox.
-        let corners = [
-            apply_matrix(ap_matrix, bbox[0], bbox[1]),
-            apply_matrix(ap_matrix, bbox[2], bbox[1]),
-            apply_matrix(ap_matrix, bbox[2], bbox[3]),
-            apply_matrix(ap_matrix, bbox[0], bbox[3]),
-        ];
-        let tx0 = corners.iter().map(|c| c.0).fold(f64::INFINITY, f64::min);
-        let tx1 = corners
-            .iter()
-            .map(|c| c.0)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let ty0 = corners.iter().map(|c| c.1).fold(f64::INFINITY, f64::min);
-        let ty1 = corners
-            .iter()
-            .map(|c| c.1)
-            .fold(f64::NEG_INFINITY, f64::max);
+        let transformed_bbox = ap_matrix.transform_rectangle(bbox);
+        let tx0 = transformed_bbox.llx;
+        let tx1 = transformed_bbox.urx;
+        let ty0 = transformed_bbox.lly;
+        let ty1 = transformed_bbox.ury;
 
         let tw = tx1 - tx0;
         let th = ty1 - ty0;
@@ -178,7 +167,7 @@ pub fn flatten_annotations_on_page<R: Read + Seek>(
         // Compute placement matrix A (PDF 32000-1 §12.5.5 algorithm).
         let sx = (rx1 - rx0) / tw;
         let sy = (ry1 - ry0) / th;
-        let matrix_a = [sx, 0.0, 0.0, sy, rx0 - sx * tx0, ry0 - sy * ty0];
+        let matrix_a = Matrix::new(sx, 0.0, 0.0, sy, rx0 - sx * tx0, ry0 - sy * ty0);
 
         to_flatten.push(AnnotData { xobj_ref, matrix_a });
         to_remove.push(ea.annot_ref);
@@ -229,12 +218,12 @@ pub fn flatten_annotations_on_page<R: Read + Seek>(
         // Build "q {a b c d e f} cm /{name} Do Q\n".
         let cm_line = format!(
             "q\n{} {} {} {} {} {} cm\n/{} Do\nQ\n",
-            fmt_f64(data.matrix_a[0]),
-            fmt_f64(data.matrix_a[1]),
-            fmt_f64(data.matrix_a[2]),
-            fmt_f64(data.matrix_a[3]),
-            fmt_f64(data.matrix_a[4]),
-            fmt_f64(data.matrix_a[5]),
+            fmt_f64(data.matrix_a.a),
+            fmt_f64(data.matrix_a.b),
+            fmt_f64(data.matrix_a.c),
+            fmt_f64(data.matrix_a.d),
+            fmt_f64(data.matrix_a.e),
+            fmt_f64(data.matrix_a.f),
             xobj_name,
         );
         append_bytes.extend_from_slice(cm_line.as_bytes());
@@ -300,12 +289,6 @@ pub fn flatten_annotations<R: Read + Seek>(pdf: &mut Pdf<R>, mode: FlattenMode) 
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
-
-/// Apply a 6-element PDF matrix [a b c d e f] to point (x, y).
-/// Row-vector convention: (a*x + c*y + e, b*x + d*y + f).
-fn apply_matrix(m: [f64; 6], x: f64, y: f64) -> (f64, f64) {
-    (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
-}
 
 /// Format an f64 as a compact, locale-independent PDF number.
 /// Integers are emitted without a decimal point (e.g. `200.0` → `"200"`).
@@ -454,12 +437,12 @@ fn resolve_ap_n<R: Read + Seek>(
 fn read_xobj_bbox_and_matrix<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     xobj_ref: ObjectRef,
-) -> Result<(Option<[f64; 4]>, [f64; 6])> {
-    let identity: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+) -> Result<(Option<Rectangle>, Matrix)> {
+    let identity = Matrix::default();
 
-    let obj = pdf.resolve_borrowed(xobj_ref)?;
+    let obj = pdf.resolve(xobj_ref)?;
     let stream_dict = match obj {
-        Object::Stream(s) => s.dict.clone(),
+        Object::Stream(s) => s.dict,
         _ => return Ok((None, identity)),
     };
 
@@ -508,7 +491,7 @@ fn read_xobj_bbox_and_matrix<R: Read + Seek>(
                 };
             }
             if valid {
-                m
+                Matrix::from(m)
             } else {
                 identity
             }
@@ -528,7 +511,7 @@ fn read_xobj_bbox_and_matrix<R: Read + Seek>(
                     };
                 }
                 if valid {
-                    m
+                    Matrix::from(m)
                 } else {
                     identity
                 }
@@ -538,7 +521,7 @@ fn read_xobj_bbox_and_matrix<R: Read + Seek>(
         _ => identity,
     };
 
-    Ok((Some(bbox_vals), ap_matrix))
+    Ok((Some(Rectangle::from(bbox_vals)), ap_matrix))
 }
 
 /// Build the pruned `/Annots` array, removing all refs in `to_remove`.
@@ -1375,7 +1358,7 @@ mod tests {
         assert!(bbox.is_none(), "non-stream should return None bbox");
         assert_eq!(
             matrix,
-            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            Matrix::default(),
             "non-stream should return identity matrix"
         );
     }
@@ -1388,7 +1371,7 @@ mod tests {
 
         let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, xobj_ref).unwrap();
         assert!(bbox.is_none());
-        assert_eq!(matrix, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(matrix, Matrix::default());
     }
 
     #[test]
@@ -1402,7 +1385,7 @@ mod tests {
 
         let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
         assert!(bbox.is_none(), "BBox with wrong length should return None");
-        assert_eq!(matrix, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(matrix, Matrix::default());
     }
 
     #[test]
@@ -1417,9 +1400,9 @@ mod tests {
         let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
         assert!(bbox.is_some(), "real-valued BBox should succeed");
         let b = bbox.unwrap();
-        assert!((b[0] - 0.5).abs() < 1e-10);
-        assert!((b[2] - 100.5).abs() < 1e-10);
-        assert_eq!(matrix, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert!((b.llx - 0.5).abs() < 1e-10);
+        assert!((b.urx - 100.5).abs() < 1e-10);
+        assert_eq!(matrix, Matrix::default());
     }
 
     #[test]
@@ -1449,8 +1432,8 @@ mod tests {
 
         let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
         assert!(bbox.is_some());
-        assert!((matrix[0] - 1.5).abs() < 1e-10, "matrix[0] should be 1.5");
-        assert!((matrix[3] - 1.5).abs() < 1e-10, "matrix[3] should be 1.5");
+        assert!((matrix.a - 1.5).abs() < 1e-10, "matrix.a should be 1.5");
+        assert!((matrix.d - 1.5).abs() < 1e-10, "matrix.d should be 1.5");
     }
 
     #[test]
@@ -1464,11 +1447,7 @@ mod tests {
 
         let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
         assert!(bbox.is_some());
-        assert_eq!(
-            matrix,
-            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            "should fall back to identity"
-        );
+        assert_eq!(matrix, Matrix::default(), "should fall back to identity");
     }
 
     #[test]
@@ -1484,7 +1463,7 @@ mod tests {
         assert!(bbox.is_some());
         assert_eq!(
             matrix,
-            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            Matrix::default(),
             "wrong-length matrix falls back to identity"
         );
     }
@@ -1528,8 +1507,8 @@ mod tests {
         let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
         assert!(bbox.is_some(), "BBox via indirect ref should be parsed");
         let b = bbox.unwrap();
-        assert_eq!(b[2] as i64, 100);
-        assert_eq!(matrix, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(b.urx as i64, 100);
+        assert_eq!(matrix, Matrix::default());
     }
 
     #[test]
@@ -1547,7 +1526,7 @@ mod tests {
 
         let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
         assert!(bbox.is_none(), "BBox ref → non-array should return None");
-        assert_eq!(matrix, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(matrix, Matrix::default());
     }
 
     #[test]
@@ -1580,12 +1559,12 @@ mod tests {
         let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
         assert!(bbox.is_some());
         assert!(
-            (matrix[0] - 2.0).abs() < 1e-10,
-            "matrix[0] via indirect ref should be 2.0"
+            (matrix.a - 2.0).abs() < 1e-10,
+            "matrix.a via indirect ref should be 2.0"
         );
         assert!(
-            (matrix[3] - 2.0).abs() < 1e-10,
-            "matrix[3] via indirect ref should be 2.0"
+            (matrix.d - 2.0).abs() < 1e-10,
+            "matrix.d via indirect ref should be 2.0"
         );
     }
 
@@ -1604,11 +1583,7 @@ mod tests {
 
         let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, ObjectRef::new(4, 0)).unwrap();
         assert!(bbox.is_some());
-        assert_eq!(
-            matrix,
-            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            "non-array matrix ref → identity"
-        );
+        assert_eq!(matrix, Matrix::default(), "non-array matrix ref → identity");
     }
 
     #[test]
@@ -1641,7 +1616,7 @@ mod tests {
         assert!(bbox.is_some());
         assert_eq!(
             matrix,
-            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            Matrix::default(),
             "bad element in matrix ref → identity"
         );
     }
@@ -1674,7 +1649,7 @@ mod tests {
         assert!(bbox.is_some());
         assert_eq!(
             matrix,
-            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            Matrix::default(),
             "wrong-length matrix ref → identity"
         );
     }
@@ -2321,7 +2296,7 @@ mod tests {
 
         let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, xobj_ref).unwrap();
         assert!(bbox.is_none(), "direct non-array /BBox should return None");
-        assert_eq!(matrix, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(matrix, Matrix::default());
     }
 
     // -----------------------------------------------------------------------

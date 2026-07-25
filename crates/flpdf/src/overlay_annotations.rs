@@ -36,7 +36,7 @@ use crate::acroform_document_helper::{collect_reachable_refs, collect_refs_in_ob
 use crate::overlay_appearance_stream::adjust_appearance_stream;
 use crate::parser::Parser;
 use crate::tokenizer::{is_delimiter, is_ws, starts_number_token};
-use crate::{Error, Object, ObjectRef, Pdf, Result};
+use crate::{Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result};
 
 /// Bound field-tree /Parent walks (widget → top-level field). Mirrors the
 /// `DEFAULT_MAX_ACROFORM_DEPTH` cap used elsewhere in the crate (review rule 4:
@@ -523,7 +523,7 @@ pub(crate) fn apply_placement<R: Read + Seek>(
     dest: &mut Pdf<R>,
     dest_page_ref: ObjectRef,
     template: &AnnotationCopyTemplate,
-    cm: [f64; 6],
+    cm: Matrix,
     dest_acroform_dr: &mut Option<ObjectRef>,
     dr_map: &mut DrMap,
 ) -> Result<Vec<ObjectRef>> {
@@ -1148,7 +1148,7 @@ fn da_operator_category(op: &[u8]) -> Option<&'static [u8]> {
 fn transform_annot_ap_streams<R: Read + Seek>(
     dest: &mut Pdf<R>,
     annot_ref: ObjectRef,
-    cm: [f64; 6],
+    cm: Matrix,
     dr_map: &DrMap,
 ) -> Result<()> {
     let Some(mut annot_dict) = dest.resolve(annot_ref)?.into_dict() else {
@@ -1210,7 +1210,7 @@ fn transform_annot_ap_streams<R: Read + Seek>(
 fn dup_and_transform_ap_stream<R: Read + Seek>(
     dest: &mut Pdf<R>,
     stream_ref: ObjectRef,
-    cm: [f64; 6],
+    cm: Matrix,
 ) -> Result<Option<ObjectRef>> {
     let obj = dest.resolve(stream_ref)?;
     let Object::Stream(mut stream) = obj else {
@@ -1219,15 +1219,23 @@ fn dup_and_transform_ap_stream<R: Read + Seek>(
     // Read the existing /Matrix (identity when absent — qpdf apcm defaults
     // to QPDFMatrix() before optional matrix.concat(cm) at line 1001).
     let old_matrix = read_matrix_array(&stream.dict, b"Matrix");
-    // qpdf: apcm.concat(cm)  →  apcm := apcm * cm  →  overlay uses qpdf_concat
-    // (in overlay.rs) with (this, other) = (apcm, cm).
+    // qpdf: apcm.concat(cm) → apcm := apcm * cm.
     let had_matrix = old_matrix.is_some();
-    let apcm = old_matrix.unwrap_or(IDENTITY);
-    let new_matrix = concat_matrices(apcm, cm);
+    let mut new_matrix = old_matrix.unwrap_or_default();
+    new_matrix.concat(cm);
     // Only write /Matrix if the source had one or the result is non-identity
     // (qpdf line 1003 same guard).
-    if had_matrix || new_matrix != IDENTITY {
-        stream.dict.insert("Matrix", matrix_to_object(new_matrix));
+    if had_matrix || new_matrix != Matrix::default() {
+        stream.dict.insert(
+            "Matrix",
+            Object::Array(
+                new_matrix
+                    .get_as_matrix()
+                    .into_iter()
+                    .map(qpdf_real)
+                    .collect(),
+            ),
+        );
     }
     let new_ref = allocate_next_ref(dest)?;
     dest.set_object(new_ref, Object::Stream(stream));
@@ -1235,7 +1243,7 @@ fn dup_and_transform_ap_stream<R: Read + Seek>(
 }
 
 /// Read a 6-element `/Matrix` from `dict[key]`, if present and well-formed.
-fn read_matrix_array(dict: &crate::Dictionary, key: &[u8]) -> Option<[f64; 6]> {
+fn read_matrix_array(dict: &crate::Dictionary, key: &[u8]) -> Option<Matrix> {
     let arr = match dict.get(key)? {
         Object::Array(a) if a.len() == 6 => a,
         _ => return None, // cov:ignore: fallback match arm — defensive/malformed input
@@ -1248,13 +1256,7 @@ fn read_matrix_array(dict: &crate::Dictionary, key: &[u8]) -> Option<[f64; 6]> {
             _ => return None, // cov:ignore: fallback match arm — defensive/malformed input
         };
     }
-    Some(out)
-}
-
-/// Serialize a 6-element matrix as an `Object::Array` of `Object::Real`,
-/// matching qpdf's `QPDFObjectHandle::newFromMatrix` output shape.
-fn matrix_to_object(m: [f64; 6]) -> Object {
-    Object::Array(m.iter().map(|&x| qpdf_real(x)).collect())
+    Some(Matrix::from(out))
 }
 
 /// Pre-round `v` so `Object::Real(rounded).write_pdf(...)` (which formats f64
@@ -1280,30 +1282,13 @@ fn qpdf_real(v: f64) -> Object {
     Object::Real(rounded)
 }
 
-/// Multiply two matrices left-to-right (`this * other`), mirroring
-/// `QPDFMatrix::concat` byte-for-byte (see overlay.rs::qpdf_concat).
-fn concat_matrices(this: [f64; 6], other: [f64; 6]) -> [f64; 6] {
-    let [a, b, c, d, e, f] = this;
-    let [oa, ob, oc, od, oe, of] = other;
-    [
-        a * oa + c * ob,
-        b * oa + d * ob,
-        a * oc + c * od,
-        b * oc + d * od,
-        a * oe + c * of + e,
-        b * oe + d * of + f,
-    ]
-}
-
-const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-
 /// Read the annot's `/Rect`, transform its four corners by `cm`, and write
 /// back the normalized bounding rectangle. Mirrors qpdf's
 /// `QPDFMatrix::transformRectangle` used at transformAnnotations line 1011.
 fn transform_annot_rect<R: Read + Seek>(
     dest: &mut Pdf<R>,
     annot_ref: ObjectRef,
-    cm: [f64; 6],
+    cm: Matrix,
 ) -> Result<()> {
     let Some(mut dict) = dest.resolve(annot_ref)?.into_dict() else {
         return Ok(()); // cov:ignore: defensive early return
@@ -1324,48 +1309,18 @@ fn transform_annot_rect<R: Read + Seek>(
             _ => return Ok(()), // cov:ignore: defensive early return
         };
     }
-    let new_rect = transform_rect_by_cm(nums, cm);
+    let new_rect = cm.transform_rectangle(Rectangle::new(nums[0], nums[1], nums[2], nums[3]));
     dict.insert(
         "Rect",
-        Object::Array(new_rect.iter().map(|&x| qpdf_real(x)).collect()),
+        Object::Array(
+            [new_rect.llx, new_rect.lly, new_rect.urx, new_rect.ury]
+                .into_iter()
+                .map(qpdf_real)
+                .collect(),
+        ),
     );
     dest.set_object(annot_ref, Object::Dictionary(dict));
     Ok(())
-}
-
-/// Transform the four corners of `rect` by `cm` and return the axis-aligned
-/// bounding rectangle of the transformed corners (`[min_x, min_y, max_x,
-/// max_y]`), mirroring qpdf's `QPDFMatrix::transformRectangle`.
-fn transform_rect_by_cm(rect: [f64; 4], cm: [f64; 6]) -> [f64; 4] {
-    let [llx, lly, urx, ury] = rect;
-    let corners = [(llx, lly), (llx, ury), (urx, lly), (urx, ury)];
-    let mut min_x = f64::INFINITY;
-    let mut min_y = f64::INFINITY;
-    let mut max_x = f64::NEG_INFINITY;
-    let mut max_y = f64::NEG_INFINITY;
-    for (x, y) in corners {
-        let (tx, ty) = apply_matrix_to_point(cm, x, y);
-        if tx < min_x {
-            min_x = tx;
-        }
-        if tx > max_x {
-            max_x = tx;
-        }
-        if ty < min_y {
-            min_y = ty;
-        }
-        if ty > max_y {
-            max_y = ty;
-        }
-    }
-    [min_x, min_y, max_x, max_y]
-}
-
-/// Apply a 6-element matrix to a point: `[a b c d e f] * (x, y)` =
-/// `(a*x + c*y + e, b*x + d*y + f)`.
-fn apply_matrix_to_point(m: [f64; 6], x: f64, y: f64) -> (f64, f64) {
-    let [a, b, c, d, e, f] = m;
-    (a * x + c * y + e, b * x + d * y + f)
 }
 
 /// Read the destination `/AcroForm`'s `/DA` and `/Q` defaults and compare
@@ -2892,7 +2847,7 @@ mod tests {
             &mut pdf,
             page_ref,
             &template,
-            IDENTITY,
+            Matrix::default(),
             &mut dest_acroform_dr,
             &mut dr_map,
         )
@@ -3012,7 +2967,7 @@ mod tests {
             &mut pdf,
             page_ref,
             &template,
-            IDENTITY,
+            Matrix::default(),
             &mut dest_acroform_dr,
             &mut dr_map,
         )

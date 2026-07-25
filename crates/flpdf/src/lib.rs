@@ -102,6 +102,7 @@ pub mod fonts;
 pub mod json;
 pub mod json_inspect;
 pub mod linearization;
+pub mod matrix;
 pub mod name_number_tree;
 pub mod name_tree_dests;
 pub mod object;
@@ -186,6 +187,7 @@ pub use filespec_helper::{
     extract_attachment_to_path, format_pdf_date, md5_checksum, write_attachment,
     EmbeddedFileStream, FileParamDates, FileSpec, FileSpecBuilder,
 };
+pub use matrix::{Matrix, Rectangle};
 pub use name_number_tree::{
     build_name_tree, build_number_tree, read_name_tree, read_number_tree, DEFAULT_MAX_TREE_DEPTH,
     LEAF_MAX,
