@@ -29,8 +29,8 @@ use flpdf::{
     parse_pdf_version, write_pdf_with_options, AnnotationObjectHelper, CompressStreams,
     CopyEncryptionSource, Dictionary, EncryptMethod, EncryptParams, FlattenMode,
     FormFieldObjectHelper, NewlineBeforeEndstream, Object, ObjectKeyAlg, ObjectRef,
-    ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions, PermissionsConfig, PrintPermission,
-    RemoveUnreferencedResources, Severity, Stream, StreamDataMode, WriteOptions,
+    ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions, PdfVersion, PermissionsConfig,
+    PrintPermission, RemoveUnreferencedResources, Severity, Stream, StreamDataMode, WriteOptions,
 };
 use flpdf::{
     copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list,
@@ -3223,43 +3223,35 @@ fn run_rewrite(
             // overlay/underlay is in play; a full CLI-wide input-version
             // accumulator across other paths is out of scope here (documented
             // as non-scope in the bd design).
-            let mut max_ver: (u8, u8) = parse_pdf_version(pdf.version()).unwrap_or((1, 0));
-            let mut max_ext: i64 = pdf.adobe_extension_level().unwrap_or(0);
+            let initial_version =
+                parse_pdf_version(pdf.version()).unwrap_or(PdfVersion::new(1, 0, 0));
+            let mut max_version = PdfVersion::new(
+                initial_version.major(),
+                initial_version.minor(),
+                pdf.adobe_extension_level().unwrap_or(0),
+            );
             for spec in built.iter_mut() {
-                let sv = parse_pdf_version(spec.source.version()).unwrap_or((1, 0));
-                let se = spec.source.adobe_extension_level().unwrap_or(0);
-                match sv.cmp(&max_ver) {
-                    std::cmp::Ordering::Greater => {
-                        max_ver = sv;
-                        max_ext = se;
-                    }
-                    std::cmp::Ordering::Equal => {
-                        if se > max_ext {
-                            max_ext = se;
-                        }
-                    }
-                    std::cmp::Ordering::Less => {}
-                }
+                let source_version =
+                    parse_pdf_version(spec.source.version()).unwrap_or(PdfVersion::new(1, 0, 0));
+                max_version.update_if_greater(PdfVersion::new(
+                    source_version.major(),
+                    source_version.minor(),
+                    spec.source.adobe_extension_level().unwrap_or(0),
+                ));
             }
             // Preserve any pre-existing --min-version / --min-extension-level
             // CLI arg by taking pairwise max with the accumulated floor.
             if let Some(ref current) = options.min_version {
-                let cur = parse_pdf_version(current).unwrap_or((1, 0));
-                let cur_ext = options.min_extension_level.unwrap_or(0);
-                match cur.cmp(&max_ver) {
-                    std::cmp::Ordering::Greater => {
-                        max_ver = cur;
-                        max_ext = cur_ext;
-                    }
-                    std::cmp::Ordering::Equal => {
-                        if cur_ext > max_ext {
-                            max_ext = cur_ext;
-                        }
-                    }
-                    std::cmp::Ordering::Less => {}
-                }
+                let current_version =
+                    parse_pdf_version(current).unwrap_or(PdfVersion::new(1, 0, 0));
+                max_version.update_if_greater(PdfVersion::new(
+                    current_version.major(),
+                    current_version.minor(),
+                    options.min_extension_level.unwrap_or(0),
+                ));
             }
-            options.min_version = Some(format!("{}.{}", max_ver.0, max_ver.1));
+            let (version, max_ext) = max_version.get_version();
+            options.min_version = Some(version);
             options.min_extension_level = (max_ext > 0).then_some(max_ext);
 
             // --verbose: emit the per-destination-page overlay/underlay plan
@@ -4232,25 +4224,31 @@ fn run_page_extraction(
         // Propagate max input header version + Adobe extension_level
         // from overlay sources (mirrors run_rewrite's overlay branch and
         // qpdf QPDFJob.cc L1714/L2913).
-        let mut max_ver: (u8, u8) = parse_pdf_version(pdf.version()).unwrap_or((1, 0));
-        let mut max_ext: i64 = pdf.adobe_extension_level().unwrap_or(0);
+        let initial_version = parse_pdf_version(pdf.version()).unwrap_or(PdfVersion::new(1, 0, 0));
+        let mut max_version = PdfVersion::new(
+            initial_version.major(),
+            initial_version.minor(),
+            pdf.adobe_extension_level().unwrap_or(0),
+        );
         for spec in built.iter_mut() {
-            let sv = parse_pdf_version(spec.source.version()).unwrap_or((1, 0));
-            let se = spec.source.adobe_extension_level().unwrap_or(0);
-            if (sv, se) > (max_ver, max_ext) {
-                max_ver = sv;
-                max_ext = se;
-            }
+            let source_version =
+                parse_pdf_version(spec.source.version()).unwrap_or(PdfVersion::new(1, 0, 0));
+            max_version.update_if_greater(PdfVersion::new(
+                source_version.major(),
+                source_version.minor(),
+                spec.source.adobe_extension_level().unwrap_or(0),
+            ));
         }
         if let Some(ref current) = options.min_version {
-            let cur = parse_pdf_version(current).unwrap_or((1, 0));
-            let cur_ext = options.min_extension_level.unwrap_or(0);
-            if (cur, cur_ext) > (max_ver, max_ext) {
-                max_ver = cur;
-                max_ext = cur_ext;
-            }
+            let current_version = parse_pdf_version(current).unwrap_or(PdfVersion::new(1, 0, 0));
+            max_version.update_if_greater(PdfVersion::new(
+                current_version.major(),
+                current_version.minor(),
+                options.min_extension_level.unwrap_or(0),
+            ));
         }
-        options.min_version = Some(format!("{}.{}", max_ver.0, max_ver.1));
+        let (version, max_ext) = max_version.get_version();
+        options.min_version = Some(version);
         options.min_extension_level = (max_ext > 0).then_some(max_ext);
 
         if verbose {

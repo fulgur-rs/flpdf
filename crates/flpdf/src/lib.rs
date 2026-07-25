@@ -226,7 +226,7 @@ pub use page_splice::{splice_pages, splice_pages_with_max_depth};
 pub use page_split::{digit_width, split_output_path, split_pages};
 pub use page_tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_depth, RebuildResult};
 pub use parser::parse_object;
-pub use pdf_version::PdfVersion;
+pub use pdf_version::{parse_pdf_version, PdfVersion};
 pub use permissions::{PermissionsConfig, PrintPermission};
 pub use qdf_fix::fix_qdf;
 pub use reader::{EncryptionInfo, Pdf, PdfOpenOptions, Permissions};
@@ -249,9 +249,9 @@ pub use struct_tree_pg::{
 pub use subset_prune::prune_after_subset;
 pub use thread_bead_p::drop_thread_bead_dangling_p;
 pub use writer::{
-    apply_stream_compress_policy, effective_pdf_version, parse_pdf_version, write_pdf,
-    write_pdf_with_options, write_qdf, write_stream_to_buf, CompressStreams,
-    NewlineBeforeEndstream, ObjectStreamMode, StreamDataMode, WriteOptions,
+    apply_stream_compress_policy, effective_pdf_version, write_pdf, write_pdf_with_options,
+    write_qdf, write_stream_to_buf, CompressStreams, NewlineBeforeEndstream, ObjectStreamMode,
+    StreamDataMode, WriteOptions,
 };
 pub use xref::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,

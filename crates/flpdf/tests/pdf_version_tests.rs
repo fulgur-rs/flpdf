@@ -1,4 +1,4 @@
-use flpdf::PdfVersion;
+use flpdf::{parse_pdf_version, PdfVersion};
 
 #[test]
 fn exposes_the_complete_qpdf_pdfversion_value_api() {
@@ -24,4 +24,9 @@ fn parses_only_existing_flpdf_major_minor_syntax() {
     assert_eq!(PdfVersion::parse("invalid"), None);
     assert_eq!(PdfVersion::parse("1.7.3"), None);
     assert_eq!(PdfVersion::parse("256.0"), None);
+}
+
+#[test]
+fn public_parser_returns_the_value_type() {
+    assert_eq!(parse_pdf_version("1.7"), Some(PdfVersion::new(1, 7, 0)));
 }

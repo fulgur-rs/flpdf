@@ -54,4 +54,36 @@ impl PdfVersion {
     pub const fn extension_level(self) -> i64 {
         self.extension_level
     }
+
+    pub(crate) const fn static_version_str(self) -> Option<&'static str> {
+        match (self.major, self.minor) {
+            (1, 3) => Some("1.3"),
+            (1, 4) => Some("1.4"),
+            (1, 5) => Some("1.5"),
+            (1, 6) => Some("1.6"),
+            (1, 7) => Some("1.7"),
+            _ => None,
+        }
+    }
+}
+
+/// Parses a PDF version string of the form `M.m`.
+pub fn parse_pdf_version(value: &str) -> Option<PdfVersion> {
+    PdfVersion::parse(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PdfVersion;
+
+    #[test]
+    fn standard_version_strings_cover_writer_encryption_floors() {
+        assert_eq!(PdfVersion::new(1, 3, 0).static_version_str(), Some("1.3"));
+        assert_eq!(PdfVersion::new(1, 4, 0).static_version_str(), Some("1.4"));
+        assert_eq!(PdfVersion::new(1, 5, 0).static_version_str(), Some("1.5"));
+        assert_eq!(PdfVersion::new(1, 6, 0).static_version_str(), Some("1.6"));
+        assert_eq!(PdfVersion::new(1, 7, 0).static_version_str(), Some("1.7"));
+        assert_eq!(PdfVersion::new(1, 7, 8).static_version_str(), Some("1.7"));
+        assert_eq!(PdfVersion::new(2, 0, 0).static_version_str(), None);
+    }
 }

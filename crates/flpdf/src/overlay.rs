@@ -1531,7 +1531,7 @@ mod byte_gate {
         // qpdf floors the output at max(dest, all sources) — form-fields-and-
         // annotations.pdf is PDF 1.6, fxo-red.pdf is PDF 1.3, so the output
         // header must be 1.6.
-        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
         let mut specs = vec![OverlaySpec {
             source: src,
             kind: OverlayKind::Overlay,
@@ -1545,7 +1545,7 @@ mod byte_gate {
             static_id: true,
             qdf: true,
             no_original_object_ids: true,
-            min_version: Some(format!("{maj}.{min}")),
+            min_version: Some(version),
             min_extension_level: (max_ext > 0).then_some(max_ext),
             ..Default::default()
         };
@@ -1573,7 +1573,7 @@ mod byte_gate {
     fn overlay_copy_annotations_source_p_and_inline_is_byte_identical_qdf() {
         let mut dest = fixture("fxo-red.pdf");
         let mut src = fixture("form-fields-and-annotations-p-and-inline.pdf");
-        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
         let mut specs = vec![OverlaySpec {
             source: src,
             kind: OverlayKind::Overlay,
@@ -1587,7 +1587,7 @@ mod byte_gate {
             static_id: true,
             qdf: true,
             no_original_object_ids: true,
-            min_version: Some(format!("{maj}.{min}")),
+            min_version: Some(version),
             min_extension_level: (max_ext > 0).then_some(max_ext),
             ..Default::default()
         };
@@ -1607,7 +1607,7 @@ mod byte_gate {
     fn overlay_copy_annotations_source_no_acroform_is_byte_identical_qdf() {
         let mut dest = fixture("fxo-red.pdf");
         let mut src = fixture("link-annot-no-acroform.pdf");
-        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
         let mut specs = vec![OverlaySpec {
             source: src,
             kind: OverlayKind::Overlay,
@@ -1621,7 +1621,7 @@ mod byte_gate {
             static_id: true,
             qdf: true,
             no_original_object_ids: true,
-            min_version: Some(format!("{maj}.{min}")),
+            min_version: Some(version),
             min_extension_level: (max_ext > 0).then_some(max_ext),
             ..Default::default()
         };
@@ -1647,7 +1647,7 @@ mod byte_gate {
     fn overlay_copy_annotations_onto_indirect_fields_is_byte_identical_qdf() {
         let mut dest = fixture("fxo-red-indirect-fields.pdf");
         let mut src = fixture("form-fields-and-annotations.pdf");
-        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
         let mut specs = vec![OverlaySpec {
             source: src,
             kind: OverlayKind::Overlay,
@@ -1661,7 +1661,7 @@ mod byte_gate {
             static_id: true,
             qdf: true,
             no_original_object_ids: true,
-            min_version: Some(format!("{maj}.{min}")),
+            min_version: Some(version),
             min_extension_level: (max_ext > 0).then_some(max_ext),
             ..Default::default()
         };
@@ -1679,7 +1679,7 @@ mod byte_gate {
     fn overlay_copy_annotations_source_direct_dr_is_byte_identical_qdf() {
         let mut dest = fixture("fxo-red.pdf");
         let mut src = fixture("form-fields-and-annotations-direct-dr.pdf");
-        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
         let mut specs = vec![OverlaySpec {
             source: src,
             kind: OverlayKind::Overlay,
@@ -1693,7 +1693,7 @@ mod byte_gate {
             static_id: true,
             qdf: true,
             no_original_object_ids: true,
-            min_version: Some(format!("{maj}.{min}")),
+            min_version: Some(version),
             min_extension_level: (max_ext > 0).then_some(max_ext),
             ..Default::default()
         };
@@ -1721,7 +1721,7 @@ mod byte_gate {
     fn overlay_copy_annotations_onto_existing_acroform_is_byte_identical_qdf() {
         let mut dest = fixture("fxo-red-with-existing-acroform.pdf");
         let mut src = fixture("form-fields-and-annotations.pdf");
-        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
         let mut specs = vec![OverlaySpec {
             source: src,
             kind: OverlayKind::Overlay,
@@ -1735,7 +1735,7 @@ mod byte_gate {
             static_id: true,
             qdf: true,
             no_original_object_ids: true,
-            min_version: Some(format!("{maj}.{min}")),
+            min_version: Some(version),
             min_extension_level: (max_ext > 0).then_some(max_ext),
             ..Default::default()
         };
@@ -1789,7 +1789,7 @@ mod byte_gate {
     fn overlay_copy_annotations_onto_existing_acroform_dr_is_byte_identical_qdf() {
         let mut dest = fixture("fxo-red-with-existing-acroform-dr.pdf");
         let mut src = fixture("form-fields-and-annotations.pdf");
-        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
         let mut specs = vec![OverlaySpec {
             source: src,
             kind: OverlayKind::Overlay,
@@ -1803,7 +1803,7 @@ mod byte_gate {
             static_id: true,
             qdf: true,
             no_original_object_ids: true,
-            min_version: Some(format!("{maj}.{min}")),
+            min_version: Some(version),
             min_extension_level: (max_ext > 0).then_some(max_ext),
             ..Default::default()
         };
@@ -1831,7 +1831,7 @@ mod byte_gate {
     fn overlay_copy_annotations_with_da_q_defaults_is_byte_identical_qdf() {
         let mut dest = fixture("fxo-red.pdf");
         let mut src = fixture("form-fields-and-annotations-with-defaults.pdf");
-        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
         let mut specs = vec![OverlaySpec {
             source: src,
             kind: OverlayKind::Overlay,
@@ -1845,7 +1845,7 @@ mod byte_gate {
             static_id: true,
             qdf: true,
             no_original_object_ids: true,
-            min_version: Some(format!("{maj}.{min}")),
+            min_version: Some(version),
             min_extension_level: (max_ext > 0).then_some(max_ext),
             ..Default::default()
         };
@@ -1866,7 +1866,7 @@ mod byte_gate {
     fn underlay_copy_annotations_fxo_red_repeat1_is_byte_identical_qdf() {
         let mut dest = fixture("fxo-red.pdf");
         let mut src = fixture("form-fields-and-annotations.pdf");
-        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
         let mut specs = vec![OverlaySpec {
             source: src,
             kind: OverlayKind::Underlay,
@@ -1880,7 +1880,7 @@ mod byte_gate {
             static_id: true,
             qdf: true,
             no_original_object_ids: true,
-            min_version: Some(format!("{maj}.{min}")),
+            min_version: Some(version),
             min_extension_level: (max_ext > 0).then_some(max_ext),
             ..Default::default()
         };
@@ -2083,16 +2083,22 @@ mod byte_gate {
     fn accumulate_max<R1: Read + Seek, R2: Read + Seek>(
         a: &mut Pdf<R1>,
         b: &mut Pdf<R2>,
-    ) -> ((u8, u8), i64) {
-        let va = crate::writer::parse_pdf_version(a.version()).unwrap_or((1, 0));
-        let vb = crate::writer::parse_pdf_version(b.version()).unwrap_or((1, 0));
-        let ea = a.adobe_extension_level().unwrap_or(0);
-        let eb = b.adobe_extension_level().unwrap_or(0);
-        match va.cmp(&vb) {
-            std::cmp::Ordering::Greater => (va, ea),
-            std::cmp::Ordering::Less => (vb, eb),
-            std::cmp::Ordering::Equal => (va, ea.max(eb)),
-        }
+    ) -> crate::PdfVersion {
+        let a_version =
+            crate::parse_pdf_version(a.version()).unwrap_or(crate::PdfVersion::new(1, 0, 0));
+        let b_version =
+            crate::parse_pdf_version(b.version()).unwrap_or(crate::PdfVersion::new(1, 0, 0));
+        let mut best = crate::PdfVersion::new(
+            a_version.major(),
+            a_version.minor(),
+            a.adobe_extension_level().unwrap_or(0),
+        );
+        best.update_if_greater(crate::PdfVersion::new(
+            b_version.major(),
+            b_version.minor(),
+            b.adobe_extension_level().unwrap_or(0),
+        ));
+        best
     }
 
     /// Resolve a workspace-relative path (from the repo root) to an absolute
@@ -2122,7 +2128,7 @@ mod byte_gate {
 
         // Mirror flpdf-cli accumulation manually: the CLI walks dest and
         // every overlay/underlay source; here there is exactly one source.
-        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
 
         let mut specs = vec![OverlaySpec {
             source: src,
@@ -2136,7 +2142,7 @@ mod byte_gate {
         let opts = WriteOptions {
             full_rewrite: true,
             static_id: true,
-            min_version: Some(format!("{maj}.{min}")),
+            min_version: Some(version),
             min_extension_level: (max_ext > 0).then_some(max_ext),
             newline_before_endstream: NewlineBeforeEndstream::Never,
             ..Default::default()
@@ -2185,7 +2191,7 @@ mod byte_gate {
 
         // Mirror flpdf-cli accumulation manually: the CLI walks dest and
         // every overlay/underlay source; here there is exactly one source.
-        let ((maj, min), max_ext) = accumulate_max(&mut dest, &mut src);
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
 
         let mut specs = vec![OverlaySpec {
             source: src,
@@ -2199,7 +2205,7 @@ mod byte_gate {
         let opts = WriteOptions {
             full_rewrite: true,
             static_id: true,
-            min_version: Some(format!("{maj}.{min}")),
+            min_version: Some(version),
             min_extension_level: (max_ext > 0).then_some(max_ext),
             newline_before_endstream: NewlineBeforeEndstream::Never,
             ..Default::default()
