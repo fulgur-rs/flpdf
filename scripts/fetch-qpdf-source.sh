@@ -26,6 +26,11 @@
 # libqpdf/ and include/qpdf/ diff clean), so the extra history costs ~34 MB and
 # changes nothing about the sources being cited.
 #
+# Inspect other revisions with commands that leave HEAD alone — `git log`,
+# `git show v12.0.0:libqpdf/QPDFWriter.cc`, `git diff v11.9.0..v12.0.0`. A
+# `git checkout` moves the tree off the pin, which makes `--print-path` fail
+# until this script is run again.
+#
 # Install location (first match wins):
 #   $FLPDF_QPDF_SRC
 #   ${XDG_CACHE_HOME:-$HOME/.cache}/flpdf/qpdf-11.9.0
