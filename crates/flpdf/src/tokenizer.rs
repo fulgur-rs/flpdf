@@ -27,6 +27,7 @@ pub(crate) struct Token<'a> {
     pub(crate) value: Cow<'a, [u8]>,
     pub(crate) raw: &'a [u8],
     pub(crate) error_message: Option<String>,
+    pub(crate) error_offset: usize,
     pub(crate) start: usize,
     pub(crate) end: usize,
 }
@@ -146,7 +147,7 @@ impl<'a> Tokenizer<'a> {
                 continue;
             }
             let Some(nibble) = hex_value(byte) else {
-                return self.bad_token(start, "invalid character in hex string");
+                return self.bad_token_at(start, self.pos - 1, "invalid character in hex string");
             };
             if let Some(high) = high_nibble.take() {
                 decoded.push((high << 4) | nibble);
@@ -155,7 +156,7 @@ impl<'a> Tokenizer<'a> {
             }
         }
 
-        self.bad_token(start, "EOF while reading token")
+        self.bad_token_at(start, self.pos, "EOF while reading token")
     }
 
     fn literal_string(&mut self, start: usize) -> Token<'a> {
@@ -177,7 +178,7 @@ impl<'a> Tokenizer<'a> {
                 }
                 b'\\' => {
                     let Some(escaped) = self.take_byte() else {
-                        return self.bad_token(start, "EOF while reading token");
+                        return self.bad_token_at(start, self.pos, "EOF while reading token");
                     };
                     match escaped {
                         b'n' => decoded.push(b'\n'),
@@ -219,7 +220,7 @@ impl<'a> Tokenizer<'a> {
             }
         }
 
-        self.bad_token(start, "EOF while reading token")
+        self.bad_token_at(start, self.pos, "EOF while reading token")
     }
 
     fn name(&mut self, start: usize) -> Token<'a> {
@@ -331,6 +332,7 @@ impl<'a> Tokenizer<'a> {
             value: Cow::Borrowed(&self.input[start..end]),
             raw: &self.input[start..end],
             error_message: None,
+            error_offset: start,
             start,
             end,
         }
@@ -349,17 +351,28 @@ impl<'a> Tokenizer<'a> {
             value: Cow::Owned(value),
             raw: &self.input[start..end],
             error_message,
+            error_offset: start,
             start,
             end,
         }
     }
 
     fn bad_token(&self, start: usize, message: impl Into<String>) -> Token<'a> {
+        self.bad_token_at(start, start, message)
+    }
+
+    fn bad_token_at(
+        &self,
+        start: usize,
+        error_offset: usize,
+        message: impl Into<String>,
+    ) -> Token<'a> {
         Token {
             token_type: TokenType::Bad,
             value: Cow::Borrowed(&self.input[start..self.pos]),
             raw: &self.input[start..self.pos],
             error_message: Some(message.into()),
+            error_offset,
             start,
             end: self.pos,
         }

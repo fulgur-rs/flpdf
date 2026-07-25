@@ -191,7 +191,7 @@ impl<'a> Parser<'a> {
             TokenType::Integer => self.integer_or_ref(token),
             TokenType::Real => self.real_object(token),
             TokenType::Bad => Err(Error::parse(
-                token.start,
+                token.error_offset,
                 token
                     .error_message
                     .unwrap_or_else(|| "bad token".to_string()),

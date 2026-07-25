@@ -522,7 +522,7 @@ fn push_spaces(out: &mut Vec<u8>, n: usize) {
 
 /// True when `literal` is a safe pass-through for [`Object::RealLiteral`]:
 /// every byte is in the PDF real-token character set (ASCII digits, one of
-/// `.`, `+`, `-`, `e`, `E`) AND `literal` parses back to `value` bit-for-bit.
+/// `.`, `+`, `-`) AND `literal` parses back to `value` bit-for-bit.
 /// Fails closed if a caller constructs a `RealLiteral` with arbitrary bytes
 /// (whitespace, `/`, `<<`, string parentheses, …) — the writer's caller
 /// falls back to the canonical shortest-decimal form so nothing outside a
@@ -533,15 +533,15 @@ fn real_literal_is_safe(literal: &[u8], value: f64) -> bool {
     }
     if !literal
         .iter()
-        .all(|b| matches!(*b, b'0'..=b'9' | b'.' | b'+' | b'-' | b'e' | b'E'))
+        .all(|b| matches!(*b, b'0'..=b'9' | b'.' | b'+' | b'-'))
     {
         return false;
     }
     let Ok(text) = std::str::from_utf8(literal) else {
         return false; // cov:ignore: unreachable — the charset check above
-                      // accepts only ASCII digits, `.`, `+`, `-`, `e`, `E`,
-                      // all of which are single-byte UTF-8, so any literal
-                      // that passes the charset check is valid UTF-8.
+                      // accepts only ASCII digits, `.`, `+`, `-`, all of which
+                      // are single-byte UTF-8, so any literal that passes the
+                      // charset check is valid UTF-8.
     };
     match text.parse::<f64>() {
         Ok(parsed) => parsed.to_bits() == value.to_bits(),
@@ -567,6 +567,12 @@ pub(crate) fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
     // by `QPDF_Name::normalizeName` (libqpdf/QPDF_Name.cc:43).
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for &b in raw {
+        if b == 0 {
+            // QPDFTokenizer uses NUL as a sentinel for a recoverable stray
+            // `#`; QPDF_Name::normalizeName restores it when serializing.
+            out.push(b'#');
+            continue;
+        }
         let needs_escape = !(0x21..=0x7E).contains(&b)
             || matches!(
                 b,
@@ -1135,6 +1141,17 @@ mod real_literal_tests {
     }
 
     #[test]
+    fn write_pdf_falls_back_when_literal_uses_exponent_notation() {
+        let mut out = Vec::new();
+        Object::RealLiteral {
+            value: 1000.0,
+            literal: b"1e3".to_vec(),
+        }
+        .write_pdf(&mut out);
+        assert_eq!(out, b"1000");
+    }
+
+    #[test]
     fn is_safe_rejects_empty_literal() {
         assert!(!real_literal_is_safe(b"", 0.0));
     }
@@ -1162,7 +1179,7 @@ mod real_literal_tests {
         assert!(real_literal_is_safe(b".75", 0.75));
         assert!(real_literal_is_safe(b"1.", 1.0));
         assert!(real_literal_is_safe(b"+.25", 0.25));
-        assert!(real_literal_is_safe(b"1e3", 1000.0));
+        assert!(!real_literal_is_safe(b"1e3", 1000.0));
     }
 
     /// A byte sequence that passes the charset check but does NOT parse to a
@@ -1173,6 +1190,21 @@ mod real_literal_tests {
         assert!(!real_literal_is_safe(b"e", 0.0));
         assert!(!real_literal_is_safe(b"1e", 0.0));
         assert!(!real_literal_is_safe(b"-.", 0.0));
+    }
+}
+
+#[cfg(test)]
+mod name_serialization_tests {
+    use super::*;
+
+    #[test]
+    fn write_pdf_restores_stray_hash_sentinel_for_round_trip() {
+        let object = Object::Name(b"a\0\x31x".to_vec());
+        let mut out = Vec::new();
+        object.write_pdf(&mut out);
+
+        assert_eq!(out, b"/a#1x");
+        assert_eq!(crate::parse_object(&out).unwrap(), object);
     }
 }
 

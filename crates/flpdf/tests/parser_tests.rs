@@ -99,6 +99,25 @@ fn parses_array_and_strings() {
 }
 
 #[test]
+fn malformed_tokens_report_the_failing_byte_or_eof() {
+    for (input, expected_offset) in [
+        (&b"<0g>"[..], 2),
+        (&b"<00"[..], 3),
+        (&b"(abc"[..], 4),
+        (&b"(abc\\"[..], 5),
+    ] {
+        let error = parse_object(input).expect_err("malformed token must fail");
+        let Error::Parse { offset, .. } = error else {
+            panic!("expected parse error, got {error:?}");
+        };
+        assert_eq!(
+            offset, expected_offset,
+            "wrong diagnostic offset for {input:?}"
+        );
+    }
+}
+
+#[test]
 fn parses_real_numbers() {
     let object = parse_object(b"[0 0 595.28 841.89 -0.5 .75 1.  +.25 -1.5]").unwrap();
 
