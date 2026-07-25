@@ -37,8 +37,8 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDF.cc` | 2667 | `reader.rs`(2454) + `reader/file_object.rs`(650) + `xref.rs`(1129) | 🔀 |
-| `QPDFParser.cc` | 519 | `parser.rs`(597) の一部 | 🔀 独立 Parser 型が無い |
+| `QPDF.cc` | 2667 | `reader.rs`(2454) + `reader/file_object.rs`(650) + `xref.rs`(1129) + `object_copy.rs`(184: `copyForeignObject`) | 🔀 |
+| `QPDFParser.cc` | 519 | `parser.rs`(597) の `Parser<'a>`(101) | 🔀 型は存在し `content_stream.rs` も再利用している。qpdf API との差分は未精査 |
 | `QPDFTokenizer.cc` | 965 | `tokenizer.rs`（normal mode / PR #549）+ `content_stream.rs`(484) に二重実装 | 🔀 → **T1-1**（`flpdf-n9t0.1`） |
 | `InputSource` 系 5 ファイル | 625 | `Read + Seek` ジェネリクスで代替 | ⚪ |
 | `QPDF_pages.cc` | 319 | `pages.rs`(741) + `page_tree_rebuild.rs`(390) | 🔀 |
@@ -109,8 +109,8 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFAcroFormDocumentHelper.cc` | 1047 | `acroform_document_helper.rs`(1096) | ✅ |
-| `QPDFPageObjectHelper.cc` | 1039 | `page_object_helper.rs`(766) + `page_form_xobject.rs`(637) + `resources.rs`(1229) + `page_annotation_flatten.rs`(596) | 🔀 |
+| `QPDFAcroFormDocumentHelper.cc` | 1047 | `acroform_document_helper.rs`(1096) + `overlay_annotations.rs`(474: `transformAnnotations` / `addAndRenameFormFields`) + `overlay_appearance_stream.rs`(720: `adjustAppearanceStream`) | 🔀 |
+| `QPDFPageObjectHelper.cc` | 1039 | `page_object_helper.rs`(766) + `page_form_xobject.rs`(637) + `resources.rs`(1229) + `page_annotation_flatten.rs`(596) + `overlay.rs`(2228: `placeFormXObject`) + `overlay_annotations.rs`(474: `copyAnnotations`) | 🔀 |
 | `QPDFFormFieldObjectHelper.cc` | 852 | `annotation_helper.rs`(748) + `appearance.rs`(2022) + `default_appearance.rs`(167) | 🔀 |
 | `QPDFPageDocumentHelper.cc` | 158 | `page_document_helper.rs`(236) | ✅ |
 | `QPDFAnnotationObjectHelper.cc` | 226 | `annotation_helper.rs` + `page_annotation_enum.rs`(249) | 🔀 |
@@ -119,7 +119,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `QPDFNameTreeObjectHelper` / `QPDFNumberTreeObjectHelper` / `NNTree.cc` | 1394 | `name_number_tree.rs`(364) + `name_tree_dests.rs`(286) | 🔀 → **T2-2** |
 | `QPDFEmbeddedFileDocumentHelper.cc` | 122 | `embedded_files.rs`(188) + `attachment_list.rs`(306) | ✅ |
 | `QPDFFileSpecObjectHelper` / `QPDFEFStreamObjectHelper` | 280 | `filespec_helper.rs`(1324) | ✅ |
-| `ResourceFinder.cc` | 56 | `resources.rs`(1229) に埋没 | 🔀 |
+| `ResourceFinder.cc` | 56 | `overlay_annotations.rs`(967-1111: オペレータ表) + `overlay_appearance_stream.rs`(2-3: `ResourceReplacer` / `ResourceFinder` token filter) | 🔀 `resources.rs` には実装が無い |
 | `QPDFDocumentHelper.cc` / `QPDFObjectHelper.cc` | 12 | 基底トレイトが無い | ⚪ |
 
 ## 8. JSON
@@ -152,16 +152,21 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 ## flpdf-only
 
-### A. 2 つの汎用機構を参照種別ごとに特殊化したもの — 2,496 行
+### A. 2 つの汎用機構を参照種別ごとに特殊化したもの — 1,748 行
 
 | flpdf | 行 | 対応する qpdf 挙動 |
 |---|---|---|
 | `outline_dest_remap.rs` | 898 | 削除ページ参照の null 化（配列要素） |
-| `acroform_field_prune.rs` | 497 | `QPDFJob.cc:2610-2632` の "Remove unreferenced form fields" |
 | `struct_tree_pg.rs` | 379 | `/Pg` の key drop |
 | `thread_bead_p.rs` | 293 | bead `/P` の key drop |
-| `subset_prune.rs` | 251 | 到達不能オブジェクトの GC |
 | `objr_obj_annot_p.rs` | 178 | OBJR 経由 annotation の `/P` key drop |
+
+**この表に含めない隣接モジュール**（責務が別で、畳み込みの対象にしてはならない）:
+
+| flpdf | 行 | 理由 |
+|---|---|---|
+| `acroform_field_prune.rs` | 497 | qpdf 側に**明示的な対応パスがある**（`QPDFJob.cc:2610-2632` "Remove unreferenced form fields"）。副作用ではなく移植対象 |
+| `subset_prune.rs` | 251 | `/Resources` の stale 名前エントリ剪定（`removeUnreferencedResources` 相当）と、xref レベルの orphan mark-and-sweep の 2 責務。null 可視性とは独立 |
 
 **挙動は検証済み**（各モジュール doc に「qpdf 11.9.0 observed behaviour」の節がある）。
 qpdf 側はこれを専用パスで実装していない:
@@ -183,6 +188,9 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 実装していたものは、この 2 機構の副作用。`QPDFObjectHandle::isNull()` は間接参照を
 解決するため、`/Pg 5 0 R` で obj 5 が null なら `/Pg` キーごと消える。
 
+**この主張が及ぶのは上表の 4 モジュール 1,748 行のみ。** `acroform_field_prune.rs` と
+`subset_prune.rs` は qpdf 側に別の対応先を持つ独立した責務であり、2 機構に還元できない。
+
 **区別すべきこと**: 挙動は検証済みで byte-identical を保っているので壊してはならない。
 機構が異なるだけ（in-place 個別修復 vs. null 置換 + writer の null 可視性）。
 畳み込みは byte リスクを伴う別の設計判断であり、writer の責務分割が固まったあとに検討する。
@@ -202,8 +210,10 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 | `standard_font_metrics.rs` | 4,633 | qpdf にフォント幅テーブルは存在しない（`grep -rl Helvetica libqpdf/` が 0 件） |
 | `signatures.rs` | 1,338 | 電子署名検査。qpdf に相当機能なし |
 | `qdf_fix.rs` | 764 | qpdf では `qpdf/fix-qdf.cc`（libqpdf 外の別バイナリ） |
-| `object_copy.rs` | 184 | `QPDF.cc` の `copyForeignObject` に相当 → 🔀 に再分類 |
 | `page_closure.rs` / `ref_chain.rs` / `qpdf_null.rs` | 341 | |
+
+`object_copy.rs`(184) は `QPDF.cc` の `copyForeignObject` に相当するため
+[§2 パース / 読み取り](#2-パース--読み取り) の `QPDF.cc` 行に移した。
 
 ---
 
@@ -225,9 +235,22 @@ byte golden の無い書き込み経路は安全に移動できない。🔀 行
 | overlay / underlay | `overlay::byte_gate` ✅ | `cli_byte_identical_overlay` ✅ |
 | `--deterministic-id` | `deterministic_id_qpdf_parity_tests` ✅ | — |
 | null 可視性 | `cmp_null_visibility_tests` ⚠ **CI 未列挙**（`flpdf-qxba.2`） | — |
-| QDF | ❌ gated byte gate 無し | ❌ |
+| QDF | 🟡 **部分的にあり**（下記） | 🟡 `overlay::byte_gate` の QDF 3 件 |
 | 暗号化出力 | ❌ gated byte gate 無し | ❌ |
 | incremental update | ❌ gated byte gate 無し | ❌ |
+
+### QDF の既存カバレッジ（部分的）
+
+「QDF に byte gate 無し」は誤り。次の 3 系統が既に存在する。
+
+| テスト | 内容 | CI |
+|---|---|---|
+| `writer_tests.rs:2170,2201` | `tests/golden/references/qdf-contents-ref-array/qdf-static-id.pdf` と `qdf-ignore-newline/qdf-static-id.pdf` に対する完全一致比較 | ✅ 列挙済み |
+| `qdf_tests.rs:1300` | `qdf_golden_minimal_is_byte_identical_to_qpdf_modulo_id` — `tests/fixtures/qdf-golden/minimal.qdf` に対し trailer `/ID` 行を除いて完全一致 | 既定テストに含まれる |
+| `overlay::byte_gate` | `three-page-overlay-one-page-qdf.pdf` ほか QDF 出力 3 件の byte-identical | ✅ `--lib overlay::byte_gate` で列挙済み |
+
+**残る穴**: QDF × ObjStm、QDF × 暗号、QDF × linearize の組み合わせ。Phase 2 で
+null 可視性を QDF 経路に広げる際に必要になるのはこれらであって、QDF 全体ではない。
 
 gated テストは `.github/workflows/ci.yml` の bytes-identical ジョブに手で列挙しないと
 CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れている。

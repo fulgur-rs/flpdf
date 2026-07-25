@@ -18,7 +18,7 @@ pre-v1.0 の唯一のゴールは qpdf 出力の byte-identical 再現（`CLAUDE
 - `QPDF_optimization.cc`(381 行) は独立モジュールが無く `linearization/plan.rs`(3,032 行)
   に埋没している
 - qpdf の 2 つの汎用機構（`QPDFJob.cc:2606` の null 置換 + `QPDFWriter.cc:1491` の
-  null 可視性）の副作用を、flpdf は参照種別ごとに **6 モジュール 2,496 行**で
+  null 可視性）の副作用を、flpdf は参照種別ごとに **4 モジュール 1,748 行**で
   特殊化して実装している
 
 最後の項目が問題の性質をよく表している。qpdf 側は
@@ -84,7 +84,7 @@ qtest pass 数は各部品の完了時に before/after を**報告する**指標
 
 | # | 条件 | 検証方法 |
 |---|---|---|
-| D1 | **全域移植** — 対応する qpdf ファイルの公開 API が全て移植されている。部分移植の場合は未移植項目を doc に明示列挙する | qpdf ヘッダの公開メンバと突き合わせ |
+| D1 | **全域移植** — 対応する qpdf ファイルの公開 API が**全て**移植されている | qpdf ヘッダの公開メンバと突き合わせ |
 | D2 | **単一実装** — 同じ責務の実装がコードベース内に他に存在しない。呼び出し元が全てこのモジュールを通る | 旧実装の削除行数 > 0、grep で重複なし |
 | D3 | **アドホック分岐ゼロ** — qpdf に根拠のない条件分岐が無い | doc に qpdf 行番号の根拠 |
 | D4 | **対応行** — doc 先頭に `//! Mirrors qpdf 11.9.0 libqpdf/X.cc` | 機械チェック可能 |
@@ -93,6 +93,11 @@ qtest pass 数は各部品の完了時に before/after を**報告する**指標
 **D2 が核心。** PR #549 は `tokenizer.rs`(+626) 新設と同時に `parser.rs` を −365 行
 している。これが「部品が完成した」ことの証拠になる。新モジュールを足しただけで旧実装が
 残るなら、それは smear を 1 つ増やしただけで完成ではない。
+
+**D1 に例外を設けない。** 未移植項目を doc に列挙することは D1 を満たす代替手段では
+なく、**D1 が未達である証拠**として扱う。部分移植のまま「完成」を宣言できてしまうと、
+この設計が解消しようとしている状態そのものを再生産する。移植しきれない部品は
+「未完成」のまま残し、issue を分割して残りを追跡する。
 
 ## 命名規則
 
@@ -130,8 +135,15 @@ crate 内で意味が曖昧になる名前は避ける（`version.rs` は crate 
 D1 の対象: コンストラクタ（major/minor/extension）、`operator<`、`operator==`、
 `updateIfGreater`、`getVersion`、`getMajor`/`getMinor`/`getExtensionLevel`。
 
-D2 の対象: `writer.rs` の `parse_pdf_version`(452) / `static_version_string`(638) と、
-`(u8, u8)` 生タプル 6 箇所（`writer.rs` / `overlay.rs` / `flpdf-cli/src/main.rs`）。
+D2 の対象:
+
+- `writer.rs` の `parse_pdf_version`(452) / `static_version_string`(638)
+- `writer/plain/plan.rs` の `parse_pdf_version` 呼び出しと生タプル比較（129, 269, 275 行。
+  `v < (1, 5)` / `version < (1, 5)`）
+- `(u8, u8)` 生タプル（`writer.rs` / `overlay.rs` / `flpdf-cli/src/main.rs`）
+
+`writer/plain/plan.rs` を落とすと第 2 のバージョン表現と `PdfVersion` 外の呼び出し元が
+残り、D2 を満たさない。
 
 **スコープ境界** — qpdf は値型とポリシーを分けている。ポリシー側は writer に残す。
 
@@ -157,19 +169,41 @@ writer に残し、内部表現のみ `PdfVersion` に置き換える。
 D1 の対象: `concat` / `scale` / `translate` / `rotatex90` / `transform` /
 `transformRectangle` / `getAsMatrix` / `unparse`。
 
-D2 の対象: `[f64; 6]` 生配列が散在し `IDENTITY` 定数と行列適用が重複している。
-`page_form_xobject.rs`（`transformation_matrix`:503, `matrix_objects`:533）/
-`page_annotation_flatten.rs`（`apply_matrix`:306, `read_xobj_bbox_and_matrix`:454）/
-`overlay.rs`。
+D2 の対象: `[f64; 6]` 生配列が散在し、`IDENTITY` 定数・行列積・点/矩形変換が
+複数箇所で重複実装されている。
+
+| モジュール | 実装 |
+|---|---|
+| `page_form_xobject.rs` | `transformation_matrix`(503), `matrix_objects`(533) |
+| `page_annotation_flatten.rs` | `apply_matrix`(306), `read_xobj_bbox_and_matrix`(454) |
+| `overlay_annotations.rs` | `concat_matrices`(1284), `IDENTITY`(1297), `transform_rect_by_cm`(1338), `apply_matrix_to_point`(1365) — doc に `QPDFMatrix` 相当と明記されている |
+| `page_rotate.rs` | `type Mat`(306), `translate`(326), `transform_box`(355) |
+| `overlay.rs` | 行列の受け渡し |
+
+`overlay_annotations.rs` と `page_rotate.rs` を落とすと重複実装が残り、D2 を満たさない。
 
 #### T0-3 `json/` ← `JSON.cc`(1,401) + `JSONHandler.cc`(189) — `flpdf-qxba.6`
 
-qpdf 側の依存は Pipeline sink のみで PDF オブジェクトモデルに非依存。規模は大きいが
-依存が無く機械的に全域移植できるため、**「完成」と言い切れる部品の代表格**。
+PDF オブジェクトモデルには非依存。規模は大きいが機械的に全域移植できる。
 
 現状 `json.rs`(159) は emitter のみで parser も schema validator も無い。
 
 D1 の対象: JSON 値モデル / parse / schema check / Base64 / writer。
+
+**Pipeline 依存の扱い（着手前に決着させること）**: `JSON.cc` は依存ゼロではなく、
+`Pl_Base64` / `Pl_Concatenate` / `Pl_String` の 3 つの Pipeline sink を使う。
+対応表は `Pipeline` を ❌ missing に分類しているため、このままでは T0-3 を
+「独立に完成できる部品」として扱えない。取りうる道は 2 つ。
+
+1. **sink 代替を逸脱として明示承認する**（推奨）— この 3 つはいずれも対応表の
+   ⚪ 逸脱候補「汎用 `Pl_*` → `Vec<u8>` / `Write`」に既に含まれており、出力バイトへの
+   影響は無い。`CLAUDE.md` の「逸脱は必ず明示」に従い、承認を得たうえで
+   `json/` の doc に逸脱理由を 1 行残す。この場合 T0-3 は Tier 0 のまま
+2. **`pipeline.rs` を先に作る** — T0-3 を Tier 1 相当に降格し、`pipeline.rs` の
+   後ろに置く。逸脱を増やさないが、後回しにした部品を前倒しすることになる
+
+**承認が得られるまで T0-3 は着手しない。** 未承認のまま `Write` で代替すると、
+`CLAUDE.md` が禁じる「暗黙の逸脱」になる。
 
 解錠するもの: `--json-input` 経路、`flpdf-iquk`、`flpdf-q28i`。
 
@@ -204,7 +238,12 @@ D1 の対象: iterator / insert / split / repair。
 | `pipeline.rs` ← `Pipeline.cc` + `Pl_*` | 依存は少ないが払いが小さい。`/ID` は既に byte-parity 済みで、原因はアルゴリズム（2 段階 MD5）であって抽象の欠落ではない。Tier 0 が片付いてから再評価 |
 | `qtc.rs` ← `QTC.cc`(50) | qtest の coverage 突き合わせが必要になった時点で |
 | `Pl_DCT` | 現状どの経路からも要求されていない |
-| CLI / `QPDFJob` 系 | byte-parity への寄与ゼロ |
+
+**`QPDFJob.cc` 本体は後回しにしない。** 対応表が示すとおり `QPDFJob.cc` は overlay /
+page 操作 / check / オーケストレーションに対応しており、`overlay.rs` のように出力
+バイトを変える処理を含む。後回しにできるのは上表の**引数解釈基盤に限る**。
+`QPDFJob.cc` 本体の再配置は Phase 2 の対象。
+| CLI の引数解釈基盤（`QPDFArgParser` / `QPDFJob_argv` / `QPDFJob_config` / `QPDFJob_json` / `QPDFUsage`） | clap 置換は出力バイトに影響しない |
 
 ## Phase 2 — 対応表に従った上位レイヤーの再配置
 
@@ -228,12 +267,22 @@ Phase 1 完了後に着手する。着手時点で対応表を**再測**する�
 横断する変更であり、writer の責務分割が済む前に入れると場当たり的な追加になるため。
 qtest +9 の実測値は順序を前倒しする根拠にしない。
 
-対応表 §A の 6 モジュール 2,496 行の畳み込みも、writer の null 可視性が構造として
+対応表 §A の 4 モジュール 1,748 行の畳み込みも、writer の null 可視性が構造として
 固まったあとの別設計とする。**挙動は検証済みで byte-identical を保っているため
 壊してはならない。** 現時点で畳み込みの issue は作らない。
 
-QDF / 暗号 / incremental の byte gate 新設は Phase 2 着手時の前提として持ち越す
-（この 3 経路には現在 gated byte gate が無い）。
+畳み込みの対象は `outline_dest_remap.rs` / `struct_tree_pg.rs` / `thread_bead_p.rs` /
+`objr_obj_annot_p.rs` の 4 つに限る。`acroform_field_prune.rs` は qpdf 側に明示的な
+対応パス（`QPDFJob.cc:2610-2632`）を持ち、`subset_prune.rs` は `/Resources` の stale
+名前エントリ剪定と orphan mark-and-sweep という独立した責務なので、**畳み込むと
+必要な処理を失う**。
+
+byte gate の新設は Phase 2 着手時の前提として持ち越す。ただし QDF は**既に部分的な
+カバレッジがある**（`writer_tests.rs:2170,2201` の qpdf golden 完全一致、
+`qdf_tests.rs:1300` の `/ID` 行を除く完全一致、`overlay::byte_gate` の QDF 3 件。
+前 2 者と `overlay::byte_gate` は CI 列挙済み）。新設が必要なのは QDF 全体ではなく
+**QDF × ObjStm / QDF × 暗号 / QDF × linearize の組み合わせと、暗号・incremental
+単体**。詳細は対応表の「QDF の既存カバレッジ」節。
 
 ## 推奨順
 
