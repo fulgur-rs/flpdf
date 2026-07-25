@@ -1,7 +1,7 @@
 use std::io::{Read, Seek, Write};
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use crate::{ObjectStreamMode, Pdf, WriteOptions};
 
@@ -10,7 +10,9 @@ pub(crate) mod plan;
 pub(crate) mod xref;
 
 #[cfg(test)]
-static PLAIN_PIPELINE_CALLS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static PLAIN_PIPELINE_CALLS: Cell<usize> = const { Cell::new(0) };
+}
 
 pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
@@ -18,7 +20,7 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     options: &WriteOptions,
 ) -> crate::Result<()> {
     #[cfg(test)]
-    PLAIN_PIPELINE_CALLS.fetch_add(1, Ordering::Relaxed);
+    PLAIN_PIPELINE_CALLS.with(|calls| calls.set(calls.get() + 1));
 
     let plan = plan::PlainWritePlan::build(pdf, options)?;
     plan.validate()?;
@@ -42,12 +44,12 @@ pub(crate) fn eligible(
 
 #[cfg(test)]
 pub(crate) fn pipeline_calls() -> usize {
-    PLAIN_PIPELINE_CALLS.load(Ordering::Relaxed)
+    PLAIN_PIPELINE_CALLS.with(Cell::get)
 }
 
 #[cfg(test)]
 pub(crate) fn reset_pipeline_calls() {
-    PLAIN_PIPELINE_CALLS.store(0, Ordering::Relaxed);
+    PLAIN_PIPELINE_CALLS.with(|calls| calls.set(0));
 }
 
 #[cfg(test)]
@@ -105,6 +107,41 @@ mod tests {
             static_aes_iv: true,
             ..WriteOptions::default()
         });
+        assert_eq!(pipeline_calls(), 0);
+    }
+
+    #[test]
+    fn requested_preserve_and_generate_forced_below_1_5_stay_legacy() {
+        for object_streams in [ObjectStreamMode::Preserve, ObjectStreamMode::Generate] {
+            reset_pipeline_calls();
+            write_with(&WriteOptions {
+                full_rewrite: true,
+                object_streams,
+                force_version: Some("1.4".into()),
+                static_id: true,
+                ..WriteOptions::default()
+            });
+            assert_eq!(pipeline_calls(), 0);
+        }
+    }
+
+    #[test]
+    fn pipeline_call_observation_is_thread_local() {
+        reset_pipeline_calls();
+
+        std::thread::spawn(|| {
+            reset_pipeline_calls();
+            write_with(&WriteOptions {
+                full_rewrite: true,
+                object_streams: ObjectStreamMode::Disable,
+                static_id: true,
+                ..WriteOptions::default()
+            });
+            assert_eq!(pipeline_calls(), 1);
+        })
+        .join()
+        .unwrap();
+
         assert_eq!(pipeline_calls(), 0);
     }
 

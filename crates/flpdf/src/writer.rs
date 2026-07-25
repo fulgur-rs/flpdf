@@ -3106,6 +3106,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     // so it never produces sub-1.5 output — and the encrypted ObjStm handling is
     // left byte-for-byte unchanged.
     let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
+    let requested_object_streams = options.object_streams;
     let suppressed_options;
     let options = if force_version_below_1_5(options)
         && (matches!(options.object_streams, ObjectStreamMode::Generate)
@@ -3199,7 +3200,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     if plain::eligible(
         pdf.encryption_ref().is_some(),
         options,
-        options.object_streams,
+        requested_object_streams,
     ) {
         return plain::write_plain(pdf, out, options);
     }
