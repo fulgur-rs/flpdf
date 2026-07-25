@@ -196,8 +196,9 @@ bd update flpdf-9hc.20.29 --append-notes "2026-07-25: current HEAD already passe
 bd update flpdf-9hc.20.30 --append-notes "2026-07-25: Generate goldens and cmp_generate_objstm_tests now exist; retain this issue for missing uniform one/two/three-page mode corpus until flpdf-2tbp.6."
 ```
 
-Expected: `.1` is in progress; the branch points at `cabb30aa`; both baseline
-commands pass; `.29/.30` remain open with current evidence.
+Expected: `.1` is in progress; the branch points at the current plan-branch tip
+(including both the approved design and this implementation plan); both
+baseline commands pass; `.29/.30` remain open with current evidence.
 
 - [ ] **Step 2: Add failing writer-owned serializer tests**
 
@@ -1283,14 +1284,18 @@ Catalog and dirty flag after this return.
 
 - [ ] **Step 6: Add explicit Disable routing and byte-parity tests**
 
-Add a test-only counter in `plain/mod.rs`:
+Add a test-only thread-local counter in `plain/mod.rs`:
 
 ```rust
 #[cfg(test)]
-static PLAIN_PIPELINE_CALLS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static PLAIN_PIPELINE_CALLS: Cell<usize> = const { Cell::new(0) };
+}
 ```
 
 Increment it at the start of `write_plain`; expose a test-only getter/resetter.
+Keeping the observation thread-local prevents concurrent Rust tests from
+resetting or incrementing one another's routing evidence.
 Add unit tests proving:
 
 - Disable increments the new counter;
@@ -1634,8 +1639,8 @@ Delete:
 - `generate_invariant`;
 - `write_pdf_generate`;
 - `write_pdf_containerized_qpdf`;
-- the old plain-only container planning, member maps, container allocation,
-  non-QDF unencrypted body loop, and generic non-QDF xref assembly from
+- the old plain-only container planning, member maps, container allocation, and
+  the non-QDF unencrypted body/xref path now owned by `plain` from
   `write_pdf_full_rewrite_inner`;
 - Task 3 shadow-comparison-only helpers;
 - comments that describe the removed containers-above-max plain architecture.
@@ -1644,7 +1649,8 @@ Retain every helper still used by:
 
 - incremental output;
 - QDF;
-- encrypt/copy-encrypt/source-encrypted full rewrite;
+- encrypt/copy-encrypt/source-encrypted full rewrite, including their generic
+  non-QDF body and xref assembly until those routes move to `plain`;
 - linearization;
 - the public `write_stream_to_buf`.
 
@@ -1685,8 +1691,8 @@ goldens. Add missing qpdf references to `tests/golden/regenerate.sh` with:
 
 ```bash
 qpdf --static-id --object-streams=generate \
-  "$fixtures/$fixture.pdf" \
-  "$references/$fixture/generate.pdf"
+  "$FIX/$fixture.pdf" \
+  "$REF/$fixture/generate.pdf"
 ```
 
 Do not regenerate or replace an existing golden unless qpdf 11.9.0 produces
