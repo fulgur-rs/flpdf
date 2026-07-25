@@ -20,6 +20,8 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
     options: &WriteOptions,
     plan: &PlainWritePlan,
 ) -> crate::Result<(Vec<u8>, BodyLayout)> {
+    validate_objstm_member_bodies(pdf, plan)?;
+
     let mut bytes = Vec::new();
     bytes.extend_from_slice(format!("%PDF-{}\n", plan.version).as_bytes());
     bytes.extend_from_slice(QPDF_BINARY_MARKER);
@@ -112,11 +114,79 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
     Ok((bytes, layout))
 }
 
+fn validate_objstm_member_bodies<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    plan: &PlainWritePlan,
+) -> crate::Result<()> {
+    if !plan
+        .objects
+        .iter()
+        .any(|object| matches!(object, PlannedIndirectObject::ObjectStream { .. }))
+    {
+        return Ok(());
+    }
+
+    let context = object_streams::eligibility_context(pdf)?;
+    for planned in &plan.objects {
+        let PlannedIndirectObject::ObjectStream { members, .. } = planned else {
+            continue;
+        };
+        for member in members {
+            let is_signature = object_streams::is_qpdf_signature_dict(pdf, member.source)?;
+            let violation = {
+                let object = pdf.resolve_borrowed(member.source)?;
+                planned_member_body_violation(member.source, member.output, object, &context)
+            }
+            .or(is_signature.then_some("signature dictionary"));
+            if let Some(kind) = violation {
+                return Err(crate::Error::Unsupported(format!(
+                    "plain writer body invariant: source {} planned as ObjStm member {} \
+                     resolves to forbidden {kind}",
+                    member.source, member.output
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn planned_member_body_violation(
+    source: crate::ObjectRef,
+    output: crate::ObjectRef,
+    object: &Object,
+    context: &object_streams::EligibilityContext,
+) -> Option<&'static str> {
+    if output.generation != 0 {
+        return Some("nonzero output generation");
+    }
+    if matches!(object, Object::Stream(_)) {
+        return Some("stream body");
+    }
+    if let Some(dict) = object.as_dict() {
+        match dict.get("Type") {
+            Some(Object::Name(name)) if name.as_slice() == b"XRef" => {
+                return Some("/Type /XRef dictionary");
+            }
+            Some(Object::Name(name)) if name.as_slice() == b"ObjStm" => {
+                return Some("/Type /ObjStm dictionary");
+            }
+            _ => {}
+        }
+    }
+    if context.encryption_ref == Some(source) {
+        return Some("encryption dictionary");
+    }
+    if context.linearization_param_ref == Some(source) {
+        return Some("linearization parameter dictionary");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::writer::plain::plan::PlannedIndirectObject;
-    use crate::{NewlineBeforeEndstream, ObjectRef, ObjectStreamMode};
+    use crate::{Dictionary, NewlineBeforeEndstream, ObjectRef, ObjectStreamMode, Stream};
 
     #[test]
     fn disable_emission_records_every_planned_source_offset() {
@@ -246,5 +316,110 @@ mod tests {
 
         assert!(matches!(error, crate::Error::Unsupported(ref message)
             if message.contains("reference 2 0 R absent from renumber map")));
+    }
+
+    fn assert_invalid_planned_member_is_rejected(invalid: Object, expected_kind: &str) {
+        let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
+        let mut pdf = Pdf::open_mem(fixture).unwrap();
+        let options = WriteOptions {
+            object_streams: ObjectStreamMode::Generate,
+            ..WriteOptions::default()
+        };
+        let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
+        let members: Vec<_> = plan
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                PlannedIndirectObject::ObjectStream { members, .. } => Some(members),
+                PlannedIndirectObject::Source { .. } => None,
+            })
+            .flatten()
+            .cloned()
+            .collect();
+        let member = members
+            .into_iter()
+            .find(|member| Some(member.source) != pdf.root_ref())
+            .unwrap();
+        pdf.set_object(member.source, invalid);
+
+        let error = emit_bodies(&mut pdf, &options, &plan).unwrap_err();
+
+        assert!(matches!(error, crate::Error::Unsupported(ref message)
+            if message.contains("plain writer body invariant")
+                && message.contains(&member.source.to_string())
+                && message.contains(expected_kind)));
+    }
+
+    #[test]
+    fn invalid_planned_objstm_stream_member_is_rejected() {
+        let mut dict = Dictionary::new();
+        dict.insert("Length", Object::Integer(0));
+        assert_invalid_planned_member_is_rejected(
+            Object::Stream(Stream {
+                dict,
+                data: Vec::new(),
+            }),
+            "stream",
+        );
+    }
+
+    #[test]
+    fn invalid_planned_objstm_xref_dictionary_member_is_rejected() {
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Name(b"XRef".to_vec()));
+        assert_invalid_planned_member_is_rejected(Object::Dictionary(dict), "/Type /XRef");
+    }
+
+    #[test]
+    fn invalid_planned_nested_objstm_dictionary_member_is_rejected() {
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
+        assert_invalid_planned_member_is_rejected(Object::Dictionary(dict), "/Type /ObjStm");
+    }
+
+    #[test]
+    fn invalid_planned_signature_dictionary_member_is_rejected() {
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Name(b"Sig".to_vec()));
+        dict.insert("ByteRange", Object::Array(Vec::new()));
+        dict.insert("Contents", Object::String(vec![0]));
+        assert_invalid_planned_member_is_rejected(Object::Dictionary(dict), "signature");
+    }
+
+    #[test]
+    fn planned_member_identity_invariants_are_classified() {
+        let source = crate::ObjectRef::new(7, 0);
+        let object = Object::Null;
+        let ordinary = object_streams::EligibilityContext {
+            encryption_ref: None,
+            linearization_param_ref: None,
+        };
+        assert_eq!(
+            planned_member_body_violation(source, crate::ObjectRef::new(2, 1), &object, &ordinary,),
+            Some("nonzero output generation")
+        );
+
+        let encrypted = object_streams::EligibilityContext {
+            encryption_ref: Some(source),
+            linearization_param_ref: None,
+        };
+        assert_eq!(
+            planned_member_body_violation(source, crate::ObjectRef::new(2, 0), &object, &encrypted,),
+            Some("encryption dictionary")
+        );
+
+        let linearized = object_streams::EligibilityContext {
+            encryption_ref: None,
+            linearization_param_ref: Some(source),
+        };
+        assert_eq!(
+            planned_member_body_violation(
+                source,
+                crate::ObjectRef::new(2, 0),
+                &object,
+                &linearized,
+            ),
+            Some("linearization parameter dictionary")
+        );
     }
 }

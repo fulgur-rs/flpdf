@@ -80,7 +80,13 @@ impl PlainWritePlan {
                 }
             }
             ObjectStreamMode::Generate => {
-                let compressible = object_streams::compressible_objgens_qpdf_plan(pdf)?;
+                let mut compressible = object_streams::compressible_objgens_qpdf_plan(pdf)?;
+                compressible
+                    .removed_refs
+                    .extend(explicitly_removed.iter().copied());
+                compressible
+                    .eligible
+                    .retain(|member| !compressible.removed_refs.contains(member));
                 let groups = object_streams::even_split_into_streams(&compressible.eligible);
                 let renumber =
                     GenerateRenumber::build(pdf, &groups, true, &compressible.removed_refs)?;
@@ -92,12 +98,11 @@ impl PlainWritePlan {
             .old_to_new
             .get(&source_root)
             .copied()
-            // cov:ignore-start: both renumberers seed traversal from the source root
             .ok_or_else(|| {
                 crate::Error::Unsupported(
                     "plain writer plan: /Root absent from renumber map".to_string(),
                 )
-            })?; // cov:ignore-end
+            })?;
         let has_object_stream = placement
             .objects
             .iter()
@@ -190,6 +195,7 @@ impl PlainWritePlan {
         for object in &self.objects {
             match object {
                 PlannedIndirectObject::Source { source, output } => {
+                    require_not_removed(&self.removed_refs, *source, "source")?;
                     require_unique_output(&mut outputs, *output)?;
                     require_unique_source(&mut sources, *source)?;
                     require_matching_mapping(&self.old_to_new, *source, *output)?;
@@ -198,6 +204,7 @@ impl PlainWritePlan {
                     has_object_stream = true;
                     require_unique_output(&mut outputs, *output)?;
                     for member in members {
+                        require_not_removed(&self.removed_refs, member.source, "ObjStm member")?;
                         if member.output.generation != 0 {
                             return Err(crate::Error::Unsupported(format!(
                                 "plain writer plan: ObjStm output member {} {} R must have generation 0",
@@ -215,6 +222,17 @@ impl PlainWritePlan {
                     }
                 }
             }
+        }
+
+        if let Some(removed) = self
+            .removed_refs
+            .iter()
+            .find(|removed| self.old_to_new.contains_key(removed))
+        {
+            return Err(crate::Error::Unsupported(format!(
+                "plain writer plan: removed source {} {} R remains in old-to-new map",
+                removed.number, removed.generation
+            )));
         }
 
         if let Some(extra) = self
@@ -401,6 +419,21 @@ fn require_unique_source(
     }
 }
 
+fn require_not_removed(
+    removed_refs: &BTreeSet<ObjectRef>,
+    source: ObjectRef,
+    role: &str,
+) -> crate::Result<()> {
+    if removed_refs.contains(&source) {
+        Err(crate::Error::Unsupported(format!(
+            "plain writer plan: removed source {} {} R has {role} placement",
+            source.number, source.generation
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn require_matching_mapping(
     old_to_new: &HashMap<ObjectRef, ObjectRef>,
     source: ObjectRef,
@@ -507,6 +540,28 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_objstm_member_colliding_with_plain_output() {
+        let member = PlannedMember {
+            source: ObjectRef::new(7, 0),
+            output: ObjectRef::new(1, 0),
+        };
+        let mut plan = plan_for_test(vec![
+            source(1, 1),
+            PlannedIndirectObject::ObjectStream {
+                output: ObjectRef::new(3, 0),
+                members: vec![member],
+            },
+        ]);
+        plan.old_to_new
+            .insert(ObjectRef::new(7, 0), ObjectRef::new(1, 0));
+
+        let err = plan.validate().unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("output object 1 has multiple placements")));
+    }
+
+    #[test]
     fn validation_accepts_nonzero_source_generation_for_zero_generation_output() {
         let member = PlannedMember {
             source: ObjectRef::new(7, 1),
@@ -608,6 +663,54 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_removed_source_placement() {
+        let mut plan = plan_for_test(vec![source(1, 1)]);
+        plan.removed_refs.insert(ObjectRef::new(1, 0));
+
+        let err = plan.validate().unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("removed source 1 0 R has source placement")));
+    }
+
+    #[test]
+    fn validation_rejects_removed_objstm_member_placement() {
+        let member = PlannedMember {
+            source: ObjectRef::new(7, 0),
+            output: ObjectRef::new(2, 0),
+        };
+        let mut plan = plan_for_test(vec![
+            source(1, 1),
+            PlannedIndirectObject::ObjectStream {
+                output: ObjectRef::new(3, 0),
+                members: vec![member],
+            },
+        ]);
+        plan.old_to_new
+            .insert(ObjectRef::new(7, 0), ObjectRef::new(2, 0));
+        plan.removed_refs.insert(ObjectRef::new(7, 0));
+        plan.trailer.form = XrefForm::Stream;
+
+        let err = plan.validate().unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("removed source 7 0 R has ObjStm member placement")));
+    }
+
+    #[test]
+    fn validation_rejects_removed_source_in_old_to_new_map() {
+        let mut plan = plan_for_test(vec![source(1, 1)]);
+        let removed = ObjectRef::new(2, 0);
+        plan.old_to_new.insert(removed, ObjectRef::new(2, 0));
+        plan.removed_refs.insert(removed);
+
+        let err = plan.validate().unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("removed source 2 0 R remains in old-to-new map")));
+    }
+
+    #[test]
     fn validation_rejects_duplicate_source_placement() {
         let plan = plan_for_test(vec![source(1, 1), source(1, 2)]);
 
@@ -706,7 +809,6 @@ mod tests {
             <PlainWritePlan as NewNumberLookup>::new_for_original(&plan, ObjectRef::new(1, 0)),
             Some(ObjectRef::new(1, 0))
         );
-        assert_eq!(plan.compressed_location(ObjectRef::new(1, 0)), None);
     }
 
     #[test]
@@ -727,6 +829,21 @@ mod tests {
             .all(|object| matches!(object, PlannedIndirectObject::Source { .. })));
         assert_eq!(plan.trailer.form, XrefForm::Table);
         plan.validate().unwrap();
+    }
+
+    #[test]
+    fn build_rejects_explicitly_deleted_root_before_placement() {
+        let path = fixture_path("three-page.pdf");
+        let mut pdf =
+            Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+        let root = pdf.root_ref().unwrap();
+        pdf.delete_object(root);
+
+        let err =
+            PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("/Root absent from renumber map")));
     }
 
     #[test]
@@ -784,6 +901,22 @@ mod tests {
             |object| matches!(object, PlannedIndirectObject::Source { source, .. }
                 if *source != deleted)
         ));
+    }
+
+    #[test]
+    fn generate_explicit_deletion_is_excluded_before_placement() {
+        let path = fixture_path("null-visible-matrix.pdf");
+        let mut pdf =
+            Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+        let deleted = ObjectRef::new(5, 0);
+        pdf.delete_object(deleted);
+
+        let plan =
+            PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Generate)).unwrap();
+
+        assert!(plan.removed_refs.contains(&deleted));
+        assert!(!plan.old_to_new.contains_key(&deleted));
+        plan.validate().unwrap();
     }
 
     #[test]

@@ -2450,6 +2450,21 @@ echo "three-page/linearize-objstm-force14.pdf"
 # linearization of the ObjStm-bearing input (NOT identical to three-page's,
 # since qpdf preserves each stream's input dict key order).
 mkdir -p "$REF/three-page-objstm"
+
+# Plain Preserve references. The script-level version gate above pins these
+# byte-sensitive outputs to qpdf 11.9.0; validate each regenerated file before
+# allowing the corpus update to continue.
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/three-page-objstm.pdf" "$REF/three-page-objstm/preserve.pdf"
+echo "three-page-objstm/preserve.pdf"
+qpdf --check --warning-exit-0 "$REF/three-page-objstm/preserve.pdf"
+
+mkdir -p "$REF/nonmonotonic-objstm-index"
+qpdf --object-streams=preserve --static-id --warning-exit-0 \
+    "$FIX/nonmonotonic-objstm-index.pdf" "$REF/nonmonotonic-objstm-index/preserve.pdf"
+echo "nonmonotonic-objstm-index/preserve.pdf"
+qpdf --check --warning-exit-0 "$REF/nonmonotonic-objstm-index/preserve.pdf"
+
 qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/three-page-objstm.pdf" "$REF/three-page-objstm/linearize-objstm.pdf"
 echo "three-page-objstm/linearize-objstm.pdf"

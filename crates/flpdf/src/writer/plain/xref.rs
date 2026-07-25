@@ -417,6 +417,78 @@ mod tests {
     }
 
     #[test]
+    fn xref_stream_rejects_xref_object_number_overflow_before_mutating_bytes() {
+        let mut bytes = b"BODY".to_vec();
+        let original = bytes.clone();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(u32::MAX, (0, 0));
+
+        let err =
+            append_xref_and_trailer(&mut bytes, &layout, &trailer(XrefForm::Stream)).unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("xref object number overflows")));
+        assert_eq!(bytes, original);
+    }
+
+    #[test]
+    fn xref_stream_rejects_size_overflow_before_mutating_bytes() {
+        let mut bytes = b"BODY".to_vec();
+        let original = bytes.clone();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(u32::MAX - 1, (0, 0));
+
+        let err =
+            append_xref_and_trailer(&mut bytes, &layout, &trailer(XrefForm::Stream)).unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("/Size overflows")));
+        assert_eq!(bytes, original);
+    }
+
+    #[test]
+    fn materialized_id_rejects_malformed_shapes() {
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("ID", Object::Integer(1));
+        let err = materialized_id(&dictionary).unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("must be an array")));
+
+        dictionary.insert("ID", Object::Array(vec![Object::String(vec![0])]));
+        let err = materialized_id(&dictionary).unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("must contain two strings")));
+    }
+
+    #[test]
+    fn classic_xref_rejects_size_overflow_before_mutating_bytes() {
+        let mut bytes = b"BODY".to_vec();
+        let original = bytes.clone();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(u32::MAX, (0, 0));
+
+        let err =
+            append_xref_and_trailer(&mut bytes, &layout, &trailer(XrefForm::Table)).unwrap_err();
+
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message.contains("/Size overflows")));
+        assert_eq!(bytes, original);
+    }
+
+    #[test]
+    fn classic_xref_emits_free_entries_for_layout_gaps() {
+        let mut bytes = Vec::new();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(2, (0, 0));
+
+        append_xref_and_trailer(&mut bytes, &layout, &trailer(XrefForm::Table)).unwrap();
+
+        assert!(bytes
+            .windows(b"0000000000 00000 f \n".len())
+            .any(|window| window == b"0000000000 00000 f \n"));
+    }
+
+    #[test]
     fn xref_stream_uses_minimal_widths_and_omits_full_range_index() {
         let mut bytes = b"BODY".to_vec();
         let mut layout = BodyLayout::default();

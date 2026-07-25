@@ -16,15 +16,24 @@ thread_local! {
 
 pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
-    mut out: W,
+    out: W,
     options: &WriteOptions,
 ) -> crate::Result<()> {
     #[cfg(test)]
     PLAIN_PIPELINE_CALLS.with(|calls| calls.set(calls.get() + 1));
 
     let plan = plan::PlainWritePlan::build(pdf, options)?;
+    write_planned(pdf, out, options, &plan)
+}
+
+fn write_planned<R: Read + Seek, W: Write>(
+    pdf: &mut Pdf<R>,
+    mut out: W,
+    options: &WriteOptions,
+    plan: &plan::PlainWritePlan,
+) -> crate::Result<()> {
     plan.validate()?;
-    let (mut bytes, layout) = body::emit_bodies(pdf, options, &plan)?;
+    let (mut bytes, layout) = body::emit_bodies(pdf, options, plan)?;
     xref::append_xref_and_trailer(&mut bytes, &layout, &plan.trailer)?;
     out.write_all(&bytes)?;
     Ok(())
@@ -55,7 +64,9 @@ pub(crate) fn reset_pipeline_calls() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{write_pdf_with_options, ObjectStreamMode, Pdf, WriteOptions};
+    use crate::{
+        write_pdf_with_options, Dictionary, Object, ObjectStreamMode, Pdf, Stream, WriteOptions,
+    };
 
     fn write_with(options: &WriteOptions) {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
@@ -184,5 +195,44 @@ mod tests {
             };
             assert!(!eligible(false, &copy_options, mode));
         }
+    }
+
+    #[test]
+    fn invalid_prebuilt_member_leaves_caller_writer_unchanged() {
+        let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
+        let mut pdf = Pdf::open_mem(fixture).unwrap();
+        let options = WriteOptions {
+            object_streams: ObjectStreamMode::Generate,
+            ..WriteOptions::default()
+        };
+        let plan = plan::PlainWritePlan::build(&mut pdf, &options).unwrap();
+        let members: Vec<_> = plan
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                plan::PlannedIndirectObject::ObjectStream { members, .. } => Some(members),
+                plan::PlannedIndirectObject::Source { .. } => None,
+            })
+            .flatten()
+            .cloned()
+            .collect();
+        let member = members.into_iter().next().unwrap();
+        let mut dict = Dictionary::new();
+        dict.insert("Length", Object::Integer(0));
+        pdf.set_object(
+            member.source,
+            Object::Stream(Stream {
+                dict,
+                data: Vec::new(),
+            }),
+        );
+        let original = b"caller sentinel".to_vec();
+        let mut caller = original.clone();
+
+        let error = write_planned(&mut pdf, &mut caller, &options, &plan).unwrap_err();
+
+        assert!(matches!(error, crate::Error::Unsupported(ref message)
+            if message.contains("plain writer body invariant")));
+        assert_eq!(caller, original);
     }
 }

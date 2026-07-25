@@ -1,6 +1,25 @@
 use super::{object_streams, CompressStreams, NewlineBeforeEndstream};
 
 /// Write a PDF stream to `out`, applying the [`NewlineBeforeEndstream`] policy.
+///
+/// The emitted layout is
+///
+/// ```text
+/// <stream-dict>\nstream\n<payload><EOL>endstream
+/// ```
+///
+/// where `<payload>` is the raw `stream.data` byte sequence and `<EOL>` is:
+///
+/// - [`NewlineBeforeEndstream::Yes`]: always one `b'\n'`;
+/// - [`NewlineBeforeEndstream::No`]: one `b'\n'` unless the payload already
+///   ends with `\n`; and
+/// - [`NewlineBeforeEndstream::Never`]: no byte.
+///
+/// # `/Length` invariant
+///
+/// This helper emits the stream dictionary unchanged. Callers must set
+/// `/Length` to `stream.data.len()`: the raw payload byte count only. Any
+/// framing LF inserted before `endstream` is not part of `/Length`.
 pub fn write_stream_to_buf(
     out: &mut Vec<u8>,
     stream: &crate::Stream,

@@ -194,7 +194,11 @@ It decides:
 - header, trailer, and ID policies.
 
 The plan stores source references, not cloned object bodies. Large streams are
-resolved and transformed once during body emission.
+resolved and transformed once during body emission. Before serializing any
+body bytes, the emitter resolves every planned ObjStm member and checks the
+body-dependent eligibility invariants that a reference-only plan cannot
+prove. The plan remains a logical placement model and does not retain those
+resolved bodies.
 
 ### `writer/plain/body.rs`
 
@@ -248,15 +252,24 @@ remain separate and continue to use the already implemented parity helpers.
 - the source `/Root` has an output mapping;
 - each object has exactly one physical role: plain, compressed member, or
   generated structural stream;
-- ObjStm output members have generation zero and are not streams, xref
-  objects, encryption dictionaries, or other forbidden structural objects
-  (a nonzero source generation may be renumbered to output generation zero);
+- no removed source identity remains in a placement or the renumber map;
+- ObjStm output members have generation zero (a nonzero source generation may
+  be renumbered to output generation zero);
 - container numbers do not collide with plain object numbers;
 - every compressed member has one container/index pair;
 - the plan can produce a complete xref range from object zero through `/Size`;
 - forced PDF versions below 1.5 contain no ObjStm or xref stream;
 - static and deterministic ID policies are mutually exclusive;
 - an output mode that requires an xref stream has a compatible PDF version.
+
+Because the logical plan deliberately stores references rather than object
+bodies, `writer/plain/body.rs` performs a separate pre-emission invariant pass
+over every planned ObjStm member. It rejects a member whose resolved body is a
+stream, an xref or ObjStm dictionary, an encryption or linearization dictionary,
+a signature dictionary, or otherwise incompatible with its planned output
+generation. This check completes before the first header or object byte is
+serialized, preserving the logical/physical separation while making
+post-planning source mutation fail atomically.
 
 Invariant failures return a diagnostic `Error` containing the affected object,
 container, or output number. They must not panic.
