@@ -85,10 +85,7 @@ impl<'a> Tokenizer<'a> {
     pub(crate) fn next_integer(&mut self) -> Result<i64> {
         let token = self.next_token();
         if token.token_type != TokenType::Integer {
-            return Err(Error::parse(
-                token.start,
-                format!("expected integer, found {}", token_description(&token)),
-            ));
+            return Err(Error::parse(token.start, "expected integer"));
         }
         std::str::from_utf8(token.value.as_ref())
             .ok()
