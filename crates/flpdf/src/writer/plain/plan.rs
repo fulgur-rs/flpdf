@@ -90,9 +90,6 @@ impl PlainWritePlan {
             .objects
             .iter()
             .any(|object| matches!(object, PlannedIndirectObject::ObjectStream { .. }));
-        let version =
-            crate::writer::effective_pdf_version(pdf.version(), options, false, has_object_stream)
-                .to_string();
 
         let form = if crate::writer::force_version_below_1_5(options) {
             XrefForm::Table
@@ -107,6 +104,13 @@ impl PlainWritePlan {
         } else {
             pdf.last_xref_form()
         };
+        let version = crate::writer::effective_pdf_version(
+            pdf.version(),
+            options,
+            false,
+            has_object_stream || form == XrefForm::Stream,
+        )
+        .to_string();
 
         let mut dictionary = pdf.trailer().clone();
         crate::writer::strip_incremental_trailer_keys(&mut dictionary);
@@ -172,10 +176,10 @@ impl PlainWritePlan {
                     has_object_stream = true;
                     require_unique_output(&mut outputs, *output)?;
                     for member in members {
-                        if member.source.generation != 0 || member.output.generation != 0 {
+                        if member.output.generation != 0 {
                             return Err(crate::Error::Unsupported(format!(
-                                "plain writer plan: ObjStm member {} {} R must have generation 0",
-                                member.source.number, member.source.generation
+                                "plain writer plan: ObjStm output member {} {} R must have generation 0",
+                                member.output.number, member.output.generation
                             )));
                         }
                         require_unique_source(&mut sources, member.source)?;
@@ -567,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_member_with_nonzero_generation() {
+    fn validation_rejects_objstm_output_with_nonzero_generation() {
         let member = PlannedMember {
             source: ObjectRef::new(7, 1),
             output: ObjectRef::new(2, 1),
@@ -578,7 +582,44 @@ mod tests {
         }]);
         let err = plan.validate().unwrap_err();
         assert!(matches!(err, crate::Error::Unsupported(ref message)
-            if message.contains("7 1 R")));
+            if message.contains("output member 2 1 R")));
+    }
+
+    #[test]
+    fn validation_accepts_nonzero_source_generation_for_zero_generation_output() {
+        let member = PlannedMember {
+            source: ObjectRef::new(7, 1),
+            output: ObjectRef::new(2, 0),
+        };
+        let mut plan = plan_for_test(vec![
+            source(1, 1),
+            PlannedIndirectObject::ObjectStream {
+                output: ObjectRef::new(3, 0),
+                members: vec![member],
+            },
+        ]);
+        plan.old_to_new
+            .insert(ObjectRef::new(7, 1), ObjectRef::new(2, 0));
+        plan.trailer.form = XrefForm::Stream;
+
+        plan.validate().unwrap();
+    }
+
+    #[test]
+    fn build_floors_xref_stream_output_to_pdf_1_5() {
+        let mut bytes = std::fs::read(fixture_path("three-page-objstm.pdf")).unwrap();
+        bytes[7] = b'4';
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+        let plan =
+            PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap();
+
+        assert_eq!(plan.version, "1.5");
+        assert_eq!(plan.trailer.form, XrefForm::Stream);
+        assert!(plan
+            .objects
+            .iter()
+            .all(|object| matches!(object, PlannedIndirectObject::Source { .. })));
     }
 
     #[test]
