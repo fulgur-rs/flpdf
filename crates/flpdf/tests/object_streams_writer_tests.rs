@@ -401,6 +401,25 @@ fn preserve_explicit_deleted_member_becomes_null_without_dangling_xref() {
     assert!(found_objstm, "surviving source members must keep an ObjStm");
 }
 
+#[test]
+fn preserve_xref_stream_without_objstm_downgrades_to_classic_table() {
+    let source = build_xref_stream_pdf_no_objstm();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Preserve;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    assert!(output
+        .windows(b"\nxref\n".len())
+        .any(|window| window == b"\nxref\n"));
+    assert!(!output
+        .windows(b"/Type /XRef".len())
+        .any(|window| window == b"/Type /XRef"));
+}
+
 // ── c. Generate mode packs eligible objects ───────────────────────────────────
 
 #[test]

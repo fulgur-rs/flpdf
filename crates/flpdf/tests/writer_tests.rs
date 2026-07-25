@@ -294,8 +294,9 @@ fn default_id_random_xref_stream_full_rewrite_resave_preserves_element1() {
         }
     }
 
-    // Source uses xref-stream form, so full_rewrite takes the xref_dict
-    // (xref-stream output) branch — the exact path under review.
+    // The source uses xref-stream form. Generate ensures the final placement
+    // also contains an ObjStm, which is qpdf's condition for taking the
+    // xref-stream output branch.
     let source = build_minimal_pdf_with_xref_stream();
     {
         let mut r = Cursor::new(&source);
@@ -307,7 +308,8 @@ fn default_id_random_xref_stream_full_rewrite_resave_preserves_element1() {
     }
 
     let mut opts = WriteOptions::default();
-    opts.full_rewrite = true; // compress_streams defaults to Yes ⇒ xref-stream output
+    opts.full_rewrite = true;
+    opts.object_streams = ObjectStreamMode::Generate;
 
     // First save: fresh random two-element /ID.
     let mut pdf1 = Pdf::open(Cursor::new(source)).unwrap();
@@ -3439,6 +3441,7 @@ fn full_rewrite_xref_stream_compress_yes_produces_valid_flate_xref() {
 
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Generate;
     // compress_streams defaults to CompressStreams::Yes
 
     let mut output = Vec::new();
@@ -3489,6 +3492,7 @@ fn full_rewrite_xref_stream_compress_no_strips_all_filter_keys() {
 
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Generate;
     options.compress_streams = CompressStreams::No;
 
     let mut output = Vec::new();
@@ -3505,6 +3509,7 @@ fn full_rewrite_xref_stream_compress_no_strips_all_filter_keys() {
     // No filter keys in the xref stream dict.
     let mut reader = Cursor::new(&output);
     let loaded = load_xref_and_trailer(&mut reader).unwrap();
+    assert_eq!(loaded.last_xref_form, XrefForm::Stream);
     for key in ["Filter", "DecodeParms", "F", "FFilter", "FDecodeParms"] {
         assert!(
             loaded.trailer.get(key).is_none(),

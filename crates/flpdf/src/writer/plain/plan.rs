@@ -108,18 +108,10 @@ impl PlainWritePlan {
             .iter()
             .any(|object| matches!(object, PlannedIndirectObject::ObjectStream { .. }));
 
-        let form = if crate::writer::force_version_below_1_5(options) {
-            XrefForm::Table
-        } else if options.object_streams == ObjectStreamMode::Generate
-            || !placement.groups.is_empty()
-        {
+        let form = if has_object_stream {
             XrefForm::Stream
-        } else if options.object_streams == ObjectStreamMode::Preserve
-            && source_had_compressed_objects
-        {
-            XrefForm::Table // cov:ignore: requires a compressed source whose qpdf packing is intentionally empty
         } else {
-            pdf.last_xref_form()
+            XrefForm::Table
         };
         let mut version = crate::writer::effective_pdf_version(
             pdf.version(),
@@ -299,7 +291,6 @@ impl PlainWritePlan {
 struct PlacementPlan {
     objects: Vec<PlannedIndirectObject>,
     old_to_new: HashMap<ObjectRef, ObjectRef>,
-    groups: Vec<Vec<ObjectRef>>,
     removed_refs: BTreeSet<ObjectRef>,
 }
 
@@ -316,7 +307,6 @@ fn build_sources_from_catalog_first(renumber: CatalogFirstRenumber) -> Placement
     PlacementPlan {
         objects,
         old_to_new,
-        groups: Vec::new(),
         removed_refs: BTreeSet::new(),
     }
 }
@@ -377,7 +367,6 @@ fn build_container_aware(
     Ok(PlacementPlan {
         objects,
         old_to_new,
-        groups,
         removed_refs,
     })
 }
@@ -582,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn build_floors_xref_stream_output_to_pdf_1_5() {
+    fn disable_xref_stream_source_keeps_parseable_source_version_and_uses_table() {
         let mut bytes = std::fs::read(fixture_path("three-page-objstm.pdf")).unwrap();
         bytes[7] = b'4';
         let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
@@ -590,8 +579,8 @@ mod tests {
         let plan =
             PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap();
 
-        assert_eq!(plan.version, "1.5");
-        assert_eq!(plan.trailer.form, XrefForm::Stream);
+        assert_eq!(plan.version, "1.4");
+        assert_eq!(plan.trailer.form, XrefForm::Table);
         assert!(plan
             .objects
             .iter()
@@ -599,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn build_repairs_unparseable_header_for_xref_stream_output() {
+    fn disable_xref_stream_source_does_not_apply_stream_version_repair() {
         let mut bytes = std::fs::read(fixture_path("three-page-objstm.pdf")).unwrap();
         bytes[5] = b'x';
         bytes[7] = b'y';
@@ -609,8 +598,8 @@ mod tests {
         let plan =
             PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap();
 
-        assert_eq!(plan.version, "1.5");
-        assert_eq!(plan.trailer.form, XrefForm::Stream);
+        assert_eq!(plan.version, "x.y");
+        assert_eq!(plan.trailer.form, XrefForm::Table);
         plan.validate().unwrap();
     }
 
