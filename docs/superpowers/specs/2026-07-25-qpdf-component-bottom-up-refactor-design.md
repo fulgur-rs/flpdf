@@ -3,6 +3,10 @@
 **Issue:** flpdf-qxba
 **Date:** 2026-07-25
 **Oracle:** qpdf 11.9.0 (`v11.9.0`) — `libqpdf/`
+**Oracle の取得:** `scripts/fetch-qpdf-source.sh`（commit `3b97c9bd` で pin / パスは
+`--print-path`）。本書および各モジュール doc の qpdf 行番号引用はすべてこのツリーに
+対するもの。11.9.0 は開発環境の Ubuntu パッケージ（`/usr/bin/qpdf`）に合わせた版で、
+挙動オラクルのバイナリと一致している必要がある。
 **対応表:** [`docs/qpdf-correspondence.md`](../../qpdf-correspondence.md)
 
 ## Problem
