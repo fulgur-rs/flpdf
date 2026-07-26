@@ -2489,6 +2489,57 @@ fn malformed_name_tree_zero_entry_repair_still_installs_an_empty_names_array() {
     assert_eq!(dests.get("Names"), Some(&Object::Array(Vec::new())));
 }
 
+fn nul_name_tree_repair_pdf() -> Vec<u8> {
+    single_outline_with_catalog(
+        "/Names << /Dests << /Names [<00> [3 0 R /Fit] 42 [3 0 R /Fit] (z) [3 0 R /Fit]] >> >>",
+        "/Dest (m)",
+        &[],
+    )
+}
+
+#[test]
+fn malformed_name_tree_repair_preserves_nul_as_pdfdoc_byte_zero() {
+    let mut pdf = Pdf::open(Cursor::new(nul_name_tree_repair_pdf())).unwrap();
+
+    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    let names = direct_dests_root(&mut pdf)
+        .get("Names")
+        .cloned()
+        .expect("repair installs /Names");
+    let Object::Array(names) = names else {
+        panic!("repaired /Names must be an array");
+    };
+    assert_eq!(names.first(), Some(&Object::String(vec![0x00])));
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 NUL destination repair oracle"]
+fn qpdf_malformed_name_tree_repair_preserves_nul_as_pdfdoc_byte_zero() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    input.write_all(&nul_name_tree_repair_pdf()).unwrap();
+    let output = Command::new("qpdf")
+        .args(["--json=2", "--json-key=outlines", "--json-key=qpdf"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let repaired_names = &json["qpdf"][1]["obj:1 0 R"]["value"]["/Names"]["/Dests"]["/Names"];
+    assert_eq!(
+        repaired_names[0],
+        serde_json::Value::String("b:00".to_string())
+    );
+}
+
 #[test]
 #[ignore = "live qpdf 11.9.0 structural-repair oracle"]
 fn qpdf_malformed_name_tree_structural_matrix_warns_and_repairs() {
