@@ -112,7 +112,7 @@ impl NodeHandle {
 
 struct ResolvedArray {
     values: Vec<Object>,
-    source: Object,
+    source_ref: Option<Object>,
     terminal_ref: Option<ObjectRef>,
 }
 
@@ -120,7 +120,8 @@ impl ResolvedArray {
     fn into_object<R: Read + Seek>(self, pdf: &mut Pdf<R>) -> Object {
         if let Some(object_ref) = self.terminal_ref {
             pdf.set_object(object_ref, Object::Array(self.values));
-            self.source
+            self.source_ref
+                .expect("an indirect array retains its source reference")
         } else {
             Object::Array(self.values)
         }
@@ -143,9 +144,10 @@ fn resolved_array<R: Read + Seek>(
     let Object::Array(values) = resolved else {
         return Ok(None);
     };
+    let source_ref = terminal_ref.map(|_| source.clone());
     Ok(Some(ResolvedArray {
         values,
-        source: source.clone(),
+        source_ref,
         terminal_ref,
     }))
 }
