@@ -256,7 +256,7 @@ pub(crate) fn finish_strict_direct_object(
                 RecoveryPolicy::RequireTerminator,
                 Vec::new(),
             )?;
-            let trailing = skip_pdf_ignorable(input, completed.after_endstream);
+            let trailing = skip_pdf_ignorable(input, completed.after_endstream)?;
             if trailing != input.len() {
                 return Err(Error::parse(trailing, "trailing bytes after object"));
             }
@@ -267,14 +267,14 @@ pub(crate) fn finish_strict_direct_object(
             return Ok(completed.object);
         }
 
-        let trailing = skip_pdf_ignorable(input, next_offset);
+        let trailing = skip_pdf_ignorable(input, next_offset)?;
         if trailing != input.len() {
             return Err(Error::parse(trailing, "trailing bytes after object"));
         }
         return Ok(Object::Dictionary(dict));
     }
 
-    let trailing = skip_pdf_ignorable(input, next_offset);
+    let trailing = skip_pdf_ignorable(input, next_offset)?;
     if trailing != input.len() {
         return Err(Error::parse(trailing, "trailing bytes after object"));
     }
@@ -298,7 +298,7 @@ pub(crate) fn finish_file_object(
             object,
             next_offset,
         } => {
-            check_endobj(input, next_offset, &mut diagnostics);
+            check_endobj(input, next_offset, &mut diagnostics)?;
             Ok(FileObjectRead {
                 object_ref,
                 object,
@@ -337,7 +337,7 @@ fn finish_stream(
         policy,
         diagnostics,
     )?;
-    check_endobj(input, completed.after_endstream, &mut completed.diagnostics);
+    check_endobj(input, completed.after_endstream, &mut completed.diagnostics)?;
     Ok(FileObjectRead {
         object_ref,
         object: completed.object,
@@ -396,10 +396,12 @@ fn complete_stream(
         dict.get("Length"),
         Some(Object::Integer(value)) if *value >= 0
     ) && exact_end.is_some_and(|end| end <= input.len());
-    let exact_terminator = exact_end.filter(|&end| end <= input.len()).and_then(|end| {
-        let terminator = skip_pdf_ignorable(input, end);
+    let exact_terminator = if let Some(end) = exact_end.filter(|&end| end <= input.len()) {
+        let terminator = skip_pdf_ignorable(input, end)?;
         keyword_token_end(input, terminator, b"endstream").map(|after| (end, after))
-    });
+    } else {
+        None
+    };
 
     let (data_end, after_endstream, included_recovery_eol) = match exact_terminator {
         Some((end, after)) => (end, after, None),
@@ -466,14 +468,19 @@ fn complete_stream(
     })
 }
 
-fn check_endobj(input: &[u8], after_body: usize, diagnostics: &mut Vec<FileObjectDiagnostic>) {
-    let expected = skip_pdf_ignorable(input, after_body);
+fn check_endobj(
+    input: &[u8],
+    after_body: usize,
+    diagnostics: &mut Vec<FileObjectDiagnostic>,
+) -> Result<()> {
+    let expected = skip_pdf_ignorable(input, after_body)?;
     if keyword_token_end(input, expected, b"endobj").is_none() {
         diagnostics.push(FileObjectDiagnostic {
             kind: FileObjectDiagnosticKind::ExpectedEndobj,
             relative_offset: expected,
         });
     }
+    Ok(())
 }
 
 fn recover_stream_boundary(
@@ -646,16 +653,11 @@ fn skip_pdf_ws(input: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-fn skip_pdf_ignorable(input: &[u8], mut pos: usize) -> usize {
-    loop {
-        pos = skip_pdf_ws(input, pos);
-        if input.get(pos) != Some(&b'%') {
-            return pos;
-        }
-        while !matches!(input.get(pos), None | Some(b'\n' | b'\r')) {
-            pos += 1;
-        }
-    }
+fn skip_pdf_ignorable(input: &[u8], pos: usize) -> Result<usize> {
+    let mut tokenizer = Tokenizer::new(input);
+    tokenizer.set_position(pos)?;
+    tokenizer.skip_ignorable()?;
+    Ok(tokenizer.position())
 }
 
 fn consume_stream_start_eol(input: &[u8], pos: usize) -> (usize, StreamStartEol) {
@@ -710,6 +712,35 @@ mod tests {
                 relative_offset: 8,
             }]
         );
+    }
+
+    #[test]
+    fn syntax_preserves_qpdf_comment_eof_error_and_offset_after_obj_header() {
+        let error = parse_file_object_syntax(b"1 0 obj %unterminated").unwrap_err();
+
+        assert_eq!(error.to_string(), "parse error at byte 21: bad token");
+    }
+
+    #[test]
+    fn syntax_ignorable_probe_rewinds_before_direct_object() {
+        let pending = parse_file_object_syntax(b"1 0 obj % comment\r\n42 endobj").unwrap();
+
+        assert_eq!(
+            pending.body,
+            PendingBody::Direct {
+                object: Object::Integer(42),
+                next_offset: 22,
+            }
+        );
+    }
+
+    #[test]
+    fn strict_stream_trailing_comment_at_eof_uses_qpdf_bad_token() {
+        let error =
+            crate::parser::parse_object(b"<< /Length 0 >>\nstream\nendstream\n%unterminated")
+                .unwrap_err();
+
+        assert_eq!(error.to_string(), "parse error at byte 46: bad token");
     }
 
     #[test]

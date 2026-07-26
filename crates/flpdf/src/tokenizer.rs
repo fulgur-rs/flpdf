@@ -758,7 +758,6 @@ impl<'a> Tokenizer<'a> {
         Ok(token)
     }
 
-    #[allow(dead_code)] // Shared cursor seeking is consumed by Layer 3.
     pub(crate) fn set_position(&mut self, position: usize) -> Result<()> {
         if position > self.input.len() {
             return Err(Error::parse(
@@ -772,8 +771,19 @@ impl<'a> Tokenizer<'a> {
     }
 
     pub(crate) fn skip_ignorable(&mut self) -> Result<()> {
-        self.skip_ignorable_inner()
-            .map_err(|start| Error::parse(start, "EOF while reading token (unterminated comment)"))
+        let saved_allow_eof = self.allow_eof;
+        let saved_include_ignorable = self.include_ignorable;
+        self.allow_eof = true;
+        self.include_ignorable = false;
+        let token = self.read_token(false, 0);
+        self.allow_eof = saved_allow_eof;
+        self.include_ignorable = saved_include_ignorable;
+
+        let token = token?;
+        if token.token_type == TokenType::Eof {
+            return Ok(());
+        }
+        self.set_position(token.start)
     }
 
     pub(crate) fn next_integer(&mut self) -> Result<i64> {
@@ -800,30 +810,6 @@ impl<'a> Tokenizer<'a> {
                     token_description(&token)
                 ),
             ))
-        }
-    }
-
-    fn skip_ignorable_inner(&mut self) -> std::result::Result<(), usize> {
-        loop {
-            while self.input.get(self.pos).copied().is_some_and(is_ws) {
-                self.pos += 1;
-            }
-            if self.input.get(self.pos) != Some(&b'%') {
-                return Ok(());
-            }
-
-            let comment_start = self.pos;
-            while self
-                .input
-                .get(self.pos)
-                .copied()
-                .is_some_and(|byte| byte != b'\r' && byte != b'\n')
-            {
-                self.pos += 1;
-            }
-            if self.pos == self.input.len() {
-                return Err(comment_start);
-            }
         }
     }
 }
@@ -1409,6 +1395,7 @@ mod tests {
         assert_eq!(comment.token_type, TokenType::Bad);
         assert!(comment.raw.is_empty());
         assert_eq!(comment.error_message, None);
+        assert_eq!((comment.start, comment.end), (12, 12));
     }
 
     #[test]
@@ -1501,14 +1488,23 @@ mod tests {
     }
 
     #[test]
-    fn skip_ignorable_reports_unterminated_comment_start() {
+    fn skip_ignorable_preserves_qpdf_comment_eof_error_and_offset() {
         let mut tokenizer = Tokenizer::new(b"% unterminated");
         let error = tokenizer.skip_ignorable().unwrap_err();
 
-        assert_eq!(
-            error.to_string(),
-            "parse error at byte 0: EOF while reading token (unterminated comment)"
-        );
+        assert_eq!(error.to_string(), "parse error at byte 14: bad token");
+    }
+
+    #[test]
+    fn skip_ignorable_rewinds_probe_before_next_token() {
+        let mut tokenizer = Tokenizer::new(b" \n% c\r\n/Name");
+        tokenizer.skip_ignorable().unwrap();
+
+        assert_eq!(tokenizer.position(), 7);
+        let token = tokenizer.read_token(false, 0).unwrap();
+        assert_eq!(token.token_type, TokenType::Name);
+        assert_eq!(token.raw, b"/Name");
+        assert_eq!((token.start, token.end), (7, 12));
     }
 
     #[test]
