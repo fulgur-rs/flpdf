@@ -10,10 +10,11 @@ pub type SharedJsonHandler = Rc<RefCell<JsonHandler>>;
 #[error("{0}")]
 pub struct JsonHandlerError(pub String);
 
-type JsonCallback = Box<dyn FnMut(&[u8], Json)>;
-type BytesCallback = Box<dyn FnMut(&[u8], &[u8])>;
-type PathCallback = Box<dyn FnMut(&[u8])>;
-type BoolCallback = Box<dyn FnMut(&[u8], bool)>;
+type HandlerKey = usize;
+type JsonCallback = Rc<RefCell<Box<dyn FnMut(&[u8], Json)>>>;
+type BytesCallback = Rc<RefCell<Box<dyn FnMut(&[u8], &[u8])>>>;
+type PathCallback = Rc<RefCell<Box<dyn FnMut(&[u8])>>>;
+type BoolCallback = Rc<RefCell<Box<dyn FnMut(&[u8], bool)>>>;
 
 #[derive(Default)]
 pub struct JsonHandler {
@@ -26,10 +27,45 @@ pub struct JsonHandler {
     dictionary_end: Option<PathCallback>,
     array_start: Option<JsonCallback>,
     array_end: Option<PathCallback>,
-    dictionary_keys: BTreeMap<Vec<u8>, SharedJsonHandler>,
-    fallback_dictionary: Option<SharedJsonHandler>,
-    array_item: Option<SharedJsonHandler>,
-    fallback: Option<SharedJsonHandler>,
+    dictionary_keys: BTreeMap<Vec<u8>, HandlerTarget>,
+    fallback_dictionary: Option<HandlerTarget>,
+    array_item: Option<HandlerTarget>,
+    fallback: Option<HandlerTarget>,
+}
+
+#[derive(Clone)]
+struct HandlerTarget {
+    key: HandlerKey,
+    handler: SharedJsonHandler,
+}
+
+impl HandlerTarget {
+    fn new(handler: SharedJsonHandler) -> Self {
+        let key = handler.as_ref().as_ptr() as HandlerKey;
+        Self { key, handler }
+    }
+}
+
+#[derive(Clone)]
+struct HandlerSnapshot {
+    any: Option<JsonCallback>,
+    null: Option<PathCallback>,
+    string: Option<BytesCallback>,
+    number: Option<BytesCallback>,
+    boolean: Option<BoolCallback>,
+    dictionary_start: Option<JsonCallback>,
+    dictionary_end: Option<PathCallback>,
+    array_start: Option<JsonCallback>,
+    array_end: Option<PathCallback>,
+    dictionary_keys: BTreeMap<Vec<u8>, HandlerTarget>,
+    fallback_dictionary: Option<HandlerTarget>,
+    array_item: Option<HandlerTarget>,
+    fallback: Option<HandlerTarget>,
+}
+
+#[derive(Default)]
+struct DispatchContext {
+    active: BTreeMap<HandlerKey, HandlerSnapshot>,
 }
 
 impl JsonHandler {
@@ -42,23 +78,23 @@ impl JsonHandler {
     }
 
     pub fn add_any_handler(&mut self, callback: impl FnMut(&[u8], Json) + 'static) {
-        self.any = Some(Box::new(callback));
+        self.any = Some(Rc::new(RefCell::new(Box::new(callback))));
     }
 
     pub fn add_null_handler(&mut self, callback: impl FnMut(&[u8]) + 'static) {
-        self.null = Some(Box::new(callback));
+        self.null = Some(Rc::new(RefCell::new(Box::new(callback))));
     }
 
     pub fn add_string_handler(&mut self, callback: impl FnMut(&[u8], &[u8]) + 'static) {
-        self.string = Some(Box::new(callback));
+        self.string = Some(Rc::new(RefCell::new(Box::new(callback))));
     }
 
     pub fn add_number_handler(&mut self, callback: impl FnMut(&[u8], &[u8]) + 'static) {
-        self.number = Some(Box::new(callback));
+        self.number = Some(Rc::new(RefCell::new(Box::new(callback))));
     }
 
     pub fn add_bool_handler(&mut self, callback: impl FnMut(&[u8], bool) + 'static) {
-        self.boolean = Some(Box::new(callback));
+        self.boolean = Some(Rc::new(RefCell::new(Box::new(callback))));
     }
 
     pub fn add_dictionary_handlers(
@@ -66,8 +102,8 @@ impl JsonHandler {
         start: impl FnMut(&[u8], Json) + 'static,
         end: impl FnMut(&[u8]) + 'static,
     ) {
-        self.dictionary_start = Some(Box::new(start));
-        self.dictionary_end = Some(Box::new(end));
+        self.dictionary_start = Some(Rc::new(RefCell::new(Box::new(start))));
+        self.dictionary_end = Some(Rc::new(RefCell::new(Box::new(end))));
     }
 
     pub fn add_dictionary_key_handler(
@@ -75,11 +111,12 @@ impl JsonHandler {
         key: impl AsRef<[u8]>,
         handler: SharedJsonHandler,
     ) {
-        self.dictionary_keys.insert(key.as_ref().to_vec(), handler);
+        self.dictionary_keys
+            .insert(key.as_ref().to_vec(), HandlerTarget::new(handler));
     }
 
     pub fn add_fallback_dictionary_handler(&mut self, handler: SharedJsonHandler) {
-        self.fallback_dictionary = Some(handler);
+        self.fallback_dictionary = Some(HandlerTarget::new(handler));
     }
 
     pub fn add_array_handlers(
@@ -88,46 +125,80 @@ impl JsonHandler {
         end: impl FnMut(&[u8]) + 'static,
         item: SharedJsonHandler,
     ) {
-        self.array_start = Some(Box::new(start));
-        self.array_end = Some(Box::new(end));
-        self.array_item = Some(item);
+        self.array_start = Some(Rc::new(RefCell::new(Box::new(start))));
+        self.array_end = Some(Rc::new(RefCell::new(Box::new(end))));
+        self.array_item = Some(HandlerTarget::new(item));
     }
 
     pub fn add_fallback_handler(&mut self, handler: SharedJsonHandler) {
-        self.fallback = Some(handler);
+        self.fallback = Some(HandlerTarget::new(handler));
     }
 
     pub fn handle(&mut self, path: &[u8], value: Json) -> Result<(), JsonHandlerError> {
-        if let Some(callback) = self.any.as_mut() {
-            callback(path, value);
+        let snapshot = self.snapshot();
+        let mut context = DispatchContext::default();
+        context
+            .active
+            .insert(self as *const JsonHandler as HandlerKey, snapshot.clone());
+        snapshot.handle(&mut context, path, value)
+    }
+
+    fn snapshot(&self) -> HandlerSnapshot {
+        HandlerSnapshot {
+            any: self.any.clone(),
+            null: self.null.clone(),
+            string: self.string.clone(),
+            number: self.number.clone(),
+            boolean: self.boolean.clone(),
+            dictionary_start: self.dictionary_start.clone(),
+            dictionary_end: self.dictionary_end.clone(),
+            array_start: self.array_start.clone(),
+            array_end: self.array_end.clone(),
+            dictionary_keys: self.dictionary_keys.clone(),
+            fallback_dictionary: self.fallback_dictionary.clone(),
+            array_item: self.array_item.clone(),
+            fallback: self.fallback.clone(),
+        }
+    }
+}
+
+impl HandlerSnapshot {
+    fn handle(
+        &self,
+        context: &mut DispatchContext,
+        path: &[u8],
+        value: Json,
+    ) -> Result<(), JsonHandlerError> {
+        if let Some(callback) = &self.any {
+            callback.borrow_mut()(path, value);
             return Ok(());
         }
 
         if value.is_null() {
-            if let Some(callback) = self.null.as_mut() {
-                callback(path);
+            if let Some(callback) = &self.null {
+                callback.borrow_mut()(path);
                 return Ok(());
             }
         }
 
-        if let (Some(callback), Some(string)) = (self.string.as_mut(), value.get_string()) {
-            callback(path, &string);
+        if let (Some(callback), Some(string)) = (&self.string, value.get_string()) {
+            callback.borrow_mut()(path, &string);
             return Ok(());
         }
 
-        if let (Some(callback), Some(number)) = (self.number.as_mut(), value.get_number()) {
-            callback(path, &number);
+        if let (Some(callback), Some(number)) = (&self.number, value.get_number()) {
+            callback.borrow_mut()(path, &number);
             return Ok(());
         }
 
-        if let (Some(callback), Some(boolean)) = (self.boolean.as_mut(), value.get_bool()) {
-            callback(path, boolean);
+        if let (Some(callback), Some(boolean)) = (&self.boolean, value.get_bool()) {
+            callback.borrow_mut()(path, boolean);
             return Ok(());
         }
 
         if value.is_dictionary() {
-            if let Some(callback) = self.dictionary_start.as_mut() {
-                callback(path, value.clone());
+            if let Some(callback) = &self.dictionary_start {
+                callback.borrow_mut()(path, value.clone());
                 let mut path_base = path.to_vec();
                 if path_base != b"." {
                     path_base.push(b'.');
@@ -138,23 +209,24 @@ impl JsonHandler {
                     let mut item_path = path_base.clone();
                     item_path.extend_from_slice(&key);
                     if let Some(handler) = self.dictionary_keys.get(&key) {
-                        handler.borrow_mut().handle(&item_path, item)?;
+                        context.dispatch(handler, &item_path, item)?;
                     } else if let Some(handler) = &self.fallback_dictionary {
-                        handler.borrow_mut().handle(&item_path, item)?;
+                        context.dispatch(handler, &item_path, item)?;
                     } else {
                         return Err(unexpected_key(&key, path));
                     }
                 }
                 self.dictionary_end
-                    .as_mut()
-                    .expect("dictionary end handler is paired with start")(path);
+                    .as_ref()
+                    .expect("dictionary end handler is paired with start")
+                    .borrow_mut()(path);
                 return Ok(());
             }
         }
 
         if value.is_array() {
-            if let Some(callback) = self.array_start.as_mut() {
-                callback(path, value.clone());
+            if let Some(callback) = &self.array_start {
+                callback.borrow_mut()(path, value.clone());
                 let mut items = Vec::new();
                 value.for_each_array_item(|item| items.push(item));
                 for (index, item) in items.into_iter().enumerate() {
@@ -163,22 +235,52 @@ impl JsonHandler {
                     self.array_item
                         .as_ref()
                         .expect("array item handler is paired with start")
-                        .borrow_mut()
-                        .handle(&item_path, item)?;
+                        .dispatch(context, &item_path, item)?;
                 }
                 self.array_end
-                    .as_mut()
-                    .expect("array end handler is paired with start")(path);
+                    .as_ref()
+                    .expect("array end handler is paired with start")
+                    .borrow_mut()(path);
                 return Ok(());
             }
         }
 
         if let Some(handler) = &self.fallback {
-            handler.borrow_mut().handle(path, value)?;
+            context.dispatch(handler, path, value)?;
             return Ok(());
         }
 
         Err(unexpected_type(path))
+    }
+}
+
+impl HandlerTarget {
+    fn dispatch(
+        &self,
+        context: &mut DispatchContext,
+        path: &[u8],
+        value: Json,
+    ) -> Result<(), JsonHandlerError> {
+        context.dispatch(self, path, value)
+    }
+}
+
+impl DispatchContext {
+    fn dispatch(
+        &mut self,
+        target: &HandlerTarget,
+        path: &[u8],
+        value: Json,
+    ) -> Result<(), JsonHandlerError> {
+        if let Some(snapshot) = self.active.get(&target.key).cloned() {
+            return snapshot.handle(self, path, value);
+        }
+
+        let snapshot = target.handler.borrow().snapshot();
+        self.active.insert(target.key, snapshot.clone());
+        let result = snapshot.handle(self, path, value);
+        self.active.remove(&target.key);
+        result
     }
 }
 

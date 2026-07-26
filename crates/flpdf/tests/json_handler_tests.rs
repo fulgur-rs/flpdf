@@ -312,3 +312,147 @@ fn unexpected_nested_key_reports_its_object_path_and_skips_end_handlers() {
     );
     assert!(ends.borrow().is_empty());
 }
+
+#[test]
+fn self_referential_dictionary_fallback_handles_finite_recursive_json() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let handler = JsonHandler::shared();
+    handler.borrow_mut().add_dictionary_handlers(
+        {
+            let seen = seen.clone();
+            move |path, _| {
+                seen.borrow_mut()
+                    .push(format!("start:{}", String::from_utf8_lossy(path)));
+            }
+        },
+        {
+            let seen = seen.clone();
+            move |path| {
+                seen.borrow_mut()
+                    .push(format!("end:{}", String::from_utf8_lossy(path)));
+            }
+        },
+    );
+    handler.borrow_mut().add_string_handler({
+        let seen = seen.clone();
+        move |path, value| {
+            seen.borrow_mut().push(format!(
+                "{}={}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(value)
+            ));
+        }
+    });
+    handler
+        .borrow_mut()
+        .add_fallback_dictionary_handler(handler.clone());
+
+    handler
+        .borrow_mut()
+        .handle(b".", Json::parse(br#"{"a":{"b":"done"}}"#).unwrap())
+        .unwrap();
+
+    assert_eq!(
+        &*seen.borrow(),
+        &["start:.", "start:.a", ".a.b=done", "end:.a", "end:.",]
+    );
+}
+
+#[test]
+fn mutually_recursive_dictionary_fallbacks_handle_a_finite_cycle() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let first = JsonHandler::shared();
+    let second = JsonHandler::shared();
+    first.borrow_mut().add_dictionary_handlers(
+        {
+            let seen = seen.clone();
+            move |path, _| {
+                seen.borrow_mut()
+                    .push(format!("first start:{}", String::from_utf8_lossy(path)));
+            }
+        },
+        {
+            let seen = seen.clone();
+            move |path| {
+                seen.borrow_mut()
+                    .push(format!("first end:{}", String::from_utf8_lossy(path)));
+            }
+        },
+    );
+    first.borrow_mut().add_string_handler({
+        let seen = seen.clone();
+        move |path, value| {
+            seen.borrow_mut().push(format!(
+                "{}={}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(value)
+            ));
+        }
+    });
+    second.borrow_mut().add_dictionary_handlers(
+        {
+            let seen = seen.clone();
+            move |path, _| {
+                seen.borrow_mut()
+                    .push(format!("second start:{}", String::from_utf8_lossy(path)));
+            }
+        },
+        {
+            let seen = seen.clone();
+            move |path| {
+                seen.borrow_mut()
+                    .push(format!("second end:{}", String::from_utf8_lossy(path)));
+            }
+        },
+    );
+    first
+        .borrow_mut()
+        .add_fallback_dictionary_handler(second.clone());
+    second
+        .borrow_mut()
+        .add_fallback_dictionary_handler(first.clone());
+
+    first
+        .borrow_mut()
+        .handle(
+            b".",
+            Json::parse(br#"{"first":{"second":"done"}}"#).unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        &*seen.borrow(),
+        &[
+            "first start:.",
+            "second start:.first",
+            ".first.second=done",
+            "second end:.first",
+            "first end:.",
+        ]
+    );
+}
+
+#[test]
+fn handler_configuration_after_registration_is_used_at_dispatch_time() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let child = JsonHandler::shared();
+    let mut root = JsonHandler::new();
+    root.add_dictionary_handlers(|_, _| {}, |_| {});
+    root.add_dictionary_key_handler(b"late", child.clone());
+
+    child.borrow_mut().add_string_handler({
+        let seen = seen.clone();
+        move |path, value| {
+            seen.borrow_mut().push(format!(
+                "{}={}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(value)
+            ));
+        }
+    });
+
+    root.handle(b".", Json::parse(br#"{"late":"configured"}"#).unwrap())
+        .unwrap();
+
+    assert_eq!(&*seen.borrow(), &[".late=configured"]);
+}
