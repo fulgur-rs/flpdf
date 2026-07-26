@@ -278,7 +278,12 @@ impl HandlerSnapshot {
                 if let Some(error) = item_error {
                     return Err(error);
                 }
-                self.dictionary_end
+                context
+                    .active
+                    .get(&owner_key)
+                    .and_then(|active| active.live.as_ref())
+                    .map(|live| live.borrow().dictionary_end.clone())
+                    .unwrap_or_else(|| self.dictionary_end.clone())
                     .as_ref()
                     .expect("dictionary end handler is paired with start")
                     .borrow_mut()(path);
@@ -294,12 +299,22 @@ impl HandlerSnapshot {
                 for (index, item) in items.into_iter().enumerate() {
                     let mut item_path = path.to_vec();
                     item_path.extend_from_slice(format!("[{index}]").as_bytes());
-                    self.array_item
+                    context
+                        .active
+                        .get(&owner_key)
+                        .and_then(|active| active.live.as_ref())
+                        .map(|live| live.borrow().array_item.clone())
+                        .unwrap_or_else(|| self.array_item.clone())
                         .as_ref()
                         .expect("array item handler is paired with start")
                         .dispatch(context, &item_path, item)?;
                 }
-                self.array_end
+                context
+                    .active
+                    .get(&owner_key)
+                    .and_then(|active| active.live.as_ref())
+                    .map(|live| live.borrow().array_end.clone())
+                    .unwrap_or_else(|| self.array_end.clone())
                     .as_ref()
                     .expect("array end handler is paired with start")
                     .borrow_mut()(path);

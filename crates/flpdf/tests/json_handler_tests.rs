@@ -115,6 +115,59 @@ fn dictionary_dispatch_rereads_fallback_before_each_item() {
 }
 
 #[test]
+fn dictionary_dispatch_rereads_end_handler_after_item_replaces_root_handlers() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let root = JsonHandler::shared();
+    root.borrow_mut().add_dictionary_handlers(
+        {
+            let seen = seen.clone();
+            move |path, _| {
+                seen.borrow_mut()
+                    .push(format!("original start:{}", String::from_utf8_lossy(path)));
+            }
+        },
+        {
+            let seen = seen.clone();
+            move |path| {
+                seen.borrow_mut()
+                    .push(format!("original end:{}", String::from_utf8_lossy(path)));
+            }
+        },
+    );
+
+    let first = JsonHandler::shared();
+    first.borrow_mut().add_number_handler({
+        let root = Rc::downgrade(&root);
+        let seen = seen.clone();
+        move |path, number| {
+            seen.borrow_mut().push(format!(
+                "item:{}={}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(number)
+            ));
+            root.upgrade()
+                .expect("root handler must be alive during dispatch")
+                .borrow_mut()
+                .add_dictionary_handlers(|_, _| {}, {
+                    let seen = seen.clone();
+                    move |path| {
+                        seen.borrow_mut()
+                            .push(format!("replacement end:{}", String::from_utf8_lossy(path)));
+                    }
+                });
+        }
+    });
+    root.borrow_mut().add_dictionary_key_handler(b"a", first);
+
+    JsonHandler::handle_shared(&root, b".", Json::parse(br#"{"a":1}"#).unwrap()).unwrap();
+
+    assert_eq!(
+        &*seen.borrow(),
+        &["original start:.", "item:.a=1", "replacement end:."]
+    );
+}
+
+#[test]
 fn dictionary_handler_observes_later_member_mutations_and_insertions() {
     let dictionary = Json::parse(br#"{"a":1,"b":2}"#).unwrap();
     let seen = Rc::new(RefCell::new(Vec::new()));
@@ -318,6 +371,80 @@ fn arrays_use_indexed_paths_then_general_fallback_handles_a_scalar() {
             ".items[1]=y",
             "end:.items",
             "fallback:.items=not-array",
+        ]
+    );
+}
+
+#[test]
+fn array_dispatch_rereads_item_and_end_handlers_after_first_item_replaces_root_handlers() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let root = JsonHandler::shared();
+
+    let replacement = JsonHandler::shared();
+    replacement.borrow_mut().add_number_handler({
+        let seen = seen.clone();
+        move |path, number| {
+            seen.borrow_mut().push(format!(
+                "replacement item:{}={}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(number)
+            ));
+        }
+    });
+    let first = JsonHandler::shared();
+    first.borrow_mut().add_number_handler({
+        let root = Rc::downgrade(&root);
+        let replacement = replacement.clone();
+        let seen = seen.clone();
+        move |path, number| {
+            seen.borrow_mut().push(format!(
+                "first item:{}={}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(number)
+            ));
+            root.upgrade()
+                .expect("root handler must be alive during dispatch")
+                .borrow_mut()
+                .add_array_handlers(
+                    |_, _| {},
+                    {
+                        let seen = seen.clone();
+                        move |path| {
+                            seen.borrow_mut()
+                                .push(format!("replacement end:{}", String::from_utf8_lossy(path)));
+                        }
+                    },
+                    replacement.clone(),
+                );
+        }
+    });
+    root.borrow_mut().add_array_handlers(
+        {
+            let seen = seen.clone();
+            move |path, _| {
+                seen.borrow_mut()
+                    .push(format!("original start:{}", String::from_utf8_lossy(path)));
+            }
+        },
+        {
+            let seen = seen.clone();
+            move |path| {
+                seen.borrow_mut()
+                    .push(format!("original end:{}", String::from_utf8_lossy(path)));
+            }
+        },
+        first,
+    );
+
+    JsonHandler::handle_shared(&root, b".items", Json::parse(br#"[1,2]"#).unwrap()).unwrap();
+
+    assert_eq!(
+        &*seen.borrow(),
+        &[
+            "original start:.items",
+            "first item:.items[0]=1",
+            "replacement item:.items[1]=2",
+            "replacement end:.items",
         ]
     );
 }
