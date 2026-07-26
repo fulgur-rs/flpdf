@@ -2995,6 +2995,61 @@ mod tests {
     }
 
     #[test]
+    fn file_mode_sink_failure_after_datafile_entry_returns_no_summary() {
+        let mut complete_pdf = load_one_page_pdf();
+        let mut complete = Vec::new();
+        write_qpdf_json_v2_selected_objects_with_options(
+            &mut complete_pdf,
+            DecodeLevel::None,
+            &StreamDataMode::File {
+                prefix: "side".to_string(),
+            },
+            &[JsonKey::Qpdf],
+            &[JsonObjectSelector::Object {
+                number: 7,
+                generation: 0,
+            }],
+            &mut complete,
+        )
+        .unwrap();
+        let marker = b"\"datafile\": \"side-7\"";
+        let marker_end = complete
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("successful file-mode JSON must contain its datafile entry")
+            + marker.len();
+
+        let mut pdf = load_one_page_pdf();
+        let mut out = FailAfter {
+            remaining: marker_end,
+            bytes: Vec::new(),
+        };
+        let result = write_qpdf_json_v2_selected_objects_with_options(
+            &mut pdf,
+            DecodeLevel::None,
+            &StreamDataMode::File {
+                prefix: "side".to_string(),
+            },
+            &[JsonKey::Qpdf],
+            &[JsonObjectSelector::Object {
+                number: 7,
+                generation: 0,
+            }],
+            &mut out,
+        );
+
+        assert!(matches!(
+            result,
+            Err(JsonOutputError::Io(ref error)) if error.to_string() == "sink full"
+        ));
+        assert!(out
+            .bytes
+            .windows(marker.len())
+            .any(|window| window == marker));
+        assert!(!out.bytes.ends_with(b"}\n"));
+    }
+
+    #[test]
     fn selected_sink_writer_inlines_stream_without_datafile_summary() {
         let mut pdf = load_one_page_pdf();
         let mut out = Vec::new();

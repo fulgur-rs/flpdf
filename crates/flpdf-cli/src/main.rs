@@ -1903,11 +1903,19 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         }
     };
 
-    // 4. Open PDF.
+    // 4. Reject an output that identifies the input file before opening or
+    // truncating it. qpdf performs this check in QPDFJob.cc:627-630. Path
+    // spelling alone is insufficient: relative aliases, symlinks, and hard
+    // links can all name the same underlying file.
     let input = cli.input.as_ref().ok_or("missing input file")?;
+    if let Some(output) = cli.json_output.as_ref() {
+        reject_same_json_output(input, output)?;
+    }
+
+    // 5. Open PDF.
     let mut pdf = open_pdf(input, cli.repair, &cli.password)?;
 
-    // 5. Write JSON incrementally.
+    // 6. Write JSON incrementally.
     //
     // `decode_level` governs both the inline `data` payloads (applied inside
     // write_qpdf_json_v2_selected_objects_with_options) and the file-mode side files
@@ -1954,7 +1962,7 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         }
     };
 
-    // 6. Write side files for stream-data=file mode only after the JSON
+    // 7. Write side files for stream-data=file mode only after the JSON
     // document completed successfully. The streaming writer records exactly
     // those stream objects that survived key/object selection.
     let side_file_result = (|| -> CliResult<()> {
@@ -4459,6 +4467,28 @@ fn run_qdf_fix(input: &std::path::Path, output: &std::path::Path) -> CliResult<(
 fn reject_encrypted_write<R: std::io::Read + std::io::Seek>(pdf: &Pdf<R>) -> CliResult<()> {
     if pdf.is_encrypted() {
         return Err("encrypted PDF output is not supported for this mode; use plain rewrite to produce decrypted plaintext".into());
+    }
+    Ok(())
+}
+
+fn reject_same_json_output(input: &Path, output: &Path) -> CliResult<()> {
+    match std::fs::metadata(output) {
+        Ok(_) => {
+            if same_file::is_same_file(input, output)? {
+                return Err(
+                    "input file and output file are the same; choose a different --json-output path"
+                        .into(),
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "unable to inspect --json-output file {}: {error}",
+                output.display()
+            )
+            .into())
+        }
     }
     Ok(())
 }

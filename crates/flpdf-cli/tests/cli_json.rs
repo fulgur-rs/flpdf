@@ -170,26 +170,112 @@ fn json_fatal_preserves_partial_output_file() {
     assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_err());
 }
 
+fn assert_same_json_output_is_rejected_without_modifying_input(
+    input_arg: &str,
+    output_arg: &str,
+    input_path: &std::path::Path,
+    current_dir: Option<&std::path::Path>,
+) {
+    let original = std::fs::read(input_path).unwrap();
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    if let Some(dir) = current_dir {
+        cmd.current_dir(dir);
+    }
+    let output = cmd
+        .args(["--json=2", "--json-output", output_arg, input_arg])
+        .output()
+        .unwrap();
+    assert_eq!(std::fs::read(input_path).unwrap(), original);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "input file and output file are the same; choose a different --json-output path"
+        ),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
-fn json_fatal_does_not_create_stream_side_files() {
-    let input = write_temp_pdf(&short_name_tree_pair_pdf());
+fn json_output_rejects_input_path_without_modifying_input() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let path = input.path().to_str().unwrap();
+    assert_same_json_output_is_rejected_without_modifying_input(path, path, input.path(), None);
+}
+
+#[test]
+fn json_output_rejects_relative_alias_without_modifying_input() {
     let temp = tempfile::tempdir().unwrap();
-    let prefix = temp.path().join("stream");
+    let input_path = temp.path().join("input.pdf");
+    std::fs::write(&input_path, one_page_pdf_with_stream()).unwrap();
+
+    assert_same_json_output_is_rejected_without_modifying_input(
+        "input.pdf",
+        "./input.pdf",
+        &input_path,
+        Some(temp.path()),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn json_output_rejects_symlink_to_input_without_modifying_input() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("input.pdf");
+    let output_path = temp.path().join("output.json");
+    std::fs::write(&input_path, one_page_pdf_with_stream()).unwrap();
+    symlink(&input_path, &output_path).unwrap();
+
+    assert_same_json_output_is_rejected_without_modifying_input(
+        input_path.to_str().unwrap(),
+        output_path.to_str().unwrap(),
+        &input_path,
+        None,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn json_output_rejects_hardlink_to_input_without_modifying_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("input.pdf");
+    let output_path = temp.path().join("output.json");
+    std::fs::write(&input_path, one_page_pdf_with_stream()).unwrap();
+    std::fs::hard_link(&input_path, &output_path).unwrap();
+
+    assert_same_json_output_is_rejected_without_modifying_input(
+        input_path.to_str().unwrap(),
+        output_path.to_str().unwrap(),
+        &input_path,
+        None,
+    );
+}
+
+#[test]
+fn json_output_overwrites_distinct_existing_file() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let temp = tempfile::tempdir().unwrap();
+    let output_path = temp.path().join("output.json");
+    std::fs::write(&output_path, b"stale output").unwrap();
 
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
             "--json=2",
-            "--json-key=outlines",
-            "--json-stream-data=file",
-            "--json-stream-prefix",
-            prefix.to_str().unwrap(),
+            "--json-output",
+            output_path.to_str().unwrap(),
             input.path().to_str().unwrap(),
         ])
         .assert()
-        .failure();
+        .success()
+        .stdout(predicate::str::is_empty());
 
-    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    let output = std::fs::read(&output_path).unwrap();
+    assert_ne!(output, b"stale output");
+    serde_json::from_slice::<serde_json::Value>(&output).unwrap();
 }
 
 // ---------------------------------------------------------------------------
