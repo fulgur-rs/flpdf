@@ -6,8 +6,10 @@
 //! `Pl_Concatenate` and `Pl_String` are `Write` and `Vec<u8>`.
 
 mod legacy;
+mod parser;
 mod value;
 mod writer;
 
 pub use legacy::{write, JsonValue};
+pub use parser::{parse, parse_reader, Reactor};
 pub use value::{Json, JsonError};
