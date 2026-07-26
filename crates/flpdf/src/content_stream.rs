@@ -30,7 +30,7 @@
 //! ```
 
 use crate::parser::Parser;
-use crate::tokenizer::{is_delimiter, is_ws, starts_number_token};
+use crate::tokenizer::{is_delimiter, is_ws, starts_number_token, Tokenizer};
 use crate::{Dictionary, Error, Object, Result};
 
 /// One lexical unit of a content stream.
@@ -197,7 +197,8 @@ impl<'a> ContentStreamParser<'a> {
 
     /// Parse a single operand using the shared object lexer.
     fn parse_operand(&mut self) -> Result<Object> {
-        let mut parser = Parser::new_no_reference(&self.input[self.pos..]);
+        let mut tokenizer = Tokenizer::new(&self.input[self.pos..]);
+        let mut parser = Parser::with_tokenizer_no_reference(&mut tokenizer);
         let obj = parser.parse_one_object()?;
         self.pos += parser.position();
         Ok(obj)
@@ -226,7 +227,8 @@ impl<'a> ContentStreamParser<'a> {
                 }
                 Some(b'/') => {
                     // Key
-                    let mut parser = Parser::new_no_reference(&self.input[self.pos..]);
+                    let mut tokenizer = Tokenizer::new(&self.input[self.pos..]);
+                    let mut parser = Parser::with_tokenizer_no_reference(&mut tokenizer);
                     let key = match parser.parse_one_object()? {
                         Object::Name(name) => name,
                         _ => return Err(Error::parse(self.pos, "inline image key is not a name")),

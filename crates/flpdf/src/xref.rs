@@ -524,7 +524,8 @@ fn recover_trailer(bytes: &[u8]) -> Result<Dictionary> {
 
     let mut cursor = ByteCursor::new(bytes, pos + marker.len());
     cursor.skip_ws();
-    let mut parser = Parser::new(&bytes[cursor.pos..]);
+    let mut tokenizer = Tokenizer::new(&bytes[cursor.pos..]);
+    let mut parser = Parser::with_tokenizer(&mut tokenizer);
     match parser.object()? {
         Object::Dictionary(trailer) => Ok(trailer),
         _ => Err(Error::parse(
@@ -745,7 +746,8 @@ fn parse_xref_table(
     }
 
     cursor.skip_ws();
-    let mut parser = Parser::new(&bytes[cursor.pos..]);
+    let mut tokenizer = Tokenizer::new(&bytes[cursor.pos..]);
+    let mut parser = Parser::with_tokenizer(&mut tokenizer);
     let trailer = match parser.object()? {
         Object::Dictionary(dict) => dict,
         _ => {

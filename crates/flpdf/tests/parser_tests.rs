@@ -99,21 +99,13 @@ fn parses_array_and_strings() {
 }
 
 #[test]
-fn malformed_tokens_report_the_failing_byte_or_eof() {
-    for (input, expected_offset) in [
-        (&b"<0g>"[..], 2),
-        (&b"<00"[..], 3),
-        (&b"(abc"[..], 4),
-        (&b"(abc\\"[..], 5),
-    ] {
+fn malformed_tokens_report_the_qpdf_token_start() {
+    for input in [&b"<0g>"[..], &b"<00"[..], &b"(abc"[..], &b"(abc\\"[..]] {
         let error = parse_object(input).expect_err("malformed token must fail");
         let Error::Parse { offset, .. } = error else {
             panic!("expected parse error, got {error:?}");
         };
-        assert_eq!(
-            offset, expected_offset,
-            "wrong diagnostic offset for {input:?}"
-        );
+        assert_eq!(offset, 0, "wrong token-start offset for {input:?}");
     }
 }
 

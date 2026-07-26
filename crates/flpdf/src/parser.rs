@@ -55,7 +55,8 @@ pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)>
 /// Object-stream members use this mode without any `endobj` check because an
 /// ObjStm body contains only adjacent direct-object representations.
 pub(crate) fn parse_qpdf_file_object(input: &[u8]) -> Result<(Object, Vec<ParserDiagnostic>)> {
-    let mut parser = Parser::new(input);
+    let mut tokenizer = Tokenizer::new(input);
+    let mut parser = Parser::with_tokenizer(&mut tokenizer);
     parser.top_level_no_reference = true;
     let object = parser.object()?;
     Ok((object, parser.diagnostics))
@@ -76,9 +77,10 @@ pub(crate) struct ParserDiagnostic {
 }
 
 pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObject> {
-    let mut parser = Parser::new(input);
+    let mut tokenizer = Tokenizer::new(input);
+    let mut parser = Parser::with_tokenizer(&mut tokenizer);
     parser.top_level_no_reference = true;
-    let token = parser.peek_token();
+    let token = parser.peek_token()?;
     if token.is_word_value(b"endobj") {
         let empty_offset = token.start;
         return Ok(ParsedDirectObject {
@@ -100,7 +102,8 @@ pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObjec
 }
 
 pub(crate) fn parse_strict_direct_object(input: &[u8]) -> Result<ParsedDirectObject> {
-    let mut parser = Parser::new(input);
+    let mut tokenizer = Tokenizer::new(input);
+    let mut parser = Parser::with_tokenizer(&mut tokenizer);
     let object = parser.object()?;
     parser.skip_ignorable()?;
     Ok(ParsedDirectObject {
@@ -111,8 +114,8 @@ pub(crate) fn parse_strict_direct_object(input: &[u8]) -> Result<ParsedDirectObj
     })
 }
 
-pub(crate) struct Parser<'a> {
-    tokenizer: Tokenizer<'a>,
+pub(crate) struct Parser<'tokenizer, 'input> {
+    tokenizer: &'tokenizer mut Tokenizer<'input>,
     buffered: VecDeque<Token>,
     /// When `true`, `N G R` is *not* recognised as an indirect reference;
     /// the first integer is returned and `G R` are left unconsumed. Content
@@ -138,10 +141,11 @@ pub(crate) struct Parser<'a> {
 // deep, so only adversarial input is rejected.
 const MAX_PARSE_DEPTH: usize = 500;
 
-impl<'a> Parser<'a> {
-    pub(crate) fn new(input: &'a [u8]) -> Self {
+impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
+    pub(crate) fn with_tokenizer(tokenizer: &'tokenizer mut Tokenizer<'input>) -> Self {
+        tokenizer.allow_eof();
         Self {
-            tokenizer: Tokenizer::new(input),
+            tokenizer,
             buffered: VecDeque::new(),
             no_reference: false,
             top_level_no_reference: false,
@@ -150,11 +154,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Like [`new`](Self::new) but with indirect-reference recognition
+    /// Like [`with_tokenizer`](Self::with_tokenizer) but with indirect-reference recognition
     /// disabled (see [`Parser::no_reference`]).
-    pub(crate) fn new_no_reference(input: &'a [u8]) -> Self {
+    pub(crate) fn with_tokenizer_no_reference(
+        tokenizer: &'tokenizer mut Tokenizer<'input>,
+    ) -> Self {
+        tokenizer.allow_eof();
         Self {
-            tokenizer: Tokenizer::new(input),
+            tokenizer,
             buffered: VecDeque::new(),
             no_reference: true,
             top_level_no_reference: false,
@@ -195,7 +202,7 @@ impl<'a> Parser<'a> {
     }
 
     fn object_inner(&mut self) -> Result<Object> {
-        let token = self.next_token();
+        let token = self.next_token()?;
         match token.token_type {
             TokenType::DictOpen => self.dictionary(),
             TokenType::ArrayOpen => self.array(),
@@ -219,7 +226,7 @@ impl<'a> Parser<'a> {
     fn dictionary(&mut self) -> Result<Object> {
         let mut dict = Dictionary::new();
         loop {
-            let token = self.next_token();
+            let token = self.next_token()?;
             if token.token_type == TokenType::DictClose {
                 return Ok(Object::Dictionary(dict));
             }
@@ -235,9 +242,9 @@ impl<'a> Parser<'a> {
     fn array(&mut self) -> Result<Object> {
         let mut values = Vec::new();
         loop {
-            let token = self.peek_token();
+            let token = self.peek_token()?;
             if token.token_type == TokenType::ArrayClose {
-                self.next_token();
+                let _ = self.next_token()?;
                 return Ok(Object::Array(values));
             }
             if token.token_type == TokenType::Eof {
@@ -253,13 +260,13 @@ impl<'a> Parser<'a> {
             return Ok(Object::Integer(first));
         }
 
-        let second_token = self.next_token();
+        let second_token = self.next_token()?;
         if second_token.token_type != TokenType::Integer {
             self.unread_token(second_token);
             return Ok(Object::Integer(first));
         }
         let second = parse_integer_token(&second_token)?;
-        let third_token = self.next_token();
+        let third_token = self.next_token()?;
         if third_token.is_word_value(b"R") {
             let number = u32::try_from(first)
                 .map_err(|_| Error::parse(first_token.start, "invalid object number"))?;
@@ -293,11 +300,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn next_token(&mut self) -> Token {
+    fn next_token(&mut self) -> Result<Token> {
         if let Some(token) = self.buffered.pop_front() {
-            return token;
+            return Ok(token);
         }
-        let token = self.tokenizer.next_token();
+        let token = self.tokenizer.read_token(true, 0)?;
         if token.token_type != TokenType::Bad {
             if let Some(message) = token.error_message.clone() {
                 self.diagnostics.push(ParserDiagnostic {
@@ -306,17 +313,17 @@ impl<'a> Parser<'a> {
                 });
             }
         }
-        token
+        Ok(token)
     }
 
     fn unread_token(&mut self, token: Token) {
         self.buffered.push_front(token);
     }
 
-    fn peek_token(&mut self) -> Token {
-        let token = self.next_token();
+    fn peek_token(&mut self) -> Result<Token> {
+        let token = self.next_token()?;
         self.unread_token(token.clone());
-        token
+        Ok(token)
     }
 
     fn skip_ignorable(&mut self) -> Result<()> {

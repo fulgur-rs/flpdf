@@ -1307,7 +1307,8 @@ fn rebuild_object_stream<R: Read + Seek>(
         let object = if updated_members.contains(&object_ref) {
             pdf.resolve(object_ref)?
         } else {
-            let mut parser = Parser::new(&stream_data[start..end]);
+            let mut tokenizer = Tokenizer::new(&stream_data[start..end]);
+            let mut parser = Parser::with_tokenizer(&mut tokenizer);
             parser.object()?
         };
 
