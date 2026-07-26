@@ -491,6 +491,8 @@ fn object_type_name(obj: &Object) -> &'static str {
         Object::Real(_) | Object::RealLiteral { .. } => "real",
         Object::Name(_) => "name",
         Object::String(_) => "string",
+        Object::Operator(_) => "operator",
+        Object::InlineImage(_) => "inline-image",
         Object::Array(_) => "array",
         Object::Dictionary(_) => "dictionary",
         Object::Stream(_) => "stream",

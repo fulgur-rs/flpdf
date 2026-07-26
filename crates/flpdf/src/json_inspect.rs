@@ -547,7 +547,7 @@ fn stream_to_json(stream: &Stream) -> Result<JsonValue, ConvertError> {
 /// non-finite (NaN or infinity).
 pub fn pdf_object_to_json(obj: &Object) -> Result<JsonValue, ConvertError> {
     match obj {
-        Object::Null => Ok(JsonValue::Null),
+        Object::Null | Object::Operator(_) | Object::InlineImage(_) => Ok(JsonValue::Null),
         Object::Boolean(b) => Ok(JsonValue::Bool(*b)),
         Object::Integer(n) => Ok(JsonValue::Integer(*n)),
         Object::Real(f) | Object::RealLiteral { value: f, .. } => {

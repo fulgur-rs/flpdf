@@ -161,10 +161,63 @@ pub enum Object {
     },
     Name(Vec<u8>),
     String(Vec<u8>),
+    /// Content-stream operator token bytes, emitted verbatim.
+    Operator(Vec<u8>),
+    /// Inline-image token bytes, emitted verbatim.
+    InlineImage(Vec<u8>),
     Array(Vec<Object>),
     Dictionary(Dictionary),
     Stream(Stream),
     Reference(ObjectRef),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operator_and_inline_image_unparse_verbatim() {
+        for object in [
+            Object::Operator(b"cm".to_vec()),
+            Object::InlineImage(b"\x00EI\xff".to_vec()),
+        ] {
+            let expected = match &object {
+                Object::Operator(value) | Object::InlineImage(value) => value.clone(),
+                _ => unreachable!(),
+            };
+            let mut out = Vec::new();
+            object.write_pdf(&mut out);
+            assert_eq!(out, expected);
+        }
+    }
+
+    #[test]
+    fn operator_and_inline_image_unparse_verbatim_in_qdf() {
+        for object in [
+            Object::Operator(b"q".to_vec()),
+            Object::InlineImage(b"\x00EI\xff".to_vec()),
+        ] {
+            let expected = match &object {
+                Object::Operator(value) | Object::InlineImage(value) => value.clone(),
+                _ => unreachable!(),
+            };
+            let mut out = Vec::new();
+            object.write_pdf_qdf(&mut out, 0);
+            assert_eq!(out, expected);
+        }
+    }
+
+    #[test]
+    fn content_only_objects_have_qpdf_accessors() {
+        assert_eq!(
+            Object::Operator(b"q".to_vec()).as_operator(),
+            Some(b"q".as_slice())
+        );
+        assert_eq!(
+            Object::InlineImage(b"data".to_vec()).as_inline_image(),
+            Some(b"data".as_slice())
+        );
+    }
 }
 
 pub(crate) fn collect_qpdf_object_references(
@@ -190,7 +243,9 @@ pub(crate) fn collect_qpdf_object_references(
             | Object::Real(_)
             | Object::RealLiteral { .. }
             | Object::Name(_)
-            | Object::String(_) => {}
+            | Object::String(_)
+            | Object::Operator(_)
+            | Object::InlineImage(_) => {}
         }
     }
 }
@@ -261,6 +316,22 @@ impl Object {
     pub fn as_string(&self) -> Option<&[u8]> {
         match self {
             Object::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Return this object as operator bytes, if it is [`Object::Operator`].
+    pub fn as_operator(&self) -> Option<&[u8]> {
+        match self {
+            Object::Operator(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Return this object as inline-image bytes, if it is [`Object::InlineImage`].
+    pub fn as_inline_image(&self) -> Option<&[u8]> {
+        match self {
+            Object::InlineImage(value) => Some(value),
             _ => None,
         }
     }
@@ -437,6 +508,9 @@ impl Object {
             }
             Object::String(value) => {
                 write_string_value(out, value);
+            }
+            Object::Operator(value) | Object::InlineImage(value) => {
+                out.extend_from_slice(value);
             }
             Object::Array(values) => {
                 // qpdf `QPDFWriter::unparseObject` (libqpdf/QPDFWriter.cc:1334-

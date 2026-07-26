@@ -196,6 +196,8 @@ fn type_code(o: &Object) -> u8 {
         Object::Dictionary(_) => 7,
         Object::Stream(_) => 8,
         Object::Reference(_) => 9,
+        Object::Operator(_) => 10,
+        Object::InlineImage(_) => 11,
     }
 }
 

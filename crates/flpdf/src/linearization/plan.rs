@@ -2723,7 +2723,9 @@ fn page_object_users<R: Read + Seek>(
                 | Object::Real(_)
                 | Object::RealLiteral { .. }
                 | Object::Name(_)
-                | Object::String(_) => {}
+                | Object::String(_)
+                | Object::Operator(_)
+                | Object::InlineImage(_) => {}
             }
         }
         result.page.push(page_users);

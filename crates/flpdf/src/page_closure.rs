@@ -201,7 +201,9 @@ fn collect_refs_in_object(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) 
         | Object::Real(_)
         | Object::RealLiteral { .. }
         | Object::Name(_)
-        | Object::String(_) => {}
+        | Object::String(_)
+        | Object::Operator(_)
+        | Object::InlineImage(_) => {}
     }
     Ok(())
 }

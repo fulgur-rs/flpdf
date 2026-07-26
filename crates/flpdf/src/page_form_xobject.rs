@@ -619,7 +619,9 @@ fn collect_object_refs(obj: &Object, out: &mut Vec<ObjectRef>) {
         | Object::Real(_)
         | Object::RealLiteral { .. }
         | Object::Name(_)
-        | Object::String(_) => {}
+        | Object::String(_)
+        | Object::Operator(_)
+        | Object::InlineImage(_) => {}
     }
 }
 

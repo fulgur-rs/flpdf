@@ -1488,7 +1488,9 @@ fn decrypt_strings_in_value(
         | Object::Real(_)
         | Object::RealLiteral { .. }
         | Object::Name(_)
-        | Object::Reference(_) => Ok(()),
+        | Object::Reference(_)
+        | Object::Operator(_)
+        | Object::InlineImage(_) => Ok(()),
     }
 }
 
@@ -1745,7 +1747,9 @@ where
         | Object::Real(_)
         | Object::RealLiteral { .. }
         | Object::Name(_)
-        | Object::Reference(_) => Ok(()),
+        | Object::Reference(_)
+        | Object::Operator(_)
+        | Object::InlineImage(_) => Ok(()),
     }
 }
 
