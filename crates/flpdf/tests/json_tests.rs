@@ -19,6 +19,12 @@ fn encoded_number_is_not_normalized() {
 #[test]
 fn real_special_values_match_qpdf_classic_locale_bytes() {
     assert_eq!(Json::make_real(f64::NAN).unparse().unwrap(), b"nan");
+    assert_eq!(
+        Json::make_real(f64::from_bits(0xfff8_0000_0000_0000))
+            .unparse()
+            .unwrap(),
+        b"-nan"
+    );
     assert_eq!(Json::make_real(f64::INFINITY).unparse().unwrap(), b"inf");
     assert_eq!(
         Json::make_real(f64::NEG_INFINITY).unparse().unwrap(),

@@ -191,7 +191,11 @@ impl Json {
 
 fn format_qpdf_real(value: f64) -> String {
     if value.is_nan() {
-        return "nan".into();
+        return if value.is_sign_negative() {
+            "-nan".into()
+        } else {
+            "nan".into()
+        };
     }
     if value == f64::INFINITY {
         return "inf".into();
