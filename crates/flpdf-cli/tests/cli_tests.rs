@@ -2602,8 +2602,9 @@ fn json_output_missing_input_preserves_existing_output_and_reports_input_open() 
 #[test]
 fn json_output_writes_to_dev_null_without_stdout() {
     // Regression for unconditional set_len/seek after the output identity
-    // check: /dev/null is writable but neither operation is valid on its
-    // non-regular file handle. The CLI must still treat it as a JSON sink.
+    // check: /dev/null is writable but rejects truncation. Other non-regular
+    // sinks, such as FIFOs, may also reject seek. The CLI must still treat it
+    // as a JSON sink.
     let output = Command::cargo_bin("flpdf")
         .unwrap()
         .args([
