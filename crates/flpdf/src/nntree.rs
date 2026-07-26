@@ -183,7 +183,11 @@ impl<K: TreeKey> NNTreeCursor<K> {
         }
     }
 
-    pub(crate) fn valid(&self) -> bool {
+    /// Whether traversal has selected an array slot.
+    ///
+    /// Malformed keys may leave a cursor positioned while [`Self::current`]
+    /// is `None`; callers must not treat this as a usable key/value pair.
+    pub(crate) fn positioned(&self) -> bool {
         self.item_number.is_some()
     }
 
@@ -305,7 +309,7 @@ impl<K: TreeKey> NNTree<K> {
         value: Object,
     ) -> Result<NNTreeCursor<K>> {
         let mut cursor = self.find(pdf, &key, true)?;
-        if !cursor.valid() {
+        if !cursor.positioned() {
             return self.insert_first(pdf, allocator, key, value);
         }
 
@@ -353,7 +357,7 @@ impl<K: TreeKey> NNTree<K> {
         key: K::Key,
         value: Object,
     ) -> Result<()> {
-        if !cursor.valid() {
+        if !cursor.positioned() {
             *cursor = self.insert_first(pdf, allocator, key, value)?;
             return Ok(());
         }
@@ -497,7 +501,7 @@ impl<K: TreeKey> NNTree<K> {
 
         let mut allocator = ObjectAllocator::default();
         let mut cursor = self.begin(pdf)?;
-        while cursor.valid() {
+        while cursor.positioned() {
             if let Some((key, value)) = cursor.cloned_current() {
                 replacement.insert_with_allocator(pdf, &mut allocator, key, value)?;
             }
@@ -813,7 +817,7 @@ impl<K: TreeKey> NNTree<K> {
                     let child =
                         self.prepare_kid(pdf, &parent_handle, remaining_kids - 1, previous)?;
                     self.descend(pdf, cursor, child, false, true)?;
-                    if cursor.valid() {
+                    if cursor.positioned() {
                         self.next(pdf, cursor)?;
                     } // cov:ignore: LLVM maps this covered conditional delimiter to a zero-count region
                 } else {
@@ -844,7 +848,7 @@ impl<K: TreeKey> NNTree<K> {
         return_previous_if_missing: bool,
     ) -> Result<NNTreeCursor<K>> {
         let first = self.begin(pdf)?;
-        if !first.valid() {
+        if !first.positioned() {
             return Ok(self.end());
         }
         if let Some((first_key, _)) = first.current() {
@@ -1882,7 +1886,7 @@ mod tests {
         );
 
         let mut end = tree.end();
-        assert!(!end.valid());
+        assert!(!end.positioned());
         tree.next(&mut pdf, &mut end).unwrap();
         assert_eq!(
             end.current().map(|(key, value)| (key.as_slice(), value)),
@@ -1914,7 +1918,7 @@ mod tests {
         let root = root_with_one_direct_leaf();
         let mut repaired = NNTree::<NameKey>::new(root, true);
         let cursor = repaired.begin(&mut repaired_pdf).unwrap();
-        assert!(cursor.valid());
+        assert!(cursor.positioned());
         assert!(matches!(
             repaired.root(),
             Object::Dictionary(root)
@@ -1936,7 +1940,7 @@ mod tests {
         let root = root_with_one_direct_leaf();
         let mut strict = NNTree::<NameKey>::new(root, false);
         let cursor = strict.begin(&mut strict_pdf).unwrap();
-        assert!(cursor.valid());
+        assert!(cursor.positioned());
         assert!(matches!(
             strict.root(),
             Object::Dictionary(root)
@@ -1955,7 +1959,7 @@ mod tests {
 
         let cursor = tree.begin(&mut pdf).unwrap();
 
-        assert!(!cursor.valid());
+        assert!(!cursor.positioned());
         assert_eq!(
             pdf.repair_diagnostics().entries()[0].message,
             "Name/Number tree node: non-dictionary node while traversing name/number tree"
@@ -1972,12 +1976,12 @@ mod tests {
             tree.find(&mut pdf, &20, false).unwrap().current(),
             Some((&20, &Object::String(b"twenty".to_vec())))
         );
-        assert!(!tree.find(&mut pdf, &25, false).unwrap().valid());
+        assert!(!tree.find(&mut pdf, &25, false).unwrap().positioned());
         assert_eq!(
             tree.find(&mut pdf, &25, true).unwrap().current(),
             Some((&20, &Object::String(b"twenty".to_vec())))
         );
-        assert!(!tree.find(&mut pdf, &-1, true).unwrap().valid());
+        assert!(!tree.find(&mut pdf, &-1, true).unwrap().positioned());
         assert_eq!(
             tree.find(&mut pdf, &99, true).unwrap().current(),
             Some((&40, &Object::String(b"forty".to_vec())))
@@ -2104,14 +2108,14 @@ mod tests {
     fn traversal_warns_on_empty_nodes_and_cycles() {
         let mut pdf = empty_pdf();
         let mut empty = NNTree::<NameKey>::new(Object::Dictionary(Dictionary::new()), false);
-        assert!(!empty.begin(&mut pdf).unwrap().valid());
+        assert!(!empty.begin(&mut pdf).unwrap().positioned());
 
         let cycle_ref = ObjectRef::new(40, 0);
         let mut node = Dictionary::new();
         node.insert("Kids", Object::Array(vec![Object::Reference(cycle_ref)]));
         pdf.set_object(cycle_ref, Object::Dictionary(node));
         let mut cyclic = NNTree::<NameKey>::new(Object::Reference(cycle_ref), false);
-        assert!(!cyclic.begin(&mut pdf).unwrap().valid());
+        assert!(!cyclic.begin(&mut pdf).unwrap().positioned());
 
         let warnings = pdf
             .repair_diagnostics()
@@ -2147,14 +2151,14 @@ mod tests {
             .unwrap()
             .insert("Names", Object::Integer(7));
         leaf.next(&mut pdf, &mut cursor).unwrap();
-        assert!(!cursor.valid());
+        assert!(!cursor.positioned());
 
         let mut parent = NNTree::<NameKey>::new(two_leaf_name_tree(&mut pdf), false);
         let mut cursor = parent.begin(&mut pdf).unwrap();
         parent.next(&mut pdf, &mut cursor).unwrap();
         parent.root.as_dict_mut().unwrap().remove("Kids");
         parent.next(&mut pdf, &mut cursor).unwrap();
-        assert!(!cursor.valid());
+        assert!(!cursor.positioned());
 
         let mut cross = NNTree::<NameKey>::new(two_leaf_name_tree(&mut pdf), false);
         let mut cursor = cross.find(&mut pdf, &b"c".to_vec(), false).unwrap();
@@ -2333,15 +2337,15 @@ mod tests {
             tree.remove_at(&mut pdf, &mut last).unwrap(),
             Some(Object::Integer(20))
         );
-        assert!(!last.valid());
+        assert!(!last.positioned());
 
         let mut only = tree.find(&mut pdf, &10, false).unwrap();
         assert_eq!(
             tree.remove_at(&mut pdf, &mut only).unwrap(),
             Some(Object::Integer(10))
         );
-        assert!(!only.valid());
-        assert!(!tree.begin(&mut pdf).unwrap().valid());
+        assert!(!only.positioned());
+        assert!(!tree.begin(&mut pdf).unwrap().positioned());
     }
 
     #[test]
@@ -2430,7 +2434,7 @@ mod tests {
         let mut last = NNTree::<NameKey>::new(Object::Dictionary(last_root), false);
         let mut last_cursor = cursor(1, empty_ref);
         last.remove_empty_leaf(&mut pdf, &mut last_cursor).unwrap();
-        assert!(!last_cursor.valid());
+        assert!(!last_cursor.positioned());
     }
 
     #[test]
@@ -2539,7 +2543,7 @@ mod tests {
         }
 
         assert_eq!(number_tree_shape(&mut pdf, tree.root()), "L[]");
-        assert!(!tree.begin(&mut pdf).unwrap().valid());
+        assert!(!tree.begin(&mut pdf).unwrap().positioned());
     }
 
     #[test]
@@ -2885,7 +2889,7 @@ mod tests {
 
         let found = tree.find(&mut pdf, &b"target".to_vec(), false).unwrap();
 
-        assert!(!found.valid());
+        assert!(!found.positioned());
         let Object::Dictionary(root) = tree.root() else {
             panic!("root must remain direct"); // cov:ignore: test-shape guard
         };
