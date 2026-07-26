@@ -1,5 +1,7 @@
 use std::io::{self, Write};
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+
 use super::value::ValueSnapshot;
 use super::Json;
 
@@ -71,10 +73,13 @@ fn write_container_or_blob(
             write_indent(out, depth)?;
             out.write_all(b"]")
         }
-        ValueSnapshot::Blob(_) => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "JSON blob writing is not available yet",
-        )),
+        ValueSnapshot::Blob(writer) => {
+            let mut bytes = Vec::new();
+            writer.borrow_mut()(&mut bytes)?;
+            out.write_all(b"\"")?;
+            out.write_all(STANDARD.encode(bytes).as_bytes())?;
+            out.write_all(b"\"")
+        }
         ValueSnapshot::String(_)
         | ValueSnapshot::Number(_)
         | ValueSnapshot::Bool(_)

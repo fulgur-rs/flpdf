@@ -45,3 +45,4 @@ yaml-rust2 = { version = "0.11", default-features = false }
 # Already present as a transitive dep via tempfile/etc — direct declaration
 # is free build-closure-wise.
 getrandom = "0.2"
+base64 = "0.22"

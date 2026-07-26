@@ -31,7 +31,7 @@ pub(crate) struct Members {
     pub(crate) end: i64,
 }
 
-#[allow(dead_code)] // Later JSON stack layers construct containers and blobs.
+#[allow(dead_code)] // Values are constructed by the later parser/tree layers.
 pub(crate) enum Value {
     Dictionary {
         members: BTreeMap<Vec<u8>, Json>,
@@ -48,7 +48,6 @@ pub(crate) enum Value {
     Blob(Rc<RefCell<Box<dyn FnMut(&mut dyn io::Write) -> io::Result<()>>>>),
 }
 
-#[allow(dead_code)] // Later JSON stack layers consume the non-scalar snapshots.
 pub(crate) enum ValueSnapshot {
     Dictionary(Vec<(Vec<u8>, Json)>),
     Array(Vec<Json>),
@@ -158,12 +157,18 @@ impl Json {
     pub(crate) fn value_snapshot(&self) -> Option<ValueSnapshot> {
         let members = self.0.as_ref()?.borrow();
         Some(match &members.value {
-            Value::Dictionary { members, .. } => ValueSnapshot::Dictionary(
-                members
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
-            ),
+            Value::Dictionary {
+                members,
+                parsed_keys,
+            } => {
+                let _ = parsed_keys;
+                ValueSnapshot::Dictionary(
+                    members
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                )
+            }
             Value::Array(values) => ValueSnapshot::Array(values.clone()),
             Value::String { encoded, .. } => ValueSnapshot::String(encoded.clone()),
             Value::Number(value) => ValueSnapshot::Number(value.clone()),
@@ -171,6 +176,76 @@ impl Json {
             Value::Null => ValueSnapshot::Null,
             Value::Blob(writer) => ValueSnapshot::Blob(writer.clone()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::rc::Rc;
+
+    use super::{Json, Value};
+
+    #[test]
+    fn scalar_constructors_preserve_qpdf_encoded_and_original_values() {
+        let string = Json::make_string(b"quote \" slash \\ control \x01");
+        assert_eq!(
+            string.get_string(),
+            Some(b"quote \" slash \\ control \x01".to_vec())
+        );
+        assert_eq!(
+            string.unparse().unwrap(),
+            b"\"quote \\\" slash \\\\ control \\u0001\""
+        );
+
+        assert_eq!(Json::make_int(-42).unparse().unwrap(), b"-42");
+        assert_eq!(Json::make_real(2.5).unparse().unwrap(), b"2.5");
+        assert_eq!(Json::make_real(0.0).unparse().unwrap(), b"0");
+        assert_eq!(Json::make_null().unparse().unwrap(), b"null");
+        assert_eq!(Json::LATEST, 2);
+    }
+
+    #[test]
+    fn offsets_are_shared_by_cloned_initialized_handles_and_ignored_by_default() {
+        let value = Json::make_bool(false);
+        let clone = value.clone();
+        value.set_start(4);
+        clone.set_end(9);
+        assert_eq!((value.start(), value.end()), (4, 9));
+
+        let default = Json::default();
+        default.set_start(1);
+        default.set_end(2);
+        assert_eq!((default.start(), default.end()), (0, 0));
+        assert_eq!(format!("{default:?}"), "Json(None)");
+    }
+
+    #[test]
+    fn tree_snapshots_write_qpdf_indentation_and_sorted_encoded_keys() {
+        let tree = Json::with_value(Value::Dictionary {
+            members: BTreeMap::from([
+                (b"a".to_vec(), Json::make_number(b"2")),
+                (
+                    b"z".to_vec(),
+                    Json::with_value(Value::Array(vec![Json::make_bool(true)])),
+                ),
+            ]),
+            parsed_keys: BTreeSet::from([b"a".to_vec()]),
+        });
+
+        assert_eq!(
+            tree.unparse().unwrap(),
+            b"{\n  \"a\": 2,\n  \"z\": [\n    true\n  ]\n}"
+        );
+    }
+
+    #[test]
+    fn blob_writer_base64_encodes_the_bytes_produced_by_its_callback() {
+        let blob = Json::with_value(Value::Blob(Rc::new(std::cell::RefCell::new(Box::new(
+            |out| out.write_all(b"\x00\xff"),
+        )))));
+
+        assert_eq!(blob.unparse().unwrap(), b"\"AP8=\"");
     }
 }
 
