@@ -52,6 +52,33 @@ pub enum JsonOutputError {
     Convert(#[from] ConvertError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error("{operation} {path}: {message}")]
+    SideFileIo {
+        operation: &'static str,
+        path: String,
+        message: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+fn side_file_io_error(
+    operation: &'static str,
+    path: &str,
+    source: std::io::Error,
+) -> JsonOutputError {
+    let rendered = source.to_string();
+    let message = source
+        .raw_os_error()
+        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+        .unwrap_or(&rendered)
+        .to_owned();
+    JsonOutputError::SideFileIo {
+        operation,
+        path: path.to_owned(),
+        message,
+        source,
+    }
 }
 
 fn json_array(values: impl IntoIterator<Item = Json>) -> Result<Json, ConvertError> {
@@ -2659,7 +2686,8 @@ fn write_file_mode_object_entry<R: Read + Seek>(
             Json::write_dictionary_key(out, &mut object_first, b"stream", 4)?;
 
             let side_path = format_json_side_file_path(prefix, object_ref.number);
-            let mut side_file = File::create(&side_path)?;
+            let mut side_file = File::create(&side_path)
+                .map_err(|source| side_file_io_error("open", &side_path, source))?;
             write_file_mode_stream_value(
                 pdf,
                 &stream,
@@ -2696,8 +2724,12 @@ fn write_file_mode_stream_value<R: Read + Seek, W: Write>(
         &Json::make_string(side_path),
         5,
     )?;
-    side_file.write_all(payload.bytes.as_ref())?;
-    side_file.flush()?;
+    side_file
+        .write_all(payload.bytes.as_ref())
+        .map_err(|source| side_file_io_error("write", side_path, source))?;
+    side_file
+        .flush()
+        .map_err(|source| side_file_io_error("flush", side_path, source))?;
 
     let dict = normalized_emitted_stream_dict(stream, payload.decode_succeeded);
     let dict_json = qpdf_dict_to_json(pdf, &dict)?;
@@ -2822,6 +2854,21 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    struct FlushFails {
+        bytes: Vec<u8>,
+    }
+
+    impl std::io::Write for FlushFails {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("flush full"))
         }
     }
 
@@ -3237,10 +3284,57 @@ mod tests {
             &mut out,
         );
 
+        let error = result.unwrap_err();
+        assert_eq!(error.to_string(), "write side-file: sink full");
         assert!(matches!(
-            result,
-            Err(JsonOutputError::Io(ref error)) if error.to_string() == "sink full"
+            error,
+            JsonOutputError::SideFileIo {
+                operation: "write",
+                ref path,
+                ref message,
+                ref source,
+            } if path == "side-file" && message == "sink full" && source.to_string() == "sink full"
         ));
+        assert!(
+            out.windows(br#""datafile": "side-file""#.len())
+                .any(|window| window == br#""datafile": "side-file""#),
+            "{out:?}"
+        );
+        assert!(
+            !out.windows(br#""dict""#.len())
+                .any(|window| window == br#""dict""#),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn file_mode_payload_flush_failure_leaves_complete_datafile_before_dict() {
+        let mut pdf = load_one_page_pdf();
+        let stream = Stream::new(Dictionary::new(), b"payload".to_vec());
+        let mut side_file = FlushFails { bytes: Vec::new() };
+        let mut out = Vec::new();
+
+        let result = write_file_mode_stream_value(
+            &mut pdf,
+            &stream,
+            DecodeLevel::None,
+            "side-file",
+            &mut side_file,
+            &mut out,
+        );
+
+        let error = result.unwrap_err();
+        assert_eq!(error.to_string(), "flush side-file: flush full");
+        assert!(matches!(
+            error,
+            JsonOutputError::SideFileIo {
+                operation: "flush",
+                ref path,
+                ref message,
+                ref source,
+            } if path == "side-file" && message == "flush full" && source.to_string() == "flush full"
+        ));
+        assert_eq!(side_file.bytes, b"payload");
         assert!(
             out.windows(br#""datafile": "side-file""#.len())
                 .any(|window| window == br#""datafile": "side-file""#),

@@ -15,6 +15,15 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
+fn normalized_os_message(error: &std::io::Error) -> String {
+    let message = error.to_string();
+    error
+        .raw_os_error()
+        .and_then(|code| message.strip_suffix(&format!(" (os error {code})")))
+        .unwrap_or(&message)
+        .to_owned()
+}
+
 fn json_qpdf_metadata(json: &serde_json::Value) -> &serde_json::Value {
     &json["qpdf"][0]
 }
@@ -2602,6 +2611,17 @@ fn json_side_file_error_emits_recorded_warning_after_partial_json_before_fatal_e
         .rfind("flpdf:")
         .unwrap_or_else(|| panic!("missing fatal error in {stderr}"));
     assert!(warning < fatal, "{stderr}");
+    let side_path = format!("{}-6", missing_prefix.display());
+    let open_error = std::fs::File::create(&side_path).unwrap_err();
+    let expected_fatal = format!(
+        "flpdf: open {side_path}: {}",
+        normalized_os_message(&open_error)
+    );
+    assert_eq!(
+        stderr.lines().last(),
+        Some(expected_fatal.as_str()),
+        "{stderr}"
+    );
     assert_eq!(
         stderr.matches("attempting to repair after error:").count(),
         1
