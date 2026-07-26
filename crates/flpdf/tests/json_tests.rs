@@ -51,6 +51,7 @@ fn qpdf_blob_uses_standard_base64_without_newlines() {
 #[test]
 fn qpdf_real_uses_six_digit_trimmed_format() {
     assert_eq!(Json::make_real(3.14159).unparse().unwrap(), b"3.14159");
+    assert_eq!(Json::make_real(3.1415927).unparse().unwrap(), b"3.141593");
     assert_eq!(Json::make_real(-0.0).unparse().unwrap(), b"-0");
 }
 
