@@ -5115,7 +5115,7 @@ fn open_pdf(
 }
 
 fn open_pdf_from_file(
-    input: &PathBuf,
+    input: &Path,
     file: File,
     repair: bool,
     password: &PasswordArgs,
@@ -5153,7 +5153,7 @@ fn open_pdf_impl(
 }
 
 fn open_pdf_file_impl(
-    input: &PathBuf,
+    input: &Path,
     file: File,
     repair: bool,
     password: &PasswordArgs,
