@@ -1095,8 +1095,8 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, Con
             // placeholder until flpdf-9hc.11.6 (outline back-references)
             ("outlines".to_string(), Json::make_array()),
             ("pageposfrom1".to_string(), Json::make_int(pageposfrom1)),
-        ])?;
-        entries.push(entry);
+        ]);
+        entries.push(entry?);
     }
 
     json_array(entries)
@@ -1148,17 +1148,17 @@ pub fn build_pagelabels_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json
     crate::pages::page_refs(pdf)?;
 
     // Resolve the Catalog.
-    let catalog_ref = match pdf.root_ref() {
-        Some(r) => r,
-        None => return Ok(Json::make_array()),
-    };
+    // A successful page-tree walk has already validated both invariants.
+    let catalog_ref = pdf
+        .root_ref()
+        .ok_or_else(|| ConvertError::PdfError("page tree has no catalog".to_string()))?;
     let catalog = pdf
         .resolve_borrowed(catalog_ref)
         .map_err(ConvertError::from)?;
-    let mut catalog_dict = match catalog {
-        Object::Dictionary(d) => d.clone(),
-        _ => return Ok(Json::make_array()),
-    };
+    let mut catalog_dict = catalog
+        .as_dict()
+        .cloned()
+        .ok_or_else(|| ConvertError::PdfError("catalog is not a dictionary".to_string()))?;
 
     // Look up /PageLabels.  May be absent, a direct Dictionary, or a Reference.
     let pagelabels_val = match catalog_dict.get("PageLabels") {
@@ -1469,8 +1469,8 @@ fn walk_acroform_fields<R: Read + Seek>(
         ("object".to_string(), Json::make_string(object_str)),
         ("parent".to_string(), parent_json),
         ("value".to_string(), value),
-    ])?;
-    output.push(entry);
+    ]);
+    output.push(entry?);
 
     // Recurse into sub-field kids.
     if depth < max_depth {
@@ -1552,29 +1552,16 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
     crate::pages::page_refs(pdf)?;
 
     // Resolve the Catalog.
-    let catalog_ref = match pdf.root_ref() {
-        Some(r) => r,
-        None => {
-            return json_dictionary([
-                ("fields".to_string(), Json::make_array()),
-                ("hasacroform".to_string(), Json::make_bool(false)),
-                ("needappearances".to_string(), Json::make_bool(false)),
-            ])
-        }
-    };
+    // A successful page-tree walk has already validated both invariants.
+    let catalog_ref = pdf
+        .root_ref()
+        .ok_or_else(|| ConvertError::PdfError("page tree has no catalog".to_string()))?;
     let catalog = pdf
         .resolve_borrowed(catalog_ref)
         .map_err(ConvertError::from)?;
-    let catalog_dict = match catalog {
-        Object::Dictionary(d) => d,
-        _ => {
-            return json_dictionary([
-                ("fields".to_string(), Json::make_array()),
-                ("hasacroform".to_string(), Json::make_bool(false)),
-                ("needappearances".to_string(), Json::make_bool(false)),
-            ])
-        }
-    };
+    let catalog_dict = catalog
+        .as_dict()
+        .ok_or_else(|| ConvertError::PdfError("catalog is not a dictionary".to_string()))?;
 
     // Check for /AcroForm.
     let acroform_val = match catalog_dict.get("AcroForm") {
@@ -2765,12 +2752,9 @@ mod tests {
         decode_level: DecodeLevel,
         stream_mode: &StreamDataMode,
     ) -> Result<serde_json::Value, ConvertError> {
-        project(super::build_qpdf_key_with_stream_mode(
-            pdf,
-            metadata,
-            decode_level,
-            stream_mode,
-        )?)
+        let value =
+            super::build_qpdf_key_with_stream_mode(pdf, metadata, decode_level, stream_mode)?;
+        project(value)
     }
 
     fn build_pages_section<R: Read + Seek>(
@@ -2868,6 +2852,20 @@ mod tests {
             .as_bytes(),
         );
         Pdf::open(Cursor::new(bytes)).expect("open")
+    }
+
+    fn no_root_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        use std::io::Cursor;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.4\n");
+        let xref = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        Pdf::open(Cursor::new(bytes)).expect("open PDF without /Root")
     }
 
     #[test]
@@ -3301,6 +3299,12 @@ mod tests {
             }),
             Err(ConvertError::NonFiniteFloat)
         );
+    }
+
+    #[test]
+    fn convert_error_json_variant_has_specific_display() {
+        let error = ConvertError::JsonError("container mismatch".to_string());
+        assert_eq!(error.to_string(), "JSON error: container mismatch");
     }
 
     // ── 10. Name conversion ───────────────────────────────────────────────────
@@ -4203,14 +4207,10 @@ mod tests {
 
         let result = build_pagelabels_section(&mut pdf).expect("build pagelabels");
 
-        let JsonValue::Array(entries) = result else {
-            panic!("expected array"); // cov:ignore: test fixture shape guard
-        };
+        let entries = result.as_array().expect("expected array");
         assert_eq!(entries.len(), 1);
-        let JsonValue::Object(entry) = &entries[0] else {
-            panic!("expected entry object"); // cov:ignore: test fixture shape guard
-        };
-        assert_eq!(entry[0], ("index".to_string(), JsonValue::Integer(0)));
+        let entry = object_pairs(&entries[0]);
+        assert_eq!(entry[0], ("index".to_string(), number(0)));
     }
 
     // ── 37. Single range: /Nums [0 << /S /D /St 1 >>] ───────────────────────
@@ -6487,6 +6487,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn acroform_indirect_non_dictionary_is_present_but_empty() {
+        let mut pdf = load_one_page_pdf();
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        patch_acroform(&mut pdf, acroform_ref, Dictionary::new());
+        pdf.set_object(acroform_ref, Object::Integer(7));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let pairs = object_pairs(&result);
+        assert_eq!(pairs[0].1, serde_json::Value::Array(vec![]));
+        assert_eq!(pairs[1].1, serde_json::Value::Bool(true));
+        assert_eq!(pairs[2].1, serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn acroform_direct_non_dictionary_is_present_but_empty() {
+        let mut pdf = load_one_page_pdf();
+        let catalog_ref = pdf.root_ref().expect("no /Root");
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog")
+            .as_dict()
+            .expect("catalog dict")
+            .clone();
+        catalog.insert("AcroForm", Object::Integer(7));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let pairs = object_pairs(&result);
+        assert_eq!(pairs[0].1, serde_json::Value::Array(vec![]));
+        assert_eq!(pairs[1].1, serde_json::Value::Bool(true));
+        assert_eq!(pairs[2].1, serde_json::Value::Bool(false));
+    }
+
     // ── acroform Test 3: Single leaf field (synthetic) ────────────────────────
 
     #[test]
@@ -6506,6 +6540,8 @@ mod tests {
         field.insert("FT", Object::Name(b"Tx".to_vec()));
         field.insert("V", Object::String(b"John".to_vec()));
         field.insert("Ff", Object::Integer(0));
+        field.insert("TU", Object::String(b"Given name".to_vec()));
+        field.insert("TM", Object::String(b"person.firstname".to_vec()));
         pdf.set_object(field_ref, Object::Dictionary(field));
 
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
@@ -6548,8 +6584,8 @@ mod tests {
         // Check values
         assert_eq!(
             entry[0].1,
-            serde_json::Value::Null,
-            "alternatename must be null"
+            serde_json::Value::String("Given name".to_string()),
+            "alternatename must come from /TU"
         );
         assert_eq!(
             entry[1].1,
@@ -6574,8 +6610,8 @@ mod tests {
         );
         assert_eq!(
             entry[6].1,
-            serde_json::Value::Null,
-            "mappingname must be null"
+            serde_json::Value::String("person.firstname".to_string()),
+            "mappingname must come from /TM"
         );
         assert_eq!(
             entry[7].1,
@@ -7295,6 +7331,42 @@ mod tests {
         assert!(pdf.dirty_object_refs().is_empty());
     }
 
+    #[test]
+    fn attachments_without_root_returns_empty() {
+        let mut pdf = no_root_pdf();
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        assert_eq!(result, object(vec![]));
+    }
+
+    #[test]
+    fn attachments_non_dictionary_catalog_returns_empty() {
+        let mut pdf = load_one_page_pdf();
+        let catalog_ref = pdf.root_ref().expect("no /Root");
+        pdf.set_object(catalog_ref, Object::Integer(7));
+
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        assert_eq!(result, object(vec![]));
+    }
+
+    #[test]
+    fn attachments_non_dictionary_indirect_names_returns_empty() {
+        let mut pdf = load_one_page_pdf();
+        let names_ref = crate::ObjectRef::new(900, 0);
+        pdf.set_object(names_ref, Object::Integer(7));
+        let catalog_ref = pdf.root_ref().expect("no /Root");
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog")
+            .as_dict()
+            .expect("catalog dict")
+            .clone();
+        catalog.insert("Names", Object::Reference(names_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        assert_eq!(result, object(vec![]));
+    }
+
     // ── attachments Test 1b: /Names present but no /EmbeddedFiles → empty ─────
 
     #[test]
@@ -7335,7 +7407,7 @@ mod tests {
 
         let result = build_attachments_section(&mut pdf).expect("build attachments");
 
-        assert_eq!(result, JsonValue::Object(vec![]));
+        assert_eq!(result, object(vec![]));
     }
 
     // ── attachments Test 1c: non-ref/non-dict leaf value is skipped ──────────
@@ -7413,9 +7485,7 @@ mod tests {
 
         let result = build_attachments_section(&mut pdf).expect("build attachments");
 
-        let JsonValue::Object(entries) = result else {
-            panic!("expected object"); // cov:ignore: test fixture shape guard
-        };
+        let entries = object_pairs(&result);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "inline");
     }
@@ -7464,9 +7534,7 @@ mod tests {
 
         let result = build_attachments_section(&mut pdf).expect("build attachments");
 
-        let JsonValue::Object(entries) = result else {
-            panic!("expected object"); // cov:ignore: test fixture shape guard
-        };
+        let entries = object_pairs(&result);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "inline");
         let catalog = pdf
@@ -7480,6 +7548,34 @@ mod tests {
         );
         assert!(!pdf.is_dirty(catalog_ref));
         assert!(pdf.is_dirty(names_ref));
+    }
+
+    #[test]
+    fn attachments_indirect_non_dictionary_filespec_is_minimal() {
+        let mut pdf = load_one_page_pdf();
+        let names_ref = crate::ObjectRef::new(910, 0);
+        let ef_root_ref = crate::ObjectRef::new(911, 0);
+        let filespec_ref = crate::ObjectRef::new(912, 0);
+        patch_embedded_files(
+            &mut pdf,
+            names_ref,
+            ef_root_ref,
+            filespec_ref,
+            Dictionary::new(),
+            b"broken",
+        );
+        pdf.set_object(filespec_ref, Object::Integer(7));
+
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        let pairs = object_pairs(&result);
+        assert_eq!(pairs.len(), 1);
+        let entry = object_pairs(&pairs[0].1);
+        assert_eq!(entry[0].1, serde_json::Value::Null);
+        assert_eq!(entry[1].1, serde_json::Value::String("912 0 R".to_string()));
+        assert_eq!(entry[2].1, object(vec![]));
+        assert_eq!(entry[3].1, serde_json::Value::Null);
+        assert_eq!(entry[4].1, serde_json::Value::Null);
+        assert_eq!(entry[5].1, object(vec![]));
     }
 
     // ── attachments Test 2: attachment-two-page.pdf → 1 entry ────────────────
@@ -7834,6 +7930,63 @@ mod tests {
             serde_json::Value::Null,
             "/UF modificationdate must be null"
         );
+    }
+
+    #[test]
+    fn attachments_params_missing_and_invalid_values_become_null() {
+        let mut pdf = load_one_page_pdf();
+        let stream_f_ref = crate::ObjectRef::new(920, 0);
+        let stream_uf_ref = crate::ObjectRef::new(921, 0);
+        let filespec_ref = crate::ObjectRef::new(922, 0);
+        let ef_root_ref = crate::ObjectRef::new(923, 0);
+        let names_ref = crate::ObjectRef::new(924, 0);
+
+        let mut f_dict = Dictionary::new();
+        f_dict.insert("Params", Object::Dictionary(Dictionary::new()));
+        pdf.set_object(
+            stream_f_ref,
+            Object::Stream(crate::object::Stream::new(f_dict, vec![])),
+        );
+
+        let mut uf_params = Dictionary::new();
+        uf_params.insert("CreationDate", Object::String(b"invalid".to_vec()));
+        uf_params.insert("ModDate", Object::String(b"invalid".to_vec()));
+        let mut uf_dict = Dictionary::new();
+        uf_dict.insert("Params", Object::Dictionary(uf_params));
+        pdf.set_object(
+            stream_uf_ref,
+            Object::Stream(crate::object::Stream::new(uf_dict, vec![])),
+        );
+
+        let mut ef_dict = Dictionary::new();
+        ef_dict.insert("F", Object::Reference(stream_f_ref));
+        ef_dict.insert("UF", Object::Reference(stream_uf_ref));
+        let mut filespec = Dictionary::new();
+        filespec.insert("EF", Object::Dictionary(ef_dict));
+        patch_embedded_files(
+            &mut pdf,
+            names_ref,
+            ef_root_ref,
+            filespec_ref,
+            filespec,
+            b"dates",
+        );
+
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        let entry = object_pairs(&object_pairs(&result)[0].1);
+        let streams = object_pairs(
+            entry
+                .iter()
+                .find(|(key, _)| key == "streams")
+                .expect("streams")
+                .1
+                .clone(),
+        );
+        for (_, stream) in streams {
+            for (_, value) in object_pairs(stream) {
+                assert_eq!(value, serde_json::Value::Null);
+            }
+        }
     }
 
     // ── attachments: direct (non-Reference) filespec value in the name tree ──
