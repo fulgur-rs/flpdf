@@ -798,6 +798,8 @@ impl<K: TreeKey> NNTree<K> {
                 return Ok(self.end());
             }
         }
+        // qpdf 11.9.0 initializes its `last_item` check with end(), not
+        // last(), so after-maximum keys intentionally use the general search.
 
         let root = self.root_handle(pdf)?;
         let root_diagnostic_ref = root.diagnostic_ref();
@@ -1346,6 +1348,8 @@ impl<K: TreeKey> NNTree<K> {
 }
 
 fn make_indirect<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<ObjectRef> {
+    // Re-read the live object set so allocations made through the same Pdf
+    // between NNTree operations cannot make a cached counter collide.
     let next = pdf
         .object_refs()
         .into_iter()
