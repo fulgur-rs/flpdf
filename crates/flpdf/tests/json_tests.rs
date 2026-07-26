@@ -204,6 +204,44 @@ fn container_accessors_expose_encoded_dictionary_keys_and_array_values() {
 }
 
 #[test]
+fn dictionary_iteration_observes_future_mutations_without_revisiting_earlier_insertions() {
+    let dictionary = Json::make_dictionary();
+    dictionary
+        .add_dictionary_member(b"a", Json::make_int(1))
+        .unwrap();
+    dictionary
+        .add_dictionary_member(b"c", Json::make_int(3))
+        .unwrap();
+    let alias = dictionary.clone();
+
+    let mut visited = Vec::new();
+    assert!(dictionary.for_each_dict_item(|key, value| {
+        visited.push((key.to_vec(), value.get_number().unwrap()));
+        if key == b"a" {
+            alias
+                .add_dictionary_member(b"c", Json::make_int(30))
+                .unwrap();
+            alias
+                .add_dictionary_member(b"b", Json::make_int(2))
+                .unwrap();
+            alias
+                .add_dictionary_member(b"0", Json::make_int(0))
+                .unwrap();
+        }
+    }));
+
+    assert_eq!(
+        visited,
+        vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec()),
+            (b"c".to_vec(), b"30".to_vec()),
+        ]
+    );
+    assert_eq!(alias.get_dict_item(b"0").get_number(), Some(b"0".to_vec()));
+}
+
+#[test]
 fn container_mutations_reject_wrong_type_with_qpdf_messages() {
     let scalar = Json::make_null();
     assert_eq!(

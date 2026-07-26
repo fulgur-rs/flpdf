@@ -254,17 +254,35 @@ impl Json {
         let Some(members) = &self.0 else {
             return false;
         };
-        let members = members.borrow();
-        let Value::Dictionary {
-            members: dictionary,
-            ..
-        } = &members.value
-        else {
-            return false;
-        };
-        for (key, value) in dictionary {
-            callback(key, value.clone());
+        let mut previous_key: Option<Vec<u8>> = None;
+        loop {
+            let next = {
+                let members = members.borrow();
+                let Value::Dictionary {
+                    members: dictionary,
+                    ..
+                } = &members.value
+                else {
+                    return false;
+                };
+                let item = match previous_key.as_deref() {
+                    Some(previous) => dictionary
+                        .range::<[u8], _>((
+                            std::ops::Bound::Excluded(previous),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .next(),
+                    None => dictionary.iter().next(),
+                };
+                item.map(|(key, value)| (key.clone(), value.clone()))
+            };
+            let Some((key, value)) = next else {
+                break;
+            };
+            callback(&key, value);
+            previous_key = Some(key);
         }
+
         true
     }
 
