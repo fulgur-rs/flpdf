@@ -330,12 +330,14 @@ impl<K: TreeKey> NNTree<K> {
             let leaf = cursor.leaf.clone().expect("valid cursor has a leaf");
             let item_number = cursor.item_number.expect("valid cursor has an item");
             let mut dictionary = self.load_node(pdf, &leaf)?;
+            // cov:ignore-start: find just returned this leaf with an items array and no callback can mutate it here
             let Some(Object::Array(mut items)) = dictionary.remove(K::ITEMS_KEY) else {
                 return Err(structural_error(
                     leaf.diagnostic_ref(),
                     "node contains no items array",
                 ));
             };
+            // cov:ignore-end
             items[item_number + 1] = value;
             dictionary.insert(K::ITEMS_KEY, Object::Array(items));
             self.store_node(pdf, &leaf, dictionary)?;
@@ -462,12 +464,14 @@ impl<K: TreeKey> NNTree<K> {
             .clone()
             .ok_or_else(|| structural_error(None, "unable to find a valid items node"))?;
         let mut dictionary = self.load_node(pdf, &leaf)?;
+        // cov:ignore-start: begin returns an empty cursor leaf only after observing its items array
         let Some(Object::Array(mut items)) = dictionary.remove(K::ITEMS_KEY) else {
             return Err(structural_error(
                 self.root_handle(pdf)?.diagnostic_ref(),
                 "unable to find a valid items node",
             ));
         };
+        // cov:ignore-end
         items.insert(0, K::to_object(&key));
         items.insert(1, value);
         dictionary.insert(K::ITEMS_KEY, Object::Array(items));
@@ -582,12 +586,14 @@ impl<K: TreeKey> NNTree<K> {
 
         let parent_index = parent_index.expect("root was normalized above");
         let mut first_dictionary = self.load_node(pdf, &node)?;
+        // cov:ignore-start: array_key was selected from this same node before root normalization
         let Some(Object::Array(mut first_half)) = first_dictionary.remove(array_key) else {
             return Err(structural_error(
                 node.diagnostic_ref(),
                 format!("/{array_key} is not an array"),
             ));
         };
+        // cov:ignore-end
         let start_index = (first_half.len() / 2) & !1;
         let second_half = first_half.split_off(start_index);
         first_dictionary.insert(array_key, Object::Array(first_half));
@@ -602,12 +608,14 @@ impl<K: TreeKey> NNTree<K> {
 
         let parent_handle = cursor.path[parent_index].node.clone();
         let mut parent = self.load_node(pdf, &parent_handle)?;
+        // cov:ignore-start: split cursor path was built from this parent Kids array
         let Some(Object::Array(mut parent_kids)) = parent.remove("Kids") else {
             return Err(structural_error(
                 parent_handle.diagnostic_ref(),
                 "node is missing /Kids",
             ));
         };
+        // cov:ignore-end
         let first_kid_index = cursor.path[parent_index].kid_number;
         parent_kids.insert(first_kid_index + 1, Object::Reference(second_ref));
         parent.insert("Kids", Object::Array(parent_kids));
@@ -1172,12 +1180,14 @@ impl<K: TreeKey> NNTree<K> {
             );
             let object_ref = make_indirect(pdf, kid_object)?;
             let mut dictionary = self.load_node(pdf, parent)?;
+            // cov:ignore-start: prepare_kid receives kid_object from this same parent Kids array
             let Some(Object::Array(mut kids)) = dictionary.remove("Kids") else {
                 return Err(structural_error(
                     parent.diagnostic_ref(),
                     "node is missing /Kids",
                 ));
             };
+            // cov:ignore-end
             kids[kid_number] = Object::Reference(object_ref);
             dictionary.insert("Kids", Object::Array(kids));
             self.store_node(pdf, parent, dictionary)?;
@@ -1289,6 +1299,7 @@ impl<K: TreeKey> NNTree<K> {
             .rev()
             .zip(dictionaries.into_iter().rev().skip(1))
         {
+            // cov:ignore-start: dictionaries were cloned only after validating every parent Kids array and index above
             let Some(Object::Array(mut kids)) = parent.remove("Kids") else {
                 return Err(structural_error(
                     handle.diagnostic_ref(),
@@ -1301,6 +1312,7 @@ impl<K: TreeKey> NNTree<K> {
                     format!("invalid kid at index {kid_index}"),
                 )
             })?;
+            // cov:ignore-end
             *kid = Object::Dictionary(updated);
             parent.insert("Kids", Object::Array(kids));
             updated = parent;
@@ -1566,21 +1578,21 @@ mod tests {
             object => object.clone(),
         };
         let Object::Dictionary(dictionary) = resolved else {
-            panic!("tree node must be a dictionary");
+            panic!("tree node must be a dictionary"); // cov:ignore: test-shape guard
         };
         if let Some(Object::Array(items)) = dictionary.get("Nums") {
             let keys = items
                 .chunks_exact(2)
                 .map(|pair| match pair[0] {
                     Object::Integer(key) => key.to_string(),
-                    ref other => panic!("unexpected number-tree key: {other:?}"),
+                    ref other => panic!("unexpected number-tree key: {other:?}"), // cov:ignore: test-shape guard
                 })
                 .collect::<Vec<_>>()
                 .join(",");
             return format!("L[{keys}]");
         }
         let Object::Array(kids) = dictionary.get("Kids").expect("node shape") else {
-            panic!("/Kids must be an array");
+            panic!("/Kids must be an array"); // cov:ignore: test-shape guard
         };
         let children = kids
             .iter()
@@ -1628,6 +1640,24 @@ mod tests {
             NameKey::to_object(&b"a\0z".to_vec()),
             Object::String(vec![0xfe, 0xff, 0x00, 0x61, 0x00, 0x00, 0x00, 0x7a])
         );
+        assert_eq!(qpdf_new_unicode_utf8_value(&[0xc2, b'A']), "�A".as_bytes());
+        assert_eq!(qpdf_new_unicode_utf8_value(&[0xc0, 0x80]), "�".as_bytes());
+        assert_eq!(qpdf_new_unicode_utf8_value(&[0xc2]), "�".as_bytes());
+        assert_eq!(qpdf_new_unicode_utf8_value(&[0x80]), "�".as_bytes());
+        assert_eq!(
+            qpdf_new_unicode_utf8_value(&[0xf8, 0x88, 0x80, 0x80, 0x80]),
+            "�".as_bytes()
+        );
+    }
+
+    #[test]
+    fn direct_kid_diagnostics_do_not_blame_the_indirect_anchor() {
+        let anchor = ObjectRef::new(17, 0);
+        assert_eq!(NodeHandle::indirect(anchor).diagnostic_ref(), Some(anchor));
+        assert_eq!(
+            NodeHandle::indirect(anchor).direct_kid(0).diagnostic_ref(),
+            None
+        );
     }
 
     #[test]
@@ -1648,13 +1678,13 @@ mod tests {
         tree.store_node(&mut pdf, &kid, changed).unwrap();
 
         let Object::Dictionary(root) = tree.root() else {
-            panic!("root must remain direct");
+            panic!("root must remain direct"); // cov:ignore: test-shape guard
         };
         let Object::Array(kids) = root.get("Kids").unwrap() else {
-            panic!("root /Kids must remain an array");
+            panic!("root /Kids must remain an array"); // cov:ignore: test-shape guard
         };
         let Object::Dictionary(leaf) = &kids[0] else {
-            panic!("kid must remain direct");
+            panic!("kid must remain direct"); // cov:ignore: test-shape guard
         };
         assert_eq!(
             leaf.get("Names"),
@@ -1833,13 +1863,255 @@ mod tests {
 
         let error = match tree.find(&mut pdf, &10, false) {
             Err(error) => error,
-            Ok(_) => panic!("missing /Limits must fail targeted lookup"),
+            Ok(_) => panic!("missing /Limits must fail targeted lookup"), // cov:ignore: negative-path assertion
         };
 
         assert_eq!(
             error.to_string(),
             "parse error at byte 0: Name/Number tree node (object 10): node is missing /Limits"
         );
+    }
+
+    #[test]
+    fn find_reports_cycles_inconsistent_limits_and_empty_selected_kids() {
+        let mut pdf = empty_pdf();
+        let leaf_ref = ObjectRef::new(10, 0);
+        let root_ref = ObjectRef::new(20, 0);
+        pdf.set_object(leaf_ref, name_leaf(&[(b"a", 1)], Some((b"a", b"a"))));
+        let mut cyclic_root = Dictionary::new();
+        cyclic_root.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(leaf_ref),
+                Object::Reference(root_ref),
+            ]),
+        );
+        cyclic_root.insert(
+            "Limits",
+            Object::Array(vec![
+                Object::String(b"b".to_vec()),
+                Object::String(b"z".to_vec()),
+            ]),
+        );
+        pdf.set_object(root_ref, Object::Dictionary(cyclic_root));
+        let mut cyclic = NNTree::<NameKey>::new(Object::Reference(root_ref), false);
+        assert!(cyclic.find(&mut pdf, &b"z".to_vec(), false).is_err());
+
+        let mut inconsistent_root = Dictionary::new();
+        inconsistent_root.insert(
+            "Kids",
+            Object::Array(vec![name_leaf(&[(b"a", 1)], Some((b"z", b"z")))]),
+        );
+        let mut inconsistent = NNTree::<NameKey>::new(Object::Dictionary(inconsistent_root), false);
+        assert!(inconsistent.find(&mut pdf, &b"b".to_vec(), false).is_err());
+
+        let valid_ref = ObjectRef::new(30, 0);
+        let empty_ref = ObjectRef::new(31, 0);
+        pdf.set_object(valid_ref, name_leaf(&[(b"a", 1)], Some((b"a", b"a"))));
+        let mut empty = Dictionary::new();
+        empty.insert(
+            "Limits",
+            Object::Array(vec![
+                Object::String(b"b".to_vec()),
+                Object::String(b"z".to_vec()),
+            ]),
+        );
+        pdf.set_object(empty_ref, Object::Dictionary(empty));
+        let mut root = Dictionary::new();
+        root.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(valid_ref),
+                Object::Reference(empty_ref),
+            ]),
+        );
+        let mut malformed = NNTree::<NameKey>::new(Object::Dictionary(root), false);
+        assert!(malformed.find(&mut pdf, &b"z".to_vec(), false).is_err());
+    }
+
+    #[test]
+    fn direct_kid_find_and_limit_validation_cover_strict_paths() {
+        let mut pdf = empty_pdf();
+        let mut tree = NNTree::<NameKey>::new(root_with_one_direct_leaf(), false);
+        assert_eq!(
+            tree.find(&mut pdf, &b"a".to_vec(), false)
+                .unwrap()
+                .current()
+                .map(|(key, value)| (key.as_slice(), value)),
+            Some((b"a".as_slice(), &Object::Integer(1)))
+        );
+
+        let tree = NNTree::<NameKey>::new(Object::Dictionary(Dictionary::new()), false);
+        for limits in [
+            Object::Array(Vec::new()),
+            Object::Array(vec![Object::Integer(1), Object::Integer(2)]),
+        ] {
+            let mut dictionary = Dictionary::new();
+            dictionary.insert("Limits", limits);
+            assert!(tree
+                .within_limits(&b"a".to_vec(), &dictionary, None)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn traversal_warns_on_empty_nodes_and_cycles() {
+        let mut pdf = empty_pdf();
+        let mut empty = NNTree::<NameKey>::new(Object::Dictionary(Dictionary::new()), false);
+        assert!(!empty.begin(&mut pdf).unwrap().valid());
+
+        let cycle_ref = ObjectRef::new(40, 0);
+        let mut node = Dictionary::new();
+        node.insert("Kids", Object::Array(vec![Object::Reference(cycle_ref)]));
+        pdf.set_object(cycle_ref, Object::Dictionary(node));
+        let mut cyclic = NNTree::<NameKey>::new(Object::Reference(cycle_ref), false);
+        assert!(!cyclic.begin(&mut pdf).unwrap().valid());
+
+        let warnings = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(warnings
+            .iter()
+            .any(|message| message.contains("neither non-empty /Names nor /Kids")));
+        assert!(warnings
+            .iter()
+            .any(|message| message.contains("loop detected while traversing")));
+    }
+
+    #[test]
+    fn increment_recovers_from_changed_parent_and_invalid_middle_leaf() {
+        let mut pdf = empty_pdf();
+        let mut root = Dictionary::new();
+        root.insert(
+            "Names",
+            Object::Array(vec![
+                Object::String(b"a".to_vec()),
+                Object::Integer(1),
+                Object::String(b"b".to_vec()),
+                Object::Integer(2),
+            ]),
+        );
+        let mut leaf = NNTree::<NameKey>::new(Object::Dictionary(root), false);
+        let mut cursor = leaf.begin(&mut pdf).unwrap();
+        leaf.root
+            .as_dict_mut()
+            .unwrap()
+            .insert("Names", Object::Integer(7));
+        leaf.next(&mut pdf, &mut cursor).unwrap();
+        assert!(!cursor.valid());
+
+        let mut parent = NNTree::<NameKey>::new(two_leaf_name_tree(&mut pdf), false);
+        let mut cursor = parent.begin(&mut pdf).unwrap();
+        parent.next(&mut pdf, &mut cursor).unwrap();
+        parent.root.as_dict_mut().unwrap().remove("Kids");
+        parent.next(&mut pdf, &mut cursor).unwrap();
+        assert!(!cursor.valid());
+
+        let mut cross = NNTree::<NameKey>::new(two_leaf_name_tree(&mut pdf), false);
+        let mut cursor = cross.find(&mut pdf, &b"c".to_vec(), false).unwrap();
+        cross.previous(&mut pdf, &mut cursor).unwrap();
+        assert_eq!(
+            cursor.current().map(|(key, _)| key.as_slice()),
+            Some(b"b".as_slice())
+        );
+
+        let left_ref = ObjectRef::new(50, 0);
+        let middle_ref = ObjectRef::new(51, 0);
+        let right_ref = ObjectRef::new(52, 0);
+        pdf.set_object(left_ref, name_leaf(&[(b"a", 1)], Some((b"a", b"a"))));
+        let mut middle = Dictionary::new();
+        middle.insert(
+            "Names",
+            Object::Array(vec![Object::Integer(2), Object::Integer(2)]),
+        );
+        middle.insert(
+            "Limits",
+            Object::Array(vec![
+                Object::String(b"b".to_vec()),
+                Object::String(b"b".to_vec()),
+            ]),
+        );
+        pdf.set_object(middle_ref, Object::Dictionary(middle));
+        pdf.set_object(right_ref, name_leaf(&[(b"c", 3)], Some((b"c", b"c"))));
+        let mut root = Dictionary::new();
+        root.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(left_ref),
+                Object::Reference(middle_ref),
+                Object::Reference(right_ref),
+            ]),
+        );
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), false);
+        let mut cursor = tree.begin(&mut pdf).unwrap();
+        tree.next(&mut pdf, &mut cursor).unwrap();
+        assert_eq!(
+            cursor.current().map(|(key, _)| key.as_slice()),
+            Some(b"c".as_slice())
+        );
+    }
+
+    #[test]
+    fn update_current_and_root_replacement_reject_malformed_state() {
+        let mut pdf = empty_pdf();
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(Dictionary::new()), false);
+        let mut empty = NNTreeCursor::<NameKey>::empty();
+        tree.update_current(&mut pdf, &mut empty, false).unwrap();
+
+        let mut wrong = Dictionary::new();
+        wrong.insert(
+            "Names",
+            Object::Array(vec![Object::Integer(1), Object::Integer(2)]),
+        );
+        tree.root = Object::Dictionary(wrong);
+        let mut cursor = NNTreeCursor {
+            path: Vec::new(),
+            leaf: Some(NodeHandle::root()),
+            item_number: Some(0),
+            current: None,
+            marker: PhantomData,
+        };
+        assert!(tree.update_current(&mut pdf, &mut cursor, false).is_err());
+        assert!(tree
+            .replace_root_contents(&mut pdf, Object::Integer(1))
+            .is_err());
+    }
+
+    #[test]
+    fn direct_node_storage_rejects_each_malformed_path_shape() {
+        let malformed_roots = [
+            {
+                let mut root = Dictionary::new();
+                root.insert("Kids", Object::Integer(1));
+                root
+            },
+            Dictionary::new(),
+            {
+                let mut root = Dictionary::new();
+                root.insert("Kids", Object::Array(Vec::new()));
+                root
+            },
+            {
+                let mut root = Dictionary::new();
+                root.insert("Kids", Object::Array(vec![Object::Integer(1)]));
+                root
+            },
+        ];
+
+        for root in malformed_roots {
+            let mut pdf = empty_pdf();
+            let handle = NodeHandle::root().direct_kid(0);
+            let tree = NNTree::<NameKey>::new(Object::Dictionary(root.clone()), false);
+            assert!(tree.load_node(&mut pdf, &handle).is_err());
+
+            let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), false);
+            assert!(tree
+                .store_node(&mut pdf, &handle, Dictionary::new())
+                .is_err());
+        }
     }
 
     #[test]
@@ -1881,6 +2153,128 @@ mod tests {
     }
 
     #[test]
+    fn cursor_mutation_handles_end_last_and_empty_root_boundaries() {
+        let mut pdf = empty_pdf();
+        let mut root = Dictionary::new();
+        root.insert("Nums", Object::Array(Vec::new()));
+        let mut tree = NNTree::<NumberKey>::new(Object::Dictionary(root), true);
+
+        let mut end = tree.end();
+        tree.insert_after(&mut pdf, &mut end, 10, Object::Integer(10))
+            .unwrap();
+        assert_eq!(end.current(), Some((&10, &Object::Integer(10))));
+
+        let mut empty = tree.end();
+        assert_eq!(tree.remove_at(&mut pdf, &mut empty).unwrap(), None);
+        tree.insert(&mut pdf, 20, Object::Integer(20)).unwrap();
+        let mut last = tree.find(&mut pdf, &20, false).unwrap();
+        assert_eq!(
+            tree.remove_at(&mut pdf, &mut last).unwrap(),
+            Some(Object::Integer(20))
+        );
+        assert!(!last.valid());
+
+        let mut only = tree.find(&mut pdf, &10, false).unwrap();
+        assert_eq!(
+            tree.remove_at(&mut pdf, &mut only).unwrap(),
+            Some(Object::Integer(10))
+        );
+        assert!(!only.valid());
+        assert!(!tree.begin(&mut pdf).unwrap().valid());
+    }
+
+    #[test]
+    fn malformed_cursors_report_mutation_errors() {
+        fn cursor(item_number: usize) -> NNTreeCursor<NumberKey> {
+            NNTreeCursor {
+                path: Vec::new(),
+                leaf: Some(NodeHandle::root()),
+                item_number: Some(item_number),
+                current: Some((1, Object::Integer(1))),
+                marker: PhantomData,
+            }
+        }
+
+        let mut pdf = empty_pdf();
+        let mut tree = NNTree::<NumberKey>::new(Object::Dictionary(Dictionary::new()), false);
+        assert!(tree
+            .insert_after(&mut pdf, &mut cursor(0), 2, Object::Integer(2))
+            .is_err());
+        assert!(tree.remove_at(&mut pdf, &mut cursor(0)).is_err());
+
+        let mut short = Dictionary::new();
+        short.insert(
+            "Nums",
+            Object::Array(vec![Object::Integer(1), Object::Integer(1)]),
+        );
+        let mut tree = NNTree::<NumberKey>::new(Object::Dictionary(short), false);
+        assert!(tree
+            .insert_after(&mut pdf, &mut cursor(2), 2, Object::Integer(2))
+            .is_err());
+        assert!(tree.remove_at(&mut pdf, &mut cursor(2)).is_err());
+    }
+
+    #[test]
+    fn split_and_limit_helpers_handle_empty_and_malformed_nodes() {
+        let mut pdf = empty_pdf();
+        let mut cursor = NNTreeCursor::<NumberKey>::empty();
+
+        let mut empty_kids = Dictionary::new();
+        empty_kids.insert("Kids", Object::Array(Vec::new()));
+        let mut tree = NNTree::<NumberKey>::new(Object::Dictionary(empty_kids), false);
+        tree.split_node(&mut pdf, &mut cursor, NodeHandle::root(), None)
+            .unwrap();
+
+        let mut empty_items = Dictionary::new();
+        empty_items.insert("Nums", Object::Array(Vec::new()));
+        let mut tree = NNTree::<NumberKey>::new(Object::Dictionary(empty_items), false);
+        tree.split_node(&mut pdf, &mut cursor, NodeHandle::root(), None)
+            .unwrap();
+
+        let mut tree = NNTree::<NumberKey>::new(Object::Dictionary(Dictionary::new()), false);
+        assert!(tree
+            .split_node(&mut pdf, &mut cursor, NodeHandle::root(), None)
+            .is_err());
+        tree.reset_limits(&mut pdf, &cursor, NodeHandle::root(), Some(0))
+            .unwrap();
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message.contains("unable to determine limits")));
+
+        let mut one_item = Dictionary::new();
+        one_item.insert("Nums", Object::Array(vec![Object::Integer(1)]));
+        assert_eq!(tree.edge_limits(&mut pdf, &one_item).unwrap(), None);
+
+        let mut bad_first = Dictionary::new();
+        bad_first.insert("Kids", Object::Array(vec![Object::Integer(1)]));
+        assert_eq!(tree.edge_limits(&mut pdf, &bad_first).unwrap(), None);
+
+        let mut first = Dictionary::new();
+        first.insert(
+            "Limits",
+            Object::Array(vec![Object::Integer(1), Object::Integer(1)]),
+        );
+        let mut bad_last = Dictionary::new();
+        bad_last.insert(
+            "Kids",
+            Object::Array(vec![Object::Dictionary(first.clone()), Object::Integer(2)]),
+        );
+        assert_eq!(tree.edge_limits(&mut pdf, &bad_last).unwrap(), None);
+
+        let mut missing_limits = Dictionary::new();
+        missing_limits.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Dictionary(Dictionary::new()),
+                Object::Dictionary(first),
+            ]),
+        );
+        assert_eq!(tree.edge_limits(&mut pdf, &missing_limits).unwrap(), None);
+    }
+
+    #[test]
     fn split_promotes_root_and_recursively_splits_parent_in_qpdf_order() {
         let mut pdf = empty_pdf();
         let mut root = Dictionary::new();
@@ -1902,7 +2296,7 @@ mod tests {
             )
         );
         let Object::Dictionary(root) = tree.root() else {
-            panic!("root must be a dictionary");
+            panic!("root must be a dictionary"); // cov:ignore: test-shape guard
         };
         assert_eq!(root.get("Limits"), None);
     }
@@ -1930,6 +2324,27 @@ mod tests {
     }
 
     #[test]
+    fn removing_split_entries_from_the_end_moves_across_previous_leaves() {
+        let mut pdf = empty_pdf();
+        let mut root = Dictionary::new();
+        root.insert("Nums", Object::Array(Vec::new()));
+        let mut tree = NNTree::<NumberKey>::new(Object::Dictionary(root), true);
+        tree.set_split_threshold(4);
+        for key in 0..13 {
+            tree.insert(&mut pdf, key, Object::Integer(key)).unwrap();
+        }
+
+        for key in (0..13).rev() {
+            assert_eq!(
+                tree.remove(&mut pdf, &key).unwrap(),
+                Some(Object::Integer(key))
+            );
+        }
+
+        assert_eq!(number_tree_shape(&mut pdf, tree.root()), "L[]");
+    }
+
+    #[test]
     fn default_threshold_splits_33_pairs_as_16_then_17() {
         let mut pdf = empty_pdf();
         let mut root = Dictionary::new();
@@ -1949,11 +2364,11 @@ mod tests {
             )
         );
         let Object::Dictionary(root) = tree.root() else {
-            panic!("root must be a dictionary");
+            panic!("root must be a dictionary"); // cov:ignore: test-shape guard
         };
         assert_eq!(root.get("Limits"), None);
         let Some(Object::Array(kids)) = root.get("Kids") else {
-            panic!("split root must contain /Kids");
+            panic!("split root must contain /Kids"); // cov:ignore: test-shape guard
         };
         assert_eq!(
             kids,
@@ -1963,10 +2378,10 @@ mod tests {
             ]
         );
         let Object::Dictionary(first) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
-            panic!("first leaf must be a dictionary");
+            panic!("first leaf must be a dictionary"); // cov:ignore: test-shape guard
         };
         let Object::Dictionary(second) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
-            panic!("second leaf must be a dictionary");
+            panic!("second leaf must be a dictionary"); // cov:ignore: test-shape guard
         };
         assert_eq!(
             first.get("Limits"),
@@ -2023,7 +2438,7 @@ mod tests {
 
         let error = match tree.find(&mut pdf, &b"beta".to_vec(), false) {
             Err(error) => error,
-            Ok(_) => panic!("missing /Limits must fail without repair"),
+            Ok(_) => panic!("missing /Limits must fail without repair"), // cov:ignore: negative-path assertion
         };
 
         assert!(error.to_string().contains("node is missing /Limits"));
@@ -2106,7 +2521,7 @@ mod tests {
         );
         assert_eq!(pdf.resolve(holder).unwrap(), Object::Reference(terminal));
         let Object::Dictionary(repaired) = pdf.resolve(terminal).unwrap() else {
-            panic!("terminal root must remain a dictionary");
+            panic!("terminal root must remain a dictionary"); // cov:ignore: test-shape guard
         };
         assert_eq!(repaired.get("Keep"), Some(&Object::Integer(7)));
         assert!(matches!(repaired.get("Names"), Some(Object::Array(_))));
@@ -2168,7 +2583,7 @@ mod tests {
 
         let error = match tree.find(&mut pdf, &b"alpha".to_vec(), false) {
             Err(error) => error,
-            Ok(_) => panic!("short first pair must remain fatal"),
+            Ok(_) => panic!("short first pair must remain fatal"), // cov:ignore: negative-path assertion
         };
 
         assert!(error
@@ -2204,10 +2619,10 @@ mod tests {
             Some(&Object::Integer(32))
         );
         let Object::Dictionary(root) = tree.root() else {
-            panic!("repaired root must be a dictionary");
+            panic!("repaired root must be a dictionary"); // cov:ignore: test-shape guard
         };
         let Some(Object::Array(kids)) = root.get("Kids") else {
-            panic!("repaired root must contain /Kids");
+            panic!("repaired root must contain /Kids"); // cov:ignore: test-shape guard
         };
         assert_eq!(
             kids,
@@ -2217,10 +2632,10 @@ mod tests {
             ]
         );
         let Object::Dictionary(first) = pdf.resolve(ObjectRef::new(11, 0)).unwrap() else {
-            panic!("first repaired leaf must be a dictionary");
+            panic!("first repaired leaf must be a dictionary"); // cov:ignore: test-shape guard
         };
         let Object::Dictionary(second) = pdf.resolve(ObjectRef::new(12, 0)).unwrap() else {
-            panic!("second repaired leaf must be a dictionary");
+            panic!("second repaired leaf must be a dictionary"); // cov:ignore: test-shape guard
         };
         assert_eq!(
             first.get("Limits"),
@@ -2253,7 +2668,7 @@ mod tests {
 
         assert!(!found.valid());
         let Object::Dictionary(root) = tree.root() else {
-            panic!("root must remain direct");
+            panic!("root must remain direct"); // cov:ignore: test-shape guard
         };
         assert_eq!(root.get("Names"), Some(&Object::Array(Vec::new())));
         assert_eq!(root.get("Kids"), None);
@@ -2269,7 +2684,7 @@ mod tests {
 
         let error = match tree.begin(&mut pdf) {
             Err(error) => error,
-            Ok(_) => panic!("object-number exhaustion must be fatal"),
+            Ok(_) => panic!("object-number exhaustion must be fatal"), // cov:ignore: negative-path assertion
         };
 
         assert_eq!(
