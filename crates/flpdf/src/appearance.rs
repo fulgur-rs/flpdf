@@ -2024,10 +2024,62 @@ fn generate_list_appearance<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content_stream::{ContentStreamParser, ContentToken};
+    use crate::content_stream::{
+        parse_content_operations, parse_content_stream_data, ParseControl, ParserCallbacks,
+    };
     use crate::writer::write_pdf;
     use crate::Pdf;
     use std::io::Cursor;
+
+    #[derive(Default)]
+    struct StrictAppearanceOperationCallbacks {
+        content_size: usize,
+        operands: Vec<Object>,
+        operations: Vec<(Vec<Object>, Vec<u8>)>,
+    }
+
+    impl ParserCallbacks for StrictAppearanceOperationCallbacks {
+        fn content_size(&mut self, size: usize) -> crate::Result<()> {
+            self.content_size = size;
+            Ok(())
+        }
+
+        fn handle_object(
+            &mut self,
+            object: Object,
+            _offset: usize,
+            _length: usize,
+        ) -> crate::Result<ParseControl> {
+            match object {
+                Object::Operator(operator) => {
+                    self.operations
+                        .push((std::mem::take(&mut self.operands), operator));
+                }
+                Object::InlineImage(_) => {}
+                operand => self.operands.push(operand),
+            }
+            Ok(ParseControl::Continue)
+        }
+
+        fn handle_eof(&mut self) -> crate::Result<()> {
+            if self.operands.is_empty() {
+                Ok(())
+            } else {
+                Err(Error::parse(
+                    self.content_size,
+                    "content stream ended with dangling operands",
+                ))
+            }
+        }
+    }
+
+    fn parse_appearance_operations_strict(
+        content: &[u8],
+    ) -> crate::Result<Vec<(Vec<Object>, Vec<u8>)>> {
+        let mut callbacks = StrictAppearanceOperationCallbacks::default();
+        parse_content_stream_data(content, &mut callbacks)?;
+        Ok(callbacks.operations)
+    }
 
     // ── Unit tests for pure helpers ──────────────────────────────────────────
 
@@ -2211,15 +2263,13 @@ mod tests {
         };
         let content = build_text_appearance_content(&params);
         // Every token must parse cleanly.
-        for tok in ContentStreamParser::new(&content) {
-            tok.expect("blank appearance must tokenize");
-        }
+        parse_appearance_operations_strict(&content).expect("blank appearance must tokenize");
         let s = String::from_utf8_lossy(&content);
         assert!(s.contains("/Tx BMC") && s.contains("EMC"));
     }
 
     #[test]
-    fn build_text_appearance_parses_with_content_stream_parser() {
+    fn build_text_appearance_parses_with_callback_parser() {
         let params = TextAppearanceParams {
             text_bytes: b"Test".to_vec(),
             font_resource_name: b"Helv".to_vec(),
@@ -2239,11 +2289,8 @@ mod tests {
         let mut tj_operand: Option<Vec<u8>> = None;
         let mut tf_font_name: Option<Vec<u8>> = None;
 
-        for tok in ContentStreamParser::new(&content).flatten() {
-            let ContentToken::Op { operands, operator } = tok else {
-                continue;
-            };
-            match operator.as_slice() {
+        let _ = parse_content_operations(&content, |operands, operator| {
+            match operator {
                 b"Tf" => {
                     found_tf = true;
                     tf_font_name = operands
@@ -2264,7 +2311,8 @@ mod tests {
                 }
                 _ => {}
             }
-        }
+            Ok(ParseControl::Continue)
+        });
 
         assert!(found_tf, "Tf operator not found in content stream");
         assert!(found_td, "Td operator not found in content stream");
@@ -2277,6 +2325,64 @@ mod tests {
         // The Tj string must decode back to the original text.
         let tj_str = tj_operand.expect("Tj has no string operand");
         assert_eq!(tj_str, b"Test", "Tj operand mismatch");
+    }
+
+    #[test]
+    fn callback_parser_preserves_appearance_operation_sequence() {
+        let content = b"q 1 0 0 1 12 34 cm /Fm0 Do Q";
+        let mut operations = Vec::new();
+        parse_content_operations(content, |operands, operator| {
+            operations.push((operands.to_vec(), operator.to_vec()));
+            Ok(ParseControl::Continue)
+        })
+        .unwrap();
+        assert_eq!(operations[2].1, b"Do");
+        assert_eq!(
+            operations[2].0.last().and_then(Object::as_name),
+            Some(b"Fm0".as_slice())
+        );
+
+        assert_eq!(count_fills(b"q 0 0 10 10 re f Q"), 1);
+
+        // qpdf rejects the first EI candidate because the following malformed
+        // hex string is suspicious content and keeps it, plus the otherwise
+        // parseable `(unexpected) Tj`, inside the image payload. A parser that
+        // stops at the false EI would expose an extra Tj callback even if it
+        // recovered from the malformed hex string.
+        let false_ei = b"(before) Tj BI /CS /RGB /W 1 /H 1 /BPC 8 \
+                         ID abc EI (unexpected) Tj <0g> EI (after) Tj";
+        assert_eq!(
+            tj_strings_from(false_ei),
+            vec![b"before".to_vec(), b"after".to_vec()]
+        );
+    }
+
+    #[test]
+    fn strict_appearance_operation_parser_rejects_malformed_content() {
+        for malformed in [b"}".as_slice(), b"1".as_slice()] {
+            assert!(
+                parse_appearance_operations_strict(malformed).is_err(),
+                "strict appearance validation accepted {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_appearance_operation_parser_ignores_inline_image_payload() {
+        let operations =
+            parse_appearance_operations_strict(b"BI /CS /RGB ID payload EI q").unwrap();
+        assert_eq!(
+            operations,
+            vec![
+                (vec![], b"BI".to_vec()),
+                (
+                    vec![Object::Name(b"CS".to_vec()), Object::Name(b"RGB".to_vec())],
+                    b"ID".to_vec()
+                ),
+                (vec![], b"EI".to_vec()),
+                (vec![], b"q".to_vec()),
+            ]
+        );
     }
 
     #[test]
@@ -2429,11 +2535,8 @@ mod tests {
         let mut tf_name: Option<Vec<u8>> = None;
         let mut tj_val: Option<Vec<u8>> = None;
 
-        for tok in ContentStreamParser::new(&content).flatten() {
-            let ContentToken::Op { operands, operator } = tok else {
-                continue;
-            };
-            match operator.as_slice() {
+        let _ = parse_content_operations(&content, |operands, operator| {
+            match operator {
                 b"Tf" => {
                     found_tf = true;
                     tf_name = operands
@@ -2449,7 +2552,8 @@ mod tests {
                 }
                 _ => {}
             }
-        }
+            Ok(ParseControl::Continue)
+        });
 
         assert!(found_tf, "Tf not in appearance stream");
         assert!(found_tj, "Tj not in appearance stream");
@@ -2562,16 +2666,15 @@ mod tests {
 
         // Tf operator must reference the /DA resource name "F1".
         let mut tf_name: Option<Vec<u8>> = None;
-        for tok in ContentStreamParser::new(&stream.data).flatten() {
-            if let ContentToken::Op { operands, operator } = tok {
-                if operator == b"Tf" {
-                    tf_name = operands
-                        .first()
-                        .and_then(|o| o.as_name())
-                        .map(|n| n.to_vec());
-                }
+        let _ = parse_content_operations(&stream.data, |operands, operator| {
+            if operator == b"Tf" {
+                tf_name = operands
+                    .first()
+                    .and_then(|o| o.as_name())
+                    .map(|n| n.to_vec());
             }
-        }
+            Ok(ParseControl::Continue)
+        });
         assert_eq!(
             tf_name.as_deref(),
             Some(b"F1" as &[u8]),
@@ -2709,15 +2812,14 @@ mod tests {
         );
         let (_ap_n, content) = btn_on_state_content(pdf);
         let mut tj_bytes: Option<Vec<u8>> = None;
-        for tok in ContentStreamParser::new(&content).flatten() {
-            if let ContentToken::Op { operands, operator } = tok {
-                if operator == b"Tj" {
-                    if let Some(Object::String(s)) = operands.first() {
-                        tj_bytes = Some(s.clone());
-                    }
+        let _ = parse_content_operations(&content, |operands, operator| {
+            if operator == b"Tj" {
+                if let Some(Object::String(s)) = operands.first() {
+                    tj_bytes = Some(s.clone());
                 }
             }
-        }
+            Ok(ParseControl::Continue)
+        });
         assert_eq!(
             tj_bytes.as_deref(),
             Some(b"4" as &[u8]),
@@ -2813,11 +2915,8 @@ mod tests {
         let content = build_text_appearance_content(&params);
 
         let mut td_ops: Vec<(f64, f64)> = Vec::new();
-        for tok in ContentStreamParser::new(&content).flatten() {
-            let ContentToken::Op { operands, operator } = tok else {
-                continue;
-            };
-            if operator.as_slice() == b"Td" {
+        let _ = parse_content_operations(&content, |operands, operator| {
+            if operator == b"Td" {
                 if let (Some(x_obj), Some(y_obj)) = (operands.first(), operands.get(1)) {
                     let x = x_obj
                         .as_real()
@@ -2830,7 +2929,8 @@ mod tests {
                     }
                 }
             }
-        }
+            Ok(ParseControl::Continue)
+        });
 
         assert!(
             td_ops.len() >= 3,
@@ -4212,10 +4312,7 @@ mod tests {
 
         // Caption "OK" must appear in a Tj.
         let mut found_caption = false;
-        for tok in ContentStreamParser::new(&stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else {
-                continue;
-            };
+        let _ = parse_content_operations(&stream.data, |operands, operator| {
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     if s == b"OK" {
@@ -4223,7 +4320,8 @@ mod tests {
                     }
                 }
             }
-        }
+            Ok(ParseControl::Continue)
+        });
         assert!(found_caption, "pushbutton Tj must contain caption 'OK'");
     }
 
@@ -4285,10 +4383,7 @@ mod tests {
 
         // Tj operand must be "4" (default checkbox glyph).
         let mut found_glyph = false;
-        for tok in ContentStreamParser::new(&on_stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else {
-                continue;
-            };
+        let _ = parse_content_operations(&on_stream.data, |operands, operator| {
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     if s == b"4" {
@@ -4296,7 +4391,8 @@ mod tests {
                     }
                 }
             }
-        }
+            Ok(ParseControl::Continue)
+        });
         assert!(found_glyph, "checkbox on stream Tj must contain glyph '4'");
 
         // off-state XObject stream must be blank.
@@ -4357,10 +4453,7 @@ mod tests {
 
         // Tj must contain 'l' (radio bullet).
         let mut found = false;
-        for tok in ContentStreamParser::new(&on_stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else {
-                continue;
-            };
+        let _ = parse_content_operations(&on_stream.data, |operands, operator| {
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     if s == b"l" {
@@ -4368,7 +4461,8 @@ mod tests {
                     }
                 }
             }
-        }
+            Ok(ParseControl::Continue)
+        });
         assert!(found, "radio on stream Tj must contain glyph 'l'");
     }
 
@@ -4530,10 +4624,7 @@ mod tests {
         };
 
         let mut found_glyph = false;
-        for tok in ContentStreamParser::new(&on_stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else {
-                continue;
-            };
+        let _ = parse_content_operations(&on_stream.data, |operands, operator| {
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     if s == b"8" {
@@ -4541,7 +4632,8 @@ mod tests {
                     }
                 }
             }
-        }
+            Ok(ParseControl::Continue)
+        });
         assert!(
             found_glyph,
             "/MK/CA '8' must appear in Tj, overriding default '4'"
@@ -4842,15 +4934,14 @@ mod tests {
         };
         // All three inherited options must be rendered as Tj strings.
         let mut tj_strings: Vec<Vec<u8>> = Vec::new();
-        for tok in ContentStreamParser::new(&stream.data).flatten() {
-            if let ContentToken::Op { operands, operator } = tok {
-                if operator == b"Tj" {
-                    if let Some(Object::String(b)) = operands.first() {
-                        tj_strings.push(b.clone());
-                    }
+        let _ = parse_content_operations(&stream.data, |operands, operator| {
+            if operator == b"Tj" {
+                if let Some(Object::String(b)) = operands.first() {
+                    tj_strings.push(b.clone());
                 }
             }
-        }
+            Ok(ParseControl::Continue)
+        });
         assert!(
             tj_strings.iter().any(|s| s == b"Red")
                 && tj_strings.iter().any(|s| s == b"Green")
@@ -4915,15 +5006,14 @@ mod tests {
         // fill op preceding the text.
         let mut saw_re = false;
         let mut saw_fill = false;
-        for tok in ContentStreamParser::new(&stream.data).flatten() {
-            if let ContentToken::Op { operator, .. } = tok {
-                if operator == b"re" {
-                    saw_re = true;
-                } else if operator == b"f" && saw_re {
-                    saw_fill = true;
-                }
+        let _ = parse_content_operations(&stream.data, |_operands, operator| {
+            if operator == b"re" {
+                saw_re = true;
+            } else if operator == b"f" && saw_re {
+                saw_fill = true;
             }
-        }
+            Ok(ParseControl::Continue)
+        });
         assert!(
             saw_fill,
             "inherited /I did not produce a selection highlight"
@@ -4982,10 +5072,13 @@ mod tests {
             panic!("not a stream");
         };
         // Two selected rows ⇒ two highlight fills (re … f).
-        let fills = ContentStreamParser::new(&stream.data)
-            .flatten()
-            .filter(|t| matches!(t, ContentToken::Op { operator, .. } if operator == b"f"))
-            .count();
+        let mut fills = 0;
+        let _ = parse_content_operations(&stream.data, |_operands, operator| {
+            if operator == b"f" {
+                fills += 1;
+            }
+            Ok(ParseControl::Continue)
+        });
         assert_eq!(
             fills, 2,
             "expected two selection highlights for Red+Blue, got {fills}"
@@ -5067,10 +5160,7 @@ mod tests {
 
         // Content must have Tj with "Blue".
         let mut found = false;
-        for tok in ContentStreamParser::new(&stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else {
-                continue;
-            };
+        let _ = parse_content_operations(&stream.data, |operands, operator| {
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     if s == b"Blue" {
@@ -5078,7 +5168,8 @@ mod tests {
                     }
                 }
             }
-        }
+            Ok(ParseControl::Continue)
+        });
         assert!(found, "combo Tj must contain value 'Blue'");
     }
 
@@ -5141,16 +5232,14 @@ mod tests {
 
         // All three options must appear as Tj operands.
         let mut tj_vals: Vec<Vec<u8>> = Vec::new();
-        for tok in ContentStreamParser::new(&stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else {
-                continue;
-            };
+        let _ = parse_content_operations(&stream.data, |operands, operator| {
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     tj_vals.push(s.clone());
                 }
             }
-        }
+            Ok(ParseControl::Continue)
+        });
         assert!(
             tj_vals.contains(&b"Red".to_vec()),
             "Red must appear in Tj; got: {tj_vals:?}"
@@ -5243,16 +5332,14 @@ mod tests {
         };
 
         let mut tj_vals: Vec<Vec<u8>> = Vec::new();
-        for tok in ContentStreamParser::new(&stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else {
-                continue;
-            };
+        let _ = parse_content_operations(&stream.data, |operands, operator| {
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     tj_vals.push(s.clone());
                 }
             }
-        }
+            Ok(ParseControl::Continue)
+        });
         assert!(
             tj_vals.contains(&b"dispA".to_vec()),
             "display string 'dispA' must appear in Tj; got {tj_vals:?}"
@@ -5311,10 +5398,7 @@ mod tests {
         };
 
         let mut found_display = false;
-        for tok in ContentStreamParser::new(&stream.data).flatten() {
-            let ContentToken::Op { operands, operator } = tok else {
-                continue;
-            };
+        let _ = parse_content_operations(&stream.data, |operands, operator| {
             if operator == b"Tj" {
                 if let Some(Object::String(s)) = operands.first() {
                     if s == b"DisplayX" {
@@ -5322,7 +5406,8 @@ mod tests {
                     }
                 }
             }
-        }
+            Ok(ParseControl::Continue)
+        });
         assert!(
             found_display,
             "combo must render display string 'DisplayX' from /Opt"
@@ -5549,17 +5634,16 @@ mod tests {
         let (_ap_n, content) = btn_on_state_content(pdf);
         // Default glyph for checkbox is "4" (ZapfDingbats checkmark).
         let mut found_default = false;
-        for tok in ContentStreamParser::new(&content).flatten() {
-            if let ContentToken::Op { operands, operator } = tok {
-                if operator == b"Tj" {
-                    if let Some(Object::String(s)) = operands.first() {
-                        if s == b"4" {
-                            found_default = true;
-                        }
+        let _ = parse_content_operations(&content, |operands, operator| {
+            if operator == b"Tj" {
+                if let Some(Object::String(s)) = operands.first() {
+                    if s == b"4" {
+                        found_default = true;
                     }
                 }
             }
-        }
+            Ok(ParseControl::Continue)
+        });
         assert!(
             found_default,
             "empty /MK/CA must fall back to default glyph '4'"
@@ -5576,17 +5660,16 @@ mod tests {
         );
         let (_ap_n, content) = btn_on_state_content(pdf);
         let mut found_default = false;
-        for tok in ContentStreamParser::new(&content).flatten() {
-            if let ContentToken::Op { operands, operator } = tok {
-                if operator == b"Tj" {
-                    if let Some(Object::String(s)) = operands.first() {
-                        if s == b"4" {
-                            found_default = true;
-                        }
+        let _ = parse_content_operations(&content, |operands, operator| {
+            if operator == b"Tj" {
+                if let Some(Object::String(s)) = operands.first() {
+                    if s == b"4" {
+                        found_default = true;
                     }
                 }
             }
-        }
+            Ok(ParseControl::Continue)
+        });
         assert!(
             found_default,
             "out-of-range UTF-16BE char must fall back to default glyph '4'"
@@ -6707,24 +6790,27 @@ mod tests {
     /// Collect all Tj string operands from a content stream.
     fn tj_strings_from(content: &[u8]) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
-        for tok in ContentStreamParser::new(content).flatten() {
-            if let ContentToken::Op { operands, operator } = tok {
-                if operator == b"Tj" {
-                    if let Some(Object::String(s)) = operands.first() {
-                        out.push(s.clone());
-                    }
+        let _ = parse_content_operations(content, |operands, operator| {
+            if operator == b"Tj" {
+                if let Some(Object::String(s)) = operands.first() {
+                    out.push(s.clone());
                 }
             }
-        }
+            Ok(ParseControl::Continue)
+        });
         out
     }
 
     /// Count `f` (fill) operators in a content stream (each is one highlight rect).
     fn count_fills(content: &[u8]) -> usize {
-        ContentStreamParser::new(content)
-            .flatten()
-            .filter(|t| matches!(t, ContentToken::Op { operator, .. } if operator == b"f"))
-            .count()
+        let mut fills = 0;
+        let _ = parse_content_operations(content, |_operands, operator| {
+            if operator == b"f" {
+                fills += 1;
+            }
+            Ok(ParseControl::Continue)
+        });
+        fills
     }
 
     // ── Ch: missing /Rect → None (line 1569) ────────────────────────────────

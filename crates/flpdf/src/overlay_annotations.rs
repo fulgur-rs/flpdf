@@ -989,8 +989,9 @@ fn duplicate_field_tree<R: Read + Seek>(
 ///
 /// This is an inline tokenizer scoped to the `/DA` subset (delegates operand
 /// lexing to the shared [`Parser`] but does not use the general
-/// [`crate::content_stream::ContentStreamParser`], which does not track
-/// per-token byte offsets).
+/// [`crate::content_stream::parse_content_operations`] adapter, whose
+/// callbacks group operands at operator boundaries instead of exposing each
+/// name token's byte span).
 ///
 /// Returns `da.to_vec()` verbatim, without scanning, when `dr_map` is empty
 /// (the common case: no placement recorded a rename on this dest page).
