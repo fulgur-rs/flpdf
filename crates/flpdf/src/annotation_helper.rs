@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFAnnotationObjectHelper.cc and QPDFFormFieldObjectHelper.cc responsibilities split across helper modules.
 //! Typed accessor helpers for annotation and form-field objects, mirroring
 //! `QPDFAnnotationObjectHelper` and `QPDFFormFieldObjectHelper`.
 //!

@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFWriter.cc standard write pipeline split across plain writer modules.
 use std::io::{Read, Seek, Write};
 
 #[cfg(test)]

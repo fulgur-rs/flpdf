@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFObjectHandle.cc and the QPDFObject/QPDFValue type family combined in one Rust object model.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;

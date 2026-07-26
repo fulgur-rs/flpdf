@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFParser.cc, Pl_QPDFTokenizer.cc, and ContentNormalizer.cc responsibilities; not yet a complete component mirror.
 //! Content-stream tokenizer (ISO 32000-1 §7.8.2).
 //!
 //! A PDF content stream is a sequence of operands followed by an operator,

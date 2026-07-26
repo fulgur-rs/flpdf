@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF_json.cc responsibilities represented by the JSON v2 inspection builders.
 //! qpdf JSON v2 inspection builders.
 //!
 //! Provides the structural frame for qpdf `--json` output.  Each builder

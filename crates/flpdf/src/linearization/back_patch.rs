@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFWriter.cc linearization back-patching split from the writer.
 //! Back-patcher for Part 1 linearization parameter dictionary.
 //!
 //! After layout is complete and all byte offsets are known, this module

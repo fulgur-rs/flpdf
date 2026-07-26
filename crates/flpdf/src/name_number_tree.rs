@@ -1,3 +1,4 @@
+//! qpdf correspondence: compatibility wrappers around the qpdf-shaped `NameTree` and `NumberTree` helpers in `nntree.rs`.
 //! Compatibility functions for name and number trees.
 //!
 //! Existing callers keep the original free-function API, while all structural

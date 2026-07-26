@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFJob.cc document-check surface over reader diagnostics.
 //! Lightweight document validator.
 //!
 //! Mirrors the surface of qpdf's `--check`: open the document (with the recovery path

@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFWriter.cc linearized object renumbering layered over the shared rewrite renumberer.
 //! Object renumbering for linearized PDF output (ISO 32000-1 Annex F).
 //!
 //! After the [`LinearizationPlan`] has partitioned all objects into Parts 2–4,

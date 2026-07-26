@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFOutlineObjectHelper.cc compatibility surface split from the document helper.
 //! The pre-1.0 flat, configurable-depth outline API was removed in favor of
 //! qpdf-compatible [`OutlineTree`] materialization.
 //!

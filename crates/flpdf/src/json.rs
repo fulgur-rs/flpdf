@@ -1,3 +1,4 @@
+//! qpdf correspondence: JSON.cc value model and materialized writer; parser, schema validation, and streaming writer remain incomplete.
 //! JSON emitter for `--json` output.
 //!
 //! Enforces the following formatting policy:

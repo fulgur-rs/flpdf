@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFExc.cc and QPDFSystemError.cc concepts combined with flpdf-specific errors; public APIs are incomplete.
 use crate::security::primitives::PrimitiveError;
 use thiserror::Error;
 

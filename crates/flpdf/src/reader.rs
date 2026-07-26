@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF.cc document reading, object resolution, recovery, and authentication responsibilities.
 pub(crate) mod file_object;
 
 use self::file_object::{

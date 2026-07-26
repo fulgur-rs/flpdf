@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFWriter.cc classic and stream xref emission for the plain writer.
 use std::collections::BTreeMap;
 
 use crate::writer::{serialize::xref_stream, write_deterministic_id_inline};

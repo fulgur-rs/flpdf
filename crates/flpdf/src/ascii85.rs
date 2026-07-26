@@ -1,3 +1,4 @@
+//! qpdf correspondence: Pl_ASCII85Decoder.cc decode semantics plus a flpdf encoder; the qpdf Pipeline component boundary is not mirrored.
 //! ASCII85 encode/decode per PDF 1.7 section 7.4.3.
 //!
 //! ## Decoder notes

@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFEmbeddedFileDocumentHelper.cc behavior without its complete public helper API boundary.
 //! Read/write access to the `/Names /EmbeddedFiles` name-tree.
 //!
 //! # Reader

@@ -1,4 +1,4 @@
-//! Mirrors qpdf 11.9.0 `libqpdf/NNTree.cc`.
+//! qpdf correspondence: NNTree.cc behavior implemented with Rust-specific storage, error, and ownership boundaries.
 //!
 //! This module provides the shared engine plus public wrappers corresponding
 //! to `QPDFNameTreeObjectHelper` and `QPDFNumberTreeObjectHelper`.

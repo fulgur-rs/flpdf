@@ -1,3 +1,4 @@
+//! qpdf correspondence: flpdf-only Standard 14 font metrics with no qpdf library component.
 //! Standard 14 PDF font glyph width tables.
 //!
 //! Generated from Adobe Core14 AFM (StartFontMetrics 4.1).

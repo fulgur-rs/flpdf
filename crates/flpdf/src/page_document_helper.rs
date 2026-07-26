@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFPageDocumentHelper.cc responsibilities split with page extraction.
 //! High-level page-document helper, mirroring qpdf's `QPDFPageDocumentHelper`.
 //!
 //! [`PageDocumentHelper`] wraps a `&mut Pdf<R>` and exposes an ergonomic API for

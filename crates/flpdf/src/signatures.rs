@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFAcroFormDocumentHelper.cc signature disabling and QPDF.cc restriction removal plus flpdf-only inspection.
 //! Digital signature helpers.
 //!
 //! This module has three layers:

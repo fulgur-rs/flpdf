@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFJob.cc page-range parsing split from page-operation orchestration.
 //! Page-range syntax parser, matching qpdf's page-range mini-language.
 //!
 //! # Syntax

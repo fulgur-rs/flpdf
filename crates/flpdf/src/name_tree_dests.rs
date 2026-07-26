@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFNameTreeObjectHelper.cc destination-tree access split from the generic tree module.
 //! Read/write access to the `/Names /Dests` name-tree (PDF 1.2+ named
 //! destinations; ISO 32000-2 §7.9.6 + §12.3.2.3).
 //!

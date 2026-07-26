@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFLogger.cc diagnostic routing represented as Rust values.
 //! Diagnostic primitives shared by the parser, writer, and `check` module.
 //!
 //! The [`Diagnostics::push_encrypted`] helper maps an [`crate::error::EncryptedError`]

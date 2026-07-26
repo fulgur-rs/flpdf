@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF_encryption.cc permission-bit encoding split from the Standard security handler.
 //! Typed permission configuration for writer-side `/Encrypt` `/P` encoding.
 //!
 //! [`Permissions`](crate::Permissions) (in `reader.rs`) is the read-only

@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF.cc indirect-reference resolution represented as a bounded shared primitive.
 //! Terminal normalization of indirect-reference chains.
 //!
 //! A PDF value reached by indirection may be stored behind *more than one*

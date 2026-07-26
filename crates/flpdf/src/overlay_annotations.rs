@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFPageObjectHelper.cc, QPDFAcroFormDocumentHelper.cc, ResourceFinder.cc, and QPDFObjectHandle.cc overlay responsibilities.
 //! Overlay/underlay annotation copy, mirroring qpdf 11.9.0's
 //! `QPDFPageObjectHelper::copyAnnotations` +
 //! `QPDFAcroFormDocumentHelper::transformAnnotations` +

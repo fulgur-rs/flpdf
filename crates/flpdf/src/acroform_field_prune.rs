@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFJob.cc removal of unreferenced form fields after page selection.
 //! AcroForm field preservation after page-subset extraction.
 //!
 //! After [`crate::page_tree_rebuild::rebuild_page_tree`] has rebuilt the page

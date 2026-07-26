@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFAcroFormDocumentHelper.cc appearance adjustment plus ResourceFinder.cc token rewriting.
 //! Port of qpdf's `AcroForm::adjustAppearanceStream` and its
 //! `ResourceReplacer` / `ResourceFinder` token filter
 //! (`libqpdf/QPDFAcroFormDocumentHelper.cc:628-849`, `libqpdf/ResourceFinder.cc`),

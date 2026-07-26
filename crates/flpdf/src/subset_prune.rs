@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFPageObjectHelper.cc resource pruning plus QPDFWriter.cc full-rewrite reachability.
 //! Resource pruning after page-subset extraction.
 //!
 //! After [`crate::page_tree_rebuild::rebuild_page_tree`] has restructured the

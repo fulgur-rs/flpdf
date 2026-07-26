@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFAcroFormDocumentHelper.cc responsibilities shared with overlay and signature modules.
 //! High-level AcroForm document helper.
 //!
 //! [`AcroFormDocumentHelper`] wraps a `&mut Pdf<R>` and exposes document-level

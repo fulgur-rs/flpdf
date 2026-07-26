@@ -1,3 +1,4 @@
+//! qpdf correspondence: Pl_ASCIIHexDecoder.cc decode semantics plus a flpdf encoder; the qpdf Pipeline component boundary is not mirrored.
 //! ASCIIHexDecode encode/decode per PDF 1.7 section 7.4.2.
 //!
 //! ## Decoder notes

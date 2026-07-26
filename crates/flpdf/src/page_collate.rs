@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFJob.cc handlePageSpecs collate ordering split into a page-operation module.
 //! Round-robin page interleaving (qpdf `--collate[=N]`).
 //!
 //! [`collate`] takes the per-input page plans from a [`CombinedPlan`] and

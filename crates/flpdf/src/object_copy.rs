@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF.cc copyForeignObject responsibility split into copy and closure modules.
 //! Cross-document deep object copier (renumber + cycle handling).
 //!
 //! [`copy_objects`] copies a pre-closed set of source [`ObjectRef`]s into a

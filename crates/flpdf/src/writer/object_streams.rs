@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF.cc getCompressibleObjGens plus QPDFWriter.cc object-stream planning and emission.
 //! ObjStm eligibility predicate — decides whether an indirect object may be
 //! stored inside an object stream (PDF 1.5+, ISO 32000-1 §7.5.7).
 //! Also provides the packing planner that groups eligible objects into batches.

@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFFormFieldObjectHelper.cc appearance generation shared with annotation helpers.
 //! Appearance-stream generators for AcroForm widgets.
 //!
 //! This module builds the `/AP/N` (normal-appearance) Form XObject for

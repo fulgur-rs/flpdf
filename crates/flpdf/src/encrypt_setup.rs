@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF_encryption.cc writer-side encryption configuration split from the security handler.
 //! User-facing encryption parameters for the writer side.
 //!
 //! Callers populate [`EncryptParams`] from CLI flags (or library API

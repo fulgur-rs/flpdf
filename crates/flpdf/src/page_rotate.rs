@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFJob.cc page rotation plus QPDFPageObjectHelper.cc matrix responsibilities.
 //! `/Rotate` manipulation for PDF pages.
 //!
 //! Applies rotation to a set of leaf `Page` objects in two modes:

@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for article beads.
 //! Article-thread bead `/P` reference drop after page extraction.
 //!
 //! After [`crate::page_tree_rebuild::rebuild_page_tree`] has rebuilt the page

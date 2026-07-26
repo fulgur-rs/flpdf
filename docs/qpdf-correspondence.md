@@ -12,6 +12,10 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 どこまで対応しているかのスナップショット。`flpdf-qxba` の work-list であり、Phase 1
 完了後に再測する。
 
+**機械可読なモジュール索引:** [`qpdf-module-doc-index.md`](qpdf-module-doc-index.md) は
+各 source module 先頭の対応行から生成する。この索引は注釈の欠落と drift を検査する
+ためのものであり、本書の責務分類・状態・実装判断を置き換えない。
+
 規模比較: qpdf `libqpdf/*.cc` = 41,459 行 / flpdf 実装部 = **68,504 行**
 
 ### 行数の位置づけ — スナップショットであり維持対象ではない
@@ -56,8 +60,8 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 | `QPDFObject.cc` / `QPDFValue.cc` | 79 | `object.rs` の `Object` | ✅ |
 | `QPDFObjGen.cc` | 68 | `object.rs` の `ObjectRef` | ✅ |
 | `QPDFXRefEntry.cc` | 51 | `xref.rs`(1129) の一部 | 🔀 独立した型境界が無く `xref.rs` に埋没 |
-| `PDFVersion.cc` | 68 | `writer.rs` の `parse_pdf_version` / `static_version_string` | 🔀 → **T0-1** |
-| `QPDFMatrix.cc` | 140 | `overlay.rs`(82-123: `IDENTITY_MATRIX` / `qpdf_concat` / `qpdf_scale` / `qpdf_translate` / `matrix_unparse`) + `overlay_annotations.rs`(1284-1365) + `page_form_xobject.rs`(503,533) + `page_annotation_flatten.rs`(306,454) + `page_rotate.rs`(306-355) に `[f64; 6]` 生配列で散在 | 🔀 → **T0-2** |
+| `PDFVersion.cc` | 68 | `pdf_version.rs` の `PdfVersion` | ✅ |
+| `QPDFMatrix.cc` | 140 | `matrix.rs` の `Matrix` / `Rectangle` | ✅ |
 
 ## 2. パース / 読み取り
 

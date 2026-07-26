@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF.cc xref-backed object cache represented as a standalone Rust module.
 use crate::{Object, ObjectRef, XrefOffset};
 use std::collections::{BTreeMap, BTreeSet};
 

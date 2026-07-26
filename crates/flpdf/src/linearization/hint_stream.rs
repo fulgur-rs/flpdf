@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF_linearization.cc plus BitStream.cc and BitWriter.cc hint encoding responsibilities.
 //! Hint stream encoder — FlateDecode-compressed binary hint tables.
 //!
 //! This module takes fully-populated [`PageOffsetHintTable`] and

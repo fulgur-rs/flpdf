@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFPageObjectHelper.cc placement and QPDFJob.cc overlay orchestration responsibilities.
 //! Apply overlay/underlay content to a destination page, mirroring qpdf's
 //! `QPDFPageObjectHelper::placeFormXObject` and `QPDFJob::doUnderOverlayForPage`
 //! (qpdf 11.9.0).
