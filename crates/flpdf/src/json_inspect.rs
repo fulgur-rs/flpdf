@@ -9,7 +9,7 @@ use crate::json::{Json, JsonValue};
 use crate::object::{Dictionary, Object, ObjectRef, Stream};
 use crate::reader::Pdf;
 use std::borrow::Cow;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 
 // ── ConvertError ──────────────────────────────────────────────────────────────
 
@@ -42,6 +42,22 @@ impl From<crate::Error> for ConvertError {
     fn from(err: crate::Error) -> Self {
         ConvertError::PdfError(err.to_string())
     }
+}
+
+/// Additional work the caller must perform after JSON emission succeeds.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct JsonOutputSummary {
+    /// Stream objects whose payloads are named by `datafile` entries.
+    pub datafile_objects: Vec<ObjectRef>,
+}
+
+/// Failure while converting or incrementally writing a qpdf JSON document.
+#[derive(Debug, thiserror::Error)]
+pub enum JsonOutputError {
+    #[error(transparent)]
+    Convert(#[from] ConvertError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 fn json_array(values: impl IntoIterator<Item = Json>) -> Result<Json, ConvertError> {
@@ -845,25 +861,7 @@ fn build_qpdf_key_selected_with_stream_mode<R: Read + Seek>(
     prepared_refs: &[ObjectRef],
 ) -> Result<Json, ConvertError> {
     // ── 1. Build metadata object (fixed key set per qpdf v2 spec) ──────────
-    let meta = json_dictionary([
-        ("jsonversion".to_string(), Json::make_int(2)),
-        (
-            "pdfversion".to_string(),
-            Json::make_string(metadata.pdf_version.clone()),
-        ),
-        (
-            "pushedinheritedpageresources".to_string(),
-            Json::make_bool(metadata.pushed_inherited_page_resources),
-        ),
-        (
-            "calledgetallpages".to_string(),
-            Json::make_bool(metadata.called_get_all_pages),
-        ),
-        (
-            "maxobjectid".to_string(),
-            Json::make_int(i64::from(metadata.max_object_id)),
-        ),
-    ])?;
+    let meta = build_qpdf_metadata(metadata)?;
 
     // ── 2. Build objects_map ───────────────────────────────────────────────
     // `prepared_refs` contains every live object plus qpdf-style placeholders
@@ -884,47 +882,7 @@ fn build_qpdf_key_selected_with_stream_mode<R: Read + Seek>(
             continue;
         }
         let key = format!("obj:{} {} R", oref.number, oref.generation);
-        let obj = qpdf_resolve_top_level_object(pdf, oref)?;
-        let json_val = match &obj {
-            Object::Stream(stream) => {
-                // Stream: emit according to stream_mode.
-                let dict_json = qpdf_dict_to_json(pdf, &stream.dict)?;
-                let stream_inner = match stream_mode {
-                    StreamDataMode::None => {
-                        // Default: dict only.
-                        json_dictionary([("dict".to_string(), dict_json)])?
-                    }
-                    StreamDataMode::Inline => {
-                        // Encode the stream payload as base64 under "data".
-                        // The payload is decoded per `decode_level` so that
-                        // Inline output matches `qpdf --decode-level=...`.
-                        // Key order: data, dict (alphabetical).
-                        let payload =
-                            stream_payload_for_decode_level(stream, decode_level).into_owned();
-                        let data = Json::make_blob(move |out| out.write_all(&payload));
-                        json_dictionary([
-                            ("data".to_string(), data),
-                            ("dict".to_string(), dict_json),
-                        ])?
-                    }
-                    StreamDataMode::File { prefix } => {
-                        // Emit a side-file path under "datafile".
-                        // Key order: datafile, dict (alphabetical).
-                        let datafile = format_json_side_file_path(prefix, oref.number);
-                        json_dictionary([
-                            ("datafile".to_string(), Json::make_string(datafile)),
-                            ("dict".to_string(), dict_json),
-                        ])?
-                    }
-                };
-                json_dictionary([("stream".to_string(), stream_inner)])?
-            }
-            other => {
-                // Non-stream (including live Object::Null): emit { "value": <json> }.
-                let val = qpdf_pdf_object_to_json(pdf, other)?;
-                json_dictionary([("value".to_string(), val)])?
-            }
-        };
+        let (json_val, _) = build_qpdf_object_entry(pdf, oref, decode_level, stream_mode)?;
         map_pairs.push((key, json_val));
     }
 
@@ -946,6 +904,66 @@ fn build_qpdf_key_selected_with_stream_mode<R: Read + Seek>(
     let objects_map = json_dictionary(map_pairs)?;
 
     json_array([meta, objects_map])
+}
+
+fn build_qpdf_metadata(metadata: QpdfMetadata) -> Result<Json, ConvertError> {
+    json_dictionary([
+        ("jsonversion".to_string(), Json::make_int(2)),
+        (
+            "pdfversion".to_string(),
+            Json::make_string(metadata.pdf_version),
+        ),
+        (
+            "pushedinheritedpageresources".to_string(),
+            Json::make_bool(metadata.pushed_inherited_page_resources),
+        ),
+        (
+            "calledgetallpages".to_string(),
+            Json::make_bool(metadata.called_get_all_pages),
+        ),
+        (
+            "maxobjectid".to_string(),
+            Json::make_int(i64::from(metadata.max_object_id)),
+        ),
+    ])
+}
+
+fn build_qpdf_object_entry<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object_ref: ObjectRef,
+    decode_level: DecodeLevel,
+    stream_mode: &StreamDataMode,
+) -> Result<(Json, bool), ConvertError> {
+    let object = qpdf_resolve_top_level_object(pdf, object_ref)?;
+    match &object {
+        Object::Stream(stream) => {
+            let dict_json = qpdf_dict_to_json(pdf, &stream.dict)?;
+            let stream_inner = match stream_mode {
+                StreamDataMode::None => json_dictionary([("dict".to_string(), dict_json)])?,
+                StreamDataMode::Inline => {
+                    let payload =
+                        stream_payload_for_decode_level(stream, decode_level).into_owned();
+                    let data = Json::make_blob(move |out| out.write_all(&payload));
+                    json_dictionary([("data".to_string(), data), ("dict".to_string(), dict_json)])?
+                }
+                StreamDataMode::File { prefix } => {
+                    let datafile = format_json_side_file_path(prefix, object_ref.number);
+                    json_dictionary([
+                        ("datafile".to_string(), Json::make_string(datafile)),
+                        ("dict".to_string(), dict_json),
+                    ])?
+                }
+            };
+            Ok((
+                json_dictionary([("stream".to_string(), stream_inner)])?,
+                true,
+            ))
+        }
+        other => Ok((
+            json_dictionary([("value".to_string(), qpdf_pdf_object_to_json(pdf, other)?)])?,
+            false,
+        )),
+    }
 }
 
 // ── DecodeLevel ──────────────────────────────────────────────────────────────
@@ -2780,6 +2798,213 @@ fn json_section_selected(keys: &[JsonKey], section: JsonKey) -> bool {
             .any(|key| key.output_key_name() == section.output_key_name())
 }
 
+fn build_parameters(decode_level: DecodeLevel) -> Result<Json, ConvertError> {
+    json_dictionary([(
+        "decodelevel",
+        Json::make_string(decode_level.as_qpdf_str().as_bytes()),
+    )])
+}
+
+fn emit_section(
+    out: &mut (impl Write + ?Sized),
+    first: &mut bool,
+    name: &[u8],
+    keys: &[JsonKey],
+    key: JsonKey,
+    build: impl FnOnce() -> Result<Json, ConvertError>,
+) -> Result<(), JsonOutputError> {
+    if json_section_selected(keys, key) {
+        let value = build()?;
+        Json::write_dictionary_item(out, first, name, &value, 1)?;
+    }
+    Ok(())
+}
+
+fn object_selected(selectors: &[JsonObjectSelector], object_ref: ObjectRef) -> bool {
+    selectors.is_empty()
+        || selectors.iter().any(|selector| {
+            matches!(
+                selector,
+                JsonObjectSelector::Object { number, generation }
+                    if *number == object_ref.number
+                        && *generation == object_ref.generation
+            )
+        })
+}
+
+fn trailer_selected(selectors: &[JsonObjectSelector]) -> bool {
+    selectors.is_empty()
+        || selectors
+            .iter()
+            .any(|selector| matches!(selector, JsonObjectSelector::Trailer))
+}
+
+fn write_qpdf_section<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    decode_level: DecodeLevel,
+    stream_mode: &StreamDataMode,
+    objects: &[JsonObjectSelector],
+    out: &mut (impl Write + ?Sized),
+    top_first: &mut bool,
+    summary: &mut JsonOutputSummary,
+) -> Result<(), JsonOutputError> {
+    let prepared = pdf
+        .prepare_qpdf_json_objects()
+        .map_err(ConvertError::from)?;
+    let metadata = QpdfMetadata {
+        pdf_version: pdf.version().to_string(),
+        max_object_id: prepared.max_object_id,
+        pushed_inherited_page_resources: false,
+        called_get_all_pages: pdf.ever_called_get_all_pages(),
+    };
+
+    Json::write_dictionary_key(out, top_first, b"qpdf", 1)?;
+    let mut qpdf_first = true;
+    Json::write_array_open(out, &mut qpdf_first, 1)?;
+    Json::write_next(out, &mut qpdf_first, 2)?;
+    let mut metadata_first = true;
+    Json::write_dictionary_open(out, &mut metadata_first, 2)?;
+    Json::write_dictionary_item(
+        out,
+        &mut metadata_first,
+        b"jsonversion",
+        &Json::make_int(2),
+        3,
+    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    Json::write_dictionary_item(
+        out,
+        &mut metadata_first,
+        b"pdfversion",
+        &Json::make_string(metadata.pdf_version),
+        3,
+    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    Json::write_dictionary_item(
+        out,
+        &mut metadata_first,
+        b"pushedinheritedpageresources",
+        &Json::make_bool(metadata.pushed_inherited_page_resources),
+        3,
+    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    Json::write_dictionary_item(
+        out,
+        &mut metadata_first,
+        b"calledgetallpages",
+        &Json::make_bool(metadata.called_get_all_pages),
+        3,
+    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    Json::write_dictionary_item(
+        out,
+        &mut metadata_first,
+        b"maxobjectid",
+        &Json::make_int(i64::from(metadata.max_object_id)),
+        3,
+    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    Json::write_dictionary_close(out, metadata_first, 2)?;
+
+    Json::write_next(out, &mut qpdf_first, 2)?;
+    let mut objects_first = true;
+    Json::write_dictionary_open(out, &mut objects_first, 2)?;
+    for object_ref in prepared.refs {
+        if !object_selected(objects, object_ref) {
+            continue;
+        }
+        let key = format!("obj:{} {} R", object_ref.number, object_ref.generation);
+        let (entry, is_stream) =
+            build_qpdf_object_entry(pdf, object_ref, decode_level, stream_mode)?;
+        Json::write_dictionary_item(out, &mut objects_first, key.as_bytes(), &entry, 3)?;
+        if is_stream && matches!(stream_mode, StreamDataMode::File { .. }) {
+            summary.datafile_objects.push(object_ref);
+        }
+    }
+
+    if trailer_selected(objects) {
+        let trailer =
+            json_dictionary([("value", qpdf_dict_to_json(pdf, &pdf.trailer().clone())?)])?;
+        Json::write_dictionary_item(out, &mut objects_first, b"trailer", &trailer, 3)?;
+    }
+    Json::write_dictionary_close(out, objects_first, 2)?;
+    Json::write_array_close(out, qpdf_first, 1)?;
+    Ok(())
+}
+
+/// Incrementally write a selected qpdf JSON v2 document.
+///
+/// The envelope and selected sections are emitted in qpdf's fixed order.
+/// Object selectors affect only the raw `qpdf` object map; qpdf metadata is
+/// still computed after preparing every live object.
+pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    decode_level: DecodeLevel,
+    stream_mode: &StreamDataMode,
+    keys: &[JsonKey],
+    objects: &[JsonObjectSelector],
+    out: &mut (impl Write + ?Sized),
+) -> Result<JsonOutputSummary, JsonOutputError> {
+    let mut summary = JsonOutputSummary::default();
+    let mut first = true;
+    Json::write_dictionary_open(out, &mut first, 0)?;
+    Json::write_dictionary_item(out, &mut first, b"version", &Json::make_int(2), 1)?;
+    Json::write_dictionary_item(
+        out,
+        &mut first,
+        b"parameters",
+        &build_parameters(decode_level)?,
+        1,
+    )?;
+    emit_section(out, &mut first, b"pages", keys, JsonKey::Pages, || {
+        build_pages_section(pdf)
+    })?;
+    emit_section(
+        out,
+        &mut first,
+        b"pagelabels",
+        keys,
+        JsonKey::Pagelabels,
+        || build_pagelabels_section(pdf),
+    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    emit_section(
+        out,
+        &mut first,
+        b"acroform",
+        keys,
+        JsonKey::Acroform,
+        || build_acroform_section(pdf),
+    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    emit_section(
+        out,
+        &mut first,
+        b"attachments",
+        keys,
+        JsonKey::Attachments,
+        || build_attachments_section(pdf),
+    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    emit_section(out, &mut first, b"encrypt", keys, JsonKey::Encrypt, || {
+        build_encrypt_section(pdf)
+    })?;
+    emit_section(
+        out,
+        &mut first,
+        b"outlines",
+        keys,
+        JsonKey::Outlines,
+        || build_outlines_section(pdf),
+    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    if json_section_selected(keys, JsonKey::Qpdf) {
+        write_qpdf_section(
+            pdf,
+            decode_level,
+            stream_mode,
+            objects,
+            out,
+            &mut first,
+            &mut summary,
+        )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    }
+    Json::write_dictionary_close(out, first, 0)?;
+    out.write_all(b"\n")?;
+    Ok(summary)
+}
+
 /// Build a qpdf JSON v2 document containing only the requested top-level
 /// sections.
 ///
@@ -2887,6 +3112,27 @@ mod tests {
     use super::*;
     use crate::json::write;
 
+    struct FailAfter {
+        remaining: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl std::io::Write for FailAfter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::other("sink full"));
+            }
+            let written = self.remaining.min(buffer.len());
+            self.bytes.extend_from_slice(&buffer[..written]);
+            self.remaining -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn emit(v: &JsonValue) -> String {
         let mut buf = Vec::new();
         write(v, &mut buf).expect("write failed");
@@ -2975,6 +3221,255 @@ mod tests {
             .as_bytes(),
         );
         Pdf::open(Cursor::new(bytes)).expect("open")
+    }
+
+    #[test]
+    fn selected_sink_writer_emits_envelope_then_selected_section() {
+        let mut pdf = load_one_page_pdf();
+        let mut out = Vec::new();
+        let summary = write_qpdf_json_v2_selected_objects_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Pages],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(summary.datafile_objects.is_empty());
+        assert!(serde_json::from_slice::<serde_json::Value>(&out).is_ok());
+        let version = out
+            .windows(b"\"version\"".len())
+            .position(|window| window == b"\"version\"")
+            .unwrap();
+        let parameters = out
+            .windows(b"\"parameters\"".len())
+            .position(|window| window == b"\"parameters\"")
+            .unwrap();
+        let pages = out
+            .windows(b"\"pages\"".len())
+            .position(|window| window == b"\"pages\"")
+            .unwrap();
+        assert!(version < parameters && parameters < pages);
+    }
+
+    #[test]
+    fn sink_writer_preserves_qpdf_metadata_field_order() {
+        let mut pdf = load_one_page_pdf();
+        let mut out = Vec::new();
+        write_qpdf_json_v2_selected_objects_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Qpdf],
+            &[JsonObjectSelector::Trailer],
+            &mut out,
+        )
+        .unwrap();
+
+        let positions = [
+            b"\"jsonversion\"".as_slice(),
+            b"\"pdfversion\"".as_slice(),
+            b"\"pushedinheritedpageresources\"".as_slice(),
+            b"\"calledgetallpages\"".as_slice(),
+            b"\"maxobjectid\"".as_slice(),
+        ]
+        .map(|needle| {
+            out.windows(needle.len())
+                .position(|window| window == needle)
+                .unwrap()
+        });
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{positions:?}"
+        );
+    }
+
+    #[test]
+    fn selected_sink_writer_records_only_emitted_datafiles() {
+        let mut pdf = load_one_page_pdf();
+        let mut out = Vec::new();
+        let summary = write_qpdf_json_v2_selected_objects_with_options(
+            &mut pdf,
+            DecodeLevel::None,
+            &StreamDataMode::File {
+                prefix: "side".to_string(),
+            },
+            &[JsonKey::Qpdf],
+            &[
+                JsonObjectSelector::Object {
+                    number: 1,
+                    generation: 0,
+                },
+                JsonObjectSelector::Object {
+                    number: 7,
+                    generation: 0,
+                },
+            ],
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(summary.datafile_objects, [crate::ObjectRef::new(7, 0)]);
+        assert!(out.ends_with(b"}\n"));
+        assert!(!out.ends_with(b"}\n\n"));
+        let document: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let objects = document["qpdf"][1].as_object().unwrap();
+        assert_eq!(
+            objects.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["obj:1 0 R", "obj:7 0 R"]
+        );
+        assert_eq!(
+            objects["obj:7 0 R"]["stream"]["datafile"],
+            serde_json::Value::String("side-7".to_string())
+        );
+    }
+
+    #[test]
+    fn selected_sink_writer_inlines_stream_without_datafile_summary() {
+        let mut pdf = load_one_page_pdf();
+        let mut out = Vec::new();
+        let summary = write_qpdf_json_v2_selected_objects_with_options(
+            &mut pdf,
+            DecodeLevel::None,
+            &StreamDataMode::Inline,
+            &[JsonKey::Qpdf],
+            &[JsonObjectSelector::Object {
+                number: 7,
+                generation: 0,
+            }],
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(summary.datafile_objects.is_empty());
+        let document: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(document["qpdf"][1]["obj:7 0 R"]["stream"]["data"]
+            .as_str()
+            .is_some_and(|data| !data.is_empty()));
+    }
+
+    #[test]
+    fn full_sink_writer_emits_all_sections_in_qpdf_order() {
+        let mut pdf = load_one_page_pdf();
+        let mut out = Vec::new();
+        write_qpdf_json_v2_selected_objects_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+
+        let positions = [
+            b"\n  \"version\"".as_slice(),
+            b"\n  \"parameters\"".as_slice(),
+            b"\n  \"pages\"".as_slice(),
+            b"\n  \"pagelabels\"".as_slice(),
+            b"\n  \"acroform\"".as_slice(),
+            b"\n  \"attachments\"".as_slice(),
+            b"\n  \"encrypt\"".as_slice(),
+            b"\n  \"outlines\"".as_slice(),
+            b"\n  \"qpdf\"".as_slice(),
+        ]
+        .map(|needle| {
+            out.windows(needle.len())
+                .position(|window| window == needle)
+                .unwrap()
+        });
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{positions:?}"
+        );
+        let document: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            document["qpdf"][0]["calledgetallpages"],
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn sink_writer_conversion_error_stops_before_selected_section_key() {
+        let mut pdf = empty_pdf();
+        let mut out = Vec::new();
+        let error = write_qpdf_json_v2_selected_objects_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Pages],
+            &[],
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            JsonOutputError::Convert(ConvertError::PdfError(_))
+        ));
+        assert!(!out
+            .windows(b"\"pages\"".len())
+            .any(|window| window == b"\"pages\""));
+    }
+
+    #[test]
+    fn sink_writer_io_error_stops_without_finishing_document() {
+        let mut pdf = load_one_page_pdf();
+        let mut out = FailAfter {
+            remaining: 24,
+            bytes: Vec::new(),
+        };
+        let error = write_qpdf_json_v2_selected_objects_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Pages],
+            &[],
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, JsonOutputError::Io(ref io) if io.to_string() == "sink full"));
+        assert!(!out.bytes.ends_with(b"\n}\n"));
+        std::io::Write::flush(&mut out).unwrap();
+    }
+
+    #[test]
+    fn sink_writer_propagates_failures_at_every_incremental_write_boundary() {
+        let mut complete_pdf = load_one_page_pdf();
+        let mut complete = Vec::new();
+        write_qpdf_json_v2_selected_objects_with_options(
+            &mut complete_pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[],
+            &[],
+            &mut complete,
+        )
+        .unwrap();
+
+        for remaining in 0..complete.len() {
+            let mut pdf = load_one_page_pdf();
+            let mut out = FailAfter {
+                remaining,
+                bytes: Vec::new(),
+            };
+            let error = write_qpdf_json_v2_selected_objects_with_options(
+                &mut pdf,
+                DecodeLevel::Generalized,
+                &StreamDataMode::None,
+                &[],
+                &[],
+                &mut out,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, JsonOutputError::Io(ref io) if io.to_string() == "sink full"),
+                "remaining={remaining}: {error}"
+            );
+        }
     }
 
     // Register a /Parent chain obj(start)->obj(start+1)->...->obj(start+len-1).
