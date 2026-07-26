@@ -686,11 +686,28 @@ pub fn pdf_object_to_json(obj: &Object) -> Result<Json, ConvertError> {
         Object::Null | Object::Operator(_) | Object::InlineImage(_) => Ok(Json::make_null()),
         Object::Boolean(b) => Ok(Json::make_bool(*b)),
         Object::Integer(n) => Ok(Json::make_int(*n)),
-        Object::Real(f) | Object::RealLiteral { value: f, .. } => {
+        Object::Real(f) => {
             if !f.is_finite() {
                 return Err(ConvertError::NonFiniteFloat);
             }
-            Ok(Json::make_real(*f))
+            Ok(Json::make_number(f.to_string()))
+        }
+        Object::RealLiteral { value, .. } => {
+            if !value.is_finite() {
+                return Err(ConvertError::NonFiniteFloat);
+            }
+
+            // Reuse Object's validated literal-or-shortest fallback contract,
+            // then apply QPDF_Real::writeJSON's JSON-only leading-zero repair
+            // (libqpdf/QPDF_Real.cc:43-53).
+            let mut encoded = Vec::new();
+            obj.write_pdf(&mut encoded);
+            if encoded.starts_with(b".") {
+                encoded.insert(0, b'0');
+            } else if encoded.starts_with(b"-.") {
+                encoded.insert(1, b'0');
+            }
+            Ok(Json::make_number(encoded))
         }
         Object::Name(bytes) => Ok(Json::make_string(qpdf_name_to_json_string(bytes))),
         Object::String(bytes) => Ok(Json::make_string(pdf_string_to_json_string(bytes))),
@@ -3158,6 +3175,47 @@ mod tests {
     }
 
     #[test]
+    fn object_real_json_preserves_qpdf_number_tokens() {
+        let cases = [
+            (
+                Object::RealLiteral {
+                    value: 0.4,
+                    literal: b".400".to_vec(),
+                },
+                b"0.400".as_slice(),
+            ),
+            (
+                Object::RealLiteral {
+                    value: -0.4,
+                    literal: b"-.400".to_vec(),
+                },
+                b"-0.400".as_slice(),
+            ),
+            (Object::Real(1.23456789), b"1.23456789".as_slice()),
+            (Object::Real(-0.0), b"-0".as_slice()),
+            (
+                Object::RealLiteral {
+                    value: 1.0,
+                    literal: b"1 true".to_vec(),
+                },
+                b"1".as_slice(),
+            ),
+            (
+                Object::RealLiteral {
+                    value: 2.0,
+                    literal: b"1.0".to_vec(),
+                },
+                b"2".as_slice(),
+            ),
+        ];
+
+        for (object, expected) in cases {
+            let json = super::pdf_object_to_json(&object).unwrap();
+            assert_eq!(json.unparse().unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn object_real_non_finite_returns_error() {
         assert_eq!(
             pdf_object_to_json(&Object::Real(f64::NAN)),
@@ -3165,6 +3223,13 @@ mod tests {
         );
         assert_eq!(
             pdf_object_to_json(&Object::Real(f64::INFINITY)),
+            Err(ConvertError::NonFiniteFloat)
+        );
+        assert_eq!(
+            pdf_object_to_json(&Object::RealLiteral {
+                value: f64::NEG_INFINITY,
+                literal: b"-inf".to_vec(),
+            }),
             Err(ConvertError::NonFiniteFloat)
         );
     }
