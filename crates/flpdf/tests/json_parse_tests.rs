@@ -1,4 +1,5 @@
-use flpdf::json::{Json, Reactor};
+use flpdf::json::{parse_reader, Json, Reactor};
+use std::collections::VecDeque;
 use std::io::{self, Cursor, Read};
 
 #[derive(Default)]
@@ -489,6 +490,92 @@ impl Read for ChunkThenErrorReader {
         out[..self.chunk.len()].copy_from_slice(self.chunk);
         Ok(self.chunk.len())
     }
+}
+
+enum ReadStep {
+    Interrupted,
+    Chunk(&'static [u8]),
+    Eof,
+}
+
+struct InterruptedReader {
+    steps: VecDeque<ReadStep>,
+}
+
+impl InterruptedReader {
+    fn new(steps: impl IntoIterator<Item = ReadStep>) -> Self {
+        Self {
+            steps: steps.into_iter().collect(),
+        }
+    }
+}
+
+impl Read for InterruptedReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        match self.steps.pop_front().expect("reader step after EOF") {
+            ReadStep::Interrupted => Err(io::ErrorKind::Interrupted.into()),
+            ReadStep::Chunk(chunk) => {
+                assert!(chunk.len() <= out.len());
+                out[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }
+            ReadStep::Eof => Ok(0),
+        }
+    }
+}
+
+#[test]
+fn parser_retries_multiple_interrupted_reads_before_input() {
+    let mut reader = InterruptedReader::new([
+        ReadStep::Interrupted,
+        ReadStep::Interrupted,
+        ReadStep::Chunk(b"  42"),
+        ReadStep::Interrupted,
+        ReadStep::Eof,
+    ]);
+
+    let value = parse_reader(&mut reader, None).unwrap();
+
+    assert_eq!(value.get_number().as_deref(), Some(b"42".as_slice()));
+    assert_eq!((value.start(), value.end()), (2, 4));
+}
+
+#[test]
+fn parser_retries_interrupted_reads_between_chunks_without_changing_reactions() {
+    let mut reader = InterruptedReader::new([
+        ReadStep::Chunk(br#"{"fi"#),
+        ReadStep::Interrupted,
+        ReadStep::Interrupted,
+        ReadStep::Chunk(br#"rst":1,"ke"#),
+        ReadStep::Interrupted,
+        ReadStep::Chunk(br#"ep":[tr"#),
+        ReadStep::Interrupted,
+        ReadStep::Interrupted,
+        ReadStep::Chunk(b"ue]}"),
+        ReadStep::Interrupted,
+        ReadStep::Eof,
+    ]);
+    let mut reactor = RecordingReactor::default();
+
+    let value = Json::parse_reader(&mut reader, Some(&mut reactor)).unwrap();
+
+    assert_eq!(
+        reactor.events,
+        [
+            "dict-start",
+            "dict-item:first:1",
+            "dict-item:keep:[]",
+            "array-start",
+            "array-item:true",
+            "end:24",
+            "end:25",
+        ]
+    );
+    assert_eq!(reactor.item_offsets, [(9, 10), (18, 19), (19, 23)]);
+    let kept = value.get_dict_item(b"keep");
+    assert!(kept.is_array());
+    assert_eq!((value.start(), value.end()), (0, 25));
+    assert_eq!((kept.start(), kept.end()), (18, 24));
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Cursor, Read};
+use std::io::{BufRead, BufReader, Cursor, ErrorKind, Read};
 
 use super::{Json, JsonError};
 
@@ -148,7 +148,13 @@ impl<'reader, 'reactor, R: Read> Parser<'reader, 'reactor, R> {
     }
 
     fn current(&mut self) -> Result<Option<u8>, JsonError> {
-        Ok(self.reader.fill_buf()?.first().copied())
+        loop {
+            match self.reader.fill_buf() {
+                Ok(input) => return Ok(input.first().copied()),
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     fn append(&mut self, byte: u8) {
