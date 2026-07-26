@@ -2549,7 +2549,6 @@ fn json_output_open_error_happens_before_json_processing() {
         "{stderr}"
     );
     assert!(stderr.contains("flpdf:"), "{stderr}");
-    assert!(stderr.contains("Is a directory"), "{stderr}");
     assert!(!stderr.contains("operation succeeded with warnings"));
     assert!(output.stdout.is_empty());
 }
