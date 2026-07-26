@@ -26,12 +26,14 @@ fn optional_flag_allows_missing_but_not_extra_keys() {
 #[test]
 fn pattern_key_validates_every_dictionary_value() {
     let schema = parsed(br#"{"<objid>":{"n":"number"}}"#);
-    let value = parsed(br#"{"one":{"n":1},"two":{"x":2}}"#);
+    let value = parsed(br#"{"one":{"a":1},"two":{"x":2}}"#);
     let mut errors = Vec::new();
     assert!(!value.check_schema(&schema, &mut errors));
     assert_eq!(
         errors,
         [
+            "json key \".one\": key \"n\" is present in schema but missing in object",
+            "json key \".one\": key \"a\" is not present in schema but appears in object",
             "json key \".two\": key \"n\" is present in schema but missing in object",
             "json key \".two\": key \"x\" is not present in schema but appears in object",
         ]
