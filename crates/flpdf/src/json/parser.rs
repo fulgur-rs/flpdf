@@ -1,3 +1,5 @@
+//! qpdf correspondence: JSON.cc parser state machine and Reactor event responsibilities.
+
 use std::io::{BufRead, BufReader, Cursor, ErrorKind, Read};
 
 use super::{Json, JsonError};
