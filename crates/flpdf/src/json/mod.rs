@@ -10,10 +10,12 @@
 mod legacy;
 mod message;
 mod parser;
+mod schema;
 mod value;
 mod writer;
 
 pub use legacy::{write, JsonValue};
 pub use message::JsonMessage;
 pub use parser::{parse, parse_reader, Reactor};
+pub use schema::SchemaFlags;
 pub use value::{Json, JsonError};
