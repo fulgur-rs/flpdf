@@ -76,6 +76,45 @@ fn dictionary_dispatch_rereads_registration_before_each_item() {
 }
 
 #[test]
+fn dictionary_dispatch_rereads_fallback_before_each_item() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let root = JsonHandler::shared();
+    root.borrow_mut().add_dictionary_handlers(|_, _| {}, |_| {});
+
+    let replacement = JsonHandler::shared();
+    replacement.borrow_mut().add_number_handler({
+        let seen = seen.clone();
+        move |path, number| {
+            seen.borrow_mut().push(format!(
+                "{}={}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(number)
+            ));
+        }
+    });
+    let stale = JsonHandler::shared();
+    stale.borrow_mut().add_any_handler(|_, _| {
+        panic!("stale fallback was used");
+    });
+    let first = JsonHandler::shared();
+    first.borrow_mut().add_number_handler({
+        let root = Rc::downgrade(&root);
+        let replacement = replacement.clone();
+        move |_, _| {
+            root.upgrade()
+                .expect("root handler must be alive during dispatch")
+                .borrow_mut()
+                .add_fallback_dictionary_handler(replacement.clone());
+        }
+    });
+    root.borrow_mut().add_dictionary_key_handler(b"a", first);
+    root.borrow_mut().add_fallback_dictionary_handler(stale);
+
+    JsonHandler::handle_shared(&root, b".", Json::parse(br#"{"a":1,"b":2}"#).unwrap()).unwrap();
+    assert_eq!(&*seen.borrow(), &[".b=2"]);
+}
+
+#[test]
 fn dictionary_handler_observes_later_member_mutations_and_insertions() {
     let dictionary = Json::parse(br#"{"a":1,"b":2}"#).unwrap();
     let seen = Rc::new(RefCell::new(Vec::new()));
