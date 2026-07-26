@@ -569,7 +569,9 @@ pub fn qpdf_raw_stream_payload<R: Read + Seek>(
         return Ok(None);
     };
     Ok(Some(
-        stream_payload_for_decode_level(&stream, decode_level).into_owned(),
+        stream_payload_with_decode_status(&stream, decode_level)
+            .bytes
+            .into_owned(),
     ))
 }
 
@@ -832,16 +834,23 @@ fn build_qpdf_object_entry<R: Read + Seek>(
     let object = qpdf_resolve_top_level_object(pdf, object_ref)?;
     match &object {
         Object::Stream(stream) => {
-            let dict_json = qpdf_dict_to_json(pdf, &stream.dict)?;
             let stream_inner = match stream_mode {
-                StreamDataMode::None => json_dictionary([("dict".to_string(), dict_json)])?,
+                StreamDataMode::None => {
+                    let dict_json = qpdf_dict_to_json(pdf, &stream.dict)?;
+                    json_dictionary([("dict".to_string(), dict_json)])?
+                }
                 StreamDataMode::Inline => {
-                    let payload =
-                        stream_payload_for_decode_level(stream, decode_level).into_owned();
-                    let data = Json::make_blob(move |out| out.write_all(&payload));
+                    let payload = stream_payload_with_decode_status(stream, decode_level);
+                    let dict = normalized_emitted_stream_dict(stream, payload.decode_succeeded);
+                    let dict_json = qpdf_dict_to_json(pdf, &dict)?;
+                    let bytes = payload.bytes.into_owned();
+                    let data = Json::make_blob(move |out| out.write_all(&bytes));
                     json_dictionary([("data".to_string(), data), ("dict".to_string(), dict_json)])?
                 }
                 StreamDataMode::File { prefix } => {
+                    let payload = stream_payload_with_decode_status(stream, decode_level);
+                    let dict = normalized_emitted_stream_dict(stream, payload.decode_succeeded);
+                    let dict_json = qpdf_dict_to_json(pdf, &dict)?;
                     let datafile = format_json_side_file_path(prefix, object_ref.number);
                     json_dictionary([
                         ("datafile".to_string(), Json::make_string(datafile)),
@@ -859,6 +868,18 @@ fn build_qpdf_object_entry<R: Read + Seek>(
             false,
         )),
     }
+}
+
+fn normalized_emitted_stream_dict(stream: &Stream, decode_succeeded: bool) -> Dictionary {
+    // qpdf 11.9.0 QPDF_Stream.cc:272-292 normalizes only dictionaries whose
+    // payload is emitted; dict-only mode keeps the original stream dictionary.
+    let mut dict = stream.dict.clone();
+    dict.remove("Length");
+    if decode_succeeded {
+        dict.remove("Filter");
+        dict.remove("DecodeParms");
+    }
+    dict
 }
 
 // ── DecodeLevel ──────────────────────────────────────────────────────────────
@@ -918,12 +939,33 @@ pub fn stream_payload_for_decode_level(
     stream: &Stream,
     decode_level: DecodeLevel,
 ) -> Cow<'_, [u8]> {
+    stream_payload_with_decode_status(stream, decode_level).bytes
+}
+
+struct StreamPayload<'a> {
+    bytes: Cow<'a, [u8]>,
+    decode_succeeded: bool,
+}
+
+fn stream_payload_with_decode_status(
+    stream: &Stream,
+    decode_level: DecodeLevel,
+) -> StreamPayload<'_> {
     match decode_level {
-        DecodeLevel::None => Cow::Borrowed(&stream.data),
+        DecodeLevel::None => StreamPayload {
+            bytes: Cow::Borrowed(&stream.data),
+            decode_succeeded: false,
+        },
         DecodeLevel::Generalized | DecodeLevel::Specialized | DecodeLevel::All => {
             match crate::filters::decode_stream_data(&stream.dict, &stream.data) {
-                Ok(decoded) => Cow::Owned(decoded),
-                Err(_) => Cow::Borrowed(&stream.data),
+                Ok(decoded) => StreamPayload {
+                    bytes: Cow::Owned(decoded),
+                    decode_succeeded: true,
+                },
+                Err(_) => StreamPayload {
+                    bytes: Cow::Borrowed(&stream.data),
+                    decode_succeeded: false,
+                },
             }
         }
     }

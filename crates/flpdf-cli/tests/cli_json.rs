@@ -829,7 +829,7 @@ fn one_page_pdf_with_flate_stream(content: &[u8]) -> Vec<u8> {
     let off4 = pdf.len();
     pdf.extend_from_slice(
         format!(
-            "4 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n",
+            "4 0 obj\n<< /Length {} /Filter /FlateDecode /DecodeParms << /Predictor 1 >> >>\nstream\n",
             encoded.len()
         )
         .as_bytes(),
@@ -850,6 +850,131 @@ fn one_page_pdf_with_flate_stream(content: &[u8]) -> Vec<u8> {
         format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
     );
     pdf
+}
+
+fn one_page_pdf_with_unsupported_stream(content: &[u8]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let off1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+    );
+    let off4 = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Length {} /Filter /DCTDecode /DecodeParms << /ColorTransform 0 >> >>\nstream\n",
+            content.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(content);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_start = pdf.len();
+    let xref = format!(
+        "xref\n0 5\n\
+         0000000000 65535 f \n\
+         {off1:010} 00000 n \n\
+         {off2:010} 00000 n \n\
+         {off3:010} 00000 n \n\
+         {off4:010} 00000 n \n"
+    );
+    pdf.extend_from_slice(xref.as_bytes());
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
+fn assert_stream_json_is_qpdf_exact(pdf: &[u8], stream_mode: &str) {
+    let input = write_temp_pdf(pdf);
+    let temp = tempfile::tempdir().unwrap();
+    let prefix = temp.path().join("stream");
+    let stream_mode_arg = format!("--json-stream-data={stream_mode}");
+    let prefix_arg = format!("--json-stream-prefix={}", prefix.display());
+    let args = [
+        "--json=2",
+        "--json-key=qpdf",
+        "--json-object=4",
+        stream_mode_arg.as_str(),
+        prefix_arg.as_str(),
+    ];
+
+    let qpdf = std::process::Command::new("qpdf")
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf 11.9.0 failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    let qpdf_side_file =
+        (stream_mode == "file").then(|| std::fs::read(format!("{}-4", prefix.display())).unwrap());
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(
+        flpdf.status.success(),
+        "flpdf failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    if let Some(qpdf_bytes) = qpdf_side_file {
+        assert_eq!(
+            std::fs::read(format!("{}-4", prefix.display())).unwrap(),
+            qpdf_bytes
+        );
+    }
+}
+
+#[test]
+fn unfiltered_inline_stream_json_is_qpdf_exact() {
+    assert_stream_json_is_qpdf_exact(&one_page_pdf_with_stream(), "inline");
+}
+
+#[test]
+fn filtered_inline_stream_json_is_qpdf_exact() {
+    assert_stream_json_is_qpdf_exact(
+        &one_page_pdf_with_flate_stream(b"qpdf filtered inline bytes"),
+        "inline",
+    );
+}
+
+#[test]
+fn filtered_stream_json_without_payload_is_qpdf_exact() {
+    assert_stream_json_is_qpdf_exact(
+        &one_page_pdf_with_flate_stream(b"qpdf filtered dictionary bytes"),
+        "none",
+    );
+}
+
+#[test]
+fn unfiltered_file_stream_json_and_payload_are_qpdf_exact() {
+    assert_stream_json_is_qpdf_exact(&one_page_pdf_with_stream(), "file");
+}
+
+#[test]
+fn filtered_file_stream_json_and_payload_are_qpdf_exact() {
+    assert_stream_json_is_qpdf_exact(
+        &one_page_pdf_with_flate_stream(b"qpdf filtered file bytes"),
+        "file",
+    );
+}
+
+#[test]
+fn unsupported_filter_inline_fallback_json_is_qpdf_exact() {
+    assert_stream_json_is_qpdf_exact(
+        &one_page_pdf_with_unsupported_stream(b"raw unsupported filter bytes"),
+        "inline",
+    );
 }
 
 /// Minimal RFC 4648 base64 encoder, for asserting on inline `data` values.
