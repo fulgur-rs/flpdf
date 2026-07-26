@@ -78,6 +78,69 @@ impl ValueSnapshot {
 impl Json {
     pub const LATEST: i32 = 2;
 
+    pub fn make_dictionary() -> Self {
+        Self::with_value(Value::Dictionary {
+            members: BTreeMap::new(),
+            parsed_keys: BTreeSet::new(),
+        })
+    }
+
+    pub fn add_dictionary_member(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: Json,
+    ) -> Result<Json, JsonError> {
+        let Some(members) = &self.0 else {
+            return Err(JsonError::Type(
+                "JSON::addDictionaryMember called on non-dictionary".into(),
+            ));
+        };
+        let mut members = members.borrow_mut();
+        let Value::Dictionary {
+            members: dictionary,
+            ..
+        } = &mut members.value
+        else {
+            return Err(JsonError::Type(
+                "JSON::addDictionaryMember called on non-dictionary".into(),
+            ));
+        };
+
+        let value = if value.0.is_some() {
+            value
+        } else {
+            Self::make_null()
+        };
+        dictionary.insert(encode_string(key.as_ref()), value.clone());
+        Ok(value)
+    }
+
+    pub fn make_array() -> Self {
+        Self::with_value(Value::Array(Vec::new()))
+    }
+
+    pub fn add_array_element(&self, value: Json) -> Result<Json, JsonError> {
+        let Some(members) = &self.0 else {
+            return Err(JsonError::Type(
+                "JSON::addArrayElement called on non-array".into(),
+            ));
+        };
+        let mut members = members.borrow_mut();
+        let Value::Array(array) = &mut members.value else {
+            return Err(JsonError::Type(
+                "JSON::addArrayElement called on non-array".into(),
+            ));
+        };
+
+        let value = if value.0.is_some() {
+            value
+        } else {
+            Self::make_null()
+        };
+        array.push(value.clone());
+        Ok(value)
+    }
+
     pub fn make_string(value: impl AsRef<[u8]>) -> Self {
         let original = value.as_ref().to_vec();
         Self::with_value(Value::String {
@@ -104,6 +167,33 @@ impl Json {
 
     pub fn make_null() -> Self {
         Self::with_value(Value::Null)
+    }
+
+    pub fn is_array(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|members| matches!(members.borrow().value, Value::Array(_)))
+    }
+
+    pub fn is_dictionary(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|members| matches!(members.borrow().value, Value::Dictionary { .. }))
+    }
+
+    pub fn check_dictionary_key_seen(&self, key: impl AsRef<[u8]>) -> Result<bool, JsonError> {
+        let Some(members) = &self.0 else {
+            return Err(JsonError::Type(
+                "JSON::checkDictionaryKey called on non-dictionary".into(),
+            ));
+        };
+        let mut members = members.borrow_mut();
+        let Value::Dictionary { parsed_keys, .. } = &mut members.value else {
+            return Err(JsonError::Type(
+                "JSON::checkDictionaryKey called on non-dictionary".into(),
+            ));
+        };
+        Ok(!parsed_keys.insert(key.as_ref().to_vec()))
     }
 
     pub fn get_string(&self) -> Option<Vec<u8>> {
@@ -134,6 +224,56 @@ impl Json {
         self.0
             .as_ref()
             .is_some_and(|members| matches!(members.borrow().value, Value::Null))
+    }
+
+    pub fn get_dict_item(&self, encoded_key: impl AsRef<[u8]>) -> Json {
+        let Some(members) = &self.0 else {
+            return Self::make_null();
+        };
+        let members = members.borrow();
+        let Value::Dictionary {
+            members: dictionary,
+            ..
+        } = &members.value
+        else {
+            return Self::make_null();
+        };
+        dictionary
+            .get(encoded_key.as_ref())
+            .cloned()
+            .unwrap_or_else(Self::make_null)
+    }
+
+    pub fn for_each_dict_item(&self, mut callback: impl FnMut(&[u8], Json)) -> bool {
+        let Some(members) = &self.0 else {
+            return false;
+        };
+        let members = members.borrow();
+        let Value::Dictionary {
+            members: dictionary,
+            ..
+        } = &members.value
+        else {
+            return false;
+        };
+        for (key, value) in dictionary {
+            callback(key, value.clone());
+        }
+        true
+    }
+
+    pub fn for_each_array_item(&self, mut callback: impl FnMut(Json)) -> bool {
+        let Some(members) = &self.0 else {
+            return false;
+        };
+        let members = members.borrow();
+        let Value::Array(array) = &members.value else {
+            return false;
+        };
+        for value in array {
+            callback(value.clone());
+        }
+        true
     }
 
     pub fn set_start(&self, start: i64) {
