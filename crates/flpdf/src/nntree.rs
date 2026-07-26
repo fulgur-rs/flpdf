@@ -171,6 +171,7 @@ pub(crate) struct NNTreeCursor<K: TreeKey> {
     path: Vec<PathElement>,
     leaf: Option<NodeHandle>,
     item_number: Option<usize>,
+    raw: Option<(Object, Object)>,
     current: Option<(K::Key, Object)>,
     marker: PhantomData<K>,
 }
@@ -181,6 +182,7 @@ impl<K: TreeKey> NNTreeCursor<K> {
             path: Vec::new(),
             leaf: None,
             item_number: None,
+            raw: None,
             current: None,
             marker: PhantomData,
         }
@@ -202,9 +204,14 @@ impl<K: TreeKey> NNTreeCursor<K> {
         self.current.clone()
     }
 
+    fn cloned_raw_current(&self) -> Option<(Object, Object)> {
+        self.raw.clone()
+    }
+
     fn clear_position(&mut self) {
         self.leaf = None;
         self.item_number = None;
+        self.raw = None;
         self.current = None;
     }
 
@@ -228,6 +235,7 @@ impl<K: TreeKey> Clone for NNTreeCursor<K> {
             path: self.path.clone(),
             leaf: self.leaf.clone(),
             item_number: self.item_number,
+            raw: self.raw.clone(),
             current: self.current.clone(),
             marker: PhantomData,
         }
@@ -960,12 +968,15 @@ impl<K: TreeKey> NNTree<K> {
     ) -> Result<NNTreeCursor<K>> {
         match self.find_internal(pdf, key, return_previous_if_missing) {
             Ok(cursor) => Ok(cursor),
-            Err(error) if self.auto_repair => {
+            Err(Error::Parse { message, .. }) if self.auto_repair => {
                 let root = self.root_handle(pdf)?;
+                // qpdf NNTreeImpl::find appends QPDFExc::what(). The
+                // qpdf-shaped structural text lives in Error::Parse::message;
+                // Error's Display adds flpdf's `parse error at byte` wrapper.
                 self.warn(
                     pdf,
                     &root,
-                    format!("attempting to repair after error: {error}"),
+                    format!("attempting to repair after error: {message}"),
                 );
                 self.repair(pdf)?;
                 self.find_internal(pdf, key, return_previous_if_missing)
@@ -995,9 +1006,20 @@ impl<K: TreeKey> NNTree<K> {
         key: K::Key,
         value: Object,
     ) -> Result<NNTreeCursor<K>> {
+        self.insert_raw_pair_with_allocator(pdf, allocator, K::to_object(&key), value)
+    }
+
+    fn insert_resolved_raw_with_allocator<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        allocator: &mut ObjectAllocator,
+        key: K::Key,
+        raw_key: Object,
+        value: Object,
+    ) -> Result<NNTreeCursor<K>> {
         let mut cursor = self.find(pdf, &key, true)?;
         if !cursor.positioned() {
-            return self.insert_first(pdf, allocator, key, value);
+            return self.insert_first_raw(pdf, allocator, raw_key, value);
         }
 
         let is_exact = cursor
@@ -1020,7 +1042,7 @@ impl<K: TreeKey> NNTree<K> {
             self.store_node(pdf, &leaf, dictionary)?;
             self.update_current(pdf, &mut cursor, false)?;
         } else {
-            self.insert_after_with_allocator(pdf, allocator, &mut cursor, key, value)?;
+            self.insert_after_raw_with_allocator(pdf, allocator, &mut cursor, raw_key, value)?;
         }
         Ok(cursor)
     }
@@ -1033,19 +1055,19 @@ impl<K: TreeKey> NNTree<K> {
         value: Object,
     ) -> Result<()> {
         let mut allocator = ObjectAllocator::default();
-        self.insert_after_with_allocator(pdf, &mut allocator, cursor, key, value)
+        self.insert_after_raw_with_allocator(pdf, &mut allocator, cursor, K::to_object(&key), value)
     }
 
-    fn insert_after_with_allocator<R: Read + Seek>(
+    fn insert_after_raw_with_allocator<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
         allocator: &mut ObjectAllocator,
         cursor: &mut NNTreeCursor<K>,
-        key: K::Key,
+        raw_key: Object,
         value: Object,
     ) -> Result<()> {
         if !cursor.positioned() {
-            *cursor = self.insert_first(pdf, allocator, key, value)?;
+            *cursor = self.insert_first_raw(pdf, allocator, raw_key, value)?;
             return Ok(());
         }
 
@@ -1065,7 +1087,7 @@ impl<K: TreeKey> NNTree<K> {
             ));
         }
         self.ensure_split_allocations_available(pdf, allocator, cursor, items.values.len() + 2)?;
-        items.values.insert(item_number + 2, K::to_object(&key));
+        items.values.insert(item_number + 2, raw_key);
         items.values.insert(item_number + 3, value);
         items.store(pdf, &mut dictionary, K::ITEMS_KEY);
         self.store_node(pdf, &leaf, dictionary)?;
@@ -1139,6 +1161,7 @@ impl<K: TreeKey> NNTree<K> {
 
         if cursor.path.is_empty() {
             cursor.item_number = None;
+            cursor.raw = None;
             cursor.current = None;
             self.reset_limits(pdf, cursor, leaf, None)?;
             return Ok(Some(removed_value));
@@ -1148,11 +1171,11 @@ impl<K: TreeKey> NNTree<K> {
         Ok(Some(removed_value))
     }
 
-    fn insert_first<R: Read + Seek>(
+    fn insert_first_raw<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
         allocator: &mut ObjectAllocator,
-        key: K::Key,
+        raw_key: Object,
         value: Object,
     ) -> Result<NNTreeCursor<K>> {
         let mut cursor = self.begin(pdf)?;
@@ -1170,12 +1193,12 @@ impl<K: TreeKey> NNTree<K> {
         };
         // cov:ignore-end
         self.ensure_split_allocations_available(pdf, allocator, &cursor, items.values.len() + 2)?;
-        items.values.insert(0, K::to_object(&key));
+        items.values.insert(0, raw_key);
         items.values.insert(1, value);
         items.store(pdf, &mut dictionary, K::ITEMS_KEY);
         self.store_node(pdf, &leaf, dictionary)?;
         cursor.item_number = Some(0);
-        self.update_current(pdf, &mut cursor, false)?;
+        self.update_current(pdf, &mut cursor, true)?;
         let parent_index = cursor.path.len().checked_sub(1);
         self.reset_limits(pdf, &cursor, leaf.clone(), parent_index)?;
         self.split_node_with_allocator(pdf, allocator, &mut cursor, leaf, parent_index)?;
@@ -1186,15 +1209,18 @@ impl<K: TreeKey> NNTree<K> {
         let mut replacement_root = Dictionary::new();
         replacement_root.insert(K::ITEMS_KEY, Object::Array(Vec::new()));
         let mut replacement = NNTree::<K>::new(Object::Dictionary(replacement_root), false);
-        replacement.set_split_threshold(self.split_threshold);
 
         let mut allocator = ObjectAllocator::default();
         let mut cursor = self.begin(pdf)?;
         while cursor.positioned() {
-            if let Some((key, value)) = cursor.cloned_current() {
-                replacement.insert_with_allocator(pdf, &mut allocator, key, value)?;
-            }
-            self.next(pdf, &mut cursor)?;
+            // qpdf NNTreeImpl::repair passes `i.first` and `i.second` as raw
+            // object handles to repl.insert. The helper resolves a typed key
+            // only for search/comparison and writes this pair's raw key.
+            let (key, value) = cursor
+                .cloned_raw_current()
+                .expect("a positioned NNTree cursor retains its raw pair");
+            replacement.insert_raw_pair_with_allocator(pdf, &mut allocator, key, value)?;
+            self.increment(pdf, &mut cursor, false)?;
         }
 
         self.replace_root_contents(pdf, replacement.into_root())
@@ -1591,6 +1617,7 @@ impl<K: TreeKey> NNTree<K> {
         // last(), so after-maximum keys intentionally use the general search.
 
         let root = self.root_handle(pdf)?;
+        let root_diagnostic_ref = root.diagnostic_ref();
         let mut node = root;
         let mut seen = HashSet::new();
         let mut cursor = NNTreeCursor::empty();
@@ -1617,7 +1644,6 @@ impl<K: TreeKey> NNTree<K> {
                 .map_err(|_| structural_error(node.diagnostic_ref(), "bad node during find"))?;
             let items = resolved_array(pdf, dictionary.get(K::ITEMS_KEY))?;
             let kids = resolved_array(pdf, dictionary.get("Kids"))?;
-            let node_diagnostic_ref = node.diagnostic_ref();
 
             if let Some(items) = items.as_ref().filter(|items| !items.values.is_empty()) {
                 let index = binary_search(
@@ -1628,14 +1654,14 @@ impl<K: TreeKey> NNTree<K> {
                         // cov:ignore-start: binary_search only supplies indices below items length divided by two
                         let Some(item) = items.values.get(item_number) else {
                             return Err(structural_error(
-                                node_diagnostic_ref,
+                                root_diagnostic_ref,
                                 format!("item at index {item_number} is not the right type"),
                             ));
                         };
                         // cov:ignore-end
                         let Some(item_key) = resolved_key::<K, _>(pdf, item)? else {
                             return Err(structural_error(
-                                node_diagnostic_ref,
+                                root_diagnostic_ref,
                                 format!("item at index {item_number} is not the right type"),
                             ));
                         };
@@ -1659,7 +1685,7 @@ impl<K: TreeKey> NNTree<K> {
                     let (resolved, terminal_ref) = resolve_ref_chain(pdf, kid)?;
                     let Object::Dictionary(kid_dictionary) = resolved else {
                         return Err(structural_error(
-                            node_diagnostic_ref,
+                            root_diagnostic_ref,
                             format!("invalid kid at index {index}"),
                         ));
                     };
@@ -1755,6 +1781,7 @@ impl<K: TreeKey> NNTree<K> {
         let original_path = cursor.path.clone();
         let original_leaf = cursor.leaf.clone();
         let original_item_number = cursor.item_number;
+        let original_raw = cursor.raw.clone();
         let original_current = cursor.current.clone();
         let mut seen: HashSet<NodeHandle> = cursor
             .path
@@ -1824,6 +1851,7 @@ impl<K: TreeKey> NNTree<K> {
             if allow_empty && items.is_some() {
                 cursor.leaf = Some(node);
                 cursor.item_number = None;
+                cursor.raw = None;
                 cursor.current = None;
                 return Ok(true);
             }
@@ -1842,6 +1870,7 @@ impl<K: TreeKey> NNTree<K> {
         cursor.path = original_path;
         cursor.leaf = original_leaf;
         cursor.item_number = original_item_number;
+        cursor.raw = original_raw;
         cursor.current = original_current;
         Ok(false)
     }
@@ -1878,10 +1907,17 @@ impl<K: TreeKey> NNTree<K> {
 
             if let Some(candidate) = candidate {
                 cursor.item_number = Some(candidate);
+                if candidate + 1 >= items.values.len() {
+                    self.warn(pdf, &leaf, "items array doesn't have enough elements");
+                    cursor.raw = None;
+                    cursor.current = None;
+                    continue;
+                }
                 self.update_current(pdf, cursor, true)?;
                 if cursor.current.is_some() {
                     return Ok(());
                 }
+                self.warn(pdf, &leaf, format!("item {candidate} has the wrong type"));
                 continue;
             }
 
@@ -1919,9 +1955,19 @@ impl<K: TreeKey> NNTree<K> {
                     cursor.path[last_index].kid_number = kid_number;
                     let kid = self.prepare_kid(pdf, &parent, kid_number, kid_object)?;
                     if self.descend(pdf, cursor, kid, !backward, false)? {
+                        if cursor.current.is_none() {
+                            let item_number = cursor
+                                .item_number
+                                .expect("descended non-empty leaf has an item number");
+                            self.warn(
+                                pdf,
+                                cursor.leaf.as_ref().expect("descended leaf is present"),
+                                format!("item {item_number} has the wrong type"),
+                            );
+                        }
                         descended = true;
+                        break;
                     }
-                    break;
                 }
                 if descended {
                     break;
@@ -1945,6 +1991,7 @@ impl<K: TreeKey> NNTree<K> {
         allow_invalid: bool,
     ) -> Result<()> {
         cursor.current = None;
+        cursor.raw = None;
         let (Some(leaf), Some(item_number)) = (&cursor.leaf, cursor.item_number) else {
             return Ok(());
         };
@@ -1961,9 +2008,11 @@ impl<K: TreeKey> NNTree<K> {
                 "update ivalue: items array is too short",
             ));
         }
-        let Some(key) = resolved_key::<K, _>(pdf, &items.values[item_number])? else {
+        let raw_key = items.values[item_number].clone();
+        let raw_value = items.values[item_number + 1].clone();
+        cursor.raw = Some((raw_key.clone(), raw_value.clone()));
+        let Some(key) = resolved_key::<K, _>(pdf, &raw_key)? else {
             if allow_invalid {
-                self.warn(pdf, leaf, format!("item {item_number} has the wrong type"));
                 return Ok(());
             }
             return Err(structural_error(
@@ -1971,8 +2020,38 @@ impl<K: TreeKey> NNTree<K> {
                 format!("item at index {item_number} is not the right type"),
             ));
         };
-        cursor.current = Some((key, items.values[item_number + 1].clone()));
+        cursor.current = Some((key, raw_value));
         Ok(())
+    }
+
+    fn insert_raw_pair_with_allocator<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        allocator: &mut ObjectAllocator,
+        key: Object,
+        value: Object,
+    ) -> Result<NNTreeCursor<K>> {
+        if let Some(resolved_key) = resolved_key::<K, _>(pdf, &key)? {
+            return self.insert_resolved_raw_with_allocator(
+                pdf,
+                allocator,
+                resolved_key,
+                key,
+                value,
+            );
+        }
+
+        // qpdf can insert the raw first pair into an empty replacement before
+        // its next insert observes that the key is invalid. Later malformed
+        // keys are skipped by increment and never reach this path.
+        let cursor = self.begin(pdf)?;
+        if cursor.positioned() {
+            return Err(structural_error(
+                self.root_handle(pdf)?.diagnostic_ref(),
+                "item at index 0 is not the right type",
+            ));
+        }
+        self.insert_first_raw(pdf, allocator, key, value)
     }
 
     fn prepare_kid<R: Read + Seek>(
@@ -2438,6 +2517,14 @@ mod tests {
             );
         }
         Object::Dictionary(dictionary)
+    }
+
+    fn utf16be_ascii_key(value: &[u8]) -> Object {
+        let mut bytes = vec![0xfe, 0xff];
+        for byte in value {
+            bytes.extend_from_slice(&[0, *byte]);
+        }
+        Object::String(bytes)
     }
 
     fn two_leaf_name_tree(pdf: &mut TestPdf) -> Object {
@@ -2910,7 +2997,7 @@ mod tests {
     }
 
     #[test]
-    fn find_attributes_deep_malformed_items_to_the_containing_node() {
+    fn find_attributes_deep_malformed_items_to_the_tree_root() {
         let mut pdf = empty_pdf();
         let root_ref = ObjectRef::new(80, 0);
         let leaf_ref = ObjectRef::new(81, 0);
@@ -2946,7 +3033,89 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "parse error at byte 0: Name/Number tree node (object 81): item at index 2 is not the right type"
+            "parse error at byte 0: Name/Number tree node (object 80): item at index 2 is not the right type"
+        );
+    }
+
+    #[test]
+    fn find_attributes_nested_invalid_kids_to_the_tree_root() {
+        let mut pdf = empty_pdf();
+        let root_ref = ObjectRef::new(80, 0);
+        let nested_ref = ObjectRef::new(81, 0);
+        let first_ref = ObjectRef::new(82, 0);
+        let nested_first_ref = ObjectRef::new(83, 0);
+        let nested_last_ref = ObjectRef::new(84, 0);
+        let last_ref = ObjectRef::new(85, 0);
+        pdf.set_object(
+            first_ref,
+            name_leaf(&[(b"alpha", 1)], Some((b"alpha", b"alpha"))),
+        );
+        pdf.set_object(
+            nested_first_ref,
+            name_leaf(&[(b"beta", 2)], Some((b"beta", b"beta"))),
+        );
+        pdf.set_object(
+            nested_last_ref,
+            name_leaf(&[(b"delta", 3)], Some((b"delta", b"delta"))),
+        );
+        pdf.set_object(
+            last_ref,
+            name_leaf(&[(b"zulu", 4)], Some((b"zulu", b"zulu"))),
+        );
+
+        let mut nested = Dictionary::new();
+        nested.insert(
+            "Limits",
+            Object::Array(vec![
+                Object::String(b"beta".to_vec()),
+                Object::String(b"delta".to_vec()),
+            ]),
+        );
+        nested.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(nested_first_ref),
+                Object::Integer(42),
+                Object::Reference(nested_last_ref),
+            ]),
+        );
+        pdf.set_object(nested_ref, Object::Dictionary(nested));
+
+        let mut root = Dictionary::new();
+        root.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(first_ref),
+                Object::Reference(nested_ref),
+                Object::Reference(last_ref),
+            ]),
+        );
+        pdf.set_object(root_ref, Object::Dictionary(root));
+        let mut tree = NNTree::<NameKey>::new(Object::Reference(root_ref), false);
+
+        assert_eq!(
+            tree.begin(&mut pdf)
+                .unwrap()
+                .current()
+                .map(|(key, _)| key.as_slice()),
+            Some(b"alpha".as_slice())
+        );
+        assert_eq!(
+            tree.last(&mut pdf)
+                .unwrap()
+                .current()
+                .map(|(key, _)| key.as_slice()),
+            Some(b"zulu".as_slice())
+        );
+
+        let error = match tree.find(&mut pdf, &b"charlie".to_vec(), false) {
+            Err(error) => error,
+            Ok(_) => panic!("nested invalid kid must fail targeted lookup"), // cov:ignore: negative-path assertion
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "parse error at byte 0: Name/Number tree node (object 80): invalid kid at index 1"
         );
     }
 
@@ -3147,6 +3316,7 @@ mod tests {
             path: Vec::new(),
             leaf: Some(NodeHandle::root()),
             item_number: Some(0),
+            raw: None,
             current: None,
             marker: PhantomData,
         };
@@ -3164,6 +3334,7 @@ mod tests {
             path: Vec::new(),
             leaf: Some(NodeHandle::root()),
             item_number: Some(0),
+            raw: None,
             current: None,
             marker: PhantomData,
         };
@@ -3283,6 +3454,7 @@ mod tests {
                 path: Vec::new(),
                 leaf: Some(NodeHandle::root()),
                 item_number: Some(item_number),
+                raw: None,
                 current: Some((1, Object::Integer(1))),
                 marker: PhantomData,
             }
@@ -3317,6 +3489,7 @@ mod tests {
                 }],
                 leaf: Some(NodeHandle::indirect(leaf)),
                 item_number: None,
+                raw: None,
                 current: None,
                 marker: PhantomData,
             }
@@ -3581,6 +3754,172 @@ mod tests {
     }
 
     #[test]
+    fn find_repair_warning_uses_qpdf_exception_message_without_parse_wrapper() {
+        let mut pdf = empty_pdf();
+        let root = malformed_name_tree_with_missing_limits_and_valid_pairs(&mut pdf);
+        let mut tree = NNTree::<NameKey>::new(root, true);
+
+        tree.find(&mut pdf, &b"beta".to_vec(), false)
+            .expect("repair must find beta");
+
+        assert_eq!(
+            pdf.repair_diagnostics().entries()[0].message,
+            "Name/Number tree node: attempting to repair after error: Name/Number tree node (object 10): node is missing /Limits"
+        );
+    }
+
+    #[test]
+    fn traversal_warnings_keep_qpdf_context_for_direct_and_indirect_roots() {
+        let mut direct_pdf = empty_pdf();
+        let mut direct = NNTree::<NameKey>::new(root_with_one_direct_leaf(), true);
+        direct.begin(&mut direct_pdf).expect("begin direct root");
+        assert_eq!(
+            direct_pdf.repair_diagnostics().entries()[0].message,
+            "Name/Number tree node: converting kid number 0 to an indirect object"
+        );
+
+        let mut indirect_pdf = empty_pdf();
+        let root_ref = ObjectRef::new(17, 0);
+        indirect_pdf.set_object(root_ref, root_with_one_direct_leaf());
+        let mut indirect = NNTree::<NameKey>::new(Object::Reference(root_ref), true);
+        indirect
+            .begin(&mut indirect_pdf)
+            .expect("begin indirect root");
+        assert_eq!(
+            indirect_pdf.repair_diagnostics().entries()[0].message,
+            "Name/Number tree node (object 17): converting kid number 0 to an indirect object"
+        );
+    }
+
+    #[test]
+    fn repair_skips_dangling_names_item_and_retains_later_branch() {
+        let mut pdf = empty_pdf();
+        let first_ref = ObjectRef::new(10, 0);
+        let target_ref = ObjectRef::new(11, 0);
+        let mut first = Dictionary::new();
+        first.insert(
+            "Names",
+            Object::Array(vec![
+                Object::String(b"alpha".to_vec()),
+                Object::Integer(1),
+                Object::String(b"dangling".to_vec()),
+            ]),
+        );
+        first.insert(
+            "Limits",
+            Object::Array(vec![
+                Object::String(b"alpha".to_vec()),
+                Object::String(b"alpha".to_vec()),
+            ]),
+        );
+        pdf.set_object(first_ref, Object::Dictionary(first));
+        pdf.set_object(target_ref, name_leaf(&[(b"target", 2)], None));
+        let mut root = Dictionary::new();
+        root.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(first_ref),
+                Object::Reference(target_ref),
+            ]),
+        );
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), true);
+
+        let found = tree.find(&mut pdf, &b"target".to_vec(), false).unwrap();
+
+        assert_eq!(
+            found.current().map(|(key, value)| (key.as_slice(), value)),
+            Some((b"target".as_slice(), &Object::Integer(2)))
+        );
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Name/Number tree node: attempting to repair after error: Name/Number tree node (object 11): node is missing /Limits",
+                "Name/Number tree node (object 10): items array doesn't have enough elements",
+            ]
+        );
+    }
+
+    #[test]
+    fn repair_enumerates_later_branches_after_invalid_kid_wrong_key_and_cycle() {
+        let mut pdf = empty_pdf();
+        let first_ref = ObjectRef::new(12, 0);
+        let cycle_ref = ObjectRef::new(9, 0);
+        let target_ref = ObjectRef::new(10, 0);
+        let wrong_key_ref = ObjectRef::new(11, 0);
+        pdf.set_object(
+            first_ref,
+            name_leaf(&[(b"alpha", 1)], Some((b"alpha", b"alpha"))),
+        );
+        let mut cycle = Dictionary::new();
+        cycle.insert(
+            "Limits",
+            Object::Array(vec![
+                Object::String(b"middle".to_vec()),
+                Object::String(b"middle".to_vec()),
+            ]),
+        );
+        cycle.insert("Kids", Object::Array(vec![Object::Reference(cycle_ref)]));
+        pdf.set_object(cycle_ref, Object::Dictionary(cycle));
+        pdf.set_object(target_ref, name_leaf(&[(b"target", 3)], None));
+        let mut wrong_key = Dictionary::new();
+        wrong_key.insert(
+            "Limits",
+            Object::Array(vec![
+                Object::String(b"zulu".to_vec()),
+                Object::String(b"zulu".to_vec()),
+            ]),
+        );
+        wrong_key.insert(
+            "Names",
+            Object::Array(vec![Object::Integer(42), Object::Integer(4)]),
+        );
+        pdf.set_object(wrong_key_ref, Object::Dictionary(wrong_key));
+        let mut root = Dictionary::new();
+        root.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(first_ref),
+                Object::Integer(42),
+                Object::Reference(cycle_ref),
+                Object::Reference(target_ref),
+                Object::Reference(wrong_key_ref),
+            ]),
+        );
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), true);
+
+        let found = tree.find(&mut pdf, &b"target".to_vec(), false).unwrap();
+
+        assert_eq!(
+            found.current().map(|(key, value)| (key.as_slice(), value)),
+            Some((b"target".as_slice(), &Object::Integer(3)))
+        );
+        assert_eq!(
+            collect_name_entries(&mut tree, &mut pdf),
+            vec![
+                (b"alpha".to_vec(), Object::Integer(1)),
+                (b"target".to_vec(), Object::Integer(3)),
+            ]
+        );
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Name/Number tree node: attempting to repair after error: Name/Number tree node (object 10): node is missing /Limits",
+                "Name/Number tree node: skipping over invalid kid at index 1",
+                "Name/Number tree node (object 9): loop detected while traversing name/number tree",
+                "Name/Number tree node (object 11): item 0 has the wrong type",
+            ]
+        );
+    }
+
+    #[test]
     fn find_does_not_mutate_when_auto_repair_is_disabled() {
         let mut pdf = empty_pdf();
         let root = malformed_name_tree_with_missing_limits_and_valid_pairs(&mut pdf);
@@ -3723,6 +4062,25 @@ mod tests {
     }
 
     #[test]
+    fn begin_does_not_warn_for_its_initial_invalid_key() {
+        let mut pdf = empty_pdf();
+        let mut root = Dictionary::new();
+        root.insert(
+            "Names",
+            Object::Array(vec![Object::Integer(42), Object::Integer(1)]),
+        );
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), false);
+
+        let cursor = tree
+            .begin(&mut pdf)
+            .expect("begin tolerates an invalid key");
+
+        assert!(cursor.positioned());
+        assert!(cursor.current().is_none());
+        assert!(pdf.repair_diagnostics().entries().is_empty());
+    }
+
+    #[test]
     fn short_first_pair_remains_fatal_after_single_repair_warning() {
         let mut pdf = empty_pdf();
         let mut root = Dictionary::new();
@@ -3805,7 +4163,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_with_zero_surviving_entries_installs_empty_items_array() {
+    fn repair_with_an_initial_invalid_key_remains_fatal_like_qpdf() {
         let mut pdf = empty_pdf();
         let mut root = Dictionary::new();
         root.insert(
@@ -3815,15 +4173,81 @@ mod tests {
         root.insert("Keep", Object::Integer(7));
         let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), true);
 
-        let found = tree.find(&mut pdf, &b"target".to_vec(), false).unwrap();
-
-        assert!(!found.positioned());
+        let error = match tree.find(&mut pdf, &b"target".to_vec(), false) {
+            Err(error) => error,
+            Ok(_) => panic!("initial invalid key must remain fatal"), // cov:ignore: negative-path assertion
+        };
+        assert_eq!(
+            error.to_string(),
+            "parse error at byte 0: Name/Number tree node: item at index 0 is not the right type"
+        );
+        assert_eq!(
+            pdf.repair_diagnostics().entries()[0].message,
+            "Name/Number tree node: attempting to repair after error: Name/Number tree node: item at index 0 is not the right type"
+        );
         let Object::Dictionary(root) = tree.root() else {
             panic!("root must remain direct"); // cov:ignore: test-shape guard
         };
-        assert_eq!(root.get("Names"), Some(&Object::Array(Vec::new())));
+        assert_eq!(
+            root.get("Names"),
+            Some(&Object::Array(vec![
+                Object::Integer(42),
+                Object::Integer(1)
+            ]))
+        );
         assert_eq!(root.get("Kids"), None);
         assert_eq!(root.get("Keep"), Some(&Object::Integer(7)));
+    }
+
+    #[test]
+    fn raw_repair_seed_follows_the_empty_replacement_insert_first_path() {
+        let mut pdf = empty_pdf();
+        let mut root = Dictionary::new();
+        root.insert("Names", Object::Array(Vec::new()));
+        let mut replacement = NNTree::<NameKey>::new(Object::Dictionary(root), false);
+        let mut allocator = ObjectAllocator::default();
+
+        let cursor = replacement
+            .insert_raw_pair_with_allocator(
+                &mut pdf,
+                &mut allocator,
+                Object::Integer(42),
+                Object::Integer(1),
+            )
+            .unwrap();
+
+        assert!(cursor.positioned());
+        assert!(cursor.current().is_none());
+        assert_eq!(
+            cursor.cloned_raw_current(),
+            Some((Object::Integer(42), Object::Integer(1)))
+        );
+        let error = match replacement.insert_raw_pair_with_allocator(
+            &mut pdf,
+            &mut allocator,
+            Object::Integer(43),
+            Object::Integer(2),
+        ) {
+            Ok(_) => panic!("a nonempty replacement must reject another invalid raw key"), // cov:ignore: negative-path assertion
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "parse error at byte 0: Name/Number tree node: item at index 0 is not the right type"
+        );
+        let Object::Dictionary(root) = replacement.root() else {
+            panic!("replacement root must remain direct"); // cov:ignore: test-shape guard
+        };
+        assert_eq!(
+            root.get("Names"),
+            Some(&Object::Array(vec![
+                Object::Integer(42),
+                Object::Integer(1)
+            ]))
+        );
+        assert_eq!(root.get("Limits"), None);
+        assert_eq!(root.get("Kids"), None);
+        assert!(pdf.repair_diagnostics().entries().is_empty());
     }
 
     #[test]
@@ -3905,5 +4329,228 @@ mod tests {
             error.to_string(),
             "unsupported PDF feature: name_number_tree: /Kids depth limit 2 exceeded"
         );
+    }
+
+    #[test]
+    fn repair_preserves_raw_name_keys_and_split_limits() {
+        let mut pdf = empty_pdf();
+        let leaf_ref = ObjectRef::new(10, 0);
+        let indirect_key_ref = ObjectRef::new(50, 0);
+        let utf16_first = utf16be_ascii_key(b"k00");
+        pdf.set_object(indirect_key_ref, Object::String(b"k32".to_vec()));
+
+        let mut names = Vec::new();
+        for index in 0..33 {
+            let key = match index {
+                0 => utf16_first.clone(),
+                32 => Object::Reference(indirect_key_ref),
+                _ => Object::String(format!("k{index:02}").into_bytes()),
+            };
+            names.extend([key, Object::Integer(index)]);
+        }
+        let mut leaf = Dictionary::new();
+        leaf.insert("Names", Object::Array(names));
+        pdf.set_object(leaf_ref, Object::Dictionary(leaf));
+        let mut root = Dictionary::new();
+        root.insert("Kids", Object::Array(vec![Object::Reference(leaf_ref)]));
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), true);
+
+        tree.find(&mut pdf, &b"k32".to_vec(), false)
+            .expect("missing /Limits must repair and find the indirect key");
+
+        let Object::Dictionary(root) = tree.root() else {
+            panic!("repaired root must remain a dictionary"); // cov:ignore: test-shape guard
+        };
+        let Some(Object::Array(kids)) = root.get("Kids") else {
+            panic!("33 repaired pairs must split into /Kids"); // cov:ignore: test-shape guard
+        };
+        assert_eq!(kids.len(), 2);
+        let Object::Reference(first_ref) = kids[0] else {
+            panic!("first split node must be indirect"); // cov:ignore: test-shape guard
+        };
+        let Object::Reference(last_ref) = kids[1] else {
+            panic!("last split node must be indirect"); // cov:ignore: test-shape guard
+        };
+        let Object::Dictionary(first) = pdf.resolve(first_ref).unwrap() else {
+            panic!("first split node must be a dictionary"); // cov:ignore: test-shape guard
+        };
+        let Object::Dictionary(last) = pdf.resolve(last_ref).unwrap() else {
+            panic!("last split node must be a dictionary"); // cov:ignore: test-shape guard
+        };
+        let Some(Object::Array(first_names)) = first.get("Names") else {
+            panic!("first split node must retain /Names"); // cov:ignore: test-shape guard
+        };
+        let Some(Object::Array(last_names)) = last.get("Names") else {
+            panic!("last split node must retain /Names"); // cov:ignore: test-shape guard
+        };
+        assert_eq!(first_names[0], utf16_first);
+        assert_eq!(
+            last_names[last_names.len() - 2],
+            Object::Reference(indirect_key_ref)
+        );
+        assert_eq!(
+            first.get("Limits"),
+            Some(&Object::Array(vec![
+                utf16be_ascii_key(b"k00"),
+                Object::String(b"k15".to_vec()),
+            ]))
+        );
+        assert_eq!(
+            last.get("Limits"),
+            Some(&Object::Array(vec![
+                Object::String(b"k16".to_vec()),
+                Object::Reference(indirect_key_ref),
+            ]))
+        );
+    }
+
+    #[test]
+    fn repair_exact_replace_keeps_the_first_raw_name_key() {
+        let mut pdf = empty_pdf();
+        let leaf_ref = ObjectRef::new(10, 0);
+        let utf16_key = utf16be_ascii_key(b"same");
+        let mut leaf = Dictionary::new();
+        leaf.insert(
+            "Names",
+            Object::Array(vec![
+                utf16_key.clone(),
+                Object::Integer(1),
+                Object::String(b"same".to_vec()),
+                Object::Integer(2),
+            ]),
+        );
+        pdf.set_object(leaf_ref, Object::Dictionary(leaf));
+        let mut root = Dictionary::new();
+        root.insert("Kids", Object::Array(vec![Object::Reference(leaf_ref)]));
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), true);
+
+        let found = tree.find(&mut pdf, &b"same".to_vec(), false).unwrap();
+
+        assert_eq!(
+            found.current().map(|(_, value)| value),
+            Some(&Object::Integer(2))
+        );
+        let Object::Dictionary(root) = tree.root() else {
+            panic!("repaired root must remain a dictionary"); // cov:ignore: test-shape guard
+        };
+        assert_eq!(
+            root.get("Names"),
+            Some(&Object::Array(vec![utf16_key, Object::Integer(2)]))
+        );
+    }
+
+    #[test]
+    fn repair_uses_the_default_replacement_threshold_before_later_custom_insertions() {
+        let mut pdf = empty_pdf();
+        let leaf_ref = ObjectRef::new(10, 0);
+        pdf.set_object(
+            leaf_ref,
+            name_leaf(
+                &[(b"a", 1), (b"b", 2), (b"c", 3), (b"d", 4), (b"e", 5)],
+                None,
+            ),
+        );
+        let mut root = Dictionary::new();
+        root.insert("Kids", Object::Array(vec![Object::Reference(leaf_ref)]));
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), true);
+        tree.set_split_threshold(2);
+
+        tree.find(&mut pdf, &b"e".to_vec(), false)
+            .expect("missing /Limits must repair");
+
+        let Object::Dictionary(root) = tree.root() else {
+            panic!("repaired root must remain a dictionary"); // cov:ignore: test-shape guard
+        };
+        assert!(root.get("Kids").is_none());
+        assert!(matches!(root.get("Names"), Some(Object::Array(names)) if names.len() == 10));
+
+        tree.insert(&mut pdf, b"f".to_vec(), Object::Integer(6))
+            .expect("post-repair insertion must use the caller threshold");
+        let Object::Dictionary(root) = tree.root() else {
+            panic!("root must remain a dictionary"); // cov:ignore: test-shape guard
+        };
+        assert!(matches!(root.get("Kids"), Some(Object::Array(_))));
+    }
+
+    #[test]
+    fn cursor_raw_is_restored_cleared_for_empty_and_cleared_after_last_remove() {
+        let mut pdf = empty_pdf();
+        let mut root = Dictionary::new();
+        root.insert(
+            "Names",
+            Object::Array(vec![Object::String(b"alpha".to_vec()), Object::Integer(1)]),
+        );
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), false);
+        let mut cursor = tree.begin(&mut pdf).unwrap();
+        let original = cursor.clone();
+
+        tree.root = Object::Dictionary(Dictionary::new());
+        assert!(!tree
+            .descend(&mut pdf, &mut cursor, NodeHandle::root(), true, false)
+            .unwrap());
+        assert_eq!(cursor.cloned_raw_current(), original.cloned_raw_current());
+
+        let mut empty = Dictionary::new();
+        empty.insert("Names", Object::Array(Vec::new()));
+        tree.root = Object::Dictionary(empty);
+        assert!(tree
+            .descend(&mut pdf, &mut cursor, NodeHandle::root(), true, true)
+            .unwrap());
+        assert!(!cursor.positioned());
+        assert!(cursor.cloned_raw_current().is_none());
+
+        let mut removable = Dictionary::new();
+        removable.insert(
+            "Names",
+            Object::Array(vec![Object::String(b"last".to_vec()), Object::Integer(9)]),
+        );
+        let mut removable = NNTree::<NameKey>::new(Object::Dictionary(removable), false);
+        let mut last = removable.begin(&mut pdf).unwrap();
+        removable.remove_at(&mut pdf, &mut last).unwrap();
+        assert!(!last.positioned());
+        assert!(last.cloned_raw_current().is_none());
+    }
+
+    #[test]
+    fn auto_repair_does_not_handle_a_depth_limit_error() {
+        let mut pdf = empty_pdf();
+        let shallow_ref = ObjectRef::new(10, 0);
+        let branch_ref = ObjectRef::new(20, 0);
+        let deep_ref = ObjectRef::new(21, 0);
+        pdf.set_object(shallow_ref, number_leaf(&[(0, b"zero")], Some((0, 0))));
+        pdf.set_object(
+            deep_ref,
+            number_leaf(&[(100, b"hundred")], Some((100, 100))),
+        );
+        let mut branch = Dictionary::new();
+        branch.insert(
+            "Limits",
+            Object::Array(vec![Object::Integer(100), Object::Integer(100)]),
+        );
+        branch.insert("Kids", Object::Array(vec![Object::Reference(deep_ref)]));
+        pdf.set_object(branch_ref, Object::Dictionary(branch));
+        let mut root = Dictionary::new();
+        root.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(shallow_ref),
+                Object::Reference(branch_ref),
+            ]),
+        );
+        let original = Object::Dictionary(root.clone());
+        let mut tree = NNTree::<NumberKey>::new(Object::Dictionary(root), true);
+        tree.max_depth = Some(2);
+
+        let error = match tree.find(&mut pdf, &100, false) {
+            Err(error) => error,
+            Ok(_) => panic!("depth-limit error must not enter repair"), // cov:ignore: negative-path assertion
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: name_number_tree: /Kids depth limit 2 exceeded"
+        );
+        assert_eq!(tree.root(), &original);
+        assert!(pdf.repair_diagnostics().entries().is_empty());
     }
 }
