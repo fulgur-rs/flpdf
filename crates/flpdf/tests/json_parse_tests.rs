@@ -147,6 +147,13 @@ fn parser_accepts_qpdf_number_forms_and_all_string_escape_forms() {
 }
 
 #[test]
+fn parser_accepts_qpdf_zero_sentinel_low_surrogate_at_offset_six() {
+    let value = Json::parse(br#""aaaaa\uDC00""#).unwrap();
+    assert_eq!(value.get_string(), Some("aaaaa𐀀".as_bytes().to_vec()));
+    assert_eq!((value.start(), value.end()), (0, 13));
+}
+
+#[test]
 fn parser_defers_container_grammar_to_task_six() {
     for input in [b"{".as_slice(), b"}".as_slice(), b"[", b"]", b":", b","] {
         assert_eq!(

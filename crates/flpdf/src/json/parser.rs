@@ -211,11 +211,10 @@ impl<'a> Parser<'a> {
             self.high_offset = Some(offset);
             self.high_surrogate = codepoint;
         } else if (codepoint & 0xfc00) == 0xdc00 {
-            let Some(high_offset) = self.high_offset else {
-                return Err(self.error(format!(
-                    "JSON: offset {offset}: UTF-16 low surrogate found not immediately after high surrogate"
-                )));
-            };
+            // qpdf uses zero as its high-surrogate-offset sentinel. This
+            // intentionally accepts a low surrogate beginning at offset 6
+            // even when no high surrogate has been seen.
+            let high_offset = self.high_offset.unwrap_or(0);
             if offset != high_offset + 6 {
                 return Err(self.error(format!(
                     "JSON: offset {offset}: UTF-16 low surrogate found not immediately after high surrogate"
