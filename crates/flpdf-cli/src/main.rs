@@ -4496,8 +4496,10 @@ fn open_verified_json_output(input: &File, output: &Path) -> CliResult<File> {
             "input file and output file are the same; choose a different --json-output path".into(),
         );
     }
-    output_file.set_len(0)?;
-    output_file.seek(SeekFrom::Start(0))?;
+    if output_file.metadata()?.file_type().is_file() {
+        output_file.set_len(0)?;
+        output_file.seek(SeekFrom::Start(0))?;
+    }
     Ok(output_file)
 }
 

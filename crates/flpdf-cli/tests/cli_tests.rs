@@ -2598,6 +2598,27 @@ fn json_output_missing_input_preserves_existing_output_and_reports_input_open() 
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn json_output_writes_to_dev_null_without_stdout() {
+    // Regression for unconditional set_len/seek after the output identity
+    // check: /dev/null is writable but neither operation is valid on its
+    // non-regular file handle. The CLI must still treat it as a JSON sink.
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--json-output",
+            "/dev/null",
+            "../../tests/fixtures/minimal.pdf",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+}
+
 #[test]
 fn json_side_file_error_emits_recorded_warning_after_partial_json_before_fatal_error() {
     let fixture = fixture_with_repaired_name_tree_and_stream();
