@@ -1357,7 +1357,41 @@ fn single_outline_with_catalog(
 }
 
 #[test]
-fn named_destination_lookup_handles_qpdf_node_shapes() {
+fn outline_named_destination_lookup_uses_only_shared_nntree_engine() {
+    const SOURCE: &str = include_str!("../src/outline_document_helper.rs");
+
+    assert!(
+        SOURCE.contains("crate::NameTree::new("),
+        "outline named-destination lookup must construct the shared NameTree"
+    );
+
+    for private_algorithm in [
+        "enum NameTreeLookup",
+        "struct NameTreeStructuralError",
+        "fn find_name_tree_value<",
+        "fn name_tree_begin_preflight<",
+        "fn name_tree_node<",
+        "fn find_name_tree_leaf_value(",
+        "fn select_name_tree_kid<",
+        "fn qpdf_name_tree_binary_search<",
+        "fn name_tree_kid_ordering<",
+        "fn enumerate_name_tree_entries<",
+        "fn repair_name_tree<",
+        "fn build_repaired_name_tree_root<",
+        "enum RepairedNameTreeNodeKind",
+        "fn split_repaired_name_tree_node(",
+        "fn repaired_name_tree_dictionary(",
+        "fn repaired_name_tree_limit(",
+    ] {
+        assert!(
+            !SOURCE.contains(private_algorithm),
+            "outline_document_helper.rs still owns private NNTree algorithm: {private_algorithm}"
+        );
+    }
+}
+
+#[test]
+fn named_destination_lookup_handles_qpdf_nonfatal_node_shapes() {
     let cases = [
         (
             "/Names << /Dests << /Names [(shape) [3 0 R /Fit]] >> >>",
@@ -1376,11 +1410,6 @@ fn named_destination_lookup_handles_qpdf_node_shapes() {
         ("/Names << /Dests << /Kids [] >> >>", &[][..], Object::Null),
         ("/Names << /Dests 42 >>", &[][..], Object::Null),
         (
-            "/Names << /Dests << /Names [42 [3 0 R /Fit]] >> >>",
-            &[][..],
-            Object::Null,
-        ),
-        (
             "/Names << /Dests << /Names [(a) [3 0 R /Fit]] >> >>",
             &[][..],
             Object::Null,
@@ -1393,11 +1422,6 @@ fn named_destination_lookup_handles_qpdf_node_shapes() {
         (
             "/Names << /Dests << /Kids [42] >> >>",
             &[][..],
-            Object::Null,
-        ),
-        (
-            "/Names << /Dests << /Kids [8 0 R] >> >>",
-            &[(8, "<< /Names [42 [3 0 R /Fit]] >>")][..],
             Object::Null,
         ),
         (
@@ -1434,6 +1458,11 @@ fn short_first_name_tree_pair_is_fatal_after_the_repair_warning() {
     for (label, catalog_entries, extra, expected_message) in cases {
         let bytes = single_outline_with_catalog(catalog_entries, "/Dest (m)", extra);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let warning_context = match extra {
+            [] => "Name/Number tree node".to_string(),
+            [(object_number, _)] => format!("Name/Number tree node (object {object_number})"),
+            _ => unreachable!(),
+        };
 
         let error = pdf.outline().get_tree().unwrap_err();
         match error {
@@ -1446,7 +1475,7 @@ fn short_first_name_tree_pair_is_fatal_after_the_repair_warning() {
         assert_eq!(
             warning_messages(&pdf),
             [format!(
-                "attempting to repair after error: {expected_message}"
+                "{warning_context}: attempting to repair after error: {expected_message}"
             )],
             "{label}"
         );
@@ -1500,8 +1529,8 @@ fn direct_first_child_short_pair_repairs_from_the_mutated_root() {
     assert_eq!(
         warning_messages(&pdf),
         [
-            "converting kid number 0 to an indirect object",
-            "attempting to repair after error: Name/Number tree node (object 6): update ivalue: items array is too short",
+            "Name/Number tree node: converting kid number 0 to an indirect object",
+            "Name/Number tree node: attempting to repair after error: Name/Number tree node (object 6): update ivalue: items array is too short",
         ]
     );
 
@@ -1559,6 +1588,103 @@ fn qpdf_direct_first_child_short_pair_preserves_converted_object_context() {
     );
     assert!(!output.stdout.is_empty());
     assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).is_err());
+}
+
+fn first_invalid_name_tree_key_pdf(indirect_root: bool) -> Vec<u8> {
+    let catalog_entries = if indirect_root {
+        "/Names << /Dests 8 0 R >>"
+    } else {
+        "/Names << /Dests << /Kids [8 0 R] >> >>"
+    };
+    let extra = if indirect_root {
+        vec![
+            (8, "<< /Kids [9 0 R] >>"),
+            (9, "<< /Names [42 [3 0 R /Fit] (m) [3 0 R /Fit]] >>"),
+        ]
+    } else {
+        vec![(8, "<< /Names [42 [3 0 R /Fit] (m) [3 0 R /Fit]] >>")]
+    };
+    single_outline_with_catalog(catalog_entries, "/Dest (m)", &extra)
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 warning-context and initial-invalid-key oracle"]
+fn qpdf_first_invalid_name_tree_key_oracle() {
+    use std::io::Write;
+    use std::process::Command;
+
+    for (label, indirect_root) in [("direct root", false), ("indirect root", true)] {
+        let mut input = tempfile::NamedTempFile::new().unwrap();
+        input
+            .write_all(&first_invalid_name_tree_key_pdf(indirect_root))
+            .unwrap();
+        let output = Command::new("qpdf")
+            .args(["--json=2", "--json-key=outlines"])
+            .arg(input.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "{label} stderr:\n{stderr}\nstdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        assert_eq!(output.status.code(), Some(2), "{label}: {stderr}");
+        let repair_context = if indirect_root {
+            "(Name/Number tree node (object 8)): attempting to repair after error:"
+        } else {
+            "(Name/Number tree node): attempting to repair after error:"
+        };
+        let inner_context = if indirect_root {
+            "(Name/Number tree node (object 9)): node is missing /Limits"
+        } else {
+            "(Name/Number tree node (object 8)): node is missing /Limits"
+        };
+        let repair = stderr
+            .find(repair_context)
+            .unwrap_or_else(|| panic!("{label}: missing repair context in {stderr}"));
+        let inner = stderr
+            .find(inner_context)
+            .unwrap_or_else(|| panic!("{label}: missing inner context in {stderr}"));
+        let fatal = stderr
+            .find("(Name/Number tree node): item at index 0 is not the right type")
+            .unwrap_or_else(|| panic!("{label}: missing fatal direct-root context in {stderr}"));
+        assert!(repair < inner && inner < fatal, "{label}: {stderr}");
+        assert!(
+            !stderr.contains("item 0 has the wrong type"),
+            "{label}: qpdf must not turn the initial invalid key into a skip warning: {stderr}"
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).is_err(),
+            "{label}: repair error must leave partial JSON"
+        );
+    }
+}
+
+#[test]
+fn first_invalid_name_tree_key_fails_during_qpdf_style_repair() {
+    for (label, indirect_root, expected_warning) in [
+        (
+            "direct root",
+            false,
+            "Name/Number tree node: attempting to repair after error: Name/Number tree node (object 8): node is missing /Limits",
+        ),
+        (
+            "indirect root",
+            true,
+            "Name/Number tree node (object 8): attempting to repair after error: Name/Number tree node (object 9): node is missing /Limits",
+        ),
+    ] {
+        let mut pdf = Pdf::open(Cursor::new(first_invalid_name_tree_key_pdf(indirect_root))).unwrap();
+
+        let error = pdf.outline().get_tree().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "parse error at byte 0: Name/Number tree node: item at index 0 is not the right type",
+            "{label}"
+        );
+        assert_eq!(warning_messages(&pdf), [expected_warning], "{label}");
+    }
 }
 
 #[test]
@@ -1784,7 +1910,7 @@ fn name_tree_begin_lower_bound_converts_the_direct_first_path_before_skipping_se
     assert_eq!(
         warning_messages(&pdf),
         [
-            "converting kid number 0 to an indirect object",
+            "Name/Number tree node: converting kid number 0 to an indirect object",
             "Name/Number tree node (object 10): converting kid number 0 to an indirect object",
         ]
     );
@@ -1897,7 +2023,7 @@ fn name_tree_begin_updates_a_direct_root_inside_an_indirect_names_holder() {
     assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
     assert_eq!(
         warning_messages(&pdf),
-        ["converting kid number 0 to an indirect object"]
+        ["Name/Number tree node: converting kid number 0 to an indirect object"]
     );
     let Object::Dictionary(names) = pdf.resolve(ObjectRef::new(8, 0)).unwrap() else {
         panic!("indirect /Names holder must remain a dictionary");
@@ -1930,7 +2056,7 @@ fn name_tree_begin_updates_a_direct_root_inside_an_indirect_names_holder() {
 }
 
 #[test]
-fn invalid_first_name_tree_key_does_not_enable_the_lower_bound_shortcut() {
+fn invalid_first_name_tree_key_is_fatal_without_mutating_the_direct_root() {
     let bytes = single_outline_with_catalog(
         "/Names << /Dests << /Names [42 [3 0 R /Fit] (m) [3 0 R /Fit] (z) [3 0 R /Fit]] >> >>",
         "/Dest (a)",
@@ -1938,17 +2064,20 @@ fn invalid_first_name_tree_key_does_not_enable_the_lower_bound_shortcut() {
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    let error = pdf.outline().get_tree().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "parse error at byte 0: Name/Number tree node: item at index 0 is not the right type"
+    );
     assert_eq!(
         warning_messages(&pdf),
-        [
-            "attempting to repair after error: Name/Number tree node: item at index 0 is not the right type",
-            "item 0 has the wrong type",
-        ]
+        ["Name/Number tree node: attempting to repair after error: Name/Number tree node: item at index 0 is not the right type"]
     );
     assert_eq!(
         direct_dests_root(&mut pdf).get("Names"),
         Some(&Object::Array(vec![
+            Object::Integer(42),
+            page_dest(3),
             Object::String(b"m".to_vec()),
             page_dest(3),
             Object::String(b"z".to_vec()),
@@ -1969,7 +2098,7 @@ fn after_last_lookup_runs_targeted_search_without_a_last_descent() {
     assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
     assert_eq!(
         warning_messages(&pdf),
-        ["converting kid number 0 to an indirect object"]
+        ["Name/Number tree node: converting kid number 0 to an indirect object"]
     );
     let dests = direct_dests_root(&mut pdf);
     let Some(Object::Array(kids)) = dests.get("Kids") else {
@@ -1996,7 +2125,7 @@ fn name_tree_begin_indirects_a_direct_scalar_before_reporting_it_as_non_dictiona
     assert_eq!(
         warning_messages(&pdf),
         [
-            "converting kid number 0 to an indirect object",
+            "Name/Number tree node: converting kid number 0 to an indirect object",
             "Name/Number tree node (object 9): non-dictionary node while traversing name/number tree",
         ]
     );
@@ -2252,7 +2381,7 @@ fn empty_root_name_tree_warns_as_traversal_missing_without_repair_or_mutation() 
     assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
     assert_eq!(
         warning_messages(&pdf),
-        ["name/number tree node has neither non-empty /Names nor /Kids"]
+        ["Name/Number tree node: name/number tree node has neither non-empty /Names nor /Kids"]
     );
     let dests = direct_dests_root(&mut pdf);
     assert_eq!(dests.get("Names"), None);
@@ -2365,7 +2494,7 @@ fn malformed_name_tree_structural_errors_warn_repair_and_retry() {
             "/Names << /Dests << /Names [(a) [3 0 R /Fit] 42 [3 0 R /Fit] (z) [3 0 R /Fit]] >> >>",
             &[][..],
             "/Dest (m)",
-            "attempting to repair after error: Name/Number tree node: item at index 2 is not the right type",
+            "Name/Number tree node: attempting to repair after error: Name/Number tree node: item at index 2 is not the right type",
         ),
         (
             "targeted cycle",
@@ -2376,7 +2505,7 @@ fn malformed_name_tree_structural_errors_warn_repair_and_retry() {
                 (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
             ][..],
             "/Dest (m)",
-            "attempting to repair after error: Name/Number tree node (object 9): loop detected in find",
+            "Name/Number tree node: attempting to repair after error: Name/Number tree node (object 9): loop detected in find",
         ),
         (
             "bad node",
@@ -2387,7 +2516,7 @@ fn malformed_name_tree_structural_errors_warn_repair_and_retry() {
                 (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
             ][..],
             "/Dest (m)",
-            "attempting to repair after error: Name/Number tree node (object 9): bad node during find",
+            "Name/Number tree node: attempting to repair after error: Name/Number tree node (object 9): bad node during find",
         ),
         (
             "empty leaf bad node",
@@ -2398,7 +2527,7 @@ fn malformed_name_tree_structural_errors_warn_repair_and_retry() {
                 (10, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
             ][..],
             "/Dest (m)",
-            "attempting to repair after error: Name/Number tree node (object 9): bad node during find",
+            "Name/Number tree node: attempting to repair after error: Name/Number tree node (object 9): bad node during find",
         ),
         (
             "binary search no candidate",
@@ -2408,7 +2537,7 @@ fn malformed_name_tree_structural_errors_warn_repair_and_retry() {
                 (9, "<< /Limits [(z) (z)] /Names [(z) [3 0 R /Fit]] >>"),
             ][..],
             "/Dest (b)",
-            "attempting to repair after error: Name/Number tree node: unexpected -1 from binary search of kids; limits may by wrong",
+            "Name/Number tree node: attempting to repair after error: Name/Number tree node: unexpected -1 from binary search of kids; limits may by wrong",
         ),
     ];
 
@@ -2450,8 +2579,8 @@ fn malformed_name_tree_invalid_kid_is_skipped_while_valid_entries_are_retained()
     assert_eq!(
         warning_messages(&pdf),
         [
-            "attempting to repair after error: Name/Number tree node: invalid kid at index 1",
-            "skipping over invalid kid at index 1",
+            "Name/Number tree node: attempting to repair after error: Name/Number tree node: invalid kid at index 1",
+            "Name/Number tree node: skipping over invalid kid at index 1",
         ]
     );
     let dests = direct_dests_root(&mut pdf);
@@ -2468,7 +2597,7 @@ fn malformed_name_tree_invalid_kid_is_skipped_while_valid_entries_are_retained()
 }
 
 #[test]
-fn malformed_name_tree_zero_entry_repair_still_installs_an_empty_names_array() {
+fn malformed_name_tree_with_only_an_initial_invalid_key_is_fatal() {
     let bytes = single_outline_with_catalog(
         "/Names << /Dests << /Names [42 [3 0 R /Fit]] >> >>",
         "/Dest (shape)",
@@ -2476,17 +2605,21 @@ fn malformed_name_tree_zero_entry_repair_still_installs_an_empty_names_array() {
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    assert_eq!(root_items(&mut pdf)[0].dest, Object::Null);
+    let error = pdf.outline().get_tree().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "parse error at byte 0: Name/Number tree node: item at index 0 is not the right type"
+    );
     assert_eq!(
         warning_messages(&pdf),
-        [
-            "attempting to repair after error: Name/Number tree node: item at index 0 is not the right type",
-            "item 0 has the wrong type",
-        ]
+        ["Name/Number tree node: attempting to repair after error: Name/Number tree node: item at index 0 is not the right type"]
     );
     let dests = direct_dests_root(&mut pdf);
     assert_eq!(dests.get("Kids"), None);
-    assert_eq!(dests.get("Names"), Some(&Object::Array(Vec::new())));
+    assert_eq!(
+        dests.get("Names"),
+        Some(&Object::Array(vec![Object::Integer(42), page_dest(3)]))
+    );
 }
 
 fn nul_name_tree_repair_pdf() -> Vec<u8> {
@@ -2651,7 +2784,7 @@ fn missing_name_tree_limits_repairs_and_mutates_the_existing_direct_root() {
     assert_eq!(
         warning_messages(&pdf),
         vec![
-            "attempting to repair after error: Name/Number tree node (object 8): node is missing /Limits"
+            "Name/Number tree node: attempting to repair after error: Name/Number tree node (object 8): node is missing /Limits"
         ]
     );
 
@@ -2763,7 +2896,7 @@ fn missing_name_tree_limits_repairs_the_terminal_indirect_root_without_collapsin
     assert_eq!(
         warning_messages(&pdf),
         vec![
-            "attempting to repair after error: Name/Number tree node (object 8): node is missing /Limits"
+            "Name/Number tree node (object 22): attempting to repair after error: Name/Number tree node (object 8): node is missing /Limits"
         ]
     );
 
@@ -2812,10 +2945,10 @@ fn malformed_name_tree_repair_enumerates_all_reachable_branches_and_terminates_c
     assert_eq!(
         warning_messages(&pdf),
         vec![
-            "attempting to repair after error: Name/Number tree node (object 10): node is missing /Limits",
-            "skipping over invalid kid at index 1",
-            "loop detected while traversing name/number tree",
-            "item 0 has the wrong type",
+            "Name/Number tree node: attempting to repair after error: Name/Number tree node (object 10): node is missing /Limits",
+            "Name/Number tree node: skipping over invalid kid at index 1",
+            "Name/Number tree node (object 9): loop detected while traversing name/number tree",
+            "Name/Number tree node (object 11): item 0 has the wrong type",
         ]
     );
 }
@@ -2941,8 +3074,8 @@ fn malformed_name_tree_repair_warns_for_a_short_names_array_and_visits_an_empty_
     assert_eq!(
         warning_messages(&pdf),
         [
-            "attempting to repair after error: Name/Number tree node (object 8): node is missing /Limits",
-            "items array doesn't have enough elements",
+            "Name/Number tree node: attempting to repair after error: Name/Number tree node (object 8): node is missing /Limits",
+            "Name/Number tree node (object 8): items array doesn't have enough elements",
             "Name/Number tree node (object 9): name/number tree node has neither non-empty /Names nor /Kids",
         ]
     );

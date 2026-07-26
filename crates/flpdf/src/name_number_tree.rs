@@ -21,8 +21,8 @@ pub const LEAF_MAX: usize = 32;
 /// Entries are returned in depth-first order (the spec mandates keys be sorted).
 /// `decode` returning `Ok(None)` skips that entry. Malformed key/value arrays
 /// follow the typed helper's qpdf cursor semantics: an unpositionable first
-/// key may produce an empty result, while a structurally short positioned pair
-/// returns an error.
+/// key may produce an empty result; after a complete pair, a dangling final
+/// item is warned about and skipped.
 ///
 /// # Errors
 /// Propagates [`Pdf::resolve_borrowed`] (indirect-object resolution) errors and
@@ -593,8 +593,9 @@ mod tests {
     }
 
     #[test]
-    fn read_name_tree_odd_length_leaf_errors() {
-        // qpdf's initial iterator dereference rejects an odd-length leaf.
+    fn read_name_tree_odd_length_leaf_keeps_the_complete_pair_and_warns() {
+        // qpdf increments past the complete pair, then warns and skips the
+        // dangling final key.
         let mut pdf = empty_pdf();
         let mut leaf = Dictionary::new();
         leaf.insert(
@@ -605,14 +606,18 @@ mod tests {
                 Object::String(b"orphan".to_vec()), // no value -> dropped
             ]),
         );
-        let error = read_name_tree(
+        let out = read_name_tree(
             &mut pdf,
             Object::Dictionary(leaf),
             ref_only,
             DEFAULT_MAX_TREE_DEPTH,
         )
-        .expect_err("odd leaf must fail");
-        assert!(error.to_string().contains("items array is too short"));
+        .unwrap();
+        assert_eq!(out, vec![(b"a".to_vec(), ObjectRef::new(10, 0))]);
+        assert_eq!(
+            pdf.repair_diagnostics().entries()[0].message,
+            "Name/Number tree node: items array doesn't have enough elements"
+        );
     }
 
     #[test]
