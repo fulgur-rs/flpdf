@@ -1,6 +1,30 @@
 use std::io;
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use flpdf::json::Json;
+
+struct MaxWriteSink {
+    bytes: Vec<u8>,
+    max_write: usize,
+}
+
+impl io::Write for MaxWriteSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.max_write {
+            return Err(io::Error::other(format!(
+                "write of {} bytes exceeds {} byte limit",
+                bytes.len(),
+                self.max_write
+            )));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 #[test]
 fn incremental_writer_matches_qpdf_nested_bytes() {
@@ -120,6 +144,22 @@ fn qpdf_string_escape_bytes_are_exact() {
 fn qpdf_blob_uses_standard_base64_without_newlines() {
     let blob = Json::make_blob(|out| out.write_all(b"\x01\x02\x03\x04\x05\xff\xfe\xfd\xfc\xfb"));
     assert_eq!(blob.unparse().unwrap(), b"\"AQIDBAX//v38+w==\"");
+}
+
+#[test]
+fn qpdf_blob_streams_base64_without_one_full_encoded_write() {
+    let bytes = vec![0x5a; 4096];
+    let payload = bytes.clone();
+    let blob = Json::make_blob(move |out| out.write_all(&payload));
+    let mut out = MaxWriteSink {
+        bytes: Vec::new(),
+        max_write: 2048,
+    };
+
+    blob.write(&mut out, 0).unwrap();
+
+    let expected = format!("\"{}\"", STANDARD.encode(bytes)).into_bytes();
+    assert_eq!(out.bytes, expected);
 }
 
 #[test]

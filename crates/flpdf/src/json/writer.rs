@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{engine::general_purpose::STANDARD, write::EncoderWriter};
 
 use super::value::{ContainerOrBlobSnapshot, ValueSnapshot};
 use super::Json;
@@ -176,10 +176,10 @@ fn write_container_or_blob(
             out.write_all(b"]")
         }
         ContainerOrBlobSnapshot::Blob(writer) => {
-            let mut bytes = Vec::new();
-            writer.borrow_mut()(&mut bytes)?;
             out.write_all(b"\"")?;
-            out.write_all(STANDARD.encode(bytes).as_bytes())?;
+            let mut encoder = EncoderWriter::new(&mut *out, &STANDARD);
+            writer.borrow_mut()(&mut encoder)?;
+            let out = encoder.finish()?;
             out.write_all(b"\"")
         }
     }
