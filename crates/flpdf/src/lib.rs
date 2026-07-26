@@ -105,6 +105,7 @@ pub mod linearization;
 pub mod matrix;
 pub mod name_number_tree;
 pub mod name_tree_dests;
+mod nntree;
 pub mod object;
 pub mod object_copy;
 pub mod objr_obj_annot_p;
