@@ -1,3 +1,5 @@
+//! qpdf correspondence: JSONHandler.cc recursive dispatch responsibilities with Rust shared ownership.
+
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;

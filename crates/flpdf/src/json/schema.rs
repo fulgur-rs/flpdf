@@ -1,3 +1,5 @@
+//! qpdf correspondence: JSON.cc schema validation responsibilities.
+
 use super::Json;
 
 /// Flags that alter qpdf-compatible JSON schema validation.
