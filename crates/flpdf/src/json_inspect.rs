@@ -530,6 +530,94 @@ fn qpdf_dict_to_json<R: Read + Seek>(
     json_dictionary(pairs)
 }
 
+/// A prepared raw-PDF value whose dictionaries retain [`Dictionary`]'s raw
+/// name order until the sink escapes each key. This is intentionally separate
+/// from generic [`Json`] dictionaries, whose encoded keys remain map-sorted.
+///
+/// qpdf 11.9.0 `QPDF_Dictionary::writeJSON` iterates the raw name map and
+/// escapes each key only at emission (`libqpdf/QPDF_Dictionary.cc:72-94`).
+enum OrderedPdfJson {
+    Json(Json),
+    Array(Vec<OrderedPdfJson>),
+    Dictionary(Vec<(Vec<u8>, OrderedPdfJson)>),
+}
+
+impl OrderedPdfJson {
+    fn write(&self, out: &mut (impl Write + ?Sized), depth: usize) -> Result<(), JsonOutputError> {
+        match self {
+            Self::Json(value) => value.write(out, depth)?,
+            Self::Array(values) => {
+                let mut first = true;
+                Json::write_array_open(out, &mut first, depth)?;
+                for value in values {
+                    Json::write_next(out, &mut first, depth + 1)?;
+                    value.write(out, depth + 1)?;
+                }
+                Json::write_array_close(out, first, depth)?;
+            }
+            Self::Dictionary(entries) => {
+                let mut first = true;
+                Json::write_dictionary_open(out, &mut first, depth)?;
+                for (key, value) in entries {
+                    Json::write_next(out, &mut first, depth + 1)?;
+                    Json::make_string(key).write(out, depth + 1)?;
+                    out.write_all(b": ")?;
+                    value.write(out, depth + 1)?;
+                }
+                Json::write_dictionary_close(out, first, depth)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn ordered_qpdf_dict<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dict: &Dictionary,
+) -> Result<OrderedPdfJson, ConvertError> {
+    let mut entries = Vec::new();
+    for (raw_key, value) in dict.iter() {
+        if crate::qpdf_null::value_is_null(pdf, value)? {
+            continue;
+        }
+        entries.push((
+            qpdf_name_to_json_string(raw_key).into_bytes(),
+            ordered_qpdf_object(pdf, value)?,
+        ));
+    }
+    Ok(OrderedPdfJson::Dictionary(entries))
+}
+
+fn ordered_qpdf_object<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object: &Object,
+) -> Result<OrderedPdfJson, ConvertError> {
+    match object {
+        Object::Reference(reference) if !crate::qpdf_null::reference_is_valid(*reference) => {
+            Ok(OrderedPdfJson::Json(Json::make_null()))
+        }
+        Object::Reference(reference) => Ok(OrderedPdfJson::Json(Json::make_string(format!(
+            "{} {} R",
+            reference.number, reference.generation
+        )))),
+        Object::Array(items) => Ok(OrderedPdfJson::Array(
+            items
+                .iter()
+                .map(|item| ordered_qpdf_object(pdf, item))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        Object::Dictionary(dict) => ordered_qpdf_dict(pdf, dict),
+        Object::Stream(stream) => Ok(OrderedPdfJson::Dictionary(vec![(
+            b"stream".to_vec(),
+            OrderedPdfJson::Dictionary(vec![(
+                b"dict".to_vec(),
+                ordered_qpdf_dict(pdf, &stream.dict)?,
+            )]),
+        )])),
+        other => Ok(OrderedPdfJson::Json(pdf_object_to_json(other)?)),
+    }
+}
+
 fn qpdf_pdf_object_to_json<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     object: &Object,
@@ -2639,31 +2727,107 @@ fn write_qpdf_section<R: Read + Seek>(
         if !object_selected(objects, object_ref) {
             continue;
         }
-        if let StreamDataMode::File { prefix } = stream_mode {
-            write_file_mode_object_entry(
+        let result = match stream_mode {
+            StreamDataMode::None => write_non_file_mode_object_entry(
+                pdf,
+                object_ref,
+                decode_level,
+                NonFileStreamDataMode::None,
+                out,
+                &mut objects_first,
+            ),
+            StreamDataMode::Inline => write_non_file_mode_object_entry(
+                pdf,
+                object_ref,
+                decode_level,
+                NonFileStreamDataMode::Inline,
+                out,
+                &mut objects_first,
+            ),
+            StreamDataMode::File { prefix } => write_file_mode_object_entry(
                 pdf,
                 object_ref,
                 decode_level,
                 prefix,
                 out,
                 &mut objects_first,
-            )?;
-        } else {
-            let key = format!("obj:{} {} R", object_ref.number, object_ref.generation);
-            let (entry, _) = build_qpdf_object_entry(pdf, object_ref, decode_level, stream_mode)?;
-            Json::write_dictionary_item(out, &mut objects_first, key.as_bytes(), &entry, 3)?;
-        }
+            ),
+        };
+        result?;
     }
 
     if trailer_selected(objects) {
-        let trailer =
-            json_dictionary([("value", qpdf_dict_to_json(pdf, &pdf.trailer().clone())?)])?;
-        Json::write_dictionary_item(out, &mut objects_first, b"trailer", &trailer, 3)?;
+        let trailer = ordered_qpdf_dict(pdf, &pdf.trailer().clone())?;
+        Json::write_dictionary_key(out, &mut objects_first, b"trailer", 3)?;
+        let mut trailer_first = true;
+        Json::write_dictionary_open(out, &mut trailer_first, 3)?;
+        Json::write_dictionary_key(out, &mut trailer_first, b"value", 4)?;
+        trailer.write(out, 4)?;
+        Json::write_dictionary_close(out, trailer_first, 3)?;
     }
     // qpdf keeps the raw object map expanded even when selectors match
     // neither an object nor the trailer: `{\n    }`, not compact `{}`.
     Json::write_dictionary_close(out, false, 2)?;
     Json::write_array_close(out, qpdf_first, 1)?;
+    Ok(())
+}
+
+enum NonFileStreamDataMode {
+    None,
+    Inline,
+}
+
+fn write_non_file_mode_object_entry<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object_ref: ObjectRef,
+    decode_level: DecodeLevel,
+    stream_mode: NonFileStreamDataMode,
+    out: &mut (impl Write + ?Sized),
+    objects_first: &mut bool,
+) -> Result<(), JsonOutputError> {
+    let object = qpdf_resolve_top_level_object(pdf, object_ref)?;
+    let key = format!("obj:{} {} R", object_ref.number, object_ref.generation);
+
+    match object {
+        Object::Stream(stream) => {
+            let (data, dict) = match stream_mode {
+                NonFileStreamDataMode::None => (None, ordered_qpdf_dict(pdf, &stream.dict)?),
+                NonFileStreamDataMode::Inline => {
+                    let payload = stream_payload_with_decode_status(&stream, decode_level);
+                    let dict = normalized_emitted_stream_dict(&stream, payload.decode_succeeded);
+                    let ordered = ordered_qpdf_dict(pdf, &dict)?;
+                    let bytes = payload.bytes.into_owned();
+                    (
+                        Some(Json::make_blob(move |sink| sink.write_all(&bytes))),
+                        ordered,
+                    )
+                }
+            };
+
+            Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
+            let mut object_first = true;
+            Json::write_dictionary_open(out, &mut object_first, 3)?;
+            Json::write_dictionary_key(out, &mut object_first, b"stream", 4)?;
+            let mut stream_first = true;
+            Json::write_dictionary_open(out, &mut stream_first, 4)?;
+            if let Some(data) = data {
+                Json::write_dictionary_item(out, &mut stream_first, b"data", &data, 5)?;
+            }
+            Json::write_dictionary_key(out, &mut stream_first, b"dict", 5)?;
+            dict.write(out, 5)?;
+            Json::write_dictionary_close(out, stream_first, 4)?;
+            Json::write_dictionary_close(out, object_first, 3)?;
+        }
+        other => {
+            let value = ordered_qpdf_object(pdf, &other)?;
+            Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
+            let mut object_first = true;
+            Json::write_dictionary_open(out, &mut object_first, 3)?;
+            Json::write_dictionary_key(out, &mut object_first, b"value", 4)?;
+            value.write(out, 4)?;
+            Json::write_dictionary_close(out, object_first, 3)?;
+        }
+    }
     Ok(())
 }
 
@@ -2699,8 +2863,13 @@ fn write_file_mode_object_entry<R: Read + Seek>(
             Json::write_dictionary_close(out, object_first, 3)?;
         }
         other => {
-            let entry = json_dictionary([("value", qpdf_pdf_object_to_json(pdf, &other)?)])?;
-            Json::write_dictionary_item(out, objects_first, key.as_bytes(), &entry, 3)?;
+            let value = ordered_qpdf_object(pdf, &other)?;
+            Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
+            let mut object_first = true;
+            Json::write_dictionary_open(out, &mut object_first, 3)?;
+            Json::write_dictionary_key(out, &mut object_first, b"value", 4)?;
+            value.write(out, 4)?;
+            Json::write_dictionary_close(out, object_first, 3)?;
         }
     }
     Ok(())
@@ -2732,8 +2901,9 @@ fn write_file_mode_stream_value<R: Read + Seek, W: Write>(
         .map_err(|source| side_file_io_error("flush", side_path, source))?;
 
     let dict = normalized_emitted_stream_dict(stream, payload.decode_succeeded);
-    let dict_json = qpdf_dict_to_json(pdf, &dict)?;
-    Json::write_dictionary_item(out, &mut stream_first, b"dict", &dict_json, 5)?;
+    let dict_json = ordered_qpdf_dict(pdf, &dict)?;
+    Json::write_dictionary_key(out, &mut stream_first, b"dict", 5)?;
+    dict_json.write(out, 5)?;
     Json::write_dictionary_close(out, stream_first, 4)?;
     Ok(())
 }
@@ -3016,6 +3186,48 @@ mod tests {
         Pdf::open(Cursor::new(bytes)).expect("open PDF without /Root")
     }
 
+    fn escaped_raw_dictionary_names_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        use std::io::Cursor;
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let off1 = bytes.len();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /#22 1 /A 2 /Nested << /#22 3 /A 4 >> >>\nendobj\n",
+        );
+        let off2 = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = bytes.len();
+        bytes.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+        );
+        let off4 = bytes.len();
+        bytes.extend_from_slice(
+            b"4 0 obj\n<< /Length 0 /#22 5 /A 6 /Nested << /#22 7 /A 8 >> >>\nstream\n\nendstream\nendobj\n",
+        );
+        let xref = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 5\n\
+                 0000000000 65535 f \n\
+                 {off1:010} 00000 n \n\
+                 {off2:010} 00000 n \n\
+                 {off3:010} 00000 n \n\
+                 {off4:010} 00000 n \n\
+                 trailer\n<< /Size 5 /Root 1 0 R /#22 9 /A 10 >>\n\
+                 startxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        Pdf::open(Cursor::new(bytes)).expect("open raw-name-order PDF")
+    }
+
+    fn positions(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+        haystack
+            .windows(needle.len())
+            .enumerate()
+            .filter_map(|(position, window)| (window == needle).then_some(position))
+            .collect()
+    }
+
     #[test]
     fn selected_sink_writer_emits_envelope_then_selected_section() {
         let mut pdf = load_one_page_pdf();
@@ -3098,6 +3310,77 @@ mod tests {
         assert_eq!(
             out,
             b"{\n  \"version\": 2,\n  \"parameters\": {\n    \"decodelevel\": \"generalized\"\n  },\n  \"qpdf\": [\n    {\n      \"jsonversion\": 2,\n      \"pdfversion\": \"1.3\",\n      \"pushedinheritedpageresources\": false,\n      \"calledgetallpages\": false,\n      \"maxobjectid\": 7\n    },\n    {\n    }\n  ]\n}\n"
+        );
+    }
+
+    #[test]
+    fn sink_writer_orders_raw_stream_and_trailer_names_before_escaping_in_all_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = temp.path().join("side").to_string_lossy().into_owned();
+        for stream_mode in [
+            StreamDataMode::None,
+            StreamDataMode::Inline,
+            StreamDataMode::File {
+                prefix: prefix.clone(),
+            },
+        ] {
+            let mut pdf = escaped_raw_dictionary_names_pdf();
+            let mut out = Vec::new();
+            write_qpdf_json_v2_selected_objects_with_options(
+                &mut pdf,
+                DecodeLevel::Generalized,
+                &stream_mode,
+                &[JsonKey::Qpdf],
+                &[
+                    JsonObjectSelector::Object {
+                        number: 4,
+                        generation: 0,
+                    },
+                    JsonObjectSelector::Trailer,
+                ],
+                &mut out,
+            )
+            .unwrap();
+
+            let quote_keys = positions(&out, br#""/\"""#);
+            let a_keys = positions(&out, br#""/A""#);
+            assert_eq!(quote_keys.len(), 3, "{stream_mode:?}: {out:?}");
+            assert_eq!(a_keys.len(), 3, "{stream_mode:?}: {out:?}");
+            assert!(
+                quote_keys
+                    .iter()
+                    .zip(a_keys.iter())
+                    .all(|(quote, a)| quote < a),
+                "{stream_mode:?}: quote={quote_keys:?}, A={a_keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_qpdf_object_preserves_nested_stream_shape_and_raw_dictionary_order() {
+        let mut dict = Dictionary::new();
+        dict.insert(b"\"", Object::Integer(1));
+        dict.insert(b"A", Object::Integer(2));
+        let object = Object::Array(vec![Object::Stream(Stream::new(dict, Vec::new()))]);
+        let mut pdf = empty_pdf();
+
+        let ordered = super::ordered_qpdf_object(&mut pdf, &object).unwrap();
+        let mut out = Vec::new();
+        ordered.write(&mut out, 0).unwrap();
+
+        assert_eq!(
+            out,
+            b"[\n  {\n    \"stream\": {\n      \"dict\": {\n        \"/\\\"\": 1,\n        \"/A\": 2\n      }\n    }\n  }\n]"
+        );
+    }
+
+    #[test]
+    fn tree_qpdf_projection_keeps_invalid_references_null() {
+        let mut pdf = empty_pdf();
+        assert_eq!(
+            qpdf_pdf_object_to_json(&mut pdf, &Object::Reference(crate::ObjectRef::new(0, 0)))
+                .unwrap(),
+            serde_json::Value::Null
         );
     }
 

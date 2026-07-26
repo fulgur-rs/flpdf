@@ -113,6 +113,44 @@ fn short_name_tree_pair_pdf() -> Vec<u8> {
     )
 }
 
+fn escaped_raw_dictionary_names_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let off1 = pdf.len();
+    pdf.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /#22 1 /A 2 /Nested << /#22 3 /A 4 >> >>\nendobj\n",
+    );
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+    );
+    let off4 = pdf.len();
+    pdf.extend_from_slice(
+        b"4 0 obj\n<< /Length 0 /#22 5 /A 6 /Nested << /#22 7 /A 8 >> >>\nstream\n\nendstream\nendobj\n",
+    );
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n"
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 5 /Root 1 0 R /#22 9 /A 10 >>\n\
+             startxref\n{xref_start}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: --json outputs JSON to stdout
 // ---------------------------------------------------------------------------
@@ -988,6 +1026,39 @@ fn unsupported_filter_inline_fallback_json_is_qpdf_exact() {
         &one_page_pdf_with_unsupported_stream(b"raw unsupported filter bytes"),
         "inline",
     );
+}
+
+#[test]
+fn raw_dictionary_names_are_ordered_before_json_escaping_like_qpdf() {
+    if !is_qpdf_available() {
+        return;
+    }
+
+    let input = write_temp_pdf(&escaped_raw_dictionary_names_pdf());
+    let args = ["--json=2", "--json-key=qpdf"];
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf 11.9.0 failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(
+        flpdf.status.success(),
+        "flpdf failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout);
 }
 
 /// Minimal RFC 4648 base64 encoder, for asserting on inline `data` values.
