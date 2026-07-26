@@ -16,9 +16,8 @@ use flpdf::{
     flatten_annotations, flatten_rotation_on_pages, fonts, generate_button_field_appearance,
     generate_choice_field_appearance, generate_text_field_appearance,
     json_inspect::{
-        format_json_side_file_path, write_qpdf_json_v2_selected_objects_with_options, DecodeLevel,
-        JsonKey, JsonObjectSelector, JsonOutputError, JsonOutputSummary,
-        StreamDataMode as JsonStreamDataMode,
+        write_qpdf_json_v2_selected_objects_with_options, DecodeLevel, JsonKey, JsonObjectSelector,
+        JsonOutputError, StreamDataMode as JsonStreamDataMode,
     },
     linearization::{
         check_linearization_path, show_linearization_path, write_linearized,
@@ -1921,9 +1920,8 @@ fn run_json(cli: &Cli) -> CliResult<()> {
 
     // 6. Write JSON incrementally.
     //
-    // `decode_level` governs both the inline `data` payloads (applied inside
-    // write_qpdf_json_v2_selected_objects_with_options) and the file-mode side files
-    // written below — the two must agree, so they share this single value.
+    // `decode_level` governs both inline `data` payloads and file-mode side files
+    // emitted by write_qpdf_json_v2_selected_objects_with_options.
     let decode_level = DecodeLevel::Generalized;
     let diagnostics_start = pdf.repair_diagnostics().entries().len();
     let had_open_warnings = diagnostics_start > 0;
@@ -1945,7 +1943,7 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     } else {
         let stdout = std::io::stdout();
         let mut locked = stdout.lock();
-        let write_result: Result<JsonOutputSummary, JsonOutputError> =
+        let write_result: Result<(), JsonOutputError> =
             write_qpdf_json_v2_selected_objects_with_options(
                 &mut pdf,
                 decode_level,
@@ -1958,34 +1956,15 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         match (write_result, flush_result) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error), // cov:ignore: real stdout flush failure cannot be induced in-process
-            (Ok(summary), Ok(())) => Ok(summary),
+            (Ok(()), Ok(())) => Ok(()),
         }
     };
-    let summary = match json_result {
-        Ok(summary) => summary,
+    match json_result {
+        Ok(()) => {}
         Err(error) => {
             emit_warnings_since(input, &pdf, diagnostics_start);
             return Err(Box::new(error));
         }
-    };
-
-    // 7. Write side files for stream-data=file mode only after the JSON
-    // document completed successfully. The streaming writer records exactly
-    // those stream objects that survived key/object selection.
-    let side_file_result = (|| -> CliResult<()> {
-        if let JsonStreamDataMode::File { ref prefix } = stream_mode {
-            for datafile in summary.datafiles {
-                // Side-file name must match the JSON `datafile` value;
-                // both come from the same helper to avoid divergence.
-                let side_path = format_json_side_file_path(prefix, datafile.object_ref.number);
-                std::fs::write(&side_path, datafile.bytes)?;
-            }
-        }
-        Ok(())
-    })();
-    if let Err(error) = side_file_result {
-        emit_warnings_since(input, &pdf, diagnostics_start);
-        return Err(error);
     }
 
     // qpdf exits 3 after successful JSON output when either opening or later
