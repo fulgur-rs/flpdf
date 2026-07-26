@@ -77,6 +77,26 @@ impl JsonHandler {
         Rc::new(RefCell::new(Self::new()))
     }
 
+    /// Handles a value without retaining the shared handler's borrow during callbacks.
+    ///
+    /// Use this entry point when a callback may dispatch through the same
+    /// [`SharedJsonHandler`]. Reentering the same active `FnMut` callback is
+    /// unsupported because its mutable callback state is already borrowed.
+    pub fn handle_shared(
+        handler: &SharedJsonHandler,
+        path: &[u8],
+        value: Json,
+    ) -> Result<(), JsonHandlerError> {
+        let key = handler.as_ref().as_ptr() as HandlerKey;
+        let snapshot = {
+            let handler = handler.borrow();
+            handler.snapshot()
+        };
+        let mut context = DispatchContext::default();
+        context.active.insert(key, snapshot.clone());
+        snapshot.handle(&mut context, path, value)
+    }
+
     pub fn add_any_handler(&mut self, callback: impl FnMut(&[u8], Json) + 'static) {
         self.any = Some(Rc::new(RefCell::new(Box::new(callback))));
     }

@@ -456,3 +456,32 @@ fn handler_configuration_after_registration_is_used_at_dispatch_time() {
 
     assert_eq!(&*seen.borrow(), &[".late=configured"]);
 }
+
+#[test]
+fn shared_entry_point_allows_callback_reentry_into_a_different_nested_callback() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let handler = JsonHandler::shared();
+    handler.borrow_mut().add_null_handler({
+        let seen = seen.clone();
+        move |path| {
+            seen.borrow_mut()
+                .push(format!("null:{}", String::from_utf8_lossy(path)));
+        }
+    });
+    handler.borrow_mut().add_string_handler({
+        let handler = handler.clone();
+        let seen = seen.clone();
+        move |path, value| {
+            seen.borrow_mut().push(format!(
+                "string:{}={}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(value)
+            ));
+            JsonHandler::handle_shared(&handler, b".nested", Json::make_null()).unwrap();
+        }
+    });
+
+    JsonHandler::handle_shared(&handler, b".", Json::make_string(b"outer")).unwrap();
+
+    assert_eq!(&*seen.borrow(), &["string:.=outer", "null:.nested"]);
+}
