@@ -37,6 +37,51 @@ fn dictionary_handler_uses_exact_key_then_unknown_key_fallback() {
 }
 
 #[test]
+fn dictionary_handler_observes_later_member_mutations_and_insertions() {
+    let dictionary = Json::parse(br#"{"a":1,"b":2}"#).unwrap();
+    let seen = Rc::new(RefCell::new(Vec::new()));
+
+    let first = JsonHandler::shared();
+    first.borrow_mut().add_number_handler({
+        let dictionary = dictionary.clone();
+        let seen = seen.clone();
+        move |path, number| {
+            seen.borrow_mut().push(format!(
+                "{}={}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(number)
+            ));
+            dictionary
+                .add_dictionary_member(b"b", Json::make_int(20))
+                .unwrap();
+            dictionary
+                .add_dictionary_member(b"c", Json::make_int(3))
+                .unwrap();
+        }
+    });
+    let later = JsonHandler::shared();
+    later.borrow_mut().add_number_handler({
+        let seen = seen.clone();
+        move |path, number| {
+            seen.borrow_mut().push(format!(
+                "{}={}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(number)
+            ));
+        }
+    });
+
+    let mut root = JsonHandler::new();
+    root.add_dictionary_handlers(|_, _| {}, |_| {});
+    root.add_dictionary_key_handler(b"a", first);
+    root.add_dictionary_key_handler(b"b", later.clone());
+    root.add_dictionary_key_handler(b"c", later);
+    root.handle(b".", dictionary).unwrap();
+
+    assert_eq!(&*seen.borrow(), &[".a=1", ".b=20", ".c=3"]);
+}
+
+#[test]
 fn typed_scalar_handlers_receive_qpdf_values_and_paths() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut handler = JsonHandler::new();
@@ -303,7 +348,10 @@ fn unexpected_nested_key_reports_its_object_path_and_skips_end_handlers() {
     root.add_dictionary_key_handler(b"known", nested);
 
     let error = root
-        .handle(b".", Json::parse(br#"{"known":{"x":"y"}}"#).unwrap())
+        .handle(
+            b".",
+            Json::parse(br#"{"known":{"x":"y","z":"must be skipped"}}"#).unwrap(),
+        )
         .unwrap_err();
 
     assert_eq!(
@@ -356,6 +404,19 @@ fn self_referential_dictionary_fallback_handles_finite_recursive_json() {
         &*seen.borrow(),
         &["start:.", "start:.a", ".a.b=done", "end:.a", "end:.",]
     );
+}
+
+#[test]
+fn self_referential_handler_does_not_retain_itself() {
+    let handler = JsonHandler::shared();
+    let weak = Rc::downgrade(&handler);
+    handler
+        .borrow_mut()
+        .add_fallback_dictionary_handler(handler.clone());
+
+    drop(handler);
+
+    assert!(weak.upgrade().is_none());
 }
 
 #[test]
@@ -429,6 +490,55 @@ fn mutually_recursive_dictionary_fallbacks_handle_a_finite_cycle() {
             "second end:.first",
             "first end:.",
         ]
+    );
+}
+
+#[test]
+fn mutually_recursive_handlers_do_not_retain_each_other() {
+    let first = JsonHandler::shared();
+    let second = JsonHandler::shared();
+    let first_weak = Rc::downgrade(&first);
+    let second_weak = Rc::downgrade(&second);
+    first
+        .borrow_mut()
+        .add_fallback_dictionary_handler(second.clone());
+    second
+        .borrow_mut()
+        .add_fallback_dictionary_handler(first.clone());
+
+    drop(first);
+    drop(second);
+
+    assert!(first_weak.upgrade().is_none());
+    assert!(second_weak.upgrade().is_none());
+}
+
+#[test]
+fn weak_cycle_edge_dispatches_while_owner_lives_then_reports_expiry() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let first = JsonHandler::shared();
+    let second = JsonHandler::shared();
+    first.borrow_mut().add_number_handler({
+        let seen = seen.clone();
+        move |path, number| {
+            seen.borrow_mut().push(format!(
+                "{}={}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(number)
+            ));
+        }
+    });
+    first.borrow_mut().add_fallback_handler(second.clone());
+    second.borrow_mut().add_fallback_handler(first.clone());
+
+    JsonHandler::handle_shared(&second, b".value", Json::make_int(1)).unwrap();
+    assert_eq!(&*seen.borrow(), &[".value=1"]);
+
+    drop(first);
+    let error = JsonHandler::handle_shared(&second, b".expired", Json::make_int(2)).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "JSON handler target at .expired is no longer available"
     );
 }
 

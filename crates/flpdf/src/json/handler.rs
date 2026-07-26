@@ -1,6 +1,6 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::{Rc, Weak};
 
 use super::Json;
 
@@ -36,13 +36,33 @@ pub struct JsonHandler {
 #[derive(Clone)]
 struct HandlerTarget {
     key: HandlerKey,
-    handler: SharedJsonHandler,
+    handler: HandlerReference,
+}
+
+#[derive(Clone)]
+enum HandlerReference {
+    Strong(SharedJsonHandler),
+    Weak(Weak<RefCell<JsonHandler>>),
 }
 
 impl HandlerTarget {
-    fn new(handler: SharedJsonHandler) -> Self {
+    fn new(owner_key: HandlerKey, handler: SharedJsonHandler) -> Self {
         let key = handler.as_ref().as_ptr() as HandlerKey;
+        let closes_cycle =
+            key == owner_key || handler_reaches(&handler, owner_key, &mut BTreeSet::new());
+        let handler = if closes_cycle {
+            HandlerReference::Weak(Rc::downgrade(&handler))
+        } else {
+            HandlerReference::Strong(handler)
+        };
         Self { key, handler }
+    }
+
+    fn upgrade(&self) -> Option<SharedJsonHandler> {
+        match &self.handler {
+            HandlerReference::Strong(handler) => Some(handler.clone()),
+            HandlerReference::Weak(handler) => handler.upgrade(),
+        }
     }
 }
 
@@ -131,12 +151,15 @@ impl JsonHandler {
         key: impl AsRef<[u8]>,
         handler: SharedJsonHandler,
     ) {
-        self.dictionary_keys
-            .insert(key.as_ref().to_vec(), HandlerTarget::new(handler));
+        let target = HandlerTarget::new(self as *const JsonHandler as HandlerKey, handler);
+        self.dictionary_keys.insert(key.as_ref().to_vec(), target);
     }
 
     pub fn add_fallback_dictionary_handler(&mut self, handler: SharedJsonHandler) {
-        self.fallback_dictionary = Some(HandlerTarget::new(handler));
+        self.fallback_dictionary = Some(HandlerTarget::new(
+            self as *const JsonHandler as HandlerKey,
+            handler,
+        ));
     }
 
     pub fn add_array_handlers(
@@ -147,11 +170,17 @@ impl JsonHandler {
     ) {
         self.array_start = Some(Rc::new(RefCell::new(Box::new(start))));
         self.array_end = Some(Rc::new(RefCell::new(Box::new(end))));
-        self.array_item = Some(HandlerTarget::new(item));
+        self.array_item = Some(HandlerTarget::new(
+            self as *const JsonHandler as HandlerKey,
+            item,
+        ));
     }
 
     pub fn add_fallback_handler(&mut self, handler: SharedJsonHandler) {
-        self.fallback = Some(HandlerTarget::new(handler));
+        self.fallback = Some(HandlerTarget::new(
+            self as *const JsonHandler as HandlerKey,
+            handler,
+        ));
     }
 
     pub fn handle(&mut self, path: &[u8], value: Json) -> Result<(), JsonHandlerError> {
@@ -179,6 +208,16 @@ impl JsonHandler {
             array_item: self.array_item.clone(),
             fallback: self.fallback.clone(),
         }
+    }
+
+    fn targets(&self) -> Vec<HandlerTarget> {
+        self.dictionary_keys
+            .values()
+            .chain(self.fallback_dictionary.iter())
+            .chain(self.array_item.iter())
+            .chain(self.fallback.iter())
+            .cloned()
+            .collect()
     }
 }
 
@@ -223,18 +262,23 @@ impl HandlerSnapshot {
                 if path_base != b"." {
                     path_base.push(b'.');
                 }
-                let mut items = Vec::new();
-                value.for_each_dict_item(|key, item| items.push((key.to_vec(), item)));
-                for (key, item) in items {
-                    let mut item_path = path_base.clone();
-                    item_path.extend_from_slice(&key);
-                    if let Some(handler) = self.dictionary_keys.get(&key) {
-                        context.dispatch(handler, &item_path, item)?;
-                    } else if let Some(handler) = &self.fallback_dictionary {
-                        context.dispatch(handler, &item_path, item)?;
-                    } else {
-                        return Err(unexpected_key(&key, path));
+                let mut item_error = None;
+                value.for_each_dict_item(|key, item| {
+                    if item_error.is_some() {
+                        return;
                     }
+                    let mut item_path = path_base.clone();
+                    item_path.extend_from_slice(key);
+                    item_error = if let Some(handler) = self.dictionary_keys.get(key) {
+                        context.dispatch(handler, &item_path, item).err()
+                    } else if let Some(handler) = &self.fallback_dictionary {
+                        context.dispatch(handler, &item_path, item).err()
+                    } else {
+                        Some(unexpected_key(key, path))
+                    };
+                });
+                if let Some(error) = item_error {
+                    return Err(error);
                 }
                 self.dictionary_end
                     .as_ref()
@@ -296,12 +340,35 @@ impl DispatchContext {
             return snapshot.handle(self, path, value);
         }
 
-        let snapshot = target.handler.borrow().snapshot();
+        let Some(handler) = target.upgrade() else {
+            return Err(JsonHandlerError(format!(
+                "JSON handler target at {} is no longer available",
+                String::from_utf8_lossy(path)
+            )));
+        };
+        let snapshot = handler.borrow().snapshot();
         self.active.insert(target.key, snapshot.clone());
         let result = snapshot.handle(self, path, value);
         self.active.remove(&target.key);
         result
     }
+}
+
+fn handler_reaches(
+    handler: &SharedJsonHandler,
+    sought: HandlerKey,
+    visited: &mut BTreeSet<HandlerKey>,
+) -> bool {
+    let key = handler.as_ref().as_ptr() as HandlerKey;
+    if !visited.insert(key) {
+        return false;
+    }
+    handler.borrow().targets().into_iter().any(|target| {
+        target.key == sought
+            || target
+                .upgrade()
+                .is_some_and(|handler| handler_reaches(&handler, sought, visited))
+    })
 }
 
 fn unexpected_key(key: &[u8], path: &[u8]) -> JsonHandlerError {
