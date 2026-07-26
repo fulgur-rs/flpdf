@@ -99,6 +99,7 @@ pub fn insert_name_tree_dest<R: Read + Seek>(
         Some(root) => crate::NameTree::new(root, true),
         None => crate::NameTree::new_empty(pdf, true)?,
     };
+    tree.set_max_depth(DEFAULT_MAX_NAME_TREE_DESTS_DEPTH);
     tree.insert(pdf, key, value)?;
     tree.make_root_indirect(pdf)?;
     names.insert("Dests", tree.into_root());
@@ -173,6 +174,7 @@ pub fn delete_name_tree_dest<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Re
     };
 
     let mut tree = crate::NameTree::new(root, true);
+    tree.set_max_depth(DEFAULT_MAX_NAME_TREE_DESTS_DEPTH);
     if tree.remove(pdf, key)?.is_none() {
         return Ok(false);
     }

@@ -1162,11 +1162,14 @@ pub fn build_pagelabels_section<R: Read + Seek>(
         None => return Ok(JsonValue::Array(vec![])),
     };
 
+    let original_pagelabels = pagelabels_val.clone();
     let mut tree = crate::NumberTree::new(pagelabels_val, true);
     tree.set_max_depth(DEFAULT_MAX_PAGE_TREE_DEPTH);
     let raw_entries = tree.as_map(pdf).map_err(ConvertError::from)?;
-    catalog_dict.insert("PageLabels", tree.into_root());
-    pdf.set_object(catalog_ref, Object::Dictionary(catalog_dict));
+    if tree.root() != &original_pagelabels {
+        catalog_dict.insert("PageLabels", tree.into_root());
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog_dict));
+    }
 
     let mut entries = Vec::with_capacity(raw_entries.len());
     for (index, value) in raw_entries {
@@ -2072,20 +2075,23 @@ pub fn build_attachments_section<R: Read + Seek>(
         None => return Ok(JsonValue::Object(vec![])),
     };
 
+    let original_ef_root = ef_root.clone();
     let mut tree = crate::NameTree::new(ef_root, true);
     tree.set_max_depth(DEFAULT_MAX_PAGE_TREE_DEPTH);
     let entries = tree.as_map(pdf).map_err(ConvertError::from)?;
-    names_dict.insert("EmbeddedFiles", tree.into_root());
-    match names_location {
-        NamesLocation::Direct => {
-            catalog.insert("Names", Object::Dictionary(names_dict));
+    if tree.root() != &original_ef_root {
+        names_dict.insert("EmbeddedFiles", tree.into_root());
+        match names_location {
+            NamesLocation::Direct => {
+                catalog.insert("Names", Object::Dictionary(names_dict));
+            }
+            NamesLocation::Indirect(names_ref) => {
+                pdf.set_object(names_ref, Object::Dictionary(names_dict));
+                catalog.insert("Names", Object::Reference(names_ref));
+            }
         }
-        NamesLocation::Indirect(names_ref) => {
-            pdf.set_object(names_ref, Object::Dictionary(names_dict));
-            catalog.insert("Names", Object::Reference(names_ref));
-        }
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
     }
-    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
     let mut raw_entries: Vec<(String, FilespecSource)> = entries
         .into_iter()
@@ -3986,6 +3992,26 @@ mod tests {
             label_pairs[2],
             ("style".to_string(), JsonValue::String("D".to_string()))
         );
+    }
+
+    #[test]
+    fn pagelabels_read_does_not_dirty_a_valid_tree() {
+        let mut pdf = load_one_page_pdf();
+        let mut label = Dictionary::new();
+        label.insert("S", Object::Name(b"D".to_vec()));
+        let mut root = Dictionary::new();
+        root.insert(
+            "Nums",
+            Object::Array(vec![Object::Integer(0), Object::Dictionary(label)]),
+        );
+        patch_pagelabels(&mut pdf, Object::Dictionary(root));
+        for object_ref in pdf.dirty_object_refs() {
+            pdf.clear_dirty(object_ref);
+        }
+
+        build_pagelabels_section(&mut pdf).expect("build page labels");
+
+        assert!(pdf.dirty_object_refs().is_empty());
     }
 
     // ── 38. Multiple ranges ────────────────────────────────────────────────
@@ -7043,6 +7069,16 @@ mod tests {
         let mut pdf = load_one_page_pdf();
         let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
         assert_eq!(result, JsonValue::Object(vec![]), "expected empty object");
+    }
+
+    #[test]
+    fn attachments_read_does_not_dirty_a_valid_tree() {
+        let mut pdf = load_attachment_pdf();
+        assert!(pdf.dirty_object_refs().is_empty());
+
+        build_attachments_section(&mut pdf).expect("build attachments");
+
+        assert!(pdf.dirty_object_refs().is_empty());
     }
 
     // ── attachments Test 1b: /Names present but no /EmbeddedFiles → empty ─────

@@ -19,8 +19,10 @@ pub const LEAF_MAX: usize = 32;
 /// or an inline node dictionary), decoding each value via `decode`.
 ///
 /// Entries are returned in depth-first order (the spec mandates keys be sorted).
-/// `decode` returning `Ok(None)` skips that entry; non-string keys and the
-/// trailing orphan of an odd-length leaf array are dropped silently.
+/// `decode` returning `Ok(None)` skips that entry. Malformed key/value arrays
+/// follow the typed helper's qpdf cursor semantics: an unpositionable first
+/// key may produce an empty result, while a structurally short positioned pair
+/// returns an error.
 ///
 /// # Errors
 /// Propagates [`Pdf::resolve_borrowed`] (indirect-object resolution) errors and
@@ -50,8 +52,8 @@ where
 /// Enumerate a **number** tree rooted at `root` (a `/Kids` root node reference,
 /// or an inline node dictionary), decoding each value via `decode`.
 ///
-/// Same semantics as [`read_name_tree`] but with `/Nums` leaves and integer
-/// keys; non-integer keys are skipped.
+/// Same malformed-tree and decoding semantics as [`read_name_tree`], but with
+/// `/Nums` leaves and integer keys.
 ///
 /// # Errors
 /// Propagates [`Pdf::resolve_borrowed`] (indirect-object resolution) errors and

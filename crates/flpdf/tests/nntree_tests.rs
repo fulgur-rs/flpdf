@@ -405,3 +405,40 @@ fn number_tree_at_or_below_reports_offset_overflow() {
         .to_string()
         .contains("number-tree at-or-below offset overflow"));
 }
+
+#[test]
+fn cursors_reject_other_trees_and_invalid_remove() {
+    let mut pdf = empty_pdf();
+    let mut left_root = Dictionary::new();
+    left_root.insert(
+        "Names",
+        Object::Array(vec![Object::String(b"left".to_vec()), Object::Integer(1)]),
+    );
+    let mut right_root = Dictionary::new();
+    right_root.insert(
+        "Names",
+        Object::Array(vec![Object::String(b"right".to_vec()), Object::Integer(2)]),
+    );
+    let mut left = NameTree::new(Object::Dictionary(left_root), true);
+    let mut right = NameTree::new(Object::Dictionary(right_root), true);
+    let mut left_cursor = left.begin(&mut pdf).expect("left cursor");
+
+    assert!(left_cursor.next(&mut right, &mut pdf).is_err());
+    assert!(left_cursor.remove(&mut right, &mut pdf).is_err());
+    assert_eq!(
+        right.find_object(&mut pdf, b"right").expect("right lookup"),
+        Some(Object::Integer(2))
+    );
+    assert!(left.end().remove(&mut left, &mut pdf).is_err());
+
+    let mut number_root = Dictionary::new();
+    number_root.insert(
+        "Nums",
+        Object::Array(vec![Object::Integer(1), Object::Integer(10)]),
+    );
+    let mut numbers = NumberTree::new(Object::Dictionary(number_root), true);
+    let mut other_numbers = NumberTree::new(Object::Dictionary(Dictionary::new()), true);
+    let mut number_cursor = numbers.begin(&mut pdf).expect("number cursor");
+    assert!(number_cursor.next(&mut other_numbers, &mut pdf).is_err());
+    assert!(numbers.end().remove(&mut numbers, &mut pdf).is_err());
+}

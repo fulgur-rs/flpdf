@@ -408,6 +408,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let Some(root) = self.pagelabels_root()? else {
             return Ok(vec![]);
         };
+        let original_root = root.clone();
         let mut tree = crate::NumberTree::new(root, true);
         tree.set_max_depth(DEFAULT_MAX_TREE_DEPTH);
         let raw_entries = tree.as_map(self.pdf)?;
@@ -430,13 +431,15 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             }
         }
 
-        let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(entries); // cov:ignore: pagelabels_root already observed this same /Root
-        };
-        if let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() {
-            catalog.insert("PageLabels", tree.into_root());
-            self.pdf
-                .set_object(catalog_ref, Object::Dictionary(catalog));
+        if tree.root() != &original_root {
+            let Some(catalog_ref) = self.pdf.root_ref() else {
+                return Ok(entries); // cov:ignore: pagelabels_root already observed this same /Root
+            };
+            if let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() {
+                catalog.insert("PageLabels", tree.into_root());
+                self.pdf
+                    .set_object(catalog_ref, Object::Dictionary(catalog));
+            }
         }
         Ok(entries)
     }
@@ -621,6 +624,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             Some(root) => crate::NumberTree::new(root, true),
             None => crate::NumberTree::new_empty(self.pdf, true)?,
         };
+        tree.set_max_depth(DEFAULT_MAX_TREE_DEPTH);
         tree.insert(
             self.pdf,
             first_page_idx,
@@ -653,6 +657,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             return Ok(false);
         };
         let mut tree = crate::NumberTree::new(root, true);
+        tree.set_max_depth(DEFAULT_MAX_TREE_DEPTH);
         if tree.remove(self.pdf, first_page_idx)?.is_none() {
             return Ok(false);
         }
@@ -1021,6 +1026,19 @@ mod tests {
         assert_eq!(h.label_string_for_page(5).unwrap(), "3");
         assert_eq!(h.label_string_for_page(6).unwrap(), "A-1");
         assert_eq!(h.label_string_for_page(8).unwrap(), "A-3");
+    }
+
+    #[test]
+    fn ranges_does_not_dirty_a_valid_indirect_tree() {
+        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
+        for object_ref in pdf.dirty_object_refs() {
+            pdf.clear_dirty(object_ref);
+        }
+
+        let ranges = pdf.page_labels().ranges().expect("read ranges");
+
+        assert_eq!(ranges.len(), 1);
+        assert!(pdf.dirty_object_refs().is_empty());
     }
 
     #[test]

@@ -516,6 +516,7 @@ pub fn insert_embedded_file<R: Read + Seek>(
         Some(root) => crate::NameTree::new(root, true),
         None => crate::NameTree::new_empty(pdf, true)?,
     };
+    tree.set_max_depth(DEFAULT_MAX_EMBEDDED_FILES_DEPTH);
     tree.insert(pdf, key, Object::Reference(filespec_ref))?;
     tree.make_root_indirect(pdf)?;
     names.insert("EmbeddedFiles", tree.into_root());
@@ -590,6 +591,7 @@ pub fn delete_embedded_file<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Res
     };
 
     let mut tree = crate::NameTree::new(root, true);
+    tree.set_max_depth(DEFAULT_MAX_EMBEDDED_FILES_DEPTH);
     if tree.remove(pdf, key)?.is_none() {
         return Ok(false);
     }
