@@ -1950,7 +1950,7 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         let flush_result = locked.flush().map_err(JsonOutputError::from);
         match (write_result, flush_result) {
             (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
+            (Ok(_), Err(error)) => Err(error), // cov:ignore: real stdout flush failure cannot be induced in-process
             (Ok(summary), Ok(())) => Ok(summary),
         }
     };
