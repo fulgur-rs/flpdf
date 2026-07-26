@@ -4473,8 +4473,8 @@ fn reject_encrypted_write<R: std::io::Read + std::io::Seek>(pdf: &Pdf<R>) -> Cli
 
 fn reject_same_json_output(input: &Path, output: &Path) -> CliResult<()> {
     match std::fs::metadata(output) {
-        Ok(_) => {
-            if same_file::is_same_file(input, output)? {
+        Ok(output_metadata) => {
+            if paths_identify_same_file(input, output, &output_metadata)? {
                 return Err(
                     "input file and output file are the same; choose a different --json-output path"
                         .into(),
@@ -4491,6 +4491,28 @@ fn reject_same_json_output(input: &Path, output: &Path) -> CliResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn paths_identify_same_file(
+    input: &Path,
+    _output: &Path,
+    output_metadata: &std::fs::Metadata,
+) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let input_metadata = std::fs::metadata(input)?;
+    Ok(input_metadata.dev() == output_metadata.dev()
+        && input_metadata.ino() == output_metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn paths_identify_same_file(
+    input: &Path,
+    output: &Path,
+    _output_metadata: &std::fs::Metadata,
+) -> std::io::Result<bool> {
+    same_file::is_same_file(input, output)
 }
 
 fn run_dump_object(

@@ -280,6 +280,35 @@ fn json_output_overwrites_distinct_existing_file() {
 
 #[cfg(unix)]
 #[test]
+fn json_output_overwrites_distinct_write_only_existing_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let temp = tempfile::tempdir().unwrap();
+    let output_path = temp.path().join("output.json");
+    std::fs::write(&output_path, b"stale output").unwrap();
+    std::fs::set_permissions(&output_path, std::fs::Permissions::from_mode(0o200)).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--json-output",
+            output_path.to_str().unwrap(),
+            input.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    std::fs::set_permissions(&output_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let output = std::fs::read(&output_path).unwrap();
+    assert_ne!(output, b"stale output");
+    serde_json::from_slice::<serde_json::Value>(&output).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn json_output_reports_identity_check_io_error_without_modifying_input() {
     let input = write_temp_pdf(&one_page_pdf_with_stream());
     let original = std::fs::read(input.path()).unwrap();

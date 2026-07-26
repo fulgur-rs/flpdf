@@ -35,6 +35,8 @@ qpdf-zlib-compat = ["flpdf/qpdf-zlib-compat"]
 [dependencies]
 clap.workspace = true
 flpdf = { path = "../flpdf", version = "0.4.0" }
+
+[target.'cfg(not(unix))'.dependencies]
 same-file.workspace = true
 
 [dev-dependencies]
