@@ -201,7 +201,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
 
-    use super::{Json, Value};
+    use super::{Json, Value, ValueSnapshot};
 
     #[test]
     fn scalar_constructors_preserve_qpdf_encoded_and_original_values() {
@@ -274,6 +274,20 @@ mod tests {
 
         let empty_array = Json::with_value(Value::Array(Vec::new()));
         assert_eq!(empty_array.unparse().unwrap(), b"[]");
+    }
+
+    #[test]
+    fn scalar_snapshots_cannot_enter_the_container_writer_path() {
+        assert!(ValueSnapshot::String(b"value".to_vec())
+            .into_container_or_blob()
+            .is_none());
+        assert!(ValueSnapshot::Number(b"1".to_vec())
+            .into_container_or_blob()
+            .is_none());
+        assert!(ValueSnapshot::Bool(false)
+            .into_container_or_blob()
+            .is_none());
+        assert!(ValueSnapshot::Null.into_container_or_blob().is_none());
     }
 
     #[test]
