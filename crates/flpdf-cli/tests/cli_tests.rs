@@ -2554,7 +2554,7 @@ fn json_output_open_error_happens_before_json_processing() {
 }
 
 #[test]
-fn json_side_file_error_emits_recorded_warning_after_complete_json_before_fatal_error() {
+fn json_side_file_error_emits_recorded_warning_after_partial_json_before_fatal_error() {
     let fixture = fixture_with_repaired_name_tree_and_stream();
     let temp = tempfile::tempdir().unwrap();
     let missing_prefix = temp.path().join("missing").join("stream");
@@ -2571,8 +2571,16 @@ fn json_side_file_error_emits_recorded_warning_after_complete_json_before_fatal_
         .assert()
         .code(2);
     let output = assert.get_output();
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["outlines"][0]["dest"][0], "3 0 R");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("{\n"), "{stdout}");
+    assert!(
+        stdout.contains("\"dest\": [\n        \"3 0 R\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains(r#""obj:6 0 R": {"#), "{stdout}");
+    assert!(stdout.contains(r#""datafile":"#), "{stdout}");
+    assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).is_err());
+    assert!(!stdout.ends_with("\n}\n"), "{stdout}");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let warning = stderr
