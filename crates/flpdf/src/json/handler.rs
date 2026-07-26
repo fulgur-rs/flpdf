@@ -1,6 +1,6 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
-use std::rc::{Rc, Weak};
+use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use super::Json;
 
@@ -36,33 +36,13 @@ pub struct JsonHandler {
 #[derive(Clone)]
 struct HandlerTarget {
     key: HandlerKey,
-    handler: HandlerReference,
-}
-
-#[derive(Clone)]
-enum HandlerReference {
-    Strong(SharedJsonHandler),
-    Weak(Weak<RefCell<JsonHandler>>),
+    handler: SharedJsonHandler,
 }
 
 impl HandlerTarget {
-    fn new(owner_key: HandlerKey, handler: SharedJsonHandler) -> Self {
+    fn new(handler: SharedJsonHandler) -> Self {
         let key = handler.as_ref().as_ptr() as HandlerKey;
-        let closes_cycle =
-            key == owner_key || handler_reaches(&handler, owner_key, &mut BTreeSet::new());
-        let handler = if closes_cycle {
-            HandlerReference::Weak(Rc::downgrade(&handler))
-        } else {
-            HandlerReference::Strong(handler)
-        };
         Self { key, handler }
-    }
-
-    fn upgrade(&self) -> Option<SharedJsonHandler> {
-        match &self.handler {
-            HandlerReference::Strong(handler) => Some(handler.clone()),
-            HandlerReference::Weak(handler) => handler.upgrade(),
-        }
     }
 }
 
@@ -83,9 +63,15 @@ struct HandlerSnapshot {
     fallback: Option<HandlerTarget>,
 }
 
+#[derive(Clone)]
+struct ActiveHandler {
+    snapshot: HandlerSnapshot,
+    live: Option<SharedJsonHandler>,
+}
+
 #[derive(Default)]
 struct DispatchContext {
-    active: BTreeMap<HandlerKey, HandlerSnapshot>,
+    active: BTreeMap<HandlerKey, ActiveHandler>,
 }
 
 impl JsonHandler {
@@ -102,6 +88,10 @@ impl JsonHandler {
     /// Use this entry point when a callback may dispatch through the same
     /// [`SharedJsonHandler`]. Reentering the same active `FnMut` callback is
     /// unsupported because its mutable callback state is already borrowed.
+    /// A callback that needs to reenter this handler should capture
+    /// `Rc::downgrade(handler)` and upgrade it for the nested call. Capturing a
+    /// strong clone in a callback owned by the same handler creates the same
+    /// ownership cycle as a qpdf `shared_ptr` callback capture.
     pub fn handle_shared(
         handler: &SharedJsonHandler,
         path: &[u8],
@@ -113,8 +103,14 @@ impl JsonHandler {
             handler.snapshot()
         };
         let mut context = DispatchContext::default();
-        context.active.insert(key, snapshot.clone());
-        snapshot.handle(&mut context, path, value)
+        context.active.insert(
+            key,
+            ActiveHandler {
+                snapshot: snapshot.clone(),
+                live: Some(handler.clone()),
+            },
+        );
+        snapshot.handle(&mut context, key, path, value)
     }
 
     pub fn add_any_handler(&mut self, callback: impl FnMut(&[u8], Json) + 'static) {
@@ -151,15 +147,12 @@ impl JsonHandler {
         key: impl AsRef<[u8]>,
         handler: SharedJsonHandler,
     ) {
-        let target = HandlerTarget::new(self as *const JsonHandler as HandlerKey, handler);
+        let target = HandlerTarget::new(handler);
         self.dictionary_keys.insert(key.as_ref().to_vec(), target);
     }
 
     pub fn add_fallback_dictionary_handler(&mut self, handler: SharedJsonHandler) {
-        self.fallback_dictionary = Some(HandlerTarget::new(
-            self as *const JsonHandler as HandlerKey,
-            handler,
-        ));
+        self.fallback_dictionary = Some(HandlerTarget::new(handler));
     }
 
     pub fn add_array_handlers(
@@ -170,26 +163,25 @@ impl JsonHandler {
     ) {
         self.array_start = Some(Rc::new(RefCell::new(Box::new(start))));
         self.array_end = Some(Rc::new(RefCell::new(Box::new(end))));
-        self.array_item = Some(HandlerTarget::new(
-            self as *const JsonHandler as HandlerKey,
-            item,
-        ));
+        self.array_item = Some(HandlerTarget::new(item));
     }
 
     pub fn add_fallback_handler(&mut self, handler: SharedJsonHandler) {
-        self.fallback = Some(HandlerTarget::new(
-            self as *const JsonHandler as HandlerKey,
-            handler,
-        ));
+        self.fallback = Some(HandlerTarget::new(handler));
     }
 
     pub fn handle(&mut self, path: &[u8], value: Json) -> Result<(), JsonHandlerError> {
         let snapshot = self.snapshot();
         let mut context = DispatchContext::default();
-        context
-            .active
-            .insert(self as *const JsonHandler as HandlerKey, snapshot.clone());
-        snapshot.handle(&mut context, path, value)
+        let key = self as *const JsonHandler as HandlerKey;
+        context.active.insert(
+            key,
+            ActiveHandler {
+                snapshot: snapshot.clone(),
+                live: None,
+            },
+        );
+        snapshot.handle(&mut context, key, path, value)
     }
 
     fn snapshot(&self) -> HandlerSnapshot {
@@ -209,22 +201,13 @@ impl JsonHandler {
             fallback: self.fallback.clone(),
         }
     }
-
-    fn targets(&self) -> Vec<HandlerTarget> {
-        self.dictionary_keys
-            .values()
-            .chain(self.fallback_dictionary.iter())
-            .chain(self.array_item.iter())
-            .chain(self.fallback.iter())
-            .cloned()
-            .collect()
-    }
 }
 
 impl HandlerSnapshot {
     fn handle(
         &self,
         context: &mut DispatchContext,
+        owner_key: HandlerKey,
         path: &[u8],
         value: Json,
     ) -> Result<(), JsonHandlerError> {
@@ -269,10 +252,25 @@ impl HandlerSnapshot {
                     }
                     let mut item_path = path_base.clone();
                     item_path.extend_from_slice(key);
-                    item_error = if let Some(handler) = self.dictionary_keys.get(key) {
-                        context.dispatch(handler, &item_path, item).err()
-                    } else if let Some(handler) = &self.fallback_dictionary {
-                        context.dispatch(handler, &item_path, item).err()
+                    let target = context
+                        .active
+                        .get(&owner_key)
+                        .and_then(|active| active.live.as_ref())
+                        .map(|live| {
+                            let live = live.borrow();
+                            live.dictionary_keys
+                                .get(key)
+                                .cloned()
+                                .or_else(|| live.fallback_dictionary.clone())
+                        })
+                        .unwrap_or_else(|| {
+                            self.dictionary_keys
+                                .get(key)
+                                .cloned()
+                                .or_else(|| self.fallback_dictionary.clone())
+                        });
+                    item_error = if let Some(handler) = target {
+                        context.dispatch(&handler, &item_path, item).err()
                     } else {
                         Some(unexpected_key(key, path))
                     };
@@ -336,39 +334,23 @@ impl DispatchContext {
         path: &[u8],
         value: Json,
     ) -> Result<(), JsonHandlerError> {
-        if let Some(snapshot) = self.active.get(&target.key).cloned() {
-            return snapshot.handle(self, path, value);
+        if let Some(active) = self.active.get(&target.key).cloned() {
+            return active.snapshot.handle(self, target.key, path, value);
         }
 
-        let Some(handler) = target.upgrade() else {
-            return Err(JsonHandlerError(format!(
-                "JSON handler target at {} is no longer available",
-                String::from_utf8_lossy(path)
-            )));
-        };
+        let handler = target.handler.clone();
         let snapshot = handler.borrow().snapshot();
-        self.active.insert(target.key, snapshot.clone());
-        let result = snapshot.handle(self, path, value);
+        self.active.insert(
+            target.key,
+            ActiveHandler {
+                snapshot: snapshot.clone(),
+                live: Some(handler),
+            },
+        );
+        let result = snapshot.handle(self, target.key, path, value);
         self.active.remove(&target.key);
         result
     }
-}
-
-fn handler_reaches(
-    handler: &SharedJsonHandler,
-    sought: HandlerKey,
-    visited: &mut BTreeSet<HandlerKey>,
-) -> bool {
-    let key = handler.as_ref().as_ptr() as HandlerKey;
-    if !visited.insert(key) {
-        return false;
-    }
-    handler.borrow().targets().into_iter().any(|target| {
-        target.key == sought
-            || target
-                .upgrade()
-                .is_some_and(|handler| handler_reaches(&handler, sought, visited))
-    })
 }
 
 fn unexpected_key(key: &[u8], path: &[u8]) -> JsonHandlerError {

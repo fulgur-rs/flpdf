@@ -37,6 +37,45 @@ fn dictionary_handler_uses_exact_key_then_unknown_key_fallback() {
 }
 
 #[test]
+fn dictionary_dispatch_rereads_registration_before_each_item() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let root = JsonHandler::shared();
+    root.borrow_mut().add_dictionary_handlers(|_, _| {}, |_| {});
+
+    let replacement = JsonHandler::shared();
+    replacement.borrow_mut().add_number_handler({
+        let seen = seen.clone();
+        move |path, number| {
+            seen.borrow_mut().push(format!(
+                "{}={}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(number)
+            ));
+        }
+    });
+    let original = JsonHandler::shared();
+    original.borrow_mut().add_any_handler(|_, _| {
+        panic!("stale registration was used");
+    });
+    let first = JsonHandler::shared();
+    first.borrow_mut().add_number_handler({
+        let root = Rc::downgrade(&root);
+        let replacement = replacement.clone();
+        move |_, _| {
+            root.upgrade()
+                .expect("root handler must be alive during dispatch")
+                .borrow_mut()
+                .add_dictionary_key_handler(b"b", replacement.clone());
+        }
+    });
+    root.borrow_mut().add_dictionary_key_handler(b"a", first);
+    root.borrow_mut().add_dictionary_key_handler(b"b", original);
+
+    JsonHandler::handle_shared(&root, b".", Json::parse(br#"{"a":1,"b":2}"#).unwrap()).unwrap();
+    assert_eq!(&*seen.borrow(), &[".b=2"]);
+}
+
+#[test]
 fn dictionary_handler_observes_later_member_mutations_and_insertions() {
     let dictionary = Json::parse(br#"{"a":1,"b":2}"#).unwrap();
     let seen = Rc::new(RefCell::new(Vec::new()));
@@ -407,19 +446,6 @@ fn self_referential_dictionary_fallback_handles_finite_recursive_json() {
 }
 
 #[test]
-fn self_referential_handler_does_not_retain_itself() {
-    let handler = JsonHandler::shared();
-    let weak = Rc::downgrade(&handler);
-    handler
-        .borrow_mut()
-        .add_fallback_dictionary_handler(handler.clone());
-
-    drop(handler);
-
-    assert!(weak.upgrade().is_none());
-}
-
-#[test]
 fn mutually_recursive_dictionary_fallbacks_handle_a_finite_cycle() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let first = JsonHandler::shared();
@@ -494,31 +520,12 @@ fn mutually_recursive_dictionary_fallbacks_handle_a_finite_cycle() {
 }
 
 #[test]
-fn mutually_recursive_handlers_do_not_retain_each_other() {
-    let first = JsonHandler::shared();
-    let second = JsonHandler::shared();
-    let first_weak = Rc::downgrade(&first);
-    let second_weak = Rc::downgrade(&second);
-    first
-        .borrow_mut()
-        .add_fallback_dictionary_handler(second.clone());
-    second
-        .borrow_mut()
-        .add_fallback_dictionary_handler(first.clone());
-
-    drop(first);
-    drop(second);
-
-    assert!(first_weak.upgrade().is_none());
-    assert!(second_weak.upgrade().is_none());
-}
-
-#[test]
-fn weak_cycle_edge_dispatches_while_owner_lives_then_reports_expiry() {
+fn breaking_registration_cycle_leaves_remaining_edge_strong() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let first = JsonHandler::shared();
     let second = JsonHandler::shared();
-    first.borrow_mut().add_number_handler({
+    let terminal = JsonHandler::shared();
+    terminal.borrow_mut().add_number_handler({
         let seen = seen.clone();
         move |path, number| {
             seen.borrow_mut().push(format!(
@@ -530,16 +537,16 @@ fn weak_cycle_edge_dispatches_while_owner_lives_then_reports_expiry() {
     });
     first.borrow_mut().add_fallback_handler(second.clone());
     second.borrow_mut().add_fallback_handler(first.clone());
+    first.borrow_mut().add_fallback_handler(terminal.clone());
 
+    let first_weak = Rc::downgrade(&first);
+    drop(first);
     JsonHandler::handle_shared(&second, b".value", Json::make_int(1)).unwrap();
     assert_eq!(&*seen.borrow(), &[".value=1"]);
+    assert!(first_weak.upgrade().is_some());
 
-    drop(first);
-    let error = JsonHandler::handle_shared(&second, b".expired", Json::make_int(2)).unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "JSON handler target at .expired is no longer available"
-    );
+    second.borrow_mut().add_fallback_handler(terminal);
+    assert!(first_weak.upgrade().is_none());
 }
 
 #[test]
@@ -571,6 +578,7 @@ fn handler_configuration_after_registration_is_used_at_dispatch_time() {
 fn shared_entry_point_allows_callback_reentry_into_a_different_nested_callback() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let handler = JsonHandler::shared();
+    let weak = Rc::downgrade(&handler);
     handler.borrow_mut().add_null_handler({
         let seen = seen.clone();
         move |path| {
@@ -579,7 +587,7 @@ fn shared_entry_point_allows_callback_reentry_into_a_different_nested_callback()
         }
     });
     handler.borrow_mut().add_string_handler({
-        let handler = handler.clone();
+        let handler = Rc::downgrade(&handler);
         let seen = seen.clone();
         move |path, value| {
             seen.borrow_mut().push(format!(
@@ -587,11 +595,21 @@ fn shared_entry_point_allows_callback_reentry_into_a_different_nested_callback()
                 String::from_utf8_lossy(path),
                 String::from_utf8_lossy(value)
             ));
-            JsonHandler::handle_shared(&handler, b".nested", Json::make_null()).unwrap();
+            JsonHandler::handle_shared(
+                &handler
+                    .upgrade()
+                    .expect("handler must be alive during callback reentry"),
+                b".nested",
+                Json::make_null(),
+            )
+            .unwrap();
         }
     });
 
     JsonHandler::handle_shared(&handler, b".", Json::make_string(b"outer")).unwrap();
 
     assert_eq!(&*seen.borrow(), &["string:.=outer", "null:.nested"]);
+
+    drop(handler);
+    assert!(weak.upgrade().is_none());
 }
