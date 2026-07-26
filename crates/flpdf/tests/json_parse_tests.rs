@@ -475,6 +475,40 @@ impl Read for FailingReader {
     }
 }
 
+struct ChunkThenErrorReader {
+    chunk: &'static [u8],
+    emitted: bool,
+}
+
+impl Read for ChunkThenErrorReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.emitted {
+            return Err(io::Error::other("reader failure after first member"));
+        }
+        self.emitted = true;
+        out[..self.chunk.len()].copy_from_slice(self.chunk);
+        Ok(self.chunk.len())
+    }
+}
+
+#[test]
+fn parser_emits_reactor_events_before_a_later_reader_error() {
+    let mut reader = ChunkThenErrorReader {
+        chunk: br#"{"first":1,"#,
+        emitted: false,
+    };
+    let mut reactor = RecordingReactor::default();
+
+    let error = Json::parse_reader(&mut reader, Some(&mut reactor)).unwrap_err();
+
+    assert_eq!(error.to_string(), "reader failure after first member");
+    assert_eq!(
+        reactor.events,
+        ["dict-start", "dict-item:first:1"],
+        "the completed first member must be emitted before reading to EOF"
+    );
+}
+
 #[test]
 fn parser_reads_scalars_from_readers_and_preserves_io_errors() {
     let mut reader = Cursor::new(b"  42\n".as_slice());

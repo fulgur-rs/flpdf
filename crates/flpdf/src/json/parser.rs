@@ -1,4 +1,4 @@
-use std::io::{Cursor, Read};
+use std::io::{BufRead, BufReader, Cursor, Read};
 
 use super::{Json, JsonError};
 
@@ -23,9 +23,7 @@ pub fn parse_reader<R: Read>(
     reader: &mut R,
     reactor: Option<&mut dyn Reactor>,
 ) -> Result<Json, JsonError> {
-    let mut input = Vec::new();
-    reader.read_to_end(&mut input)?;
-    Parser::new(&input, reactor).parse()
+    Parser::new(reader, reactor).parse()
 }
 
 impl Json {
@@ -84,8 +82,8 @@ struct StackEntry {
     item: Json,
 }
 
-struct Parser<'input, 'reactor> {
-    input: &'input [u8],
+struct Parser<'reader, 'reactor, R: Read> {
+    reader: BufReader<&'reader mut R>,
     reactor: Option<&'reactor mut dyn Reactor>,
     pos: usize,
     state: LexState,
@@ -102,10 +100,10 @@ struct Parser<'input, 'reactor> {
     dict_key_offset: i64,
 }
 
-impl<'input, 'reactor> Parser<'input, 'reactor> {
-    fn new(input: &'input [u8], reactor: Option<&'reactor mut dyn Reactor>) -> Self {
+impl<'reader, 'reactor, R: Read> Parser<'reader, 'reactor, R> {
+    fn new(reader: &'reader mut R, reactor: Option<&'reactor mut dyn Reactor>) -> Self {
         Self {
-            input,
+            reader: BufReader::with_capacity(16 * 1024, reader),
             reactor,
             pos: 0,
             state: LexState::Top,
@@ -149,22 +147,23 @@ impl<'input, 'reactor> Parser<'input, 'reactor> {
         self.pos as i64
     }
 
-    fn current(&self) -> Option<u8> {
-        self.input.get(self.pos).copied()
+    fn current(&mut self) -> Result<Option<u8>, JsonError> {
+        Ok(self.reader.fill_buf()?.first().copied())
     }
 
-    fn append(&mut self) {
-        self.token
-            .push(self.current().expect("append requires input"));
+    fn append(&mut self, byte: u8) {
+        self.token.push(byte);
+        self.reader.consume(1);
         self.pos += 1;
     }
 
-    fn append_state(&mut self, state: LexState) {
+    fn append_state(&mut self, state: LexState, byte: u8) {
         self.state = state;
-        self.append();
+        self.append(byte);
     }
 
     fn ignore(&mut self) {
+        self.reader.consume(1);
         self.pos += 1;
     }
 
@@ -177,12 +176,12 @@ impl<'input, 'reactor> Parser<'input, 'reactor> {
         JsonError::Parse(message.into())
     }
 
-    fn token_error(&self) -> Result<(), JsonError> {
+    fn token_error(&mut self) -> Result<(), JsonError> {
         if self.done {
             return Err(self.error("JSON: premature end of input"));
         }
 
-        let byte = self.current().expect("not done has input");
+        let byte = self.current()?.expect("not done has input");
         let offset = self.offset();
         match self.state {
             LexState::U4 => Err(self.error(format!(
@@ -267,7 +266,7 @@ impl<'input, 'reactor> Parser<'input, 'reactor> {
         self.high_offset = None;
 
         loop {
-            let Some(byte) = self.current() else {
+            let Some(byte) = self.current()? else {
                 self.done = true;
                 break;
             };
@@ -295,7 +294,7 @@ impl<'input, 'reactor> Parser<'input, 'reactor> {
                         return Ok(());
                     }
                     if self.state == LexState::String {
-                        self.append();
+                        self.append(byte);
                     } else {
                         break;
                     }
@@ -306,7 +305,7 @@ impl<'input, 'reactor> Parser<'input, 'reactor> {
                         return Ok(());
                     }
                     if self.state == LexState::String {
-                        self.append();
+                        self.append(byte);
                     } else {
                         break;
                     }
@@ -315,7 +314,7 @@ impl<'input, 'reactor> Parser<'input, 'reactor> {
                     if self.state == LexState::Top {
                         self.ignore();
                     } else if self.state == LexState::String {
-                        self.append();
+                        self.append(byte);
                     } else {
                         break;
                     }
@@ -327,7 +326,7 @@ impl<'input, 'reactor> Parser<'input, 'reactor> {
                         return Ok(());
                     }
                     if self.state == LexState::String {
-                        self.append();
+                        self.append(byte);
                     } else {
                         break;
                     }
@@ -338,7 +337,7 @@ impl<'input, 'reactor> Parser<'input, 'reactor> {
                         return Ok(());
                     }
                     if self.state == LexState::String {
-                        self.append();
+                        self.append(byte);
                     } else {
                         break;
                     }
@@ -350,7 +349,7 @@ impl<'input, 'reactor> Parser<'input, 'reactor> {
                         return Ok(());
                     }
                     if self.state == LexState::String {
-                        self.append();
+                        self.append(byte);
                     } else {
                         break;
                     }
@@ -361,7 +360,7 @@ impl<'input, 'reactor> Parser<'input, 'reactor> {
                         return Ok(());
                     }
                     if self.state == LexState::String {
-                        self.append();
+                        self.append(byte);
                     } else {
                         break;
                     }
@@ -371,10 +370,10 @@ impl<'input, 'reactor> Parser<'input, 'reactor> {
                         self.token_start = self.offset();
                         match byte {
                             b'"' => self.ignore_state(LexState::String),
-                            b'a'..=b'z' => self.append_state(LexState::Alpha),
-                            b'-' => self.append_state(LexState::NumberMinus),
-                            b'1'..=b'9' => self.append_state(LexState::NumberBeforePoint),
-                            b'0' => self.append_state(LexState::NumberLeadingZero),
+                            b'a'..=b'z' => self.append_state(LexState::Alpha, byte),
+                            b'-' => self.append_state(LexState::NumberMinus, byte),
+                            b'1'..=b'9' => self.append_state(LexState::NumberBeforePoint, byte),
+                            b'0' => self.append_state(LexState::NumberLeadingZero, byte),
                             _ => {
                                 return Err(self.error(format!(
                                     "JSON: offset {}: unexpected character {}",
@@ -385,8 +384,8 @@ impl<'input, 'reactor> Parser<'input, 'reactor> {
                         }
                     }
                     LexState::NumberMinus => match byte {
-                        b'1'..=b'9' => self.append_state(LexState::NumberBeforePoint),
-                        b'0' => self.append_state(LexState::NumberLeadingZero),
+                        b'1'..=b'9' => self.append_state(LexState::NumberBeforePoint, byte),
+                        b'0' => self.append_state(LexState::NumberLeadingZero, byte),
                         _ => {
                             return Err(self.error(format!(
                                 "JSON: offset {}: numeric literal: no digit after minus sign",
@@ -395,8 +394,8 @@ impl<'input, 'reactor> Parser<'input, 'reactor> {
                         }
                     },
                     LexState::NumberLeadingZero => match byte {
-                        b'.' => self.append_state(LexState::NumberPoint),
-                        b'e' | b'E' => self.append_state(LexState::NumberE),
+                        b'.' => self.append_state(LexState::NumberPoint, byte),
+                        b'e' | b'E' => self.append_state(LexState::NumberE, byte),
                         _ => {
                             return Err(self.error(format!(
                                 "JSON: offset {}: number with leading zero",
@@ -405,45 +404,45 @@ impl<'input, 'reactor> Parser<'input, 'reactor> {
                         }
                     },
                     LexState::NumberBeforePoint => match byte {
-                        b'0'..=b'9' => self.append(),
-                        b'.' => self.append_state(LexState::NumberPoint),
-                        b'e' | b'E' => self.append_state(LexState::NumberE),
+                        b'0'..=b'9' => self.append(byte),
+                        b'.' => self.append_state(LexState::NumberPoint, byte),
+                        b'e' | b'E' => self.append_state(LexState::NumberE, byte),
                         _ => return self.token_error(),
                     },
                     LexState::NumberPoint => {
                         if byte.is_ascii_digit() {
-                            self.append_state(LexState::NumberAfterPoint);
+                            self.append_state(LexState::NumberAfterPoint, byte);
                         } else {
                             return self.token_error();
                         }
                     }
                     LexState::NumberAfterPoint => match byte {
-                        b'0'..=b'9' => self.append(),
-                        b'e' | b'E' => self.append_state(LexState::NumberE),
+                        b'0'..=b'9' => self.append(byte),
+                        b'e' | b'E' => self.append_state(LexState::NumberE, byte),
                         _ => return self.token_error(),
                     },
                     LexState::NumberE => match byte {
-                        b'0'..=b'9' => self.append_state(LexState::Number),
-                        b'+' | b'-' => self.append_state(LexState::NumberESign),
+                        b'0'..=b'9' => self.append_state(LexState::Number, byte),
+                        b'+' | b'-' => self.append_state(LexState::NumberESign, byte),
                         _ => return self.token_error(),
                     },
                     LexState::NumberESign => {
                         if byte.is_ascii_digit() {
-                            self.append_state(LexState::Number);
+                            self.append_state(LexState::Number, byte);
                         } else {
                             return self.token_error();
                         }
                     }
                     LexState::Number => {
                         if byte.is_ascii_digit() {
-                            self.append();
+                            self.append(byte);
                         } else {
                             return self.token_error();
                         }
                     }
                     LexState::Alpha => {
                         if byte.is_ascii_lowercase() {
-                            self.append();
+                            self.append(byte);
                         } else {
                             return self.token_error();
                         }
@@ -459,7 +458,7 @@ impl<'input, 'reactor> Parser<'input, 'reactor> {
                             return Ok(());
                         }
                         b'\\' => self.ignore_state(LexState::Backslash),
-                        _ => self.append(),
+                        _ => self.append(byte),
                     },
                     LexState::Backslash => {
                         self.state = LexState::String;
