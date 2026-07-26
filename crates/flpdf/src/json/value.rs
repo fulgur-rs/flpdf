@@ -58,6 +58,23 @@ pub(crate) enum ValueSnapshot {
     Blob(Rc<RefCell<Box<dyn FnMut(&mut dyn io::Write) -> io::Result<()>>>>),
 }
 
+pub(crate) enum ContainerOrBlobSnapshot {
+    Dictionary(Vec<(Vec<u8>, Json)>),
+    Array(Vec<Json>),
+    Blob(Rc<RefCell<Box<dyn FnMut(&mut dyn io::Write) -> io::Result<()>>>>),
+}
+
+impl ValueSnapshot {
+    pub(crate) fn into_container_or_blob(self) -> Option<ContainerOrBlobSnapshot> {
+        match self {
+            Self::Dictionary(members) => Some(ContainerOrBlobSnapshot::Dictionary(members)),
+            Self::Array(values) => Some(ContainerOrBlobSnapshot::Array(values)),
+            Self::Blob(writer) => Some(ContainerOrBlobSnapshot::Blob(writer)),
+            Self::String(_) | Self::Number(_) | Self::Bool(_) | Self::Null => None,
+        }
+    }
+}
+
 impl Json {
     pub const LATEST: i32 = 2;
 
@@ -197,11 +214,16 @@ mod tests {
             string.unparse().unwrap(),
             b"\"quote \\\" slash \\\\ control \\u0001\""
         );
+        assert_eq!(
+            Json::make_string(b"\x08\x0c\n\r\t\x1f").unparse().unwrap(),
+            b"\"\\b\\f\\n\\r\\t\\u001f\""
+        );
 
         assert_eq!(Json::make_int(-42).unparse().unwrap(), b"-42");
         assert_eq!(Json::make_real(2.5).unparse().unwrap(), b"2.5");
         assert_eq!(Json::make_real(0.0).unparse().unwrap(), b"0");
         assert_eq!(Json::make_null().unparse().unwrap(), b"null");
+        assert_eq!(Json::make_null().get_bool(), None);
         assert_eq!(Json::LATEST, 2);
     }
 
@@ -237,6 +259,21 @@ mod tests {
             tree.unparse().unwrap(),
             b"{\n  \"a\": 2,\n  \"z\": [\n    true\n  ]\n}"
         );
+    }
+
+    #[test]
+    fn empty_and_multi_element_containers_write_qpdf_delimiters() {
+        let empty_dictionary = Json::with_value(Value::Dictionary {
+            members: BTreeMap::new(),
+            parsed_keys: BTreeSet::new(),
+        });
+        assert_eq!(empty_dictionary.unparse().unwrap(), b"{}");
+
+        let array = Json::with_value(Value::Array(vec![Json::make_int(1), Json::make_int(2)]));
+        assert_eq!(array.unparse().unwrap(), b"[\n  1,\n  2\n]");
+
+        let empty_array = Json::with_value(Value::Array(Vec::new()));
+        assert_eq!(empty_array.unparse().unwrap(), b"[]");
     }
 
     #[test]

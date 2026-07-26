@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 
-use super::value::ValueSnapshot;
+use super::value::{ContainerOrBlobSnapshot, ValueSnapshot};
 use super::Json;
 
 impl Json {
@@ -19,7 +19,13 @@ impl Json {
                 out.write_all(&encoded)?;
                 out.write_all(b"\"")
             }
-            Some(other) => write_container_or_blob(other, out, depth),
+            Some(other) => write_container_or_blob(
+                other
+                    .into_container_or_blob()
+                    .expect("scalar values are handled by Json::write"),
+                out,
+                depth,
+            ),
         }
     }
 
@@ -31,12 +37,12 @@ impl Json {
 }
 
 fn write_container_or_blob(
-    value: ValueSnapshot,
+    value: ContainerOrBlobSnapshot,
     out: &mut (impl Write + ?Sized),
     depth: usize,
 ) -> io::Result<()> {
     match value {
-        ValueSnapshot::Dictionary(members) => {
+        ContainerOrBlobSnapshot::Dictionary(members) => {
             if members.is_empty() {
                 return out.write_all(b"{}");
             }
@@ -56,7 +62,7 @@ fn write_container_or_blob(
             write_indent(out, depth)?;
             out.write_all(b"}")
         }
-        ValueSnapshot::Array(values) => {
+        ContainerOrBlobSnapshot::Array(values) => {
             if values.is_empty() {
                 return out.write_all(b"[]");
             }
@@ -73,17 +79,13 @@ fn write_container_or_blob(
             write_indent(out, depth)?;
             out.write_all(b"]")
         }
-        ValueSnapshot::Blob(writer) => {
+        ContainerOrBlobSnapshot::Blob(writer) => {
             let mut bytes = Vec::new();
             writer.borrow_mut()(&mut bytes)?;
             out.write_all(b"\"")?;
             out.write_all(STANDARD.encode(bytes).as_bytes())?;
             out.write_all(b"\"")
         }
-        ValueSnapshot::String(_)
-        | ValueSnapshot::Number(_)
-        | ValueSnapshot::Bool(_)
-        | ValueSnapshot::Null => unreachable!("scalar values are handled by Json::write"),
     }
 }
 
