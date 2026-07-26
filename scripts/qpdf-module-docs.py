@@ -383,7 +383,12 @@ def _render_markdown_code_span(value: str) -> str:
         default=0,
     )
     delimiter = "`" * (longest_backtick_run + 1)
-    return f"{delimiter}{table_safe_value}{delimiter}"
+    padding = (
+        " "
+        if table_safe_value.startswith("`") or table_safe_value.endswith("`")
+        else ""
+    )
+    return f"{delimiter}{padding}{table_safe_value}{padding}{delimiter}"
 
 
 def render_index(entries: list[tuple[Path, Classification]]) -> str:

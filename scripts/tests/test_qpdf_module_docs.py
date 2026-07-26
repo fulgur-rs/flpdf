@@ -355,6 +355,29 @@ class GeneratorTests(unittest.TestCase):
             rendered,
         )
 
+    def test_module_path_code_span_pads_edge_backticks(self):
+        rendered = self.module.render_index(
+            [
+                (
+                    Path("`leading.rs"),
+                    self.module.Classification("correspondence", "leading"),
+                ),
+                (
+                    Path("trailing.rs`"),
+                    self.module.Classification("correspondence", "trailing"),
+                ),
+            ]
+        )
+
+        self.assertIn(
+            "| `` `leading.rs `` | correspondence | leading |",
+            rendered,
+        )
+        self.assertIn(
+            "| `` trailing.rs` `` | correspondence | trailing |",
+            rendered,
+        )
+
     def test_module_path_code_span_escapes_backslash_before_pipe(self):
         rendered = self.module.render_index(
             [

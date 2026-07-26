@@ -107,7 +107,7 @@ fn require_mapping<'a>(value: &'a Yaml, context: &str) -> ContractResult<&'a Yam
         .ok_or_else(|| format!("{context} must be a mapping"))
 }
 
-fn has_default_run_shell(mapping: &Yaml, context: &str) -> ContractResult<bool> {
+fn has_default_run_override(mapping: &Yaml, context: &str) -> ContractResult<bool> {
     let Some(defaults) = mapping_get(mapping, "defaults") else {
         return Ok(false);
     };
@@ -116,7 +116,7 @@ fn has_default_run_shell(mapping: &Yaml, context: &str) -> ContractResult<bool> 
         return Ok(false);
     };
     let run = require_mapping(run, &format!("{context}.defaults.run"))?;
-    Ok(mapping_contains_key(run, "shell"))
+    Ok(mapping_contains_key(run, "shell") || mapping_contains_key(run, "working-directory"))
 }
 
 fn continue_on_error_is_gating(mapping: &Yaml) -> bool {
@@ -129,16 +129,17 @@ fn continue_on_error_is_gating(mapping: &Yaml) -> bool {
 fn step_is_gating(step: &Yaml) -> bool {
     !mapping_contains_key(step, "if")
         && !mapping_contains_key(step, "shell")
+        && !mapping_contains_key(step, "working-directory")
         && continue_on_error_is_gating(step)
 }
 
 fn job_contains_exact_command(
     job: &Yaml,
-    inherited_default_shell: bool,
+    inherited_default_run_override: bool,
     command: &str,
 ) -> ContractResult<bool> {
     let job = require_mapping(job, "job")?;
-    let job_has_default_shell = has_default_run_shell(job, "job")?;
+    let job_has_default_run_override = has_default_run_override(job, "job")?;
     let steps = match mapping_get(job, "steps") {
         Some(steps) => Some(
             steps
@@ -148,9 +149,10 @@ fn job_contains_exact_command(
         None => None,
     };
 
-    if inherited_default_shell
-        || job_has_default_shell
+    if inherited_default_run_override
+        || job_has_default_run_override
         || mapping_contains_key(job, "if")
+        || mapping_contains_key(job, "needs")
         || !continue_on_error_is_gating(job)
     {
         return Ok(false);
@@ -176,14 +178,14 @@ fn workflow_contains_exact_command(workflow: &str, command: &str) -> ContractRes
 
 fn quality_workflow_contains_exact_command(workflow: &str, command: &str) -> ContractResult<bool> {
     let workflow = parse_workflow(workflow)?;
-    let inherited_default_shell = has_default_run_shell(&workflow, "workflow")?;
+    let inherited_default_run_override = has_default_run_override(&workflow, "workflow")?;
     let jobs =
         mapping_get(&workflow, "jobs").ok_or_else(|| "ci workflow must define jobs".to_owned())?;
     let jobs = require_mapping(jobs, "workflow.jobs")?;
     let quality = mapping_get(jobs, "quality")
         .ok_or_else(|| "ci workflow must define the quality job".to_owned())?;
 
-    job_contains_exact_command(quality, inherited_default_shell, command)
+    job_contains_exact_command(quality, inherited_default_run_override, command)
 }
 
 #[test]
@@ -531,6 +533,21 @@ steps:
 }
 
 #[test]
+fn workflow_exact_command_match_rejects_custom_step_working_directory() {
+    let command = "python3 scripts/qpdf-module-docs.py --check";
+    let workflow = format!(
+        "\
+steps:
+  - run: {command}
+    working-directory: scripts
+"
+    );
+
+    assert!(!workflow_contains_exact_command(&workflow, command)
+        .expect("synthetic job workflow must be valid"));
+}
+
+#[test]
 fn workflow_exact_command_match_rejects_quoted_custom_step_shell_key() {
     let command = "python3 scripts/qpdf-module-docs.py --check";
     let workflow = format!(
@@ -585,6 +602,25 @@ fn quality_command_contract_rejects_workflow_default_shell() {
 defaults:
   run:
     shell: echo {{0}}
+jobs:
+  quality:
+    steps:
+      - run: {command}
+"
+    );
+
+    assert!(!quality_workflow_contains_exact_command(&workflow, command)
+        .expect("synthetic complete workflow must be valid"));
+}
+
+#[test]
+fn quality_command_contract_rejects_workflow_default_working_directory() {
+    let command = "python3 scripts/qpdf-module-docs.py --check";
+    let workflow = format!(
+        "\
+defaults:
+  run:
+    working-directory: scripts
 jobs:
   quality:
     steps:
@@ -678,7 +714,7 @@ steps:
 }
 
 #[test]
-fn flow_style_default_working_directory_does_not_disable_gate() {
+fn workflow_exact_command_match_rejects_flow_style_default_working_directory() {
     let command = "python3 scripts/qpdf-module-docs.py --check";
     let workflow = format!(
         "\
@@ -688,8 +724,8 @@ steps:
 "
     );
 
-    assert!(workflow_contains_exact_command(&workflow, command)
-        .expect("flow-style defaults must parse"));
+    assert!(!workflow_contains_exact_command(&workflow, command)
+        .expect("synthetic job workflow must be valid"));
 }
 
 #[test]
@@ -720,6 +756,27 @@ steps:
 
     assert!(!workflow_contains_exact_command(&workflow, command)
         .expect("synthetic job workflow must be valid"));
+}
+
+#[test]
+fn quality_command_contract_rejects_dependent_quality_job() {
+    let command = "python3 scripts/qpdf-module-docs.py --check";
+    let workflow = format!(
+        "\
+jobs:
+  setup:
+    if: false
+    steps:
+      - run: echo skipped
+  quality:
+    needs: setup
+    steps:
+      - run: {command}
+"
+    );
+
+    assert!(!quality_workflow_contains_exact_command(&workflow, command)
+        .expect("synthetic complete workflow must be valid"));
 }
 
 #[test]
