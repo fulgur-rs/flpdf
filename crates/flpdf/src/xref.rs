@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF.cc xref loading and repair plus QPDFXRefEntry.cc data representation.
 use crate::diagnostics::Diagnostic;
 use crate::object::collect_qpdf_object_references;
 use crate::parser::{parse_indirect_object, Parser};

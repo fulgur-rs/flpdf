@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFJob.cc rotate-spec parsing split from page rotation.
 //! Parser for qpdf's `--rotate` flag specification.
 //!
 //! # Syntax

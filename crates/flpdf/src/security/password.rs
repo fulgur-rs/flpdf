@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF_encryption.cc password normalization and revision-specific truncation.
 //! Password input mode handling and normalization for Standard security handler.
 //!
 //! qpdf exposes `--password-mode={auto,bytes,hex-bytes,unicode}` to control how

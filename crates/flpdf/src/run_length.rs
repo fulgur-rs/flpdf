@@ -1,3 +1,4 @@
+//! qpdf correspondence: Pl_RunLength.cc codec semantics via whole-buffer functions; the qpdf Pipeline component boundary is not mirrored.
 //! RunLengthDecode encode/decode per PDF 1.7 section 7.4.5.
 //!
 //! ## Decoder notes

@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFJob.cc handlePageSpecs single-document selection planning.
 //! Page-selection plan for a single document.
 //!
 //! Given a [`Pdf`] and a [`PageRange`], [`PagePlan::build`] resolves the range

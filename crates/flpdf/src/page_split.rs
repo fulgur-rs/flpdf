@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFJob.cc split-pages orchestration and output naming.
 //! Split a single PDF into multiple smaller PDFs by consecutive page chunks.
 //!
 //! [`split_pages`] implements qpdf's `--split-pages=N` semantics: it divides

@@ -1,3 +1,4 @@
+//! qpdf correspondence: flpdf-only font-resource inspection surface.
 //! Font-resource collection helpers.
 //!
 //! Aggregates the fonts referenced from every `Page` node's `/Resources /Font`

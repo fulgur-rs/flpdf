@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFTokenizer.cc normal mode; additional qpdf tokenizer modes remain incomplete.
 use std::borrow::Cow;
 
 use crate::{Error, Result};

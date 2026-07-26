@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFWriter.cc plain object-body emission split from planning and xref output.
 use std::io::{Read, Seek};
 
 use crate::rewrite_renumber::renumber_qpdf_refs_in_place_with_removed;

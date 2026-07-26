@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFPageObjectHelper.cc and QPDFAnnotationObjectHelper.cc annotation enumeration.
 //! Per-page annotation enumeration and widget-to-field linkage.
 //!
 //! [`enumerate_page_annotations`] reads the `/Annots` array of a leaf page,

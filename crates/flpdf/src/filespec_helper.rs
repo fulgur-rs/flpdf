@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc partial helper surface; public APIs are incomplete.
 //! Typed wrappers for `/Filespec` dictionaries and `/EmbeddedFile` streams,
 //! plus a builder for constructing them.
 //!

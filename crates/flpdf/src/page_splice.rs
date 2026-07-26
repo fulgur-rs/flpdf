@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFPageDocumentHelper.cc page insertion and removal represented as an in-place splice.
 //! Surgical in-place splice of the `/Pages` tree.
 //!
 //! Unlike [`crate::page_tree_rebuild`], which always produces a flat single-level

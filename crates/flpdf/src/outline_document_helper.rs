@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFOutlineDocumentHelper.cc and QPDFOutlineObjectHelper.cc responsibilities split with outline.rs.
 //! High-level outline (`/Outlines`) document helper.
 //!
 //! [`OutlineDocumentHelper`] wraps a `&mut Pdf<R>` and materializes the document

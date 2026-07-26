@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFJob.cc page selection and QPDFWriter.cc null visibility specialized for surviving destinations.
 //! Outline and named-destination remapping after page extraction.
 //!
 //! After [`crate::page_tree_rebuild::rebuild_page_tree`] has rebuilt the page tree

@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFPageLabelDocumentHelper.cc behavior without a completed public API and single-implementation audit.
 //! qpdf `QPDFPageLabelDocumentHelper`-equivalent page-label access.
 //!
 //! [`PageLabelDocumentHelper`] reads, renders (ISO 32000-1 §12.4.2), and edits

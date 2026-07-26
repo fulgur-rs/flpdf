@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for OBJR annotations.
 //! Annotation `/P` reference drop for annotations kept alive only through a
 //! structure-tree object reference (`/Type /OBJR`) `/Obj`, after page
 //! extraction.

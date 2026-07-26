@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF_linearization.cc hint decoding plus QPDFJob.cc display formatting.
 //! Linearization hint-stream decoder and `show-linearization` formatter.
 //!
 //! This module is the read-side inverse of the hint-stream encoder in

@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF.cc readObject/readStream framing and recovery split from the document reader.
 use crate::parser::{
     keyword_token_end, parse_qpdf_direct_object, parse_strict_direct_object, ParsedDirectObject,
     RecoveredStreamEol,

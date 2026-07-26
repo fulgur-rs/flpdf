@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF_linearization.cc responsibilities split across the linearization module tree.
 //! Linearization support — data model and planning structures.
 //!
 //! This module implements the planning layer for producing PDF linearized output

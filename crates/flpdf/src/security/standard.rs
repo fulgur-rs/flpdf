@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF_encryption.cc Standard security handler algorithms split from writer setup.
 //! Standard Security Handler key derivation for PDF V=1, V=2, V=4, and V=5.
 //!
 //! Implements the following algorithms from PDF 1.7 §7.6.3.3:

@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFParser.cc object parsing with tokenizer responsibilities still shared elsewhere.
 use std::collections::VecDeque;
 
 use crate::tokenizer::{is_delimiter, is_ws, Token, TokenType, Tokenizer};

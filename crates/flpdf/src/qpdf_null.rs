@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFObjectHandle.cc isNull resolution plus QPDFWriter.cc null-valued dictionary visibility.
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};

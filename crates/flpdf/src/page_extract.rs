@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFPageDocumentHelper.cc emptyPDF/addPage operations plus QPDFJob.cc page extraction.
 //! Page extraction into a fresh minimal document.
 //!
 //! [`extract_pages`] builds a brand-new minimal [`Pdf`] containing the

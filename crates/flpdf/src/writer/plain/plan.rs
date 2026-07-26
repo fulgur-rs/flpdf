@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFWriter.cc standard-write object placement and renumber planning.
 //! Logical object placements for the qpdf-shaped plain writer pipeline.
 
 use std::collections::{BTreeSet, HashMap};

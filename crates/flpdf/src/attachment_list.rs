@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFJob.cc attachment enumeration and display formatting.
 //! Structured enumeration and formatted display of PDF attachments.
 //!
 //! This module builds on [`crate::embedded_files::list_embedded_files`] and

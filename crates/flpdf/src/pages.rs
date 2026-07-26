@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF_pages.cc traversal responsibilities shared with page-tree rebuild and linearization repair.
 //! Page-tree traversal helpers.
 //!
 //! Iterates the document's `/Pages` tree in the order described by ISO 32000-1 §7.7.3.2

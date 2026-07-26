@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF_pages.cc page-tree repair plus QPDFJob.cc page-selection rebuilding.
 //! Page-tree rebuild after extraction / merge / rotate.
 //!
 //! Given an open [`Pdf`] and an ordered list of selected leaf `/Page`

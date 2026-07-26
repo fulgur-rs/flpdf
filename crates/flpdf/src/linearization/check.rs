@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF_linearization.cc structural validation represented as a standalone checker.
 //! Linearization structural checker.
 //!
 //! This module validates that a PDF file conforms to the linearization layout

@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF_encryption.cc responsibilities split across the Rust security module tree.
 //! Internal security primitives used by PDF encryption/decryption.
 //!
 //! Nothing in this module is part of the public API; all items are

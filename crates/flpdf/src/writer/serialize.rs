@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFWriter.cc shared object, stream, trailer, and xref serialization primitives.
 use super::{object_streams, CompressStreams, NewlineBeforeEndstream};
 
 /// Write a PDF stream to `out`, applying the [`NewlineBeforeEndstream`] policy.

@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF.cc copyForeignObject graph closure split from object copying.
 //! Per-page transitive object closure.
 //!
 //! Given a page `ObjectRef`, [`page_object_closure`] computes the complete set

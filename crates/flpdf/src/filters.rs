@@ -1,3 +1,4 @@
+//! qpdf correspondence: Pl_Flate, Pl_LZWDecoder, predictor, and stream-filter responsibilities combined in one Rust pipeline.
 use crate::ascii85;
 use crate::ascii_hex;
 use crate::run_length;

@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFPageObjectHelper.cc removeUnreferencedResources traversal split from the page helper.
 //! Unreferenced-resource pruning (ISO 32000-1 §7.8.3 / qpdf `--remove-unreferenced-resources`).
 //!
 //! Scans every page's content stream(s) via [`crate::content_stream::ContentStreamParser`],

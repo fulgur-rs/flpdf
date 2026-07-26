@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFJob.cc handlePageSpecs multi-input combination split into a page-operation module.
 //! Multi-input page list combiner.
 //!
 //! [`CombinedPlan`] opens multiple input documents (each with an optional

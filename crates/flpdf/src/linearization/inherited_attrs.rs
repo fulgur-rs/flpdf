@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF_pages.cc and QPDF_optimization.cc page-tree repair responsibilities.
 //! Push inherited page attributes down to `/Page` leaves and strip them from
 //! interior `/Pages` nodes, mirroring qpdf's `pushInheritedAttributesToPage`
 //! (`QPDF_optimization.cc:127-156`) together with the page-tree repairs its
