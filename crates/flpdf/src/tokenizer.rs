@@ -343,7 +343,7 @@ impl<'a> Tokenizer<'a> {
             State::StringEscape => self.in_string_escape(byte),
             State::CharCode => self.in_char_code(byte),
             State::Literal => self.in_literal(byte),
-            State::InlineImage => self.in_inline_image(byte), // cov:ignore: Task 4 adds the only entry path
+            State::InlineImage => self.in_inline_image(byte),
             State::InHexString => self.in_hex_string(byte),
             State::InHexStringSecond => self.in_hex_string_second(byte),
             State::NameHex1 => self.in_name_hex1(byte),
@@ -676,7 +676,6 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
-    // cov:ignore-start: Task 4 adds the only entry path for inline-image state
     fn in_inline_image(&mut self, _byte: u8) {
         if self.raw.len() + 1 == self.inline_image_bytes {
             self.token_type = TokenType::InlineImage;
@@ -684,12 +683,56 @@ impl<'a> Tokenizer<'a> {
             self.state = State::TokenReady;
         }
     }
-    // cov:ignore-end
 }
 
 impl<'a> Tokenizer<'a> {
     pub(crate) fn position(&self) -> usize {
         self.pos
+    }
+
+    #[allow(dead_code)] // Task 6 routes content-stream inline images through this tokenizer API.
+    pub(crate) fn expect_inline_image(&mut self) -> std::result::Result<(), TokenizerStateError> {
+        if self.state == State::TokenReady {
+            self.reset();
+        } else if self.state != State::BeforeToken {
+            return Err(TokenizerStateError::ImproperInlineImageState);
+        }
+
+        self.inline_image_bytes = self.find_ei().unwrap_or(0);
+        self.before_token = false;
+        self.in_token = true;
+        self.state = State::InlineImage;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Called by expect_inline_image before Task 6 adds its production caller.
+    fn find_ei(&mut self) -> Option<usize> {
+        let initial_pos = self.pos;
+        let mut search_pos = initial_pos;
+        let mut candidate_distance = None;
+
+        while search_pos < self.input.len() {
+            let Some(relative_start) = self.input[search_pos..]
+                .windows(2)
+                .position(|window| window == b"EI")
+            else {
+                break;
+            };
+            let candidate_start = search_pos + relative_start;
+            if let Some(after_ei) = word_token_at(self.input, candidate_start, b"EI") {
+                candidate_distance = Some(candidate_start - initial_pos);
+                self.pos = after_ei;
+                if inline_lookahead_is_plausible(self.input, after_ei) {
+                    break;
+                }
+                search_pos = after_ei;
+            } else {
+                search_pos = candidate_start + 1;
+            }
+        }
+
+        self.pos = initial_pos;
+        candidate_distance
     }
 
     /// Pull adapter matching qpdf 11.9.0 `QPDFTokenizer::readToken` and
@@ -812,6 +855,58 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
+#[allow(dead_code)] // Called by find_ei before Task 6 adds the production entry path.
+fn word_token_at(input: &[u8], start: usize, expected: &[u8]) -> Option<usize> {
+    let end = start.checked_add(expected.len())?;
+    if start == 0
+        || input.get(start..end)? != expected
+        || !is_token_delimiter(input[start - 1])
+        || input
+            .get(end)
+            .is_some_and(|&byte| !is_token_delimiter(byte))
+    {
+        return None;
+    }
+    Some(end)
+}
+
+#[allow(dead_code)] // Called by find_ei before Task 6 adds the production entry path.
+fn inline_lookahead_is_plausible(input: &[u8], after_ei: usize) -> bool {
+    let mut tokenizer = Tokenizer::new(&input[after_ei..]);
+    tokenizer.allow_eof();
+
+    for _ in 0..10 {
+        let token = tokenizer
+            .read_token(true, 0)
+            .expect("allow_bad makes tokenizer errors observable as tokens");
+        if token.token_type == TokenType::Eof {
+            return true;
+        }
+        if token.token_type == TokenType::Bad {
+            return false;
+        }
+        if token.token_type == TokenType::Word {
+            let mut found_alpha = false;
+            let mut found_non_printable = false;
+            let mut found_other = false;
+            for &byte in &token.value {
+                if byte.is_ascii_alphabetic() || byte == b'*' {
+                    found_alpha = true;
+                } else if (byte as i8) < 32 && !is_ws(byte) {
+                    found_non_printable = true;
+                    break;
+                } else {
+                    found_other = true;
+                }
+            }
+            if found_non_printable || (found_alpha && found_other) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -901,6 +996,150 @@ mod tests {
 
     fn first_pulled(input: &[u8]) -> Token {
         Tokenizer::new(input).read_token(true, 0).unwrap()
+    }
+
+    fn inline_image_token(input_after_id_separator: &[u8]) -> Token {
+        let mut tokenizer = Tokenizer::new(input_after_id_separator);
+        tokenizer.allow_eof();
+        tokenizer.expect_inline_image().unwrap();
+        tokenizer.read_token(true, 0).unwrap()
+    }
+
+    #[test]
+    fn inline_image_skips_false_ei_followed_by_suspicious_tokens() {
+        let token = inline_image_token(b"abc EI \x01bad EI Q");
+        assert_eq!(token.token_type, TokenType::InlineImage);
+        assert_eq!(token.value, b"abc EI \x01bad ");
+        assert_eq!(token.raw, token.value);
+    }
+
+    #[test]
+    fn inline_image_accepts_ei_followed_by_ten_good_content_tokens() {
+        let token = inline_image_token(b"payload EI q 1 0 0 1 0 0 cm Q");
+        assert_eq!(token.token_type, TokenType::InlineImage);
+        assert_eq!(token.value, b"payload ");
+    }
+
+    #[test]
+    fn inline_image_requires_word_boundaries() {
+        let token = inline_image_token(b"zaEI aEIx b EI Q");
+        assert_eq!(token.token_type, TokenType::InlineImage);
+        assert_eq!(token.value, b"zaEI aEIx b ");
+    }
+
+    #[test]
+    fn inline_image_without_ei_returns_qpdf_bad_eof_token() {
+        let token = inline_image_token(b"unterminated");
+        assert_eq!(token.token_type, TokenType::Bad);
+        assert_eq!(
+            token.error_message.as_deref(),
+            Some("EOF while reading token")
+        );
+    }
+
+    #[test]
+    fn inline_image_rejects_non_printable_word_bytes() {
+        let token = inline_image_token(b"one EI \x01 two EI Q");
+        assert_eq!(token.token_type, TokenType::InlineImage);
+        assert_eq!(token.value, b"one EI \x01 two ");
+    }
+
+    #[test]
+    fn inline_image_treats_high_bytes_as_signed_non_printable() {
+        let token = inline_image_token(b"one EI \x80 two EI Q");
+        assert_eq!(token.token_type, TokenType::InlineImage);
+        assert_eq!(token.value, b"one EI \x80 two ");
+    }
+
+    #[test]
+    fn inline_image_rejects_mixed_alphabetic_and_other_word_bytes() {
+        let token = inline_image_token(b"one EI A1 two EI Q");
+        assert_eq!(token.token_type, TokenType::InlineImage);
+        assert_eq!(token.value, b"one EI A1 two ");
+    }
+
+    #[test]
+    fn inline_image_treats_star_as_alphabetic() {
+        let token = inline_image_token(b"one EI f* Q two EI Q");
+        assert_eq!(token.token_type, TokenType::InlineImage);
+        assert_eq!(token.value, b"one ");
+    }
+
+    #[test]
+    fn inline_image_accepts_candidate_at_eof() {
+        let token = inline_image_token(b"payload EI");
+        assert_eq!(token.token_type, TokenType::InlineImage);
+        assert_eq!(token.value, b"payload ");
+    }
+
+    #[test]
+    fn inline_image_skips_more_than_one_rejected_candidate() {
+        let token = inline_image_token(b"one EI A1 two EI \x01 three EI Q");
+        assert_eq!(token.token_type, TokenType::InlineImage);
+        assert_eq!(token.value, b"one EI A1 two EI \x01 three ");
+    }
+
+    #[test]
+    fn inline_image_falls_back_to_last_rejected_candidate() {
+        let token = inline_image_token(b"one EI A1 two EI \x01 tail");
+        assert_eq!(token.token_type, TokenType::InlineImage);
+        assert_eq!(token.value, b"one EI A1 two ");
+    }
+
+    #[test]
+    fn inline_image_lookahead_stops_after_ten_good_tokens() {
+        let token = inline_image_token(b"one EI q 1 0 0 1 0 0 cm Q q A1 two EI Q");
+        assert_eq!(token.token_type, TokenType::InlineImage);
+        assert_eq!(token.value, b"one ");
+    }
+
+    #[test]
+    fn inline_image_lookahead_rejects_bad_tokens() {
+        let token = inline_image_token(b"one EI ) two EI Q");
+        assert_eq!(token.token_type, TokenType::InlineImage);
+        assert_eq!(token.value, b"one EI ) two ");
+    }
+
+    #[test]
+    fn inline_image_discovery_restores_cursor_and_token_offsets() {
+        let mut tokenizer = Tokenizer::new(b"XX payload EI Q");
+        tokenizer.set_position(3).unwrap();
+
+        tokenizer.expect_inline_image().unwrap();
+        assert_eq!(tokenizer.position(), 3);
+
+        let image = tokenizer.read_token(true, 0).unwrap();
+        assert_eq!(image.token_type, TokenType::InlineImage);
+        assert_eq!(image.value, b"payload ");
+        assert_eq!((image.start, image.end), (3, 11));
+        assert_eq!(tokenizer.position(), 11);
+
+        let end = tokenizer.read_token(true, 0).unwrap();
+        assert_eq!(end.token_type, TokenType::Word);
+        assert_eq!(end.value, b"EI");
+        assert_eq!((end.start, end.end), (11, 13));
+    }
+
+    #[test]
+    fn inline_image_expectation_rejects_improper_state() {
+        let mut tokenizer = Tokenizer::new(b"(payload) EI");
+        tokenizer.present_character(b'(').unwrap();
+
+        assert_eq!(
+            tokenizer.expect_inline_image(),
+            Err(TokenizerStateError::ImproperInlineImageState)
+        );
+    }
+
+    #[test]
+    fn inline_image_expectation_discards_a_waiting_token() {
+        let mut tokenizer = Tokenizer::new(b"payload EI Q");
+        tokenizer.present_character(b'[').unwrap();
+
+        tokenizer.expect_inline_image().unwrap();
+        let token = tokenizer.read_token(true, 0).unwrap();
+        assert_eq!(token.token_type, TokenType::InlineImage);
+        assert_eq!(token.value, b"payload ");
     }
 
     #[test]
