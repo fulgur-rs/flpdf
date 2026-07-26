@@ -32,7 +32,7 @@ pub(crate) struct Token {
     pub(crate) token_type: TokenType,
     pub(crate) value: Vec<u8>,
     pub(crate) raw: Vec<u8>,
-    pub(crate) error_message: Option<String>,
+    pub(crate) error_message: Option<Vec<u8>>,
     pub(crate) error_offset: usize,
     pub(crate) start: usize,
     #[allow(dead_code)] // Retained as part of qpdf's token range contract.
@@ -62,7 +62,7 @@ impl Token {
         token_type: TokenType,
         value: Vec<u8>,
         raw: Vec<u8>,
-        error_message: Option<String>,
+        error_message: Option<Vec<u8>>,
         range: Range<usize>,
     ) -> Self {
         Self {
@@ -154,7 +154,7 @@ pub(crate) struct Tokenizer<'a> {
     token_type: TokenType,
     value: Vec<u8>,
     raw: Vec<u8>,
-    error_message: Option<String>,
+    error_message: Option<Vec<u8>>,
     before_token: bool,
     in_token: bool,
     char_to_unread: Option<u8>,
@@ -269,10 +269,6 @@ impl<'a> Tokenizer<'a> {
             }
         }
         self.state = State::TokenReady;
-        if self.token_type == TokenType::Eof && !self.allow_eof {
-            self.token_type = TokenType::Bad;
-            self.error_message = Some("unexpected EOF".into());
-        }
         Ok(())
     }
 
@@ -632,10 +628,7 @@ impl<'a> Tokenizer<'a> {
         } else if is_ws(byte) {
         } else {
             self.token_type = TokenType::Bad;
-            self.error_message = Some(format!(
-                "invalid character ({}) in hexstring",
-                char::from(byte)
-            ));
+            self.error_message = Some(invalid_hex_character_message(byte));
             self.state = State::TokenReady;
         }
     }
@@ -651,10 +644,7 @@ impl<'a> Tokenizer<'a> {
         } else if is_ws(byte) {
         } else {
             self.token_type = TokenType::Bad;
-            self.error_message = Some(format!(
-                "invalid character ({}) in hexstring",
-                char::from(byte)
-            ));
+            self.error_message = Some(invalid_hex_character_message(byte));
             self.state = State::TokenReady;
         }
     }
@@ -721,11 +711,16 @@ impl<'a> Tokenizer<'a> {
             let candidate_start = search_pos + relative_start;
             if let Some(after_ei) = word_token_at(self.input, candidate_start, b"EI") {
                 candidate_distance = Some(candidate_start - initial_pos);
-                self.pos = after_ei;
-                if inline_lookahead_is_plausible(self.input, after_ei) {
+                let (plausible, next_search_pos) =
+                    inline_lookahead_is_plausible(self.input, after_ei);
+                if plausible {
                     break;
                 }
-                search_pos = after_ei;
+                // qpdf continues from the cursor advanced by the rejected
+                // lookahead, not from immediately after EI. This prevents an
+                // EI embedded in the suspicious token from becoming the next
+                // candidate (`libqpdf/QPDFTokenizer.cc:799-855`).
+                search_pos = next_search_pos;
             } else {
                 search_pos = candidate_start + 1;
             }
@@ -778,6 +773,13 @@ impl<'a> Tokenizer<'a> {
                         )
                     })?;
                     // cov:ignore-end
+                    // `allowEOF` is a pull-only policy in qpdf. Direct push
+                    // callers always receive an EOF token
+                    // (`libqpdf/QPDFTokenizer.cc:723-762,933-939`).
+                    if self.token_type == TokenType::Eof && !self.allow_eof {
+                        self.token_type = TokenType::Bad;
+                        self.error_message = Some("unexpected EOF".into());
+                    }
                 }
             }
         }
@@ -792,7 +794,8 @@ impl<'a> Tokenizer<'a> {
                 token.start,
                 token
                     .error_message
-                    .clone()
+                    .as_deref()
+                    .map(|message| String::from_utf8_lossy(message).into_owned())
                     .unwrap_or_else(|| "bad token".into()),
             ));
         }
@@ -873,18 +876,20 @@ fn word_token_at(input: &[u8], start: usize, expected: &[u8]) -> Option<usize> {
     let end = start.checked_add(expected.len())?;
     if start == 0
         || input.get(start..end)? != expected
-        || !is_token_delimiter(input[start - 1])
         || input
             .get(end)
             .is_some_and(|&byte| !is_token_delimiter(byte))
     {
         return None;
     }
+    // Despite its preceding-delimiter comment, qpdf 11.9.0 checks only that
+    // the absolute token start is nonzero and that the following byte is a
+    // delimiter (`libqpdf/QPDFTokenizer.cc:45-72`).
     Some(end)
 }
 
 #[allow(dead_code)] // Called by find_ei before Task 6 adds the production entry path.
-fn inline_lookahead_is_plausible(input: &[u8], after_ei: usize) -> bool {
+fn inline_lookahead_is_plausible(input: &[u8], after_ei: usize) -> (bool, usize) {
     let mut tokenizer = Tokenizer::new(&input[after_ei..]);
     tokenizer.allow_eof();
 
@@ -892,11 +897,12 @@ fn inline_lookahead_is_plausible(input: &[u8], after_ei: usize) -> bool {
         let token = tokenizer
             .read_token(true, 0)
             .expect("allow_bad makes tokenizer errors observable as tokens");
+        let next_search_pos = after_ei + tokenizer.position();
         if token.token_type == TokenType::Eof {
-            return true;
+            return (true, next_search_pos);
         }
         if token.token_type == TokenType::Bad {
-            return false;
+            return (false, next_search_pos);
         }
         if token.token_type == TokenType::Word {
             let mut found_alpha = false;
@@ -913,11 +919,11 @@ fn inline_lookahead_is_plausible(input: &[u8], after_ei: usize) -> bool {
                 }
             }
             if found_non_printable || (found_alpha && found_other) {
-                return false;
+                return (false, next_search_pos);
             }
         }
     }
-    true
+    (true, after_ei + tokenizer.position())
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -927,6 +933,13 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+fn invalid_hex_character_message(byte: u8) -> Vec<u8> {
+    let mut message = b"invalid character (".to_vec();
+    message.push(byte);
+    message.extend_from_slice(b") in hexstring");
+    message
 }
 
 pub(crate) fn is_ws(byte: u8) -> bool {
@@ -970,11 +983,17 @@ fn token_description(token: &Token) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::fmt::Write as _;
+    use std::path::Path;
+    use std::process::Command;
+    #[cfg(unix)]
+    use std::{fs, os::unix::fs::PermissionsExt};
 
     use super::{PushedToken, Token, TokenType, Tokenizer, TokenizerStateError};
 
-    type ValueCase<'a> = (&'a [u8], TokenType, &'a [u8], Option<&'a str>);
-    type RawValueCase<'a> = (&'a [u8], TokenType, &'a [u8], &'a [u8], Option<&'a str>);
+    type ValueCase<'a> = (&'a [u8], TokenType, &'a [u8], Option<&'a [u8]>);
+    type RawValueCase<'a> = (&'a [u8], TokenType, &'a [u8], &'a [u8], Option<&'a [u8]>);
+    type MessageCase<'a> = (&'a [u8], TokenType, Option<&'a [u8]>);
 
     fn push_all(tokenizer: &mut Tokenizer<'static>, input: &[u8]) -> Vec<PushedToken> {
         let mut output = Vec::new();
@@ -1018,6 +1037,538 @@ mod tests {
         tokenizer.read_token(true, 0).unwrap()
     }
 
+    #[derive(Clone, Copy)]
+    enum OracleMode {
+        Pull,
+        Push,
+        PullInline,
+        PushInline,
+        Between,
+    }
+
+    impl OracleMode {
+        fn as_arg(self) -> &'static str {
+            match self {
+                Self::Pull => "pull",
+                Self::Push => "push",
+                Self::PullInline => "pull-inline",
+                Self::PushInline => "push-inline",
+                Self::Between => "between",
+            }
+        }
+    }
+
+    struct OracleCase {
+        name: &'static str,
+        mode: OracleMode,
+        input: &'static [u8],
+        allow_eof: bool,
+        include_ignorable: bool,
+        max_len: usize,
+        inline_offset: Option<usize>,
+    }
+
+    fn qpdf_oracle_cases() -> Vec<OracleCase> {
+        let all_types = b"%c\r\n \t[]{}<<>> 12 -0.5 /A#2fB (x\\n) <414> null true false word ) >x";
+        vec![
+            OracleCase {
+                name: "pull-all-types-ignorable",
+                mode: OracleMode::Pull,
+                input: all_types,
+                allow_eof: true,
+                include_ignorable: true,
+                max_len: 0,
+                inline_offset: None,
+            },
+            OracleCase {
+                name: "push-all-types-ignorable",
+                mode: OracleMode::Push,
+                input: all_types,
+                allow_eof: true,
+                include_ignorable: true,
+                max_len: 0,
+                inline_offset: None,
+            },
+            OracleCase {
+                name: "push-between-and-unread",
+                mode: OracleMode::Between,
+                input: b" %c\r\n 1 /Name ",
+                allow_eof: true,
+                include_ignorable: false,
+                max_len: 0,
+                inline_offset: None,
+            },
+            OracleCase {
+                name: "push-default-eof",
+                mode: OracleMode::Push,
+                input: b"",
+                allow_eof: false,
+                include_ignorable: false,
+                max_len: 0,
+                inline_offset: None,
+            },
+            OracleCase {
+                name: "pull-default-eof",
+                mode: OracleMode::Pull,
+                input: b"",
+                allow_eof: false,
+                include_ignorable: false,
+                max_len: 0,
+                inline_offset: None,
+            },
+            OracleCase {
+                name: "pull-max-length",
+                mode: OracleMode::Pull,
+                input: b"abcdefgh ",
+                allow_eof: true,
+                include_ignorable: false,
+                max_len: 5,
+                inline_offset: None,
+            },
+            OracleCase {
+                name: "pull-raw-value-and-recovery",
+                mode: OracleMode::Pull,
+                input: b"/A#20B /a#1x /a#00b (a\\r\\101) <010 2> <0g",
+                allow_eof: true,
+                include_ignorable: false,
+                max_len: 0,
+                inline_offset: None,
+            },
+            OracleCase {
+                name: "pull-leading-ignorable-offset",
+                mode: OracleMode::Pull,
+                input: b" \n% c\r\n/Name ",
+                allow_eof: true,
+                include_ignorable: false,
+                max_len: 0,
+                inline_offset: None,
+            },
+            OracleCase {
+                name: "pull-non-utf8-error-byte",
+                mode: OracleMode::Pull,
+                input: b"<\x80",
+                allow_eof: true,
+                include_ignorable: false,
+                max_len: 0,
+                inline_offset: None,
+            },
+            OracleCase {
+                name: "pull-inline-false-ei",
+                mode: OracleMode::PullInline,
+                input: b"XX abc EI \x01bad EI Q",
+                allow_eof: true,
+                include_ignorable: false,
+                max_len: 0,
+                inline_offset: Some(3),
+            },
+            OracleCase {
+                name: "push-inline-false-ei",
+                mode: OracleMode::PushInline,
+                input: b"XX abc EI \x01bad EI Q",
+                allow_eof: true,
+                include_ignorable: false,
+                max_len: 0,
+                inline_offset: Some(3),
+            },
+            OracleCase {
+                name: "pull-inline-preceding-boundary",
+                mode: OracleMode::PullInline,
+                input: b"XX zaEI Q EI Q",
+                allow_eof: true,
+                include_ignorable: false,
+                max_len: 0,
+                inline_offset: Some(3),
+            },
+            OracleCase {
+                name: "pull-inline-rejected-lookahead-cursor",
+                mode: OracleMode::PullInline,
+                input: b"XX one EI A1EI Q tail",
+                allow_eof: true,
+                include_ignorable: false,
+                max_len: 0,
+                inline_offset: Some(3),
+            },
+            OracleCase {
+                name: "pull-inline-unterminated",
+                mode: OracleMode::PullInline,
+                input: b"XX unterminated",
+                allow_eof: true,
+                include_ignorable: false,
+                max_len: 0,
+                inline_offset: Some(3),
+            },
+        ]
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(encoded, "{byte:02x}").unwrap();
+        }
+        encoded
+    }
+
+    fn token_type_name(token_type: TokenType) -> &'static str {
+        match token_type {
+            TokenType::Bad => "bad",
+            TokenType::ArrayClose => "array_close",
+            TokenType::ArrayOpen => "array_open",
+            TokenType::BraceClose => "brace_close",
+            TokenType::BraceOpen => "brace_open",
+            TokenType::DictClose => "dict_close",
+            TokenType::DictOpen => "dict_open",
+            TokenType::Integer => "integer",
+            TokenType::Name => "name",
+            TokenType::Real => "real",
+            TokenType::String => "string",
+            TokenType::Null => "null",
+            TokenType::Bool => "bool",
+            TokenType::Word => "word",
+            TokenType::Eof => "eof",
+            TokenType::Space => "space",
+            TokenType::Comment => "comment",
+            TokenType::InlineImage => "inline-image",
+        }
+    }
+
+    fn append_token_record(
+        records: &mut String,
+        token: &Token,
+        range: Option<(usize, usize)>,
+        unread: Option<u8>,
+    ) {
+        let (start, end) = range
+            .map(|(start, end)| (start.to_string(), end.to_string()))
+            .unwrap_or_else(|| ("-".into(), "-".into()));
+        writeln!(
+            records,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            token_type_name(token.token_type),
+            hex_encode(&token.value),
+            hex_encode(&token.raw),
+            token
+                .error_message
+                .as_deref()
+                .map_or_else(String::new, hex_encode),
+            start,
+            end,
+            unread.map_or_else(String::new, |byte| hex_encode(&[byte])),
+        )
+        .unwrap();
+    }
+
+    fn configure_tokenizer(tokenizer: &mut Tokenizer<'_>, case: &OracleCase) {
+        if case.allow_eof {
+            tokenizer.allow_eof();
+        }
+        if case.include_ignorable {
+            tokenizer.include_ignorable();
+        }
+    }
+
+    fn dump_flpdf_pull(case: &OracleCase, inline: bool) -> String {
+        let mut tokenizer = Tokenizer::new(case.input);
+        configure_tokenizer(&mut tokenizer, case);
+        if inline {
+            let offset = case.inline_offset.expect("inline case offset");
+            tokenizer.set_position(offset).unwrap();
+            tokenizer.expect_inline_image().unwrap();
+        }
+
+        let mut records = String::new();
+        for _ in 0..case.input.len() + 32 {
+            let token = tokenizer.read_token(true, case.max_len).unwrap();
+            let done = token.token_type == TokenType::Eof
+                || (!case.allow_eof
+                    && token.token_type == TokenType::Bad
+                    && token.raw.is_empty()
+                    && tokenizer.position() == case.input.len());
+            append_token_record(&mut records, &token, Some((token.start, token.end)), None);
+            if done {
+                return records;
+            }
+        }
+        panic!("pull oracle case did not terminate: {}", case.name); // cov:ignore: bounded harness guard; every finite authored pull case terminates
+    }
+
+    fn push_input(case: &OracleCase, inline: bool) -> (Tokenizer<'static>, VecDeque<u8>) {
+        if inline {
+            let offset = case.inline_offset.expect("inline case offset");
+            let input: &'static [u8] = case.input;
+            let mut tokenizer = Tokenizer::new(input);
+            tokenizer.set_position(offset).unwrap();
+            tokenizer.expect_inline_image().unwrap();
+            (
+                tokenizer,
+                input[offset..].iter().copied().collect::<VecDeque<_>>(),
+            )
+        } else {
+            (
+                Tokenizer::push(),
+                case.input.iter().copied().collect::<VecDeque<_>>(),
+            )
+        }
+    }
+
+    fn dump_flpdf_push(case: &OracleCase, inline: bool) -> String {
+        let (mut tokenizer, mut pending) = push_input(case, inline);
+        configure_tokenizer(&mut tokenizer, case);
+        let mut records = String::new();
+
+        while let Some(byte) = pending.pop_front() {
+            tokenizer.present_character(byte).unwrap();
+            if let Some(ready) = tokenizer.get_token() {
+                if let Some(unread) = ready.unread {
+                    pending.push_front(unread);
+                }
+                append_token_record(&mut records, &ready.token, None, ready.unread);
+            }
+        }
+
+        for _ in 0..4 {
+            tokenizer.present_eof().unwrap();
+            let ready = tokenizer.get_token().expect("EOF must finish a token");
+            let done = matches!(ready.token.token_type, TokenType::Eof | TokenType::Bad);
+            append_token_record(&mut records, &ready.token, None, ready.unread);
+            if done {
+                return records;
+            }
+        }
+        panic!("push oracle case did not terminate: {}", case.name); // cov:ignore: bounded harness guard; every finite authored push case terminates
+    }
+
+    fn dump_flpdf_between(case: &OracleCase) -> String {
+        let (mut tokenizer, mut pending) = push_input(case, false);
+        configure_tokenizer(&mut tokenizer, case);
+        let mut records = String::new();
+        let mut event = 0;
+
+        while let Some(byte) = pending.pop_front() {
+            let before = tokenizer.between_tokens();
+            tokenizer.present_character(byte).unwrap();
+            let after_present = tokenizer.between_tokens();
+            let ready = tokenizer.get_token();
+            let after_get = tokenizer.between_tokens();
+            let unread = ready.as_ref().and_then(|token| token.unread);
+            if let Some(unread) = unread {
+                pending.push_front(unread);
+            }
+            writeln!(
+                records,
+                "state\t{event}\t{}\t{}\t{}\t{}\t{}",
+                hex_encode(&[byte]),
+                u8::from(before),
+                u8::from(after_present),
+                u8::from(ready.is_some()),
+                unread.map_or_else(String::new, |byte| hex_encode(&[byte])),
+            )
+            .unwrap();
+            writeln!(records, "reset\t{event}\t{}", u8::from(after_get)).unwrap();
+            event += 1;
+        }
+        records
+    }
+
+    fn dump_flpdf_tokens(case: &OracleCase) -> String {
+        match case.mode {
+            OracleMode::Pull => dump_flpdf_pull(case, false),
+            OracleMode::Push => dump_flpdf_push(case, false),
+            OracleMode::PullInline => dump_flpdf_pull(case, true),
+            OracleMode::PushInline => dump_flpdf_push(case, true),
+            OracleMode::Between => dump_flpdf_between(case),
+        }
+    }
+
+    fn run_qpdf_probe(probe: &Path, case: &OracleCase) -> String {
+        let inline_offset = case
+            .inline_offset
+            .map_or_else(|| "none".into(), |offset| offset.to_string());
+        let output = Command::new(probe)
+            .args([
+                "--mode",
+                case.mode.as_arg(),
+                "--input-hex",
+                &hex_encode(case.input),
+                "--allow-eof",
+                if case.allow_eof { "1" } else { "0" },
+                "--include-ignorable",
+                if case.include_ignorable { "1" } else { "0" },
+                "--allow-bad",
+                "1",
+                "--max-len",
+                &case.max_len.to_string(),
+                "--inline-offset",
+                &inline_offset,
+            ])
+            .output()
+            // cov:ignore-start: script supplies a verified executable; spawn failure is only a harness diagnostic
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to execute qpdf tokenizer probe {}: {error}",
+                    probe.display()
+                )
+            });
+        // cov:ignore-end
+        assert!(
+            output.status.success(),
+            "qpdf tokenizer probe failed for {} ({}):\n{}",
+            case.name,
+            output.status,
+            String::from_utf8_lossy(&output.stderr), // cov:ignore: failure-only assert diagnostic
+        );
+        String::from_utf8(output.stdout).expect("probe records are ASCII")
+    }
+
+    fn assert_qpdf_oracle_matches(mut qpdf_records: impl FnMut(&OracleCase) -> String) {
+        for case in qpdf_oracle_cases() {
+            let qpdf = qpdf_records(&case);
+            let flpdf = dump_flpdf_tokens(&case);
+            assert_eq!(flpdf, qpdf, "case {}", case.name);
+        }
+    }
+
+    #[test]
+    #[ignore = "live qpdf 11.9.0 tokenizer oracle"]
+    // cov:ignore-start: ignored live entry point; ordinary tests cover the comparison loop and fake-probe boundary
+    fn qpdf_tokenizer_differential_all_modes() {
+        let probe = std::env::var_os("QPDF_TOKENIZER_PROBE")
+            .expect("set QPDF_TOKENIZER_PROBE to the built qpdf 11.9.0 probe");
+        assert_qpdf_oracle_matches(|case| run_qpdf_probe(Path::new(&probe), case));
+    }
+    // cov:ignore-end
+
+    #[test]
+    fn qpdf_oracle_case_dumps_match_record_snapshots() {
+        let expected = [
+            ("pull-all-types-ignorable", "pull", 825, 0x9311b6348d3ad84a),
+            ("push-all-types-ignorable", "push", 814, 0x4a3c11fd1a28cc10),
+            (
+                "push-between-and-unread",
+                "between",
+                464,
+                0xd36dd04e5bc4426f,
+            ),
+            ("push-default-eof", "push", 12, 0x0ce86a1b248464d9),
+            ("pull-default-eof", "pull", 40, 0x42c8e6e90a40a245),
+            ("pull-max-length", "pull", 159, 0xec08cd6ed738226b),
+            (
+                "pull-raw-value-and-recovery",
+                "pull",
+                463,
+                0xb26af9e055dc7438,
+            ),
+            (
+                "pull-leading-ignorable-offset",
+                "pull",
+                48,
+                0x4d83e56be5eb7476,
+            ),
+            ("pull-non-utf8-error-byte", "pull", 100, 0x948da051dc166688),
+            (
+                "pull-inline-false-ei",
+                "pull-inline",
+                126,
+                0x11d2fe8257de43e8,
+            ),
+            (
+                "push-inline-false-ei",
+                "push-inline",
+                121,
+                0x48e0db9dda93da90,
+            ),
+            (
+                "pull-inline-preceding-boundary",
+                "pull-inline",
+                123,
+                0x5fa6af99646f0f7a,
+            ),
+            (
+                "pull-inline-rejected-lookahead-cursor",
+                "pull-inline",
+                153,
+                0x50ea4d1cb1687be4,
+            ),
+            (
+                "pull-inline-unterminated",
+                "pull-inline",
+                121,
+                0x808e0936d25566d2,
+            ),
+        ];
+        let cases = qpdf_oracle_cases();
+        assert_eq!(cases.len(), expected.len());
+        for (case, (name, mode, expected_len, expected_fingerprint)) in
+            cases.into_iter().zip(expected)
+        {
+            let records = dump_flpdf_tokens(&case);
+            let fingerprint = records.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            });
+            assert_eq!(case.name, name);
+            assert_eq!(case.mode.as_arg(), mode, "case {name}");
+            assert_eq!(records.len(), expected_len, "case {name}");
+            assert_eq!(fingerprint, expected_fingerprint, "case {name}");
+        }
+        assert_qpdf_oracle_matches(dump_flpdf_tokens);
+    }
+
+    #[cfg(unix)]
+    fn write_test_probe(path: &Path, source: &str) {
+        fs::write(path, source).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_probe_command_passes_exact_case_arguments_and_returns_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        write_test_probe(&probe, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+        let cases = qpdf_oracle_cases();
+
+        assert_eq!(
+            run_qpdf_probe(&probe, &cases[5]),
+            "--mode\npull\n--input-hex\n616263646566676820\n--allow-eof\n1\n\
+             --include-ignorable\n0\n--allow-bad\n1\n--max-len\n5\n--inline-offset\nnone\n"
+        );
+        assert_eq!(
+            run_qpdf_probe(&probe, &cases[9]),
+            "--mode\npull-inline\n--input-hex\n58582061626320454920016261642045492051\n\
+             --allow-eof\n1\n--include-ignorable\n0\n--allow-bad\n1\n--max-len\n0\n\
+             --inline-offset\n3\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_probe_failure_reports_case_status_and_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        write_test_probe(&probe, "#!/bin/sh\nprintf 'probe stderr' >&2\nexit 7\n");
+        let case = &qpdf_oracle_cases()[5];
+
+        let panic = std::panic::catch_unwind(|| run_qpdf_probe(&probe, case)).unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("qpdf tokenizer probe failed for pull-max-length"));
+        assert!(message.contains("exit status: 7"));
+        assert!(message.contains("probe stderr"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_probe_rejects_non_utf8_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        write_test_probe(&probe, "#!/bin/sh\nprintf '\\377'\n");
+        let case = &qpdf_oracle_cases()[5];
+
+        let panic = std::panic::catch_unwind(|| run_qpdf_probe(&probe, case)).unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("probe records are ASCII"));
+    }
+
     #[test]
     fn inline_image_skips_false_ei_followed_by_suspicious_tokens() {
         let token = inline_image_token(b"abc EI \x01bad EI Q");
@@ -1034,10 +1585,17 @@ mod tests {
     }
 
     #[test]
-    fn inline_image_requires_word_boundaries() {
+    fn inline_image_requires_only_a_following_word_boundary_like_qpdf() {
         let token = inline_image_token(b"zaEI aEIx b EI Q");
         assert_eq!(token.token_type, TokenType::InlineImage);
-        assert_eq!(token.value, b"zaEI aEIx b ");
+        assert_eq!(token.value, b"za");
+    }
+
+    #[test]
+    fn inline_image_resumes_search_after_rejected_lookahead_token_like_qpdf() {
+        let token = inline_image_token(b"one EI A1EI Q tail");
+        assert_eq!(token.token_type, TokenType::InlineImage);
+        assert_eq!(token.value, b"one ");
     }
 
     #[test]
@@ -1046,7 +1604,7 @@ mod tests {
         assert_eq!(token.token_type, TokenType::Bad);
         assert_eq!(
             token.error_message.as_deref(),
-            Some("EOF while reading token")
+            Some(b"EOF while reading token".as_slice())
         );
     }
 
@@ -1204,7 +1762,7 @@ mod tests {
         assert_eq!(token.raw, b"abcde");
         assert_eq!(
             token.error_message.as_deref(),
-            Some("exceeded allowable length while reading token")
+            Some(b"exceeded allowable length while reading token".as_slice())
         );
 
         let mut strict = Tokenizer::new(b"abcdefgh ");
@@ -1276,18 +1834,33 @@ mod tests {
     }
 
     #[test]
-    fn eof_policy_matches_qpdf_default_and_allow_eof() {
-        let mut strict = Tokenizer::push();
-        strict.present_eof().unwrap();
-        let token = strict.get_token().unwrap().token;
-        assert_eq!(token.token_type, TokenType::Bad);
-        assert_eq!(token.error_message.as_deref(), Some("unexpected EOF"));
+    fn push_eof_is_always_a_token_while_pull_requires_allow_eof() {
+        let mut default_push = Tokenizer::push();
+        default_push.present_eof().unwrap();
+        let token = default_push.get_token().unwrap().token;
+        assert_eq!(token.token_type, TokenType::Eof);
+        assert_eq!(token.error_message, None);
 
-        let mut allowed = Tokenizer::push();
-        allowed.allow_eof();
-        allowed.present_eof().unwrap();
+        let mut allowed_push = Tokenizer::push();
+        allowed_push.allow_eof();
+        allowed_push.present_eof().unwrap();
         assert_eq!(
-            allowed.get_token().unwrap().token.token_type,
+            allowed_push.get_token().unwrap().token.token_type,
+            TokenType::Eof
+        );
+
+        let mut default_pull = Tokenizer::new(b"");
+        let token = default_pull.read_token(true, 0).unwrap();
+        assert_eq!(token.token_type, TokenType::Bad);
+        assert_eq!(
+            token.error_message.as_deref(),
+            Some(b"unexpected EOF".as_slice())
+        );
+
+        let mut allowed_pull = Tokenizer::new(b"");
+        allowed_pull.allow_eof();
+        assert_eq!(
+            allowed_pull.read_token(true, 0).unwrap().token_type,
             TokenType::Eof
         );
     }
@@ -1339,25 +1912,25 @@ mod tests {
                 b"/a#",
                 TokenType::Name,
                 b"/a\0",
-                Some("name with stray # will not work with PDF >= 1.2"),
+                Some(b"name with stray # will not work with PDF >= 1.2"),
             ),
             (
                 b"/a#1",
                 TokenType::Name,
                 b"/a\0\x31",
-                Some("name with stray # will not work with PDF >= 1.2"),
+                Some(b"name with stray # will not work with PDF >= 1.2"),
             ),
             (
                 b"/a#1x",
                 TokenType::Name,
                 b"/a\0\x31x",
-                Some("name with stray # will not work with PDF >= 1.2"),
+                Some(b"name with stray # will not work with PDF >= 1.2"),
             ),
             (
                 b"/a#00b",
                 TokenType::Bad,
                 b"/a#00b",
-                Some("null character not allowed in name token"),
+                Some(b"null character not allowed in name token"),
             ),
         ];
 
@@ -1381,16 +1954,16 @@ mod tests {
                 TokenType::Bad,
                 b"<0g",
                 b"<0g",
-                Some("invalid character (g) in hexstring"),
+                Some(b"invalid character (g) in hexstring"),
             ),
             (
                 b"<g",
                 TokenType::Bad,
                 b"<g",
                 b"<g",
-                Some("invalid character (g) in hexstring"),
+                Some(b"invalid character (g) in hexstring"),
             ),
-            (b">x", TokenType::Bad, b">", b">", Some("unexpected >")),
+            (b">x", TokenType::Bad, b">", b">", Some(b"unexpected >")),
         ];
 
         for &(input, token_type, value, raw, message) in cases {
@@ -1430,11 +2003,11 @@ mod tests {
 
     #[test]
     fn braces_and_bad_closing_delimiters_match_qpdf() {
-        let cases: &[(&[u8], TokenType, Option<&str>)] = &[
+        let cases: &[MessageCase<'_>] = &[
             (b"{", TokenType::BraceOpen, None),
             (b"}", TokenType::BraceClose, None),
-            (b")", TokenType::Bad, Some("unexpected )")),
-            (b">", TokenType::Bad, Some("EOF while reading token")),
+            (b")", TokenType::Bad, Some(b"unexpected )")),
+            (b">", TokenType::Bad, Some(b"EOF while reading token")),
         ];
 
         for &(input, token_type, message) in cases {
@@ -1468,7 +2041,7 @@ mod tests {
             assert_eq!(token.token_type, TokenType::Bad, "{input:?}");
             assert_eq!(
                 token.error_message.as_deref(),
-                Some("EOF while reading token"),
+                Some(b"EOF while reading token".as_slice()),
                 "{input:?}"
             );
         }
@@ -1600,6 +2173,15 @@ mod tests {
     }
 
     #[test]
+    fn high_bit_hex_error_preserves_qpdf_message_bytes() {
+        let token = first_pulled(b"<\x80");
+        assert_eq!(
+            token.error_message.as_deref(),
+            Some(b"invalid character (\x80) in hexstring".as_slice())
+        );
+    }
+
+    #[test]
     fn comments_and_pdf_delimiters_follow_normal_pull_mode() {
         let mut tokenizer = Tokenizer::new(b"% comment\r\n[<<{}>>]");
         tokenizer.allow_eof();
@@ -1639,7 +2221,10 @@ mod tests {
         let unexpected = first_pulled(b")");
         assert_eq!(unexpected.token_type, TokenType::Bad);
         assert_eq!(unexpected.raw, b")");
-        assert_eq!(unexpected.error_message.as_deref(), Some("unexpected )"));
+        assert_eq!(
+            unexpected.error_message.as_deref(),
+            Some(b"unexpected )".as_slice())
+        );
 
         let comment = first_pulled(b"% no newline");
         assert_eq!(comment.token_type, TokenType::Bad);
@@ -1654,7 +2239,7 @@ mod tests {
         assert_eq!(unexpected.token_type, TokenType::Bad);
         assert_eq!(
             unexpected.error_message.as_deref(),
-            Some("EOF while reading token")
+            Some(b"EOF while reading token".as_slice())
         );
 
         let literal = first_pulled(b"(a\\\r\nb\\7x\\q)");
@@ -1665,7 +2250,7 @@ mod tests {
         assert_eq!(trailing_escape.token_type, TokenType::Bad);
         assert_eq!(
             trailing_escape.error_message.as_deref(),
-            Some("EOF while reading token")
+            Some(b"EOF while reading token".as_slice())
         );
     }
 
@@ -1676,7 +2261,7 @@ mod tests {
         assert_eq!(null.value, b"/a#00b".to_vec());
         assert_eq!(
             null.error_message.as_deref(),
-            Some("null character not allowed in name token")
+            Some(b"null character not allowed in name token".as_slice())
         );
 
         let stray = first_pulled(b"/a#1x");
@@ -1684,7 +2269,7 @@ mod tests {
         assert_eq!(stray.value, b"/a\0\x31x".to_vec());
         assert_eq!(
             stray.error_message.as_deref(),
-            Some("name with stray # will not work with PDF >= 1.2")
+            Some(b"name with stray # will not work with PDF >= 1.2".as_slice())
         );
     }
 
@@ -1704,7 +2289,7 @@ mod tests {
             assert_eq!(token.value, expected.to_vec());
             assert_eq!(
                 token.error_message.as_deref(),
-                Some("name with stray # will not work with PDF >= 1.2")
+                Some(b"name with stray # will not work with PDF >= 1.2".as_slice())
             );
         }
     }

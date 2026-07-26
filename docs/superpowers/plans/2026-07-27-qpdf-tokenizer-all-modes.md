@@ -88,7 +88,7 @@ pub(crate) struct Token {
     pub(crate) token_type: TokenType,
     pub(crate) value: Vec<u8>,
     pub(crate) raw: Vec<u8>,
-    pub(crate) error_message: Option<String>,
+    pub(crate) error_message: Option<Vec<u8>>,
     pub(crate) error_offset: usize,
     pub(crate) start: usize,
     pub(crate) end: usize,
@@ -160,7 +160,7 @@ fn token_equality_matches_qpdf_type_and_value_only() {
         TokenType::Name,
         b"/A".to_vec(),
         b"/#41".to_vec(),
-        Some("ignored by equality".into()),
+        Some(b"ignored by equality".to_vec()),
         40..44,
     );
     assert_eq!(left, right);
@@ -231,7 +231,7 @@ pub(crate) struct Token {
     pub(crate) token_type: TokenType,
     pub(crate) value: Vec<u8>,
     pub(crate) raw: Vec<u8>,
-    pub(crate) error_message: Option<String>,
+    pub(crate) error_message: Option<Vec<u8>>,
     pub(crate) error_offset: usize,
     pub(crate) start: usize,
     pub(crate) end: usize,
@@ -259,7 +259,7 @@ impl Token {
         token_type: TokenType,
         value: Vec<u8>,
         raw: Vec<u8>,
-        error_message: Option<String>,
+        error_message: Option<Vec<u8>>,
         range: Range<usize>,
     ) -> Self {
         Self {
@@ -288,7 +288,9 @@ impl Token {
 ```
 
 Do not implement Rust's `Eq`: qpdf deliberately makes `Bad` non-reflexive, so
-claiming Rust's reflexive equality contract would be incorrect.
+claiming Rust's reflexive equality contract would be incorrect. Error messages
+remain raw owned bytes because qpdf's `std::string` may contain non-UTF-8 input;
+convert them lossily only at the public parse-error/diagnostic display boundary.
 
 Implement `canonical_name_raw` using the same name escaping policy as
 `Object::Name` while retaining qpdf's leading slash convention. Implement
@@ -447,18 +449,34 @@ fn include_ignorable_returns_contiguous_space_and_comment_tokens() {
 }
 
 #[test]
-fn eof_policy_matches_qpdf_default_and_allow_eof() {
-    let mut strict = Tokenizer::push();
-    strict.present_eof().unwrap();
-    let token = strict.get_token().unwrap().token;
-    assert_eq!(token.token_type, TokenType::Bad);
-    assert_eq!(token.error_message.as_deref(), Some("unexpected EOF"));
-
-    let mut allowed = Tokenizer::push();
-    allowed.allow_eof();
-    allowed.present_eof().unwrap();
+fn push_eof_is_always_a_token_while_pull_requires_allow_eof() {
+    let mut default_push = Tokenizer::push();
+    default_push.present_eof().unwrap();
     assert_eq!(
-        allowed.get_token().unwrap().token.token_type,
+        default_push.get_token().unwrap().token.token_type,
+        TokenType::Eof
+    );
+
+    let mut allowed_push = Tokenizer::push();
+    allowed_push.allow_eof();
+    allowed_push.present_eof().unwrap();
+    assert_eq!(
+        allowed_push.get_token().unwrap().token.token_type,
+        TokenType::Eof
+    );
+
+    let mut default_pull = Tokenizer::new(b"");
+    let token = default_pull.read_token(true, 0).unwrap();
+    assert_eq!(token.token_type, TokenType::Bad);
+    assert_eq!(
+        token.error_message.as_deref(),
+        Some(b"unexpected EOF".as_slice())
+    );
+
+    let mut allowed_pull = Tokenizer::new(b"");
+    allowed_pull.allow_eof();
+    assert_eq!(
+        allowed_pull.read_token(true, 0).unwrap().token_type,
         TokenType::Eof
     );
 }
@@ -485,7 +503,7 @@ Run:
 ```bash
 cargo test -p flpdf tokenizer::tests::push_mode_returns_unread_delimiter_and_between_token_state -- --exact
 cargo test -p flpdf tokenizer::tests::include_ignorable_returns_contiguous_space_and_comment_tokens -- --exact
-cargo test -p flpdf tokenizer::tests::eof_policy_matches_qpdf_default_and_allow_eof -- --exact
+cargo test -p flpdf tokenizer::tests::push_eof_is_always_a_token_while_pull_requires_allow_eof -- --exact
 ```
 
 Expected: compilation failure because push APIs, ignorable token production,
@@ -535,7 +553,7 @@ pub(crate) struct Tokenizer<'a> {
     token_type: TokenType,
     value: Vec<u8>,
     raw: Vec<u8>,
-    error_message: Option<String>,
+    error_message: Option<Vec<u8>>,
     before_token: bool,
     in_token: bool,
     char_to_unread: Option<u8>,
@@ -621,7 +639,9 @@ pub(crate) fn get_token(&mut self) -> Option<PushedToken> {
 
 `present_eof` uses the exact state table in the design spec. A final appendable
 token is completed via the qpdf synthetic form-feed delimiter; do not append
-that delimiter to the returned raw token.
+that delimiter to the returned raw token. Direct push `present_eof` always
+emits `Eof`; `allow_eof` is consulted only by the pull wrapper when it receives
+that token (`QPDFTokenizer.cc:723-762,933-939`).
 
 - [ ] **Step 5: Run the full tokenizer state matrix**
 
@@ -730,7 +750,7 @@ fn pull_max_len_returns_qpdf_bad_token_or_error() {
     assert_eq!(token.raw, b"abcde");
     assert_eq!(
         token.error_message.as_deref(),
-        Some("exceeded allowable length while reading token")
+        Some(b"exceeded allowable length while reading token".as_slice())
     );
 
     let mut strict = Tokenizer::new(b"abcdefgh ");
@@ -792,7 +812,7 @@ pub(crate) fn read_token(&mut self, allow_bad: bool, max_len: usize) -> Result<T
                     self.token_type = TokenType::Bad;
                     self.state = State::TokenReady;
                     self.error_message =
-                        Some("exceeded allowable length while reading token".into());
+                        Some(b"exceeded allowable length while reading token".to_vec());
                 }
             }
             None => self.present_eof().map_err(tokenizer_state_as_parse_error)?,
@@ -806,7 +826,11 @@ pub(crate) fn read_token(&mut self, allow_bad: bool, max_len: usize) -> Result<T
     if token.token_type == TokenType::Bad && !allow_bad {
         return Err(Error::parse(
             token.start,
-            token.error_message.clone().unwrap_or_else(|| "bad token".into()),
+            token
+                .error_message
+                .as_deref()
+                .map(|message| String::from_utf8_lossy(message).into_owned())
+                .unwrap_or_else(|| "bad token".to_string()),
         ));
     }
     self.reset();
@@ -839,7 +863,7 @@ fn next_token(&mut self) -> Result<Token> {
         if let Some(message) = token.error_message.clone() {
             self.diagnostics.push(ParserDiagnostic {
                 relative_offset: token.start,
-                message,
+                message: String::from_utf8_lossy(&message).into_owned(),
             });
         }
     }
@@ -979,10 +1003,17 @@ fn inline_image_accepts_ei_followed_by_ten_good_content_tokens() {
 }
 
 #[test]
-fn inline_image_requires_word_boundaries() {
-    let token = inline_image_token(b"aEIx b EI Q");
+fn inline_image_requires_only_a_following_word_boundary_like_qpdf() {
+    let token = inline_image_token(b"zaEI aEIx b EI Q");
     assert_eq!(token.token_type, TokenType::InlineImage);
-    assert_eq!(token.value, b"aEIx b ");
+    assert_eq!(token.value, b"za");
+}
+
+#[test]
+fn inline_image_resumes_search_after_rejected_lookahead_token_like_qpdf() {
+    let token = inline_image_token(b"one EI A1EI Q tail");
+    assert_eq!(token.token_type, TokenType::InlineImage);
+    assert_eq!(token.value, b"one ");
 }
 
 #[test]
@@ -991,7 +1022,7 @@ fn inline_image_without_ei_returns_qpdf_bad_eof_token() {
     assert_eq!(token.token_type, TokenType::Bad);
     assert_eq!(
         token.error_message.as_deref(),
-        Some("EOF while reading token")
+        Some(b"EOF while reading token".as_slice())
     );
 }
 ```
@@ -1018,12 +1049,13 @@ Add private helpers:
 
 ```rust
 fn word_token_at(input: &[u8], start: usize, expected: &[u8]) -> Option<usize>;
-fn inline_lookahead_is_plausible(input: &[u8], after_ei: usize) -> bool;
+fn inline_lookahead(input: &[u8], after_ei: usize) -> (bool, usize);
 fn find_ei(&mut self) -> Option<usize>;
 ```
 
-`word_token_at` requires a delimiter before `EI` and delimiter/EOF after it.
-`inline_lookahead_is_plausible` creates a fresh tokenizer and checks at most
+`word_token_at` requires a nonzero absolute candidate start and delimiter/EOF
+after `EI`; qpdf 11.9.0 does not inspect the preceding byte despite its stale
+source comment. `inline_lookahead` creates a fresh tokenizer and checks at most
 ten tokens with `allow_bad = true`, applying qpdf's three word flags:
 
 ```rust
@@ -1043,10 +1075,13 @@ for &byte in &token.value {
 let suspicious = found_non_printable || (found_alpha && found_other);
 ```
 
-Restore `pos` after lookahead. Store the accepted/fallback candidate distance
-in `inline_image_bytes`, set `State::InlineImage`, and let
-`in_inline_image` make the token ready at that exact byte count. Do not search
-for or consume `EI` in a separate content parser.
+Restore the shared `pos` after lookahead. When a candidate is rejected, resume
+the search from the cursor advanced by the lookahead tokenizer, not immediately
+after that `EI`; this prevents an `EI` embedded in the suspicious lookahead
+word from being reconsidered. Store the accepted/fallback candidate distance in
+`inline_image_bytes`, set `State::InlineImage`, and let `in_inline_image` make
+the token ready at that exact byte count. Do not search for or consume `EI` in
+a separate content parser.
 
 - [ ] **Step 5: Verify inline-image and existing content behavior**
 
@@ -1930,6 +1965,7 @@ Add remaining migrated files explicitly if the searches identified them.
 
 **Files:**
 - Create: `scripts/qpdf-tokenizer-diff.sh`
+- Create: `scripts/tests/qpdf-tokenizer-diff-contract.sh`
 - Create: `tests/oracle/qpdf_tokenizer_probe.cc`
 - Create: `crates/flpdf/tests/tokenizer_oracle_vectors.rs` only if the public test surface can exercise the internal probe without exposing tokenizer; otherwise keep the ignored differential unit test in `tokenizer.rs`
 - Modify: `crates/flpdf/src/tokenizer.rs`
@@ -1971,7 +2007,8 @@ offset, and inline image.
 Run:
 
 ```bash
-cargo test -p flpdf qpdf_tokenizer_differential_all_modes \
+cargo test -p flpdf --lib \
+  tokenizer::tests::qpdf_tokenizer_differential_all_modes \
   -- --ignored --exact
 ```
 
@@ -1982,28 +2019,42 @@ probe script/binary is absent.
 
 `scripts/qpdf-tokenizer-diff.sh` must:
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-qpdf_source="$("${repo_root}/scripts/fetch-qpdf-source.sh" --print-path)"
-build_dir="${TMPDIR:-/tmp}/flpdf-qpdf-tokenizer-probe-11.9.0"
-
-cmake -S "${qpdf_source}" -B "${build_dir}" \
-  -DBUILD_STATIC_LIBS=OFF \
-  -DBUILD_SHARED_LIBS=ON \
-  -DREQUIRE_CRYPTO_NATIVE=OFF
-cmake --build "${build_dir}" --target libqpdf --parallel
-
-c++ -std=c++17 \
-  -I"${qpdf_source}/include" \
-  "${repo_root}/tests/oracle/qpdf_tokenizer_probe.cc" \
-  -L"${build_dir}/libqpdf" \
-  -Wl,-rpath,"${build_dir}/libqpdf" \
-  -lqpdf \
-  -o "${build_dir}/flpdf-qpdf-tokenizer-probe"
-```
+- verify the pinned source commit and tracked-file cleanliness before work, and
+  recheck cleanliness on every exit path;
+- resolve repository, source, and candidate temp-base paths physically before
+  configure, reject a base inside the repository or source, and fall back from
+  an unsafe `TMPDIR` to a proven external base;
+- reject candidate temp-base paths whose lexical and physical paths differ, and
+  verify every physical ancestor is owned by numeric uid `0`, the current uid,
+  or the owner of `/` on the same device as `/`; never apply a nonzero
+  root-anchor owner to a different filesystem;
+- accept the temp base only when it is writable/searchable and either:
+  - current-uid-owned, with neither the group nor other permission class
+    granting both write and search permission; or
+  - sticky and owned by numeric uid `0`, or by the same-device owner of `/`, so
+    a different uid cannot replace the current-uid-owned cache parent;
+  evaluate the root-owned sticky branch before the current-owner private branch
+  so a uid-0 invocation accepts mode `1777`; another process under the current
+  uid remains inside the script's explicit trust boundary;
+- after an unsafe requested base, consider only existing, fully validated
+  `XDG_CACHE_HOME`, `HOME/.cache`, qpdf-cache-ancestor, `/tmp`, and `/var/tmp`
+  candidates; never create a fallback base under an untrusted parent;
+- atomically create a private cache parent and build directory with `umask 077`;
+  on reuse, reject symlinks/non-directories, a different uid owner, or any mode
+  other than `0700` rather than changing permissions on existing content;
+- reject legacy top-level cache/lock artifacts and require explicit migration;
+  never automatically trust a cache created by an older driver;
+- open the verified build directory itself read-only on an FD and `flock` that
+  FD for configure/build/link/verify/test; never open a predictable lock-file
+  path with shell redirection;
+- after acquiring the lock, revalidate owner, mode, physical containment, and
+  the locked-FD/path inode identity before invoking an external build tool;
+- build shared `libqpdf` out of tree and link the probe with
+  `-Wl,--disable-new-dtags` plus a build-local `rpath`;
+- prepend the pinned library directory to any existing `LD_LIBRARY_PATH`, then
+  inspect the loader's resolved `libqpdf` path and fail closed unless its
+  physical path belongs to the exact build directory;
+- run the exact ignored library test by its full module path.
 
 The committed flpdf-authored C++ probe accepts hex-encoded input and explicit
 push/pull, ignorable, EOF, max-length, and inline-image flags. It links to the
@@ -2013,9 +2064,9 @@ pinned shared `libqpdf` and emits one tab-separated record per token:
 type<TAB>value_hex<TAB>raw_hex<TAB>error_hex<TAB>start<TAB>end<TAB>unread_hex
 ```
 
-Then set `QPDF_TOKENIZER_PROBE` and run the ignored Rust test. The script may
-cache build artifacts outside the repository but must never modify the pinned
-source tree.
+Then set `QPDF_TOKENIZER_PROBE` and run the ignored Rust test in the verified
+loader environment. The script may cache build artifacts outside the
+repository but must never modify the repository or pinned source tree.
 
 - [ ] **Step 4: Run the live differential test and resolve every mismatch**
 
@@ -2087,8 +2138,10 @@ missing-qpdf rule; on Linux CI qpdf must be present.
 - [ ] **Step 8: Commit oracle/docs changes**
 
 ```bash
-git add scripts/qpdf-tokenizer-diff.sh tests/oracle/qpdf_tokenizer_probe.cc \
-  crates/flpdf/src/tokenizer.rs docs/qpdf-correspondence.md
+git add scripts/qpdf-tokenizer-diff.sh \
+  scripts/tests/qpdf-tokenizer-diff-contract.sh \
+  tests/oracle/qpdf_tokenizer_probe.cc crates/flpdf/src/tokenizer.rs \
+  docs/qpdf-correspondence.md
 git commit -m "test(tokenizer): lock qpdf all-mode parity"
 ```
 

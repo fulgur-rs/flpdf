@@ -63,7 +63,7 @@ replace its non-qpdf normalization policy with `ContentNormalizer`.
 | `include/qpdf/QPDFTokenizer.hh` | `crates/flpdf/src/tokenizer.rs` public shape within the crate |
 | `libqpdf/QPDFTokenizer.cc` | `crates/flpdf/src/tokenizer.rs` state and behavior |
 | `libqpdf/QPDFParser.cc` content-stream branch | `crates/flpdf/src/parser.rs` content mode |
-| `QPDFObjectHandle.cc:1793-1847` | `content_stream.rs` content-event orchestration |
+| `QPDFObjectHandle.cc:1770-1847` | `content_stream.rs` content-event orchestration and callback lifecycle |
 | `QPDF_Operator.cc` | `Object::Operator` |
 | `QPDF_InlineImage.cc` | `Object::InlineImage` |
 | `QPDFObjectHandle::ParserCallbacks` | Rust callback trait/control flow |
@@ -128,8 +128,14 @@ Each token carries:
 - type;
 - canonical value;
 - raw input value;
-- optional error message;
+- optional error message as owned raw bytes, matching qpdf's `std::string`;
 - pull-mode start and end offsets.
+
+Tokenizer error bytes are converted with a lossy UTF-8 display policy only at
+the human-facing `Error::parse` / parser-diagnostic boundary. Keeping the token
+contract byte-preserving is required for high-bit invalid input; qpdf inserts
+the offending byte directly into its error `std::string`
+(`QPDFTokenizer.cc:640-680`).
 
 For `Name` and `String`, canonical value and raw value are distinct:
 
@@ -165,12 +171,15 @@ current function-per-token pull scanner:
 - sign, decimal, integer, real, and generic literal;
 - inline image.
 
-The configuration defaults match qpdf:
+The pull configuration defaults match qpdf:
 
 - EOF is not allowed;
 - ignorable tokens are not included.
 
-`allow_eof` changes EOF from `Bad("unexpected EOF")` to `Eof`.
+`allow_eof` changes pull EOF from `Bad("unexpected EOF")` to `Eof`.
+It does not affect direct push mode: qpdf's `presentEOF` always produces
+`Eof`, while the policy check exists only in pull `nextToken`
+(`QPDFTokenizer.cc:723-762,933-939`).
 `include_ignorable` returns contiguous PDF whitespace as `Space` and comments
 without their terminating line ending as `Comment`.
 
@@ -213,7 +222,8 @@ EOF behavior follows the active state:
 
 - appendable name, number, sign, decimal, real, or literal states are completed
   by presenting qpdf's synthetic delimiter;
-- top/before-token becomes `Eof` when allowed;
+- top/before-token becomes `Eof` in push mode or in pull mode when allowed;
+- disallowed pull EOF becomes `Bad("unexpected EOF")`;
 - ignorable whitespace becomes `Space` when requested, otherwise EOF;
 - a final comment becomes `Comment` when ignorable tokens are requested and
   `Bad` otherwise;
@@ -233,13 +243,19 @@ operator and consumed exactly one following byte, as qpdf does in
 
 `expect_inline_image` performs qpdf's `findEI` behavior:
 
-1. Find an `EI` word candidate with a delimiter before it and delimiter or EOF
-   after it.
+1. Find an `EI` candidate at a nonzero absolute offset with a delimiter or EOF
+   after it. Although the qpdf source comment says “preceded by a delimiter,”
+   qpdf 11.9.0 does not inspect the preceding byte and accepts `EI` embedded
+   after other bytes when its following boundary is valid
+   (`QPDFTokenizer.cc:45-72`, confirmed by the live probe).
 2. Tokenize up to ten tokens following the candidate.
 3. Reject the candidate if that lookahead encounters a bad token.
 4. For word tokens, reject candidates whose lookahead contains non-printable
    non-space bytes, or mixes alphabetic/`*` characters with other characters.
-5. Continue searching after a rejected candidate.
+5. Continue searching after a rejected candidate from the cursor reached by
+   the lookahead tokenizer, not immediately after the candidate. This prevents
+   an `EI` embedded inside the rejected token from being reconsidered
+   (`QPDFTokenizer.cc:799-855`).
 6. Use the first candidate that passes; if the scan ends after candidates were
    seen, retain qpdf's last-candidate fallback behavior.
 7. Restore the shared cursor to the beginning of image data.
@@ -413,8 +429,8 @@ Provide an ignored live differential test or repository script that:
 1. resolves the read-only pinned qpdf 11.9.0 source;
 2. builds or uses a tokenizer probe outside the repository worktree;
 3. feeds identical flpdf-authored inputs to qpdf and flpdf;
-4. compares type, canonical value, raw value, error, unread decision, and
-   offsets for push and pull modes.
+4. compares type, canonical value, raw value, error, pull offsets, and push
+   unread decisions.
 
 The probe and its inputs must not copy qpdf qtest fixtures into flpdf.
 

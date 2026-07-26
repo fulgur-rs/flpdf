@@ -235,6 +235,8 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
                 token.error_offset,
                 token
                     .error_message
+                    .as_deref()
+                    .map(|message| String::from_utf8_lossy(message).into_owned())
                     .unwrap_or_else(|| "bad token".to_string()),
             )),
             TokenType::Eof => Err(Error::parse(token.start, "unexpected EOF")),
@@ -330,7 +332,7 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
             if let Some(message) = token.error_message.clone() {
                 self.diagnostics.push(ParserDiagnostic {
                     relative_offset: token.start,
-                    message,
+                    message: String::from_utf8_lossy(&message).into_owned(),
                 });
             }
         }
