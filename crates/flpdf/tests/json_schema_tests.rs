@@ -129,3 +129,21 @@ fn schema_strings_are_wildcards_and_prior_errors_affect_return_value() {
     assert!(!value.check_schema(&schema, &mut errors));
     assert_eq!(errors, ["previous error"]);
 }
+
+#[test]
+fn uninitialized_checked_handle_fails_without_adding_an_error() {
+    let mut errors = Vec::new();
+
+    assert!(!Json::default().check_schema(&parsed(br#""value""#), &mut errors));
+    assert!(errors.is_empty());
+}
+
+#[test]
+fn fixed_length_array_accepts_each_matching_position() {
+    let schema = parsed(br#"["first","second"]"#);
+    let value = parsed(br#"[1,true]"#);
+    let mut errors = Vec::new();
+
+    assert!(value.check_schema(&schema, &mut errors));
+    assert!(errors.is_empty());
+}

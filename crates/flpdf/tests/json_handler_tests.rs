@@ -252,6 +252,35 @@ fn unhandled_value_reports_the_qpdf_method_specific_path() {
 }
 
 #[test]
+fn unconfigured_type_handlers_reject_null_and_containers() {
+    let mut handler = JsonHandler::new();
+    handler.add_string_handler(|_, _| {});
+
+    for (path, value, expected) in [
+        (
+            b".null".as_slice(),
+            Json::make_null(),
+            "JSON handler: value at .null is not of expected type",
+        ),
+        (
+            b".dictionary".as_slice(),
+            Json::make_dictionary(),
+            "JSON handler: value at .dictionary is not of expected type",
+        ),
+        (
+            b".array".as_slice(),
+            Json::make_array(),
+            "JSON handler: value at .array is not of expected type",
+        ),
+    ] {
+        assert_eq!(
+            handler.handle(path, value).unwrap_err().to_string(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn unexpected_nested_key_reports_its_object_path_and_skips_end_handlers() {
     let ends = Rc::new(RefCell::new(Vec::new()));
     let nested = JsonHandler::shared();
