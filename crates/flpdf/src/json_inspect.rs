@@ -2870,35 +2870,35 @@ fn write_qpdf_section<R: Read + Seek>(
         b"jsonversion",
         &Json::make_int(2),
         3,
-    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    )?;
     Json::write_dictionary_item(
         out,
         &mut metadata_first,
         b"pdfversion",
         &Json::make_string(metadata.pdf_version),
         3,
-    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    )?;
     Json::write_dictionary_item(
         out,
         &mut metadata_first,
         b"pushedinheritedpageresources",
         &Json::make_bool(metadata.pushed_inherited_page_resources),
         3,
-    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    )?;
     Json::write_dictionary_item(
         out,
         &mut metadata_first,
         b"calledgetallpages",
         &Json::make_bool(metadata.called_get_all_pages),
         3,
-    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    )?;
     Json::write_dictionary_item(
         out,
         &mut metadata_first,
         b"maxobjectid",
         &Json::make_int(i64::from(metadata.max_object_id)),
         3,
-    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    )?;
     Json::write_dictionary_close(out, metadata_first, 2)?;
 
     Json::write_next(out, &mut qpdf_first, 2)?;
@@ -2922,7 +2922,9 @@ fn write_qpdf_section<R: Read + Seek>(
             json_dictionary([("value", qpdf_dict_to_json(pdf, &pdf.trailer().clone())?)])?;
         Json::write_dictionary_item(out, &mut objects_first, b"trailer", &trailer, 3)?;
     }
-    Json::write_dictionary_close(out, objects_first, 2)?;
+    // qpdf keeps the raw object map expanded even when selectors match
+    // neither an object nor the trailer: `{\n    }`, not compact `{}`.
+    Json::write_dictionary_close(out, false, 2)?;
     Json::write_array_close(out, qpdf_first, 1)?;
     Ok(())
 }
@@ -2932,6 +2934,11 @@ fn write_qpdf_section<R: Read + Seek>(
 /// The envelope and selected sections are emitted in qpdf's fixed order.
 /// Object selectors affect only the raw `qpdf` object map; qpdf metadata is
 /// still computed after preparing every live object.
+///
+/// On conversion or I/O failure, bytes already accepted by `out` remain as a
+/// partial JSON prefix; this function does not roll back or truncate the sink.
+/// [`JsonOutputSummary`] is returned only after the full document and its
+/// trailing LF have been written successfully.
 pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     decode_level: DecodeLevel,
@@ -2961,7 +2968,7 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
         keys,
         JsonKey::Pagelabels,
         || build_pagelabels_section(pdf),
-    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    )?;
     emit_section(
         out,
         &mut first,
@@ -2969,7 +2976,7 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
         keys,
         JsonKey::Acroform,
         || build_acroform_section(pdf),
-    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    )?;
     emit_section(
         out,
         &mut first,
@@ -2977,7 +2984,7 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
         keys,
         JsonKey::Attachments,
         || build_attachments_section(pdf),
-    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    )?;
     emit_section(out, &mut first, b"encrypt", keys, JsonKey::Encrypt, || {
         build_encrypt_section(pdf)
     })?;
@@ -2988,7 +2995,7 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
         keys,
         JsonKey::Outlines,
         || build_outlines_section(pdf),
-    )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+    )?;
     if json_section_selected(keys, JsonKey::Qpdf) {
         write_qpdf_section(
             pdf,
@@ -2998,7 +3005,7 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
             out,
             &mut first,
             &mut summary,
-        )?; // cov:ignore: llvm-cov maps this multiline try terminator to no path despite the sink failure sweep
+        )?;
     }
     Json::write_dictionary_close(out, first, 0)?;
     out.write_all(b"\n")?;
@@ -3283,6 +3290,29 @@ mod tests {
         assert!(
             positions.windows(2).all(|pair| pair[0] < pair[1]),
             "{positions:?}"
+        );
+    }
+
+    #[test]
+    fn sink_writer_keeps_missing_selector_object_map_expanded() {
+        let mut pdf = load_one_page_pdf();
+        let mut out = Vec::new();
+        write_qpdf_json_v2_selected_objects_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Qpdf],
+            &[JsonObjectSelector::Object {
+                number: 999,
+                generation: 0,
+            }],
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            out,
+            b"{\n  \"version\": 2,\n  \"parameters\": {\n    \"decodelevel\": \"generalized\"\n  },\n  \"qpdf\": [\n    {\n      \"jsonversion\": 2,\n      \"pdfversion\": \"1.3\",\n      \"pushedinheritedpageresources\": false,\n      \"calledgetallpages\": false,\n      \"maxobjectid\": 7\n    },\n    {\n    }\n  ]\n}\n"
         );
     }
 
