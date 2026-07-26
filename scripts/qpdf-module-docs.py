@@ -14,9 +14,10 @@ MIRROR_START = "//! Mirrors qpdf "
 MIRROR_VERSION = "11.9.0"
 CORRESPONDENCE_PREFIX = "//! qpdf correspondence: "
 QPDF_PATH_RE = re.compile(r"libqpdf/[A-Za-z0-9_+-]+\.cc")
-RUST_WHITESPACE = frozenset(
+RUST_WHITESPACE_CHARS = (
     "\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u200e\u200f\u2028\u2029"
 )
+RUST_WHITESPACE = frozenset(RUST_WHITESPACE_CHARS)
 
 
 @dataclass(frozen=True)
@@ -291,10 +292,10 @@ def classify_source(path: Path, source: str) -> Classification:
 
     line = candidates[0]
     if line.startswith(CORRESPONDENCE_PREFIX):
-        reason = line[len(CORRESPONDENCE_PREFIX) :].strip()
+        reason = line[len(CORRESPONDENCE_PREFIX) :].strip(RUST_WHITESPACE_CHARS)
         if not reason.endswith("."):
             raise ValueError(f"{path}: classification must end with a terminal period")
-        reason = reason[:-1].rstrip()
+        reason = reason[:-1].rstrip(RUST_WHITESPACE_CHARS)
         if not reason:
             raise ValueError(f"{path}: qpdf correspondence reason must be non-empty")
         return Classification("correspondence", reason)
@@ -308,11 +309,13 @@ def classify_source(path: Path, source: str) -> Classification:
             f"{path}: Mirrors qpdf version must be {MIRROR_VERSION}, got {version}"
         )
 
-    path_list = path_list.strip()
+    path_list = path_list.strip(RUST_WHITESPACE_CHARS)
     if not path_list.endswith("."):
         raise ValueError(f"{path}: classification must end with a terminal period")
-    path_list = path_list[:-1].rstrip()
-    qpdf_paths = [item.strip() for item in path_list.split(",")]
+    path_list = path_list[:-1].rstrip(RUST_WHITESPACE_CHARS)
+    qpdf_paths = [
+        item.strip(RUST_WHITESPACE_CHARS) for item in path_list.split(",")
+    ]
     if not qpdf_paths or any(not QPDF_PATH_RE.fullmatch(item) for item in qpdf_paths):
         raise ValueError(f"{path}: invalid qpdf path list: {path_list}")
     return Classification("mirror", ", ".join(qpdf_paths))
@@ -377,7 +380,11 @@ def _escape_markdown_cell(value: str) -> str:
 
 
 def _render_markdown_code_span(value: str) -> str:
-    table_safe_value = value.replace("\\", "\\\\").replace("|", "\\|")
+    table_safe_value = re.sub(
+        r"(\\*)\|",
+        lambda match: match.group(1) * 2 + r"\|",
+        value,
+    )
     longest_backtick_run = max(
         (len(match.group()) for match in re.finditer(r"`+", table_safe_value)),
         default=0,

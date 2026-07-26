@@ -334,6 +334,18 @@ class ClassificationTests(unittest.TestCase):
             "terminal period",
         )
 
+    def test_rejects_non_rust_whitespace_after_correspondence_period(self):
+        self.assert_invalid(
+            "//! qpdf correspondence: valid.\u001c\n",
+            "terminal period",
+        )
+
+    def test_rejects_non_rust_whitespace_after_mirror_period(self):
+        self.assert_invalid(
+            "//! Mirrors qpdf 11.9.0 libqpdf/QPDF.cc.\u001c\n",
+            "terminal period",
+        )
+
 
 class GeneratorTests(unittest.TestCase):
     @classmethod
@@ -390,6 +402,21 @@ class GeneratorTests(unittest.TestCase):
 
         self.assertIn(
             r"| `crates/flpdf/src/a\\\|b.rs` | correspondence | test module |",
+            rendered,
+        )
+
+    def test_module_path_code_span_preserves_lone_backslash(self):
+        rendered = self.module.render_index(
+            [
+                (
+                    Path(r"crates/flpdf/src/a\b.rs"),
+                    self.module.Classification("correspondence", "test module"),
+                )
+            ]
+        )
+
+        self.assertIn(
+            r"| `crates/flpdf/src/a\b.rs` | correspondence | test module |",
             rendered,
         )
 
