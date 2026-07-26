@@ -2084,13 +2084,12 @@ pub fn build_attachments_section<R: Read + Seek>(
         match names_location {
             NamesLocation::Direct => {
                 catalog.insert("Names", Object::Dictionary(names_dict));
+                pdf.set_object(catalog_ref, Object::Dictionary(catalog));
             }
             NamesLocation::Indirect(names_ref) => {
                 pdf.set_object(names_ref, Object::Dictionary(names_dict));
-                catalog.insert("Names", Object::Reference(names_ref));
             }
         }
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
     }
 
     let mut raw_entries: Vec<(String, FilespecSource)> = entries
@@ -7207,7 +7206,7 @@ mod tests {
     }
 
     #[test]
-    fn attachments_repairs_direct_kid_in_indirect_names_holder() {
+    fn attachments_repairs_direct_kid_without_collapsing_names_holder_chain() {
         let mut pdf = load_one_page_pdf();
         let mut filespec = Dictionary::new();
         filespec.insert("F", Object::String(b"inline.txt".to_vec()));
@@ -7231,7 +7230,9 @@ mod tests {
         tree.insert("Kids", Object::Array(vec![Object::Dictionary(leaf)]));
         let mut names = Dictionary::new();
         names.insert("EmbeddedFiles", Object::Dictionary(tree));
-        let names_ref = crate::ObjectRef::new(902, 0);
+        let names_holder_ref = crate::ObjectRef::new(902, 0);
+        let names_ref = crate::ObjectRef::new(903, 0);
+        pdf.set_object(names_holder_ref, Object::Reference(names_ref));
         pdf.set_object(names_ref, Object::Dictionary(names));
         let catalog_ref = pdf.root_ref().expect("catalog ref");
         let mut catalog = pdf
@@ -7240,8 +7241,11 @@ mod tests {
             .as_dict()
             .expect("catalog dict")
             .clone();
-        catalog.insert("Names", Object::Reference(names_ref));
+        catalog.insert("Names", Object::Reference(names_holder_ref));
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        for object_ref in pdf.dirty_object_refs() {
+            pdf.clear_dirty(object_ref);
+        }
 
         let result = build_attachments_section(&mut pdf).expect("build attachments");
 
@@ -7250,6 +7254,17 @@ mod tests {
         };
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "inline");
+        let catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("catalog")
+            .as_dict()
+            .expect("catalog dict");
+        assert_eq!(
+            catalog.get("Names"),
+            Some(&Object::Reference(names_holder_ref))
+        );
+        assert!(!pdf.is_dirty(catalog_ref));
+        assert!(pdf.is_dirty(names_ref));
     }
 
     // ── attachments Test 2: attachment-two-page.pdf → 1 entry ────────────────
