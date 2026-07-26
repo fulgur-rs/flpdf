@@ -1064,6 +1064,7 @@ impl<K: TreeKey> NNTree<K> {
                 "insert: items array is too short",
             ));
         }
+        self.ensure_split_allocations_available(pdf, allocator, cursor, items.values.len() + 2)?;
         items.values.insert(item_number + 2, K::to_object(&key));
         items.values.insert(item_number + 3, value);
         items.store(pdf, &mut dictionary, K::ITEMS_KEY);
@@ -1168,6 +1169,7 @@ impl<K: TreeKey> NNTree<K> {
             ));
         };
         // cov:ignore-end
+        self.ensure_split_allocations_available(pdf, allocator, &cursor, items.values.len() + 2)?;
         items.values.insert(0, K::to_object(&key));
         items.values.insert(1, value);
         items.store(pdf, &mut dictionary, K::ITEMS_KEY);
@@ -1196,6 +1198,45 @@ impl<K: TreeKey> NNTree<K> {
         }
 
         self.replace_root_contents(pdf, replacement.into_root())
+    }
+
+    fn ensure_split_allocations_available<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        allocator: &ObjectAllocator,
+        cursor: &NNTreeCursor<K>,
+        item_array_len: usize,
+    ) -> Result<()> {
+        if item_array_len <= 2 * self.split_threshold {
+            return Ok(());
+        }
+
+        let mut allocations = 0usize;
+        let mut parent_index = cursor.path.len().checked_sub(1);
+        loop {
+            let Some(index) = parent_index else {
+                allocations += 2;
+                break;
+            };
+            allocations += 1;
+
+            let parent_handle = &cursor.path[index].node;
+            let parent = self.load_node(pdf, parent_handle)?;
+            // cov:ignore-start: the cursor path was built from this parent's /Kids array
+            let Some(kids) = resolved_array(pdf, parent.get("Kids"))? else {
+                return Err(structural_error(
+                    parent_handle.diagnostic_ref(),
+                    "node is missing /Kids",
+                ));
+            };
+            // cov:ignore-end
+            if kids.values.len() < self.split_threshold {
+                break;
+            }
+            parent_index = index.checked_sub(1);
+        }
+
+        allocator.ensure_available(pdf, allocations)
     }
 
     fn replace_root_contents<R: Read + Seek>(
@@ -1305,7 +1346,9 @@ impl<K: TreeKey> NNTree<K> {
             ));
         };
         // cov:ignore-end
-        let start_index = (first_half.values.len() / 2) & !1;
+        // Item arrays alternate key/value pairs; /Kids entries are independent.
+        let midpoint = first_half.values.len() / 2;
+        let start_index = if is_leaf { midpoint & !1 } else { midpoint };
         let second_half = first_half.values.split_off(start_index);
         first_half.store(pdf, &mut first_dictionary, array_key);
         self.store_node(pdf, &node, first_dictionary)?;
@@ -2123,6 +2166,31 @@ struct ObjectAllocator {
     next: Option<u64>,
 }
 
+impl ObjectAllocator {
+    fn next_number<R: Read + Seek>(&self, pdf: &Pdf<R>) -> u64 {
+        self.next.unwrap_or_else(|| {
+            pdf.object_refs()
+                .into_iter()
+                .map(|object_ref| u64::from(object_ref.number))
+                .max()
+                .unwrap_or(0)
+                + 1
+        })
+    }
+
+    fn ensure_available<R: Read + Seek>(&self, pdf: &Pdf<R>, count: usize) -> Result<()> {
+        debug_assert!(count > 0);
+        let available = (u64::from(u32::MAX) + 1).saturating_sub(self.next_number(pdf));
+        if (count as u64) <= available {
+            Ok(())
+        } else {
+            Err(Error::Unsupported(
+                "object-number space exhausted".to_string(),
+            ))
+        }
+    }
+}
+
 fn make_indirect<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     allocator: &mut ObjectAllocator,
@@ -2131,14 +2199,7 @@ fn make_indirect<R: Read + Seek>(
     // A fresh allocator is created for each tree update, so allocations made
     // through the same Pdf between updates are included in this initial scan.
     // Recursive splits and repair rebuilds then advance in O(1) per object.
-    let next = *allocator.next.get_or_insert_with(|| {
-        pdf.object_refs()
-            .into_iter()
-            .map(|object_ref| u64::from(object_ref.number))
-            .max()
-            .unwrap_or(0)
-            + 1
-    });
+    let next = allocator.next_number(pdf);
     let number = u32::try_from(next)
         .map_err(|_| Error::Unsupported("object-number space exhausted".to_string()))?;
     allocator.next = Some(next + 1);

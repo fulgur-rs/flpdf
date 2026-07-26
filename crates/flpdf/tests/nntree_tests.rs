@@ -301,6 +301,61 @@ fn number_tree_helper_exposes_sorted_find_map_and_remove() {
 }
 
 #[test]
+fn number_tree_threshold_two_keeps_all_entries_across_internal_split() {
+    let mut pdf = empty_pdf();
+    let mut root = Dictionary::new();
+    root.insert("Nums", Object::Array(Vec::new()));
+    let mut tree = NumberTree::new(Object::Dictionary(root), true);
+    tree.set_split_threshold(2);
+
+    for key in 0..5 {
+        tree.insert(&mut pdf, key, Object::Integer(key))
+            .expect("insert must survive an internal split");
+    }
+
+    assert_eq!(
+        tree.as_map(&mut pdf).expect("map"),
+        BTreeMap::from([
+            (0, Object::Integer(0)),
+            (1, Object::Integer(1)),
+            (2, Object::Integer(2)),
+            (3, Object::Integer(3)),
+            (4, Object::Integer(4)),
+        ])
+    );
+}
+
+#[test]
+fn number_tree_split_allocation_failure_leaves_tree_unchanged() {
+    let mut pdf = empty_pdf();
+    let mut root = Dictionary::new();
+    root.insert("Nums", Object::Array(Vec::new()));
+    let mut tree = NumberTree::new(Object::Dictionary(root), true);
+    tree.set_split_threshold(2);
+    tree.insert(&mut pdf, 0, Object::Integer(0))
+        .expect("insert zero");
+    tree.insert(&mut pdf, 1, Object::Integer(1))
+        .expect("insert one");
+    pdf.set_object(ObjectRef::new(u32::MAX - 1, 0), Object::Null);
+    let before = tree.as_map(&mut pdf).expect("map before failed insert");
+
+    let error = match tree.insert(&mut pdf, 2, Object::Integer(2)) {
+        Err(error) => error,
+        Ok(_) => panic!("root split needs two objects but only one remains"),
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "unsupported PDF feature: object-number space exhausted"
+    );
+    assert_eq!(
+        tree.as_map(&mut pdf).expect("map after failed insert"),
+        before
+    );
+    assert!(!pdf.object_refs().contains(&ObjectRef::new(u32::MAX, 0)));
+}
+
+#[test]
 fn compatibility_name_reader_returns_qpdf_normalized_utf8_key() {
     let mut pdf = empty_pdf();
     let mut root = Dictionary::new();
