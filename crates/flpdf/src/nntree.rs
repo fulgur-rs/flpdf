@@ -750,8 +750,8 @@ impl<K: TreeKey> NNTree<K> {
                         cursor,
                         parent_handle.clone(),
                         path_index.checked_sub(1),
-                    )?;
-                }
+                    )?; // cov:ignore: LLVM maps this covered multi-line call terminator to a zero-count region
+                } // cov:ignore: LLVM maps this covered limit-reset branch delimiter to a zero-count region
                 cursor.clear_position();
                 if removed_kid == remaining_kids {
                     cursor.path[path_index].kid_number -= 1;
@@ -761,7 +761,7 @@ impl<K: TreeKey> NNTree<K> {
                     self.descend(pdf, cursor, child, false, true)?;
                     if cursor.valid() {
                         self.next(pdf, cursor)?;
-                    }
+                    } // cov:ignore: LLVM maps this covered conditional delimiter to a zero-count region
                 } else {
                     let next = kids[removed_kid].clone();
                     let child = self.prepare_kid(pdf, &parent_handle, removed_kid, next)?;
