@@ -1,21 +1,11 @@
-//! Generic name-tree / number-tree iteration (ISO 32000-2 §7.9.6 / §7.9.7).
+//! Compatibility functions for name and number trees.
 //!
-//! Name trees (`/Names` leaf, string keys) and number trees (`/Nums` leaf,
-//! integer keys) share the same shape: `/Kids` intermediate nodes, an optional
-//! `/Limits [least greatest]` array, depth-first key-ascending order, and the
-//! need for depth + cycle guards against hostile or cyclic `/Kids` chains.
-//!
-//! [`read_name_tree`] / [`read_number_tree`] enumerate a tree, decoding each
-//! value via a caller-supplied hook (generic over the value type, so the same
-//! walker serves verbatim-`Object`, reference-only, and resolved-`Dictionary`
-//! views). [`build_name_tree`] rebuilds a name tree from sorted entries.
-//!
-//! This module owns only structural concerns (parse + build). Catalog wiring,
-//! `/AF` upkeep, GC, and prune-during-walk stay in the consumer.
+//! Existing callers keep the original free-function API, while all structural
+//! reads and writes are forwarded to the shared [`crate::NameTree`] and
+//! [`crate::NumberTree`] component. Catalog wiring, `/AF` upkeep, GC, and
+//! consumer-specific decoding stay in the caller.
 
-use crate::ref_chain::resolve_ref_chain;
-use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
-use std::collections::BTreeSet;
+use crate::{Object, ObjectRef, Pdf, Result};
 use std::io::{Read, Seek};
 
 /// Default `/Kids` descent depth limit (cyclic / maliciously deep guard).
@@ -45,22 +35,15 @@ where
     R: Read + Seek,
     F: FnMut(&mut Pdf<R>, Object) -> Result<Option<V>>,
 {
-    let mut out = Vec::new();
-    let mut visited = BTreeSet::new();
-    walk_tree(
-        pdf,
-        root,
-        "Names",
-        &|o| match o {
-            Object::String(b) => Some(b),
-            _ => None,
-        },
-        &mut decode,
-        &mut out,
-        &mut visited,
-        0,
-        max_depth,
-    )?;
+    let mut tree = crate::NameTree::new(root, false);
+    tree.set_max_depth(max_depth);
+    let entries = tree.as_map(pdf)?;
+    let mut out = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        if let Some(value) = decode(pdf, value)? {
+            out.push((key, value));
+        }
+    }
     Ok(out)
 }
 
@@ -83,22 +66,15 @@ where
     R: Read + Seek,
     F: FnMut(&mut Pdf<R>, Object) -> Result<Option<V>>,
 {
-    let mut out = Vec::new();
-    let mut visited = BTreeSet::new();
-    walk_tree(
-        pdf,
-        root,
-        "Nums",
-        &|o| match o {
-            Object::Integer(n) => Some(n),
-            _ => None,
-        },
-        &mut decode,
-        &mut out,
-        &mut visited,
-        0,
-        max_depth,
-    )?;
+    let mut tree = crate::NumberTree::new(root, false);
+    tree.set_max_depth(max_depth);
+    let entries = tree.as_map(pdf)?;
+    let mut out = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        if let Some(value) = decode(pdf, value)? {
+            out.push((key, value));
+        }
+    }
     Ok(out)
 }
 
@@ -124,66 +100,12 @@ where
 /// Debug-asserts `entries` is non-empty.
 pub fn build_name_tree<A>(
     entries: &[(Vec<u8>, Object)],
-    mut alloc: A,
+    alloc: A,
 ) -> (ObjectRef, Vec<(ObjectRef, Object)>)
 where
     A: FnMut() -> ObjectRef,
 {
-    debug_assert!(
-        !entries.is_empty(),
-        "build_name_tree requires non-empty entries"
-    );
-    let mut nodes: Vec<(ObjectRef, Object)> = Vec::new();
-
-    if entries.len() <= LEAF_MAX {
-        let root_ref = alloc();
-        // Root node omits /Limits: ISO 32000-2 7.9.6 restricts /Limits to
-        // intermediate and leaf nodes. qpdf emits a single-node name-tree root as
-        // /Names only.
-        let mut root = Dictionary::new();
-        root.insert("Names", Object::Array(name_pairs(entries)));
-        nodes.push((root_ref, Object::Dictionary(root)));
-        return (root_ref, nodes);
-    }
-
-    let n_leaves = entries.len().div_ceil(LEAF_MAX);
-    let chunk_size = entries.len().div_ceil(n_leaves);
-    let mut kids: Vec<Object> = Vec::with_capacity(n_leaves);
-    for chunk in entries.chunks(chunk_size) {
-        let leaf_ref = alloc();
-        nodes.push((leaf_ref, Object::Dictionary(build_leaf_dict(chunk))));
-        kids.push(Object::Reference(leaf_ref));
-    }
-    // Root node omits /Limits (ISO 32000-2 7.9.6: /Limits is for intermediate
-    // and leaf nodes only; qpdf emits a multi-node root as /Kids only).
-    let mut root = Dictionary::new();
-    root.insert("Kids", Object::Array(kids));
-    let root_ref = alloc();
-    nodes.push((root_ref, Object::Dictionary(root)));
-    (root_ref, nodes)
-}
-
-/// The `/Names` value: a flat `[key1 val1 key2 val2 ...]` array.
-fn name_pairs(entries: &[(Vec<u8>, Object)]) -> Vec<Object> {
-    let mut pairs = Vec::with_capacity(entries.len() * 2);
-    for (key, val) in entries {
-        pairs.push(Object::String(key.clone()));
-        pairs.push(val.clone());
-    }
-    pairs
-}
-
-/// Leaf node dict: `/Limits [first last]` + `/Names [k1 v1 ...]`.
-fn build_leaf_dict(entries: &[(Vec<u8>, Object)]) -> Dictionary {
-    let first = entries.first().map(|(k, _)| k.clone()).unwrap_or_default();
-    let last = entries.last().map(|(k, _)| k.clone()).unwrap_or_default();
-    let mut dict = Dictionary::new();
-    dict.insert(
-        "Limits",
-        Object::Array(vec![Object::String(first), Object::String(last)]),
-    );
-    dict.insert("Names", Object::Array(name_pairs(entries)));
-    dict
+    crate::nntree::build_name_tree_compat(entries, alloc)
 }
 
 /// Build a **number** tree from a **non-empty, pre-sorted** `(key, value)` slice.
@@ -200,171 +122,18 @@ fn build_leaf_dict(entries: &[(Vec<u8>, Object)]) -> Dictionary {
 /// Debug-asserts `entries` is non-empty.
 pub fn build_number_tree<A>(
     entries: &[(i64, Object)],
-    mut alloc: A,
+    alloc: A,
 ) -> (ObjectRef, Vec<(ObjectRef, Object)>)
 where
     A: FnMut() -> ObjectRef,
 {
-    debug_assert!(
-        !entries.is_empty(),
-        "build_number_tree requires non-empty entries"
-    );
-    let mut nodes: Vec<(ObjectRef, Object)> = Vec::new();
-
-    if entries.len() <= LEAF_MAX {
-        let root_ref = alloc();
-        // Root node omits /Limits: ISO 32000-2 7.9.7 restricts /Limits to
-        // intermediate and leaf nodes. qpdf emits a single-node number-tree root
-        // as /Nums only.
-        let mut root = Dictionary::new();
-        root.insert("Nums", Object::Array(num_pairs(entries)));
-        nodes.push((root_ref, Object::Dictionary(root)));
-        return (root_ref, nodes);
-    }
-
-    let n_leaves = entries.len().div_ceil(LEAF_MAX);
-    let chunk_size = entries.len().div_ceil(n_leaves);
-    let mut kids: Vec<Object> = Vec::with_capacity(n_leaves);
-    for chunk in entries.chunks(chunk_size) {
-        let leaf_ref = alloc();
-        nodes.push((leaf_ref, Object::Dictionary(build_num_leaf_dict(chunk))));
-        kids.push(Object::Reference(leaf_ref));
-    }
-    // Root node omits /Limits (ISO 32000-2 7.9.7: /Limits is for intermediate
-    // and leaf nodes only; qpdf emits a multi-node root as /Kids only).
-    let mut root = Dictionary::new();
-    root.insert("Kids", Object::Array(kids));
-    let root_ref = alloc();
-    nodes.push((root_ref, Object::Dictionary(root)));
-    (root_ref, nodes)
-}
-
-/// The `/Nums` value: a flat `[key1 val1 key2 val2 ...]` array (integer keys).
-fn num_pairs(entries: &[(i64, Object)]) -> Vec<Object> {
-    let mut pairs = Vec::with_capacity(entries.len() * 2);
-    for (key, val) in entries {
-        pairs.push(Object::Integer(*key));
-        pairs.push(val.clone());
-    }
-    pairs
-}
-
-/// Leaf node dict: `/Limits [first last]` (integers) + `/Nums [k1 v1 ...]`.
-fn build_num_leaf_dict(entries: &[(i64, Object)]) -> Dictionary {
-    let first = entries.first().map(|(k, _)| *k).unwrap_or_default();
-    let last = entries.last().map(|(k, _)| *k).unwrap_or_default();
-    let mut dict = Dictionary::new();
-    dict.insert(
-        "Limits",
-        Object::Array(vec![Object::Integer(first), Object::Integer(last)]),
-    );
-    dict.insert("Nums", Object::Array(num_pairs(entries)));
-    dict
-}
-
-/// Internal generic walker shared by name + number readers.
-///
-/// `node` is a `Reference` (resolved + cycle-tracked here) or a `Dictionary`.
-/// `leaf_key` is `"Names"` or `"Nums"`; `parse_key` converts a leaf key object
-/// to `K` (or `None` to skip the pair).
-#[allow(clippy::too_many_arguments)]
-fn walk_tree<R, K, V, FK, FV>(
-    pdf: &mut Pdf<R>,
-    node: Object,
-    leaf_key: &str,
-    parse_key: &FK,
-    decode: &mut FV,
-    out: &mut Vec<(K, V)>,
-    visited: &mut BTreeSet<ObjectRef>,
-    depth: usize,
-    max_depth: usize,
-) -> Result<()>
-where
-    R: Read + Seek,
-    FK: Fn(Object) -> Option<K>,
-    FV: FnMut(&mut Pdf<R>, Object) -> Result<Option<V>>,
-{
-    if depth >= max_depth {
-        return Err(crate::Error::Unsupported(format!(
-            "name_number_tree: /Kids depth limit {max_depth} exceeded"
-        )));
-    }
-
-    // Resolve a reference node (cycle-tracked); inline dicts pass through.
-    let mut dict: Dictionary = match node {
-        Object::Dictionary(d) => d,
-        Object::Reference(r) => {
-            // A /Kids node ref may be a holder chain (`r → r2 → node dict`);
-            // follow it to the terminal so a doubled-indirect kid is descended,
-            // not dropped. Holder hops are bounded by resolve_ref_chain's own
-            // MAX_REF_CHAIN_DEPTH — a separate axis from the /Kids `visited` /
-            // `depth` guards (kept as-is). `into_dict` takes the terminal by
-            // value, so no extra clone over the prior `as_dict().clone()`.
-            let (terminal, terminal_ref) = resolve_ref_chain(pdf, &Object::Reference(r))?;
-            // Dedup on the *terminal* ref, not the holder `r`: two distinct
-            // holders (`21 0 R`, `22 0 R`) resolving to one terminal node are
-            // the holder-form of a direct `[20 0 R 20 0 R]` dup, which the
-            // visited set already collapses. Keying on `r` would walk that
-            // shared child twice and emit duplicate name/number-tree entries.
-            // (terminal_ref is always Some for a Reference start; fall back to
-            // `r` defensively.)
-            if !visited.insert(terminal_ref.unwrap_or(r)) {
-                return Ok(()); // already walked this terminal node / cycle — skip
-            }
-            match terminal.into_dict() {
-                Some(d) => d,
-                None => return Ok(()), // malformed / non-dict node — skip
-            }
-        }
-        _ => return Ok(()), // unexpected node type — skip
-    };
-
-    // Leaf takes priority over /Kids (spec leaf vs. intermediate). `dict` is
-    // owned here, so move the leaf array out instead of copying it. A non-array
-    // (or absent) leaf value falls through to /Kids, matching the old
-    // `.and_then(Object::as_array)` semantics.
-    if let Some(Object::Array(pairs)) = dict.remove(leaf_key) {
-        let mut it = pairs.into_iter();
-        while let Some(key_obj) = it.next() {
-            let Some(val_obj) = it.next() else {
-                break; // odd-length array — drop orphan key
-            };
-            let Some(key) = parse_key(key_obj) else {
-                continue; // non-matching key type — skip pair
-            };
-            if let Some(v) = decode(pdf, val_obj)? {
-                out.push((key, v));
-            }
-        }
-        return Ok(());
-    }
-
-    // Intermediate node. Only indirect-reference kids are descended (inline-dict
-    // kids are dropped, preserving the two legacy walkers this module replaces).
-    if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
-        // `kids` borrows the owned local `dict`; the recursive call only borrows
-        // `pdf`/`decode`/… (never `dict`), so iterate the filter_map directly and
-        // avoid a per-node `Vec<ObjectRef>` heap allocation.
-        for r in kids.iter().filter_map(Object::as_ref_id) {
-            walk_tree(
-                pdf,
-                Object::Reference(r),
-                leaf_key,
-                parse_key,
-                decode,
-                out,
-                visited,
-                depth + 1,
-                max_depth,
-            )?;
-        }
-    }
-    Ok(())
+    crate::nntree::build_number_tree_compat(entries, alloc)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Dictionary;
 
     // Shared decode hooks, reused across tests so each body is defined (and
     // covered) once instead of as a fresh inline closure per call site.
@@ -570,10 +339,9 @@ mod tests {
     }
 
     #[test]
-    fn read_name_tree_skips_inline_dict_kid() {
-        // A /Kids array element that is an inline Dictionary leaf (not an
-        // indirect reference) must NOT be descended — preserving the legacy
-        // reference-only descent. Only Reference kids are followed.
+    fn read_name_tree_accepts_inline_dict_kid() {
+        // The qpdf helper descends a direct kid while warning that it should be
+        // indirect when auto-repair is disabled.
         let mut pdf = empty_pdf();
         let mut inline_leaf = Dictionary::new();
         inline_leaf.insert(
@@ -592,7 +360,7 @@ mod tests {
             DEFAULT_MAX_TREE_DEPTH,
         )
         .unwrap();
-        assert!(out.is_empty(), "inline-dict kid must not be descended");
+        assert_eq!(out, vec![(b"k".to_vec(), ObjectRef::new(99, 0))]);
     }
 
     #[test]
@@ -676,13 +444,13 @@ mod tests {
     }
 
     #[test]
-    fn read_number_tree_skips_noninteger_key() {
+    fn read_number_tree_invalid_first_key_yields_no_entries() {
         let mut pdf = empty_pdf();
         let mut leaf = Dictionary::new();
         leaf.insert(
             "Nums",
             Object::Array(vec![
-                Object::Name("oops".into()), // non-integer key -> skip pair
+                Object::Name("oops".into()),
                 Object::Integer(1),
                 Object::Integer(7),
                 Object::Integer(2),
@@ -695,7 +463,7 @@ mod tests {
             DEFAULT_MAX_TREE_DEPTH,
         )
         .unwrap();
-        assert_eq!(out, vec![(7, 2)]);
+        assert!(out.is_empty());
     }
 
     fn mk_entries(n: usize) -> Vec<(Vec<u8>, Object)> {
@@ -765,9 +533,9 @@ mod tests {
     }
 
     #[test]
-    fn read_name_tree_skips_non_string_key() {
-        // A /Names leaf whose key is not a PDF string drops that pair; its value
-        // is still consumed so the following pair stays aligned.
+    fn read_name_tree_invalid_first_key_yields_no_entries() {
+        // The qpdf iterator treats an invalid first key as an invalid cursor;
+        // the compatibility map therefore contains no entries from this leaf.
         let mut pdf = empty_pdf();
         let mut leaf = Dictionary::new();
         leaf.insert(
@@ -786,7 +554,7 @@ mod tests {
             DEFAULT_MAX_TREE_DEPTH,
         )
         .unwrap();
-        assert_eq!(out, vec![(b"ok".to_vec(), ObjectRef::new(11, 0))]);
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -823,8 +591,8 @@ mod tests {
     }
 
     #[test]
-    fn read_name_tree_odd_length_leaf_drops_orphan() {
-        // An odd-length /Names array drops the trailing key with no value.
+    fn read_name_tree_odd_length_leaf_errors() {
+        // qpdf's initial iterator dereference rejects an odd-length leaf.
         let mut pdf = empty_pdf();
         let mut leaf = Dictionary::new();
         leaf.insert(
@@ -835,14 +603,14 @@ mod tests {
                 Object::String(b"orphan".to_vec()), // no value -> dropped
             ]),
         );
-        let out = read_name_tree(
+        let error = read_name_tree(
             &mut pdf,
             Object::Dictionary(leaf),
             ref_only,
             DEFAULT_MAX_TREE_DEPTH,
         )
-        .unwrap();
-        assert_eq!(out, vec![(b"a".to_vec(), ObjectRef::new(10, 0))]);
+        .expect_err("odd leaf must fail");
+        assert!(error.to_string().contains("items array is too short"));
     }
 
     #[test]

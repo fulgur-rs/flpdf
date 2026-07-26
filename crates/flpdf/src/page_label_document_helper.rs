@@ -2,12 +2,12 @@
 //!
 //! [`PageLabelDocumentHelper`] reads, renders (ISO 32000-1 §12.4.2), and edits
 //! the catalog `/PageLabels` number tree. [`LabelRange`] models one label range
-//! (`/S` style, `/P` prefix, `/St` start). The number-tree walking/building is
-//! delegated to [`crate::name_number_tree`].
+//! (`/S` style, `/P` prefix, `/St` start). Structural traversal and mutation
+//! are delegated to [`crate::NumberTree`].
 
 use crate::name_number_tree::DEFAULT_MAX_TREE_DEPTH;
 use crate::ref_chain::resolve_ref_chain;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Error, Object, Pdf, Result};
 use std::io::{Read, Seek};
 
 /// Page-label numbering style (ISO 32000-1 §12.4.2 `/S`).
@@ -408,29 +408,37 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let Some(root) = self.pagelabels_root()? else {
             return Ok(vec![]);
         };
-        crate::name_number_tree::read_number_tree(
-            self.pdf,
-            root,
-            |pdf, v| {
-                let dict = match v {
-                    Object::Dictionary(d) => Some(d),
-                    Object::Reference(r) => {
-                        // A label-range value may be stored behind a holder
-                        // chain (ref -> ref -> dict); follow the chain to its
-                        // terminal rather than a single hop, then move the
-                        // owned dictionary out.
-                        let (terminal, _) = resolve_ref_chain(pdf, &Object::Reference(r))?;
-                        terminal.into_dict()
-                    }
-                    _ => None,
-                };
-                match dict {
-                    Some(d) => Ok(Some(LabelRange::from_dict_resolved(pdf, &d)?)),
-                    None => Ok(None),
+        let mut tree = crate::NumberTree::new(root, true);
+        tree.set_max_depth(DEFAULT_MAX_TREE_DEPTH);
+        let raw_entries = tree.as_map(self.pdf)?;
+        let mut entries = Vec::with_capacity(raw_entries.len());
+        for (index, value) in raw_entries {
+            let dictionary = match value {
+                Object::Dictionary(dictionary) => Some(dictionary),
+                Object::Reference(object_ref) => {
+                    let (terminal, _) =
+                        resolve_ref_chain(self.pdf, &Object::Reference(object_ref))?;
+                    terminal.into_dict()
                 }
-            },
-            DEFAULT_MAX_TREE_DEPTH,
-        )
+                _ => None,
+            };
+            if let Some(dictionary) = dictionary {
+                entries.push((
+                    index,
+                    LabelRange::from_dict_resolved(self.pdf, &dictionary)?,
+                ));
+            }
+        }
+
+        let Some(catalog_ref) = self.pdf.root_ref() else {
+            return Ok(entries);
+        };
+        if let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() {
+            catalog.insert("PageLabels", tree.into_root());
+            self.pdf
+                .set_object(catalog_ref, Object::Dictionary(catalog));
+        }
+        Ok(entries)
     }
 
     /// The effective label for a 0-based page index (qpdf `getLabelForPage`):
@@ -593,20 +601,6 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         Ok(())
     }
 
-    /// Collect the raw `(index, value Object)` entries of the `/PageLabels` tree
-    /// verbatim (values un-decoded), for rebuild.
-    fn raw_entries(&mut self) -> Result<Vec<(i64, Object)>> {
-        let Some(root) = self.pagelabels_root()? else {
-            return Ok(vec![]);
-        };
-        crate::name_number_tree::read_number_tree(
-            self.pdf,
-            root,
-            |_, v| Ok(Some(v)),
-            DEFAULT_MAX_TREE_DEPTH,
-        )
-    }
-
     /// Insert or replace the label range whose first page index is
     /// `first_page_idx`. Rebuilds the `/Nums` tree and points the catalog
     /// `/PageLabels` at the new (indirect) root.
@@ -617,16 +611,26 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     ///   exceeded while reading the existing tree.
     /// - Any error from [`Pdf::resolve`].
     pub fn set_range(&mut self, first_page_idx: i64, range: LabelRange) -> Result<()> {
-        let mut entries = self.raw_entries()?;
-        let value = Object::Dictionary(range.to_dict());
-        match entries.iter_mut().find(|(k, _)| *k == first_page_idx) {
-            Some(e) => e.1 = value,
-            None => {
-                entries.push((first_page_idx, value));
-                entries.sort_by_key(|(k, _)| *k);
-            }
-        }
-        self.rebuild(entries)
+        let Some(catalog_ref) = self.pdf.root_ref() else {
+            return Ok(());
+        };
+        let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
+            return Ok(());
+        };
+        let mut tree = match catalog.get("PageLabels").cloned() {
+            Some(root) => crate::NumberTree::new(root, true),
+            None => crate::NumberTree::new_empty(self.pdf, true)?,
+        };
+        tree.insert(
+            self.pdf,
+            first_page_idx,
+            Object::Dictionary(range.to_dict()),
+        )?;
+        tree.make_root_indirect(self.pdf)?;
+        catalog.insert("PageLabels", tree.into_root());
+        self.pdf
+            .set_object(catalog_ref, Object::Dictionary(catalog));
+        Ok(())
     }
 
     /// Remove the label range whose first page index is `first_page_idx`.
@@ -639,13 +643,27 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     ///   exceeded while reading the existing tree.
     /// - Any error from [`Pdf::resolve`].
     pub fn remove_range(&mut self, first_page_idx: i64) -> Result<bool> {
-        let mut entries = self.raw_entries()?;
-        let before = entries.len();
-        entries.retain(|(k, _)| *k != first_page_idx);
-        if entries.len() == before {
+        let Some(catalog_ref) = self.pdf.root_ref() else {
+            return Ok(false);
+        };
+        let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
+            return Ok(false);
+        };
+        let Some(root) = catalog.get("PageLabels").cloned() else {
+            return Ok(false);
+        };
+        let mut tree = crate::NumberTree::new(root, true);
+        if tree.remove(self.pdf, first_page_idx)?.is_none() {
             return Ok(false);
         }
-        self.rebuild(entries)?;
+        if tree.begin(self.pdf)?.valid() {
+            tree.make_root_indirect(self.pdf)?;
+            catalog.insert("PageLabels", tree.into_root());
+        } else {
+            catalog.remove("PageLabels");
+        }
+        self.pdf
+            .set_object(catalog_ref, Object::Dictionary(catalog));
         Ok(true)
     }
 
@@ -657,8 +675,8 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// This is the bulk counterpart to [`Self::set_range`]/[`Self::remove_range`]:
     /// where those mutate one entry of the existing tree, `write_labels`
     /// discards whatever the tree currently holds and rebuilds it from the
-    /// given list (rebalanced through [`crate::name_number_tree::build_number_tree`],
-    /// same leaf-chunking rule as every other tree in this crate).
+    /// given list (rebalanced through [`crate::NumberTree`] with qpdf's split
+    /// behavior).
     ///
     /// # Errors
     ///
@@ -901,23 +919,12 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             return Ok(());
         }
 
-        let mut next_num: u32 = self
-            .pdf
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0);
-        let mut alloc = move || -> ObjectRef {
-            next_num += 1;
-            ObjectRef::new(next_num, 0)
-        };
-
-        let (root_ref, nodes) = crate::name_number_tree::build_number_tree(&entries, &mut alloc);
-        for (r, node) in nodes {
-            self.pdf.set_object(r, node);
+        let mut tree = crate::NumberTree::new_empty(self.pdf, true)?;
+        let mut cursor = tree.end();
+        for (index, value) in entries {
+            cursor.insert_after(&mut tree, self.pdf, index, value)?;
         }
-        catalog.insert("PageLabels", Object::Reference(root_ref));
+        catalog.insert("PageLabels", tree.into_root());
         self.pdf
             .set_object(catalog_ref, Object::Dictionary(catalog));
         Ok(())
@@ -935,6 +942,7 @@ impl<R: Read + Seek> Pdf<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ObjectRef;
     use std::io::Cursor;
 
     /// A minimal one-page PDF with no `/PageLabels` key at all (as opposed to

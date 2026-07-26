@@ -1151,8 +1151,8 @@ pub fn build_pagelabels_section<R: Read + Seek>(
     let catalog = pdf
         .resolve_borrowed(catalog_ref)
         .map_err(ConvertError::from)?;
-    let catalog_dict = match catalog {
-        Object::Dictionary(d) => d,
+    let mut catalog_dict = match catalog {
+        Object::Dictionary(d) => d.clone(),
         _ => return Ok(JsonValue::Array(vec![])),
     };
 
@@ -1162,23 +1162,28 @@ pub fn build_pagelabels_section<R: Read + Seek>(
         None => return Ok(JsonValue::Array(vec![])),
     };
 
-    // The generic number-tree walker resolves the root reference itself, so
-    // pass `pagelabels_val` (Reference or Dictionary) straight in.
-    let mut entries: Vec<(i64, Dictionary)> = crate::name_number_tree::read_number_tree(
-        pdf,
-        pagelabels_val,
-        |pdf, v| match v {
-            Object::Dictionary(d) => Ok(Some(d)),
-            Object::Reference(r) => Ok(pdf.resolve_borrowed(r)?.as_dict().cloned()),
-            _ => Ok(None),
-        },
-        DEFAULT_MAX_PAGE_TREE_DEPTH,
-    )
-    .map_err(ConvertError::from)?;
+    let mut tree = crate::NumberTree::new(pagelabels_val, true);
+    tree.set_max_depth(DEFAULT_MAX_PAGE_TREE_DEPTH);
+    let raw_entries = tree.as_map(pdf).map_err(ConvertError::from)?;
+    catalog_dict.insert("PageLabels", tree.into_root());
+    pdf.set_object(catalog_ref, Object::Dictionary(catalog_dict));
 
-    // Sort by page index (ascending) — spec guarantees ascending order in a
-    // well-formed number tree, but we sort defensively.
-    entries.sort_by_key(|(idx, _)| *idx);
+    let mut entries = Vec::with_capacity(raw_entries.len());
+    for (index, value) in raw_entries {
+        let dictionary = match value {
+            Object::Dictionary(dictionary) => Some(dictionary),
+            Object::Reference(object_ref) => {
+                let (terminal, _) =
+                    crate::ref_chain::resolve_ref_chain(pdf, &Object::Reference(object_ref))
+                        .map_err(ConvertError::from)?;
+                terminal.into_dict()
+            }
+            _ => None,
+        };
+        if let Some(dictionary) = dictionary {
+            entries.push((index, dictionary));
+        }
+    }
 
     let result: Vec<JsonValue> = entries
         .into_iter()
@@ -2032,18 +2037,30 @@ pub fn build_attachments_section<R: Read + Seek>(
     let catalog = pdf
         .resolve_borrowed(catalog_ref)
         .map_err(ConvertError::from)?;
-    let names_val = match catalog {
-        Object::Dictionary(d) => d.get("Names").cloned(),
+    let mut catalog = match catalog {
+        Object::Dictionary(dictionary) => dictionary.clone(),
         _ => return Ok(JsonValue::Object(vec![])),
     };
+    let names_val = catalog.get("Names").cloned();
 
-    // /Names dictionary from catalog
-    let names_dict = match names_val {
-        Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
-            Object::Dictionary(d) => d.clone(),
-            _ => return Ok(JsonValue::Object(vec![])),
-        },
+    enum NamesLocation {
+        Direct,
+        Indirect(crate::ObjectRef),
+    }
+
+    let (names_location, mut names_dict) = match names_val {
+        Some(Object::Dictionary(dictionary)) => (NamesLocation::Direct, dictionary),
+        Some(source @ Object::Reference(source_ref)) => {
+            let (terminal, terminal_ref) =
+                crate::ref_chain::resolve_ref_chain(pdf, &source).map_err(ConvertError::from)?;
+            match terminal.into_dict() {
+                Some(dictionary) => (
+                    NamesLocation::Indirect(terminal_ref.unwrap_or(source_ref)),
+                    dictionary,
+                ),
+                None => return Ok(JsonValue::Object(vec![])),
+            }
+        }
         _ => return Ok(JsonValue::Object(vec![])),
     };
 
@@ -2055,28 +2072,32 @@ pub fn build_attachments_section<R: Read + Seek>(
         None => return Ok(JsonValue::Object(vec![])),
     };
 
-    // Walk the name tree to collect (name, filespec source) pairs via the
-    // shared name-tree reader; decode the raw string key afterwards.
-    let mut raw_entries: Vec<(String, FilespecSource)> = crate::name_number_tree::read_name_tree(
-        pdf,
-        ef_root,
-        |_, v| {
-            Ok(match v {
-                Object::Reference(r) => Some(FilespecSource::Indirect(r)),
-                Object::Dictionary(d) => Some(FilespecSource::Direct(d)),
-                _ => None,
-            })
-        },
-        DEFAULT_MAX_PAGE_TREE_DEPTH,
-    )
-    .map_err(ConvertError::from)?
-    .into_iter()
-    .map(|(key_bytes, source)| {
-        let name = decode_pdf_text_string(&key_bytes)
-            .unwrap_or_else(|| String::from_utf8_lossy(&key_bytes).into_owned());
-        (name, source)
-    })
-    .collect();
+    let mut tree = crate::NameTree::new(ef_root, true);
+    tree.set_max_depth(DEFAULT_MAX_PAGE_TREE_DEPTH);
+    let entries = tree.as_map(pdf).map_err(ConvertError::from)?;
+    names_dict.insert("EmbeddedFiles", tree.into_root());
+    match names_location {
+        NamesLocation::Direct => {
+            catalog.insert("Names", Object::Dictionary(names_dict));
+        }
+        NamesLocation::Indirect(names_ref) => {
+            pdf.set_object(names_ref, Object::Dictionary(names_dict));
+            catalog.insert("Names", Object::Reference(names_ref));
+        }
+    }
+    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+    let mut raw_entries: Vec<(String, FilespecSource)> = entries
+        .into_iter()
+        .filter_map(|(key_bytes, value)| {
+            let source = match value {
+                Object::Reference(object_ref) => FilespecSource::Indirect(object_ref),
+                Object::Dictionary(dictionary) => FilespecSource::Direct(dictionary),
+                _ => return None,
+            };
+            Some((String::from_utf8_lossy(&key_bytes).into_owned(), source))
+        })
+        .collect();
 
     // Sort by name (alphabetical)
     raw_entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3885,6 +3906,37 @@ mod tests {
             JsonValue::Array(vec![]),
             "missing /PageLabels must yield empty array"
         );
+    }
+
+    #[test]
+    fn pagelabels_repairs_direct_number_tree_kid() {
+        let mut pdf = load_one_page_pdf();
+        let mut label = Dictionary::new();
+        label.insert("S", Object::Name(b"D".to_vec()));
+        label.insert("St", Object::Integer(3));
+        let mut leaf = Dictionary::new();
+        leaf.insert(
+            "Limits",
+            Object::Array(vec![Object::Integer(0), Object::Integer(0)]),
+        );
+        leaf.insert(
+            "Nums",
+            Object::Array(vec![Object::Integer(0), Object::Dictionary(label)]),
+        );
+        let mut root = Dictionary::new();
+        root.insert("Kids", Object::Array(vec![Object::Dictionary(leaf)]));
+        patch_pagelabels(&mut pdf, Object::Dictionary(root));
+
+        let result = build_pagelabels_section(&mut pdf).expect("build pagelabels");
+
+        let JsonValue::Array(entries) = result else {
+            panic!("expected array");
+        };
+        assert_eq!(entries.len(), 1);
+        let JsonValue::Object(entry) = &entries[0] else {
+            panic!("expected entry object");
+        };
+        assert_eq!(entry[0], ("index".to_string(), JsonValue::Integer(0)));
     }
 
     // ── 37. Single range: /Nums [0 << /S /D /St 1 >>] ───────────────────────
@@ -7052,6 +7104,50 @@ mod tests {
             JsonValue::Object(vec![]),
             "non-ref/non-dict leaf value must be skipped"
         );
+    }
+
+    #[test]
+    fn attachments_repairs_direct_name_tree_kid() {
+        let mut pdf = load_one_page_pdf();
+        let mut filespec = Dictionary::new();
+        filespec.insert("F", Object::String(b"inline.txt".to_vec()));
+        filespec.insert("UF", Object::String(b"inline.txt".to_vec()));
+        let mut leaf = Dictionary::new();
+        leaf.insert(
+            "Limits",
+            Object::Array(vec![
+                Object::String(b"inline".to_vec()),
+                Object::String(b"inline".to_vec()),
+            ]),
+        );
+        leaf.insert(
+            "Names",
+            Object::Array(vec![
+                Object::String(b"inline".to_vec()),
+                Object::Dictionary(filespec),
+            ]),
+        );
+        let mut tree = Dictionary::new();
+        tree.insert("Kids", Object::Array(vec![Object::Dictionary(leaf)]));
+        let mut names = Dictionary::new();
+        names.insert("EmbeddedFiles", Object::Dictionary(tree));
+        let catalog_ref = pdf.root_ref().expect("catalog ref");
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("catalog")
+            .as_dict()
+            .expect("catalog dict")
+            .clone();
+        catalog.insert("Names", Object::Dictionary(names));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let result = build_attachments_section(&mut pdf).expect("build attachments");
+
+        let JsonValue::Object(entries) = result else {
+            panic!("expected object");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "inline");
     }
 
     // ── attachments Test 2: attachment-two-page.pdf → 1 entry ────────────────

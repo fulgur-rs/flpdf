@@ -151,6 +151,45 @@ fn writer_multiple_inserts_sorted() {
     assert_eq!(keys, vec![b"apple" as &[u8], b"mango", b"zebra"]);
 }
 
+#[test]
+fn writer_second_insert_mutates_existing_tree_root() {
+    let mut pdf = open(build_empty_pdf());
+    insert_name_tree_dest(&mut pdf, b"alpha", dest_array(ObjectRef::new(3, 0)))
+        .expect("insert alpha");
+
+    let catalog_ref = pdf.root_ref().expect("catalog ref");
+    let root_before = {
+        let catalog = pdf
+            .resolve(catalog_ref)
+            .expect("catalog")
+            .into_dict()
+            .expect("catalog dict");
+        let names_ref = catalog.get_ref("Names").expect("names ref");
+        let names = pdf
+            .resolve(names_ref)
+            .expect("names")
+            .into_dict()
+            .expect("names dict");
+        names.get_ref("Dests").expect("dests root")
+    };
+
+    insert_name_tree_dest(&mut pdf, b"beta", dest_array(ObjectRef::new(3, 0)))
+        .expect("insert beta");
+
+    let catalog = pdf
+        .resolve(catalog_ref)
+        .expect("catalog")
+        .into_dict()
+        .expect("catalog dict");
+    let names_ref = catalog.get_ref("Names").expect("names ref");
+    let names = pdf
+        .resolve(names_ref)
+        .expect("names")
+        .into_dict()
+        .expect("names dict");
+    assert_eq!(names.get_ref("Dests"), Some(root_before));
+}
+
 // ── W3: insert duplicate key replaces value ───────────────────────────────────
 
 #[test]
@@ -194,6 +233,50 @@ fn writer_delete_existing_key() {
     let entries = collect_raw_dests_tree(&mut pdf);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].0, b"keep");
+}
+
+#[test]
+fn writer_delete_mutates_existing_nonempty_tree_root() {
+    let mut pdf = open(build_empty_pdf());
+    insert_name_tree_dest(&mut pdf, b"keep", dest_array(ObjectRef::new(3, 0)))
+        .expect("insert keep");
+    insert_name_tree_dest(&mut pdf, b"remove", dest_array(ObjectRef::new(3, 0)))
+        .expect("insert remove");
+
+    let catalog_ref = pdf.root_ref().expect("catalog ref");
+    let root_before = {
+        let catalog = pdf
+            .resolve(catalog_ref)
+            .expect("catalog")
+            .into_dict()
+            .expect("catalog dict");
+        let names_ref = catalog.get_ref("Names").expect("names ref");
+        let names = pdf
+            .resolve(names_ref)
+            .expect("names")
+            .into_dict()
+            .expect("names dict");
+        names.get_ref("Dests").expect("dests root")
+    };
+
+    assert!(delete_name_tree_dest(&mut pdf, b"remove").expect("delete"));
+
+    let catalog = pdf
+        .resolve(catalog_ref)
+        .expect("catalog")
+        .into_dict()
+        .expect("catalog dict");
+    let names_ref = catalog.get_ref("Names").expect("names ref");
+    let names = pdf
+        .resolve(names_ref)
+        .expect("names")
+        .into_dict()
+        .expect("names dict");
+    assert_eq!(names.get_ref("Dests"), Some(root_before));
+    assert_eq!(
+        collect_raw_dests_tree(&mut pdf),
+        vec![(b"keep".to_vec(), dest_array(ObjectRef::new(3, 0)))]
+    );
 }
 
 // ── W5: delete non-existent key returns false ─────────────────────────────────
@@ -801,4 +884,25 @@ fn delete_last_entry_from_inline_names_dict_keeps_names_inline_with_sibling() {
     );
 
     assert!(collect_raw_dests_tree(&mut pdf).is_empty());
+}
+
+#[test]
+fn inserting_into_direct_dests_root_indirectizes_it() {
+    let mut pdf = open(build_inline_names_dict_with_sibling_and_dest_pdf());
+
+    insert_name_tree_dest(&mut pdf, b"other", Object::Integer(7)).expect("insert");
+
+    let catalog_ref = pdf.root_ref().expect("catalog");
+    let catalog = pdf
+        .resolve(catalog_ref)
+        .expect("resolve catalog")
+        .into_dict()
+        .expect("catalog dict");
+    let names_ref = catalog.get_ref("Names").expect("indirect Names");
+    let names = pdf
+        .resolve(names_ref)
+        .expect("resolve Names")
+        .into_dict()
+        .expect("Names dict");
+    assert!(matches!(names.get("Dests"), Some(Object::Reference(_))));
 }

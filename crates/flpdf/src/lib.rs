@@ -105,9 +105,6 @@ pub mod linearization;
 pub mod matrix;
 pub mod name_number_tree;
 pub mod name_tree_dests;
-// This bottom stack layer intentionally lands the shared engine before the
-// typed public wrappers and consumer cutovers in flpdf-qxba.8.2/.8.3.
-#[allow(dead_code)]
 mod nntree;
 pub mod object;
 pub mod object_copy;
@@ -199,6 +196,7 @@ pub use name_number_tree::{
 pub use name_tree_dests::{
     delete_name_tree_dest, insert_name_tree_dest, DEFAULT_MAX_NAME_TREE_DESTS_DEPTH,
 };
+pub use nntree::{NameTree, NameTreeCursor, NumberTree, NumberTreeCursor};
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use object_copy::copy_objects;
 pub use objr_obj_annot_p::drop_objr_obj_annot_dangling_p;

@@ -6,7 +6,7 @@
 mod common;
 
 use common::build_pdf;
-use flpdf::{LabelStyle, Object, ObjectRef, Pdf};
+use flpdf::{LabelRange, LabelStyle, Object, ObjectRef, Pdf};
 use std::io::Cursor;
 
 /// A `/Nums` label-range value stored behind a two-hop holder chain
@@ -55,4 +55,174 @@ fn ranges_follows_two_hop_holder_chain_for_label_dict() {
     assert_eq!(ranges[0].1.start, 4, "/St 4");
     // The rendered label for page 0 confirms the range is fully wired.
     assert_eq!(h.label_string_for_page(0).expect("label"), "4");
+}
+
+#[test]
+fn set_range_mutates_existing_page_labels_root() {
+    let pdf_bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /PageLabels 4 0 R >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+            ),
+            (4, "<< /Nums [0 << /S /D >>] >>".into()),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+
+    pdf.page_labels()
+        .set_range(
+            5,
+            LabelRange {
+                style: LabelStyle::RomanUpper,
+                prefix: "A".to_string(),
+                start: 2,
+            },
+        )
+        .expect("set range");
+
+    let catalog_ref = pdf.root_ref().expect("catalog ref");
+    let catalog = pdf
+        .resolve(catalog_ref)
+        .expect("catalog")
+        .into_dict()
+        .expect("catalog dict");
+    assert_eq!(
+        catalog.get_ref("PageLabels"),
+        Some(ObjectRef::new(4, 0)),
+        "qpdf NumberTree insertion mutates the existing root"
+    );
+    assert_eq!(
+        pdf.page_labels().label_string_for_page(5).expect("label"),
+        "AII"
+    );
+}
+
+#[test]
+fn remove_range_mutates_existing_nonempty_page_labels_root() {
+    let pdf_bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /PageLabels 4 0 R >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+            ),
+            (4, "<< /Nums [0 << /S /D >> 5 << /S /r /P (x) >>] >>".into()),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+
+    assert!(pdf.page_labels().remove_range(5).expect("remove range"));
+
+    let catalog_ref = pdf.root_ref().expect("catalog ref");
+    let catalog = pdf
+        .resolve(catalog_ref)
+        .expect("catalog")
+        .into_dict()
+        .expect("catalog dict");
+    assert_eq!(catalog.get_ref("PageLabels"), Some(ObjectRef::new(4, 0)));
+    assert_eq!(
+        pdf.page_labels().label_string_for_page(0).expect("label"),
+        "1"
+    );
+}
+
+#[test]
+fn ranges_repairs_and_reads_direct_number_tree_kid() {
+    let pdf_bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R \
+                 /PageLabels << /Kids [ << /Limits [0 0] \
+                 /Nums [0 << /S /D /St 3 >>] >> ] >> >>"
+                    .into(),
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+
+    let ranges = pdf.page_labels().ranges().expect("ranges");
+
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].0, 0);
+    assert_eq!(ranges[0].1.style, LabelStyle::Decimal);
+    assert_eq!(ranges[0].1.start, 3);
+}
+
+#[test]
+fn write_labels_uses_qpdf_sixteen_seventeen_split_order() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    let ranges = (0..33)
+        .map(|index| {
+            (
+                index,
+                LabelRange {
+                    style: LabelStyle::Decimal,
+                    prefix: String::new(),
+                    start: 1,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    pdf.page_labels()
+        .write_labels(&ranges)
+        .expect("write labels");
+
+    let catalog_ref = pdf.root_ref().expect("catalog ref");
+    let catalog = pdf
+        .resolve(catalog_ref)
+        .expect("catalog")
+        .into_dict()
+        .expect("catalog dict");
+    let root_ref = catalog.get_ref("PageLabels").expect("page labels root");
+    let root = pdf
+        .resolve(root_ref)
+        .expect("root")
+        .into_dict()
+        .expect("root dict");
+    let kids = root
+        .get("Kids")
+        .and_then(Object::as_array)
+        .expect("split kids");
+    let first_ref = kids[0].as_ref_id().expect("first kid ref");
+    let first = pdf
+        .resolve(first_ref)
+        .expect("first leaf")
+        .into_dict()
+        .expect("first leaf dict");
+    let first_items = first
+        .get("Nums")
+        .and_then(Object::as_array)
+        .expect("first nums");
+    assert_eq!(first_items.len() / 2, 16);
 }
