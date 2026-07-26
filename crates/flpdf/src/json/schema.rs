@@ -131,7 +131,9 @@ fn check_schema_internal(
                 schema_array.len()
             ));
             return false;
-        } else if let Some(value_array) = value_array {
+        } else {
+            let value_array =
+                value_array.expect("length check guarantees the checked value is an array");
             for (index, item) in value_array.into_iter().enumerate() {
                 check_schema_internal(
                     &item,
