@@ -124,7 +124,7 @@ fn qpdf_unicode_string_bytes(utf8: &[u8]) -> Vec<u8> {
     for character in text.chars() {
         let mut encoded_character = [0; 4];
         let encoded_character = character.encode_utf8(&mut encoded_character).as_bytes();
-        let encoded = (1_u16..=u16::from(u8::MAX))
+        let encoded = (0_u16..=u16::from(u8::MAX))
             .map(|byte| byte as u8)
             .filter(|byte| !matches!(byte, 0x7f | 0x9f | 0xad))
             .find(|&byte| crate::json_inspect::qpdf_utf8_value(&[byte]) == encoded_character);
@@ -1640,7 +1640,7 @@ mod tests {
         );
         assert_eq!(
             NameKey::to_object(&b"a\0z".to_vec()),
-            Object::String(vec![0xfe, 0xff, 0x00, 0x61, 0x00, 0x00, 0x00, 0x7a])
+            Object::String(b"a\0z".to_vec())
         );
         assert_eq!(qpdf_new_unicode_utf8_value(&[0xc2, b'A']), "�A".as_bytes());
         assert_eq!(qpdf_new_unicode_utf8_value(&[0xc0, 0x80]), "�".as_bytes());
