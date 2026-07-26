@@ -47,8 +47,14 @@ impl From<crate::Error> for ConvertError {
 /// Additional work the caller must perform after JSON emission succeeds.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct JsonOutputSummary {
-    /// Stream objects whose payloads are named by `datafile` entries.
-    pub datafile_objects: Vec<ObjectRef>,
+    /// Decoded stream payloads named by successfully emitted `datafile` entries.
+    pub datafiles: Vec<JsonDatafile>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct JsonDatafile {
+    pub object_ref: ObjectRef,
+    pub bytes: Vec<u8>,
 }
 
 /// Failure while converting or incrementally writing a qpdf JSON document.
@@ -830,7 +836,7 @@ fn build_qpdf_object_entry<R: Read + Seek>(
     object_ref: ObjectRef,
     decode_level: DecodeLevel,
     stream_mode: &StreamDataMode,
-) -> Result<(Json, bool), ConvertError> {
+) -> Result<(Json, Option<Vec<u8>>), ConvertError> {
     let object = qpdf_resolve_top_level_object(pdf, object_ref)?;
     match &object {
         Object::Stream(stream) => {
@@ -852,20 +858,24 @@ fn build_qpdf_object_entry<R: Read + Seek>(
                     let dict = normalized_emitted_stream_dict(stream, payload.decode_succeeded);
                     let dict_json = qpdf_dict_to_json(pdf, &dict)?;
                     let datafile = format_json_side_file_path(prefix, object_ref.number);
-                    json_dictionary([
+                    let stream_inner = json_dictionary([
                         ("datafile".to_string(), Json::make_string(datafile)),
                         ("dict".to_string(), dict_json),
-                    ])?
+                    ])?;
+                    return Ok((
+                        json_dictionary([("stream".to_string(), stream_inner)])?,
+                        Some(payload.bytes.into_owned()),
+                    ));
                 }
             };
             Ok((
                 json_dictionary([("stream".to_string(), stream_inner)])?,
-                true,
+                None,
             ))
         }
         other => Ok((
             json_dictionary([("value".to_string(), qpdf_pdf_object_to_json(pdf, other)?)])?,
-            false,
+            None,
         )),
     }
 }
@@ -2616,11 +2626,11 @@ fn write_qpdf_section<R: Read + Seek>(
             continue;
         }
         let key = format!("obj:{} {} R", object_ref.number, object_ref.generation);
-        let (entry, is_stream) =
+        let (entry, datafile) =
             build_qpdf_object_entry(pdf, object_ref, decode_level, stream_mode)?;
         Json::write_dictionary_item(out, &mut objects_first, key.as_bytes(), &entry, 3)?;
-        if is_stream && matches!(stream_mode, StreamDataMode::File { .. }) {
-            summary.datafile_objects.push(object_ref);
+        if let Some(bytes) = datafile {
+            summary.datafiles.push(JsonDatafile { object_ref, bytes });
         }
     }
 
@@ -2924,7 +2934,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(summary.datafile_objects.is_empty());
+        assert!(summary.datafiles.is_empty());
         assert!(serde_json::from_slice::<serde_json::Value>(&out).is_ok());
         let version = out
             .windows(b"\"version\"".len())
@@ -2999,6 +3009,14 @@ mod tests {
     #[test]
     fn selected_sink_writer_records_only_emitted_datafiles() {
         let mut pdf = load_one_page_pdf();
+        let mut expected_pdf = load_one_page_pdf();
+        let expected_payload = qpdf_raw_stream_payload(
+            &mut expected_pdf,
+            crate::ObjectRef::new(7, 0),
+            DecodeLevel::None,
+        )
+        .unwrap()
+        .unwrap();
         let mut out = Vec::new();
         let summary = write_qpdf_json_v2_selected_objects_with_options(
             &mut pdf,
@@ -3021,7 +3039,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(summary.datafile_objects, [crate::ObjectRef::new(7, 0)]);
+        assert_eq!(summary.datafiles.len(), 1);
+        assert_eq!(summary.datafiles[0].object_ref, crate::ObjectRef::new(7, 0));
+        assert_eq!(summary.datafiles[0].bytes, expected_payload);
         assert!(out.ends_with(b"}\n"));
         assert!(!out.ends_with(b"}\n\n"));
         let document: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -3108,7 +3128,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(summary.datafile_objects.is_empty());
+        assert!(summary.datafiles.is_empty());
         let document: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert!(document["qpdf"][1]["obj:7 0 R"]["stream"]["data"]
             .as_str()
