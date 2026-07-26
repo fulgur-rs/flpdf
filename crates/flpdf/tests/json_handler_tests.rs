@@ -168,6 +168,59 @@ fn dictionary_dispatch_rereads_end_handler_after_item_replaces_root_handlers() {
 }
 
 #[test]
+fn dictionary_handler_calls_start_items_and_end_in_order_with_original_value() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let item = JsonHandler::shared();
+    item.borrow_mut().add_any_handler({
+        let seen = seen.clone();
+        move |path, value| {
+            seen.borrow_mut().push(format!(
+                "item:{}={}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(&value.unparse().unwrap())
+            ));
+        }
+    });
+
+    let mut handler = JsonHandler::new();
+    handler.add_dictionary_handlers(
+        {
+            let seen = seen.clone();
+            move |path, value| {
+                seen.borrow_mut().push(format!(
+                    "start:{}={}",
+                    String::from_utf8_lossy(path),
+                    String::from_utf8_lossy(&value.unparse().unwrap())
+                ));
+            }
+        },
+        {
+            let seen = seen.clone();
+            move |path| {
+                seen.borrow_mut()
+                    .push(format!("end:{}", String::from_utf8_lossy(path)));
+            }
+        },
+    );
+    handler.add_dictionary_key_handler(b"a", item.clone());
+    handler.add_dictionary_key_handler(b"b", item);
+
+    handler
+        .handle(b".root", Json::parse(br#"{"b":2,"a":1}"#).unwrap())
+        .unwrap();
+
+    assert_eq!(
+        &*seen.borrow(),
+        &[
+            "start:.root={\n  \"a\": 1,\n  \"b\": 2\n}",
+            "item:.root.a=1",
+            "item:.root.b=2",
+            "end:.root",
+        ]
+    );
+}
+
+#[test]
 fn dictionary_handler_observes_later_member_mutations_and_insertions() {
     let dictionary = Json::parse(br#"{"a":1,"b":2}"#).unwrap();
     let seen = Rc::new(RefCell::new(Vec::new()));

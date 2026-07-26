@@ -1087,7 +1087,9 @@ fn json_outlines_short_first_name_tree_pair_exits_two_without_complete_json() {
             .count(),
         2
     );
-    assert!(output.stdout.is_empty());
+    assert!(output.stdout.starts_with(b"{\n  \"version\": 2,"));
+    assert!(!output.stdout.ends_with(b"}\n"));
+    assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).is_err());
 }
 
 #[test]
@@ -2528,7 +2530,7 @@ fn json_processing_warnings_do_not_repeat_open_time_warnings() {
 }
 
 #[test]
-fn json_output_error_emits_recorded_processing_warning_before_fatal_error() {
+fn json_output_open_error_happens_before_json_processing() {
     let fixture = fixture_with_repaired_name_tree_and_stream();
     let output_directory = tempfile::tempdir().unwrap();
 
@@ -2541,17 +2543,13 @@ fn json_output_error_emits_recorded_processing_warning_before_fatal_error() {
         .code(2);
     let output = assert.get_output();
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let warning = stderr
-        .find("attempting to repair after error:")
-        .unwrap_or_else(|| panic!("missing repair warning in {stderr}"));
-    let fatal = stderr
-        .rfind("flpdf:")
-        .unwrap_or_else(|| panic!("missing fatal error in {stderr}"));
-    assert!(warning < fatal, "{stderr}");
     assert_eq!(
         stderr.matches("attempting to repair after error:").count(),
-        1
+        0,
+        "{stderr}"
     );
+    assert!(stderr.contains("flpdf:"), "{stderr}");
+    assert!(stderr.contains("Is a directory"), "{stderr}");
     assert!(!stderr.contains("operation succeeded with warnings"));
     assert!(output.stdout.is_empty());
 }

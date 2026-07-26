@@ -66,6 +66,35 @@ fn dictionary_failures_accumulate_with_qpdf_paths() {
 }
 
 #[test]
+fn dictionary_schema_paths_preserve_escaped_keys() {
+    let schema = parsed(b"{\"line\\n\":{\"needed\":\"value\"}}");
+    let value = parsed(b"{\"line\\n\":{}}");
+    let mut errors = Vec::new();
+
+    assert!(!value.check_schema(&schema, &mut errors));
+    assert_eq!(
+        errors,
+        ["json key \".line\\n\": key \"needed\" is present in schema but missing in object"]
+    );
+}
+
+#[test]
+fn dictionary_errors_follow_validation_passes_not_message_sort_order() {
+    let schema = parsed(br#"{"z":"value"}"#);
+    let value = parsed(br#"{"a":1}"#);
+    let mut errors = Vec::new();
+
+    assert!(!value.check_schema(&schema, &mut errors));
+    assert_eq!(
+        errors,
+        [
+            "top-level object: key \"z\" is present in schema but missing in object",
+            "top-level object: key \"a\" is not present in schema but appears in object",
+        ]
+    );
+}
+
+#[test]
 fn array_schemas_accept_single_item_or_validate_each_array_element() {
     let schema = parsed(br#"[{"n":"number"}]"#);
     let scalar = parsed(br#"{"n":1}"#);

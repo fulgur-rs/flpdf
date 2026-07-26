@@ -156,8 +156,8 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `JSON.cc` | 1401 | `json.rs`(159: `JsonValue` + `write`。production の JSON 出力経路) | 🔀 → **T0-3** 値モデルと writer は実装済み。parse / checkSchema / 逐次 writer が未移植 |
-| `JSONHandler.cc` | 189 | 無し | ❌ → **T0-3** |
+| `JSON.cc` | 1401 | `json/` | ✅ |
+| `JSONHandler.cc` | 189 | `json/` | ✅ |
 | `QPDF_json.cc` | 946 | `json_inspect.rs`(2661) の一部 | 🔀 |
 
 ## 9. Job / CLI
@@ -341,9 +341,9 @@ CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れてい
 
 | 状態 | qpdf 側の該当行数 | 内訳 |
 |---|---|---|
-| ✅ mirrors | 1,354 | 責務境界も一致。触らない |
-| 🔀 smeared | 29,894 | 再配置の主対象。qpdf 全体の 72% |
-| ❌ missing | 812 | `Pipeline.cc`(114) / `Pl_Count`+`Pl_MD5`(114) / `QPDFStreamFilter`(19) / `Pl_DCT`(326) / `QTC`(50) / `JSONHandler`(189) |
+| ✅ mirrors | 2,944 | 責務境界も一致。触らない |
+| 🔀 smeared | 28,493 | 再配置の主対象。qpdf 全体の 69% |
+| ❌ missing | 623 | `Pipeline.cc`(114) / `Pl_Count`+`Pl_MD5`(114) / `QPDFStreamFilter`(19) / `Pl_DCT`(326) / `QTC`(50) |
 | ⚪ 逸脱候補 | 7,162 | 要承認（下記の方針矛盾を参照） |
 | ➖ 対象外 | 2,237 | C API |
 | **合計** | **41,459** | qpdf `libqpdf/*.cc` の実測 41,459 行と一致 |

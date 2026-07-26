@@ -7,6 +7,7 @@
 use assert_cmd::Command;
 use flpdf::{filters, Dictionary, Object};
 use predicates::prelude::*;
+use std::collections::BTreeMap;
 use std::io::Write;
 
 // ---------------------------------------------------------------------------
@@ -56,6 +57,53 @@ fn write_temp_pdf(bytes: &[u8]) -> tempfile::NamedTempFile {
     f
 }
 
+fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = BTreeMap::new();
+    let max = objects.iter().map(|(number, _)| *number).max().unwrap_or(0);
+    for (number, body) in objects {
+        offsets.insert(*number, out.len());
+        out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let xref_start = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", max + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for number in 1..=max {
+        if let Some(offset) = offsets.get(&number) {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        } else {
+            out.extend_from_slice(b"0000000000 65535 f \n");
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root {root} 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
+            max + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+fn short_name_tree_pair_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names << /Dests << /Kids [<< /Names [(m)] >>] >> >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (One) /Parent 4 0 R /Dest (m) >>"),
+        ],
+        1,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: --json outputs JSON to stdout
 // ---------------------------------------------------------------------------
@@ -74,6 +122,74 @@ fn json_flag_outputs_json_to_stdout() {
         .stdout(predicate::str::contains("\"pages\""))
         // stderr is empty — no spurious warnings for a clean PDF
         .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn json_fatal_preserves_partial_stdout() {
+    let input = write_temp_pdf(&short_name_tree_pair_pdf());
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--json-key=outlines",
+            input.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.starts_with(b"{\n  \"version\": 2,"));
+    assert!(!output.stdout.ends_with(b"}\n"));
+    assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).is_err());
+}
+
+#[test]
+fn json_fatal_preserves_partial_output_file() {
+    let input = write_temp_pdf(&short_name_tree_pair_pdf());
+    let temp = tempfile::tempdir().unwrap();
+    let output_path = temp.path().join("out.json");
+    std::fs::write(&output_path, b"pre-existing content").unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--json-key=outlines",
+            "--json-output",
+            output_path.to_str().unwrap(),
+            input.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let bytes = std::fs::read(&output_path).unwrap();
+    assert!(bytes.starts_with(b"{\n  \"version\": 2,"));
+    assert!(!bytes.ends_with(b"}\n"));
+    assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_err());
+}
+
+#[test]
+fn json_fatal_does_not_create_stream_side_files() {
+    let input = write_temp_pdf(&short_name_tree_pair_pdf());
+    let temp = tempfile::tempdir().unwrap();
+    let prefix = temp.path().join("stream");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--json-key=outlines",
+            "--json-stream-data=file",
+            "--json-stream-prefix",
+            prefix.to_str().unwrap(),
+            input.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
 }
 
 // ---------------------------------------------------------------------------

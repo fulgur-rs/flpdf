@@ -16,9 +16,9 @@ use flpdf::{
     flatten_annotations, flatten_rotation_on_pages, fonts, generate_button_field_appearance,
     generate_choice_field_appearance, generate_text_field_appearance,
     json_inspect::{
-        build_qpdf_json_v2_selected_objects_with_options, format_json_side_file_path,
-        qpdf_raw_stream_payload, DecodeLevel, JsonKey, JsonObjectSelector,
-        StreamDataMode as JsonStreamDataMode,
+        format_json_side_file_path, qpdf_raw_stream_payload,
+        write_qpdf_json_v2_selected_objects_with_options, DecodeLevel, JsonKey, JsonObjectSelector,
+        JsonOutputError, JsonOutputSummary, StreamDataMode as JsonStreamDataMode,
     },
     linearization::{
         check_linearization_path, show_linearization_path, write_linearized,
@@ -1907,65 +1907,64 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     let input = cli.input.as_ref().ok_or("missing input file")?;
     let mut pdf = open_pdf(input, cli.repair, &cli.password)?;
 
-    // 5. Build JSON.
+    // 5. Write JSON incrementally.
     //
     // `decode_level` governs both the inline `data` payloads (applied inside
-    // build_qpdf_json_v2_selected_with_options) and the file-mode side files
+    // write_qpdf_json_v2_selected_objects_with_options) and the file-mode side files
     // written below — the two must agree, so they share this single value.
     let decode_level = DecodeLevel::Generalized;
     let diagnostics_start = pdf.repair_diagnostics().entries().len();
     let had_open_warnings = diagnostics_start > 0;
-    let v2 = match build_qpdf_json_v2_selected_objects_with_options(
-        &mut pdf,
-        decode_level,
-        &stream_mode,
-        &json_keys,
-        &json_objects,
-    ) {
-        Ok(v2) => v2,
+    let json_result = if let Some(ref path) = cli.json_output {
+        match File::create(path) {
+            Ok(mut file) => write_qpdf_json_v2_selected_objects_with_options(
+                &mut pdf,
+                decode_level,
+                &stream_mode,
+                &json_keys,
+                &json_objects,
+                &mut file,
+            ),
+            Err(error) => Err(JsonOutputError::from(error)),
+        }
+    } else {
+        let stdout = std::io::stdout();
+        let mut locked = stdout.lock();
+        let write_result: Result<JsonOutputSummary, JsonOutputError> =
+            write_qpdf_json_v2_selected_objects_with_options(
+                &mut pdf,
+                decode_level,
+                &stream_mode,
+                &json_keys,
+                &json_objects,
+                &mut locked,
+            );
+        let flush_result = locked.flush().map_err(JsonOutputError::from);
+        match (write_result, flush_result) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(summary), Ok(())) => Ok(summary),
+        }
+    };
+    let summary = match json_result {
+        Ok(summary) => summary,
         Err(error) => {
             emit_warnings_since(input, &pdf, diagnostics_start);
-            return Err(Box::<dyn std::error::Error>::from(error.to_string()));
+            return Err(Box::new(error));
         }
     };
 
-    // 6. Write JSON to output destination. Outline/name-tree processing may
-    // already have recorded warnings while building `v2`. If output fails,
-    // emit those warnings before returning the fatal write error so they are
-    // not lost; the success summary is intentionally omitted on this path.
-    let json_write_result = (|| -> CliResult<()> {
-        if let Some(ref out_path) = cli.json_output {
-            let mut file = File::create(out_path)?;
-            flpdf::json::write(&v2, &mut file)?;
-        } else {
-            let stdout = std::io::stdout();
-            let mut locked = stdout.lock();
-            flpdf::json::write(&v2, &mut locked)?;
-            locked.flush()?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = json_write_result {
-        emit_warnings_since(input, &pdf, diagnostics_start);
-        return Err(error);
-    }
-
-    // 7. Write side files for stream-data=file mode — only for streams
-    // that actually survived --json-key / --json-object filtering. Walk
-    // the final JSON and collect every "datafile" value emitted in the
-    // qpdf objects map, then write exactly those streams to disk. Without
-    // this scoping, --json-key=pages --json-stream-data=file would dump
-    // every stream to the filesystem even though the qpdf section was
-    // filtered out of the output.
+    // 6. Write side files for stream-data=file mode only after the JSON
+    // document completed successfully. The streaming writer records exactly
+    // those stream objects that survived key/object selection.
     let side_file_result = (|| -> CliResult<()> {
         if let JsonStreamDataMode::File { ref prefix } = stream_mode {
-            let wanted_refs = collect_datafile_object_refs(&v2);
             // Reuse the same `pdf` handle the JSON was built from. Re-opening
             // the input here would risk the file being swapped mid-run, so the
             // JSON body and the side files could capture different snapshots.
-            for oref in wanted_refs {
+            for oref in summary.datafile_objects {
                 let Some(payload) = qpdf_raw_stream_payload(&mut pdf, oref, decode_level)? else {
-                    continue; // cov:ignore: collector only returns entries with stream.datafile
+                    continue; // cov:ignore: summary only contains stream objects
                 };
                 // Side-file name must match the JSON `datafile` value;
                 // both come from the same helper to avoid divergence.
@@ -1995,57 +1994,6 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     }
 
     Ok(())
-}
-
-/// Walk the qpdf JSON v2 output and collect every `(obj_num, generation)`
-/// whose stream entry carries a `datafile` field. Used to scope side-file
-/// writes to exactly the streams that survived --json-key/--json-object
-/// filtering, so the CLI never writes streams the JSON output doesn't
-/// reference.
-fn collect_datafile_object_refs(v2: &flpdf::json::JsonValue) -> Vec<ObjectRef> {
-    use flpdf::json::JsonValue;
-    let mut out = Vec::new();
-    let JsonValue::Object(top) = v2 else {
-        return out;
-    };
-    let Some((_, qpdf_value)) = top.iter().find(|(k, _)| k == "qpdf") else {
-        return out;
-    };
-    let JsonValue::Array(qpdf_arr) = qpdf_value else {
-        return out;
-    };
-    // Expected shape: [metadata, objects_map].
-    let Some(JsonValue::Object(objects_map)) = qpdf_arr.get(1) else {
-        return out;
-    };
-    for (key, entry) in objects_map {
-        // Skip the "trailer" entry — it has no object number.
-        let Some(rest) = key.strip_prefix("obj:") else {
-            continue;
-        };
-        let rest = rest.trim_end_matches(" R");
-        let mut parts = rest.split_whitespace();
-        let Some(num) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
-            continue;
-        };
-        let Some(gen) = parts.next().and_then(|s| s.parse::<u16>().ok()) else {
-            continue;
-        };
-        // Only collect if the stream entry has a datafile field.
-        let JsonValue::Object(entry_pairs) = entry else {
-            continue;
-        };
-        let Some((_, stream_val)) = entry_pairs.iter().find(|(k, _)| k == "stream") else {
-            continue;
-        };
-        let JsonValue::Object(stream_pairs) = stream_val else {
-            continue;
-        };
-        if stream_pairs.iter().any(|(k, _)| k == "datafile") {
-            out.push(ObjectRef::new(num, gen));
-        }
-    }
-    out
 }
 
 fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()> {

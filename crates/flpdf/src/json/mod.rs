@@ -8,7 +8,6 @@
 //! container items to keep them out of the returned tree.
 
 mod handler;
-mod legacy;
 mod message;
 mod parser;
 mod schema;
@@ -16,7 +15,6 @@ mod value;
 mod writer;
 
 pub use handler::{JsonHandler, JsonHandlerError, WeakJsonHandler};
-pub use legacy::{write, JsonValue};
 pub use message::JsonMessage;
 pub use parser::{parse, parse_reader, Reactor};
 pub use schema::SchemaFlags;

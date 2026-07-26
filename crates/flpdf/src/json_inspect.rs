@@ -5,7 +5,7 @@
 //! returns a [`Json`] that the caller can extend with per-section data
 //! (pages, objects, …) in later subtasks.
 
-use crate::json::{Json, JsonValue};
+use crate::json::Json;
 use crate::object::{Dictionary, Object, ObjectRef, Stream};
 use crate::reader::Pdf;
 use std::borrow::Cow;
@@ -82,117 +82,12 @@ fn json_dictionary<K: AsRef<[u8]>>(
     Ok(dictionary)
 }
 
-// The whole-document APIs and CLI remain on the legacy tree until Task 11
-// replaces materialization with sink-oriented emission. Keep that boundary
-// narrow: section builders and object conversion use `Json`, and only the
-// completed-tree compatibility wrappers convert back.
-fn legacy_json_value(value: &Json) -> Result<JsonValue, ConvertError> {
-    if value.is_null() {
-        return Ok(JsonValue::Null);
-    }
-    if let Some(boolean) = value.get_bool() {
-        return Ok(JsonValue::Bool(boolean));
-    }
-    if let Some(number) = value.get_number() {
-        let encoded = std::str::from_utf8(&number)
-            .map_err(|error| ConvertError::JsonError(error.to_string()))?;
-        return if let Ok(integer) = encoded.parse::<i64>() {
-            Ok(JsonValue::Integer(integer))
-        } else {
-            encoded
-                .parse::<f64>()
-                .map(JsonValue::Float)
-                .map_err(|error| ConvertError::JsonError(error.to_string()))
-        };
-    }
-    if let Some(string) = value.get_string() {
-        return String::from_utf8(string)
-            .map(JsonValue::String)
-            .map_err(|error| ConvertError::JsonError(error.to_string()));
-    }
-
-    let mut dictionary = Vec::new();
-    let mut dictionary_error = None;
-    if value.for_each_dict_item(|encoded_key, member| {
-        if dictionary_error.is_some() {
-            return;
-        }
-        let mut quoted_key = Vec::with_capacity(encoded_key.len() + 2);
-        quoted_key.push(b'"');
-        quoted_key.extend_from_slice(encoded_key);
-        quoted_key.push(b'"');
-        let result = crate::json::parse(&quoted_key)
-            .map_err(|error| ConvertError::JsonError(error.to_string()))
-            .and_then(|key| {
-                key.get_string().ok_or_else(|| {
-                    ConvertError::JsonError("dictionary key did not parse as a string".into())
-                })
-            })
-            .and_then(|key| {
-                String::from_utf8(key).map_err(|error| ConvertError::JsonError(error.to_string()))
-            })
-            .and_then(|key| legacy_json_value(&member).map(|member| (key, member)));
-        match result {
-            Ok(pair) => dictionary.push(pair),
-            Err(error) => dictionary_error = Some(error),
-        }
-    }) {
-        const QPDF_METADATA_ORDER: [&str; 5] = [
-            "jsonversion",
-            "pdfversion",
-            "pushedinheritedpageresources",
-            "calledgetallpages",
-            "maxobjectid",
-        ];
-        if dictionary.len() == QPDF_METADATA_ORDER.len()
-            && QPDF_METADATA_ORDER
-                .iter()
-                .all(|expected| dictionary.iter().any(|(key, _)| key == expected))
-        {
-            dictionary.sort_by_key(|(key, _)| {
-                QPDF_METADATA_ORDER
-                    .iter()
-                    .position(|expected| key == expected)
-                    .expect("all metadata keys were checked above")
-            });
-        }
-        return match dictionary_error {
-            Some(error) => Err(error),
-            None => Ok(JsonValue::Object(dictionary)),
-        };
-    }
-
-    let mut array = Vec::new();
-    let mut array_error = None;
-    if value.for_each_array_item(|member| {
-        if array_error.is_some() {
-            return;
-        }
-        match legacy_json_value(&member) {
-            Ok(member) => array.push(member),
-            Err(error) => array_error = Some(error),
-        }
-    }) {
-        return match array_error {
-            Some(error) => Err(error),
-            None => Ok(JsonValue::Array(array)),
-        };
-    }
-
-    // The only remaining initialized value kind is Blob. Serializing it here
-    // delegates Base64 to the shared writer; parsing the resulting JSON string
-    // avoids any second encoder in this compatibility boundary.
+#[cfg(test)]
+fn test_value(value: &Json) -> Result<serde_json::Value, ConvertError> {
     let encoded = value
         .unparse()
         .map_err(|error| ConvertError::JsonError(error.to_string()))?;
-    let parsed =
-        crate::json::parse(&encoded).map_err(|error| ConvertError::JsonError(error.to_string()))?;
-    let bytes = parsed
-        .get_string()
-        .ok_or_else(|| ConvertError::JsonError("blob did not serialize as a string".into()))?;
-    String::from_utf8(bytes)
-        .map(JsonValue::String)
-        .map_err(|error| ConvertError::JsonError(error.to_string()))
+    serde_json::from_slice(&encoded).map_err(|error| ConvertError::JsonError(error.to_string()))
 }
 
 // ── pdf_object_to_json ────────────────────────────────────────────────────────
@@ -1032,39 +927,6 @@ pub fn stream_payload_for_decode_level(
             }
         }
     }
-}
-
-// ── build_envelope ───────────────────────────────────────────────────────────
-
-/// Build the qpdf JSON v2 top-level envelope.
-///
-/// Returns a [`JsonValue::Object`] with exactly two keys in qpdf order:
-/// `"version"` and `"parameters"`.  Callers can append additional section
-/// keys (e.g. `"pages"`, `"objects"`) to the returned object's pair list.
-///
-/// # Example
-///
-/// ```
-/// use flpdf::json_inspect::{build_envelope, DecodeLevel};
-/// use flpdf::json::write;
-///
-/// let envelope = build_envelope(DecodeLevel::Generalized);
-/// let mut buf = Vec::new();
-/// write(&envelope, &mut buf).unwrap();
-/// let s = String::from_utf8(buf).unwrap();
-/// assert!(s.contains("\"version\": 2"));
-/// assert!(s.contains("\"decodelevel\": \"generalized\""));
-/// ```
-pub fn build_envelope(decode_level: DecodeLevel) -> JsonValue {
-    let parameters = JsonValue::Object(vec![(
-        "decodelevel".to_string(),
-        JsonValue::String(decode_level.as_qpdf_str().to_string()),
-    )]);
-
-    JsonValue::Object(vec![
-        ("version".to_string(), JsonValue::Integer(2)),
-        ("parameters".to_string(), parameters),
-    ])
 }
 
 // ── build_pages_section ───────────────────────────────────────────────────────
@@ -2002,7 +1864,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
     };
 
     // names: collect /F, /UF, /DOS, /Mac, /Unix — each decoded as PDF text string
-    // Keys are in alphabetical order (they already are in BTree).
+    // Keys are in alphabetical order (they already are in BTreeMap).
     let name_keys = ["DOS", "F", "Mac", "UF", "Unix"];
     let mut names_pairs: Vec<(String, Json)> = Vec::new();
     for key in &name_keys {
@@ -2492,7 +2354,7 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
     }
 }
 
-// ── JsonKey / filter_json_keys ────────────────────────────────────────────────
+// ── JsonKey ────────────────────────────────────────────────
 
 /// A top-level qpdf JSON v2 key that the caller may request via --json-key.
 ///
@@ -2550,70 +2412,7 @@ impl JsonKey {
     }
 }
 
-/// Filter a fully-built qpdf JSON v2 document to only the requested keys.
-///
-/// `version` and `parameters` are always preserved (they are the envelope).
-/// `keys` may contain duplicates; the result still contains each key at
-/// most once. Returns the input unchanged when `keys` is empty (no filter).
-///
-/// Every selector maps directly to the same-named qpdf JSON v2 section.
-pub fn filter_json_keys(v2: JsonValue, keys: &[JsonKey]) -> JsonValue {
-    // No filter — return unchanged.
-    if keys.is_empty() {
-        return v2;
-    }
-
-    // Collect the set of resolved output-key names that were requested.
-    let mut requested: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
-    for k in keys {
-        requested.insert(k.output_key_name());
-    }
-
-    // Pattern-match the top-level Object; return as-is for any other variant.
-    let pairs = match v2 {
-        JsonValue::Object(p) => p,
-        other => return other,
-    };
-
-    // Rebuild: always keep version + parameters first, then walk qpdf v2 order.
-    let mut out: Vec<(String, JsonValue)> = Vec::new();
-
-    // Pass 1: copy the envelope keys in their fixed order (version,
-    // parameters) regardless of how they were laid out in the input. If
-    // either key is absent, it is simply skipped — the function contract is
-    // that the output never inverts the envelope order.
-    for envelope_key in ["version", "parameters"] {
-        if let Some((k, v)) = pairs.iter().find(|(k, _)| k == envelope_key) {
-            out.push((k.clone(), v.clone()));
-        }
-    }
-
-    // Pass 2: walk the fixed qpdf v2 emission order and pick requested keys.
-    // Order: pages, pagelabels, acroform, attachments, encrypt, outlines, qpdf
-    const V2_ORDER: &[&str] = &[
-        "pages",
-        "pagelabels",
-        "acroform",
-        "attachments",
-        "encrypt",
-        "outlines",
-        "qpdf",
-    ];
-    for &section_name in V2_ORDER {
-        if !requested.contains(section_name) {
-            continue;
-        }
-        // Find this key in the input pairs (may be absent if caller built a
-        // partial document — just skip rather than panic).
-        if let Some((k, v)) = pairs.iter().find(|(k, _)| k == section_name) {
-            out.push((k.clone(), v.clone()));
-        }
-    }
-
-    JsonValue::Object(out)
-}
-
-// ── JsonObjectSelector / filter_json_objects ──────────────────────────────────
+// ── JsonObjectSelector ────────────────────────────────────────────────────────
 
 /// A `--json-object` selector. Either a specific (obj_num, generation) or
 /// the special `trailer` token.
@@ -2668,127 +2467,6 @@ impl JsonObjectSelector {
 
         Some(JsonObjectSelector::Object { number, generation })
     }
-}
-
-/// Filter the `qpdf` top-level key's objects map to only the requested
-/// selectors. `version`, `parameters`, and every other top-level section
-/// (pages, pagelabels, etc.) are preserved untouched. The metadata
-/// (`qpdf[0]`) is also preserved.
-///
-/// When `selectors` is empty, the input is returned unchanged.
-///
-/// Selectors that match no object in the input are silently dropped (the
-/// resulting `qpdf[1]` is simply missing them), matching qpdf's behavior.
-pub fn filter_json_objects(v2: JsonValue, selectors: &[JsonObjectSelector]) -> JsonValue {
-    // No filter — return unchanged.
-    if selectors.is_empty() {
-        return v2;
-    }
-
-    // Build a HashSet of wanted object-map keys (deduped automatically).
-    let mut wanted: std::collections::HashSet<String> =
-        std::collections::HashSet::with_capacity(selectors.len());
-    for sel in selectors {
-        match sel {
-            JsonObjectSelector::Object { number, generation } => {
-                wanted.insert(format!("obj:{number} {generation} R"));
-            }
-            JsonObjectSelector::Trailer => {
-                wanted.insert("trailer".to_string());
-            }
-        }
-    }
-
-    // Pattern-match the top-level Object; return as-is for any other variant.
-    let mut pairs = match v2 {
-        JsonValue::Object(p) => p,
-        other => return other,
-    };
-
-    // Find the "qpdf" entry index; if absent return unchanged.
-    let qpdf_idx = match pairs.iter().position(|(k, _)| k == "qpdf") {
-        Some(i) => i,
-        None => return JsonValue::Object(pairs),
-    };
-
-    // Extract the qpdf value and validate it is Array([metadata, objects_map]).
-    let qpdf_val = std::mem::replace(
-        &mut pairs[qpdf_idx].1,
-        JsonValue::Null, // temporary placeholder
-    );
-
-    let mut arr = match qpdf_val {
-        JsonValue::Array(a) if a.len() == 2 => a,
-        other => {
-            // Restore and return unchanged.
-            pairs[qpdf_idx].1 = other;
-            return JsonValue::Object(pairs);
-        }
-    };
-
-    // arr[0] = metadata (preserve as-is), arr[1] = objects_map (filter).
-    let objects_map = std::mem::replace(&mut arr[1], JsonValue::Null);
-
-    let filtered_map = match objects_map {
-        JsonValue::Object(obj_pairs) => {
-            // Keep only pairs whose key is in `wanted`, preserving original order.
-            let kept: Vec<(String, JsonValue)> = obj_pairs
-                .into_iter()
-                .filter(|(k, _)| wanted.contains(k))
-                .collect();
-            JsonValue::Object(kept)
-        }
-        other => {
-            // Not an Object — restore and return unchanged.
-            arr[1] = other;
-            pairs[qpdf_idx].1 = JsonValue::Array(arr);
-            return JsonValue::Object(pairs);
-        }
-    };
-
-    arr[1] = filtered_map;
-    pairs[qpdf_idx].1 = JsonValue::Array(arr);
-    JsonValue::Object(pairs)
-}
-
-// ── build_qpdf_json_v2 (top-level composite) ─────────────────────────────────
-
-/// Build the full qpdf JSON v2 document for `pdf`, combining the envelope
-/// (`version`, `parameters`) with every section that flpdf currently
-/// implements.
-///
-/// This produces: `version`, `parameters`, `pages`,
-/// `pagelabels`, `acroform`, `attachments`, `encrypt`, `outlines`, `qpdf`.
-/// Key order matches qpdf v2 output (fixed, not alphabetical).
-///
-/// Key order matches qpdf v2 output: top-level keys are emitted in the
-/// fixed order shown in qpdf's `--json=2` output, not alphabetical.
-///
-/// This is a thin wrapper around [`build_qpdf_json_v2_with_options`] using
-/// [`StreamDataMode::None`] (the default — stream entries contain `dict` only).
-///
-/// # Errors
-///
-/// Returns a [`ConvertError`] if any section builder fails.
-pub fn build_qpdf_json_v2<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    decode_level: DecodeLevel,
-) -> Result<JsonValue, ConvertError> {
-    build_qpdf_json_v2_with_options(pdf, decode_level, &StreamDataMode::None)
-}
-
-/// Like [`build_qpdf_json_v2`], but also takes a [`StreamDataMode`] that is
-/// forwarded to the `qpdf` top-level key builder.
-///
-/// # Errors
-///
-/// Returns a [`ConvertError`] if any section builder fails.
-pub fn build_qpdf_json_v2_with_options<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    decode_level: DecodeLevel,
-    stream_mode: &StreamDataMode,
-) -> Result<JsonValue, ConvertError> {
-    build_qpdf_json_v2_selected_with_options(pdf, decode_level, stream_mode, &[])
 }
 
 fn json_section_selected(keys: &[JsonKey], section: JsonKey) -> bool {
@@ -3012,112 +2690,31 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
     Ok(summary)
 }
 
-/// Build a qpdf JSON v2 document containing only the requested top-level
-/// sections.
-///
-/// The `version` and `parameters` envelope is always present. An empty
-/// `keys` slice selects every section. Selected sections are constructed in
-/// qpdf's fixed order; unselected section builders are not called. This API
-/// accepts only JSON v2 selectors; qpdf's v1-only `objects` and `objectinfo`
-/// names are not aliases for `qpdf`.
-///
-/// # Errors
-///
-/// Returns a [`ConvertError`] if a selected section builder fails.
-pub fn build_qpdf_json_v2_selected_with_options<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    decode_level: DecodeLevel,
-    stream_mode: &StreamDataMode,
-    keys: &[JsonKey],
-) -> Result<JsonValue, ConvertError> {
-    build_qpdf_json_v2_selected_objects_with_options(pdf, decode_level, stream_mode, keys, &[])
-}
-
-/// Build selected qpdf JSON v2 sections and serialize only the requested raw
-/// qpdf objects after completing qpdf's all-xref preparation pass.
-///
-/// An empty `objects` slice emits every prepared object plus the trailer.
-/// Non-empty selectors affect only the qpdf raw map; metadata preparation still
-/// resolves every live xref object. Existing section selection semantics are
-/// identical to [`build_qpdf_json_v2_selected_with_options`].
-///
-/// # Errors
-///
-/// Returns a [`ConvertError`] if a selected section or raw object cannot be
-/// resolved or converted.
-pub fn build_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    decode_level: DecodeLevel,
-    stream_mode: &StreamDataMode,
-    keys: &[JsonKey],
-    objects: &[JsonObjectSelector],
-) -> Result<JsonValue, ConvertError> {
-    let mut pairs = match build_envelope(decode_level) {
-        JsonValue::Object(p) => p,
-        _ => unreachable!("build_envelope always returns an Object"),
-    };
-
-    if json_section_selected(keys, JsonKey::Pages) {
-        let pages = build_pages_section(pdf)?;
-        pairs.push(("pages".to_string(), legacy_json_value(&pages)?));
-    }
-
-    if json_section_selected(keys, JsonKey::Pagelabels) {
-        let pagelabels = build_pagelabels_section(pdf)?;
-        pairs.push(("pagelabels".to_string(), legacy_json_value(&pagelabels)?));
-    }
-
-    if json_section_selected(keys, JsonKey::Acroform) {
-        let acroform = build_acroform_section(pdf)?;
-        pairs.push(("acroform".to_string(), legacy_json_value(&acroform)?));
-    }
-
-    if json_section_selected(keys, JsonKey::Attachments) {
-        let attachments = build_attachments_section(pdf)?;
-        pairs.push(("attachments".to_string(), legacy_json_value(&attachments)?));
-    }
-
-    if json_section_selected(keys, JsonKey::Encrypt) {
-        let encrypt = build_encrypt_section(pdf)?;
-        pairs.push(("encrypt".to_string(), legacy_json_value(&encrypt)?));
-    }
-
-    if json_section_selected(keys, JsonKey::Outlines) {
-        let outlines = build_outlines_section(pdf)?;
-        pairs.push(("outlines".to_string(), legacy_json_value(&outlines)?));
-    }
-
-    if json_section_selected(keys, JsonKey::Qpdf) {
-        // qpdf resolves every live xref object before reading the object-cache
-        // maximum. Parsing those bodies registers dangling generations as
-        // placeholders, while unrelated free xref entries remain excluded.
-        let prepared = pdf.prepare_qpdf_json_objects()?;
-        let qpdf_metadata = QpdfMetadata {
-            pdf_version: pdf.version().to_string(),
-            max_object_id: prepared.max_object_id,
-            pushed_inherited_page_resources: false,
-            called_get_all_pages: pdf.ever_called_get_all_pages(),
-        };
-        let qpdf = build_qpdf_key_selected_with_stream_mode(
-            pdf,
-            qpdf_metadata,
-            decode_level,
-            stream_mode,
-            objects,
-            &prepared.refs,
-        )?; // cov:ignore: Err propagation requires an I/O failure after the Pdf has opened
-        pairs.push(("qpdf".to_string(), legacy_json_value(&qpdf)?));
-    }
-
-    Ok(JsonValue::Object(pairs))
-}
-
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::json::write;
+
+    fn number(value: impl ToString) -> serde_json::Value {
+        serde_json::from_str(&value.to_string()).expect("number must serialize")
+    }
+
+    fn object(pairs: Vec<(String, serde_json::Value)>) -> serde_json::Value {
+        serde_json::Value::Object(pairs.into_iter().collect())
+    }
+
+    fn object_pairs(
+        value: impl std::borrow::Borrow<serde_json::Value>,
+    ) -> Vec<(String, serde_json::Value)> {
+        value
+            .borrow()
+            .as_object()
+            .expect("expected JSON object")
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
 
     struct FailAfter {
         remaining: usize,
@@ -3140,35 +2737,26 @@ mod tests {
         }
     }
 
-    fn emit(v: &JsonValue) -> String {
-        let mut buf = Vec::new();
-        write(v, &mut buf).expect("write failed");
-        String::from_utf8(buf).expect("not utf-8")
+    fn project(value: Json) -> Result<serde_json::Value, ConvertError> {
+        test_value(&value)
     }
 
-    // Keep the existing structural regression assertions readable while the
-    // production builders move to `Json`. The one RED/GREEN conversion test
-    // below calls `super::pdf_object_to_json` directly and locks the new type.
-    fn legacy(value: Json) -> Result<JsonValue, ConvertError> {
-        legacy_json_value(&value)
-    }
-
-    fn pdf_object_to_json(object: &Object) -> Result<JsonValue, ConvertError> {
-        legacy(super::pdf_object_to_json(object)?)
+    fn pdf_object_to_json(object: &Object) -> Result<serde_json::Value, ConvertError> {
+        project(super::pdf_object_to_json(object)?)
     }
 
     fn qpdf_pdf_object_to_json<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         object: &Object,
-    ) -> Result<JsonValue, ConvertError> {
-        legacy(super::qpdf_pdf_object_to_json(pdf, object)?)
+    ) -> Result<serde_json::Value, ConvertError> {
+        project(super::qpdf_pdf_object_to_json(pdf, object)?)
     }
 
     fn build_qpdf_key<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         metadata: QpdfMetadata,
-    ) -> Result<JsonValue, ConvertError> {
-        legacy(super::build_qpdf_key(pdf, metadata)?)
+    ) -> Result<serde_json::Value, ConvertError> {
+        project(super::build_qpdf_key(pdf, metadata)?)
     }
 
     fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
@@ -3176,8 +2764,8 @@ mod tests {
         metadata: QpdfMetadata,
         decode_level: DecodeLevel,
         stream_mode: &StreamDataMode,
-    ) -> Result<JsonValue, ConvertError> {
-        legacy(super::build_qpdf_key_with_stream_mode(
+    ) -> Result<serde_json::Value, ConvertError> {
+        project(super::build_qpdf_key_with_stream_mode(
             pdf,
             metadata,
             decode_level,
@@ -3185,32 +2773,84 @@ mod tests {
         )?)
     }
 
-    fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
-        legacy(super::build_pages_section(pdf)?)
+    fn build_pages_section<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+    ) -> Result<serde_json::Value, ConvertError> {
+        project(super::build_pages_section(pdf)?)
     }
 
     fn build_pagelabels_section<R: Read + Seek>(
         pdf: &mut Pdf<R>,
-    ) -> Result<JsonValue, ConvertError> {
-        legacy(super::build_pagelabels_section(pdf)?)
+    ) -> Result<serde_json::Value, ConvertError> {
+        project(super::build_pagelabels_section(pdf)?)
     }
 
-    fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
-        legacy(super::build_outlines_section(pdf)?)
+    fn build_outlines_section<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+    ) -> Result<serde_json::Value, ConvertError> {
+        project(super::build_outlines_section(pdf)?)
     }
 
-    fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
-        legacy(super::build_acroform_section(pdf)?)
+    fn build_acroform_section<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+    ) -> Result<serde_json::Value, ConvertError> {
+        project(super::build_acroform_section(pdf)?)
     }
 
     fn build_attachments_section<R: Read + Seek>(
         pdf: &mut Pdf<R>,
-    ) -> Result<JsonValue, ConvertError> {
-        legacy(super::build_attachments_section(pdf)?)
+    ) -> Result<serde_json::Value, ConvertError> {
+        project(super::build_attachments_section(pdf)?)
     }
 
-    fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
-        legacy(super::build_encrypt_section(pdf)?)
+    fn build_encrypt_section<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+    ) -> Result<serde_json::Value, ConvertError> {
+        project(super::build_encrypt_section(pdf)?)
+    }
+
+    fn build_test_document_selected_objects<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        decode_level: DecodeLevel,
+        stream_mode: &StreamDataMode,
+        keys: &[JsonKey],
+        objects: &[JsonObjectSelector],
+    ) -> Result<serde_json::Value, String> {
+        let mut out = Vec::new();
+        write_qpdf_json_v2_selected_objects_with_options(
+            pdf,
+            decode_level,
+            stream_mode,
+            keys,
+            objects,
+            &mut out,
+        )
+        .map_err(|error| error.to_string())?;
+        serde_json::from_slice(&out).map_err(|error| error.to_string())
+    }
+
+    fn build_test_document_selected<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        decode_level: DecodeLevel,
+        stream_mode: &StreamDataMode,
+        keys: &[JsonKey],
+    ) -> Result<serde_json::Value, String> {
+        build_test_document_selected_objects(pdf, decode_level, stream_mode, keys, &[])
+    }
+
+    fn build_test_document_with_options<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        decode_level: DecodeLevel,
+        stream_mode: &StreamDataMode,
+    ) -> Result<serde_json::Value, String> {
+        build_test_document_selected(pdf, decode_level, stream_mode, &[])
+    }
+
+    fn build_test_document<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        decode_level: DecodeLevel,
+    ) -> Result<serde_json::Value, String> {
+        build_test_document_with_options(pdf, decode_level, &StreamDataMode::None)
     }
 
     // Minimal valid PDF; nodes are supplied via set_object refs (catalog unused).
@@ -3546,99 +3186,6 @@ mod tests {
         assert_eq!(got, Some(Object::Integer(42)));
     }
 
-    // ── 1. Default (Generalized) envelope matches qpdf structural output ──────
-
-    #[test]
-    fn envelope_generalized_structural_match() {
-        let envelope = build_envelope(DecodeLevel::Generalized);
-        let out = emit(&envelope);
-        // Must contain the two top-level fields and the decodelevel value.
-        assert!(
-            out.contains("\"version\": 2"),
-            "missing version field: {out}"
-        );
-        assert!(
-            out.contains("\"decodelevel\": \"generalized\""),
-            "missing decodelevel: {out}"
-        );
-        // Must end with a single trailing newline.
-        assert!(out.ends_with('\n'), "missing trailing newline");
-        // Full structural match (no extra sections like pages/objects).
-        let expected = "{\n  \"version\": 2,\n  \"parameters\": {\n    \"decodelevel\": \"generalized\"\n  }\n}\n";
-        assert_eq!(out, expected, "structural mismatch");
-    }
-
-    // ── 2. All other DecodeLevel variants produce the right string ────────────
-
-    #[test]
-    fn envelope_none_decodelevel() {
-        let out = emit(&build_envelope(DecodeLevel::None));
-        assert!(
-            out.contains("\"decodelevel\": \"none\""),
-            "wrong decodelevel: {out}"
-        );
-    }
-
-    #[test]
-    fn envelope_specialized_decodelevel() {
-        let out = emit(&build_envelope(DecodeLevel::Specialized));
-        assert!(
-            out.contains("\"decodelevel\": \"specialized\""),
-            "wrong decodelevel: {out}"
-        );
-    }
-
-    #[test]
-    fn envelope_all_decodelevel() {
-        let out = emit(&build_envelope(DecodeLevel::All));
-        assert!(
-            out.contains("\"decodelevel\": \"all\""),
-            "wrong decodelevel: {out}"
-        );
-    }
-
-    // ── 3. Key order: version must appear before parameters ───────────────────
-
-    #[test]
-    fn key_order_version_before_parameters() {
-        let envelope = build_envelope(DecodeLevel::Generalized);
-        let out = emit(&envelope);
-        let version_pos = out.find("\"version\"").expect("version not found");
-        let parameters_pos = out.find("\"parameters\"").expect("parameters not found");
-        assert!(
-            version_pos < parameters_pos,
-            "version must appear before parameters, got: {out}"
-        );
-    }
-
-    // ── 4. parameters object contains exactly one key (decodelevel only) ──────
-
-    #[test]
-    fn parameters_has_only_decodelevel() {
-        let envelope = build_envelope(DecodeLevel::Generalized);
-        // Inspect the JsonValue directly, not the string.
-        let JsonValue::Object(pairs) = &envelope else {
-            panic!("envelope is not an Object");
-        };
-        let (_, params_val) = pairs
-            .iter()
-            .find(|(k, _)| k == "parameters")
-            .expect("parameters key not found");
-        let JsonValue::Object(param_pairs) = params_val else {
-            panic!("parameters is not an Object");
-        };
-        assert_eq!(
-            param_pairs.len(),
-            1,
-            "parameters must have exactly 1 key, got: {:?}",
-            param_pairs.iter().map(|(k, _)| k).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            param_pairs[0].0, "decodelevel",
-            "the single key must be 'decodelevel'"
-        );
-    }
-
     // ── 5. Default is Generalized ─────────────────────────────────────────────
 
     #[test]
@@ -3666,7 +3213,7 @@ mod tests {
     fn object_bool_true_to_json() {
         assert_eq!(
             pdf_object_to_json(&Object::Boolean(true)).unwrap(),
-            JsonValue::Bool(true)
+            serde_json::Value::Bool(true)
         );
     }
 
@@ -3674,7 +3221,7 @@ mod tests {
     fn object_bool_false_to_json() {
         assert_eq!(
             pdf_object_to_json(&Object::Boolean(false)).unwrap(),
-            JsonValue::Bool(false)
+            serde_json::Value::Bool(false)
         );
     }
 
@@ -3693,10 +3240,7 @@ mod tests {
 
     #[test]
     fn object_real_to_json() {
-        assert_eq!(
-            pdf_object_to_json(&Object::Real(1.5)).unwrap(),
-            JsonValue::Float(1.5)
-        );
+        assert_eq!(pdf_object_to_json(&Object::Real(1.5)).unwrap(), number(1.5));
     }
 
     #[test]
@@ -3765,11 +3309,11 @@ mod tests {
     fn object_name_to_json() {
         assert_eq!(
             pdf_object_to_json(&Object::Name(b"Type".to_vec())).unwrap(),
-            JsonValue::String("/Type".to_string())
+            serde_json::Value::String("/Type".to_string())
         );
         assert_eq!(
             pdf_object_to_json(&Object::Name(b"Font".to_vec())).unwrap(),
-            JsonValue::String("/Font".to_string())
+            serde_json::Value::String("/Font".to_string())
         );
     }
 
@@ -3809,7 +3353,7 @@ mod tests {
     #[test]
     fn object_string_ascii_text_has_u_prefix() {
         let result = pdf_object_to_json(&Object::String(b"hello".to_vec())).unwrap();
-        assert_eq!(result, JsonValue::String("u:hello".to_string()));
+        assert_eq!(result, serde_json::Value::String("u:hello".to_string()));
     }
 
     #[test]
@@ -3817,7 +3361,7 @@ mod tests {
         // 0x01 is unassigned in PDFDocEncoding (no UTF-16 BOM either), so the
         // string is not decodable as PDF text and must fall back to "b:" hex.
         let result = pdf_object_to_json(&Object::String(vec![0x2d, 0x01, 0x80])).unwrap();
-        assert_eq!(result, JsonValue::String("b:2d0180".to_string()));
+        assert_eq!(result, serde_json::Value::String("b:2d0180".to_string()));
     }
 
     #[test]
@@ -3826,7 +3370,7 @@ mod tests {
         // useHexString() heuristic. With non_ascii=1 and len=3, 5*1 > 3 so
         // qpdf emits b:<hex>; flpdf matches that.
         let result = pdf_object_to_json(&Object::String(vec![b'A', 0xC7, b'B'])).unwrap();
-        assert_eq!(result, JsonValue::String("b:41c742".to_string()));
+        assert_eq!(result, serde_json::Value::String("b:41c742".to_string()));
     }
 
     #[test]
@@ -3842,7 +3386,7 @@ mod tests {
         let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
         assert_eq!(
             result,
-            JsonValue::String("u:the quick\u{00C7}brown!!".to_string())
+            serde_json::Value::String("u:the quick\u{00C7}brown!!".to_string())
         );
     }
 
@@ -3851,7 +3395,7 @@ mod tests {
         // FEFF + 0041 + 0042 → "u:AB"
         let bytes = vec![0xFE, 0xFF, 0x00, 0x41, 0x00, 0x42];
         let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
-        assert_eq!(result, JsonValue::String("u:AB".to_string()));
+        assert_eq!(result, serde_json::Value::String("u:AB".to_string()));
     }
 
     #[test]
@@ -3859,7 +3403,7 @@ mod tests {
         // FFFE + 41 00 + 42 00 → "u:AB"
         let bytes = vec![0xFF, 0xFE, 0x41, 0x00, 0x42, 0x00];
         let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
-        assert_eq!(result, JsonValue::String("u:AB".to_string()));
+        assert_eq!(result, serde_json::Value::String("u:AB".to_string()));
     }
 
     #[test]
@@ -3867,7 +3411,7 @@ mod tests {
         // FEFF + 3042 (あ) + 3044 (い) → "u:あい"
         let bytes = vec![0xFE, 0xFF, 0x30, 0x42, 0x30, 0x44];
         let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
-        assert_eq!(result, JsonValue::String("u:あい".to_string()));
+        assert_eq!(result, serde_json::Value::String("u:あい".to_string()));
     }
 
     #[test]
@@ -3876,7 +3420,7 @@ mod tests {
         // the trailing odd byte and emits u:A; flpdf matches that.
         let bytes = vec![0xFE, 0xFF, 0x00, 0x41, 0x00];
         let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
-        assert_eq!(result, JsonValue::String("u:A".to_string()));
+        assert_eq!(result, serde_json::Value::String("u:A".to_string()));
     }
 
     #[test]
@@ -3890,7 +3434,7 @@ mod tests {
         let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
         assert_eq!(
             result,
-            JsonValue::String("b:d41d8cd98f00b204e9800998ecf8427e".to_string())
+            serde_json::Value::String("b:d41d8cd98f00b204e9800998ecf8427e".to_string())
         );
     }
 
@@ -3899,14 +3443,14 @@ mod tests {
         // 0x1E falls in the 0x18..=0x1F range that useHexString counts as
         // non_ascii; with len=3 the 5*non_ascii > len threshold triggers.
         let result = pdf_object_to_json(&Object::String(vec![b'A', 0x1E, b'B'])).unwrap();
-        assert_eq!(result, JsonValue::String("b:411e42".to_string()));
+        assert_eq!(result, serde_json::Value::String("b:411e42".to_string()));
     }
 
     #[test]
     fn object_string_del_0x7f_forces_hex() {
         // 0x7F (DEL) is counted as non_ascii by qpdf.
         let result = pdf_object_to_json(&Object::String(vec![b'A', 0x7F, b'B'])).unwrap();
-        assert_eq!(result, JsonValue::String("b:417f42".to_string()));
+        assert_eq!(result, serde_json::Value::String("b:417f42".to_string()));
     }
 
     #[test]
@@ -3915,7 +3459,7 @@ mod tests {
         // emitted as a UTF-8 string.
         let bytes = vec![0xEF, 0xBB, 0xBF, b'A', b'B'];
         let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
-        assert_eq!(result, JsonValue::String("u:AB".to_string()));
+        assert_eq!(result, serde_json::Value::String("u:AB".to_string()));
     }
 
     #[test]
@@ -3923,7 +3467,7 @@ mod tests {
         // EF BB BF + "café" (UTF-8 bytes for café) → u:café.
         let bytes = vec![0xEF, 0xBB, 0xBF, b'c', b'a', b'f', 0xC3, 0xA9];
         let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
-        assert_eq!(result, JsonValue::String("u:café".to_string()));
+        assert_eq!(result, serde_json::Value::String("u:café".to_string()));
     }
 
     #[test]
@@ -3934,13 +3478,13 @@ mod tests {
         // for an /ID array element that contains a NUL.
         let bytes = vec![0xab, 0xcd, 0x00, 0xef];
         let result = pdf_object_to_json(&Object::String(bytes)).unwrap();
-        assert_eq!(result, JsonValue::String("b:abcd00ef".to_string()));
+        assert_eq!(result, serde_json::Value::String("b:abcd00ef".to_string()));
     }
 
     #[test]
     fn object_string_empty_is_text() {
         let result = pdf_object_to_json(&Object::String(vec![])).unwrap();
-        assert_eq!(result, JsonValue::String("u:".to_string()));
+        assert_eq!(result, serde_json::Value::String("u:".to_string()));
     }
 
     // ── 12. Reference conversion ──────────────────────────────────────────────
@@ -3949,14 +3493,17 @@ mod tests {
     fn object_reference_to_json() {
         use crate::ObjectRef;
         let result = pdf_object_to_json(&Object::Reference(ObjectRef::new(2, 0))).unwrap();
-        assert_eq!(result, JsonValue::String("2 0 R".to_string()));
+        assert_eq!(result, serde_json::Value::String("2 0 R".to_string()));
     }
 
     // ── 13. Null conversion ───────────────────────────────────────────────────
 
     #[test]
     fn object_null_to_json() {
-        assert_eq!(pdf_object_to_json(&Object::Null).unwrap(), JsonValue::Null);
+        assert_eq!(
+            pdf_object_to_json(&Object::Null).unwrap(),
+            serde_json::Value::Null
+        );
     }
 
     // ── 14. Array conversion ──────────────────────────────────────────────────
@@ -3971,10 +3518,10 @@ mod tests {
         let result = pdf_object_to_json(&arr).unwrap();
         assert_eq!(
             result,
-            JsonValue::Array(vec![
-                JsonValue::Integer(1),
-                JsonValue::Bool(true),
-                JsonValue::Null,
+            serde_json::Value::Array(vec![
+                number(1),
+                serde_json::Value::Bool(true),
+                serde_json::Value::Null,
             ])
         );
     }
@@ -3989,9 +3536,7 @@ mod tests {
         dict.insert("Apple", Object::Integer(2));
         dict.insert("Mango", Object::Integer(3));
         let result = pdf_object_to_json(&Object::Dictionary(dict)).unwrap();
-        let JsonValue::Object(pairs) = result else {
-            panic!("expected Object, got {:?}", result);
-        };
+        let pairs = object_pairs(result);
         // Keys should be in alphabetical order: /Apple, /Mango, /Zebra
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["/Apple", "/Mango", "/Zebra"]);
@@ -4004,9 +3549,7 @@ mod tests {
         use crate::object::{Dictionary, Stream};
         let stream = Object::Stream(Stream::new(Dictionary::new(), vec![]));
         let result = pdf_object_to_json(&stream).unwrap();
-        let JsonValue::Object(pairs) = &result else {
-            panic!("expected Object");
-        };
+        let pairs = object_pairs(&result);
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "stream");
     }
@@ -4046,7 +3589,7 @@ mod tests {
             called_get_all_pages: true,
         };
         let result = build_qpdf_key(&mut pdf, meta).expect("build_qpdf_key failed");
-        let JsonValue::Array(elems) = result else {
+        let serde_json::Value::Array(elems) = result else {
             panic!("expected Array, got {:?}", result);
         };
         assert_eq!(
@@ -4067,26 +3610,16 @@ mod tests {
             pushed_inherited_page_resources: false,
             called_get_all_pages: true,
         };
-        let JsonValue::Array(elems) =
+        let serde_json::Value::Array(elems) =
             build_qpdf_key(&mut pdf, meta).expect("build_qpdf_key failed")
         else {
             panic!("expected Array");
         };
-        let JsonValue::Object(meta_pairs) = &elems[0] else {
-            panic!("metadata is not an Object");
-        };
-        // Check fixed key order: jsonversion, pdfversion, pushedinheritedpageresources,
-        // calledgetallpages, maxobjectid
-        assert_eq!(meta_pairs[0].0, "jsonversion");
-        assert_eq!(meta_pairs[0].1, JsonValue::Integer(2));
-        assert_eq!(meta_pairs[1].0, "pdfversion");
-        assert_eq!(meta_pairs[1].1, JsonValue::String("1.3".to_string()));
-        assert_eq!(meta_pairs[2].0, "pushedinheritedpageresources");
-        assert_eq!(meta_pairs[2].1, JsonValue::Bool(false));
-        assert_eq!(meta_pairs[3].0, "calledgetallpages");
-        assert_eq!(meta_pairs[3].1, JsonValue::Bool(true));
-        assert_eq!(meta_pairs[4].0, "maxobjectid");
-        assert_eq!(meta_pairs[4].1, JsonValue::Integer(7));
+        assert_eq!(elems[0]["jsonversion"], number(2));
+        assert_eq!(elems[0]["pdfversion"], "1.3");
+        assert_eq!(elems[0]["pushedinheritedpageresources"], false);
+        assert_eq!(elems[0]["calledgetallpages"], true);
+        assert_eq!(elems[0]["maxobjectid"], number(7));
     }
 
     // ── 19. objects_map has the expected keys ─────────────────────────────────
@@ -4100,14 +3633,12 @@ mod tests {
             pushed_inherited_page_resources: false,
             called_get_all_pages: true,
         };
-        let JsonValue::Array(elems) =
+        let serde_json::Value::Array(elems) =
             build_qpdf_key(&mut pdf, meta).expect("build_qpdf_key failed")
         else {
             panic!("expected Array");
         };
-        let JsonValue::Object(map_pairs) = &elems[1] else {
-            panic!("objects_map is not an Object");
-        };
+        let map_pairs = object_pairs(&elems[1]);
         let keys: Vec<&str> = map_pairs.iter().map(|(k, _)| k.as_str()).collect();
         // one-page.pdf has objects 1..7 (some may be free) plus trailer.
         // At minimum, trailer must be present.
@@ -4136,27 +3667,21 @@ mod tests {
             pushed_inherited_page_resources: false,
             called_get_all_pages: true,
         };
-        let JsonValue::Array(elems) =
+        let serde_json::Value::Array(elems) =
             build_qpdf_key(&mut pdf, meta).expect("build_qpdf_key failed")
         else {
             panic!("expected Array");
         };
-        let JsonValue::Object(map_pairs) = &elems[1] else {
-            panic!("objects_map is not an Object");
-        };
+        let map_pairs = object_pairs(&elems[1]);
         let obj7 = map_pairs
             .iter()
             .find(|(k, _)| k == "obj:7 0 R")
             .map(|(_, v)| v)
             .expect("obj:7 0 R not found");
         // Must be { "stream": { "dict": { ... } } }
-        let JsonValue::Object(obj7_pairs) = obj7 else {
-            panic!("obj:7 0 R is not an Object: {obj7:?}");
-        };
+        let obj7_pairs = object_pairs(obj7);
         assert_eq!(obj7_pairs[0].0, "stream", "obj:7 must have 'stream' key");
-        let JsonValue::Object(stream_inner) = &obj7_pairs[0].1 else {
-            panic!("stream value is not an Object");
-        };
+        let stream_inner = object_pairs(&obj7_pairs[0].1);
         assert_eq!(stream_inner[0].0, "dict", "stream must have 'dict' key");
     }
 
@@ -4171,33 +3696,27 @@ mod tests {
             pushed_inherited_page_resources: false,
             called_get_all_pages: true,
         };
-        let JsonValue::Array(elems) =
+        let serde_json::Value::Array(elems) =
             build_qpdf_key(&mut pdf, meta).expect("build_qpdf_key failed")
         else {
             panic!("expected Array");
         };
-        let JsonValue::Object(map_pairs) = &elems[1] else {
-            panic!("objects_map is not an Object");
-        };
+        let map_pairs = object_pairs(&elems[1]);
         let trailer = map_pairs
             .iter()
             .find(|(k, _)| k == "trailer")
             .map(|(_, v)| v)
             .expect("trailer not found");
-        let JsonValue::Object(trailer_pairs) = trailer else {
-            panic!("trailer is not an Object");
-        };
+        let trailer_pairs = object_pairs(trailer);
         assert_eq!(trailer_pairs[0].0, "value", "trailer must have 'value' key");
         // /Size should be Integer(8)
-        let JsonValue::Object(trailer_dict) = &trailer_pairs[0].1 else {
-            panic!("trailer.value is not an Object");
-        };
+        let trailer_dict = object_pairs(&trailer_pairs[0].1);
         let size = trailer_dict
             .iter()
             .find(|(k, _)| k == "/Size")
             .map(|(_, v)| v)
             .expect("/Size not found in trailer");
-        assert_eq!(*size, JsonValue::Integer(8), "/Size should be 8");
+        assert_eq!(*size, number(8), "/Size should be 8");
     }
 
     // ── 22. Live null indirect object is emitted, not silently dropped ────────
@@ -4222,30 +3741,26 @@ mod tests {
             pushed_inherited_page_resources: false,
             called_get_all_pages: true,
         };
-        let JsonValue::Array(elems) =
+        let serde_json::Value::Array(elems) =
             build_qpdf_key(&mut pdf, meta).expect("build_qpdf_key failed")
         else {
             panic!("expected Array");
         };
-        let JsonValue::Object(map_pairs) = &elems[1] else {
-            panic!("objects_map is not an Object");
-        };
+        let map_pairs = object_pairs(&elems[1]);
 
         let obj2 = map_pairs
             .iter()
             .find(|(k, _)| k == "obj:2 0 R")
             .map(|(_, v)| v)
             .expect("obj:2 0 R must remain in objects_map when it is live and null");
-        let JsonValue::Object(obj2_pairs) = obj2 else {
-            panic!("obj:2 0 R is not an Object");
-        };
+        let obj2_pairs = object_pairs(obj2);
         assert_eq!(
             obj2_pairs.len(),
             1,
             "live null indirect must have a single 'value' key"
         );
         assert_eq!(obj2_pairs[0].0, "value");
-        assert_eq!(obj2_pairs[0].1, JsonValue::Null);
+        assert_eq!(obj2_pairs[0].1, serde_json::Value::Null);
     }
 
     // ── 23. Pdf::live_object_refs() unit check ────────────────────────────────
@@ -4266,14 +3781,14 @@ mod tests {
         // /A followed by 0xFF — invalid UTF-8 in the raw name bytes.
         let obj = Object::Name(b"A\xffB".to_vec());
         let json = pdf_object_to_json(&obj).unwrap();
-        assert_eq!(json, JsonValue::String("n:/A#ffB".to_string()));
+        assert_eq!(json, serde_json::Value::String("n:/A#ffB".to_string()));
     }
 
     #[test]
     fn pdf_object_to_json_non_utf8_name_restores_tokenizer_null_marker() {
         let obj = Object::Name(vec![0, 0xff]);
         let json = pdf_object_to_json(&obj).unwrap();
-        assert_eq!(json, JsonValue::String("n:/##ff".to_string()));
+        assert_eq!(json, serde_json::Value::String("n:/##ff".to_string()));
     }
 
     #[test]
@@ -4284,7 +3799,7 @@ mod tests {
         let json = pdf_object_to_json(&obj).unwrap();
         assert_eq!(
             json,
-            JsonValue::String("/a b#(c)".to_string()),
+            serde_json::Value::String("/a b#(c)".to_string()),
             "valid UTF-8 name bytes must stay decoded"
         );
     }
@@ -4294,7 +3809,7 @@ mod tests {
         // Plain ASCII names are emitted unchanged.
         let obj = Object::Name(b"Helvetica".to_vec());
         let json = pdf_object_to_json(&obj).unwrap();
-        assert_eq!(json, JsonValue::String("/Helvetica".to_string()));
+        assert_eq!(json, serde_json::Value::String("/Helvetica".to_string()));
     }
 
     #[test]
@@ -4303,21 +3818,19 @@ mod tests {
         let mut dict = Dictionary::new();
         dict.insert(b"K\xffey", Object::Integer(7));
         let json = pdf_object_to_json(&Object::Dictionary(dict)).unwrap();
-        let JsonValue::Object(pairs) = json else {
-            panic!("expected Object");
-        };
+        let pairs = object_pairs(json);
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "n:/K#ffey");
-        assert_eq!(pairs[0].1, JsonValue::Integer(7));
+        assert_eq!(pairs[0].1, number(7));
     }
 
     #[test]
     fn pdf_object_to_json_name_with_control_byte_escapes() {
-        // Control bytes are valid UTF-8; JsonValue retains the byte and the
+        // Control bytes are valid UTF-8; serde_json::Value retains the byte and the
         // final JSON serializer emits the required JSON escape.
         let obj = Object::Name(b"x\x01y".to_vec());
         let json = pdf_object_to_json(&obj).unwrap();
-        assert_eq!(json, JsonValue::String("/x\u{1}y".to_string()));
+        assert_eq!(json, serde_json::Value::String("/x\u{1}y".to_string()));
     }
 
     // ── 25. Pdf::live_object_refs() unit check ────────────────────────────────
@@ -4357,14 +3870,11 @@ mod tests {
     }
 
     // Helper: get page entry at index from build_pages_section result.
-    fn get_page_entry(pages: &JsonValue, idx: usize) -> &[(String, JsonValue)] {
-        let JsonValue::Array(arr) = pages else {
+    fn get_page_entry(pages: &serde_json::Value, idx: usize) -> Vec<(String, serde_json::Value)> {
+        let serde_json::Value::Array(arr) = pages else {
             panic!("pages section is not an Array");
         };
-        let JsonValue::Object(pairs) = &arr[idx] else {
-            panic!("page entry {idx} is not an Object");
-        };
-        pairs.as_slice()
+        object_pairs(&arr[idx])
     }
 
     // ── 26. one-page.pdf: pages array length ─────────────────────────────────
@@ -4373,7 +3883,7 @@ mod tests {
     fn build_pages_section_one_page_length() {
         let mut pdf = load_fixture_pdf("one-page.pdf");
         let pages = build_pages_section(&mut pdf).expect("build_pages_section failed");
-        let JsonValue::Array(arr) = &pages else {
+        let serde_json::Value::Array(arr) = &pages else {
             panic!("expected Array");
         };
         assert_eq!(arr.len(), 1, "one-page.pdf must have exactly 1 page entry");
@@ -4415,27 +3925,31 @@ mod tests {
         // contents = ["7 0 R"]
         assert_eq!(
             pairs[0].1,
-            JsonValue::Array(vec![JsonValue::String("7 0 R".to_string())]),
+            serde_json::Value::Array(vec![serde_json::Value::String("7 0 R".to_string())]),
             "contents mismatch"
         );
         // images = []
-        assert_eq!(pairs[1].1, JsonValue::Array(vec![]), "images must be empty");
+        assert_eq!(
+            pairs[1].1,
+            serde_json::Value::Array(vec![]),
+            "images must be empty"
+        );
         // label = null
-        assert_eq!(pairs[2].1, JsonValue::Null, "label must be null");
+        assert_eq!(pairs[2].1, serde_json::Value::Null, "label must be null");
         // object = "3 0 R"
         assert_eq!(
             pairs[3].1,
-            JsonValue::String("3 0 R".to_string()),
+            serde_json::Value::String("3 0 R".to_string()),
             "object mismatch"
         );
         // outlines = []
         assert_eq!(
             pairs[4].1,
-            JsonValue::Array(vec![]),
+            serde_json::Value::Array(vec![]),
             "outlines must be empty"
         );
         // pageposfrom1 = 1
-        assert_eq!(pairs[5].1, JsonValue::Integer(1), "pageposfrom1 must be 1");
+        assert_eq!(pairs[5].1, number(1), "pageposfrom1 must be 1");
     }
 
     #[test]
@@ -4482,7 +3996,7 @@ mod tests {
         // pages[2]: object="5 0 R", contents=["11 0 R"], pageposfrom1=3
         let mut pdf = load_fixture_pdf("three-page.pdf");
         let pages = build_pages_section(&mut pdf).expect("build_pages_section failed");
-        let JsonValue::Array(arr) = &pages else {
+        let serde_json::Value::Array(arr) = &pages else {
             panic!("expected Array");
         };
         assert_eq!(arr.len(), 3, "three-page.pdf must have 3 page entries");
@@ -4496,24 +4010,28 @@ mod tests {
             let pairs = get_page_entry(&pages, i);
             assert_eq!(
                 pairs[0].1,
-                JsonValue::Array(vec![JsonValue::String(exp_contents.to_string())]),
+                serde_json::Value::Array(vec![serde_json::Value::String(exp_contents.to_string())]),
                 "page {i} contents mismatch"
             );
             assert_eq!(
                 pairs[3].1,
-                JsonValue::String(exp_obj.to_string()),
+                serde_json::Value::String(exp_obj.to_string()),
                 "page {i} object mismatch"
             );
             assert_eq!(
                 pairs[5].1,
-                JsonValue::Integer(*exp_pos),
+                number(*exp_pos),
                 "page {i} pageposfrom1 mismatch"
             );
             // label and outlines are placeholders
-            assert_eq!(pairs[2].1, JsonValue::Null, "page {i} label must be null");
+            assert_eq!(
+                pairs[2].1,
+                serde_json::Value::Null,
+                "page {i} label must be null"
+            );
             assert_eq!(
                 pairs[4].1,
-                JsonValue::Array(vec![]),
+                serde_json::Value::Array(vec![]),
                 "page {i} outlines must be empty"
             );
         }
@@ -4528,7 +4046,7 @@ mod tests {
         // pages[1]: object="7 0 R", contents=["11 0 R"], pageposfrom1=2
         let mut pdf = load_fixture_pdf("attachment-two-page.pdf");
         let pages = build_pages_section(&mut pdf).expect("build_pages_section failed");
-        let JsonValue::Array(arr) = &pages else {
+        let serde_json::Value::Array(arr) = &pages else {
             panic!("expected Array");
         };
         assert_eq!(
@@ -4542,17 +4060,17 @@ mod tests {
             let pairs = get_page_entry(&pages, i);
             assert_eq!(
                 pairs[0].1,
-                JsonValue::Array(vec![JsonValue::String(exp_contents.to_string())]),
+                serde_json::Value::Array(vec![serde_json::Value::String(exp_contents.to_string())]),
                 "page {i} contents mismatch"
             );
             assert_eq!(
                 pairs[3].1,
-                JsonValue::String(exp_obj.to_string()),
+                serde_json::Value::String(exp_obj.to_string()),
                 "page {i} object mismatch"
             );
             assert_eq!(
                 pairs[5].1,
-                JsonValue::Integer(*exp_pos),
+                number(*exp_pos),
                 "page {i} pageposfrom1 mismatch"
             );
         }
@@ -4659,7 +4177,7 @@ mod tests {
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
         assert_eq!(
             result,
-            JsonValue::Array(vec![]),
+            serde_json::Value::Array(vec![]),
             "missing /PageLabels must yield empty array"
         );
     }
@@ -4716,31 +4234,33 @@ mod tests {
         patch_pagelabels(&mut pdf, pagelabels);
 
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
-        let JsonValue::Array(arr) = &result else {
+        let serde_json::Value::Array(arr) = &result else {
             panic!("expected Array, got {result:?}");
         };
         assert_eq!(arr.len(), 1, "expected 1 entry");
 
-        let JsonValue::Object(entry) = &arr[0] else {
-            panic!("entry is not an Object");
-        };
+        let entry = object_pairs(&arr[0]);
         // Key order: index, label
         assert_eq!(entry[0].0, "index");
-        assert_eq!(entry[0].1, JsonValue::Integer(0));
+        assert_eq!(entry[0].1, number(0));
         assert_eq!(entry[1].0, "label");
 
-        let JsonValue::Object(label_pairs) = &entry[1].1 else {
-            panic!("label is not an Object");
-        };
+        let label_pairs = object_pairs(&entry[1].1);
         // Key order: first, prefix, style
-        assert_eq!(label_pairs[0], ("first".to_string(), JsonValue::Integer(1)));
+        assert_eq!(label_pairs[0], ("first".to_string(), number(1)));
         assert_eq!(
             label_pairs[1],
-            ("prefix".to_string(), JsonValue::String(String::new()))
+            (
+                "prefix".to_string(),
+                serde_json::Value::String(String::new())
+            )
         );
         assert_eq!(
             label_pairs[2],
-            ("style".to_string(), JsonValue::String("D".to_string()))
+            (
+                "style".to_string(),
+                serde_json::Value::String("D".to_string())
+            )
         );
     }
 
@@ -4800,20 +4320,15 @@ mod tests {
         patch_pagelabels(&mut pdf, pagelabels);
 
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
-        let JsonValue::Array(arr) = &result else {
+        let serde_json::Value::Array(arr) = &result else {
             panic!("expected Array"); // cov:ignore: test-shape guard
         };
         assert_eq!(arr.len(), 3, "expected 3 entries");
 
         // Check indices
         let get_index = |i: usize| {
-            let JsonValue::Object(e) = &arr[i] else {
-                panic!()
-            };
-            match &e[0].1 {
-                JsonValue::Integer(n) => *n,
-                _ => panic!(),
-            }
+            let e = object_pairs(&arr[i]);
+            value_for_key(&e, "index").as_i64().unwrap()
         };
         assert_eq!(get_index(0), 0);
         assert_eq!(get_index(1), 5);
@@ -4821,26 +4336,18 @@ mod tests {
 
         // Check styles
         let get_style = |i: usize| {
-            let JsonValue::Object(e) = &arr[i] else {
-                panic!()
-            };
-            let JsonValue::Object(lp) = &e[1].1 else {
-                panic!()
-            };
+            let e = object_pairs(&arr[i]);
+            let lp = object_pairs(&e[1].1);
             lp[2].1.clone()
         };
-        assert_eq!(get_style(0), JsonValue::String("D".to_string()));
-        assert_eq!(get_style(1), JsonValue::String("R".to_string()));
-        assert_eq!(get_style(2), JsonValue::String("a".to_string()));
+        assert_eq!(get_style(0), serde_json::Value::String("D".to_string()));
+        assert_eq!(get_style(1), serde_json::Value::String("R".to_string()));
+        assert_eq!(get_style(2), serde_json::Value::String("a".to_string()));
 
         // Check prefix on entry 1
-        let JsonValue::Object(e1) = &arr[1] else {
-            panic!()
-        };
-        let JsonValue::Object(lp1) = &e1[1].1 else {
-            panic!()
-        };
-        assert_eq!(lp1[1].1, JsonValue::String("Appx".to_string()));
+        let e1 = object_pairs(&arr[1]);
+        let lp1 = object_pairs(&e1[1].1);
+        assert_eq!(lp1[1].1, serde_json::Value::String("Appx".to_string()));
     }
 
     // ── 38b. Indirect label value is resolved ────────────────────────────────
@@ -4867,7 +4374,7 @@ mod tests {
 
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
         assert!(
-            matches!(&result, JsonValue::Array(arr) if arr.len() == 1),
+            matches!(&result, serde_json::Value::Array(arr) if arr.len() == 1),
             "indirect label value must resolve to one entry, got {result:?}"
         );
     }
@@ -4892,7 +4399,7 @@ mod tests {
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
         assert_eq!(
             result,
-            JsonValue::Array(vec![]),
+            serde_json::Value::Array(vec![]),
             "non-dict label value yields no entries"
         );
     }
@@ -4918,20 +4425,16 @@ mod tests {
         patch_pagelabels(&mut pdf, pagelabels);
 
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
-        let JsonValue::Array(arr) = &result else {
+        let serde_json::Value::Array(arr) = &result else {
             panic!("expected Array"); // cov:ignore: test-shape guard
         };
         assert_eq!(arr.len(), 1);
-        let JsonValue::Object(entry) = &arr[0] else {
-            panic!() // cov:ignore: test-shape guard
-        };
-        let JsonValue::Object(label_pairs) = &entry[1].1 else {
-            panic!() // cov:ignore: test-shape guard
-        };
+        let entry = object_pairs(&arr[0]);
+        let label_pairs = object_pairs(&entry[1].1);
         assert_eq!(label_pairs[2].0, "style");
         assert_eq!(
             label_pairs[2].1,
-            JsonValue::Null,
+            serde_json::Value::Null,
             "style must be null when /S is absent"
         );
     }
@@ -4963,18 +4466,14 @@ mod tests {
         patch_pagelabels(&mut pdf, pagelabels);
 
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
-        let JsonValue::Array(arr) = &result else {
+        let serde_json::Value::Array(arr) = &result else {
             panic!("expected Array"); // cov:ignore: test-shape guard
         };
         assert_eq!(arr.len(), 1, "expected 1 entry from /Kids walk");
-        let JsonValue::Object(entry) = &arr[0] else {
-            panic!() // cov:ignore: test-shape guard
-        };
-        assert_eq!(entry[0].1, JsonValue::Integer(0));
-        let JsonValue::Object(lp) = &entry[1].1 else {
-            panic!() // cov:ignore: test-shape guard
-        };
-        assert_eq!(lp[2].1, JsonValue::String("r".to_string()));
+        let entry = object_pairs(&arr[0]);
+        assert_eq!(entry[0].1, number(0));
+        let lp = object_pairs(&entry[1].1);
+        assert_eq!(lp[2].1, serde_json::Value::String("r".to_string()));
     }
 
     // ── 41. All compat fixtures without /PageLabels yield empty array ─────────
@@ -4988,24 +4487,21 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{name}: build_pagelabels_section failed: {e:?}"));
             assert_eq!(
                 result,
-                JsonValue::Array(vec![]),
+                serde_json::Value::Array(vec![]),
                 "{name}: expected empty pagelabels array"
             );
         }
     }
 
-    // ── build_qpdf_json_v2 (top-level composite output) ───────────────────────
+    // ── build_test_document (top-level composite output) ───────────────────────
 
     #[test]
-    fn build_qpdf_json_v2_has_expected_top_level_keys_in_order() {
+    fn build_test_document_has_expected_top_level_keys_in_order() {
         let mut pdf = load_one_page_pdf();
-        let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
-            .expect("build_qpdf_json_v2 failed");
-        let JsonValue::Object(pairs) = v2 else {
-            panic!("expected Object at top level"); // cov:ignore: test-shape guard
-        };
+        let v2 = build_test_document(&mut pdf, DecodeLevel::Generalized)
+            .expect("build_test_document failed");
         // qpdf-style fixed order: version, parameters, pages, pagelabels, acroform, attachments, encrypt, outlines, qpdf
-        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        let keys = top_level_key_names(&v2);
         assert_eq!(
             keys,
             vec![
@@ -5056,27 +4552,27 @@ mod tests {
         Pdf::open(std::io::Cursor::new(bytes)).unwrap()
     }
 
-    fn top_level_key_names(value: &JsonValue) -> Vec<&str> {
-        let JsonValue::Object(pairs) = value else {
-            panic!("expected top-level JSON object"); // cov:ignore: test-shape guard
-        };
-        pairs.iter().map(|(key, _)| key.as_str()).collect()
+    fn top_level_key_names(value: &serde_json::Value) -> Vec<String> {
+        const QPDF_ORDER: [&str; 9] = [
+            "version",
+            "parameters",
+            "pages",
+            "pagelabels",
+            "acroform",
+            "attachments",
+            "encrypt",
+            "outlines",
+            "qpdf",
+        ];
+        QPDF_ORDER
+            .into_iter()
+            .filter(|key| value.get(*key).is_some())
+            .map(str::to_string)
+            .collect()
     }
 
-    fn qpdf_object_value<'a>(value: &'a JsonValue, object: &str) -> &'a JsonValue {
-        let JsonValue::Object(top) = value else {
-            panic!("expected top-level JSON object"); // cov:ignore: test-shape guard
-        };
-        let JsonValue::Array(qpdf) = value_for_key(top, "qpdf") else {
-            panic!("expected qpdf array"); // cov:ignore: test-shape guard
-        };
-        let JsonValue::Object(objects) = &qpdf[1] else {
-            panic!("expected qpdf object map"); // cov:ignore: test-shape guard
-        };
-        let JsonValue::Object(entry) = value_for_key(objects, object) else {
-            panic!("expected qpdf object entry"); // cov:ignore: test-shape guard
-        };
-        value_for_key(entry, "value")
+    fn qpdf_object_value<'a>(value: &'a serde_json::Value, object: &str) -> &'a serde_json::Value {
+        &value["qpdf"][1][object]["value"]
     }
 
     fn direct_dests_root(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> Dictionary {
@@ -5097,7 +4593,7 @@ mod tests {
         let mut pdf = load_repairable_outline_pdf();
         let before = pdf.resolve(crate::ObjectRef::new(1, 0)).unwrap().clone();
 
-        let json = build_qpdf_json_v2_selected_with_options(
+        let json = build_test_document_selected(
             &mut pdf,
             DecodeLevel::Generalized,
             &StreamDataMode::None,
@@ -5121,7 +4617,7 @@ mod tests {
     fn selected_outlines_repairs_only_the_requested_section() {
         let mut pdf = load_repairable_outline_pdf();
 
-        let json = build_qpdf_json_v2_selected_with_options(
+        let json = build_test_document_selected(
             &mut pdf,
             DecodeLevel::Generalized,
             &StreamDataMode::None,
@@ -5143,7 +4639,7 @@ mod tests {
     fn selected_outlines_precede_qpdf_and_raw_objects_reflect_repair() {
         let mut pdf = load_repairable_outline_pdf();
 
-        let json = build_qpdf_json_v2_selected_with_options(
+        let json = build_test_document_selected(
             &mut pdf,
             DecodeLevel::Generalized,
             &StreamDataMode::None,
@@ -5210,7 +4706,7 @@ mod tests {
 
         for (keys, expected) in cases {
             let mut pdf = load_one_page_pdf();
-            let json = build_qpdf_json_v2_selected_with_options(
+            let json = build_test_document_selected(
                 &mut pdf,
                 DecodeLevel::Generalized,
                 &StreamDataMode::None,
@@ -5221,19 +4717,8 @@ mod tests {
         }
     }
 
-    fn selected_qpdf_metadata(json: &JsonValue) -> &JsonValue {
-        let JsonValue::Object(top) = json else {
-            panic!("top-level JSON must be an object"); // cov:ignore: test-shape guard
-        };
-        let qpdf = top
-            .iter()
-            .find(|(key, _)| key == "qpdf")
-            .map(|(_, value)| value)
-            .expect("selected document must contain qpdf");
-        let JsonValue::Array(qpdf) = qpdf else {
-            panic!("qpdf must be an array"); // cov:ignore: test-shape guard
-        };
-        qpdf.first().expect("qpdf metadata element")
+    fn selected_qpdf_metadata(json: &serde_json::Value) -> &serde_json::Value {
+        &json["qpdf"][0]
     }
 
     #[test]
@@ -5283,7 +4768,7 @@ mod tests {
                 .map(|reference| reference.number)
                 .max()
                 .unwrap_or(0);
-            let json = build_qpdf_json_v2_selected_with_options(
+            let json = build_test_document_selected(
                 &mut pdf,
                 DecodeLevel::Generalized,
                 &StreamDataMode::None,
@@ -5293,21 +4778,21 @@ mod tests {
 
             assert_eq!(
                 selected_qpdf_metadata(&json),
-                &JsonValue::Object(vec![
-                    ("jsonversion".to_string(), JsonValue::Integer(2)),
-                    ("pdfversion".to_string(), JsonValue::String(pdf_version)),
+                &object(vec![
+                    ("jsonversion".to_string(), number(2)),
+                    (
+                        "pdfversion".to_string(),
+                        serde_json::Value::String(pdf_version)
+                    ),
                     (
                         "pushedinheritedpageresources".to_string(),
-                        JsonValue::Bool(false),
+                        serde_json::Value::Bool(false),
                     ),
                     (
                         "calledgetallpages".to_string(),
-                        JsonValue::Bool(called_get_all_pages),
+                        serde_json::Value::Bool(called_get_all_pages),
                     ),
-                    (
-                        "maxobjectid".to_string(),
-                        JsonValue::Integer(i64::from(max_object_id)),
-                    ),
+                    ("maxobjectid".to_string(), number(i64::from(max_object_id)),),
                 ]),
                 "{label}: keys={keys:?}"
             );
@@ -5317,7 +4802,7 @@ mod tests {
     #[test]
     fn qpdf_dangling_body_reference_participates_in_maxobjectid_for_trailer_selection() {
         let mut pdf = load_fixture_pdf("dangling-body-one-page.pdf");
-        let json = build_qpdf_json_v2_selected_with_options(
+        let json = build_test_document_selected(
             &mut pdf,
             DecodeLevel::Generalized,
             &StreamDataMode::None,
@@ -5327,18 +4812,21 @@ mod tests {
 
         assert_eq!(
             selected_qpdf_metadata(&json),
-            &JsonValue::Object(vec![
-                ("jsonversion".to_string(), JsonValue::Integer(2)),
+            &object(vec![
+                ("jsonversion".to_string(), number(2)),
                 (
                     "pdfversion".to_string(),
-                    JsonValue::String("1.3".to_string()),
+                    serde_json::Value::String("1.3".to_string()),
                 ),
                 (
                     "pushedinheritedpageresources".to_string(),
-                    JsonValue::Bool(false),
+                    serde_json::Value::Bool(false),
                 ),
-                ("calledgetallpages".to_string(), JsonValue::Bool(false),),
-                ("maxobjectid".to_string(), JsonValue::Integer(99)),
+                (
+                    "calledgetallpages".to_string(),
+                    serde_json::Value::Bool(false),
+                ),
+                ("maxobjectid".to_string(), number(99)),
             ])
         );
     }
@@ -6021,28 +5509,16 @@ mod tests {
         );
     }
 
-    fn selected_qpdf_object_map(json: &JsonValue) -> &[(String, JsonValue)] {
-        let JsonValue::Object(top) = json else {
-            panic!("top-level JSON must be an object"); // cov:ignore: test-shape guard
-        };
-        let JsonValue::Array(qpdf) = top
-            .iter()
-            .find(|(key, _)| key == "qpdf")
-            .map(|(_, value)| value)
-            .expect("qpdf section")
-        else {
-            panic!("qpdf section must be an array"); // cov:ignore: test-shape guard
-        };
-        let JsonValue::Object(map) = &qpdf[1] else {
-            panic!("qpdf object map"); // cov:ignore: test-shape guard
-        };
-        map
+    fn selected_qpdf_object_map(
+        json: &serde_json::Value,
+    ) -> &serde_json::Map<String, serde_json::Value> {
+        json["qpdf"][1].as_object().expect("qpdf object map")
     }
 
     #[test]
     fn qpdf_dangling_raw_projection_matches_qpdf_container_null_rules() {
         let mut pdf = load_fixture_pdf("dangling-body-one-page.pdf");
-        let json = build_qpdf_json_v2_selected_with_options(
+        let json = build_test_document_selected(
             &mut pdf,
             DecodeLevel::Generalized,
             &StreamDataMode::None,
@@ -6053,38 +5529,41 @@ mod tests {
 
         let obj4 = map
             .iter()
-            .find(|(key, _)| key == "obj:4 0 R")
+            .find(|(key, _)| *key == "obj:4 0 R")
             .map(|(_, value)| value)
             .expect("catalog object");
         assert_eq!(
             obj4,
-            &JsonValue::Object(vec![(
+            &object(vec![(
                 "value".to_string(),
-                JsonValue::Object(vec![
+                object(vec![
                     (
                         "/ArrZero".to_string(),
-                        JsonValue::Array(vec![JsonValue::Null]),
+                        serde_json::Value::Array(vec![serde_json::Value::Null]),
                     ),
-                    ("/Nested".to_string(), JsonValue::Object(Vec::new()),),
+                    ("/Nested".to_string(), object(Vec::new()),),
                     (
                         "/PageMode".to_string(),
-                        JsonValue::String("/UseNone".to_string()),
+                        serde_json::Value::String("/UseNone".to_string()),
                     ),
-                    ("/Pages".to_string(), JsonValue::String("6 0 R".to_string()),),
+                    (
+                        "/Pages".to_string(),
+                        serde_json::Value::String("6 0 R".to_string()),
+                    ),
                     (
                         "/Type".to_string(),
-                        JsonValue::String("/Catalog".to_string()),
+                        serde_json::Value::String("/Catalog".to_string()),
                     ),
                 ]),
             )])
         );
         assert_eq!(
             map.iter()
-                .find(|(key, _)| key == "obj:99 0 R")
+                .find(|(key, _)| *key == "obj:99 0 R")
                 .map(|(_, value)| value),
-            Some(&JsonValue::Object(vec![(
+            Some(&object(vec![(
                 "value".to_string(),
-                JsonValue::Null,
+                serde_json::Value::Null,
             )]))
         );
     }
@@ -6109,7 +5588,7 @@ mod tests {
 
         for (label, selectors, expected_keys) in cases {
             let mut pdf = load_fixture_pdf("dangling-body-one-page.pdf");
-            let json = build_qpdf_json_v2_selected_objects_with_options(
+            let json = build_test_document_selected_objects(
                 &mut pdf,
                 DecodeLevel::Generalized,
                 &StreamDataMode::None,
@@ -6118,15 +5597,13 @@ mod tests {
             )
             .expect("build selected objects");
 
-            let JsonValue::Object(metadata) = selected_qpdf_metadata(&json) else {
-                panic!("qpdf metadata must be an object"); // cov:ignore: test-shape guard
-            };
+            let metadata = object_pairs(selected_qpdf_metadata(&json));
             assert_eq!(
                 metadata
                     .iter()
                     .find(|(key, _)| key == "maxobjectid")
                     .map(|(_, value)| value),
-                Some(&JsonValue::Integer(99)),
+                Some(&number(99)),
                 "{label}"
             );
             assert_eq!(
@@ -6159,50 +5636,46 @@ mod tests {
         let nested_stream = Object::Stream(Stream::new(nested_dict, Vec::new()));
         assert_eq!(
             qpdf_pdf_object_to_json(&mut pdf, &nested_stream).unwrap(),
-            JsonValue::Object(vec![(
+            object(vec![(
                 "stream".to_string(),
-                JsonValue::Object(vec![("dict".to_string(), JsonValue::Object(Vec::new()),)]),
+                object(vec![("dict".to_string(), object(Vec::new()),)]),
             )])
         );
     }
 
     #[test]
-    fn build_qpdf_json_v2_includes_pagelabels_section() {
+    fn build_test_document_includes_pagelabels_section() {
         // Regression for CodeRabbit's flpdf-9hc.11.5 finding: the
         // pagelabels builder was added but never wired into the top-level
         // JSON, so users would never see the section. This test fails if
         // the wiring is dropped again.
         let mut pdf = load_one_page_pdf();
-        let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
-            .expect("build_qpdf_json_v2 failed");
-        let JsonValue::Object(pairs) = v2 else {
-            panic!("expected Object at top level"); // cov:ignore: test-shape guard
-        };
+        let v2 = build_test_document(&mut pdf, DecodeLevel::Generalized)
+            .expect("build_test_document failed");
+        let pairs = object_pairs(v2);
         let pagelabels = pairs
             .iter()
             .find(|(k, _)| k == "pagelabels")
             .map(|(_, v)| v)
             .expect("pagelabels key must be present in the composite output");
         assert!(
-            matches!(pagelabels, JsonValue::Array(_)),
+            matches!(pagelabels, serde_json::Value::Array(_)),
             "pagelabels must be an Array"
         );
     }
 
     #[test]
-    fn build_qpdf_json_v2_pages_count_matches_fixture() {
+    fn build_test_document_pages_count_matches_fixture() {
         let mut pdf = load_three_page_pdf();
-        let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
-            .expect("build_qpdf_json_v2 failed");
-        let JsonValue::Object(pairs) = v2 else {
-            panic!("expected Object at top level"); // cov:ignore: test-shape guard
-        };
+        let v2 = build_test_document(&mut pdf, DecodeLevel::Generalized)
+            .expect("build_test_document failed");
+        let pairs = object_pairs(v2);
         let pages = pairs
             .iter()
             .find(|(k, _)| k == "pages")
             .map(|(_, v)| v)
             .expect("pages key missing");
-        let JsonValue::Array(page_entries) = pages else {
+        let serde_json::Value::Array(page_entries) = pages else {
             panic!("pages must be Array"); // cov:ignore: test-shape guard
         };
         assert_eq!(
@@ -6213,27 +5686,23 @@ mod tests {
     }
 
     #[test]
-    fn build_qpdf_json_v2_qpdf_metadata_uses_actual_pdf_version() {
+    fn build_test_document_qpdf_metadata_uses_actual_pdf_version() {
         let mut pdf = load_one_page_pdf();
-        let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
-            .expect("build_qpdf_json_v2 failed");
-        let JsonValue::Object(pairs) = v2 else {
-            panic!("expected Object"); // cov:ignore: test-shape guard
-        };
+        let v2 = build_test_document(&mut pdf, DecodeLevel::Generalized)
+            .expect("build_test_document failed");
+        let pairs = object_pairs(v2);
         let qpdf = pairs.iter().find(|(k, _)| k == "qpdf").unwrap().1.clone();
-        let JsonValue::Array(qpdf_arr) = qpdf else {
+        let serde_json::Value::Array(qpdf_arr) = qpdf else {
             panic!("qpdf must be Array");
         };
-        let JsonValue::Object(meta_pairs) = &qpdf_arr[0] else {
-            panic!("qpdf[0] must be Object");
-        };
+        let meta_pairs = object_pairs(&qpdf_arr[0]);
         let pdf_version = meta_pairs
             .iter()
             .find(|(k, _)| k == "pdfversion")
             .map(|(_, v)| v)
             .expect("pdfversion missing");
         // one-page.pdf header is "%PDF-1.3".
-        assert_eq!(*pdf_version, JsonValue::String("1.3".to_string()));
+        assert_eq!(*pdf_version, serde_json::Value::String("1.3".to_string()));
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -6248,22 +5717,22 @@ mod tests {
         Pdf::open(std::io::Cursor::new(bytes.to_vec())).unwrap()
     }
 
-    fn value_for_key<'a>(pairs: &'a [(String, JsonValue)], key: &str) -> &'a JsonValue {
+    fn value_for_key<'a>(
+        pairs: &'a [(String, serde_json::Value)],
+        key: &str,
+    ) -> &'a serde_json::Value {
         &pairs.iter().find(|(name, _)| name == key).unwrap().1
     }
 
-    fn json_array(value: &JsonValue) -> &[JsonValue] {
+    fn json_array(value: &serde_json::Value) -> &[serde_json::Value] {
         match value {
-            JsonValue::Array(items) => items,
+            serde_json::Value::Array(items) => items,
             _ => panic!("expected JSON array"), // cov:ignore: test-shape guard
         }
     }
 
-    fn json_object(value: &JsonValue) -> &[(String, JsonValue)] {
-        match value {
-            JsonValue::Object(pairs) => pairs,
-            _ => panic!("expected JSON object"), // cov:ignore: test-shape guard
-        }
+    fn json_object(value: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+        object_pairs(value)
     }
 
     #[test]
@@ -6286,41 +5755,44 @@ mod tests {
             ]
         );
         assert_eq!(
-            value_for_key(first, "dest"),
-            &JsonValue::Array(vec![
-                JsonValue::String("8 0 R".into()),
-                JsonValue::String("/XYZ".into()),
-                JsonValue::Null,
-                JsonValue::Null,
-                JsonValue::Null,
+            value_for_key(&first, "dest"),
+            &serde_json::Value::Array(vec![
+                serde_json::Value::String("8 0 R".into()),
+                serde_json::Value::String("/XYZ".into()),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
             ])
         );
+        assert_eq!(value_for_key(&first, "destpageposfrom1"), &number(6));
         assert_eq!(
-            value_for_key(first, "destpageposfrom1"),
-            &JsonValue::Integer(6)
+            value_for_key(&first, "object"),
+            &serde_json::Value::String("96 0 R".into())
         );
         assert_eq!(
-            value_for_key(first, "object"),
-            &JsonValue::String("96 0 R".into())
+            value_for_key(&first, "open"),
+            &serde_json::Value::Bool(true)
         );
-        assert_eq!(value_for_key(first, "open"), &JsonValue::Bool(true));
         assert_eq!(
-            value_for_key(first, "title"),
-            &JsonValue::String("Isís 1 -> 5: /XYZ null null null".into())
+            value_for_key(&first, "title"),
+            &serde_json::Value::String("Isís 1 -> 5: /XYZ null null null".into())
         );
 
-        let kids = json_array(value_for_key(first, "kids"));
+        let kids = json_array(value_for_key(&first, "kids"));
         assert_eq!(kids.len(), 2);
         let first_kid = json_object(&kids[0]);
         let second_kid = json_object(&kids[1]);
         assert_eq!(
-            value_for_key(first_kid, "title"),
-            &JsonValue::String("Amanda 1.1 -> 11: /Fit".into())
+            value_for_key(&first_kid, "title"),
+            &serde_json::Value::String("Amanda 1.1 -> 11: /Fit".into())
         );
-        assert_eq!(value_for_key(first_kid, "open"), &JsonValue::Bool(false));
         assert_eq!(
-            value_for_key(second_kid, "title"),
-            &JsonValue::String("Sandy ÷Σανδι÷ 1.2 -> 13: /FitH 792".into())
+            value_for_key(&first_kid, "open"),
+            &serde_json::Value::Bool(false)
+        );
+        assert_eq!(
+            value_for_key(&second_kid, "title"),
+            &serde_json::Value::String("Sandy ÷Σανδι÷ 1.2 -> 13: /FitH 792".into())
         );
     }
 
@@ -6358,49 +5830,58 @@ mod tests {
         let second = json_object(&entries[1]);
 
         assert_eq!(
-            value_for_key(first, "object"),
-            &JsonValue::Object(vec![
-                ("/Count".into(), JsonValue::Integer(-1)),
+            value_for_key(&first, "object"),
+            &object(vec![
+                ("/Count".into(), number(-1)),
                 (
                     "/Dest".into(),
-                    JsonValue::Array(vec![
-                        JsonValue::String(page_ref.to_string()),
-                        JsonValue::String("/Fit".into()),
+                    serde_json::Value::Array(vec![
+                        serde_json::Value::String(page_ref.to_string()),
+                        serde_json::Value::String("/Fit".into()),
                     ]),
                 ),
                 (
                     "/Next".into(),
-                    JsonValue::Object(vec![(
+                    object(vec![(
                         "/Title".into(),
-                        JsonValue::String("u:Direct B".into()),
+                        serde_json::Value::String("u:Direct B".into()),
                     )]),
                 ),
-                ("/Title".into(), JsonValue::String("u:Direct A".into())),
+                (
+                    "/Title".into(),
+                    serde_json::Value::String("u:Direct A".into())
+                ),
             ])
         );
+        assert_eq!(value_for_key(&first, "destpageposfrom1"), &number(1));
         assert_eq!(
-            value_for_key(first, "destpageposfrom1"),
-            &JsonValue::Integer(1)
+            value_for_key(&first, "open"),
+            &serde_json::Value::Bool(false)
         );
-        assert_eq!(value_for_key(first, "open"), &JsonValue::Bool(false));
         assert_eq!(
-            value_for_key(first, "title"),
-            &JsonValue::String("Direct A".into())
+            value_for_key(&first, "title"),
+            &serde_json::Value::String("Direct A".into())
         );
 
-        assert_eq!(value_for_key(second, "dest"), &JsonValue::Null);
-        assert_eq!(value_for_key(second, "destpageposfrom1"), &JsonValue::Null);
+        assert_eq!(value_for_key(&second, "dest"), &serde_json::Value::Null);
         assert_eq!(
-            value_for_key(second, "object"),
-            &JsonValue::Object(vec![(
+            value_for_key(&second, "destpageposfrom1"),
+            &serde_json::Value::Null
+        );
+        assert_eq!(
+            value_for_key(&second, "object"),
+            &object(vec![(
                 "/Title".into(),
-                JsonValue::String("u:Direct B".into()),
+                serde_json::Value::String("u:Direct B".into()),
             )])
         );
-        assert_eq!(value_for_key(second, "open"), &JsonValue::Bool(true));
         assert_eq!(
-            value_for_key(second, "title"),
-            &JsonValue::String("Direct B".into())
+            value_for_key(&second, "open"),
+            &serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            value_for_key(&second, "title"),
+            &serde_json::Value::String("Direct B".into())
         );
     }
 
@@ -6424,7 +5905,10 @@ mod tests {
         let result = build_outlines_section(&mut pdf).unwrap();
         let entries = json_array(&result);
         let parent = json_object(&entries[0]);
-        assert_eq!(value_for_key(parent, "kids"), &JsonValue::Array(Vec::new()));
+        assert_eq!(
+            value_for_key(&parent, "kids"),
+            &serde_json::Value::Array(Vec::new())
+        );
     }
 
     #[test]
@@ -6465,16 +5949,13 @@ mod tests {
         let entries = json_array(&result);
         let item = json_object(&entries[0]);
         assert_eq!(
-            value_for_key(item, "dest"),
-            &JsonValue::Array(vec![
-                JsonValue::String(page_ref.to_string()),
-                JsonValue::String("/Fit".into()),
+            value_for_key(&item, "dest"),
+            &serde_json::Value::Array(vec![
+                serde_json::Value::String(page_ref.to_string()),
+                serde_json::Value::String("/Fit".into()),
             ])
         );
-        assert_eq!(
-            value_for_key(item, "destpageposfrom1"),
-            &JsonValue::Integer(1)
-        );
+        assert_eq!(value_for_key(&item, "destpageposfrom1"), &number(1));
     }
 
     /// Helper: inject a synthetic /Outlines tree into the catalog of `pdf`.
@@ -6506,7 +5987,7 @@ mod tests {
         let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
         assert_eq!(
             result,
-            JsonValue::Array(vec![]),
+            serde_json::Value::Array(vec![]),
             "missing /Outlines must yield empty array"
         );
     }
@@ -6522,7 +6003,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{name}: build_outlines_section failed: {e:?}"));
             assert_eq!(
                 result,
-                JsonValue::Array(vec![]),
+                serde_json::Value::Array(vec![]),
                 "{name}: expected empty outlines array"
             );
         }
@@ -6552,14 +6033,12 @@ mod tests {
         pdf.set_object(item_ref, Object::Dictionary(item));
 
         let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
-        let JsonValue::Array(entries) = &result else {
+        let serde_json::Value::Array(entries) = &result else {
             panic!("expected Array, got {result:?}");
         };
         assert_eq!(entries.len(), 1, "expected 1 outline entry");
 
-        let JsonValue::Object(entry) = &entries[0] else {
-            panic!("entry is not an Object");
-        };
+        let entry = object_pairs(&entries[0]);
 
         // Key order: dest, destpageposfrom1, kids, object, open, title.
         let keys: Vec<&str> = entry.iter().map(|(k, _)| k.as_str()).collect();
@@ -6576,21 +6055,33 @@ mod tests {
             "key order must be alphabetical"
         );
 
-        assert_eq!(entry[0].1, JsonValue::Null, "dest must be Null");
-        assert_eq!(entry[1].1, JsonValue::Null, "page position must be Null");
+        assert_eq!(entry[0].1, serde_json::Value::Null, "dest must be Null");
+        assert_eq!(
+            entry[1].1,
+            serde_json::Value::Null,
+            "page position must be Null"
+        );
         // kids = [] (no /First in item)
-        assert_eq!(entry[2].1, JsonValue::Array(vec![]), "kids must be empty");
+        assert_eq!(
+            entry[2].1,
+            serde_json::Value::Array(vec![]),
+            "kids must be empty"
+        );
         // object = "101 0 R"
         assert_eq!(
             entry[3].1,
-            JsonValue::String("101 0 R".to_string()),
+            serde_json::Value::String("101 0 R".to_string()),
             "object mismatch"
         );
-        assert_eq!(entry[4].1, JsonValue::Bool(true), "open must default true");
+        assert_eq!(
+            entry[4].1,
+            serde_json::Value::Bool(true),
+            "open must default true"
+        );
         // title = bare "Chapter 1" (no u: prefix)
         assert_eq!(
             entry[5].1,
-            JsonValue::String("Chapter 1".to_string()),
+            serde_json::Value::String("Chapter 1".to_string()),
             "title must be bare string without u: prefix"
         );
     }
@@ -6638,35 +6129,31 @@ mod tests {
         pdf.set_object(child2_ref, Object::Dictionary(child2));
 
         let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
-        let JsonValue::Array(root_entries) = &result else {
+        let serde_json::Value::Array(root_entries) = &result else {
             panic!("expected Array");
         };
         assert_eq!(root_entries.len(), 1, "root chain has 1 entry (parent)");
 
-        let JsonValue::Object(parent_entry) = &root_entries[0] else {
-            panic!("parent entry is not an Object");
-        };
+        let parent_entry = object_pairs(&root_entries[0]);
         // kids should contain 2 children.
         let kids_val = &parent_entry.iter().find(|(k, _)| k == "kids").unwrap().1;
-        let JsonValue::Array(kids) = kids_val else {
+        let serde_json::Value::Array(kids) = kids_val else {
             panic!("kids is not an Array");
         };
         assert_eq!(kids.len(), 2, "parent must have 2 children in kids");
 
         // Verify child titles.
-        let get_title = |entry: &JsonValue| {
-            let JsonValue::Object(pairs) = entry else {
-                panic!("kid entry is not an Object");
-            };
+        let get_title = |entry: &serde_json::Value| {
+            let pairs = object_pairs(entry);
             pairs.iter().find(|(k, _)| k == "title").unwrap().1.clone()
         };
         assert_eq!(
             get_title(&kids[0]),
-            JsonValue::String("Chapter 1".to_string())
+            serde_json::Value::String("Chapter 1".to_string())
         );
         assert_eq!(
             get_title(&kids[1]),
-            JsonValue::String("Chapter 2".to_string())
+            serde_json::Value::String("Chapter 2".to_string())
         );
     }
 
@@ -6695,7 +6182,7 @@ mod tests {
 
         // Must not hang; must return exactly 1 entry (the item itself, not looped).
         let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
-        let JsonValue::Array(entries) = &result else {
+        let serde_json::Value::Array(entries) = &result else {
             panic!("expected Array");
         };
         assert_eq!(
@@ -6735,19 +6222,17 @@ mod tests {
         pdf.set_object(child_ref, Object::Dictionary(child));
 
         let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
-        let JsonValue::Array(entries) = &result else {
+        let serde_json::Value::Array(entries) = &result else {
             panic!("expected Array"); // cov:ignore: test-shape guard
         };
         assert_eq!(entries.len(), 1, "root chain must contain the parent");
-        let JsonValue::Object(parent_entry) = &entries[0] else {
-            panic!("parent entry is not an Object"); // cov:ignore: test-shape guard
-        };
+        let parent_entry = object_pairs(&entries[0]);
         let kids = parent_entry
             .iter()
             .find(|(key, _)| key == "kids")
             .map(|(_, value)| value)
             .expect("parent must contain kids");
-        let JsonValue::Array(kids) = kids else {
+        let serde_json::Value::Array(kids) = kids else {
             panic!("kids is not an Array"); // cov:ignore: test-shape guard
         };
         assert_eq!(
@@ -6781,40 +6266,39 @@ mod tests {
 
         // Must not crash — /Parent is never followed by our implementation.
         let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
-        let JsonValue::Array(entries) = &result else {
+        let serde_json::Value::Array(entries) = &result else {
             panic!("expected Array");
         };
         assert_eq!(entries.len(), 1, "expected 1 entry despite broken /Parent");
-        let JsonValue::Object(entry) = &entries[0] else {
-            panic!("entry is not an Object");
-        };
+        let entry = object_pairs(&entries[0]);
         let title = entry.iter().find(|(k, _)| k == "title").unwrap().1.clone();
-        assert_eq!(title, JsonValue::String("Broken Parent".to_string()));
+        assert_eq!(
+            title,
+            serde_json::Value::String("Broken Parent".to_string())
+        );
     }
 
-    // ── Test 6: build_qpdf_json_v2 includes outlines section ─────────────────
+    // ── Test 6: build_test_document includes outlines section ─────────────────
 
     #[test]
-    fn build_qpdf_json_v2_includes_outlines_section() {
+    fn build_test_document_includes_outlines_section() {
         let mut pdf = load_one_page_pdf();
-        let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
-            .expect("build_qpdf_json_v2 failed");
-        let JsonValue::Object(pairs) = v2 else {
-            panic!("expected Object at top level");
-        };
+        let v2 = build_test_document(&mut pdf, DecodeLevel::Generalized)
+            .expect("build_test_document failed");
+        let pairs = object_pairs(v2);
         let outlines = pairs
             .iter()
             .find(|(k, _)| k == "outlines")
             .map(|(_, v)| v)
             .expect("outlines key must be present in composite output");
         assert!(
-            matches!(outlines, JsonValue::Array(_)),
+            matches!(outlines, serde_json::Value::Array(_)),
             "outlines must be an Array"
         );
         // one-page.pdf has no /Outlines → must be empty array
         assert_eq!(
             *outlines,
-            JsonValue::Array(vec![]),
+            serde_json::Value::Array(vec![]),
             "one-page.pdf has no outlines"
         );
     }
@@ -6842,15 +6326,13 @@ mod tests {
         pdf.set_object(item_ref, Object::Dictionary(item));
 
         let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
-        let JsonValue::Array(entries) = &result else {
+        let serde_json::Value::Array(entries) = &result else {
             panic!("expected Array");
         };
-        let JsonValue::Object(entry) = &entries[0] else {
-            panic!("entry is not an Object");
-        };
+        let entry = object_pairs(&entries[0]);
         let title = entry.iter().find(|(k, _)| k == "title").unwrap().1.clone();
         // Must be bare "AB" — no "u:" prefix.
-        assert_eq!(title, JsonValue::String("AB".to_string()));
+        assert_eq!(title, serde_json::Value::String("AB".to_string()));
     }
 
     // ── Test 8: raw actions are projected only through resolved dest ──────
@@ -6882,16 +6364,14 @@ mod tests {
         pdf.set_object(item_ref, Object::Dictionary(item));
 
         let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
-        let JsonValue::Array(entries) = &result else {
+        let serde_json::Value::Array(entries) = &result else {
             panic!("expected Array");
         };
-        let JsonValue::Object(entry) = &entries[0] else {
-            panic!("entry is not an Object");
-        };
-        assert_eq!(value_for_key(entry, "dest"), &JsonValue::Null);
+        let entry = object_pairs(&entries[0]);
+        assert_eq!(value_for_key(&entry, "dest"), &serde_json::Value::Null);
         assert_eq!(
-            value_for_key(entry, "object"),
-            &JsonValue::String("101 0 R".to_string())
+            value_for_key(&entry, "object"),
+            &serde_json::Value::String("101 0 R".to_string())
         );
         assert!(entry.iter().all(|(key, _)| key != "action"));
     }
@@ -6920,16 +6400,14 @@ mod tests {
         pdf.set_object(item_ref, Object::Dictionary(item));
 
         let result = build_outlines_section(&mut pdf).expect("build_outlines_section failed");
-        let JsonValue::Array(entries) = result else {
+        let serde_json::Value::Array(entries) = result else {
             panic!("expected Array");
         };
-        let JsonValue::Object(entry) = &entries[0] else {
-            panic!("entry is not an Object");
-        };
-        assert_eq!(value_for_key(entry, "dest"), &JsonValue::Null);
+        let entry = object_pairs(&entries[0]);
+        assert_eq!(value_for_key(&entry, "dest"), &serde_json::Value::Null);
         assert_eq!(
-            value_for_key(entry, "object"),
-            &JsonValue::String("101 0 R".to_string())
+            value_for_key(&entry, "object"),
+            &serde_json::Value::String("101 0 R".to_string())
         );
     }
 
@@ -6959,20 +6437,22 @@ mod tests {
     fn acroform_missing_returns_empty() {
         let mut pdf = load_one_page_pdf();
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
-        let JsonValue::Object(pairs) = &result else {
-            panic!("expected Object, got {result:?}");
-        };
+        let pairs = object_pairs(&result);
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["fields", "hasacroform", "needappearances"]);
-        assert_eq!(pairs[0].1, JsonValue::Array(vec![]), "fields must be empty");
+        assert_eq!(
+            pairs[0].1,
+            serde_json::Value::Array(vec![]),
+            "fields must be empty"
+        );
         assert_eq!(
             pairs[1].1,
-            JsonValue::Bool(false),
+            serde_json::Value::Bool(false),
             "hasacroform must be false"
         );
         assert_eq!(
             pairs[2].1,
-            JsonValue::Bool(false),
+            serde_json::Value::Bool(false),
             "needappearances must be false"
         );
     }
@@ -6989,18 +6469,20 @@ mod tests {
         patch_acroform(&mut pdf, acroform_ref, acroform);
 
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
-        let JsonValue::Object(pairs) = &result else {
-            panic!("expected Object");
-        };
-        assert_eq!(pairs[0].1, JsonValue::Array(vec![]), "fields must be empty");
+        let pairs = object_pairs(&result);
+        assert_eq!(
+            pairs[0].1,
+            serde_json::Value::Array(vec![]),
+            "fields must be empty"
+        );
         assert_eq!(
             pairs[1].1,
-            JsonValue::Bool(true),
+            serde_json::Value::Bool(true),
             "hasacroform must be true"
         );
         assert_eq!(
             pairs[2].1,
-            JsonValue::Bool(false),
+            serde_json::Value::Bool(false),
             "needappearances must be false"
         );
     }
@@ -7027,24 +6509,24 @@ mod tests {
         pdf.set_object(field_ref, Object::Dictionary(field));
 
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
-        let JsonValue::Object(top) = &result else {
-            panic!("expected Object");
-        };
-        assert_eq!(top[1].1, JsonValue::Bool(true), "hasacroform must be true");
+        let top = object_pairs(&result);
+        assert_eq!(
+            top[1].1,
+            serde_json::Value::Bool(true),
+            "hasacroform must be true"
+        );
         assert_eq!(
             top[2].1,
-            JsonValue::Bool(true),
+            serde_json::Value::Bool(true),
             "needappearances must be true"
         );
 
-        let JsonValue::Array(fields) = &top[0].1 else {
+        let serde_json::Value::Array(fields) = &top[0].1 else {
             panic!("fields must be Array");
         };
         assert_eq!(fields.len(), 1, "expected 1 field entry");
 
-        let JsonValue::Object(entry) = &fields[0] else {
-            panic!("field entry must be Object");
-        };
+        let entry = object_pairs(&fields[0]);
         let keys: Vec<&str> = entry.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
@@ -7064,34 +6546,50 @@ mod tests {
         );
 
         // Check values
-        assert_eq!(entry[0].1, JsonValue::Null, "alternatename must be null");
+        assert_eq!(
+            entry[0].1,
+            serde_json::Value::Null,
+            "alternatename must be null"
+        );
         assert_eq!(
             entry[1].1,
-            JsonValue::Array(vec![]),
+            serde_json::Value::Array(vec![]),
             "annotations must be empty (no widget)"
         );
-        assert_eq!(entry[2].1, JsonValue::Null, "defaultvalue must be null");
-        assert_eq!(entry[3].1, JsonValue::Integer(0), "fieldflags must be 0");
+        assert_eq!(
+            entry[2].1,
+            serde_json::Value::Null,
+            "defaultvalue must be null"
+        );
+        assert_eq!(entry[3].1, number(0), "fieldflags must be 0");
         assert_eq!(
             entry[4].1,
-            JsonValue::String("Tx".to_string()),
+            serde_json::Value::String("Tx".to_string()),
             "fieldtype must be Tx (bare, no /)"
         );
         assert_eq!(
             entry[5].1,
-            JsonValue::String("firstname".to_string()),
+            serde_json::Value::String("firstname".to_string()),
             "fullname must match /T"
         );
-        assert_eq!(entry[6].1, JsonValue::Null, "mappingname must be null");
+        assert_eq!(
+            entry[6].1,
+            serde_json::Value::Null,
+            "mappingname must be null"
+        );
         assert_eq!(
             entry[7].1,
-            JsonValue::String("201 0 R".to_string()),
+            serde_json::Value::String("201 0 R".to_string()),
             "object must be ref string"
         );
-        assert_eq!(entry[8].1, JsonValue::Null, "parent must be null at root");
+        assert_eq!(
+            entry[8].1,
+            serde_json::Value::Null,
+            "parent must be null at root"
+        );
         assert_eq!(
             entry[9].1,
-            JsonValue::String("u:John".to_string()),
+            serde_json::Value::String("u:John".to_string()),
             "value must be u:John"
         );
     }
@@ -7131,19 +6629,15 @@ mod tests {
         pdf.set_object(child_field_ref, Object::Dictionary(child_field));
 
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
-        let JsonValue::Object(top) = &result else {
-            panic!("expected Object");
-        };
-        let JsonValue::Array(fields) = &top[0].1 else {
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
             panic!("fields must be Array");
         };
         // flat list: parent + child = 2 entries
         assert_eq!(fields.len(), 2, "expected 2 entries (parent + child)");
 
         // First entry is the parent
-        let JsonValue::Object(parent_entry) = &fields[0] else {
-            panic!("first entry must be Object");
-        };
+        let parent_entry = object_pairs(&fields[0]);
         let parent_fullname = parent_entry
             .iter()
             .find(|(k, _)| k == "fullname")
@@ -7151,7 +6645,7 @@ mod tests {
             .expect("fullname missing");
         assert_eq!(
             *parent_fullname,
-            JsonValue::String("person".to_string()),
+            serde_json::Value::String("person".to_string()),
             "parent fullname must be 'person'"
         );
         let parent_obj = parent_entry
@@ -7159,12 +6653,13 @@ mod tests {
             .find(|(k, _)| k == "object")
             .map(|(_, v)| v)
             .expect("object missing");
-        assert_eq!(*parent_obj, JsonValue::String("201 0 R".to_string()));
+        assert_eq!(
+            *parent_obj,
+            serde_json::Value::String("201 0 R".to_string())
+        );
 
         // Second entry is the child
-        let JsonValue::Object(child_entry) = &fields[1] else {
-            panic!("second entry must be Object");
-        };
+        let child_entry = object_pairs(&fields[1]);
         let child_fullname = child_entry
             .iter()
             .find(|(k, _)| k == "fullname")
@@ -7172,7 +6667,7 @@ mod tests {
             .expect("fullname missing");
         assert_eq!(
             *child_fullname,
-            JsonValue::String("person.name".to_string()),
+            serde_json::Value::String("person.name".to_string()),
             "child fullname must be 'person.name'"
         );
         let child_parent = child_entry
@@ -7182,7 +6677,7 @@ mod tests {
             .expect("parent missing");
         assert_eq!(
             *child_parent,
-            JsonValue::String("201 0 R".to_string()),
+            serde_json::Value::String("201 0 R".to_string()),
             "child parent must point to 201 0 R"
         );
     }
@@ -7200,12 +6695,10 @@ mod tests {
         patch_acroform(&mut pdf, acroform_ref, acroform);
 
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
-        let JsonValue::Object(pairs) = &result else {
-            panic!("expected Object");
-        };
+        let pairs = object_pairs(&result);
         assert_eq!(
             pairs[2].1,
-            JsonValue::Bool(true),
+            serde_json::Value::Bool(true),
             "needappearances must be true"
         );
     }
@@ -7222,17 +6715,15 @@ mod tests {
         patch_acroform(&mut pdf, acroform_ref, acroform);
 
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
-        let JsonValue::Object(pairs) = &result else {
-            panic!("expected Object");
-        };
+        let pairs = object_pairs(&result);
         assert_eq!(
             pairs[0].1,
-            JsonValue::Array(vec![]),
+            serde_json::Value::Array(vec![]),
             "fields must be empty when /Fields absent"
         );
         assert_eq!(
             pairs[1].1,
-            JsonValue::Bool(true),
+            serde_json::Value::Bool(true),
             "hasacroform must be true even with no /Fields"
         );
     }
@@ -7246,33 +6737,28 @@ mod tests {
             let mut pdf = load_fixture_pdf(name);
             let result = build_acroform_section(&mut pdf)
                 .unwrap_or_else(|e| panic!("{name}: build_acroform_section failed: {e:?}"));
-            let JsonValue::Object(pairs) = &result else {
-                panic!("{name}: expected Object");
-            };
+            let pairs = object_pairs(&result);
             assert_eq!(
                 pairs[1].1,
-                JsonValue::Bool(false),
+                serde_json::Value::Bool(false),
                 "{name}: hasacroform must be false"
             );
             assert_eq!(
                 pairs[0].1,
-                JsonValue::Array(vec![]),
+                serde_json::Value::Array(vec![]),
                 "{name}: fields must be empty"
             );
         }
     }
 
-    // ── acroform: build_qpdf_json_v2 has acroform key before outlines ─────────
+    // ── acroform: build_test_document has acroform key before outlines ─────────
 
     #[test]
-    fn build_qpdf_json_v2_has_expected_top_level_keys_with_acroform() {
+    fn build_test_document_has_expected_top_level_keys_with_acroform() {
         let mut pdf = load_one_page_pdf();
-        let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
-            .expect("build_qpdf_json_v2 failed");
-        let JsonValue::Object(pairs) = v2 else {
-            panic!("expected Object at top level");
-        };
-        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        let v2 = build_test_document(&mut pdf, DecodeLevel::Generalized)
+            .expect("build_test_document failed");
+        let keys = top_level_key_names(&v2);
         assert_eq!(
             keys,
             vec![
@@ -7331,43 +6817,39 @@ mod tests {
         pdf.set_object(child_field_ref, Object::Dictionary(child_field));
 
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
-        let JsonValue::Object(top) = &result else {
-            panic!("expected Object");
-        };
-        let JsonValue::Array(fields) = &top[0].1 else {
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
             panic!("fields must be Array");
         };
         // The child is the second entry (parent listed first).
-        let JsonValue::Object(child_entry) = &fields[1] else {
-            panic!("child entry must be Object");
-        };
+        let child_entry = object_pairs(&fields[1]);
 
-        let get = |k: &str| -> JsonValue {
+        let get = |k: &str| -> serde_json::Value {
             child_entry
                 .iter()
                 .find(|(key, _)| key == k)
                 .map(|(_, v)| v.clone())
-                .unwrap_or(JsonValue::Null)
+                .unwrap_or(serde_json::Value::Null)
         };
 
         assert_eq!(
             get("fieldtype"),
-            JsonValue::String("Tx".to_string()),
+            serde_json::Value::String("Tx".to_string()),
             "child must inherit /FT from parent"
         );
         assert_eq!(
             get("value"),
-            JsonValue::String("u:alice".to_string()),
+            serde_json::Value::String("u:alice".to_string()),
             "child must inherit /V from parent"
         );
         assert_eq!(
             get("defaultvalue"),
-            JsonValue::String("u:default-alice".to_string()),
+            serde_json::Value::String("u:default-alice".to_string()),
             "child must inherit /DV from parent"
         );
         assert_eq!(
             get("fieldflags"),
-            JsonValue::Integer(8192),
+            number(8192),
             "child must inherit /Ff from parent"
         );
     }
@@ -7409,10 +6891,8 @@ mod tests {
         pdf.set_object(leaf_ref, Object::Dictionary(leaf));
 
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
-        let JsonValue::Object(top) = &result else {
-            panic!("expected Object");
-        };
-        let JsonValue::Array(fields) = &top[0].1 else {
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
             panic!("fields must be Array");
         };
         // Both the unnamed intermediate and the leaf must appear (2 entries).
@@ -7424,9 +6904,7 @@ mod tests {
 
         // The leaf entry must be present with fullname == "name" (intermediate
         // contributed no name segment because /T was absent).
-        let JsonValue::Object(leaf_entry) = &fields[1] else {
-            panic!("leaf entry must be Object");
-        };
+        let leaf_entry = object_pairs(&fields[1]);
         let leaf_fullname = leaf_entry
             .iter()
             .find(|(k, _)| k == "fullname")
@@ -7434,7 +6912,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             leaf_fullname,
-            JsonValue::String("name".to_string()),
+            serde_json::Value::String("name".to_string()),
             "leaf fullname must be 'name' (unnamed intermediate contributes no segment)"
         );
 
@@ -7444,7 +6922,7 @@ mod tests {
             .find(|(k, _)| k == "fieldtype")
             .map(|(_, v)| v.clone())
             .unwrap();
-        assert_eq!(leaf_ft, JsonValue::String("Tx".to_string()));
+        assert_eq!(leaf_ft, serde_json::Value::String("Tx".to_string()));
     }
 
     // ── acroform: widget kid with /Parent is still classified as annotation ─
@@ -7483,10 +6961,8 @@ mod tests {
         pdf.set_object(widget_ref, Object::Dictionary(widget));
 
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
-        let JsonValue::Object(top) = &result else {
-            panic!("expected Object");
-        };
-        let JsonValue::Array(fields) = &top[0].1 else {
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
             panic!("fields must be Array");
         };
         // Only the parent field should be in the flat list — widget must
@@ -7497,9 +6973,7 @@ mod tests {
             "widget kid with /Parent must NOT create a second field entry"
         );
 
-        let JsonValue::Object(field_entry) = &fields[0] else {
-            panic!("field entry must be Object");
-        };
+        let field_entry = object_pairs(&fields[0]);
         let annotations = field_entry
             .iter()
             .find(|(k, _)| k == "annotations")
@@ -7507,7 +6981,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             annotations,
-            JsonValue::Array(vec![JsonValue::String("202 0 R".to_string())]),
+            serde_json::Value::Array(vec![serde_json::Value::String("202 0 R".to_string())]),
             "the widget kid must be listed in annotations, not promoted to a field"
         );
     }
@@ -7552,10 +7026,8 @@ mod tests {
         pdf.set_object(merged_ref, Object::Dictionary(merged));
 
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
-        let JsonValue::Object(top) = &result else {
-            panic!("expected Object");
-        };
-        let JsonValue::Array(fields) = &top[0].1 else {
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
             panic!("fields must be Array");
         };
         // Both parent and merged widget+field must appear.
@@ -7567,21 +7039,22 @@ mod tests {
 
         // Second entry is the merged widget+field — verify its local /V and
         // /Ff are emitted, not the parent's.
-        let JsonValue::Object(merged_entry) = &fields[1] else {
-            panic!("merged entry must be Object");
-        };
+        let merged_entry = object_pairs(&fields[1]);
         let value = merged_entry
             .iter()
             .find(|(k, _)| k == "value")
             .map(|(_, v)| v.clone())
             .unwrap();
-        assert_eq!(value, JsonValue::String("u:42 Somewhere".to_string()));
+        assert_eq!(
+            value,
+            serde_json::Value::String("u:42 Somewhere".to_string())
+        );
         let flags = merged_entry
             .iter()
             .find(|(k, _)| k == "fieldflags")
             .map(|(_, v)| v.clone())
             .unwrap();
-        assert_eq!(flags, JsonValue::Integer(4));
+        assert_eq!(flags, number(4));
 
         // The merged widget must also list itself in annotations[] because
         // it carries /Subtype /Widget.
@@ -7592,7 +7065,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             annotations,
-            JsonValue::Array(vec![JsonValue::String("202 0 R".to_string())])
+            serde_json::Value::Array(vec![serde_json::Value::String("202 0 R".to_string())])
         );
     }
 
@@ -7628,15 +7101,11 @@ mod tests {
         pdf.set_object(child_field_ref, Object::Dictionary(child_field));
 
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
-        let JsonValue::Object(top) = &result else {
-            panic!("expected Object");
-        };
-        let JsonValue::Array(fields) = &top[0].1 else {
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
             panic!("fields must be Array");
         };
-        let JsonValue::Object(child_entry) = &fields[1] else {
-            panic!("child entry must be Object");
-        };
+        let child_entry = object_pairs(&fields[1]);
         let value = child_entry
             .iter()
             .find(|(k, _)| k == "value")
@@ -7644,7 +7113,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             value,
-            JsonValue::String("u:bob".to_string()),
+            serde_json::Value::String("u:bob".to_string()),
             "local /V must win over parent's /V"
         );
     }
@@ -7682,10 +7151,8 @@ mod tests {
         pdf.set_object(field_ref, Object::Dictionary(field));
 
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
-        let JsonValue::Object(top) = &result else {
-            panic!("expected Object");
-        };
-        let JsonValue::Array(fields) = &top[0].1 else {
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
             panic!("fields must be Array");
         };
         assert_eq!(
@@ -7693,15 +7160,13 @@ mod tests {
             1,
             "indirect /Fields array must be resolved, not dropped"
         );
-        let JsonValue::Object(entry) = &fields[0] else {
-            panic!("entry must be Object");
-        };
+        let entry = object_pairs(&fields[0]);
         let fullname = entry
             .iter()
             .find(|(k, _)| k == "fullname")
             .map(|(_, v)| v.clone())
             .unwrap();
-        assert_eq!(fullname, JsonValue::String("name".to_string()));
+        assert_eq!(fullname, serde_json::Value::String("name".to_string()));
     }
 
     #[test]
@@ -7735,10 +7200,8 @@ mod tests {
         pdf.set_object(child_ref, Object::Dictionary(child));
 
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
-        let JsonValue::Object(top) = &result else {
-            panic!("expected Object");
-        };
-        let JsonValue::Array(fields) = &top[0].1 else {
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
             panic!("fields must be Array");
         };
         // parent + child must both show up; the indirect /Kids array must
@@ -7748,15 +7211,16 @@ mod tests {
             2,
             "indirect /Kids array must be resolved so descendants are emitted"
         );
-        let JsonValue::Object(child_entry) = &fields[1] else {
-            panic!("child entry must be Object");
-        };
+        let child_entry = object_pairs(&fields[1]);
         let child_fullname = child_entry
             .iter()
             .find(|(k, _)| k == "fullname")
             .map(|(_, v)| v.clone())
             .unwrap();
-        assert_eq!(child_fullname, JsonValue::String("group.name".to_string()));
+        assert_eq!(
+            child_fullname,
+            serde_json::Value::String("group.name".to_string())
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -7818,7 +7282,7 @@ mod tests {
     fn attachments_no_embedded_files_returns_empty() {
         let mut pdf = load_one_page_pdf();
         let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
-        assert_eq!(result, JsonValue::Object(vec![]), "expected empty object");
+        assert_eq!(result, object(vec![]), "expected empty object");
     }
 
     #[test]
@@ -7851,7 +7315,7 @@ mod tests {
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
         let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
-        assert_eq!(result, JsonValue::Object(vec![]), "expected empty object");
+        assert_eq!(result, object(vec![]), "expected empty object");
     }
 
     #[test]
@@ -7907,7 +7371,7 @@ mod tests {
         let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
         assert_eq!(
             result,
-            JsonValue::Object(vec![]),
+            object(vec![]),
             "non-ref/non-dict leaf value must be skipped"
         );
     }
@@ -8024,9 +7488,7 @@ mod tests {
     fn attachments_fixture_has_one_entry() {
         let mut pdf = load_attachment_pdf();
         let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
-        let JsonValue::Object(pairs) = &result else {
-            panic!("expected Object, got {result:?}");
-        };
+        let pairs = object_pairs(&result);
         assert_eq!(
             pairs.len(),
             1,
@@ -8044,14 +7506,10 @@ mod tests {
     fn attachments_fixture_entry_fields() {
         let mut pdf = load_attachment_pdf();
         let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
-        let JsonValue::Object(pairs) = &result else {
-            panic!("expected Object");
-        };
-        let JsonValue::Object(entry) = &pairs[0].1 else {
-            panic!("entry must be Object");
-        };
+        let pairs = object_pairs(&result);
+        let entry = object_pairs(&pairs[0].1);
 
-        let get = |k: &str| -> &JsonValue {
+        let get = |k: &str| -> &serde_json::Value {
             entry
                 .iter()
                 .find(|(key, _)| key == k)
@@ -8077,12 +7535,12 @@ mod tests {
         // description: null (no /Desc in fixture)
         assert_eq!(
             *get("description"),
-            JsonValue::Null,
+            serde_json::Value::Null,
             "description must be null"
         );
 
         // filespec: must be a ref string
-        let JsonValue::String(filespec_str) = get("filespec") else {
+        let serde_json::Value::String(filespec_str) = get("filespec") else {
             panic!("filespec must be a String");
         };
         assert!(
@@ -8093,21 +7551,17 @@ mod tests {
         // preferredname: "attachment.txt"
         assert_eq!(
             *get("preferredname"),
-            JsonValue::String("attachment.txt".to_string()),
+            serde_json::Value::String("attachment.txt".to_string()),
             "preferredname must be 'attachment.txt'"
         );
 
         // streams: must be an Object with at least one stream entry
-        let JsonValue::Object(streams) = get("streams") else {
-            panic!("streams must be Object");
-        };
+        let streams = object_pairs(get("streams"));
         assert!(!streams.is_empty(), "streams must not be empty");
 
         // Each stream entry must have checksum, creationdate, mimetype, modificationdate
         for (stream_key, stream_val) in streams {
-            let JsonValue::Object(stream_entry) = stream_val else {
-                panic!("stream entry for {stream_key} must be Object");
-            };
+            let stream_entry = object_pairs(stream_val);
             let stream_keys: Vec<&str> = stream_entry.iter().map(|(k, _)| k.as_str()).collect();
             assert_eq!(
                 stream_keys,
@@ -8118,9 +7572,7 @@ mod tests {
 
         // ── qpdf-parity value assertions (matching qpdf --json output) ───────
         // names dict: /F and /UF both map to "attachment.txt"
-        let JsonValue::Object(names) = get("names") else {
-            panic!("names must be Object");
-        };
+        let names = object_pairs(get("names"));
         let name_keys: Vec<&str> = names.iter().map(|(k, _)| k.as_str()).collect();
         assert!(
             name_keys.contains(&"/F") || name_keys.contains(&"/UF"),
@@ -8128,14 +7580,14 @@ mod tests {
         );
         for (_key, val) in names {
             assert_eq!(
-                *val,
-                JsonValue::String("attachment.txt".to_string()),
+                val,
+                serde_json::Value::String("attachment.txt".to_string()),
                 "each name entry must be 'attachment.txt'"
             );
         }
 
         // preferredcontents must be a valid ref string (not null)
-        let JsonValue::String(preferred_contents_str) = get("preferredcontents") else {
+        let serde_json::Value::String(preferred_contents_str) = get("preferredcontents") else {
             panic!("preferredcontents must be a String ref");
         };
         assert!(
@@ -8148,14 +7600,10 @@ mod tests {
         // creationdate: 2026-01-01T00:00:00Z
         // modificationdate: 2026-01-01T00:00:00Z
         // mimetype: null (no /Subtype in fixture)
-        let JsonValue::Object(streams2) = get("streams") else {
-            panic!("streams must be Object");
-        };
+        let streams2 = object_pairs(get("streams"));
         for (stream_key, stream_val) in streams2 {
-            let JsonValue::Object(stream_entry) = stream_val else {
-                panic!("stream entry for {stream_key} must be Object");
-            };
-            let s_get = |k: &str| -> &JsonValue {
+            let stream_entry = object_pairs(stream_val);
+            let s_get = |k: &str| -> &serde_json::Value {
                 stream_entry
                     .iter()
                     .find(|(key, _)| key == k)
@@ -8164,22 +7612,22 @@ mod tests {
             };
             assert_eq!(
                 *s_get("checksum"),
-                JsonValue::String("542266a1f565c3e5d8cfbd55eb7dfa40".to_string()),
+                serde_json::Value::String("542266a1f565c3e5d8cfbd55eb7dfa40".to_string()),
                 "checksum mismatch for stream {stream_key}"
             );
             assert_eq!(
                 *s_get("creationdate"),
-                JsonValue::String("2026-01-01T00:00:00Z".to_string()),
+                serde_json::Value::String("2026-01-01T00:00:00Z".to_string()),
                 "creationdate mismatch for stream {stream_key}"
             );
             assert_eq!(
                 *s_get("modificationdate"),
-                JsonValue::String("2026-01-01T00:00:00Z".to_string()),
+                serde_json::Value::String("2026-01-01T00:00:00Z".to_string()),
                 "modificationdate mismatch for stream {stream_key}"
             );
             assert_eq!(
                 *s_get("mimetype"),
-                JsonValue::Null,
+                serde_json::Value::Null,
                 "mimetype must be null for stream {stream_key} (no /Subtype in fixture)"
             );
         }
@@ -8251,18 +7699,14 @@ mod tests {
         );
 
         let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
-        let JsonValue::Object(pairs) = &result else {
-            panic!("expected Object");
-        };
+        let pairs = object_pairs(&result);
 
         assert_eq!(pairs.len(), 1, "expected 1 attachment");
         assert_eq!(pairs[0].0, "my-attachment.txt", "name mismatch");
 
-        let JsonValue::Object(entry) = &pairs[0].1 else {
-            panic!("entry must be Object");
-        };
+        let entry = object_pairs(&pairs[0].1);
 
-        let get = |k: &str| -> &JsonValue {
+        let get = |k: &str| -> &serde_json::Value {
             entry
                 .iter()
                 .find(|(key, _)| key == k)
@@ -8273,14 +7717,12 @@ mod tests {
         // description: bare string (no u: prefix)
         assert_eq!(
             *get("description"),
-            JsonValue::String("My file description".to_string()),
+            serde_json::Value::String("My file description".to_string()),
             "description must be bare string"
         );
 
         // names: /F and /UF both present
-        let JsonValue::Object(names) = get("names") else {
-            panic!("names must be Object");
-        };
+        let names = object_pairs(get("names"));
         let name_keys: Vec<&str> = names.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             name_keys,
@@ -8289,26 +7731,26 @@ mod tests {
         );
         assert_eq!(
             names[0].1,
-            JsonValue::String("f-name.txt".to_string()),
+            serde_json::Value::String("f-name.txt".to_string()),
             "/F name mismatch"
         );
         assert_eq!(
             names[1].1,
-            JsonValue::String("uf-name.txt".to_string()),
+            serde_json::Value::String("uf-name.txt".to_string()),
             "/UF name mismatch"
         );
 
         // preferredname: /UF wins over /F
         assert_eq!(
             *get("preferredname"),
-            JsonValue::String("uf-name.txt".to_string()),
+            serde_json::Value::String("uf-name.txt".to_string()),
             "preferredname must be /UF (uf-name.txt)"
         );
 
         // preferredcontents: /EF/UF wins over /EF/F
         assert_eq!(
             *get("preferredcontents"),
-            JsonValue::String(format!(
+            serde_json::Value::String(format!(
                 "{} {} R",
                 stream_uf_ref.number, stream_uf_ref.generation
             )),
@@ -8316,9 +7758,7 @@ mod tests {
         );
 
         // streams: /F and /UF both present
-        let JsonValue::Object(streams) = get("streams") else {
-            panic!("streams must be Object");
-        };
+        let streams = object_pairs(get("streams"));
         let stream_keys: Vec<&str> = streams.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             stream_keys,
@@ -8327,10 +7767,8 @@ mod tests {
         );
 
         // /F stream: check checksum hex, dates, mimetype
-        let JsonValue::Object(f_stream) = &streams[0].1 else {
-            panic!("/F stream entry must be Object");
-        };
-        let f_get = |k: &str| -> &JsonValue {
+        let f_stream = object_pairs(&streams[0].1);
+        let f_get = |k: &str| -> &serde_json::Value {
             f_stream
                 .iter()
                 .find(|(key, _)| key == k)
@@ -8342,36 +7780,34 @@ mod tests {
         let expected_hex: String = (0u8..16).map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             *f_get("checksum"),
-            JsonValue::String(expected_hex),
+            serde_json::Value::String(expected_hex),
             "checksum must be lowercase hex"
         );
 
         // creationdate: D:20260101000000Z → 2026-01-01T00:00:00Z
         assert_eq!(
             *f_get("creationdate"),
-            JsonValue::String("2026-01-01T00:00:00Z".to_string()),
+            serde_json::Value::String("2026-01-01T00:00:00Z".to_string()),
             "creationdate mismatch"
         );
 
         // modificationdate: D:20260202120000+09'00' → 2026-02-02T12:00:00+09:00
         assert_eq!(
             *f_get("modificationdate"),
-            JsonValue::String("2026-02-02T12:00:00+09:00".to_string()),
+            serde_json::Value::String("2026-02-02T12:00:00+09:00".to_string()),
             "modificationdate mismatch"
         );
 
         // mimetype: bare "text/plain" (no "/" prefix, no "u:" prefix)
         assert_eq!(
             *f_get("mimetype"),
-            JsonValue::String("text/plain".to_string()),
+            serde_json::Value::String("text/plain".to_string()),
             "mimetype must be bare 'text/plain'"
         );
 
         // /UF stream: no /Subtype → mimetype null, no /Params → other fields null
-        let JsonValue::Object(uf_stream) = &streams[1].1 else {
-            panic!("/UF stream entry must be Object");
-        };
-        let uf_get = |k: &str| -> &JsonValue {
+        let uf_stream = object_pairs(&streams[1].1);
+        let uf_get = |k: &str| -> &serde_json::Value {
             uf_stream
                 .iter()
                 .find(|(key, _)| key == k)
@@ -8380,22 +7816,22 @@ mod tests {
         };
         assert_eq!(
             *uf_get("mimetype"),
-            JsonValue::Null,
+            serde_json::Value::Null,
             "/UF mimetype must be null"
         );
         assert_eq!(
             *uf_get("checksum"),
-            JsonValue::Null,
+            serde_json::Value::Null,
             "/UF checksum must be null"
         );
         assert_eq!(
             *uf_get("creationdate"),
-            JsonValue::Null,
+            serde_json::Value::Null,
             "/UF creationdate must be null"
         );
         assert_eq!(
             *uf_get("modificationdate"),
-            JsonValue::Null,
+            serde_json::Value::Null,
             "/UF modificationdate must be null"
         );
     }
@@ -8443,9 +7879,7 @@ mod tests {
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
         let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
-        let JsonValue::Object(pairs) = &result else {
-            panic!("expected Object");
-        };
+        let pairs = object_pairs(&result);
 
         // The inline filespec must produce an entry, not be silently dropped.
         assert_eq!(
@@ -8455,10 +7889,8 @@ mod tests {
         );
         assert_eq!(pairs[0].0, "inline.txt");
 
-        let JsonValue::Object(entry) = &pairs[0].1 else {
-            panic!("entry must be Object");
-        };
-        let get = |k: &str| -> &JsonValue {
+        let entry = object_pairs(&pairs[0].1);
+        let get = |k: &str| -> &serde_json::Value {
             entry
                 .iter()
                 .find(|(key, _)| key == k)
@@ -8468,13 +7900,11 @@ mod tests {
         // No indirect reference → filespec must be null.
         assert_eq!(
             *get("filespec"),
-            JsonValue::Null,
+            serde_json::Value::Null,
             "filespec must be null when the leaf value was a direct dictionary"
         );
         // The names sub-object still surfaces the inlined /F and /UF.
-        let JsonValue::Object(names) = get("names") else {
-            panic!("names must be Object");
-        };
+        let names = object_pairs(get("names"));
         assert_eq!(names.len(), 2);
         assert_eq!(names[0].0, "/F");
         assert_eq!(names[1].0, "/UF");
@@ -8648,90 +8078,84 @@ mod tests {
     fn encrypt_section_plaintext_encrypted_false() {
         let mut pdf = load_one_page_pdf();
         let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
-        let JsonValue::Object(ref pairs) = enc else {
-            panic!("encrypt section must be an Object");
-        };
+        let pairs = object_pairs(enc);
         let encrypted = pairs
             .iter()
             .find(|(k, _)| k == "encrypted")
             .unwrap()
             .1
             .clone();
-        assert_eq!(encrypted, JsonValue::Bool(false));
+        assert_eq!(encrypted, serde_json::Value::Bool(false));
     }
 
     #[test]
     fn encrypt_section_plaintext_ownerpasswordmatched_false() {
         let mut pdf = load_one_page_pdf();
         let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
-        let JsonValue::Object(ref pairs) = enc else {
-            panic!("not an Object")
-        };
+        let pairs = object_pairs(enc);
         let v = pairs
             .iter()
             .find(|(k, _)| k == "ownerpasswordmatched")
             .unwrap()
             .1
             .clone();
-        assert_eq!(v, JsonValue::Bool(false));
+        assert_eq!(v, serde_json::Value::Bool(false));
         let v2 = pairs
             .iter()
             .find(|(k, _)| k == "userpasswordmatched")
             .unwrap()
             .1
             .clone();
-        assert_eq!(v2, JsonValue::Bool(false));
+        assert_eq!(v2, serde_json::Value::Bool(false));
     }
 
     #[test]
     fn encrypt_section_plaintext_parameters_are_zero_and_none() {
         let mut pdf = load_one_page_pdf();
         let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
-        let JsonValue::Object(ref pairs) = enc else {
-            panic!("not an Object")
-        };
+        let pairs = object_pairs(enc);
         let params = pairs
             .iter()
             .find(|(k, _)| k == "parameters")
             .unwrap()
             .1
             .clone();
-        let JsonValue::Object(ref p) = params else {
-            panic!("parameters must be Object")
-        };
+        let p = object_pairs(params);
 
         let get = |k: &str| p.iter().find(|(ky, _)| ky == k).unwrap().1.clone();
-        assert_eq!(get("P"), JsonValue::Integer(0));
-        assert_eq!(get("R"), JsonValue::Integer(0));
-        assert_eq!(get("V"), JsonValue::Integer(0));
-        assert_eq!(get("bits"), JsonValue::Integer(0));
-        assert_eq!(get("filemethod"), JsonValue::String("none".into()));
-        assert_eq!(get("method"), JsonValue::String("none".into()));
-        assert_eq!(get("streammethod"), JsonValue::String("none".into()));
-        assert_eq!(get("stringmethod"), JsonValue::String("none".into()));
-        assert_eq!(get("key"), JsonValue::Null);
+        assert_eq!(get("P"), number(0));
+        assert_eq!(get("R"), number(0));
+        assert_eq!(get("V"), number(0));
+        assert_eq!(get("bits"), number(0));
+        assert_eq!(get("filemethod"), serde_json::Value::String("none".into()));
+        assert_eq!(get("method"), serde_json::Value::String("none".into()));
+        assert_eq!(
+            get("streammethod"),
+            serde_json::Value::String("none".into())
+        );
+        assert_eq!(
+            get("stringmethod"),
+            serde_json::Value::String("none".into())
+        );
+        assert_eq!(get("key"), serde_json::Value::Null);
     }
 
     #[test]
     fn encrypt_section_plaintext_capabilities_all_true() {
         let mut pdf = load_one_page_pdf();
         let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
-        let JsonValue::Object(ref pairs) = enc else {
-            panic!("not Object")
-        };
+        let pairs = object_pairs(enc);
         let caps = pairs
             .iter()
             .find(|(k, _)| k == "capabilities")
             .unwrap()
             .1
             .clone();
-        let JsonValue::Object(ref cp) = caps else {
-            panic!("capabilities must be Object")
-        };
+        let cp = object_pairs(caps);
         for (_, v) in cp.iter() {
             assert_eq!(
                 *v,
-                JsonValue::Bool(true),
+                serde_json::Value::Bool(true),
                 "all plaintext capabilities must be true"
             );
         }
@@ -8743,16 +8167,14 @@ mod tests {
     fn encrypt_section_encrypted_r4_encrypted_true() {
         let mut pdf = load_encrypted_r4_pdf();
         let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
-        let JsonValue::Object(ref pairs) = enc else {
-            panic!("not Object")
-        };
+        let pairs = object_pairs(enc);
         let v = pairs
             .iter()
             .find(|(k, _)| k == "encrypted")
             .unwrap()
             .1
             .clone();
-        assert_eq!(v, JsonValue::Bool(true));
+        assert_eq!(v, serde_json::Value::Bool(true));
     }
 
     // Regression for CodeRabbit's flpdf-9hc.11.9 review: previously both
@@ -8765,9 +8187,7 @@ mod tests {
     fn encrypt_section_plaintext_password_match_flags_are_both_false() {
         let mut pdf = load_one_page_pdf();
         let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
-        let JsonValue::Object(ref pairs) = enc else {
-            panic!("not Object")
-        };
+        let pairs = object_pairs(enc);
         let owner = pairs
             .iter()
             .find(|(k, _)| k == "ownerpasswordmatched")
@@ -8780,8 +8200,8 @@ mod tests {
             .unwrap()
             .1
             .clone();
-        assert_eq!(owner, JsonValue::Bool(false));
-        assert_eq!(user, JsonValue::Bool(false));
+        assert_eq!(owner, serde_json::Value::Bool(false));
+        assert_eq!(user, serde_json::Value::Bool(false));
     }
 
     #[test]
@@ -8864,52 +8284,52 @@ mod tests {
     fn encrypt_section_encrypted_r4_ownerpasswordmatched_true() {
         let mut pdf = load_encrypted_r4_pdf();
         let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
-        let JsonValue::Object(ref pairs) = enc else {
-            panic!("not Object")
-        };
+        let pairs = object_pairs(enc);
         let v = pairs
             .iter()
             .find(|(k, _)| k == "ownerpasswordmatched")
             .unwrap()
             .1
             .clone();
-        assert_eq!(v, JsonValue::Bool(true));
+        assert_eq!(v, serde_json::Value::Bool(true));
         let v2 = pairs
             .iter()
             .find(|(k, _)| k == "userpasswordmatched")
             .unwrap()
             .1
             .clone();
-        assert_eq!(v2, JsonValue::Bool(true));
+        assert_eq!(v2, serde_json::Value::Bool(true));
     }
 
     #[test]
     fn encrypt_section_encrypted_r4_parameters() {
         let mut pdf = load_encrypted_r4_pdf();
         let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
-        let JsonValue::Object(ref pairs) = enc else {
-            panic!("not Object")
-        };
+        let pairs = object_pairs(enc);
         let params = pairs
             .iter()
             .find(|(k, _)| k == "parameters")
             .unwrap()
             .1
             .clone();
-        let JsonValue::Object(ref p) = params else {
-            panic!("parameters must be Object")
-        };
+        let p = object_pairs(params);
 
         let get = |k: &str| p.iter().find(|(ky, _)| ky == k).unwrap().1.clone();
-        assert_eq!(get("P"), JsonValue::Integer(-4));
-        assert_eq!(get("R"), JsonValue::Integer(4));
-        assert_eq!(get("V"), JsonValue::Integer(4));
-        assert_eq!(get("bits"), JsonValue::Integer(128));
-        assert_eq!(get("filemethod"), JsonValue::String("AESv2".into()));
-        assert_eq!(get("method"), JsonValue::String("AESv2".into()));
-        assert_eq!(get("streammethod"), JsonValue::String("AESv2".into()));
-        assert_eq!(get("stringmethod"), JsonValue::String("AESv2".into()));
-        assert_eq!(get("key"), JsonValue::Null);
+        assert_eq!(get("P"), number(-4));
+        assert_eq!(get("R"), number(4));
+        assert_eq!(get("V"), number(4));
+        assert_eq!(get("bits"), number(128));
+        assert_eq!(get("filemethod"), serde_json::Value::String("AESv2".into()));
+        assert_eq!(get("method"), serde_json::Value::String("AESv2".into()));
+        assert_eq!(
+            get("streammethod"),
+            serde_json::Value::String("AESv2".into())
+        );
+        assert_eq!(
+            get("stringmethod"),
+            serde_json::Value::String("AESv2".into())
+        );
+        assert_eq!(get("key"), serde_json::Value::Null);
     }
 
     #[test]
@@ -8917,22 +8337,18 @@ mod tests {
         // /P = -4 = 0xFFFFFFFC → all permission bits set → all capabilities true
         let mut pdf = load_encrypted_r4_pdf();
         let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
-        let JsonValue::Object(ref pairs) = enc else {
-            panic!("not Object")
-        };
+        let pairs = object_pairs(enc);
         let caps = pairs
             .iter()
             .find(|(k, _)| k == "capabilities")
             .unwrap()
             .1
             .clone();
-        let JsonValue::Object(ref cp) = caps else {
-            panic!("capabilities must be Object")
-        };
+        let cp = object_pairs(caps);
         for (name, v) in cp.iter() {
             assert_eq!(
                 *v,
-                JsonValue::Bool(true),
+                serde_json::Value::Bool(true),
                 "capability {name} must be true for P=-4"
             );
         }
@@ -8944,18 +8360,14 @@ mod tests {
     fn encrypt_section_capabilities_key_order() {
         let mut pdf = load_one_page_pdf();
         let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
-        let JsonValue::Object(ref pairs) = enc else {
-            panic!("not Object")
-        };
+        let pairs = object_pairs(enc);
         let caps = pairs
             .iter()
             .find(|(k, _)| k == "capabilities")
             .unwrap()
             .1
             .clone();
-        let JsonValue::Object(ref cp) = caps else {
-            panic!("capabilities must be Object")
-        };
+        let cp = object_pairs(caps);
         let keys: Vec<&str> = cp.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
@@ -8979,18 +8391,14 @@ mod tests {
     fn encrypt_section_parameters_key_order() {
         let mut pdf = load_one_page_pdf();
         let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
-        let JsonValue::Object(ref pairs) = enc else {
-            panic!("not Object")
-        };
+        let pairs = object_pairs(enc);
         let params = pairs
             .iter()
             .find(|(k, _)| k == "parameters")
             .unwrap()
             .1
             .clone();
-        let JsonValue::Object(ref p) = params else {
-            panic!("parameters must be Object")
-        };
+        let p = object_pairs(params);
         let keys: Vec<&str> = p.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
@@ -9014,9 +8422,7 @@ mod tests {
     fn encrypt_section_top_level_key_order() {
         let mut pdf = load_one_page_pdf();
         let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
-        let JsonValue::Object(ref pairs) = enc else {
-            panic!("not Object")
-        };
+        let pairs = object_pairs(enc);
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
@@ -9037,48 +8443,42 @@ mod tests {
     fn encrypt_section_recovereduserpassword_always_null() {
         let mut pdf_plain = load_one_page_pdf();
         let enc_plain = build_encrypt_section(&mut pdf_plain).expect("plain failed");
-        let JsonValue::Object(ref p) = enc_plain else {
-            panic!("not Object") // cov:ignore: test-shape guard
-        };
+        let p = object_pairs(enc_plain);
         let v = p
             .iter()
             .find(|(k, _)| k == "recovereduserpassword")
             .unwrap()
             .1
             .clone();
-        assert_eq!(v, JsonValue::Null);
+        assert_eq!(v, serde_json::Value::Null);
 
         let mut pdf_enc = load_encrypted_r4_pdf();
         let enc_enc = build_encrypt_section(&mut pdf_enc).expect("encrypted failed");
-        let JsonValue::Object(ref pe) = enc_enc else {
-            panic!("not Object") // cov:ignore: test-shape guard
-        };
+        let pe = object_pairs(enc_enc);
         let ve = pe
             .iter()
             .find(|(k, _)| k == "recovereduserpassword")
             .unwrap()
             .1
             .clone();
-        assert_eq!(ve, JsonValue::Null);
+        assert_eq!(ve, serde_json::Value::Null);
     }
 
-    // ── Test 7: composite build_qpdf_json_v2 includes encrypt key ─────────────
+    // ── Test 7: composite build_test_document includes encrypt key ─────────────
 
     #[test]
-    fn build_qpdf_json_v2_includes_encrypt_section() {
+    fn build_test_document_includes_encrypt_section() {
         let mut pdf = load_one_page_pdf();
-        let v2 = build_qpdf_json_v2(&mut pdf, DecodeLevel::Generalized)
-            .expect("build_qpdf_json_v2 failed");
-        let JsonValue::Object(pairs) = v2 else {
-            panic!("expected Object at top level")
-        };
+        let v2 = build_test_document(&mut pdf, DecodeLevel::Generalized)
+            .expect("build_test_document failed");
+        let pairs = object_pairs(v2);
         let enc = pairs.iter().find(|(k, _)| k == "encrypt").map(|(_, v)| v);
         assert!(
             enc.is_some(),
             "encrypt key must be present in composite output"
         );
         assert!(
-            matches!(enc.unwrap(), JsonValue::Object(_)),
+            matches!(enc.unwrap(), serde_json::Value::Object(_)),
             "encrypt must be an Object"
         );
     }
@@ -9093,33 +8493,27 @@ mod tests {
         pdf: &mut crate::Pdf<std::io::Cursor<Vec<u8>>>,
         decode_level: DecodeLevel,
         mode: &StreamDataMode,
-    ) -> Vec<(String, JsonValue)> {
+    ) -> Vec<(String, serde_json::Value)> {
         let meta = QpdfMetadata {
             pdf_version: "1.3".to_string(),
             max_object_id: 7,
             pushed_inherited_page_resources: false,
             called_get_all_pages: true,
         };
-        let JsonValue::Array(elems) =
+        let serde_json::Value::Array(elems) =
             build_qpdf_key_with_stream_mode(pdf, meta, decode_level, mode).expect("build failed")
         else {
             panic!("expected Array");
         };
-        let JsonValue::Object(map_pairs) = &elems[1] else {
-            panic!("objects_map is not an Object");
-        };
+        let map_pairs = object_pairs(&elems[1]);
         let obj7 = map_pairs
             .iter()
             .find(|(k, _)| k == "obj:7 0 R")
             .map(|(_, v)| v)
             .expect("obj:7 0 R not found");
-        let JsonValue::Object(obj7_pairs) = obj7 else {
-            panic!("obj:7 0 R is not an Object");
-        };
+        let obj7_pairs = object_pairs(obj7);
         assert_eq!(obj7_pairs[0].0, "stream");
-        let JsonValue::Object(inner) = &obj7_pairs[0].1 else {
-            panic!("stream value is not an Object");
-        };
+        let inner = object_pairs(&obj7_pairs[0].1);
         inner.clone()
     }
 
@@ -9152,7 +8546,7 @@ mod tests {
         assert_eq!(inner[0].0, "data", "first key must be 'data'");
         assert_eq!(inner[1].0, "dict", "second key must be 'dict'");
         assert!(
-            matches!(&inner[0].1, JsonValue::String(_)),
+            matches!(&inner[0].1, serde_json::Value::String(_)),
             "data must be a base64 String"
         );
     }
@@ -9173,7 +8567,7 @@ mod tests {
         };
 
         let inner = get_obj7_stream_inner(&mut pdf, DecodeLevel::None, &StreamDataMode::Inline);
-        let JsonValue::String(b64) = &inner[0].1 else {
+        let serde_json::Value::String(b64) = &inner[0].1 else {
             panic!("data is not a String");
         };
         let decoded = base64_decode_test_helper(b64);
@@ -9192,7 +8586,7 @@ mod tests {
 
         let inner =
             get_obj7_stream_inner(&mut pdf, DecodeLevel::Generalized, &StreamDataMode::Inline);
-        let JsonValue::String(b64) = &inner[0].1 else {
+        let serde_json::Value::String(b64) = &inner[0].1 else {
             panic!("data is not a String");
         };
         let decoded = base64_decode_test_helper(b64);
@@ -9227,7 +8621,7 @@ mod tests {
         assert_eq!(inner[1].0, "dict", "second key must be 'dict'");
 
         // datafile must be "<prefix>-<obj_num>" = "out-7" for obj:7
-        assert_eq!(inner[0].1, JsonValue::String("out-7".to_string()));
+        assert_eq!(inner[0].1, serde_json::Value::String("out-7".to_string()));
     }
 
     // ── Test 3b: side-file naming has no zero-padding (qpdf 11.9.0) ───────────
@@ -9259,23 +8653,19 @@ mod tests {
                 pushed_inherited_page_resources: false,
                 called_get_all_pages: true,
             };
-            let JsonValue::Array(elems) =
+            let serde_json::Value::Array(elems) =
                 build_qpdf_key_with_stream_mode(&mut pdf, meta, DecodeLevel::Generalized, mode)
                     .expect("build failed")
             else {
                 panic!("expected Array");
             };
-            let JsonValue::Object(map_pairs) = &elems[1] else {
-                panic!("objects_map is not an Object");
-            };
+            let map_pairs = object_pairs(&elems[1]);
             let trailer = map_pairs
                 .iter()
                 .find(|(k, _)| k == "trailer")
                 .map(|(_, v)| v)
                 .expect("trailer not found");
-            let JsonValue::Object(trailer_pairs) = trailer else {
-                panic!("trailer is not an Object for mode {mode:?}");
-            };
+            let trailer_pairs = object_pairs(trailer);
             assert_eq!(
                 trailer_pairs[0].0, "value",
                 "trailer must have 'value' key regardless of StreamDataMode ({mode:?})"
@@ -9283,12 +8673,12 @@ mod tests {
         }
     }
 
-    // ── Test 5: build_qpdf_json_v2_with_options propagates stream_mode ────────
+    // ── Test 5: build_test_document_with_options propagates stream_mode ────────
 
     #[test]
-    fn build_qpdf_json_v2_with_options_inline_propagates_to_qpdf_key() {
+    fn build_test_document_with_options_inline_propagates_to_qpdf_key() {
         let mut pdf = load_one_page_pdf();
-        let v2 = build_qpdf_json_v2_with_options(
+        let v2 = build_test_document_with_options(
             &mut pdf,
             DecodeLevel::Generalized,
             &StreamDataMode::Inline,
@@ -9296,77 +8686,61 @@ mod tests {
         .expect("build failed");
 
         // Navigate: v2["qpdf"][1]["obj:7 0 R"]["stream"]["data"]
-        let JsonValue::Object(top_pairs) = &v2 else {
-            panic!("expected Object at top level");
-        };
+        let top_pairs = object_pairs(&v2);
         let qpdf_val = top_pairs
             .iter()
             .find(|(k, _)| k == "qpdf")
             .map(|(_, v)| v)
             .expect("qpdf key not found");
-        let JsonValue::Array(qpdf_arr) = qpdf_val else {
+        let serde_json::Value::Array(qpdf_arr) = qpdf_val else {
             panic!("qpdf is not an Array");
         };
-        let JsonValue::Object(obj_map) = &qpdf_arr[1] else {
-            panic!("qpdf[1] is not an Object");
-        };
+        let obj_map = object_pairs(&qpdf_arr[1]);
         let obj7 = obj_map
             .iter()
             .find(|(k, _)| k == "obj:7 0 R")
             .map(|(_, v)| v)
             .expect("obj:7 0 R not found in qpdf key");
-        let JsonValue::Object(obj7_pairs) = obj7 else {
-            panic!("obj:7 is not an Object");
-        };
-        let JsonValue::Object(stream_inner) = &obj7_pairs[0].1 else {
-            panic!("stream value is not Object");
-        };
+        let obj7_pairs = object_pairs(obj7);
+        let stream_inner = object_pairs(&obj7_pairs[0].1);
         // Inline mode: first key is "data"
         assert_eq!(stream_inner[0].0, "data",
-            "Inline mode must produce 'data' key in stream entry via build_qpdf_json_v2_with_options");
+            "Inline mode must produce 'data' key in stream entry via build_test_document_with_options");
         assert!(
-            matches!(&stream_inner[0].1, JsonValue::String(_)),
+            matches!(&stream_inner[0].1, serde_json::Value::String(_)),
             "data must be a String"
         );
     }
 
-    // ── Test 7: build_qpdf_json_v2_with_options threads DecodeLevel to the
+    // ── Test 7: build_test_document_with_options threads DecodeLevel to the
     //           qpdf key — None vs Generalized yield different stream data. ──
 
     #[test]
-    fn build_qpdf_json_v2_with_options_threads_decode_level_to_qpdf_key() {
+    fn build_test_document_with_options_threads_decode_level_to_qpdf_key() {
         // Extract obj:7 0 R inline "data" base64 for a given DecodeLevel.
         fn obj7_inline_data(decode_level: DecodeLevel) -> String {
             let mut pdf = load_one_page_pdf();
             let v2 =
-                build_qpdf_json_v2_with_options(&mut pdf, decode_level, &StreamDataMode::Inline)
+                build_test_document_with_options(&mut pdf, decode_level, &StreamDataMode::Inline)
                     .expect("build failed");
-            let JsonValue::Object(top) = &v2 else {
-                panic!("top is not Object");
-            };
+            let top = object_pairs(&v2);
             let qpdf = top
                 .iter()
                 .find(|(k, _)| k == "qpdf")
                 .map(|(_, v)| v)
                 .expect("qpdf key");
-            let JsonValue::Array(arr) = qpdf else {
+            let serde_json::Value::Array(arr) = qpdf else {
                 panic!("qpdf not Array");
             };
-            let JsonValue::Object(obj_map) = &arr[1] else {
-                panic!("qpdf[1] not Object");
-            };
+            let obj_map = object_pairs(&arr[1]);
             let obj7 = obj_map
                 .iter()
                 .find(|(k, _)| k == "obj:7 0 R")
                 .map(|(_, v)| v)
                 .expect("obj:7");
-            let JsonValue::Object(obj7_pairs) = obj7 else {
-                panic!("obj:7 not Object");
-            };
-            let JsonValue::Object(stream_inner) = &obj7_pairs[0].1 else {
-                panic!("stream not Object");
-            };
-            let JsonValue::String(b64) = &stream_inner[0].1 else {
+            let obj7_pairs = object_pairs(obj7);
+            let stream_inner = object_pairs(&obj7_pairs[0].1);
+            let serde_json::Value::String(b64) = &stream_inner[0].1 else {
                 panic!("data not String");
             };
             b64.clone()
@@ -9383,7 +8757,7 @@ mod tests {
         let generalized = base64_decode_test_helper(&generalized_b64);
         assert!(
             generalized.starts_with(b"1 0 0 1 0 0 cm  BT /F1 12 Tf"),
-            "Generalized must emit filter-decoded content via build_qpdf_json_v2_with_options"
+            "Generalized must emit filter-decoded content via build_test_document_with_options"
         );
     }
 
@@ -9443,7 +8817,7 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // JsonKey / filter_json_keys unit tests  (flpdf-9hc.11.11)
+    // JsonKey unit tests  (flpdf-9hc.11.11)
     // ══════════════════════════════════════════════════════════════════════════
 
     // ── JsonKey::from_str: all JSON v2 names ─────────────────────────────────
@@ -9497,123 +8871,6 @@ mod tests {
         assert_eq!(JsonKey::Pagelabels.output_key_name(), "pagelabels");
         assert_eq!(JsonKey::Pages.output_key_name(), "pages");
         assert_eq!(JsonKey::Qpdf.output_key_name(), "qpdf");
-    }
-
-    // ── Helper: build a minimal v2-shaped JsonValue for filter tests ──────────
-
-    fn make_v2_doc() -> JsonValue {
-        // Construct a fake but structurally correct v2 document so that
-        // filter_json_keys has a real Object to work with.
-        JsonValue::Object(vec![
-            ("version".to_string(), JsonValue::Integer(2)),
-            (
-                "parameters".to_string(),
-                JsonValue::Object(vec![(
-                    "decodelevel".to_string(),
-                    JsonValue::String("generalized".to_string()),
-                )]),
-            ),
-            ("pages".to_string(), JsonValue::Array(vec![])),
-            ("pagelabels".to_string(), JsonValue::Array(vec![])),
-            ("acroform".to_string(), JsonValue::Null),
-            ("attachments".to_string(), JsonValue::Object(vec![])),
-            ("encrypt".to_string(), JsonValue::Null),
-            ("outlines".to_string(), JsonValue::Array(vec![])),
-            ("qpdf".to_string(), JsonValue::Array(vec![])),
-        ])
-    }
-
-    fn key_names(v: &JsonValue) -> Vec<&str> {
-        match v {
-            JsonValue::Object(pairs) => pairs.iter().map(|(k, _)| k.as_str()).collect(),
-            _ => panic!("expected Object"),
-        }
-    }
-
-    // ── filter_json_keys: empty keys → return input unchanged ─────────────────
-
-    #[test]
-    fn filter_json_keys_empty_returns_unchanged() {
-        let doc = make_v2_doc();
-        let filtered = filter_json_keys(doc.clone(), &[]);
-        // Should be structurally equal to the original.
-        assert_eq!(key_names(&filtered), key_names(&doc));
-    }
-
-    // ── filter_json_keys: single key [Pages] → version, parameters, pages ─────
-
-    #[test]
-    fn filter_json_keys_single_pages() {
-        let doc = make_v2_doc();
-        let filtered = filter_json_keys(doc, &[JsonKey::Pages]);
-        let names = key_names(&filtered);
-        assert_eq!(names, vec!["version", "parameters", "pages"]);
-    }
-
-    // ── filter_json_keys: [Pages, Pagelabels] → 4 keys in v2 order ───────────
-
-    #[test]
-    fn filter_json_keys_pages_and_pagelabels() {
-        let doc = make_v2_doc();
-        let filtered = filter_json_keys(doc, &[JsonKey::Pages, JsonKey::Pagelabels]);
-        let names = key_names(&filtered);
-        assert_eq!(names, vec!["version", "parameters", "pages", "pagelabels"]);
-    }
-
-    // ── filter_json_keys: duplicate dedupe ([Pages, Pages]) ──────────────────
-
-    #[test]
-    fn filter_json_keys_dedupe_pages() {
-        let doc = make_v2_doc();
-        let filtered = filter_json_keys(doc, &[JsonKey::Pages, JsonKey::Pages]);
-        let names = key_names(&filtered);
-        assert_eq!(names, vec!["version", "parameters", "pages"]);
-    }
-
-    // ── filter_json_keys: key absent from input → not in output (no panic) ────
-
-    #[test]
-    fn filter_json_keys_absent_key_skipped() {
-        // Build a doc that intentionally lacks the "encrypt" section.
-        let partial_doc = JsonValue::Object(vec![
-            ("version".to_string(), JsonValue::Integer(2)),
-            (
-                "parameters".to_string(),
-                JsonValue::Object(vec![(
-                    "decodelevel".to_string(),
-                    JsonValue::String("generalized".to_string()),
-                )]),
-            ),
-            ("pages".to_string(), JsonValue::Array(vec![])),
-        ]);
-        // Request both "pages" (present) and "encrypt" (absent) — must not panic.
-        let filtered = filter_json_keys(partial_doc, &[JsonKey::Pages, JsonKey::Encrypt]);
-        let names = key_names(&filtered);
-        // Only "pages" is present; "encrypt" is silently skipped.
-        assert_eq!(names, vec!["version", "parameters", "pages"]);
-        assert!(!names.contains(&"encrypt"));
-    }
-
-    // ── filter_json_keys: qpdf v2 output order is preserved regardless of
-    //    request order (Qpdf before Pages requested → pages still before qpdf) ─
-
-    #[test]
-    fn filter_json_keys_output_order_fixed() {
-        let doc = make_v2_doc();
-        // Request in reverse v2 order.
-        let filtered = filter_json_keys(doc, &[JsonKey::Qpdf, JsonKey::Pages]);
-        let names = key_names(&filtered);
-        // Output must follow v2 order: version, parameters, pages, qpdf
-        assert_eq!(names, vec!["version", "parameters", "pages", "qpdf"]);
-    }
-
-    // ── filter_json_keys: non-Object input returned as-is (no panic) ─────────
-
-    #[test]
-    fn filter_json_keys_non_object_returned_as_is() {
-        let v = JsonValue::Integer(42);
-        let result = filter_json_keys(v, &[JsonKey::Pages]);
-        assert_eq!(result, JsonValue::Integer(42));
     }
 
     // ── JsonObjectSelector::from_str ──────────────────────────────────────────
@@ -9707,214 +8964,6 @@ mod tests {
         assert_eq!(JsonObjectSelector::from_str("TRAILER"), None);
     }
 
-    // ── Helper: build a minimal qpdf-array-shaped JsonValue for object filter tests
-
-    fn make_qpdf_doc_with_objects() -> JsonValue {
-        // Simulate a v2 doc with qpdf: [metadata, {obj:3 0 R, obj:5 0 R, trailer}]
-        let metadata = JsonValue::Object(vec![
-            ("jsonversion".to_string(), JsonValue::Integer(2)),
-            (
-                "pdfversion".to_string(),
-                JsonValue::String("1.4".to_string()),
-            ),
-            (
-                "pushedinheritedpageresources".to_string(),
-                JsonValue::Bool(false),
-            ),
-            ("calledgetallpages".to_string(), JsonValue::Bool(true)),
-            ("maxobjectid".to_string(), JsonValue::Integer(5)),
-        ]);
-        let objects_map = JsonValue::Object(vec![
-            (
-                "obj:3 0 R".to_string(),
-                JsonValue::Object(vec![("value".to_string(), JsonValue::Integer(42))]),
-            ),
-            (
-                "obj:5 0 R".to_string(),
-                JsonValue::Object(vec![("value".to_string(), JsonValue::Integer(99))]),
-            ),
-            (
-                "trailer".to_string(),
-                JsonValue::Object(vec![("value".to_string(), JsonValue::Object(vec![]))]),
-            ),
-        ]);
-        JsonValue::Object(vec![
-            ("version".to_string(), JsonValue::Integer(2)),
-            (
-                "parameters".to_string(),
-                JsonValue::Object(vec![(
-                    "decodelevel".to_string(),
-                    JsonValue::String("generalized".to_string()),
-                )]),
-            ),
-            ("pages".to_string(), JsonValue::Array(vec![])),
-            (
-                "qpdf".to_string(),
-                JsonValue::Array(vec![metadata, objects_map]),
-            ),
-        ])
-    }
-
-    fn qpdf_objects_keys(v: &JsonValue) -> Vec<&str> {
-        match v {
-            JsonValue::Object(pairs) => {
-                // find the "qpdf" key
-                let qpdf_arr = pairs.iter().find(|(k, _)| k == "qpdf").map(|(_, v)| v);
-                match qpdf_arr {
-                    Some(JsonValue::Array(arr)) if arr.len() == 2 => match &arr[1] {
-                        JsonValue::Object(obj_pairs) => {
-                            obj_pairs.iter().map(|(k, _)| k.as_str()).collect()
-                        }
-                        _ => vec![],
-                    },
-                    _ => vec![],
-                }
-            }
-            _ => panic!("expected Object"),
-        }
-    }
-
-    // ── filter_json_objects: empty selectors → input unchanged ────────────────
-
-    #[test]
-    fn filter_json_objects_empty_selectors_unchanged() {
-        let doc = make_qpdf_doc_with_objects();
-        let filtered = filter_json_objects(doc.clone(), &[]);
-        // Full equality: every key including pages must be present.
-        assert_eq!(key_names(&filtered), key_names(&doc));
-        assert_eq!(
-            qpdf_objects_keys(&filtered),
-            vec!["obj:3 0 R", "obj:5 0 R", "trailer"]
-        );
-    }
-
-    // ── filter_json_objects: Object{3,0} → only obj:3 0 R in qpdf[1] ─────────
-
-    #[test]
-    fn filter_json_objects_single_object() {
-        let doc = make_qpdf_doc_with_objects();
-        let sel = JsonObjectSelector::Object {
-            number: 3,
-            generation: 0,
-        };
-        let filtered = filter_json_objects(doc, &[sel]);
-        assert_eq!(qpdf_objects_keys(&filtered), vec!["obj:3 0 R"]);
-        // pages and other top-level keys preserved
-        assert!(key_names(&filtered).contains(&"pages"));
-    }
-
-    // ── filter_json_objects: Trailer → only trailer in qpdf[1] ───────────────
-
-    #[test]
-    fn filter_json_objects_trailer_only() {
-        let doc = make_qpdf_doc_with_objects();
-        let filtered = filter_json_objects(doc, &[JsonObjectSelector::Trailer]);
-        assert_eq!(qpdf_objects_keys(&filtered), vec!["trailer"]);
-    }
-
-    // ── filter_json_objects: [Object{3,0}, Trailer] → both present ────────────
-
-    #[test]
-    fn filter_json_objects_object_and_trailer() {
-        let doc = make_qpdf_doc_with_objects();
-        let sels = vec![
-            JsonObjectSelector::Object {
-                number: 3,
-                generation: 0,
-            },
-            JsonObjectSelector::Trailer,
-        ];
-        let filtered = filter_json_objects(doc, &sels);
-        assert_eq!(qpdf_objects_keys(&filtered), vec!["obj:3 0 R", "trailer"]);
-    }
-
-    // ── filter_json_objects: non-existent object → qpdf[1] is empty Object ───
-
-    #[test]
-    fn filter_json_objects_missing_object_empty_result() {
-        let doc = make_qpdf_doc_with_objects();
-        let sel = JsonObjectSelector::Object {
-            number: 999,
-            generation: 0,
-        };
-        let filtered = filter_json_objects(doc, &[sel]);
-        assert_eq!(qpdf_objects_keys(&filtered), Vec::<&str>::new());
-    }
-
-    // ── filter_json_objects: duplicate selectors → dedupe ────────────────────
-
-    #[test]
-    fn filter_json_objects_duplicate_selectors_dedupe() {
-        let doc = make_qpdf_doc_with_objects();
-        let sel = JsonObjectSelector::Object {
-            number: 3,
-            generation: 0,
-        };
-        let filtered = filter_json_objects(doc, &[sel, sel]);
-        // dedupe: obj:3 0 R appears exactly once
-        assert_eq!(qpdf_objects_keys(&filtered), vec!["obj:3 0 R"]);
-    }
-
-    // ── filter_json_objects: no "qpdf" key → input returned unchanged ─────────
-
-    #[test]
-    fn filter_json_objects_no_qpdf_key_unchanged() {
-        // A doc without "qpdf" (e.g. after filter_json_keys removed it)
-        let doc = JsonValue::Object(vec![
-            ("version".to_string(), JsonValue::Integer(2)),
-            ("pages".to_string(), JsonValue::Array(vec![])),
-        ]);
-        let sel = JsonObjectSelector::Object {
-            number: 3,
-            generation: 0,
-        };
-        let filtered = filter_json_objects(doc, &[sel]);
-        assert_eq!(key_names(&filtered), vec!["version", "pages"]);
-    }
-
-    #[test]
-    fn filter_json_objects_preserves_malformed_envelope_shapes() {
-        let selector = [JsonObjectSelector::Trailer];
-
-        assert_eq!(
-            filter_json_objects(JsonValue::Null, &selector),
-            JsonValue::Null
-        );
-
-        let scalar_qpdf = JsonValue::Object(vec![("qpdf".to_string(), JsonValue::Integer(7))]);
-        assert_eq!(
-            filter_json_objects(scalar_qpdf.clone(), &selector),
-            scalar_qpdf
-        );
-
-        let scalar_map = JsonValue::Object(vec![(
-            "qpdf".to_string(),
-            JsonValue::Array(vec![JsonValue::Null, JsonValue::Integer(9)]),
-        )]);
-        assert_eq!(
-            filter_json_objects(scalar_map.clone(), &selector),
-            scalar_map
-        );
-    }
-
-    // ── filter_json_objects: envelope and other sections preserved ─────────────
-
-    #[test]
-    fn filter_json_objects_envelope_and_pages_preserved() {
-        let doc = make_qpdf_doc_with_objects();
-        let sel = JsonObjectSelector::Object {
-            number: 3,
-            generation: 0,
-        };
-        let filtered = filter_json_objects(doc, &[sel]);
-        // version, parameters, pages all still present
-        let names = key_names(&filtered);
-        assert!(names.contains(&"version"), "version missing");
-        assert!(names.contains(&"parameters"), "parameters missing");
-        assert!(names.contains(&"pages"), "pages missing");
-        assert!(names.contains(&"qpdf"), "qpdf missing");
-    }
-
     // ── base64 decode helper (test-only) ─────────────────────────────────────
 
     /// Simple base64 decoder used only in tests to verify round-trips.
@@ -9946,57 +8995,5 @@ mod tests {
             }
         }
         out
-    }
-
-    // ── filter_json_keys: envelope order is fixed, regardless of input order
-    //
-    // Regression for CodeRabbit's PR #121 finding. The two-pass envelope
-    // copy used `for (k, v) in &pairs` which preserved the input order, so
-    // a caller that built `{ parameters, version, ... }` would get
-    // `{ parameters, version, ... }` back. The function contract is that
-    // the output is *always* `{ version, parameters, ... }`.
-
-    #[test]
-    fn filter_json_keys_normalizes_envelope_to_version_then_parameters() {
-        // Build the input with parameters first, version second — the
-        // reverse of the canonical order.
-        let v2 = JsonValue::Object(vec![
-            (
-                "parameters".to_string(),
-                JsonValue::Object(vec![(
-                    "decodelevel".to_string(),
-                    JsonValue::String("generalized".to_string()),
-                )]),
-            ),
-            ("version".to_string(), JsonValue::Integer(2)),
-            ("pages".to_string(), JsonValue::Array(vec![])),
-        ]);
-
-        let filtered = filter_json_keys(v2, &[JsonKey::Pages]);
-        let JsonValue::Object(pairs) = filtered else {
-            panic!("expected Object");
-        };
-        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(
-            keys,
-            vec!["version", "parameters", "pages"],
-            "envelope must always be emitted as version, parameters, … even when the input has the opposite order"
-        );
-    }
-
-    #[test]
-    fn filter_json_keys_preserves_envelope_order_when_version_only_present() {
-        // Only version is present, parameters is missing — output must
-        // still start with version and not panic.
-        let v2 = JsonValue::Object(vec![
-            ("version".to_string(), JsonValue::Integer(2)),
-            ("pages".to_string(), JsonValue::Array(vec![])),
-        ]);
-        let filtered = filter_json_keys(v2, &[JsonKey::Pages]);
-        let JsonValue::Object(pairs) = filtered else {
-            panic!("expected Object");
-        };
-        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(keys, vec!["version", "pages"]);
     }
 }
