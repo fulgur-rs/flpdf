@@ -34,6 +34,27 @@ fn real_special_values_match_qpdf_classic_locale_bytes() {
 }
 
 #[test]
+fn qpdf_string_escape_bytes_are_exact() {
+    let value = Json::make_string(b"<1>\xcf\x80<2>\xf0\x9f\xa5\x94\\\"<3>\x03\t\x08\r\n<4>");
+    assert_eq!(
+        value.unparse().unwrap(),
+        b"\"<1>\xcf\x80<2>\xf0\x9f\xa5\x94\\\\\\\"<3>\\u0003\\t\\b\\r\\n<4>\""
+    );
+}
+
+#[test]
+fn qpdf_blob_uses_standard_base64_without_newlines() {
+    let blob = Json::make_blob(|out| out.write_all(b"\x01\x02\x03\x04\x05\xff\xfe\xfd\xfc\xfb"));
+    assert_eq!(blob.unparse().unwrap(), b"\"AQIDBAX//v38+w==\"");
+}
+
+#[test]
+fn qpdf_real_uses_six_digit_trimmed_format() {
+    assert_eq!(Json::make_real(3.14159).unparse().unwrap(), b"3.14159");
+    assert_eq!(Json::make_real(-0.0).unparse().unwrap(), b"-0");
+}
+
+#[test]
 fn scalar_accessors_reject_other_types_without_mutating_output() {
     let value = Json::make_bool(true);
     assert_eq!(value.get_bool(), Some(true));

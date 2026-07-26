@@ -169,6 +169,10 @@ impl Json {
         Self::with_value(Value::Null)
     }
 
+    pub fn make_blob(callback: impl FnMut(&mut dyn io::Write) -> io::Result<()> + 'static) -> Self {
+        Self::with_value(Value::Blob(Rc::new(RefCell::new(Box::new(callback)))))
+    }
+
     pub fn is_array(&self) -> bool {
         self.0
             .as_ref()
