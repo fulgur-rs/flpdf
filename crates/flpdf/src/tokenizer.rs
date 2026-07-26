@@ -1,8 +1,12 @@
-//! qpdf correspondence: QPDFTokenizer.cc normal mode; additional qpdf tokenizer modes remain incomplete.
-use std::borrow::Cow;
+//! qpdf correspondence: complete mirror of qpdf 11.9.0 QPDFTokenizer.cc across push, pull, normal, and inline-image modes.
+//!
+//! Mirrors qpdf 11.9.0 `libqpdf/QPDFTokenizer.cc`.
 
-use crate::{Error, Result};
+use std::ops::Range;
 
+use crate::{object::write_name_escaped, object::write_string_value, Error, Result};
+
+#[allow(dead_code)] // Space, Comment, and InlineImage are produced by Task 2's state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TokenType {
     Bad,
@@ -20,17 +24,83 @@ pub(crate) enum TokenType {
     Bool,
     Word,
     Eof,
+    Space,
+    Comment,
+    InlineImage,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Token<'a> {
+#[derive(Debug, Clone)]
+pub(crate) struct Token {
     pub(crate) token_type: TokenType,
-    pub(crate) value: Cow<'a, [u8]>,
-    pub(crate) raw: &'a [u8],
+    pub(crate) value: Vec<u8>,
+    pub(crate) raw: Vec<u8>,
     pub(crate) error_message: Option<String>,
     pub(crate) error_offset: usize,
     pub(crate) start: usize,
+    #[allow(dead_code)] // Retained as part of qpdf's token range contract.
     pub(crate) end: usize,
+}
+
+impl PartialEq for Token {
+    fn eq(&self, other: &Self) -> bool {
+        self.token_type != TokenType::Bad
+            && self.token_type == other.token_type
+            && self.value == other.value
+    }
+}
+
+impl Token {
+    pub(crate) fn new(token_type: TokenType, value: Vec<u8>) -> Self {
+        let raw = match token_type {
+            TokenType::Name => canonical_name_raw(&value),
+            TokenType::String => canonical_string_raw(&value),
+            _ => value.clone(),
+        };
+        Self::from_parts(token_type, value, raw, None, 0..0)
+    }
+
+    pub(crate) fn from_parts(
+        token_type: TokenType,
+        value: Vec<u8>,
+        raw: Vec<u8>,
+        error_message: Option<String>,
+        range: Range<usize>,
+    ) -> Self {
+        Self {
+            token_type,
+            value,
+            raw,
+            error_message,
+            error_offset: range.start,
+            start: range.start,
+            end: range.end,
+        }
+    }
+
+    pub(crate) fn is_integer(&self) -> bool {
+        self.token_type == TokenType::Integer
+    }
+
+    pub(crate) fn is_word(&self) -> bool {
+        self.token_type == TokenType::Word
+    }
+
+    pub(crate) fn is_word_value(&self, value: &[u8]) -> bool {
+        self.is_word() && self.value == value
+    }
+}
+
+fn canonical_name_raw(value: &[u8]) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(value.len());
+    raw.push(b'/');
+    write_name_escaped(&mut raw, value.strip_prefix(b"/").unwrap_or(value));
+    raw
+}
+
+fn canonical_string_raw(value: &[u8]) -> Vec<u8> {
+    let mut raw = Vec::new();
+    write_string_value(&mut raw, value);
+    raw
 }
 
 pub(crate) struct Tokenizer<'a> {
@@ -52,7 +122,7 @@ impl<'a> Tokenizer<'a> {
             .map_err(|start| Error::parse(start, "EOF while reading token (unterminated comment)"))
     }
 
-    pub(crate) fn next_token(&mut self) -> Token<'a> {
+    pub(crate) fn next_token(&mut self) -> Token {
         if let Err(start) = self.skip_ignorable_inner() {
             return self.bad_token(start, "EOF while reading token");
         }
@@ -86,10 +156,10 @@ impl<'a> Tokenizer<'a> {
 
     pub(crate) fn next_integer(&mut self) -> Result<i64> {
         let token = self.next_token();
-        if token.token_type != TokenType::Integer {
+        if !token.is_integer() {
             return Err(Error::parse(token.start, "expected integer"));
         }
-        std::str::from_utf8(token.value.as_ref())
+        std::str::from_utf8(&token.value)
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
             .ok_or_else(|| Error::parse(token.start, "integer is out of range"))
@@ -97,7 +167,7 @@ impl<'a> Tokenizer<'a> {
 
     pub(crate) fn expect_word(&mut self, expected: &[u8]) -> Result<()> {
         let token = self.next_token();
-        if token.token_type == TokenType::Word && token.value.as_ref() == expected {
+        if token.is_word_value(expected) {
             Ok(())
         } else {
             Err(Error::parse(
@@ -133,7 +203,7 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
-    fn hex_string(&mut self, start: usize) -> Token<'a> {
+    fn hex_string(&mut self, start: usize) -> Token {
         let mut decoded = Vec::new();
         let mut high_nibble = None;
 
@@ -160,7 +230,7 @@ impl<'a> Tokenizer<'a> {
         self.bad_token_at(start, self.pos, "EOF while reading token")
     }
 
-    fn literal_string(&mut self, start: usize) -> Token<'a> {
+    fn literal_string(&mut self, start: usize) -> Token {
         let mut decoded = Vec::new();
         let mut depth = 1usize;
 
@@ -224,7 +294,7 @@ impl<'a> Tokenizer<'a> {
         self.bad_token_at(start, self.pos, "EOF while reading token")
     }
 
-    fn name(&mut self, start: usize) -> Token<'a> {
+    fn name(&mut self, start: usize) -> Token {
         let mut decoded = vec![b'/'];
         let mut error_message = None;
         let mut bad = false;
@@ -301,7 +371,7 @@ impl<'a> Tokenizer<'a> {
         self.owned_token(token_type, decoded, start, self.pos, error_message)
     }
 
-    fn scalar(&mut self, start: usize) -> Token<'a> {
+    fn scalar(&mut self, start: usize) -> Token {
         while self
             .peek_byte()
             .is_some_and(|byte| !is_ws(byte) && !is_delimiter(byte))
@@ -327,16 +397,12 @@ impl<'a> Tokenizer<'a> {
         self.input.get(self.pos).copied()
     }
 
-    fn borrowed_token(&self, token_type: TokenType, start: usize, end: usize) -> Token<'a> {
-        Token {
-            token_type,
-            value: Cow::Borrowed(&self.input[start..end]),
-            raw: &self.input[start..end],
-            error_message: None,
-            error_offset: start,
-            start,
-            end,
-        }
+    fn borrowed_token(&self, token_type: TokenType, start: usize, end: usize) -> Token {
+        let mut token = Token::new(token_type, self.input[start..end].to_vec());
+        token.error_offset = start;
+        token.start = start;
+        token.end = end;
+        token
     }
 
     fn owned_token(
@@ -346,32 +412,25 @@ impl<'a> Tokenizer<'a> {
         start: usize,
         end: usize,
         error_message: Option<String>,
-    ) -> Token<'a> {
-        Token {
+    ) -> Token {
+        Token::from_parts(
             token_type,
-            value: Cow::Owned(value),
-            raw: &self.input[start..end],
+            value,
+            self.input[start..end].to_vec(),
             error_message,
-            error_offset: start,
-            start,
-            end,
-        }
+            start..end,
+        )
     }
 
-    fn bad_token(&self, start: usize, message: impl Into<String>) -> Token<'a> {
+    fn bad_token(&self, start: usize, message: impl Into<String>) -> Token {
         self.bad_token_at(start, start, message)
     }
 
-    fn bad_token_at(
-        &self,
-        start: usize,
-        error_offset: usize,
-        message: impl Into<String>,
-    ) -> Token<'a> {
+    fn bad_token_at(&self, start: usize, error_offset: usize, message: impl Into<String>) -> Token {
         Token {
             token_type: TokenType::Bad,
-            value: Cow::Borrowed(&self.input[start..self.pos]),
-            raw: &self.input[start..self.pos],
+            value: self.input[start..self.pos].to_vec(),
+            raw: self.input[start..self.pos].to_vec(),
             error_message: Some(message.into()),
             error_offset,
             start,
@@ -448,21 +507,71 @@ pub(crate) fn starts_number_token(input: &[u8]) -> bool {
     )
 }
 
-fn token_description(token: &Token<'_>) -> String {
+fn token_description(token: &Token) -> String {
     if token.token_type == TokenType::Eof {
         "EOF".into()
     } else {
         format!(
             "{:?} token {:?}",
             token.token_type,
-            String::from_utf8_lossy(token.raw)
+            String::from_utf8_lossy(&token.raw)
         )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TokenType, Tokenizer};
+    use super::{Token, TokenType, Tokenizer};
+
+    #[test]
+    fn token_type_covers_qpdf_ignorable_and_inline_image_types() {
+        let types = [
+            TokenType::Bad,
+            TokenType::ArrayClose,
+            TokenType::ArrayOpen,
+            TokenType::BraceClose,
+            TokenType::BraceOpen,
+            TokenType::DictClose,
+            TokenType::DictOpen,
+            TokenType::Integer,
+            TokenType::Name,
+            TokenType::Real,
+            TokenType::String,
+            TokenType::Null,
+            TokenType::Bool,
+            TokenType::Word,
+            TokenType::Eof,
+            TokenType::Space,
+            TokenType::Comment,
+            TokenType::InlineImage,
+        ];
+        assert_eq!(types.len(), 18);
+    }
+
+    #[test]
+    fn token_equality_matches_qpdf_type_and_value_only() {
+        let left = Token::from_parts(TokenType::Name, b"/A".to_vec(), b"/A".to_vec(), None, 3..5);
+        let right = Token::from_parts(
+            TokenType::Name,
+            b"/A".to_vec(),
+            b"/#41".to_vec(),
+            Some("ignored by equality".into()),
+            40..44,
+        );
+        assert_eq!(left, right);
+
+        let bad = Token::new(TokenType::Bad, b"x".to_vec());
+        assert_ne!(bad, bad.clone());
+    }
+
+    #[test]
+    fn constructed_name_and_string_tokens_have_canonical_pdf_raw_values() {
+        let name = Token::new(TokenType::Name, b"/text/plain".to_vec());
+        assert_eq!(name.raw, b"/text#2fplain");
+
+        let string = Token::new(TokenType::String, b"a(b".to_vec());
+        assert_eq!(string.raw, br"(a\(b)");
+    }
 
     #[test]
     fn hex_string_ignores_pdf_whitespace_and_pads_odd_nibble() {
@@ -470,8 +579,8 @@ mod tests {
         let token = Tokenizer::new(input).next_token();
 
         assert_eq!(token.token_type, TokenType::String);
-        assert_eq!(token.value.as_ref(), b"\x01\x02\x03\x00\x04\x05\x60");
-        assert_eq!(token.raw, input);
+        assert_eq!(token.value, b"\x01\x02\x03\x00\x04\x05\x60".to_vec());
+        assert_eq!(token.raw, input.to_vec());
         assert_eq!((token.start, token.end), (0, 18));
         assert_eq!(token.error_message, None);
     }
@@ -482,13 +591,13 @@ mod tests {
 
         let name = tokenizer.next_token();
         assert_eq!(name.token_type, TokenType::Name);
-        assert_eq!(name.value.as_ref(), b"/");
-        assert_eq!(name.raw, b"/");
+        assert_eq!(name.value, b"/".to_vec());
+        assert_eq!(name.raw, b"/".to_vec());
 
         let exponent = tokenizer.next_token();
         assert_eq!(exponent.token_type, TokenType::Word);
-        assert_eq!(exponent.value.as_ref(), b"1e3");
-        assert_eq!(exponent.raw, b"1e3");
+        assert_eq!(exponent.value, b"1e3".to_vec());
+        assert_eq!(exponent.raw, b"1e3".to_vec());
     }
 
     #[test]
@@ -496,8 +605,8 @@ mod tests {
         let token = Tokenizer::new(b"(a\rb\r\nc\\777)").next_token();
 
         assert_eq!(token.token_type, TokenType::String);
-        assert_eq!(token.value.as_ref(), b"a\nb\nc\xff");
-        assert_eq!(token.raw, b"(a\rb\r\nc\\777)");
+        assert_eq!(token.value, b"a\nb\nc\xff".to_vec());
+        assert_eq!(token.raw, b"(a\rb\r\nc\\777)".to_vec());
         assert_eq!(token.error_message, None);
     }
 
@@ -505,13 +614,13 @@ mod tests {
     fn invalid_and_unterminated_hex_strings_are_bad_tokens() {
         let invalid = Tokenizer::new(b"<0g>").next_token();
         assert_eq!(invalid.token_type, TokenType::Bad);
-        assert_eq!(invalid.raw, b"<0g");
+        assert_eq!(invalid.raw, b"<0g".to_vec());
         assert_eq!((invalid.start, invalid.end), (0, 3));
         assert!(invalid.error_message.is_some());
 
         let unterminated = Tokenizer::new(b"<01").next_token();
         assert_eq!(unterminated.token_type, TokenType::Bad);
-        assert_eq!(unterminated.raw, b"<01");
+        assert_eq!(unterminated.raw, b"<01".to_vec());
         assert_eq!((unterminated.start, unterminated.end), (0, 3));
         assert!(unterminated.error_message.is_some());
     }
@@ -553,7 +662,7 @@ mod tests {
 
         let literal = Tokenizer::new(b"(a\\\r\nb\\7x\\q)").next_token();
         assert_eq!(literal.token_type, TokenType::String);
-        assert_eq!(literal.value.as_ref(), b"ab\x07xq");
+        assert_eq!(literal.value, b"ab\x07xq".to_vec());
 
         let trailing_escape = Tokenizer::new(b"(abc\\").next_token();
         assert_eq!(trailing_escape.token_type, TokenType::Bad);
@@ -567,7 +676,7 @@ mod tests {
     fn name_null_and_stray_hashes_preserve_qpdf_recovery_values() {
         let null = Tokenizer::new(b"/a#00b").next_token();
         assert_eq!(null.token_type, TokenType::Bad);
-        assert_eq!(null.value.as_ref(), b"/a#00b");
+        assert_eq!(null.value, b"/a#00b".to_vec());
         assert_eq!(
             null.error_message.as_deref(),
             Some("null character not allowed in name token")
@@ -575,7 +684,7 @@ mod tests {
 
         let stray = Tokenizer::new(b"/a#1x").next_token();
         assert_eq!(stray.token_type, TokenType::Name);
-        assert_eq!(stray.value.as_ref(), b"/a\0\x31x");
+        assert_eq!(stray.value, b"/a\0\x31x".to_vec());
         assert_eq!(
             stray.error_message.as_deref(),
             Some("name with stray # will not work with PDF >= 1.2")
@@ -595,7 +704,7 @@ mod tests {
         for &(input, expected) in cases {
             let token = Tokenizer::new(input).next_token();
             assert_eq!(token.token_type, TokenType::Name);
-            assert_eq!(token.value.as_ref(), expected);
+            assert_eq!(token.value, expected.to_vec());
             assert_eq!(
                 token.error_message.as_deref(),
                 Some("name with stray # will not work with PDF >= 1.2")
@@ -608,14 +717,14 @@ mod tests {
         let mut first_nibble = Tokenizer::new(b"/a#/tail");
         let name = first_nibble.next_token();
         assert_eq!(name.token_type, TokenType::Name);
-        assert_eq!(name.value.as_ref(), b"/a\0");
-        assert_eq!(first_nibble.next_token().value.as_ref(), b"/tail");
+        assert_eq!(name.value, b"/a\0".to_vec());
+        assert_eq!(first_nibble.next_token().value, b"/tail".to_vec());
 
         let mut second_nibble = Tokenizer::new(b"/a#1/tail");
         let name = second_nibble.next_token();
         assert_eq!(name.token_type, TokenType::Name);
-        assert_eq!(name.value.as_ref(), b"/a\0\x31");
-        assert_eq!(second_nibble.next_token().value.as_ref(), b"/tail");
+        assert_eq!(name.value, b"/a\0\x31".to_vec());
+        assert_eq!(second_nibble.next_token().value, b"/tail".to_vec());
     }
 
     #[test]

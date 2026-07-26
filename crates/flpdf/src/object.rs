@@ -436,11 +436,7 @@ impl Object {
                 write_name_escaped(out, name);
             }
             Object::String(value) => {
-                if is_printable_string(value) {
-                    write_literal_string(out, value);
-                } else {
-                    write_hex_string(out, value);
-                }
+                write_string_value(out, value);
             }
             Object::Array(values) => {
                 // qpdf `QPDFWriter::unparseObject` (libqpdf/QPDFWriter.cc:1334-
@@ -625,7 +621,7 @@ pub(crate) fn write_id_style_value(out: &mut Vec<u8>, obj: &Object) {
 /// (0x20–0x7e) even if the value contains `(`, `)`, or `\` — those simply
 /// need escaping. We mirror that: only CR / LF force the hex fallback because
 /// flpdf does not currently emit multi-line literals.
-fn is_printable_string(value: &[u8]) -> bool {
+pub(crate) fn is_printable_string(value: &[u8]) -> bool {
     value
         .iter()
         .all(|byte| (0x20..=0x7e).contains(byte) && !matches!(*byte, b'\r' | b'\n'))
@@ -643,6 +639,14 @@ pub(crate) fn write_literal_string(out: &mut Vec<u8>, value: &[u8]) {
         }
     }
     out.push(b')');
+}
+
+pub(crate) fn write_string_value(out: &mut Vec<u8>, value: &[u8]) {
+    if is_printable_string(value) {
+        write_literal_string(out, value);
+    } else {
+        write_hex_string(out, value);
+    }
 }
 
 fn write_hex_string(out: &mut Vec<u8>, value: &[u8]) {

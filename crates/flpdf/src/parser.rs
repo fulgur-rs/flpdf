@@ -79,7 +79,7 @@ pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObjec
     let mut parser = Parser::new(input);
     parser.top_level_no_reference = true;
     let token = parser.peek_token();
-    if token.token_type == TokenType::Word && token.value.as_ref() == b"endobj" {
+    if token.is_word_value(b"endobj") {
         let empty_offset = token.start;
         return Ok(ParsedDirectObject {
             object: Object::Null,
@@ -113,7 +113,7 @@ pub(crate) fn parse_strict_direct_object(input: &[u8]) -> Result<ParsedDirectObj
 
 pub(crate) struct Parser<'a> {
     tokenizer: Tokenizer<'a>,
-    buffered: VecDeque<Token<'a>>,
+    buffered: VecDeque<Token>,
     /// When `true`, `N G R` is *not* recognised as an indirect reference;
     /// the first integer is returned and `G R` are left unconsumed. Content
     /// streams never contain indirect references, so the tokenizer sets this
@@ -199,9 +199,9 @@ impl<'a> Parser<'a> {
         match token.token_type {
             TokenType::DictOpen => self.dictionary(),
             TokenType::ArrayOpen => self.array(),
-            TokenType::Name => Ok(Object::Name(token.value.as_ref()[1..].to_vec())),
-            TokenType::String => Ok(Object::String(token.value.into_owned())),
-            TokenType::Bool => Ok(Object::Boolean(token.value.as_ref() == b"true")),
+            TokenType::Name => Ok(Object::Name(token.value[1..].to_vec())),
+            TokenType::String => Ok(Object::String(token.value)),
+            TokenType::Bool => Ok(Object::Boolean(token.value == b"true")),
             TokenType::Null => Ok(Object::Null),
             TokenType::Integer => self.integer_or_ref(token),
             TokenType::Real => self.real_object(token),
@@ -226,7 +226,7 @@ impl<'a> Parser<'a> {
             if token.token_type != TokenType::Name {
                 return Err(Error::parse(token.start, "expected byte 47"));
             }
-            let key = token.value.as_ref()[1..].to_vec();
+            let key = token.value[1..].to_vec();
             let value = self.object()?;
             dict.insert(key, value);
         }
@@ -247,7 +247,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn integer_or_ref(&mut self, first_token: Token<'a>) -> Result<Object> {
+    fn integer_or_ref(&mut self, first_token: Token) -> Result<Object> {
         let first = parse_integer_token(&first_token)?;
         if self.no_reference || (self.top_level_no_reference && self.depth == 1) {
             return Ok(Object::Integer(first));
@@ -260,7 +260,7 @@ impl<'a> Parser<'a> {
         }
         let second = parse_integer_token(&second_token)?;
         let third_token = self.next_token();
-        if third_token.token_type == TokenType::Word && third_token.value.as_ref() == b"R" {
+        if third_token.is_word_value(b"R") {
             let number = u32::try_from(first)
                 .map_err(|_| Error::parse(first_token.start, "invalid object number"))?;
             let generation = u16::try_from(second)
@@ -272,8 +272,8 @@ impl<'a> Parser<'a> {
         Ok(Object::Integer(first))
     }
 
-    fn real_object(&self, token: Token<'a>) -> Result<Object> {
-        let text = std::str::from_utf8(token.value.as_ref())
+    fn real_object(&self, token: Token) -> Result<Object> {
+        let text = std::str::from_utf8(&token.value)
             .map_err(|_| Error::parse(token.start, "real is not utf-8"))?;
         let value = text
             .parse::<f64>()
@@ -288,12 +288,12 @@ impl<'a> Parser<'a> {
         } else {
             Ok(Object::RealLiteral {
                 value,
-                literal: token.raw.to_vec(),
+                literal: token.raw,
             })
         }
     }
 
-    fn next_token(&mut self) -> Token<'a> {
+    fn next_token(&mut self) -> Token {
         if let Some(token) = self.buffered.pop_front() {
             return token;
         }
@@ -309,11 +309,11 @@ impl<'a> Parser<'a> {
         token
     }
 
-    fn unread_token(&mut self, token: Token<'a>) {
+    fn unread_token(&mut self, token: Token) {
         self.buffered.push_front(token);
     }
 
-    fn peek_token(&mut self) -> Token<'a> {
+    fn peek_token(&mut self) -> Token {
         let token = self.next_token();
         self.unread_token(token.clone());
         token
@@ -328,8 +328,8 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn parse_integer_token(token: &Token<'_>) -> Result<i64> {
-    std::str::from_utf8(token.value.as_ref())
+fn parse_integer_token(token: &Token) -> Result<i64> {
+    std::str::from_utf8(&token.value)
         .ok()
         .and_then(|text| text.parse::<i64>().ok())
         .ok_or_else(|| Error::parse(token.start, "invalid integer"))
