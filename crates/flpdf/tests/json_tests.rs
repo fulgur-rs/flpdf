@@ -17,6 +17,17 @@ fn encoded_number_is_not_normalized() {
 }
 
 #[test]
+fn real_special_values_match_qpdf_classic_locale_bytes() {
+    assert_eq!(Json::make_real(f64::NAN).unparse().unwrap(), b"nan");
+    assert_eq!(Json::make_real(f64::INFINITY).unparse().unwrap(), b"inf");
+    assert_eq!(
+        Json::make_real(f64::NEG_INFINITY).unparse().unwrap(),
+        b"-inf"
+    );
+    assert_eq!(Json::make_real(-0.0).unparse().unwrap(), b"-0");
+}
+
+#[test]
 fn scalar_accessors_reject_other_types_without_mutating_output() {
     let value = Json::make_bool(true);
     assert_eq!(value.get_bool(), Some(true));

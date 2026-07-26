@@ -91,14 +91,7 @@ impl Json {
     }
 
     pub fn make_real(value: f64) -> Self {
-        let mut encoded = format!("{value:.6}");
-        while encoded.ends_with('0') && encoded.len() > 1 {
-            encoded.pop();
-        }
-        if encoded.ends_with('.') && encoded.len() > 1 {
-            encoded.pop();
-        }
-        Self::make_number(encoded)
+        Self::make_number(format_qpdf_real(value))
     }
 
     pub fn make_number(encoded: impl AsRef<[u8]>) -> Self {
@@ -194,6 +187,27 @@ impl Json {
             Value::Blob(writer) => ValueSnapshot::Blob(writer.clone()),
         })
     }
+}
+
+fn format_qpdf_real(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".into();
+    }
+    if value == f64::INFINITY {
+        return "inf".into();
+    }
+    if value == f64::NEG_INFINITY {
+        return "-inf".into();
+    }
+
+    let mut encoded = format!("{value:.6}");
+    while encoded.ends_with('0') && encoded.len() > 1 {
+        encoded.pop();
+    }
+    if encoded.ends_with('.') && encoded.len() > 1 {
+        encoded.pop();
+    }
+    encoded
 }
 
 #[cfg(test)]
