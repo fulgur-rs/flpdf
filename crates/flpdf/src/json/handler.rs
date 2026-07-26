@@ -349,8 +349,14 @@ impl DispatchContext {
         path: &[u8],
         value: Json,
     ) -> Result<(), JsonHandlerError> {
-        if let Some(active) = self.active.get(&target.key).cloned() {
-            return active.snapshot.handle(self, target.key, path, value);
+        if let Some(snapshot) = self.active.get(&target.key).map(|active| {
+            active
+                .live
+                .as_ref()
+                .map(|live| live.borrow().snapshot())
+                .unwrap_or_else(|| active.snapshot.clone())
+        }) {
+            return snapshot.handle(self, target.key, path, value);
         }
 
         let handler = target.handler.clone();

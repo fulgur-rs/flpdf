@@ -612,6 +612,42 @@ fn self_referential_dictionary_fallback_handles_finite_recursive_json() {
 }
 
 #[test]
+fn active_recursive_fallback_refreshes_the_root_snapshot_after_dictionary_start() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let root = JsonHandler::shared();
+    root.borrow_mut().add_dictionary_handlers(
+        {
+            let root = Rc::downgrade(&root);
+            let seen = seen.clone();
+            move |path, _| {
+                seen.borrow_mut()
+                    .push(format!("start:{}", String::from_utf8_lossy(path)));
+                root.upgrade()
+                    .expect("root handler must be alive during dispatch")
+                    .borrow_mut()
+                    .add_number_handler({
+                        let seen = seen.clone();
+                        move |path, number| {
+                            seen.borrow_mut().push(format!(
+                                "{}={}",
+                                String::from_utf8_lossy(path),
+                                String::from_utf8_lossy(number)
+                            ));
+                        }
+                    });
+            }
+        },
+        |_| {},
+    );
+    root.borrow_mut()
+        .add_fallback_dictionary_handler(root.clone());
+
+    JsonHandler::handle_shared(&root, b".", Json::parse(br#"{"a":1}"#).unwrap()).unwrap();
+
+    assert_eq!(&*seen.borrow(), &["start:.", ".a=1"]);
+}
+
+#[test]
 fn mutually_recursive_dictionary_fallbacks_handle_a_finite_cycle() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let first = JsonHandler::shared();
