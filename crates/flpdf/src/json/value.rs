@@ -290,12 +290,15 @@ impl Json {
         let Some(members) = &self.0 else {
             return false;
         };
-        let members = members.borrow();
-        let Value::Array(array) = &members.value else {
-            return false;
+        let values = {
+            let members = members.borrow();
+            let Value::Array(array) = &members.value else {
+                return false;
+            };
+            array.clone()
         };
-        for value in array {
-            callback(value.clone());
+        for value in values {
+            callback(value);
         }
         true
     }

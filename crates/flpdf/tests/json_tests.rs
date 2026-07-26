@@ -244,6 +244,31 @@ fn container_accessors_expose_encoded_dictionary_keys_and_array_values() {
 }
 
 #[test]
+fn array_iteration_releases_borrow_and_uses_initial_elements() {
+    let array = Json::make_array();
+    array.add_array_element(Json::make_int(1)).unwrap();
+    array.add_array_element(Json::make_int(2)).unwrap();
+    let mut first_pass = Vec::new();
+
+    assert!(array.for_each_array_item(|item| {
+        first_pass.push(item.get_number().unwrap());
+        if first_pass.len() == 1 {
+            array.set_start(7);
+            array.set_end(9);
+            array.add_array_element(Json::make_int(3)).unwrap();
+        }
+    }));
+
+    assert_eq!(first_pass, [b"1".to_vec(), b"2".to_vec()]);
+    assert_eq!((array.start(), array.end()), (7, 9));
+    let mut second_pass = Vec::new();
+    assert!(array.for_each_array_item(|item| {
+        second_pass.push(item.get_number().unwrap());
+    }));
+    assert_eq!(second_pass, [b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]);
+}
+
+#[test]
 fn dictionary_iteration_observes_future_mutations_without_revisiting_earlier_insertions() {
     let dictionary = Json::make_dictionary();
     dictionary
