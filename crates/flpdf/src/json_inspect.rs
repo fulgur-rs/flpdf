@@ -550,9 +550,9 @@ fn qpdf_resolve_top_level_object<R: Read + Seek>(
 ///
 /// Unlike [`Pdf::resolve`](crate::Pdf::resolve), this intentionally uses the
 /// qpdf JSON object-cache view, which can retain a historical xref stream that
-/// a newer xref section has freed. The owned return value keeps that internal
-/// resolver and its cache semantics out of the public API while allowing the
-/// CLI to write exactly the bytes named by a generated `datafile` entry.
+/// a newer xref section has freed. The owned return value lets callers inspect
+/// or persist the exact payload named by a qpdf JSON file-mode `datafile`
+/// entry while keeping that resolver and its cache semantics encapsulated.
 pub fn qpdf_raw_stream_payload<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     object_ref: ObjectRef,
