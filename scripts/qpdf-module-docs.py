@@ -359,6 +359,12 @@ def scan_modules(
                 f"{relative_path_posix!r}: line breaks are not allowed in module paths"
             )
         try:
+            relative_path_posix.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError(
+                f"{relative_path_posix!r}: module paths must be valid UTF-8"
+            ) from error
+        try:
             resolved_source_path = source_path.resolve(strict=True)
             _require_under_root(resolved_source_path, source_root, "source file")
             _require_under_root(resolved_source_path, repo_root, "source file")

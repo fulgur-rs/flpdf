@@ -444,6 +444,32 @@ class GeneratorTests(unittest.TestCase):
                     self.assertNotIn("\r", str(error.exception))
                     module_path.unlink()
 
+    def test_scan_rejects_non_utf8_module_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_root = root / "crates/flpdf/src"
+            source_root.mkdir(parents=True)
+            (source_root / "lib.rs").write_text(
+                "//! qpdf correspondence: crate root.\n",
+                encoding="utf-8",
+            )
+            # `pathlib` surrogate-escapes undecodable filename bytes, which
+            # would otherwise reach `render_index(...).encode("utf-8")` and
+            # abort with an uncaught UnicodeEncodeError.
+            undecodable_name = b"bad\xff.rs".decode("utf-8", "surrogateescape")
+            try:
+                (source_root / undecodable_name).write_text(
+                    "//! qpdf correspondence: undecodable name.\n",
+                    encoding="utf-8",
+                )
+            except (OSError, UnicodeEncodeError) as error:
+                self.skipTest(f"undecodable filenames unavailable: {error}")
+
+            with self.assertRaisesRegex(
+                ValueError, "module paths must be valid UTF-8"
+            ):
+                self.module.scan_modules(source_root, root)
+
     def test_scan_order_and_markdown_escaping_are_deterministic(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
