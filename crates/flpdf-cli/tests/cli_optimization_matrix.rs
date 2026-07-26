@@ -65,7 +65,7 @@ use flpdf::{
     filters::decode_stream_data,
     normalize_content_stream,
     pages::{page_content_bytes, page_refs},
-    ContentStreamParser, ContentToken, Object, Pdf,
+    parse_content_operations, Object, ParseControl, Pdf,
 };
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -336,16 +336,17 @@ fn coalesce_contents_merges_array_to_single_stream() {
     }
 }
 
-/// Collect `ContentToken::Op` entries (operator + operand values) from a content
-/// stream for semantic comparison (order-sensitive, but ignores whitespace
-/// differences).  InlineImage and Comment tokens are excluded because the
-/// coalesce fixture contains only text operators; excluding them keeps the
-/// filter consistent with the original while comparing full operand values.
-fn collect_content_tokens(bytes: &[u8]) -> Vec<ContentToken> {
-    ContentStreamParser::new(bytes)
-        .map(|t| t.expect("content stream must parse successfully"))
-        .filter(|t| matches!(t, ContentToken::Op { .. }))
-        .collect()
+/// Collect operation events (operator + operand values) from a content stream
+/// for semantic comparison (order-sensitive, but ignores whitespace
+/// differences). The coalesce fixture contains only text operators.
+fn collect_content_tokens(bytes: &[u8]) -> Vec<(Vec<Object>, Vec<u8>)> {
+    let mut tokens = Vec::new();
+    parse_content_operations(bytes, |operands, operator| {
+        tokens.push((operands.to_vec(), operator.to_vec()));
+        Ok(ParseControl::Continue)
+    })
+    .expect("content stream must parse successfully");
+    tokens
 }
 
 // ---------------------------------------------------------------------------

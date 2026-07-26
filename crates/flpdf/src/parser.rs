@@ -183,8 +183,8 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
     }
 
     /// Parse a single direct object at the current position (after leading
-    /// whitespace/comments). Re-exported for the content-stream tokenizer so it
-    /// can reuse the operand lexer without duplicating it.
+    /// whitespace/comments). Exact-byte overlay token filters use this to share
+    /// the parser's operand grammar.
     pub(crate) fn parse_one_object(&mut self) -> Result<Object> {
         self.object()
     }
