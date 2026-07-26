@@ -979,6 +979,8 @@ impl<K: TreeKey> NNTree<K> {
                 let item_number = if first {
                     0
                 } else {
+                    // qpdf 11.9.0 NNTreeIterator::deepen uses nitems - 2
+                    // verbatim, including value-slot selection in odd arrays.
                     items.len().saturating_sub(2)
                 };
                 cursor.leaf = Some(node);
