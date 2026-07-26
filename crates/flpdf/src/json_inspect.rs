@@ -7206,6 +7206,52 @@ mod tests {
         assert_eq!(entries[0].0, "inline");
     }
 
+    #[test]
+    fn attachments_repairs_direct_kid_in_indirect_names_holder() {
+        let mut pdf = load_one_page_pdf();
+        let mut filespec = Dictionary::new();
+        filespec.insert("F", Object::String(b"inline.txt".to_vec()));
+        filespec.insert("UF", Object::String(b"inline.txt".to_vec()));
+        let mut leaf = Dictionary::new();
+        leaf.insert(
+            "Limits",
+            Object::Array(vec![
+                Object::String(b"inline".to_vec()),
+                Object::String(b"inline".to_vec()),
+            ]),
+        );
+        leaf.insert(
+            "Names",
+            Object::Array(vec![
+                Object::String(b"inline".to_vec()),
+                Object::Dictionary(filespec),
+            ]),
+        );
+        let mut tree = Dictionary::new();
+        tree.insert("Kids", Object::Array(vec![Object::Dictionary(leaf)]));
+        let mut names = Dictionary::new();
+        names.insert("EmbeddedFiles", Object::Dictionary(tree));
+        let names_ref = crate::ObjectRef::new(902, 0);
+        pdf.set_object(names_ref, Object::Dictionary(names));
+        let catalog_ref = pdf.root_ref().expect("catalog ref");
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("catalog")
+            .as_dict()
+            .expect("catalog dict")
+            .clone();
+        catalog.insert("Names", Object::Reference(names_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let result = build_attachments_section(&mut pdf).expect("build attachments");
+
+        let JsonValue::Object(entries) = result else {
+            panic!("expected object"); // cov:ignore: test fixture shape guard
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "inline");
+    }
+
     // ── attachments Test 2: attachment-two-page.pdf → 1 entry ────────────────
 
     #[test]

@@ -1480,6 +1480,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(!h.remove_range(0).unwrap());
     }
 
     #[test]
