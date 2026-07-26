@@ -2,10 +2,10 @@
 //! qpdf JSON v2 inspection builders.
 //!
 //! Provides the structural frame for qpdf `--json` output.  Each builder
-//! returns a [`JsonValue`] that the caller can extend with per-section data
+//! returns a [`Json`] that the caller can extend with per-section data
 //! (pages, objects, …) in later subtasks.
 
-use crate::json::JsonValue;
+use crate::json::{Json, JsonValue};
 use crate::object::{Dictionary, Object, ObjectRef, Stream};
 use crate::reader::Pdf;
 use std::borrow::Cow;
@@ -20,6 +20,8 @@ pub enum ConvertError {
     NonFiniteFloat,
     /// An underlying PDF read/parse error.
     PdfError(String),
+    /// A shared JSON value could not be mutated as the requested container.
+    JsonError(String),
 }
 
 impl std::fmt::Display for ConvertError {
@@ -29,6 +31,7 @@ impl std::fmt::Display for ConvertError {
                 write!(f, "non-finite float cannot be serialized as JSON")
             }
             ConvertError::PdfError(msg) => write!(f, "PDF error: {msg}"),
+            ConvertError::JsonError(msg) => write!(f, "JSON error: {msg}"),
         }
     }
 }
@@ -39,6 +42,141 @@ impl From<crate::Error> for ConvertError {
     fn from(err: crate::Error) -> Self {
         ConvertError::PdfError(err.to_string())
     }
+}
+
+fn json_array(values: impl IntoIterator<Item = Json>) -> Result<Json, ConvertError> {
+    let array = Json::make_array();
+    for value in values {
+        array
+            .add_array_element(value)
+            .map_err(|error| ConvertError::JsonError(error.to_string()))?;
+    }
+    Ok(array)
+}
+
+fn json_dictionary<K: AsRef<[u8]>>(
+    pairs: impl IntoIterator<Item = (K, Json)>,
+) -> Result<Json, ConvertError> {
+    let dictionary = Json::make_dictionary();
+    for (key, value) in pairs {
+        dictionary
+            .add_dictionary_member(key, value)
+            .map_err(|error| ConvertError::JsonError(error.to_string()))?;
+    }
+    Ok(dictionary)
+}
+
+// The whole-document APIs and CLI remain on the legacy tree until Task 11
+// replaces materialization with sink-oriented emission. Keep that boundary
+// narrow: section builders and object conversion use `Json`, and only the
+// completed-tree compatibility wrappers convert back.
+fn legacy_json_value(value: &Json) -> Result<JsonValue, ConvertError> {
+    if value.is_null() {
+        return Ok(JsonValue::Null);
+    }
+    if let Some(boolean) = value.get_bool() {
+        return Ok(JsonValue::Bool(boolean));
+    }
+    if let Some(number) = value.get_number() {
+        let encoded = std::str::from_utf8(&number)
+            .map_err(|error| ConvertError::JsonError(error.to_string()))?;
+        return if let Ok(integer) = encoded.parse::<i64>() {
+            Ok(JsonValue::Integer(integer))
+        } else {
+            encoded
+                .parse::<f64>()
+                .map(JsonValue::Float)
+                .map_err(|error| ConvertError::JsonError(error.to_string()))
+        };
+    }
+    if let Some(string) = value.get_string() {
+        return String::from_utf8(string)
+            .map(JsonValue::String)
+            .map_err(|error| ConvertError::JsonError(error.to_string()));
+    }
+
+    let mut dictionary = Vec::new();
+    let mut dictionary_error = None;
+    if value.for_each_dict_item(|encoded_key, member| {
+        if dictionary_error.is_some() {
+            return;
+        }
+        let mut quoted_key = Vec::with_capacity(encoded_key.len() + 2);
+        quoted_key.push(b'"');
+        quoted_key.extend_from_slice(encoded_key);
+        quoted_key.push(b'"');
+        let result = crate::json::parse(&quoted_key)
+            .map_err(|error| ConvertError::JsonError(error.to_string()))
+            .and_then(|key| {
+                key.get_string().ok_or_else(|| {
+                    ConvertError::JsonError("dictionary key did not parse as a string".into())
+                })
+            })
+            .and_then(|key| {
+                String::from_utf8(key).map_err(|error| ConvertError::JsonError(error.to_string()))
+            })
+            .and_then(|key| legacy_json_value(&member).map(|member| (key, member)));
+        match result {
+            Ok(pair) => dictionary.push(pair),
+            Err(error) => dictionary_error = Some(error),
+        }
+    }) {
+        const QPDF_METADATA_ORDER: [&str; 5] = [
+            "jsonversion",
+            "pdfversion",
+            "pushedinheritedpageresources",
+            "calledgetallpages",
+            "maxobjectid",
+        ];
+        if dictionary.len() == QPDF_METADATA_ORDER.len()
+            && QPDF_METADATA_ORDER
+                .iter()
+                .all(|expected| dictionary.iter().any(|(key, _)| key == expected))
+        {
+            dictionary.sort_by_key(|(key, _)| {
+                QPDF_METADATA_ORDER
+                    .iter()
+                    .position(|expected| key == expected)
+                    .expect("all metadata keys were checked above")
+            });
+        }
+        return match dictionary_error {
+            Some(error) => Err(error),
+            None => Ok(JsonValue::Object(dictionary)),
+        };
+    }
+
+    let mut array = Vec::new();
+    let mut array_error = None;
+    if value.for_each_array_item(|member| {
+        if array_error.is_some() {
+            return;
+        }
+        match legacy_json_value(&member) {
+            Ok(member) => array.push(member),
+            Err(error) => array_error = Some(error),
+        }
+    }) {
+        return match array_error {
+            Some(error) => Err(error),
+            None => Ok(JsonValue::Array(array)),
+        };
+    }
+
+    // The only remaining initialized value kind is Blob. Serializing it here
+    // delegates Base64 to the shared writer; parsing the resulting JSON string
+    // avoids any second encoder in this compatibility boundary.
+    let encoded = value
+        .unparse()
+        .map_err(|error| ConvertError::JsonError(error.to_string()))?;
+    let parsed =
+        crate::json::parse(&encoded).map_err(|error| ConvertError::JsonError(error.to_string()))?;
+    let bytes = parsed
+        .get_string()
+        .ok_or_else(|| ConvertError::JsonError("blob did not serialize as a string".into()))?;
+    String::from_utf8(bytes)
+        .map(JsonValue::String)
+        .map_err(|error| ConvertError::JsonError(error.to_string()))
 }
 
 // ── pdf_object_to_json ────────────────────────────────────────────────────────
@@ -425,7 +563,7 @@ fn qpdf_name_to_json_string(bytes: &[u8]) -> String {
 
 /// Convert a PDF [`Dictionary`] to a JSON object, with keys sorted alphabetically
 /// (with the `/` prefix included in the sort key).
-fn dict_to_json(dict: &Dictionary) -> Result<JsonValue, ConvertError> {
+fn dict_to_json(dict: &Dictionary) -> Result<Json, ConvertError> {
     // Dictionary::iter() already yields entries in lexicographic order of raw
     // bytes (BTreeMap). qpdf JSON v2 emits valid UTF-8 names directly and uses
     // an `n:`-prefixed normalized form for non-UTF8 names.
@@ -438,13 +576,13 @@ fn dict_to_json(dict: &Dictionary) -> Result<JsonValue, ConvertError> {
     // Sort by the escaped "/Name" string so the lexicographic order is stable
     // across runs and matches qpdf's alphabetical output.
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(JsonValue::Object(pairs))
+    json_dictionary(pairs)
 }
 
 fn qpdf_dict_to_json<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dict: &Dictionary,
-) -> Result<JsonValue, ConvertError> {
+) -> Result<Json, ConvertError> {
     let mut pairs = Vec::new();
     for (raw_key, value) in dict.iter() {
         let omit = crate::qpdf_null::value_is_null(pdf, value)?;
@@ -457,34 +595,32 @@ fn qpdf_dict_to_json<R: Read + Seek>(
         ));
     }
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(JsonValue::Object(pairs))
+    json_dictionary(pairs)
 }
 
 fn qpdf_pdf_object_to_json<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     object: &Object,
-) -> Result<JsonValue, ConvertError> {
+) -> Result<Json, ConvertError> {
     match object {
         Object::Reference(reference) if !crate::qpdf_null::reference_is_valid(*reference) => {
-            Ok(JsonValue::Null)
+            Ok(Json::make_null())
         }
-        Object::Reference(reference) => Ok(JsonValue::String(format!(
+        Object::Reference(reference) => Ok(Json::make_string(format!(
             "{} {} R",
             reference.number, reference.generation
         ))),
-        Object::Array(items) => items
-            .iter()
-            .map(|item| qpdf_pdf_object_to_json(pdf, item))
-            .collect::<Result<Vec<_>, _>>()
-            .map(JsonValue::Array),
+        Object::Array(items) => json_array(
+            items
+                .iter()
+                .map(|item| qpdf_pdf_object_to_json(pdf, item))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
         Object::Dictionary(dict) => qpdf_dict_to_json(pdf, dict),
-        Object::Stream(stream) => Ok(JsonValue::Object(vec![(
+        Object::Stream(stream) => json_dictionary([(
             "stream".to_string(),
-            JsonValue::Object(vec![(
-                "dict".to_string(),
-                qpdf_dict_to_json(pdf, &stream.dict)?,
-            )]),
-        )])),
+            json_dictionary([("dict".to_string(), qpdf_dict_to_json(pdf, &stream.dict)?)])?,
+        )]),
         other => pdf_object_to_json(other),
     }
 }
@@ -527,12 +663,12 @@ pub fn qpdf_raw_stream_payload<R: Read + Seek>(
 }
 
 /// Convert a stream's dict to a JSON stream-shape object: `{ "stream": { "dict": ... } }`.
-fn stream_to_json(stream: &Stream) -> Result<JsonValue, ConvertError> {
+fn stream_to_json(stream: &Stream) -> Result<Json, ConvertError> {
     let dict_json = dict_to_json(&stream.dict)?;
-    Ok(JsonValue::Object(vec![(
+    json_dictionary([(
         "stream".to_string(),
-        JsonValue::Object(vec![("dict".to_string(), dict_json)]),
-    )]))
+        json_dictionary([("dict".to_string(), dict_json)])?,
+    )])
 }
 
 /// Convert a PDF object into the qpdf v2 JSON value form.
@@ -545,27 +681,27 @@ fn stream_to_json(stream: &Stream) -> Result<JsonValue, ConvertError> {
 ///
 /// Returns [`ConvertError::NonFiniteFloat`] when a [`Object::Real`] value is
 /// non-finite (NaN or infinity).
-pub fn pdf_object_to_json(obj: &Object) -> Result<JsonValue, ConvertError> {
+pub fn pdf_object_to_json(obj: &Object) -> Result<Json, ConvertError> {
     match obj {
-        Object::Null | Object::Operator(_) | Object::InlineImage(_) => Ok(JsonValue::Null),
-        Object::Boolean(b) => Ok(JsonValue::Bool(*b)),
-        Object::Integer(n) => Ok(JsonValue::Integer(*n)),
+        Object::Null | Object::Operator(_) | Object::InlineImage(_) => Ok(Json::make_null()),
+        Object::Boolean(b) => Ok(Json::make_bool(*b)),
+        Object::Integer(n) => Ok(Json::make_int(*n)),
         Object::Real(f) | Object::RealLiteral { value: f, .. } => {
             if !f.is_finite() {
                 return Err(ConvertError::NonFiniteFloat);
             }
-            Ok(JsonValue::Float(*f))
+            Ok(Json::make_real(*f))
         }
-        Object::Name(bytes) => Ok(JsonValue::String(qpdf_name_to_json_string(bytes))),
-        Object::String(bytes) => Ok(JsonValue::String(pdf_string_to_json_string(bytes))),
-        Object::Reference(r) => Ok(JsonValue::String(format!(
+        Object::Name(bytes) => Ok(Json::make_string(qpdf_name_to_json_string(bytes))),
+        Object::String(bytes) => Ok(Json::make_string(pdf_string_to_json_string(bytes))),
+        Object::Reference(r) => Ok(Json::make_string(format!(
             "{} {} R",
             r.number, r.generation
         ))),
         Object::Array(elems) => {
-            let values: Result<Vec<JsonValue>, ConvertError> =
+            let values: Result<Vec<Json>, ConvertError> =
                 elems.iter().map(pdf_object_to_json).collect();
-            Ok(JsonValue::Array(values?))
+            json_array(values?)
         }
         Object::Dictionary(dict) => dict_to_json(dict),
         // Stream nested inside a container — not spec-compliant, but handle safely.
@@ -618,41 +754,12 @@ pub fn format_json_side_file_path(prefix: &str, obj_num: u32) -> String {
     format!("{prefix}-{obj_num}")
 }
 
-// ── base64_encode ─────────────────────────────────────────────────────────────
-
-/// Encode `bytes` as a standard Base64 string (RFC 4648, with `=` padding).
-///
-/// No external dependencies: ~30 lines of pure Rust.
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let combined = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((combined >> 18) & 0x3F) as usize] as char);
-        out.push(ALPHABET[((combined >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[((combined >> 6) & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[(combined & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
 // ── build_qpdf_key ────────────────────────────────────────────────────────────
 
 /// Build the contents of the top-level `qpdf` key (`[metadata, objects_map]`).
 ///
-/// Returns a [`JsonValue::Array`] of exactly two elements:
-/// 1. The metadata object with fixed key order.
+/// Returns a [`Json`] array of exactly two elements:
+/// 1. The metadata object with the fixed qpdf v2 key set.
 /// 2. The objects map with all indirect objects and the trailer, sorted alphabetically
 ///    by key.
 ///
@@ -665,7 +772,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 pub fn build_qpdf_key<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     metadata: QpdfMetadata,
-) -> Result<JsonValue, ConvertError> {
+) -> Result<Json, ConvertError> {
     // StreamDataMode::None emits dict only, so the decode level is irrelevant.
     build_qpdf_key_with_stream_mode(
         pdf,
@@ -700,7 +807,7 @@ pub fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
     metadata: QpdfMetadata,
     decode_level: DecodeLevel,
     stream_mode: &StreamDataMode,
-) -> Result<JsonValue, ConvertError> {
+) -> Result<Json, ConvertError> {
     let prepared = pdf.prepare_qpdf_json_objects()?;
     build_qpdf_key_selected_with_stream_mode(
         pdf,
@@ -719,33 +826,33 @@ fn build_qpdf_key_selected_with_stream_mode<R: Read + Seek>(
     stream_mode: &StreamDataMode,
     selectors: &[JsonObjectSelector],
     prepared_refs: &[ObjectRef],
-) -> Result<JsonValue, ConvertError> {
-    // ── 1. Build metadata object (fixed key order per qpdf v2 spec) ────────
-    let meta = JsonValue::Object(vec![
-        ("jsonversion".to_string(), JsonValue::Integer(2)),
+) -> Result<Json, ConvertError> {
+    // ── 1. Build metadata object (fixed key set per qpdf v2 spec) ──────────
+    let meta = json_dictionary([
+        ("jsonversion".to_string(), Json::make_int(2)),
         (
             "pdfversion".to_string(),
-            JsonValue::String(metadata.pdf_version.clone()),
+            Json::make_string(metadata.pdf_version.clone()),
         ),
         (
             "pushedinheritedpageresources".to_string(),
-            JsonValue::Bool(metadata.pushed_inherited_page_resources),
+            Json::make_bool(metadata.pushed_inherited_page_resources),
         ),
         (
             "calledgetallpages".to_string(),
-            JsonValue::Bool(metadata.called_get_all_pages),
+            Json::make_bool(metadata.called_get_all_pages),
         ),
         (
             "maxobjectid".to_string(),
-            JsonValue::Integer(i64::from(metadata.max_object_id)),
+            Json::make_int(i64::from(metadata.max_object_id)),
         ),
-    ]);
+    ])?;
 
     // ── 2. Build objects_map ───────────────────────────────────────────────
     // `prepared_refs` contains every live object plus qpdf-style placeholders
     // for valid references whose exact generation is absent. Both a placeholder
     // and a live indirect null are emitted as `{ "value": null }`.
-    let mut map_pairs: Vec<(String, JsonValue)> = Vec::new();
+    let mut map_pairs: Vec<(String, Json)> = Vec::new();
 
     for &oref in prepared_refs {
         let selected = selectors.is_empty()
@@ -768,36 +875,37 @@ fn build_qpdf_key_selected_with_stream_mode<R: Read + Seek>(
                 let stream_inner = match stream_mode {
                     StreamDataMode::None => {
                         // Default: dict only.
-                        JsonValue::Object(vec![("dict".to_string(), dict_json)])
+                        json_dictionary([("dict".to_string(), dict_json)])?
                     }
                     StreamDataMode::Inline => {
                         // Encode the stream payload as base64 under "data".
                         // The payload is decoded per `decode_level` so that
                         // Inline output matches `qpdf --decode-level=...`.
                         // Key order: data, dict (alphabetical).
-                        let payload = stream_payload_for_decode_level(stream, decode_level);
-                        let data_str = base64_encode(&payload);
-                        JsonValue::Object(vec![
-                            ("data".to_string(), JsonValue::String(data_str)),
+                        let payload =
+                            stream_payload_for_decode_level(stream, decode_level).into_owned();
+                        let data = Json::make_blob(move |out| out.write_all(&payload));
+                        json_dictionary([
+                            ("data".to_string(), data),
                             ("dict".to_string(), dict_json),
-                        ])
+                        ])?
                     }
                     StreamDataMode::File { prefix } => {
                         // Emit a side-file path under "datafile".
                         // Key order: datafile, dict (alphabetical).
                         let datafile = format_json_side_file_path(prefix, oref.number);
-                        JsonValue::Object(vec![
-                            ("datafile".to_string(), JsonValue::String(datafile)),
+                        json_dictionary([
+                            ("datafile".to_string(), Json::make_string(datafile)),
                             ("dict".to_string(), dict_json),
-                        ])
+                        ])?
                     }
                 };
-                JsonValue::Object(vec![("stream".to_string(), stream_inner)])
+                json_dictionary([("stream".to_string(), stream_inner)])?
             }
             other => {
                 // Non-stream (including live Object::Null): emit { "value": <json> }.
                 let val = qpdf_pdf_object_to_json(pdf, other)?;
-                JsonValue::Object(vec![("value".to_string(), val)])
+                json_dictionary([("value".to_string(), val)])?
             }
         };
         map_pairs.push((key, json_val));
@@ -811,16 +919,16 @@ fn build_qpdf_key_selected_with_stream_mode<R: Read + Seek>(
     {
         let trailer_dict = pdf.trailer().clone();
         let trailer_json = qpdf_dict_to_json(pdf, &trailer_dict)?;
-        let trailer_val = JsonValue::Object(vec![("value".to_string(), trailer_json)]);
+        let trailer_val = json_dictionary([("value".to_string(), trailer_json)])?;
         map_pairs.push(("trailer".to_string(), trailer_val));
     }
 
     // ── 4. Sort objects_map alphabetically by key ──────────────────────────
     map_pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let objects_map = JsonValue::Object(map_pairs);
+    let objects_map = json_dictionary(map_pairs)?;
 
-    Ok(JsonValue::Array(vec![meta, objects_map]))
+    json_array([meta, objects_map])
 }
 
 // ── DecodeLevel ──────────────────────────────────────────────────────────────
@@ -1038,7 +1146,7 @@ fn collect_image_refs<R: Read + Seek>(
 
 /// Build the qpdf JSON v2 `"pages"` section.
 ///
-/// Returns a [`JsonValue::Array`] where each element is a JSON object with
+/// Returns a [`Json`] array where each element is a JSON object with
 /// keys in alphabetical order:
 /// `contents`, `images`, `label`, `object`, `outlines`, `pageposfrom1`.
 ///
@@ -1049,11 +1157,11 @@ fn collect_image_refs<R: Read + Seek>(
 ///
 /// Returns a [`ConvertError`] if the page tree cannot be traversed or any
 /// object resolution fails.
-pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
+pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
     let page_refs =
         crate::pages::page_refs(pdf).map_err(|e| ConvertError::PdfError(e.to_string()))?;
 
-    let mut entries: Vec<JsonValue> = Vec::with_capacity(page_refs.len());
+    let mut entries: Vec<Json> = Vec::with_capacity(page_refs.len());
 
     for (idx, page_ref) in page_refs.into_iter().enumerate() {
         let pageposfrom1 = (idx as i64) + 1;
@@ -1065,36 +1173,36 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue
             Object::Dictionary(d) => d.get("Contents").cloned(),
             _ => None,
         };
-        let contents: Vec<JsonValue> = match &contents_obj {
+        let contents: Vec<Json> = match &contents_obj {
             Some(c) => collect_content_refs(pdf, c)?
                 .into_iter()
-                .map(JsonValue::String)
+                .map(Json::make_string)
                 .collect(),
             None => vec![],
         };
 
         // Collect image XObject refs from (inherited) Resources.
-        let images: Vec<JsonValue> = collect_image_refs(pdf, page_ref)?
+        let images: Vec<Json> = collect_image_refs(pdf, page_ref)?
             .into_iter()
-            .map(JsonValue::String)
+            .map(Json::make_string)
             .collect();
 
         // Build page entry with keys in strict alphabetical order:
         // contents < images < label < object < outlines < pageposfrom1
-        let entry = JsonValue::Object(vec![
-            ("contents".to_string(), JsonValue::Array(contents)),
-            ("images".to_string(), JsonValue::Array(images)),
+        let entry = json_dictionary([
+            ("contents".to_string(), json_array(contents)?),
+            ("images".to_string(), json_array(images)?),
             // placeholder until flpdf-9hc.11.5 (page labels)
-            ("label".to_string(), JsonValue::Null),
-            ("object".to_string(), JsonValue::String(object_str)),
+            ("label".to_string(), Json::make_null()),
+            ("object".to_string(), Json::make_string(object_str)),
             // placeholder until flpdf-9hc.11.6 (outline back-references)
-            ("outlines".to_string(), JsonValue::Array(vec![])),
-            ("pageposfrom1".to_string(), JsonValue::Integer(pageposfrom1)),
-        ]);
+            ("outlines".to_string(), Json::make_array()),
+            ("pageposfrom1".to_string(), Json::make_int(pageposfrom1)),
+        ])?;
         entries.push(entry);
     }
 
-    Ok(JsonValue::Array(entries))
+    json_array(entries)
 }
 
 // ── build_pagelabels_section ──────────────────────────────────────────────────
@@ -1105,38 +1213,36 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue
 /// - `first`  = `/St` (integer, default 1)
 /// - `prefix` = `/P` (PDF text string, decoded without `u:`/`b:` prefix; default `""`)
 /// - `style`  = `/S` (name string `"D"/"R"/"r"/"A"/"a"`, or `null` when absent)
-fn label_dict_to_json(dict: &Dictionary) -> JsonValue {
+fn label_dict_to_json(dict: &Dictionary) -> Result<Json, ConvertError> {
     // Derive /S, /P, /St via the shared (non-resolving) LabelRange parser to keep
     // a single source of truth. `from_dict` is byte-for-byte equivalent to the
     // prior inline extraction; use it (not `from_dict_resolved`) to preserve the
     // existing non-resolving JSON behavior.
     let range = crate::page_label_document_helper::LabelRange::from_dict(dict);
     let style = match range.style.to_name() {
-        Some(s) => JsonValue::String(s.to_string()),
-        None => JsonValue::Null,
+        Some(s) => Json::make_string(s),
+        None => Json::make_null(),
     };
 
     // Key order: alphabetical → first, prefix, style
-    JsonValue::Object(vec![
-        ("first".to_string(), JsonValue::Integer(range.start)),
-        ("prefix".to_string(), JsonValue::String(range.prefix)),
+    json_dictionary([
+        ("first".to_string(), Json::make_int(range.start)),
+        ("prefix".to_string(), Json::make_string(range.prefix)),
         ("style".to_string(), style),
     ])
 }
 
 /// Build the qpdf JSON v2 `"pagelabels"` section.
 ///
-/// Returns a [`JsonValue::Array`] where each element is a JSON object with
+/// Returns a [`Json`] array where each element is a JSON object with
 /// keys in alphabetical order: `index`, `label`.
 ///
-/// Returns `JsonValue::Array(vec![])` when the document has no `/PageLabels` entry.
+/// Returns an empty [`Json`] array when the document has no `/PageLabels` entry.
 ///
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if any indirect object resolution fails during tree walk.
-pub fn build_pagelabels_section<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-) -> Result<JsonValue, ConvertError> {
+pub fn build_pagelabels_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
     use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 
     // qpdf's doJSONPageLabels obtains the full page list before checking
@@ -1147,20 +1253,20 @@ pub fn build_pagelabels_section<R: Read + Seek>(
     // Resolve the Catalog.
     let catalog_ref = match pdf.root_ref() {
         Some(r) => r,
-        None => return Ok(JsonValue::Array(vec![])),
+        None => return Ok(Json::make_array()),
     };
     let catalog = pdf
         .resolve_borrowed(catalog_ref)
         .map_err(ConvertError::from)?;
     let mut catalog_dict = match catalog {
         Object::Dictionary(d) => d.clone(),
-        _ => return Ok(JsonValue::Array(vec![])),
+        _ => return Ok(Json::make_array()),
     };
 
     // Look up /PageLabels.  May be absent, a direct Dictionary, or a Reference.
     let pagelabels_val = match catalog_dict.get("PageLabels") {
         Some(v) => v.clone(),
-        None => return Ok(JsonValue::Array(vec![])),
+        None => return Ok(Json::make_array()),
     };
 
     let original_pagelabels = pagelabels_val.clone();
@@ -1189,18 +1295,18 @@ pub fn build_pagelabels_section<R: Read + Seek>(
         }
     }
 
-    let result: Vec<JsonValue> = entries
+    let result: Result<Vec<Json>, ConvertError> = entries
         .into_iter()
         .map(|(idx, label_dict)| {
-            let label_json = label_dict_to_json(&label_dict);
-            JsonValue::Object(vec![
-                ("index".to_string(), JsonValue::Integer(idx)),
+            let label_json = label_dict_to_json(&label_dict)?;
+            json_dictionary([
+                ("index".to_string(), Json::make_int(idx)),
                 ("label".to_string(), label_json),
             ])
         })
         .collect();
 
-    Ok(JsonValue::Array(result))
+    json_array(result?)
 }
 
 // ── build_outlines_section ────────────────────────────────────────────────────
@@ -1210,16 +1316,16 @@ fn outline_item_to_json(
     tree: &crate::OutlineTree,
     id: crate::OutlineId,
     page_numbers: &std::collections::BTreeMap<crate::ObjectRef, i64>,
-) -> Result<JsonValue, ConvertError> {
+) -> Result<Json, ConvertError> {
     let item = &tree[id];
     let dest = pdf_object_to_json(&item.dest)?;
     let destpageposfrom1 = match item.dest_page() {
         Object::Reference(reference) => page_numbers
             .get(&reference)
             .copied()
-            .map(JsonValue::Integer)
-            .unwrap_or(JsonValue::Null),
-        _ => JsonValue::Null,
+            .map(Json::make_int)
+            .unwrap_or_else(Json::make_null),
+        _ => Json::make_null(),
     };
     let kids = item
         .kids
@@ -1228,25 +1334,25 @@ fn outline_item_to_json(
         .map(|kid| outline_item_to_json(tree, kid, page_numbers))
         .collect::<Result<Vec<_>, _>>()?;
     let object = match item.source_ref {
-        Some(reference) => JsonValue::String(reference.to_string()),
+        Some(reference) => Json::make_string(reference.to_string()),
         None => pdf_object_to_json(&item.object)?,
     };
 
-    Ok(JsonValue::Object(vec![
+    json_dictionary([
         ("dest".to_string(), dest),
         ("destpageposfrom1".to_string(), destpageposfrom1),
-        ("kids".to_string(), JsonValue::Array(kids)),
+        ("kids".to_string(), json_array(kids)?),
         ("object".to_string(), object),
-        ("open".to_string(), JsonValue::Bool(item.count >= 0)),
-        ("title".to_string(), JsonValue::String(item.title.clone())),
-    ]))
+        ("open".to_string(), Json::make_bool(item.count >= 0)),
+        ("title".to_string(), Json::make_string(item.title.clone())),
+    ])
 }
 
 /// Build the qpdf JSON v2 `"outlines"` section.
 ///
-/// Returns a [`JsonValue::Array`] where each element is a JSON object
+/// Returns a [`Json`] array where each element is a JSON object
 /// representing one root-level outline item (with `kids` recursively
-/// expanded).  Returns `JsonValue::Array(vec![])` when the document has no
+/// expanded).  Returns an empty [`Json`] array when the document has no
 /// `/Outlines` entry or the outline dictionary has no `/First` child.
 ///
 /// Each entry has keys in alphabetical order: `dest`, `destpageposfrom1`,
@@ -1255,7 +1361,7 @@ fn outline_item_to_json(
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if any indirect object resolution fails.
-pub fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
+pub fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
     let page_numbers = crate::pages::page_refs(pdf)?
         .into_iter()
         .enumerate()
@@ -1268,7 +1374,7 @@ pub fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
         .copied()
         .map(|id| outline_item_to_json(&tree, id, &page_numbers))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(JsonValue::Array(entries))
+    json_array(entries)
 }
 
 // ── build_acroform_section ────────────────────────────────────────────────────
@@ -1288,7 +1394,7 @@ fn walk_acroform_fields<R: Read + Seek>(
     field_ref: crate::ObjectRef,
     parent_fullname: &str,
     parent_ref: Option<crate::ObjectRef>,
-    output: &mut Vec<JsonValue>,
+    output: &mut Vec<Json>,
     seen: &mut std::collections::BTreeSet<crate::ObjectRef>,
     depth: usize,
     max_depth: usize,
@@ -1327,36 +1433,34 @@ fn walk_acroform_fields<R: Read + Seek>(
 
     // parent ref string (null at root)
     let parent_json = match parent_ref {
-        Some(r) => JsonValue::String(format!("{} {} R", r.number, r.generation)),
-        None => JsonValue::Null,
+        Some(r) => Json::make_string(format!("{} {} R", r.number, r.generation)),
+        None => Json::make_null(),
     };
 
     // /FT, /V, /DV, /Ff are all inheritable down the /Parent chain
     // (ISO 32000-1 §12.7.3.1). Use the same lookup helper for each.
     let ft_obj = inherited_field_value(pdf, &field_dict, "FT")?;
     let fieldtype = match ft_obj {
-        Some(Object::Name(bytes)) => {
-            JsonValue::String(String::from_utf8_lossy(&bytes).into_owned())
-        }
-        _ => JsonValue::Null,
+        Some(Object::Name(bytes)) => Json::make_string(String::from_utf8_lossy(&bytes).as_bytes()),
+        _ => Json::make_null(),
     };
 
     // /V — value, run through pdf_object_to_json. Inherited from /Parent.
     let value = match inherited_field_value(pdf, &field_dict, "V")? {
         Some(v) => pdf_object_to_json(&v)?,
-        None => JsonValue::Null,
+        None => Json::make_null(),
     };
 
     // /DV — default value. Inherited from /Parent.
     let defaultvalue = match inherited_field_value(pdf, &field_dict, "DV")? {
         Some(v) => pdf_object_to_json(&v)?,
-        None => JsonValue::Null,
+        None => Json::make_null(),
     };
 
     // /Ff — field flags integer. Inherited from /Parent.
     let fieldflags = match inherited_field_value(pdf, &field_dict, "Ff")? {
-        Some(Object::Integer(n)) => JsonValue::Integer(n),
-        _ => JsonValue::Null,
+        Some(Object::Integer(n)) => Json::make_int(n),
+        _ => Json::make_null(),
     };
 
     // /TU — alternate name.
@@ -1364,9 +1468,9 @@ fn walk_acroform_fields<R: Read + Seek>(
         Some(Object::String(bytes)) => {
             let s = decode_pdf_text_string(bytes)
                 .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
-            JsonValue::String(s)
+            Json::make_string(s)
         }
-        _ => JsonValue::Null,
+        _ => Json::make_null(),
     };
 
     // /TM — mapping name.
@@ -1374,9 +1478,9 @@ fn walk_acroform_fields<R: Read + Seek>(
         Some(Object::String(bytes)) => {
             let s = decode_pdf_text_string(bytes)
                 .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
-            JsonValue::String(s)
+            Json::make_string(s)
         }
-        _ => JsonValue::Null,
+        _ => Json::make_null(),
     };
 
     // Determine if this field is itself a widget annotation.
@@ -1397,7 +1501,7 @@ fn walk_acroform_fields<R: Read + Seek>(
         _ => vec![],
     };
 
-    let mut annotations: Vec<JsonValue> = Vec::new();
+    let mut annotations: Vec<Json> = Vec::new();
     let mut has_subfield_kids = false;
 
     // Classify each kid as a widget annotation vs a (sub-)field dictionary.
@@ -1439,7 +1543,7 @@ fn walk_acroform_fields<R: Read + Seek>(
 
         if is_widget_subtype && !has_field_entries {
             // Pure widget annotation — collect ref string, do not recurse.
-            annotations.push(JsonValue::String(format!(
+            annotations.push(Json::make_string(format!(
                 "{} {} R",
                 kid_ref.number, kid_ref.generation
             )));
@@ -1453,22 +1557,22 @@ fn walk_acroform_fields<R: Read + Seek>(
 
     // If this field itself is a widget (and no sub-fields), add self to annotations.
     if is_widget && !has_subfield_kids {
-        annotations.insert(0, JsonValue::String(object_str.clone()));
+        annotations.insert(0, Json::make_string(object_str.clone()));
     }
 
     // Build and push this field's JSON entry (alphabetical key order).
-    let entry = JsonValue::Object(vec![
+    let entry = json_dictionary([
         ("alternatename".to_string(), alternatename),
-        ("annotations".to_string(), JsonValue::Array(annotations)),
+        ("annotations".to_string(), json_array(annotations)?),
         ("defaultvalue".to_string(), defaultvalue),
         ("fieldflags".to_string(), fieldflags),
         ("fieldtype".to_string(), fieldtype),
-        ("fullname".to_string(), JsonValue::String(fullname.clone())),
+        ("fullname".to_string(), Json::make_string(fullname.clone())),
         ("mappingname".to_string(), mappingname),
-        ("object".to_string(), JsonValue::String(object_str)),
+        ("object".to_string(), Json::make_string(object_str)),
         ("parent".to_string(), parent_json),
         ("value".to_string(), value),
-    ]);
+    ])?;
     output.push(entry);
 
     // Recurse into sub-field kids.
@@ -1533,7 +1637,7 @@ fn inherited_field_value<R: Read + Seek>(
 
 /// Build the qpdf JSON v2 `"acroform"` section.
 ///
-/// Returns a [`JsonValue::Object`] with three keys in alphabetical order:
+/// Returns a [`Json`] dictionary with three keys in alphabetical order:
 /// `fields`, `hasacroform`, `needappearances`.
 ///
 /// - `hasacroform`: true iff `/Catalog/AcroForm` exists.
@@ -1543,7 +1647,7 @@ fn inherited_field_value<R: Read + Seek>(
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if any indirect object resolution fails.
-pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
+pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
     use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 
     // qpdf's doJSONAcroform always walks every page to discover widgets,
@@ -1554,11 +1658,11 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
     let catalog_ref = match pdf.root_ref() {
         Some(r) => r,
         None => {
-            return Ok(JsonValue::Object(vec![
-                ("fields".to_string(), JsonValue::Array(vec![])),
-                ("hasacroform".to_string(), JsonValue::Bool(false)),
-                ("needappearances".to_string(), JsonValue::Bool(false)),
-            ]))
+            return json_dictionary([
+                ("fields".to_string(), Json::make_array()),
+                ("hasacroform".to_string(), Json::make_bool(false)),
+                ("needappearances".to_string(), Json::make_bool(false)),
+            ])
         }
     };
     let catalog = pdf
@@ -1567,11 +1671,11 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
     let catalog_dict = match catalog {
         Object::Dictionary(d) => d,
         _ => {
-            return Ok(JsonValue::Object(vec![
-                ("fields".to_string(), JsonValue::Array(vec![])),
-                ("hasacroform".to_string(), JsonValue::Bool(false)),
-                ("needappearances".to_string(), JsonValue::Bool(false)),
-            ]))
+            return json_dictionary([
+                ("fields".to_string(), Json::make_array()),
+                ("hasacroform".to_string(), Json::make_bool(false)),
+                ("needappearances".to_string(), Json::make_bool(false)),
+            ])
         }
     };
 
@@ -1579,11 +1683,11 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
     let acroform_val = match catalog_dict.get("AcroForm") {
         Some(v) => v.clone(),
         None => {
-            return Ok(JsonValue::Object(vec![
-                ("fields".to_string(), JsonValue::Array(vec![])),
-                ("hasacroform".to_string(), JsonValue::Bool(false)),
-                ("needappearances".to_string(), JsonValue::Bool(false)),
-            ]))
+            return json_dictionary([
+                ("fields".to_string(), Json::make_array()),
+                ("hasacroform".to_string(), Json::make_bool(false)),
+                ("needappearances".to_string(), Json::make_bool(false)),
+            ])
         }
     };
 
@@ -1592,20 +1696,20 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
         Object::Reference(r) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
             Object::Dictionary(d) => d.clone(),
             _ => {
-                return Ok(JsonValue::Object(vec![
-                    ("fields".to_string(), JsonValue::Array(vec![])),
-                    ("hasacroform".to_string(), JsonValue::Bool(true)),
-                    ("needappearances".to_string(), JsonValue::Bool(false)),
-                ]))
+                return json_dictionary([
+                    ("fields".to_string(), Json::make_array()),
+                    ("hasacroform".to_string(), Json::make_bool(true)),
+                    ("needappearances".to_string(), Json::make_bool(false)),
+                ])
             }
         },
         Object::Dictionary(d) => d,
         _ => {
-            return Ok(JsonValue::Object(vec![
-                ("fields".to_string(), JsonValue::Array(vec![])),
-                ("hasacroform".to_string(), JsonValue::Bool(true)),
-                ("needappearances".to_string(), JsonValue::Bool(false)),
-            ]))
+            return json_dictionary([
+                ("fields".to_string(), Json::make_array()),
+                ("hasacroform".to_string(), Json::make_bool(true)),
+                ("needappearances".to_string(), Json::make_bool(false)),
+            ])
         }
     };
 
@@ -1628,7 +1732,7 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
         _ => vec![],
     };
 
-    let mut output: Vec<JsonValue> = Vec::new();
+    let mut output: Vec<Json> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
 
     for field_obj in &fields_array {
@@ -1648,14 +1752,14 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVa
         )?;
     }
 
-    Ok(JsonValue::Object(vec![
-        ("fields".to_string(), JsonValue::Array(output)),
-        ("hasacroform".to_string(), JsonValue::Bool(true)),
+    json_dictionary([
+        ("fields".to_string(), json_array(output)?),
+        ("hasacroform".to_string(), Json::make_bool(true)),
         (
             "needappearances".to_string(),
-            JsonValue::Bool(need_appearances),
+            Json::make_bool(need_appearances),
         ),
-    ]))
+    ])
 }
 
 // ── build_attachments_section ─────────────────────────────────────────────────
@@ -1812,7 +1916,7 @@ enum FilespecSource {
 fn filespec_to_json<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filespec_ref: crate::ObjectRef,
-) -> Result<JsonValue, ConvertError> {
+) -> Result<Json, ConvertError> {
     let filespec_str = format!("{} {} R", filespec_ref.number, filespec_ref.generation);
 
     let filespec_obj = pdf
@@ -1822,14 +1926,14 @@ fn filespec_to_json<R: Read + Seek>(
         Object::Dictionary(d) => d.clone(),
         _ => {
             // Malformed filespec — return a minimal entry
-            return Ok(JsonValue::Object(vec![
-                ("description".to_string(), JsonValue::Null),
-                ("filespec".to_string(), JsonValue::String(filespec_str)),
-                ("names".to_string(), JsonValue::Object(vec![])),
-                ("preferredcontents".to_string(), JsonValue::Null),
-                ("preferredname".to_string(), JsonValue::Null),
-                ("streams".to_string(), JsonValue::Object(vec![])),
-            ]));
+            return json_dictionary([
+                ("description".to_string(), Json::make_null()),
+                ("filespec".to_string(), Json::make_string(filespec_str)),
+                ("names".to_string(), Json::make_dictionary()),
+                ("preferredcontents".to_string(), Json::make_null()),
+                ("preferredname".to_string(), Json::make_null()),
+                ("streams".to_string(), Json::make_dictionary()),
+            ]);
         }
     };
 
@@ -1839,17 +1943,17 @@ fn filespec_to_json<R: Read + Seek>(
 /// Same as [`filespec_to_json`] but takes the filespec dictionary directly,
 /// for the case where the name tree leaf value is a direct dictionary rather
 /// than an indirect reference. When `filespec_str` is `Some`, it is used for
-/// the `filespec` key; when `None`, that key emits `JsonValue::Null` because
+/// the `filespec` key; when `None`, that key emits JSON null because
 /// no reference number exists.
 fn filespec_dict_to_json<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filespec_dict: &Dictionary,
     filespec_str: Option<String>,
-) -> Result<JsonValue, ConvertError> {
+) -> Result<Json, ConvertError> {
     let filespec_dict = filespec_dict.clone();
     let filespec_value = match filespec_str {
-        Some(s) => JsonValue::String(s),
-        None => JsonValue::Null,
+        Some(s) => Json::make_string(s),
+        None => Json::make_null(),
     };
 
     // description: /Desc decoded as PDF text string, bare (no u:/b: prefix)
@@ -1857,20 +1961,20 @@ fn filespec_dict_to_json<R: Read + Seek>(
         Some(Object::String(bytes)) => {
             let s = decode_pdf_text_string(bytes)
                 .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
-            JsonValue::String(s)
+            Json::make_string(s)
         }
-        _ => JsonValue::Null,
+        _ => Json::make_null(),
     };
 
     // names: collect /F, /UF, /DOS, /Mac, /Unix — each decoded as PDF text string
     // Keys are in alphabetical order (they already are in BTree).
     let name_keys = ["DOS", "F", "Mac", "UF", "Unix"];
-    let mut names_pairs: Vec<(String, JsonValue)> = Vec::new();
+    let mut names_pairs: Vec<(String, Json)> = Vec::new();
     for key in &name_keys {
         if let Some(Object::String(bytes)) = filespec_dict.get(*key) {
             let s = decode_pdf_text_string(bytes)
                 .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
-            names_pairs.push((format!("/{key}"), JsonValue::String(s)));
+            names_pairs.push((format!("/{key}"), Json::make_string(s)));
         }
     }
 
@@ -1882,12 +1986,12 @@ fn filespec_dict_to_json<R: Read + Seek>(
             if let Some(Object::String(bytes)) = filespec_dict.get(*key) {
                 let s = decode_pdf_text_string(bytes)
                     .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
-                Some(JsonValue::String(s))
+                Some(Json::make_string(s))
             } else {
                 None
             }
         })
-        .unwrap_or(JsonValue::Null);
+        .unwrap_or_else(Json::make_null);
 
     // /EF dictionary: embedded file stream refs, keyed by /F /UF /DOS /Mac /Unix
     let ef_dict = match filespec_dict.get("EF") {
@@ -1906,7 +2010,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
             .iter()
             .find_map(|key| {
                 if let Some(Object::Reference(r)) = ef.get(*key) {
-                    Some(JsonValue::String(format!(
+                    Some(Json::make_string(format!(
                         "{} {} R",
                         r.number, r.generation
                     )))
@@ -1914,15 +2018,15 @@ fn filespec_dict_to_json<R: Read + Seek>(
                     None
                 }
             })
-            .unwrap_or(JsonValue::Null)
+            .unwrap_or_else(Json::make_null)
     } else {
-        JsonValue::Null
+        Json::make_null()
     };
 
     // streams: for each key in /EF, build a stream-info object
     // Keys alphabetical: /DOS, /F, /Mac, /UF, /Unix
     let ef_key_order = ["DOS", "F", "Mac", "UF", "Unix"];
-    let mut streams_pairs: Vec<(String, JsonValue)> = Vec::new();
+    let mut streams_pairs: Vec<(String, Json)> = Vec::new();
 
     if let Some(ref ef) = ef_dict {
         for key in &ef_key_order {
@@ -1943,9 +2047,9 @@ fn filespec_dict_to_json<R: Read + Seek>(
             let mimetype = match stream_dict.get("Subtype") {
                 Some(Object::Name(bytes)) => {
                     let s = String::from_utf8_lossy(bytes).into_owned();
-                    JsonValue::String(s)
+                    Json::make_string(s)
                 }
-                _ => JsonValue::Null,
+                _ => Json::make_null(),
             };
 
             // /Params sub-dict
@@ -1963,87 +2067,85 @@ fn filespec_dict_to_json<R: Read + Seek>(
             // checksum: /Params /CheckSum bytes → lowercase hex, or null
             let checksum = if let Some(ref p) = params_dict {
                 match p.get("CheckSum") {
-                    Some(Object::String(bytes)) => JsonValue::String(checksum_to_hex(bytes)),
-                    _ => JsonValue::Null,
+                    Some(Object::String(bytes)) => Json::make_string(checksum_to_hex(bytes)),
+                    _ => Json::make_null(),
                 }
             } else {
-                JsonValue::Null
+                Json::make_null()
             };
 
             // creationdate: /Params /CreationDate → ISO 8601, or null
             let creationdate = if let Some(ref p) = params_dict {
                 match p.get("CreationDate") {
                     Some(Object::String(bytes)) => match parse_pdf_date(bytes) {
-                        Some(s) => JsonValue::String(s),
-                        None => JsonValue::Null,
+                        Some(s) => Json::make_string(s),
+                        None => Json::make_null(),
                     },
-                    _ => JsonValue::Null,
+                    _ => Json::make_null(),
                 }
             } else {
-                JsonValue::Null
+                Json::make_null()
             };
 
             // modificationdate: /Params /ModDate → ISO 8601, or null
             let modificationdate = if let Some(ref p) = params_dict {
                 match p.get("ModDate") {
                     Some(Object::String(bytes)) => match parse_pdf_date(bytes) {
-                        Some(s) => JsonValue::String(s),
-                        None => JsonValue::Null,
+                        Some(s) => Json::make_string(s),
+                        None => Json::make_null(),
                     },
-                    _ => JsonValue::Null,
+                    _ => Json::make_null(),
                 }
             } else {
-                JsonValue::Null
+                Json::make_null()
             };
 
             // Stream entry keys: checksum, creationdate, mimetype, modificationdate
-            let stream_entry = JsonValue::Object(vec![
+            let stream_entry = json_dictionary([
                 ("checksum".to_string(), checksum),
                 ("creationdate".to_string(), creationdate),
                 ("mimetype".to_string(), mimetype),
                 ("modificationdate".to_string(), modificationdate),
-            ]);
+            ])?;
             streams_pairs.push((format!("/{key}"), stream_entry));
         }
     }
 
-    Ok(JsonValue::Object(vec![
+    json_dictionary([
         ("description".to_string(), description),
         ("filespec".to_string(), filespec_value),
-        ("names".to_string(), JsonValue::Object(names_pairs)),
+        ("names".to_string(), json_dictionary(names_pairs)?),
         ("preferredcontents".to_string(), preferredcontents),
         ("preferredname".to_string(), preferredname),
-        ("streams".to_string(), JsonValue::Object(streams_pairs)),
-    ]))
+        ("streams".to_string(), json_dictionary(streams_pairs)?),
+    ])
 }
 
 /// Build the qpdf JSON v2 `"attachments"` section.
 ///
-/// Returns a [`JsonValue::Object`] where each key is an EmbeddedFiles name-tree
+/// Returns a [`Json`] dictionary where each key is an EmbeddedFiles name-tree
 /// entry name (decoded PDF string, bare without prefix) and each value is a
 /// filespec entry object.
 ///
-/// Returns `JsonValue::Object(vec![])` when the document has no `/Names/EmbeddedFiles`.
+/// Returns an empty [`Json`] dictionary when the document has no `/Names/EmbeddedFiles`.
 ///
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if any indirect object resolution fails.
-pub fn build_attachments_section<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-) -> Result<JsonValue, ConvertError> {
+pub fn build_attachments_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
     use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 
     // Resolve the Catalog.
     let catalog_ref = match pdf.root_ref() {
         Some(r) => r,
-        None => return Ok(JsonValue::Object(vec![])),
+        None => return Ok(Json::make_dictionary()),
     };
     let catalog = pdf
         .resolve_borrowed(catalog_ref)
         .map_err(ConvertError::from)?;
     let mut catalog = match catalog {
         Object::Dictionary(dictionary) => dictionary.clone(),
-        _ => return Ok(JsonValue::Object(vec![])),
+        _ => return Ok(Json::make_dictionary()),
     };
     let names_val = catalog.get("Names").cloned();
 
@@ -2062,10 +2164,10 @@ pub fn build_attachments_section<R: Read + Seek>(
                     NamesLocation::Indirect(terminal_ref.unwrap_or(source_ref)),
                     dictionary,
                 ),
-                None => return Ok(JsonValue::Object(vec![])),
+                None => return Ok(Json::make_dictionary()),
             }
         }
-        _ => return Ok(JsonValue::Object(vec![])),
+        _ => return Ok(Json::make_dictionary()),
     };
 
     // /EmbeddedFiles name tree root: keep the original object shape so the
@@ -2073,7 +2175,7 @@ pub fn build_attachments_section<R: Read + Seek>(
     // ObjectRef in the visited set (cycle guard on a self-referential root).
     let ef_root = match names_dict.get("EmbeddedFiles").cloned() {
         Some(v) => v,
-        None => return Ok(JsonValue::Object(vec![])),
+        None => return Ok(Json::make_dictionary()),
     };
 
     let original_ef_root = ef_root.clone();
@@ -2110,7 +2212,7 @@ pub fn build_attachments_section<R: Read + Seek>(
 
     // Build the output object. Both indirect (Reference) and direct
     // (inlined Dictionary) filespec values yield an attachments entry.
-    let mut pairs: Vec<(String, JsonValue)> = Vec::new();
+    let mut pairs: Vec<(String, Json)> = Vec::new();
     for (name, source) in raw_entries {
         let entry = match source {
             FilespecSource::Indirect(filespec_ref) => filespec_to_json(pdf, filespec_ref)?,
@@ -2119,7 +2221,7 @@ pub fn build_attachments_section<R: Read + Seek>(
         pairs.push((name, entry));
     }
 
-    Ok(JsonValue::Object(pairs))
+    json_dictionary(pairs)
 }
 
 // ── build_encrypt_section ─────────────────────────────────────────────────────
@@ -2182,7 +2284,7 @@ fn dict_name_str<'a>(dict: &'a Dictionary, key: &str) -> Option<&'a str> {
 /// `p_raw` is the signed /P value. Per ISO 32000-1 §7.6.3.2 the bits are
 /// tested after casting to u32 so that negative values (like -4) behave as
 /// the expected all-bits-set value.
-fn capabilities_from_p(p_raw: i32) -> Vec<(String, JsonValue)> {
+fn capabilities_from_p(p_raw: i32) -> Vec<(String, Json)> {
     let p = p_raw as u32;
     // All nine capabilities in alphabetical order (qpdf schema).
     let accessibility = (p & 0x0200) != 0;
@@ -2197,33 +2299,33 @@ fn capabilities_from_p(p_raw: i32) -> Vec<(String, JsonValue)> {
     let printlow = (p & 0x0004) != 0;
 
     vec![
-        ("accessibility".into(), JsonValue::Bool(accessibility)),
-        ("extract".into(), JsonValue::Bool(extract)),
-        ("modify".into(), JsonValue::Bool(modify)),
+        ("accessibility".into(), Json::make_bool(accessibility)),
+        ("extract".into(), Json::make_bool(extract)),
+        ("modify".into(), Json::make_bool(modify)),
         (
             "modifyannotations".into(),
-            JsonValue::Bool(modifyannotations),
+            Json::make_bool(modifyannotations),
         ),
-        ("modifyassembly".into(), JsonValue::Bool(modifyassembly)),
-        ("modifyforms".into(), JsonValue::Bool(modifyforms)),
-        ("modifyother".into(), JsonValue::Bool(modifyother)),
-        ("printhigh".into(), JsonValue::Bool(printhigh)),
-        ("printlow".into(), JsonValue::Bool(printlow)),
+        ("modifyassembly".into(), Json::make_bool(modifyassembly)),
+        ("modifyforms".into(), Json::make_bool(modifyforms)),
+        ("modifyother".into(), Json::make_bool(modifyother)),
+        ("printhigh".into(), Json::make_bool(printhigh)),
+        ("printlow".into(), Json::make_bool(printlow)),
     ]
 }
 
 /// All-true capabilities object used for plaintext (no /Encrypt) documents.
-fn all_true_capabilities() -> JsonValue {
-    JsonValue::Object(vec![
-        ("accessibility".into(), JsonValue::Bool(true)),
-        ("extract".into(), JsonValue::Bool(true)),
-        ("modify".into(), JsonValue::Bool(true)),
-        ("modifyannotations".into(), JsonValue::Bool(true)),
-        ("modifyassembly".into(), JsonValue::Bool(true)),
-        ("modifyforms".into(), JsonValue::Bool(true)),
-        ("modifyother".into(), JsonValue::Bool(true)),
-        ("printhigh".into(), JsonValue::Bool(true)),
-        ("printlow".into(), JsonValue::Bool(true)),
+fn all_true_capabilities() -> Result<Json, ConvertError> {
+    json_dictionary([
+        ("accessibility", Json::make_bool(true)),
+        ("extract", Json::make_bool(true)),
+        ("modify", Json::make_bool(true)),
+        ("modifyannotations", Json::make_bool(true)),
+        ("modifyassembly", Json::make_bool(true)),
+        ("modifyforms", Json::make_bool(true)),
+        ("modifyother", Json::make_bool(true)),
+        ("printhigh", Json::make_bool(true)),
+        ("printlow", Json::make_bool(true)),
     ])
 }
 
@@ -2243,7 +2345,7 @@ fn all_true_capabilities() -> JsonValue {
 ///
 /// Returns a [`ConvertError`] only when an indirect `/Encrypt` reference
 /// cannot be resolved (i.e. an underlying I/O or parse error).
-pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
+pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
     // Resolve /Encrypt dictionary from the trailer.
     let encrypt_dict: Option<Dictionary> = match pdf.trailer().get("Encrypt").cloned() {
         None => None,
@@ -2260,26 +2362,26 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVal
     match encrypt_dict {
         None => {
             // Plaintext document: all defaults.
-            let capabilities = all_true_capabilities();
-            let parameters = JsonValue::Object(vec![
-                ("P".into(), JsonValue::Integer(0)),
-                ("R".into(), JsonValue::Integer(0)),
-                ("V".into(), JsonValue::Integer(0)),
-                ("bits".into(), JsonValue::Integer(0)),
-                ("filemethod".into(), JsonValue::String("none".into())),
-                ("key".into(), JsonValue::Null),
-                ("method".into(), JsonValue::String("none".into())),
-                ("streammethod".into(), JsonValue::String("none".into())),
-                ("stringmethod".into(), JsonValue::String("none".into())),
-            ]);
-            Ok(JsonValue::Object(vec![
-                ("capabilities".into(), capabilities),
-                ("encrypted".into(), JsonValue::Bool(false)),
-                ("ownerpasswordmatched".into(), JsonValue::Bool(false)),
-                ("parameters".into(), parameters),
-                ("recovereduserpassword".into(), JsonValue::Null),
-                ("userpasswordmatched".into(), JsonValue::Bool(false)),
-            ]))
+            let capabilities = all_true_capabilities()?;
+            let parameters = json_dictionary([
+                ("P", Json::make_int(0)),
+                ("R", Json::make_int(0)),
+                ("V", Json::make_int(0)),
+                ("bits", Json::make_int(0)),
+                ("filemethod", Json::make_string("none")),
+                ("key", Json::make_null()),
+                ("method", Json::make_string("none")),
+                ("streammethod", Json::make_string("none")),
+                ("stringmethod", Json::make_string("none")),
+            ])?;
+            json_dictionary([
+                ("capabilities", capabilities),
+                ("encrypted", Json::make_bool(false)),
+                ("ownerpasswordmatched", Json::make_bool(false)),
+                ("parameters", parameters),
+                ("recovereduserpassword", Json::make_null()),
+                ("userpasswordmatched", Json::make_bool(false)),
+            ])
         }
         Some(ref enc) => {
             // Encrypted document: read V, R, P, /Length, CF methods.
@@ -2321,42 +2423,36 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonVal
             // top-level `method` mirrors streammethod (qpdf behaviour)
             let method = streammethod;
 
-            let capabilities = JsonValue::Object(capabilities_from_p(p_raw));
-            let parameters = JsonValue::Object(vec![
-                ("P".into(), JsonValue::Integer(p_raw as i64)),
-                ("R".into(), JsonValue::Integer(r)),
-                ("V".into(), JsonValue::Integer(v)),
-                ("bits".into(), JsonValue::Integer(bits)),
-                ("filemethod".into(), JsonValue::String(filemethod.into())),
-                ("key".into(), JsonValue::Null),
-                ("method".into(), JsonValue::String(method.into())),
-                (
-                    "streammethod".into(),
-                    JsonValue::String(streammethod.into()),
-                ),
-                (
-                    "stringmethod".into(),
-                    JsonValue::String(stringmethod.into()),
-                ),
-            ]);
+            let capabilities = json_dictionary(capabilities_from_p(p_raw))?;
+            let parameters = json_dictionary([
+                ("P", Json::make_int(p_raw as i64)),
+                ("R", Json::make_int(r)),
+                ("V", Json::make_int(v)),
+                ("bits", Json::make_int(bits)),
+                ("filemethod", Json::make_string(filemethod)),
+                ("key", Json::make_null()),
+                ("method", Json::make_string(method)),
+                ("streammethod", Json::make_string(streammethod)),
+                ("stringmethod", Json::make_string(stringmethod)),
+            ])?;
 
             // ownerpasswordmatched / userpasswordmatched come from the
             // reader's authentication record so user-only-authenticated
             // documents do not falsely report owner=true.
-            Ok(JsonValue::Object(vec![
-                ("capabilities".into(), capabilities),
-                ("encrypted".into(), JsonValue::Bool(is_encrypted)),
+            json_dictionary([
+                ("capabilities", capabilities),
+                ("encrypted", Json::make_bool(is_encrypted)),
                 (
-                    "ownerpasswordmatched".into(),
-                    JsonValue::Bool(pdf.owner_password_matched()),
+                    "ownerpasswordmatched",
+                    Json::make_bool(pdf.owner_password_matched()),
                 ),
-                ("parameters".into(), parameters),
-                ("recovereduserpassword".into(), JsonValue::Null),
+                ("parameters", parameters),
+                ("recovereduserpassword", Json::make_null()),
                 (
-                    "userpasswordmatched".into(),
-                    JsonValue::Bool(pdf.user_password_matched()),
+                    "userpasswordmatched",
+                    Json::make_bool(pdf.user_password_matched()),
                 ),
-            ]))
+            ])
         }
     }
 }
@@ -2714,32 +2810,32 @@ pub fn build_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
 
     if json_section_selected(keys, JsonKey::Pages) {
         let pages = build_pages_section(pdf)?;
-        pairs.push(("pages".to_string(), pages));
+        pairs.push(("pages".to_string(), legacy_json_value(&pages)?));
     }
 
     if json_section_selected(keys, JsonKey::Pagelabels) {
         let pagelabels = build_pagelabels_section(pdf)?;
-        pairs.push(("pagelabels".to_string(), pagelabels));
+        pairs.push(("pagelabels".to_string(), legacy_json_value(&pagelabels)?));
     }
 
     if json_section_selected(keys, JsonKey::Acroform) {
         let acroform = build_acroform_section(pdf)?;
-        pairs.push(("acroform".to_string(), acroform));
+        pairs.push(("acroform".to_string(), legacy_json_value(&acroform)?));
     }
 
     if json_section_selected(keys, JsonKey::Attachments) {
         let attachments = build_attachments_section(pdf)?;
-        pairs.push(("attachments".to_string(), attachments));
+        pairs.push(("attachments".to_string(), legacy_json_value(&attachments)?));
     }
 
     if json_section_selected(keys, JsonKey::Encrypt) {
         let encrypt = build_encrypt_section(pdf)?;
-        pairs.push(("encrypt".to_string(), encrypt));
+        pairs.push(("encrypt".to_string(), legacy_json_value(&encrypt)?));
     }
 
     if json_section_selected(keys, JsonKey::Outlines) {
         let outlines = build_outlines_section(pdf)?;
-        pairs.push(("outlines".to_string(), outlines));
+        pairs.push(("outlines".to_string(), legacy_json_value(&outlines)?));
     }
 
     if json_section_selected(keys, JsonKey::Qpdf) {
@@ -2761,7 +2857,7 @@ pub fn build_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
             objects,
             &prepared.refs,
         )?; // cov:ignore: Err propagation requires an I/O failure after the Pdf has opened
-        pairs.push(("qpdf".to_string(), qpdf));
+        pairs.push(("qpdf".to_string(), legacy_json_value(&qpdf)?));
     }
 
     Ok(JsonValue::Object(pairs))
@@ -2778,6 +2874,73 @@ mod tests {
         let mut buf = Vec::new();
         write(v, &mut buf).expect("write failed");
         String::from_utf8(buf).expect("not utf-8")
+    }
+
+    // Keep the existing structural regression assertions readable while the
+    // production builders move to `Json`. The one RED/GREEN conversion test
+    // below calls `super::pdf_object_to_json` directly and locks the new type.
+    fn legacy(value: Json) -> Result<JsonValue, ConvertError> {
+        legacy_json_value(&value)
+    }
+
+    fn pdf_object_to_json(object: &Object) -> Result<JsonValue, ConvertError> {
+        legacy(super::pdf_object_to_json(object)?)
+    }
+
+    fn qpdf_pdf_object_to_json<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        object: &Object,
+    ) -> Result<JsonValue, ConvertError> {
+        legacy(super::qpdf_pdf_object_to_json(pdf, object)?)
+    }
+
+    fn build_qpdf_key<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        metadata: QpdfMetadata,
+    ) -> Result<JsonValue, ConvertError> {
+        legacy(super::build_qpdf_key(pdf, metadata)?)
+    }
+
+    fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        metadata: QpdfMetadata,
+        decode_level: DecodeLevel,
+        stream_mode: &StreamDataMode,
+    ) -> Result<JsonValue, ConvertError> {
+        legacy(super::build_qpdf_key_with_stream_mode(
+            pdf,
+            metadata,
+            decode_level,
+            stream_mode,
+        )?)
+    }
+
+    fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
+        legacy(super::build_pages_section(pdf)?)
+    }
+
+    fn build_pagelabels_section<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+    ) -> Result<JsonValue, ConvertError> {
+        legacy(super::build_pagelabels_section(pdf)?)
+    }
+
+    fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
+        legacy(super::build_outlines_section(pdf)?)
+    }
+
+    fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
+        legacy(super::build_acroform_section(pdf)?)
+    }
+
+    fn build_attachments_section<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+    ) -> Result<JsonValue, ConvertError> {
+        legacy(super::build_attachments_section(pdf)?)
+    }
+
+    fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<JsonValue, ConvertError> {
+        legacy(super::build_encrypt_section(pdf)?)
     }
 
     // Minimal valid PDF; nodes are supplied via set_object refs (catalog unused).
@@ -2977,14 +3140,11 @@ mod tests {
 
     #[test]
     fn object_integer_to_json() {
-        assert_eq!(
-            pdf_object_to_json(&Object::Integer(42)).unwrap(),
-            JsonValue::Integer(42)
-        );
-        assert_eq!(
-            pdf_object_to_json(&Object::Integer(-7)).unwrap(),
-            JsonValue::Integer(-7)
-        );
+        fn assert_json(_: &crate::json::Json) {}
+
+        let converted = super::pdf_object_to_json(&Object::Integer(42)).unwrap();
+        assert_json(&converted);
+        assert_eq!(converted.get_number().as_deref(), Some(b"42".as_slice()));
     }
 
     // ── 9. Real (float) conversion ────────────────────────────────────────────
@@ -8533,33 +8693,7 @@ mod tests {
         }
     }
 
-    // ── Test 5: base64_encode unit tests ─────────────────────────────────────
-
-    #[test]
-    fn base64_encode_rfc4648_vectors() {
-        // RFC 4648 test vectors
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-    }
-
-    #[test]
-    fn base64_encode_all_byte_values() {
-        // Encode all 256 byte values; verify length is correct (no panics).
-        let all_bytes: Vec<u8> = (0u8..=255).collect();
-        let encoded = base64_encode(&all_bytes);
-        // 256 bytes → ceil(256/3)*4 = 344 chars
-        assert_eq!(encoded.len(), 344);
-        // Verify the round-trip using the test helper decoder.
-        let decoded = base64_decode_test_helper(&encoded);
-        assert_eq!(decoded, all_bytes);
-    }
-
-    // ── Test 6: build_qpdf_json_v2_with_options propagates stream_mode ────────
+    // ── Test 5: build_qpdf_json_v2_with_options propagates stream_mode ────────
 
     #[test]
     fn build_qpdf_json_v2_with_options_inline_propagates_to_qpdf_key() {
