@@ -75,6 +75,14 @@ pub trait ParserCallbacks {
 /// after `ID`, an unterminated inline image, or invalid tokenizer state.
 /// Callback errors are propagated unchanged.
 pub fn parse_content_stream_data(input: &[u8], callbacks: &mut impl ParserCallbacks) -> Result<()> {
+    parse_content_stream_data_impl(input, callbacks, false)
+}
+
+fn parse_content_stream_data_impl(
+    input: &[u8],
+    callbacks: &mut impl ParserCallbacks,
+    recover_object_errors: bool,
+) -> Result<()> {
     callbacks.content_size(input.len())?;
 
     let mut tokenizer = Tokenizer::new(input);
@@ -89,8 +97,20 @@ pub fn parse_content_stream_data(input: &[u8], callbacks: &mut impl ParserCallba
         tokenizer.set_position(offset)?;
 
         let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
-        let Some(object) = parser.parse_content_object()? else {
-            break;
+        let object = match parser.parse_content_object() {
+            Ok(Some(object)) => object,
+            Ok(None) => break,
+            Err(_) if recover_object_errors && parser.position() > offset => {
+                // qpdf turns bad top-level content tokens into recoverable null
+                // objects and continues at the tokenizer-owned boundary
+                // (libqpdf/QPDFParser.cc:49-67). The operation adapter retains
+                // flpdf's established "skip malformed, last-wins" contract by
+                // discarding that failed object. Crucially, forward progress
+                // comes from the shared parser/tokenizer cursor; this layer
+                // never scans or skips input bytes itself.
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         let length = parser.position() - offset;
         let is_id = object.as_operator() == Some(b"ID");
@@ -138,6 +158,66 @@ pub fn parse_content_stream_data(input: &[u8], callbacks: &mut impl ParserCallba
     }
 
     callbacks.handle_eof()
+}
+
+/// Accumulates content objects until an operator event is received.
+///
+/// This adapter deliberately sees only parser events. Lexical boundaries and
+/// inline-image discovery remain owned by [`parse_content_stream_data`].
+pub(crate) struct OperationCallbacks<F> {
+    operands: Vec<Object>,
+    on_operation: F,
+}
+
+impl<F> ParserCallbacks for OperationCallbacks<F>
+where
+    F: FnMut(&[Object], &[u8]) -> Result<ParseControl>,
+{
+    fn handle_object(
+        &mut self,
+        object: Object,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<ParseControl> {
+        match object {
+            Object::Operator(operator) => {
+                let control = (self.on_operation)(&self.operands, &operator)?;
+                self.operands.clear();
+                Ok(control)
+            }
+            Object::InlineImage(_) => Ok(ParseControl::Continue),
+            operand => {
+                self.operands.push(operand);
+                Ok(ParseControl::Continue)
+            }
+        }
+    }
+
+    fn handle_eof(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Parse content and invoke `on_operation` with each operator's accumulated
+/// operands.
+///
+/// Inline-image payload events are ignored by this convenience adapter.
+/// Consumers that need inline-image headers or payloads should implement
+/// [`ParserCallbacks`] directly.
+///
+/// # Errors
+///
+/// Recoverable object-token errors are skipped at parser-owned boundaries.
+/// Inline-image/tokenizer state errors and callback errors are propagated.
+pub fn parse_content_operations<F>(input: &[u8], on_operation: F) -> Result<()>
+where
+    F: FnMut(&[Object], &[u8]) -> Result<ParseControl>,
+{
+    let mut callbacks = OperationCallbacks {
+        operands: Vec::new(),
+        on_operation,
+    };
+    parse_content_stream_data_impl(input, &mut callbacks, true)
 }
 
 /// One lexical unit of a content stream.

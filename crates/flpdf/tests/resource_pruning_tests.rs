@@ -7,9 +7,8 @@
 //!   (d) Yes mode: same shared situation → pruned (union over sharing pages).
 //!   (e) No mode: nothing changes.
 
-use flpdf::content_stream::{ContentStreamParser, ContentToken};
 use flpdf::resources::{remove_unreferenced_resources, RemoveUnreferencedResources};
-use flpdf::{Dictionary, Object, ObjectRef, Pdf};
+use flpdf::{parse_content_operations, Dictionary, Object, ObjectRef, ParseControl, Pdf};
 use std::io::Cursor;
 
 // ── Minimal PDF builder ───────────────────────────────────────────────────────
@@ -153,12 +152,12 @@ fn test_a_unused_font_pruned_used_font_kept() {
     // Verify re-parsing the content stream still works (rendering-safe check).
     let content =
         flpdf::pages::page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).expect("content bytes");
-    let tokens: Vec<_> = ContentStreamParser::new(&content)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("parse");
-    let has_tf = tokens
-        .iter()
-        .any(|t| matches!(t, ContentToken::Op { operator, .. } if operator == b"Tf"));
+    let mut has_tf = false;
+    parse_content_operations(&content, |_, operator| {
+        has_tf |= operator == b"Tf";
+        Ok(ParseControl::Continue)
+    })
+    .expect("parse");
     assert!(has_tf, "Tf operator must survive");
 }
 
@@ -1501,6 +1500,82 @@ fn test_page_inline_image_nonbuiltin_cs_kept() {
     );
 }
 
+#[test]
+fn inline_image_false_ei_payload_is_not_parsed_as_resource_content() {
+    // The first bounded `EI` is followed by a token that is invalid as PDF
+    // content, so qpdf's inline-image lookahead rejects it. Those bytes are
+    // image payload, not a malformed content stream: /Foo is kept and the
+    // genuinely unused /Bar can still be pruned.
+    let content = b"BI /CS /Foo /W 1 /H 1 /BPC 8 ID abc EI <0g> EI Q";
+    let resources = "<< /ColorSpace << /Foo [ /CalRGB << >> ] /Bar [ /CalRGB << >> ] >> >>";
+    let extra = vec![(4u32, stream_obj(4, content)), (5, obj_bytes(5, resources))];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(resources) = pdf.resolve(ObjectRef::new(5, 0)).expect("resources")
+    else {
+        panic!("resources not a dictionary");
+    };
+    let Some(Object::Dictionary(color_spaces)) = resources.get("ColorSpace") else {
+        panic!("used /ColorSpace/Foo must remain");
+    };
+    assert!(color_spaces.get("Foo").is_some());
+    assert!(
+        color_spaces.get("Bar").is_none(),
+        "payload bytes after a false EI must not make resource collection incomplete"
+    );
+}
+
+#[test]
+fn inline_image_long_colorspace_key_is_last_wins() {
+    let content = b"BI /CS /Bar /ColorSpace /Foo /W 1 /H 1 /BPC 8 ID payload EI Q";
+    let resources = "<< /ColorSpace << /Foo [ /CalRGB << >> ] /Bar [ /CalRGB << >> ] >> >>";
+    let extra = vec![(4u32, stream_obj(4, content)), (5, obj_bytes(5, resources))];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(resources) = pdf.resolve(ObjectRef::new(5, 0)).expect("resources")
+    else {
+        panic!("resources not a dictionary");
+    };
+    let Some(Object::Dictionary(color_spaces)) = resources.get("ColorSpace") else {
+        panic!("used /ColorSpace/Foo must remain");
+    };
+    assert!(color_spaces.get("Foo").is_some());
+    assert!(
+        color_spaces.get("Bar").is_none(),
+        "the later /ColorSpace key must override the abbreviated /CS key"
+    );
+}
+
+#[test]
+fn inline_image_payload_resource_names_are_ignored() {
+    let content = b"BI /CS /Foo /W 1 /H 1 ID /ColorSpace /Bar Do EI Q";
+    let resources = "<< /ColorSpace << /Foo [ /CalRGB << >> ] /Bar [ /CalRGB << >> ] >> >>";
+    let extra = vec![(4u32, stream_obj(4, content)), (5, obj_bytes(5, resources))];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let Object::Dictionary(resources) = pdf.resolve(ObjectRef::new(5, 0)).expect("resources")
+    else {
+        panic!("resources not a dictionary");
+    };
+    let Some(Object::Dictionary(color_spaces)) = resources.get("ColorSpace") else {
+        panic!("used /ColorSpace/Foo must remain");
+    };
+    assert!(color_spaces.get("Foo").is_some());
+    assert!(
+        color_spaces.get("Bar").is_none(),
+        "inline-image payload bytes are not content resource events"
+    );
+}
+
 // A Form XObject whose OWN /Resources is an indirect reference is resolved via
 // that reference; its names stay scoped to the Form and do not leak to the page.
 // (flpdf-u79t: covers the indirect own-/Resources resolution arm.)
@@ -2822,8 +2897,8 @@ fn corrupt_page_content_single_page_default_mode_does_not_abort() {
 #[test]
 fn malformed_page_content_midstream_retains_resources() {
     // `1 2 3` after `Tf` are dangling operands with no operator → at EOF the
-    // ContentStreamParser yields Err("content stream ended with dangling
-    // operands"). /F1 is recorded before the error; /F2 must NOT be pruned.
+    // The resource callback sees dangling operands at EOF. /F1 is recorded
+    // before the error; /F2 must NOT be pruned.
     let extra = vec![
         (4u32, stream_obj(4, b"BT /F1 12 Tf (x) Tj ET 1 2 3")),
         (

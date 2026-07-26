@@ -3,7 +3,10 @@
 use flpdf::content_stream::{
     normalize_content_stream, ContentParseOptions, ContentStreamParser, ContentToken,
 };
-use flpdf::{parse_content_stream_data, Error, Object, ParseControl, ParserCallbacks};
+use flpdf::{
+    parse_content_operations, parse_content_stream_data, Error, Object, ParseControl,
+    ParserCallbacks,
+};
 
 #[derive(Default)]
 struct RecordingCallbacks {
@@ -58,6 +61,59 @@ impl ParserCallbacks for DefaultContentSizeCallbacks {
         self.eof = true;
         Ok(())
     }
+}
+
+#[test]
+fn operation_adapter_groups_objects_without_lexing_bytes() {
+    let mut seen = Vec::new();
+    parse_content_operations(b"1 2 cm q", |operands, operator| {
+        seen.push((operands.to_vec(), operator.to_vec()));
+        Ok(ParseControl::Continue)
+    })
+    .unwrap();
+
+    assert_eq!(
+        seen,
+        vec![
+            (vec![Object::Integer(1), Object::Integer(2)], b"cm".to_vec()),
+            (vec![], b"q".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn operation_adapter_recovers_at_parser_token_boundaries() {
+    let mut operators = Vec::new();
+    parse_content_operations(b"1 2 add } 3 4 sub", |_, operator| {
+        operators.push(operator.to_vec());
+        Ok(ParseControl::Continue)
+    })
+    .unwrap();
+
+    assert_eq!(operators, vec![b"add".to_vec(), b"sub".to_vec()]);
+}
+
+#[test]
+fn operation_adapter_ignores_inline_image_payload_events() {
+    let mut seen = Vec::new();
+    parse_content_operations(b"BI /CS /RGB ID payload EI q", |operands, operator| {
+        seen.push((operands.to_vec(), operator.to_vec()));
+        Ok(ParseControl::Continue)
+    })
+    .unwrap();
+
+    assert_eq!(
+        seen,
+        vec![
+            (vec![], b"BI".to_vec()),
+            (
+                vec![Object::Name(b"CS".to_vec()), Object::Name(b"RGB".to_vec())],
+                b"ID".to_vec()
+            ),
+            (vec![], b"EI".to_vec()),
+            (vec![], b"q".to_vec()),
+        ]
+    );
 }
 
 #[test]

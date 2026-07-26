@@ -4,7 +4,7 @@
 //! A `/DA` value is a small content-stream fragment such as
 //! `/Helv 0 Tf 0 g` that sets the font, size, and colour used to render
 //! text in a form field.  This module tokenises the fragment with the
-//! shared [`crate::content_stream::ContentStreamParser`] and extracts the
+//! shared qpdf-shaped content parser callbacks and extracts the
 //! structured [`DefaultAppearance`] value.
 //!
 //! # Inheritance
@@ -13,7 +13,7 @@
 //! Inheritance resolution (falling back to the `/AcroForm` root `/DA` when a
 //! field-level `/DA` is absent) is the caller's responsibility.
 
-use crate::content_stream::{ContentParseOptions, ContentStreamParser, ContentToken};
+use crate::content_stream::{parse_content_operations, ParseControl};
 use crate::Object;
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -85,20 +85,12 @@ pub fn parse_default_appearance(da: &[u8]) -> DefaultAppearance {
     let mut auto_size: bool = true;
     let mut color: TextColor = TextColor::Gray(0.0);
 
-    // Enable error recovery so a malformed token mid-`/DA` does not drop the
-    // operators that follow it. This honours the "skip malformed tokens /
-    // last-wins" contract and mirrors qpdf, whose tokenizer skips bad tokens
-    // (`allow_bad`) and keeps scanning rather than aborting the whole `/DA`.
-    let options = ContentParseOptions {
-        recover_from_errors: true,
-        ..ContentParseOptions::default()
-    };
-    for token in ContentStreamParser::with_options(da, options).flatten() {
-        let ContentToken::Op { operands, operator } = token else {
-            continue;
-        };
-
-        match operator.as_slice() {
+    // The operation adapter recovers at parser/tokenizer-owned token
+    // boundaries, so a malformed token does not drop later operators. Ignore
+    // the final error for this best-effort public API, preserving its
+    // "skip malformed / last wins" contract.
+    let _ = parse_content_operations(da, |operands, operator| {
+        match operator {
             b"Tf" => {
                 // Operands: /FontName size. PDF operators consume their operands
                 // from the top of the stack, so read the **last** two operands
@@ -108,7 +100,7 @@ pub fn parse_default_appearance(da: &[u8]) -> DefaultAppearance {
                 // and a numeric size are present, so update all three fields
                 // together; a malformed `Tf` (missing/typed operand) is ignored
                 // wholesale rather than partially applied.
-                if let [.., name, size] = operands.as_slice() {
+                if let [.., name, size] = operands {
                     if let (Some(name), Some(size)) = (name.as_name(), obj_as_f64(size)) {
                         font_name = Some(name.to_vec());
                         font_size = size;
@@ -124,7 +116,7 @@ pub fn parse_default_appearance(da: &[u8]) -> DefaultAppearance {
             }
             b"rg" => {
                 // Device RGB: r g b  (3 operands — top of stack)
-                if let [.., r, g, b] = operands.as_slice() {
+                if let [.., r, g, b] = operands {
                     if let (Some(r), Some(g), Some(b)) =
                         (obj_as_f64(r), obj_as_f64(g), obj_as_f64(b))
                     {
@@ -134,7 +126,7 @@ pub fn parse_default_appearance(da: &[u8]) -> DefaultAppearance {
             }
             b"k" => {
                 // Device CMYK: c m y k  (4 operands — top of stack)
-                if let [.., c, m, y, k] = operands.as_slice() {
+                if let [.., c, m, y, k] = operands {
                     if let (Some(c), Some(m), Some(y), Some(k)) =
                         (obj_as_f64(c), obj_as_f64(m), obj_as_f64(y), obj_as_f64(k))
                     {
@@ -144,7 +136,8 @@ pub fn parse_default_appearance(da: &[u8]) -> DefaultAppearance {
             }
             _ => {}
         }
-    }
+        Ok(ParseControl::Continue)
+    });
 
     DefaultAppearance {
         font_name,

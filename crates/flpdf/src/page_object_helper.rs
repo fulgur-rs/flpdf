@@ -13,9 +13,9 @@
 //! call so that mutations applied through other helpers remain visible
 //! immediately.
 //!
-//! - [`content_streams`](PageObjectHelper::content_streams) — decode via the
-//!   existing stream filter pipeline, then tokenize with
-//!   [`ContentStreamParser`].
+//! - [`content_stream_objects`](PageObjectHelper::content_stream_objects) —
+//!   decode via the existing stream filter pipeline, then parse into
+//!   qpdf-shaped [`Object`] events.
 //! - [`resources`](PageObjectHelper::resources) — delegates to
 //!   [`crate::pages::resolve_inherited_resources`] (walks `/Parent` chain).
 //! - [`rotate`](PageObjectHelper::rotate) — **getter** that delegates to
@@ -44,8 +44,8 @@
 //! let page_refs = pages::page_refs(&mut pdf)?;
 //! if let Some(&page_ref) = page_refs.first() {
 //!     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-//!     let tokens = helper.content_streams()?;
-//!     println!("{} content-stream tokens on page 1", tokens.len());
+//!     let objects = helper.content_stream_objects()?;
+//!     println!("{} content-stream objects on page 1", objects.len());
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -121,7 +121,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use crate::content_stream::{ContentStreamParser, ContentToken};
+use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
 use crate::page_rotate::resolve_inherited_rotate;
 use crate::pages::{resolve_inherited_resources, DEFAULT_MAX_PAGE_TREE_DEPTH};
 use crate::ref_chain::resolve_ref_chain;
@@ -172,6 +172,27 @@ pub struct PageObjectHelper<'a, R: Read + Seek> {
     pdf: &'a mut Pdf<R>,
 }
 
+#[derive(Default)]
+struct ObjectRecordingCallbacks {
+    objects: Vec<Object>,
+}
+
+impl ParserCallbacks for ObjectRecordingCallbacks {
+    fn handle_object(
+        &mut self,
+        object: Object,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<ParseControl> {
+        self.objects.push(object);
+        Ok(ParseControl::Continue)
+    }
+
+    fn handle_eof(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Create a new helper for `page_ref` borrowing `pdf` mutably.
     ///
@@ -201,15 +222,15 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     }
 
     // -----------------------------------------------------------------------
-    // content_streams
+    // content_stream_objects
     // -----------------------------------------------------------------------
 
-    /// Return the tokenized content stream of this page.
+    /// Return the qpdf-shaped content object events for this page.
     ///
     /// Aggregates the page's `/Contents` entry (single stream or array), decodes
     /// each stream through its filter pipeline (same as
-    /// [`crate::pages::page_content_bytes`]), then tokenizes the concatenated
-    /// bytes via [`ContentStreamParser`].
+    /// [`crate::pages::page_content_bytes`]), then parses the concatenated bytes
+    /// through [`parse_content_stream_data`].
     ///
     /// Returns an empty `Vec` when the page has no `/Contents`.
     ///
@@ -218,7 +239,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// - [`Error::Unsupported`] when `page_ref` does not resolve to a
     ///   `/Type /Page` dictionary, or when a `/Contents` element is not a stream.
     /// - Any error from [`crate::pages::page_content_bytes`] or
-    ///   [`ContentStreamParser`].
+    ///   [`parse_content_stream_data`].
     ///
     /// # Examples
     ///
@@ -231,19 +252,17 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// let page_refs = pages::page_refs(&mut pdf)?;
     /// if let Some(&page_ref) = page_refs.first() {
     ///     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    ///     let tokens = helper.content_streams()?;
-    ///     println!("{} tokens", tokens.len());
+    ///     let objects = helper.content_stream_objects()?;
+    ///     println!("{} objects", objects.len());
     /// }
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn content_streams(&mut self) -> Result<Vec<ContentToken>> {
+    pub fn content_stream_objects(&mut self) -> Result<Vec<Object>> {
         self.ensure_leaf_page()?;
         let raw = crate::pages::page_content_bytes(self.pdf, self.page_ref)?;
-        if raw.is_empty() {
-            return Ok(Vec::new());
-        }
-        let tokens = ContentStreamParser::new(&raw).collect::<Result<Vec<_>>>()?;
-        Ok(tokens)
+        let mut callbacks = ObjectRecordingCallbacks::default();
+        parse_content_stream_data(&raw, &mut callbacks)?;
+        Ok(callbacks.objects)
     }
 
     // -----------------------------------------------------------------------

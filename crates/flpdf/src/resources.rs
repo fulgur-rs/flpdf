@@ -1,9 +1,10 @@
 //! qpdf correspondence: QPDFPageObjectHelper.cc removeUnreferencedResources traversal split from the page helper.
 //! Unreferenced-resource pruning (ISO 32000-1 §7.8.3 / qpdf `--remove-unreferenced-resources`).
 //!
-//! Scans every page's content stream(s) via [`crate::content_stream::ContentStreamParser`],
-//! collects every resource name that is actually referenced by a PDF operator, and then
-//! removes entries from the page's `/Resources` sub-dictionaries that are not referenced.
+//! Scans every page's content stream(s) through qpdf-shaped parser callbacks,
+//! collects every resource name that is actually referenced by a PDF operator,
+//! and then removes entries from the page's `/Resources` sub-dictionaries that
+//! are not referenced.
 //!
 //! # Modes
 //!
@@ -20,7 +21,7 @@
 //! `/Properties`). It does **not** garbage-collect unreachable PDF objects at
 //! the xref level — that is a separate concern.
 
-use crate::content_stream::{ContentStreamParser, ContentToken};
+use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
 use crate::filters::decode_stream_data;
 use crate::ref_chain::{resolve_ref_chain, terminal_ref_of_chain};
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
@@ -663,6 +664,114 @@ struct Scope<'a> {
     owner: ObjectRef,
 }
 
+/// Parser callback that groups resource-operator operands and tracks the
+/// special `BI`...`ID` inline-image header scope.
+///
+/// Inline-image payload objects are deliberately ignored. Header names are
+/// ordinary parser object events, so `/CS` and `/ColorSpace` are interpreted
+/// here without recreating byte or token boundaries.
+struct ResourceCallbacks<'callback, 'pdf, 'scope, R: Read + Seek> {
+    ctx: &'callback mut CollectCtx<'pdf, R>,
+    scope: Scope<'scope>,
+    depth: usize,
+    operands: Vec<Object>,
+    inline_header: Option<Vec<Object>>,
+    complete: bool,
+    structural_error: Option<Error>,
+}
+
+impl<R: Read + Seek> ResourceCallbacks<'_, '_, '_, R> {
+    fn finish_inline_header(&mut self, header: Vec<Object>) -> bool {
+        let mut chunks = header.chunks_exact(2);
+        let mut color_space = None;
+        for pair in &mut chunks {
+            let Some(key) = pair[0].as_name() else {
+                return false;
+            };
+            if matches!(key, b"CS" | b"ColorSpace") {
+                color_space = pair[1].as_name().map(<[u8]>::to_vec);
+            }
+        }
+        if !chunks.remainder().is_empty() {
+            return false;
+        }
+
+        if self.scope.record_direct {
+            if let Some(name) = color_space {
+                if !is_builtin_inline_image_cs(&name) {
+                    self.ctx
+                        .used
+                        .entry(b"ColorSpace".to_vec())
+                        .or_default()
+                        .insert(name);
+                }
+            } // cov:ignore: llvm-cov gap region after the covered ColorSpace insertion
+        }
+        true
+    }
+
+    fn stop_incomplete(&mut self) -> Result<ParseControl> {
+        self.complete = false;
+        Ok(ParseControl::Stop)
+    }
+}
+
+impl<R: Read + Seek> ParserCallbacks for ResourceCallbacks<'_, '_, '_, R> {
+    fn handle_object(
+        &mut self,
+        object: Object,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<ParseControl> {
+        match object {
+            Object::Operator(operator) if self.inline_header.is_some() => {
+                let header = self
+                    .inline_header
+                    .take()
+                    .expect("inline_header guard guarantees a header");
+                if operator != b"ID" || !self.finish_inline_header(header) {
+                    return self.stop_incomplete();
+                }
+                Ok(ParseControl::Continue)
+            }
+            Object::Operator(operator) if operator == b"BI" => {
+                if !self.operands.is_empty() {
+                    return self.stop_incomplete();
+                }
+                self.inline_header = Some(Vec::new());
+                Ok(ParseControl::Continue)
+            }
+            Object::Operator(operator) => {
+                let operands = std::mem::take(&mut self.operands);
+                match process_operator(self.ctx, &operator, &operands, self.scope, self.depth) {
+                    Ok(true) => Ok(ParseControl::Continue),
+                    Ok(false) => self.stop_incomplete(),
+                    Err(error) => {
+                        self.structural_error = Some(error);
+                        Ok(ParseControl::Stop)
+                    }
+                }
+            }
+            Object::InlineImage(_) => Ok(ParseControl::Continue),
+            operand => {
+                if let Some(header) = &mut self.inline_header {
+                    header.push(operand);
+                } else {
+                    self.operands.push(operand);
+                }
+                Ok(ParseControl::Continue)
+            }
+        }
+    }
+
+    fn handle_eof(&mut self) -> Result<()> {
+        if self.inline_header.is_some() || !self.operands.is_empty() {
+            self.complete = false;
+        }
+        Ok(())
+    }
+}
+
 /// Core recursive walker: tokenises `stream_bytes` and records every resource
 /// reference into `ctx.used`. `scope` is the resource scope in force for this
 /// stream (see [`Scope`]).
@@ -685,38 +794,26 @@ fn collect_from_stream<R: Read + Seek>(
     scope: Scope<'_>,
     depth: usize,
 ) -> Result<bool> {
-    let parser = ContentStreamParser::new(stream_bytes);
-    for token_result in parser {
-        // A malformed token means the rest of this stream is unreliable. Signal
-        // an incomplete collection so the page's resources are retained rather
-        // than pruned against a partial used-name set.
-        let Ok(token) = token_result else {
-            return Ok(false);
-        };
-
-        match token {
-            ContentToken::Op { operands, operator } => {
-                if !process_operator(ctx, &operator, &operands, scope, depth)? {
-                    return Ok(false);
-                }
-            }
-            ContentToken::InlineImage { dict, .. } if scope.record_direct => {
-                // /CS operand in an inline image may reference /ColorSpace.
-                // Abbreviated key is /CS (ISO 32000-1 Table 93).
-                let cs_val = dict.get("CS").or_else(|| dict.get("ColorSpace")).cloned();
-                if let Some(name) = cs_val.and_then(Object::into_name) {
-                    if !is_builtin_inline_image_cs(&name) {
-                        ctx.used
-                            .entry(b"ColorSpace".to_vec())
-                            .or_default()
-                            .insert(name);
-                    }
-                }
-            }
-            ContentToken::InlineImage { .. } | ContentToken::Comment(_) => {}
-        }
+    let mut callbacks = ResourceCallbacks {
+        ctx,
+        scope,
+        depth,
+        operands: Vec::new(),
+        inline_header: None,
+        complete: true,
+        structural_error: None,
+    };
+    let parse_result = parse_content_stream_data(stream_bytes, &mut callbacks);
+    if let Some(error) = callbacks.structural_error {
+        return Err(error);
     }
-    Ok(true)
+    match parse_result {
+        Ok(()) => Ok(callbacks.complete),
+        // Content syntax failures make the used-name set incomplete and retain
+        // the whole resource group. Structural errors from recursive lookups
+        // were captured separately above and still propagate.
+        Err(_) => Ok(false),
+    }
 }
 
 /// Process a single content-stream operator and record any resource references
@@ -1619,5 +1716,81 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
         let loc = resources_location(&mut pdf, ObjectRef::new(3, 0)).expect("ok");
         assert_eq!(loc, ResourcesLoc::None);
+    }
+
+    fn collect_test_content(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        content: &[u8],
+        resources: Option<&Dictionary>,
+    ) -> Result<(bool, UsedNames)> {
+        let mut used = UsedNames::new();
+        let mut visited = BTreeSet::new();
+        let complete = {
+            let mut ctx = CollectCtx {
+                pdf,
+                used: &mut used,
+                visited: &mut visited,
+            };
+            let scope = Scope {
+                resources,
+                record_direct: true,
+                owner: ObjectRef::new(3, 0),
+            };
+            collect_from_stream(&mut ctx, content, scope, 0)?
+        };
+        Ok((complete, used))
+    }
+
+    #[test]
+    fn resource_callbacks_reject_malformed_inline_image_protocol() {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /MediaBox [0 0 612 792] >>",
+            "null",
+        );
+        let malformed: &[&[u8]] = &[
+            // Header keys must be names.
+            b"BI 1 /Foo ID payload EI",
+            // Header objects must form key/value pairs.
+            b"BI /CS ID payload EI",
+            // BI starts only at an operation boundary.
+            b"1 BI /CS /Foo ID payload EI",
+        ];
+
+        for content in malformed {
+            let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("PDF should parse");
+            let (complete, _) =
+                collect_test_content(&mut pdf, content, None).expect("content walk should stop");
+            assert!(!complete, "malformed content was accepted: {content:?}");
+        }
+    }
+
+    #[test]
+    fn resource_callbacks_retain_on_object_parse_error() {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /MediaBox [0 0 612 792] >>",
+            "null",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+
+        let (complete, _) = collect_test_content(&mut pdf, b"<0g>", None)
+            .expect("content syntax errors are conservative, not structural");
+        assert!(!complete);
+    }
+
+    #[test]
+    fn resource_callbacks_propagate_form_resolution_errors() {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /MediaBox [0 0 612 792] >>",
+            "<0g>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let mut xobjects = Dictionary::new();
+        xobjects.insert("Fm0", Object::Reference(ObjectRef::new(4, 0)));
+        let mut resources = Dictionary::new();
+        resources.insert("XObject", Object::Dictionary(xobjects));
+
+        let error = collect_test_content(&mut pdf, b"/Fm0 Do", Some(&resources))
+            .expect_err("malformed Form object is a structural error");
+        assert!(matches!(error, Error::Parse { .. }));
     }
 }

@@ -7,8 +7,9 @@
 //!       nesting is preserved.
 //!   (d) Single-stream /Contents is left unchanged (no mutation).
 
-use flpdf::content_stream::{ContentStreamParser, ContentToken};
-use flpdf::{pages, Dictionary, Object, ObjectRef, Pdf, Stream};
+use flpdf::{
+    pages, parse_content_operations, Dictionary, Object, ObjectRef, ParseControl, Pdf, Stream,
+};
 use std::io::Cursor;
 
 // ── Minimal PDF builder helpers ───────────────────────────────────────────────
@@ -81,12 +82,13 @@ fn stream_obj(num: u32, body: &[u8]) -> Vec<u8> {
 
 /// Collect all operators from a content stream in order.
 fn operators(stream: &[u8]) -> Vec<Vec<u8>> {
-    ContentStreamParser::new(stream)
-        .filter_map(|tok| match tok.unwrap() {
-            ContentToken::Op { operator, .. } => Some(operator),
-            _ => None,
-        })
-        .collect()
+    let mut operators = Vec::new();
+    parse_content_operations(stream, |_, operator| {
+        operators.push(operator.to_vec());
+        Ok(ParseControl::Continue)
+    })
+    .expect("content operations should parse");
+    operators
 }
 
 // ── (a) 2+ stream array → single newline-joined stream ───────────────────────
@@ -255,7 +257,7 @@ fn coalesce_newline_prevents_token_fusion() {
     // seg1: "12 w"   (sets line width to 12)
     // seg2: "0 0 0 0 re f"  (draw a zero-area rectangle and fill)
     // Without '\n': "12 w0 0 0 0 re f" — `w0` is not a known operator,
-    // ContentStreamParser would read it as keyword `w0` and fail or misparse.
+    // The content parser would read it as keyword `w0` and fail or misparse.
     let seg1 = b"12 w";
     let seg2 = b"0 0 0 0 re f";
 

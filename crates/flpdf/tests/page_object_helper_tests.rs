@@ -1,13 +1,13 @@
 //! Integration tests for [`flpdf::PageObjectHelper`].
 //!
 //! All tests build in-memory PDFs without touching the filesystem. They
-//! exercise the per-page accessor methods (content_streams, resources,
+//! exercise the per-page accessor methods (content_stream_objects, resources,
 //! rotate, get_annotations, and all bounding-box variants) including
 //! inheritance resolution and per-page mutation round-trips.
 
 use flpdf::{
-    apply_rotate_to_pages, pages, write_pdf, ContentToken, Error, Object, ObjectRef, PageBox,
-    PageObjectHelper, Pdf, RotateMode, RotateOp,
+    apply_rotate_to_pages, pages, write_pdf, Error, Object, ObjectRef, PageBox, PageObjectHelper,
+    Pdf, RotateMode, RotateOp,
 };
 use std::io::Cursor;
 
@@ -113,20 +113,20 @@ fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
 }
 
 // ---------------------------------------------------------------------------
-// content_streams()
+// content_stream_objects()
 // ---------------------------------------------------------------------------
 
 #[test]
-fn content_streams_empty_when_no_contents() {
+fn content_stream_objects_empty_when_no_contents() {
     let bytes = build_single_page_pdf("/MediaBox [0 0 612 792]", "");
     let mut pdf = open(bytes);
     let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
-    let tokens = helper.content_streams().unwrap();
-    assert!(tokens.is_empty(), "expected no tokens on empty page");
+    let objects = helper.content_stream_objects().unwrap();
+    assert!(objects.is_empty(), "expected no objects on empty page");
 }
 
 #[test]
-fn content_streams_tokenizes_single_stream() {
+fn content_stream_objects_parses_single_stream() {
     // Single /Contents stream: "q Q"
     let body = b"q Q";
     let (num, extra) = make_stream_object(4, body);
@@ -137,26 +137,19 @@ fn content_streams_tokenizes_single_stream() {
     );
     let mut pdf = open(bytes);
     let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
-    let tokens = helper.content_streams().unwrap();
-    assert!(!tokens.is_empty(), "expected tokens from content stream");
-    // q is an op with no operands
-    assert!(
-        tokens
-            .iter()
-            .any(|t| matches!(t, ContentToken::Op { operator, .. } if operator == b"q")),
-        "expected 'q' operator"
-    );
-    assert!(
-        tokens
-            .iter()
-            .any(|t| matches!(t, ContentToken::Op { operator, .. } if operator == b"Q")),
-        "expected 'Q' operator"
+    let objects = helper.content_stream_objects().unwrap();
+    assert_eq!(
+        objects,
+        vec![
+            Object::Operator(b"q".to_vec()),
+            Object::Operator(b"Q".to_vec())
+        ]
     );
 }
 
 #[test]
-fn content_streams_concatenates_array_contents() {
-    // Two-element /Contents array — tokens from both streams appear.
+fn content_stream_objects_concatenates_array_contents() {
+    // Two-element /Contents array — objects from both streams appear.
     let body1 = b"q";
     let body2 = b"Q";
     let extra1 = make_stream_object(4, body1);
@@ -168,19 +161,41 @@ fn content_streams_concatenates_array_contents() {
     );
     let mut pdf = open(bytes);
     let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
-    let tokens = helper.content_streams().unwrap();
-    // Both q and Q operators must be present.
-    assert!(
-        tokens
-            .iter()
-            .any(|t| matches!(t, ContentToken::Op { operator, .. } if operator == b"q")),
-        "expected 'q' from first stream"
+    let objects = helper.content_stream_objects().unwrap();
+    assert_eq!(
+        objects,
+        vec![
+            Object::Operator(b"q".to_vec()),
+            Object::Operator(b"Q".to_vec())
+        ]
     );
-    assert!(
-        tokens
-            .iter()
-            .any(|t| matches!(t, ContentToken::Op { operator, .. } if operator == b"Q")),
-        "expected 'Q' from second stream"
+}
+
+#[test]
+fn content_stream_objects_preserves_inline_image_as_a_separate_event() {
+    let body = b"BI /W 1 /H 1 ID x EI Q";
+    let (num, extra) = make_stream_object(4, body);
+    let bytes = build_pdf_with_extras(
+        "/MediaBox [0 0 612 792]",
+        "/Contents 4 0 R",
+        &[(num, extra)],
+    );
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    assert_eq!(
+        helper.content_stream_objects().unwrap(),
+        vec![
+            Object::Operator(b"BI".to_vec()),
+            Object::Name(b"W".to_vec()),
+            Object::Integer(1),
+            Object::Name(b"H".to_vec()),
+            Object::Integer(1),
+            Object::Operator(b"ID".to_vec()),
+            Object::InlineImage(b"x ".to_vec()),
+            Object::Operator(b"EI".to_vec()),
+            Object::Operator(b"Q".to_vec()),
+        ]
     );
 }
 
@@ -663,7 +678,7 @@ fn accessors_reject_pages_tree_node() {
         "get_annotations() must reject a /Pages node"
     );
     assert!(
-        helper.content_streams().is_err(),
-        "content_streams() must reject a /Pages node"
+        helper.content_stream_objects().is_err(),
+        "content_stream_objects() must reject a /Pages node"
     );
 }
