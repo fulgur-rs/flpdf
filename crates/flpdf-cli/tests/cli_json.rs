@@ -278,6 +278,34 @@ fn json_output_overwrites_distinct_existing_file() {
     serde_json::from_slice::<serde_json::Value>(&output).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn json_output_reports_identity_check_io_error_without_modifying_input() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let original = std::fs::read(input.path()).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let non_directory = temp.path().join("not-a-directory");
+    std::fs::write(&non_directory, b"blocker").unwrap();
+    let output_path = non_directory.join("output.json");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--json-output",
+            output_path.to_str().unwrap(),
+            input.path().to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "unable to inspect --json-output file",
+        ));
+
+    assert_eq!(std::fs::read(input.path()).unwrap(), original);
+}
+
 // ---------------------------------------------------------------------------
 // Test 2: --json --json-output writes to file, stdout is empty
 // ---------------------------------------------------------------------------
