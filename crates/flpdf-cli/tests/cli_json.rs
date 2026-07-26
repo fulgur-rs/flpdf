@@ -9,10 +9,19 @@ use flpdf::{filters, Dictionary, Object};
 use predicates::prelude::*;
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::process::Command as ShellCommand;
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
 // ---------------------------------------------------------------------------
+
+fn is_qpdf_available() -> bool {
+    ShellCommand::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
 
 /// One-page PDF with a single content stream so we have at least one stream
 /// object in the qpdf section.
@@ -889,6 +898,10 @@ fn one_page_pdf_with_unsupported_stream(content: &[u8]) -> Vec<u8> {
 }
 
 fn assert_stream_json_is_qpdf_exact(pdf: &[u8], stream_mode: &str) {
+    if !is_qpdf_available() {
+        return;
+    }
+
     let input = write_temp_pdf(pdf);
     let temp = tempfile::tempdir().unwrap();
     let prefix = temp.path().join("stream");
