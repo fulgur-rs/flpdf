@@ -1617,6 +1617,7 @@ impl<K: TreeKey> NNTree<K> {
         // last(), so after-maximum keys intentionally use the general search.
 
         let root = self.root_handle(pdf)?;
+        let root_diagnostic_ref = root.diagnostic_ref();
         let mut node = root;
         let mut seen = HashSet::new();
         let mut cursor = NNTreeCursor::empty();
@@ -1643,7 +1644,6 @@ impl<K: TreeKey> NNTree<K> {
                 .map_err(|_| structural_error(node.diagnostic_ref(), "bad node during find"))?;
             let items = resolved_array(pdf, dictionary.get(K::ITEMS_KEY))?;
             let kids = resolved_array(pdf, dictionary.get("Kids"))?;
-            let node_diagnostic_ref = node.diagnostic_ref();
 
             if let Some(items) = items.as_ref().filter(|items| !items.values.is_empty()) {
                 let index = binary_search(
@@ -1654,14 +1654,14 @@ impl<K: TreeKey> NNTree<K> {
                         // cov:ignore-start: binary_search only supplies indices below items length divided by two
                         let Some(item) = items.values.get(item_number) else {
                             return Err(structural_error(
-                                node_diagnostic_ref,
+                                root_diagnostic_ref,
                                 format!("item at index {item_number} is not the right type"),
                             ));
                         };
                         // cov:ignore-end
                         let Some(item_key) = resolved_key::<K, _>(pdf, item)? else {
                             return Err(structural_error(
-                                node_diagnostic_ref,
+                                root_diagnostic_ref,
                                 format!("item at index {item_number} is not the right type"),
                             ));
                         };
@@ -1685,7 +1685,7 @@ impl<K: TreeKey> NNTree<K> {
                     let (resolved, terminal_ref) = resolve_ref_chain(pdf, kid)?;
                     let Object::Dictionary(kid_dictionary) = resolved else {
                         return Err(structural_error(
-                            node_diagnostic_ref,
+                            root_diagnostic_ref,
                             format!("invalid kid at index {index}"),
                         ));
                     };
@@ -2997,7 +2997,7 @@ mod tests {
     }
 
     #[test]
-    fn find_attributes_deep_malformed_items_to_the_containing_node() {
+    fn find_attributes_deep_malformed_items_to_the_tree_root() {
         let mut pdf = empty_pdf();
         let root_ref = ObjectRef::new(80, 0);
         let leaf_ref = ObjectRef::new(81, 0);
@@ -3033,7 +3033,89 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "parse error at byte 0: Name/Number tree node (object 81): item at index 2 is not the right type"
+            "parse error at byte 0: Name/Number tree node (object 80): item at index 2 is not the right type"
+        );
+    }
+
+    #[test]
+    fn find_attributes_nested_invalid_kids_to_the_tree_root() {
+        let mut pdf = empty_pdf();
+        let root_ref = ObjectRef::new(80, 0);
+        let nested_ref = ObjectRef::new(81, 0);
+        let first_ref = ObjectRef::new(82, 0);
+        let nested_first_ref = ObjectRef::new(83, 0);
+        let nested_last_ref = ObjectRef::new(84, 0);
+        let last_ref = ObjectRef::new(85, 0);
+        pdf.set_object(
+            first_ref,
+            name_leaf(&[(b"alpha", 1)], Some((b"alpha", b"alpha"))),
+        );
+        pdf.set_object(
+            nested_first_ref,
+            name_leaf(&[(b"beta", 2)], Some((b"beta", b"beta"))),
+        );
+        pdf.set_object(
+            nested_last_ref,
+            name_leaf(&[(b"delta", 3)], Some((b"delta", b"delta"))),
+        );
+        pdf.set_object(
+            last_ref,
+            name_leaf(&[(b"zulu", 4)], Some((b"zulu", b"zulu"))),
+        );
+
+        let mut nested = Dictionary::new();
+        nested.insert(
+            "Limits",
+            Object::Array(vec![
+                Object::String(b"beta".to_vec()),
+                Object::String(b"delta".to_vec()),
+            ]),
+        );
+        nested.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(nested_first_ref),
+                Object::Integer(42),
+                Object::Reference(nested_last_ref),
+            ]),
+        );
+        pdf.set_object(nested_ref, Object::Dictionary(nested));
+
+        let mut root = Dictionary::new();
+        root.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(first_ref),
+                Object::Reference(nested_ref),
+                Object::Reference(last_ref),
+            ]),
+        );
+        pdf.set_object(root_ref, Object::Dictionary(root));
+        let mut tree = NNTree::<NameKey>::new(Object::Reference(root_ref), false);
+
+        assert_eq!(
+            tree.begin(&mut pdf)
+                .unwrap()
+                .current()
+                .map(|(key, _)| key.as_slice()),
+            Some(b"alpha".as_slice())
+        );
+        assert_eq!(
+            tree.last(&mut pdf)
+                .unwrap()
+                .current()
+                .map(|(key, _)| key.as_slice()),
+            Some(b"zulu".as_slice())
+        );
+
+        let error = match tree.find(&mut pdf, &b"charlie".to_vec(), false) {
+            Err(error) => error,
+            Ok(_) => panic!("nested invalid kid must fail targeted lookup"), // cov:ignore: negative-path assertion
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "parse error at byte 0: Name/Number tree node (object 80): invalid kid at index 1"
         );
     }
 
