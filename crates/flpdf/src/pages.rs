@@ -764,6 +764,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn object_type_name_labels_content_only_values() {
+        assert_eq!(
+            object_type_name(&Object::Operator(b"q".to_vec())),
+            "operator"
+        );
+        assert_eq!(
+            object_type_name(&Object::InlineImage(b"data".to_vec())),
+            "inline-image"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Minimal PDF builder helpers
     // -----------------------------------------------------------------------

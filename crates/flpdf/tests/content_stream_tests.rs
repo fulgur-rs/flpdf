@@ -3,7 +3,220 @@
 use flpdf::content_stream::{
     normalize_content_stream, ContentParseOptions, ContentStreamParser, ContentToken,
 };
-use flpdf::Object;
+use flpdf::{parse_content_stream_data, Error, Object, ParseControl, ParserCallbacks};
+
+#[derive(Default)]
+struct RecordingCallbacks {
+    size: Option<usize>,
+    objects: Vec<(Object, usize, usize)>,
+    eof: bool,
+    stop_after: Option<usize>,
+}
+
+impl ParserCallbacks for RecordingCallbacks {
+    fn content_size(&mut self, size: usize) -> flpdf::Result<()> {
+        self.size = Some(size);
+        Ok(())
+    }
+
+    fn handle_object(
+        &mut self,
+        object: Object,
+        offset: usize,
+        length: usize,
+    ) -> flpdf::Result<ParseControl> {
+        self.objects.push((object, offset, length));
+        Ok(if self.stop_after == Some(self.objects.len()) {
+            ParseControl::Stop
+        } else {
+            ParseControl::Continue
+        })
+    }
+
+    fn handle_eof(&mut self) -> flpdf::Result<()> {
+        self.eof = true;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct DefaultContentSizeCallbacks {
+    eof: bool,
+}
+
+impl ParserCallbacks for DefaultContentSizeCallbacks {
+    fn handle_object(
+        &mut self,
+        _object: Object,
+        _offset: usize,
+        _length: usize,
+    ) -> flpdf::Result<ParseControl> {
+        Ok(ParseControl::Continue)
+    }
+
+    fn handle_eof(&mut self) -> flpdf::Result<()> {
+        self.eof = true;
+        Ok(())
+    }
+}
+
+#[test]
+fn default_content_size_callback_is_optional_and_empty_input_reports_eof() {
+    let mut callbacks = DefaultContentSizeCallbacks::default();
+    parse_content_stream_data(b"", &mut callbacks).unwrap();
+    assert!(callbacks.eof);
+}
+
+#[test]
+fn callbacks_receive_qpdf_object_offsets_lengths_and_eof() {
+    let input = b"  1 2 cm\n";
+    let mut callbacks = RecordingCallbacks::default();
+    parse_content_stream_data(input, &mut callbacks).unwrap();
+
+    assert_eq!(callbacks.size, Some(input.len()));
+    assert_eq!(
+        callbacks.objects,
+        vec![
+            (Object::Integer(1), 2, 1),
+            (Object::Integer(2), 4, 1),
+            (Object::Operator(b"cm".to_vec()), 6, 2),
+        ]
+    );
+    assert!(callbacks.eof);
+}
+
+#[test]
+fn callbacks_receive_nested_objects_at_the_probe_start_with_consumed_length() {
+    let input = b"[1] <</K 2>> q";
+    let mut callbacks = RecordingCallbacks::default();
+    parse_content_stream_data(input, &mut callbacks).unwrap();
+
+    let mut dictionary = flpdf::Dictionary::new();
+    dictionary.insert(b"K", Object::Integer(2));
+    assert_eq!(
+        callbacks.objects,
+        vec![
+            (Object::Array(vec![Object::Integer(1)]), 0, 3),
+            (Object::Dictionary(dictionary), 4, 8),
+            (Object::Operator(b"q".to_vec()), 13, 1),
+        ]
+    );
+}
+
+#[test]
+fn early_stop_skips_handle_eof_like_qpdf() {
+    let mut callbacks = RecordingCallbacks {
+        stop_after: Some(1),
+        ..RecordingCallbacks::default()
+    };
+    parse_content_stream_data(b"1 2 cm", &mut callbacks).unwrap();
+
+    assert_eq!(callbacks.objects.len(), 1);
+    assert!(!callbacks.eof);
+}
+
+#[test]
+fn callbacks_report_inline_image_as_a_separate_qpdf_object_event() {
+    let input = b"BI /W 1 /H 1 ID x EI Q";
+    let mut callbacks = RecordingCallbacks::default();
+    parse_content_stream_data(input, &mut callbacks).unwrap();
+
+    assert_eq!(
+        callbacks.objects,
+        vec![
+            (Object::Operator(b"BI".to_vec()), 0, 2),
+            (Object::Name(b"W".to_vec()), 3, 2),
+            (Object::Integer(1), 6, 1),
+            (Object::Name(b"H".to_vec()), 8, 2),
+            (Object::Integer(1), 11, 1),
+            (Object::Operator(b"ID".to_vec()), 13, 2),
+            (Object::InlineImage(b"x ".to_vec()), 16, 2),
+            (Object::Operator(b"EI".to_vec()), 18, 2),
+            (Object::Operator(b"Q".to_vec()), 21, 1),
+        ]
+    );
+    assert!(callbacks.eof);
+}
+
+#[test]
+fn stopping_on_inline_image_skips_ei_and_eof_callbacks() {
+    let mut callbacks = RecordingCallbacks {
+        stop_after: Some(3),
+        ..RecordingCallbacks::default()
+    };
+    parse_content_stream_data(b"BI ID x EI", &mut callbacks).unwrap();
+
+    assert_eq!(
+        callbacks.objects,
+        vec![
+            (Object::Operator(b"BI".to_vec()), 0, 2),
+            (Object::Operator(b"ID".to_vec()), 3, 2),
+            (Object::InlineImage(b"x ".to_vec()), 6, 2),
+        ]
+    );
+    assert!(!callbacks.eof);
+}
+
+#[test]
+fn inline_image_protocol_discards_exactly_one_byte_after_id() {
+    let input = b"BI ID\r\nx EI";
+    let mut callbacks = RecordingCallbacks::default();
+    parse_content_stream_data(input, &mut callbacks).unwrap();
+
+    assert_eq!(
+        callbacks.objects,
+        vec![
+            (Object::Operator(b"BI".to_vec()), 0, 2),
+            (Object::Operator(b"ID".to_vec()), 3, 2),
+            (Object::InlineImage(b"\nx ".to_vec()), 6, 3),
+            (Object::Operator(b"EI".to_vec()), 9, 2),
+        ]
+    );
+}
+
+#[test]
+fn inline_image_protocol_requires_a_byte_after_id() {
+    let mut callbacks = RecordingCallbacks::default();
+    let error = parse_content_stream_data(b"ID", &mut callbacks)
+        .expect_err("ID at EOF must not synthesize a separator");
+
+    let Error::Parse { offset, message } = error else {
+        panic!("expected parse error");
+    };
+    assert_eq!(offset, 2);
+    assert!(message.contains("separator after ID"));
+    assert!(!callbacks.eof);
+}
+
+#[test]
+fn unterminated_inline_image_reports_the_qpdf_diagnostic_at_data_start() {
+    let mut callbacks = RecordingCallbacks::default();
+    let error = parse_content_stream_data(b"ID x", &mut callbacks)
+        .expect_err("inline image without EI must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "parse error at byte 3: EOF found while reading inline image"
+    );
+    assert!(!callbacks.eof);
+}
+
+#[test]
+fn bad_content_token_preserves_its_qpdf_offset_and_message() {
+    let mut callbacks = RecordingCallbacks::default();
+    let error = parse_content_stream_data(b"q <0g>", &mut callbacks)
+        .expect_err("bad content token must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "parse error at byte 2: invalid character (g) in hexstring"
+    );
+    assert_eq!(
+        callbacks.objects,
+        vec![(Object::Operator(b"q".to_vec()), 0, 1)]
+    );
+    assert!(!callbacks.eof);
+}
 
 fn tokens(input: &[u8]) -> Vec<ContentToken> {
     ContentStreamParser::new(input)

@@ -552,3 +552,21 @@ fn qpdf_object_type_name(value: &Object) -> &'static str {
         Object::Reference(_) => "reference",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::qpdf_object_type_name;
+    use crate::Object;
+
+    #[test]
+    fn qpdf_object_type_name_labels_content_only_values() {
+        assert_eq!(
+            qpdf_object_type_name(&Object::Operator(b"q".to_vec())),
+            "operator"
+        );
+        assert_eq!(
+            qpdf_object_type_name(&Object::InlineImage(b"data".to_vec())),
+            "inline-image"
+        );
+    }
+}

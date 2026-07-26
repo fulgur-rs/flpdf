@@ -177,14 +177,13 @@ mod tests {
 
     #[test]
     fn operator_and_inline_image_unparse_verbatim() {
-        for object in [
-            Object::Operator(b"cm".to_vec()),
-            Object::InlineImage(b"\x00EI\xff".to_vec()),
+        for (object, expected) in [
+            (Object::Operator(b"cm".to_vec()), b"cm".as_slice()),
+            (
+                Object::InlineImage(b"\x00EI\xff".to_vec()),
+                b"\x00EI\xff".as_slice(),
+            ),
         ] {
-            let expected = match &object {
-                Object::Operator(value) | Object::InlineImage(value) => value.clone(),
-                _ => unreachable!(),
-            };
             let mut out = Vec::new();
             object.write_pdf(&mut out);
             assert_eq!(out, expected);
@@ -193,14 +192,13 @@ mod tests {
 
     #[test]
     fn operator_and_inline_image_unparse_verbatim_in_qdf() {
-        for object in [
-            Object::Operator(b"q".to_vec()),
-            Object::InlineImage(b"\x00EI\xff".to_vec()),
+        for (object, expected) in [
+            (Object::Operator(b"q".to_vec()), b"q".as_slice()),
+            (
+                Object::InlineImage(b"\x00EI\xff".to_vec()),
+                b"\x00EI\xff".as_slice(),
+            ),
         ] {
-            let expected = match &object {
-                Object::Operator(value) | Object::InlineImage(value) => value.clone(),
-                _ => unreachable!(),
-            };
             let mut out = Vec::new();
             object.write_pdf_qdf(&mut out, 0);
             assert_eq!(out, expected);
@@ -217,6 +215,7 @@ mod tests {
             Object::InlineImage(b"data".to_vec()).as_inline_image(),
             Some(b"data".as_slice())
         );
+        assert_eq!(Object::Null.as_inline_image(), None);
     }
 }
 

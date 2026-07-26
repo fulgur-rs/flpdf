@@ -811,6 +811,19 @@ impl<'a> Tokenizer<'a> {
         Ok(())
     }
 
+    /// Consume exactly one byte at the current cursor.
+    ///
+    /// qpdf uses this after the `ID` operator to discard the byte that
+    /// terminated the token (`libqpdf/QPDFObjectHandle.cc:1820-1825`).
+    pub(crate) fn consume_one_byte(&mut self) -> Result<()> {
+        if self.pos >= self.input.len() {
+            return Err(Error::parse(self.pos, "missing separator after ID"));
+        }
+        self.pos += 1;
+        self.reset();
+        Ok(())
+    }
+
     pub(crate) fn skip_ignorable(&mut self) -> Result<()> {
         let saved_allow_eof = self.allow_eof;
         let saved_include_ignorable = self.include_ignorable;

@@ -117,11 +117,7 @@ pub(crate) fn parse_strict_direct_object(input: &[u8]) -> Result<ParsedDirectObj
 pub(crate) struct Parser<'tokenizer, 'input> {
     tokenizer: &'tokenizer mut Tokenizer<'input>,
     buffered: VecDeque<Token>,
-    /// When `true`, `N G R` is *not* recognised as an indirect reference;
-    /// the first integer is returned and `G R` are left unconsumed. Content
-    /// streams never contain indirect references, so the tokenizer sets this
-    /// to avoid mis-parsing operands like `0 0 1 R` (rg/RG colour ops).
-    no_reference: bool,
+    mode: ParserMode,
     /// qpdf treats an indirect reference in the body of an indirect object as
     /// a malformed direct object: it returns the first integer and warns that
     /// `endobj` was expected at the generation number. References nested in an
@@ -131,6 +127,13 @@ pub(crate) struct Parser<'tokenizer, 'input> {
     /// to bound recursion against adversarially deep input.
     depth: usize,
     diagnostics: Vec<ParserDiagnostic>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParserMode {
+    Object,
+    NoReference,
+    Content,
 }
 
 // Maximum object-nesting depth the recursive-descent parser will accept before
@@ -143,27 +146,30 @@ const MAX_PARSE_DEPTH: usize = 500;
 
 impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
     pub(crate) fn with_tokenizer(tokenizer: &'tokenizer mut Tokenizer<'input>) -> Self {
-        tokenizer.allow_eof();
-        Self {
-            tokenizer,
-            buffered: VecDeque::new(),
-            no_reference: false,
-            top_level_no_reference: false,
-            depth: 0,
-            diagnostics: Vec::new(),
-        }
+        Self::with_mode(tokenizer, ParserMode::Object)
     }
 
-    /// Like [`with_tokenizer`](Self::with_tokenizer) but with indirect-reference recognition
-    /// disabled (see [`Parser::no_reference`]).
+    /// Like [`with_tokenizer`](Self::with_tokenizer) but in
+    /// [`ParserMode::NoReference`] mode, which leaves `N G R` as separate
+    /// objects instead of constructing an indirect reference.
     pub(crate) fn with_tokenizer_no_reference(
         tokenizer: &'tokenizer mut Tokenizer<'input>,
     ) -> Self {
+        Self::with_mode(tokenizer, ParserMode::NoReference)
+    }
+
+    /// Construct a parser in qpdf content-stream mode over the caller's
+    /// tokenizer and cursor.
+    pub(crate) fn with_tokenizer_content(tokenizer: &'tokenizer mut Tokenizer<'input>) -> Self {
+        Self::with_mode(tokenizer, ParserMode::Content)
+    }
+
+    fn with_mode(tokenizer: &'tokenizer mut Tokenizer<'input>, mode: ParserMode) -> Self {
         tokenizer.allow_eof();
         Self {
             tokenizer,
             buffered: VecDeque::new(),
-            no_reference: true,
+            mode,
             top_level_no_reference: false,
             depth: 0,
             diagnostics: Vec::new(),
@@ -181,6 +187,16 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
     /// can reuse the operand lexer without duplicating it.
     pub(crate) fn parse_one_object(&mut self) -> Result<Object> {
         self.object()
+    }
+
+    /// Parse one qpdf content-stream object, returning `None` at content EOF.
+    pub(crate) fn parse_content_object(&mut self) -> Result<Option<Object>> {
+        let token = self.next_token()?;
+        if token.token_type == TokenType::Eof {
+            return Ok(None);
+        }
+        self.unread_token(token);
+        self.object().map(Some)
     }
 
     pub(crate) fn object(&mut self) -> Result<Object> {
@@ -212,6 +228,9 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
             TokenType::Null => Ok(Object::Null),
             TokenType::Integer => self.integer_or_ref(token),
             TokenType::Real => self.real_object(token),
+            TokenType::Word if self.mode == ParserMode::Content => {
+                Ok(Object::Operator(token.value))
+            }
             TokenType::Bad => Err(Error::parse(
                 token.error_offset,
                 token
@@ -256,7 +275,9 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
 
     fn integer_or_ref(&mut self, first_token: Token) -> Result<Object> {
         let first = parse_integer_token(&first_token)?;
-        if self.no_reference || (self.top_level_no_reference && self.depth == 1) {
+        if matches!(self.mode, ParserMode::NoReference | ParserMode::Content)
+            || (self.top_level_no_reference && self.depth == 1)
+        {
             return Ok(Object::Integer(first));
         }
 
@@ -340,6 +361,98 @@ fn parse_integer_token(token: &Token) -> Result<i64> {
         .ok()
         .and_then(|text| text.parse::<i64>().ok())
         .ok_or_else(|| Error::parse(token.start, "invalid integer"))
+}
+
+#[cfg(test)]
+mod content_mode_tests {
+    use super::Parser;
+    use crate::tokenizer::Tokenizer;
+    use crate::{Error, Object};
+
+    #[test]
+    fn content_mode_returns_words_as_operators_and_never_builds_references() {
+        let mut tokenizer = Tokenizer::new(b"0 0 1 R");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        assert_eq!(
+            parser.parse_content_object().unwrap(),
+            Some(Object::Integer(0))
+        );
+        assert_eq!(
+            parser.parse_content_object().unwrap(),
+            Some(Object::Integer(0))
+        );
+        assert_eq!(
+            parser.parse_content_object().unwrap(),
+            Some(Object::Integer(1))
+        );
+        assert_eq!(
+            parser.parse_content_object().unwrap(),
+            Some(Object::Operator(b"R".to_vec()))
+        );
+        assert_eq!(parser.parse_content_object().unwrap(), None);
+    }
+
+    #[test]
+    fn content_mode_builds_nested_arrays_and_dictionaries_without_references() {
+        let mut tokenizer = Tokenizer::new(b"[0 0 1 R] << /Values [2 3] /Action Do >>");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        assert_eq!(
+            parser.parse_content_object().unwrap(),
+            Some(Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(1),
+                Object::Operator(b"R".to_vec()),
+            ]))
+        );
+
+        let dictionary = parser
+            .parse_content_object()
+            .unwrap()
+            .expect("dictionary")
+            .into_dict()
+            .expect("dictionary object");
+        assert_eq!(
+            dictionary.get("Values"),
+            Some(&Object::Array(vec![Object::Integer(2), Object::Integer(3)]))
+        );
+        assert_eq!(
+            dictionary.get("Action"),
+            Some(&Object::Operator(b"Do".to_vec()))
+        );
+        assert_eq!(parser.parse_content_object().unwrap(), None);
+    }
+
+    #[test]
+    fn content_mode_preserves_the_object_nesting_guard() {
+        let depth = 501;
+        let mut input = vec![b'['; depth];
+        input.extend(std::iter::repeat_n(b']', depth));
+        let mut tokenizer = Tokenizer::new(&input);
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        let error = parser
+            .parse_content_object()
+            .expect_err("over-limit content object must fail");
+        assert!(matches!(error, Error::Parse { .. }));
+        assert!(error.to_string().contains("object nesting too deep"));
+    }
+
+    #[test]
+    fn content_mode_preserves_bad_token_offset_and_diagnostic() {
+        let mut tokenizer = Tokenizer::new(b"  <0g>");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        let error = parser
+            .parse_content_object()
+            .expect_err("bad content token must fail");
+        assert_eq!(
+            error.to_string(),
+            "parse error at byte 2: invalid character (g) in hexstring"
+        );
+    }
 }
 
 pub(crate) fn keyword_token_end(input: &[u8], pos: usize, keyword: &[u8]) -> Option<usize> {

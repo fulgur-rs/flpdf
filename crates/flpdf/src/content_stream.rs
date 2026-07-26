@@ -30,8 +30,115 @@
 //! ```
 
 use crate::parser::Parser;
-use crate::tokenizer::{is_delimiter, is_ws, starts_number_token, Tokenizer};
+use crate::tokenizer::{
+    is_delimiter, is_ws, starts_number_token, TokenType, Tokenizer, TokenizerStateError,
+};
 use crate::{Dictionary, Error, Object, Result};
+
+/// Whether content-stream parsing should continue after an object callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseControl {
+    /// Continue parsing the content stream.
+    Continue,
+    /// Stop immediately without calling [`ParserCallbacks::handle_eof`].
+    Stop,
+}
+
+/// Receives qpdf-shaped content-stream object events.
+pub trait ParserCallbacks {
+    /// Receive the full content byte length before the first object.
+    fn content_size(&mut self, _size: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Receive one parsed object and its non-ignorable start and consumed
+    /// byte length.
+    fn handle_object(
+        &mut self,
+        object: Object,
+        offset: usize,
+        length: usize,
+    ) -> Result<ParseControl>;
+
+    /// Receive normal content EOF.
+    fn handle_eof(&mut self) -> Result<()>;
+}
+
+/// Parse raw content-stream bytes and deliver qpdf-shaped object callbacks.
+///
+/// The callback offset begins at the next non-ignorable token. Its length is
+/// the distance consumed by the shared tokenizer/parser cursor.
+///
+/// # Errors
+///
+/// Returns [`Error::Parse`] for malformed content objects, a missing byte
+/// after `ID`, an unterminated inline image, or invalid tokenizer state.
+/// Callback errors are propagated unchanged.
+pub fn parse_content_stream_data(input: &[u8], callbacks: &mut impl ParserCallbacks) -> Result<()> {
+    callbacks.content_size(input.len())?;
+
+    let mut tokenizer = Tokenizer::new(input);
+    tokenizer.allow_eof();
+
+    while tokenizer.position() < input.len() {
+        // qpdf probes and rewinds so callbacks exclude leading whitespace and
+        // comments while parser and orchestrator retain one shared cursor.
+        // libqpdf/QPDFObjectHandle.cc:1805-1817.
+        let probe = tokenizer.read_token(true, 0)?;
+        let offset = probe.start;
+        tokenizer.set_position(offset)?;
+
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+        let Some(object) = parser.parse_content_object()? else {
+            break;
+        };
+        let length = parser.position() - offset;
+        let is_id = object.as_operator() == Some(b"ID");
+
+        if callbacks.handle_object(object, offset, length)? == ParseControl::Stop {
+            return Ok(());
+        }
+
+        if is_id {
+            // qpdf discards exactly one byte after ID, asks the same tokenizer
+            // to scan to EI, and leaves EI for the normal parser.
+            // libqpdf/QPDFObjectHandle.cc:1820-1843.
+            tokenizer.consume_one_byte()?;
+            let inline_offset = tokenizer.position();
+            tokenizer.expect_inline_image().map_err(|error| {
+                // cov:ignore-start: consume_one_byte resets the shared tokenizer, so this
+                // state error is unreachable through parse_content_stream_data.
+                let message = match error {
+                    TokenizerStateError::TokenWaiting => "tokenizer already has a token waiting",
+                    TokenizerStateError::ImproperInlineImageState => {
+                        "tokenizer is in an improper inline image state"
+                    }
+                };
+                Error::parse(inline_offset, message)
+            })?;
+            // cov:ignore-end
+            let image = tokenizer.read_token(true, 0)?;
+            if image.token_type == TokenType::Bad {
+                return Err(Error::parse(
+                    image.error_offset,
+                    "EOF found while reading inline image",
+                ));
+            }
+            let image_offset = image.start;
+            let image_length = image.end - image.start;
+            if callbacks.handle_object(
+                Object::InlineImage(image.value),
+                image_offset,
+                image_length,
+            )? == ParseControl::Stop
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    callbacks.handle_eof()
+}
 
 /// One lexical unit of a content stream.
 #[derive(Debug, Clone, PartialEq)]
