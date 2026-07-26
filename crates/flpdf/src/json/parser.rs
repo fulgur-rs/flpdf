@@ -73,6 +73,25 @@ enum LexState {
     Comma,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParseState {
+    Top,
+    DictionaryBegin,
+    DictionaryAfterKey,
+    DictionaryAfterColon,
+    DictionaryAfterItem,
+    DictionaryAfterComma,
+    ArrayBegin,
+    ArrayAfterItem,
+    ArrayAfterComma,
+    Done,
+}
+
+struct StackEntry {
+    state: ParseState,
+    item: Json,
+}
+
 struct Parser<'a> {
     input: &'a [u8],
     pos: usize,
@@ -84,7 +103,10 @@ struct Parser<'a> {
     u_value: u32,
     high_surrogate: u32,
     high_offset: Option<i64>,
-    value: Option<Json>,
+    parse_state: ParseState,
+    stack: Vec<StackEntry>,
+    dict_key: Vec<u8>,
+    dict_key_offset: i64,
 }
 
 impl<'a> Parser<'a> {
@@ -100,7 +122,10 @@ impl<'a> Parser<'a> {
             u_value: 0,
             high_surrogate: 0,
             high_offset: None,
-            value: None,
+            parse_state: ParseState::Top,
+            stack: Vec::new(),
+            dict_key: Vec::new(),
+            dict_key_offset: 0,
         }
     }
 
@@ -109,8 +134,15 @@ impl<'a> Parser<'a> {
             self.get_token()?;
             self.handle_token()?;
         }
-        self.value
-            .ok_or_else(|| JsonError::Parse("JSON: premature end of input".into()))
+        if self.parse_state != ParseState::Done {
+            return Err(self.error("JSON: premature end of input"));
+        }
+        Ok(self
+            .stack
+            .last()
+            .expect("completed JSON parser has a top-level value")
+            .item
+            .clone())
     }
 
     fn offset(&self) -> i64 {
@@ -490,7 +522,7 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
 
-        if self.value.is_some() {
+        if self.parse_state == ParseState::Done {
             return Err(self.error(format!(
                 "JSON: offset {}: material follows end of object: {}",
                 self.offset(),
@@ -500,6 +532,71 @@ impl<'a> Parser<'a> {
 
         let state = std::mem::replace(&mut self.state, LexState::Top);
         let value = match state {
+            LexState::BeginDictionary => Json::make_dictionary(),
+            LexState::BeginArray => Json::make_array(),
+            LexState::Colon => {
+                if self.parse_state != ParseState::DictionaryAfterKey {
+                    return Err(
+                        self.error(format!("JSON: offset {}: unexpected colon", self.offset()))
+                    );
+                }
+                self.parse_state = ParseState::DictionaryAfterColon;
+                return Ok(());
+            }
+            LexState::Comma => {
+                self.parse_state = match self.parse_state {
+                    ParseState::DictionaryAfterItem => ParseState::DictionaryAfterComma,
+                    ParseState::ArrayAfterItem => ParseState::ArrayAfterComma,
+                    _ => {
+                        return Err(
+                            self.error(format!("JSON: offset {}: unexpected comma", self.offset()))
+                        );
+                    }
+                };
+                return Ok(());
+            }
+            LexState::EndArray => {
+                if !matches!(
+                    self.parse_state,
+                    ParseState::ArrayBegin | ParseState::ArrayAfterItem
+                ) {
+                    return Err(self.error(format!(
+                        "JSON: offset {}: unexpected array end delimiter",
+                        self.offset()
+                    )));
+                }
+                let entry = self
+                    .stack
+                    .last()
+                    .expect("array end has a matching stack entry");
+                self.parse_state = entry.state;
+                entry.item.set_end(self.offset());
+                if self.parse_state != ParseState::Done {
+                    self.stack.pop();
+                }
+                return Ok(());
+            }
+            LexState::EndDictionary => {
+                if !matches!(
+                    self.parse_state,
+                    ParseState::DictionaryBegin | ParseState::DictionaryAfterItem
+                ) {
+                    return Err(self.error(format!(
+                        "JSON: offset {}: unexpected dictionary end delimiter",
+                        self.offset()
+                    )));
+                }
+                let entry = self
+                    .stack
+                    .last()
+                    .expect("dictionary end has a matching stack entry");
+                self.parse_state = entry.state;
+                entry.item.set_end(self.offset());
+                if self.parse_state != ParseState::Done {
+                    self.stack.pop();
+                }
+                return Ok(());
+            }
             LexState::Number => Json::make_number(&self.token),
             LexState::Alpha => match self.token.as_slice() {
                 b"true" => Json::make_bool(true),
@@ -513,7 +610,18 @@ impl<'a> Parser<'a> {
                     )));
                 }
             },
-            LexState::AfterString => Json::make_string(&self.token),
+            LexState::AfterString => {
+                if matches!(
+                    self.parse_state,
+                    ParseState::DictionaryBegin | ParseState::DictionaryAfterComma
+                ) {
+                    self.dict_key.clone_from(&self.token);
+                    self.dict_key_offset = self.token_start;
+                    self.parse_state = ParseState::DictionaryAfterKey;
+                    return Ok(());
+                }
+                Json::make_string(&self.token)
+            }
             _ => {
                 return Err(self.error(format!(
                     "JSON: offset {}: premature end of input",
@@ -524,7 +632,87 @@ impl<'a> Parser<'a> {
 
         value.set_start(self.token_start);
         value.set_end(self.offset());
-        self.value = Some(value);
+
+        match self.parse_state {
+            ParseState::DictionaryBegin | ParseState::DictionaryAfterComma => {
+                return Err(self.error(format!(
+                    "JSON: offset {}: expect string as dictionary key",
+                    self.offset()
+                )));
+            }
+            ParseState::DictionaryAfterColon => {
+                let parent = &self
+                    .stack
+                    .last()
+                    .expect("dictionary value has a matching stack entry")
+                    .item;
+                if parent.check_dictionary_key_seen(&self.dict_key)? {
+                    return Err(self.error(format!(
+                        "JSON: offset {}: duplicated dictionary key",
+                        self.dict_key_offset
+                    )));
+                }
+                parent.add_dictionary_member(&self.dict_key, value.clone())?;
+                self.parse_state = ParseState::DictionaryAfterItem;
+            }
+            ParseState::ArrayBegin | ParseState::ArrayAfterComma => {
+                self.stack
+                    .last()
+                    .expect("array value has a matching stack entry")
+                    .item
+                    .add_array_element(value.clone())?;
+                self.parse_state = ParseState::ArrayAfterItem;
+            }
+            ParseState::Top => {
+                self.parse_state = ParseState::Done;
+            }
+            ParseState::DictionaryAfterKey => {
+                return Err(self.error(format!("JSON: offset {}: expected ':'", self.offset())));
+            }
+            ParseState::DictionaryAfterItem => {
+                return Err(self.error(format!(
+                    "JSON: offset {}: expected ',' or '}}'",
+                    self.offset()
+                )));
+            }
+            ParseState::ArrayAfterItem => {
+                return Err(self.error(format!(
+                    "JSON: offset {}: expected ',' or ']'",
+                    self.offset()
+                )));
+            }
+            ParseState::Done => unreachable!("done state is checked before token dispatch"),
+        }
+
+        if value.is_dictionary() || value.is_array() {
+            self.stack.push(StackEntry {
+                state: self.parse_state,
+                item: value,
+            });
+            self.parse_state = if self
+                .stack
+                .last()
+                .expect("new stack entry exists")
+                .item
+                .is_dictionary()
+            {
+                ParseState::DictionaryBegin
+            } else {
+                ParseState::ArrayBegin
+            };
+
+            if self.stack.len() > 500 {
+                return Err(self.error(format!(
+                    "JSON: offset {}: maximum object depth exceeded",
+                    self.offset()
+                )));
+            }
+        } else if self.parse_state == ParseState::Done {
+            self.stack.push(StackEntry {
+                state: ParseState::Done,
+                item: value,
+            });
+        }
         Ok(())
     }
 }

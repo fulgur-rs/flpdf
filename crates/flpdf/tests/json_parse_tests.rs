@@ -154,26 +154,123 @@ fn parser_accepts_qpdf_zero_sentinel_low_surrogate_at_offset_six() {
 }
 
 #[test]
-fn parser_defers_container_grammar_to_task_six() {
-    for input in [b"{".as_slice(), b"}".as_slice(), b"[", b"]", b":", b","] {
+fn parser_decodes_escapes_and_utf16_surrogate_pairs_in_dictionary_values() {
+    let value = Json::parse(br#"{"x":"\u03c0 \ud83e\udd54"}"#).unwrap();
+    let string = value.get_dict_item(b"x").get_string().unwrap();
+    assert_eq!(string, "π 🥔".as_bytes());
+}
+
+#[test]
+fn parser_builds_nested_container_tree_and_preserves_exclusive_offsets() {
+    let value = Json::parse(br#"{"items":[true,{"line\n":null}],"number":-2}"#).unwrap();
+    assert!(value.is_dictionary());
+    assert_eq!((value.start(), value.end()), (0, 44));
+
+    let items = value.get_dict_item(b"items");
+    assert!(items.is_array());
+    assert_eq!((items.start(), items.end()), (9, 31));
+
+    let mut array = Vec::new();
+    assert!(items.for_each_array_item(|item| array.push(item)));
+    assert_eq!(array.len(), 2);
+    assert_eq!(array[0].get_bool(), Some(true));
+    assert!(array[1].get_dict_item(b"line\\n").is_null());
+    assert_eq!(
+        value.get_dict_item(b"number").get_number(),
+        Some(b"-2".to_vec())
+    );
+}
+
+#[test]
+fn parser_accepts_empty_root_containers_with_exclusive_offsets() {
+    let dictionary = Json::parse(b"{}").unwrap();
+    assert!(dictionary.is_dictionary());
+    assert_eq!((dictionary.start(), dictionary.end()), (0, 2));
+
+    let array = Json::parse(b"[]").unwrap();
+    assert!(array.is_array());
+    assert_eq!((array.start(), array.end()), (0, 2));
+}
+
+#[test]
+fn parser_preserves_literal_high_bit_string_bytes_in_containers() {
+    let value = Json::parse(b"{\"x\":\"\x80\"}").unwrap();
+    assert_eq!(value.get_dict_item(b"x").get_string(), Some(vec![0x80]));
+}
+
+#[test]
+fn parser_rejects_duplicate_key_even_when_spelling_uses_escape() {
+    let error = Json::parse(br#"{"a":1,"\u0061":2}"#).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "JSON: offset 7: duplicated dictionary key"
+    );
+}
+
+#[test]
+fn parser_reports_qpdf_container_grammar_errors() {
+    for (input, expected) in [
+        (br#"{"x" "y"}"#.as_slice(), "JSON: offset 8: expected ':'"),
+        (
+            br#"{"x":3 "y"}"#.as_slice(),
+            "JSON: offset 10: expected ',' or '}'",
+        ),
+        (
+            br#"["x" "y"]"#.as_slice(),
+            "JSON: offset 8: expected ',' or ']'",
+        ),
+        (
+            br#"{5:5}"#.as_slice(),
+            "JSON: offset 2: expect string as dictionary key",
+        ),
+        (
+            br#"["a"}"#.as_slice(),
+            "JSON: offset 5: unexpected dictionary end delimiter",
+        ),
+        (br#"[,]"#.as_slice(), "JSON: offset 2: unexpected comma"),
+    ] {
         assert_eq!(
             Json::parse(input).unwrap_err().to_string(),
-            "JSON: offset 1: premature end of input",
+            expected,
             "{input:?}"
         );
     }
 }
 
 #[test]
-fn parser_lexes_scalar_delimiters_before_task_six_handles_them() {
-    for input in [b"1,".as_slice(), b"1:", b"1{", b"1}", b"1[", b"1]"] {
+fn parser_limits_nesting_to_qpdf_maximum_depth() {
+    let mut input = vec![b'['; 501];
+    input.extend(vec![b']'; 501]);
+    assert_eq!(
+        Json::parse(&input).unwrap_err().to_string(),
+        "JSON: offset 501: maximum object depth exceeded"
+    );
+}
+
+#[test]
+fn parser_lexes_scalar_delimiters_inside_container_grammar() {
+    for (input, expected) in [
+        (
+            b"[1,]".as_slice(),
+            "JSON: offset 4: unexpected array end delimiter",
+        ),
+        (
+            b"{\"x\":}".as_slice(),
+            "JSON: offset 6: unexpected dictionary end delimiter",
+        ),
+    ] {
         assert_eq!(
             Json::parse(input).unwrap_err().to_string(),
-            "JSON: offset 2: material follows end of object: ",
+            expected,
             "{input:?}"
         );
     }
 
+    assert_eq!(Json::parse(b"[0.1]").unwrap().start(), 0);
+}
+
+#[test]
+fn parser_reports_scalar_delimiter_and_numeric_errors_after_container_support() {
     for (input, expected) in [
         (
             b"-x".as_slice(),
@@ -198,11 +295,6 @@ fn parser_lexes_scalar_delimiters_before_task_six_handles_them() {
             "{input:?}"
         );
     }
-
-    assert_eq!(
-        Json::parse(b"0.1").unwrap().get_number(),
-        Some(b"0.1".to_vec())
-    );
 }
 
 struct FailingReader;
