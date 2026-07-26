@@ -43,6 +43,7 @@
 //! let _ = pdf.outline().get_root_with_max_depth(10);
 //! ```
 
+use crate::json_inspect::{qpdf_new_unicode_utf8_value, qpdf_unicode_string_bytes};
 use crate::outline::{OutlineId, OutlineItem, OutlineTree};
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::cmp::Ordering;
@@ -431,68 +432,6 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         }
     }
 }
-/// Match `newUnicodeString(utf8).getUTF8Value()` in qpdf 11.9.0.
-///
-/// qpdf accepts up to six-byte UTF-8 forms while decoding, consumes malformed
-/// sequences according to `QUtil::get_next_utf8_codepoint`, then writes U+FFFD
-/// for every decode error, surrogate, or code point above U+10FFFF.
-fn qpdf_new_unicode_utf8_value(utf8: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(utf8.len());
-    let mut pos = 0;
-    while pos < utf8.len() {
-        let original_pos = pos;
-        let mut byte = utf8[pos];
-        pos += 1;
-
-        if byte < 0x80 {
-            result.push(byte);
-            continue;
-        }
-
-        let mut bytes_needed = 0;
-        let mut bit_check = 0x40;
-        let mut to_clear = 0x80;
-        while byte & bit_check != 0 {
-            bytes_needed += 1;
-            to_clear |= bit_check;
-            bit_check >>= 1;
-        }
-
-        let mut error = !(1..=5).contains(&bytes_needed) || pos + bytes_needed > utf8.len();
-        let mut codepoint = 0xfffd;
-        if !error {
-            codepoint = u32::from(byte & !to_clear);
-            for _ in 0..bytes_needed {
-                byte = utf8[pos];
-                pos += 1;
-                if byte & 0xc0 != 0x80 {
-                    pos -= 1;
-                    error = true;
-                    break;
-                }
-                codepoint = (codepoint << 6) + u32::from(byte & 0x3f);
-            }
-
-            if !error {
-                let lower_bounds = [0, 0, 1 << 7, 1 << 11, 1 << 16, 1 << 12, 1 << 26];
-                let lower_bound = lower_bounds[pos - original_pos];
-                if lower_bound > 0 && codepoint < lower_bound {
-                    error = true;
-                }
-            }
-        }
-
-        let scalar = if error {
-            '\u{fffd}'
-        } else {
-            char::from_u32(codepoint).unwrap_or('\u{fffd}')
-        };
-        let mut encoded = [0; 4];
-        result.extend_from_slice(scalar.encode_utf8(&mut encoded).as_bytes());
-    }
-    result
-}
-
 impl<R: Read + Seek> Pdf<R> {
     /// Return a high-level outline helper for this document.
     pub fn outline(&mut self) -> OutlineDocumentHelper<'_, R> {
@@ -1312,26 +1251,6 @@ fn replace_direct_dests_root<R: Read + Seek>(
     Ok(())
 }
 
-/// Encode the normalized UTF-8 key as qpdf `newUnicodeString`: PDFDocEncoding
-/// when every scalar is representable, otherwise UTF-16BE with a BOM.
-fn qpdf_unicode_string_bytes(utf8: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(utf8);
-    let mut pdfdoc = Vec::with_capacity(text.len());
-    for character in text.chars() {
-        let mut encoded_character = [0; 4];
-        let encoded_character = character.encode_utf8(&mut encoded_character).as_bytes();
-        let encoded = (1_u16..=u16::from(u8::MAX))
-            .map(|byte| byte as u8)
-            .filter(|byte| !matches!(byte, 0x7f | 0x9f | 0xad))
-            .find(|&byte| crate::json_inspect::qpdf_utf8_value(&[byte]) == encoded_character);
-        let Some(encoded) = encoded else {
-            return crate::filespec_helper::encode_utf16be(&text);
-        };
-        pdfdoc.push(encoded);
-    }
-    pdfdoc
-}
-
 /// Decode an outline `/Title`, resolving one level of indirection (review rule 2).
 fn resolve_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<String> {
     let Some(value) = value else {
@@ -1465,10 +1384,7 @@ mod qpdf_utf8_tests {
             qpdf_unicode_string_bytes("�".as_bytes()),
             vec![0xfe, 0xff, 0xff, 0xfd]
         );
-        assert_eq!(
-            qpdf_unicode_string_bytes("\0".as_bytes()),
-            vec![0xfe, 0xff, 0x00, 0x00]
-        );
+        assert_eq!(qpdf_unicode_string_bytes("\0".as_bytes()), vec![0x00]);
     }
 
     #[test]

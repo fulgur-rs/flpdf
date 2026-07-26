@@ -3,9 +3,11 @@
 //! Public wrappers corresponding to `QPDFNameTreeObjectHelper` and
 //! `QPDFNumberTreeObjectHelper` are added in the next stacked layer.
 
+use crate::json_inspect::{qpdf_new_unicode_utf8_value, qpdf_unicode_string_bytes};
 use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::io::{Read, Seek};
 use std::marker::PhantomData;
@@ -61,88 +63,13 @@ impl TreeKey for NumberKey {
     }
 }
 
-fn qpdf_new_unicode_utf8_value(utf8: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(utf8.len());
-    let mut position = 0;
-    while position < utf8.len() {
-        let original_position = position;
-        let mut byte = utf8[position];
-        position += 1;
-
-        if byte < 0x80 {
-            result.push(byte);
-            continue;
-        }
-
-        let mut bytes_needed = 0;
-        let mut bit_check = 0x40;
-        let mut to_clear = 0x80;
-        while byte & bit_check != 0 {
-            bytes_needed += 1;
-            to_clear |= bit_check;
-            bit_check >>= 1;
-        }
-
-        let mut error = !(1..=5).contains(&bytes_needed) || position + bytes_needed > utf8.len();
-        let mut codepoint = 0xfffd;
-        if !error {
-            codepoint = u32::from(byte & !to_clear);
-            for _ in 0..bytes_needed {
-                byte = utf8[position];
-                position += 1;
-                if byte & 0xc0 != 0x80 {
-                    position -= 1;
-                    error = true;
-                    break;
-                }
-                codepoint = (codepoint << 6) + u32::from(byte & 0x3f);
-            }
-
-            if !error {
-                let lower_bounds = [0, 0, 1 << 7, 1 << 11, 1 << 16, 1 << 12, 1 << 26];
-                let lower_bound = lower_bounds[position - original_position];
-                if lower_bound > 0 && codepoint < lower_bound {
-                    error = true;
-                }
-            }
-        }
-
-        let scalar = if error {
-            '\u{fffd}'
-        } else {
-            char::from_u32(codepoint).unwrap_or('\u{fffd}')
-        };
-        let mut encoded = [0; 4];
-        result.extend_from_slice(scalar.encode_utf8(&mut encoded).as_bytes());
-    }
-    result
-}
-
-fn qpdf_unicode_string_bytes(utf8: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(utf8);
-    let mut pdfdoc = Vec::with_capacity(text.len());
-    for character in text.chars() {
-        let mut encoded_character = [0; 4];
-        let encoded_character = character.encode_utf8(&mut encoded_character).as_bytes();
-        let encoded = (0_u16..=u16::from(u8::MAX))
-            .map(|byte| byte as u8)
-            .filter(|byte| !matches!(byte, 0x7f | 0x9f | 0xad))
-            .find(|&byte| crate::json_inspect::qpdf_utf8_value(&[byte]) == encoded_character);
-        let Some(encoded) = encoded else {
-            return crate::filespec_helper::encode_utf16be(&text);
-        };
-        pdfdoc.push(encoded);
-    }
-    pdfdoc
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum NodeAnchor {
     Root,
     Indirect(ObjectRef),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct NodeHandle {
     anchor: NodeAnchor,
     direct_kids: Vec<usize>,
@@ -931,17 +858,16 @@ impl<K: TreeKey> NNTree<K> {
         let root = self.root_handle(pdf)?;
         let root_diagnostic_ref = root.diagnostic_ref();
         let mut node = root;
-        let mut seen = Vec::new();
+        let mut seen = HashSet::new();
         let mut cursor = NNTreeCursor::empty();
 
         loop {
-            if seen.contains(&node) {
+            if !seen.insert(node.clone()) {
                 return Err(structural_error(
                     node.diagnostic_ref(),
                     "loop detected in find",
                 ));
             }
-            seen.push(node.clone());
 
             let dictionary = self
                 .load_node(pdf, &node)
@@ -1086,7 +1012,7 @@ impl<K: TreeKey> NNTree<K> {
         let original_leaf = cursor.leaf.clone();
         let original_item_number = cursor.item_number;
         let original_current = cursor.current.clone();
-        let mut seen: Vec<NodeHandle> = cursor
+        let mut seen: HashSet<NodeHandle> = cursor
             .path
             .iter()
             .map(|element| element.node.clone())
@@ -1094,7 +1020,7 @@ impl<K: TreeKey> NNTree<K> {
         let mut node = start;
 
         loop {
-            if seen.contains(&node) {
+            if !seen.insert(node.clone()) {
                 self.warn(
                     pdf,
                     &node,
@@ -1102,7 +1028,6 @@ impl<K: TreeKey> NNTree<K> {
                 );
                 break;
             }
-            seen.push(node.clone());
 
             let dictionary = match self.load_node(pdf, &node) {
                 Ok(dictionary) => dictionary,

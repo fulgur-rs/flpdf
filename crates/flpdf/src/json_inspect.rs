@@ -147,6 +147,89 @@ pub(crate) fn qpdf_utf8_value(bytes: &[u8]) -> Vec<u8> {
         .into_bytes()
 }
 
+/// Match `newUnicodeString(utf8).getUTF8Value()` in qpdf 11.9.0.
+///
+/// qpdf accepts up to six-byte UTF-8 forms while decoding, consumes malformed
+/// sequences according to `QUtil::get_next_utf8_codepoint`, then writes U+FFFD
+/// for every decode error, surrogate, or code point above U+10FFFF.
+pub(crate) fn qpdf_new_unicode_utf8_value(utf8: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(utf8.len());
+    let mut position = 0;
+    while position < utf8.len() {
+        let original_position = position;
+        let mut byte = utf8[position];
+        position += 1;
+
+        if byte < 0x80 {
+            result.push(byte);
+            continue;
+        }
+
+        let mut bytes_needed = 0;
+        let mut bit_check = 0x40;
+        let mut to_clear = 0x80;
+        while byte & bit_check != 0 {
+            bytes_needed += 1;
+            to_clear |= bit_check;
+            bit_check >>= 1;
+        }
+
+        let mut error = !(1..=5).contains(&bytes_needed) || position + bytes_needed > utf8.len();
+        let mut codepoint = 0xfffd;
+        if !error {
+            codepoint = u32::from(byte & !to_clear);
+            for _ in 0..bytes_needed {
+                byte = utf8[position];
+                position += 1;
+                if byte & 0xc0 != 0x80 {
+                    position -= 1;
+                    error = true;
+                    break;
+                }
+                codepoint = (codepoint << 6) + u32::from(byte & 0x3f);
+            }
+
+            if !error {
+                // qpdf 11.9.0 QUtil.cc uses 1 << 12 for five-byte forms.
+                let lower_bounds = [0, 0, 1 << 7, 1 << 11, 1 << 16, 1 << 12, 1 << 26];
+                let lower_bound = lower_bounds[position - original_position];
+                if lower_bound > 0 && codepoint < lower_bound {
+                    error = true;
+                }
+            }
+        }
+
+        let scalar = if error {
+            '\u{fffd}'
+        } else {
+            char::from_u32(codepoint).unwrap_or('\u{fffd}')
+        };
+        let mut encoded = [0; 4];
+        result.extend_from_slice(scalar.encode_utf8(&mut encoded).as_bytes());
+    }
+    result
+}
+
+/// Encode normalized UTF-8 as qpdf `newUnicodeString`: PDFDocEncoding when
+/// every scalar is representable, otherwise UTF-16BE with a BOM.
+pub(crate) fn qpdf_unicode_string_bytes(utf8: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(utf8);
+    let mut pdfdoc = Vec::with_capacity(text.len());
+    for character in text.chars() {
+        let mut encoded_character = [0; 4];
+        let encoded_character = character.encode_utf8(&mut encoded_character).as_bytes();
+        let encoded = (0_u16..=u16::from(u8::MAX))
+            .map(|byte| byte as u8)
+            .filter(|byte| !matches!(byte, 0x7f | 0x9f | 0xad))
+            .find(|&byte| qpdf_utf8_value(&[byte]) == encoded_character);
+        let Some(encoded) = encoded else {
+            return crate::filespec_helper::encode_utf16be(&text);
+        };
+        pdfdoc.push(encoded);
+    }
+    pdfdoc
+}
+
 /// Decode a PDF text string (ISO 32000-1 §7.9.2) into a Rust `String`.
 ///
 /// Returns `Some(text)` when the byte sequence is valid as a PDF text string
