@@ -1,4 +1,4 @@
-//! Mirrors qpdf 11.9.0 `libqpdf/JSON.cc` and `libqpdf/JSONHandler.cc`.
+//! qpdf correspondence: JSON.cc and JSONHandler.cc responsibilities split across the json module tree.
 //! Public APIs: qpdf 11.9.0 `include/qpdf/JSON.hh` and
 //! `libqpdf/qpdf/JSONHandler.hh`.
 //!

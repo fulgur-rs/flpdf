@@ -1,3 +1,5 @@
+//! qpdf correspondence: JSON.cc incremental serialization and blob Base64 responsibilities.
+
 use std::io::{self, Write};
 
 use base64::{engine::general_purpose::STANDARD, write::EncoderWriter};
