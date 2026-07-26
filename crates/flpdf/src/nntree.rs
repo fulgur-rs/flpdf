@@ -210,6 +210,150 @@ impl<K: TreeKey> NNTree<K> {
         self.increment(pdf, cursor, true)
     }
 
+    pub(crate) fn find<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: &K::Key,
+        return_previous_if_missing: bool,
+    ) -> Result<NNTreeCursor<K>> {
+        self.find_internal(pdf, key, return_previous_if_missing)
+    }
+
+    fn find_internal<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: &K::Key,
+        return_previous_if_missing: bool,
+    ) -> Result<NNTreeCursor<K>> {
+        let first = self.begin(pdf)?;
+        let Some((first_key, _)) = first.current() else {
+            return Ok(self.end());
+        };
+        if K::compare(key, first_key) == Ordering::Less {
+            return Ok(self.end());
+        }
+
+        let root = self.root_handle(pdf)?;
+        let root_diagnostic_ref = root.diagnostic_ref();
+        let mut node = root;
+        let mut seen = Vec::new();
+        let mut cursor = NNTreeCursor::empty();
+
+        loop {
+            if seen.contains(&node) {
+                return Err(structural_error(
+                    node.diagnostic_ref(),
+                    "loop detected in find",
+                ));
+            }
+            seen.push(node.clone());
+
+            let dictionary = self
+                .load_node(pdf, &node)
+                .map_err(|_| structural_error(node.diagnostic_ref(), "bad node during find"))?;
+            let items = match dictionary.get(K::ITEMS_KEY) {
+                Some(Object::Array(items)) => Some(items),
+                _ => None,
+            };
+            let kids = match dictionary.get("Kids") {
+                Some(Object::Array(kids)) => Some(kids),
+                _ => None,
+            };
+
+            if let Some(items) = items.filter(|items| !items.is_empty()) {
+                let index = binary_search(items.len() / 2, return_previous_if_missing, |index| {
+                    let item_number = 2 * index;
+                    let Some(item_key) = items.get(item_number).and_then(K::from_object) else {
+                        return Err(structural_error(
+                            root_diagnostic_ref,
+                            format!("item at index {item_number} is not the right type"),
+                        ));
+                    };
+                    Ok(K::compare(key, &item_key))
+                })?;
+                if let Some(index) = index {
+                    cursor.leaf = Some(node);
+                    cursor.item_number = Some(2 * index);
+                    self.update_current(pdf, &mut cursor, false)?;
+                }
+                return Ok(cursor);
+            }
+
+            if let Some(kids) = kids.filter(|kids| !kids.is_empty()) {
+                let index = binary_search(kids.len(), true, |index| {
+                    let kid = kids.get(index).expect("binary-search index is in range");
+                    let (resolved, terminal_ref) = resolve_ref_chain(pdf, kid)?;
+                    let Object::Dictionary(kid_dictionary) = resolved else {
+                        return Err(structural_error(
+                            root_diagnostic_ref,
+                            format!("invalid kid at index {index}"),
+                        ));
+                    };
+                    self.within_limits(key, &kid_dictionary, terminal_ref)
+                })?
+                .ok_or_else(|| {
+                    structural_error(
+                        node.diagnostic_ref(),
+                        "unexpected -1 from binary search of kids; limits may by wrong",
+                    )
+                })?;
+                let kid_object = kids[index].clone();
+                cursor.path.push(PathElement {
+                    node: node.clone(),
+                    kid_number: index,
+                });
+                node = self.handle_for_kid(pdf, &node, index, &kid_object)?;
+                continue;
+            }
+
+            return Err(structural_error(
+                node.diagnostic_ref(),
+                "bad node during find",
+            ));
+        }
+    }
+
+    fn within_limits(
+        &self,
+        key: &K::Key,
+        dictionary: &Dictionary,
+        object_ref: Option<ObjectRef>,
+    ) -> Result<Ordering> {
+        let Some(Object::Array(limits)) = dictionary.get("Limits") else {
+            return Err(structural_error(object_ref, "node is missing /Limits"));
+        };
+        let (Some(first), Some(last)) = (
+            limits.first().and_then(K::from_object),
+            limits.get(1).and_then(K::from_object),
+        ) else {
+            return Err(structural_error(object_ref, "node is missing /Limits"));
+        };
+        if K::compare(key, &first) == Ordering::Less {
+            Ok(Ordering::Less)
+        } else if K::compare(key, &last) == Ordering::Greater {
+            Ok(Ordering::Greater)
+        } else {
+            Ok(Ordering::Equal)
+        }
+    }
+
+    fn handle_for_kid<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        parent: &NodeHandle,
+        kid_number: usize,
+        kid: &Object,
+    ) -> Result<NodeHandle> {
+        if matches!(kid, Object::Reference(_)) {
+            let (_, terminal_ref) = resolve_ref_chain(pdf, kid)?;
+            terminal_ref
+                .map(NodeHandle::indirect)
+                .ok_or_else(|| structural_error(parent.diagnostic_ref(), "invalid kid"))
+        } else {
+            Ok(parent.direct_kid(kid_number))
+        }
+    }
+
     fn root_handle<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> Result<NodeHandle> {
         let (_, terminal_ref) = resolve_ref_chain(pdf, &self.root)?;
         Ok(terminal_ref.map_or_else(NodeHandle::root, NodeHandle::indirect))
@@ -647,6 +791,63 @@ fn make_indirect<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<Obje
     Ok(object_ref)
 }
 
+fn binary_search<F>(
+    count: usize,
+    return_previous_if_missing: bool,
+    mut compare: F,
+) -> Result<Option<usize>>
+where
+    F: FnMut(usize) -> Result<Ordering>,
+{
+    let mut max_index = 1usize;
+    while max_index < count {
+        max_index <<= 1;
+    }
+    let mut step = max_index / 2;
+    let mut checks = max_index;
+    let mut index = step;
+    let mut found_index = None;
+    let mut found = false;
+    let mut found_less_or_equal = false;
+
+    while !found && checks > 0 {
+        let status = if index < count {
+            let status = compare(index)?;
+            if status != Ordering::Less {
+                found_less_or_equal = true;
+                found_index = Some(index);
+            }
+            status
+        } else {
+            Ordering::Less
+        };
+        if status == Ordering::Equal {
+            found = true;
+        } else {
+            checks >>= 1;
+            if checks > 0 {
+                step >>= 1;
+                if step == 0 {
+                    step = 1;
+                }
+                if status == Ordering::Less {
+                    index = index.saturating_sub(step);
+                } else {
+                    index = index.saturating_add(step);
+                }
+            }
+        }
+    }
+
+    Ok(
+        if found || (found_less_or_equal && return_previous_if_missing) {
+            found_index
+        } else {
+            None
+        },
+    )
+}
+
 fn structural_error(object_ref: Option<ObjectRef>, message: impl AsRef<str>) -> Error {
     Error::parse(0, structural_message(object_ref, message))
 }
@@ -729,6 +930,44 @@ mod tests {
         root.insert(
             "Kids",
             Object::Array(vec![name_leaf(&[(b"a", 1)], Some((b"a", b"a")))]),
+        );
+        Object::Dictionary(root)
+    }
+
+    fn number_leaf(entries: &[(i64, &[u8])], limits: Option<(i64, i64)>) -> Object {
+        let mut dictionary = Dictionary::new();
+        let items = entries
+            .iter()
+            .flat_map(|(key, value)| [Object::Integer(*key), Object::String(value.to_vec())])
+            .collect();
+        dictionary.insert("Nums", Object::Array(items));
+        if let Some((first, last)) = limits {
+            dictionary.insert(
+                "Limits",
+                Object::Array(vec![Object::Integer(first), Object::Integer(last)]),
+            );
+        }
+        Object::Dictionary(dictionary)
+    }
+
+    fn two_leaf_number_tree(pdf: &mut TestPdf) -> Object {
+        let left_ref = ObjectRef::new(10, 0);
+        let right_ref = ObjectRef::new(11, 0);
+        pdf.set_object(
+            left_ref,
+            number_leaf(&[(10, b"ten"), (20, b"twenty")], Some((10, 20))),
+        );
+        pdf.set_object(
+            right_ref,
+            number_leaf(&[(30, b"thirty"), (40, b"forty")], Some((30, 40))),
+        );
+        let mut root = Dictionary::new();
+        root.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(left_ref),
+                Object::Reference(right_ref),
+            ]),
         );
         Object::Dictionary(root)
     }
@@ -906,6 +1145,62 @@ mod tests {
         assert_eq!(
             pdf.repair_diagnostics().entries()[0].message,
             "Name/Number tree node: non-dictionary node while traversing name/number tree"
+        );
+    }
+
+    #[test]
+    fn find_returns_exact_previous_or_end_like_qpdf() {
+        let mut pdf = empty_pdf();
+        let root = two_leaf_number_tree(&mut pdf);
+        let mut tree = NNTree::<NumberKey>::new(root, false);
+
+        assert_eq!(
+            tree.find(&mut pdf, &20, false).unwrap().current(),
+            Some((&20, &Object::String(b"twenty".to_vec())))
+        );
+        assert!(!tree.find(&mut pdf, &25, false).unwrap().valid());
+        assert_eq!(
+            tree.find(&mut pdf, &25, true).unwrap().current(),
+            Some((&20, &Object::String(b"twenty".to_vec())))
+        );
+        assert!(!tree.find(&mut pdf, &-1, true).unwrap().valid());
+        assert_eq!(
+            tree.find(&mut pdf, &99, true).unwrap().current(),
+            Some((&40, &Object::String(b"forty".to_vec())))
+        );
+    }
+
+    #[test]
+    fn find_crosses_name_tree_limits() {
+        let mut pdf = empty_pdf();
+        let root = two_leaf_name_tree(&mut pdf);
+        let mut tree = NNTree::<NameKey>::new(root, false);
+
+        let cursor = tree.find(&mut pdf, &b"c".to_vec(), false).unwrap();
+
+        assert_eq!(
+            cursor.current().map(|(key, value)| (key.as_slice(), value)),
+            Some((b"c".as_slice(), &Object::Integer(3)))
+        );
+    }
+
+    #[test]
+    fn find_reports_the_indirect_node_missing_limits() {
+        let mut pdf = empty_pdf();
+        let leaf_ref = ObjectRef::new(10, 0);
+        pdf.set_object(leaf_ref, number_leaf(&[(10, b"ten")], None));
+        let mut root = Dictionary::new();
+        root.insert("Kids", Object::Array(vec![Object::Reference(leaf_ref)]));
+        let mut tree = NNTree::<NumberKey>::new(Object::Dictionary(root), false);
+
+        let error = match tree.find(&mut pdf, &10, false) {
+            Err(error) => error,
+            Ok(_) => panic!("missing /Limits must fail targeted lookup"),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "parse error at byte 0: Name/Number tree node (object 10): node is missing /Limits"
         );
     }
 }
