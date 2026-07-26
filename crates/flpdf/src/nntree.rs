@@ -97,10 +97,57 @@ impl NodeHandle {
     }
 
     fn diagnostic_ref(&self) -> Option<ObjectRef> {
+        if !self.direct_kids.is_empty() {
+            return None;
+        }
         match self.anchor {
             NodeAnchor::Indirect(object_ref) => Some(object_ref),
             NodeAnchor::Root => None,
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PathElement {
+    node: NodeHandle,
+    kid_number: usize,
+}
+
+pub(crate) struct NNTreeCursor<K: TreeKey> {
+    path: Vec<PathElement>,
+    leaf: Option<NodeHandle>,
+    item_number: Option<usize>,
+    current: Option<(K::Key, Object)>,
+    marker: PhantomData<K>,
+}
+
+impl<K: TreeKey> NNTreeCursor<K> {
+    fn empty() -> Self {
+        Self {
+            path: Vec::new(),
+            leaf: None,
+            item_number: None,
+            current: None,
+            marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn valid(&self) -> bool {
+        self.item_number.is_some()
+    }
+
+    pub(crate) fn current(&self) -> Option<(&K::Key, &Object)> {
+        self.current.as_ref().map(|(key, value)| (key, value))
+    }
+
+    fn cloned_current(&self) -> Option<(K::Key, Object)> {
+        self.current.clone()
+    }
+
+    fn clear_position(&mut self) {
+        self.leaf = None;
+        self.item_number = None;
+        self.current = None;
     }
 }
 
@@ -129,12 +176,334 @@ impl<K: TreeKey> NNTree<K> {
         self.root
     }
 
+    pub(crate) fn begin<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NNTreeCursor<K>> {
+        let mut cursor = NNTreeCursor::empty();
+        let root = self.root_handle(pdf)?;
+        self.descend(pdf, &mut cursor, root, true, true)?;
+        Ok(cursor)
+    }
+
+    pub(crate) fn end(&self) -> NNTreeCursor<K> {
+        NNTreeCursor::empty()
+    }
+
+    pub(crate) fn last<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NNTreeCursor<K>> {
+        let mut cursor = NNTreeCursor::empty();
+        let root = self.root_handle(pdf)?;
+        self.descend(pdf, &mut cursor, root, false, true)?;
+        Ok(cursor)
+    }
+
+    pub(crate) fn next<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        cursor: &mut NNTreeCursor<K>,
+    ) -> Result<()> {
+        self.increment(pdf, cursor, false)
+    }
+
+    pub(crate) fn previous<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        cursor: &mut NNTreeCursor<K>,
+    ) -> Result<()> {
+        self.increment(pdf, cursor, true)
+    }
+
     fn root_handle<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> Result<NodeHandle> {
-        let (root, terminal_ref) = resolve_ref_chain(pdf, &self.root)?;
-        if !matches!(root, Object::Dictionary(_)) {
-            return Err(structural_error(terminal_ref, "bad node"));
-        }
+        let (_, terminal_ref) = resolve_ref_chain(pdf, &self.root)?;
         Ok(terminal_ref.map_or_else(NodeHandle::root, NodeHandle::indirect))
+    }
+
+    fn descend<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        cursor: &mut NNTreeCursor<K>,
+        start: NodeHandle,
+        first: bool,
+        allow_empty: bool,
+    ) -> Result<bool> {
+        let original_path = cursor.path.clone();
+        let original_leaf = cursor.leaf.clone();
+        let original_item_number = cursor.item_number;
+        let original_current = cursor.current.clone();
+        let mut seen: Vec<NodeHandle> = cursor
+            .path
+            .iter()
+            .map(|element| element.node.clone())
+            .collect();
+        let mut node = start;
+
+        loop {
+            if seen.contains(&node) {
+                self.warn(
+                    pdf,
+                    &node,
+                    "loop detected while traversing name/number tree",
+                );
+                break;
+            }
+            seen.push(node.clone());
+
+            let dictionary = match self.load_node(pdf, &node) {
+                Ok(dictionary) => dictionary,
+                Err(_) => {
+                    self.warn(
+                        pdf,
+                        &node,
+                        "non-dictionary node while traversing name/number tree",
+                    );
+                    break;
+                }
+            };
+            let items = match dictionary.get(K::ITEMS_KEY) {
+                Some(Object::Array(items)) => Some(items),
+                _ => None,
+            };
+            let kids = match dictionary.get("Kids") {
+                Some(Object::Array(kids)) => Some(kids),
+                _ => None,
+            };
+
+            if let Some(items) = items.filter(|items| !items.is_empty()) {
+                let item_number = if first {
+                    0
+                } else {
+                    items.len().saturating_sub(2)
+                };
+                cursor.leaf = Some(node);
+                cursor.item_number = Some(item_number);
+                self.update_current(pdf, cursor, false)?;
+                return Ok(true);
+            }
+
+            if let Some(kids) = kids.filter(|kids| !kids.is_empty()) {
+                let kid_number = if first { 0 } else { kids.len() - 1 };
+                let kid_object = kids[kid_number].clone();
+                cursor.path.push(PathElement {
+                    node: node.clone(),
+                    kid_number,
+                });
+                node = self.prepare_kid(pdf, &node, kid_number, kid_object)?;
+                continue;
+            }
+
+            if allow_empty && items.is_some() {
+                cursor.leaf = Some(node);
+                cursor.item_number = None;
+                cursor.current = None;
+                return Ok(true);
+            }
+
+            self.warn(
+                pdf,
+                &node,
+                format!(
+                    "name/number tree node has neither non-empty /{} nor /Kids",
+                    K::ITEMS_KEY
+                ),
+            );
+            break;
+        }
+
+        cursor.path = original_path;
+        cursor.leaf = original_leaf;
+        cursor.item_number = original_item_number;
+        cursor.current = original_current;
+        Ok(false)
+    }
+
+    fn increment<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        cursor: &mut NNTreeCursor<K>,
+        backward: bool,
+    ) -> Result<()> {
+        if cursor.item_number.is_none() {
+            cursor.path.clear();
+            cursor.clear_position();
+            let root = self.root_handle(pdf)?;
+            self.descend(pdf, cursor, root, !backward, true)?;
+            return Ok(());
+        }
+
+        loop {
+            let leaf = cursor.leaf.clone().expect("valid cursor has a leaf");
+            let dictionary = self.load_node(pdf, &leaf)?;
+            let items = match dictionary.get(K::ITEMS_KEY) {
+                Some(Object::Array(items)) => items,
+                _ => {
+                    cursor.clear_position();
+                    return Ok(());
+                }
+            };
+            let item_number = cursor.item_number.expect("checked above");
+            let candidate = if backward {
+                item_number.checked_sub(2)
+            } else {
+                item_number
+                    .checked_add(2)
+                    .filter(|index| *index < items.len())
+            };
+
+            if let Some(candidate) = candidate {
+                cursor.item_number = Some(candidate);
+                self.update_current(pdf, cursor, true)?;
+                if cursor.current.is_some() {
+                    return Ok(());
+                }
+                continue;
+            }
+
+            cursor.clear_position();
+            let mut descended = false;
+            while let Some(last_index) = cursor.path.len().checked_sub(1) {
+                let parent = cursor.path[last_index].node.clone();
+                let dictionary = self.load_node(pdf, &parent)?;
+                let Some(Object::Array(kids)) = dictionary.get("Kids") else {
+                    cursor.path.pop();
+                    continue;
+                };
+                let mut kid_number = cursor.path[last_index].kid_number;
+                loop {
+                    let next_index = if backward {
+                        kid_number.checked_sub(1)
+                    } else {
+                        kid_number
+                            .checked_add(1)
+                            .filter(|index| *index < kids.len())
+                    };
+                    let Some(next_index) = next_index else {
+                        break;
+                    };
+                    kid_number = next_index;
+                    let kid_object = kids[kid_number].clone();
+                    if !self.kid_has_tree_shape(pdf, &kid_object)? {
+                        self.warn(
+                            pdf,
+                            &parent,
+                            format!("skipping over invalid kid at index {kid_number}"),
+                        );
+                        continue;
+                    }
+                    cursor.path[last_index].kid_number = kid_number;
+                    let kid = self.prepare_kid(pdf, &parent, kid_number, kid_object)?;
+                    if self.descend(pdf, cursor, kid, !backward, false)? {
+                        descended = true;
+                    }
+                    break;
+                }
+                if descended {
+                    break;
+                }
+                cursor.path.pop();
+            }
+
+            if !descended {
+                return Ok(());
+            }
+            if cursor.current.is_some() {
+                return Ok(());
+            }
+        }
+    }
+
+    fn update_current<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        cursor: &mut NNTreeCursor<K>,
+        allow_invalid: bool,
+    ) -> Result<()> {
+        cursor.current = None;
+        let (Some(leaf), Some(item_number)) = (&cursor.leaf, cursor.item_number) else {
+            return Ok(());
+        };
+        let dictionary = self.load_node(pdf, leaf)?;
+        let items = match dictionary.get(K::ITEMS_KEY) {
+            Some(Object::Array(items)) => items,
+            _ => {
+                return Err(structural_error(
+                    leaf.diagnostic_ref(),
+                    format!("update ivalue: /{} is not an array", K::ITEMS_KEY),
+                ));
+            }
+        };
+        if item_number + 1 >= items.len() {
+            if allow_invalid {
+                self.warn(pdf, leaf, "items array doesn't have enough elements");
+                return Ok(());
+            }
+            return Err(structural_error(
+                leaf.diagnostic_ref(),
+                "update ivalue: items array is too short",
+            ));
+        }
+        let Some(key) = K::from_object(&items[item_number]) else {
+            if allow_invalid {
+                self.warn(pdf, leaf, format!("item {item_number} has the wrong type"));
+                return Ok(());
+            }
+            return Err(structural_error(
+                leaf.diagnostic_ref(),
+                format!("item at index {item_number} is not the right type"),
+            ));
+        };
+        cursor.current = Some((key, items[item_number + 1].clone()));
+        Ok(())
+    }
+
+    fn prepare_kid<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        parent: &NodeHandle,
+        kid_number: usize,
+        kid_object: Object,
+    ) -> Result<NodeHandle> {
+        if matches!(kid_object, Object::Reference(_)) {
+            let (_, terminal_ref) = resolve_ref_chain(pdf, &kid_object)?;
+            return terminal_ref
+                .map(NodeHandle::indirect)
+                .ok_or_else(|| structural_error(parent.diagnostic_ref(), "invalid kid"));
+        }
+
+        if self.auto_repair {
+            self.warn(
+                pdf,
+                parent,
+                format!("converting kid number {kid_number} to an indirect object"),
+            );
+            let object_ref = make_indirect(pdf, kid_object)?;
+            let mut dictionary = self.load_node(pdf, parent)?;
+            let Some(Object::Array(mut kids)) = dictionary.remove("Kids") else {
+                return Err(structural_error(
+                    parent.diagnostic_ref(),
+                    "node is missing /Kids",
+                ));
+            };
+            kids[kid_number] = Object::Reference(object_ref);
+            dictionary.insert("Kids", Object::Array(kids));
+            self.store_node(pdf, parent, dictionary)?;
+            Ok(NodeHandle::indirect(object_ref))
+        } else {
+            self.warn(
+                pdf,
+                parent,
+                format!("kid number {kid_number} is not an indirect object"),
+            );
+            Ok(parent.direct_kid(kid_number))
+        }
+    }
+
+    fn kid_has_tree_shape<R: Read + Seek>(&self, pdf: &mut Pdf<R>, kid: &Object) -> Result<bool> {
+        let (resolved, _) = resolve_ref_chain(pdf, kid)?;
+        let Object::Dictionary(dictionary) = resolved else {
+            return Ok(false);
+        };
+        Ok(dictionary.get("Kids").is_some() || dictionary.get(K::ITEMS_KEY).is_some())
+    }
+
+    fn warn<R: Read + Seek>(&self, pdf: &mut Pdf<R>, node: &NodeHandle, message: impl AsRef<str>) {
+        pdf.push_warning(structural_message(node.diagnostic_ref(), message));
     }
 
     fn load_node<R: Read + Seek>(
@@ -279,11 +648,15 @@ fn make_indirect<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<Obje
 }
 
 fn structural_error(object_ref: Option<ObjectRef>, message: impl AsRef<str>) -> Error {
+    Error::parse(0, structural_message(object_ref, message))
+}
+
+fn structural_message(object_ref: Option<ObjectRef>, message: impl AsRef<str>) -> String {
     let prefix = match object_ref {
         Some(object_ref) => format!("Name/Number tree node (object {}): ", object_ref.number),
         None => "Name/Number tree node: ".to_string(),
     };
-    Error::parse(0, format!("{prefix}{}", message.as_ref()))
+    format!("{prefix}{}", message.as_ref())
 }
 
 #[cfg(test)]
@@ -308,6 +681,56 @@ mod tests {
             .as_bytes(),
         );
         Pdf::open(Cursor::new(bytes)).expect("open")
+    }
+
+    fn name_leaf(entries: &[(&[u8], i64)], limits: Option<(&[u8], &[u8])>) -> Object {
+        let mut dictionary = Dictionary::new();
+        let items = entries
+            .iter()
+            .flat_map(|(key, value)| [Object::String(key.to_vec()), Object::Integer(*value)])
+            .collect();
+        dictionary.insert("Names", Object::Array(items));
+        if let Some((first, last)) = limits {
+            dictionary.insert(
+                "Limits",
+                Object::Array(vec![
+                    Object::String(first.to_vec()),
+                    Object::String(last.to_vec()),
+                ]),
+            );
+        }
+        Object::Dictionary(dictionary)
+    }
+
+    fn two_leaf_name_tree(pdf: &mut TestPdf) -> Object {
+        let left_ref = ObjectRef::new(10, 0);
+        let right_ref = ObjectRef::new(11, 0);
+        pdf.set_object(
+            left_ref,
+            name_leaf(&[(b"a", 1), (b"b", 2)], Some((b"a", b"b"))),
+        );
+        pdf.set_object(
+            right_ref,
+            name_leaf(&[(b"c", 3), (b"d", 4)], Some((b"c", b"d"))),
+        );
+        let mut root = Dictionary::new();
+        root.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(left_ref),
+                Object::Reference(right_ref),
+            ]),
+        );
+        Object::Dictionary(root)
+    }
+
+    fn root_with_one_direct_leaf() -> Object {
+        let mut root = Dictionary::new();
+        root.insert(
+            "Kids",
+            Object::Array(vec![name_leaf(&[(b"a", 1)], Some((b"a", b"a")))]),
+        );
+        Object::Dictionary(root)
     }
 
     #[test]
@@ -381,5 +804,108 @@ mod tests {
 
         assert_eq!(pdf.resolve(terminal).unwrap(), Object::Dictionary(changed));
         assert_eq!(tree.root(), &Object::Reference(holder));
+    }
+
+    #[test]
+    fn begin_next_previous_last_and_end_match_qpdf_cursor_rules() {
+        let mut pdf = empty_pdf();
+        let root = two_leaf_name_tree(&mut pdf);
+        let mut tree = NNTree::<NameKey>::new(root, true);
+
+        let mut cursor = tree.begin(&mut pdf).unwrap();
+        assert_eq!(
+            cursor.current().map(|(key, value)| (key.as_slice(), value)),
+            Some((b"a".as_slice(), &Object::Integer(1)))
+        );
+        tree.next(&mut pdf, &mut cursor).unwrap();
+        assert_eq!(
+            cursor.current().map(|(key, value)| (key.as_slice(), value)),
+            Some((b"b".as_slice(), &Object::Integer(2)))
+        );
+        tree.next(&mut pdf, &mut cursor).unwrap();
+        assert_eq!(
+            cursor.current().map(|(key, value)| (key.as_slice(), value)),
+            Some((b"c".as_slice(), &Object::Integer(3)))
+        );
+
+        let mut end = tree.end();
+        assert!(!end.valid());
+        tree.next(&mut pdf, &mut end).unwrap();
+        assert_eq!(
+            end.current().map(|(key, value)| (key.as_slice(), value)),
+            Some((b"a".as_slice(), &Object::Integer(1)))
+        );
+
+        let mut end = tree.end();
+        tree.previous(&mut pdf, &mut end).unwrap();
+        assert_eq!(
+            end.current().map(|(key, value)| (key.as_slice(), value)),
+            Some((b"d".as_slice(), &Object::Integer(4)))
+        );
+
+        let mut last = tree.last(&mut pdf).unwrap();
+        assert_eq!(
+            last.current().map(|(key, value)| (key.as_slice(), value)),
+            Some((b"d".as_slice(), &Object::Integer(4)))
+        );
+        tree.previous(&mut pdf, &mut last).unwrap();
+        assert_eq!(
+            last.current().map(|(key, value)| (key.as_slice(), value)),
+            Some((b"c".as_slice(), &Object::Integer(3)))
+        );
+    }
+
+    #[test]
+    fn direct_kid_is_indirectized_only_when_auto_repair_is_enabled() {
+        let mut repaired_pdf = empty_pdf();
+        let root = root_with_one_direct_leaf();
+        let mut repaired = NNTree::<NameKey>::new(root, true);
+        let cursor = repaired.begin(&mut repaired_pdf).unwrap();
+        assert!(cursor.valid());
+        assert!(matches!(
+            repaired.root(),
+            Object::Dictionary(root)
+                if matches!(
+                    root.get("Kids"),
+                    Some(Object::Array(kids))
+                        if matches!(kids.first(), Some(Object::Reference(_)))
+                )
+        ));
+        assert!(repaired_pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry
+                .message
+                .contains("converting kid number 0 to an indirect object")));
+
+        let mut strict_pdf = empty_pdf();
+        let root = root_with_one_direct_leaf();
+        let mut strict = NNTree::<NameKey>::new(root, false);
+        let cursor = strict.begin(&mut strict_pdf).unwrap();
+        assert!(cursor.valid());
+        assert!(matches!(
+            strict.root(),
+            Object::Dictionary(root)
+                if matches!(
+                    root.get("Kids"),
+                    Some(Object::Array(kids))
+                        if matches!(kids.first(), Some(Object::Dictionary(_)))
+                )
+        ));
+    }
+
+    #[test]
+    fn non_dictionary_root_warns_and_produces_end_cursor() {
+        let mut pdf = empty_pdf();
+        let mut tree = NNTree::<NameKey>::new(Object::Integer(42), true);
+
+        let cursor = tree.begin(&mut pdf).unwrap();
+
+        assert!(!cursor.valid());
+        assert_eq!(
+            pdf.repair_diagnostics().entries()[0].message,
+            "Name/Number tree node: non-dictionary node while traversing name/number tree"
+        );
     }
 }
