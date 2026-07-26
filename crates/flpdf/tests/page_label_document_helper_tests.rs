@@ -257,6 +257,39 @@ fn set_range_creates_tree_and_remove_missing_range_is_false() {
 }
 
 #[test]
+fn set_range_propagates_malformed_number_tree_error() {
+    let pdf_bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0] >> >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+
+    let error = pdf
+        .page_labels()
+        .set_range(
+            0,
+            LabelRange {
+                style: LabelStyle::Decimal,
+                prefix: String::new(),
+                start: 1,
+            },
+        )
+        .expect_err("malformed tree must fail");
+
+    assert!(error.to_string().contains("items array is too short"));
+}
+
+#[test]
 fn remove_range_without_catalog_root_is_false() {
     let mut bytes = b"%PDF-1.4\n".to_vec();
     let object_offset = bytes.len() as u64;
