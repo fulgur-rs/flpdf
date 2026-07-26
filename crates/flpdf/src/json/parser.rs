@@ -3,9 +3,6 @@ use std::io::{Cursor, Read};
 use super::{Json, JsonError};
 
 /// Receives qpdf-style events while a JSON value is parsed.
-///
-/// Task 5 declares the public interface required by `parse_reader`. Event
-/// dispatch and container consumption are added by the later Reactor task.
 pub trait Reactor {
     fn dictionary_start(&mut self);
     fn array_start(&mut self);
@@ -26,14 +23,9 @@ pub fn parse_reader<R: Read>(
     reader: &mut R,
     reactor: Option<&mut dyn Reactor>,
 ) -> Result<Json, JsonError> {
-    // The public Reactor interface is declared in this task to make this API
-    // usable. Dispatch and consumption semantics are deliberately deferred to
-    // Task 7.
-    let _ = reactor;
-
     let mut input = Vec::new();
     reader.read_to_end(&mut input)?;
-    Parser::new(&input).parse()
+    Parser::new(&input, reactor).parse()
 }
 
 impl Json {
@@ -92,8 +84,9 @@ struct StackEntry {
     item: Json,
 }
 
-struct Parser<'a> {
-    input: &'a [u8],
+struct Parser<'input, 'reactor> {
+    input: &'input [u8],
+    reactor: Option<&'reactor mut dyn Reactor>,
     pos: usize,
     state: LexState,
     done: bool,
@@ -109,10 +102,11 @@ struct Parser<'a> {
     dict_key_offset: i64,
 }
 
-impl<'a> Parser<'a> {
-    fn new(input: &'a [u8]) -> Self {
+impl<'input, 'reactor> Parser<'input, 'reactor> {
+    fn new(input: &'input [u8], reactor: Option<&'reactor mut dyn Reactor>) -> Self {
         Self {
             input,
+            reactor,
             pos: 0,
             state: LexState::Top,
             done: false,
@@ -137,12 +131,18 @@ impl<'a> Parser<'a> {
         if self.parse_state != ParseState::Done {
             return Err(self.error("JSON: premature end of input"));
         }
-        Ok(self
+        let item = self
             .stack
             .last()
             .expect("completed JSON parser has a top-level value")
             .item
-            .clone())
+            .clone();
+        if !(item.is_array() || item.is_dictionary()) {
+            if let Some(reactor) = self.reactor.as_deref_mut() {
+                reactor.top_level_scalar();
+            }
+        }
+        Ok(item)
     }
 
     fn offset(&self) -> i64 {
@@ -565,12 +565,18 @@ impl<'a> Parser<'a> {
                         self.offset()
                     )));
                 }
-                let entry = self
-                    .stack
-                    .last()
-                    .expect("array end has a matching stack entry");
-                self.parse_state = entry.state;
-                entry.item.set_end(self.offset());
+                let (parent_state, item) = {
+                    let entry = self
+                        .stack
+                        .last()
+                        .expect("array end has a matching stack entry");
+                    (entry.state, entry.item.clone())
+                };
+                self.parse_state = parent_state;
+                item.set_end(self.offset());
+                if let Some(reactor) = self.reactor.as_deref_mut() {
+                    reactor.container_end(&item);
+                }
                 if self.parse_state != ParseState::Done {
                     self.stack.pop();
                 }
@@ -586,12 +592,18 @@ impl<'a> Parser<'a> {
                         self.offset()
                     )));
                 }
-                let entry = self
-                    .stack
-                    .last()
-                    .expect("dictionary end has a matching stack entry");
-                self.parse_state = entry.state;
-                entry.item.set_end(self.offset());
+                let (parent_state, item) = {
+                    let entry = self
+                        .stack
+                        .last()
+                        .expect("dictionary end has a matching stack entry");
+                    (entry.state, entry.item.clone())
+                };
+                self.parse_state = parent_state;
+                item.set_end(self.offset());
+                if let Some(reactor) = self.reactor.as_deref_mut() {
+                    reactor.container_end(&item);
+                }
                 if self.parse_state != ParseState::Done {
                     self.stack.pop();
                 }
@@ -641,26 +653,43 @@ impl<'a> Parser<'a> {
                 )));
             }
             ParseState::DictionaryAfterColon => {
-                let parent = &self
+                let parent = self
                     .stack
                     .last()
                     .expect("dictionary value has a matching stack entry")
-                    .item;
+                    .item
+                    .clone();
                 if parent.check_dictionary_key_seen(&self.dict_key)? {
                     return Err(self.error(format!(
                         "JSON: offset {}: duplicated dictionary key",
                         self.dict_key_offset
                     )));
                 }
-                parent.add_dictionary_member(&self.dict_key, value.clone())?;
+                let consumed = if let Some(reactor) = self.reactor.as_deref_mut() {
+                    reactor.dictionary_item(&self.dict_key, &value)
+                } else {
+                    false
+                };
+                if !consumed {
+                    parent.add_dictionary_member(&self.dict_key, value.clone())?;
+                }
                 self.parse_state = ParseState::DictionaryAfterItem;
             }
             ParseState::ArrayBegin | ParseState::ArrayAfterComma => {
-                self.stack
+                let parent = self
+                    .stack
                     .last()
                     .expect("array value has a matching stack entry")
                     .item
-                    .add_array_element(value.clone())?;
+                    .clone();
+                let consumed = if let Some(reactor) = self.reactor.as_deref_mut() {
+                    reactor.array_item(&value)
+                } else {
+                    false
+                };
+                if !consumed {
+                    parent.add_array_element(value.clone())?;
+                }
                 self.parse_state = ParseState::ArrayAfterItem;
             }
             ParseState::Top => {
@@ -681,23 +710,24 @@ impl<'a> Parser<'a> {
                     self.offset()
                 )));
             }
-            ParseState::Done => unreachable!("done state is checked before token dispatch"),
+            ParseState::Done => unreachable!("done state is checked before token dispatch"), // cov:ignore: ParseState::Done returns before token dispatch
         }
 
         if value.is_dictionary() || value.is_array() {
+            let is_dictionary = value.is_dictionary();
             self.stack.push(StackEntry {
                 state: self.parse_state,
                 item: value,
             });
-            self.parse_state = if self
-                .stack
-                .last()
-                .expect("new stack entry exists")
-                .item
-                .is_dictionary()
-            {
+            self.parse_state = if is_dictionary {
+                if let Some(reactor) = self.reactor.as_deref_mut() {
+                    reactor.dictionary_start();
+                }
                 ParseState::DictionaryBegin
             } else {
+                if let Some(reactor) = self.reactor.as_deref_mut() {
+                    reactor.array_start();
+                }
                 ParseState::ArrayBegin
             };
 

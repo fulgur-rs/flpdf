@@ -1,5 +1,152 @@
-use flpdf::json::Json;
+use flpdf::json::{Json, Reactor};
 use std::io::{self, Cursor, Read};
+
+#[derive(Default)]
+struct RecordingReactor {
+    events: Vec<String>,
+    item_offsets: Vec<(i64, i64)>,
+}
+
+impl Reactor for RecordingReactor {
+    fn dictionary_start(&mut self) {
+        self.events.push("dict-start".into());
+    }
+
+    fn array_start(&mut self) {
+        self.events.push("array-start".into());
+    }
+
+    fn container_end(&mut self, value: &Json) {
+        self.events.push(format!("end:{}", value.end()));
+    }
+
+    fn top_level_scalar(&mut self) {
+        self.events.push("scalar".into());
+    }
+
+    fn dictionary_item(&mut self, key: &[u8], value: &Json) -> bool {
+        self.item_offsets.push((value.start(), value.end()));
+        self.events.push(format!(
+            "dict-item:{}:{}",
+            String::from_utf8_lossy(key),
+            value
+                .unparse()
+                .map(|value| String::from_utf8_lossy(&value).into_owned())
+                .unwrap()
+        ));
+        key != b"keep"
+    }
+
+    fn array_item(&mut self, value: &Json) -> bool {
+        self.item_offsets.push((value.start(), value.end()));
+        self.events.push(format!(
+            "array-item:{}",
+            String::from_utf8_lossy(&value.unparse().unwrap())
+        ));
+        true
+    }
+}
+
+#[derive(Default)]
+struct KeepingArrayReactor {
+    events: Vec<String>,
+}
+
+impl Reactor for KeepingArrayReactor {
+    fn dictionary_start(&mut self) {
+        self.events.push("dict-start".into());
+    }
+
+    fn array_start(&mut self) {
+        self.events.push("array-start".into());
+    }
+
+    fn container_end(&mut self, value: &Json) {
+        self.events.push(format!("end:{}", value.end()));
+    }
+
+    fn top_level_scalar(&mut self) {
+        self.events.push("scalar".into());
+    }
+
+    fn dictionary_item(&mut self, _: &[u8], _: &Json) -> bool {
+        false
+    }
+
+    fn array_item(&mut self, value: &Json) -> bool {
+        self.events.push(format!(
+            "array-item:{}",
+            String::from_utf8_lossy(&value.unparse().unwrap())
+        ));
+        false
+    }
+}
+
+#[test]
+fn reactor_parent_sees_empty_child_before_child_start() {
+    let mut reader = Cursor::new(br#"{"drop":[1],"keep":2}"#.as_slice());
+    let mut reactor = RecordingReactor::default();
+    let value = Json::parse_reader(&mut reader, Some(&mut reactor)).unwrap();
+
+    assert_eq!(
+        reactor.events,
+        [
+            "dict-start",
+            "dict-item:drop:[]",
+            "array-start",
+            "array-item:1",
+            "end:11",
+            "dict-item:keep:2",
+            "end:21",
+        ]
+    );
+    assert_eq!(reactor.item_offsets, [(8, 9), (9, 10), (19, 20)]);
+
+    let mut members = Vec::new();
+    assert!(value.for_each_dict_item(|key, value| {
+        members.push((key.to_vec(), value.get_number()));
+    }));
+    assert_eq!(members, [(b"keep".to_vec(), Some(b"2".to_vec()))]);
+}
+
+#[test]
+fn reactor_duplicate_detection_precedes_callback_for_consumed_items() {
+    let mut reader = Cursor::new(br#"{"dup":1,"dup":2}"#.as_slice());
+    let mut reactor = RecordingReactor::default();
+    let error = Json::parse_reader(&mut reader, Some(&mut reactor)).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "JSON: offset 9: duplicated dictionary key"
+    );
+    assert_eq!(
+        reactor.events,
+        ["dict-start", "dict-item:dup:1"],
+        "the duplicate value must not reach the callback"
+    );
+}
+
+#[test]
+fn reactor_reports_top_level_scalar_after_parsing() {
+    let mut reader = Cursor::new(b"true".as_slice());
+    let mut reactor = RecordingReactor::default();
+    let value = Json::parse_reader(&mut reader, Some(&mut reactor)).unwrap();
+
+    assert_eq!(value.get_bool(), Some(true));
+    assert_eq!(reactor.events, ["scalar"]);
+}
+
+#[test]
+fn reactor_array_item_false_keeps_the_item() {
+    let mut reader = Cursor::new(b"[false]".as_slice());
+    let mut reactor = KeepingArrayReactor::default();
+    let value = Json::parse_reader(&mut reader, Some(&mut reactor)).unwrap();
+
+    assert_eq!(reactor.events, ["array-start", "array-item:false", "end:7"]);
+    let mut items = Vec::new();
+    assert!(value.for_each_array_item(|value| items.push(value.get_bool())));
+    assert_eq!(items, [Some(false)]);
+}
 
 #[test]
 fn parser_preserves_number_token_and_offsets() {
@@ -10,11 +157,26 @@ fn parser_preserves_number_token_and_offsets() {
 
 #[test]
 fn parser_rejects_material_after_top_level_value() {
-    let error = Json::parse(b"null true").unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "JSON: offset 9: material follows end of object: true"
-    );
+    for (input, expected) in [
+        (
+            b"null true".as_slice(),
+            "JSON: offset 9: material follows end of object: true",
+        ),
+        (
+            b"1{".as_slice(),
+            "JSON: offset 2: material follows end of object: ",
+        ),
+        (
+            b"1[".as_slice(),
+            "JSON: offset 2: material follows end of object: ",
+        ),
+    ] {
+        assert_eq!(
+            Json::parse(input).unwrap_err().to_string(),
+            expected,
+            "{input:?}"
+        );
+    }
 }
 
 #[test]
@@ -31,6 +193,8 @@ fn parser_accepts_each_scalar_kind_and_decodes_string_escapes() {
 #[test]
 fn parser_reports_qpdf_scalar_lexical_errors() {
     for (input, expected) in [
+        (b"".as_slice(), "JSON: premature end of input"),
+        (b"\"".as_slice(), "JSON: offset 1: premature end of input"),
         (b"01".as_slice(), "JSON: offset 1: number with leading zero"),
         (b"1.".as_slice(), "JSON: premature end of input"),
         (b"1e+".as_slice(), "JSON: premature end of input"),
@@ -174,7 +338,12 @@ fn parser_builds_nested_container_tree_and_preserves_exclusive_offsets() {
     assert!(items.for_each_array_item(|item| array.push(item)));
     assert_eq!(array.len(), 2);
     assert_eq!(array[0].get_bool(), Some(true));
-    assert!(array[1].get_dict_item(b"line\\n").is_null());
+    let mut nested_keys = Vec::new();
+    assert!(array[1].for_each_dict_item(|key, value| {
+        nested_keys.push(key.to_vec());
+        assert!(value.is_null());
+    }));
+    assert_eq!(nested_keys, [b"line\\n".to_vec()]);
     assert_eq!(
         value.get_dict_item(b"number").get_number(),
         Some(b"-2".to_vec())
@@ -210,6 +379,7 @@ fn parser_rejects_duplicate_key_even_when_spelling_uses_escape() {
 #[test]
 fn parser_reports_qpdf_container_grammar_errors() {
     for (input, expected) in [
+        (b":".as_slice(), "JSON: offset 1: unexpected colon"),
         (br#"{"x" "y"}"#.as_slice(), "JSON: offset 8: expected ':'"),
         (
             br#"{"x":3 "y"}"#.as_slice(),
