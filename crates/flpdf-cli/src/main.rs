@@ -1912,7 +1912,7 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     }
 
     // 5. Open PDF once and retain an identity handle for the output check.
-    let input_file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
+    let input_file = File::open(input).map_err(|error| json_input_open_error(input, error))?;
     let input_identity = input_file
         .try_clone()
         .map_err(|error| error_with_file(input, error.into()))?;
@@ -4452,7 +4452,10 @@ fn reject_encrypted_write<R: std::io::Read + std::io::Seek>(pdf: &Pdf<R>) -> Cli
 fn reject_same_json_output(input: &Path, output: &Path) -> CliResult<()> {
     match std::fs::metadata(output) {
         Ok(output_metadata) => {
-            if paths_identify_same_file(input, output, &output_metadata)? {
+            // This is only a non-destructive hint: if inspecting the input
+            // fails, the real input open below owns its path-specific error.
+            // Output metadata failures remain fail-closed in the next arm.
+            if let Ok(true) = paths_identify_same_file(input, output, &output_metadata) {
                 return Err(
                     "input file and output file are the same; choose a different --json-output path"
                         .into(),
@@ -4469,6 +4472,15 @@ fn reject_same_json_output(input: &Path, output: &Path) -> CliResult<()> {
         }
     }
     Ok(())
+}
+
+fn json_input_open_error(input: &Path, error: std::io::Error) -> Box<dyn std::error::Error> {
+    let rendered = error.to_string();
+    let message = error
+        .raw_os_error()
+        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+        .unwrap_or(&rendered);
+    format!("open {}: {message}", input.display()).into()
 }
 
 fn open_verified_json_output(input: &File, output: &Path) -> CliResult<File> {

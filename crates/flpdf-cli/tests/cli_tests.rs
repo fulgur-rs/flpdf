@@ -2563,6 +2563,42 @@ fn json_output_open_error_happens_before_json_processing() {
 }
 
 #[test]
+fn json_output_missing_input_preserves_existing_output_and_reports_input_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("missing.pdf");
+    let output_path = temp.path().join("out.json");
+    let original_output = b"existing JSON output must remain unchanged\n";
+    std::fs::write(&output_path, original_output).unwrap();
+
+    let expected_error = format!(
+        "flpdf: open {}: {}",
+        input.display(),
+        normalized_os_message(&File::open(&input).unwrap_err())
+    );
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--json-output"])
+        .arg(&output_path)
+        .arg(&input)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(std::fs::read(&output_path).unwrap(), original_output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.lines().last(),
+        Some(expected_error.as_str()),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("unable to inspect --json-output file"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn json_side_file_error_emits_recorded_warning_after_partial_json_before_fatal_error() {
     let fixture = fixture_with_repaired_name_tree_and_stream();
     let temp = tempfile::tempdir().unwrap();
