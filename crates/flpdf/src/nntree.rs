@@ -860,7 +860,6 @@ impl<K: TreeKey> NNTree<K> {
         // last(), so after-maximum keys intentionally use the general search.
 
         let root = self.root_handle(pdf)?;
-        let root_diagnostic_ref = root.diagnostic_ref();
         let mut node = root;
         let mut seen = HashSet::new();
         let mut cursor = NNTreeCursor::empty();
@@ -878,6 +877,7 @@ impl<K: TreeKey> NNTree<K> {
                 .map_err(|_| structural_error(node.diagnostic_ref(), "bad node during find"))?;
             let items = resolved_array(pdf, dictionary.get(K::ITEMS_KEY))?;
             let kids = resolved_array(pdf, dictionary.get("Kids"))?;
+            let node_diagnostic_ref = node.diagnostic_ref();
 
             if let Some(items) = items.as_ref().filter(|items| !items.values.is_empty()) {
                 let index = binary_search(
@@ -888,14 +888,14 @@ impl<K: TreeKey> NNTree<K> {
                         // cov:ignore-start: binary_search only supplies indices below items length divided by two
                         let Some(item) = items.values.get(item_number) else {
                             return Err(structural_error(
-                                root_diagnostic_ref,
+                                node_diagnostic_ref,
                                 format!("item at index {item_number} is not the right type"),
                             ));
                         };
                         // cov:ignore-end
                         let Some(item_key) = resolved_key::<K, _>(pdf, item)? else {
                             return Err(structural_error(
-                                root_diagnostic_ref,
+                                node_diagnostic_ref,
                                 format!("item at index {item_number} is not the right type"),
                             ));
                         };
@@ -919,7 +919,7 @@ impl<K: TreeKey> NNTree<K> {
                     let (resolved, terminal_ref) = resolve_ref_chain(pdf, kid)?;
                     let Object::Dictionary(kid_dictionary) = resolved else {
                         return Err(structural_error(
-                            root_diagnostic_ref,
+                            node_diagnostic_ref,
                             format!("invalid kid at index {index}"),
                         ));
                     };
@@ -2019,6 +2019,47 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "parse error at byte 0: Name/Number tree node (object 10): node is missing /Limits"
+        );
+    }
+
+    #[test]
+    fn find_attributes_deep_malformed_items_to_the_containing_node() {
+        let mut pdf = empty_pdf();
+        let root_ref = ObjectRef::new(80, 0);
+        let leaf_ref = ObjectRef::new(81, 0);
+        let mut leaf = Dictionary::new();
+        leaf.insert(
+            "Names",
+            Object::Array(vec![
+                Object::String(b"alpha".to_vec()),
+                Object::Integer(1),
+                Object::Integer(42),
+                Object::Integer(2),
+                Object::String(b"zulu".to_vec()),
+                Object::Integer(3),
+            ]),
+        );
+        leaf.insert(
+            "Limits",
+            Object::Array(vec![
+                Object::String(b"alpha".to_vec()),
+                Object::String(b"zulu".to_vec()),
+            ]),
+        );
+        pdf.set_object(leaf_ref, Object::Dictionary(leaf));
+        let mut root = Dictionary::new();
+        root.insert("Kids", Object::Array(vec![Object::Reference(leaf_ref)]));
+        pdf.set_object(root_ref, Object::Dictionary(root));
+        let mut tree = NNTree::<NameKey>::new(Object::Reference(root_ref), false);
+
+        let error = match tree.find(&mut pdf, &b"middle".to_vec(), false) {
+            Err(error) => error,
+            Ok(_) => panic!("wrong-typed key must fail targeted lookup"), // cov:ignore: negative-path assertion
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "parse error at byte 0: Name/Number tree node (object 81): item at index 2 is not the right type"
         );
     }
 
