@@ -346,7 +346,7 @@ def scan_modules(
         )
 
     source_paths = sorted(
-        source_root.rglob("*.rs"),
+        (path for path in source_root.rglob("*.rs") if not path.is_dir()),
         key=lambda item: item.relative_to(repo_root).as_posix(),
     )
     if not source_paths:

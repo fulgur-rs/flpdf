@@ -782,6 +782,34 @@ class GeneratorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "symlinked directory"):
                 self.module.scan_modules(source_root, root)
 
+    def test_scan_skips_directories_named_like_modules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_root = root / "crates/flpdf/src"
+            source_root.mkdir(parents=True)
+            (source_root / "lib.rs").write_text(
+                "//! qpdf correspondence: crate root.\n",
+                encoding="utf-8",
+            )
+            # rustc accepts `#[path = "assets.rs/inner.rs"]`, so a directory
+            # whose name ends in `.rs` is a legal part of a source tree.
+            module_like_directory = source_root / "assets.rs"
+            module_like_directory.mkdir()
+            (module_like_directory / "inner.rs").write_text(
+                "//! qpdf correspondence: embedded asset table.\n",
+                encoding="utf-8",
+            )
+
+            entries = self.module.scan_modules(source_root, root)
+
+            self.assertEqual(
+                [
+                    Path("crates/flpdf/src/assets.rs/inner.rs"),
+                    Path("crates/flpdf/src/lib.rs"),
+                ],
+                [source_path for source_path, _ in entries],
+            )
+
     def test_write_rejects_empty_source_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
