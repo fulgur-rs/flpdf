@@ -10,24 +10,14 @@
 //!
 //! # Writer
 //!
-//! [`insert_embedded_file`] and [`delete_embedded_file`] mutate the tree
-//! using a **collect → modify → rebuild** strategy that mirrors qpdf's
-//! aggressive rebuild policy: all entries are gathered in one pass, the entry
-//! list is changed, sorted, and the entire tree is reconstructed from scratch.
+//! [`insert_embedded_file`] and [`delete_embedded_file`] mutate the existing
+//! tree through [`crate::NameTree`]. Unaffected nodes and the existing root
+//! reference are retained; splits and `/Limits` repairs follow qpdf's NNTree
+//! behavior.
 //!
-//! The reconstruction uses at most two levels:
-//! - ≤ [`LEAF_MAX`] entries → a single leaf node (no `/Kids`).
-//! - > [`LEAF_MAX`] entries → a root node with `/Kids` pointing to leaf chunks.
-//!
-//! Intermediate and leaf nodes carry a `/Limits [first, last]` array bounding
-//! the key range of their subtree, but the **root node omits `/Limits`**
-//! (ISO 32000-2 §7.9.6 restricts `/Limits` to intermediate and leaf nodes;
-//! this matches qpdf's observed output).
-//!
-//! The writer normalises the catalog path: after any mutation `/Names` is
-//! stored as an indirect object and `/EmbeddedFiles` within it is an indirect
-//! reference to the tree root.  Other keys in the `/Names` dictionary (e.g.
-//! `/Dests`, `/JavaScript`) are preserved unchanged.
+//! Insertion normalises a direct or missing catalog `/Names` dictionary to an
+//! indirect object. Existing indirect holders and tree roots are preserved.
+//! Other keys in `/Names` (e.g. `/Dests`, `/JavaScript`) remain unchanged.
 //!
 //! When deletion reduces the entry list to zero the `/EmbeddedFiles` key is
 //! removed from the `/Names` dictionary; if that makes the dictionary empty
@@ -343,12 +333,7 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
 
 // ── Writer constants ──────────────────────────────────────────────────────────
 
-/// Maximum number of entries in a single leaf `/Names` node before the writer
-/// splits into multiple leaves under a `/Kids` root.
-///
-/// This mirrors the threshold used by qpdf's aggressive rebuild policy.  Any
-/// tree with more than this many entries will have two levels (root + leaves);
-/// three levels are never emitted.
+/// Compatibility alias for qpdf's default NNTree split threshold.
 pub use crate::name_number_tree::LEAF_MAX;
 
 /// Default maximum depth when descending `/Kids` chains.
@@ -367,9 +352,8 @@ pub const DEFAULT_MAX_EMBEDDED_FILES_DEPTH: usize = 100;
 ///
 /// **Semantics:** name-tree values that are *direct* `/Filespec` dictionaries
 /// (rather than indirect references) are intentionally **skipped** — this
-/// reader only surfaces `(key, ObjectRef)` pairs. Writers must not use this as
-/// their rebuild source; see `collect_embedded_file_pairs_raw`, which
-/// preserves direct-dict values verbatim so a rebuild never drops them.
+/// reader only surfaces `(key, ObjectRef)` pairs. Mutation and copying use
+/// `collect_embedded_file_pairs_raw`, which preserves direct-dict values.
 // TODO(flpdf-9hc.10.6): consider exposing direct-dict entries via the public
 // list/show API (e.g. an `Object`-valued variant) once list/show land.
 ///
@@ -432,7 +416,13 @@ pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
         Some(v) => v,
         None => return Ok(vec![]),
     };
-    crate::name_number_tree::read_name_tree(pdf, ef_value, |_, v| Ok(v.as_ref_id()), max_depth)
+    let mut tree = crate::NameTree::new(ef_value, false);
+    tree.set_max_depth(max_depth);
+    Ok(tree
+        .as_map(pdf)?
+        .into_iter()
+        .filter_map(|(key, value)| value.as_ref_id().map(|object_ref| (key, object_ref)))
+        .collect())
 }
 
 // ── Raw collector (writer source of truth) ────────────────────────────────────
@@ -442,10 +432,7 @@ pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
 /// [`Object`] — indirect references *and* direct `/Filespec` dictionaries.
 ///
 /// The public reader [`list_embedded_files`] intentionally filters to indirect
-/// references, but the writer must not: rebuilding the tree from the
-/// reference-only view would silently drop pre-existing direct-dict entries.
-/// Insert/delete therefore collect through this function so untouched
-/// attachments survive a rebuild regardless of how they were encoded.
+/// references, while mutation and copying preserve direct-dict entries.
 pub(crate) fn collect_embedded_file_pairs_raw<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,
@@ -473,7 +460,9 @@ pub(crate) fn collect_embedded_file_pairs_raw<R: Read + Seek>(
         Some(v) => v,
         None => return Ok(vec![]),
     };
-    crate::name_number_tree::read_name_tree(pdf, ef_value, |_, v| Ok(Some(v)), max_depth)
+    let mut tree = crate::NameTree::new(ef_value, false);
+    tree.set_max_depth(max_depth);
+    Ok(tree.as_map(pdf)?.into_iter().collect())
 }
 
 // ── Writer ────────────────────────────────────────────────────────────────────
@@ -484,9 +473,8 @@ pub(crate) fn collect_embedded_file_pairs_raw<R: Read + Seek>(
 /// If `key` already exists its value is replaced with `filespec_ref`.
 /// If the `/Names /EmbeddedFiles` path does not yet exist it is created.
 ///
-/// The entire tree is rebuilt from scratch after the insertion (qpdf-style
-/// aggressive rebuild): all existing entries are read, the new entry is merged
-/// in sorted order, and a fresh tree is written back via [`Pdf::set_object`].
+/// The existing tree is mutated in place; an existing root reference is
+/// retained.
 ///
 /// # Errors
 ///
@@ -496,19 +484,66 @@ pub fn insert_embedded_file<R: Read + Seek>(
     key: &[u8],
     filespec_ref: ObjectRef,
 ) -> Result<()> {
-    // Collect existing entries verbatim (references AND direct dicts) so a
-    // rebuild never silently drops pre-existing direct-dict attachments.
-    let mut entries = collect_embedded_file_pairs_raw(pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)?;
+    let Some(catalog_ref) = pdf.root_ref() else {
+        return Ok(());
+    };
+    let Some(mut catalog) = pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
+        return Ok(());
+    };
 
-    // Insert or replace.
-    if let Some(existing) = entries.iter_mut().find(|(k, _)| k == key) {
-        existing.1 = Object::Reference(filespec_ref);
-    } else {
-        entries.push((key.to_vec(), Object::Reference(filespec_ref)));
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    enum NamesLocation {
+        Direct,
+        Indirect(ObjectRef),
+        Missing,
     }
 
-    rebuild_embedded_files_tree(pdf, entries)
+    let (location, mut names) = match catalog.get("Names").cloned() {
+        Some(value @ Object::Reference(source_ref)) => {
+            let (terminal, terminal_ref) = resolve_ref_chain(pdf, &value)?;
+            match terminal.into_dict() {
+                Some(dictionary) => (
+                    NamesLocation::Indirect(terminal_ref.unwrap_or(source_ref)),
+                    dictionary,
+                ),
+                None => (NamesLocation::Missing, Dictionary::new()),
+            }
+        }
+        Some(Object::Dictionary(dictionary)) => (NamesLocation::Direct, dictionary),
+        _ => (NamesLocation::Missing, Dictionary::new()),
+    };
+
+    let mut tree = match names.get("EmbeddedFiles").cloned() {
+        Some(root) => crate::NameTree::new(root, true),
+        None => crate::NameTree::new_empty(pdf, true)?,
+    };
+    tree.set_max_depth(DEFAULT_MAX_EMBEDDED_FILES_DEPTH);
+    tree.insert(pdf, key, Object::Reference(filespec_ref))?;
+    tree.make_root_indirect(pdf)?;
+    names.insert("EmbeddedFiles", tree.into_root());
+
+    match location {
+        NamesLocation::Indirect(names_ref) => {
+            pdf.set_object(names_ref, Object::Dictionary(names));
+            catalog.insert("Names", Object::Reference(names_ref));
+        }
+        NamesLocation::Direct | NamesLocation::Missing => {
+            let number = pdf
+                .object_refs()
+                .into_iter()
+                .map(|object_ref| object_ref.number)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    crate::Error::Unsupported("object-number space exhausted".to_string())
+                })?;
+            let names_ref = ObjectRef::new(number, 0);
+            pdf.set_object(names_ref, Object::Dictionary(names));
+            catalog.insert("Names", Object::Reference(names_ref));
+        }
+    }
+    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    Ok(())
 }
 
 /// Remove the entry with `key` from the catalog's `/Names /EmbeddedFiles`
@@ -525,153 +560,67 @@ pub fn insert_embedded_file<R: Read + Seek>(
 ///
 /// Propagates any error from [`Pdf::resolve`].
 pub fn delete_embedded_file<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result<bool> {
-    let mut entries = collect_embedded_file_pairs_raw(pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)?;
-    let before = entries.len();
-    entries.retain(|(k, _)| k != key);
-    if entries.len() == before {
-        return Ok(false); // Key was not present.
-    }
-
-    rebuild_embedded_files_tree(pdf, entries)?;
-    Ok(true)
-}
-
-// ── Internal rebuild ──────────────────────────────────────────────────────────
-
-/// Rebuild the `/Names /EmbeddedFiles` name tree from a sorted entry list and
-/// patch it back into the document via [`Pdf::set_object`].
-///
-/// When `entries` is empty the function removes `/EmbeddedFiles` from the
-/// `/Names` dictionary (and removes `/Names` from the catalog if it then
-/// becomes empty), leaving no dangling references.
-///
-/// Otherwise it constructs a tree with at most two levels:
-/// - ≤ [`LEAF_MAX`] entries → single-node root (just `/Names`; the root omits
-///   `/Limits`).
-/// - > [`LEAF_MAX`] entries → root with `/Kids` pointing to leaf chunks.
-///
-/// Leaf and intermediate nodes carry `/Limits [first, last]` bounding their
-/// subtree's key range; the root node does not (ISO 32000-2 §7.9.6 restricts
-/// `/Limits` to intermediate and leaf nodes).  The catalog `/Names` reference is
-/// stored as an indirect object; `/EmbeddedFiles` within it points indirectly to
-/// the tree root.
-fn rebuild_embedded_files_tree<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    entries: Vec<(Vec<u8>, Object)>,
-) -> Result<()> {
-    // Resolve the catalog.
-    let catalog_ref = match pdf.root_ref() {
-        Some(r) => r,
-        None => return Ok(()),
+    let Some(catalog_ref) = pdf.root_ref() else {
+        return Ok(false);
     };
     let Some(mut catalog) = pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
-        return Ok(());
+        return Ok(false);
     };
 
-    // ── Allocate a block of fresh object numbers ──────────────────────────────
-    // Snapshot the current maximum to avoid re-querying inside the loop.
-    let mut next_num: u32 = pdf
-        .object_refs()
-        .iter()
-        .map(|r| r.number)
-        .max()
-        .unwrap_or(0);
-    let mut alloc = move || -> ObjectRef {
-        next_num += 1;
-        ObjectRef::new(next_num, 0)
-    };
-
-    // ── Empty case: remove /EmbeddedFiles ────────────────────────────────────
-    if entries.is_empty() {
-        // Retrieve (or create empty) /Names dict and drop /EmbeddedFiles from it.
-        let names_dict_opt = match catalog.get("Names") {
-            // /Names may be reached through more than one indirect hop
-            // (ref -> ref -> dict); follow the chain so the terminal dict — the
-            // object actually rewritten below — is the one updated, not an
-            // intermediate carrier.
-            Some(value @ Object::Reference(r)) => {
-                let (terminal, terminal_ref) = resolve_ref_chain(pdf, value)?;
-                terminal
-                    .into_dict()
-                    .map(|d| (Some(terminal_ref.unwrap_or(*r)), d))
-            }
-            Some(Object::Dictionary(d)) => Some((None, d.clone())),
-            _ => None,
-        };
-        if let Some((names_ref_opt, mut names_dict)) = names_dict_opt {
-            names_dict.remove("EmbeddedFiles");
-            if names_dict.iter().next().is_none() {
-                // /Names dict is now empty — remove from catalog.
-                catalog.remove("Names");
-                pdf.set_object(catalog_ref, Object::Dictionary(catalog));
-                if let Some(r) = names_ref_opt {
-                    pdf.delete_object(r);
-                }
-            } else {
-                match names_ref_opt {
-                    Some(r) => {
-                        pdf.set_object(r, Object::Dictionary(names_dict));
-                        // Collapse any holder chain: re-point catalog /Names
-                        // straight at the terminal dict so a mutated
-                        // `ref -> ref -> dict` /Names is normalized to one hop,
-                        // mirroring the non-empty rebuild path. For an
-                        // already-direct /Names this re-inserts the same ref
-                        // (harmless).
-                        catalog.insert("Names", Object::Reference(r));
-                        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
-                    }
-                    None => {
-                        catalog.insert("Names", Object::Dictionary(names_dict));
-                        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
-                    }
-                }
-            }
-        }
-        return Ok(());
+    enum NamesLocation {
+        Direct,
+        Indirect(ObjectRef),
     }
 
-    // ── Build the name-tree nodes (shared builder) ────────────────────────────
-    let (tree_root_ref, nodes) = crate::name_number_tree::build_name_tree(&entries, &mut alloc);
-    for (node_ref, node) in nodes {
-        pdf.set_object(node_ref, node);
-    }
-
-    // ── Patch the catalog /Names dictionary ───────────────────────────────────
-    // Resolve or create the /Names dict.  We always store it as an indirect
-    // object and point /EmbeddedFiles to the tree root indirectly.
-    let (names_ref, mut names_dict) = match catalog.get("Names") {
-        // /Names may be reached through more than one indirect hop
-        // (ref -> ref -> dict); follow the chain so /EmbeddedFiles is written
-        // into the terminal dict and the catalog /Names rewrite below collapses
-        // the chain to point straight at it.
-        Some(value @ Object::Reference(r)) => {
-            let (terminal, terminal_ref) = resolve_ref_chain(pdf, value)?;
-            match terminal.into_dict() {
-                Some(d) => (terminal_ref.unwrap_or(*r), d),
-                None => {
-                    let r2 = alloc();
-                    (r2, Dictionary::new())
-                }
-            }
+    let (location, mut names) = match catalog.get("Names").cloned() {
+        Some(value @ Object::Reference(source_ref)) => {
+            let (terminal, terminal_ref) = resolve_ref_chain(pdf, &value)?;
+            let Some(dictionary) = terminal.into_dict() else {
+                return Ok(false);
+            };
+            (
+                NamesLocation::Indirect(terminal_ref.unwrap_or(source_ref)),
+                dictionary,
+            )
         }
-        Some(Object::Dictionary(d)) => {
-            let r = alloc();
-            (r, d.clone())
-        }
-        _ => {
-            let r = alloc();
-            (r, Dictionary::new())
-        }
+        Some(Object::Dictionary(dictionary)) => (NamesLocation::Direct, dictionary),
+        _ => return Ok(false),
+    };
+    let Some(root) = names.get("EmbeddedFiles").cloned() else {
+        return Ok(false);
     };
 
-    names_dict.insert("EmbeddedFiles", Object::Reference(tree_root_ref));
-    pdf.set_object(names_ref, Object::Dictionary(names_dict));
+    let mut tree = crate::NameTree::new(root, true);
+    tree.set_max_depth(DEFAULT_MAX_EMBEDDED_FILES_DEPTH);
+    if tree.remove(pdf, key)?.is_none() {
+        return Ok(false);
+    }
 
-    // Point catalog /Names to the (possibly new) indirect names dict.
-    catalog.insert("Names", Object::Reference(names_ref));
+    if tree.begin(pdf)?.valid() {
+        tree.make_root_indirect(pdf)?;
+        names.insert("EmbeddedFiles", tree.into_root());
+    } else {
+        names.remove("EmbeddedFiles");
+    }
+
+    if names.iter().next().is_none() {
+        catalog.remove("Names");
+        if let NamesLocation::Indirect(names_ref) = location {
+            pdf.delete_object(names_ref);
+        }
+    } else {
+        match location {
+            NamesLocation::Direct => {
+                catalog.insert("Names", Object::Dictionary(names));
+            }
+            NamesLocation::Indirect(names_ref) => {
+                pdf.set_object(names_ref, Object::Dictionary(names));
+                catalog.insert("Names", Object::Reference(names_ref));
+            }
+        }
+    }
     pdf.set_object(catalog_ref, Object::Dictionary(catalog));
-
-    Ok(())
+    Ok(true)
 }
 
 // ── Tests for remove_attachment ───────────────────────────────────────────────

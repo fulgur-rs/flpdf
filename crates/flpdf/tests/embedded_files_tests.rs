@@ -83,6 +83,23 @@ fn build_single_level_pdf() -> Vec<u8> {
     out
 }
 
+fn build_pdfdocencoded_key_pdf() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut off: BTreeMap<u32, u64> = BTreeMap::new();
+
+    off.insert(1, out.len() as u64);
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Names 2 0 R >>\nendobj\n");
+    off.insert(2, out.len() as u64);
+    out.extend_from_slice(b"2 0 obj\n<< /EmbeddedFiles 3 0 R >>\nendobj\n");
+    off.insert(3, out.len() as u64);
+    out.extend_from_slice(b"3 0 obj\n<< /Names [ (\\200) 4 0 R ] >>\nendobj\n");
+    off.insert(4, out.len() as u64);
+    out.extend_from_slice(b"4 0 obj\n<< /Type /Filespec /F (bullet.txt) >>\nendobj\n");
+
+    finish_pdf(&mut out, &off, 4, 1);
+    out
+}
+
 #[test]
 fn single_level_returns_ordered_list() {
     let mut pdf = open(build_single_level_pdf());
@@ -92,6 +109,16 @@ fn single_level_returns_ordered_list() {
     assert_eq!(entries[0].1, ObjectRef::new(4, 0));
     assert_eq!(entries[1].0, b"beta");
     assert_eq!(entries[1].1, ObjectRef::new(5, 0));
+}
+
+#[test]
+fn list_normalizes_pdfdocencoded_name_keys_to_utf8() {
+    let mut pdf = open(build_pdfdocencoded_key_pdf());
+
+    assert_eq!(
+        list_embedded_files(&mut pdf).expect("list"),
+        vec![("•".as_bytes().to_vec(), ObjectRef::new(4, 0))]
+    );
 }
 
 // ── Test 2: multi-level /Kids tree ───────────────────────────────────────────
@@ -252,6 +279,73 @@ fn no_names_key_returns_empty() {
     assert!(entries.is_empty(), "expected empty list when /Names absent");
 }
 
+fn build_no_root_pdf() -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let object_offset = out.len() as u64;
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref = out.len() as u64;
+    out.extend_from_slice(
+        format!(
+            "xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \n\
+             trailer\n<< /Size 2 >>\nstartxref\n{xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+fn build_non_dict_root_pdf() -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = BTreeMap::new();
+    offsets.insert(1, out.len() as u64);
+    out.extend_from_slice(b"1 0 obj\n[1 2 3]\nendobj\n");
+    finish_pdf(&mut out, &offsets, 1, 1);
+    out
+}
+
+#[test]
+fn writer_handles_missing_and_malformed_catalog_paths() {
+    let mut no_root = open(build_no_root_pdf());
+    insert_embedded_file(&mut no_root, b"x", ObjectRef::new(1, 0)).expect("insert no root");
+    assert!(!delete_embedded_file(&mut no_root, b"x").expect("delete no root"));
+
+    let mut non_dict_root = open(build_non_dict_root_pdf());
+    insert_embedded_file(&mut non_dict_root, b"x", ObjectRef::new(1, 0))
+        .expect("insert non-dict root");
+    assert!(!delete_embedded_file(&mut non_dict_root, b"x").expect("delete non-dict root"));
+
+    let mut non_dict_names = open(build_non_dict_names_pdf());
+    assert!(!delete_embedded_file(&mut non_dict_names, b"x").expect("non-dict Names"));
+
+    let mut no_names = open(build_no_names_pdf());
+    assert!(!delete_embedded_file(&mut no_names, b"x").expect("no Names"));
+
+    let mut no_embedded_files = open(build_no_embedded_files_pdf());
+    assert!(!delete_embedded_file(&mut no_embedded_files, b"x").expect("no EmbeddedFiles"));
+}
+
+#[test]
+fn insert_reports_exhausted_names_object_number_space() {
+    let mut pdf = open(build_single_level_pdf());
+    let catalog_ref = pdf.root_ref().expect("catalog");
+    let mut catalog = pdf
+        .resolve(catalog_ref)
+        .expect("resolve catalog")
+        .into_dict()
+        .expect("catalog dict");
+    let names_ref = catalog.get_ref("Names").expect("Names ref");
+    let names = pdf
+        .resolve(names_ref)
+        .expect("resolve Names")
+        .into_dict()
+        .expect("Names dict");
+    catalog.insert("Names", Object::Dictionary(names));
+    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    pdf.set_object(ObjectRef::new(u32::MAX, 0), Object::Null);
+
+    assert!(insert_embedded_file(&mut pdf, b"alpha", ObjectRef::new(4, 0)).is_err());
+}
+
 // ── Test 6: inline /EmbeddedFiles dict (direct, not indirect) ────────────────
 
 /// Some generators embed the name-tree root directly in /Names dict without
@@ -281,6 +375,30 @@ fn inline_ef_dict_returns_entry() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].0, b"inline");
     assert_eq!(entries[0].1, ObjectRef::new(2, 0));
+}
+
+#[test]
+fn inserting_into_direct_embedded_files_root_indirectizes_it() {
+    let mut pdf = open(build_inline_ef_pdf());
+
+    insert_embedded_file(&mut pdf, b"other", ObjectRef::new(2, 0)).expect("insert");
+
+    let catalog_ref = pdf.root_ref().expect("catalog");
+    let catalog = pdf
+        .resolve(catalog_ref)
+        .expect("resolve catalog")
+        .into_dict()
+        .expect("catalog dict");
+    let names_ref = catalog.get_ref("Names").expect("indirect Names");
+    let names = pdf
+        .resolve(names_ref)
+        .expect("resolve Names")
+        .into_dict()
+        .expect("Names dict");
+    assert!(matches!(
+        names.get("EmbeddedFiles"),
+        Some(Object::Reference(_))
+    ));
 }
 
 // ── Test 7: fixture attachment-two-page.pdf (integration) ────────────────────
@@ -388,6 +506,47 @@ fn writer_multiple_inserts_sorted() {
     }
 }
 
+#[test]
+fn writer_second_insert_mutates_existing_tree_root() {
+    let mut pdf = open(build_empty_pdf());
+    insert_embedded_file(&mut pdf, b"alpha.txt", ObjectRef::new(3, 0)).expect("insert alpha");
+
+    let catalog_ref = pdf.root_ref().expect("catalog ref");
+    let first_root = {
+        let catalog = pdf
+            .resolve(catalog_ref)
+            .expect("catalog")
+            .into_dict()
+            .expect("catalog dict");
+        let names_ref = catalog.get_ref("Names").expect("names ref");
+        let names = pdf
+            .resolve(names_ref)
+            .expect("names")
+            .into_dict()
+            .expect("names dict");
+        names.get_ref("EmbeddedFiles").expect("tree root")
+    };
+
+    insert_embedded_file(&mut pdf, b"beta.txt", ObjectRef::new(4, 0)).expect("insert beta");
+
+    let catalog = pdf
+        .resolve(catalog_ref)
+        .expect("catalog")
+        .into_dict()
+        .expect("catalog dict");
+    let names_ref = catalog.get_ref("Names").expect("names ref");
+    let names = pdf
+        .resolve(names_ref)
+        .expect("names")
+        .into_dict()
+        .expect("names dict");
+    assert_eq!(
+        names.get_ref("EmbeddedFiles"),
+        Some(first_root),
+        "qpdf helper insertion mutates the existing root instead of rebuilding it"
+    );
+}
+
 // ── W3: insert duplicate key replaces value ───────────────────────────────────
 
 #[test]
@@ -428,6 +587,48 @@ fn writer_delete_existing_key() {
     // flat leaf (no /Kids array needed), so the tree round-trips cleanly.
     let entries2 = list_embedded_files(&mut pdf).expect("second list");
     assert_eq!(entries2.len(), 1);
+}
+
+#[test]
+fn writer_delete_mutates_existing_nonempty_tree_root() {
+    let mut pdf = open(build_empty_pdf());
+    insert_embedded_file(&mut pdf, b"keep.txt", ObjectRef::new(3, 0)).expect("insert keep");
+    insert_embedded_file(&mut pdf, b"remove.txt", ObjectRef::new(4, 0)).expect("insert remove");
+
+    let catalog_ref = pdf.root_ref().expect("catalog ref");
+    let root_before = {
+        let catalog = pdf
+            .resolve(catalog_ref)
+            .expect("catalog")
+            .into_dict()
+            .expect("catalog dict");
+        let names_ref = catalog.get_ref("Names").expect("names ref");
+        let names = pdf
+            .resolve(names_ref)
+            .expect("names")
+            .into_dict()
+            .expect("names dict");
+        names.get_ref("EmbeddedFiles").expect("tree root")
+    };
+
+    assert!(delete_embedded_file(&mut pdf, b"remove.txt").expect("delete"));
+
+    let catalog = pdf
+        .resolve(catalog_ref)
+        .expect("catalog")
+        .into_dict()
+        .expect("catalog dict");
+    let names_ref = catalog.get_ref("Names").expect("names ref");
+    let names = pdf
+        .resolve(names_ref)
+        .expect("names")
+        .into_dict()
+        .expect("names dict");
+    assert_eq!(names.get_ref("EmbeddedFiles"), Some(root_before));
+    assert_eq!(
+        list_embedded_files(&mut pdf).expect("list"),
+        vec![(b"keep.txt".to_vec(), ObjectRef::new(3, 0))]
+    );
 }
 
 // ── W5: delete non-existent key returns false ─────────────────────────────────

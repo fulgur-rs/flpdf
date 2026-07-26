@@ -151,6 +151,45 @@ fn writer_multiple_inserts_sorted() {
     assert_eq!(keys, vec![b"apple" as &[u8], b"mango", b"zebra"]);
 }
 
+#[test]
+fn writer_second_insert_mutates_existing_tree_root() {
+    let mut pdf = open(build_empty_pdf());
+    insert_name_tree_dest(&mut pdf, b"alpha", dest_array(ObjectRef::new(3, 0)))
+        .expect("insert alpha");
+
+    let catalog_ref = pdf.root_ref().expect("catalog ref");
+    let root_before = {
+        let catalog = pdf
+            .resolve(catalog_ref)
+            .expect("catalog")
+            .into_dict()
+            .expect("catalog dict");
+        let names_ref = catalog.get_ref("Names").expect("names ref");
+        let names = pdf
+            .resolve(names_ref)
+            .expect("names")
+            .into_dict()
+            .expect("names dict");
+        names.get_ref("Dests").expect("dests root")
+    };
+
+    insert_name_tree_dest(&mut pdf, b"beta", dest_array(ObjectRef::new(3, 0)))
+        .expect("insert beta");
+
+    let catalog = pdf
+        .resolve(catalog_ref)
+        .expect("catalog")
+        .into_dict()
+        .expect("catalog dict");
+    let names_ref = catalog.get_ref("Names").expect("names ref");
+    let names = pdf
+        .resolve(names_ref)
+        .expect("names")
+        .into_dict()
+        .expect("names dict");
+    assert_eq!(names.get_ref("Dests"), Some(root_before));
+}
+
 // ── W3: insert duplicate key replaces value ───────────────────────────────────
 
 #[test]
@@ -194,6 +233,50 @@ fn writer_delete_existing_key() {
     let entries = collect_raw_dests_tree(&mut pdf);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].0, b"keep");
+}
+
+#[test]
+fn writer_delete_mutates_existing_nonempty_tree_root() {
+    let mut pdf = open(build_empty_pdf());
+    insert_name_tree_dest(&mut pdf, b"keep", dest_array(ObjectRef::new(3, 0)))
+        .expect("insert keep");
+    insert_name_tree_dest(&mut pdf, b"remove", dest_array(ObjectRef::new(3, 0)))
+        .expect("insert remove");
+
+    let catalog_ref = pdf.root_ref().expect("catalog ref");
+    let root_before = {
+        let catalog = pdf
+            .resolve(catalog_ref)
+            .expect("catalog")
+            .into_dict()
+            .expect("catalog dict");
+        let names_ref = catalog.get_ref("Names").expect("names ref");
+        let names = pdf
+            .resolve(names_ref)
+            .expect("names")
+            .into_dict()
+            .expect("names dict");
+        names.get_ref("Dests").expect("dests root")
+    };
+
+    assert!(delete_name_tree_dest(&mut pdf, b"remove").expect("delete"));
+
+    let catalog = pdf
+        .resolve(catalog_ref)
+        .expect("catalog")
+        .into_dict()
+        .expect("catalog dict");
+    let names_ref = catalog.get_ref("Names").expect("names ref");
+    let names = pdf
+        .resolve(names_ref)
+        .expect("names")
+        .into_dict()
+        .expect("names dict");
+    assert_eq!(names.get_ref("Dests"), Some(root_before));
+    assert_eq!(
+        collect_raw_dests_tree(&mut pdf),
+        vec![(b"keep".to_vec(), dest_array(ObjectRef::new(3, 0)))]
+    );
 }
 
 // ── W5: delete non-existent key returns false ─────────────────────────────────
@@ -680,6 +763,48 @@ fn insert_is_noop_when_root_not_a_dict() {
     // contract under test is simply "does not error or panic".
 }
 
+#[test]
+fn delete_handles_missing_and_malformed_catalog_paths() {
+    let mut no_root = open(build_no_root_pdf());
+    assert!(!delete_name_tree_dest(&mut no_root, b"x").expect("no root"));
+
+    let mut non_dict_root = open(build_nondict_root_pdf());
+    assert!(!delete_name_tree_dest(&mut non_dict_root, b"x").expect("non-dict root"));
+
+    let mut non_dict_names = open(build_non_dict_names_pdf());
+    assert!(!delete_name_tree_dest(&mut non_dict_names, b"x").expect("non-dict Names"));
+
+    let mut no_names = open(build_empty_pdf());
+    assert!(!delete_name_tree_dest(&mut no_names, b"x").expect("no Names"));
+
+    let mut no_dests = open(build_pdf_with_sibling_embedded_files());
+    assert!(!delete_name_tree_dest(&mut no_dests, b"x").expect("no Dests"));
+}
+
+#[test]
+fn insert_reports_exhausted_names_object_number_space() {
+    let mut pdf = open(build_empty_pdf());
+    insert_name_tree_dest(&mut pdf, b"existing", Object::Integer(1)).expect("seed");
+
+    let catalog_ref = pdf.root_ref().expect("catalog");
+    let mut catalog = pdf
+        .resolve(catalog_ref)
+        .expect("resolve catalog")
+        .into_dict()
+        .expect("catalog dict");
+    let names_ref = catalog.get_ref("Names").expect("Names ref");
+    let names = pdf
+        .resolve(names_ref)
+        .expect("resolve Names")
+        .into_dict()
+        .expect("Names dict");
+    catalog.insert("Names", Object::Dictionary(names));
+    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    pdf.set_object(ObjectRef::new(u32::MAX, 0), Object::Null);
+
+    assert!(insert_name_tree_dest(&mut pdf, b"existing", Object::Integer(2)).is_err());
+}
+
 // ── Boundary: catalog carries an INLINE (non-indirect) /Names dict ───────────
 
 /// Catalog `/Names` is a direct (inline) dictionary rather than an indirect
@@ -801,4 +926,25 @@ fn delete_last_entry_from_inline_names_dict_keeps_names_inline_with_sibling() {
     );
 
     assert!(collect_raw_dests_tree(&mut pdf).is_empty());
+}
+
+#[test]
+fn inserting_into_direct_dests_root_indirectizes_it() {
+    let mut pdf = open(build_inline_names_dict_with_sibling_and_dest_pdf());
+
+    insert_name_tree_dest(&mut pdf, b"other", Object::Integer(7)).expect("insert");
+
+    let catalog_ref = pdf.root_ref().expect("catalog");
+    let catalog = pdf
+        .resolve(catalog_ref)
+        .expect("resolve catalog")
+        .into_dict()
+        .expect("catalog dict");
+    let names_ref = catalog.get_ref("Names").expect("indirect Names");
+    let names = pdf
+        .resolve(names_ref)
+        .expect("resolve Names")
+        .into_dict()
+        .expect("Names dict");
+    assert!(matches!(names.get("Dests"), Some(Object::Reference(_))));
 }

@@ -1,16 +1,17 @@
 //! Mirrors qpdf 11.9.0 `libqpdf/NNTree.cc`.
 //!
-//! Public wrappers corresponding to `QPDFNameTreeObjectHelper` and
-//! `QPDFNumberTreeObjectHelper` are added in the next stacked layer.
+//! This module provides the shared engine plus public wrappers corresponding
+//! to `QPDFNameTreeObjectHelper` and `QPDFNumberTreeObjectHelper`.
 
 use crate::json_inspect::{qpdf_new_unicode_utf8_value, qpdf_unicode_string_bytes};
 use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
 use std::io::{Read, Seek};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 pub(crate) const DEFAULT_SPLIT_THRESHOLD: usize = 32;
 
@@ -206,13 +207,687 @@ impl<K: TreeKey> NNTreeCursor<K> {
         self.item_number = None;
         self.current = None;
     }
+
+    fn same_position(&self, other: &Self) -> bool {
+        if self.item_number.is_none() && other.item_number.is_none() {
+            return true;
+        }
+        self.item_number == other.item_number
+            && self.path.len() == other.path.len()
+            && self
+                .path
+                .iter()
+                .zip(&other.path)
+                .all(|(left, right)| left.kid_number == right.kid_number)
+    }
+}
+
+impl<K: TreeKey> Clone for NNTreeCursor<K> {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            leaf: self.leaf.clone(),
+            item_number: self.item_number,
+            current: self.current.clone(),
+            marker: PhantomData,
+        }
+    }
 }
 
 pub(crate) struct NNTree<K: TreeKey> {
     root: Object,
     auto_repair: bool,
     split_threshold: usize,
+    max_depth: Option<usize>,
     marker: PhantomData<K>,
+}
+
+/// qpdf-compatible helper for a PDF name tree.
+///
+/// Name keys are supplied as UTF-8 bytes. Both byte slices and strings are
+/// accepted through [`AsRef<[u8]>`].
+pub struct NameTree {
+    inner: NNTree<NameKey>,
+    cursor_owner: Arc<()>,
+}
+
+impl NameTree {
+    /// Wrap an existing name-tree root.
+    pub fn new(root: Object, auto_repair: bool) -> Self {
+        Self {
+            inner: NNTree::new(root, auto_repair),
+            cursor_owner: Arc::new(()),
+        }
+    }
+
+    /// Create an empty name tree with an indirect root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the PDF object-number space is exhausted.
+    pub fn new_empty<R: Read + Seek>(pdf: &mut Pdf<R>, auto_repair: bool) -> Result<Self> {
+        let mut root = Dictionary::new();
+        root.insert(NameKey::ITEMS_KEY, Object::Array(Vec::new()));
+        let root_ref = make_indirect(
+            pdf,
+            &mut ObjectAllocator::default(),
+            Object::Dictionary(root),
+        )?;
+        Ok(Self::new(Object::Reference(root_ref), auto_repair))
+    }
+
+    /// Return the current tree root.
+    pub fn root(&self) -> &Object {
+        self.inner.root()
+    }
+
+    /// Consume the helper and return its current tree root.
+    pub fn into_root(self) -> Object {
+        self.inner.into_root()
+    }
+
+    /// Return an invalid cursor representing the position past the tree.
+    pub fn end(&self) -> NameTreeCursor {
+        NameTreeCursor {
+            inner: self.inner.end(),
+            owner: Arc::clone(&self.cursor_owner),
+        }
+    }
+
+    /// Return a cursor positioned at the first entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or traversed.
+    pub fn begin<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NameTreeCursor> {
+        self.inner.begin(pdf).map(|inner| NameTreeCursor {
+            inner,
+            owner: Arc::clone(&self.cursor_owner),
+        })
+    }
+
+    /// Return a cursor positioned at the last entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or traversed.
+    pub fn last<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NameTreeCursor> {
+        self.inner.last(pdf).map(|inner| NameTreeCursor {
+            inner,
+            owner: Arc::clone(&self.cursor_owner),
+        })
+    }
+
+    /// Find `key`, optionally returning the closest lower entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or searched.
+    pub fn find<R: Read + Seek, K: AsRef<[u8]>>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: K,
+        return_previous_if_missing: bool,
+    ) -> Result<NameTreeCursor> {
+        let key = key.as_ref().to_vec();
+        self.inner
+            .find(pdf, &key, return_previous_if_missing)
+            .map(|inner| NameTreeCursor {
+                inner,
+                owner: Arc::clone(&self.cursor_owner),
+            })
+    }
+
+    /// Insert or replace an entry and return a cursor positioned at it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or mutated.
+    pub fn insert<R: Read + Seek, K: AsRef<[u8]>>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: K,
+        value: Object,
+    ) -> Result<NameTreeCursor> {
+        self.inner
+            .insert(pdf, key.as_ref().to_vec(), value)
+            .map(|inner| NameTreeCursor {
+                inner,
+                owner: Arc::clone(&self.cursor_owner),
+            })
+    }
+
+    /// Return whether the tree contains an explicit entry for `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or searched.
+    pub fn has_name<R: Read + Seek, K: AsRef<[u8]>>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: K,
+    ) -> Result<bool> {
+        Ok(self.find_object(pdf, key)?.is_some())
+    }
+
+    /// Find the value stored at `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or searched.
+    pub fn find_object<R: Read + Seek, K: AsRef<[u8]>>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: K,
+    ) -> Result<Option<Object>> {
+        Ok(self
+            .inner
+            .find(pdf, &key.as_ref().to_vec(), false)?
+            .cloned_current()
+            .map(|(_, value)| value))
+    }
+
+    /// Remove the entry at `key`, returning its former value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or mutated.
+    pub fn remove<R: Read + Seek, K: AsRef<[u8]>>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: K,
+    ) -> Result<Option<Object>> {
+        self.inner.remove(pdf, &key.as_ref().to_vec())
+    }
+
+    /// Materialize the tree as a sorted map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or traversed.
+    pub fn as_map<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+    ) -> Result<BTreeMap<Vec<u8>, Object>> {
+        let mut result = BTreeMap::new();
+        let mut cursor = self.inner.begin(pdf)?;
+        while let Some((key, value)) = cursor.cloned_current() {
+            result.insert(key, value);
+            self.inner.next(pdf, &mut cursor)?;
+        }
+        Ok(result)
+    }
+
+    /// Set the node split threshold.
+    ///
+    /// This exists for qpdf-compatible tests; production callers normally
+    /// retain the default threshold of 32.
+    pub fn set_split_threshold(&mut self, threshold: usize) {
+        self.inner.set_split_threshold(threshold);
+    }
+
+    pub(crate) fn set_max_depth(&mut self, max_depth: usize) {
+        self.inner.max_depth = Some(max_depth);
+    }
+
+    pub(crate) fn make_root_indirect<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<()> {
+        self.inner.make_root_indirect(pdf)
+    }
+}
+
+/// Cursor over a [`NameTree`].
+pub struct NameTreeCursor {
+    inner: NNTreeCursor<NameKey>,
+    owner: Arc<()>,
+}
+
+impl Clone for NameTreeCursor {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            owner: Arc::clone(&self.owner),
+        }
+    }
+}
+
+impl PartialEq for NameTreeCursor {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.same_position(&other.inner)
+    }
+}
+
+impl Eq for NameTreeCursor {}
+
+impl NameTreeCursor {
+    /// Whether the cursor points to a valid key/value pair.
+    pub fn valid(&self) -> bool {
+        self.inner.current().is_some()
+    }
+
+    /// Return a clone of the current key/value pair.
+    pub fn current(&self) -> Option<(Vec<u8>, Object)> {
+        self.inner.cloned_current()
+    }
+
+    /// Advance to the next entry.
+    ///
+    /// Advancing an end cursor selects the first entry, matching qpdf.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or traversed, or the
+    /// cursor belongs to another tree.
+    pub fn next<R: Read + Seek>(&mut self, tree: &mut NameTree, pdf: &mut Pdf<R>) -> Result<()> {
+        self.ensure_owner(tree)?;
+        tree.inner.next(pdf, &mut self.inner)
+    }
+
+    /// Move to the previous entry.
+    ///
+    /// Moving an end cursor backward selects the last entry, matching qpdf.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or traversed, or the
+    /// cursor belongs to another tree.
+    pub fn previous<R: Read + Seek>(
+        &mut self,
+        tree: &mut NameTree,
+        pdf: &mut Pdf<R>,
+    ) -> Result<()> {
+        self.ensure_owner(tree)?;
+        tree.inner.previous(pdf, &mut self.inner)
+    }
+
+    /// Insert an entry immediately after the cursor and select it.
+    ///
+    /// This fast path does not validate key ordering, matching qpdf.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or mutated, or the
+    /// cursor belongs to another tree.
+    pub fn insert_after<R: Read + Seek, K: AsRef<[u8]>>(
+        &mut self,
+        tree: &mut NameTree,
+        pdf: &mut Pdf<R>,
+        key: K,
+        value: Object,
+    ) -> Result<()> {
+        self.ensure_owner(tree)?;
+        tree.inner
+            .insert_after(pdf, &mut self.inner, key.as_ref().to_vec(), value)
+    }
+
+    /// Remove the current entry and advance to the next entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or mutated, the
+    /// cursor belongs to another tree, or the cursor is invalid.
+    pub fn remove<R: Read + Seek>(&mut self, tree: &mut NameTree, pdf: &mut Pdf<R>) -> Result<()> {
+        self.ensure_owner(tree)?;
+        if !self.valid() {
+            return Err(Error::Unsupported(
+                "attempted to remove an invalid name-tree cursor".to_string(),
+            ));
+        }
+        tree.inner.remove_at(pdf, &mut self.inner).map(|_| ())
+    }
+
+    fn ensure_owner(&self, tree: &NameTree) -> Result<()> {
+        if Arc::ptr_eq(&self.owner, &tree.cursor_owner) {
+            Ok(())
+        } else {
+            Err(Error::Unsupported(
+                "name-tree cursor belongs to a different tree".to_string(),
+            ))
+        }
+    }
+}
+
+/// qpdf-compatible helper for a PDF number tree.
+///
+/// The helper owns the tree root while all indirect nodes remain in the
+/// supplied [`Pdf`]. Mutating a direct root therefore updates this helper's
+/// owned root; use the helper for subsequent operations.
+pub struct NumberTree {
+    inner: NNTree<NumberKey>,
+    cursor_owner: Arc<()>,
+}
+
+impl NumberTree {
+    /// Wrap an existing number-tree root.
+    pub fn new(root: Object, auto_repair: bool) -> Self {
+        Self {
+            inner: NNTree::new(root, auto_repair),
+            cursor_owner: Arc::new(()),
+        }
+    }
+
+    /// Create an empty number tree with an indirect root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the PDF object-number space is exhausted.
+    pub fn new_empty<R: Read + Seek>(pdf: &mut Pdf<R>, auto_repair: bool) -> Result<Self> {
+        let mut root = Dictionary::new();
+        root.insert(NumberKey::ITEMS_KEY, Object::Array(Vec::new()));
+        let root_ref = make_indirect(
+            pdf,
+            &mut ObjectAllocator::default(),
+            Object::Dictionary(root),
+        )?;
+        Ok(Self::new(Object::Reference(root_ref), auto_repair))
+    }
+
+    /// Return the current tree root.
+    pub fn root(&self) -> &Object {
+        self.inner.root()
+    }
+
+    /// Consume the helper and return its current tree root.
+    pub fn into_root(self) -> Object {
+        self.inner.into_root()
+    }
+
+    /// Return an invalid cursor representing the position past the tree.
+    pub fn end(&self) -> NumberTreeCursor {
+        NumberTreeCursor {
+            inner: self.inner.end(),
+            owner: Arc::clone(&self.cursor_owner),
+        }
+    }
+
+    /// Return a cursor positioned at the first entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or traversed.
+    pub fn begin<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NumberTreeCursor> {
+        self.inner.begin(pdf).map(|inner| NumberTreeCursor {
+            inner,
+            owner: Arc::clone(&self.cursor_owner),
+        })
+    }
+
+    /// Return a cursor positioned at the last entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or traversed.
+    pub fn last<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NumberTreeCursor> {
+        self.inner.last(pdf).map(|inner| NumberTreeCursor {
+            inner,
+            owner: Arc::clone(&self.cursor_owner),
+        })
+    }
+
+    /// Find `key`, optionally returning the closest lower entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or searched.
+    pub fn find<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: i64,
+        return_previous_if_missing: bool,
+    ) -> Result<NumberTreeCursor> {
+        self.inner
+            .find(pdf, &key, return_previous_if_missing)
+            .map(|inner| NumberTreeCursor {
+                inner,
+                owner: Arc::clone(&self.cursor_owner),
+            })
+    }
+
+    /// Insert or replace an entry and return a cursor positioned at it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or mutated.
+    pub fn insert<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: i64,
+        value: Object,
+    ) -> Result<NumberTreeCursor> {
+        self.inner
+            .insert(pdf, key, value)
+            .map(|inner| NumberTreeCursor {
+                inner,
+                owner: Arc::clone(&self.cursor_owner),
+            })
+    }
+
+    /// Find the value stored at `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or searched.
+    pub fn find_object<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: i64,
+    ) -> Result<Option<Object>> {
+        Ok(self
+            .inner
+            .find(pdf, &key, false)?
+            .cloned_current()
+            .map(|(_, value)| value))
+    }
+
+    /// Return the smallest index, or `0` when the tree is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or traversed.
+    pub fn min<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<i64> {
+        Ok(self
+            .inner
+            .begin(pdf)?
+            .cloned_current()
+            .map_or(0, |(key, _)| key))
+    }
+
+    /// Return the largest index, or `0` when the tree is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or traversed.
+    pub fn max<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<i64> {
+        Ok(self
+            .inner
+            .last(pdf)?
+            .cloned_current()
+            .map_or(0, |(key, _)| key))
+    }
+
+    /// Return whether the tree contains an explicit entry at `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or searched.
+    pub fn has_index<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>, key: i64) -> Result<bool> {
+        Ok(self.find_object(pdf, key)?.is_some())
+    }
+
+    /// Find the value at `key`, or the closest value below it.
+    ///
+    /// The returned offset is `key - actual_key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be searched or the signed offset
+    /// cannot be represented as an [`i64`].
+    pub fn find_object_at_or_below<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: i64,
+    ) -> Result<Option<(Object, i64)>> {
+        let Some((actual_key, value)) = self.inner.find(pdf, &key, true)?.cloned_current() else {
+            return Ok(None);
+        };
+        let offset = key.checked_sub(actual_key).ok_or_else(|| {
+            Error::Unsupported("number-tree at-or-below offset overflow".to_string())
+        })?;
+        Ok(Some((value, offset)))
+    }
+
+    /// Remove the entry at `key`, returning its former value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or mutated.
+    pub fn remove<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>, key: i64) -> Result<Option<Object>> {
+        self.inner.remove(pdf, &key)
+    }
+
+    /// Materialize the tree as a sorted map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or traversed.
+    pub fn as_map<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<BTreeMap<i64, Object>> {
+        let mut result = BTreeMap::new();
+        let mut cursor = self.inner.begin(pdf)?;
+        while let Some((key, value)) = cursor.cloned_current() {
+            result.insert(key, value);
+            self.inner.next(pdf, &mut cursor)?;
+        }
+        Ok(result)
+    }
+
+    /// Set the node split threshold.
+    ///
+    /// This exists for qpdf-compatible tests; production callers normally
+    /// retain the default threshold of 32.
+    pub fn set_split_threshold(&mut self, threshold: usize) {
+        self.inner.set_split_threshold(threshold);
+    }
+
+    pub(crate) fn set_max_depth(&mut self, max_depth: usize) {
+        self.inner.max_depth = Some(max_depth);
+    }
+
+    pub(crate) fn make_root_indirect<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<()> {
+        self.inner.make_root_indirect(pdf)
+    }
+}
+
+/// Cursor over a [`NumberTree`].
+pub struct NumberTreeCursor {
+    inner: NNTreeCursor<NumberKey>,
+    owner: Arc<()>,
+}
+
+impl Clone for NumberTreeCursor {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            owner: Arc::clone(&self.owner),
+        }
+    }
+}
+
+impl PartialEq for NumberTreeCursor {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.same_position(&other.inner)
+    }
+}
+
+impl Eq for NumberTreeCursor {}
+
+impl NumberTreeCursor {
+    /// Whether the cursor points to a valid key/value pair.
+    pub fn valid(&self) -> bool {
+        self.inner.current().is_some()
+    }
+
+    /// Return a clone of the current key/value pair.
+    pub fn current(&self) -> Option<(i64, Object)> {
+        self.inner.cloned_current()
+    }
+
+    /// Advance to the next entry.
+    ///
+    /// Advancing an end cursor selects the first entry, matching qpdf.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or traversed, or the
+    /// cursor belongs to another tree.
+    pub fn next<R: Read + Seek>(&mut self, tree: &mut NumberTree, pdf: &mut Pdf<R>) -> Result<()> {
+        self.ensure_owner(tree)?;
+        tree.inner.next(pdf, &mut self.inner)
+    }
+
+    /// Move to the previous entry.
+    ///
+    /// Moving an end cursor backward selects the last entry, matching qpdf.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or traversed, or the
+    /// cursor belongs to another tree.
+    pub fn previous<R: Read + Seek>(
+        &mut self,
+        tree: &mut NumberTree,
+        pdf: &mut Pdf<R>,
+    ) -> Result<()> {
+        self.ensure_owner(tree)?;
+        tree.inner.previous(pdf, &mut self.inner)
+    }
+
+    /// Insert an entry immediately after the cursor and select it.
+    ///
+    /// This fast path does not validate key ordering, matching qpdf.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or mutated, or the
+    /// cursor belongs to another tree.
+    pub fn insert_after<R: Read + Seek>(
+        &mut self,
+        tree: &mut NumberTree,
+        pdf: &mut Pdf<R>,
+        key: i64,
+        value: Object,
+    ) -> Result<()> {
+        self.ensure_owner(tree)?;
+        tree.inner.insert_after(pdf, &mut self.inner, key, value)
+    }
+
+    /// Remove the current entry and advance to the next entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be resolved or mutated, the
+    /// cursor belongs to another tree, or the cursor is invalid.
+    pub fn remove<R: Read + Seek>(
+        &mut self,
+        tree: &mut NumberTree,
+        pdf: &mut Pdf<R>,
+    ) -> Result<()> {
+        self.ensure_owner(tree)?;
+        if !self.valid() {
+            return Err(Error::Unsupported(
+                "attempted to remove an invalid number-tree cursor".to_string(),
+            ));
+        }
+        tree.inner.remove_at(pdf, &mut self.inner).map(|_| ())
+    }
+
+    fn ensure_owner(&self, tree: &NumberTree) -> Result<()> {
+        if Arc::ptr_eq(&self.owner, &tree.cursor_owner) {
+            Ok(())
+        } else {
+            Err(Error::Unsupported(
+                "number-tree cursor belongs to a different tree".to_string(),
+            ))
+        }
+    }
 }
 
 impl<K: TreeKey> NNTree<K> {
@@ -221,6 +896,7 @@ impl<K: TreeKey> NNTree<K> {
             root,
             auto_repair,
             split_threshold: DEFAULT_SPLIT_THRESHOLD,
+            max_depth: None,
             marker: PhantomData,
         }
     }
@@ -231,6 +907,15 @@ impl<K: TreeKey> NNTree<K> {
 
     pub(crate) fn into_root(self) -> Object {
         self.root
+    }
+
+    fn make_root_indirect<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<()> {
+        if matches!(self.root, Object::Reference(_)) {
+            return Ok(());
+        }
+        let object_ref = make_indirect(pdf, &mut ObjectAllocator::default(), self.root.clone())?;
+        self.root = Object::Reference(object_ref);
+        Ok(())
     }
 
     pub(crate) fn begin<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NNTreeCursor<K>> {
@@ -538,6 +1223,7 @@ impl<K: TreeKey> NNTree<K> {
         self.store_node(pdf, &root, current)
     }
 
+    #[cfg(test)]
     fn split_node<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
@@ -867,6 +1553,15 @@ impl<K: TreeKey> NNTree<K> {
         let mut cursor = NNTreeCursor::empty();
 
         loop {
+            if self
+                .max_depth
+                .is_some_and(|max_depth| cursor.path.len() >= max_depth)
+            {
+                let max_depth = self.max_depth.expect("checked above");
+                return Err(Error::Unsupported(format!(
+                    "name_number_tree: /Kids depth limit {max_depth} exceeded"
+                )));
+            }
             if !seen.insert(node.clone()) {
                 return Err(structural_error(
                     node.diagnostic_ref(),
@@ -1026,6 +1721,15 @@ impl<K: TreeKey> NNTree<K> {
         let mut node = start;
 
         loop {
+            if self
+                .max_depth
+                .is_some_and(|max_depth| cursor.path.len() >= max_depth)
+            {
+                let max_depth = self.max_depth.expect("checked above");
+                return Err(Error::Unsupported(format!(
+                    "name_number_tree: /Kids depth limit {max_depth} exceeded"
+                )));
+            }
             if !seen.insert(node.clone()) {
                 self.warn(
                     pdf,
@@ -1510,6 +2214,126 @@ fn structural_message(object_ref: Option<ObjectRef>, message: impl AsRef<str>) -
         None => "Name/Number tree node: ".to_string(),
     };
     format!("{prefix}{}", message.as_ref())
+}
+
+pub(crate) fn build_name_tree_compat<A>(
+    entries: &[(Vec<u8>, Object)],
+    mut alloc: A,
+) -> (ObjectRef, Vec<(ObjectRef, Object)>)
+where
+    A: FnMut() -> ObjectRef,
+{
+    debug_assert!(
+        !entries.is_empty(),
+        "build_name_tree requires non-empty entries"
+    );
+    let mut nodes = Vec::new();
+
+    if entries.len() <= DEFAULT_SPLIT_THRESHOLD {
+        let root_ref = alloc();
+        let mut root = Dictionary::new();
+        root.insert("Names", Object::Array(name_pairs(entries)));
+        nodes.push((root_ref, Object::Dictionary(root)));
+        return (root_ref, nodes);
+    }
+
+    let leaf_count = entries.len().div_ceil(DEFAULT_SPLIT_THRESHOLD);
+    let chunk_size = entries.len().div_ceil(leaf_count);
+    let mut kids = Vec::with_capacity(leaf_count);
+    for chunk in entries.chunks(chunk_size) {
+        let leaf_ref = alloc();
+        nodes.push((leaf_ref, Object::Dictionary(build_name_leaf(chunk))));
+        kids.push(Object::Reference(leaf_ref));
+    }
+    let mut root = Dictionary::new();
+    root.insert("Kids", Object::Array(kids));
+    let root_ref = alloc();
+    nodes.push((root_ref, Object::Dictionary(root)));
+    (root_ref, nodes)
+}
+
+fn name_pairs(entries: &[(Vec<u8>, Object)]) -> Vec<Object> {
+    let mut pairs = Vec::with_capacity(entries.len() * 2);
+    for (key, value) in entries {
+        pairs.push(Object::String(key.clone()));
+        pairs.push(value.clone());
+    }
+    pairs
+}
+
+fn build_name_leaf(entries: &[(Vec<u8>, Object)]) -> Dictionary {
+    let first = entries
+        .first()
+        .map(|(key, _)| key.clone())
+        .unwrap_or_default();
+    let last = entries
+        .last()
+        .map(|(key, _)| key.clone())
+        .unwrap_or_default();
+    let mut leaf = Dictionary::new();
+    leaf.insert(
+        "Limits",
+        Object::Array(vec![Object::String(first), Object::String(last)]),
+    );
+    leaf.insert("Names", Object::Array(name_pairs(entries)));
+    leaf
+}
+
+pub(crate) fn build_number_tree_compat<A>(
+    entries: &[(i64, Object)],
+    mut alloc: A,
+) -> (ObjectRef, Vec<(ObjectRef, Object)>)
+where
+    A: FnMut() -> ObjectRef,
+{
+    debug_assert!(
+        !entries.is_empty(),
+        "build_number_tree requires non-empty entries"
+    );
+    let mut nodes = Vec::new();
+
+    if entries.len() <= DEFAULT_SPLIT_THRESHOLD {
+        let root_ref = alloc();
+        let mut root = Dictionary::new();
+        root.insert("Nums", Object::Array(number_pairs(entries)));
+        nodes.push((root_ref, Object::Dictionary(root)));
+        return (root_ref, nodes);
+    }
+
+    let leaf_count = entries.len().div_ceil(DEFAULT_SPLIT_THRESHOLD);
+    let chunk_size = entries.len().div_ceil(leaf_count);
+    let mut kids = Vec::with_capacity(leaf_count);
+    for chunk in entries.chunks(chunk_size) {
+        let leaf_ref = alloc();
+        nodes.push((leaf_ref, Object::Dictionary(build_number_leaf(chunk))));
+        kids.push(Object::Reference(leaf_ref));
+    }
+    let mut root = Dictionary::new();
+    root.insert("Kids", Object::Array(kids));
+    let root_ref = alloc();
+    nodes.push((root_ref, Object::Dictionary(root)));
+    (root_ref, nodes)
+}
+
+fn number_pairs(entries: &[(i64, Object)]) -> Vec<Object> {
+    let mut pairs = Vec::with_capacity(entries.len() * 2);
+    for (key, value) in entries {
+        pairs.push(Object::Integer(*key));
+        pairs.push(value.clone());
+    }
+    pairs
+}
+
+fn build_number_leaf(entries: &[(i64, Object)]) -> Dictionary {
+    let first = entries.first().map(|(key, _)| *key).unwrap_or_default();
+    let last = entries.last().map(|(key, _)| *key).unwrap_or_default();
+    let mut leaf = Dictionary::new();
+    leaf.insert(
+        "Limits",
+        Object::Array(vec![Object::Integer(first), Object::Integer(last)]),
+    );
+    leaf.insert("Nums", Object::Array(number_pairs(entries)));
+    leaf
 }
 
 #[cfg(test)]
@@ -2979,6 +3803,46 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "unsupported PDF feature: object-number space exhausted"
+        );
+    }
+
+    #[test]
+    fn targeted_find_enforces_depth_limit_after_a_shallow_begin() {
+        let mut pdf = empty_pdf();
+        let shallow_ref = ObjectRef::new(10, 0);
+        let branch_ref = ObjectRef::new(20, 0);
+        let deep_ref = ObjectRef::new(21, 0);
+        pdf.set_object(shallow_ref, number_leaf(&[(0, b"zero")], Some((0, 0))));
+        pdf.set_object(
+            deep_ref,
+            number_leaf(&[(100, b"hundred")], Some((100, 100))),
+        );
+        let mut branch = Dictionary::new();
+        branch.insert(
+            "Limits",
+            Object::Array(vec![Object::Integer(100), Object::Integer(100)]),
+        );
+        branch.insert("Kids", Object::Array(vec![Object::Reference(deep_ref)]));
+        pdf.set_object(branch_ref, Object::Dictionary(branch));
+        let mut root = Dictionary::new();
+        root.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(shallow_ref),
+                Object::Reference(branch_ref),
+            ]),
+        );
+        let mut tree = NNTree::<NumberKey>::new(Object::Dictionary(root), false);
+        tree.max_depth = Some(2);
+
+        let error = match tree.find(&mut pdf, &100, false) {
+            Err(error) => error,
+            Ok(_) => panic!("targeted find must enforce the depth limit"), // cov:ignore: negative-path assertion
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: name_number_tree: /Kids depth limit 2 exceeded"
         );
     }
 }
