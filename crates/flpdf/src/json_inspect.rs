@@ -9,6 +9,7 @@ use crate::json::Json;
 use crate::object::{Dictionary, Object, ObjectRef, Stream};
 use crate::reader::Pdf;
 use std::borrow::Cow;
+use std::fs::File;
 use std::io::{Read, Seek, Write};
 
 // ── ConvertError ──────────────────────────────────────────────────────────────
@@ -663,8 +664,8 @@ pub enum StreamDataMode {
     Inline,
     /// Emit a side-file path under `datafile`.
     /// Yields `{ "stream": { "datafile": "<prefix>-<obj_num>", "dict": ... } }`.
-    /// The JSON writer writes the decoded bytes to the named file after the
-    /// corresponding object entry has been emitted.
+    /// The JSON writer opens the named file after the outer `stream` key and
+    /// writes its decoded bytes before emitting the stream dictionary.
     File { prefix: String },
 }
 
@@ -2611,13 +2612,19 @@ fn write_qpdf_section<R: Read + Seek>(
         if !object_selected(objects, object_ref) {
             continue;
         }
-        let key = format!("obj:{} {} R", object_ref.number, object_ref.generation);
-        let (entry, datafile) =
-            build_qpdf_object_entry(pdf, object_ref, decode_level, stream_mode)?;
-        Json::write_dictionary_item(out, &mut objects_first, key.as_bytes(), &entry, 3)?;
-        if let (Some(bytes), StreamDataMode::File { prefix }) = (datafile, stream_mode) {
-            let side_path = format_json_side_file_path(prefix, object_ref.number);
-            std::fs::write(side_path, bytes)?;
+        if let StreamDataMode::File { prefix } = stream_mode {
+            write_file_mode_object_entry(
+                pdf,
+                object_ref,
+                decode_level,
+                prefix,
+                out,
+                &mut objects_first,
+            )?;
+        } else {
+            let key = format!("obj:{} {} R", object_ref.number, object_ref.generation);
+            let (entry, _) = build_qpdf_object_entry(pdf, object_ref, decode_level, stream_mode)?;
+            Json::write_dictionary_item(out, &mut objects_first, key.as_bytes(), &entry, 3)?;
         }
     }
 
@@ -2630,6 +2637,72 @@ fn write_qpdf_section<R: Read + Seek>(
     // neither an object nor the trailer: `{\n    }`, not compact `{}`.
     Json::write_dictionary_close(out, false, 2)?;
     Json::write_array_close(out, qpdf_first, 1)?;
+    Ok(())
+}
+
+fn write_file_mode_object_entry<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object_ref: ObjectRef,
+    decode_level: DecodeLevel,
+    prefix: &str,
+    out: &mut (impl Write + ?Sized),
+    objects_first: &mut bool,
+) -> Result<(), JsonOutputError> {
+    let object = qpdf_resolve_top_level_object(pdf, object_ref)?;
+    let key = format!("obj:{} {} R", object_ref.number, object_ref.generation);
+
+    match object {
+        Object::Stream(stream) => {
+            Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
+            let mut object_first = true;
+            Json::write_dictionary_open(out, &mut object_first, 3)?;
+            Json::write_dictionary_key(out, &mut object_first, b"stream", 4)?;
+
+            let side_path = format_json_side_file_path(prefix, object_ref.number);
+            let mut side_file = File::create(&side_path)?;
+            write_file_mode_stream_value(
+                pdf,
+                &stream,
+                decode_level,
+                &side_path,
+                &mut side_file,
+                out,
+            )?;
+            Json::write_dictionary_close(out, object_first, 3)?;
+        }
+        other => {
+            let entry = json_dictionary([("value", qpdf_pdf_object_to_json(pdf, &other)?)])?;
+            Json::write_dictionary_item(out, objects_first, key.as_bytes(), &entry, 3)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_file_mode_stream_value<R: Read + Seek, W: Write>(
+    pdf: &mut Pdf<R>,
+    stream: &Stream,
+    decode_level: DecodeLevel,
+    side_path: &str,
+    side_file: &mut W,
+    out: &mut (impl Write + ?Sized),
+) -> Result<(), JsonOutputError> {
+    let payload = stream_payload_with_decode_status(stream, decode_level);
+    let mut stream_first = true;
+    Json::write_dictionary_open(out, &mut stream_first, 4)?;
+    Json::write_dictionary_item(
+        out,
+        &mut stream_first,
+        b"datafile",
+        &Json::make_string(side_path),
+        5,
+    )?;
+    side_file.write_all(payload.bytes.as_ref())?;
+    side_file.flush()?;
+
+    let dict = normalized_emitted_stream_dict(stream, payload.decode_succeeded);
+    let dict_json = qpdf_dict_to_json(pdf, &dict)?;
+    Json::write_dictionary_item(out, &mut stream_first, b"dict", &dict_json, 5)?;
+    Json::write_dictionary_close(out, stream_first, 4)?;
     Ok(())
 }
 
@@ -3033,6 +3106,154 @@ mod tests {
     }
 
     #[test]
+    fn file_mode_sink_failure_after_open_leaves_empty_side_file_before_stream_value() {
+        let temp = tempfile::tempdir().unwrap();
+        let reference_prefix = temp.path().join("reference").to_string_lossy().into_owned();
+        let prefix = temp.path().join("actual___").to_string_lossy().into_owned();
+        assert_eq!(reference_prefix.len(), prefix.len());
+
+        let mut complete_pdf = load_one_page_pdf();
+        let mut complete = Vec::new();
+        write_qpdf_json_v2_selected_objects_with_options(
+            &mut complete_pdf,
+            DecodeLevel::None,
+            &StreamDataMode::File {
+                prefix: reference_prefix,
+            },
+            &[JsonKey::Qpdf],
+            &[JsonObjectSelector::Object {
+                number: 7,
+                generation: 0,
+            }],
+            &mut complete,
+        )
+        .unwrap();
+        let stream_key = b"\"stream\": ";
+        let fail_after = complete
+            .windows(stream_key.len())
+            .position(|window| window == stream_key)
+            .expect("successful file-mode JSON must contain the stream key")
+            + stream_key.len();
+
+        let side_path = format_json_side_file_path(&prefix, 7);
+        let mut pdf = load_one_page_pdf();
+        let mut out = FailAfter {
+            remaining: fail_after,
+            bytes: Vec::new(),
+        };
+        let result = write_qpdf_json_v2_selected_objects_with_options(
+            &mut pdf,
+            DecodeLevel::None,
+            &StreamDataMode::File { prefix },
+            &[JsonKey::Qpdf],
+            &[JsonObjectSelector::Object {
+                number: 7,
+                generation: 0,
+            }],
+            &mut out,
+        );
+
+        assert!(matches!(
+            result,
+            Err(JsonOutputError::Io(ref error)) if error.to_string() == "sink full"
+        ));
+        assert!(out.bytes.ends_with(stream_key), "{:?}", out.bytes);
+        assert_eq!(std::fs::read(&side_path).unwrap(), b"");
+    }
+
+    #[test]
+    fn file_mode_sink_failure_during_datafile_leaves_empty_side_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let reference_prefix = temp.path().join("reference").to_string_lossy().into_owned();
+        let prefix = temp.path().join("actual___").to_string_lossy().into_owned();
+        assert_eq!(reference_prefix.len(), prefix.len());
+
+        let mut complete_pdf = load_one_page_pdf();
+        let mut complete = Vec::new();
+        write_qpdf_json_v2_selected_objects_with_options(
+            &mut complete_pdf,
+            DecodeLevel::None,
+            &StreamDataMode::File {
+                prefix: reference_prefix,
+            },
+            &[JsonKey::Qpdf],
+            &[JsonObjectSelector::Object {
+                number: 7,
+                generation: 0,
+            }],
+            &mut complete,
+        )
+        .unwrap();
+        let stream_key = b"\"stream\": ";
+        let fail_after = complete
+            .windows(stream_key.len())
+            .position(|window| window == stream_key)
+            .expect("successful file-mode JSON must contain the stream key")
+            + stream_key.len()
+            + 1;
+
+        let side_path = format_json_side_file_path(&prefix, 7);
+        let mut pdf = load_one_page_pdf();
+        let mut out = FailAfter {
+            remaining: fail_after,
+            bytes: Vec::new(),
+        };
+        let result = write_qpdf_json_v2_selected_objects_with_options(
+            &mut pdf,
+            DecodeLevel::None,
+            &StreamDataMode::File { prefix },
+            &[JsonKey::Qpdf],
+            &[JsonObjectSelector::Object {
+                number: 7,
+                generation: 0,
+            }],
+            &mut out,
+        );
+
+        assert!(matches!(
+            result,
+            Err(JsonOutputError::Io(ref error)) if error.to_string() == "sink full"
+        ));
+        assert!(out.bytes.ends_with(b"\"stream\": {"), "{:?}", out.bytes);
+        assert_eq!(std::fs::read(&side_path).unwrap(), b"");
+    }
+
+    #[test]
+    fn file_mode_payload_writer_failure_leaves_complete_datafile_before_dict() {
+        let mut pdf = load_one_page_pdf();
+        let stream = Stream::new(Dictionary::new(), b"payload".to_vec());
+        let mut side_file = FailAfter {
+            remaining: 0,
+            bytes: Vec::new(),
+        };
+        let mut out = Vec::new();
+
+        let result = write_file_mode_stream_value(
+            &mut pdf,
+            &stream,
+            DecodeLevel::None,
+            "side-file",
+            &mut side_file,
+            &mut out,
+        );
+
+        assert!(matches!(
+            result,
+            Err(JsonOutputError::Io(ref error)) if error.to_string() == "sink full"
+        ));
+        assert!(
+            out.windows(br#""datafile": "side-file""#.len())
+                .any(|window| window == br#""datafile": "side-file""#),
+            "{out:?}"
+        );
+        assert!(
+            !out.windows(br#""dict""#.len())
+                .any(|window| window == br#""dict""#),
+            "{out:?}"
+        );
+    }
+
+    #[test]
     fn later_sink_failure_keeps_earlier_file_mode_payload() {
         let temp = tempfile::tempdir().unwrap();
         let reference_prefix = temp.path().join("reference").to_string_lossy().into_owned();
@@ -3132,7 +3353,7 @@ mod tests {
     }
 
     #[test]
-    fn file_mode_processes_multiple_payloads_without_summary() {
+    fn file_mode_processes_multiple_payloads_incrementally() {
         let mut pdf = load_one_page_pdf();
         let second_ref = crate::ObjectRef::new(8, 0);
         let second_payload = b"second stream payload";

@@ -2578,13 +2578,18 @@ fn json_side_file_error_emits_recorded_warning_after_partial_json_before_fatal_e
         "{stdout}"
     );
     assert!(stdout.contains(r#""obj:6 0 R": {"#), "{stdout}");
-    assert!(stdout.contains(r#""datafile":"#), "{stdout}");
-    let expected_datafile = format!("{}-6", missing_prefix.display());
-    let expected_datafile_fragment = format!(
-        r#""datafile": {}"#,
-        serde_json::to_string(&expected_datafile).unwrap()
+    assert!(
+        stdout.ends_with("\"stream\": "),
+        "qpdf opens the final side file immediately after the stream key: {stdout}"
     );
-    assert!(stdout.contains(&expected_datafile_fragment), "{stdout}");
+    assert!(
+        !stdout[stdout.rfind("\"stream\": ").unwrap()..].contains('{'),
+        "the stream value must not start before the side-file open succeeds: {stdout}"
+    );
+    assert!(
+        !stdout[stdout.rfind("\"stream\": ").unwrap()..].contains("datafile"),
+        "the datafile member must not start before the side-file open succeeds: {stdout}"
+    );
     let json_error = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap_err();
     assert!(json_error.is_eof(), "{json_error}: {stdout}");
     assert!(!stdout.ends_with("\n}\n"), "{stdout}");

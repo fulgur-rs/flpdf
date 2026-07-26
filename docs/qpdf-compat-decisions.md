@@ -124,7 +124,7 @@ Grouped by area for navigation.
 
 **Decision:** observable (structural equivalence)  
 **Owner:** flpdf-9hc.11.1  
-**Rationale:** Byte-identical JSON output requires reproducing qpdf's exact key-ordering policy and serializer quirks (2-space indent, fixed internal key order, trailing newlines). These are fragile to qpdf upstream changes and add no information value for consumers, since all real consumers route bytes through a JSON parser. Decision: pursue structural equivalence (same parsed JSON value) rather than byte-identical output. Concessions kept for maximum compatibility: keys emitted in qpdf's fixed v2 internal order where defined by downstream subtasks (the emitter preserves insertion order via `Vec<(String, JsonValue)>`); 2-space indent; LF line endings; UTF-8; trailing LF at end of file. Byte-identical output can be revisited as a separate issue if a downstream measurement shows it is required.
+**Rationale:** Byte-identical JSON output requires reproducing qpdf's exact key-ordering policy and serializer quirks (2-space indent, fixed internal key order, trailing newlines). These are fragile to qpdf upstream changes and add no information value for consumers, since all real consumers route bytes through a JSON parser. Decision: pursue structural equivalence (same parsed JSON value) rather than byte-identical output. Concessions kept for maximum compatibility: shared-handle `Json` values retain qpdf's encoded-key ordering, and the fixed-order incremental writer emits the mandated v2 sections and members; it also keeps 2-space indent, LF line endings, UTF-8, and a trailing LF. Byte-identical output can be revisited as a separate issue if a downstream measurement shows it is required.
 
 ### Identifier generation
 
