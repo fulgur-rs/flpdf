@@ -1,4 +1,6 @@
-use flpdf::{read_name_tree, read_number_tree, Dictionary, NameTree, NumberTree, Object, Pdf};
+use flpdf::{
+    read_name_tree, read_number_tree, Dictionary, NameTree, NumberTree, Object, ObjectRef, Pdf,
+};
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
@@ -371,4 +373,35 @@ fn typed_cursors_are_cloneable_and_compare_by_qpdf_position() {
     let number_first = number_tree.begin(&mut pdf).expect("number first");
     assert!(number_first == number_first.clone());
     assert!(number_first != number_tree.end());
+}
+
+#[test]
+fn new_empty_reports_exhausted_object_number_space() {
+    let mut pdf = empty_pdf();
+    pdf.set_object(ObjectRef::new(u32::MAX, 0), Object::Null);
+
+    assert!(NameTree::new_empty(&mut pdf, true).is_err());
+    assert!(NumberTree::new_empty(&mut pdf, true).is_err());
+}
+
+#[test]
+fn number_tree_at_or_below_reports_offset_overflow() {
+    let mut pdf = empty_pdf();
+    let mut root = Dictionary::new();
+    root.insert(
+        "Nums",
+        Object::Array(vec![
+            Object::Integer(i64::MIN),
+            Object::String(b"minimum".to_vec()),
+        ]),
+    );
+    let mut tree = NumberTree::new(Object::Dictionary(root), true);
+
+    let error = tree
+        .find_object_at_or_below(&mut pdf, i64::MAX)
+        .expect_err("offset must overflow");
+
+    assert!(error
+        .to_string()
+        .contains("number-tree at-or-below offset overflow"));
 }

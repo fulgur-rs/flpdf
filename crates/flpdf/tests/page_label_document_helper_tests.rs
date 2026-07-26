@@ -226,3 +226,50 @@ fn write_labels_uses_qpdf_sixteen_seventeen_split_order() {
         .expect("first nums");
     assert_eq!(first_items.len() / 2, 16);
 }
+
+#[test]
+fn set_range_creates_tree_and_remove_missing_range_is_false() {
+    let pdf_bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+
+    pdf.page_labels()
+        .set_range(
+            0,
+            LabelRange {
+                style: LabelStyle::Decimal,
+                prefix: String::new(),
+                start: 1,
+            },
+        )
+        .expect("set");
+
+    assert!(!pdf.page_labels().remove_range(99).expect("remove missing"));
+}
+
+#[test]
+fn remove_range_without_catalog_root_is_false() {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let object_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref = bytes.len() as u64;
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \n\
+             trailer\n<< /Size 2 >>\nstartxref\n{xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open");
+
+    assert!(!pdf.page_labels().remove_range(0).expect("remove"));
+}

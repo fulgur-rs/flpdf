@@ -431,7 +431,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         }
 
         let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(entries);
+            return Ok(entries); // cov:ignore: pagelabels_root already observed this same /Root
         };
         if let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() {
             catalog.insert("PageLabels", tree.into_root());

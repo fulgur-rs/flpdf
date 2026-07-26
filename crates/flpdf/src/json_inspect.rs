@@ -3930,11 +3930,11 @@ mod tests {
         let result = build_pagelabels_section(&mut pdf).expect("build pagelabels");
 
         let JsonValue::Array(entries) = result else {
-            panic!("expected array");
+            panic!("expected array"); // cov:ignore: test fixture shape guard
         };
         assert_eq!(entries.len(), 1);
         let JsonValue::Object(entry) = &entries[0] else {
-            panic!("expected entry object");
+            panic!("expected entry object"); // cov:ignore: test fixture shape guard
         };
         assert_eq!(entry[0], ("index".to_string(), JsonValue::Integer(0)));
     }
@@ -7068,6 +7068,26 @@ mod tests {
         assert_eq!(result, JsonValue::Object(vec![]), "expected empty object");
     }
 
+    #[test]
+    fn attachments_indirect_names_terminating_at_non_dictionary_returns_empty() {
+        let mut pdf = load_one_page_pdf();
+        let names_ref = crate::ObjectRef::new(902, 0);
+        pdf.set_object(names_ref, Object::Integer(7));
+        let catalog_ref = pdf.root_ref().expect("no /Root");
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("resolve catalog")
+            .as_dict()
+            .expect("catalog dict")
+            .clone();
+        catalog.insert("Names", Object::Reference(names_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let result = build_attachments_section(&mut pdf).expect("build attachments");
+
+        assert_eq!(result, JsonValue::Object(vec![]));
+    }
+
     // ── attachments Test 1c: non-ref/non-dict leaf value is skipped ──────────
 
     #[test]
@@ -7144,7 +7164,7 @@ mod tests {
         let result = build_attachments_section(&mut pdf).expect("build attachments");
 
         let JsonValue::Object(entries) = result else {
-            panic!("expected object");
+            panic!("expected object"); // cov:ignore: test fixture shape guard
         };
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "inline");

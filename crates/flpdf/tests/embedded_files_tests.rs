@@ -279,6 +279,73 @@ fn no_names_key_returns_empty() {
     assert!(entries.is_empty(), "expected empty list when /Names absent");
 }
 
+fn build_no_root_pdf() -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let object_offset = out.len() as u64;
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref = out.len() as u64;
+    out.extend_from_slice(
+        format!(
+            "xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \n\
+             trailer\n<< /Size 2 >>\nstartxref\n{xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+fn build_non_dict_root_pdf() -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = BTreeMap::new();
+    offsets.insert(1, out.len() as u64);
+    out.extend_from_slice(b"1 0 obj\n[1 2 3]\nendobj\n");
+    finish_pdf(&mut out, &offsets, 1, 1);
+    out
+}
+
+#[test]
+fn writer_handles_missing_and_malformed_catalog_paths() {
+    let mut no_root = open(build_no_root_pdf());
+    insert_embedded_file(&mut no_root, b"x", ObjectRef::new(1, 0)).expect("insert no root");
+    assert!(!delete_embedded_file(&mut no_root, b"x").expect("delete no root"));
+
+    let mut non_dict_root = open(build_non_dict_root_pdf());
+    insert_embedded_file(&mut non_dict_root, b"x", ObjectRef::new(1, 0))
+        .expect("insert non-dict root");
+    assert!(!delete_embedded_file(&mut non_dict_root, b"x").expect("delete non-dict root"));
+
+    let mut non_dict_names = open(build_non_dict_names_pdf());
+    assert!(!delete_embedded_file(&mut non_dict_names, b"x").expect("non-dict Names"));
+
+    let mut no_names = open(build_no_names_pdf());
+    assert!(!delete_embedded_file(&mut no_names, b"x").expect("no Names"));
+
+    let mut no_embedded_files = open(build_no_embedded_files_pdf());
+    assert!(!delete_embedded_file(&mut no_embedded_files, b"x").expect("no EmbeddedFiles"));
+}
+
+#[test]
+fn insert_reports_exhausted_names_object_number_space() {
+    let mut pdf = open(build_single_level_pdf());
+    let catalog_ref = pdf.root_ref().expect("catalog");
+    let mut catalog = pdf
+        .resolve(catalog_ref)
+        .expect("resolve catalog")
+        .into_dict()
+        .expect("catalog dict");
+    let names_ref = catalog.get_ref("Names").expect("Names ref");
+    let names = pdf
+        .resolve(names_ref)
+        .expect("resolve Names")
+        .into_dict()
+        .expect("Names dict");
+    catalog.insert("Names", Object::Dictionary(names));
+    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    pdf.set_object(ObjectRef::new(u32::MAX, 0), Object::Null);
+
+    assert!(insert_embedded_file(&mut pdf, b"alpha", ObjectRef::new(4, 0)).is_err());
+}
+
 // ── Test 6: inline /EmbeddedFiles dict (direct, not indirect) ────────────────
 
 /// Some generators embed the name-tree root directly in /Names dict without

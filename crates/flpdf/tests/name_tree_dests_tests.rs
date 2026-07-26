@@ -763,6 +763,48 @@ fn insert_is_noop_when_root_not_a_dict() {
     // contract under test is simply "does not error or panic".
 }
 
+#[test]
+fn delete_handles_missing_and_malformed_catalog_paths() {
+    let mut no_root = open(build_no_root_pdf());
+    assert!(!delete_name_tree_dest(&mut no_root, b"x").expect("no root"));
+
+    let mut non_dict_root = open(build_nondict_root_pdf());
+    assert!(!delete_name_tree_dest(&mut non_dict_root, b"x").expect("non-dict root"));
+
+    let mut non_dict_names = open(build_non_dict_names_pdf());
+    assert!(!delete_name_tree_dest(&mut non_dict_names, b"x").expect("non-dict Names"));
+
+    let mut no_names = open(build_empty_pdf());
+    assert!(!delete_name_tree_dest(&mut no_names, b"x").expect("no Names"));
+
+    let mut no_dests = open(build_pdf_with_sibling_embedded_files());
+    assert!(!delete_name_tree_dest(&mut no_dests, b"x").expect("no Dests"));
+}
+
+#[test]
+fn insert_reports_exhausted_names_object_number_space() {
+    let mut pdf = open(build_empty_pdf());
+    insert_name_tree_dest(&mut pdf, b"existing", Object::Integer(1)).expect("seed");
+
+    let catalog_ref = pdf.root_ref().expect("catalog");
+    let mut catalog = pdf
+        .resolve(catalog_ref)
+        .expect("resolve catalog")
+        .into_dict()
+        .expect("catalog dict");
+    let names_ref = catalog.get_ref("Names").expect("Names ref");
+    let names = pdf
+        .resolve(names_ref)
+        .expect("resolve Names")
+        .into_dict()
+        .expect("Names dict");
+    catalog.insert("Names", Object::Dictionary(names));
+    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    pdf.set_object(ObjectRef::new(u32::MAX, 0), Object::Null);
+
+    assert!(insert_name_tree_dest(&mut pdf, b"existing", Object::Integer(2)).is_err());
+}
+
 // ── Boundary: catalog carries an INLINE (non-indirect) /Names dict ───────────
 
 /// Catalog `/Names` is a direct (inline) dictionary rather than an indirect
