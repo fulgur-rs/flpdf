@@ -51,7 +51,7 @@ pub(crate) enum Value {
 }
 
 pub(crate) enum ValueSnapshot {
-    Dictionary(Vec<(Vec<u8>, Json)>),
+    Dictionary,
     Array(Vec<Json>),
     String(Vec<u8>),
     Number(Vec<u8>),
@@ -61,7 +61,7 @@ pub(crate) enum ValueSnapshot {
 }
 
 pub(crate) enum ContainerOrBlobSnapshot {
-    Dictionary(Vec<(Vec<u8>, Json)>),
+    Dictionary,
     Array(Vec<Json>),
     Blob(BlobWriter),
 }
@@ -69,7 +69,7 @@ pub(crate) enum ContainerOrBlobSnapshot {
 impl ValueSnapshot {
     pub(crate) fn into_container_or_blob(self) -> Option<ContainerOrBlobSnapshot> {
         match self {
-            Self::Dictionary(members) => Some(ContainerOrBlobSnapshot::Dictionary(members)),
+            Self::Dictionary => Some(ContainerOrBlobSnapshot::Dictionary),
             Self::Array(values) => Some(ContainerOrBlobSnapshot::Array(values)),
             Self::Blob(writer) => Some(ContainerOrBlobSnapshot::Blob(writer)),
             Self::String(_) | Self::Number(_) | Self::Bool(_) | Self::Null => None,
@@ -251,39 +251,37 @@ impl Json {
     }
 
     pub fn for_each_dict_item(&self, mut callback: impl FnMut(&[u8], Json)) -> bool {
-        let Some(members) = &self.0 else {
-            return false;
-        };
         let mut previous_key: Option<Vec<u8>> = None;
-        loop {
-            let next = {
-                let members = members.borrow();
-                let Value::Dictionary {
-                    members: dictionary,
-                    ..
-                } = &members.value
-                else {
-                    return false;
-                };
-                let item = match previous_key.as_deref() {
-                    Some(previous) => dictionary
-                        .range::<[u8], _>((
-                            std::ops::Bound::Excluded(previous),
-                            std::ops::Bound::Unbounded,
-                        ))
-                        .next(),
-                    None => dictionary.iter().next(),
-                };
-                item.map(|(key, value)| (key.clone(), value.clone()))
-            };
-            let Some((key, value)) = next else {
-                break;
-            };
+        while let Some((key, value)) = self.next_dictionary_item_after(previous_key.as_deref()) {
             callback(&key, value);
             previous_key = Some(key);
         }
 
-        true
+        self.is_dictionary()
+    }
+
+    pub(crate) fn next_dictionary_item_after(
+        &self,
+        previous_key: Option<&[u8]>,
+    ) -> Option<(Vec<u8>, Json)> {
+        let members = self.0.as_ref()?.borrow();
+        let Value::Dictionary {
+            members: dictionary,
+            ..
+        } = &members.value
+        else {
+            return None;
+        };
+        let item = match previous_key {
+            Some(previous) => dictionary
+                .range::<[u8], _>((
+                    std::ops::Bound::Excluded(previous),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next(),
+            None => dictionary.iter().next(),
+        };
+        item.map(|(key, value)| (key.clone(), value.clone()))
     }
 
     pub fn for_each_array_item(&self, mut callback: impl FnMut(Json)) -> bool {
@@ -334,17 +332,9 @@ impl Json {
     pub(crate) fn value_snapshot(&self) -> Option<ValueSnapshot> {
         let members = self.0.as_ref()?.borrow();
         Some(match &members.value {
-            Value::Dictionary {
-                members,
-                parsed_keys,
-            } => {
+            Value::Dictionary { parsed_keys, .. } => {
                 let _ = parsed_keys;
-                ValueSnapshot::Dictionary(
-                    members
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect(),
-                )
+                ValueSnapshot::Dictionary
             }
             Value::Array(values) => ValueSnapshot::Array(values.clone()),
             Value::String { encoded, .. } => ValueSnapshot::String(encoded.clone()),

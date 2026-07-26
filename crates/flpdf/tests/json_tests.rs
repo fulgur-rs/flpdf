@@ -1,4 +1,6 @@
+use std::cell::{Cell, RefCell};
 use std::io;
+use std::rc::Rc;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use flpdf::json::Json;
@@ -160,6 +162,78 @@ fn qpdf_blob_streams_base64_without_one_full_encoded_write() {
 
     let expected = format!("\"{}\"", STANDARD.encode(bytes)).into_bytes();
     assert_eq!(out.bytes, expected);
+}
+
+#[test]
+fn dictionary_writer_observes_live_mutations_from_blob_callback() {
+    let dictionary = Json::make_dictionary();
+    let owner = Rc::new(RefCell::new(Some(dictionary.clone())));
+    let weak_owner = Rc::downgrade(&owner);
+    dictionary
+        .add_dictionary_member(
+            b"a",
+            Json::make_blob(move |_| {
+                let owner = weak_owner
+                    .upgrade()
+                    .expect("dictionary owner must be alive");
+                let owner = owner.borrow();
+                let dictionary = owner.as_ref().expect("dictionary must remain installed");
+                dictionary
+                    .add_dictionary_member(b"b", Json::make_int(2))
+                    .unwrap();
+                dictionary
+                    .add_dictionary_member(b"c", Json::make_int(30))
+                    .unwrap();
+                dictionary
+                    .add_dictionary_member(b"0", Json::make_int(0))
+                    .unwrap();
+                Ok(())
+            }),
+        )
+        .unwrap();
+    dictionary
+        .add_dictionary_member(b"c", Json::make_int(3))
+        .unwrap();
+
+    assert_eq!(
+        dictionary.unparse().unwrap(),
+        b"{\n  \"a\": \"\",\n  \"b\": 2,\n  \"c\": 30\n}"
+    );
+    assert_eq!(
+        dictionary.get_dict_item(b"0").get_number(),
+        Some(b"0".to_vec())
+    );
+}
+
+#[test]
+fn dictionary_writer_stops_after_blob_io_error() {
+    let later_visits = Rc::new(Cell::new(0));
+    let dictionary = Json::make_dictionary();
+    dictionary
+        .add_dictionary_member(
+            b"a",
+            Json::make_blob(|_| Err(io::Error::other("first blob failed"))),
+        )
+        .unwrap();
+    dictionary
+        .add_dictionary_member(
+            b"b",
+            Json::make_blob({
+                let later_visits = later_visits.clone();
+                move |_| {
+                    later_visits.set(later_visits.get() + 1);
+                    Ok(())
+                }
+            }),
+        )
+        .unwrap();
+    let mut out = Vec::new();
+
+    let error = dictionary.write(&mut out, 0).unwrap_err();
+
+    assert_eq!(error.to_string(), "first blob failed");
+    assert_eq!(out, b"{\n  \"a\": \"");
+    assert_eq!(later_visits.get(), 0);
 }
 
 #[test]

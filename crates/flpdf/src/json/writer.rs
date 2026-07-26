@@ -103,6 +103,7 @@ impl Json {
                 out.write_all(b"\"")
             }
             Some(other) => write_container_or_blob(
+                self,
                 other
                     .into_container_or_blob()
                     .expect("scalar values are handled by Json::write"),
@@ -133,30 +134,22 @@ fn write_close(
 }
 
 fn write_container_or_blob(
+    owner: &Json,
     value: ContainerOrBlobSnapshot,
     out: &mut (impl Write + ?Sized),
     depth: usize,
 ) -> io::Result<()> {
     match value {
-        ContainerOrBlobSnapshot::Dictionary(members) => {
-            if members.is_empty() {
-                return out.write_all(b"{}");
+        ContainerOrBlobSnapshot::Dictionary => {
+            let mut first = true;
+            Json::write_dictionary_open(out, &mut first, depth)?;
+            let mut previous_key = None;
+            while let Some((key, value)) = owner.next_dictionary_item_after(previous_key.as_deref())
+            {
+                Json::write_dictionary_item(out, &mut first, &key, &value, depth + 1)?;
+                previous_key = Some(key);
             }
-            out.write_all(b"{")?;
-            for (index, (key, value)) in members.iter().enumerate() {
-                out.write_all(b"\n")?;
-                write_indent(out, depth + 1)?;
-                out.write_all(b"\"")?;
-                out.write_all(key)?;
-                out.write_all(b"\": ")?;
-                value.write(out, depth + 1)?;
-                if index + 1 < members.len() {
-                    out.write_all(b",")?;
-                }
-            }
-            out.write_all(b"\n")?;
-            write_indent(out, depth)?;
-            out.write_all(b"}")
+            Json::write_dictionary_close(out, first, depth)
         }
         ContainerOrBlobSnapshot::Array(values) => {
             if values.is_empty() {
