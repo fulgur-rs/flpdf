@@ -742,7 +742,7 @@ impl<K: TreeKey> NNTree<K> {
                 cursor,
                 parent_handle,
                 grandparent_index,
-            )?;
+            )?; // cov:ignore: LLVM assigns the covered recursive call terminator a zero-count region
         }
         Ok(())
     }
@@ -955,12 +955,14 @@ impl<K: TreeKey> NNTree<K> {
                     return_previous_if_missing,
                     |index| {
                         let item_number = 2 * index;
+                        // cov:ignore-start: binary_search only supplies indices below items length divided by two
                         let Some(item) = items.values.get(item_number) else {
                             return Err(structural_error(
                                 root_diagnostic_ref,
                                 format!("item at index {item_number} is not the right type"),
                             ));
                         };
+                        // cov:ignore-end
                         let Some(item_key) = resolved_key::<K, _>(pdf, item)? else {
                             return Err(structural_error(
                                 root_diagnostic_ref,
@@ -1884,7 +1886,11 @@ mod tests {
         );
         pdf.set_object(
             limits_ref,
-            Object::Array(vec![Object::Integer(10), Object::Integer(20)]),
+            Object::Array(vec![
+                Object::Integer(10),
+                Object::Integer(20),
+                Object::Integer(30),
+            ]),
         );
         let mut leaf = Dictionary::new();
         leaf.insert("Nums", Object::Reference(items_ref));
@@ -1916,6 +1922,10 @@ mod tests {
             pdf.resolve(leaf_ref).unwrap(),
             Object::Dictionary(leaf)
                 if leaf.get("Nums") == Some(&Object::Reference(items_ref))
+                    && leaf.get("Limits") == Some(&Object::Array(vec![
+                        Object::Integer(15),
+                        Object::Integer(20),
+                    ]))
         ));
         assert!(matches!(
             tree.root(),
