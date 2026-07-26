@@ -448,10 +448,10 @@ fn write_back_direct_dests_root<R: Read + Seek>(
 ) -> Result<()> {
     let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
     let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref)? else {
-        return Ok(());
+        return Ok(()); // cov:ignore: resolve_name_tree_node_dest just resolved the catalog dictionary
     };
     let Some(names_value) = catalog.get("Names").cloned() else {
-        return Ok(());
+        return Ok(()); // cov:ignore: resolve_name_tree_node_dest just established catalog /Names
     };
 
     match names_value {
@@ -463,15 +463,15 @@ fn write_back_direct_dests_root<R: Read + Seek>(
         value @ Object::Reference(_) => {
             let (terminal, terminal_ref) = crate::ref_chain::resolve_ref_chain(pdf, &value)?;
             let Some(mut names) = terminal.into_dict() else {
-                return Ok(());
+                return Ok(()); // cov:ignore: caller established /Names reference terminal as a dictionary
             };
             let Some(terminal_ref) = terminal_ref else {
-                return Ok(());
+                return Ok(()); // cov:ignore: caller established /Names reference has an indirect terminal
             };
             names.insert("Dests", Object::Dictionary(repaired_root));
             pdf.set_object(terminal_ref, Object::Dictionary(names));
         }
-        _ => {}
+        _ => {} // cov:ignore: caller established catalog /Names as a dictionary or reference
     }
     Ok(())
 }

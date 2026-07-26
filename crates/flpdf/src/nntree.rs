@@ -4140,6 +4140,19 @@ mod tests {
             cursor.cloned_raw_current(),
             Some((Object::Integer(42), Object::Integer(1)))
         );
+        let error = match replacement.insert_raw_pair_with_allocator(
+            &mut pdf,
+            &mut allocator,
+            Object::Integer(43),
+            Object::Integer(2),
+        ) {
+            Ok(_) => panic!("a nonempty replacement must reject another invalid raw key"), // cov:ignore: negative-path assertion
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "parse error at byte 0: Name/Number tree node: item at index 0 is not the right type"
+        );
         let Object::Dictionary(root) = replacement.root() else {
             panic!("replacement root must remain direct"); // cov:ignore: test-shape guard
         };
