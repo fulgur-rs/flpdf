@@ -1,4 +1,78 @@
+use std::io;
+
 use flpdf::json::Json;
+
+#[test]
+fn incremental_writer_matches_qpdf_nested_bytes() {
+    let mut out = Vec::new();
+    let mut top_first = true;
+    Json::write_dictionary_open(&mut out, &mut top_first, 0).unwrap();
+    Json::write_dictionary_item(&mut out, &mut top_first, b"version", &Json::make_int(2), 1)
+        .unwrap();
+    Json::write_dictionary_key(&mut out, &mut top_first, b"items", 1).unwrap();
+    let mut array_first = true;
+    Json::write_array_open(&mut out, &mut array_first, 1).unwrap();
+    Json::write_array_item(&mut out, &mut array_first, &Json::make_bool(true), 2).unwrap();
+    Json::write_array_close(&mut out, array_first, 1).unwrap();
+    Json::write_dictionary_close(&mut out, top_first, 0).unwrap();
+    assert_eq!(
+        out,
+        b"{\n  \"version\": 2,\n  \"items\": [\n    true\n  ]\n}"
+    );
+}
+
+#[test]
+fn incremental_writer_keeps_empty_containers_compact() {
+    let mut out = Vec::new();
+    let mut first = false;
+    Json::write_dictionary_open(&mut out, &mut first, 3).unwrap();
+    assert!(first);
+    Json::write_dictionary_close(&mut out, first, 3).unwrap();
+
+    Json::write_array_open(&mut out, &mut first, 8).unwrap();
+    assert!(first);
+    Json::write_array_close(&mut out, first, 8).unwrap();
+
+    assert_eq!(out, b"{}[]");
+}
+
+#[test]
+fn incremental_writer_writes_dictionary_keys_that_are_already_encoded() {
+    let mut out = Vec::new();
+    let mut first = true;
+    Json::write_dictionary_open(&mut out, &mut first, 0).unwrap();
+    Json::write_dictionary_item(&mut out, &mut first, b"line\\n", &Json::make_int(1), 1).unwrap();
+    Json::write_dictionary_close(&mut out, first, 0).unwrap();
+
+    assert_eq!(out, b"{\n  \"line\\n\": 1\n}");
+}
+
+#[test]
+fn make_blob_propagates_callback_io_errors() {
+    let blob = Json::make_blob(|_| Err(io::Error::other("blob callback failure")));
+
+    let error = blob.unparse().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert_eq!(error.to_string(), "blob callback failure");
+}
+
+#[test]
+fn encoded_member_order_is_independent_from_parsed_key_tracking() {
+    let dictionary = Json::make_dictionary();
+    dictionary
+        .add_dictionary_member(b"\x03", Json::make_int(1))
+        .unwrap();
+    dictionary
+        .add_dictionary_member(b"Z", Json::make_int(2))
+        .unwrap();
+
+    assert!(!dictionary.check_dictionary_key_seen(b"\x03").unwrap());
+    assert!(dictionary.check_dictionary_key_seen(b"\x03").unwrap());
+    assert_eq!(
+        dictionary.unparse().unwrap(),
+        b"{\n  \"Z\": 2,\n  \"\\u0003\": 1\n}"
+    );
+}
 
 #[test]
 fn default_handle_writes_null_but_is_not_initialized_null() {
@@ -49,6 +123,7 @@ fn qpdf_blob_uses_standard_base64_without_newlines() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)]
 fn qpdf_real_uses_six_digit_trimmed_format() {
     assert_eq!(Json::make_real(3.14159).unparse().unwrap(), b"3.14159");
     assert_eq!(Json::make_real(3.1415927).unparse().unwrap(), b"3.141593");
@@ -61,6 +136,7 @@ fn scalar_accessors_reject_other_types_without_mutating_output() {
     assert_eq!(value.get_bool(), Some(true));
     assert_eq!(value.get_string(), None);
     assert_eq!(value.get_number(), None);
+    assert!(value.get_dict_item(b"key").is_null());
 }
 
 #[test]

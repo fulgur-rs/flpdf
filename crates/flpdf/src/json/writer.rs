@@ -6,6 +6,89 @@ use super::value::{ContainerOrBlobSnapshot, ValueSnapshot};
 use super::Json;
 
 impl Json {
+    pub fn write_dictionary_open(
+        out: &mut (impl Write + ?Sized),
+        first: &mut bool,
+        _depth: usize,
+    ) -> io::Result<()> {
+        out.write_all(b"{")?;
+        *first = true;
+        Ok(())
+    }
+
+    pub fn write_array_open(
+        out: &mut (impl Write + ?Sized),
+        first: &mut bool,
+        _depth: usize,
+    ) -> io::Result<()> {
+        out.write_all(b"[")?;
+        *first = true;
+        Ok(())
+    }
+
+    pub fn write_dictionary_close(
+        out: &mut (impl Write + ?Sized),
+        first: bool,
+        depth: usize,
+    ) -> io::Result<()> {
+        write_close(out, first, depth, b"}")
+    }
+
+    pub fn write_array_close(
+        out: &mut (impl Write + ?Sized),
+        first: bool,
+        depth: usize,
+    ) -> io::Result<()> {
+        write_close(out, first, depth, b"]")
+    }
+
+    pub fn write_dictionary_item(
+        out: &mut (impl Write + ?Sized),
+        first: &mut bool,
+        key: &[u8],
+        value: &Json,
+        depth: usize,
+    ) -> io::Result<()> {
+        Self::write_dictionary_key(out, first, key, depth)?;
+        value.write(out, depth)
+    }
+
+    pub fn write_dictionary_key(
+        out: &mut (impl Write + ?Sized),
+        first: &mut bool,
+        encoded_key: &[u8],
+        depth: usize,
+    ) -> io::Result<()> {
+        Self::write_next(out, first, depth)?;
+        out.write_all(b"\"")?;
+        out.write_all(encoded_key)?;
+        out.write_all(b"\": ")
+    }
+
+    pub fn write_array_item(
+        out: &mut (impl Write + ?Sized),
+        first: &mut bool,
+        value: &Json,
+        depth: usize,
+    ) -> io::Result<()> {
+        Self::write_next(out, first, depth)?;
+        value.write(out, depth)
+    }
+
+    pub fn write_next(
+        out: &mut (impl Write + ?Sized),
+        first: &mut bool,
+        depth: usize,
+    ) -> io::Result<()> {
+        if *first {
+            *first = false;
+            out.write_all(b"\n")?;
+        } else {
+            out.write_all(b",\n")?;
+        }
+        write_indent(out, depth)
+    }
+
     pub fn write(&self, out: &mut (impl Write + ?Sized), depth: usize) -> io::Result<()> {
         match self.value_snapshot() {
             None => out.write_all(b"null"),
@@ -34,6 +117,19 @@ impl Json {
         self.write(&mut out, 0)?;
         Ok(out)
     }
+}
+
+fn write_close(
+    out: &mut (impl Write + ?Sized),
+    first: bool,
+    depth: usize,
+    delimiter: &[u8],
+) -> io::Result<()> {
+    if !first {
+        out.write_all(b"\n")?;
+        write_indent(out, depth)?;
+    }
+    out.write_all(delimiter)
 }
 
 fn write_container_or_blob(

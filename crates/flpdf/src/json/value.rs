@@ -16,6 +16,8 @@ pub enum JsonError {
 #[derive(Clone, Default)]
 pub struct Json(Option<Rc<RefCell<Members>>>);
 
+type BlobWriter = Rc<RefCell<Box<dyn FnMut(&mut dyn io::Write) -> io::Result<()>>>>;
+
 impl std::fmt::Debug for Json {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -45,7 +47,7 @@ pub(crate) enum Value {
     Number(Vec<u8>),
     Bool(bool),
     Null,
-    Blob(Rc<RefCell<Box<dyn FnMut(&mut dyn io::Write) -> io::Result<()>>>>),
+    Blob(BlobWriter),
 }
 
 pub(crate) enum ValueSnapshot {
@@ -55,13 +57,13 @@ pub(crate) enum ValueSnapshot {
     Number(Vec<u8>),
     Bool(bool),
     Null,
-    Blob(Rc<RefCell<Box<dyn FnMut(&mut dyn io::Write) -> io::Result<()>>>>),
+    Blob(BlobWriter),
 }
 
 pub(crate) enum ContainerOrBlobSnapshot {
     Dictionary(Vec<(Vec<u8>, Json)>),
     Array(Vec<Json>),
-    Blob(Rc<RefCell<Box<dyn FnMut(&mut dyn io::Write) -> io::Result<()>>>>),
+    Blob(BlobWriter),
 }
 
 impl ValueSnapshot {
@@ -358,6 +360,27 @@ fn format_qpdf_real(value: f64) -> String {
     encoded
 }
 
+fn encode_string(value: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(value.len());
+    for &byte in value {
+        match byte {
+            b'\\' => encoded.extend_from_slice(b"\\\\"),
+            b'"' => encoded.extend_from_slice(b"\\\""),
+            b'\x08' => encoded.extend_from_slice(b"\\b"),
+            b'\x0c' => encoded.extend_from_slice(b"\\f"),
+            b'\n' => encoded.extend_from_slice(b"\\n"),
+            b'\r' => encoded.extend_from_slice(b"\\r"),
+            b'\t' => encoded.extend_from_slice(b"\\t"),
+            0x00..=0x1f => {
+                encoded.extend_from_slice(if byte < 0x10 { b"\\u000" } else { b"\\u001" });
+                encoded.push(b"0123456789abcdef"[(byte & 0x0f) as usize]);
+            }
+            _ => encoded.push(byte),
+        }
+    }
+    encoded
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -460,29 +483,4 @@ mod tests {
 
         assert_eq!(blob.unparse().unwrap(), b"\"AP8=\"");
     }
-}
-
-fn encode_string(value: &[u8]) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(value.len());
-    for &byte in value {
-        match byte {
-            b'\\' => encoded.extend_from_slice(&[b'\\', b'\\']),
-            b'"' => encoded.extend_from_slice(&[b'\\', b'"']),
-            b'\x08' => encoded.extend_from_slice(&[b'\\', b'b']),
-            b'\x0c' => encoded.extend_from_slice(&[b'\\', b'f']),
-            b'\n' => encoded.extend_from_slice(&[b'\\', b'n']),
-            b'\r' => encoded.extend_from_slice(&[b'\\', b'r']),
-            b'\t' => encoded.extend_from_slice(&[b'\\', b't']),
-            0x00..=0x1f => {
-                encoded.extend_from_slice(if byte < 0x10 {
-                    &[b'\\', b'u', b'0', b'0', b'0']
-                } else {
-                    &[b'\\', b'u', b'0', b'0', b'1']
-                });
-                encoded.push(b"0123456789abcdef"[(byte & 0x0f) as usize]);
-            }
-            _ => encoded.push(byte),
-        }
-    }
-    encoded
 }
