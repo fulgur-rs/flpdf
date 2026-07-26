@@ -672,7 +672,7 @@ pub enum StreamDataMode {
 ///
 /// qpdf 11.9.0 names side files `<prefix>-<obj_num>` — the bare object
 /// number with no zero-padding. Centralized here so the JSON `datafile`
-/// value and the CLI side-file writer always produce the same name.
+/// value and incremental JSON side-file writer always produce the same name.
 pub fn format_json_side_file_path(prefix: &str, obj_num: u32) -> String {
     format!("{prefix}-{obj_num}")
 }
