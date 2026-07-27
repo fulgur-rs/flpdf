@@ -87,12 +87,15 @@
 | `crates/flpdf/src/pipeline/buffer.rs` | correspondence | Pl_Buffer.cc accumulation, optional pass-through, finish readiness, and getBuffer reset ownership; Rust take_buffer returns the moved Vec directly |
 | `crates/flpdf/src/pipeline/count.rs` | correspondence | Pl_Count.cc byte-count, last-byte, forwarding, and finish responsibilities |
 | `crates/flpdf/src/pipeline/flate.rs` | correspondence | Pl_Flate.cc streaming inflate, deflate, warning callback, compression-level, and finish responsibilities via flate2 |
+| `crates/flpdf/src/pipeline/qpdf_tokenizer.rs` | correspondence | Pl_QPDFTokenizer.cc buffered token-filter pipeline |
 | `crates/flpdf/src/pipeline/rc4.rs` | correspondence | Pl_RC4.cc bounded streaming over one retained RC4 state |
 | `crates/flpdf/src/qdf_fix.rs` | correspondence | qpdf/fix-qdf.cc tool behavior outside libqpdf |
 | `crates/flpdf/src/qpdf_null.rs` | correspondence | QPDFObjectHandle.cc isNull resolution plus QPDFWriter.cc null-valued dictionary visibility |
 | `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc document reading, object resolution, recovery, and authentication responsibilities |
 | `crates/flpdf/src/reader/file_object.rs` | correspondence | QPDF.cc readObject/readStream framing and recovery split from the document reader |
 | `crates/flpdf/src/ref_chain.rs` | correspondence | QPDF.cc indirect-reference resolution represented as a bounded shared primitive |
+| `crates/flpdf/src/resource_finder.rs` | correspondence | \`ResourceFinder.cc\` |
+| `crates/flpdf/src/resource_replacer.rs` | correspondence | \`QPDFAcroFormDocumentHelper.cc\` \`ResourceReplacer\` |
 | `crates/flpdf/src/resources.rs` | correspondence | QPDFPageObjectHelper.cc removeUnreferencedResources traversal split from the page helper |
 | `crates/flpdf/src/rewrite_renumber.rs` | correspondence | QPDFWriter.cc object renumbering shared by plain and linearized writers |
 | `crates/flpdf/src/rotate_spec.rs` | correspondence | QPDFJob.cc rotate-spec parsing split from page rotation |
@@ -108,6 +111,7 @@
 | `crates/flpdf/src/struct_tree_pg.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for structure elements |
 | `crates/flpdf/src/subset_prune.rs` | correspondence | QPDFPageObjectHelper.cc resource pruning plus QPDFWriter.cc full-rewrite reachability |
 | `crates/flpdf/src/thread_bead_p.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for article beads |
+| `crates/flpdf/src/token_filter.rs` | correspondence | QPDFObjectHandle::TokenFilter callback boundary |
 | `crates/flpdf/src/tokenizer.rs` | mirror | libqpdf/QPDFTokenizer.cc |
 | `crates/flpdf/src/writer.rs` | correspondence | QPDFWriter.cc responsibilities shared with writer submodules and linearization |
 | `crates/flpdf/src/writer/object_streams.rs` | correspondence | QPDF.cc getCompressibleObjGens plus QPDFWriter.cc object-stream planning and emission |

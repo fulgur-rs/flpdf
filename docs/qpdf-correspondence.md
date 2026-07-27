@@ -68,8 +68,8 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
 | `QPDF.cc` | 2667 | `reader.rs`(2454) + `reader/file_object.rs`(650) + `xref.rs`(1129) + `object_copy.rs`(184: `copyForeignObject`) + `cache.rs`(102: xref 由来の `ObjectCache` / `CacheEntry`。消費者は `reader.rs`) + `writer/object_streams.rs`(207-237: `compressible_objgens_qpdf_plan` = `getCompressibleObjGens`、`QPDF.cc:2392-2445`)  + `signatures.rs`(245-: `removeSecurityRestrictions`) + `page_closure.rs`(207: `page_object_closure`。`object_copy.rs` は pre-closed な集合しか受け取らず、両者で `copyForeignObject` 相当を構成する) + `ref_chain.rs`(77: `resolve_ref_chain` / `terminal_ref_of_chain` / `MAX_REF_CHAIN_DEPTH` — 深さ上限付き間接参照解決の共有プリミティブ。20 モジュールが使用) | 🔀 |
-| `QPDFParser.cc` | 519 | `parser.rs` の `Parser`（Object / NoReference / Content mode）。Content mode は EOF → `None`、word → `Object::Operator`、間接参照化の抑止を共有 object grammar 上で実装し、`content_stream.rs` が使用（`QPDFParser.cc:27-125,130-377`） | 🔀 content branch は対応済み。file-object parser 全体の API / recovery 差分は未精査 |
-| `QPDFTokenizer.cc` | 965 | `tokenizer.rs`（18 token types、owned value/raw/error bytes/offset、push/pull、pull-only `allowEOF`、`includeIgnorable`、space/comment、bad-token recovery、max length、`betweenTokens`、unread、inline-image `EI` discovery。`QPDFTokenizer.hh:34-193`; `QPDFTokenizer.cc:45-965`）+ `parser.rs` の content mode + `content_stream.rs` の `ParserCallbacks` orchestration + `object.rs` の `Operator` / `InlineImage`（`QPDFParser.cc:27-125,130-377`; `QPDFObjectHandle.cc:1770-1847`） | ✅ `QPDFTokenizer` の責務境界を移植済み。object/parser/content callback consumers は共有 tokenizer を使用し、旧 content lexer は削除。`Pl_QPDFTokenizer` / `ContentNormalizer` は本行の完了範囲外で `flpdf-qxba.7` に残る |
+| `QPDFParser.cc` | 519 | `parser.rs` の `Parser`（Object / Content mode）。Content mode は EOF → `None`、word → `Object::Operator`、間接参照化の抑止を共有 object grammar 上で実装し、`content_stream.rs` が使用（`QPDFParser.cc:27-125,130-377`） | 🔀 content branch は対応済み。file-object parser 全体の API / recovery 差分は未精査 |
+| `QPDFTokenizer.cc` | 965 | `tokenizer.rs`（18 token types、owned value/raw/error bytes/offset、push/pull、pull-only `allowEOF`、`includeIgnorable`、space/comment、bad-token recovery、max length、`betweenTokens`、unread、inline-image `EI` discovery。`QPDFTokenizer.hh:34-193`; `QPDFTokenizer.cc:45-965`）+ `parser.rs` の content mode + `content_stream.rs` の `ParserCallbacks` orchestration + `object.rs` の `Operator` / `InlineImage`（`QPDFParser.cc:27-125,130-377`; `QPDFObjectHandle.cc:1770-1847`） | ✅ `QPDFTokenizer` の責務境界を移植済み。object/parser/content callback consumers は共有 tokenizer を使用し、旧 content lexer は削除 |
 | `InputSource` 系 5 ファイル | 625 | `Read + Seek` ジェネリクスで代替 | ⚪ |
 | `QPDF_pages.cc` | 319 | `pages.rs`(741) + `page_tree_rebuild.rs`(390) + `linearization/inherited_attrs.rs`(575: `QPDF_pages.cc:39-138` の `getAllPagesInternal` 修復を移植。`linearization/plan.rs:773` と `linearization/writer.rs:2582` から呼ばれる) | 🔀 |
 | `QPDFExc.cc` / `QPDFSystemError.cc` | 123 | `error.rs`(125) | ✅ |
@@ -127,7 +127,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `Pl_RunLength` | 146 | `run_length.rs`(140) | ✅ |
 | `Pl_AES_PDF` | 200 | `security/standard.rs` の AES single-buffer helper と `writer.rs` の stream consumer に分散。Pipeline 統合は `flpdf-qynx.10` | 🔀 |
 | `Pl_RC4` | 43 | `pipeline/rc4.rs`（65,536-byte既定buffer、stateful `security/rc4.rs`、write/finish lifecycle）+ `reader.rs` / `writer.rs` の本番stream consumer | ✅ |
-| `Pl_QPDFTokenizer.cc` / `ContentNormalizer.cc` | 141 | `content_normalizer.rs`（既存 `tokenizer.rs` を駆動する token-filter runner、EOF-token → `handle_eof`、`ID` separator 注入、inline-image 切替、raw-token normalization、bad-token state、CR/string/name normalization） | ✅ |
+| `Pl_QPDFTokenizer.cc` / `ContentNormalizer.cc` | 141 | `pipeline/qpdf_tokenizer.rs`（optional downstream を持つ token-filter runner、EOF-token → `handle_eof`、`ID` separator 注入、inline-image 切替、raw token/discard/output と finish/error timing）+ production consumer `content_normalizer.rs`（bad-token state、CR/string/name normalization） | ✅ |
 | `QPDFStreamFilter.cc` | 19 | `stream_filter.rs`（`set_decode_params`、decode pipeline factory、specialized / lossy の既定分類） | ✅ |
 | `Pl_DCT.cc` | 326 | 無し。`json_inspect.rs` の `DecodeLevel::All`(758) が DCT デコードを doc で約束しつつ encoded バイトへフォールバックしている | ❌ 消費者あり |
 | `Pl_Base64` / `Pl_Concatenate` / `Pl_Discard` / `Pl_Function` / `Pl_OStream` / `Pl_StdioFile` / `Pl_String` / `Pl_SHA2` / `Pl_Buffer` | 570 | Rust の `Write` で代替 | ⚪ |
@@ -141,8 +141,8 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFAcroFormDocumentHelper.cc` | 1047 | `signatures.rs`(280-447: `disableDigitalSignatures` / `analyze` / `traverseField`) + `acroform_document_helper.rs`(1096) + `overlay_annotations.rs`(2263: `transformAnnotations` / `addAndRenameFormFields`) + `overlay_appearance_stream.rs`(720: `adjustAppearanceStream`) | 🔀 |
-| `QPDFPageObjectHelper.cc` | 1039 | `page_object_helper.rs`(766) + `page_form_xobject.rs`(637) + `resources.rs`(1229) + `page_annotation_flatten.rs`(596) + `overlay.rs`(2228: `placeFormXObject`) + `overlay_annotations.rs`(2263: `copyAnnotations`) | 🔀 |
+| `QPDFAcroFormDocumentHelper.cc` | 1047 | `signatures.rs`(280-447: `disableDigitalSignatures` / `analyze` / `traverseField`) + `acroform_document_helper.rs`(1096) + `overlay_annotations.rs`(2263: `transformAnnotations` / `addAndRenameFormFields`、`/DA` の resource-name replacement consumer) + `overlay_appearance_stream.rs`(720: `adjustAppearanceStream`、AP stream consumer) | 🔀 |
+| `QPDFPageObjectHelper.cc` | 1039 | `page_object_helper.rs`(766) + `page_form_xobject.rs`(637) + `resources.rs`(1229: `ResourceFinder` を使う resource pruning consumer) + `page_annotation_flatten.rs`(596) + `overlay.rs`(2228: `placeFormXObject`) + `overlay_annotations.rs`(2263: `copyAnnotations`) | 🔀 |
 | `QPDFFormFieldObjectHelper.cc` | 852 | `annotation_helper.rs`(748) + `appearance.rs`(2022) + `default_appearance.rs`(167) | 🔀 |
 | `QPDFPageDocumentHelper.cc` | 158 | `page_document_helper.rs`(236) + `page_extract.rs`(435: `emptyPDF()` + `addPage()` 経路。doc に明記) | 🔀 |
 | `QPDFAnnotationObjectHelper.cc` | 226 | `annotation_helper.rs` + `page_annotation_enum.rs`(249) | 🔀 |
@@ -151,7 +151,8 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `QPDFNameTreeObjectHelper` / `QPDFNumberTreeObjectHelper` / `NNTree.cc` | 1394 | `nntree.rs`（shared engine）+ `name_number_tree.rs`（compatibility wrapper）+ consumer adapters | ✅ |
 | `QPDFEmbeddedFileDocumentHelper.cc` | 122 | `embedded_files.rs`(678) | ✅ |
 | `QPDFFileSpecObjectHelper` / `QPDFEFStreamObjectHelper` | 280 | `filespec_helper.rs`(1324) | ✅ |
-| `ResourceFinder.cc` | 56 | `overlay_annotations.rs`(967-1111: オペレータ表) + `overlay_appearance_stream.rs`(2-3: `ResourceReplacer` / `ResourceFinder` token filter) | 🔀 `resources.rs` には実装が無い |
+| `ResourceFinder.cc` | 56 | `resource_finder.rs`（operator/name tracking と resource type/offset 集約）。production consumer は `resource_replacer.rs` と `resources.rs` の resource pruning | ✅ |
+| `QPDFAcroFormDocumentHelper.cc` anonymous `ResourceReplacer` | — | `resource_replacer.rs`（`ResourceFinder` の name offsets を exact-byte 置換）。production consumer は `overlay_annotations.rs` の `/DA` と `overlay_appearance_stream.rs` の AP streams | ✅ |
 | `QPDFDocumentHelper.cc` / `QPDFObjectHelper.cc` | 12 | 基底トレイトが無い | ⚪ |
 
 ## 8. JSON
