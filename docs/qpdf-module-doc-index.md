@@ -13,7 +13,7 @@
 | `crates/flpdf/src/attachment_list.rs` | correspondence | QPDFJob.cc attachment enumeration and display formatting |
 | `crates/flpdf/src/cache.rs` | correspondence | QPDF.cc xref-backed object cache represented as a standalone Rust module |
 | `crates/flpdf/src/check.rs` | correspondence | QPDFJob.cc document-check surface over reader diagnostics |
-| `crates/flpdf/src/content_stream.rs` | correspondence | QPDFParser.cc, Pl_QPDFTokenizer.cc, and ContentNormalizer.cc responsibilities; not yet a complete component mirror |
+| `crates/flpdf/src/content_stream.rs` | correspondence | QPDFParser.cc content callbacks plus transitional Pl_QPDFTokenizer.cc and ContentNormalizer.cc responsibilities; not yet a complete component mirror |
 | `crates/flpdf/src/default_appearance.rs` | correspondence | QPDFFormFieldObjectHelper.cc default-appearance parsing split from the form-field helper |
 | `crates/flpdf/src/diagnostics.rs` | correspondence | QPDFLogger.cc diagnostic routing represented as Rust values |
 | `crates/flpdf/src/embedded_files.rs` | correspondence | QPDFEmbeddedFileDocumentHelper.cc behavior without its complete public helper API boundary |
