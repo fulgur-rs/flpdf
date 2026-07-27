@@ -197,6 +197,9 @@ fn decode_stream_data_with_filters_and_crypt<F>(
 where
     F: FnMut(Option<&Object>, &[u8]) -> Result<Vec<u8>>,
 {
+    if let Some(Object::Array(filters)) = filter {
+        validate_filter_chain_len(filters)?;
+    }
     let specs = decode_filter_specs(filter, decode_params)?;
     validate_filter_chain_count(specs.len())?;
     let mut decoded = Cow::Borrowed(stream_data);
@@ -1587,6 +1590,21 @@ mod tests {
         assert!(
             matches!(err, Err(Error::Unsupported(ref m)) if m.contains("filter chain length")),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_overlong_filter_chain_before_malformed_item() {
+        let mut filters = vec![Object::Name(b"FlateDecode".to_vec()); 16];
+        filters.push(Object::Integer(1));
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Array(filters));
+
+        let error = decode_stream_data(&dict, b"anything").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: filter chain length 17 exceeds maximum of 16"
         );
     }
 

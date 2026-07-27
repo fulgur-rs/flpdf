@@ -8,6 +8,7 @@
 use crate::filters::{
     decode_stream_data_with_limits_and_warnings, is_decode_output_limit_error, DecodeLimits,
 };
+use crate::stream_filter::normalize_filter_name;
 use crate::{Diagnostic, Diagnostics, Dictionary, Error, Object, Pdf, PdfOpenOptions};
 use std::io::{Read, Seek};
 
@@ -266,7 +267,7 @@ const GENERALIZED_FILTERS: [&[u8]; 5] = [
 /// reported as a stream-encoding error).
 fn content_filter_chain_is_generalized(dict: &Dictionary) -> bool {
     fn is_generalized(name: &[u8]) -> bool {
-        GENERALIZED_FILTERS.contains(&name)
+        GENERALIZED_FILTERS.contains(&normalize_filter_name(name))
     }
     // An indirect `/Filter` on a content stream is essentially never seen;
     // treating it conservatively as "skip" trades a vanishing parity gap for
@@ -689,6 +690,17 @@ mod tests {
         )
     }
 
+    fn truncated_abbreviated_flate_content_pdf() -> Vec<u8> {
+        content_pdf("4 0 R", &[(4, corrupt_filtered_object(4, "Fl", b"\x78"))])
+    }
+
+    fn malformed_header_abbreviated_flate_content_pdf() -> Vec<u8> {
+        content_pdf(
+            "4 0 R",
+            &[(4, corrupt_filtered_object(4, "Fl", b"\x78\x00"))],
+        )
+    }
+
     fn truncated_flate_then_invalid_ascii85_content_pdf() -> Vec<u8> {
         let mut flate_dict = Dictionary::new();
         flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
@@ -1027,6 +1039,48 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.severity == Severity::Error));
+    }
+
+    #[test]
+    fn abbreviated_truncated_flate_content_is_a_warning_not_an_error() {
+        let report = check_reader_with_options(
+            Cursor::new(truncated_abbreviated_flate_content_pdf()),
+            PdfOpenOptions {
+                repair: false,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report.valid);
+        assert!(report.diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic.message.contains("content stream object 4 0")
+                && diagnostic
+                    .message
+                    .contains("input stream is complete but output may still be valid")
+        }));
+        assert!(!report
+            .diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Error));
+    }
+
+    #[test]
+    fn abbreviated_malformed_flate_header_is_a_content_stream_error() {
+        let report =
+            check_reader_strict(Cursor::new(malformed_header_abbreviated_flate_content_pdf()))
+                .unwrap();
+
+        assert!(!report.valid);
+        assert!(report.diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Error
+                && diagnostic.message.contains("content stream object 4 0")
+                && diagnostic
+                    .message
+                    .contains("errors while decoding content stream")
+        }));
     }
 
     #[test]

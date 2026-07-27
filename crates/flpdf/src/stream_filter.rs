@@ -15,16 +15,20 @@ pub(crate) struct FilterSpec<'a> {
 
 impl FilterSpec<'_> {
     pub(crate) fn normalized_name(&self) -> &[u8] {
-        match self.name {
-            b"Fl" => b"FlateDecode",
-            b"LZW" => b"LZWDecode",
-            b"A85" => b"ASCII85Decode",
-            b"AHx" => b"ASCIIHexDecode",
-            b"RL" => b"RunLengthDecode",
-            b"CCF" => b"CCITTFaxDecode",
-            b"DCT" => b"DCTDecode",
-            name => name,
-        }
+        normalize_filter_name(self.name)
+    }
+}
+
+pub(crate) fn normalize_filter_name(name: &[u8]) -> &[u8] {
+    match name {
+        b"Fl" => b"FlateDecode",
+        b"LZW" => b"LZWDecode",
+        b"A85" => b"ASCII85Decode",
+        b"AHx" => b"ASCIIHexDecode",
+        b"RL" => b"RunLengthDecode",
+        b"CCF" => b"CCITTFaxDecode",
+        b"DCT" => b"DCTDecode",
+        name => name,
     }
 }
 
@@ -169,17 +173,15 @@ pub(crate) trait StreamFilter {
     }
 }
 
-#[derive(Default)]
-struct FlateStreamFilter {
-    decode_params: Option<Object>,
-}
+struct FlateStreamFilter;
 
 impl StreamFilter for FlateStreamFilter {
-    fn set_decode_params(&mut self, decode_params: Option<&Object>) -> bool {
+    fn set_decode_params(&mut self, _decode_params: Option<&Object>) -> bool {
         // SF_FlateLzwDecode::setDecodeParms asks getKeys() for every non-null
         // object. qpdf warns and treats a non-dictionary as an empty
-        // dictionary, so it remains filterable.
-        self.decode_params = decode_params.cloned();
+        // dictionary, so it remains filterable. Predictor parameters are
+        // validated and applied by filters.rs before and after pipe_decode, so
+        // this adapter has no parameter state to retain.
         true
     }
 
@@ -228,7 +230,7 @@ impl StreamFilter for BorrowedInputProbe {
 
 pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilter>> {
     match filter_name {
-        b"FlateDecode" => Some(Box::new(FlateStreamFilter::default())),
+        b"FlateDecode" => Some(Box::new(FlateStreamFilter)),
         #[cfg(test)]
         b"TestRejectDecode" => Some(Box::new(TestStreamFilter)),
         #[cfg(test)]
@@ -285,7 +287,8 @@ pub(crate) fn encode_flate(data: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::{
         decode_filter_specs, decode_flate, decode_flate_chunks, encode_flate, ignore_warning,
-        stream_filter_for, OutputBuffer, Pipeline, DECODE_OUTPUT_LIMIT_PREFIX,
+        stream_filter_for, FlateStreamFilter, OutputBuffer, Pipeline, StreamFilter,
+        DECODE_OUTPUT_LIMIT_PREFIX,
     };
     use crate::{Dictionary, Error, Object};
     use std::cell::RefCell;
@@ -512,6 +515,15 @@ mod tests {
         let mut filter = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
 
         assert!(filter.set_decode_params(Some(&Object::Integer(1))));
+    }
+
+    #[test]
+    fn flate_filter_does_not_retain_validated_decode_params() {
+        let params = Object::String(vec![b'x'; 64 * 1024]);
+        let mut filter = FlateStreamFilter;
+
+        assert!(filter.set_decode_params(Some(&params)));
+        assert_eq!(std::mem::size_of_val(&filter), 0);
     }
 
     #[test]
