@@ -7,4 +7,5 @@
 
 pub(crate) mod password;
 pub(crate) mod primitives;
+pub(crate) mod rc4;
 pub(crate) mod standard;
