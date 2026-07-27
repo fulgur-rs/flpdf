@@ -186,3 +186,45 @@ fn schema_errors_preserve_non_utf8_keys_in_paths_and_messages() {
         b"json key \".\x80\": key \"\xff\" is present in schema but missing in object"
     );
 }
+
+#[test]
+fn large_disjoint_dictionaries_preserve_qpdf_error_order() {
+    const KEY_COUNT: usize = 2048;
+
+    let schema = Json::make_dictionary();
+    let value = Json::make_dictionary();
+    for index in 0..KEY_COUNT {
+        schema
+            .add_dictionary_member(
+                format!("s{index:04}").as_bytes(),
+                Json::make_string(b"value"),
+            )
+            .unwrap();
+        value
+            .add_dictionary_member(
+                format!("v{index:04}").as_bytes(),
+                Json::make_int(index as i64),
+            )
+            .unwrap();
+    }
+    let mut errors = Vec::new();
+
+    assert!(!value.check_schema(&schema, &mut errors));
+    assert_eq!(errors.len(), KEY_COUNT * 2);
+    assert_eq!(
+        errors[0].as_bytes(),
+        b"top-level object: key \"s0000\" is present in schema but missing in object"
+    );
+    assert_eq!(
+        errors[KEY_COUNT - 1].as_bytes(),
+        b"top-level object: key \"s2047\" is present in schema but missing in object"
+    );
+    assert_eq!(
+        errors[KEY_COUNT].as_bytes(),
+        b"top-level object: key \"v0000\" is not present in schema but appears in object"
+    );
+    assert_eq!(
+        errors[KEY_COUNT * 2 - 1].as_bytes(),
+        b"top-level object: key \"v2047\" is not present in schema but appears in object"
+    );
+}

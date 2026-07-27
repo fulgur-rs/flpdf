@@ -1,5 +1,7 @@
 //! qpdf correspondence: JSON.cc schema validation responsibilities.
 
+use std::collections::BTreeMap;
+
 use super::{Json, JsonMessage};
 
 /// Flags that alter qpdf-compatible JSON schema validation.
@@ -60,8 +62,14 @@ fn check_schema_internal(
             return false;
         };
 
-        if schema_dictionary.len() == 1 && is_pattern_key(&schema_dictionary[0].0) {
-            let pattern_schema = &schema_dictionary[0].1;
+        let pattern_schema = if schema_dictionary.len() == 1 {
+            schema_dictionary
+                .first_key_value()
+                .and_then(|(key, item_schema)| is_pattern_key(key).then_some(item_schema))
+        } else {
+            None
+        };
+        if let Some(pattern_schema) = pattern_schema {
             for (key, item) in value_dictionary {
                 check_schema_internal(
                     &item,
@@ -73,10 +81,7 @@ fn check_schema_internal(
             }
         } else {
             for (key, item_schema) in &schema_dictionary {
-                if let Some((_, item)) = value_dictionary
-                    .iter()
-                    .find(|(value_key, _)| value_key == key)
-                {
+                if let Some(item) = value_dictionary.get(key) {
                     check_schema_internal(
                         item,
                         item_schema,
@@ -93,10 +98,7 @@ fn check_schema_internal(
                 }
             }
             for (key, _) in value_dictionary {
-                if !schema_dictionary
-                    .iter()
-                    .any(|(schema_key, _)| schema_key == &key)
-                {
+                if !schema_dictionary.contains_key(&key) {
                     errors.push(key_error(
                         prefix,
                         &key,
@@ -146,10 +148,12 @@ fn check_schema_internal(
     errors.is_empty()
 }
 
-fn dictionary_items(value: &Json) -> Option<Vec<(Vec<u8>, Json)>> {
-    let mut items = Vec::new();
+fn dictionary_items(value: &Json) -> Option<BTreeMap<Vec<u8>, Json>> {
+    let mut items = BTreeMap::new();
     value
-        .for_each_dict_item(|key, item| items.push((key.to_vec(), item)))
+        .for_each_dict_item(|key, item| {
+            items.insert(key.to_vec(), item);
+        })
         .then_some(items)
 }
 
