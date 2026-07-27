@@ -42,7 +42,7 @@ namespace
         }
         std::cerr
             << "usage: qpdf_tokenizer_probe"
-               " --mode pull|push|pull-inline|push-inline|between|content|normalize|token-filter|resource-finder"
+               " --mode pull|push|pull-inline|push-inline|between|content|normalize|token-filter|token-filter-lifecycle|resource-finder"
                " --input-hex HEX --allow-eof 0|1 --include-ignorable 0|1"
                " --allow-bad 0|1 --max-len N --inline-offset none|N --chunks all|N[,N...]\n";
         std::exit(2);
@@ -175,6 +175,7 @@ namespace
             options.mode != "pull-inline" && options.mode != "push-inline" &&
             options.mode != "between" && options.mode != "content" &&
             options.mode != "normalize" && options.mode != "token-filter" &&
+            options.mode != "token-filter-lifecycle" &&
             options.mode != "resource-finder") {
             usage("invalid mode " + options.mode);
         }
@@ -542,6 +543,107 @@ namespace
         std::cout << "output\t" << hex_encode(output.getString()) << '\n';
     }
 
+    class LifecycleSink final: public Pipeline
+    {
+      public:
+        explicit LifecycleSink(bool fail_first_finish) :
+            Pipeline("lifecycle sink", nullptr),
+            fail_first_finish(fail_first_finish)
+        {
+        }
+
+        void
+        write(unsigned char const* data, size_t len) override
+        {
+            output.append(reinterpret_cast<char const*>(data), len);
+        }
+
+        void
+        finish() override
+        {
+            ++finishes;
+            if (fail_first_finish && finishes == 1) {
+                throw std::runtime_error("lifecycle sink finish failed");
+            }
+        }
+
+        std::string output;
+        size_t finishes{0};
+
+      private:
+        bool fail_first_finish;
+    };
+
+    class LifecycleTokenFilter final: public QPDFObjectHandle::TokenFilter
+    {
+      public:
+        void
+        handleToken(QPDFTokenizer::Token const& token) override
+        {
+            ++tokens;
+            writeToken(token);
+        }
+
+        void
+        handleEOF() override
+        {
+            ++eof_callbacks;
+            write("!", 1);
+        }
+
+        size_t tokens{0};
+        size_t eof_callbacks{0};
+    };
+
+    void
+    emit_lifecycle_state(
+        char const* label,
+        LifecycleTokenFilter const& filter,
+        LifecycleSink const& sink)
+    {
+        std::cout << label << "\ttokens\t" << filter.tokens << '\n'
+                  << label << "\teof-callbacks\t" << filter.eof_callbacks << '\n'
+                  << label << "\tfinishes\t" << sink.finishes << '\n'
+                  << label << "\toutput\t" << hex_encode(sink.output) << '\n';
+    }
+
+    void
+    dump_token_filter_lifecycle(Options const& options)
+    {
+        {
+            LifecycleSink sink(false);
+            LifecycleTokenFilter filter;
+            Pl_QPDFTokenizer tokenizer("reusable token filter", &filter, &sink);
+            tokenizer.write(
+                reinterpret_cast<unsigned char const*>(options.input.data()),
+                options.input.size());
+            tokenizer.finish();
+            tokenizer.finish();
+            tokenizer.write(reinterpret_cast<unsigned char const*>("Q"), 1);
+            tokenizer.finish();
+            emit_lifecycle_state("reuse", filter, sink);
+        }
+
+        {
+            LifecycleSink sink(true);
+            LifecycleTokenFilter filter;
+            Pl_QPDFTokenizer tokenizer("retry token filter", &filter, &sink);
+            tokenizer.write(
+                reinterpret_cast<unsigned char const*>(options.input.data()),
+                options.input.size());
+            try {
+                tokenizer.finish();
+                std::cout << "fail-retry\tfirst-error\t-\n";
+            } catch (std::exception const& error) {
+                std::cout << "fail-retry\tfirst-error\t" << error.what() << '\n';
+            }
+            tokenizer.finish();
+            tokenizer.write(reinterpret_cast<unsigned char const*>("Q"), 1);
+            tokenizer.finish();
+            emit_lifecycle_state("fail-retry", filter, sink);
+        }
+    }
+
     void
     dump_resource_finder(Options const& options)
     {
@@ -584,6 +686,8 @@ main(int argc, char* argv[])
             dump_normalize(options);
         } else if (options.mode == "token-filter") {
             dump_token_filter(options);
+        } else if (options.mode == "token-filter-lifecycle") {
+            dump_token_filter_lifecycle(options);
         } else if (options.mode == "resource-finder") {
             dump_resource_finder(options);
         } else {

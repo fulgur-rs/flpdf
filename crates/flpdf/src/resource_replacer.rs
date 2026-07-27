@@ -17,6 +17,17 @@ pub(crate) struct ResourceReplacer {
     to_replace: BTreeMap<Vec<u8>, BTreeMap<usize, Vec<u8>>>,
 }
 
+fn name_value_from_decoded_body(body: &[u8]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(body.len() + 1);
+    value.push(b'/');
+    value.extend_from_slice(body);
+    value
+}
+
+fn name_token_from_decoded_body(body: &[u8]) -> Token {
+    Token::new(TokenType::Name, name_value_from_decoded_body(body))
+}
+
 impl ResourceReplacer {
     pub(crate) fn new(renames: &ResourceRenames, names: &ResourceNamesByType) -> Self {
         let mut to_replace = BTreeMap::new();
@@ -29,9 +40,7 @@ impl ResourceReplacer {
                 let Some(offsets) = names_by_name.get(old_name) else {
                     continue;
                 };
-                let mut old_token_value = Vec::with_capacity(old_name.len() + 1);
-                old_token_value.push(b'/');
-                old_token_value.extend_from_slice(old_name);
+                let old_token_value = name_value_from_decoded_body(old_name);
                 for offset in offsets {
                     to_replace
                         .entry(old_token_value.clone())
@@ -46,6 +55,14 @@ impl ResourceReplacer {
             to_replace,
         }
     }
+
+    fn advance_offset(&mut self, length: usize) -> PipelineResult<()> {
+        self.offset = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| PipelineError::runtime("ResourceReplacer offset overflow"))?;
+        Ok(())
+    }
 }
 
 impl TokenFilter for ResourceReplacer {
@@ -59,15 +76,12 @@ impl TokenFilter for ResourceReplacer {
             .flatten()
             .and_then(|offsets| offsets.get(&self.offset));
         if let Some(new_name) = replacement {
-            output.write_token(&Token::new(TokenType::Name, new_name.clone()))?;
+            output.write_token(&name_token_from_decoded_body(new_name))?;
+            self.advance_offset(token.raw.len())
         } else {
-            output.write_token(token)?;
+            self.advance_offset(token.raw.len())?;
+            output.write_token(token)
         }
-        self.offset = self
-            .offset
-            .checked_add(token.raw.len())
-            .ok_or_else(|| PipelineError::runtime("ResourceReplacer offset overflow"))?;
-        Ok(())
     }
 }
 
@@ -101,6 +115,7 @@ pub(crate) fn replace_resource_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn font_renames(old_name: &[u8], new_name: &[u8]) -> ResourceRenames {
         let mut renames = ResourceRenames::new();
@@ -109,6 +124,40 @@ mod tests {
             .or_default()
             .insert(old_name.to_vec(), new_name.to_vec());
         renames
+    }
+
+    fn font_names(name: &[u8], offset: usize) -> ResourceNamesByType {
+        let mut names = ResourceNamesByType::new();
+        names
+            .entry(b"Font".to_vec())
+            .or_default()
+            .insert(name.to_vec(), BTreeSet::from([offset]));
+        names
+    }
+
+    #[derive(Default)]
+    struct FailOnceWriteSink {
+        failed: bool,
+        bytes: Vec<u8>,
+    }
+
+    impl Pipeline for FailOnceWriteSink {
+        fn identifier(&self) -> &str {
+            "fail-once write sink"
+        }
+
+        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            if !self.failed {
+                self.failed = true;
+                return Err(PipelineError::logic("sink write failed once"));
+            }
+            self.bytes.extend_from_slice(data);
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -137,6 +186,64 @@ mod tests {
             replace_resource_names(input, &renames).unwrap().unwrap(),
             b"/MuchLonger 1 Tf /MuchLonger 2 Tf"
         );
+    }
+
+    #[test]
+    fn replacement_preserves_leading_slash_in_decoded_name_body() {
+        let renames = font_renames(b"/F", b"/F_1");
+        assert_eq!(
+            replace_resource_names(b"/#2fF 12 Tf", &renames)
+                .unwrap()
+                .unwrap(),
+            b"/#2fF_1 12 Tf"
+        );
+    }
+
+    #[test]
+    fn non_replacement_write_failure_advances_source_offset_before_retry() {
+        let renames = font_renames(b"F", b"G");
+        let names = font_names(b"F", 1);
+        let mut replacer = ResourceReplacer::new(&renames, &names);
+        let mut sink = FailOnceWriteSink::default();
+        {
+            let mut output = TokenFilterOutput::new(Some(&mut sink));
+
+            assert_eq!(
+                replacer
+                    .handle_token(&Token::new(TokenType::Word, b"q".to_vec()), &mut output)
+                    .unwrap_err()
+                    .message(),
+                "sink write failed once"
+            );
+            replacer
+                .handle_token(&Token::new(TokenType::Name, b"/F".to_vec()), &mut output)
+                .unwrap();
+        }
+
+        assert_eq!(sink.bytes, b"/G");
+    }
+
+    #[test]
+    fn replacement_write_failure_keeps_source_offset_for_retry() {
+        let renames = font_renames(b"F", b"G");
+        let names = font_names(b"F", 0);
+        let mut replacer = ResourceReplacer::new(&renames, &names);
+        let mut sink = FailOnceWriteSink::default();
+        let token = Token::new(TokenType::Name, b"/F".to_vec());
+        {
+            let mut output = TokenFilterOutput::new(Some(&mut sink));
+
+            assert_eq!(
+                replacer
+                    .handle_token(&token, &mut output)
+                    .unwrap_err()
+                    .message(),
+                "sink write failed once"
+            );
+            replacer.handle_token(&token, &mut output).unwrap();
+        }
+
+        assert_eq!(sink.bytes, b"/G");
     }
 
     #[test]

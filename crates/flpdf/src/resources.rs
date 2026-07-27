@@ -675,6 +675,7 @@ struct Scope<'a> {
 struct ResourceCallbacks {
     finder: ResourceFinder,
     inline_header: Option<Vec<Object>>,
+    valid_xobjects: Vec<Vec<u8>>,
     complete: bool,
 }
 
@@ -740,7 +741,14 @@ impl ParserCallbacks for ResourceCallbacks {
                 Ok(ParseControl::Continue)
             }
             Object::Operator(operator) if operator == b"ID" => self.stop_incomplete(),
-            Object::Operator(_) => Ok(ParseControl::Continue),
+            Object::Operator(operator) => {
+                if operator == b"Do" && self.complete {
+                    if let Some(name) = self.finder.last_name() {
+                        self.valid_xobjects.push(name.to_vec());
+                    }
+                }
+                Ok(ParseControl::Continue)
+            }
             Object::InlineImage(_) => Ok(ParseControl::Continue),
             operand => {
                 if let Some(header) = &mut self.inline_header {
@@ -785,29 +793,26 @@ fn collect_from_stream<R: Read + Seek>(
     let mut callbacks = ResourceCallbacks {
         finder: ResourceFinder::default(),
         inline_header: None,
+        valid_xobjects: Vec::new(),
         complete: true,
     };
     let parse_result = parse_content_stream_data(stream_bytes, &mut callbacks);
-    if parse_result.is_err() || callbacks.finder.had_diagnostics() || !callbacks.complete {
-        return Ok(false);
-    }
+    let mut complete =
+        parse_result.is_ok() && !callbacks.finder.had_diagnostics() && callbacks.complete;
 
     let names = callbacks.finder.names_by_resource_type();
-    record_direct_names(ctx.used, names, scope.record_direct);
+    if complete {
+        record_direct_names(ctx.used, names, scope.record_direct);
+    }
 
-    let mut xobjects = names
-        .get(b"XObject".as_slice())
-        .into_iter()
-        .flat_map(|by_name| by_name.iter())
-        .map(|(name, offsets)| (offsets.iter().next().copied().unwrap_or(usize::MAX), name))
-        .collect::<Vec<_>>();
-    xobjects.sort_by_key(|(offset, _)| *offset);
-    for (_, name) in xobjects {
-        if !recurse_form_xobject(ctx, name, scope, depth)? {
-            return Ok(false);
+    let mut traversed = BTreeSet::new();
+    for name in &callbacks.valid_xobjects {
+        if traversed.insert(name.as_slice()) && !recurse_form_xobject(ctx, name, scope, depth)? {
+            complete = false;
+            break;
         }
     }
-    Ok(true)
+    Ok(complete)
 }
 
 fn record_direct_names(used: &mut UsedNames, names: &ResourceNamesByType, record_direct: bool) {
@@ -1670,6 +1675,19 @@ mod tests {
         Ok((complete, used))
     }
 
+    fn malformed_form_pdf_and_resources() -> (Pdf<Cursor<Vec<u8>>>, Dictionary) {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /MediaBox [0 0 612 792] >>",
+            "<0g>",
+        );
+        let pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let mut xobjects = Dictionary::new();
+        xobjects.insert("Fm0", Object::Reference(ObjectRef::new(4, 0)));
+        let mut resources = Dictionary::new();
+        resources.insert("XObject", Object::Dictionary(xobjects));
+        (pdf, resources)
+    }
+
     #[test]
     fn resource_callbacks_reject_malformed_inline_image_protocol() {
         let bytes = build_page_with_resources_carrier_pdf(
@@ -1721,6 +1739,44 @@ mod tests {
         let error = collect_test_content(&mut pdf, b"/Fm0 Do", Some(&resources))
             .expect_err("malformed Form object is a structural error");
         assert!(matches!(error, Error::Parse { .. }));
+    }
+
+    #[test]
+    fn form_error_before_later_parser_diagnostic_is_propagated() {
+        let (mut pdf, resources) = malformed_form_pdf_and_resources();
+
+        let error = collect_test_content(&mut pdf, b"/Fm0 Do <0g>", Some(&resources))
+            .expect_err("the valid earlier Do must surface its structural Form error");
+        assert!(matches!(error, Error::Parse { .. }));
+    }
+
+    #[test]
+    fn parser_diagnostic_before_form_use_stops_later_traversal() {
+        let (mut pdf, resources) = malformed_form_pdf_and_resources();
+
+        let (complete, _) = collect_test_content(&mut pdf, b"<0g> /Fm0 Do", Some(&resources))
+            .expect("the later Do is outside the valid parser-event prefix");
+        assert!(!complete);
+    }
+
+    #[test]
+    fn invalid_inline_header_do_does_not_trigger_form_traversal() {
+        let (mut pdf, resources) = malformed_form_pdf_and_resources();
+
+        let (complete, _) = collect_test_content(&mut pdf, b"BI /Fm0 Do", Some(&resources))
+            .expect("an invalid inline-image header is incomplete, not a Form traversal");
+        assert!(!complete);
+    }
+
+    #[test]
+    fn inline_image_payload_do_is_opaque_to_form_traversal() {
+        let (mut pdf, resources) = malformed_form_pdf_and_resources();
+
+        let (complete, used) =
+            collect_test_content(&mut pdf, b"BI /W 1 ID /Fm0 Do EI Q", Some(&resources))
+                .expect("inline-image payload bytes are opaque");
+        assert!(complete);
+        assert!(!used.contains_key(b"XObject".as_slice()));
     }
 
     #[test]

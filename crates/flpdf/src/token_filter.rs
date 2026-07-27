@@ -21,7 +21,6 @@ pub(crate) struct TokenFilterOutput<'a> {
     next: Option<&'a mut dyn Pipeline>,
 }
 
-#[allow(dead_code)] // The output API is consumed by later TokenFilter implementations.
 impl<'a> TokenFilterOutput<'a> {
     pub(crate) fn new(next: Option<&'a mut dyn Pipeline>) -> Self {
         Self { next }

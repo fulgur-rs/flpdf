@@ -10,21 +10,49 @@ pub(crate) struct QpdfTokenizer<'a> {
     identifier: String,
     filter: &'a mut dyn TokenFilter,
     next: Option<&'a mut dyn Pipeline>,
+    filter_output_attached: bool,
     data: Vec<u8>,
 }
 
-#[allow(dead_code)] // Task 2 moves ContentNormalizer onto this shared pipeline.
 impl<'a> QpdfTokenizer<'a> {
     pub(crate) fn new(
         identifier: impl Into<String>,
         filter: &'a mut dyn TokenFilter,
         next: Option<&'a mut dyn Pipeline>,
     ) -> Self {
+        let filter_output_attached = next.is_some();
         Self {
             identifier: identifier.into(),
             filter,
             next,
+            filter_output_attached,
             data: Vec::new(),
+        }
+    }
+
+    fn handle_token(&mut self, token: &Token) -> PipelineResult<()> {
+        if self.filter_output_attached {
+            let mut output = TokenFilterOutput::new(self.next.take());
+            let result = self.filter.handle_token(token, &mut output);
+            self.next = output.into_next();
+            result
+        } else {
+            let mut output = TokenFilterOutput::new(None);
+            self.filter.handle_token(token, &mut output)
+        }
+    }
+
+    fn handle_eof(&mut self) -> PipelineResult<()> {
+        if self.filter_output_attached {
+            let mut output = TokenFilterOutput::new(self.next.take());
+            let result = self.filter.handle_eof(&mut output);
+            self.next = output.into_next();
+            result?;
+            self.filter_output_attached = false;
+            Ok(())
+        } else {
+            let mut output = TokenFilterOutput::new(None);
+            self.filter.handle_eof(&mut output)
         }
     }
 }
@@ -51,24 +79,14 @@ impl Pipeline for QpdfTokenizer<'_> {
                 .map_err(|error| PipelineError::runtime(format!("{}: {error}", self.identifier)))?;
             let is_eof = token.token_type == TokenType::Eof;
             let is_id = token.is_word_value(b"ID");
-            {
-                let mut output = TokenFilterOutput::new(self.next.take());
-                let result = self.filter.handle_token(&token, &mut output);
-                self.next = output.into_next();
-                result?;
-            }
+            self.handle_token(&token)?;
             if is_eof {
                 break;
             }
             if is_id {
                 let separator = tokenizer.consume_one_byte_or(b' ');
                 let space = Token::new(TokenType::Space, vec![separator]);
-                {
-                    let mut output = TokenFilterOutput::new(self.next.take());
-                    let result = self.filter.handle_token(&space, &mut output);
-                    self.next = output.into_next();
-                    result?;
-                }
+                self.handle_token(&space)?;
                 // cov:ignore-start: after a word ID the tokenizer is necessarily between tokens
                 tokenizer.expect_inline_image().map_err(|error| {
                     PipelineError::logic(format!("{}: {error:?}", self.identifier))
@@ -76,12 +94,7 @@ impl Pipeline for QpdfTokenizer<'_> {
                 // cov:ignore-end
             }
         }
-        {
-            let mut output = TokenFilterOutput::new(self.next.take());
-            let result = self.filter.handle_eof(&mut output);
-            self.next = output.into_next();
-            result?;
-        }
+        self.handle_eof()?;
         if let Some(next) = self.next.as_deref_mut() {
             next.finish()?;
         }
@@ -163,6 +176,55 @@ mod tests {
     }
     // cov:ignore-end
 
+    #[derive(Default)]
+    struct FinishFailOnceSink {
+        chunks: Vec<Vec<u8>>,
+        finishes: usize,
+    }
+
+    // cov:ignore-start: test-only sink identifiers have no behavioral role
+    impl Pipeline for FinishFailOnceSink {
+        fn identifier(&self) -> &str {
+            "finish fail once sink"
+        }
+
+        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            self.chunks.push(data.to_vec());
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            self.finishes += 1;
+            if self.finishes == 1 {
+                return Err(PipelineError::logic("lifecycle sink finish failed"));
+            }
+            Ok(())
+        }
+    }
+    // cov:ignore-end
+
+    #[derive(Default)]
+    struct EofWritingFilter {
+        events: Vec<(TokenType, Vec<u8>)>,
+        eof_calls: usize,
+    }
+
+    impl TokenFilter for EofWritingFilter {
+        fn handle_token(
+            &mut self,
+            token: &Token,
+            output: &mut TokenFilterOutput<'_>,
+        ) -> PipelineResult<()> {
+            self.events.push((token.token_type, token.raw.clone()));
+            output.write_token(token)
+        }
+
+        fn handle_eof(&mut self, output: &mut TokenFilterOutput<'_>) -> PipelineResult<()> {
+            self.eof_calls += 1;
+            output.write(b"!")
+        }
+    }
+
     struct FailOnWord(&'static str);
 
     impl TokenFilter for FailOnWord {
@@ -191,6 +253,54 @@ mod tests {
 
         fn handle_eof(&mut self, _output: &mut TokenFilterOutput<'_>) -> PipelineResult<()> {
             Err(PipelineError::logic("filter EOF failed"))
+        }
+    }
+
+    #[derive(Default)]
+    struct FailOnceOnWord {
+        failed: bool,
+    }
+
+    impl TokenFilter for FailOnceOnWord {
+        fn handle_token(
+            &mut self,
+            token: &Token,
+            output: &mut TokenFilterOutput<'_>,
+        ) -> PipelineResult<()> {
+            output.write_token(token)?;
+            if token.is_word_value(b"q") && !self.failed {
+                self.failed = true;
+                return Err(PipelineError::logic("token callback failed once"));
+            }
+            Ok(())
+        }
+
+        fn handle_eof(&mut self, output: &mut TokenFilterOutput<'_>) -> PipelineResult<()> {
+            output.write(b"E")
+        }
+    }
+
+    #[derive(Default)]
+    struct FailOnceOnEof {
+        failed: bool,
+    }
+
+    impl TokenFilter for FailOnceOnEof {
+        fn handle_token(
+            &mut self,
+            token: &Token,
+            output: &mut TokenFilterOutput<'_>,
+        ) -> PipelineResult<()> {
+            output.write_token(token)
+        }
+
+        fn handle_eof(&mut self, output: &mut TokenFilterOutput<'_>) -> PipelineResult<()> {
+            if !self.failed {
+                self.failed = true;
+                output.write(b"F")?;
+                return Err(PipelineError::logic("EOF callback failed once"));
+            }
+            output.write(b"E")
         }
     }
 
@@ -293,9 +403,9 @@ mod tests {
     }
 
     #[test]
-    fn second_finish_delivers_an_empty_eof_cycle_and_finishes_downstream_again() {
+    fn second_finish_delivers_empty_eof_but_filter_output_stays_detached() {
         let mut sink = RecordingSink::default();
-        let mut filter = RecordingFilter::default();
+        let mut filter = EofWritingFilter::default();
         let mut stage = QpdfTokenizer::new("token filter", &mut filter, Some(&mut sink));
         stage.write(b"q").unwrap();
         stage.finish().unwrap();
@@ -312,12 +422,13 @@ mod tests {
             2
         );
         assert_eq!(sink.finishes, 2);
+        assert_eq!(sink.chunks.concat(), b"q!");
     }
 
     #[test]
-    fn write_after_finish_starts_a_fresh_input_cycle() {
+    fn write_after_finish_delivers_callbacks_but_not_more_filter_output() {
         let mut sink = RecordingSink::default();
-        let mut filter = RecordingFilter::default();
+        let mut filter = EofWritingFilter::default();
         let mut stage = QpdfTokenizer::new("token filter", &mut filter, Some(&mut sink));
         stage.write(b"q").unwrap();
         stage.finish().unwrap();
@@ -334,8 +445,38 @@ mod tests {
                 (TokenType::Eof, Vec::new()),
             ]
         );
-        assert_eq!(sink.chunks.concat(), b"qQ");
+        assert_eq!(sink.chunks.concat(), b"q!");
         assert_eq!(sink.finishes, 2);
+    }
+
+    #[test]
+    fn downstream_finish_failure_retry_keeps_filter_output_detached() {
+        let mut sink = FinishFailOnceSink::default();
+        let mut filter = EofWritingFilter::default();
+        let mut stage = QpdfTokenizer::new("token filter", &mut filter, Some(&mut sink));
+        stage.write(b"q").unwrap();
+        assert_eq!(
+            stage.finish().unwrap_err().message(),
+            "lifecycle sink finish failed"
+        );
+        stage.finish().unwrap();
+        stage.write(b"Q").unwrap();
+        stage.finish().unwrap();
+        drop(stage);
+
+        assert_eq!(filter.eof_calls, 3);
+        assert_eq!(
+            filter.events,
+            vec![
+                (TokenType::Word, b"q".to_vec()),
+                (TokenType::Eof, Vec::new()),
+                (TokenType::Eof, Vec::new()),
+                (TokenType::Word, b"Q".to_vec()),
+                (TokenType::Eof, Vec::new()),
+            ]
+        );
+        assert_eq!(sink.finishes, 3);
+        assert_eq!(sink.chunks.concat(), b"q!");
     }
 
     #[test]
@@ -349,6 +490,40 @@ mod tests {
         drop(stage);
 
         assert_eq!(sink.finishes, 1);
+    }
+
+    #[test]
+    fn token_callback_failure_keeps_filter_output_attached_for_retry() {
+        let mut sink = RecordingSink::default();
+        let mut filter = FailOnceOnWord::default();
+        let mut stage = QpdfTokenizer::new("token filter", &mut filter, Some(&mut sink));
+        stage.write(b"q").unwrap();
+        assert_eq!(
+            stage.finish().unwrap_err().message(),
+            "token callback failed once"
+        );
+        stage.finish().unwrap();
+        drop(stage);
+
+        assert_eq!(sink.finishes, 1);
+        assert_eq!(sink.chunks.concat(), b"qE");
+    }
+
+    #[test]
+    fn handle_eof_failure_keeps_filter_output_attached_for_retry() {
+        let mut sink = RecordingSink::default();
+        let mut filter = FailOnceOnEof::default();
+        let mut stage = QpdfTokenizer::new("token filter", &mut filter, Some(&mut sink));
+        stage.write(b"q").unwrap();
+        assert_eq!(
+            stage.finish().unwrap_err().message(),
+            "EOF callback failed once"
+        );
+        stage.finish().unwrap();
+        drop(stage);
+
+        assert_eq!(sink.finishes, 1);
+        assert_eq!(sink.chunks.concat(), b"qFE");
     }
 
     // cov:ignore-start: the ignored live qpdf oracle is separately run by qpdf-tokenizer-diff.sh
@@ -475,6 +650,92 @@ mod tests {
         String::from_utf8(output.stdout).expect("probe records are ASCII")
     }
 
+    fn dump_flpdf_token_filter_lifecycle(input: &[u8]) -> String {
+        let mut records = String::new();
+
+        {
+            let mut sink = RecordingSink::default();
+            let mut filter = EofWritingFilter::default();
+            let mut stage =
+                QpdfTokenizer::new("reusable token filter", &mut filter, Some(&mut sink));
+            stage.write(input).unwrap();
+            stage.finish().unwrap();
+            stage.finish().unwrap();
+            stage.write(b"Q").unwrap();
+            stage.finish().unwrap();
+            drop(stage);
+            writeln!(records, "reuse\ttokens\t{}", filter.events.len()).unwrap();
+            writeln!(records, "reuse\teof-callbacks\t{}", filter.eof_calls).unwrap();
+            writeln!(records, "reuse\tfinishes\t{}", sink.finishes).unwrap();
+            writeln!(
+                records,
+                "reuse\toutput\t{}",
+                hex_encode(&sink.chunks.concat())
+            )
+            .unwrap();
+        }
+
+        {
+            let mut sink = FinishFailOnceSink::default();
+            let mut filter = EofWritingFilter::default();
+            let mut stage = QpdfTokenizer::new("retry token filter", &mut filter, Some(&mut sink));
+            stage.write(input).unwrap();
+            let error = stage.finish().unwrap_err();
+            writeln!(records, "fail-retry\tfirst-error\t{}", error.message()).unwrap();
+            stage.finish().unwrap();
+            stage.write(b"Q").unwrap();
+            stage.finish().unwrap();
+            drop(stage);
+            writeln!(records, "fail-retry\ttokens\t{}", filter.events.len()).unwrap();
+            writeln!(records, "fail-retry\teof-callbacks\t{}", filter.eof_calls).unwrap();
+            writeln!(records, "fail-retry\tfinishes\t{}", sink.finishes).unwrap();
+            writeln!(
+                records,
+                "fail-retry\toutput\t{}",
+                hex_encode(&sink.chunks.concat())
+            )
+            .unwrap();
+        }
+
+        records
+    }
+
+    fn run_qpdf_token_filter_lifecycle_probe(probe: &Path, input: &[u8]) -> String {
+        let output = Command::new(probe)
+            .args([
+                "--mode",
+                "token-filter-lifecycle",
+                "--input-hex",
+                &hex_encode(input),
+                "--allow-eof",
+                "1",
+                "--include-ignorable",
+                "1",
+                "--allow-bad",
+                "1",
+                "--max-len",
+                "0",
+                "--inline-offset",
+                "none",
+                "--chunks",
+                "all",
+            ])
+            .output()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to execute qpdf token-filter lifecycle probe {}: {error}",
+                    probe.display()
+                )
+            });
+        assert!(
+            output.status.success(),
+            "qpdf token-filter lifecycle probe failed ({}):\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8(output.stdout).expect("probe records are ASCII")
+    }
+
     #[test]
     #[ignore = "live qpdf 11.9.0 token-filter oracle"]
     fn qpdf_token_filter_differential() {
@@ -519,6 +780,17 @@ mod tests {
                 "case {name}",
             );
         }
+    }
+
+    #[test]
+    #[ignore = "live qpdf 11.9.0 token-filter lifecycle oracle"]
+    fn qpdf_token_filter_lifecycle_differential() {
+        let probe = std::env::var_os("QPDF_TOKENIZER_PROBE")
+            .expect("set QPDF_TOKENIZER_PROBE to the built qpdf 11.9.0 probe");
+        assert_eq!(
+            dump_flpdf_token_filter_lifecycle(b"q"),
+            run_qpdf_token_filter_lifecycle_probe(Path::new(&probe), b"q"),
+        );
     }
     // cov:ignore-end
 }

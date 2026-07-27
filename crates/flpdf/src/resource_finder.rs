@@ -9,13 +9,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::content_stream::{ParseControl, ParserCallbacks};
 use crate::{Object, Result};
 
-pub(crate) type ResourceNames = BTreeSet<Vec<u8>>;
 pub(crate) type ResourceNamesByType = BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, BTreeSet<usize>>>;
 
 #[derive(Debug, Default)]
 pub(crate) struct ResourceFinder {
     last_name: Option<(Vec<u8>, usize)>,
-    names: ResourceNames,
     names_by_resource_type: ResourceNamesByType,
     had_diagnostics: bool,
     pending_operands: bool,
@@ -39,13 +37,16 @@ impl ResourceFinder {
         self.pending_operands
     }
 
+    pub(crate) fn last_name(&self) -> Option<&[u8]> {
+        self.last_name.as_ref().map(|(name, _)| name.as_slice())
+    }
+
     pub(crate) fn record_resource_name(
         &mut self,
         resource_type: &[u8],
         name: &[u8],
         offset: usize,
     ) {
-        self.names.insert(name.to_vec());
         self.names_by_resource_type
             .entry(resource_type.to_vec())
             .or_default()
@@ -136,7 +137,12 @@ mod tests {
     fn dump_flpdf_resource_finder(input: &[u8]) -> String {
         let finder = find(input).unwrap();
         let mut records = String::new();
-        for name in &finder.names {
+        let flat_names = finder
+            .names_by_resource_type()
+            .values()
+            .flat_map(|by_name| by_name.keys())
+            .collect::<BTreeSet<_>>();
+        for name in flat_names {
             writeln!(records, "name\t{}", qpdf_name_hex(name)).unwrap();
         }
         for (resource_type, names) in finder.names_by_resource_type() {
@@ -209,8 +215,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resource_finder_probe_passes_exact_arguments_and_returns_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        write_test_probe(
+            &probe,
+            "#!/bin/sh\nprintf '%s' \"$1\"\nshift\nprintf ' %s' \"$@\"\nprintf '\\n'\n",
+        );
         assert_eq!(
-            run_qpdf_resource_finder_probe(Path::new("/bin/echo"), b"/F1 12 Tf"),
+            run_qpdf_resource_finder_probe(&probe, b"/F1 12 Tf"),
             "--mode resource-finder --input-hex 2f4631203132205466 --allow-eof 1 \
              --include-ignorable 0 --allow-bad 1 --max-len 0 --inline-offset none \
              --chunks all\n"
@@ -224,15 +236,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resource_finder_probe_spawn_failure_reports_path() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
         let dir = tempfile::tempdir().unwrap();
-        let probe = dir.path().join("missing-probe");
+        let probe = dir.path().join(OsStr::from_bytes(b"missing-\xff-probe"));
 
         let panic =
             std::panic::catch_unwind(|| run_qpdf_resource_finder_probe(&probe, b"/F1 12 Tf"))
                 .unwrap_err();
         let message = panic.downcast_ref::<String>().unwrap();
         assert!(message.contains("failed to execute qpdf resource finder probe"));
-        assert!(message.contains(probe.to_str().unwrap()));
+        assert!(message.contains(&probe.display().to_string()));
     }
 
     #[cfg(unix)]
@@ -269,7 +284,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![b"X1".to_vec()]
         );
-        assert_eq!(finder.names.len(), 10);
+        let flat_names = finder
+            .names_by_resource_type()
+            .values()
+            .flat_map(|by_name| by_name.keys())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(flat_names.len(), 10);
     }
 
     #[test]

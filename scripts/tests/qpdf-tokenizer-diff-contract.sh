@@ -6,9 +6,11 @@ probe_source="${repo_root}/tests/oracle/qpdf_tokenizer_probe.cc"
 script_source="${repo_root}/scripts/qpdf-tokenizer-diff.sh"
 
 grep -F 'token-filter' "${probe_source}"
+grep -F 'token-filter-lifecycle' "${probe_source}"
 grep -F 'resource-finder' "${probe_source}"
 grep -F -- '--chunks' "${probe_source}"
 grep -F 'pipeline::qpdf_tokenizer::tests::qpdf_token_filter_differential' "${script_source}"
+grep -F 'pipeline::qpdf_tokenizer::tests::qpdf_token_filter_lifecycle_differential' "${script_source}"
 grep -F 'ResourceFinder.cc' "${script_source}"
 grep -F 'resource_finder::tests::qpdf_resource_finder_differential' "${script_source}"
 
