@@ -1,10 +1,10 @@
 //! Mirrors qpdf 11.9.0 libqpdf/Pipeline.cc.
 
-mod buffer;
+pub(crate) mod buffer;
 
-mod count;
+pub(crate) mod count;
 
-mod flate;
+pub(crate) mod flate;
 
 #[allow(dead_code)]
 pub(crate) type PipelineResult<T> = std::result::Result<T, PipelineError>;

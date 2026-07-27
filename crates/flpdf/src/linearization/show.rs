@@ -90,15 +90,15 @@ macro_rules! malformed {
 }
 
 // ---------------------------------------------------------------------------
-// MSB-first BitReader — inverse of HintStreamBuilder
+// MSB-first BitReader — inverse of BitWriter
 // ---------------------------------------------------------------------------
 
 /// A read-only MSB-first bit reader over an in-memory buffer.
 ///
 /// Bits are consumed from the most-significant position of the current byte
-/// downward — the inverse of [`super::hint_stream::HintStreamBuilder`].
+/// downward — the inverse of [`crate::bit_writer::BitWriter`].
 /// [`BitReader::skip_to_next_byte`] advances to the next byte boundary,
-/// mirroring the encoder's `align_to_byte`.
+/// mirroring the encoder's `flush`.
 struct BitReader<'a> {
     buf: &'a [u8],
     /// Index of the byte currently being read.
@@ -171,7 +171,8 @@ impl<'a> BitReader<'a> {
 
     /// Advance to the next byte boundary if not already aligned.
     ///
-    /// Mirrors `HintStreamBuilder::align_to_byte` and qpdf's `skipToNextByte`.
+    /// Mirrors [`crate::bit_writer::BitWriter::flush`] and qpdf's
+    /// `skipToNextByte`.
     fn skip_to_next_byte(&mut self) {
         if self.bit_pos != 0 {
             self.bit_pos = 0;
@@ -997,21 +998,35 @@ pub fn show_linearization_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linearization::hint_stream::{encode_hint_stream, HintStreamBuilder};
+    use crate::bit_writer::BitWriter;
+    use crate::linearization::hint_stream::encode_hint_stream;
+    use crate::pipeline::buffer::Buffer;
+    use crate::pipeline::{Pipeline, PipelineResult};
 
     // -----------------------------------------------------------------------
-    // BitReader: write via HintStreamBuilder, read back. Covers cross-byte
+    // BitReader: write via BitWriter, read back. Covers cross-byte
     // patterns and byte alignment (inverse of the encoder).
     // -----------------------------------------------------------------------
 
+    fn bit_writer_bytes(write: impl FnOnce(&mut BitWriter<'_>) -> PipelineResult<()>) -> Vec<u8> {
+        let mut sink = Buffer::new("show test bit writer", None);
+        {
+            let mut writer = BitWriter::new(&mut sink);
+            write(&mut writer).expect("write test bitstream");
+            writer.flush().expect("flush test bitstream");
+        }
+        sink.finish().expect("finish test bitstream");
+        sink.take_buffer().expect("take test bitstream")
+    }
+
     #[test]
     fn bitreader_reads_back_msb_first_patterns() {
-        let mut b = HintStreamBuilder::new();
-        b.write_bits(0xDEAD_BEEF, 32);
-        b.write_bits(0b101, 3);
-        b.write_bits(0b10110, 5);
-        b.write_bits(0b1100_1010_0011, 12);
-        let buf = b.finish();
+        let buf = bit_writer_bytes(|writer| {
+            writer.write_bits(0xDEAD_BEEF, 32)?;
+            writer.write_bits(0b101, 3)?;
+            writer.write_bits(0b10110, 5)?;
+            writer.write_bits(0b1100_1010_0011, 12)
+        });
 
         let mut r = BitReader::new(&buf);
         assert_eq!(r.get_bits(32).unwrap(), 0xDEAD_BEEF);
@@ -1032,11 +1047,11 @@ mod tests {
     #[test]
     fn bitreader_skip_to_next_byte_matches_align() {
         // Write 1 bit then align (pad to byte), then a full byte.
-        let mut b = HintStreamBuilder::new();
-        b.write_bits(1, 1);
-        b.align_to_byte();
-        b.write_bits(0x5A, 8);
-        let buf = b.finish();
+        let buf = bit_writer_bytes(|writer| {
+            writer.write_bits(1, 1)?;
+            writer.flush()?;
+            writer.write_bits(0x5A, 8)
+        });
 
         let mut r = BitReader::new(&buf);
         assert_eq!(r.get_bits(1).unwrap(), 1);
@@ -1046,10 +1061,10 @@ mod tests {
 
     #[test]
     fn bitreader_skip_on_boundary_is_noop() {
-        let mut b = HintStreamBuilder::new();
-        b.write_bits(0xAB, 8);
-        b.write_bits(0xCD, 8);
-        let buf = b.finish();
+        let buf = bit_writer_bytes(|writer| {
+            writer.write_bits(0xAB, 8)?;
+            writer.write_bits(0xCD, 8)
+        });
 
         let mut r = BitReader::new(&buf);
         assert_eq!(r.get_bits(8).unwrap(), 0xAB);
@@ -1447,7 +1462,7 @@ mod tests {
     // qpdf's reader expects four SEPARATE columns: delta_group_length, then a
     // 1-bit signature_present column (byte-aligned), then a run of 128-bit
     // signatures (one per set flag, no inner alignment), then nobjects. We
-    // build the bitstream in that exact reader order via HintStreamBuilder and
+    // build the bitstream in that exact reader order via BitWriter and
     // assert the decoder skips the signature correctly so the nobjects column
     // stays aligned.  (flpdf never emits signatures, so this path is exercised
     // only here, but it must mirror qpdf for arbitrary linearized input.)
@@ -1459,32 +1474,32 @@ mod tests {
         let nbits_nobjects = 4u32;
         let nshared_total = 2u32;
 
-        let mut b = HintStreamBuilder::new();
-        // 7-field header (32-bit ×5, 16-bit ×2 = 24 bytes, byte-aligned).
-        b.write_bits(1, 32); // first_shared_obj
-        b.write_bits(0, 32); // first_shared_offset
-        b.write_bits(2, 32); // nshared_first_page
-        b.write_bits(nshared_total as u64, 32); // nshared_total
-        b.write_bits(nbits_nobjects as u64, 16); // nbits_nobjects
-        b.write_bits(0, 32); // min_group_length
-        b.write_bits(nbits_delta_group_length as u64, 16); // nbits_delta_group_length
-                                                           // col a: delta_group_length × N
-        b.write_bits(3, nbits_delta_group_length);
-        b.write_bits(9, nbits_delta_group_length);
-        b.align_to_byte();
-        // col b: signature_present × N (entry 0 set, entry 1 clear)
-        b.write_bits(1, 1);
-        b.write_bits(0, 1);
-        b.align_to_byte();
-        // col c: 128 bits (4×32) for the one set flag — no inner alignment
-        for _ in 0..4 {
-            b.write_bits(0xDEAD_BEEF, 32);
-        }
-        // col d: nobjects_minus_one × N
-        b.write_bits(5, nbits_nobjects);
-        b.write_bits(7, nbits_nobjects);
-        b.align_to_byte();
-        let buf = b.finish();
+        let buf = bit_writer_bytes(|writer| {
+            // 7-field header (32-bit ×5, 16-bit ×2 = 24 bytes, byte-aligned).
+            writer.write_bits(1, 32)?; // first_shared_obj
+            writer.write_bits(0, 32)?; // first_shared_offset
+            writer.write_bits(2, 32)?; // nshared_first_page
+            writer.write_bits(nshared_total as u64, 32)?; // nshared_total
+            writer.write_bits(nbits_nobjects as u64, 16)?; // nbits_nobjects
+            writer.write_bits(0, 32)?; // min_group_length
+            writer.write_bits(nbits_delta_group_length as u64, 16)?; // nbits_delta_group_length
+                                                                     // col a: delta_group_length × N
+            writer.write_bits(3, nbits_delta_group_length as usize)?;
+            writer.write_bits(9, nbits_delta_group_length as usize)?;
+            writer.flush()?;
+            // col b: signature_present × N (entry 0 set, entry 1 clear)
+            writer.write_bits(1, 1)?;
+            writer.write_bits(0, 1)?;
+            writer.flush()?;
+            // col c: 128 bits (4×32) for the one set flag — no inner alignment
+            for _ in 0..4 {
+                writer.write_bits(0xDEAD_BEEF, 32)?;
+            }
+            // col d: nobjects_minus_one × N
+            writer.write_bits(5, nbits_nobjects as usize)?;
+            writer.write_bits(7, nbits_nobjects as usize)?;
+            writer.flush()
+        });
 
         let decoded = read_h_shared_object(&buf).expect("decode");
         assert!(decoded.entries[0].signature_present);
@@ -1503,15 +1518,15 @@ mod tests {
         // no column bytes following. Each entry needs at least one bit (the
         // signature_present column), so the decoder must reject it as malformed
         // rather than pre-allocating ~u32::MAX entries (OOM DoS guard).
-        let mut b = HintStreamBuilder::new();
-        b.write_bits(0, 32); // first_shared_obj
-        b.write_bits(0, 32); // first_shared_offset
-        b.write_bits(0, 32); // nshared_first_page
-        b.write_bits(1_000_000, 32); // nshared_total (far exceeds 0 remaining bits)
-        b.write_bits(0, 16); // nbits_nobjects
-        b.write_bits(0, 32); // min_group_length
-        b.write_bits(0, 16); // nbits_delta_group_length
-        let buf = b.finish();
+        let buf = bit_writer_bytes(|writer| {
+            writer.write_bits(0, 32)?; // first_shared_obj
+            writer.write_bits(0, 32)?; // first_shared_offset
+            writer.write_bits(0, 32)?; // nshared_first_page
+            writer.write_bits(1_000_000, 32)?; // nshared_total
+            writer.write_bits(0, 16)?; // nbits_nobjects
+            writer.write_bits(0, 32)?; // min_group_length
+            writer.write_bits(0, 16) // nbits_delta_group_length
+        });
         assert_eq!(buf.len(), 24, "header is exactly 24 bytes, no column data");
 
         let is_malformed = matches!(
@@ -1530,26 +1545,26 @@ mod tests {
         // refs, but the stream ends right after that column. With zero-width
         // identifier/numerator fields the nested loops would push ~1e6 entries
         // from a tiny buffer; the per-page bound must reject it instead.
-        let mut b = HintStreamBuilder::new();
-        // 13-field header (5×32 + 8×16 = 36 bytes, byte-aligned).
-        b.write_bits(0, 32); // min_nobjects
-        b.write_bits(0, 32); // first_page_offset
-        b.write_bits(0, 16); // nbits_delta_nobjects = 0
-        b.write_bits(0, 32); // min_page_length
-        b.write_bits(0, 16); // nbits_delta_page_length = 0
-        b.write_bits(0, 32); // min_content_offset
-        b.write_bits(0, 16); // nbits_delta_content_offset = 0
-        b.write_bits(0, 32); // min_content_length
-        b.write_bits(0, 16); // nbits_delta_content_length = 0
-        b.write_bits(32, 16); // nbits_nshared_objects = 32
-        b.write_bits(0, 16); // nbits_shared_identifier = 0
-        b.write_bits(0, 16); // nbits_shared_numerator = 0
-        b.write_bits(1, 16); // shared_denominator
-                             // cols (a)/(b): 0-bit, nothing written. col (c):
-                             // nshared_objects for the single page.
-        b.write_bits(1_000_000, 32);
-        b.align_to_byte();
-        let buf = b.finish();
+        let buf = bit_writer_bytes(|writer| {
+            // 13-field header (5×32 + 8×16 = 36 bytes, byte-aligned).
+            writer.write_bits(0, 32)?; // min_nobjects
+            writer.write_bits(0, 32)?; // first_page_offset
+            writer.write_bits(0, 16)?; // nbits_delta_nobjects = 0
+            writer.write_bits(0, 32)?; // min_page_length
+            writer.write_bits(0, 16)?; // nbits_delta_page_length = 0
+            writer.write_bits(0, 32)?; // min_content_offset
+            writer.write_bits(0, 16)?; // nbits_delta_content_offset = 0
+            writer.write_bits(0, 32)?; // min_content_length
+            writer.write_bits(0, 16)?; // nbits_delta_content_length = 0
+            writer.write_bits(32, 16)?; // nbits_nshared_objects = 32
+            writer.write_bits(0, 16)?; // nbits_shared_identifier = 0
+            writer.write_bits(0, 16)?; // nbits_shared_numerator = 0
+            writer.write_bits(1, 16)?; // shared_denominator
+                                       // cols (a)/(b): 0-bit, nothing written. col (c):
+                                       // nshared_objects for the single page.
+            writer.write_bits(1_000_000, 32)?;
+            writer.flush()
+        });
         assert_eq!(
             buf.len(),
             40,
@@ -1694,12 +1709,12 @@ mod tests {
 
     #[test]
     fn read_h_generic_decodes_four_fields() {
-        let mut b = HintStreamBuilder::new();
-        b.write_bits(11, 32); // first_object
-        b.write_bits(222, 32); // first_object_offset
-        b.write_bits(3, 32); // nobjects
-        b.write_bits(4444, 32); // group_length
-        let buf = b.finish();
+        let buf = bit_writer_bytes(|writer| {
+            writer.write_bits(11, 32)?; // first_object
+            writer.write_bits(222, 32)?; // first_object_offset
+            writer.write_bits(3, 32)?; // nobjects
+            writer.write_bits(4444, 32) // group_length
+        });
         let g = read_h_generic(&buf).expect("decode generic");
         assert_eq!(g.first_object, 11);
         assert_eq!(g.first_object_offset, 222);
