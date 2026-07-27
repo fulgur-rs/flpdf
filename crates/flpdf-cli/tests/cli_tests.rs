@@ -4117,7 +4117,7 @@ fn rewrite_normalize_content_propagates_indirect_stream_decode_error() {
         .arg(&output)
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("deflate"));
+        .stderr(predicate::str::contains("inflate"));
 
     assert!(
         !output.exists(),
