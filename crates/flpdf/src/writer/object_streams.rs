@@ -2008,10 +2008,12 @@ mod tests {
             Some(&Object::Integer(stream.data.len() as i64)),
             "/Length must equal compressed data length"
         );
-        // Even empty input produces some deflate bytes (header + checksum).
+        // qpdf's Pl_Flate does not initialize zlib until the first non-empty
+        // write, so an empty object stream retains /FlateDecode with a
+        // zero-length encoded payload.
         assert!(
-            !stream.data.is_empty(),
-            "compressed empty input must produce non-empty deflate bytes"
+            stream.data.is_empty(),
+            "compressed empty input must match qpdf's zero-byte Pl_Flate output"
         );
     }
 
