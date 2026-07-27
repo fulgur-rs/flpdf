@@ -51,6 +51,7 @@ Integration-test files:
 ```text
 crates/flpdf/tests/cmp_diff_zero_tests.rs
 crates/flpdf/tests/object_streams_writer_tests.rs
+crates/flpdf/tests/reader_tests.rs
 crates/flpdf/tests/writer_tests.rs
 crates/flpdf/tests/xref_tests.rs
 ```
@@ -58,11 +59,12 @@ crates/flpdf/tests/xref_tests.rs
 ## Delivery Boundary
 
 **Branch:** `feature/flpdf-qxba-phase2-xref-entry`
-**PR base / patch-coverage base:** `origin/feature/flpdf-qxba-phase2-pipeline`
+**PR base:** `origin/main`
+**Patch-coverage base:** `git merge-base HEAD origin/main`
 
-If `flpdf-80b6` changes the writer base before execution, first land/rebase that result below the
-Pipeline layer, then recreate this exact four-layer stack. Do not change the immediate-parent
-coverage rule.
+The Pipeline layer and the writer work owned by `flpdf-80b6` are merged into `origin/main`.
+If new overlapping writer work appears before execution, first land/rebase that result below this
+branch. Do not change the immediate-parent coverage rule.
 
 ---
 
@@ -169,7 +171,9 @@ git commit -m "feat: add xref entry value component"
 - Modify: `crates/flpdf/src/reader.rs:1-90,530-885`
 - Modify: `crates/flpdf/src/cache.rs:1-40`
 - Modify: `crates/flpdf/tests/xref_tests.rs`
+- Modify: `crates/flpdf/tests/reader_tests.rs`
 - Test: `crates/flpdf/tests/xref_tests.rs`
+- Test: `crates/flpdf/tests/reader_tests.rs`
 - Test: `crates/flpdf/src/cache.rs`
 
 **Interfaces:**
@@ -387,11 +391,12 @@ Expected: PASS; `compat_matrix_tests` uses its existing explicit skip when qpdf 
 Run:
 
 ```bash
-rg -n "XrefOffset|::Offset\\(" crates docs scripts
+rg -n "XrefOffset|::Offset\\(" crates scripts
 ```
 
-Expected: no `XrefOffset` matches. Inspect any `::Offset(` match before changing it; unrelated
-offset enums are not part of this task.
+Expected: no `XrefOffset` matches in code or scripts. Historical design and plan documents retain
+the old symbol where they describe the pre-cutover implementation. Inspect any `::Offset(` match
+before changing it; unrelated offset enums are not part of this task.
 
 - [ ] **Step 7: Commit**
 
@@ -416,13 +421,13 @@ git commit -m "refactor: cut over all xref entry consumers"
 Run:
 
 ```bash
-rg -n "XrefOffset" crates docs scripts
+rg -n "XrefOffset" crates scripts
 rg -n "pub enum XrefEntry|pub use .*XrefEntry" crates/flpdf/src
 rg -n "XrefEntry" crates/flpdf/src crates/flpdf/tests crates/flpdf-cli/tests
 ```
 
-Expected: zero old-symbol matches, one enum definition, one public re-export, and every expected
-consumer listed in the refreshed inventory.
+Expected: zero old-symbol matches in code or scripts, one enum definition, one public re-export,
+and every expected consumer listed in the refreshed inventory.
 
 - [ ] **Step 2: Run correspondence and public docs**
 
@@ -457,7 +462,7 @@ Expected: all commands exit 0.
 Run:
 
 ```bash
-base_ref="origin/feature/flpdf-qxba-phase2-pipeline"
+base_ref="$(git merge-base HEAD origin/main)"
 cargo llvm-cov clean --workspace
 cargo llvm-cov --workspace --all-features --lcov --output-path /tmp/flpdf-xref-entry.lcov
 scripts/patch-coverage.sh "$base_ref" HEAD /tmp/flpdf-xref-entry.lcov
