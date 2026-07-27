@@ -28,6 +28,23 @@ impl io::Write for MaxWriteSink {
     }
 }
 
+struct CallbackSink<F> {
+    bytes: Vec<u8>,
+    callback: F,
+}
+
+impl<F: FnMut(&[u8])> io::Write for CallbackSink<F> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        (self.callback)(&self.bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn incremental_writer_matches_qpdf_nested_bytes() {
     let mut out = Vec::new();
@@ -162,6 +179,87 @@ fn qpdf_blob_streams_base64_without_one_full_encoded_write() {
 
     let expected = format!("\"{}\"", STANDARD.encode(bytes)).into_bytes();
     assert_eq!(out.bytes, expected);
+}
+
+#[test]
+fn dictionary_writer_rereads_value_after_key_output() {
+    let dictionary = Json::make_dictionary();
+    dictionary
+        .add_dictionary_member(b"a", Json::make_int(1))
+        .unwrap();
+    let alias = dictionary.clone();
+    let replaced = Rc::new(Cell::new(false));
+    let mut sink = CallbackSink {
+        bytes: Vec::new(),
+        callback: {
+            let replaced = replaced.clone();
+            move |bytes: &[u8]| {
+                if !replaced.get() && bytes.ends_with(b"\"a\": ") {
+                    replaced.set(true);
+                    alias
+                        .add_dictionary_member(b"a", Json::make_int(99))
+                        .unwrap();
+                }
+            }
+        },
+    };
+
+    dictionary.write(&mut sink, 0).unwrap();
+
+    assert!(replaced.get());
+    assert_eq!(sink.bytes, b"{\n  \"a\": 99\n}");
+}
+
+#[test]
+fn dictionary_writer_starts_iteration_after_opening_brace() {
+    let dictionary = Json::make_dictionary();
+    dictionary
+        .add_dictionary_member(b"a", Json::make_int(1))
+        .unwrap();
+    let alias = dictionary.clone();
+    let inserted = Rc::new(Cell::new(false));
+    let mut sink = CallbackSink {
+        bytes: Vec::new(),
+        callback: {
+            let inserted = inserted.clone();
+            move |bytes: &[u8]| {
+                if !inserted.get() && bytes == b"{" {
+                    inserted.set(true);
+                    alias
+                        .add_dictionary_member(b"b", Json::make_int(2))
+                        .unwrap();
+                }
+            }
+        },
+    };
+
+    dictionary.write(&mut sink, 0).unwrap();
+
+    assert_eq!(sink.bytes, b"{\n  \"a\": 1,\n  \"b\": 2\n}");
+}
+
+#[test]
+fn array_writer_snapshots_elements_after_opening_bracket() {
+    let array = Json::make_array();
+    array.add_array_element(Json::make_int(1)).unwrap();
+    let alias = array.clone();
+    let inserted = Rc::new(Cell::new(false));
+    let mut sink = CallbackSink {
+        bytes: Vec::new(),
+        callback: {
+            let inserted = inserted.clone();
+            move |bytes: &[u8]| {
+                if !inserted.get() && bytes == b"[" {
+                    inserted.set(true);
+                    alias.add_array_element(Json::make_int(2)).unwrap();
+                }
+            }
+        },
+    };
+
+    array.write(&mut sink, 0).unwrap();
+
+    assert_eq!(sink.bytes, b"[\n  1,\n  2\n]");
 }
 
 #[test]

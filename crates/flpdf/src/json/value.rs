@@ -54,7 +54,7 @@ pub(crate) enum Value {
 
 pub(crate) enum ValueSnapshot {
     Dictionary,
-    Array(Vec<Json>),
+    Array,
     String(Vec<u8>),
     Number(Vec<u8>),
     Bool(bool),
@@ -64,7 +64,7 @@ pub(crate) enum ValueSnapshot {
 
 pub(crate) enum ContainerOrBlobSnapshot {
     Dictionary,
-    Array(Vec<Json>),
+    Array,
     Blob(BlobWriter),
 }
 
@@ -72,7 +72,7 @@ impl ValueSnapshot {
     pub(crate) fn into_container_or_blob(self) -> Option<ContainerOrBlobSnapshot> {
         match self {
             Self::Dictionary => Some(ContainerOrBlobSnapshot::Dictionary),
-            Self::Array(values) => Some(ContainerOrBlobSnapshot::Array(values)),
+            Self::Array => Some(ContainerOrBlobSnapshot::Array),
             Self::Blob(writer) => Some(ContainerOrBlobSnapshot::Blob(writer)),
             Self::String(_) | Self::Number(_) | Self::Bool(_) | Self::Null => None,
         }
@@ -286,6 +286,26 @@ impl Json {
         item.map(|(key, value)| (key.clone(), value.clone()))
     }
 
+    pub(crate) fn dictionary_item_for_write(&self, encoded_key: &[u8]) -> Option<Json> {
+        let members = self.0.as_ref()?.borrow();
+        let Value::Dictionary {
+            members: dictionary,
+            ..
+        } = &members.value
+        else {
+            return None;
+        };
+        dictionary.get(encoded_key).cloned()
+    }
+
+    pub(crate) fn array_items_snapshot(&self) -> Option<Vec<Json>> {
+        let members = self.0.as_ref()?.borrow();
+        let Value::Array(values) = &members.value else {
+            return None;
+        };
+        Some(values.clone())
+    }
+
     pub fn for_each_array_item(&self, mut callback: impl FnMut(Json)) -> bool {
         let Some(members) = &self.0 else {
             return false;
@@ -338,7 +358,7 @@ impl Json {
                 let _ = parsed_keys;
                 ValueSnapshot::Dictionary
             }
-            Value::Array(values) => ValueSnapshot::Array(values.clone()),
+            Value::Array(_) => ValueSnapshot::Array,
             Value::String { encoded, .. } => ValueSnapshot::String(encoded.clone()),
             Value::Number(value) => ValueSnapshot::Number(value.clone()),
             Value::Bool(value) => ValueSnapshot::Bool(*value),

@@ -148,27 +148,24 @@ fn write_container_or_blob(
             let mut previous_key = None;
             while let Some((key, value)) = owner.next_dictionary_item_after(previous_key.as_deref())
             {
-                Json::write_dictionary_item(out, &mut first, &key, &value, depth + 1)?;
+                let selected = value;
+                Json::write_dictionary_key(out, &mut first, &key, depth + 1)?;
+                let value = owner.dictionary_item_for_write(&key).unwrap_or(selected);
+                value.write(out, depth + 1)?;
                 previous_key = Some(key);
             }
             Json::write_dictionary_close(out, first, depth)
         }
-        ContainerOrBlobSnapshot::Array(values) => {
-            if values.is_empty() {
-                return out.write_all(b"[]");
+        ContainerOrBlobSnapshot::Array => {
+            let mut first = true;
+            Json::write_array_open(out, &mut first, depth)?;
+            let values = owner
+                .array_items_snapshot()
+                .expect("array tag was obtained from the same Json handle");
+            for value in &values {
+                Json::write_array_item(out, &mut first, value, depth + 1)?;
             }
-            out.write_all(b"[")?;
-            for (index, value) in values.iter().enumerate() {
-                out.write_all(b"\n")?;
-                write_indent(out, depth + 1)?;
-                value.write(out, depth + 1)?;
-                if index + 1 < values.len() {
-                    out.write_all(b",")?;
-                }
-            }
-            out.write_all(b"\n")?;
-            write_indent(out, depth)?;
-            out.write_all(b"]")
+            Json::write_array_close(out, first, depth)
         }
         ContainerOrBlobSnapshot::Blob(writer) => {
             out.write_all(b"\"")?;
