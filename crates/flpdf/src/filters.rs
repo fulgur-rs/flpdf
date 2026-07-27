@@ -2,7 +2,6 @@
 use crate::ascii85;
 use crate::ascii_hex;
 use crate::run_length;
-use crate::security::standard::{decrypt_cipher_bytes, StringCipher};
 use crate::{Dictionary, Error, Object, Result};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
@@ -129,18 +128,6 @@ pub fn decode_stream_data_with_limits(
         stream_data,
         limits,
     )
-}
-
-// Wired into encrypted document reads by later flpdf-9hc.3 layers.
-#[allow(dead_code)]
-pub(crate) fn decode_stream_data_with_decryption(
-    dict: &Dictionary,
-    stream_data: &[u8],
-    cipher: StringCipher<'_>,
-) -> Result<Vec<u8>> {
-    let mut decrypted = stream_data.to_vec();
-    decrypt_cipher_bytes(&mut decrypted, cipher)?;
-    decode_stream_data(dict, &decrypted)
 }
 
 /// Encode `stream_data` by applying the stream dictionary's `/Filter` chain,
@@ -861,97 +848,11 @@ fn object_debug_repr(object: &Object) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::rc4::Rc4;
-    use crate::security::standard::StringCipher;
-    use aes::{Aes128, Aes256};
-    use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
-    use cbc::Encryptor;
 
     fn flate_dict() -> Dictionary {
         let mut dict = Dictionary::new();
         dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
         dict
-    }
-
-    fn aes128_stream(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
-        let enc = <Encryptor<Aes128> as KeyIvInit>::new(key.into(), iv.into());
-        let mut buf = plaintext.to_vec();
-        let msg_len = buf.len();
-        buf.resize(msg_len + 16, 0);
-        let ciphertext = enc.encrypt_padded_mut::<Pkcs7>(&mut buf, msg_len).unwrap();
-        let mut out = iv.to_vec();
-        out.extend_from_slice(ciphertext);
-        out
-    }
-
-    fn aes256_stream(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
-        let enc = <Encryptor<Aes256> as KeyIvInit>::new(key.into(), iv.into());
-        let mut buf = plaintext.to_vec();
-        let msg_len = buf.len();
-        buf.resize(msg_len + 16, 0);
-        let ciphertext = enc.encrypt_padded_mut::<Pkcs7>(&mut buf, msg_len).unwrap();
-        let mut out = iv.to_vec();
-        out.extend_from_slice(ciphertext);
-        out
-    }
-
-    #[test]
-    fn decode_stream_data_with_decryption_decrypts_before_flate() {
-        let dict = flate_dict();
-        let plaintext = b"stream plaintext after flate";
-        let mut encrypted = encode_stream_data(&dict, plaintext).unwrap();
-        Rc4::new(b"Key").unwrap().process_in_place(&mut encrypted);
-
-        let decoded = decode_stream_data_with_decryption(
-            &dict,
-            &encrypted,
-            StringCipher::Rc4 { key: b"Key" },
-        )
-        .unwrap();
-
-        assert_eq!(decoded, plaintext);
-    }
-
-    #[test]
-    fn decode_stream_data_with_decryption_handles_no_filter_rc4_streams() {
-        let dict = Dictionary::new();
-        let mut encrypted = b"raw encrypted stream".to_vec();
-        Rc4::new(b"Key").unwrap().process_in_place(&mut encrypted);
-
-        let decoded = decode_stream_data_with_decryption(
-            &dict,
-            &encrypted,
-            StringCipher::Rc4 { key: b"Key" },
-        )
-        .unwrap();
-
-        assert_eq!(decoded, b"raw encrypted stream");
-    }
-
-    #[test]
-    fn decode_stream_data_with_decryption_handles_aes_streams() {
-        let dict = Dictionary::new();
-        let aes128_key = [0x11; 16];
-        let aes128_iv = [0x22; 16];
-        let aes128 = aes128_stream(&aes128_key, &aes128_iv, b"AES-128 stream");
-        let decoded = decode_stream_data_with_decryption(
-            &dict,
-            &aes128,
-            StringCipher::Aes128 { key: &aes128_key },
-        )
-        .unwrap();
-        assert_eq!(decoded, b"AES-128 stream");
-
-        let aes256_key = [0x33; 32];
-        let aes256_iv = [0x44; 16];
-        let aes256 = aes256_stream(&aes256_key, &aes256_iv, b"AES-256 stream");
-        let decoded = decode_stream_data_with_decryption(
-            &dict,
-            &aes256,
-            StringCipher::Aes256 { key: &aes256_key },
-        )
-        .unwrap();
-        assert_eq!(decoded, b"AES-256 stream");
     }
 
     #[test]

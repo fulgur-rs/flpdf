@@ -4514,24 +4514,16 @@ mod tests {
         assert_eq!(call_count, 0, "RC4 walker must not consume IVs");
     }
 
-    /// Stream payload round-trip: `encrypt_cipher_bytes`
-    /// also serves stream payloads (single-buffer API; the caller controls
-    /// per-stream IV uniqueness and the `/Metadata` exemption by choosing
-    /// whether to call this at all). Verified for both V=4 ciphers and V=5.
+    /// AES stream payload round-trip through the single-buffer helper retained
+    /// until `Pl_AES_PDF` takes over stream encryption and decryption.
     #[test]
-    fn encrypt_cipher_bytes_round_trips_stream_payloads_for_all_aes_variants() {
+    fn encrypt_cipher_bytes_round_trips_stream_payloads_for_aes_variants() {
         let payload = b"\x78\x9c\x03\x00\x00\x00\x00\x01"; // mock compressed bytes
         let iv = [0x55u8; 16];
 
-        for cipher_kind in ["rc4", "aes128", "aes256"] {
+        for cipher_kind in ["aes128", "aes256"] {
             let mut buf = payload.to_vec();
             match cipher_kind {
-                "rc4" => {
-                    let key = b"rc4-stream-key";
-                    encrypt_cipher_bytes(&mut buf, StringEncryptCipher::Rc4 { key: &key[..] }, &iv)
-                        .unwrap();
-                    decrypt_cipher_bytes(&mut buf, StringCipher::Rc4 { key: &key[..] }).unwrap();
-                }
                 "aes128" => {
                     let key = [0x11u8; 16];
                     encrypt_cipher_bytes(&mut buf, StringEncryptCipher::Aes128 { key: &key }, &iv)

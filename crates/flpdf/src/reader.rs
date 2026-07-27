@@ -9,6 +9,9 @@ use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
 use crate::parser::parse_qpdf_file_object;
+use crate::pipeline::buffer::Buffer;
+use crate::pipeline::rc4::PlRc4;
+use crate::pipeline::Pipeline;
 use crate::security::password::{normalize_password, PasswordMode};
 use crate::security::standard::{
     check_owner_password, check_owner_password_r5, check_owner_password_r6,
@@ -1756,7 +1759,14 @@ fn decrypt_stream_bytes(
                 u32::from(object_ref.generation),
                 ObjectKeyAlg::Rc4,
             );
-            decrypt_cipher_bytes(bytes, StringCipher::Rc4 { key: &key })
+            let mut output = Buffer::new("RC4 stream decryption output", None);
+            {
+                let mut rc4 = PlRc4::new("RC4 stream decryption", &mut output, &key)?;
+                rc4.write(bytes)?;
+                rc4.finish()?;
+            }
+            *bytes = output.take_buffer()?;
+            Ok(())
         }
         EncryptionMode::Aes128 => {
             let key = per_object_key(

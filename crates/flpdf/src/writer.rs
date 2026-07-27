@@ -2814,6 +2814,9 @@ fn encrypt_stream_payload_for_writer(
     stream: &mut crate::Stream,
     ctx: &EncryptionContext,
 ) -> Result<()> {
+    use crate::pipeline::buffer::Buffer;
+    use crate::pipeline::rc4::PlRc4;
+    use crate::pipeline::Pipeline;
     use crate::security::standard::{
         encrypt_cipher_bytes, per_object_key, ObjectKeyAlg, StringEncryptCipher,
     };
@@ -2852,10 +2855,17 @@ fn encrypt_stream_payload_for_writer(
                     encrypt_cipher_bytes(&mut stream.data, cipher, &iv)?;
                 }
                 ObjectKeyAlg::Rc4 => {
-                    let cipher = StringEncryptCipher::Rc4 {
-                        key: per_obj_key.as_slice(),
-                    };
-                    encrypt_cipher_bytes(&mut stream.data, cipher, &iv)?;
+                    let mut output = Buffer::new("rc4 stream encryption output", None);
+                    {
+                        let mut rc4 = PlRc4::new(
+                            "rc4 stream encryption",
+                            &mut output,
+                            per_obj_key.as_slice(),
+                        )?;
+                        rc4.write(&stream.data)?;
+                        rc4.finish()?;
+                    }
+                    stream.data = output.take_buffer()?;
                 }
             }
         }
