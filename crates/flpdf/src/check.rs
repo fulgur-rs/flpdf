@@ -381,7 +381,7 @@ fn check_content_streams<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::filters::encode_stream_data;
-    use crate::{ObjectRef, Severity};
+    use crate::{ObjectRef, Severity, Stream};
     use std::io::Cursor;
 
     #[test]
@@ -1054,6 +1054,31 @@ mod tests {
                 && diagnostic
                     .message
                     .contains("errors while decoding content stream")
+        }));
+    }
+
+    #[test]
+    fn direct_content_stream_warning_names_inline_location() {
+        let mut pdf = Pdf::open(Cursor::new(clean_flate_content_pdf())).unwrap();
+        let mut flate_dict = Dictionary::new();
+        flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let mut page = Dictionary::new();
+        page.insert("Type", Object::Name(b"Page".to_vec()));
+        page.insert(
+            "Contents",
+            Object::Stream(Stream::new(flate_dict, b"\x78".to_vec())),
+        );
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+        let mut diagnostics = Diagnostics::default();
+        check_content_streams(&mut pdf, &mut diagnostics, DecodeLimits::default());
+
+        assert!(diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic.message.contains("inline content stream")
+                && diagnostic
+                    .message
+                    .contains("input stream is complete but output may still be valid")
         }));
     }
 
