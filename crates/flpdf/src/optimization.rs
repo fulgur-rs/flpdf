@@ -84,6 +84,82 @@ impl Optimization {
         self.object_to_users.entry(object).or_default().insert(user);
     }
 
+    pub(crate) fn optimize<R, F>(
+        pdf: &mut Pdf<R>,
+        object_stream_data: &BTreeMap<u32, u32>,
+        allow_changes: bool,
+        skip_stream_parameters: F,
+    ) -> crate::Result<Self>
+    where
+        R: Read + Seek,
+        F: FnMut(&Stream) -> u8,
+    {
+        if let Some(root_ref) = pdf.root_ref() {
+            if let Object::Dictionary(mut root) = pdf.resolve(root_ref)? {
+                if let Some(Object::Dictionary(outlines)) = root.get("Outlines").cloned() {
+                    let outlines_ref = next_object_ref(pdf)?;
+                    pdf.set_object(outlines_ref, Object::Dictionary(outlines));
+                    root.insert("Outlines", Object::Reference(outlines_ref));
+                    pdf.set_object(root_ref, Object::Dictionary(root));
+                }
+            }
+        }
+
+        let prepared = crate::pages::repair::prepare_for_optimization(pdf)?;
+        if let Some(ref prepared) = prepared {
+            inherited_attrs::push_inherited_attributes_to_pages(
+                pdf,
+                prepared,
+                allow_changes,
+                false,
+            )?;
+        }
+        let page_refs = prepared
+            .as_ref()
+            .map(|prepared| prepared.pages.as_slice())
+            .unwrap_or_default();
+        let mut maps = Self::build_after_inherited(pdf, page_refs, skip_stream_parameters)?;
+        maps.filter_compressed_objects(object_stream_data);
+        Ok(maps)
+    }
+
+    pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+    ) -> crate::Result<()> {
+        let Some(prepared) = crate::pages::repair::prepare_for_optimization(pdf)? else {
+            return Ok(());
+        };
+        inherited_attrs::push_inherited_attributes_to_pages(pdf, &prepared, true, false)
+    }
+
+    pub(crate) fn filter_compressed_objects(&mut self, object_stream_data: &BTreeMap<u32, u32>) {
+        if object_stream_data.is_empty() {
+            return;
+        }
+        let mut filtered = Self::default();
+        for (user, objects) in &self.user_to_objects {
+            for &object in objects {
+                let target = object_stream_data
+                    .get(&object.number)
+                    .map(|&stream| ObjectRef::new(stream, 0))
+                    .unwrap_or(object);
+                filtered.record(user.clone(), target);
+            }
+        }
+        *self = filtered;
+    }
+
+    pub(crate) fn users_for_members<'a>(
+        &self,
+        members: impl IntoIterator<Item = &'a ObjectRef>,
+    ) -> BTreeSet<ObjectUser> {
+        let mut users = BTreeSet::new();
+        for member in members {
+            users.extend(self.users_for(*member).iter().cloned());
+        }
+        users
+    }
+
     pub(crate) fn build_after_inherited<R, F>(
         pdf: &mut Pdf<R>,
         page_refs: &[ObjectRef],
@@ -304,11 +380,23 @@ fn empty_object_users() -> &'static BTreeSet<ObjectUser> {
     EMPTY.get_or_init(BTreeSet::new)
 }
 
+fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> crate::Result<ObjectRef> {
+    let number = pdf
+        .object_refs()
+        .into_iter()
+        .map(|object_ref| object_ref.number)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Unsupported("object-number space exhausted".to_owned()))?;
+    Ok(ObjectRef::new(number, 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ObjectUser, Optimization};
     use crate::{Object, ObjectRef, Pdf};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
 
     fn pdf_bytes(bodies: &[(u32, &[u8])], trailer_entries: &[u8]) -> Vec<u8> {
@@ -357,6 +445,85 @@ mod tests {
             nested = Object::Array(vec![nested]);
         }
         nested
+    }
+
+    fn direct_outlines_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        open_pdf(
+            &[
+                (
+                    1,
+                    b"<< /Type /Catalog /Pages 2 0 R /Outlines << /Count 0 >> >>",
+                ),
+                (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (
+                    3,
+                    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+                ),
+            ],
+            b"",
+        )
+    }
+
+    #[test]
+    fn optimize_makes_direct_outlines_indirect_before_building_maps() {
+        let mut pdf = direct_outlines_pdf();
+
+        let maps = Optimization::optimize(&mut pdf, &BTreeMap::new(), true, |_| 1).unwrap();
+
+        assert_eq!(
+            maps.objects_for(&ObjectUser::RootKey(b"Outlines".to_vec()))
+                .len(),
+            1
+        );
+        let catalog = pdf.resolve(pdf.root_ref().unwrap()).unwrap();
+        assert!(matches!(
+            catalog,
+            Object::Dictionary(ref dict)
+                if matches!(dict.get("Outlines"), Some(Object::Reference(_)))
+        ));
+    }
+
+    #[test]
+    fn no_change_optimize_still_indirectizes_outlines_like_qpdf() {
+        let mut pdf = direct_outlines_pdf();
+        let root = pdf.root_ref().unwrap();
+
+        Optimization::optimize(&mut pdf, &BTreeMap::new(), false, |_| 1).unwrap();
+
+        assert!(matches!(
+            pdf.resolve(root).unwrap(),
+            Object::Dictionary(ref dict)
+                if matches!(dict.get("Outlines"), Some(Object::Reference(_)))
+        ));
+    }
+
+    #[test]
+    fn filter_compressed_objects_rekeys_both_maps_to_container() {
+        let member = ObjectRef::new(7, 3);
+        let container = ObjectRef::new(20, 0);
+        let user = ObjectUser::Page(0);
+        let mut maps = Optimization::default();
+        maps.record(user.clone(), member);
+
+        maps.filter_compressed_objects(&BTreeMap::from([(7, 20)]));
+
+        assert!(!maps.users_for(member).contains(&user));
+        assert!(maps.users_for(container).contains(&user));
+        assert!(maps.objects_for(&user).contains(&container));
+    }
+
+    #[test]
+    fn users_for_members_returns_the_union_once() {
+        let mut maps = Optimization::default();
+        let a = ObjectRef::new(3, 0);
+        let b = ObjectRef::new(4, 0);
+        maps.record(ObjectUser::Page(0), a);
+        maps.record(ObjectUser::Thumbnail(1), b);
+
+        assert_eq!(
+            maps.users_for_members([&a, &b]),
+            BTreeSet::from([ObjectUser::Page(0), ObjectUser::Thumbnail(1)])
+        );
     }
 
     #[test]
