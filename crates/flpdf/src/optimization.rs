@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ObjectUser {
+    #[allow(dead_code)]
     Bad,
     Page(u32),
     Thumbnail(u32),
@@ -42,6 +43,36 @@ impl Optimization {
         self.object_to_users
             .iter()
             .map(|(&object, users)| (object, users))
+    }
+
+    pub(crate) fn referenced_pages(&self, object: ObjectRef) -> BTreeSet<u32> {
+        self.users_for(object)
+            .iter()
+            .filter_map(|user| match user {
+                ObjectUser::Page(page_number) => Some(*page_number),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn thumbnail_objects(&self) -> BTreeSet<ObjectRef> {
+        self.user_to_objects
+            .iter()
+            .filter_map(|(user, objects)| match user {
+                ObjectUser::Thumbnail(_) => Some(objects),
+                _ => None,
+            })
+            .flat_map(|objects| objects.iter().copied())
+            .collect()
+    }
+
+    pub(crate) fn objects_for_root_key(&self, key: &[u8]) -> BTreeSet<ObjectRef> {
+        self.objects_for(&ObjectUser::RootKey(key.to_vec())).clone()
+    }
+
+    pub(crate) fn objects_for_trailer_key(&self, key: &[u8]) -> BTreeSet<ObjectRef> {
+        self.objects_for(&ObjectUser::TrailerKey(key.to_vec()))
+            .clone()
     }
 
     fn record(&mut self, user: ObjectUser, object: ObjectRef) {
@@ -394,6 +425,8 @@ mod tests {
             maps.users_for(target),
             &BTreeSet::from([ObjectUser::Thumbnail(0)])
         );
+        assert!(maps.referenced_pages(target).is_empty());
+        assert_eq!(maps.thumbnail_objects(), BTreeSet::from([target]));
         assert!(!maps.objects_for(&ObjectUser::Page(0)).contains(&target));
         assert!(
             !maps
@@ -554,6 +587,10 @@ mod tests {
             &BTreeSet::from([ObjectRef::new(5, 0), ObjectRef::new(6, 0)])
         );
         assert_eq!(
+            maps.objects_for_root_key(b"Outlines"),
+            BTreeSet::from([ObjectRef::new(5, 0), ObjectRef::new(6, 0)])
+        );
+        assert_eq!(
             maps.objects_for(&ObjectUser::RootKey(b"OpenAction".to_vec())),
             &BTreeSet::from([ObjectRef::new(7, 0), ObjectRef::new(8, 0)])
         );
@@ -564,6 +601,10 @@ mod tests {
         assert_eq!(
             maps.objects_for(&ObjectUser::TrailerKey(b"Info".to_vec())),
             &BTreeSet::from([ObjectRef::new(11, 0)])
+        );
+        assert_eq!(
+            maps.objects_for_trailer_key(b"Info"),
+            BTreeSet::from([ObjectRef::new(11, 0)])
         );
         assert_eq!(
             maps.objects_for(&ObjectUser::TrailerKey(b"CustomTrailer".to_vec())),
