@@ -26,7 +26,7 @@ use std::io::{Read, Seek};
 
 use crate::overlay_annotations::DrMap;
 use crate::parser::Parser;
-use crate::tokenizer::{is_delimiter, is_ws, starts_number_token};
+use crate::tokenizer::{is_delimiter, is_ws, starts_number_token, Tokenizer};
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
 
 /// Resource category for a content-stream operator that consumes a resource
@@ -157,7 +157,8 @@ pub(crate) fn resource_replacer(content: &[u8], dr_map: &DrMap) -> Vec<u8> {
             // strings, names, arrays, dictionaries), matching how
             // `crate::content_stream` and `adjust_default_appearance` both
             // reuse it, so name/string escaping is identical everywhere.
-            let mut parser = Parser::new_no_reference(&content[pos..]);
+            let mut tokenizer = Tokenizer::new(&content[pos..]);
+            let mut parser = Parser::with_tokenizer_no_reference(&mut tokenizer);
             match parser.parse_one_object() {
                 Ok(obj) => {
                     let end = pos + parser.position();
@@ -327,7 +328,8 @@ fn ei_lookahead_passes(rest: &[u8]) -> bool {
             || (matches!(byte, b'+' | b'-' | b'.' | b'0'..=b'9')
                 && starts_number_token(&rest[pos..]))
         {
-            let mut parser = Parser::new_no_reference(&rest[pos..]);
+            let mut tokenizer = Tokenizer::new(&rest[pos..]);
+            let mut parser = Parser::with_tokenizer_no_reference(&mut tokenizer);
             match parser.parse_one_object() {
                 Ok(_) => {
                     pos += parser.position();

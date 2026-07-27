@@ -1,40 +1,375 @@
-//! Tokenizer tests for `flpdf::content_stream`.
+//! Callback, operation-adapter, and normalization tests for content streams.
 
-use flpdf::content_stream::{
-    normalize_content_stream, ContentParseOptions, ContentStreamParser, ContentToken,
+use flpdf::content_stream::normalize_content_stream;
+use flpdf::{
+    parse_content_operations, parse_content_stream_data, Error, Object, ParseControl,
+    ParserCallbacks,
 };
-use flpdf::Object;
 
-fn tokens(input: &[u8]) -> Vec<ContentToken> {
-    ContentStreamParser::new(input)
-        .collect::<flpdf::Result<Vec<_>>>()
-        .expect("tokenize")
+#[derive(Default)]
+struct RecordingCallbacks {
+    size: Option<usize>,
+    objects: Vec<(Object, usize, usize)>,
+    diagnostics: Vec<(usize, String)>,
+    eof: bool,
+    stop_after: Option<usize>,
 }
 
-fn tokens_keep_comments(input: &[u8]) -> Vec<ContentToken> {
-    ContentStreamParser::with_options(
-        input,
-        ContentParseOptions {
-            keep_comments: true,
-            ..ContentParseOptions::default()
-        },
-    )
-    .collect::<flpdf::Result<Vec<_>>>()
-    .expect("tokenize")
+impl ParserCallbacks for RecordingCallbacks {
+    fn content_size(&mut self, size: usize) -> flpdf::Result<()> {
+        self.size = Some(size);
+        Ok(())
+    }
+
+    fn handle_object(
+        &mut self,
+        object: Object,
+        offset: usize,
+        length: usize,
+    ) -> flpdf::Result<ParseControl> {
+        self.objects.push((object, offset, length));
+        Ok(if self.stop_after == Some(self.objects.len()) {
+            ParseControl::Stop
+        } else {
+            ParseControl::Continue
+        })
+    }
+
+    fn handle_diagnostic(&mut self, offset: usize, message: &str) -> flpdf::Result<()> {
+        self.diagnostics.push((offset, message.to_string()));
+        Ok(())
+    }
+
+    fn handle_eof(&mut self) -> flpdf::Result<()> {
+        self.eof = true;
+        Ok(())
+    }
 }
 
-fn op(operands: Vec<Object>, operator: &[u8]) -> ContentToken {
-    ContentToken::Op {
-        operands,
-        operator: operator.to_vec(),
+#[derive(Default)]
+struct DefaultContentSizeCallbacks {
+    eof: bool,
+}
+
+impl ParserCallbacks for DefaultContentSizeCallbacks {
+    fn handle_object(
+        &mut self,
+        _object: Object,
+        _offset: usize,
+        _length: usize,
+    ) -> flpdf::Result<ParseControl> {
+        Ok(ParseControl::Continue)
+    }
+
+    fn handle_eof(&mut self) -> flpdf::Result<()> {
+        self.eof = true;
+        Ok(())
     }
 }
 
 #[test]
-fn text_showing_block() {
-    let toks = tokens(b"BT /F1 12 Tf (Hello World) Tj ET");
+fn content_module_has_no_independent_lexer_helpers() {
+    let source = include_str!("../src/content_stream.rs");
+    for forbidden in [
+        "skip_ws_collect_comment",
+        "read_keyword",
+        "at_operand_start",
+        "starts_number_token",
+        "fn parse_inline_image",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "legacy lexical helper remains: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn operation_adapter_groups_objects_without_lexing_bytes() {
+    let mut seen = Vec::new();
+    parse_content_operations(b"1 2 cm q", |operands, operator| {
+        seen.push((operands.to_vec(), operator.to_vec()));
+        Ok(ParseControl::Continue)
+    })
+    .unwrap();
+
     assert_eq!(
-        toks,
+        seen,
+        vec![
+            (vec![Object::Integer(1), Object::Integer(2)], b"cm".to_vec()),
+            (vec![], b"q".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn operation_adapter_recovers_at_parser_token_boundaries() {
+    let mut operators = Vec::new();
+    parse_content_operations(b"1 2 add } 3 4 sub", |_, operator| {
+        operators.push(operator.to_vec());
+        Ok(ParseControl::Continue)
+    })
+    .unwrap();
+
+    assert_eq!(operators, vec![b"add".to_vec(), b"sub".to_vec()]);
+}
+
+#[test]
+fn operation_adapter_preserves_qpdf_recovered_null_operands() {
+    let mut seen = Vec::new();
+    parse_content_operations(b"1 } cm [1 } 2] cm", |operands, operator| {
+        seen.push((operands.to_vec(), operator.to_vec()));
+        Ok(ParseControl::Continue)
+    })
+    .unwrap();
+
+    assert_eq!(
+        seen,
+        vec![
+            (vec![Object::Integer(1), Object::Null], b"cm".to_vec(),),
+            (
+                vec![Object::Array(vec![
+                    Object::Integer(1),
+                    Object::Null,
+                    Object::Integer(2),
+                ])],
+                b"cm".to_vec(),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn callbacks_receive_qpdf_recovery_diagnostics_and_nulls() {
+    let mut callbacks = RecordingCallbacks::default();
+    parse_content_stream_data(b"<< /A } /B 2 >> cm", &mut callbacks).unwrap();
+
+    let mut expected = flpdf::Dictionary::new();
+    expected.insert("A", Object::Null);
+    expected.insert("B", Object::Integer(2));
+    assert_eq!(callbacks.objects[0].0, Object::Dictionary(expected));
+    assert_eq!(
+        callbacks.diagnostics,
+        vec![(6, "treating unexpected brace token as null".to_string())]
+    );
+}
+
+#[test]
+fn operation_adapter_ignores_inline_image_payload_events() {
+    let mut seen = Vec::new();
+    parse_content_operations(b"BI /CS /RGB ID payload EI q", |operands, operator| {
+        seen.push((operands.to_vec(), operator.to_vec()));
+        Ok(ParseControl::Continue)
+    })
+    .unwrap();
+
+    assert_eq!(
+        seen,
+        vec![
+            (vec![], b"BI".to_vec()),
+            (
+                vec![Object::Name(b"CS".to_vec()), Object::Name(b"RGB".to_vec())],
+                b"ID".to_vec()
+            ),
+            (vec![], b"EI".to_vec()),
+            (vec![], b"q".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn default_content_size_callback_is_optional_and_empty_input_reports_eof() {
+    let mut callbacks = DefaultContentSizeCallbacks::default();
+    parse_content_stream_data(b"", &mut callbacks).unwrap();
+    assert!(callbacks.eof);
+}
+
+#[test]
+fn callbacks_receive_qpdf_object_offsets_lengths_and_eof() {
+    let input = b"  1 2 cm\n";
+    let mut callbacks = RecordingCallbacks::default();
+    parse_content_stream_data(input, &mut callbacks).unwrap();
+
+    assert_eq!(callbacks.size, Some(input.len()));
+    assert_eq!(
+        callbacks.objects,
+        vec![
+            (Object::Integer(1), 2, 1),
+            (Object::Integer(2), 4, 1),
+            (Object::Operator(b"cm".to_vec()), 6, 2),
+        ]
+    );
+    assert!(callbacks.eof);
+}
+
+#[test]
+fn callbacks_receive_nested_objects_at_the_probe_start_with_consumed_length() {
+    let input = b"[1] <</K 2>> q";
+    let mut callbacks = RecordingCallbacks::default();
+    parse_content_stream_data(input, &mut callbacks).unwrap();
+
+    let mut dictionary = flpdf::Dictionary::new();
+    dictionary.insert(b"K", Object::Integer(2));
+    assert_eq!(
+        callbacks.objects,
+        vec![
+            (Object::Array(vec![Object::Integer(1)]), 0, 3),
+            (Object::Dictionary(dictionary), 4, 8),
+            (Object::Operator(b"q".to_vec()), 13, 1),
+        ]
+    );
+}
+
+#[test]
+fn early_stop_skips_handle_eof_like_qpdf() {
+    let mut callbacks = RecordingCallbacks {
+        stop_after: Some(1),
+        ..RecordingCallbacks::default()
+    };
+    parse_content_stream_data(b"1 2 cm", &mut callbacks).unwrap();
+
+    assert_eq!(callbacks.objects.len(), 1);
+    assert!(!callbacks.eof);
+}
+
+#[test]
+fn callbacks_report_inline_image_as_a_separate_qpdf_object_event() {
+    let input = b"BI /W 1 /H 1 ID x EI Q";
+    let mut callbacks = RecordingCallbacks::default();
+    parse_content_stream_data(input, &mut callbacks).unwrap();
+
+    assert_eq!(
+        callbacks.objects,
+        vec![
+            (Object::Operator(b"BI".to_vec()), 0, 2),
+            (Object::Name(b"W".to_vec()), 3, 2),
+            (Object::Integer(1), 6, 1),
+            (Object::Name(b"H".to_vec()), 8, 2),
+            (Object::Integer(1), 11, 1),
+            (Object::Operator(b"ID".to_vec()), 13, 2),
+            (Object::InlineImage(b"x ".to_vec()), 16, 2),
+            (Object::Operator(b"EI".to_vec()), 18, 2),
+            (Object::Operator(b"Q".to_vec()), 21, 1),
+        ]
+    );
+    assert!(callbacks.eof);
+}
+
+#[test]
+fn stopping_on_inline_image_skips_ei_and_eof_callbacks() {
+    let mut callbacks = RecordingCallbacks {
+        stop_after: Some(3),
+        ..RecordingCallbacks::default()
+    };
+    parse_content_stream_data(b"BI ID x EI", &mut callbacks).unwrap();
+
+    assert_eq!(
+        callbacks.objects,
+        vec![
+            (Object::Operator(b"BI".to_vec()), 0, 2),
+            (Object::Operator(b"ID".to_vec()), 3, 2),
+            (Object::InlineImage(b"x ".to_vec()), 6, 2),
+        ]
+    );
+    assert!(!callbacks.eof);
+}
+
+#[test]
+fn inline_image_protocol_discards_exactly_one_byte_after_id() {
+    let input = b"BI ID\r\nx EI";
+    let mut callbacks = RecordingCallbacks::default();
+    parse_content_stream_data(input, &mut callbacks).unwrap();
+
+    assert_eq!(
+        callbacks.objects,
+        vec![
+            (Object::Operator(b"BI".to_vec()), 0, 2),
+            (Object::Operator(b"ID".to_vec()), 3, 2),
+            (Object::InlineImage(b"\nx ".to_vec()), 6, 3),
+            (Object::Operator(b"EI".to_vec()), 9, 2),
+        ]
+    );
+}
+
+#[test]
+fn inline_image_protocol_requires_a_byte_after_id() {
+    let mut callbacks = RecordingCallbacks::default();
+    let error = parse_content_stream_data(b"ID", &mut callbacks)
+        .expect_err("ID at EOF must not synthesize a separator");
+
+    let Error::Parse { offset, message } = error else {
+        panic!("expected parse error");
+    };
+    assert_eq!(offset, 2);
+    assert!(message.contains("separator after ID"));
+    assert!(!callbacks.eof);
+}
+
+#[test]
+fn unterminated_inline_image_reports_the_qpdf_diagnostic_at_data_start() {
+    let mut callbacks = RecordingCallbacks::default();
+    let error = parse_content_stream_data(b"ID x", &mut callbacks)
+        .expect_err("inline image without EI must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "parse error at byte 3: EOF found while reading inline image"
+    );
+    assert!(!callbacks.eof);
+}
+
+#[test]
+fn bad_content_token_preserves_its_qpdf_offset_and_message() {
+    let mut callbacks = RecordingCallbacks::default();
+    parse_content_stream_data(b"q <0g>", &mut callbacks)
+        .expect("bad content token is a recoverable qpdf null");
+
+    assert_eq!(
+        callbacks.diagnostics,
+        vec![
+            (2, "invalid character (g) in hexstring".to_string()),
+            (5, "EOF while reading token".to_string()),
+        ]
+    );
+    assert_eq!(
+        callbacks.objects,
+        vec![
+            (Object::Operator(b"q".to_vec()), 0, 1),
+            (Object::Null, 2, 3),
+            (Object::Null, 5, 1),
+        ]
+    );
+    assert!(callbacks.eof);
+}
+
+fn operations(input: &[u8]) -> Vec<(Vec<Object>, Vec<u8>)> {
+    let mut seen = Vec::new();
+    parse_content_operations(input, |operands, operator| {
+        seen.push((operands.to_vec(), operator.to_vec()));
+        Ok(ParseControl::Continue)
+    })
+    .expect("parse content operations");
+    seen
+}
+
+fn content_objects(input: &[u8]) -> Vec<Object> {
+    let mut callbacks = RecordingCallbacks::default();
+    parse_content_stream_data(input, &mut callbacks).expect("parse content objects");
+    callbacks
+        .objects
+        .into_iter()
+        .map(|(object, _, _)| object)
+        .collect()
+}
+
+fn op(operands: Vec<Object>, operator: &[u8]) -> (Vec<Object>, Vec<u8>) {
+    (operands, operator.to_vec())
+}
+
+#[test]
+fn operation_adapter_preserves_text_graphics_and_nested_operands() {
+    assert_eq!(
+        operations(b"BT /F1 12 Tf (Hello World) Tj ET"),
         vec![
             op(vec![], b"BT"),
             op(
@@ -45,60 +380,31 @@ fn text_showing_block() {
             op(vec![], b"ET"),
         ]
     );
+
+    let seen = operations(b"q 1 0 0 1 10.5 20 cm [(A) -120 (B)] TJ /OC << /Type /OCG >> BDC Q");
+    assert_eq!(seen[1].1, b"cm");
+    assert_eq!(seen[1].0[4], Object::Real(10.5));
+    assert!(matches!(&seen[2].0[0], Object::Array(_)));
+    assert!(matches!(&seen[3].0[1], Object::Dictionary(_)));
 }
 
 #[test]
-fn graphics_cm_q_q_rectangle_fill() {
-    let toks = tokens(b"q 1 0 0 1 10.5 20 cm 0 0 100 200 re f Q");
+fn operation_adapter_preserves_keyword_and_quote_operator_boundaries() {
     assert_eq!(
-        toks,
+        operations(b"5 1e3 12abc nullop trueColor falseStart"),
         vec![
-            op(vec![], b"q"),
-            op(
-                vec![
-                    Object::Integer(1),
-                    Object::Integer(0),
-                    Object::Integer(0),
-                    Object::Integer(1),
-                    Object::Real(10.5),
-                    Object::Integer(20),
-                ],
-                b"cm"
-            ),
-            op(
-                vec![
-                    Object::Integer(0),
-                    Object::Integer(0),
-                    Object::Integer(100),
-                    Object::Integer(200),
-                ],
-                b"re"
-            ),
-            op(vec![], b"f"),
-            op(vec![], b"Q"),
+            op(vec![Object::Integer(5)], b"1e3"),
+            op(vec![], b"12abc"),
+            op(vec![], b"nullop"),
+            op(vec![], b"trueColor"),
+            op(vec![], b"falseStart"),
         ]
     );
-}
-
-#[test]
-fn numeric_looking_words_are_operators() {
     assert_eq!(
-        tokens(b"5 1e3 12abc"),
-        vec![op(vec![Object::Integer(5)], b"1e3"), op(vec![], b"12abc"),]
-    );
-}
-
-#[test]
-fn path_with_starred_and_quote_operators() {
-    // W*, f*, single-quote and double-quote operators must tokenize.
-    let toks = tokens(b"10 20 m 30 40 l W* n (line) ' 1 2 (q) \"");
-    assert_eq!(
-        toks,
+        operations(b"10 20 m W* (line) ' 1 2 (q) \""),
         vec![
             op(vec![Object::Integer(10), Object::Integer(20)], b"m"),
-            op(vec![Object::Integer(30), Object::Integer(40)], b"l"),
             op(vec![], b"W*"),
-            op(vec![], b"n"),
             op(vec![Object::String(b"line".to_vec())], b"'"),
             op(
                 vec![
@@ -113,384 +419,55 @@ fn path_with_starred_and_quote_operators() {
 }
 
 #[test]
-fn nested_array_and_dict_operands() {
-    // TJ array operand, and a BDC with a properties dictionary operand.
-    let toks = tokens(b"[(A) -120 (B) [(C) 5] ] TJ /OC << /Type /OCG /Nested [1 [2 3]] >> BDC");
-    assert_eq!(toks.len(), 2);
-    match &toks[0] {
-        ContentToken::Op { operands, operator } => {
-            assert_eq!(operator, b"TJ");
-            assert_eq!(operands.len(), 1);
-            match &operands[0] {
-                Object::Array(items) => {
-                    assert_eq!(items.len(), 4);
-                    assert_eq!(items[0], Object::String(b"A".to_vec()));
-                    assert_eq!(items[1], Object::Integer(-120));
-                    assert!(matches!(&items[3], Object::Array(_)));
-                }
-                other => panic!("expected array operand, got {other:?}"),
-            }
-        }
-        other => panic!("expected TJ op, got {other:?}"),
-    }
-    match &toks[1] {
-        ContentToken::Op { operands, operator } => {
-            assert_eq!(operator, b"BDC");
-            assert_eq!(operands.len(), 2);
-            assert_eq!(operands[0], Object::Name(b"OC".to_vec()));
-            assert!(matches!(&operands[1], Object::Dictionary(_)));
-        }
-        other => panic!("expected BDC op, got {other:?}"),
-    }
-}
-
-#[test]
-fn inline_image_preserves_raw_bytes() {
-    // 6 raw bytes of "image data", including a byte sequence that contains
-    // `EI` inside it to prove the boundary scan is robust.
-    let raw: &[u8] = b"\x01EI\x02\x03\xff";
+fn callback_pipeline_preserves_inline_image_payload_events() {
+    let raw: &[u8] = b"\x01}EI \x02/EI \xff";
     let mut input = Vec::new();
-    input.extend_from_slice(b"q BI /W 2 /H 3 /BPC 8 /CS /RGB ID ");
+    input.extend_from_slice(b"q BI /W 2 /H 1 /BPC 8 /CS /G ID ");
     input.extend_from_slice(raw);
     input.extend_from_slice(b" EI Q");
 
-    let toks = tokens(&input);
-    assert_eq!(toks.len(), 3);
-    assert_eq!(toks[0], op(vec![], b"q"));
-    match &toks[1] {
-        ContentToken::InlineImage { dict, data } => {
-            assert_eq!(data, raw, "inline image data must be byte-identical");
-            assert_eq!(dict.get("W"), Some(&Object::Integer(2)));
-            assert_eq!(dict.get("H"), Some(&Object::Integer(3)));
-            assert_eq!(dict.get("BPC"), Some(&Object::Integer(8)));
-            // Abbreviated /CS name kept as-is, not normalized.
-            assert_eq!(dict.get("CS"), Some(&Object::Name(b"RGB".to_vec())));
-        }
-        other => panic!("expected inline image, got {other:?}"),
-    }
-    assert_eq!(toks[2], op(vec![], b"Q"));
-}
-
-#[test]
-fn inline_image_with_binary_payload_and_crlf() {
-    // ID followed by CRLF separator; data contains NUL and high bytes.
-    let raw: &[u8] = b"\x00\x10\x20\x80\xfe";
-    let mut input = Vec::new();
-    input.extend_from_slice(b"BI /W 1 /H 1 /CS /G /BPC 8 /F /AHx ID\r\n");
-    input.extend_from_slice(raw);
-    input.extend_from_slice(b"\nEI");
-
-    let toks = tokens(&input);
-    assert_eq!(toks.len(), 1);
-    match &toks[0] {
-        ContentToken::InlineImage { dict, data } => {
-            assert_eq!(data, raw);
-            assert_eq!(dict.get("F"), Some(&Object::Name(b"AHx".to_vec())));
-        }
-        other => panic!("expected inline image, got {other:?}"),
-    }
-}
-
-#[test]
-fn inline_image_header_comment_with_keep_comments_does_not_break() {
-    // A comment inside the inline-image header must be consumed (not
-    // emitted, not fatal) even when keep_comments=true.
-    let toks = tokens_keep_comments(b"BI %hdr comment\n/W 1 /H 1 /BPC 8 /CS /G ID x EI");
-    assert_eq!(toks.len(), 1, "inline image must parse with header comment");
-    match &toks[0] {
-        ContentToken::InlineImage { dict, data } => {
-            assert_eq!(data, b"x");
-            assert_eq!(dict.get("W"), Some(&Object::Integer(1)));
-        }
-        other => panic!("expected inline image, got {other:?}"),
-    }
-    // Same input with default options must behave identically.
-    let toks = tokens(b"BI %hdr comment\n/W 1 /H 1 /BPC 8 /CS /G ID x EI");
-    assert_eq!(toks.len(), 1);
-}
-
-#[test]
-fn inline_image_data_with_delimiter_before_ei_not_truncated() {
-    // Image data contains `}EI ` and `/EI ` — a delimiter immediately
-    // before `EI` followed by whitespace. Per ISO 32000-1 §7.8.2 the real
-    // terminating `EI` must be preceded by whitespace, so these embedded
-    // sequences must NOT end the image.
-    let raw: &[u8] = b"\x01}EI \x02/EI \xff";
-    let mut input = Vec::new();
-    input.extend_from_slice(b"BI /W 2 /H 1 /BPC 8 /CS /G ID ");
-    input.extend_from_slice(raw);
-    input.extend_from_slice(b" EI");
-
-    let toks = tokens(&input);
-    assert_eq!(toks.len(), 1, "delimiter+EI inside data must not terminate");
-    match &toks[0] {
-        ContentToken::InlineImage { data, .. } => {
-            assert_eq!(data, raw, "image data must be preserved byte-identical");
-        }
-        other => panic!("expected inline image, got {other:?}"),
-    }
-}
-
-#[test]
-fn keyword_prefixed_operators_are_not_split_as_bool_null_operands() {
-    // Extension/unknown operators sharing a true/false/null prefix must
-    // tokenize as a single operator, not operand + shorter operator.
-    let toks = tokens(b"nullop trueColor falseStart");
+    let objects = content_objects(&input);
+    assert_eq!(objects.first(), Some(&Object::Operator(b"q".to_vec())));
     assert_eq!(
-        toks,
-        vec![
-            op(vec![], b"nullop"),
-            op(vec![], b"trueColor"),
-            op(vec![], b"falseStart"),
-        ]
+        objects
+            .iter()
+            .find_map(Object::as_inline_image)
+            .expect("inline image event"),
+        [raw, b" "].concat()
     );
-    // Genuine keyword operands still parse (token-bounded).
-    let toks = tokens(b"true false null do");
+    assert_eq!(objects.last(), Some(&Object::Operator(b"Q".to_vec())));
+}
+
+#[test]
+fn callback_pipeline_skips_comments_and_preserves_scalar_operands() {
     assert_eq!(
-        toks,
-        vec![op(
-            vec![Object::Boolean(true), Object::Boolean(false), Object::Null,],
-            b"do"
-        )]
-    );
-}
-
-#[test]
-fn operands_before_bi_are_a_parse_error() {
-    // `BI` takes no operands; stray operands before it mean the content
-    // stream is malformed and must not be silently discarded.
-    let mut p = ContentStreamParser::new(b"1 2 BI /W 1 /H 1 ID x EI");
-    match p.next() {
-        Some(Err(_)) => {}
-        other => panic!("expected parse error for operands before BI, got {other:?}"),
-    }
-    // Iterator fuses after an error.
-    assert!(p.next().is_none(), "iterator must fuse after error");
-}
-
-#[test]
-fn default_mode_fuses_on_malformed_token_dropping_later_operators() {
-    // A stray `}` is an unparseable token. In the default (non-recover) mode
-    // the iterator fuses, so the `sub` operator after it is never produced.
-    let ops: Vec<Vec<u8>> = ContentStreamParser::new(b"1 2 add } 3 4 sub")
-        .flatten()
-        .filter_map(|t| match t {
-            ContentToken::Op { operator, .. } => Some(operator),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        ops,
-        vec![b"add".to_vec()],
-        "default mode must fuse after `}}`"
-    );
-}
-
-#[test]
-fn recover_mode_skips_malformed_token_and_continues() {
-    // With recovery enabled, the bad `}` is skipped and scanning continues,
-    // so both operators are produced ("skip malformed, last-wins"). Mirrors
-    // qpdf's allow_bad tokenizer behaviour.
-    let opts = ContentParseOptions {
-        recover_from_errors: true,
-        ..ContentParseOptions::default()
-    };
-    let ops: Vec<Vec<u8>> = ContentStreamParser::with_options(b"1 2 add } 3 4 sub", opts)
-        .flatten()
-        .filter_map(|t| match t {
-            ContentToken::Op { operator, .. } => Some(operator),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(ops, vec![b"add".to_vec(), b"sub".to_vec()]);
-}
-
-#[test]
-fn recover_mode_terminates_on_consecutive_garbage() {
-    // A run of unparseable delimiters must not loop forever: each recovery
-    // advances the cursor by at least one byte. The parser still yields the
-    // trailing valid operator.
-    let opts = ContentParseOptions {
-        recover_from_errors: true,
-        ..ContentParseOptions::default()
-    };
-    let ops: Vec<Vec<u8>> = ContentStreamParser::with_options(b"}}}} )))) q", opts)
-        .flatten()
-        .filter_map(|t| match t {
-            ContentToken::Op { operator, .. } => Some(operator),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(ops, vec![b"q".to_vec()]);
-}
-
-#[test]
-fn inline_image_crlf_before_ei_strips_full_separator() {
-    // `ID` separator is CRLF and the `EI` is also preceded by CRLF. Both
-    // separators must be stripped wholly: a single-byte strip before `EI`
-    // would leave a stray `\r` at the end of `data`, changing the payload.
-    let raw: &[u8] = b"\x00\x10\xff\x7f";
-    let mut input = Vec::new();
-    input.extend_from_slice(b"BI /W 2 /H 1 /BPC 8 /CS /G ID\r\n");
-    input.extend_from_slice(raw);
-    input.extend_from_slice(b"\r\nEI");
-
-    let toks = tokens(&input);
-    assert_eq!(toks.len(), 1);
-    match &toks[0] {
-        ContentToken::InlineImage { data, .. } => {
-            assert_eq!(
-                data, raw,
-                "CRLF before EI must be stripped fully (no trailing \\r)"
-            );
-        }
-        other => panic!("expected inline image, got {other:?}"),
-    }
-}
-
-#[test]
-fn comments_stripped_by_default() {
-    let toks = tokens(b"% header comment\n1 0 0 1 0 0 cm % trailing\nBT ET");
-    assert_eq!(
-        toks,
+        operations(b"% lead\ntrue false null /Foo <48656c6c6f> BDC % tail\nQ"),
         vec![
             op(
                 vec![
-                    Object::Integer(1),
-                    Object::Integer(0),
-                    Object::Integer(0),
-                    Object::Integer(1),
-                    Object::Integer(0),
-                    Object::Integer(0),
+                    Object::Boolean(true),
+                    Object::Boolean(false),
+                    Object::Null,
+                    Object::Name(b"Foo".to_vec()),
+                    Object::String(b"Hello".to_vec()),
                 ],
-                b"cm"
+                b"BDC"
             ),
-            op(vec![], b"BT"),
-            op(vec![], b"ET"),
-        ]
-    );
-}
-
-#[test]
-fn comments_preserved_when_requested() {
-    let toks = tokens_keep_comments(b"% lead\nq % inline\nQ");
-    assert_eq!(
-        toks,
-        vec![
-            ContentToken::Comment(b" lead".to_vec()),
-            op(vec![], b"q"),
-            ContentToken::Comment(b" inline".to_vec()),
             op(vec![], b"Q"),
         ]
     );
-}
-
-#[test]
-fn empty_input_yields_no_tokens() {
-    assert!(tokens(b"").is_empty());
-    assert!(tokens(b"   \n\t  ").is_empty());
-}
-
-#[test]
-fn dangling_operands_is_an_error() {
-    let mut parser = ContentStreamParser::new(b"1 2 3");
-    let last = parser.by_ref().last();
-    assert!(matches!(last, Some(Err(_))));
-    // Iterator fuses after an error.
-    assert!(parser.next().is_none());
-}
-
-#[test]
-fn boolean_and_null_operands() {
-    let toks = tokens(b"true false null /Foo BDC");
-    assert_eq!(
-        toks,
-        vec![op(
-            vec![
-                Object::Boolean(true),
-                Object::Boolean(false),
-                Object::Null,
-                Object::Name(b"Foo".to_vec()),
-            ],
-            b"BDC"
-        )]
-    );
-}
-
-#[test]
-fn hex_string_operand() {
-    let toks = tokens(b"<48656c6c6f> Tj");
-    assert_eq!(
-        toks,
-        vec![op(vec![Object::String(b"Hello".to_vec())], b"Tj")]
-    );
-}
-
-#[test]
-fn realistic_mixed_content_stream() {
-    let stream = b"q
-0 0 0 rg
-BT
-/F1 24 Tf
-1 0 0 1 72 720 Tm
-(qpdf test) Tj
-ET
-0 0 1 RG
-2 w
-72 700 m
-540 700 l
-S
-Q";
-    let toks = tokens(stream);
-    let operators: Vec<&[u8]> = toks
-        .iter()
-        .filter_map(|t| match t {
-            ContentToken::Op { operator, .. } => Some(operator.as_slice()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        operators,
-        vec![
-            b"q".as_slice(),
-            b"rg",
-            b"BT",
-            b"Tf",
-            b"Tm",
-            b"Tj",
-            b"ET",
-            b"RG",
-            b"w",
-            b"m",
-            b"l",
-            b"S",
-            b"Q",
-        ]
-    );
+    assert!(operations(b" \n% only a comment\r\n").is_empty());
 }
 
 // ============================================================
 // normalize_content_stream tests
 // ============================================================
 
-/// Helper: collect operator names from a byte slice via ContentStreamParser.
 fn operator_sequence(input: &[u8]) -> Vec<Vec<u8>> {
-    ContentStreamParser::new(input)
-        .collect::<flpdf::Result<Vec<_>>>()
-        .expect("parse")
+    operations(input)
         .into_iter()
-        .filter_map(|tok| match tok {
-            ContentToken::Op { operator, .. } => Some(operator),
-            _ => None,
-        })
+        .map(|(_, operator)| operator)
         .collect()
-}
-
-/// Helper: collect all tokens (including InlineImage) from a byte slice.
-fn all_tokens(input: &[u8]) -> Vec<ContentToken> {
-    ContentStreamParser::new(input)
-        .collect::<flpdf::Result<Vec<_>>>()
-        .expect("parse")
 }
 
 /// Round-trip property: normalize produces the same operator sequence as the
@@ -539,22 +516,12 @@ fn normalize_one_operator_per_line() {
 fn normalize_operand_values_preserved() {
     let input = b"1 0 0 1 10.5 20.0 cm";
     let out = normalize_content_stream(input).expect("normalize");
-    let toks = all_tokens(&out);
-    assert_eq!(toks.len(), 1);
-    match &toks[0] {
-        ContentToken::Op { operands, operator } => {
-            assert_eq!(operator, b"cm");
-            assert_eq!(operands.len(), 6);
-            assert_eq!(operands[0], Object::Integer(1));
-            assert_eq!(operands[1], Object::Integer(0));
-            assert_eq!(operands[2], Object::Integer(0));
-            assert_eq!(operands[3], Object::Integer(1));
-            // 10.5 is preserved as Real; 20.0 is serialized as "20" which
-            // re-parses as Integer(20) — this is a documented behaviour.
-            assert_eq!(operands[4], Object::Real(10.5));
-        }
-        other => panic!("unexpected token: {other:?}"),
-    }
+    let seen = operations(&out);
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].1, b"cm");
+    assert_eq!(seen[0].0.len(), 6);
+    assert_eq!(seen[0].0[0], Object::Integer(1));
+    assert_eq!(seen[0].0[4], Object::Real(10.5));
 }
 
 /// Nested array operand (TJ) is preserved after round-trip.
@@ -562,24 +529,20 @@ fn normalize_operand_values_preserved() {
 fn normalize_nested_array_operand() {
     let input = b"[(A) -120 (B)] TJ";
     let out = normalize_content_stream(input).expect("normalize");
-    let toks = all_tokens(&out);
-    assert_eq!(toks.len(), 1);
-    match &toks[0] {
-        ContentToken::Op { operands, operator } => {
-            assert_eq!(operator, b"TJ");
-            assert_eq!(operands.len(), 1);
-            match &operands[0] {
-                Object::Array(items) => {
-                    assert_eq!(items.len(), 3);
-                    assert_eq!(items[0], Object::String(b"A".to_vec()));
-                    assert_eq!(items[1], Object::Integer(-120));
-                    assert_eq!(items[2], Object::String(b"B".to_vec()));
-                }
-                other => panic!("expected array operand, got {other:?}"),
-            }
-        }
-        other => panic!("unexpected token: {other:?}"),
-    }
+    let seen = operations(&out);
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].1, b"TJ");
+    let Object::Array(items) = &seen[0].0[0] else {
+        panic!("expected array operand");
+    };
+    assert_eq!(
+        items,
+        &vec![
+            Object::String(b"A".to_vec()),
+            Object::Integer(-120),
+            Object::String(b"B".to_vec())
+        ]
+    );
 }
 
 /// Dictionary operand (BDC) is preserved after round-trip.
@@ -587,22 +550,13 @@ fn normalize_nested_array_operand() {
 fn normalize_dict_operand() {
     let input = b"/OC << /Type /OCG >> BDC";
     let out = normalize_content_stream(input).expect("normalize");
-    let toks = all_tokens(&out);
-    assert_eq!(toks.len(), 1);
-    match &toks[0] {
-        ContentToken::Op { operands, operator } => {
-            assert_eq!(operator, b"BDC");
-            assert_eq!(operands.len(), 2);
-            assert_eq!(operands[0], Object::Name(b"OC".to_vec()));
-            match &operands[1] {
-                Object::Dictionary(d) => {
-                    assert_eq!(d.get("Type"), Some(&Object::Name(b"OCG".to_vec())));
-                }
-                other => panic!("expected dict, got {other:?}"),
-            }
-        }
-        other => panic!("unexpected token: {other:?}"),
-    }
+    let seen = operations(&out);
+    assert_eq!(seen[0].1, b"BDC");
+    assert_eq!(seen[0].0[0], Object::Name(b"OC".to_vec()));
+    let Object::Dictionary(dictionary) = &seen[0].0[1] else {
+        panic!("expected dictionary operand");
+    };
+    assert_eq!(dictionary.get("Type"), Some(&Object::Name(b"OCG".to_vec())));
 }
 
 /// Inline image round-trip: BI/ID/EI structure is preserved; data bytes are
@@ -616,20 +570,20 @@ fn normalize_inline_image_round_trip() {
     input.extend_from_slice(b" EI Q");
 
     let out = normalize_content_stream(&input).expect("normalize");
-    let toks = all_tokens(&out);
-    assert_eq!(toks.len(), 3, "tokens: {toks:?}");
-    assert_eq!(toks[0], op(vec![], b"q"));
-    match &toks[1] {
-        ContentToken::InlineImage { dict, data } => {
-            assert_eq!(data, raw, "inline image data must be byte-identical");
-            assert_eq!(dict.get("W"), Some(&Object::Integer(2)));
-            assert_eq!(dict.get("H"), Some(&Object::Integer(2)));
-            assert_eq!(dict.get("BPC"), Some(&Object::Integer(8)));
-            assert_eq!(dict.get("CS"), Some(&Object::Name(b"RGB".to_vec())));
-        }
-        other => panic!("expected inline image, got {other:?}"),
-    }
-    assert_eq!(toks[2], op(vec![], b"Q"));
+    let mut expected = b"q\nBI\n /BPC 8\n /CS /RGB\n /H 2\n /W 2\nID\n".to_vec();
+    expected.extend_from_slice(raw);
+    expected.extend_from_slice(b"\nEI\nQ\n");
+    assert_eq!(
+        out, expected,
+        "temporary bridge must preserve the established CLI bytes"
+    );
+    assert_eq!(
+        content_objects(&out)
+            .into_iter()
+            .find_map(|object| object.as_inline_image().map(<[u8]>::to_vec))
+            .expect("inline image event"),
+        [raw, b"\n"].concat()
+    );
 }
 
 /// Inline image with binary payload (contains high bytes and EI-like sequence).
@@ -642,13 +596,160 @@ fn normalize_inline_image_binary_payload() {
     input.extend_from_slice(b" EI");
 
     let out = normalize_content_stream(&input).expect("normalize");
-    let toks = all_tokens(&out);
-    assert_eq!(toks.len(), 1);
-    match &toks[0] {
-        ContentToken::InlineImage { data, .. } => {
-            assert_eq!(data, raw, "binary payload must survive normalize");
-        }
-        other => panic!("expected inline image, got {other:?}"),
+    let payload = content_objects(&out)
+        .into_iter()
+        .find_map(|object| object.as_inline_image().map(<[u8]>::to_vec))
+        .expect("inline image event");
+    assert_eq!(payload, [raw, b"\n"].concat());
+}
+
+#[test]
+fn normalize_inline_image_crlf_separators_preserve_existing_cli_bytes() {
+    let input = b"BI /W 1 ID\r\nraw\r\nEI";
+    assert_eq!(
+        normalize_content_stream(input).expect("normalize"),
+        b"BI\n /W 1\nID\nraw\nEI\n"
+    );
+}
+
+#[test]
+fn inline_image_events_preserve_qpdf_payload_boundaries_and_offsets() {
+    for (input, expected_payload, expected_offset, expected_length) in [
+        (
+            b"BI /W 1 ID \nraw EI".as_slice(),
+            b"\nraw ".as_slice(),
+            11,
+            5,
+        ),
+        (
+            b"BI /W 1 ID\r\nraw\r\nEI".as_slice(),
+            b"\nraw\r\n".as_slice(),
+            11,
+            6,
+        ),
+        (
+            b"BI /W 1 ID payload}EI Q".as_slice(),
+            b"payload}".as_slice(),
+            11,
+            8,
+        ),
+        (
+            b"BI /W 1 ID raw\xff EI".as_slice(),
+            b"raw\xff ".as_slice(),
+            11,
+            5,
+        ),
+        (b"BI /W 1 ID  EI".as_slice(), b" ".as_slice(), 11, 1),
+        (
+            b"BI /W 1 ID one EI A1 two EI Q".as_slice(),
+            b"one EI A1 two ".as_slice(),
+            11,
+            14,
+        ),
+    ] {
+        let mut callbacks = RecordingCallbacks::default();
+        parse_content_stream_data(input, &mut callbacks).expect("parse inline image");
+        let event = callbacks
+            .objects
+            .iter()
+            .find(|(object, _, _)| object.as_inline_image().is_some())
+            .expect("inline image event");
+        assert_eq!(
+            event,
+            &(
+                Object::InlineImage(expected_payload.to_vec()),
+                expected_offset,
+                expected_length,
+            ),
+            "input {input:?}"
+        );
+    }
+}
+
+#[test]
+fn normalize_preserves_payload_lf_after_space_separator() {
+    assert_eq!(
+        normalize_content_stream(b"BI /W 1 ID \nraw EI").expect("normalize"),
+        b"BI\n /W 1\nID\n\nraw\nEI\n"
+    );
+}
+
+#[test]
+fn normalize_preserves_non_whitespace_payload_terminal_bytes() {
+    for (input, expected) in [
+        (
+            b"BI /W 1 ID payload}EI Q".as_slice(),
+            b"BI\n /W 1\nID\npayload}\nEI\nQ\n".as_slice(),
+        ),
+        (
+            b"BI /W 1 ID raw\xff EI".as_slice(),
+            b"BI\n /W 1\nID\nraw\xff\nEI\n".as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            normalize_content_stream(input).expect("normalize"),
+            expected,
+            "input {input:?}"
+        );
+    }
+}
+
+#[test]
+fn normalize_strips_only_actual_inline_image_separator_whitespace() {
+    for (input, expected) in [
+        (
+            b"BI /W 1 ID\nraw\nEI".as_slice(),
+            b"BI\n /W 1\nID\nraw\nEI\n".as_slice(),
+        ),
+        (
+            b"BI /W 1 ID\r\nraw\r\nEI".as_slice(),
+            b"BI\n /W 1\nID\nraw\nEI\n".as_slice(),
+        ),
+        (
+            b"BI /W 1 ID  EI".as_slice(),
+            b"BI\n /W 1\nID\n\nEI\n".as_slice(),
+        ),
+        (
+            b"BI /W 1 ID one EI A1 two EI Q".as_slice(),
+            b"BI\n /W 1\nID\none EI A1 two\nEI\nQ\n".as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            normalize_content_stream(input).expect("normalize"),
+            expected,
+            "input {input:?}"
+        );
+    }
+}
+
+#[test]
+fn normalize_rejects_malformed_event_sequences() {
+    for (input, expected) in [
+        (
+            b"1 BI ID x EI".as_slice(),
+            "inline image operator BI cannot have operands",
+        ),
+        (
+            b"BI 1 2 ID x EI".as_slice(),
+            "inline image key is not a name",
+        ),
+        (b"BI /W ID x EI".as_slice(), "inline image key has no value"),
+        (
+            b"BI q".as_slice(),
+            "unexpected operator q in inline image header",
+        ),
+        (b"ID x EI".as_slice(), "inline image found outside BI/ID"),
+        (
+            b"1 2".as_slice(),
+            "content stream ended with dangling operands",
+        ),
+        (b"BI /W 1".as_slice(), "inline image missing ID"),
+    ] {
+        let error = normalize_content_stream(input).expect_err("normalization must fail");
+        assert!(
+            error.to_string().contains(expected),
+            "input {input:?}: expected {expected:?}, got {error}"
+        );
     }
 }
 

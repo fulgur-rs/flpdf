@@ -68,8 +68,8 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
 | `QPDF.cc` | 2667 | `reader.rs`(2454) + `reader/file_object.rs`(650) + `xref.rs`(1129) + `object_copy.rs`(184: `copyForeignObject`) + `cache.rs`(102: xref 由来の `ObjectCache` / `CacheEntry`。消費者は `reader.rs`) + `writer/object_streams.rs`(207-237: `compressible_objgens_qpdf_plan` = `getCompressibleObjGens`、`QPDF.cc:2392-2445`)  + `signatures.rs`(245-: `removeSecurityRestrictions`) + `page_closure.rs`(207: `page_object_closure`。`object_copy.rs` は pre-closed な集合しか受け取らず、両者で `copyForeignObject` 相当を構成する) + `ref_chain.rs`(77: `resolve_ref_chain` / `terminal_ref_of_chain` / `MAX_REF_CHAIN_DEPTH` — 深さ上限付き間接参照解決の共有プリミティブ。20 モジュールが使用) | 🔀 |
-| `QPDFParser.cc` | 519 | `parser.rs`(905) の `Parser<'a>`(101) | 🔀 型は存在し `content_stream.rs` も再利用している。qpdf API との差分は未精査 |
-| `QPDFTokenizer.cc` | 965 | `tokenizer.rs`（normal mode / PR #549）+ `content_stream.rs`(484) に二重実装 | 🔀 → **T1-1**（`flpdf-n9t0.1`） |
+| `QPDFParser.cc` | 519 | `parser.rs` の `Parser`（Object / NoReference / Content mode）。Content mode は EOF → `None`、word → `Object::Operator`、間接参照化の抑止を共有 object grammar 上で実装し、`content_stream.rs` が使用（`QPDFParser.cc:27-125,130-377`） | 🔀 content branch は対応済み。file-object parser 全体の API / recovery 差分は未精査 |
+| `QPDFTokenizer.cc` | 965 | `tokenizer.rs`（18 token types、owned value/raw/error bytes/offset、push/pull、pull-only `allowEOF`、`includeIgnorable`、space/comment、bad-token recovery、max length、`betweenTokens`、unread、inline-image `EI` discovery。`QPDFTokenizer.hh:34-193`; `QPDFTokenizer.cc:45-965`）+ `parser.rs` の content mode + `content_stream.rs` の `ParserCallbacks` orchestration + `object.rs` の `Operator` / `InlineImage`（`QPDFParser.cc:27-125,130-377`; `QPDFObjectHandle.cc:1770-1847`） | ✅ `QPDFTokenizer` の責務境界を移植済み。object/parser/content callback consumers は共有 tokenizer を使用し、旧 content lexer は削除。`Pl_QPDFTokenizer` / `ContentNormalizer` は本行の完了範囲外で `flpdf-qxba.7` に残る |
 | `InputSource` 系 5 ファイル | 625 | `Read + Seek` ジェネリクスで代替 | ⚪ |
 | `QPDF_pages.cc` | 319 | `pages.rs`(741) + `page_tree_rebuild.rs`(390) + `linearization/inherited_attrs.rs`(575: `QPDF_pages.cc:39-138` の `getAllPagesInternal` 修復を移植。`linearization/plan.rs:773` と `linearization/writer.rs:2582` から呼ばれる) | 🔀 |
 | `QPDFExc.cc` / `QPDFSystemError.cc` | 123 | `error.rs`(125) | ✅ |
@@ -125,7 +125,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `Pl_ASCIIHexDecoder` | 96 | `ascii_hex.rs`(85) | ✅ |
 | `Pl_RunLength` | 146 | `run_length.rs`(140) | ✅ |
 | `Pl_AES_PDF` / `Pl_RC4` | 243 | `writer.rs` の `encrypt_stream_payload_for_writer` に埋没 | 🔀 |
-| `Pl_QPDFTokenizer.cc` / `ContentNormalizer.cc` | 141 | `content_stream.rs`(439-475: `normalize_content_stream`) | 🔀 → **T2-1** 独自実装が既に production にあり CLI から使われている（doc に既知のバイト差の記載あり）。T2-1 は「解錠」ではなく**置き換え** |
+| `Pl_QPDFTokenizer.cc` / `ContentNormalizer.cc` | 141 | `content_stream.rs`（共有 tokenizer / `ParserCallbacks` 上の暫定 `NormalizationBridge` と `normalize_content_stream`） | 🔀 → **T2-1**（`flpdf-qxba.7`）。共通 tokenizer 基盤は完成したが、`Pl_QPDFTokenizer` の TokenFilter pipeline、EOF-token → `handleEOF`、`ID` separator 注入、inline-image 切替（`Pl_QPDFTokenizer.cc:13-66`）と、raw-token normalization、bad-token state、CR/string/name normalization（`ContentNormalizer.cc:12-75`）は未移植。既知の byte 差も残るため complete にしない |
 | `QPDFStreamFilter.cc` | 19 | filter 登録機構が無い | ❌ |
 | `Pl_DCT.cc` | 326 | 無し。`json_inspect.rs` の `DecodeLevel::All`(758) が DCT デコードを doc で約束しつつ encoded バイトへフォールバックしている | ❌ 消費者あり |
 | `Pl_Base64` / `Pl_Concatenate` / `Pl_Discard` / `Pl_Function` / `Pl_OStream` / `Pl_StdioFile` / `Pl_String` / `Pl_SHA2` / `Pl_Buffer` | 570 | Rust の `Write` で代替 | ⚪ |

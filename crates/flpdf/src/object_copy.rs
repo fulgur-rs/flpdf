@@ -147,7 +147,9 @@ pub(crate) fn rewrite_refs(
         | Object::Real(_)
         | Object::RealLiteral { .. }
         | Object::Name(_)
-        | Object::String(_) => {}
+        | Object::String(_)
+        | Object::Operator(_)
+        | Object::InlineImage(_) => {}
     }
     Ok(())
 }

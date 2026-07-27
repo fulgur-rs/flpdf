@@ -1,4 +1,6 @@
-use flpdf::{Dictionary, Object, ObjectRef, Stream};
+use flpdf::{
+    json::JsonValue, json_inspect::pdf_object_to_json, Dictionary, Object, ObjectRef, Stream,
+};
 
 #[test]
 fn object_ref_formats_as_pdf_reference() {
@@ -24,6 +26,16 @@ fn object_string_is_hex_encoded_when_non_printable() {
     out.clear();
     Object::String(Vec::new()).write_pdf(&mut out);
     assert_eq!(out, b"()".to_vec());
+}
+
+#[test]
+fn content_only_objects_convert_to_json_null() {
+    for object in [
+        Object::Operator(b"cm".to_vec()),
+        Object::InlineImage(b"\x00EI\xff".to_vec()),
+    ] {
+        assert_eq!(pdf_object_to_json(&object).unwrap(), JsonValue::Null);
+    }
 }
 
 #[test]

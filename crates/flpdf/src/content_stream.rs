@@ -1,400 +1,369 @@
-//! qpdf correspondence: QPDFParser.cc, Pl_QPDFTokenizer.cc, and ContentNormalizer.cc responsibilities; not yet a complete component mirror.
-//! Content-stream tokenizer (ISO 32000-1 §7.8.2).
+//! qpdf correspondence: QPDFParser.cc content callbacks plus transitional Pl_QPDFTokenizer.cc and ContentNormalizer.cc responsibilities; not yet a complete component mirror.
+//! Content-stream object callbacks (ISO 32000-1 §7.8.2).
 //!
 //! A PDF content stream is a sequence of operands followed by an operator,
-//! interleaved with inline images and comments. This module turns the raw
-//! bytes into a stream of [`ContentToken`]s without normalising or
-//! re-serialising anything — it is the shared foundation for the downstream
-//! normalize / coalesce / resource-scan passes.
+//! interleaved with inline images and comments. This module routes the shared
+//! tokenizer and [`crate::parser`] through qpdf-shaped
+//! [`ParserCallbacks`]. It contains orchestration and event accumulation only;
+//! lexical boundaries remain owned by the tokenizer.
 //!
-//! The operand lexer (numbers, strings, names, arrays, dictionaries,
-//! booleans, `null`) is reused verbatim from [`crate::parser`]: content
-//! streams use exactly the same object syntax minus indirect references
-//! (`N G R` never appears in a content stream).
-//!
-//! # Example
-//!
-//! ```
-//! use flpdf::content_stream::{ContentStreamParser, ContentToken};
-//! use flpdf::Object;
-//!
-//! let mut tokens = ContentStreamParser::new(b"1 0 0 1 72 720 cm\nBT /F1 12 Tf ET");
-//! match tokens.next().unwrap().unwrap() {
-//!     ContentToken::Op { operands, operator } => {
-//!         assert_eq!(operator, b"cm");
-//!         assert_eq!(operands.len(), 6);
-//!         assert_eq!(operands[0], Object::Integer(1));
-//!     }
-//!     other => panic!("expected cm op, got {other:?}"),
-//! }
-//! ```
+//! [`parse_content_operations`] provides the common operand/operator adapter
+//! for consumers that do not need inline-image payload events.
 
 use crate::parser::Parser;
-use crate::tokenizer::{is_delimiter, is_ws, starts_number_token};
-use crate::{Dictionary, Error, Object, Result};
+use crate::tokenizer::{is_ws, TokenType, Tokenizer, TokenizerStateError};
+use crate::{Error, Object, Result};
+use std::collections::BTreeMap;
 
-/// One lexical unit of a content stream.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ContentToken {
-    /// An operator and the operands that preceded it.
-    ///
-    /// `operator` is the raw keyword bytes (e.g. `b"cm"`, `b"Tj"`, `b"'"`).
-    Op {
-        operands: Vec<Object>,
-        operator: Vec<u8>,
-    },
-    /// An inline image: `BI` … `ID` … `EI`.
-    ///
-    /// `dict` holds the inline-image parameters with their **abbreviated**
-    /// names preserved (`/W`, `/H`, `/BPC`, `/CS`, …) — they are *not*
-    /// expanded to their long forms. `data` is the raw, untouched payload
-    /// between the single whitespace byte after `ID` and the `EI` keyword.
-    /// The one whitespace byte after `ID` **and** the single whitespace byte
-    /// immediately before `EI` (the separators) are excluded from `data`, so
-    /// a round-tripping consumer must re-insert a separator on each side.
-    InlineImage { dict: Dictionary, data: Vec<u8> },
-    /// A `%` comment up to (not including) the end-of-line.
-    ///
-    /// Only emitted when [`ContentParseOptions::keep_comments`] is `true`.
-    /// The leading `%` is not included in the bytes.
-    Comment(Vec<u8>),
+/// Whether content-stream parsing should continue after an object callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseControl {
+    /// Continue parsing the content stream.
+    Continue,
+    /// Stop immediately without calling [`ParserCallbacks::handle_eof`].
+    Stop,
 }
 
-/// Tokenizer behaviour knobs.
-///
-/// `Default` yields `keep_comments == false` (comments stripped).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ContentParseOptions {
-    /// When `true`, `%` comments are emitted as [`ContentToken::Comment`].
-    /// When `false` (the default) they are skipped silently.
-    pub keep_comments: bool,
-
-    /// When `true`, a malformed token does **not** fuse the iterator: the
-    /// parser skips one byte past the offending position and resumes, so later
-    /// well-formed operators are still produced ("skip malformed, last-wins").
-    /// Operands accumulated before the bad token are preserved.
-    ///
-    /// When `false` (the default) the iterator fuses on the first error, which
-    /// is the safe choice for general content-stream consumers where a bad
-    /// token leaves the operand stack in an unreliable state. Recovery is
-    /// intended for tolerant scanners such as the `/DA` parser, mirroring
-    /// qpdf's `allow_bad` tokenizer behaviour.
-    ///
-    /// Forward progress is guaranteed: each recovered error advances the cursor
-    /// by at least one byte, so the iterator always terminates.
-    pub recover_from_errors: bool,
-}
-
-/// Streaming content-stream tokenizer.
-///
-/// Implements [`Iterator`] yielding `Result<ContentToken>`. Iteration stops
-/// (returns `None`) at end of input; a malformed token yields `Some(Err(_))`
-/// and, unless [`ContentParseOptions::recover_from_errors`] is set, the
-/// iterator then terminates. With recovery enabled the error is still yielded
-/// but the iterator skips past the offending byte and continues.
-pub struct ContentStreamParser<'a> {
-    input: &'a [u8],
-    pos: usize,
-    options: ContentParseOptions,
-    /// Operands accumulated since the last operator/image/comment.
-    operands: Vec<Object>,
-    /// Set once an error has been produced so the iterator fuses.
-    done: bool,
-}
-
-impl<'a> ContentStreamParser<'a> {
-    /// Create a tokenizer over `input` with default options
-    /// (comments stripped).
-    pub fn new(input: &'a [u8]) -> Self {
-        Self::with_options(input, ContentParseOptions::default())
+/// Receives qpdf-shaped content-stream object events.
+pub trait ParserCallbacks {
+    /// Receive the full content byte length before the first object.
+    fn content_size(&mut self, _size: usize) -> Result<()> {
+        Ok(())
     }
 
-    /// Create a tokenizer over `input` with explicit options.
-    pub fn with_options(input: &'a [u8], opts: ContentParseOptions) -> Self {
+    /// Receive one parsed object and its non-ignorable start and consumed
+    /// byte length.
+    fn handle_object(
+        &mut self,
+        object: Object,
+        offset: usize,
+        length: usize,
+    ) -> Result<ParseControl>;
+
+    /// Receive a non-fatal qpdf parser recovery diagnostic.
+    fn handle_diagnostic(&mut self, _offset: usize, _message: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Receive normal content EOF.
+    fn handle_eof(&mut self) -> Result<()>;
+}
+
+/// Parse raw content-stream bytes and deliver qpdf-shaped object callbacks.
+///
+/// The callback offset begins at the next non-ignorable token. Its length is
+/// the distance consumed by the shared tokenizer/parser cursor.
+///
+/// # Errors
+///
+/// Returns [`Error::Parse`] for malformed content objects, a missing byte
+/// after `ID`, an unterminated inline image, or invalid tokenizer state.
+/// Callback errors are propagated unchanged.
+pub fn parse_content_stream_data(input: &[u8], callbacks: &mut impl ParserCallbacks) -> Result<()> {
+    parse_content_stream_data_impl(input, callbacks)
+}
+
+fn parse_content_stream_data_impl(
+    input: &[u8],
+    callbacks: &mut impl ParserCallbacks,
+) -> Result<()> {
+    callbacks.content_size(input.len())?;
+
+    let mut tokenizer = Tokenizer::new(input);
+    tokenizer.allow_eof();
+
+    while tokenizer.position() < input.len() {
+        // qpdf probes and rewinds so callbacks exclude leading whitespace and
+        // comments while parser and orchestrator retain one shared cursor.
+        // libqpdf/QPDFObjectHandle.cc:1805-1817.
+        let probe = tokenizer.read_token(true, 0)?;
+        let offset = probe.start;
+        tokenizer.set_position(offset)?;
+
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+        let object = match parser.parse_content_object()? {
+            Some(object) => object,
+            None => break,
+        };
+        let length = parser.position() - offset;
+        for diagnostic in parser.take_diagnostics() {
+            callbacks.handle_diagnostic(diagnostic.relative_offset, &diagnostic.message)?;
+        }
+        let is_id = object.as_operator() == Some(b"ID");
+
+        if callbacks.handle_object(object, offset, length)? == ParseControl::Stop {
+            return Ok(());
+        }
+
+        if is_id {
+            // qpdf discards exactly one byte after ID, asks the same tokenizer
+            // to scan to EI, and leaves EI for the normal parser.
+            // libqpdf/QPDFObjectHandle.cc:1820-1843.
+            tokenizer.consume_one_byte()?;
+            let inline_offset = tokenizer.position();
+            tokenizer.expect_inline_image().map_err(|error| {
+                // cov:ignore-start: consume_one_byte resets the shared tokenizer, so this
+                // state error is unreachable through parse_content_stream_data.
+                let message = match error {
+                    TokenizerStateError::TokenWaiting => "tokenizer already has a token waiting",
+                    TokenizerStateError::ImproperInlineImageState => {
+                        "tokenizer is in an improper inline image state"
+                    }
+                };
+                Error::parse(inline_offset, message)
+            })?;
+            // cov:ignore-end
+            let image = tokenizer.read_token(true, 0)?;
+            if image.token_type == TokenType::Bad {
+                return Err(Error::parse(
+                    image.error_offset,
+                    "EOF found while reading inline image",
+                ));
+            }
+            let image_offset = image.start;
+            let image_length = image.end - image.start;
+            if callbacks.handle_object(
+                Object::InlineImage(image.value),
+                image_offset,
+                image_length,
+            )? == ParseControl::Stop
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    callbacks.handle_eof()
+}
+
+/// Accumulates content objects until an operator event is received.
+///
+/// This adapter deliberately sees only parser events. Lexical boundaries and
+/// inline-image discovery remain owned by [`parse_content_stream_data`].
+pub(crate) struct OperationCallbacks<F> {
+    operands: Vec<Object>,
+    on_operation: F,
+}
+
+impl<F> ParserCallbacks for OperationCallbacks<F>
+where
+    F: FnMut(&[Object], &[u8]) -> Result<ParseControl>,
+{
+    fn handle_object(
+        &mut self,
+        object: Object,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<ParseControl> {
+        match object {
+            Object::Operator(operator) => {
+                let control = (self.on_operation)(&self.operands, &operator)?;
+                self.operands.clear();
+                Ok(control)
+            }
+            Object::InlineImage(_) => Ok(ParseControl::Continue),
+            operand => {
+                self.operands.push(operand);
+                Ok(ParseControl::Continue)
+            }
+        }
+    }
+
+    fn handle_eof(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Parse content and invoke `on_operation` with each operator's accumulated
+/// operands.
+///
+/// Inline-image payload events are ignored by this convenience adapter.
+/// Consumers that need inline-image headers or payloads should implement
+/// [`ParserCallbacks`] directly.
+///
+/// # Errors
+///
+/// Recoverable object-token errors are skipped at parser-owned boundaries.
+/// Inline-image/tokenizer state errors and callback errors are propagated.
+pub fn parse_content_operations<F>(input: &[u8], on_operation: F) -> Result<()>
+where
+    F: FnMut(&[Object], &[u8]) -> Result<ParseControl>,
+{
+    let mut callbacks = OperationCallbacks {
+        operands: Vec::new(),
+        on_operation,
+    };
+    parse_content_stream_data_impl(input, &mut callbacks)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NormalizationState {
+    Operations,
+    InlineHeader,
+    InlineData,
+}
+
+/// Temporary adapter that preserves flpdf's established normalization bytes.
+///
+/// This adapter deliberately consumes parsed objects only. The shared
+/// tokenizer owns comments, token boundaries, and inline-image discovery.
+/// `flpdf-qxba.7` replaces this one-operator-per-line policy with qpdf's
+/// token-preserving `ContentNormalizer`.
+struct NormalizationBridge<'a> {
+    input: &'a [u8],
+    output: Vec<u8>,
+    operands: Vec<Object>,
+    inline_header: Vec<Object>,
+    state: NormalizationState,
+    end_offset: usize,
+}
+
+impl<'a> NormalizationBridge<'a> {
+    fn new(input: &'a [u8]) -> Self {
         Self {
             input,
-            pos: 0,
-            options: opts,
+            output: Vec::with_capacity(input.len()),
             operands: Vec::new(),
-            done: false,
+            inline_header: Vec::new(),
+            state: NormalizationState::Operations,
+            end_offset: 0,
         }
     }
 
-    fn peek(&self) -> Option<u8> {
-        self.input.get(self.pos).copied()
-    }
-
-    fn peek_at(&self, offset: usize) -> Option<u8> {
-        self.input.get(self.pos + offset).copied()
-    }
-
-    /// Skip whitespace. If `keep_comments` is false, also skip `%` comments.
-    /// Returns `Some(comment_bytes)` when a comment was encountered and
-    /// `keep_comments` is true (caller should emit it).
-    fn skip_ws_collect_comment(&mut self) -> Option<Vec<u8>> {
-        loop {
-            while matches!(self.peek(), Some(byte) if is_ws(byte)) {
-                self.pos += 1;
+    fn write_operation(&mut self, operator: &[u8]) {
+        for (index, operand) in self.operands.iter().enumerate() {
+            if index > 0 {
+                self.output.push(b' ');
             }
-            if self.peek() == Some(b'%') {
-                let start = self.pos + 1;
-                while !matches!(self.peek(), None | Some(b'\n' | b'\r')) {
-                    self.pos += 1;
-                }
-                if self.options.keep_comments {
-                    return Some(self.input[start..self.pos].to_vec());
-                }
-                // Skipped: keep looping (there may be more ws/comments).
-                continue;
-            }
-            return None;
+            operand.write_pdf(&mut self.output);
         }
-    }
-
-    /// Read the next bare keyword (operator) token: bytes up to the next
-    /// whitespace or delimiter. Caller has already verified the current byte
-    /// does not start an operand.
-    fn read_keyword(&mut self) -> Vec<u8> {
-        let start = self.pos;
-        while let Some(byte) = self.peek() {
-            if is_ws(byte) || is_delimiter(byte) {
-                break;
-            }
-            self.pos += 1;
+        if !self.operands.is_empty() {
+            self.output.push(b' ');
         }
-        self.input[start..self.pos].to_vec()
+        self.output.extend_from_slice(operator);
+        self.output.push(b'\n');
+        self.operands.clear();
     }
 
-    /// Does the byte at the current position begin a PDF operand
-    /// (number, string, name, array, dict, or `true`/`false`/`null`)?
-    fn at_operand_start(&self) -> bool {
-        match self.peek() {
-            None => false,
-            Some(byte) => match byte {
-                b'/' | b'(' | b'[' => true,
-                b'<' => true, // hex string or `<<` dictionary
-                b'+' | b'-' | b'.' | b'0'..=b'9' => starts_number_token(&self.input[self.pos..]),
-                b't' => self.keyword_operand(b"true"),
-                b'f' => self.keyword_operand(b"false"),
-                b'n' => self.keyword_operand(b"null"),
-                _ => false,
-            },
+    fn write_inline_header(&mut self, offset: usize) -> Result<()> {
+        let mut entries = BTreeMap::new();
+        let mut header = std::mem::take(&mut self.inline_header).into_iter();
+        while let Some(key) = header.next() {
+            let Object::Name(key) = key else {
+                return Err(Error::parse(offset, "inline image key is not a name"));
+            };
+            let Some(value) = header.next() else {
+                return Err(Error::parse(offset, "inline image key has no value"));
+            };
+            entries.insert(key, value);
         }
+
+        self.output.extend_from_slice(b"BI\n");
+        for (key, value) in entries {
+            self.output.push(b' ');
+            Object::Name(key).write_pdf(&mut self.output);
+            self.output.push(b' ');
+            value.write_pdf(&mut self.output);
+            self.output.push(b'\n');
+        }
+        self.output.extend_from_slice(b"ID\n");
+        Ok(())
     }
 
-    /// Is the input at `pos` exactly the keyword `kw` followed by a token
-    /// boundary (EOF, whitespace, or a delimiter)? Without the boundary
-    /// check an extension operator like `nullop` or `trueColor` would be
-    /// mis-split into a `null`/`true` operand plus a shorter operator.
-    fn keyword_operand(&self, kw: &[u8]) -> bool {
-        let rest = &self.input[self.pos..];
-        rest.starts_with(kw)
-            && match rest.get(kw.len()) {
-                None => true,
-                Some(b) => is_ws(*b) || is_delimiter(*b),
-            }
+    fn finish(self) -> Vec<u8> {
+        self.output
     }
+}
 
-    /// Parse a single operand using the shared object lexer.
-    fn parse_operand(&mut self) -> Result<Object> {
-        let mut parser = Parser::new_no_reference(&self.input[self.pos..]);
-        let obj = parser.parse_one_object()?;
-        self.pos += parser.position();
-        Ok(obj)
-    }
-
-    /// Parse the inline-image dictionary (bare `/Key value` pairs) up to the
-    /// Consume whitespace and `%` comments unconditionally, never emitting
-    /// a comment. Used in contexts (inline-image header) where a comment is
-    /// not a standalone token: with `keep_comments == true`,
-    /// [`Self::skip_ws_collect_comment`] returns at the comment's line end
-    /// without consuming the newline, so a single call would leave the
-    /// parser stuck on whitespace. Looping drains every comment/whitespace
-    /// run regardless of the option.
-    fn skip_ws_and_comments(&mut self) {
-        while self.skip_ws_collect_comment().is_some() {}
-    }
-
-    /// `ID` keyword, then collect raw data up to the `EI` keyword.
-    fn parse_inline_image(&mut self) -> Result<ContentToken> {
-        let mut dict = Dictionary::new();
-        loop {
-            self.skip_ws_and_comments();
-            match self.peek() {
-                None => {
-                    return Err(Error::parse(self.pos, "inline image missing ID"));
-                }
-                Some(b'/') => {
-                    // Key
-                    let mut parser = Parser::new_no_reference(&self.input[self.pos..]);
-                    let key = match parser.parse_one_object()? {
-                        Object::Name(name) => name,
-                        _ => return Err(Error::parse(self.pos, "inline image key is not a name")),
-                    };
-                    self.pos += parser.position();
-                    // Value
-                    self.skip_ws_and_comments();
-                    let value = self.parse_operand()?;
-                    dict.insert(key, value);
-                }
-                Some(_) => {
-                    // Expect the `ID` keyword.
-                    let kw = self.read_keyword();
-                    if kw == b"ID" {
-                        break;
+impl ParserCallbacks for NormalizationBridge<'_> {
+    fn handle_object(
+        &mut self,
+        object: Object,
+        offset: usize,
+        length: usize,
+    ) -> Result<ParseControl> {
+        self.end_offset = offset + length;
+        match self.state {
+            NormalizationState::Operations => match object {
+                Object::Operator(operator) if operator == b"BI" => {
+                    if !self.operands.is_empty() {
+                        return Err(Error::parse(
+                            offset,
+                            "inline image operator BI cannot have operands",
+                        ));
                     }
+                    self.state = NormalizationState::InlineHeader;
+                }
+                Object::Operator(operator) => self.write_operation(&operator),
+                Object::InlineImage(_) => {
+                    return Err(Error::parse(offset, "inline image found outside BI/ID"));
+                }
+                operand => self.operands.push(operand),
+            },
+            NormalizationState::InlineHeader => match object {
+                Object::Operator(operator) if operator == b"ID" => {
+                    self.write_inline_header(offset)?;
+                    self.state = NormalizationState::InlineData;
+                }
+                Object::Operator(operator) => {
                     return Err(Error::parse(
-                        self.pos,
+                        offset,
                         format!(
-                            "unexpected token {:?} in inline image header",
-                            String::from_utf8_lossy(&kw)
+                            "unexpected operator {} in inline image header",
+                            String::from_utf8_lossy(&operator)
                         ),
                     ));
                 }
+                operand => self.inline_header.push(operand),
+            },
+            NormalizationState::InlineData => {
+                let Object::InlineImage(data) = object else {
+                    unreachable!("InlineImage must follow ID"); // cov:ignore: orchestrator guarantees the next event
+                };
+
+                // qpdf consumes exactly one already-classified separator byte
+                // after ID. Preserve a payload-leading LF after a consumed
+                // space, but finish consuming the CRLF pair used as the old
+                // normalizer's single separator. This is an O(1) lookup at the
+                // callback boundary, not an inline-image scan.
+                let consumed_separator = offset
+                    .checked_sub(1)
+                    .and_then(|index| self.input.get(index));
+                let data_start =
+                    usize::from(consumed_separator == Some(&b'\r') && data.first() == Some(&b'\n'));
+
+                // The qpdf InlineImage event includes any whitespace
+                // immediately before EI. Exclude only a canonical PDF
+                // whitespace separator; a delimiter or binary byte is data.
+                let data_end = if data.ends_with(b"\r\n") {
+                    data.len() - 2
+                } else if data.last().is_some_and(|byte| is_ws(*byte)) {
+                    data.len() - 1
+                } else {
+                    data.len()
+                };
+                self.output
+                    .extend_from_slice(&data[data_start.min(data_end)..data_end]);
+                self.output.push(b'\n');
+                // The tokenizer leaves EI for the next ordinary operator event.
+                self.state = NormalizationState::Operations;
             }
         }
-
-        // Skip exactly one whitespace byte after `ID`. Per ISO 32000-1
-        // §7.8.2 the data begins after a single whitespace character; we
-        // treat a `\r\n` pair as one separator (matching qpdf), otherwise a
-        // bare `\n` data byte would be lost.
-        match self.peek() {
-            Some(b'\r') if self.peek_at(1) == Some(b'\n') => self.pos += 2,
-            Some(byte) if is_ws(byte) => self.pos += 1,
-            _ => {}
-        }
-
-        let data_start = self.pos;
-        // Scan for `EI` bounded by whitespace/delimiter/EOF on both sides.
-        // A naive search for "EI" is wrong: image bytes can contain "EI".
-        loop {
-            match self.peek() {
-                None => {
-                    return Err(Error::parse(self.pos, "inline image missing EI"));
-                }
-                Some(b'E') if self.peek_at(1) == Some(b'I') => {
-                    // Per ISO 32000-1 §7.8.2 the terminating `EI` must be
-                    // preceded by whitespace. Accepting a delimiter here
-                    // would false-match binary image data containing byte
-                    // sequences like `>EI ` and truncate the image.
-                    let prev_ok = self.pos == data_start
-                        || self.input.get(self.pos - 1).is_some_and(|b| is_ws(*b));
-                    let after = self.peek_at(2);
-                    let after_ok = after.is_none_or(|b| is_ws(b) || is_delimiter(b));
-                    if prev_ok && after_ok {
-                        // Data excludes the whitespace separator that
-                        // precedes `EI`. This must mirror the post-`ID`
-                        // separator handling: a `\r\n` pair is one
-                        // separator (strip 2 bytes), otherwise a single
-                        // whitespace byte (strip 1). Stripping only one
-                        // byte off a `\r\n` terminator would leave a
-                        // stray `\r` in `data` and change the payload on
-                        // re-serialization.
-                        let mut data_end = self.pos;
-                        if data_end >= data_start + 2
-                            && self.input.get(data_end - 2) == Some(&b'\r')
-                            && self.input.get(data_end - 1) == Some(&b'\n')
-                        {
-                            data_end -= 2;
-                        } else if data_end > data_start
-                            && self.input.get(data_end - 1).is_some_and(|b| is_ws(*b))
-                        {
-                            data_end -= 1;
-                        }
-                        let data = self.input[data_start..data_end].to_vec();
-                        self.pos += 2; // consume `EI`
-                        return Ok(ContentToken::InlineImage { dict, data });
-                    }
-                    self.pos += 1;
-                }
-                Some(_) => self.pos += 1,
-            }
-        }
+        Ok(ParseControl::Continue)
     }
 
-    /// Produce the next token, or `None` at end of input.
-    fn next_token(&mut self) -> Option<Result<ContentToken>> {
-        loop {
-            if let Some(comment) = self.skip_ws_collect_comment() {
-                return Some(Ok(ContentToken::Comment(comment)));
-            }
-            if self.peek().is_none() {
-                if self.operands.is_empty() {
-                    return None;
-                }
-                // Trailing operands with no operator: malformed stream.
-                return Some(Err(Error::parse(
-                    self.pos,
-                    "content stream ended with dangling operands",
-                )));
-            }
-
-            if self.at_operand_start() {
-                match self.parse_operand() {
-                    Ok(obj) => {
-                        self.operands.push(obj);
-                        continue;
-                    }
-                    Err(err) => return Some(Err(err)),
-                }
-            }
-
-            // Otherwise it is an operator keyword.
-            let keyword = self.read_keyword();
-            if keyword.is_empty() {
-                // A lone delimiter that did not start an operand (e.g. a
-                // stray `}`); cannot make progress.
-                return Some(Err(Error::parse(
-                    self.pos,
-                    "unexpected delimiter in content stream",
-                )));
-            }
-
-            if keyword == b"BI" {
-                // An inline image takes no operands. Operands sitting in
-                // the buffer before `BI` mean the stream is malformed;
-                // surface that rather than silently discarding them.
-                if !self.operands.is_empty() {
-                    return Some(Err(Error::parse(
-                        self.pos,
-                        "inline image operator BI cannot have operands",
-                    )));
-                }
-                return Some(self.parse_inline_image());
-            }
-
-            let operands = std::mem::take(&mut self.operands);
-            return Some(Ok(ContentToken::Op {
-                operands,
-                operator: keyword,
-            }));
+    fn handle_eof(&mut self) -> Result<()> {
+        match self.state {
+            NormalizationState::Operations if self.operands.is_empty() => Ok(()),
+            NormalizationState::Operations => Err(Error::parse(
+                self.end_offset,
+                "content stream ended with dangling operands",
+            )),
+            NormalizationState::InlineHeader | NormalizationState::InlineData => Err(Error::parse(
+                self.end_offset,
+                "inline image missing ID or payload",
+            )),
         }
-    }
-}
-
-impl<'a> Iterator for ContentStreamParser<'a> {
-    type Item = Result<ContentToken>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        let item = self.next_token();
-        match item {
-            Some(Err(_)) if self.options.recover_from_errors && self.pos < self.input.len() => {
-                // Best-effort recovery: skip one byte past the offending
-                // position so the next call makes progress, and do NOT fuse.
-                // Operands accumulated before the bad token are kept so a
-                // following operator still sees them. `pos` strictly increases
-                // each error, guaranteeing termination.
-                self.pos += 1;
-            }
-            Some(Err(_)) | None => {
-                self.done = true;
-            }
-            Some(Ok(_)) => {}
-        }
-        item
     }
 }
 
@@ -436,51 +405,10 @@ impl<'a> Iterator for ContentStreamParser<'a> {
 ///
 /// # Errors
 ///
-/// Returns an error if `input` is not a well-formed content stream
-/// (propagated from [`ContentStreamParser`]).
+/// Returns an error if `input` is not a well-formed content stream or callback
+/// event sequence.
 pub fn normalize_content_stream(input: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len());
-    for token in ContentStreamParser::new(input) {
-        match token? {
-            ContentToken::Op { operands, operator } => {
-                // Emit all operands space-separated, then the operator, then newline.
-                for (i, operand) in operands.iter().enumerate() {
-                    if i > 0 {
-                        out.push(b' ');
-                    }
-                    operand.write_pdf(&mut out);
-                }
-                if !operands.is_empty() {
-                    out.push(b' ');
-                }
-                out.extend_from_slice(&operator);
-                out.push(b'\n');
-            }
-            ContentToken::InlineImage { dict, data } => {
-                // BI header
-                out.extend_from_slice(b"BI\n");
-                for (key, value) in dict.iter() {
-                    out.extend_from_slice(b" /");
-                    out.extend_from_slice(key);
-                    out.push(b' ');
-                    value.write_pdf(&mut out);
-                    out.push(b'\n');
-                }
-                // ID separator (one \n counts as the required whitespace byte
-                // per ISO 32000-1 §7.8.2; the parser strips exactly one ws byte
-                // after ID and one before EI, so we must re-insert one on each side)
-                out.extend_from_slice(b"ID\n");
-                out.extend_from_slice(&data);
-                // EI separator then EI keyword
-                out.push(b'\n');
-                out.extend_from_slice(b"EI\n");
-            }
-            ContentToken::Comment(_) => {
-                // Comments are always stripped by normalize; the parser is
-                // constructed with keep_comments=false (the default), so this
-                // branch is unreachable in practice.
-            }
-        }
-    }
-    Ok(out)
+    let mut callbacks = NormalizationBridge::new(input);
+    parse_content_stream_data(input, &mut callbacks)?;
+    Ok(callbacks.finish())
 }

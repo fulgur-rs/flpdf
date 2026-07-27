@@ -55,7 +55,8 @@ pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)>
 /// Object-stream members use this mode without any `endobj` check because an
 /// ObjStm body contains only adjacent direct-object representations.
 pub(crate) fn parse_qpdf_file_object(input: &[u8]) -> Result<(Object, Vec<ParserDiagnostic>)> {
-    let mut parser = Parser::new(input);
+    let mut tokenizer = Tokenizer::new(input);
+    let mut parser = Parser::with_tokenizer(&mut tokenizer);
     parser.top_level_no_reference = true;
     let object = parser.object()?;
     Ok((object, parser.diagnostics))
@@ -76,10 +77,11 @@ pub(crate) struct ParserDiagnostic {
 }
 
 pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObject> {
-    let mut parser = Parser::new(input);
+    let mut tokenizer = Tokenizer::new(input);
+    let mut parser = Parser::with_tokenizer(&mut tokenizer);
     parser.top_level_no_reference = true;
-    let token = parser.peek_token();
-    if token.token_type == TokenType::Word && token.value.as_ref() == b"endobj" {
+    let token = parser.peek_token()?;
+    if token.is_word_value(b"endobj") {
         let empty_offset = token.start;
         return Ok(ParsedDirectObject {
             object: Object::Null,
@@ -100,7 +102,8 @@ pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObjec
 }
 
 pub(crate) fn parse_strict_direct_object(input: &[u8]) -> Result<ParsedDirectObject> {
-    let mut parser = Parser::new(input);
+    let mut tokenizer = Tokenizer::new(input);
+    let mut parser = Parser::with_tokenizer(&mut tokenizer);
     let object = parser.object()?;
     parser.skip_ignorable()?;
     Ok(ParsedDirectObject {
@@ -111,14 +114,10 @@ pub(crate) fn parse_strict_direct_object(input: &[u8]) -> Result<ParsedDirectObj
     })
 }
 
-pub(crate) struct Parser<'a> {
-    tokenizer: Tokenizer<'a>,
-    buffered: VecDeque<Token<'a>>,
-    /// When `true`, `N G R` is *not* recognised as an indirect reference;
-    /// the first integer is returned and `G R` are left unconsumed. Content
-    /// streams never contain indirect references, so the tokenizer sets this
-    /// to avoid mis-parsing operands like `0 0 1 R` (rg/RG colour ops).
-    no_reference: bool,
+pub(crate) struct Parser<'tokenizer, 'input> {
+    tokenizer: &'tokenizer mut Tokenizer<'input>,
+    buffered: VecDeque<Token>,
+    mode: ParserMode,
     /// qpdf treats an indirect reference in the body of an indirect object as
     /// a malformed direct object: it returns the first integer and warns that
     /// `endobj` was expected at the generation number. References nested in an
@@ -128,6 +127,16 @@ pub(crate) struct Parser<'a> {
     /// to bound recursion against adversarially deep input.
     depth: usize,
     diagnostics: Vec<ParserDiagnostic>,
+    content_good_count: usize,
+    content_bad_count: usize,
+    content_give_up: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParserMode {
+    Object,
+    NoReference,
+    Content,
 }
 
 // Maximum object-nesting depth the recursive-descent parser will accept before
@@ -138,28 +147,38 @@ pub(crate) struct Parser<'a> {
 // deep, so only adversarial input is rejected.
 const MAX_PARSE_DEPTH: usize = 500;
 
-impl<'a> Parser<'a> {
-    pub(crate) fn new(input: &'a [u8]) -> Self {
-        Self {
-            tokenizer: Tokenizer::new(input),
-            buffered: VecDeque::new(),
-            no_reference: false,
-            top_level_no_reference: false,
-            depth: 0,
-            diagnostics: Vec::new(),
-        }
+impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
+    pub(crate) fn with_tokenizer(tokenizer: &'tokenizer mut Tokenizer<'input>) -> Self {
+        Self::with_mode(tokenizer, ParserMode::Object)
     }
 
-    /// Like [`new`](Self::new) but with indirect-reference recognition
-    /// disabled (see [`Parser::no_reference`]).
-    pub(crate) fn new_no_reference(input: &'a [u8]) -> Self {
+    /// Like [`with_tokenizer`](Self::with_tokenizer) but in
+    /// [`ParserMode::NoReference`] mode, which leaves `N G R` as separate
+    /// objects instead of constructing an indirect reference.
+    pub(crate) fn with_tokenizer_no_reference(
+        tokenizer: &'tokenizer mut Tokenizer<'input>,
+    ) -> Self {
+        Self::with_mode(tokenizer, ParserMode::NoReference)
+    }
+
+    /// Construct a parser in qpdf content-stream mode over the caller's
+    /// tokenizer and cursor.
+    pub(crate) fn with_tokenizer_content(tokenizer: &'tokenizer mut Tokenizer<'input>) -> Self {
+        Self::with_mode(tokenizer, ParserMode::Content)
+    }
+
+    fn with_mode(tokenizer: &'tokenizer mut Tokenizer<'input>, mode: ParserMode) -> Self {
+        tokenizer.allow_eof();
         Self {
-            tokenizer: Tokenizer::new(input),
+            tokenizer,
             buffered: VecDeque::new(),
-            no_reference: true,
+            mode,
             top_level_no_reference: false,
             depth: 0,
             diagnostics: Vec::new(),
+            content_good_count: 0,
+            content_bad_count: 0,
+            content_give_up: false,
         }
     }
 
@@ -170,10 +189,24 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a single direct object at the current position (after leading
-    /// whitespace/comments). Re-exported for the content-stream tokenizer so it
-    /// can reuse the operand lexer without duplicating it.
+    /// whitespace/comments). Exact-byte overlay token filters use this to share
+    /// the parser's operand grammar.
     pub(crate) fn parse_one_object(&mut self) -> Result<Object> {
         self.object()
+    }
+
+    /// Parse one qpdf content-stream object, returning `None` at content EOF.
+    pub(crate) fn parse_content_object(&mut self) -> Result<Option<Object>> {
+        let token = self.next_token()?;
+        if token.token_type == TokenType::Eof {
+            return Ok(None);
+        }
+        self.unread_token(token);
+        self.object().map(Some)
+    }
+
+    pub(crate) fn take_diagnostics(&mut self) -> Vec<ParserDiagnostic> {
+        std::mem::take(&mut self.diagnostics)
     }
 
     pub(crate) fn object(&mut self) -> Result<Object> {
@@ -195,20 +228,61 @@ impl<'a> Parser<'a> {
     }
 
     fn object_inner(&mut self) -> Result<Object> {
-        let token = self.next_token();
+        let token = self.next_token()?;
+        if self.mode == ParserMode::Content && self.depth > 1 {
+            self.content_good_count += 1;
+        }
         match token.token_type {
-            TokenType::DictOpen => self.dictionary(),
-            TokenType::ArrayOpen => self.array(),
-            TokenType::Name => Ok(Object::Name(token.value.as_ref()[1..].to_vec())),
-            TokenType::String => Ok(Object::String(token.value.into_owned())),
-            TokenType::Bool => Ok(Object::Boolean(token.value.as_ref() == b"true")),
+            TokenType::DictOpen => {
+                self.reset_content_recovery_at_top_level();
+                if self.mode == ParserMode::Content {
+                    self.content_dictionary(self.position())
+                } else {
+                    self.dictionary()
+                }
+            }
+            TokenType::ArrayOpen => {
+                self.reset_content_recovery_at_top_level();
+                self.array()
+            }
+            TokenType::Name => Ok(Object::Name(token.value[1..].to_vec())),
+            TokenType::String => Ok(Object::String(token.value)),
+            TokenType::Bool => Ok(Object::Boolean(token.value == b"true")),
             TokenType::Null => Ok(Object::Null),
             TokenType::Integer => self.integer_or_ref(token),
             TokenType::Real => self.real_object(token),
+            TokenType::Word if self.mode == ParserMode::Content => {
+                Ok(Object::Operator(token.value))
+            }
+            TokenType::Bad if self.mode == ParserMode::Content => {
+                let message = token
+                    .error_message
+                    .as_deref()
+                    .map(|message| String::from_utf8_lossy(message).into_owned())
+                    .unwrap_or_else(|| "bad token".to_string());
+                Ok(self.recover_content_null(&token, message))
+            }
+            TokenType::BraceOpen | TokenType::BraceClose if self.mode == ParserMode::Content => {
+                Ok(self.recover_content_null(
+                    &token,
+                    "treating unexpected brace token as null".to_string(),
+                ))
+            }
+            TokenType::ArrayClose if self.mode == ParserMode::Content => Ok(self
+                .recover_content_null(
+                    &token,
+                    "treating unexpected array close token as null".to_string(),
+                )),
+            TokenType::DictClose if self.mode == ParserMode::Content => {
+                Ok(self
+                    .recover_content_null(&token, "unexpected dictionary close token".to_string()))
+            }
             TokenType::Bad => Err(Error::parse(
                 token.error_offset,
                 token
                     .error_message
+                    .as_deref()
+                    .map(|message| String::from_utf8_lossy(message).into_owned())
                     .unwrap_or_else(|| "bad token".to_string()),
             )),
             TokenType::Eof => Err(Error::parse(token.start, "unexpected EOF")),
@@ -219,48 +293,159 @@ impl<'a> Parser<'a> {
     fn dictionary(&mut self) -> Result<Object> {
         let mut dict = Dictionary::new();
         loop {
-            let token = self.next_token();
+            let token = self.next_token()?;
             if token.token_type == TokenType::DictClose {
                 return Ok(Object::Dictionary(dict));
             }
             if token.token_type != TokenType::Name {
                 return Err(Error::parse(token.start, "expected byte 47"));
             }
-            let key = token.value.as_ref()[1..].to_vec();
+            let key = token.value[1..].to_vec();
             let value = self.object()?;
             dict.insert(key, value);
         }
     }
 
+    fn content_dictionary(&mut self, frame_offset: usize) -> Result<Object> {
+        let mut dict = Dictionary::new();
+        let mut missing_key_values = Vec::new();
+        loop {
+            let token = self.next_token()?;
+            if token.token_type == TokenType::DictClose {
+                self.content_good_count += 1;
+                return Ok(self.finish_content_dictionary(dict, missing_key_values, frame_offset));
+            }
+            if token.token_type == TokenType::Eof {
+                return Err(Error::parse(token.start, "unexpected EOF in dictionary"));
+            }
+            if token.token_type == TokenType::Name {
+                self.content_good_count += 1;
+                let key = token.value[1..].to_vec();
+                let value_token = self.peek_token()?;
+                if value_token.token_type == TokenType::DictClose {
+                    let _ = self.next_token()?;
+                    self.content_good_count += 1;
+                    self.diagnostics.push(ParserDiagnostic {
+                        relative_offset: frame_offset,
+                        message: "dictionary ended prematurely; using null as value for last key"
+                            .to_string(),
+                    });
+                    dict.insert(key, Object::Null);
+                    return Ok(self.finish_content_dictionary(
+                        dict,
+                        missing_key_values,
+                        frame_offset,
+                    ));
+                }
+                let value = self.object()?;
+                if self.content_give_up {
+                    return Ok(Object::Null);
+                }
+                dict.insert(key, value);
+            } else {
+                self.unread_token(token);
+                missing_key_values.push(self.object()?);
+                if self.content_give_up {
+                    return Ok(Object::Null);
+                }
+            }
+        }
+    }
+
+    fn finish_content_dictionary(
+        &mut self,
+        mut dict: Dictionary,
+        missing_key_values: Vec<Object>,
+        frame_offset: usize,
+    ) -> Object {
+        let mut next_fake_key = 1;
+        for value in missing_key_values {
+            let key = loop {
+                let candidate = format!("QPDFFake{next_fake_key}");
+                next_fake_key += 1;
+                if dict.get(candidate.as_bytes()).is_none() {
+                    break candidate;
+                }
+            };
+            self.diagnostics.push(ParserDiagnostic {
+                relative_offset: frame_offset,
+                message: format!(
+                    "expected dictionary key but found non-name object; inserting key /{key}"
+                ),
+            });
+            dict.insert(key, value);
+        }
+        Object::Dictionary(dict)
+    }
+
     fn array(&mut self) -> Result<Object> {
         let mut values = Vec::new();
         loop {
-            let token = self.peek_token();
+            let token = self.peek_token()?;
             if token.token_type == TokenType::ArrayClose {
-                self.next_token();
+                let _ = self.next_token()?;
+                if self.mode == ParserMode::Content {
+                    self.content_good_count += 1;
+                }
                 return Ok(Object::Array(values));
             }
             if token.token_type == TokenType::Eof {
                 return Err(Error::parse(token.start, "unexpected EOF in array"));
             }
             values.push(self.object()?);
+            if self.content_give_up {
+                return Ok(Object::Null);
+            }
         }
     }
 
-    fn integer_or_ref(&mut self, first_token: Token<'a>) -> Result<Object> {
+    fn reset_content_recovery_at_top_level(&mut self) {
+        if self.mode == ParserMode::Content && self.depth == 1 {
+            self.content_good_count = 0;
+            self.content_bad_count = 0;
+            self.content_give_up = false;
+        }
+    }
+
+    fn recover_content_null(&mut self, token: &Token, message: String) -> Object {
+        self.diagnostics.push(ParserDiagnostic {
+            relative_offset: token.error_offset,
+            message,
+        });
+        if self.depth > 1 {
+            if self.content_good_count <= 4 {
+                self.content_bad_count += 1;
+            } else {
+                self.content_bad_count = 1;
+            }
+            self.content_good_count = 0;
+            if self.content_bad_count > 5 {
+                self.diagnostics.push(ParserDiagnostic {
+                    relative_offset: token.error_offset,
+                    message: "too many errors; giving up on reading object".to_string(),
+                });
+                self.content_give_up = true;
+            }
+        }
+        Object::Null
+    }
+
+    fn integer_or_ref(&mut self, first_token: Token) -> Result<Object> {
         let first = parse_integer_token(&first_token)?;
-        if self.no_reference || (self.top_level_no_reference && self.depth == 1) {
+        if matches!(self.mode, ParserMode::NoReference | ParserMode::Content)
+            || (self.top_level_no_reference && self.depth == 1)
+        {
             return Ok(Object::Integer(first));
         }
 
-        let second_token = self.next_token();
+        let second_token = self.next_token()?;
         if second_token.token_type != TokenType::Integer {
             self.unread_token(second_token);
             return Ok(Object::Integer(first));
         }
         let second = parse_integer_token(&second_token)?;
-        let third_token = self.next_token();
-        if third_token.token_type == TokenType::Word && third_token.value.as_ref() == b"R" {
+        let third_token = self.next_token()?;
+        if third_token.is_word_value(b"R") {
             let number = u32::try_from(first)
                 .map_err(|_| Error::parse(first_token.start, "invalid object number"))?;
             let generation = u16::try_from(second)
@@ -272,8 +457,8 @@ impl<'a> Parser<'a> {
         Ok(Object::Integer(first))
     }
 
-    fn real_object(&self, token: Token<'a>) -> Result<Object> {
-        let text = std::str::from_utf8(token.value.as_ref())
+    fn real_object(&self, token: Token) -> Result<Object> {
+        let text = std::str::from_utf8(&token.value)
             .map_err(|_| Error::parse(token.start, "real is not utf-8"))?;
         let value = text
             .parse::<f64>()
@@ -288,35 +473,35 @@ impl<'a> Parser<'a> {
         } else {
             Ok(Object::RealLiteral {
                 value,
-                literal: token.raw.to_vec(),
+                literal: token.raw,
             })
         }
     }
 
-    fn next_token(&mut self) -> Token<'a> {
+    fn next_token(&mut self) -> Result<Token> {
         if let Some(token) = self.buffered.pop_front() {
-            return token;
+            return Ok(token);
         }
-        let token = self.tokenizer.next_token();
+        let token = self.tokenizer.read_token(true, 0)?;
         if token.token_type != TokenType::Bad {
             if let Some(message) = token.error_message.clone() {
                 self.diagnostics.push(ParserDiagnostic {
                     relative_offset: token.start,
-                    message,
+                    message: String::from_utf8_lossy(&message).into_owned(),
                 });
             }
         }
-        token
+        Ok(token)
     }
 
-    fn unread_token(&mut self, token: Token<'a>) {
+    fn unread_token(&mut self, token: Token) {
         self.buffered.push_front(token);
     }
 
-    fn peek_token(&mut self) -> Token<'a> {
-        let token = self.next_token();
+    fn peek_token(&mut self) -> Result<Token> {
+        let token = self.next_token()?;
         self.unread_token(token.clone());
-        token
+        Ok(token)
     }
 
     fn skip_ignorable(&mut self) -> Result<()> {
@@ -328,11 +513,253 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn parse_integer_token(token: &Token<'_>) -> Result<i64> {
-    std::str::from_utf8(token.value.as_ref())
+fn parse_integer_token(token: &Token) -> Result<i64> {
+    std::str::from_utf8(&token.value)
         .ok()
         .and_then(|text| text.parse::<i64>().ok())
         .ok_or_else(|| Error::parse(token.start, "invalid integer"))
+}
+
+#[cfg(test)]
+mod content_mode_tests {
+    use super::Parser;
+    use crate::tokenizer::Tokenizer;
+    use crate::{Error, Object};
+
+    #[test]
+    fn content_mode_returns_words_as_operators_and_never_builds_references() {
+        let mut tokenizer = Tokenizer::new(b"0 0 1 R");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        assert_eq!(
+            parser.parse_content_object().unwrap(),
+            Some(Object::Integer(0))
+        );
+        assert_eq!(
+            parser.parse_content_object().unwrap(),
+            Some(Object::Integer(0))
+        );
+        assert_eq!(
+            parser.parse_content_object().unwrap(),
+            Some(Object::Integer(1))
+        );
+        assert_eq!(
+            parser.parse_content_object().unwrap(),
+            Some(Object::Operator(b"R".to_vec()))
+        );
+        assert_eq!(parser.parse_content_object().unwrap(), None);
+    }
+
+    #[test]
+    fn content_mode_builds_nested_arrays_and_dictionaries_without_references() {
+        let mut tokenizer = Tokenizer::new(b"[0 0 1 R] << /Values [2 3] /Action Do >>");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        assert_eq!(
+            parser.parse_content_object().unwrap(),
+            Some(Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(1),
+                Object::Operator(b"R".to_vec()),
+            ]))
+        );
+
+        let dictionary = parser
+            .parse_content_object()
+            .unwrap()
+            .expect("dictionary")
+            .into_dict()
+            .expect("dictionary object");
+        assert_eq!(
+            dictionary.get("Values"),
+            Some(&Object::Array(vec![Object::Integer(2), Object::Integer(3)]))
+        );
+        assert_eq!(
+            dictionary.get("Action"),
+            Some(&Object::Operator(b"Do".to_vec()))
+        );
+        assert_eq!(parser.parse_content_object().unwrap(), None);
+    }
+
+    #[test]
+    fn content_mode_preserves_the_object_nesting_guard() {
+        let depth = 501;
+        let mut input = vec![b'['; depth];
+        input.extend(std::iter::repeat_n(b']', depth));
+        let mut tokenizer = Tokenizer::new(&input);
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        let error = parser
+            .parse_content_object()
+            .expect_err("over-limit content object must fail");
+        assert!(matches!(error, Error::Parse { .. }));
+        assert!(error.to_string().contains("object nesting too deep"));
+    }
+
+    #[test]
+    fn content_mode_recovers_bad_token_as_null_with_offset_and_diagnostic() {
+        let mut tokenizer = Tokenizer::new(b"  <0g>");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        assert_eq!(
+            parser.parse_content_object().expect("recovered object"),
+            Some(Object::Null)
+        );
+        assert_eq!(
+            parser.diagnostics,
+            vec![super::ParserDiagnostic {
+                relative_offset: 2,
+                message: "invalid character (g) in hexstring".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn content_mode_applies_qpdf_bad_token_limit_inside_container() {
+        let mut tokenizer = Tokenizer::new(b"[ } } } } } } 1 ]");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        assert_eq!(
+            parser.parse_content_object().expect("recovered object"),
+            Some(Object::Null)
+        );
+        assert_eq!(
+            parser
+                .diagnostics
+                .last()
+                .map(|diagnostic| diagnostic.message.as_str()),
+            Some("too many errors; giving up on reading object")
+        );
+    }
+
+    #[test]
+    fn content_mode_resets_qpdf_bad_streak_after_enough_good_tokens() {
+        let mut tokenizer = Tokenizer::new(b"[ } } } } } 1 2 3 4 } } } } } 6 ]");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        let object = parser
+            .parse_content_object()
+            .expect("recovered object")
+            .expect("array");
+        assert!(matches!(object, Object::Array(_)));
+        assert_eq!(parser.diagnostics.len(), 10);
+        assert!(
+            !parser
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message
+                    == "too many errors; giving up on reading object")
+        );
+    }
+
+    #[test]
+    fn content_mode_counts_normal_dictionary_close_in_qpdf_good_token_streak() {
+        let mut tokenizer = Tokenizer::new(b"[ } } } } } << >> 1 2 } ]");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        assert_eq!(
+            parser.parse_content_object().expect("recovered object"),
+            Some(Object::Array(vec![
+                Object::Null,
+                Object::Null,
+                Object::Null,
+                Object::Null,
+                Object::Null,
+                Object::Dictionary(crate::Dictionary::new()),
+                Object::Integer(1),
+                Object::Integer(2),
+                Object::Null,
+            ]))
+        );
+        assert_eq!(parser.position(), 25);
+        assert!(
+            !parser
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message
+                    == "too many errors; giving up on reading object")
+        );
+    }
+
+    #[test]
+    fn content_mode_recovers_unexpected_top_level_closes_as_null() {
+        for (input, expected_message) in [
+            (
+                b"]".as_slice(),
+                "treating unexpected array close token as null",
+            ),
+            (b">>".as_slice(), "unexpected dictionary close token"),
+        ] {
+            let mut tokenizer = Tokenizer::new(input);
+            let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+            assert_eq!(
+                parser.parse_content_object().expect("recovered object"),
+                Some(Object::Null)
+            );
+            assert_eq!(parser.diagnostics[0].message, expected_message);
+        }
+    }
+
+    #[test]
+    fn content_mode_matches_qpdf_dictionary_recovery() {
+        let mut tokenizer = Tokenizer::new(b"<< /QPDFFake1 9 7 } /A >>");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        let dictionary = parser
+            .parse_content_object()
+            .expect("recovered object")
+            .expect("dictionary")
+            .into_dict()
+            .expect("dictionary object");
+        assert_eq!(dictionary.get("QPDFFake1"), Some(&Object::Integer(9)));
+        assert_eq!(dictionary.get("QPDFFake2"), Some(&Object::Integer(7)));
+        assert_eq!(dictionary.get("QPDFFake3"), Some(&Object::Null));
+        assert_eq!(dictionary.get("A"), Some(&Object::Null));
+        assert!(parser.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("dictionary ended prematurely; using null as value for last key")
+        }));
+    }
+
+    #[test]
+    fn content_mode_rejects_eof_while_waiting_for_another_dictionary_key() {
+        let mut tokenizer = Tokenizer::new(b"<< /A 1");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        assert_eq!(
+            parser
+                .parse_content_object()
+                .expect_err("unterminated dictionary must fail")
+                .to_string(),
+            "parse error at byte 7: unexpected EOF in dictionary"
+        );
+    }
+
+    #[test]
+    fn content_mode_gives_up_from_dictionary_key_or_value_recovery() {
+        for input in [
+            b"<< } } } } } } >>".as_slice(),
+            b"<< /A [ } } } } } } ] >>".as_slice(),
+        ] {
+            let mut tokenizer = Tokenizer::new(input);
+            let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+            assert_eq!(
+                parser.parse_content_object().expect("recovered object"),
+                Some(Object::Null)
+            );
+            assert_eq!(
+                parser
+                    .diagnostics
+                    .last()
+                    .map(|diagnostic| diagnostic.message.as_str()),
+                Some("too many errors; giving up on reading object")
+            );
+        }
+    }
 }
 
 pub(crate) fn keyword_token_end(input: &[u8], pos: usize, keyword: &[u8]) -> Option<usize> {

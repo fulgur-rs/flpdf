@@ -6,7 +6,7 @@ use crate::reader::file_object::{
     finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, RecoveryPolicy,
     ResolvedStreamLength,
 };
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{Token, TokenType, Tokenizer};
 use crate::{filters, Diagnostics, Dictionary, Error, Object, ObjectRef, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -522,9 +522,9 @@ fn recover_trailer(bytes: &[u8]) -> Result<Dictionary> {
         return Err(Error::parse(0, "trailer dictionary not found"));
     };
 
-    let mut cursor = ByteCursor::new(bytes, pos + marker.len());
-    cursor.skip_ws();
-    let mut parser = Parser::new(&bytes[cursor.pos..]);
+    let cursor = ByteCursor::new(bytes, pos + marker.len());
+    let mut tokenizer = Tokenizer::new(&bytes[cursor.pos..]);
+    let mut parser = Parser::with_tokenizer(&mut tokenizer);
     match parser.object()? {
         Object::Dictionary(trailer) => Ok(trailer),
         _ => Err(Error::parse(
@@ -555,105 +555,29 @@ fn next_line_start(bytes: &[u8], from: usize) -> usize {
     pos
 }
 
-/// PDF whitespace: NUL, TAB, LF, FF, CR, and space (ISO 32000-2 Table 1).
-fn is_pdf_whitespace(byte: u8) -> bool {
-    matches!(byte, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
+const XREF_RECONSTRUCTION_MAX_TOKEN_LEN: usize = 100;
+
+/// Read the next qpdf token whose start lies in `[from, limit)`. The bounded
+/// prefix keeps whitespace/comment-only line floods linear. A token beginning
+/// on the line is still complete because `next_line_start` includes its EOL
+/// delimiter. Later header tokens use the full input so they may span lines,
+/// matching qpdf's reconstruction loop.
+fn read_scan_token(bytes: &[u8], from: usize, limit: usize) -> Option<Token> {
+    let bounded = bytes.get(..limit)?;
+    let mut tokenizer = Tokenizer::new(bounded);
+    tokenizer.allow_eof();
+    tokenizer.set_position(from).ok()?;
+    let token = tokenizer
+        .read_token(true, XREF_RECONSTRUCTION_MAX_TOKEN_LEN)
+        .ok()?;
+    (token.token_type != TokenType::Eof && token.start < limit).then_some(token)
 }
 
-/// PDF delimiters plus `%` (comment introducer); any of these ends a regular
-/// token (ISO 32000-2 Table 2).
-fn is_pdf_delimiter(byte: u8) -> bool {
-    matches!(
-        byte,
-        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
-    )
-}
-
-/// Advance `pos` past PDF whitespace and `%...EOL` comments — the two ignorable
-/// constructs allowed between tokens — but never beyond `limit`. qpdf's
-/// tokenizer skips comments in this position too, so an object header with a
-/// comment between its tokens (`1 %c<EOL>0 obj`) is still recovered.
-fn skip_ignorable(bytes: &[u8], mut pos: usize, limit: usize) -> usize {
-    loop {
-        while pos < limit && is_pdf_whitespace(bytes[pos]) {
-            pos += 1;
-        }
-        if pos < limit && bytes[pos] == b'%' {
-            while pos < limit && !matches!(bytes[pos], b'\n' | b'\r') {
-                pos += 1;
-            }
-        } else {
-            return pos;
-        }
-    }
-}
-
-/// A token read by the reconstruction scanner, with its byte range. Only the
-/// distinctions the `int int obj` match needs are modelled.
-struct ScanToken {
-    start: usize,
-    end: usize,
-    kind: ScanKind,
-}
-
-enum ScanKind {
-    /// A numeric token (`[+-]?[0-9]+` that fits `i64`).
-    Integer(i64),
-    /// A non-numeric regular token (compared to `obj` via the byte range).
-    Word,
-    /// A delimiter-led token. The scanner stops as soon as a slot it expected to
-    /// be `int`/`obj` is one of these.
-    Delimiter,
-}
-
-/// Read the next token whose start lies in `[from, limit)`, skipping leading
-/// whitespace and `%...EOL` comments. Returns `None` when no token starts before
-/// `limit` (the region is only whitespace/comments).
-///
-/// `limit` bounds where the token may *start*, not where it ends — a regular
-/// token still runs to the next whitespace/delimiter. Passing `next_line_start`
-/// for the first token keeps the scan linear: a whitespace- or comment-only line
-/// is rejected after scanning only its own bytes, instead of skipping forward
-/// into later lines and re-scanning that suffix on every iteration (an O(n^2)
-/// blowup). Later tokens pass `bytes.len()` so an `int int obj` header may span
-/// lines, matching qpdf.
-fn read_scan_token(bytes: &[u8], from: usize, limit: usize) -> Option<ScanToken> {
-    let start = skip_ignorable(bytes, from, limit);
-    if start >= limit {
+fn parse_scan_integer(token: &Token) -> Option<i64> {
+    if !token.is_integer() {
         return None;
     }
-    let first = bytes[start];
-    if is_pdf_delimiter(first) {
-        return Some(ScanToken {
-            start,
-            end: start + 1,
-            kind: ScanKind::Delimiter,
-        });
-    }
-
-    let mut pos = start;
-    while pos < bytes.len() && !is_pdf_whitespace(bytes[pos]) && !is_pdf_delimiter(bytes[pos]) {
-        pos += 1;
-    }
-    let end = pos;
-    let kind = match parse_scan_integer(&bytes[start..end]) {
-        Some(value) => ScanKind::Integer(value),
-        None => ScanKind::Word,
-    };
-    Some(ScanToken { start, end, kind })
-}
-
-/// Classify a regular token as an unsigned PDF integer (`[0-9]+` that fits
-/// `i64`). Returns `None` for any token containing a non-digit (a word such as
-/// `obj`) or a digit run too long to fit `i64`. Object and generation numbers in
-/// real PDFs are unsigned, so a leading sign is treated as a word; this only ever
-/// changes the outcome for synthetic `+N`/`-N` headers, which qpdf's
-/// `obj > 0`/`gen >= 0` guards reject anyway.
-fn parse_scan_integer(token: &[u8]) -> Option<i64> {
-    if token.is_empty() || !token.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    std::str::from_utf8(token).ok()?.parse().ok()
+    std::str::from_utf8(&token.value).ok()?.parse().ok()
 }
 
 /// If the line beginning at `line_start` opens with an `int int obj` token
@@ -673,18 +597,13 @@ fn scan_object_header_at_line(
     // Bounding the first token to this line is what keeps a whitespace- or
     // comment-only line from re-scanning the remaining file on every iteration.
     let number_token = read_scan_token(bytes, line_start, next_line_start)?;
-    let ScanKind::Integer(obj) = number_token.kind else {
-        return None;
-    };
+    let obj = parse_scan_integer(&number_token)?;
 
     let gen_token = read_scan_token(bytes, number_token.end, bytes.len())?;
-    let ScanKind::Integer(gen) = gen_token.kind else {
-        return None;
-    };
+    let gen = parse_scan_integer(&gen_token)?;
 
     let obj_token = read_scan_token(bytes, gen_token.end, bytes.len())?;
-    if !matches!(obj_token.kind, ScanKind::Word) || &bytes[obj_token.start..obj_token.end] != b"obj"
-    {
+    if !obj_token.is_word_value(b"obj") {
         return None;
     }
 
@@ -706,13 +625,12 @@ fn parse_xref_table(
 ) -> Result<(BTreeMap<ObjectRef, XrefOffset>, Dictionary)> {
     let mut entries = BTreeMap::new();
     loop {
-        cursor.skip_ws();
-        if cursor.starts_with(b"trailer") {
-            cursor.pos += b"trailer".len();
+        let first_token = cursor.read_token()?;
+        if first_token.is_word_value(b"trailer") {
             break;
         }
 
-        let first = cursor.read_u32()?;
+        let first = parse_xref_subsection_u32(&first_token)?;
         let count = cursor.read_u32()?;
         for index in 0..count {
             cursor.skip_ws();
@@ -744,8 +662,8 @@ fn parse_xref_table(
         }
     }
 
-    cursor.skip_ws();
-    let mut parser = Parser::new(&bytes[cursor.pos..]);
+    let mut tokenizer = Tokenizer::new(&bytes[cursor.pos..]);
+    let mut parser = Parser::with_tokenizer(&mut tokenizer);
     let trailer = match parser.object()? {
         Object::Dictionary(dict) => dict,
         _ => {
@@ -1022,7 +940,6 @@ fn parse_startxref(bytes: &[u8]) -> Result<u64> {
     };
 
     let mut cursor = ByteCursor::new(bytes, pos + marker.len());
-    cursor.skip_ws();
     cursor.read_u64()
 }
 
@@ -1034,10 +951,6 @@ struct ByteCursor<'a> {
 impl<'a> ByteCursor<'a> {
     fn new(bytes: &'a [u8], pos: usize) -> Self {
         Self { bytes, pos }
-    }
-
-    fn starts_with(&self, token: &[u8]) -> bool {
-        self.bytes[self.pos..].starts_with(token)
     }
 
     fn skip_ws(&mut self) {
@@ -1067,12 +980,28 @@ impl<'a> ByteCursor<'a> {
     }
 
     fn read_u32(&mut self) -> Result<u32> {
-        let value = self.read_unsigned()?;
-        u32::try_from(value).map_err(|_| Error::parse(self.pos, "number does not fit u32"))
+        let token = self.read_token()?;
+        parse_xref_subsection_u32(&token)
     }
 
     fn read_u64(&mut self) -> Result<u64> {
-        self.read_unsigned()
+        let token = self.read_token()?;
+        if !token.is_integer() {
+            return Err(Error::parse(token.start, "expected unsigned integer"));
+        }
+        let text = std::str::from_utf8(&token.value)
+            .map_err(|_| Error::parse(token.start, "number is not utf-8"))?;
+        text.parse::<u64>()
+            .map_err(|_| Error::parse(token.start, "invalid unsigned integer"))
+    }
+
+    fn read_token(&mut self) -> Result<Token> {
+        let mut tokenizer = Tokenizer::new(self.bytes);
+        tokenizer.allow_eof();
+        tokenizer.set_position(self.pos)?;
+        let token = tokenizer.read_token(false, 0)?;
+        self.pos = tokenizer.position();
+        Ok(token)
     }
 
     fn read_fixed_u64(&mut self, width: usize) -> Result<u64> {
@@ -1112,20 +1041,15 @@ impl<'a> ByteCursor<'a> {
         self.pos += width;
         Ok(text)
     }
+}
 
-    fn read_unsigned(&mut self) -> Result<u64> {
-        self.skip_ws();
-        let start = self.pos;
-        while matches!(self.bytes.get(self.pos), Some(b'0'..=b'9')) {
-            self.pos += 1;
-        }
-        if start == self.pos {
-            return Err(Error::parse(start, "expected unsigned integer"));
-        }
-
-        let text = std::str::from_utf8(&self.bytes[start..self.pos])
-            .map_err(|_| Error::parse(start, "number is not utf-8"))?;
-        text.parse::<u64>()
-            .map_err(|_| Error::parse(start, "invalid unsigned integer"))
+fn parse_xref_subsection_u32(token: &Token) -> Result<u32> {
+    if !token.is_integer() || !token.value.iter().all(u8::is_ascii_digit) {
+        return Err(Error::parse(token.start, "expected unsigned integer"));
     }
+    let value = std::str::from_utf8(&token.value)
+        .map_err(|_| Error::parse(token.start, "number is not utf-8"))?
+        .parse::<u64>()
+        .map_err(|_| Error::parse(token.start, "invalid unsigned integer"))?;
+    u32::try_from(value).map_err(|_| Error::parse(token.start, "number does not fit u32"))
 }

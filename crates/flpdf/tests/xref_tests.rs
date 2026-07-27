@@ -42,6 +42,31 @@ fn loads_xref_table_and_trailer() {
 }
 
 #[test]
+fn accepts_plus_prefixed_startxref_integer_token() {
+    let mut bytes = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        b"xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n\
+          trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n",
+    );
+    bytes.extend_from_slice(format!("+{xref_offset}\n%%EOF\n").as_bytes());
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(loaded.startxref, xref_offset as u64);
+}
+
+#[test]
+fn rejects_non_integer_startxref_token_at_token_start() {
+    let bytes = b"%PDF-1.7\nstartxref\n/not-an-offset\n%%EOF\n";
+
+    let error = load_xref_and_trailer(&mut Cursor::new(bytes)).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "parse error at byte 19: expected unsigned integer"
+    );
+}
+
+#[test]
 fn loads_xref_stream_and_trailer() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
@@ -1075,6 +1100,49 @@ fn best_effort_recovers_object_with_comment_between_header_tokens() {
         loaded.entries.get(&ObjectRef::new(7, 0)),
         Some(&XrefOffset::Offset(obj7_offset))
     );
+}
+
+#[test]
+fn best_effort_recovers_plus_prefixed_object_number() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let object_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"+7 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 7 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(7, 0)),
+        Some(&XrefOffset::Offset(object_offset))
+    );
+}
+
+#[test]
+fn best_effort_reconstruction_applies_qpdf_100_byte_token_limit() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let token_99 = format!("{}7", "0".repeat(98));
+    let token_100 = format!("{}8", "0".repeat(99));
+    assert_eq!(token_99.len(), 99);
+    assert_eq!(token_100.len(), 100);
+
+    let object_7_offset = bytes.len() as u64;
+    bytes.extend_from_slice(format!("{token_99} 0 obj\n<< /Type /Catalog >>\nendobj\n").as_bytes());
+    bytes.extend_from_slice(format!("{token_100} 0 obj\n<< >>\nendobj\n").as_bytes());
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 1\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 9 /Root 7 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(7, 0)),
+        Some(&XrefOffset::Offset(object_7_offset))
+    );
+    assert!(!loaded.entries.contains_key(&ObjectRef::new(8, 0)));
 }
 
 /// The line scan must honour qpdf's `reconstruct_xref` guards: a token sequence

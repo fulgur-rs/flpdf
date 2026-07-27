@@ -36,7 +36,7 @@ use std::io::{Read, Seek};
 use crate::acroform_document_helper::{collect_reachable_refs, collect_refs_in_object};
 use crate::overlay_appearance_stream::adjust_appearance_stream;
 use crate::parser::Parser;
-use crate::tokenizer::{is_delimiter, is_ws, starts_number_token};
+use crate::tokenizer::{is_delimiter, is_ws, starts_number_token, Tokenizer};
 use crate::{Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result};
 
 /// Bound field-tree /Parent walks (widget → top-level field). Mirrors the
@@ -989,8 +989,9 @@ fn duplicate_field_tree<R: Read + Seek>(
 ///
 /// This is an inline tokenizer scoped to the `/DA` subset (delegates operand
 /// lexing to the shared [`Parser`] but does not use the general
-/// [`crate::content_stream::ContentStreamParser`], which does not track
-/// per-token byte offsets).
+/// [`crate::content_stream::parse_content_operations`] adapter, whose
+/// callbacks group operands at operator boundaries instead of exposing each
+/// name token's byte span).
 ///
 /// Returns `da.to_vec()` verbatim, without scanning, when `dr_map` is empty
 /// (the common case: no placement recorded a rename on this dest page).
@@ -1043,7 +1044,8 @@ fn adjust_default_appearance(
             // `crate::content_stream` also reuses verbatim, so name/string
             // escaping matches the rest of the crate exactly rather than
             // reimplementing it here.
-            let mut parser = Parser::new_no_reference(&da[pos..]);
+            let mut tokenizer = Tokenizer::new(&da[pos..]);
+            let mut parser = Parser::with_tokenizer_no_reference(&mut tokenizer);
             match parser.parse_one_object() {
                 Ok(obj) => {
                     let end = pos + parser.position();

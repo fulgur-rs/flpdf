@@ -491,6 +491,8 @@ fn object_type_name(obj: &Object) -> &'static str {
         Object::Real(_) | Object::RealLiteral { .. } => "real",
         Object::Name(_) => "name",
         Object::String(_) => "string",
+        Object::Operator(_) => "operator",
+        Object::InlineImage(_) => "inline-image",
         Object::Array(_) => "array",
         Object::Dictionary(_) => "dictionary",
         Object::Stream(_) => "stream",
@@ -759,6 +761,18 @@ mod tests {
                 literal: b"1.5".to_vec(),
             }),
             "real"
+        );
+    }
+
+    #[test]
+    fn object_type_name_labels_content_only_values() {
+        assert_eq!(
+            object_type_name(&Object::Operator(b"q".to_vec())),
+            "operator"
+        );
+        assert_eq!(
+            object_type_name(&Object::InlineImage(b"data".to_vec())),
+            "inline-image"
         );
     }
 
