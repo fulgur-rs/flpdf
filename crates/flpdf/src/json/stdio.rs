@@ -65,12 +65,6 @@ impl<W: Write> Write for QpdfStdioWriter<W> {
             return Ok(0);
         }
 
-        if self.buffer.len() == BUFFER_CAPACITY {
-            if let Err((_, error)) = self.drain_buffer() {
-                return Err(error);
-            }
-        }
-
         let old_len = self.buffer.len();
         let copied = (BUFFER_CAPACITY - old_len).min(input.len());
         self.buffer.extend_from_slice(&input[..copied]);
@@ -189,6 +183,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_write_returns_zero_without_touching_the_sink() {
+        let mut writer =
+            QpdfStdioWriter::new(ScriptedSink::with_write_steps([WriteStep::Error(28)]));
+
+        assert_eq!(writer.write(b"").unwrap(), 0);
+        assert!(writer.inner.write_calls.is_empty());
+    }
+
+    #[test]
     fn final_enospc_below_stdio_boundary_is_ignored() {
         let sink = ProbeSink {
             write_errno: Some(28),
@@ -272,6 +275,21 @@ mod tests {
         let mut expected = vec![b'x'; 4095];
         expected.push(b'y');
         assert_eq!(writer.inner.bytes, expected);
+        assert_eq!(write_call_lengths(&writer.inner), [4096, 4096]);
+    }
+
+    #[test]
+    fn full_buffer_retry_propagates_a_second_zero_progress_error() {
+        let sink = ScriptedSink::with_write_steps([WriteStep::Error(28), WriteStep::Error(5)]);
+        let mut writer = QpdfStdioWriter::new(sink);
+        writer.write_all(&vec![b'x'; 4095]).unwrap();
+
+        let first_error = writer.write(b"y").unwrap_err();
+        assert_eq!(first_error.raw_os_error(), Some(28));
+
+        let retry_error = writer.write(b"y").unwrap_err();
+        assert_eq!(retry_error.raw_os_error(), Some(5));
+        assert!(writer.inner.bytes.is_empty());
         assert_eq!(write_call_lengths(&writer.inner), [4096, 4096]);
     }
 

@@ -3035,28 +3035,11 @@ mod tests {
         }
     }
 
-    struct FlushFails {
-        bytes: Vec<u8>,
-        flush_calls: usize,
-    }
-
-    impl std::io::Write for FlushFails {
-        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-            self.bytes.extend_from_slice(buffer);
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.flush_calls += 1;
-            Err(std::io::Error::other("flush full"))
-        }
-    }
-
     struct ErrnoSink(i32);
 
     impl std::io::Write for ErrnoSink {
-        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::from_raw_os_error(self.0))
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
@@ -3616,10 +3599,7 @@ mod tests {
     fn file_mode_stream_value_does_not_finish_the_side_sink_before_dict() {
         let mut pdf = load_one_page_pdf();
         let stream = Stream::new(Dictionary::new(), b"payload".to_vec());
-        let mut side_file = FlushFails {
-            bytes: Vec::new(),
-            flush_calls: 0,
-        };
+        let mut side_file = std::io::BufWriter::with_capacity(4096, Vec::new());
         let mut out = Vec::new();
 
         write_file_mode_stream_value(
@@ -3632,8 +3612,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(side_file.bytes, b"payload");
-        assert_eq!(side_file.flush_calls, 0);
+        assert_eq!(side_file.buffer(), b"payload");
+        assert!(side_file.get_ref().is_empty());
         assert!(out.windows(br#""dict""#.len()).any(|w| w == br#""dict""#));
         assert!(out.ends_with(b"\n        }"));
     }
