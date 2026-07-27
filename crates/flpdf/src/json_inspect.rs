@@ -520,6 +520,7 @@ fn dict_to_json(dict: &Dictionary) -> Result<Json, ConvertError> {
     json_dictionary(pairs)
 }
 
+#[cfg(test)]
 fn qpdf_dict_to_json<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dict: &Dictionary,
@@ -627,6 +628,7 @@ fn ordered_qpdf_object<R: Read + Seek>(
     }
 }
 
+#[cfg(test)]
 fn qpdf_pdf_object_to_json<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     object: &Object,
@@ -757,18 +759,12 @@ pub fn pdf_object_to_json(obj: &Object) -> Result<Json, ConvertError> {
     }
 }
 
-// ── QpdfMetadata ─────────────────────────────────────────────────────────────
-
-/// Metadata for the `qpdf` top-level key's first element.
-pub struct QpdfMetadata {
-    /// PDF version header (e.g. `"1.3"`).
-    pub pdf_version: String,
-    /// Maximum object id seen in this document.
-    pub max_object_id: u32,
-    /// Whether inherited page resources were pushed into page dictionaries.
-    pub pushed_inherited_page_resources: bool,
-    /// Whether the document's complete page tree was enumerated before emission.
-    pub called_get_all_pages: bool,
+#[cfg(test)]
+struct QpdfMetadata {
+    pdf_version: String,
+    max_object_id: u32,
+    pushed_inherited_page_resources: bool,
+    called_get_all_pages: bool,
     // jsonversion is always 2 in v2 output.
 }
 
@@ -804,20 +800,8 @@ pub fn format_json_side_file_path(prefix: &str, obj_num: u32) -> String {
 
 // ── build_qpdf_key ────────────────────────────────────────────────────────────
 
-/// Build the contents of the top-level `qpdf` key (`[metadata, objects_map]`).
-///
-/// Returns a [`Json`] array of exactly two elements:
-/// 1. The metadata object with the fixed qpdf v2 key set.
-/// 2. The objects map with all indirect objects and the trailer, sorted alphabetically
-///    by key.
-///
-/// This is a thin wrapper around [`build_qpdf_key_with_stream_mode`] using
-/// [`StreamDataMode::None`] (the default — stream entries contain `dict` only).
-///
-/// # Errors
-///
-/// Returns a [`ConvertError`] if any object cannot be converted to JSON.
-pub fn build_qpdf_key<R: Read + Seek>(
+#[cfg(test)]
+fn build_qpdf_key<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     metadata: QpdfMetadata,
 ) -> Result<Json, ConvertError> {
@@ -830,27 +814,8 @@ pub fn build_qpdf_key<R: Read + Seek>(
     )
 }
 
-/// Like [`build_qpdf_key`], but accepts a [`StreamDataMode`] that controls
-/// whether each `obj:N M R` stream entry includes `data` (Inline) or
-/// `datafile` (File) alongside `dict`, plus a [`DecodeLevel`] that controls
-/// how the `Inline` payload is decoded (see [`stream_payload_for_decode_level`]).
-///
-/// # Stream entry shapes
-///
-/// - `None`   → `{ "stream": { "dict": ... } }`
-/// - `Inline` → `{ "stream": { "data": "<base64>", "dict": ... } }`
-/// - `File`   → `{ "stream": { "datafile": "<prefix>-<obj_num>", "dict": ... } }`
-///
-/// For `Inline`, `decode_level` selects between the raw filter-encoded bytes
-/// (`DecodeLevel::None`) and the filter-decoded content (any other level),
-/// matching `qpdf --json-stream-data=inline --decode-level=...`. `File` mode
-/// emits only the side-file path here; the caller writes the bytes and must
-/// apply the same `decode_level` (see [`stream_payload_for_decode_level`]).
-///
-/// # Errors
-///
-/// Returns a [`ConvertError`] if any object cannot be converted to JSON.
-pub fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
+#[cfg(test)]
+fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     metadata: QpdfMetadata,
     decode_level: DecodeLevel,
@@ -867,6 +832,7 @@ pub fn build_qpdf_key_with_stream_mode<R: Read + Seek>(
     )
 }
 
+#[cfg(test)]
 fn build_qpdf_key_selected_with_stream_mode<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     metadata: QpdfMetadata,
@@ -921,6 +887,7 @@ fn build_qpdf_key_selected_with_stream_mode<R: Read + Seek>(
     json_array([meta, objects_map])
 }
 
+#[cfg(test)]
 fn build_qpdf_metadata(metadata: QpdfMetadata) -> Result<Json, ConvertError> {
     json_dictionary([
         ("jsonversion".to_string(), Json::make_int(2)),
@@ -943,6 +910,7 @@ fn build_qpdf_metadata(metadata: QpdfMetadata) -> Result<Json, ConvertError> {
     ])
 }
 
+#[cfg(test)]
 fn build_qpdf_object_entry<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     object_ref: ObjectRef,
@@ -2913,6 +2881,17 @@ fn write_file_mode_stream_value<R: Read + Seek, W: Write>(
 ///
 /// On conversion or I/O failure, bytes already accepted by `out` remain as a
 /// partial JSON prefix; this function does not roll back or truncate the sink.
+///
+/// # Migration from the 0.4 materialized API
+///
+/// Exact qpdf bytes depend on sink-time ordering: metadata has a fixed field
+/// order, while raw PDF dictionaries are ordered before their names are JSON
+/// escaped. The former `json::JsonValue`, `json::write`,
+/// `build_qpdf_json_v2*`, `filter_json_keys`, `filter_json_objects`, and
+/// materialized `build_qpdf_key*` APIs could not preserve both contracts.
+/// Call this incremental writer instead; select sections with `keys`, select
+/// raw objects with `objects`, and inspect or transform the accepted bytes at
+/// the supplied `Write` sink.
 pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     decode_level: DecodeLevel,
