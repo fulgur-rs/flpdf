@@ -2861,7 +2861,8 @@ fn encrypt_stream_payload_for_writer(
                             "rc4 stream encryption",
                             &mut output,
                             per_obj_key.as_slice(),
-                        )?;
+                        )
+                        .expect("Algorithm 1 always derives a non-empty RC4 key");
                         rc4.write(&stream.data)?;
                         rc4.finish()?;
                     }

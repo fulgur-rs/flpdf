@@ -328,6 +328,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn identifiers_and_fault_sink_noop_halves_obey_pipeline_contract() {
+        let mut recording = RecordingSink::default();
+        {
+            let stage = PlRc4::new("rc4-stage", &mut recording, b"Key").unwrap();
+            assert_eq!(stage.identifier(), "rc4-stage");
+        }
+        assert_eq!(recording.identifier(), "recording");
+
+        let mut write_fault = WriteFaultSink;
+        assert_eq!(write_fault.identifier(), "write-fault");
+        write_fault.finish().unwrap();
+
+        let mut finish_fault = FinishFaultSink::default();
+        assert_eq!(finish_fault.identifier(), "finish-fault");
+        finish_fault.write(b"ignored").unwrap();
+    }
+
     #[derive(Clone, Copy)]
     enum OracleKeyMode {
         Explicit,
@@ -521,7 +539,7 @@ mod tests {
         command.args(["-c", "printf '%s\\n' \"$@\"", "probe"]);
         let case = OracleCase {
             name: "arguments",
-            mode: OracleKeyMode::Explicit,
+            mode: OracleKeyMode::CStr,
             key: vec![0x01, 0xab],
             input_len: 9,
             write_split: 4,
@@ -529,8 +547,22 @@ mod tests {
         };
         assert_eq!(
             run_qpdf_pl_rc4_command(command, &case),
-            "pipeline\nexplicit\n01ab\n9\n4\n7\n"
+            "pipeline\ncstr\n01ab\n9\n4\n7\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_pl_rc4_probe_wrapper_executes_requested_path() {
+        let case = OracleCase {
+            name: "wrapper",
+            mode: OracleKeyMode::Explicit,
+            key: b"Key".to_vec(),
+            input_len: 0,
+            write_split: 0,
+            out_buffer_size: DEFAULT_OUT_BUFFER_SIZE,
+        };
+        assert_eq!(run_qpdf_pl_rc4_probe(Path::new("/bin/true"), &case), "");
     }
 
     #[cfg(unix)]
