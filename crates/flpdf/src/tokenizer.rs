@@ -1713,6 +1713,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn qpdf_probe_wrapper_executes_requested_path() {
+        let case = &qpdf_oracle_cases()[5];
+
+        assert_eq!(run_qpdf_probe(Path::new("true"), case), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn qpdf_probe_failure_reports_case_status_and_stderr() {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "printf 'probe stderr' >&2; exit 7", "probe"]);
