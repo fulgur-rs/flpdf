@@ -293,7 +293,7 @@ impl Json {
             ..
         } = &members.value
         else {
-            return None;
+            return None; // cov:ignore: writer-only accessor follows the immutable dictionary tag
         };
         dictionary.get(encoded_key).cloned()
     }
@@ -301,7 +301,7 @@ impl Json {
     pub(crate) fn array_items_snapshot(&self) -> Option<Vec<Json>> {
         let members = self.0.as_ref()?.borrow();
         let Value::Array(values) = &members.value else {
-            return None;
+            return None; // cov:ignore: writer-only accessor follows the immutable array tag
         };
         Some(values.clone())
     }
