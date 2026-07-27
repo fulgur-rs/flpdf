@@ -69,9 +69,11 @@ impl Pipeline for QpdfTokenizer<'_> {
                     self.next = output.into_next();
                     result?;
                 }
+                // cov:ignore-start: after a word ID the tokenizer is necessarily between tokens
                 tokenizer.expect_inline_image().map_err(|error| {
                     PipelineError::logic(format!("{}: {error:?}", self.identifier))
                 })?;
+                // cov:ignore-end
             }
         }
         {
@@ -125,6 +127,7 @@ mod tests {
         finishes: usize,
     }
 
+    // cov:ignore-start: test-only sink identifiers have no behavioral role
     impl Pipeline for RecordingSink {
         fn identifier(&self) -> &str {
             "recording sink"
@@ -140,9 +143,11 @@ mod tests {
             Ok(())
         }
     }
+    // cov:ignore-end
 
     struct FinishFailSink;
 
+    // cov:ignore-start: test-only sink identifiers have no behavioral role
     impl Pipeline for FinishFailSink {
         fn identifier(&self) -> &str {
             "finish fail sink"
@@ -156,6 +161,7 @@ mod tests {
             Err(PipelineError::logic("sink finish failed"))
         }
     }
+    // cov:ignore-end
 
     struct FailOnWord(&'static str);
 
@@ -218,6 +224,9 @@ mod tests {
     #[test]
     fn chunk_boundaries_do_not_change_tokens_or_output() {
         let input = b"%c\r\nBI /W 1 ID \0/F1 9 Tf EI /F2 12 Tf";
+        let mut identifier_filter = RecordingFilter::default();
+        let identifier_stage = QpdfTokenizer::new("token filter", &mut identifier_filter, None);
+        assert_eq!(identifier_stage.identifier(), "token filter");
         let one = run_recording(&[input.as_slice()], true).unwrap();
         let bytewise_chunks = input.iter().map(std::slice::from_ref).collect::<Vec<_>>();
         let bytewise = run_recording(&bytewise_chunks, true).unwrap();
@@ -342,6 +351,7 @@ mod tests {
         assert_eq!(sink.finishes, 1);
     }
 
+    // cov:ignore-start: the ignored live qpdf oracle is separately run by qpdf-tokenizer-diff.sh
     fn token_type_name(token_type: TokenType) -> &'static str {
         match token_type {
             TokenType::Bad => "bad",
@@ -510,4 +520,5 @@ mod tests {
             );
         }
     }
+    // cov:ignore-end
 }
