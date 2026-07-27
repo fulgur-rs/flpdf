@@ -182,6 +182,29 @@ fn qpdf_blob_streams_base64_without_one_full_encoded_write() {
 }
 
 #[test]
+fn blob_base64_preserves_pending_bytes_across_split_writes() {
+    let one_plus_one = Json::make_blob(|out| {
+        out.write_all(b"x")?;
+        out.write_all(b"y")
+    });
+    assert_eq!(one_plus_one.unparse().unwrap(), b"\"eHk=\"");
+
+    let two_plus_empty = Json::make_blob(|out| {
+        out.write_all(b"xy")?;
+        assert_eq!(out.write(&[])?, 0);
+        Ok(())
+    });
+    assert_eq!(two_plus_empty.unparse().unwrap(), b"\"eHk=\"");
+
+    let one_plus_one_plus_one = Json::make_blob(|out| {
+        out.write_all(b"x")?;
+        out.write_all(b"y")?;
+        out.write_all(b"z")
+    });
+    assert_eq!(one_plus_one_plus_one.unparse().unwrap(), b"\"eHl6\"");
+}
+
+#[test]
 fn blob_callback_can_reenter_the_same_callback() {
     let holder = Rc::new(RefCell::new(None::<Json>));
     let weak_holder = Rc::downgrade(&holder);

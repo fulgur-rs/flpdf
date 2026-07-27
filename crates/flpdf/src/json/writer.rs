@@ -55,6 +55,9 @@ impl<W: Write + ?Sized> Write for Base64Writer<'_, W> {
                 self.write_group(&group)?;
                 self.pending_len = 0;
             }
+            if input.is_empty() {
+                return Ok(input_len);
+            }
         }
 
         while input.len() >= 3 {
