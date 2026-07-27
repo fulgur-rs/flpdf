@@ -4389,7 +4389,7 @@ fn normalize_and_store_stream<R: std::io::Read + std::io::Seek>(
     let decoded = filters::decode_stream_data(&stream.dict, &stream.data)?;
 
     // Normalize the decoded content stream bytes.
-    let normalized = normalize_content_stream(&decoded)?;
+    let normalized = normalize_content_stream(&decoded).into_bytes();
 
     // Build a new stream dict with the updated /Length.
     let mut new_dict: Dictionary = stream.dict.clone();

@@ -174,9 +174,9 @@ pub use check::{
     check_reader, check_reader_strict, check_reader_with_options,
     check_reader_with_options_and_limits, CheckReport, CheckSummary,
 };
+pub use content_normalizer::{normalize_content_stream, ContentNormalization};
 pub use content_stream::{
-    normalize_content_stream, parse_content_operations, parse_content_stream_data, ParseControl,
-    ParserCallbacks,
+    parse_content_operations, parse_content_stream_data, ParseControl, ParserCallbacks,
 };
 pub use default_appearance::{parse_default_appearance, DefaultAppearance, TextColor};
 pub use diagnostics::{Diagnostic, Diagnostics, Severity};

@@ -33,20 +33,6 @@
 //!
 //! # qpdf-byte divergence documentation
 //!
-//! ## .12.2 (normalize-content)
-//!
-//! `flpdf::normalize_content_stream` diverges from qpdf's `--normalize-content`
-//! at the byte level in three known ways (documented in `crates/flpdf/src/content_stream.rs`):
-//! - **Integer-valued reals**: `Real(1.0)` is emitted as `"1"` (no trailing `.0`).
-//!   qpdf preserves the decimal point.
-//! - **Dictionary key ordering**: `BTreeMap` gives lexicographic order; qpdf may
-//!   use insertion order.
-//! - **Token separation**: a single space is always emitted between operands;
-//!   qpdf may omit spaces between adjacent delimiters (`>>`, `<<`).
-//!
-//! These tests therefore validate observable equivalence (re-parsing yields the same
-//! operator sequence and operand values) rather than byte identity with qpdf.
-//!
 //! ## .12.5 (compress-streams)
 //!
 //! `flpdf` uses `flate2` with `Compression::default()`, which selects a different
@@ -188,8 +174,7 @@ fn normalize_content_y_produces_canonical_form() {
         let out_content = page_content_bytes(&mut out_pdf, *out_pr).unwrap();
 
         // The expected bytes are the result of normalize(input content).
-        let expected = normalize_content_stream(&in_content)
-            .expect("normalize_content_stream must succeed on input");
+        let expected = normalize_content_stream(&in_content).into_bytes();
 
         // Primary assertion: the decoded output bytes must equal normalize(input)
         // directly.  This catches any regression where the CLI emits semantically
@@ -206,8 +191,7 @@ fn normalize_content_y_produces_canonical_form() {
         // Diagnostic: verify idempotency — normalize(output) == normalize(input).
         // This should always hold after the primary assertion, but it catches any
         // re-normalization divergence independently.
-        let normalized_out = normalize_content_stream(&out_content)
-            .expect("normalize_content_stream must succeed on output");
+        let normalized_out = normalize_content_stream(&out_content).into_bytes();
         assert_eq!(
             normalized_out, expected,
             "normalize-content=y: output content stream is not idempotent under \
