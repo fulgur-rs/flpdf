@@ -67,6 +67,145 @@ impl Rc4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::process::Command;
+
+    #[derive(Clone, Copy)]
+    enum OracleKeyMode {
+        Explicit,
+        CStr,
+    }
+
+    struct OracleCase {
+        name: &'static str,
+        mode: OracleKeyMode,
+        key: Vec<u8>,
+        input: Vec<u8>,
+        split: usize,
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn oracle_cases() -> Vec<OracleCase> {
+        vec![
+            OracleCase {
+                name: "explicit-one-byte-empty-input",
+                mode: OracleKeyMode::Explicit,
+                key: vec![0x7f],
+                input: vec![],
+                split: 0,
+            },
+            OracleCase {
+                name: "explicit-five-byte-rfc",
+                mode: OracleKeyMode::Explicit,
+                key: vec![1, 2, 3, 4, 5],
+                input: vec![0; 32],
+                split: 7,
+            },
+            OracleCase {
+                name: "explicit-sixteen-byte-in-place",
+                mode: OracleKeyMode::Explicit,
+                key: (0..16).collect(),
+                input: (0..97).map(|i| (i * 17) as u8).collect(),
+                split: 31,
+            },
+            OracleCase {
+                name: "explicit-256-byte-key",
+                mode: OracleKeyMode::Explicit,
+                key: (0..=255).collect(),
+                input: (0..64).collect(),
+                split: 1,
+            },
+            OracleCase {
+                name: "explicit-key-over-256",
+                mode: OracleKeyMode::Explicit,
+                key: (0..300).map(|i| (i * 29) as u8).collect(),
+                input: (0..129).map(|i| (i * 11) as u8).collect(),
+                split: 128,
+            },
+            OracleCase {
+                name: "c-string-first-nul",
+                mode: OracleKeyMode::CStr,
+                key: b"Key\0ignored suffix".to_vec(),
+                input: b"Plaintext split across calls".to_vec(),
+                split: 9,
+            },
+        ]
+    }
+
+    fn flpdf_records(case: &OracleCase) -> String {
+        let new_cipher = || match case.mode {
+            OracleKeyMode::Explicit => Rc4::new(&case.key).unwrap(),
+            OracleKeyMode::CStr => {
+                Rc4::from_c_str(CStr::from_bytes_until_nul(&case.key).unwrap()).unwrap()
+            }
+        };
+
+        let mut one_shot = new_cipher();
+        let one = one_shot.process(&case.input);
+        let mut split_cipher = new_cipher();
+        let mut split = split_cipher.process(&case.input[..case.split]);
+        split.extend(split_cipher.process(&case.input[case.split..]));
+        let mut in_place = case.input.clone();
+        new_cipher().process_in_place(&mut in_place);
+        format!(
+            "one\t{}\nsplit\t{}\nin-place\t{}\n",
+            hex(&one),
+            hex(&split),
+            hex(&in_place)
+        )
+    }
+
+    fn run_qpdf_probe(probe: &Path, case: &OracleCase) -> String {
+        let mode = match case.mode {
+            OracleKeyMode::Explicit => "explicit",
+            OracleKeyMode::CStr => "cstr",
+        };
+        let output = Command::new(probe)
+            .args([
+                mode,
+                &hex(&case.key),
+                &hex(&case.input),
+                &case.split.to_string(),
+            ])
+            .output()
+            .expect("execute qpdf RC4 probe");
+        assert!(
+            output.status.success(),
+            "qpdf RC4 probe failed for {}: {}",
+            case.name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("probe output is ASCII")
+    }
+
+    #[test]
+    #[ignore = "live qpdf 11.9.0 RC4 oracle"]
+    fn qpdf_rc4_differential() {
+        let probe = std::env::var_os("QPDF_RC4_PROBE")
+            .expect("set QPDF_RC4_PROBE to the qpdf 11.9.0 probe");
+        for case in oracle_cases() {
+            assert_eq!(
+                flpdf_records(&case),
+                run_qpdf_probe(Path::new(&probe), &case),
+                "case {}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn oracle_cases_have_matching_one_split_and_in_place_records() {
+        for case in oracle_cases() {
+            let records = flpdf_records(&case);
+            let mut lines = records.lines().map(|line| line.split_once('\t').unwrap().1);
+            let one = lines.next().unwrap();
+            assert_eq!(lines.next(), Some(one), "split case {}", case.name);
+            assert_eq!(lines.next(), Some(one), "in-place case {}", case.name);
+        }
+    }
 
     #[test]
     fn rfc_6229_five_byte_key_keystream() {
