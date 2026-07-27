@@ -67,6 +67,23 @@ c++ -std=c++17 \
   "${qpdf_source}/libqpdf/RC4_native.cc" \
   -o "${probe}"
 
+assert_rejected_key() {
+  local expected="$1"
+  shift
+  local output
+  if output="$("${probe}" "$@" 2>&1)"; then
+    echo "qpdf-rc4-diff.sh: invalid key was accepted: $*" >&2
+    exit 1
+  fi
+  if [[ "${output}" != "qpdf_rc4_probe: ${expected}" ]]; then
+    echo "qpdf-rc4-diff.sh: invalid key did not stop before qpdf: ${output}" >&2
+    exit 1
+  fi
+}
+
+assert_rejected_key "empty explicit key" explicit "" "" 0
+assert_rejected_key "empty C-string key" cstr 00 "" 0
+
 cd "${repo_root}"
 QPDF_RC4_PROBE="${probe}" \
   cargo test -p flpdf --lib \

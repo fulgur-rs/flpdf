@@ -66,6 +66,12 @@ main(int argc, char* argv[])
         if (split_at > input.size()) {
             throw std::runtime_error("split exceeds input");
         }
+        if (key.empty()) {
+            throw std::runtime_error("empty explicit key");
+        }
+        if (c_string && key.front() == 0) {
+            throw std::runtime_error("empty C-string key");
+        }
         size_t explicit_key_len = key.size();
         size_t input_len = input.size();
         key.push_back(0);
