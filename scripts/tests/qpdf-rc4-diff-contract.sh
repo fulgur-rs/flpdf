@@ -19,7 +19,7 @@ trap cleanup EXIT
 
 mkdir -p \
   "${fixture_repo}/scripts" \
-  "${fixture_repo}/tests/oracle" \
+  "${fixture_repo}/tests/oracle/qpdf_pl_rc4_shim/qpdf" \
   "${fixture_source}/include/qpdf" \
   "${fixture_source}/libqpdf" \
   "${fixture_home}/.cache" \
@@ -31,6 +31,8 @@ cp "${repo_root}/scripts/qpdf-rc4-diff.sh" \
   "${fixture_repo}/scripts/qpdf-rc4-diff.sh"
 cp "${repo_root}/tests/oracle/qpdf_rc4_probe.cc" \
   "${fixture_repo}/tests/oracle/qpdf_rc4_probe.cc"
+cp "${repo_root}/tests/oracle/qpdf_pl_rc4_shim/qpdf/RC4.hh" \
+  "${fixture_repo}/tests/oracle/qpdf_pl_rc4_shim/qpdf/RC4.hh"
 
 real_git="$(command -v git)"
 real_mktemp="$(command -v mktemp)"
@@ -119,21 +121,49 @@ cat >"${output}" <<'PROBE'
 #!/usr/bin/env bash
 set -euo pipefail
 
-case "${1:-}|${2:-}|${3:-}|${4:-}" in
-  "explicit|||0")
+case "${1:-}|${2:-}|${3:-}|${4:-}|${5:-}|${6:-}" in
+  "explicit|||0||")
     echo "qpdf_rc4_probe: empty explicit key" >&2
     exit 2
     ;;
-  "cstr|||0" | "cstr|00||0")
+  "cstr|||0||" | "cstr|00||0||")
     echo "qpdf_rc4_probe: empty C-string key" >&2
     exit 2
     ;;
-  "explicit|0g||0")
+  "explicit|0g||0||")
     echo "qpdf_rc4_probe: invalid hex" >&2
     exit 2
     ;;
-  "explicit|00||0junk")
+  "explicit|00||0junk||")
     echo "qpdf_rc4_probe: invalid split" >&2
+    exit 2
+    ;;
+  "pipeline|explicit||0|0|65536")
+    echo "qpdf_rc4_probe: empty explicit key" >&2
+    exit 2
+    ;;
+  "pipeline|cstr|00|0|0|65536")
+    echo "qpdf_rc4_probe: empty C-string key" >&2
+    exit 2
+    ;;
+  "pipeline|explicit|00|0junk|0|65536")
+    echo "qpdf_rc4_probe: invalid input length" >&2
+    exit 2
+    ;;
+  "pipeline|explicit|00|0|0junk|65536")
+    echo "qpdf_rc4_probe: invalid write split" >&2
+    exit 2
+    ;;
+  "pipeline|explicit|00|0|0|1junk")
+    echo "qpdf_rc4_probe: invalid output buffer size" >&2
+    exit 2
+    ;;
+  "pipeline|explicit|00|0|1|65536")
+    echo "qpdf_rc4_probe: write split exceeds input" >&2
+    exit 2
+    ;;
+  "pipeline|explicit|00|0|0|0")
+    echo "qpdf_rc4_probe: zero output buffer size" >&2
     exit 2
     ;;
 esac

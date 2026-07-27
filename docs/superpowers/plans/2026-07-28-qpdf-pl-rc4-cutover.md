@@ -123,10 +123,10 @@ git commit -m "feat(rc4): add qpdf PlRc4 pipeline stage"
 ### Task 2: Add the pinned qpdf Pl_RC4 differential
 
 **Files:**
-- Create: `tests/oracle/qpdf_pl_rc4_probe.cc`
 - Create: `tests/oracle/qpdf_pl_rc4_shim/qpdf/RC4.hh`
-- Create: `scripts/qpdf-pl-rc4-diff.sh`
-- Create: `scripts/tests/qpdf-pl-rc4-diff-contract.sh`
+- Modify: `tests/oracle/qpdf_rc4_probe.cc`
+- Modify: `scripts/qpdf-rc4-diff.sh`
+- Modify: `scripts/tests/qpdf-rc4-diff-contract.sh`
 - Modify: `crates/flpdf/src/pipeline/rc4.rs`
 
 **Interfaces:**
@@ -145,15 +145,18 @@ Add deterministic oracle cases in `pipeline/rc4.rs` for:
 - repeated finish;
 - exact write-after-finish error text.
 
-Add an ignored test:
+Add an ignored test whose name contains the shared
+`qpdf_rc4_differential` selector:
 
 ```rust
 #[test]
 #[ignore = "live qpdf 11.9.0 Pl_RC4 oracle"]
-fn qpdf_pl_rc4_differential() {
+fn qpdf_rc4_differential_pl_rc4_pipeline() {
     let probe = std::env::var_os("QPDF_PL_RC4_PROBE")
         .expect("set QPDF_PL_RC4_PROBE to the qpdf 11.9.0 probe");
-    assert_qpdf_oracle_matches(|case| run_qpdf_probe(Path::new(&probe), case));
+    assert_qpdf_pl_rc4_oracle_matches(|case| {
+        run_qpdf_pl_rc4_probe(Path::new(&probe), case)
+    });
 }
 ```
 
@@ -164,14 +167,18 @@ Ordinary tests must exercise the comparison loop and fake-probe success, failure
 Run:
 
 ```bash
-cargo test -p flpdf --lib pipeline::rc4::tests::qpdf_pl_rc4_differential -- --ignored --exact
+cargo test -p flpdf --lib pipeline::rc4::tests::qpdf_rc4_differential_pl_rc4_pipeline -- --ignored --exact
 ```
 
 Expected: failure stating that `QPDF_PL_RC4_PROBE` is unset.
 
 - [ ] **Step 3: Add the C++ probe and shim**
 
-The probe must instantiate the pinned `Pl_RC4` implementation over a recording `Pipeline` sink and print a stable record containing ciphertext hex, downstream chunk lengths, finish count, and write-after-finish message.
+Extend the existing RC4 probe with a `pipeline` mode. It must instantiate the
+pinned `Pl_RC4` implementation over a recording `Pipeline` sink and print a
+stable record containing ciphertext hex, downstream chunk lengths, finish
+count, and write-after-finish message. Existing primitive probe modes remain
+unchanged.
 
 The test-only `qpdf/RC4.hh` shim must preserve the production wrapper contract exactly:
 
@@ -198,25 +205,29 @@ This allows the actual pinned `Pl_RC4.cc` to compile with pinned `RC4_native.cc`
 
 - [ ] **Step 4: Add and contract-test the runner**
 
-`scripts/qpdf-pl-rc4-diff.sh` must:
+Extend the already hardened `scripts/qpdf-rc4-diff.sh` rather than duplicating
+its temporary-directory safety machinery. It must:
 
 1. resolve only `scripts/fetch-qpdf-source.sh --print-path`;
 2. verify commit `3b97c9bd266b7c32ea36d3536e22dab77412886d` and tracked cleanliness before and after each external action;
 3. create a private external `mktemp` directory;
 4. compile the probe with C++17, shim include first, then pinned includes, plus pinned `Pipeline.cc`, `Pl_RC4.cc`, and `RC4_native.cc`;
 5. reject malformed probe arguments before Rust execution;
-6. set `QPDF_PL_RC4_PROBE` and run only the ignored exact differential;
+6. set both `QPDF_RC4_PROBE` and `QPDF_PL_RC4_PROBE`, then run the shared
+   `qpdf_rc4_differential` ignored-test selector;
 7. remove only its verified private temporary directory.
 
-The shell contract test uses fake `git`, `mktemp`, `c++`, and `cargo` tools to verify compile arguments, exact Cargo selector/environment, source-state checks, unsafe temporary-path rejection, and cleanup containment.
+The existing shell contract test uses fake `git`, `mktemp`, `c++`, and `cargo`
+tools to verify the expanded compile arguments, Cargo selector/environment,
+source-state checks, unsafe temporary-path rejection, and cleanup containment.
 
 - [ ] **Step 5: Run live oracle GREEN**
 
 Run:
 
 ```bash
-scripts/tests/qpdf-pl-rc4-diff-contract.sh
-scripts/qpdf-pl-rc4-diff.sh
+scripts/tests/qpdf-rc4-diff-contract.sh
+scripts/qpdf-rc4-diff.sh
 ```
 
 Expected: contract test and every live qpdf Pl_RC4 differential case pass.
@@ -224,7 +235,7 @@ Expected: contract test and every live qpdf Pl_RC4 differential case pass.
 - [ ] **Step 6: Commit the oracle**
 
 ```bash
-git add crates/flpdf/src/pipeline/rc4.rs tests/oracle/qpdf_pl_rc4_probe.cc tests/oracle/qpdf_pl_rc4_shim/qpdf/RC4.hh scripts/qpdf-pl-rc4-diff.sh scripts/tests/qpdf-pl-rc4-diff-contract.sh
+git add crates/flpdf/src/pipeline/rc4.rs tests/oracle/qpdf_rc4_probe.cc tests/oracle/qpdf_pl_rc4_shim/qpdf/RC4.hh scripts/qpdf-rc4-diff.sh scripts/tests/qpdf-rc4-diff-contract.sh docs/superpowers/plans/2026-07-28-qpdf-pl-rc4-cutover.md
 git commit -m "test(rc4): add qpdf PlRc4 differential"
 ```
 
@@ -353,8 +364,8 @@ python3 scripts/qpdf-module-docs.py --check
 Run:
 
 ```bash
-scripts/tests/qpdf-pl-rc4-diff-contract.sh
-scripts/qpdf-pl-rc4-diff.sh
+scripts/tests/qpdf-rc4-diff-contract.sh
+scripts/qpdf-rc4-diff.sh
 rg -n "Pl_RC4|PlRc4|flpdf-qynx\\.2\\.2" docs/qpdf-correspondence.md docs/qpdf-module-doc-index.md crates/flpdf/src
 rg -n "decode_stream_data_with_decryption" crates
 ```
@@ -398,4 +409,3 @@ git commit -m "docs: record PlRc4 production cutover"
 - [ ] **Step 6: Close and publish**
 
 After verifying `git status`, append exact verification notes to `flpdf-qynx.2.2`, close it, push Beads, rebase if required, and push `feature/flpdf-qynx-2-2-plrc4`.
-

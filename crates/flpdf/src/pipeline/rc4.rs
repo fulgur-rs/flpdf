@@ -103,7 +103,11 @@ mod tests {
     use super::{PlRc4, DEFAULT_OUT_BUFFER_SIZE};
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
     use crate::security::rc4::Rc4;
-    use std::ffi::CStr;
+    use std::ffi::{CStr, CString};
+    use std::path::Path;
+    use std::process::Command;
+    #[cfg(unix)]
+    use std::{fs, os::unix::fs::PermissionsExt};
 
     #[derive(Default)]
     struct RecordingSink {
@@ -324,5 +328,254 @@ mod tests {
             error.to_string(),
             "Pl_RC4: output buffer size must be greater than zero"
         );
+    }
+
+    #[derive(Clone, Copy)]
+    enum OracleKeyMode {
+        Explicit,
+        CStr,
+    }
+
+    struct OracleCase {
+        name: &'static str,
+        mode: OracleKeyMode,
+        key: Vec<u8>,
+        input_len: usize,
+        write_split: usize,
+        out_buffer_size: usize,
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn oracle_input(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|index| (index.wrapping_mul(37).wrapping_add(11)) as u8)
+            .collect()
+    }
+
+    fn oracle_cases() -> Vec<OracleCase> {
+        vec![
+            OracleCase {
+                name: "empty-input",
+                mode: OracleKeyMode::Explicit,
+                key: b"Key".to_vec(),
+                input_len: 0,
+                write_split: 0,
+                out_buffer_size: DEFAULT_OUT_BUFFER_SIZE,
+            },
+            OracleCase {
+                name: "below-default-boundary",
+                mode: OracleKeyMode::Explicit,
+                key: (0..16).collect(),
+                input_len: DEFAULT_OUT_BUFFER_SIZE - 1,
+                write_split: 31,
+                out_buffer_size: DEFAULT_OUT_BUFFER_SIZE,
+            },
+            OracleCase {
+                name: "at-default-boundary",
+                mode: OracleKeyMode::Explicit,
+                key: (1..=5).collect(),
+                input_len: DEFAULT_OUT_BUFFER_SIZE,
+                write_split: DEFAULT_OUT_BUFFER_SIZE,
+                out_buffer_size: DEFAULT_OUT_BUFFER_SIZE,
+            },
+            OracleCase {
+                name: "above-default-boundary",
+                mode: OracleKeyMode::Explicit,
+                key: b"stream-key".to_vec(),
+                input_len: DEFAULT_OUT_BUFFER_SIZE + 1,
+                write_split: 17,
+                out_buffer_size: DEFAULT_OUT_BUFFER_SIZE,
+            },
+            OracleCase {
+                name: "multiple-default-buffers",
+                mode: OracleKeyMode::Explicit,
+                key: (0..=255).collect(),
+                input_len: DEFAULT_OUT_BUFFER_SIZE * 2 + 1,
+                write_split: DEFAULT_OUT_BUFFER_SIZE + 9,
+                out_buffer_size: DEFAULT_OUT_BUFFER_SIZE,
+            },
+            OracleCase {
+                name: "custom-buffer",
+                mode: OracleKeyMode::Explicit,
+                key: b"custom".to_vec(),
+                input_len: 211,
+                write_split: 100,
+                out_buffer_size: 64,
+            },
+            OracleCase {
+                name: "c-string-key",
+                mode: OracleKeyMode::CStr,
+                key: b"Key\0ignored".to_vec(),
+                input_len: 97,
+                write_split: 41,
+                out_buffer_size: DEFAULT_OUT_BUFFER_SIZE,
+            },
+        ]
+    }
+
+    fn flpdf_oracle_record(case: &OracleCase) -> String {
+        let input = oracle_input(case.input_len);
+        let mut sink = RecordingSink::default();
+        let after_finish;
+        {
+            let mut stage = match case.mode {
+                OracleKeyMode::Explicit => {
+                    PlRc4::with_buffer_size("pl-rc4", &mut sink, &case.key, case.out_buffer_size)
+                        .unwrap()
+                }
+                OracleKeyMode::CStr => {
+                    let key = CString::new(
+                        case.key
+                            .split(|byte| *byte == 0)
+                            .next()
+                            .expect("C-string oracle key has a prefix"),
+                    )
+                    .unwrap();
+                    PlRc4::from_c_str("pl-rc4", &mut sink, &key).unwrap()
+                }
+            };
+            stage.write(&input[..case.write_split]).unwrap();
+            stage.write(&input[case.write_split..]).unwrap();
+            stage.finish().unwrap();
+            stage.finish().unwrap();
+            after_finish = stage.write(b"x").unwrap_err().to_string();
+        }
+        let chunks = sink
+            .chunk_lengths()
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "output\t{}\nchunks\t{chunks}\nfinishes\t{}\nafter-finish\t{after_finish}\n",
+            hex(&sink.bytes()),
+            sink.finishes
+        )
+    }
+
+    fn run_qpdf_pl_rc4_probe(probe: &Path, case: &OracleCase) -> String {
+        let mode = match case.mode {
+            OracleKeyMode::Explicit => "explicit",
+            OracleKeyMode::CStr => "cstr",
+        };
+        let output = Command::new(probe)
+            .args([
+                "pipeline",
+                mode,
+                &hex(&case.key),
+                &case.input_len.to_string(),
+                &case.write_split.to_string(),
+                &case.out_buffer_size.to_string(),
+            ])
+            .output()
+            .expect("execute qpdf Pl_RC4 probe");
+        assert!(
+            output.status.success(),
+            "qpdf Pl_RC4 probe failed for {}: {}",
+            case.name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("Pl_RC4 probe output is ASCII")
+    }
+
+    fn assert_qpdf_pl_rc4_oracle_matches(mut qpdf_records: impl FnMut(&OracleCase) -> String) {
+        for case in oracle_cases() {
+            assert_eq!(
+                flpdf_oracle_record(&case),
+                qpdf_records(&case),
+                "case {}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "live qpdf 11.9.0 Pl_RC4 oracle"]
+    // cov:ignore-start: ignored live entry point; ordinary tests cover the comparison and process boundary
+    fn qpdf_rc4_differential_pl_rc4_pipeline() {
+        let probe = std::env::var_os("QPDF_PL_RC4_PROBE")
+            .expect("set QPDF_PL_RC4_PROBE to the qpdf 11.9.0 probe");
+        assert_qpdf_pl_rc4_oracle_matches(|case| run_qpdf_pl_rc4_probe(Path::new(&probe), case));
+    }
+    // cov:ignore-end
+
+    #[test]
+    fn qpdf_pl_rc4_comparison_checks_every_oracle_case() {
+        let mut visited = Vec::new();
+        assert_qpdf_pl_rc4_oracle_matches(|case| {
+            visited.push(case.name);
+            flpdf_oracle_record(case)
+        });
+        assert_eq!(visited.len(), oracle_cases().len());
+    }
+
+    #[cfg(unix)]
+    fn write_test_probe(path: &Path, source: &str) {
+        fs::write(path, source).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_pl_rc4_probe_receives_exact_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        write_test_probe(&probe, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+        let case = OracleCase {
+            name: "arguments",
+            mode: OracleKeyMode::Explicit,
+            key: vec![0x01, 0xab],
+            input_len: 9,
+            write_split: 4,
+            out_buffer_size: 7,
+        };
+        assert_eq!(
+            run_qpdf_pl_rc4_probe(&probe, &case),
+            "pipeline\nexplicit\n01ab\n9\n4\n7\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_pl_rc4_probe_failure_reports_case_and_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        write_test_probe(&probe, "#!/bin/sh\nprintf 'probe stderr' >&2\nexit 7\n");
+        let case = OracleCase {
+            name: "failure-case",
+            mode: OracleKeyMode::Explicit,
+            key: vec![1],
+            input_len: 0,
+            write_split: 0,
+            out_buffer_size: DEFAULT_OUT_BUFFER_SIZE,
+        };
+        let panic = std::panic::catch_unwind(|| run_qpdf_pl_rc4_probe(&probe, &case)).unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("qpdf Pl_RC4 probe failed for failure-case"));
+        assert!(message.contains("probe stderr"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_pl_rc4_probe_rejects_non_utf8_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        write_test_probe(&probe, "#!/bin/sh\nprintf '\\377'\n");
+        let case = OracleCase {
+            name: "non-utf8",
+            mode: OracleKeyMode::Explicit,
+            key: vec![1],
+            input_len: 0,
+            write_split: 0,
+            out_buffer_size: DEFAULT_OUT_BUFFER_SIZE,
+        };
+        let panic = std::panic::catch_unwind(|| run_qpdf_pl_rc4_probe(&probe, &case)).unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("Pl_RC4 probe output is ASCII"));
     }
 }

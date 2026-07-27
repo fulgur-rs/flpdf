@@ -1,3 +1,4 @@
+#include <qpdf/Pl_RC4.hh>
 #include <qpdf/RC4_native.hh>
 
 #include <cstdlib>
@@ -51,12 +52,125 @@ namespace
             key.data(),
             c_string ? -1 : static_cast<int>(explicit_key_len));
     }
+
+    size_t
+    parse_size(char const* value, char const* label)
+    {
+        size_t consumed = 0;
+        auto result = std::stoull(value, &consumed);
+        if (consumed != std::string(value).size()) {
+            throw std::runtime_error(std::string("invalid ") + label);
+        }
+        return static_cast<size_t>(result);
+    }
+
+    class RecordingPipeline: public Pipeline
+    {
+      public:
+        RecordingPipeline() :
+            Pipeline("recording", nullptr)
+        {
+        }
+
+        void write(unsigned char const* data, size_t len) override
+        {
+            chunks.push_back(len);
+            output.insert(output.end(), data, data + len);
+        }
+
+        void finish() override
+        {
+            ++finishes;
+        }
+
+        std::vector<unsigned char> output;
+        std::vector<size_t> chunks;
+        size_t finishes{0};
+    };
+
+    int
+    run_pipeline(int argc, char* argv[])
+    {
+        if (argc != 7) {
+            throw std::runtime_error(
+                "usage: qpdf_rc4_probe pipeline explicit|cstr KEY_HEX "
+                "INPUT_LEN WRITE_SPLIT OUT_BUFFER_SIZE");
+        }
+        bool c_string = std::string(argv[2]) == "cstr";
+        if (!c_string && std::string(argv[2]) != "explicit") {
+            throw std::runtime_error("invalid key mode");
+        }
+        auto key = decode(argv[3]);
+        if (key.empty()) {
+            throw std::runtime_error(
+                c_string ? "empty C-string key" : "empty explicit key");
+        }
+        if (c_string && key.front() == 0) {
+            throw std::runtime_error("empty C-string key");
+        }
+        auto input_len = parse_size(argv[4], "input length");
+        auto write_split = parse_size(argv[5], "write split");
+        auto out_buffer_size = parse_size(argv[6], "output buffer size");
+        if (write_split > input_len) {
+            throw std::runtime_error("write split exceeds input");
+        }
+        if (out_buffer_size == 0) {
+            throw std::runtime_error("zero output buffer size");
+        }
+
+        std::vector<unsigned char> input;
+        input.reserve(input_len);
+        for (size_t i = 0; i < input_len; ++i) {
+            input.push_back(static_cast<unsigned char>((i * 37U + 11U) & 0xffU));
+        }
+        auto explicit_key_len = key.size();
+        key.push_back(0);
+
+        RecordingPipeline sink;
+        Pl_RC4 stage(
+            "pl-rc4",
+            &sink,
+            key.data(),
+            c_string ? -1 : static_cast<int>(explicit_key_len),
+            out_buffer_size);
+        stage.write(input.data(), write_split);
+        stage.write(input.data() + write_split, input_len - write_split);
+        stage.finish();
+        stage.finish();
+
+        std::string after_finish;
+        try {
+            unsigned char byte = 0;
+            stage.write(&byte, 1);
+        } catch (std::logic_error const& error) {
+            after_finish = error.what();
+        }
+        if (after_finish.empty()) {
+            throw std::runtime_error("write after finish did not fail");
+        }
+
+        std::ostringstream chunks;
+        for (size_t i = 0; i < sink.chunks.size(); ++i) {
+            if (i > 0) {
+                chunks << ",";
+            }
+            chunks << sink.chunks.at(i);
+        }
+        std::cout << "output\t" << encode(sink.output) << "\n"
+                  << "chunks\t" << chunks.str() << "\n"
+                  << "finishes\t" << sink.finishes << "\n"
+                  << "after-finish\t" << after_finish << "\n";
+        return 0;
+    }
 }
 
 int
 main(int argc, char* argv[])
 {
     try {
+        if ((argc >= 2) && (std::string(argv[1]) == "pipeline")) {
+            return run_pipeline(argc, argv);
+        }
         if (argc != 5) {
             throw std::runtime_error(
                 "usage: qpdf_rc4_probe explicit|cstr KEY_HEX INPUT_HEX SPLIT");
