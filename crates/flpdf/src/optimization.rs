@@ -105,12 +105,13 @@ impl Optimization {
         let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer(), false);
         for (key, value) in crate::qpdf_null::visible_entries(pdf, trailer_entries)? {
             if key != b"Root" {
-                maps.update_object_maps(
+                let update = maps.update_object_maps(
                     pdf,
                     ObjectUser::TrailerKey(key),
                     value,
                     &mut skip_stream_parameters,
-                )?;
+                );
+                update?;
             }
         }
 
@@ -118,12 +119,13 @@ impl Optimization {
             if let Object::Dictionary(root) = pdf.resolve(root_ref)? {
                 let root_entries = crate::qpdf_null::snapshot_entries(&root, false);
                 for (key, value) in crate::qpdf_null::visible_entries(pdf, root_entries)? {
-                    maps.update_object_maps(
+                    let update = maps.update_object_maps(
                         pdf,
                         ObjectUser::RootKey(key),
                         value,
                         &mut skip_stream_parameters,
-                    )?;
+                    );
+                    update?;
                 }
             }
             maps.record(ObjectUser::Root, root_ref);
@@ -347,6 +349,14 @@ mod tests {
             .expect("object-user maps should build")
     }
 
+    fn too_deep_object() -> Object {
+        let mut nested = Object::Null;
+        for _ in 0..=crate::object::MAX_INLINE_DEPTH {
+            nested = Object::Array(vec![nested]);
+        }
+        nested
+    }
+
     #[test]
     fn object_user_order_matches_qpdf_discriminant_page_and_key_order() {
         let users = BTreeSet::from([
@@ -370,6 +380,18 @@ mod tests {
                 ObjectUser::Root,
             ]
         );
+    }
+
+    #[test]
+    fn non_page_users_use_qpdfs_zero_page_number_fallback() {
+        for user in [
+            ObjectUser::Bad,
+            ObjectUser::TrailerKey(b"Info".to_vec()),
+            ObjectUser::RootKey(b"Pages".to_vec()),
+            ObjectUser::Root,
+        ] {
+            assert_eq!(user.page_number(), 0);
+        }
     }
 
     #[test]
@@ -622,6 +644,68 @@ mod tests {
     }
 
     #[test]
+    fn missing_and_non_dictionary_roots_keep_only_qpdf_root_identity() {
+        let mut without_root = pdf_bytes(&[(1, b"<<>>")], b"");
+        let marker = b" /Root 1 0 R";
+        let offset = without_root
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("fixture should contain /Root");
+        without_root[offset..offset + marker.len()].fill(b' ');
+        let mut without_root =
+            Pdf::open_mem_owned(without_root).expect("rootless fixture should parse");
+        assert!(without_root.root_ref().is_none());
+        let maps = Optimization::build_after_inherited(&mut without_root, &[], |_| 1)
+            .expect("rootless document should build empty maps");
+        assert!(maps.objects_for(&ObjectUser::Root).is_empty());
+
+        let mut non_dictionary_root = open_pdf(&[(1, b"42")], b"");
+        let maps = Optimization::build_after_inherited(&mut non_dictionary_root, &[], |_| 1)
+            .expect("non-dictionary root should retain its identity");
+        assert_eq!(
+            maps.objects_for(&ObjectUser::Root),
+            &BTreeSet::from([ObjectRef::new(1, 0)])
+        );
+    }
+
+    #[test]
+    fn excessive_trailer_and_catalog_key_depth_errors_propagate() {
+        let mut trailer_pdf = open_pdf(
+            &[
+                (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (
+                    3,
+                    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+                ),
+                (5, b"null"),
+            ],
+            b"/CustomTrailer 5 0 R",
+        );
+        trailer_pdf.set_object(ObjectRef::new(5, 0), too_deep_object());
+        let error = Optimization::build_after_inherited(&mut trailer_pdf, &[], |_| 1)
+            .expect_err("trailer traversal error must propagate");
+        assert!(matches!(error, crate::Error::Unsupported(_)));
+
+        let mut catalog_pdf = open_pdf(
+            &[
+                (1, b"<< /Type /Catalog /Pages 2 0 R /Deep 5 0 R >>"),
+                (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (
+                    3,
+                    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+                ),
+                (5, b"null"),
+            ],
+            b"",
+        );
+        catalog_pdf.set_object(ObjectRef::new(5, 0), too_deep_object());
+        let error = Optimization::build_after_inherited(&mut catalog_pdf, &[], |_| 1)
+            .expect_err("catalog traversal error must propagate");
+        assert!(matches!(error, crate::Error::Unsupported(_)));
+    }
+
+    #[test]
     fn excessive_direct_inline_depth_is_rejected() {
         let mut pdf = open_pdf(
             &[
@@ -637,14 +721,12 @@ mod tests {
         crate::linearization::inherited_attrs::push_inherited_attributes_to_pages(&mut pdf)
             .unwrap();
         let pages = crate::pages::page_refs(&mut pdf).unwrap();
-        let mut nested = Object::Null;
-        for _ in 0..=crate::object::MAX_INLINE_DEPTH {
-            nested = Object::Array(vec![nested]);
-        }
-        let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
-            panic!("page should be a dictionary");
-        };
-        page.insert("Deep", nested);
+        let mut page = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .unwrap()
+            .into_dict()
+            .expect("page should be a dictionary");
+        page.insert("Deep", too_deep_object());
         pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
 
         let error = Optimization::build_after_inherited(&mut pdf, &pages, |_| 1)
