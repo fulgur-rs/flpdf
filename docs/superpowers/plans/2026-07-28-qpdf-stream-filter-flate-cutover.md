@@ -661,7 +661,7 @@ cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_tests
 
 Expected: all applicable tests pass or report only their documented environment skip.
 
-- [ ] **Step 5: Obtain fresh 100% patch coverage**
+- [x] **Step 5: Obtain fresh 100% patch coverage**
 
 Run a fresh report:
 
@@ -673,7 +673,7 @@ scripts/patch-coverage.sh --base origin/main --lcov target/llvm-cov/lcov.info
 
 Expected: every changed executable line is covered; patch coverage is exactly 100%.
 
-- [ ] **Step 6: Final self-review and commit**
+- [x] **Step 6: Final self-review and commit**
 
 Review:
 
