@@ -7,11 +7,21 @@
 use assert_cmd::Command;
 use flpdf::{filters, Dictionary, Object};
 use predicates::prelude::*;
+use std::collections::BTreeMap;
 use std::io::Write;
+use std::process::Command as ShellCommand;
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
 // ---------------------------------------------------------------------------
+
+fn is_qpdf_available() -> bool {
+    ShellCommand::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
 
 /// One-page PDF with a single content stream so we have at least one stream
 /// object in the qpdf section.
@@ -56,6 +66,103 @@ fn write_temp_pdf(bytes: &[u8]) -> tempfile::NamedTempFile {
     f
 }
 
+fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = BTreeMap::new();
+    let max = objects.iter().map(|(number, _)| *number).max().unwrap_or(0);
+    for (number, body) in objects {
+        offsets.insert(*number, out.len());
+        out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let xref_start = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", max + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for number in 1..=max {
+        if let Some(offset) = offsets.get(&number) {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        } else {
+            out.extend_from_slice(b"0000000000 65535 f \n");
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root {root} 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
+            max + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+fn short_name_tree_pair_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Names << /Dests << /Kids [<< /Names [(m)] >>] >> >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (One) /Parent 4 0 R /Dest (m) >>"),
+        ],
+        1,
+    )
+}
+
+fn lazy_malformed_orphan_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Broken [1 2"),
+        ],
+        1,
+    )
+}
+
+fn escaped_raw_dictionary_names_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let off1 = pdf.len();
+    pdf.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /#22 1 /A 2 /Nested << /#22 3 /A 4 >> >>\nendobj\n",
+    );
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+    );
+    let off4 = pdf.len();
+    pdf.extend_from_slice(
+        b"4 0 obj\n<< /Length 0 /#22 5 /A 6 /Nested << /#22 7 /A 8 >> >>\nstream\n\nendstream\nendobj\n",
+    );
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n"
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 5 /Root 1 0 R /#22 9 /A 10 >>\n\
+             startxref\n{xref_start}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: --json outputs JSON to stdout
 // ---------------------------------------------------------------------------
@@ -74,6 +181,254 @@ fn json_flag_outputs_json_to_stdout() {
         .stdout(predicate::str::contains("\"pages\""))
         // stderr is empty — no spurious warnings for a clean PDF
         .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn json_fatal_preserves_partial_stdout() {
+    let input = write_temp_pdf(&short_name_tree_pair_pdf());
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--json-key=outlines",
+            input.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.starts_with(b"{\n  \"version\": 2,"));
+    assert!(!output.stdout.ends_with(b"}\n"));
+    assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).is_err());
+}
+
+#[test]
+fn json_fatal_preserves_partial_output_file() {
+    let input = write_temp_pdf(&short_name_tree_pair_pdf());
+    let temp = tempfile::tempdir().unwrap();
+    let output_path = temp.path().join("out.json");
+    std::fs::write(&output_path, b"pre-existing content").unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--json-key=outlines",
+            "--json-output",
+            output_path.to_str().unwrap(),
+            input.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let bytes = std::fs::read(&output_path).unwrap();
+    assert!(bytes.starts_with(b"{\n  \"version\": 2,"));
+    assert!(!bytes.ends_with(b"}\n"));
+    assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_err());
+}
+
+#[test]
+fn lazy_object_failure_keeps_qpdf_maxobjectid_value_prefix() {
+    if !is_qpdf_available() {
+        return;
+    }
+
+    let input = write_temp_pdf(&lazy_malformed_orphan_pdf());
+    let args = ["--json=2", "--json-key=qpdf"];
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    let marker = b"      \"maxobjectid\": ";
+    let marker_end = qpdf
+        .stdout
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("qpdf 11.9.0 must emit qpdf metadata before object preparation")
+        + marker.len();
+    let qpdf_prefix = &qpdf.stdout[..marker_end];
+    assert_eq!(
+        qpdf_prefix,
+        b"{\n  \"version\": 2,\n  \"parameters\": {\n    \"decodelevel\": \"generalized\"\n  },\n  \"qpdf\": [\n    {\n      \"jsonversion\": 2,\n      \"pdfversion\": \"1.7\",\n      \"pushedinheritedpageresources\": false,\n      \"calledgetallpages\": false,\n      \"maxobjectid\": "
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+
+    assert!(!flpdf.status.success());
+    assert_eq!(flpdf.stdout, qpdf_prefix);
+}
+
+fn assert_same_json_output_is_rejected_without_modifying_input(
+    input_arg: &str,
+    output_arg: &str,
+    input_path: &std::path::Path,
+    current_dir: Option<&std::path::Path>,
+) {
+    let original = std::fs::read(input_path).unwrap();
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    if let Some(dir) = current_dir {
+        cmd.current_dir(dir);
+    }
+    let output = cmd
+        .args(["--json=2", "--json-output", output_arg, input_arg])
+        .output()
+        .unwrap();
+    assert_eq!(std::fs::read(input_path).unwrap(), original);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "input file and output file are the same; choose a different --json-output path"
+        ),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn json_output_rejects_input_path_without_modifying_input() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let path = input.path().to_str().unwrap();
+    assert_same_json_output_is_rejected_without_modifying_input(path, path, input.path(), None);
+}
+
+#[test]
+fn json_output_rejects_relative_alias_without_modifying_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("input.pdf");
+    std::fs::write(&input_path, one_page_pdf_with_stream()).unwrap();
+
+    assert_same_json_output_is_rejected_without_modifying_input(
+        "input.pdf",
+        "./input.pdf",
+        &input_path,
+        Some(temp.path()),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn json_output_rejects_symlink_to_input_without_modifying_input() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("input.pdf");
+    let output_path = temp.path().join("output.json");
+    std::fs::write(&input_path, one_page_pdf_with_stream()).unwrap();
+    symlink(&input_path, &output_path).unwrap();
+
+    assert_same_json_output_is_rejected_without_modifying_input(
+        input_path.to_str().unwrap(),
+        output_path.to_str().unwrap(),
+        &input_path,
+        None,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn json_output_rejects_hardlink_to_input_without_modifying_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("input.pdf");
+    let output_path = temp.path().join("output.json");
+    std::fs::write(&input_path, one_page_pdf_with_stream()).unwrap();
+    std::fs::hard_link(&input_path, &output_path).unwrap();
+
+    assert_same_json_output_is_rejected_without_modifying_input(
+        input_path.to_str().unwrap(),
+        output_path.to_str().unwrap(),
+        &input_path,
+        None,
+    );
+}
+
+#[test]
+fn json_output_overwrites_distinct_existing_file() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let temp = tempfile::tempdir().unwrap();
+    let output_path = temp.path().join("output.json");
+    std::fs::write(&output_path, b"stale output").unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--json-output",
+            output_path.to_str().unwrap(),
+            input.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    let output = std::fs::read(&output_path).unwrap();
+    assert_ne!(output, b"stale output");
+    serde_json::from_slice::<serde_json::Value>(&output).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn json_output_overwrites_distinct_write_only_existing_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let temp = tempfile::tempdir().unwrap();
+    let output_path = temp.path().join("output.json");
+    std::fs::write(&output_path, b"stale output").unwrap();
+    std::fs::set_permissions(&output_path, std::fs::Permissions::from_mode(0o200)).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--json-output",
+            output_path.to_str().unwrap(),
+            input.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    std::fs::set_permissions(&output_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let output = std::fs::read(&output_path).unwrap();
+    assert_ne!(output, b"stale output");
+    serde_json::from_slice::<serde_json::Value>(&output).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn json_output_reports_identity_check_io_error_without_modifying_input() {
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let original = std::fs::read(input.path()).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let non_directory = temp.path().join("not-a-directory");
+    std::fs::write(&non_directory, b"blocker").unwrap();
+    let output_path = non_directory.join("output.json");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--json-output",
+            output_path.to_str().unwrap(),
+            input.path().to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "unable to inspect --json-output file",
+        ));
+
+    assert_eq!(std::fs::read(input.path()).unwrap(), original);
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +925,7 @@ fn one_page_pdf_with_flate_stream(content: &[u8]) -> Vec<u8> {
     let off4 = pdf.len();
     pdf.extend_from_slice(
         format!(
-            "4 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n",
+            "4 0 obj\n<< /Length {} /Filter /FlateDecode /DecodeParms << /Predictor 1 >> >>\nstream\n",
             encoded.len()
         )
         .as_bytes(),
@@ -591,6 +946,210 @@ fn one_page_pdf_with_flate_stream(content: &[u8]) -> Vec<u8> {
         format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
     );
     pdf
+}
+
+fn one_page_pdf_with_unsupported_stream(content: &[u8]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let off1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+    );
+    let off4 = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Length {} /Filter /DCTDecode /DecodeParms << /ColorTransform 0 >> >>\nstream\n",
+            content.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(content);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_start = pdf.len();
+    let xref = format!(
+        "xref\n0 5\n\
+         0000000000 65535 f \n\
+         {off1:010} 00000 n \n\
+         {off2:010} 00000 n \n\
+         {off3:010} 00000 n \n\
+         {off4:010} 00000 n \n"
+    );
+    pdf.extend_from_slice(xref.as_bytes());
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
+fn assert_stream_json_is_qpdf_exact(pdf: &[u8], stream_mode: &str) {
+    if !is_qpdf_available() {
+        return;
+    }
+
+    let input = write_temp_pdf(pdf);
+    let temp = tempfile::tempdir().unwrap();
+    let prefix = temp.path().join("stream");
+    let stream_mode_arg = format!("--json-stream-data={stream_mode}");
+    let prefix_arg = format!("--json-stream-prefix={}", prefix.display());
+    let args = [
+        "--json=2",
+        "--json-key=qpdf",
+        "--json-object=4",
+        stream_mode_arg.as_str(),
+        prefix_arg.as_str(),
+    ];
+
+    let qpdf = std::process::Command::new("qpdf")
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf 11.9.0 failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    let qpdf_side_file =
+        (stream_mode == "file").then(|| std::fs::read(format!("{}-4", prefix.display())).unwrap());
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(
+        flpdf.status.success(),
+        "flpdf failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    if let Some(qpdf_bytes) = qpdf_side_file {
+        assert_eq!(
+            std::fs::read(format!("{}-4", prefix.display())).unwrap(),
+            qpdf_bytes
+        );
+    }
+}
+
+#[test]
+fn unfiltered_inline_stream_json_is_qpdf_exact() {
+    assert_stream_json_is_qpdf_exact(&one_page_pdf_with_stream(), "inline");
+}
+
+#[test]
+fn filtered_inline_stream_json_is_qpdf_exact() {
+    assert_stream_json_is_qpdf_exact(
+        &one_page_pdf_with_flate_stream(b"qpdf filtered inline bytes"),
+        "inline",
+    );
+}
+
+#[test]
+fn filtered_stream_json_without_payload_is_qpdf_exact() {
+    assert_stream_json_is_qpdf_exact(
+        &one_page_pdf_with_flate_stream(b"qpdf filtered dictionary bytes"),
+        "none",
+    );
+}
+
+#[test]
+fn unfiltered_file_stream_json_and_payload_are_qpdf_exact() {
+    assert_stream_json_is_qpdf_exact(&one_page_pdf_with_stream(), "file");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn file_stream_to_dev_full_matches_qpdf_success_and_complete_json() {
+    use std::os::unix::fs::symlink;
+
+    if !is_qpdf_available() {
+        return;
+    }
+
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let temp = tempfile::tempdir().unwrap();
+    let prefix = temp.path().join("stream");
+    symlink("/dev/full", temp.path().join("stream-4")).unwrap();
+    let prefix_arg = format!("--json-stream-prefix={}", prefix.display());
+    let args = [
+        "--json=2",
+        "--json-key=qpdf",
+        "--json-object=4",
+        "--json-stream-data=file",
+        prefix_arg.as_str(),
+    ];
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(qpdf.status.success(), "{qpdf:?}");
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+
+    assert!(flpdf.status.success(), "{flpdf:?}");
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    serde_json::from_slice::<serde_json::Value>(&flpdf.stdout).unwrap();
+}
+
+#[test]
+fn filtered_file_stream_json_and_payload_are_qpdf_exact() {
+    assert_stream_json_is_qpdf_exact(
+        &one_page_pdf_with_flate_stream(b"qpdf filtered file bytes"),
+        "file",
+    );
+}
+
+#[test]
+fn unsupported_filter_inline_fallback_json_is_qpdf_exact() {
+    assert_stream_json_is_qpdf_exact(
+        &one_page_pdf_with_unsupported_stream(b"raw unsupported filter bytes"),
+        "inline",
+    );
+}
+
+#[test]
+fn raw_dictionary_names_are_ordered_before_json_escaping_like_qpdf() {
+    if !is_qpdf_available() {
+        return;
+    }
+
+    let input = write_temp_pdf(&escaped_raw_dictionary_names_pdf());
+    let args = ["--json=2", "--json-key=qpdf"];
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf 11.9.0 failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(
+        flpdf.status.success(),
+        "flpdf failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout);
 }
 
 /// Minimal RFC 4648 base64 encoder, for asserting on inline `data` values.

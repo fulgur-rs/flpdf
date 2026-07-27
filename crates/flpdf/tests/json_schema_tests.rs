@@ -1,0 +1,280 @@
+use flpdf::json::{Json, SchemaFlags};
+
+fn parsed(input: &[u8]) -> Json {
+    Json::parse(input).unwrap()
+}
+
+fn error_bytes(errors: &[flpdf::json::JsonMessage]) -> Vec<&[u8]> {
+    errors.iter().map(|error| error.as_bytes()).collect()
+}
+
+#[test]
+fn optional_flag_allows_missing_but_not_extra_keys() {
+    let schema = parsed(br#"{"a":"value","b":"value"}"#);
+    let value = parsed(br#"{"a":1}"#);
+    let mut errors = Vec::new();
+    assert!(value.check_schema_with_flags(
+        &schema,
+        SchemaFlags::NONE | SchemaFlags::OPTIONAL,
+        &mut errors,
+    ));
+
+    let extra = parsed(br#"{"a":1,"x":2}"#);
+    assert!(!extra.check_schema_with_flags(&schema, SchemaFlags::OPTIONAL, &mut errors));
+    assert_eq!(
+        errors.last().unwrap().as_bytes(),
+        b"top-level object: key \"x\" is not present in schema but appears in object"
+    );
+}
+
+#[test]
+fn pattern_key_validates_every_dictionary_value() {
+    let schema = parsed(br#"{"<objid>":{"n":"number"}}"#);
+    let value = parsed(br#"{"one":{"a":1},"two":{"x":2}}"#);
+    let mut errors = Vec::new();
+    assert!(!value.check_schema(&schema, &mut errors));
+    assert_eq!(
+        error_bytes(&errors),
+        [
+            b"json key \".one\": key \"n\" is present in schema but missing in object".as_slice(),
+            b"json key \".one\": key \"a\" is not present in schema but appears in object"
+                .as_slice(),
+            b"json key \".two\": key \"n\" is present in schema but missing in object".as_slice(),
+            b"json key \".two\": key \"x\" is not present in schema but appears in object"
+                .as_slice(),
+        ]
+    );
+}
+
+#[test]
+fn dictionary_failures_accumulate_with_qpdf_paths() {
+    let schema = parsed(br#"{"a":{"n":"number"},"b":"value"}"#);
+    let value = parsed(br#"{"a":{"x":1},"extra":2}"#);
+    let mut errors = Vec::new();
+
+    assert!(!value.check_schema(&schema, &mut errors));
+    assert_eq!(
+        error_bytes(&errors),
+        [
+            b"json key \".a\": key \"n\" is present in schema but missing in object".as_slice(),
+            b"json key \".a\": key \"x\" is not present in schema but appears in object".as_slice(),
+            b"top-level object: key \"b\" is present in schema but missing in object".as_slice(),
+            b"top-level object: key \"extra\" is not present in schema but appears in object"
+                .as_slice(),
+        ]
+    );
+}
+
+#[test]
+fn dictionary_schema_paths_preserve_escaped_keys() {
+    let schema = parsed(b"{\"line\\n\":{\"needed\":\"value\"}}");
+    let value = parsed(b"{\"line\\n\":{}}");
+    let mut errors = Vec::new();
+
+    assert!(!value.check_schema(&schema, &mut errors));
+    assert_eq!(
+        error_bytes(&errors),
+        [
+            b"json key \".line\\n\": key \"needed\" is present in schema but missing in object"
+                .as_slice()
+        ]
+    );
+}
+
+#[test]
+fn dictionary_errors_follow_validation_passes_not_message_sort_order() {
+    let schema = parsed(br#"{"z":"value"}"#);
+    let value = parsed(br#"{"a":1}"#);
+    let mut errors = Vec::new();
+
+    assert!(!value.check_schema(&schema, &mut errors));
+    assert_eq!(
+        error_bytes(&errors),
+        [
+            b"top-level object: key \"z\" is present in schema but missing in object".as_slice(),
+            b"top-level object: key \"a\" is not present in schema but appears in object"
+                .as_slice(),
+        ]
+    );
+}
+
+#[test]
+fn array_schemas_accept_single_item_or_validate_each_array_element() {
+    let schema = parsed(br#"[{"n":"number"}]"#);
+    let scalar = parsed(br#"{"n":1}"#);
+    let array = parsed(br#"[{"n":1},{"x":2}]"#);
+    let mut errors = Vec::new();
+
+    assert!(scalar.check_schema(&schema, &mut errors));
+    assert!(!array.check_schema(&schema, &mut errors));
+    assert_eq!(
+        error_bytes(&errors),
+        [
+            b"json key \".1\": key \"n\" is present in schema but missing in object".as_slice(),
+            b"json key \".1\": key \"x\" is not present in schema but appears in object".as_slice(),
+        ]
+    );
+}
+
+#[test]
+fn fixed_length_array_reports_length_and_invalid_schema_types() {
+    let fixed_schema = parsed(br#"["first","second"]"#);
+    let short_value = parsed(br#"[1]"#);
+    let mut errors = Vec::new();
+
+    assert!(!short_value.check_schema(&fixed_schema, &mut errors));
+    assert_eq!(
+        error_bytes(&errors),
+        [b"top-level object is supposed to be an array of length 2".as_slice()]
+    );
+
+    let same_length_schema = parsed(br#"[{"a":"value"},{"b":"value"}]"#);
+    let same_length_value = parsed(br#"[{"a":1},{"x":2}]"#);
+    let mut errors = Vec::new();
+    assert!(!same_length_value.check_schema(&same_length_schema, &mut errors));
+    assert_eq!(
+        error_bytes(&errors),
+        [
+            b"json key \".1\": key \"b\" is present in schema but missing in object".as_slice(),
+            b"json key \".1\": key \"x\" is not present in schema but appears in object".as_slice(),
+        ]
+    );
+
+    let invalid_schema = parsed(b"true");
+    let value = parsed(b"null");
+    let mut errors = Vec::new();
+    assert!(!value.check_schema(&invalid_schema, &mut errors));
+    assert_eq!(
+        error_bytes(&errors),
+        [b"top-level object schema value is not dictionary, array, or string".as_slice()]
+    );
+}
+
+#[test]
+fn dictionary_schema_rejects_a_non_dictionary_checked_value() {
+    let schema = parsed(br#"{"a":"value"}"#);
+    let value = parsed(br#"[]"#);
+    let mut errors = Vec::new();
+
+    assert!(!value.check_schema(&schema, &mut errors));
+    assert_eq!(
+        error_bytes(&errors),
+        [b"top-level object is supposed to be a dictionary".as_slice()]
+    );
+}
+
+#[test]
+fn schema_strings_are_wildcards_and_prior_errors_affect_return_value() {
+    let schema = parsed(br#""description""#);
+    let value = parsed(br#"{"any":[true,2]}"#);
+    let mut errors = vec![flpdf::json::JsonMessage::from("previous error")];
+
+    assert!(!value.check_schema(&schema, &mut errors));
+    assert_eq!(error_bytes(&errors), [b"previous error".as_slice()]);
+}
+
+#[test]
+fn nested_string_wildcard_accepts_a_large_dictionary() {
+    let schema = parsed(br#"["anything"]"#);
+    let value = Json::make_dictionary();
+    for index in 0..4096 {
+        let item = Json::make_array();
+        item.add_array_element(Json::make_int(index)).unwrap();
+        value
+            .add_dictionary_member(format!("key-{index:04}").as_bytes(), item)
+            .unwrap();
+    }
+    let mut errors = Vec::new();
+
+    assert!(value.check_schema(&schema, &mut errors));
+    assert!(errors.is_empty());
+}
+
+#[test]
+fn uninitialized_checked_handle_fails_without_adding_an_error() {
+    let mut errors = Vec::new();
+
+    assert!(!Json::default().check_schema(&parsed(br#""value""#), &mut errors));
+    assert!(errors.is_empty());
+}
+
+#[test]
+fn fixed_length_array_accepts_each_matching_position() {
+    let schema = parsed(br#"["first","second"]"#);
+    let value = parsed(br#"[1,true]"#);
+    let mut errors = Vec::new();
+
+    assert!(value.check_schema(&schema, &mut errors));
+    assert!(errors.is_empty());
+}
+
+#[test]
+fn schema_errors_preserve_non_utf8_keys_in_paths_and_messages() {
+    let schema = Json::make_dictionary();
+    schema
+        .add_dictionary_member(b"\xff", Json::make_string(b"value"))
+        .unwrap();
+    let value = Json::make_dictionary();
+    let mut errors = Vec::new();
+
+    assert!(!value.check_schema(&schema, &mut errors));
+    assert_eq!(
+        errors[0].as_bytes(),
+        b"top-level object: key \"\xff\" is present in schema but missing in object"
+    );
+
+    let pattern = Json::make_dictionary();
+    pattern.add_dictionary_member(b"<item>", schema).unwrap();
+    let nested = Json::make_dictionary();
+    nested
+        .add_dictionary_member(b"\x80", Json::make_dictionary())
+        .unwrap();
+    let mut errors = Vec::new();
+    assert!(!nested.check_schema(&pattern, &mut errors));
+    assert_eq!(
+        errors[0].as_bytes(),
+        b"json key \".\x80\": key \"\xff\" is present in schema but missing in object"
+    );
+}
+
+#[test]
+fn large_disjoint_dictionaries_preserve_qpdf_error_order() {
+    const KEY_COUNT: usize = 2048;
+
+    let schema = Json::make_dictionary();
+    let value = Json::make_dictionary();
+    for index in 0..KEY_COUNT {
+        schema
+            .add_dictionary_member(
+                format!("s{index:04}").as_bytes(),
+                Json::make_string(b"value"),
+            )
+            .unwrap();
+        value
+            .add_dictionary_member(
+                format!("v{index:04}").as_bytes(),
+                Json::make_int(index as i64),
+            )
+            .unwrap();
+    }
+    let mut errors = Vec::new();
+
+    assert!(!value.check_schema(&schema, &mut errors));
+    assert_eq!(errors.len(), KEY_COUNT * 2);
+    assert_eq!(
+        errors[0].as_bytes(),
+        b"top-level object: key \"s0000\" is present in schema but missing in object"
+    );
+    assert_eq!(
+        errors[KEY_COUNT - 1].as_bytes(),
+        b"top-level object: key \"s2047\" is present in schema but missing in object"
+    );
+    assert_eq!(
+        errors[KEY_COUNT].as_bytes(),
+        b"top-level object: key \"v0000\" is not present in schema but appears in object"
+    );
+    assert_eq!(
+        errors[KEY_COUNT * 2 - 1].as_bytes(),
+        b"top-level object: key \"v2047\" is not present in schema but appears in object"
+    );
+}

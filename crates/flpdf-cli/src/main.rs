@@ -16,9 +16,8 @@ use flpdf::{
     flatten_annotations, flatten_rotation_on_pages, fonts, generate_button_field_appearance,
     generate_choice_field_appearance, generate_text_field_appearance,
     json_inspect::{
-        build_qpdf_json_v2_selected_objects_with_options, format_json_side_file_path,
-        qpdf_raw_stream_payload, DecodeLevel, JsonKey, JsonObjectSelector,
-        StreamDataMode as JsonStreamDataMode,
+        write_qpdf_json_v2_selected_objects_with_options, DecodeLevel, JsonKey, JsonObjectSelector,
+        JsonOutputError, StreamDataMode as JsonStreamDataMode,
     },
     linearization::{
         check_linearization_path, show_linearization_path, write_linearized,
@@ -37,8 +36,8 @@ use flpdf::{
     insert_embedded_file, list_attachment_info, remove_attachment, FileParamDates, FileSpecBuilder,
 };
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufReader, Read, Seek, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -1903,83 +1902,69 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         }
     };
 
-    // 4. Open PDF.
+    // 4. Reject an output that identifies the input file before opening or
+    // truncating it. qpdf performs this check in QPDFJob.cc:627-630. Path
+    // spelling alone is insufficient: relative aliases, symlinks, and hard
+    // links can all name the same underlying file.
     let input = cli.input.as_ref().ok_or("missing input file")?;
-    let mut pdf = open_pdf(input, cli.repair, &cli.password)?;
+    if let Some(output) = cli.json_output.as_ref() {
+        reject_same_json_output(input, output)?;
+    }
 
-    // 5. Build JSON.
+    // 5. Open PDF once and retain an identity handle for the output check.
+    let input_file = File::open(input).map_err(|error| json_input_open_error(input, error))?;
+    let input_identity = input_file
+        .try_clone()
+        .map_err(|error| error_with_file(input, error.into()))?;
+    let mut pdf = open_pdf_from_file(input, input_file, cli.repair, &cli.password)?;
+
+    // 6. Write JSON incrementally.
     //
-    // `decode_level` governs both the inline `data` payloads (applied inside
-    // build_qpdf_json_v2_selected_with_options) and the file-mode side files
-    // written below — the two must agree, so they share this single value.
+    // `decode_level` governs both inline `data` payloads and file-mode side files
+    // emitted by write_qpdf_json_v2_selected_objects_with_options.
     let decode_level = DecodeLevel::Generalized;
     let diagnostics_start = pdf.repair_diagnostics().entries().len();
     let had_open_warnings = diagnostics_start > 0;
-    let v2 = match build_qpdf_json_v2_selected_objects_with_options(
-        &mut pdf,
-        decode_level,
-        &stream_mode,
-        &json_keys,
-        &json_objects,
-    ) {
-        Ok(v2) => v2,
-        Err(error) => {
-            emit_warnings_since(input, &pdf, diagnostics_start);
-            return Err(Box::<dyn std::error::Error>::from(error.to_string()));
-        }
-    };
-
-    // 6. Write JSON to output destination. Outline/name-tree processing may
-    // already have recorded warnings while building `v2`. If output fails,
-    // emit those warnings before returning the fatal write error so they are
-    // not lost; the success summary is intentionally omitted on this path.
-    let json_write_result = (|| -> CliResult<()> {
-        if let Some(ref out_path) = cli.json_output {
-            let mut file = File::create(out_path)?;
-            flpdf::json::write(&v2, &mut file)?;
-        } else {
-            let stdout = std::io::stdout();
-            let mut locked = stdout.lock();
-            flpdf::json::write(&v2, &mut locked)?;
-            locked.flush()?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = json_write_result {
-        emit_warnings_since(input, &pdf, diagnostics_start);
-        return Err(error);
-    }
-
-    // 7. Write side files for stream-data=file mode — only for streams
-    // that actually survived --json-key / --json-object filtering. Walk
-    // the final JSON and collect every "datafile" value emitted in the
-    // qpdf objects map, then write exactly those streams to disk. Without
-    // this scoping, --json-key=pages --json-stream-data=file would dump
-    // every stream to the filesystem even though the qpdf section was
-    // filtered out of the output.
-    let side_file_result = (|| -> CliResult<()> {
-        if let JsonStreamDataMode::File { ref prefix } = stream_mode {
-            let wanted_refs = collect_datafile_object_refs(&v2);
-            // Reuse the same `pdf` handle the JSON was built from. Re-opening
-            // the input here would risk the file being swapped mid-run, so the
-            // JSON body and the side files could capture different snapshots.
-            for oref in wanted_refs {
-                let Some(payload) = qpdf_raw_stream_payload(&mut pdf, oref, decode_level)? else {
-                    continue; // cov:ignore: collector only returns entries with stream.datafile
-                };
-                // Side-file name must match the JSON `datafile` value;
-                // both come from the same helper to avoid divergence.
-                let side_path = format_json_side_file_path(prefix, oref.number);
-                // Apply the same DecodeLevel the JSON body was built with so
-                // the side file matches what inline mode would emit.
-                std::fs::write(&side_path, payload)?;
+    let json_result = if let Some(ref path) = cli.json_output {
+        match open_verified_json_output(&input_identity, path) {
+            Ok(mut file) => write_qpdf_json_v2_selected_objects_with_options(
+                &mut pdf,
+                decode_level,
+                &stream_mode,
+                &json_keys,
+                &json_objects,
+                &mut file,
+            ),
+            Err(error) => {
+                emit_warnings_since(input, &pdf, diagnostics_start);
+                return Err(error);
             }
         }
-        Ok(())
-    })();
-    if let Err(error) = side_file_result {
-        emit_warnings_since(input, &pdf, diagnostics_start);
-        return Err(error);
+    } else {
+        let stdout = std::io::stdout();
+        let mut locked = stdout.lock();
+        let write_result: Result<(), JsonOutputError> =
+            write_qpdf_json_v2_selected_objects_with_options(
+                &mut pdf,
+                decode_level,
+                &stream_mode,
+                &json_keys,
+                &json_objects,
+                &mut locked,
+            );
+        let flush_result = locked.flush().map_err(JsonOutputError::from);
+        match (write_result, flush_result) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error), // cov:ignore: real stdout flush failure cannot be induced in-process
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    };
+    match json_result {
+        Ok(()) => {}
+        Err(error) => {
+            emit_warnings_since(input, &pdf, diagnostics_start);
+            return Err(Box::new(error));
+        }
     }
 
     // qpdf exits 3 after successful JSON output when either opening or later
@@ -1995,57 +1980,6 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     }
 
     Ok(())
-}
-
-/// Walk the qpdf JSON v2 output and collect every `(obj_num, generation)`
-/// whose stream entry carries a `datafile` field. Used to scope side-file
-/// writes to exactly the streams that survived --json-key/--json-object
-/// filtering, so the CLI never writes streams the JSON output doesn't
-/// reference.
-fn collect_datafile_object_refs(v2: &flpdf::json::JsonValue) -> Vec<ObjectRef> {
-    use flpdf::json::JsonValue;
-    let mut out = Vec::new();
-    let JsonValue::Object(top) = v2 else {
-        return out;
-    };
-    let Some((_, qpdf_value)) = top.iter().find(|(k, _)| k == "qpdf") else {
-        return out;
-    };
-    let JsonValue::Array(qpdf_arr) = qpdf_value else {
-        return out;
-    };
-    // Expected shape: [metadata, objects_map].
-    let Some(JsonValue::Object(objects_map)) = qpdf_arr.get(1) else {
-        return out;
-    };
-    for (key, entry) in objects_map {
-        // Skip the "trailer" entry — it has no object number.
-        let Some(rest) = key.strip_prefix("obj:") else {
-            continue;
-        };
-        let rest = rest.trim_end_matches(" R");
-        let mut parts = rest.split_whitespace();
-        let Some(num) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
-            continue;
-        };
-        let Some(gen) = parts.next().and_then(|s| s.parse::<u16>().ok()) else {
-            continue;
-        };
-        // Only collect if the stream entry has a datafile field.
-        let JsonValue::Object(entry_pairs) = entry else {
-            continue;
-        };
-        let Some((_, stream_val)) = entry_pairs.iter().find(|(k, _)| k == "stream") else {
-            continue;
-        };
-        let JsonValue::Object(stream_pairs) = stream_val else {
-            continue;
-        };
-        if stream_pairs.iter().any(|(k, _)| k == "datafile") {
-            out.push(ObjectRef::new(num, gen));
-        }
-    }
-    out
 }
 
 fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()> {
@@ -4515,6 +4449,82 @@ fn reject_encrypted_write<R: std::io::Read + std::io::Seek>(pdf: &Pdf<R>) -> Cli
     Ok(())
 }
 
+fn reject_same_json_output(input: &Path, output: &Path) -> CliResult<()> {
+    match std::fs::metadata(output) {
+        Ok(output_metadata) => {
+            // This is only a non-destructive hint: if inspecting the input
+            // fails, the real input open below owns its path-specific error.
+            // Output metadata failures remain fail-closed in the next arm.
+            if let Ok(true) = paths_identify_same_file(input, output, &output_metadata) {
+                return Err(
+                    "input file and output file are the same; choose a different --json-output path"
+                        .into(),
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "unable to inspect --json-output file {}: {error}",
+                output.display()
+            )
+            .into())
+        }
+    }
+    Ok(())
+}
+
+fn json_input_open_error(input: &Path, error: std::io::Error) -> Box<dyn std::error::Error> {
+    let rendered = error.to_string();
+    let message = error
+        .raw_os_error()
+        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+        .unwrap_or(&rendered);
+    format!("open {}: {message}", input.display()).into()
+}
+
+fn open_verified_json_output(input: &File, output: &Path) -> CliResult<File> {
+    let mut output_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(output)?;
+    let input_handle = same_file::Handle::from_file(input.try_clone()?)?;
+    let output_handle = same_file::Handle::from_file(output_file.try_clone()?)?;
+    if input_handle == output_handle {
+        return Err(
+            "input file and output file are the same; choose a different --json-output path".into(),
+        );
+    }
+    if output_file.metadata()?.file_type().is_file() {
+        output_file.set_len(0)?;
+        output_file.seek(SeekFrom::Start(0))?;
+    }
+    Ok(output_file)
+}
+
+#[cfg(unix)]
+fn paths_identify_same_file(
+    input: &Path,
+    _output: &Path,
+    output_metadata: &std::fs::Metadata,
+) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let input_metadata = std::fs::metadata(input)?;
+    Ok(input_metadata.dev() == output_metadata.dev()
+        && input_metadata.ino() == output_metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn paths_identify_same_file(
+    input: &Path,
+    output: &Path,
+    _output_metadata: &std::fs::Metadata,
+) -> std::io::Result<bool> {
+    same_file::is_same_file(input, output)
+}
+
 fn run_dump_object(
     input: Option<PathBuf>,
     repair: bool,
@@ -5097,6 +5107,15 @@ fn open_pdf(
     open_pdf_impl(input, repair, password, false)
 }
 
+fn open_pdf_from_file(
+    input: &Path,
+    file: File,
+    repair: bool,
+    password: &PasswordArgs,
+) -> CliResult<Pdf<BufReader<File>>> {
+    open_pdf_file_impl(input, file, repair, password, false)
+}
+
 /// Open for the read-only encryption inspections (`show-encryption`,
 /// `show-encryption-key`).
 ///
@@ -5123,6 +5142,16 @@ fn open_pdf_impl(
     force_allow_weak_crypto: bool,
 ) -> CliResult<Pdf<BufReader<File>>> {
     let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
+    open_pdf_file_impl(input, file, repair, password, force_allow_weak_crypto)
+}
+
+fn open_pdf_file_impl(
+    input: &Path,
+    file: File,
+    repair: bool,
+    password: &PasswordArgs,
+    force_allow_weak_crypto: bool,
+) -> CliResult<Pdf<BufReader<File>>> {
     let mut options = pdf_open_options(repair, password)?;
     if force_allow_weak_crypto {
         options.allow_weak_crypto = true;
@@ -5616,6 +5645,29 @@ mod tests {
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_json_output_rejects_hardlink_swapped_after_path_check() {
+        let temp = tempfile::tempdir().unwrap();
+        let input_path = temp.path().join("input.pdf");
+        let output_path = temp.path().join("output.json");
+        let original = b"input bytes must survive".to_vec();
+        std::fs::write(&input_path, &original).unwrap();
+        std::fs::write(&output_path, b"distinct output").unwrap();
+        reject_same_json_output(&input_path, &output_path).unwrap();
+
+        std::fs::remove_file(&output_path).unwrap();
+        std::fs::hard_link(&input_path, &output_path).unwrap();
+        let input_file = File::open(&input_path).unwrap();
+
+        let error = open_verified_json_output(&input_file, &output_path).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("input file and output file are the same"));
+        assert_eq!(std::fs::read(&input_path).unwrap(), original);
     }
 
     // --- parse_overlay_segment ------------------------------------------

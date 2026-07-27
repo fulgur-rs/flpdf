@@ -15,6 +15,15 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
+fn normalized_os_message(error: &std::io::Error) -> String {
+    let message = error.to_string();
+    error
+        .raw_os_error()
+        .and_then(|code| message.strip_suffix(&format!(" (os error {code})")))
+        .unwrap_or(&message)
+        .to_owned()
+}
+
 fn json_qpdf_metadata(json: &serde_json::Value) -> &serde_json::Value {
     &json["qpdf"][0]
 }
@@ -1087,7 +1096,9 @@ fn json_outlines_short_first_name_tree_pair_exits_two_without_complete_json() {
             .count(),
         2
     );
-    assert!(output.stdout.is_empty());
+    assert!(output.stdout.starts_with(b"{\n  \"version\": 2,"));
+    assert!(!output.stdout.ends_with(b"}\n"));
+    assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).is_err());
 }
 
 #[test]
@@ -2528,7 +2539,7 @@ fn json_processing_warnings_do_not_repeat_open_time_warnings() {
 }
 
 #[test]
-fn json_output_error_emits_recorded_processing_warning_before_fatal_error() {
+fn json_output_open_error_happens_before_json_processing() {
     let fixture = fixture_with_repaired_name_tree_and_stream();
     let output_directory = tempfile::tempdir().unwrap();
 
@@ -2541,23 +2552,76 @@ fn json_output_error_emits_recorded_processing_warning_before_fatal_error() {
         .code(2);
     let output = assert.get_output();
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let warning = stderr
-        .find("attempting to repair after error:")
-        .unwrap_or_else(|| panic!("missing repair warning in {stderr}"));
-    let fatal = stderr
-        .rfind("flpdf:")
-        .unwrap_or_else(|| panic!("missing fatal error in {stderr}"));
-    assert!(warning < fatal, "{stderr}");
     assert_eq!(
         stderr.matches("attempting to repair after error:").count(),
-        1
+        0,
+        "{stderr}"
     );
+    assert!(stderr.contains("flpdf:"), "{stderr}");
     assert!(!stderr.contains("operation succeeded with warnings"));
     assert!(output.stdout.is_empty());
 }
 
 #[test]
-fn json_side_file_error_emits_recorded_warning_after_complete_json_before_fatal_error() {
+fn json_output_missing_input_preserves_existing_output_and_reports_input_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("missing.pdf");
+    let output_path = temp.path().join("out.json");
+    let original_output = b"existing JSON output must remain unchanged\n";
+    std::fs::write(&output_path, original_output).unwrap();
+
+    let expected_error = format!(
+        "flpdf: open {}: {}",
+        input.display(),
+        normalized_os_message(&File::open(&input).unwrap_err())
+    );
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--json-output"])
+        .arg(&output_path)
+        .arg(&input)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(std::fs::read(&output_path).unwrap(), original_output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.lines().last(),
+        Some(expected_error.as_str()),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("unable to inspect --json-output file"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn json_output_writes_to_dev_null_without_stdout() {
+    // Regression for unconditional set_len/seek after the output identity
+    // check: /dev/null is writable but rejects truncation. Other non-regular
+    // sinks, such as FIFOs, may also reject seek. The CLI must still treat it
+    // as a JSON sink.
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--json-output",
+            "/dev/null",
+            "../../tests/fixtures/minimal.pdf",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+}
+
+#[test]
+fn json_side_file_error_emits_recorded_warning_after_partial_json_before_fatal_error() {
     let fixture = fixture_with_repaired_name_tree_and_stream();
     let temp = tempfile::tempdir().unwrap();
     let missing_prefix = temp.path().join("missing").join("stream");
@@ -2574,8 +2638,28 @@ fn json_side_file_error_emits_recorded_warning_after_complete_json_before_fatal_
         .assert()
         .code(2);
     let output = assert.get_output();
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["outlines"][0]["dest"][0], "3 0 R");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("{\n"), "{stdout}");
+    assert!(
+        stdout.contains("\"dest\": [\n        \"3 0 R\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains(r#""obj:6 0 R": {"#), "{stdout}");
+    assert!(
+        stdout.ends_with("\"stream\": "),
+        "qpdf opens the final side file immediately after the stream key: {stdout}"
+    );
+    assert!(
+        !stdout[stdout.rfind("\"stream\": ").unwrap()..].contains('{'),
+        "the stream value must not start before the side-file open succeeds: {stdout}"
+    );
+    assert!(
+        !stdout[stdout.rfind("\"stream\": ").unwrap()..].contains("datafile"),
+        "the datafile member must not start before the side-file open succeeds: {stdout}"
+    );
+    let json_error = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap_err();
+    assert!(json_error.is_eof(), "{json_error}: {stdout}");
+    assert!(!stdout.ends_with("\n}\n"), "{stdout}");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let warning = stderr
@@ -2585,6 +2669,17 @@ fn json_side_file_error_emits_recorded_warning_after_complete_json_before_fatal_
         .rfind("flpdf:")
         .unwrap_or_else(|| panic!("missing fatal error in {stderr}"));
     assert!(warning < fatal, "{stderr}");
+    let side_path = format!("{}-6", missing_prefix.display());
+    let open_error = std::fs::File::create(&side_path).unwrap_err();
+    let expected_fatal = format!(
+        "flpdf: open {side_path}: {}",
+        normalized_os_message(&open_error)
+    );
+    assert_eq!(
+        stderr.lines().last(),
+        Some(expected_fatal.as_str()),
+        "{stderr}"
+    );
     assert_eq!(
         stderr.matches("attempting to repair after error:").count(),
         1
