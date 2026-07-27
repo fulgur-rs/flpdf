@@ -3,7 +3,8 @@ use crate::ascii85;
 use crate::ascii_hex;
 use crate::run_length;
 use crate::stream_filter::{
-    decode_filter_specs, encode_flate, stream_filter_for, DECODE_OUTPUT_LIMIT_PREFIX,
+    decode_filter_specs, encode_flate, ignore_warning, stream_filter_for,
+    DECODE_OUTPUT_LIMIT_PREFIX,
 };
 use crate::{Dictionary, Error, Object, Result};
 
@@ -187,7 +188,7 @@ where
                 // the codec pipeline. Predictor migration remains in qynx.5.3,
                 // but its existing validation must retain that error timing.
                 extract_predictor_params(spec.decode_params)?;
-                filter.pipe_decode(&decoded, limits.max_output, &mut |_, _| Ok(()))?
+                filter.pipe_decode(&decoded, limits.max_output, &mut ignore_warning)?
             } else {
                 apply_single_filter_decode(
                     filter_name,
@@ -815,6 +816,19 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "unsupported PDF feature: unsupported /DecodeParms /Predictor 9"
+        );
+    }
+    #[test]
+    fn registered_filter_rejects_unsupported_decode_params_before_pipeline() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"TestRejectDecode".to_vec()));
+        dict.insert("DecodeParms", Object::Integer(1));
+
+        let error = decode_stream_data(&dict, b"not decoded").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream filter TestRejectDecode does not support supplied /DecodeParms"
         );
     }
     #[test]

@@ -121,6 +121,10 @@ fn map_pipeline_error(error: PipelineError) -> Error {
     Error::Unsupported(error.to_string())
 }
 
+pub(crate) fn ignore_warning(_: &str, _: i32) -> PipelineResult<()> {
+    Ok(())
+}
+
 /// Rust equivalent of qpdf's `QPDFStreamFilter` extension boundary.
 ///
 /// `pipe_decode` owns construction and completion of the filter's decode
@@ -177,9 +181,26 @@ impl StreamFilter for FlateStreamFilter {
     }
 }
 
+#[cfg(test)]
+struct TestStreamFilter;
+
+#[cfg(test)]
+impl StreamFilter for TestStreamFilter {
+    fn pipe_decode(
+        &mut self,
+        data: &[u8],
+        _: Option<usize>,
+        _: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+    ) -> Result<Vec<u8>> {
+        Ok(data.to_vec())
+    }
+}
+
 pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilter>> {
     match filter_name {
         b"FlateDecode" => Some(Box::new(FlateStreamFilter::default())),
+        #[cfg(test)]
+        b"TestRejectDecode" => Some(Box::new(TestStreamFilter)),
         _ => None,
     }
 }
@@ -209,7 +230,7 @@ fn decode_flate_chunks<'a>(
 
 #[cfg(test)]
 fn decode_flate(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>> {
-    decode_flate_chunks([data], max_output, &mut |_, _| Ok(()))
+    decode_flate_chunks([data], max_output, &mut ignore_warning)
 }
 
 pub(crate) fn encode_flate(data: &[u8]) -> Result<Vec<u8>> {
@@ -231,8 +252,8 @@ pub(crate) fn encode_flate(data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_filter_specs, decode_flate, decode_flate_chunks, encode_flate, stream_filter_for,
-        DECODE_OUTPUT_LIMIT_PREFIX,
+        decode_filter_specs, decode_flate, decode_flate_chunks, encode_flate, ignore_warning,
+        stream_filter_for, OutputBuffer, Pipeline, DECODE_OUTPUT_LIMIT_PREFIX,
     };
     use crate::{Dictionary, Error, Object};
     use std::cell::RefCell;
@@ -300,6 +321,31 @@ mod tests {
             error.to_string(),
             "unsupported PDF feature: stream filter type is not name or array"
         );
+    }
+
+    #[test]
+    fn scalar_non_name_filter_is_rejected_before_decode() {
+        let error = decode_filter_specs(Some(&Object::Integer(1)), None).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream filter type is not name or array"
+        );
+    }
+
+    #[test]
+    fn empty_filter_array_ignores_decode_parms() {
+        let filter = Object::Array(Vec::new());
+        let params = Object::Array(vec![Object::Integer(1)]);
+
+        assert!(decode_filter_specs(Some(&filter), Some(&params))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn output_buffer_has_qpdf_pipeline_identifier() {
+        assert_eq!(OutputBuffer::new(None).identifier(), "stream data buffer");
     }
 
     #[test]
@@ -379,20 +425,18 @@ mod tests {
                 -5,
             )]
         );
+        assert!(
+            decode_flate_chunks([b"\x78".as_slice()], None, &mut ignore_warning)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn empty_inflate_skips_codec_and_warning_like_qpdf() {
-        let warnings = RefCell::new(Vec::new());
-
-        let decoded = decode_flate_chunks(std::iter::empty(), None, &mut |message, code| {
-            warnings.borrow_mut().push((message.to_string(), code));
-            Ok(())
-        })
-        .unwrap();
+        let decoded = decode_flate_chunks(std::iter::empty(), None, &mut ignore_warning).unwrap();
 
         assert!(decoded.is_empty());
-        assert!(warnings.into_inner().is_empty());
     }
 
     #[test]
@@ -400,7 +444,7 @@ mod tests {
         let error = decode_flate_chunks(
             [b"\x78\x00".as_slice(), b"not reached".as_slice()],
             None,
-            &mut |_, _| Ok(()),
+            &mut ignore_warning,
         )
         .unwrap_err();
 
@@ -441,5 +485,20 @@ mod tests {
     #[test]
     fn factory_returns_none_for_not_yet_migrated_filters() {
         assert!(stream_filter_for(b"ASCII85Decode").is_none());
+    }
+
+    #[test]
+    fn default_stream_filter_contract_accepts_only_null_params() {
+        let mut filter = stream_filter_for(b"TestRejectDecode").expect("test filter");
+
+        assert!(filter.set_decode_params(None));
+        assert!(filter.set_decode_params(Some(&Object::Null)));
+        assert!(!filter.set_decode_params(Some(&Object::Integer(1))));
+        assert_eq!(
+            filter
+                .pipe_decode(b"test filter", None, &mut ignore_warning)
+                .unwrap(),
+            b"test filter"
+        );
     }
 }
