@@ -4347,7 +4347,7 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
     seen: &mut HashSet<ObjectRef>,
 ) -> CliResult<Vec<bool>> {
     let mut warnings = Vec::new();
-    for (stream_ref, stream) in pages::page_content_stream_entries(pdf, page_ref)? {
+    for (stream_ref, stream) in pages::page_content_stream_entries_tolerant(pdf, page_ref)? {
         if let Some(stream_ref) = stream_ref {
             if let Some(last_bad) = normalize_and_store_stream(pdf, stream_ref, stream, seen)? {
                 warnings.push(last_bad);

@@ -3303,6 +3303,27 @@ fn one_page_pdf_with_duplicate_content_array(content: &[u8]) -> Vec<u8> {
     ])
 }
 
+fn one_page_pdf_with_mixed_content_array(content: &[u8], extra: &[u8]) -> Vec<u8> {
+    let stream = [
+        format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    let page = [
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents [4 0 R ".as_slice(),
+        extra,
+        b"] >>\nendobj\n".as_slice(),
+    ]
+    .concat();
+    build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        page.as_slice(),
+        stream.as_slice(),
+    ])
+}
+
 fn one_page_pdf_with_stale_length_and_content(content: &[u8]) -> Vec<u8> {
     let stream = [
         b"4 0 obj\n<< /Length 99 >>\nstream\n".to_vec(),
@@ -4034,6 +4055,47 @@ fn rewrite_normalize_content_follows_indirect_contents_array() {
     assert_eq!(
         flpdf::pages::page_content_bytes(&mut pdf, page).unwrap(),
         b"\n<0g"
+    );
+}
+
+#[test]
+fn rewrite_normalize_content_skips_null_array_entries_like_qpdf() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("mixed-content-array.pdf");
+    let output = temp.path().join("normalized.pdf");
+    std::fs::write(
+        &input,
+        one_page_pdf_with_mixed_content_array(b"q\rQ", b"null"),
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--normalize-content=y", "--compress-streams=n"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    let page = pdf.resolve(page_ref).unwrap();
+    let contents = page
+        .as_dict()
+        .and_then(|dict| dict.get("Contents"))
+        .and_then(Object::as_array)
+        .expect("rewritten page must retain its /Contents array");
+    let Object::Reference(stream_ref) = contents[0] else {
+        panic!("first /Contents element must remain a stream reference");
+    };
+    let stream = pdf
+        .resolve(stream_ref)
+        .unwrap()
+        .into_stream()
+        .expect("first /Contents element must resolve to a stream");
+    assert_eq!(
+        flpdf::filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+        b"q\nQ"
     );
 }
 
