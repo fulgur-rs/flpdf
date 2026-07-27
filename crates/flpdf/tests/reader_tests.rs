@@ -7,7 +7,7 @@ use flate2::Compression;
 use flpdf::{
     load_xref_and_trailer, parse_object, write_pdf_with_options, CompressStreams, EncryptMethod,
     EncryptParams, EncryptedError, Error, NewlineBeforeEndstream, Object, ObjectRef,
-    ObjectStreamMode, Pdf, PdfOpenOptions, StreamDataMode, WriteOptions, XrefOffset,
+    ObjectStreamMode, Pdf, PdfOpenOptions, StreamDataMode, WriteOptions, XrefEntry,
 };
 use md5::{Digest, Md5};
 use std::fs::File;
@@ -644,7 +644,7 @@ fn resolve_decrypts_object_stream_before_filter_decode() {
     assert!(
         matches!(
             xref.entries.get(&info_ref),
-            Some(XrefOffset::Compressed { .. })
+            Some(XrefEntry::Compressed { .. })
         ),
         "/Info must be a compressed object-stream member"
     );

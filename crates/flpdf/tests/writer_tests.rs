@@ -3,7 +3,7 @@ use flate2::Compression;
 use flpdf::{
     check_reader, filters, load_xref_and_trailer, parse_object, write_pdf, write_pdf_with_options,
     write_qdf, CompressStreams, Dictionary, Object, ObjectRef, ObjectStreamMode, Pdf, WriteOptions,
-    XrefForm, XrefOffset,
+    XrefEntry, XrefForm,
 };
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -687,11 +687,11 @@ fn write_pdf_deletes_object_with_free_incremental_xref_entry() {
     let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(0, 65535)),
-        Some(&XrefOffset::Free { next: 3 })
+        Some(&XrefEntry::Free { next: 3 })
     );
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(3, 1)),
-        Some(&XrefOffset::Free { next: 0 })
+        Some(&XrefEntry::Free { next: 0 })
     );
 
     if is_qpdf_available() {
@@ -816,7 +816,7 @@ fn delete_object_ignores_existing_free_tombstone() {
     let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(2, 1)),
-        Some(&XrefOffset::Free { next: 0 })
+        Some(&XrefEntry::Free { next: 0 })
     );
 }
 
@@ -1181,7 +1181,7 @@ fn write_pdf_preserves_large_compressed_xref_stream_index() {
     let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(2, 0)),
-        Some(&XrefOffset::Compressed {
+        Some(&XrefEntry::Compressed {
             stream: 4,
             index: large_index
         })
@@ -1264,7 +1264,7 @@ fn write_pdf_preserves_xref_stream_free_tombstones() {
     let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(2, 1)),
-        Some(&XrefOffset::Free { next: 0 })
+        Some(&XrefEntry::Free { next: 0 })
     );
 }
 
@@ -3743,7 +3743,7 @@ fn full_rewrite_preserves_catalog_version_verbatim_under_force_version() {
 /// All assertions go through the public reader API
 /// (`Pdf::open`/`resolve` and `load_xref_and_trailer`); no hand parsing of
 /// xref bytes. The plan's `pdf.compressed_parent(...)` check is expressed via
-/// `LoadedXref::entries` (`XrefOffset::Compressed`) because
+/// `LoadedXref::entries` (`XrefEntry::Compressed`) because
 /// `Pdf::compressed_parent` / `Pdf::previous_xref_offset` are `pub(crate)`
 /// and not reachable from the integration-test crate.
 #[test]
@@ -3850,7 +3850,7 @@ fn incremental_generate_roundtrip_packs_mutated_object_into_objstm() {
         "output must remain xref-stream form"
     );
     match loaded.entries.get(&mutated_ref) {
-        Some(XrefOffset::Compressed { stream, index }) => {
+        Some(XrefEntry::Compressed { stream, index }) => {
             assert_eq!(
                 *stream, expected_container.number,
                 "(c) mutated object must be compressed into the new container"
@@ -4126,7 +4126,7 @@ fn incremental_generate_combined_paths_packs_deletes_and_touches_existing_member
         // `set_object(2,…)` would not populate `compressed_member_parents`
         // and the writer would route obj2 through the plain-touched path.
         match src_loaded.entries.get(&ObjectRef::new(2, 0)) {
-            Some(XrefOffset::Compressed { stream, index }) => {
+            Some(XrefEntry::Compressed { stream, index }) => {
                 assert_eq!(*stream, 3, "fixture: obj 2 must be in source ObjStm 3");
                 assert_eq!(*index, 0, "fixture: obj 2 must be at source ObjStm index 0");
             }
@@ -4216,7 +4216,7 @@ fn incremental_generate_combined_paths_packs_deletes_and_touches_existing_member
 
     // (a) packed → type-2 compressed entry in the NEW container at index 0.
     match loaded.entries.get(&packed_ref) {
-        Some(XrefOffset::Compressed { stream, index }) => {
+        Some(XrefEntry::Compressed { stream, index }) => {
             assert_eq!(
                 *stream, expected_new_container.number,
                 "(a) packed object must be compressed into the freshly-allocated container"
@@ -4232,7 +4232,7 @@ fn incremental_generate_combined_paths_packs_deletes_and_touches_existing_member
     }
     // New container itself must be a plain type-1 indirect object.
     match loaded.entries.get(&expected_new_container) {
-        Some(XrefOffset::Offset(_)) => {}
+        Some(XrefEntry::Uncompressed { .. }) => {}
         other => panic!(
             "(a) new ObjStm container {expected_new_container:?} must have a type-1 Offset entry, got {other:?}"
         ),
@@ -4252,7 +4252,7 @@ fn incremental_generate_combined_paths_packs_deletes_and_touches_existing_member
     // ObjectRef{ number: 4, generation: 1 } in the appended xref stream.
     let deleted_free_key = ObjectRef::new(deleted_ref.number, 1);
     match loaded.entries.get(&deleted_free_key) {
-        Some(XrefOffset::Free { .. }) => {}
+        Some(XrefEntry::Free { .. }) => {}
         other => panic!(
             "(b) deleted object {deleted_ref:?} must produce a Free xref entry at gen 1, got {other:?}"
         ),
@@ -4265,7 +4265,7 @@ fn incremental_generate_combined_paths_packs_deletes_and_touches_existing_member
     // 7 and trip this assertion.
     let source_container = ObjectRef::new(3, 0);
     match loaded.entries.get(&member_ref) {
-        Some(XrefOffset::Compressed { stream, index }) => {
+        Some(XrefEntry::Compressed { stream, index }) => {
             assert_eq!(
                 *stream, source_container.number,
                 "(c) touched existing-ObjStm member must stay in its source container — \
@@ -4286,7 +4286,7 @@ fn incremental_generate_combined_paths_packs_deletes_and_touches_existing_member
     // patched payload reflects the touched member); its xref kind stays
     // type-1 Offset.
     match loaded.entries.get(&source_container) {
-        Some(XrefOffset::Offset(_)) => {}
+        Some(XrefEntry::Uncompressed { .. }) => {}
         other => panic!(
             "(c) source ObjStm container {source_container:?} must remain type-1 Offset after patch, got {other:?}"
         ),

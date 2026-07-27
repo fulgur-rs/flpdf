@@ -8,7 +8,7 @@ use crate::pdf_version::{parse_pdf_version, PDF_1_5};
 use crate::rewrite_renumber::{CatalogFirstRenumber, GenerateRenumber, NewNumberLookup};
 use crate::writer::object_streams::{self, ObjectStreamMode};
 use crate::writer::plain::xref::{IdPlan, TrailerPlan};
-use crate::{CompressStreams, Object, ObjectRef, Pdf, WriteOptions, XrefForm, XrefOffset};
+use crate::{CompressStreams, Object, ObjectRef, Pdf, WriteOptions, XrefEntry, XrefForm};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlannedMember {
@@ -376,7 +376,7 @@ fn build_container_aware(
 pub(crate) fn source_has_compressed_entries<R: Read + Seek>(pdf: &Pdf<R>) -> bool {
     pdf.source_xref_entries()
         .values()
-        .any(|offset| matches!(offset, XrefOffset::Compressed { .. }))
+        .any(|offset| matches!(offset, XrefEntry::Compressed { .. }))
 }
 
 impl NewNumberLookup for PlainWritePlan {

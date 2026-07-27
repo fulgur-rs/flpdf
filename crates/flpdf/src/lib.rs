@@ -266,7 +266,7 @@ pub use writer::{
 };
 pub use xref::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
-    LoadedXref, XrefForm, XrefOffset,
+    LoadedXref, XrefForm,
 };
 pub use xref_entry::XrefEntry;
 

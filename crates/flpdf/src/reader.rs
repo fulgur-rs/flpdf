@@ -19,7 +19,7 @@ use crate::security::standard::{
 use crate::tokenizer::Tokenizer;
 use crate::xref::load_xref_state_with_repair;
 use crate::{
-    Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, Result, XrefForm, XrefOffset,
+    Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, Result, XrefEntry, XrefForm,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -69,7 +69,7 @@ pub struct Pdf<R: Read + Seek> {
     /// of objects whose bodies run to EOF cannot revive the quadratic cost.
     resolution_fallbacks_remaining: u32,
     source_xref_offsets: Vec<(ObjectRef, u64)>,
-    source_xref_entries: BTreeMap<ObjectRef, XrefOffset>,
+    source_xref_entries: BTreeMap<ObjectRef, XrefEntry>,
     dirty_object_refs: BTreeSet<ObjectRef>,
     /// Exact source framing EOLs removed while a line-anchored `endstream`
     /// scan remained authoritative. Rewriting restores this private metadata
@@ -541,16 +541,16 @@ impl<R: Read + Seek> Pdf<R> {
             .entries
             .iter()
             .filter_map(|(object_ref, offset)| match offset {
-                crate::XrefOffset::Free { .. } => None,
-                crate::XrefOffset::Offset(offset) => Some((*object_ref, *offset)),
-                crate::XrefOffset::Compressed { .. } => None,
+                crate::XrefEntry::Free { .. } => None,
+                crate::XrefEntry::Uncompressed { offset } => Some((*object_ref, *offset)),
+                crate::XrefEntry::Compressed { .. } => None,
             })
             .collect();
         let mut sorted_object_offsets: Vec<u64> = loaded
             .entries
             .values()
             .filter_map(|offset| match offset {
-                crate::XrefOffset::Offset(offset) => Some(*offset),
+                crate::XrefEntry::Uncompressed { offset } => Some(*offset),
                 _ => None,
             })
             .collect();
@@ -870,7 +870,7 @@ impl<R: Read + Seek> Pdf<R> {
         self.source_xref_offsets.clone()
     }
 
-    pub(crate) fn source_xref_entries(&self) -> BTreeMap<ObjectRef, XrefOffset> {
+    pub(crate) fn source_xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
         self.source_xref_entries.clone()
     }
 
@@ -977,7 +977,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// Object refs that the cross-reference table marks as live.
     ///
     /// Excludes:
-    /// - `Deleted` — free entries (from `XrefOffset::Free`) and explicit
+    /// - `Deleted` — free entries (from `XrefEntry::Free`) and explicit
     ///   `delete_object()` calls,
     /// - `Missing` — referenced but never present in any xref,
     /// - `Reserved` — forward-reference placeholders that

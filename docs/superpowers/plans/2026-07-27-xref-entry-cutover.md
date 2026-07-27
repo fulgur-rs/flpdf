@@ -4,7 +4,7 @@
 
 **Goal:** Replace the misleading public `XrefOffset` enum with a qpdf-shaped `XrefEntry` component and route every reader, cache, writer, object-stream, linearization, and test consumer through it.
 
-**Architecture:** A new root `xref_entry.rs` owns only the three xref entry value variants. `xref.rs` retains xref parsing, repair, `LoadedXref`, and `XrefForm`; consumers switch in two compile-safe waves before the old enum and re-export are deleted.
+**Architecture:** A new root `xref_entry.rs` owns only the three xref entry value variants. `xref.rs` retains xref parsing, repair, `LoadedXref`, and `XrefForm`; after adding the new type, every consumer switches in one compile-safe cutover before the old enum and re-export are deleted.
 
 **Tech Stack:** Rust 2021; qpdf 11.9.0 `QPDFXRefEntry`; Cargo unit/integration tests; Clippy; strict rustdoc; `cargo llvm-cov`; `scripts/patch-coverage.sh`.
 
@@ -29,6 +29,10 @@ pub enum XrefEntry {
 - Preserve xref parse, repair, cache, full/incremental writer, ObjStm, linearization, and byte output behavior.
 - Coordinate with `flpdf-80b6`: if its writer branch is still active and overlaps the listed writer files, wait for it to settle or stack this work on its result. Do not edit the same writer surface concurrently.
 - Every production change follows RED→GREEN→REFACTOR and fresh patch coverage against the immediate parent must reach 100%.
+- `Pdf::source_xref_entries()` feeds writer, ObjStm, and linearization consumers directly, so
+  Tasks 2 and 3 form one compile-safe RED→GREEN batch. Change every affected test consumer first,
+  then migrate all production consumers and delete `XrefOffset`; do not land the intermediate
+  Task 2 commit or introduce a conversion wrapper to force an artificial boundary.
 
 ## Current Inventory to Refresh
 
@@ -258,12 +262,10 @@ cargo test -p flpdf cache::tests --lib
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Continue directly into Task 3**
 
-```bash
-git add crates/flpdf/src/xref.rs crates/flpdf/src/reader.rs crates/flpdf/src/cache.rs crates/flpdf/tests/xref_tests.rs
-git commit -m "refactor: use xref entries in reader paths"
-```
+Do not commit this intermediate state: the reader source-entry type is consumed directly by the
+writer, ObjStm, and linearization paths. Complete Task 3 and commit the compile-safe cutover once.
 
 ---
 
@@ -401,7 +403,7 @@ before changing it; unrelated offset enums are not part of this task.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/flpdf/src/writer.rs crates/flpdf/src/writer/object_streams.rs crates/flpdf/src/writer/plain/plan.rs crates/flpdf/src/linearization/plan.rs crates/flpdf/src/linearization/writer.rs crates/flpdf/src/xref.rs crates/flpdf/src/lib.rs crates/flpdf/tests/cmp_diff_zero_tests.rs crates/flpdf/tests/object_streams_writer_tests.rs crates/flpdf/tests/writer_tests.rs
+git add crates/flpdf/src/cache.rs crates/flpdf/src/reader.rs crates/flpdf/src/writer.rs crates/flpdf/src/writer/object_streams.rs crates/flpdf/src/writer/plain/plan.rs crates/flpdf/src/linearization/plan.rs crates/flpdf/src/linearization/writer.rs crates/flpdf/src/xref.rs crates/flpdf/src/lib.rs crates/flpdf/tests/cmp_diff_zero_tests.rs crates/flpdf/tests/object_streams_writer_tests.rs crates/flpdf/tests/reader_tests.rs crates/flpdf/tests/writer_tests.rs crates/flpdf/tests/xref_tests.rs
 git commit -m "refactor: cut over all xref entry consumers"
 ```
 

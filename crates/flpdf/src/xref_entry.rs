@@ -1,4 +1,4 @@
-//! Mirrors qpdf 11.9.0 `libqpdf/QPDFXRefEntry.cc`.
+//! qpdf correspondence: QPDFXRefEntry.cc cross-reference entry value representation.
 
 /// A PDF cross-reference entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -2784,7 +2784,7 @@ pub fn write_linearized<R: Read + Seek>(
                 .source_xref_entries()
                 .into_iter()
                 .filter_map(|(object_ref, offset)| match offset {
-                    crate::XrefOffset::Compressed { stream, .. } => Some((object_ref, stream)),
+                    crate::XrefEntry::Compressed { stream, .. } => Some((object_ref, stream)),
                     _ => None,
                 })
                 .collect();

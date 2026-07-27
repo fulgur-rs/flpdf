@@ -836,12 +836,10 @@ impl LinearizationPlan {
         // qpdf classifies them as first-page section objects (Part 2) when reached
         // from the first page, giving them HIGH object numbers. Without this, they
         // land in part4_rest with LOW numbers (flpdf-o9im).
-        let source_had_compressed_objects =
-            pdf.source_xref_entries()
-                .iter()
-                .any(|(_reference, offset)| {
-                    matches!(offset, crate::xref::XrefOffset::Compressed { .. })
-                });
+        let source_had_compressed_objects = pdf
+            .source_xref_entries()
+            .iter()
+            .any(|(_reference, offset)| matches!(offset, crate::XrefEntry::Compressed { .. }));
         let operation_removes_stale_generations = use_generate_objstm
             || (matches!(
                 object_stream_mode,
@@ -2140,14 +2138,14 @@ impl LinearizationPlan {
         length_exclusions: &BTreeSet<ObjectRef>,
         routing_users: &LinearizationRoutingUsers,
     ) -> crate::Result<ObjStmBatchPlan> {
-        use crate::XrefOffset;
+        use crate::XrefEntry;
 
         let entries = pdf.source_xref_entries();
 
         // Build source ObjStm groups: container_number → [(index, ref)]
         let mut groups: BTreeMap<u32, Vec<(u32, ObjectRef)>> = BTreeMap::new();
         for (obj_ref, offset) in &entries {
-            if let XrefOffset::Compressed { stream, index } = offset {
+            if let XrefEntry::Compressed { stream, index } = offset {
                 groups.entry(*stream).or_default().push((*index, *obj_ref));
             }
         }
