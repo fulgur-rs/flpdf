@@ -43,11 +43,16 @@ audit is clean.
 **Interfaces:**
 - Produces a bounded Phase 2 Foundations Epic under `flpdf-qxba`.
 - Produces four ordered child issues, one for each implementation plan.
-- Produces a separate full-Pipeline Epic blocked by the Pipeline foundation child.
+- Produces a separate full-Pipeline Epic whose inventory entry task is blocked by the Pipeline
+  foundation child. Beads does not permit a task to block an Epic directly.
 - Produces an explicit future RC4 child whose acceptance criterion is qpdf component-contract
   parity, not normal PDF key-size coverage.
 
-- [ ] **Step 1: Refresh Beads and reject duplicate titles**
+**Created 2026-07-27:** foundations `flpdf-qxba.9` with children
+`flpdf-qxba.9.1`–`.9.4`; full Pipeline `flpdf-qynx` with children
+`flpdf-qynx.1`–`.4`.
+
+- [x] **Step 1: Refresh Beads and reject duplicate titles**
 
 Run:
 
@@ -60,7 +65,7 @@ bd list --json | rg -n \
 Expected: no existing issue already represents one of the proposed exact scopes. If a matching
 issue exists, use its ID in the later dependency commands and do not create a duplicate.
 
-- [ ] **Step 2: Create the bounded foundations Epic and four children**
+- [x] **Step 2: Create the bounded foundations Epic and four children**
 
 Run:
 
@@ -113,7 +118,7 @@ optimization_complete_id="$(bd create \
 
 Expected: five non-empty IDs. Do not pass `--id` together with `--parent`.
 
-- [ ] **Step 3: Create the ordered foundations dependency chain**
+- [x] **Step 3: Create the ordered foundations dependency chain**
 
 Run:
 
@@ -126,7 +131,7 @@ bd dep cycles
 
 Expected: no dependency cycles.
 
-- [ ] **Step 4: Create the separate full-Pipeline Epic and scoped future children**
+- [x] **Step 4: Create the separate full-Pipeline Epic and scoped future children**
 
 Run:
 
@@ -172,12 +177,12 @@ logger_id="$(bd create \
   --silent)"
 ```
 
-- [ ] **Step 5: Add full-Pipeline dependencies and verify readback**
+- [x] **Step 5: Add full-Pipeline dependencies and verify readback**
 
 Run:
 
 ```bash
-bd dep "$pipeline_id" --blocks "$full_pipeline_id"
+bd dep "$pipeline_id" --blocks "$pipeline_inventory_id"
 bd dep "$pipeline_inventory_id" --blocks "$rc4_id"
 bd dep "$pipeline_inventory_id" --blocks "$resource_id"
 bd dep "$pipeline_inventory_id" --blocks "$logger_id"
@@ -190,7 +195,7 @@ bd show "$full_pipeline_id"
 Expected: no cycles; four bounded foundation children; separate full-Pipeline Epic; RC4 decision
 and ResourceFinder's dual dependency visible in readback.
 
-- [ ] **Step 6: Persist Beads**
+- [x] **Step 6: Persist Beads**
 
 Run:
 
