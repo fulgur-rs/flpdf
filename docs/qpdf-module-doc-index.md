@@ -55,6 +55,7 @@
 | `crates/flpdf/src/object.rs` | correspondence | QPDFObjectHandle.cc and the QPDFObject/QPDFValue type family combined in one Rust object model |
 | `crates/flpdf/src/object_copy.rs` | correspondence | QPDF.cc copyForeignObject responsibility split into copy and closure modules |
 | `crates/flpdf/src/objr_obj_annot_p.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for OBJR annotations |
+| `crates/flpdf/src/optimization.rs` | correspondence | QPDF_optimization.cc object-user map portion |
 | `crates/flpdf/src/outline.rs` | correspondence | QPDFOutlineObjectHelper.cc compatibility surface split from the document helper |
 | `crates/flpdf/src/outline_dest_remap.rs` | correspondence | QPDFJob.cc page selection and QPDFWriter.cc null visibility specialized for surviving destinations |
 | `crates/flpdf/src/outline_document_helper.rs` | correspondence | QPDFOutlineDocumentHelper.cc and QPDFOutlineObjectHelper.cc responsibilities split with outline.rs |

@@ -1,5 +1,4 @@
-//! qpdf correspondence: qpdf 11.9.0 `libqpdf/QPDF_optimization.cc`
-//! object-user map portion.
+//! qpdf correspondence: QPDF_optimization.cc object-user map portion.
 
 use crate::object::MAX_INLINE_DEPTH;
 use crate::{Object, ObjectRef, Pdf, Stream};
