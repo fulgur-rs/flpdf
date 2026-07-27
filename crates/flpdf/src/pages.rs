@@ -6,6 +6,8 @@
 //! cycles (each node is visited at most once) and bounds its recursion via a configurable
 //! depth limit, since malformed PDFs occasionally embed self-referential page trees.
 
+pub(crate) mod repair;
+
 use crate::filters::decode_stream_data;
 use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
