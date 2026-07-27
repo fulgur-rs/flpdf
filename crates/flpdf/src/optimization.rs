@@ -1,5 +1,7 @@
 //! qpdf correspondence: QPDF_optimization.cc object-user map portion.
 
+pub(crate) mod inherited_attrs;
+
 use crate::object::MAX_INLINE_DEPTH;
 use crate::{Object, ObjectRef, Pdf, Stream};
 use std::collections::{BTreeMap, BTreeSet};

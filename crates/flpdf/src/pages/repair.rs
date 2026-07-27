@@ -2,23 +2,12 @@
 //! Repairs the page tree before optimization and returns qpdf's effective page
 //! order. The normal non-linearized writer does not call this path.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
 use crate::object::{Dictionary, Object, ObjectRef};
 use crate::ref_chain::terminal_ref_of_chain;
 use crate::{Error, Pdf, Result};
-
-/// The four page attributes a `/Pages` node may pass down to its descendants
-/// (ISO 32000-2 §7.7.3.4 Table 30, "Inheritable").
-// Alphabetical order, matching qpdf's own iteration order: `cur_pages.getKeys()`
-// (QPDF_Dictionary.cc) returns keys via a sorted `std::set<std::string>`, so
-// `QPDF_pages.cc`'s push loop visits inheritable keys as CropBox, MediaBox,
-// Resources, Rotate. When a single node needs to mint more than one of these
-// in the same visit (direct, non-indirect values), the mint order — and thus
-// which new object number each gets — must match qpdf's, so this array is
-// kept in that same order rather than declaration-convenient order.
-const INHERITABLE_KEYS: [&[u8]; 4] = [b"CropBox", b"MediaBox", b"Resources", b"Rotate"];
 
 /// Defensive cycle/depth bound. qpdf relies on an earlier `cache()` pass (which
 /// repairs duplicate page objects and detects loops) before its own recursive
@@ -127,170 +116,6 @@ pub(crate) fn prepare_for_optimization<R: Read + Seek>(
         root: pages_ref,
         pages,
     }))
-}
-
-/// Temporary compatibility route while inherited pushing moves to
-/// `crate::optimization`.
-pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
-    let Some(prepared) = prepare_for_optimization(pdf)? else {
-        return Ok(());
-    };
-    let mut key_ancestors: BTreeMap<&'static [u8], Vec<Object>> = BTreeMap::new();
-    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-    push_internal(
-        pdf,
-        prepared.root,
-        &mut key_ancestors,
-        &mut visited,
-        0,
-    )?;
-    debug_assert!(
-        key_ancestors.values().all(Vec::is_empty),
-        "key_ancestors not empty after pushing inherited attributes to pages"
-    );
-    Ok(())
-}
-
-fn push_internal<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    node_ref: ObjectRef,
-    key_ancestors: &mut BTreeMap<&'static [u8], Vec<Object>>,
-    visited: &mut BTreeSet<ObjectRef>,
-    depth: usize,
-) -> Result<()> {
-    if depth >= MAX_DEPTH {
-        return Err(Error::Unsupported(format!(
-            "page tree depth exceeds maximum of {MAX_DEPTH} at {node_ref}"
-        )));
-    }
-    if !visited.insert(node_ref) {
-        // Cycle guard: a node already on the path back to /Root. qpdf relies on
-        // an earlier repair pass to make this unreachable; flpdf has none, so
-        // this function defends itself. A well-formed tree never hits this.
-        return Ok(());
-    }
-
-    let Object::Dictionary(mut dict) = pdf.resolve(node_ref)? else {
-        return Ok(()); // Non-dictionary node: leave untouched (matches PageWalk's silent skip).
-    };
-
-    // Only an interior /Pages node has attributes to push down; a /Page leaf
-    // reached here directly (e.g. a malformed /Root/Pages pointing straight at
-    // a /Page, which flpdf's PageWalk tolerates leniently) has no /Kids to
-    // push its own attributes to, so stripping them would drop real content.
-    // qpdf never reaches an equivalent state: `Pages::cache()` (called before
-    // its own push) throws on a /Kids-less root, or force-retypes a /Kids-
-    // bearing one to /Pages first (QPDF_pages.cc) — flpdf has no matching
-    // repair step, so guard here instead.
-    let is_pages_node =
-        matches!(dict.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Pages");
-    if !is_pages_node {
-        return Ok(());
-    }
-
-    let mut own_keys: Vec<&'static [u8]> = Vec::new();
-    for &key in &INHERITABLE_KEYS {
-        let Some(value) = dict.remove(key) else {
-            continue;
-        };
-        // qpdf's collection loop iterates `cur_pages.getKeys()`
-        // (QPDF_Dictionary.cc), which filters out any key whose value
-        // resolves — following the FULL indirect-reference chain, not just
-        // one hop — to null. Such a key is invisible to qpdf's loop, so it is
-        // neither erased from this node nor pushed to descendants. Put a null
-        // value back and skip it here to match: otherwise a null-valued key
-        // on an interior /Pages node would shadow a real ancestor value
-        // further up the stack instead of being transparent to it.
-        let is_null = match &value {
-            Object::Null => true,
-            Object::Reference(r) => {
-                let terminal = terminal_ref_of_chain(pdf, *r)?;
-                matches!(pdf.resolve_borrowed(terminal)?, Object::Null)
-            }
-            _ => false,
-        };
-        if is_null {
-            dict.insert(key, value);
-            continue;
-        }
-        let value = match value {
-            Object::Reference(_) => value, // already indirect: descendants share this ref
-            Object::Array(_) | Object::Dictionary(_) => {
-                // Direct (non-indirect) non-scalar value: mint a new indirect
-                // object so descendants share ONE object instead of each
-                // duplicating the structure inline (mirrors qpdf's
-                // makeIndirectObject call in QPDF_optimization.cc:186-196).
-                let new_ref = next_object_ref(pdf)?;
-                pdf.set_object(new_ref, value);
-                Object::Reference(new_ref)
-            }
-            // Integer/Real/Boolean/Name/String/Null: copy by value, no minting.
-            scalar => scalar,
-        };
-        key_ancestors.entry(key).or_default().push(value);
-        own_keys.push(key);
-    }
-
-    let kids = dict
-        .get("Kids")
-        .and_then(Object::as_array)
-        .map(<[Object]>::to_vec);
-    pdf.set_object(node_ref, Object::Dictionary(dict));
-
-    if let Some(kids) = kids {
-        for kid in &kids {
-            let Object::Reference(kid_ref) = kid else {
-                continue;
-            };
-            let is_pages_node = matches!(
-                pdf.resolve_borrowed(*kid_ref)?,
-                Object::Dictionary(d)
-                    if matches!(d.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Pages")
-            );
-            if is_pages_node {
-                push_internal(pdf, *kid_ref, key_ancestors, visited, depth + 1)?;
-            } else {
-                let Object::Dictionary(mut leaf) = pdf.resolve(*kid_ref)? else {
-                    continue;
-                };
-                for (&key, values) in key_ancestors.iter() {
-                    // A direct or indirect `null` counts as absent, matching
-                    // qpdf's `contains()` (`!(*this)[key].null()` — resolves
-                    // the FULL reference chain, not just one hop). Otherwise
-                    // an explicit `/Resources null` leaf would keep the null
-                    // instead of inheriting the ancestor's real value.
-                    let leaf_value_is_present = match leaf.get(key) {
-                        None | Some(Object::Null) => false,
-                        Some(Object::Reference(r)) => {
-                            let terminal = terminal_ref_of_chain(pdf, *r)?;
-                            !matches!(pdf.resolve_borrowed(terminal)?, Object::Null)
-                        }
-                        Some(_) => true,
-                    };
-                    if !leaf_value_is_present {
-                        if let Some(v) = values.last() {
-                            leaf.insert(key, v.clone());
-                        }
-                    }
-                }
-                pdf.set_object(*kid_ref, Object::Dictionary(leaf));
-            }
-        }
-    }
-
-    for key in own_keys {
-        if let Some(stack) = key_ancestors.get_mut(key) {
-            stack.pop();
-            if stack.is_empty() {
-                key_ancestors.remove(key);
-            }
-        } // cov:ignore: unreachable — `own_keys` holds exactly the keys this
-          // frame pushed onto `key_ancestors` above; every nested `push_internal`
-          // call pops what it pushes before returning (balanced push/pop) and
-          // any early `?` return skips this cleanup loop entirely, so the
-          // stack for a key in `own_keys` is always still present here.
-    }
-    Ok(())
 }
 
 /// Partial mirror of qpdf 11.9.0 `getAllPagesInternal` (QPDF_pages.cc:77-138):
@@ -602,6 +427,15 @@ mod tests {
     use super::*;
     use crate::Pdf;
     use std::io::Cursor;
+
+    fn push_inherited_attributes_to_pages<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
+        let Some(prepared) = prepare_for_optimization(pdf)? else {
+            return Ok(());
+        };
+        crate::optimization::inherited_attrs::push_inherited_attributes_to_pages(
+            pdf, &prepared, true, false,
+        )
+    }
 
     /// One `/Pages` node, one `/Page` leaf, no inheritable keys anywhere.
     /// Object layout: 1 Catalog, 2 Pages, 3 Page.
