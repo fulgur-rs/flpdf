@@ -275,6 +275,7 @@ fi
 case "$5" in
   tokenizer::tests::qpdf_tokenizer_differential_all_modes | \
     pipeline::qpdf_tokenizer::tests::qpdf_token_filter_differential | \
+    pipeline::qpdf_tokenizer::tests::qpdf_token_filter_lifecycle_differential | \
     content_normalizer::tests::qpdf_content_normalizer_differential | \
     resource_finder::tests::qpdf_resource_finder_differential)
     ;;
@@ -588,7 +589,7 @@ TMPDIR="${parallel_tmp}" run_fixture >"${fixture_root}/parallel-2.out" 2>&1 &
 second_pid=$!
 wait "${first_pid}"
 wait "${second_pid}"
-[[ "$(grep -c '^cargo' "${contract_log}")" == 8 ]]
+[[ "$(grep -c '^cargo' "${contract_log}")" == 10 ]]
 [[ "$(
   grep -Fxc \
     'cargo <test> <-p> <flpdf> <--lib> <tokenizer::tests::qpdf_tokenizer_differential_all_modes> <--> <--ignored> <--exact>' \
@@ -597,6 +598,11 @@ wait "${second_pid}"
 [[ "$(
   grep -Fxc \
     'cargo <test> <-p> <flpdf> <--lib> <pipeline::qpdf_tokenizer::tests::qpdf_token_filter_differential> <--> <--ignored> <--exact>' \
+    "${contract_log}"
+)" == 2 ]]
+[[ "$(
+  grep -Fxc \
+    'cargo <test> <-p> <flpdf> <--lib> <pipeline::qpdf_tokenizer::tests::qpdf_token_filter_lifecycle_differential> <--> <--ignored> <--exact>' \
     "${contract_log}"
 )" == 2 ]]
 [[ "$(
