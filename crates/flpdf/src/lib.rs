@@ -113,6 +113,7 @@ mod nntree;
 pub mod object;
 pub mod object_copy;
 pub mod objr_obj_annot_p;
+pub(crate) mod optimization;
 pub mod outline;
 pub mod outline_dest_remap;
 pub mod outline_document_helper;
