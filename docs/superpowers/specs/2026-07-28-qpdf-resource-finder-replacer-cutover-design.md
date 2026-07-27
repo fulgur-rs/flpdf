@@ -1,9 +1,9 @@
 # qpdf ResourceFinder / ResourceReplacer cutover design
 
-**Issue:** `flpdf-qynx.3`  
-**Date:** 2026-07-28  
-**Oracle:** qpdf 11.9.0 (`v11.9.0`, commit `3b97c9bd`)  
-**Oracle source:** `scripts/fetch-qpdf-source.sh --print-path`  
+**Issue:** `flpdf-qynx.3`
+**Date:** 2026-07-28
+**Oracle:** qpdf 11.9.0 (`v11.9.0`, commit `3b97c9bd`)
+**Oracle source:** `scripts/fetch-qpdf-source.sh --print-path`
 **Parent design:** [qpdf Phase 2 foundations design](2026-07-27-qpdf-phase-2-foundations-design.md)
 
 ## Problem
