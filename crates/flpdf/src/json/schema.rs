@@ -52,12 +52,10 @@ fn check_schema_internal(
     errors: &mut Vec<JsonMessage>,
     prefix: &[u8],
 ) -> bool {
-    let value_array = array_items(value);
-    let value_dictionary = dictionary_items(value);
-    let schema_array = array_items(schema);
-    let schema_dictionary = dictionary_items(schema);
-    if let Some(schema_dictionary) = schema_dictionary {
-        let Some(value_dictionary) = value_dictionary else {
+    if schema.is_dictionary() {
+        let schema_dictionary =
+            dictionary_items(schema).expect("dictionary schema must expose dictionary items");
+        let Some(value_dictionary) = dictionary_items(value) else {
             errors.push(described_error(prefix, b" is supposed to be a dictionary"));
             return false;
         };
@@ -107,7 +105,9 @@ fn check_schema_internal(
                 }
             }
         }
-    } else if let Some(schema_array) = schema_array {
+    } else if schema.is_array() {
+        let schema_array = array_items(schema).expect("array schema must expose array items");
+        let value_array = array_items(value);
         if schema_array.len() == 1 {
             if let Some(value_array) = value_array {
                 for (index, item) in value_array.into_iter().enumerate() {

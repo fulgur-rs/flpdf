@@ -718,6 +718,7 @@ fn mutually_recursive_dictionary_fallbacks_handle_a_finite_cycle() {
     );
     first.add_fallback_dictionary_handler(second.clone());
     second.add_fallback_dictionary_handler(first.clone());
+    drop(second);
 
     first
         .handle(
@@ -739,10 +740,102 @@ fn mutually_recursive_dictionary_fallbacks_handle_a_finite_cycle() {
 }
 
 #[test]
-fn breaking_registration_cycle_leaves_remaining_edge_strong() {
+fn recursive_registration_cycles_release_handlers_and_callbacks() {
+    let drops = Rc::new(Cell::new(0));
+
+    let handler = JsonHandler::new();
+    let handler_weak = handler.downgrade();
+    handler.add_any_handler({
+        let probe = DropProbe(drops.clone());
+        move |_, _| {
+            let _ = &probe;
+        }
+    });
+    handler.add_fallback_dictionary_handler(handler.clone());
+    drop(handler);
+
+    assert!(handler_weak.upgrade().is_none());
+    assert_eq!(drops.get(), 1);
+
+    let first = JsonHandler::new();
+    let second = JsonHandler::new();
+    let first_weak = first.downgrade();
+    let second_weak = second.downgrade();
+    first.add_any_handler({
+        let probe = DropProbe(drops.clone());
+        move |_, _| {
+            let _ = &probe;
+        }
+    });
+    second.add_any_handler({
+        let probe = DropProbe(drops.clone());
+        move |_, _| {
+            let _ = &probe;
+        }
+    });
+    first.add_fallback_dictionary_handler(second.clone());
+    second.add_fallback_dictionary_handler(first.clone());
+    drop(first);
+    drop(second);
+
+    assert!(first_weak.upgrade().is_none());
+    assert!(second_weak.upgrade().is_none());
+    assert_eq!(drops.get(), 3);
+
+    let first = JsonHandler::new();
+    let second = JsonHandler::new();
+    let observer = JsonHandler::new();
+    let first_weak = first.downgrade();
+    let second_weak = second.downgrade();
+    first.add_dictionary_key_handler(b"next", second.clone());
+    second.add_fallback_handler(first.clone());
+    observer.add_fallback_handler(first.clone());
+    drop(first);
+    drop(second);
+    drop(observer);
+    assert!(first_weak.upgrade().is_none());
+    assert!(second_weak.upgrade().is_none());
+
+    let first = JsonHandler::new();
+    let second = JsonHandler::new();
+    let first_weak = first.downgrade();
+    let second_weak = second.downgrade();
+    first.add_array_handlers(|_, _| {}, |_| {}, second.clone());
+    second.add_fallback_handler(first.clone());
+    drop(first);
+    drop(second);
+    assert!(first_weak.upgrade().is_none());
+    assert!(second_weak.upgrade().is_none());
+
+    let owner = JsonHandler::new();
+    let child = JsonHandler::new();
+    let left = JsonHandler::new();
+    let right = JsonHandler::new();
+    let owner_weak = owner.downgrade();
+    let child_weak = child.downgrade();
+    let left_weak = left.downgrade();
+    let right_weak = right.downgrade();
+    child.add_dictionary_key_handler(b"left", left.clone());
+    child.add_dictionary_key_handler(b"right", right.clone());
+    left.add_fallback_handler(owner.clone());
+    right.add_fallback_handler(owner.clone());
+    owner.add_fallback_handler(child.clone());
+    drop(owner);
+    drop(child);
+    drop(left);
+    drop(right);
+    assert!(owner_weak.upgrade().is_none());
+    assert!(child_weak.upgrade().is_none());
+    assert!(left_weak.upgrade().is_none());
+    assert!(right_weak.upgrade().is_none());
+}
+
+#[test]
+fn cycle_closing_back_edge_keeps_entry_target_strong() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let first = JsonHandler::new();
     let second = JsonHandler::new();
+    let second_weak = second.downgrade();
     let terminal = JsonHandler::new();
     terminal.add_number_handler({
         let seen = seen.clone();
@@ -756,16 +849,13 @@ fn breaking_registration_cycle_leaves_remaining_edge_strong() {
     });
     first.add_fallback_handler(second.clone());
     second.add_fallback_handler(first.clone());
-    first.add_fallback_handler(terminal.clone());
+    drop(second);
+    assert!(second_weak.upgrade().is_some());
 
-    let first_weak = first.downgrade();
-    drop(first);
-    second.handle(b".value", Json::make_int(1)).unwrap();
+    first.add_fallback_handler(terminal);
+    assert!(second_weak.upgrade().is_none());
+    first.handle(b".value", Json::make_int(1)).unwrap();
     assert_eq!(&*seen.borrow(), &[".value=1"]);
-    assert!(first_weak.upgrade().is_some());
-
-    second.add_fallback_handler(terminal);
-    assert!(first_weak.upgrade().is_none());
 }
 
 #[test]

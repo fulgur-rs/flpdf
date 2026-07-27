@@ -141,6 +141,23 @@ fn schema_strings_are_wildcards_and_prior_errors_affect_return_value() {
 }
 
 #[test]
+fn nested_string_wildcard_accepts_a_large_dictionary() {
+    let schema = parsed(br#"["anything"]"#);
+    let value = Json::make_dictionary();
+    for index in 0..4096 {
+        let item = Json::make_array();
+        item.add_array_element(Json::make_int(index)).unwrap();
+        value
+            .add_dictionary_member(format!("key-{index:04}").as_bytes(), item)
+            .unwrap();
+    }
+    let mut errors = Vec::new();
+
+    assert!(value.check_schema(&schema, &mut errors));
+    assert!(errors.is_empty());
+}
+
+#[test]
 fn uninitialized_checked_handle_fails_without_adding_an_error() {
     let mut errors = Vec::new();
 

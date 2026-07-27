@@ -1,7 +1,7 @@
 //! qpdf correspondence: JSONHandler.cc recursive dispatch responsibilities with Rust shared ownership.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::rc::{Rc, Weak};
 
 use super::{Json, JsonMessage};
@@ -15,6 +15,28 @@ type BytesCallback = Rc<dyn Fn(&[u8], &[u8])>;
 type PathCallback = Rc<dyn Fn(&[u8])>;
 type BoolCallback = Rc<dyn Fn(&[u8], bool)>;
 
+#[derive(Clone)]
+enum HandlerEdge {
+    Strong(JsonHandler),
+    Weak(WeakJsonHandler),
+}
+
+impl HandlerEdge {
+    fn resolve(&self) -> Option<JsonHandler> {
+        match self {
+            Self::Strong(handler) => Some(handler.clone()),
+            Self::Weak(handler) => handler.upgrade(),
+        }
+    }
+
+    fn strong_target(&self) -> Option<JsonHandler> {
+        match self {
+            Self::Strong(handler) => Some(handler.clone()),
+            Self::Weak(_) => None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Handlers {
     any: Option<JsonCallback>,
@@ -26,10 +48,10 @@ struct Handlers {
     dictionary_end: Option<PathCallback>,
     array_start: Option<JsonCallback>,
     array_end: Option<PathCallback>,
-    dictionary_keys: BTreeMap<Vec<u8>, JsonHandler>,
-    fallback_dictionary: Option<JsonHandler>,
-    array_item: Option<JsonHandler>,
-    fallback: Option<JsonHandler>,
+    dictionary_keys: BTreeMap<Vec<u8>, HandlerEdge>,
+    fallback_dictionary: Option<HandlerEdge>,
+    array_item: Option<HandlerEdge>,
+    fallback: Option<HandlerEdge>,
 }
 
 #[derive(Clone, Default)]
@@ -84,14 +106,16 @@ impl JsonHandler {
     }
 
     pub fn add_dictionary_key_handler(&self, key: impl AsRef<[u8]>, handler: JsonHandler) {
+        let edge = self.edge_to(handler);
         self.inner
             .borrow_mut()
             .dictionary_keys
-            .insert(key.as_ref().to_vec(), handler);
+            .insert(key.as_ref().to_vec(), edge);
     }
 
     pub fn add_fallback_dictionary_handler(&self, handler: JsonHandler) {
-        self.inner.borrow_mut().fallback_dictionary = Some(handler);
+        let edge = self.edge_to(handler);
+        self.inner.borrow_mut().fallback_dictionary = Some(edge);
     }
 
     pub fn add_array_handlers(
@@ -100,6 +124,7 @@ impl JsonHandler {
         end: impl Fn(&[u8]) + 'static,
         item: JsonHandler,
     ) {
+        let item = self.edge_to(item);
         let mut handlers = self.inner.borrow_mut();
         handlers.array_start = Some(Rc::new(start));
         handlers.array_end = Some(Rc::new(end));
@@ -107,7 +132,8 @@ impl JsonHandler {
     }
 
     pub fn add_fallback_handler(&self, handler: JsonHandler) {
-        self.inner.borrow_mut().fallback = Some(handler);
+        let edge = self.edge_to(handler);
+        self.inner.borrow_mut().fallback = Some(edge);
     }
 
     pub fn handle(&self, path: &[u8], value: Json) -> Result<(), JsonHandlerError> {
@@ -161,11 +187,13 @@ impl JsonHandler {
                     }
                     let target = {
                         let handlers = self.inner.borrow();
-                        handlers
-                            .dictionary_keys
-                            .get(key)
-                            .cloned()
-                            .or_else(|| handlers.fallback_dictionary.clone())
+                        match handlers.dictionary_keys.get(key) {
+                            Some(handler) => handler.resolve(),
+                            None => handlers
+                                .fallback_dictionary
+                                .as_ref()
+                                .and_then(HandlerEdge::resolve),
+                        }
                     };
                     let mut item_path = path_base.clone();
                     item_path.extend_from_slice(key);
@@ -195,14 +223,15 @@ impl JsonHandler {
                 let mut items = Vec::new();
                 value.for_each_array_item(|item| items.push(item));
                 for (index, item) in items.into_iter().enumerate() {
+                    let mut item_path = path.to_vec();
+                    item_path.extend_from_slice(format!("[{index}]").as_bytes());
                     let target = self
                         .inner
                         .borrow()
                         .array_item
-                        .clone()
-                        .expect("array handlers are registered together");
-                    let mut item_path = path.to_vec();
-                    item_path.extend_from_slice(format!("[{index}]").as_bytes());
+                        .as_ref()
+                        .and_then(HandlerEdge::resolve)
+                        .ok_or_else(|| unexpected_type(&item_path))?;
                     target.handle(&item_path, item)?;
                 }
                 let end = self
@@ -216,12 +245,82 @@ impl JsonHandler {
             }
         }
 
-        let fallback = { self.inner.borrow().fallback.clone() };
+        let fallback = {
+            self.inner
+                .borrow()
+                .fallback
+                .as_ref()
+                .and_then(HandlerEdge::resolve)
+        };
         if let Some(fallback) = fallback {
             return fallback.handle(path, value);
         }
 
         Err(unexpected_type(path))
+    }
+
+    fn edge_to(&self, handler: JsonHandler) -> HandlerEdge {
+        if Rc::ptr_eq(&self.inner, &handler.inner) {
+            return HandlerEdge::Weak(handler.downgrade());
+        }
+        if handler.has_strong_path_to(&self.inner) {
+            HandlerEdge::Weak(handler.downgrade())
+        } else {
+            HandlerEdge::Strong(handler)
+        }
+    }
+
+    fn has_strong_path_to(&self, target: &Rc<RefCell<Handlers>>) -> bool {
+        let mut pending = vec![self.clone()];
+        let mut seen = HashSet::new();
+
+        while let Some(handler) = pending.pop() {
+            if !seen.insert(Rc::as_ptr(&handler.inner)) {
+                continue;
+            }
+            for child in handler.strong_edges() {
+                if Rc::ptr_eq(&child.inner, target) {
+                    return true;
+                } else {
+                    pending.push(child);
+                }
+            }
+        }
+
+        false
+    }
+
+    fn strong_edges(&self) -> Vec<JsonHandler> {
+        let handlers = self.inner.borrow();
+        let mut edges = Vec::new();
+        edges.extend(
+            handlers
+                .dictionary_keys
+                .values()
+                .filter_map(HandlerEdge::strong_target),
+        );
+        if let Some(handler) = handlers
+            .fallback_dictionary
+            .as_ref()
+            .and_then(HandlerEdge::strong_target)
+        {
+            edges.push(handler);
+        }
+        if let Some(handler) = handlers
+            .array_item
+            .as_ref()
+            .and_then(HandlerEdge::strong_target)
+        {
+            edges.push(handler);
+        }
+        if let Some(handler) = handlers
+            .fallback
+            .as_ref()
+            .and_then(HandlerEdge::strong_target)
+        {
+            edges.push(handler);
+        }
+        edges
     }
 }
 
