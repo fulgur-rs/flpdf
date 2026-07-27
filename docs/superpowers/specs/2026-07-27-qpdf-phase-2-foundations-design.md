@@ -290,7 +290,7 @@ The scope includes qpdf's important classification semantics:
 - stream dictionary traversal and indirect `/Length` treatment;
 - page-tree inherited-key exclusions;
 - thumbnail and first-page classification;
-- object-stream membership using the union of member user sets.
+- retained bidirectional user maps consumed by later linearization classification.
 
 This slice is not "byte-neutral extraction" if that phrase implies leaving the old route in
 place. It is a complete consumer cutover whose output must nevertheless remain byte-identical.
@@ -301,6 +301,7 @@ Resolve the boundary among:
 
 - qpdf `pushInheritedAttributesToPage`;
 - qpdf `updateObjectMaps` / `updateObjectMapsInternal`;
+- qpdf `filterCompressedObjects`, folding each ObjStm member's users onto its container;
 - flpdf `linearization/inherited_attrs.rs`;
 - page-tree traversal and repair;
 - ObjStm member user union.
