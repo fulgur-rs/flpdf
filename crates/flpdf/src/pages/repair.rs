@@ -93,29 +93,29 @@ pub(crate) fn prepare_for_optimization<R: Read + Seek>(
         pages_ref = corrected;
     }
 
-    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut clone_visited: BTreeSet<ObjectRef> = BTreeSet::new();
     // Compute the first free object number once and carry it through the
     // walk, incrementing per clone. Re-deriving it with `next_object_ref`
     // for every clone would rescan all object refs each time, making a
     // `/Kids` array with many duplicate leaves quadratic.
-    let mut next_clone = next_object_ref(pdf)?;
-    let mut pages = Vec::new();
-    repair_page_tree(
-        pdf,
-        pages_ref,
-        &mut seen,
-        &mut clone_visited,
-        &mut next_clone,
-        &mut pages,
-        0,
-        false,
-    )?;
+    let mut state = RepairState {
+        seen: BTreeSet::new(),
+        visited: BTreeSet::new(),
+        next_clone: next_object_ref(pdf)?,
+        pages: Vec::new(),
+    };
+    repair_page_tree(pdf, pages_ref, &mut state, 0, false)?;
 
     Ok(Some(PreparedPages {
         root: pages_ref,
-        pages,
+        pages: state.pages,
     }))
+}
+
+struct RepairState {
+    seen: BTreeSet<ObjectRef>,
+    visited: BTreeSet<ObjectRef>,
+    next_clone: ObjectRef,
+    pages: Vec<ObjectRef>,
 }
 
 /// Partial mirror of qpdf 11.9.0 `getAllPagesInternal` (QPDF_pages.cc:77-138):
@@ -167,10 +167,7 @@ pub(crate) fn prepare_for_optimization<R: Read + Seek>(
 fn repair_page_tree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     node_ref: ObjectRef,
-    seen: &mut BTreeSet<ObjectRef>,
-    visited: &mut BTreeSet<ObjectRef>,
-    next_clone: &mut ObjectRef,
-    pages: &mut Vec<ObjectRef>,
+    state: &mut RepairState,
     depth: usize,
     media_box: bool,
 ) -> Result<()> {
@@ -179,7 +176,7 @@ fn repair_page_tree<R: Read + Seek>(
             "page tree depth exceeds maximum of {MAX_DEPTH} at {node_ref}"
         )));
     }
-    if !visited.insert(node_ref) {
+    if !state.visited.insert(node_ref) {
         // Cycle guard: qpdf throws here; flpdf tolerates (matching PageWalk) and
         // stops descending. A well-formed tree never hits this.
         return Ok(());
@@ -239,12 +236,12 @@ fn repair_page_tree<R: Read + Seek>(
             // existing leaf branch below apply the default to the now-indirect
             // object yields the SAME object content and — since defaulting never
             // mints — the SAME object numbers, so this reordering is byte-faithful.
-            let new_ref = *next_clone;
+            let new_ref = state.next_clone;
             let next_num = new_ref
                 .number
                 .checked_add(1)
                 .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
-            *next_clone = ObjectRef::new(next_num, 0);
+            state.next_clone = ObjectRef::new(next_num, 0);
             // Move the inline dict out of the /Kids entry WITHOUT cloning; the
             // moved dict carries no /Parent and makeIndirectObject adds none.
             let owned = std::mem::replace(kid, Object::Reference(new_ref));
@@ -264,16 +261,7 @@ fn repair_page_tree<R: Read + Seek>(
         };
         if has_kids {
             // Interior /Pages node: descend, threading the /MediaBox flag.
-            repair_page_tree(
-                pdf,
-                kid_ref,
-                seen,
-                visited,
-                next_clone,
-                pages,
-                depth + 1,
-                media_box,
-            )?;
+            repair_page_tree(pdf, kid_ref, state, depth + 1, media_box)?;
             continue;
         }
         // Leaf branch.
@@ -301,18 +289,18 @@ fn repair_page_tree<R: Read + Seek>(
         // (:131-134), so both flow through the (2l) override below. The clone is
         // taken from the (possibly defaulted) original via `resolve`, so it
         // inherits any /MediaBox default applied just above.
-        let leaf_ref = if seen.insert(kid_ref) {
+        let leaf_ref = if state.seen.insert(kid_ref) {
             kid_ref // First occurrence of this leaf.
         } else {
             let clone = pdf.resolve(kid_ref)?; // Owned copy of the leaf dict.
-            let new_ref = *next_clone;
+            let new_ref = state.next_clone;
             let next_num = new_ref
                 .number
                 .checked_add(1)
                 .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
-            *next_clone = ObjectRef::new(next_num, 0);
+            state.next_clone = ObjectRef::new(next_num, 0);
             pdf.set_object(new_ref, clone);
-            seen.insert(new_ref);
+            state.seen.insert(new_ref);
             *kid = Object::Reference(new_ref);
             changed = true;
             new_ref
@@ -330,7 +318,7 @@ fn repair_page_tree<R: Read + Seek>(
                 pdf.set_object(leaf_ref, Object::Dictionary(leaf));
             }
         }
-        pages.push(leaf_ref);
+        state.pages.push(leaf_ref);
     }
     if changed {
         dict.insert("Kids", Object::Array(kids));
