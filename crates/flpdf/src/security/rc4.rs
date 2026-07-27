@@ -40,11 +40,25 @@ impl Rc4 {
     }
 
     /// Initialize RC4 using qpdf's NUL-terminated key mode.
+    ///
+    /// Retained for the qpdf-compatible stateful API and exercised by the
+    /// differential/unit oracle; current PDF consumers use explicit keys.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "retained for the planned qpdf-compatible API")
+    )]
     pub(crate) fn from_c_str(key: &CStr) -> Result<Self, PrimitiveError> {
         Self::new(key.to_bytes())
     }
 
     /// Return an encrypted/decrypted copy of `input`, retaining stream state.
+    ///
+    /// Retained alongside the in-place operation for qpdf API parity and
+    /// exercised by the differential/unit oracle.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "retained for the planned qpdf-compatible API")
+    )]
     pub(crate) fn process(&mut self, input: &[u8]) -> Vec<u8> {
         let mut output = input.to_vec();
         self.process_in_place(&mut output);
@@ -277,7 +291,7 @@ mod tests {
 
     #[test]
     fn c_string_mode_excludes_the_terminating_nul() {
-        let c_key = CStr::from_bytes_with_nul(b"Key\0").unwrap();
+        let c_key = c"Key";
         let mut c_string = Rc4::from_c_str(c_key).unwrap();
         let mut explicit = Rc4::new(b"Key").unwrap();
         assert_eq!(c_string.process(&[0; 32]), explicit.process(&[0; 32]));
@@ -297,7 +311,7 @@ mod tests {
     #[test]
     fn empty_explicit_and_c_string_keys_are_rejected() {
         assert!(matches!(Rc4::new(b""), Err(PrimitiveError::InvalidLength)));
-        let empty = CStr::from_bytes_with_nul(b"\0").unwrap();
+        let empty = c"";
         assert!(matches!(
             Rc4::from_c_str(empty),
             Err(PrimitiveError::InvalidLength)
