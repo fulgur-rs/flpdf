@@ -4,6 +4,8 @@ mod buffer;
 
 mod count;
 
+mod flate;
+
 #[allow(dead_code)]
 pub(crate) type PipelineResult<T> = std::result::Result<T, PipelineError>;
 
