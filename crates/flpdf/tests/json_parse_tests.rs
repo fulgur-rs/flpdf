@@ -254,6 +254,7 @@ fn parser_preserves_raw_bytes_in_lexical_diagnostics() {
 fn json_message_exposes_exact_owned_bytes_and_lossy_display() {
     let message = flpdf::json::JsonMessage::from_bytes(vec![b'x', 0xff]);
     assert_eq!(message.as_bytes(), b"x\xff");
+    assert_eq!(format!("{message:?}"), "JsonMessage([120, 255])");
     assert_eq!(message.to_string(), "x\u{fffd}");
     assert_eq!(message.into_bytes(), b"x\xff");
 }
