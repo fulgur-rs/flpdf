@@ -160,7 +160,7 @@ pub fn page_content_bytes<R: Read + Seek>(
 /// Resolve a `Page`'s `/Contents` into its content streams, each paired with the
 /// terminal [`ObjectRef`] of the indirect chain that produced it (`None` for a
 /// direct inline stream). Holder chains (`ref -> ref -> stream`) are followed via
-/// [`resolve_ref_chain`], so a doubly-indirect `/Contents` is not dropped.
+/// `resolve_ref_chain`, so a doubly-indirect `/Contents` is not dropped.
 ///
 /// Every legal `/Contents` shape is accepted: a direct stream, an (indirect)
 /// reference to a stream, an array of stream references, or a reference to such
