@@ -522,7 +522,7 @@ fn handler_errors_preserve_non_utf8_key_and_path_bytes() {
 }
 
 #[test]
-fn unconfigured_type_handlers_reject_null_and_containers() {
+fn unconfigured_type_handlers_reject_null_bool_and_containers() {
     let handler = JsonHandler::new();
     handler.add_string_handler(|_, _| {});
 
@@ -531,6 +531,11 @@ fn unconfigured_type_handlers_reject_null_and_containers() {
             b".null".as_slice(),
             Json::make_null(),
             "JSON handler: value at .null is not of expected type",
+        ),
+        (
+            b".bool".as_slice(),
+            Json::make_bool(true),
+            "JSON handler: value at .bool is not of expected type",
         ),
         (
             b".dictionary".as_slice(),
