@@ -169,7 +169,9 @@ impl<'a> Flate<'a> {
 
     fn consume_zlib_header(&mut self, data: &[u8]) -> PipelineResult<usize> {
         let InflatePhase::Header { bytes, len } = &mut self.inflate_state.phase else {
+            // cov:ignore-start: private caller dispatches only while phase is Header
             return Ok(0);
+            // cov:ignore-end
         };
         let consumed = (2 - *len).min(data.len());
         bytes[*len..*len + consumed].copy_from_slice(&data[..consumed]);
@@ -197,7 +199,9 @@ impl<'a> Flate<'a> {
 
     fn consume_zlib_trailer(&mut self, data: &[u8]) -> usize {
         let InflatePhase::Trailer { bytes, len } = &mut self.inflate_state.phase else {
+            // cov:ignore-start: private caller dispatches only while phase is Trailer
             return 0;
+            // cov:ignore-end
         };
         let consumed = (4 - *len).min(data.len());
         bytes[*len..*len + consumed].copy_from_slice(&data[..consumed]);
@@ -214,10 +218,12 @@ impl<'a> Flate<'a> {
 
     fn write_deflate(&mut self, data: &[u8], flush: FlushCompress) -> PipelineResult<()> {
         let Some(FlateCodec::Deflate(codec)) = self.codec.as_mut() else {
+            // cov:ignore-start: action-based initialization guarantees a deflate codec
             return Err(PipelineError::state(
                 &self.identifier,
                 "deflate codec is unavailable",
             ));
+            // cov:ignore-end
         };
         let mut input_offset = 0;
 
@@ -231,6 +237,7 @@ impl<'a> Flate<'a> {
             let status = match result {
                 Ok(status) => status,
                 Err(source) => {
+                    // cov:ignore-start: validated level and lifecycle prevent flate2 stream misuse
                     let detail = source
                         .message()
                         .unwrap_or("zlib compression error")
@@ -240,10 +247,12 @@ impl<'a> Flate<'a> {
                         format!("deflate: data: {detail}"),
                         source,
                     ));
+                    // cov:ignore-end
                 }
             };
 
             if status == Status::BufError {
+                // cov:ignore-start: nonzero output with nonempty writes or Finish always progresses
                 self.warn(BUF_ERROR_WARNING, Z_BUF_ERROR)?;
                 if flush == FlushCompress::Finish {
                     return Err(PipelineError::codec(
@@ -252,6 +261,7 @@ impl<'a> Flate<'a> {
                     ));
                 }
                 return Ok(());
+                // cov:ignore-end
             }
 
             if produced > 0 {
@@ -268,10 +278,12 @@ impl<'a> Flate<'a> {
                 return Ok(());
             }
             if consumed == 0 && produced == 0 {
+                // cov:ignore-start: defensive termination guard after all valid stop statuses
                 return Err(PipelineError::codec(
                     &self.identifier,
                     "deflate: data: codec made no progress",
                 ));
+                // cov:ignore-end
             }
         }
     }
@@ -311,10 +323,12 @@ impl<'a> Flate<'a> {
             }
 
             let Some(FlateCodec::Inflate(codec)) = self.codec.as_mut() else {
+                // cov:ignore-start: action-based initialization guarantees an inflate codec
                 return Err(PipelineError::state(
                     &self.identifier,
                     "inflate codec is unavailable",
                 ));
+                // cov:ignore-end
             };
             let before_in = codec.total_in();
             let before_out = codec.total_out();
@@ -358,10 +372,12 @@ impl<'a> Flate<'a> {
                 return Ok(());
             }
             if consumed == 0 && produced == 0 {
+                // cov:ignore-start: defensive termination guard after BufError and valid stops
                 return Err(PipelineError::codec(
                     &self.identifier,
                     "inflate: data: codec made no progress",
                 ));
+                // cov:ignore-end
             }
         }
     }
@@ -424,7 +440,7 @@ impl Pipeline for Flate<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Flate, FlateAction};
+    use super::{Flate, FlateAction, BUF_ERROR_WARNING};
     use crate::pipeline::buffer::Buffer;
     use crate::pipeline::{Pipeline, PipelineError, PipelineErrorKind, PipelineResult};
     use std::cell::RefCell;
@@ -652,6 +668,103 @@ mod tests {
     }
 
     #[test]
+    fn zlib_header_validation_reports_specific_codec_sources() {
+        for (header, detail) in [
+            ([0x79, 0x00], "unknown compression method"),
+            ([0x88, 0x00], "invalid window size"),
+            ([0x78, 0x00], "incorrect header check"),
+            ([0x78, 0x20], "preset dictionary is not supported"),
+        ] {
+            let mut sink = RecordingSink::default();
+            assert_eq!(sink.identifier(), "recording");
+            let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 3).unwrap();
+            let err = flate.write(&header).unwrap_err();
+            assert_eq!(err.kind(), PipelineErrorKind::Codec);
+            assert_eq!(err.source().unwrap().to_string(), detail);
+        }
+    }
+
+    #[test]
+    fn split_header_and_trailer_are_consumed_incrementally() {
+        let encoded = deflate_chunks(&[b"split framing"], 5).unwrap();
+        let trailer_start = encoded.len() - 4;
+        let mut sink = Buffer::new("sink", None);
+        {
+            let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 3).unwrap();
+            flate.write(&encoded[..1]).unwrap();
+            flate.write(&encoded[1..trailer_start + 2]).unwrap();
+            flate.write(&encoded[trailer_start + 2..]).unwrap();
+            flate.finish().unwrap();
+        }
+        assert_eq!(sink.take_buffer().unwrap(), b"split framing");
+    }
+
+    #[test]
+    fn finish_with_incomplete_header_warns_and_finishes_downstream() {
+        let warnings = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = RecordingSink::default();
+        {
+            let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 3).unwrap();
+            let observed = Rc::clone(&warnings);
+            flate.set_warn_callback(move |message, code| {
+                observed.borrow_mut().push((message.to_owned(), code));
+                Ok(())
+            });
+            flate.write(&[0x78]).unwrap();
+            flate.finish().unwrap();
+        }
+        assert_eq!(
+            warnings.borrow().as_slice(),
+            [(BUF_ERROR_WARNING.to_owned(), -5)]
+        );
+        assert_eq!(sink.finishes, 1);
+    }
+
+    #[test]
+    fn finish_with_incomplete_trailer_warns_after_preserving_output() {
+        let encoded = deflate_chunks(&[b"truncated trailer"], 5).unwrap();
+        let warnings = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = RecordingSink::default();
+        {
+            let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 3).unwrap();
+            let observed = Rc::clone(&warnings);
+            flate.set_warn_callback(move |message, code| {
+                observed.borrow_mut().push((message.to_owned(), code));
+                Ok(())
+            });
+            flate.write(&encoded[..encoded.len() - 2]).unwrap();
+            flate.finish().unwrap();
+        }
+        assert_eq!(sink.chunks.concat(), b"truncated trailer");
+        assert_eq!(
+            warnings.borrow().as_slice(),
+            [(BUF_ERROR_WARNING.to_owned(), -5)]
+        );
+        assert_eq!(sink.finishes, 1);
+    }
+
+    #[test]
+    fn buf_error_without_callback_is_nonfatal() {
+        const ENCODED_PREFIX: [u8; 4] = [0x78, 0x9c, 0x4b, 0x04];
+        let mut sink = RecordingSink::default();
+        let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 1).unwrap();
+        flate.write(&ENCODED_PREFIX).unwrap();
+        drop(flate);
+        assert_eq!(sink.chunks.concat(), b"a");
+    }
+
+    #[test]
+    fn downstream_finish_error_is_returned_when_local_finish_succeeds() {
+        let mut sink = FinishFaultSink::default();
+        let mut flate = Flate::new("flate", &mut sink, FlateAction::Deflate, 8).unwrap();
+        flate.write(b"x").unwrap();
+        let err = flate.finish().unwrap_err();
+        assert_eq!(err.stage(), "finish-fault");
+        drop(flate);
+        assert_eq!(sink.finishes, 1);
+    }
+
+    #[test]
     fn write_after_inflate_stream_end_is_not_write_after_finish() {
         let encoded = deflate_chunks(&[b"ended"], 8).unwrap();
         let mut sink = Buffer::new("sink", None);
@@ -669,6 +782,8 @@ mod tests {
         let mut sink = RecordingSink::default();
         {
             let mut flate = Flate::new("flate", &mut sink, FlateAction::Deflate, 8).unwrap();
+            assert_eq!(flate.identifier(), "flate");
+            flate.write(b"").unwrap();
             flate.write(b"x").unwrap();
             flate.finish().unwrap();
             flate.finish().unwrap();
