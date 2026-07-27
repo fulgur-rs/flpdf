@@ -123,6 +123,8 @@ namespace
         for (size_t i = 0; i < input_len; ++i) {
             input.push_back(static_cast<unsigned char>((i * 37U + 11U) & 0xffU));
         }
+        unsigned char empty_input_sentinel = 0;
+        auto input_data = input.empty() ? &empty_input_sentinel : input.data();
         auto explicit_key_len = key.size();
         key.push_back(0);
 
@@ -133,8 +135,8 @@ namespace
             key.data(),
             c_string ? -1 : static_cast<int>(explicit_key_len),
             out_buffer_size);
-        stage.write(input.data(), write_split);
-        stage.write(input.data() + write_split, input_len - write_split);
+        stage.write(input_data, write_split);
+        stage.write(input_data + write_split, input_len - write_split);
         stage.finish();
         stage.finish();
 

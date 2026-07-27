@@ -562,7 +562,7 @@ mod tests {
             write_split: 0,
             out_buffer_size: DEFAULT_OUT_BUFFER_SIZE,
         };
-        assert_eq!(run_qpdf_pl_rc4_probe(Path::new("/bin/true"), &case), "");
+        assert_eq!(run_qpdf_pl_rc4_probe(Path::new("true"), &case), "");
     }
 
     #[cfg(unix)]
