@@ -1753,9 +1753,11 @@ fn write_incremental_xref_stream(
             0,
             XrefEntry::Uncompressed {
                 offset: u64::try_from(xref_offset).map_err(|_| {
+                    // cov:ignore-start: Rust supports no target whose usize is wider than u64.
                     crate::Error::Unsupported(
                         "xref stream object offset does not fit u64".to_string(),
                     )
+                    // cov:ignore-end
                 })?,
             },
         ),
@@ -4084,9 +4086,11 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                             gen,
                             XrefEntry::Uncompressed {
                                 offset: u64::try_from(off).map_err(|_| {
+                                    // cov:ignore-start: Rust supports no target whose usize is wider than u64.
                                     crate::Error::Unsupported(
                                         "xref offset does not fit u64".to_string(),
                                     )
+                                    // cov:ignore-end
                                 })?,
                             },
                         ),
@@ -4111,7 +4115,9 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                 } else {
                     // Gap in emitted objects — emit as a free entry so the
                     // xref stream covers `[0, /Size)` contiguously.
+                    // cov:ignore-start: Catalog-first numbering is contiguous and every number is emitted or assigned to an ObjStm.
                     xref_entries.insert(number, (0, XrefEntry::Free { next: 0 }));
+                    // cov:ignore-end
                 }
             }
             xref_entries.insert(
@@ -4120,9 +4126,11 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     0,
                     XrefEntry::Uncompressed {
                         offset: u64::try_from(xref_offset).map_err(|_| {
+                            // cov:ignore-start: Rust supports no target whose usize is wider than u64.
                             crate::Error::Unsupported(
                                 "xref stream offset does not fit u64".to_string(),
                             )
+                            // cov:ignore-end
                         })?,
                     },
                 ),
