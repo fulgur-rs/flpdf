@@ -876,6 +876,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             {
                 "crates/flpdf/src/matrix.rs",
                 "crates/flpdf/src/pdf_version.rs",
+                "crates/flpdf/src/tokenizer.rs",
             },
             mirrors,
         )

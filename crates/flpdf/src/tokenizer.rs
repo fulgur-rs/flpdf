@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDFTokenizer.cc normal, push, and pull modes; inline-image mode is added by the stacked successor branch.
+//! Mirrors qpdf 11.9.0 libqpdf/QPDFTokenizer.cc.
 
 use std::ops::Range;
 
