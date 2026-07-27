@@ -106,8 +106,6 @@ mod tests {
     use std::ffi::{CStr, CString};
     use std::path::Path;
     use std::process::Command;
-    #[cfg(unix)]
-    use std::{fs, os::unix::fs::PermissionsExt};
 
     #[derive(Default)]
     struct RecordingSink {
@@ -456,12 +454,12 @@ mod tests {
         )
     }
 
-    fn run_qpdf_pl_rc4_probe(probe: &Path, case: &OracleCase) -> String {
+    fn run_qpdf_pl_rc4_command(mut command: Command, case: &OracleCase) -> String {
         let mode = match case.mode {
             OracleKeyMode::Explicit => "explicit",
             OracleKeyMode::CStr => "cstr",
         };
-        let output = Command::new(probe)
+        let output = command
             .args([
                 "pipeline",
                 mode,
@@ -479,6 +477,10 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).expect("Pl_RC4 probe output is ASCII")
+    }
+
+    fn run_qpdf_pl_rc4_probe(probe: &Path, case: &OracleCase) -> String {
+        run_qpdf_pl_rc4_command(Command::new(probe), case)
     }
 
     fn assert_qpdf_pl_rc4_oracle_matches(mut qpdf_records: impl FnMut(&OracleCase) -> String) {
@@ -513,19 +515,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_test_probe(path: &Path, source: &str) {
-        fs::write(path, source).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(path, permissions).unwrap();
-    }
-
-    #[cfg(unix)]
     #[test]
     fn qpdf_pl_rc4_probe_receives_exact_arguments() {
-        let dir = tempfile::tempdir().unwrap();
-        let probe = dir.path().join("probe");
-        write_test_probe(&probe, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '%s\\n' \"$@\"", "probe"]);
         let case = OracleCase {
             name: "arguments",
             mode: OracleKeyMode::Explicit,
@@ -535,7 +528,7 @@ mod tests {
             out_buffer_size: 7,
         };
         assert_eq!(
-            run_qpdf_pl_rc4_probe(&probe, &case),
+            run_qpdf_pl_rc4_command(command, &case),
             "pipeline\nexplicit\n01ab\n9\n4\n7\n"
         );
     }
@@ -543,9 +536,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn qpdf_pl_rc4_probe_failure_reports_case_and_stderr() {
-        let dir = tempfile::tempdir().unwrap();
-        let probe = dir.path().join("probe");
-        write_test_probe(&probe, "#!/bin/sh\nprintf 'probe stderr' >&2\nexit 7\n");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'probe stderr' >&2; exit 7", "probe"]);
         let case = OracleCase {
             name: "failure-case",
             mode: OracleKeyMode::Explicit,
@@ -554,7 +546,10 @@ mod tests {
             write_split: 0,
             out_buffer_size: DEFAULT_OUT_BUFFER_SIZE,
         };
-        let panic = std::panic::catch_unwind(|| run_qpdf_pl_rc4_probe(&probe, &case)).unwrap_err();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_qpdf_pl_rc4_command(command, &case)
+        }))
+        .unwrap_err();
         let message = panic.downcast_ref::<String>().unwrap();
         assert!(message.contains("qpdf Pl_RC4 probe failed for failure-case"));
         assert!(message.contains("probe stderr"));
@@ -563,9 +558,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn qpdf_pl_rc4_probe_rejects_non_utf8_stdout() {
-        let dir = tempfile::tempdir().unwrap();
-        let probe = dir.path().join("probe");
-        write_test_probe(&probe, "#!/bin/sh\nprintf '\\377'\n");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '\\377'", "probe"]);
         let case = OracleCase {
             name: "non-utf8",
             mode: OracleKeyMode::Explicit,
@@ -574,7 +568,10 @@ mod tests {
             write_split: 0,
             out_buffer_size: DEFAULT_OUT_BUFFER_SIZE,
         };
-        let panic = std::panic::catch_unwind(|| run_qpdf_pl_rc4_probe(&probe, &case)).unwrap_err();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_qpdf_pl_rc4_command(command, &case)
+        }))
+        .unwrap_err();
         let message = panic.downcast_ref::<String>().unwrap();
         assert!(message.contains("Pl_RC4 probe output is ASCII"));
     }
