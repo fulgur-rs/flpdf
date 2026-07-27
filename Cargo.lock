@@ -336,7 +336,6 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "md-5",
- "rc4",
  "serde_json",
  "sha2",
  "stringprep",
@@ -658,15 +657,6 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
-
-[[package]]
-name = "rc4"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f1256e23efe6097f27aa82d6ca6889361c001586ae0f6917cbad072f05eb275"
-dependencies = [
- "cipher",
-]
 
 [[package]]
 name = "regex"

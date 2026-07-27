@@ -1,13 +1,8 @@
-//! qpdf correspondence: Rust crypto-crate substitution for qpdf AES, RC4, MD5, and SHA2 native implementations.
+//! qpdf correspondence: Rust crypto-crate substitution for qpdf AES, MD5, and SHA2 native implementations.
 //! Low-level cryptographic primitives used by the PDF security handler.
 //!
 //! All functions are `pub(crate)`; no dependency types from RustCrypto crates
 //! are exposed through the `flpdf` public API.
-//!
-//! # RC4 notice
-//! `rc4` is a broken stream cipher. Its use in PDF is legacy (PDF 1.x–1.6
-//! encryption). Higher-level code MUST gate RC4 usage behind an
-//! `--allow-weak-crypto` flag before calling [`rc4()`].
 //!
 //! # Dead-code notice
 //! Several primitives in this module support encrypted-PDF handling
@@ -41,54 +36,6 @@ pub(crate) enum PrimitiveError {
     /// PKCS#7 unpadding failed (bad or missing padding bytes).
     #[error("invalid PKCS#7 padding")]
     PaddingError,
-}
-
-/// Apply RC4 keystream to `data` in-place.
-///
-/// # Security warning
-/// RC4 is cryptographically broken. Higher-level callers MUST require the
-/// user to opt-in with `--allow-weak-crypto` before invoking this function.
-///
-/// # Implementation note
-/// `rc4::Rc4` is generic over a compile-time key-size const, which does not
-/// match PDF's runtime-variable 5–16-byte keys. This wrapper therefore
-/// implements KSA + PRGA inline (mirroring the `rc4` crate's `Rc4State`
-/// logic, MIT/Apache-2.0).
-///
-/// # Errors
-/// Returns [`PrimitiveError::InvalidLength`] if `key` is empty. Empty `data`
-/// is permitted (no-op `Ok(())`) — encrypting/decrypting a zero-byte string
-/// is well-defined and used by PDF Algorithm 6 on edge cases.
-pub(crate) fn rc4(key: &[u8], data: &mut [u8]) -> Result<(), PrimitiveError> {
-    if key.is_empty() {
-        return Err(PrimitiveError::InvalidLength);
-    }
-    if data.is_empty() {
-        return Ok(());
-    }
-
-    // Key Scheduling Algorithm (KSA)
-    let mut state = [0u8; 256];
-    for (i, s) in state.iter_mut().enumerate() {
-        *s = i as u8;
-    }
-    let mut j: u8 = 0;
-    for i in 0..256usize {
-        j = j.wrapping_add(state[i]).wrapping_add(key[i % key.len()]);
-        state.swap(i, j as usize);
-    }
-
-    // Pseudo-Random Generation Algorithm (PRGA) — apply keystream
-    let mut i: u8 = 0;
-    let mut j: u8 = 0;
-    for byte in data.iter_mut() {
-        i = i.wrapping_add(1);
-        j = j.wrapping_add(state[i as usize]);
-        state.swap(i as usize, j as usize);
-        let idx = state[i as usize].wrapping_add(state[j as usize]) as usize;
-        *byte ^= state[idx];
-    }
-    Ok(())
 }
 
 /// Decrypt `ciphertext` in-place with AES-128-CBC and remove PKCS#7 padding.
@@ -203,46 +150,6 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("invalid hex digit"))
             .collect()
-    }
-
-    // ── RC4 ──────────────────────────────────────────────────────────────────
-
-    /// RFC 6229 §2 – Test vector: key "Key", plaintext "Plaintext"
-    /// Expected keystream (XOR'd with zeros) = BBF316E8D940AF0AD3...
-    /// Equivalently: rc4("Key", "Plaintext") == [0xBB,0xF3,0x16,0xE8,0xD9,0x40,0xAF,0x0A,0xD3]
-    #[test]
-    fn rc4_rfc6229_key_plaintext() {
-        let mut data = b"Plaintext".to_vec();
-        rc4(b"Key", &mut data).unwrap();
-        assert_eq!(data, [0xBB, 0xF3, 0x16, 0xE8, 0xD9, 0x40, 0xAF, 0x0A, 0xD3]);
-    }
-
-    /// Additional sanity: key "Wiki", plaintext "pedia"
-    #[test]
-    fn rc4_wiki_pedia() {
-        let mut data = b"pedia".to_vec();
-        rc4(b"Wiki", &mut data).unwrap();
-        assert_eq!(data, [0x10, 0x21, 0xBF, 0x04, 0x20]);
-    }
-
-    /// An empty key is a programmer error, not a silent no-op: KSA would
-    /// be undefined. The function returns `InvalidLength` so callers cannot
-    /// accidentally pass an unauthenticated buffer through unchanged.
-    #[test]
-    fn rc4_empty_key_returns_invalid_length() {
-        let mut data = b"abc".to_vec();
-        let err = rc4(b"", &mut data).unwrap_err();
-        assert!(matches!(err, PrimitiveError::InvalidLength));
-        assert_eq!(data, b"abc", "data must be untouched on error");
-    }
-
-    /// Empty data is a well-defined no-op (used by Algorithm 6 edge cases),
-    /// not an error.
-    #[test]
-    fn rc4_empty_data_is_ok_noop() {
-        let mut data: Vec<u8> = Vec::new();
-        rc4(b"Key", &mut data).unwrap();
-        assert!(data.is_empty());
     }
 
     // ── MD5 ──────────────────────────────────────────────────────────────────

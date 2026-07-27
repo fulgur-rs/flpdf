@@ -314,7 +314,8 @@ def classify_source(path: Path, source: str) -> Classification:
         raise ValueError(f"{path}: classification must end with a terminal period")
     path_list = path_list[:-1].rstrip(RUST_WHITESPACE_CHARS)
     qpdf_paths = [
-        item.strip(RUST_WHITESPACE_CHARS) for item in path_list.split(",")
+        item.strip(RUST_WHITESPACE_CHARS)
+        for item in re.split(r",| and ", path_list)
     ]
     if not qpdf_paths or any(not QPDF_PATH_RE.fullmatch(item) for item in qpdf_paths):
         raise ValueError(f"{path}: invalid qpdf path list: {path_list}")

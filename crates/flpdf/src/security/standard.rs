@@ -43,7 +43,8 @@
 #![allow(dead_code)]
 
 use crate::error::{EncryptedError, Result};
-use crate::security::primitives::{md5, rc4, sha256, sha384, sha512};
+use crate::security::primitives::{md5, sha256, sha384, sha512};
+use crate::security::rc4::Rc4;
 use crate::{Dictionary, Object, ObjectRef};
 use aes::{Aes128, Aes256};
 use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
@@ -579,7 +580,8 @@ pub(crate) fn check_user_password(
         // Algorithm 6, step (b) for R=2:
         // Encrypt the padding string with the file key using RC4.
         let mut encrypted = PASSWORD_PADDING;
-        rc4(&file_key, &mut encrypted)?;
+        let mut cipher = Rc4::new(&file_key)?;
+        cipher.process_in_place(&mut encrypted);
         // Compare against /U (all 32 bytes).
         if encrypted[..] != inputs.u[..] {
             return Err(EncryptedError::BadPassword.into());
@@ -594,12 +596,14 @@ pub(crate) fn check_user_password(
 
         // 2. Encrypt that 16-byte digest with the file key.
         let mut data = digest;
-        rc4(&file_key, &mut data)?;
+        let mut cipher = Rc4::new(&file_key)?;
+        cipher.process_in_place(&mut data);
 
         // 3. Apply 19 further RC4 passes with (file_key XOR i) for i = 1..=19.
-        for i in 1u8..=19 {
-            let xor_key: Vec<u8> = file_key.iter().map(|&b| b ^ i).collect();
-            rc4(&xor_key, &mut data)?;
+        for i in 1_u8..=19 {
+            let xor_key: Vec<u8> = file_key.iter().map(|&byte| byte ^ i).collect();
+            let mut cipher = Rc4::new(&xor_key)?;
+            cipher.process_in_place(&mut data);
         }
 
         // 4. Compare the 16-byte result with the first 16 bytes of /U.
@@ -624,10 +628,12 @@ pub(crate) fn check_user_password_v4(
     let digest = md5(&md5_input);
 
     let mut data = digest;
-    rc4(&file_key, &mut data)?;
-    for i in 1u8..=19 {
-        let xor_key: Vec<u8> = file_key.iter().map(|&b| b ^ i).collect();
-        rc4(&xor_key, &mut data)?;
+    let mut cipher = Rc4::new(&file_key)?;
+    cipher.process_in_place(&mut data);
+    for i in 1_u8..=19 {
+        let xor_key: Vec<u8> = file_key.iter().map(|&byte| byte ^ i).collect();
+        let mut cipher = Rc4::new(&xor_key)?;
+        cipher.process_in_place(&mut data);
     }
 
     if data[..] != inputs.u[..16] {
@@ -655,12 +661,14 @@ pub(crate) fn check_owner_password(
 
     if inputs.r == 2 {
         // Single RC4 pass.
-        rc4(&rc4_key, &mut candidate)?;
+        let mut cipher = Rc4::new(&rc4_key)?;
+        cipher.process_in_place(&mut candidate);
     } else {
         // 20 passes in DESCENDING order (i = 19..=0).
-        for i in (0u8..=19).rev() {
-            let xor_key: Vec<u8> = rc4_key.iter().map(|&b| b ^ i).collect();
-            rc4(&xor_key, &mut candidate)?;
+        for i in (0_u8..=19).rev() {
+            let xor_key: Vec<u8> = rc4_key.iter().map(|&byte| byte ^ i).collect();
+            let mut cipher = Rc4::new(&xor_key)?;
+            cipher.process_in_place(&mut candidate);
         }
     }
 
@@ -681,9 +689,10 @@ pub(crate) fn check_owner_password_v4(
     }
     let rc4_key = &digest[..n];
     let mut candidate = *inputs.o;
-    for i in (0u8..=19).rev() {
-        let xor_key: Vec<u8> = rc4_key.iter().map(|&b| b ^ i).collect();
-        rc4(&xor_key, &mut candidate)?;
+    for i in (0_u8..=19).rev() {
+        let xor_key: Vec<u8> = rc4_key.iter().map(|&byte| byte ^ i).collect();
+        let mut cipher = Rc4::new(&xor_key)?;
+        cipher.process_in_place(&mut candidate);
     }
     check_user_password_v4(&candidate, inputs)
 }
@@ -747,10 +756,12 @@ fn compute_u_first_16_r3plus(file_key: &[u8], id0: &[u8]) -> Result<[u8; 16]> {
     md5_input.extend_from_slice(id0);
     let mut data = md5(&md5_input);
 
-    rc4(file_key, &mut data)?;
-    for i in 1u8..=19 {
-        let xor_key: Vec<u8> = file_key.iter().map(|&b| b ^ i).collect();
-        rc4(&xor_key, &mut data)?;
+    let mut cipher = Rc4::new(file_key)?;
+    cipher.process_in_place(&mut data);
+    for i in 1_u8..=19 {
+        let xor_key: Vec<u8> = file_key.iter().map(|&byte| byte ^ i).collect();
+        let mut cipher = Rc4::new(&xor_key)?;
+        cipher.process_in_place(&mut data);
     }
     Ok(data)
 }
@@ -849,11 +860,13 @@ pub(crate) fn compute_o_entry(
 
     let mut buf: [u8; 32] = pad_password(user_password);
     if r == 2 {
-        rc4(&rc4_key, &mut buf)?;
+        let mut cipher = Rc4::new(&rc4_key)?;
+        cipher.process_in_place(&mut buf);
     } else {
-        for i in 0u8..=19 {
-            let xor_key: Vec<u8> = rc4_key.iter().map(|&b| b ^ i).collect();
-            rc4(&xor_key, &mut buf)?;
+        for i in 0_u8..=19 {
+            let xor_key: Vec<u8> = rc4_key.iter().map(|&byte| byte ^ i).collect();
+            let mut cipher = Rc4::new(&xor_key)?;
+            cipher.process_in_place(&mut buf);
         }
     }
     Ok(buf)
@@ -876,7 +889,8 @@ pub(crate) fn compute_u_entry(file_key: &[u8], id0: &[u8], r: i64) -> Result<[u8
 
     if r == 2 {
         let mut buf = PASSWORD_PADDING;
-        rc4(file_key, &mut buf)?;
+        let mut cipher = Rc4::new(file_key)?;
+        cipher.process_in_place(&mut buf);
         Ok(buf)
     } else {
         let first16 = compute_u_first_16_r3plus(file_key, id0)?;
@@ -1497,7 +1511,11 @@ fn decrypt_strings_in_value(
 pub(crate) fn decrypt_cipher_bytes(bytes: &mut Vec<u8>, cipher: StringCipher<'_>) -> Result<()> {
     match cipher {
         StringCipher::Identity => Ok(()),
-        StringCipher::Rc4 { key } => rc4(key, bytes).map_err(Into::into),
+        StringCipher::Rc4 { key } => {
+            let mut cipher = Rc4::new(key)?;
+            cipher.process_in_place(bytes);
+            Ok(())
+        }
         StringCipher::Aes128 { key } => {
             let Some((iv, ciphertext)) = bytes.split_first_chunk::<16>() else {
                 return Err(EncryptedError::Malformed {
@@ -1619,7 +1637,11 @@ pub(crate) fn encrypt_cipher_bytes(
 ) -> Result<()> {
     match cipher {
         StringEncryptCipher::Identity => Ok(()),
-        StringEncryptCipher::Rc4 { key } => rc4(key, bytes).map_err(Into::into),
+        StringEncryptCipher::Rc4 { key } => {
+            let mut cipher = Rc4::new(key)?;
+            cipher.process_in_place(bytes);
+            Ok(())
+        }
         StringEncryptCipher::Aes128 { key } => {
             *bytes = aes128_cbc_encrypt_with_iv(key, iv, bytes);
             Ok(())
@@ -1886,6 +1908,7 @@ pub(crate) fn prepend_crypt_filter_to_stream_dict(dict: &mut Dictionary, cf_name
 mod tests {
     use super::*;
     use crate::object::MAX_INLINE_DEPTH;
+    use crate::security::rc4::Rc4;
     use crate::{Dictionary, Object, ObjectRef, Stream};
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -1954,11 +1977,11 @@ mod tests {
     fn decrypt_strings_descends_into_nested_arrays_dicts_and_stream_dicts() {
         let key = b"Key";
         let mut nested = b"nested".to_vec();
-        rc4(key, &mut nested).unwrap();
+        Rc4::new(key).unwrap().process_in_place(&mut nested);
         let mut in_dict = b"in dict".to_vec();
-        rc4(key, &mut in_dict).unwrap();
+        Rc4::new(key).unwrap().process_in_place(&mut in_dict);
         let mut in_stream_dict = b"in stream dict".to_vec();
-        rc4(key, &mut in_stream_dict).unwrap();
+        Rc4::new(key).unwrap().process_in_place(&mut in_stream_dict);
 
         let mut inner = Dictionary::new();
         inner.insert("S", Object::String(in_dict));
@@ -2042,7 +2065,7 @@ mod tests {
     fn decrypt_strings_skips_encrypt_object_subtree() {
         let key = b"Key";
         let mut secret = b"must stay encrypted".to_vec();
-        rc4(key, &mut secret).unwrap();
+        Rc4::new(key).unwrap().process_in_place(&mut secret);
         let encrypted = secret.clone();
         let mut dict = Dictionary::new();
         dict.insert("O", Object::String(secret));
@@ -2066,7 +2089,7 @@ mod tests {
     fn decrypt_strings_handles_rc4_aes128_and_v5_aes256_string_bytes() {
         let rc4_key = b"Key";
         let mut rc4_string = b"Plaintext".to_vec();
-        rc4(rc4_key, &mut rc4_string).unwrap();
+        Rc4::new(rc4_key).unwrap().process_in_place(&mut rc4_string);
         let mut rc4_object = Object::String(rc4_string);
         decrypt_strings_in_object(
             ObjectRef::new(10, 0),
