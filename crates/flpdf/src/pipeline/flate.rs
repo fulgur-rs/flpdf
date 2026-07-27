@@ -167,11 +167,24 @@ impl<'a> Flate<'a> {
         )
     }
 
+    fn ensure_codec_progress(
+        identifier: &str,
+        operation: &str,
+        consumed: usize,
+        produced: usize,
+    ) -> PipelineResult<()> {
+        if consumed == 0 && produced == 0 {
+            return Err(PipelineError::codec(
+                identifier,
+                format!("{operation}: data: codec made no progress"),
+            ));
+        }
+        Ok(())
+    }
+
     fn consume_zlib_header(&mut self, data: &[u8]) -> PipelineResult<usize> {
         let InflatePhase::Header { bytes, len } = &mut self.inflate_state.phase else {
-            // cov:ignore-start: private caller dispatches only while phase is Header
             return Ok(0);
-            // cov:ignore-end
         };
         let consumed = (2 - *len).min(data.len());
         bytes[*len..*len + consumed].copy_from_slice(&data[..consumed]);
@@ -199,9 +212,7 @@ impl<'a> Flate<'a> {
 
     fn consume_zlib_trailer(&mut self, data: &[u8]) -> usize {
         let InflatePhase::Trailer { bytes, len } = &mut self.inflate_state.phase else {
-            // cov:ignore-start: private caller dispatches only while phase is Trailer
             return 0;
-            // cov:ignore-end
         };
         let consumed = (4 - *len).min(data.len());
         bytes[*len..*len + consumed].copy_from_slice(&data[..consumed]);
@@ -218,12 +229,10 @@ impl<'a> Flate<'a> {
 
     fn write_deflate(&mut self, data: &[u8], flush: FlushCompress) -> PipelineResult<()> {
         let Some(FlateCodec::Deflate(codec)) = self.codec.as_mut() else {
-            // cov:ignore-start: action-based initialization guarantees a deflate codec
             return Err(PipelineError::state(
                 &self.identifier,
                 "deflate codec is unavailable",
             ));
-            // cov:ignore-end
         };
         let mut input_offset = 0;
 
@@ -234,25 +243,12 @@ impl<'a> Flate<'a> {
             let consumed = (codec.total_in() - before_in) as usize;
             let produced = (codec.total_out() - before_out) as usize;
             input_offset += consumed;
-            let status = match result {
-                Ok(status) => status,
-                Err(source) => {
-                    // cov:ignore-start: validated level and lifecycle prevent flate2 stream misuse
-                    let detail = source
-                        .message()
-                        .unwrap_or("zlib compression error")
-                        .to_owned();
-                    return Err(PipelineError::codec_with_source(
-                        &self.identifier,
-                        format!("deflate: data: {detail}"),
-                        source,
-                    ));
-                    // cov:ignore-end
-                }
-            };
+            let identifier = &self.identifier;
+            let detail = "deflate: data: zlib compression error";
+            let status = result
+                .map_err(|source| PipelineError::codec_with_source(identifier, detail, source))?;
 
             if status == Status::BufError {
-                // cov:ignore-start: nonzero output with nonempty writes or Finish always progresses
                 self.warn(BUF_ERROR_WARNING, Z_BUF_ERROR)?;
                 if flush == FlushCompress::Finish {
                     return Err(PipelineError::codec(
@@ -261,7 +257,6 @@ impl<'a> Flate<'a> {
                     ));
                 }
                 return Ok(());
-                // cov:ignore-end
             }
 
             if produced > 0 {
@@ -277,14 +272,7 @@ impl<'a> Flate<'a> {
             {
                 return Ok(());
             }
-            if consumed == 0 && produced == 0 {
-                // cov:ignore-start: defensive termination guard after all valid stop statuses
-                return Err(PipelineError::codec(
-                    &self.identifier,
-                    "deflate: data: codec made no progress",
-                ));
-                // cov:ignore-end
-            }
+            Self::ensure_codec_progress(&self.identifier, "deflate", consumed, produced)?;
         }
     }
 
@@ -323,12 +311,10 @@ impl<'a> Flate<'a> {
             }
 
             let Some(FlateCodec::Inflate(codec)) = self.codec.as_mut() else {
-                // cov:ignore-start: action-based initialization guarantees an inflate codec
                 return Err(PipelineError::state(
                     &self.identifier,
                     "inflate codec is unavailable",
                 ));
-                // cov:ignore-end
             };
             let before_in = codec.total_in();
             let before_out = codec.total_out();
@@ -371,14 +357,7 @@ impl<'a> Flate<'a> {
             if input_offset == data.len() && produced < self.output.len() {
                 return Ok(());
             }
-            if consumed == 0 && produced == 0 {
-                // cov:ignore-start: defensive termination guard after BufError and valid stops
-                return Err(PipelineError::codec(
-                    &self.identifier,
-                    "inflate: data: codec made no progress",
-                ));
-                // cov:ignore-end
-            }
+            Self::ensure_codec_progress(&self.identifier, "inflate", consumed, produced)?;
         }
     }
 
@@ -440,9 +419,10 @@ impl Pipeline for Flate<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Flate, FlateAction, BUF_ERROR_WARNING};
+    use super::{Flate, FlateAction, InflatePhase, BUF_ERROR_WARNING};
     use crate::pipeline::buffer::Buffer;
     use crate::pipeline::{Pipeline, PipelineError, PipelineErrorKind, PipelineResult};
+    use flate2::{FlushCompress, FlushDecompress};
     use std::cell::RefCell;
     use std::error::Error as _;
     use std::rc::Rc;
@@ -700,6 +680,22 @@ mod tests {
     }
 
     #[test]
+    fn inflate_accepts_zero_output_body_prefix_and_ignores_bytes_after_trailer() {
+        let encoded = deflate_chunks(&[b"framing with trailing bytes"], 5).unwrap();
+        let mut final_chunk = encoded[3..].to_vec();
+        final_chunk.extend_from_slice(b"ignored");
+        let mut sink = RecordingSink::default();
+        {
+            let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 3).unwrap();
+            flate.write(&encoded[..2]).unwrap();
+            flate.write(&encoded[2..3]).unwrap();
+            flate.write(&final_chunk).unwrap();
+            flate.finish().unwrap();
+        }
+        assert_eq!(sink.chunks.concat(), b"framing with trailing bytes");
+    }
+
+    #[test]
     fn finish_with_incomplete_header_warns_and_finishes_downstream() {
         let warnings = Rc::new(RefCell::new(Vec::new()));
         let mut sink = RecordingSink::default();
@@ -762,6 +758,87 @@ mod tests {
         assert_eq!(err.stage(), "finish-fault");
         drop(flate);
         assert_eq!(sink.finishes, 1);
+    }
+
+    #[test]
+    fn private_codec_guards_report_mismatches_and_invalid_reuse() {
+        assert_eq!(
+            Flate::ensure_codec_progress("guard", "inflate", 0, 0)
+                .unwrap_err()
+                .kind(),
+            PipelineErrorKind::Codec
+        );
+        Flate::ensure_codec_progress("guard", "inflate", 1, 0).unwrap();
+        Flate::ensure_codec_progress("guard", "inflate", 0, 1).unwrap();
+
+        let mut sink = RecordingSink::default();
+        {
+            let mut inflate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 8).unwrap();
+            inflate.initialize_codec();
+            assert_eq!(
+                inflate
+                    .write_deflate(b"x", FlushCompress::None)
+                    .unwrap_err()
+                    .kind(),
+                PipelineErrorKind::State
+            );
+            inflate.inflate_state.phase = InflatePhase::Body;
+            assert_eq!(inflate.consume_zlib_header(b"x").unwrap(), 0);
+            assert_eq!(inflate.consume_zlib_trailer(b"x"), 0);
+        }
+        {
+            let mut deflate = Flate::new("deflate", &mut sink, FlateAction::Deflate, 8).unwrap();
+            deflate.initialize_codec();
+            deflate.inflate_state.phase = InflatePhase::Body;
+            assert_eq!(
+                deflate
+                    .write_inflate(b"x", FlushDecompress::Sync)
+                    .unwrap_err()
+                    .kind(),
+                PipelineErrorKind::State
+            );
+            deflate.write_deflate(b"x", FlushCompress::Finish).unwrap();
+            #[cfg(feature = "qpdf-zlib-compat")]
+            assert_eq!(
+                deflate
+                    .write_deflate(b"x", FlushCompress::None)
+                    .unwrap_err()
+                    .kind(),
+                PipelineErrorKind::Codec
+            );
+            #[cfg(not(feature = "qpdf-zlib-compat"))]
+            deflate.write_deflate(b"x", FlushCompress::None).unwrap();
+        }
+    }
+
+    #[test]
+    fn private_deflate_buf_error_paths_preserve_warning_and_finish_error() {
+        let warnings = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = RecordingSink::default();
+        {
+            let mut flate = Flate::new("deflate", &mut sink, FlateAction::Deflate, 8).unwrap();
+            let observed = Rc::clone(&warnings);
+            flate.set_warn_callback(move |message, code| {
+                observed.borrow_mut().push((message.to_owned(), code));
+                Ok(())
+            });
+            flate.initialize_codec();
+            flate.write_deflate(&[], FlushCompress::None).unwrap();
+            flate.output.clear();
+            assert_eq!(
+                flate
+                    .write_deflate(&[], FlushCompress::Finish)
+                    .unwrap_err()
+                    .kind(),
+                PipelineErrorKind::Codec
+            );
+        }
+        let warnings = warnings.borrow();
+        assert_eq!(warnings[0], (BUF_ERROR_WARNING.to_owned(), -5));
+        #[cfg(not(feature = "qpdf-zlib-compat"))]
+        assert_eq!(warnings.len(), 2);
+        #[cfg(feature = "qpdf-zlib-compat")]
+        assert_eq!(warnings.len(), 1);
     }
 
     #[test]
