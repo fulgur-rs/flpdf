@@ -83,6 +83,8 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::process::Command;
+    #[cfg(unix)]
+    use std::{fs, os::unix::fs::PermissionsExt};
 
     #[derive(Clone, Copy)]
     enum OracleKeyMode {
@@ -195,20 +197,26 @@ mod tests {
         String::from_utf8(output.stdout).expect("probe output is ASCII")
     }
 
-    #[test]
-    #[ignore = "live qpdf 11.9.0 RC4 oracle"]
-    fn qpdf_rc4_differential() {
-        let probe = std::env::var_os("QPDF_RC4_PROBE")
-            .expect("set QPDF_RC4_PROBE to the qpdf 11.9.0 probe");
+    fn assert_qpdf_oracle_matches(mut qpdf_records: impl FnMut(&OracleCase) -> String) {
         for case in oracle_cases() {
             assert_eq!(
                 flpdf_records(&case),
-                run_qpdf_probe(Path::new(&probe), &case),
+                qpdf_records(&case),
                 "case {}",
                 case.name
             );
         }
     }
+
+    #[test]
+    #[ignore = "live qpdf 11.9.0 RC4 oracle"]
+    // cov:ignore-start: ignored live entry point; ordinary tests cover the comparison loop and fake-probe boundary
+    fn qpdf_rc4_differential() {
+        let probe = std::env::var_os("QPDF_RC4_PROBE")
+            .expect("set QPDF_RC4_PROBE to the qpdf 11.9.0 probe");
+        assert_qpdf_oracle_matches(|case| run_qpdf_probe(Path::new(&probe), case));
+    }
+    // cov:ignore-end
 
     #[test]
     fn oracle_cases_have_matching_one_split_and_in_place_records() {
@@ -219,6 +227,116 @@ mod tests {
             assert_eq!(lines.next(), Some(one), "split case {}", case.name);
             assert_eq!(lines.next(), Some(one), "in-place case {}", case.name);
         }
+    }
+
+    #[cfg(unix)]
+    fn write_test_probe(path: &Path, source: &str) {
+        fs::write(path, source).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_probe_passes_exact_explicit_and_c_string_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        write_test_probe(&probe, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+
+        let explicit = OracleCase {
+            name: "explicit-arguments",
+            mode: OracleKeyMode::Explicit,
+            key: vec![0x01, 0xab],
+            input: vec![0x00, 0xff],
+            split: 1,
+        };
+        assert_eq!(
+            run_qpdf_probe(&probe, &explicit),
+            "explicit\n01ab\n00ff\n1\n"
+        );
+
+        let c_string = OracleCase {
+            name: "c-string-arguments",
+            mode: OracleKeyMode::CStr,
+            key: vec![b'K', 0, b'Z'],
+            input: vec![b'A'],
+            split: 0,
+        };
+        assert_eq!(run_qpdf_probe(&probe, &c_string), "cstr\n4b005a\n41\n0\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_probe_failure_reports_case_and_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        write_test_probe(&probe, "#!/bin/sh\nprintf 'probe stderr' >&2\nexit 7\n");
+        let case = OracleCase {
+            name: "failure-case",
+            mode: OracleKeyMode::Explicit,
+            key: vec![1],
+            input: vec![],
+            split: 0,
+        };
+
+        let panic = std::panic::catch_unwind(|| run_qpdf_probe(&probe, &case)).unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("qpdf RC4 probe failed for failure-case"));
+        assert!(message.contains("probe stderr"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_probe_rejects_non_utf8_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        write_test_probe(&probe, "#!/bin/sh\nprintf '\\377'\n");
+        let case = OracleCase {
+            name: "non-utf8",
+            mode: OracleKeyMode::Explicit,
+            key: vec![1],
+            input: vec![],
+            split: 0,
+        };
+
+        let panic = std::panic::catch_unwind(|| run_qpdf_probe(&probe, &case)).unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("probe output is ASCII"));
+    }
+
+    #[test]
+    fn qpdf_comparison_checks_every_oracle_case() {
+        let mut visited = Vec::new();
+        assert_qpdf_oracle_matches(|case| {
+            visited.push(case.name);
+            flpdf_records(case)
+        });
+        assert_eq!(
+            visited,
+            [
+                "explicit-one-byte-empty-input",
+                "explicit-five-byte-rfc",
+                "explicit-sixteen-byte-in-place",
+                "explicit-256-byte-key",
+                "explicit-key-over-256",
+                "c-string-first-nul",
+            ]
+        );
+    }
+
+    #[test]
+    fn qpdf_comparison_rejects_a_mismatched_record() {
+        let panic = std::panic::catch_unwind(|| {
+            assert_qpdf_oracle_matches(|case| {
+                if case.name == "explicit-five-byte-rfc" {
+                    "wrong record".to_string()
+                } else {
+                    flpdf_records(case)
+                }
+            });
+        });
+        assert!(panic.is_err());
     }
 
     #[test]
