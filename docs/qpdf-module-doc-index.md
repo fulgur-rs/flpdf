@@ -27,6 +27,7 @@
 | `crates/flpdf/src/json/mod.rs` | correspondence | JSON.cc and JSONHandler.cc responsibilities split across the json module tree |
 | `crates/flpdf/src/json/parser.rs` | correspondence | JSON.cc parser state machine and Reactor event responsibilities |
 | `crates/flpdf/src/json/schema.rs` | correspondence | JSON.cc schema validation responsibilities |
+| `crates/flpdf/src/json/stdio.rs` | correspondence | Pl_StdioFile.cc write and finish semantics for JSON side files |
 | `crates/flpdf/src/json/value.rs` | correspondence | JSON.cc shared value model and mutation and accessor responsibilities |
 | `crates/flpdf/src/json/writer.rs` | correspondence | JSON.cc incremental serialization and blob Base64 responsibilities |
 | `crates/flpdf/src/json_inspect.rs` | correspondence | QPDF_json.cc responsibilities represented by the JSON v2 inspection builders |
