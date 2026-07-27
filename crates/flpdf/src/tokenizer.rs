@@ -2295,6 +2295,12 @@ mod tests {
         for (value, expected) in [
             (b"a(b".as_slice(), br"(a\(b)".as_slice()),
             (b"a\nb".as_slice(), br"(a\nb)".as_slice()),
+            (b"a\rb".as_slice(), br"(a\rb)".as_slice()),
+            (b"a\tb".as_slice(), br"(a\tb)".as_slice()),
+            (b"a\x08b".as_slice(), br"(a\bb)".as_slice()),
+            (b"a\x0cb".as_slice(), br"(a\fb)".as_slice()),
+            (b"a)b".as_slice(), br"(a\)b)".as_slice()),
+            (b"a\\b".as_slice(), br"(a\\b)".as_slice()),
             (b"\x01".as_slice(), b"<01>".as_slice()),
             (b"\x18abcd".as_slice(), br"(\030abcd)".as_slice()),
             (b"\xa0abcd".as_slice(), b"(\xa0abcd)".as_slice()),

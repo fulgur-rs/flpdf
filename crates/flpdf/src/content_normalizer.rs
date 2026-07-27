@@ -133,6 +133,8 @@ mod tests {
     use std::fmt::Write as _;
     use std::path::Path;
     use std::process::Command;
+    #[cfg(unix)]
+    use std::{fs, os::unix::fs::PermissionsExt};
 
     fn normalizer_oracle_cases() -> [(&'static str, &'static [u8]); 12] {
         [
@@ -290,6 +292,91 @@ mod tests {
         assert_eq!(
             filter.0,
             vec![TokenType::Word, TokenType::Eof, TokenType::BraceOpen]
+        );
+    }
+
+    #[test]
+    fn normalizer_oracle_case_records_match_snapshots() {
+        let expected = [
+            (
+                "layout-comments-crlf",
+                "output\t25206b6565700a425420202f4e616d652051\n\
+                 any_bad_tokens\t0\nlast_token_was_bad\t0\n",
+            ),
+            (
+                "string-control",
+                "output\t3c30313e20546a\nany_bad_tokens\t0\nlast_token_was_bad\t0\n",
+            ),
+            (
+                "string-newline",
+                "output\t28615c6e62290a20546a\nany_bad_tokens\t0\nlast_token_was_bad\t0\n",
+            ),
+            (
+                "iso-latin-literal",
+                "output\t28a0616263642920546a\nany_bad_tokens\t0\nlast_token_was_bad\t0\n",
+            ),
+            (
+                "iso-latin-hex",
+                "output\t3c61303631363236333e20546a\n\
+                 any_bad_tokens\t0\nlast_token_was_bad\t0\n",
+            ),
+            (
+                "bad-recovers",
+                "output\t3c30673e2071\nany_bad_tokens\t1\nlast_token_was_bad\t0\n",
+            ),
+            (
+                "bad-at-eof",
+                "output\t3c3067\nany_bad_tokens\t1\nlast_token_was_bad\t1\n",
+            ),
+            (
+                "id-at-eof",
+                "output\t494420\nany_bad_tokens\t1\nlast_token_was_bad\t1\n",
+            ),
+            (
+                "id-crlf-separator",
+                "output\t42492049440a0a7261772045492051\n\
+                 any_bad_tokens\t0\nlast_token_was_bad\t0\n",
+            ),
+            (
+                "inline-false-ei",
+                "output\t4249202f572031204944206f6e652045492041312074776f2045492051\n\
+                 any_bad_tokens\t0\nlast_token_was_bad\t0\n",
+            ),
+            (
+                "inline-binary",
+                "output\t4249202f5720312049442000ff2045492051\n\
+                 any_bad_tokens\t0\nlast_token_was_bad\t0\n",
+            ),
+            (
+                "all-space",
+                "output\t712009000c0a0a0a51\nany_bad_tokens\t0\nlast_token_was_bad\t0\n",
+            ),
+        ];
+
+        for ((name, input), (expected_name, expected_record)) in
+            normalizer_oracle_cases().into_iter().zip(expected)
+        {
+            assert_eq!(name, expected_name);
+            assert_eq!(normalizer_record(input), expected_record, "case {name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalizer_probe_command_passes_exact_arguments_and_returns_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        fs::write(&probe, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        let mut permissions = fs::metadata(&probe).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&probe, permissions).unwrap();
+
+        let (name, input) = normalizer_oracle_cases()[10];
+        assert_eq!(
+            run_normalizer_probe(&probe, name, input),
+            "--mode\nnormalize\n--input-hex\n4249202f5720312049442000ff2045492051\n\
+             --allow-eof\n1\n--include-ignorable\n1\n--allow-bad\n1\n--max-len\n0\n\
+             --inline-offset\nnone\n"
         );
     }
 
