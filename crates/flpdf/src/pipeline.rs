@@ -1,4 +1,4 @@
-//! qpdf correspondence: Pipeline.cc lifecycle and stage-error responsibilities represented by a crate-private Rust trait.
+//! qpdf correspondence: Pipeline.cc write/finish chaining lifecycle represented by a crate-private Rust trait; PipelineError stage, kind, and source transport is flpdf-specific.
 
 pub(crate) mod buffer;
 

@@ -1,4 +1,4 @@
-//! qpdf correspondence: Pl_Buffer.cc buffering, optional pass-through, finish, and takeBuffer responsibilities.
+//! qpdf correspondence: Pl_Buffer.cc accumulation, optional pass-through, finish readiness, and getBuffer reset ownership; Rust take_buffer returns the moved Vec directly.
 
 use super::{Pipeline, PipelineError, PipelineResult};
 

@@ -785,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn hint_encoding_propagates_pipeline_errors_from_every_section_write_and_finish() {
+    fn hint_encoding_propagates_page_and_shared_section_write_and_finish_errors() {
         let tables = nonzero_tables();
         let encoded = encode_hint_stream(&tables.0, &tables.1, None).unwrap();
 

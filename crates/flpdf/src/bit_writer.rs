@@ -89,7 +89,7 @@ mod tests {
     struct TestSink {
         bytes: Vec<u8>,
         finishes: usize,
-        fail_writes: bool,
+        fail_writes_remaining: usize,
     }
 
     impl Pipeline for TestSink {
@@ -98,7 +98,8 @@ mod tests {
         }
 
         fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
-            if self.fail_writes {
+            if self.fail_writes_remaining > 0 {
+                self.fail_writes_remaining -= 1;
                 return Err(PipelineError::state(self.identifier(), "write failed"));
             }
             self.bytes.extend_from_slice(data);
@@ -219,23 +220,33 @@ mod tests {
     }
 
     #[test]
-    fn propagates_downstream_write_errors_for_complete_and_partial_bytes() {
+    fn complete_byte_write_failure_retains_pending_byte_for_identical_retry() {
         let mut complete_sink = TestSink {
-            fail_writes: true,
+            fail_writes_remaining: 1,
             ..TestSink::default()
         };
-        let complete_error = BitWriter::new(&mut complete_sink)
-            .write_bits(0xff, 8)
-            .unwrap_err();
-        assert_eq!(complete_error.kind(), PipelineErrorKind::State);
+        {
+            let mut writer = BitWriter::new(&mut complete_sink);
+            let complete_error = writer.write_bits(0xa5, 8).unwrap_err();
+            assert_eq!(complete_error.kind(), PipelineErrorKind::State);
+            writer.write_bits(0xa5, 8).unwrap();
+        }
+        assert_eq!(complete_sink.bytes, [0xa5]);
+    }
 
+    #[test]
+    fn partial_byte_flush_failure_retains_pending_byte_for_flush_retry() {
         let mut partial_sink = TestSink {
-            fail_writes: true,
+            fail_writes_remaining: 1,
             ..TestSink::default()
         };
-        let mut writer = BitWriter::new(&mut partial_sink);
-        writer.write_bits(0xf, 4).unwrap();
-        let partial_error = writer.flush().unwrap_err();
-        assert_eq!(partial_error.kind(), PipelineErrorKind::State);
+        {
+            let mut writer = BitWriter::new(&mut partial_sink);
+            writer.write_bits(0b101, 3).unwrap();
+            let partial_error = writer.flush().unwrap_err();
+            assert_eq!(partial_error.kind(), PipelineErrorKind::State);
+            writer.flush().unwrap();
+        }
+        assert_eq!(partial_sink.bytes, [0b1010_0000]);
     }
 }
