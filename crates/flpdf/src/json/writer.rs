@@ -7,6 +7,9 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use super::value::{ContainerOrBlobSnapshot, ValueSnapshot};
 use super::Json;
 
+const BASE64_INPUT_CHUNK_LEN: usize = 6 * 1024;
+const BASE64_OUTPUT_CHUNK_LEN: usize = BASE64_INPUT_CHUNK_LEN / 3 * 4;
+
 struct Base64Writer<'a, W: Write + ?Sized> {
     out: &'a mut W,
     pending: [u8; 3],
@@ -22,12 +25,16 @@ impl<'a, W: Write + ?Sized> Base64Writer<'a, W> {
         }
     }
 
-    fn write_group(&mut self, group: &[u8; 3]) -> io::Result<()> {
-        let mut encoded = [0; 4];
-        STANDARD
-            .encode_slice(group, &mut encoded)
-            .expect("three input bytes always encode into four output bytes");
-        self.out.write_all(&encoded)
+    fn write_complete_groups(&mut self, groups: &[u8]) -> io::Result<()> {
+        debug_assert!(!groups.is_empty());
+        debug_assert_eq!(groups.len() % 3, 0);
+        debug_assert!(groups.len() <= BASE64_INPUT_CHUNK_LEN);
+
+        let mut encoded = [0; BASE64_OUTPUT_CHUNK_LEN];
+        let encoded_len = STANDARD
+            .encode_slice(groups, &mut encoded)
+            .expect("complete Base64 groups fit in the bounded output chunk");
+        self.out.write_all(&encoded[..encoded_len])
     }
 
     fn finish(self) -> io::Result<()> {
@@ -52,7 +59,7 @@ impl<W: Write + ?Sized> Write for Base64Writer<'_, W> {
             input = &input[copied..];
             if self.pending_len == 3 {
                 let group = self.pending;
-                self.write_group(&group)?;
+                self.write_complete_groups(&group)?;
                 self.pending_len = 0;
             }
             if input.is_empty() {
@@ -61,11 +68,9 @@ impl<W: Write + ?Sized> Write for Base64Writer<'_, W> {
         }
 
         while input.len() >= 3 {
-            let group: [u8; 3] = input[..3]
-                .try_into()
-                .expect("three-byte slice has fixed length");
-            self.write_group(&group)?;
-            input = &input[3..];
+            let complete_len = input.len().min(BASE64_INPUT_CHUNK_LEN) / 3 * 3;
+            self.write_complete_groups(&input[..complete_len])?;
+            input = &input[complete_len..];
         }
 
         self.pending[..input.len()].copy_from_slice(input);

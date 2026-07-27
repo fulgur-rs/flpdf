@@ -8,6 +8,7 @@ use flpdf::json::Json;
 struct MaxWriteSink {
     bytes: Vec<u8>,
     max_write: usize,
+    write_sizes: Vec<usize>,
 }
 
 impl io::Write for MaxWriteSink {
@@ -19,6 +20,7 @@ impl io::Write for MaxWriteSink {
                 self.max_write
             )));
         }
+        self.write_sizes.push(bytes.len());
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
@@ -183,19 +185,25 @@ fn qpdf_blob_uses_standard_base64_without_newlines() {
 }
 
 #[test]
-fn qpdf_blob_streams_base64_without_one_full_encoded_write() {
+fn qpdf_blob_batches_base64_into_bounded_writes() {
     let bytes = vec![0x5a; 4096];
     let payload = bytes.clone();
     let blob = Json::make_blob(move |out| out.write_all(&payload));
     let mut out = MaxWriteSink {
         bytes: Vec::new(),
-        max_write: 2048,
+        max_write: 8192,
+        write_sizes: Vec::new(),
     };
 
     blob.write(&mut out, 0).unwrap();
 
     let expected = format!("\"{}\"", STANDARD.encode(bytes)).into_bytes();
     assert_eq!(out.bytes, expected);
+    assert!(
+        out.write_sizes.len() <= 4,
+        "bounded Base64 batching should need at most opening quote, complete groups, tail, and closing quote; got {:?}",
+        out.write_sizes
+    );
 }
 
 #[test]
