@@ -121,6 +121,7 @@ fn map_pipeline_error(error: PipelineError) -> Error {
     Error::Unsupported(error.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn ignore_warning(_: &str, _: i32) -> PipelineResult<()> {
     Ok(())
 }
