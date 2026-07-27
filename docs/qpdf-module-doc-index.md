@@ -113,4 +113,5 @@
 | `crates/flpdf/src/writer/plain/plan.rs` | correspondence | QPDFWriter.cc standard-write object placement and renumber planning |
 | `crates/flpdf/src/writer/plain/xref.rs` | correspondence | QPDFWriter.cc classic and stream xref emission for the plain writer |
 | `crates/flpdf/src/writer/serialize.rs` | correspondence | QPDFWriter.cc shared object, stream, trailer, and xref serialization primitives |
-| `crates/flpdf/src/xref.rs` | correspondence | QPDF.cc xref loading and repair plus QPDFXRefEntry.cc data representation |
+| `crates/flpdf/src/xref.rs` | correspondence | QPDF.cc xref loading and repair |
+| `crates/flpdf/src/xref_entry.rs` | correspondence | QPDFXRefEntry.cc cross-reference entry value representation |

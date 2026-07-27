@@ -1,6 +1,6 @@
 use flpdf::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
-    Diagnostics, Dictionary, Error, LoadedXref, ObjectRef, XrefForm, XrefOffset,
+    Diagnostics, Dictionary, Error, LoadedXref, ObjectRef, XrefEntry, XrefForm,
 };
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -32,11 +32,11 @@ fn loads_xref_table_and_trailer() {
     assert_eq!(loaded.last_xref_form, XrefForm::Table);
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(&XrefOffset::Offset(9))
+        Some(&XrefEntry::Uncompressed { offset: 9 })
     );
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(2, 0)),
-        Some(&XrefOffset::Offset(58))
+        Some(&XrefEntry::Uncompressed { offset: 58 })
     );
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
 }
@@ -97,11 +97,11 @@ fn loads_xref_stream_and_trailer() {
     assert_eq!(loaded.last_xref_form, XrefForm::Stream);
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(&XrefOffset::Offset(10))
+        Some(&XrefEntry::Uncompressed { offset: 10 })
     );
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(2, 0)),
-        Some(&XrefOffset::Offset(20))
+        Some(&XrefEntry::Uncompressed { offset: 20 })
     );
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
     assert_eq!(startxref, loaded.startxref as usize);
@@ -218,11 +218,11 @@ fn loads_xref_stream_without_index_uses_size_range() {
 
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(&XrefOffset::Offset(10))
+        Some(&XrefEntry::Uncompressed { offset: 10 })
     );
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(2, 0)),
-        Some(&XrefOffset::Offset(20))
+        Some(&XrefEntry::Uncompressed { offset: 20 })
     );
 }
 
@@ -283,7 +283,7 @@ fn parses_xref_stream_with_compressed_entries() {
 
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(&XrefOffset::Compressed {
+        Some(&XrefEntry::Compressed {
             stream: 2,
             index: 0
         })
@@ -324,15 +324,19 @@ fn loads_latest_xref_stream_free_entries_over_previous_live_entries() {
 
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(2, 0)),
-        Some(&XrefOffset::Free { next: 0 })
+        Some(&XrefEntry::Free { next: 0 })
     );
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(&XrefOffset::Offset(obj1_offset))
+        Some(&XrefEntry::Uncompressed {
+            offset: obj1_offset
+        })
     );
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(3, 0)),
-        Some(&XrefOffset::Offset(latest_xref_offset))
+        Some(&XrefEntry::Uncompressed {
+            offset: latest_xref_offset
+        })
     );
 }
 
@@ -503,7 +507,7 @@ fn best_effort_recovers_from_corrupt_xref_data() {
         .any(|entry| entry.message == "Attempting to reconstruct cross-reference table"));
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(&XrefOffset::Offset(9))
+        Some(&XrefEntry::Uncompressed { offset: 9 })
     );
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
 }
@@ -652,7 +656,7 @@ fn rejects_startxref_offset_exactly_at_eof_without_panic() {
 }
 
 /// Best-effort recovery must detect a `/Type /ObjStm` object stream during the
-/// linear scan and emit `XrefOffset::Compressed` entries for the objects it
+/// linear scan and emit `XrefEntry::Compressed` entries for the objects it
 /// packs (`recover_xref_entries` ObjStm branch + `recover_compressed_offsets_from_objstm`).
 ///
 /// The ObjStm carries no `/Filter`, so `decode_stream_data` is a passthrough and
@@ -709,14 +713,16 @@ fn best_effort_recovers_objstm_compressed_entries() {
     // The ObjStm object itself recovers as a normal offset entry.
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(objstm_obj_number, 0)),
-        Some(&XrefOffset::Offset(objstm_offset))
+        Some(&XrefEntry::Uncompressed {
+            offset: objstm_offset
+        })
     );
     // The packed object recovers as a compressed entry pointing at the ObjStm.
     assert_eq!(
         loaded
             .entries
             .get(&ObjectRef::new(compressed_obj_number, 0)),
-        Some(&XrefOffset::Compressed {
+        Some(&XrefEntry::Compressed {
             stream: objstm_obj_number,
             index: 0,
         })
@@ -725,7 +731,7 @@ fn best_effort_recovers_objstm_compressed_entries() {
         loaded
             .entries
             .values()
-            .any(|entry| matches!(entry, XrefOffset::Compressed { stream, .. } if *stream == objstm_obj_number)),
+            .any(|entry| matches!(entry, XrefEntry::Compressed { stream, .. } if *stream == objstm_obj_number)),
         "expected at least one compressed entry referencing the ObjStm"
     );
 }
@@ -755,11 +761,13 @@ fn best_effort_recovers_objstm_with_indirect_length() {
 
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(5, 0)),
-        Some(&XrefOffset::Offset(objstm_offset))
+        Some(&XrefEntry::Uncompressed {
+            offset: objstm_offset
+        })
     );
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(7, 0)),
-        Some(&XrefOffset::Compressed {
+        Some(&XrefEntry::Compressed {
             stream: 5,
             index: 0,
         })
@@ -801,13 +809,15 @@ fn best_effort_recovers_objstm_truncated_by_in_stream_header() {
     // The ObjStm itself recovers as a normal offset entry.
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(5, 0)),
-        Some(&XrefOffset::Offset(objstm_offset))
+        Some(&XrefEntry::Uncompressed {
+            offset: objstm_offset
+        })
     );
     // The packed object recovers despite the in-stream header truncating the
     // bounded window — proof the fallback ran.
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(7, 0)),
-        Some(&XrefOffset::Compressed {
+        Some(&XrefEntry::Compressed {
             stream: 5,
             index: 0,
         })
@@ -874,7 +884,7 @@ fn assert_no_compressed_entry(bytes: Vec<u8>, objstm_obj_number: u32) {
     assert!(
         !loaded.entries.values().any(|entry| matches!(
             entry,
-            XrefOffset::Compressed { stream, .. } if *stream == objstm_obj_number
+            XrefEntry::Compressed { stream, .. } if *stream == objstm_obj_number
         )),
         "malformed ObjStm must not yield a compressed entry"
     );
@@ -1098,7 +1108,9 @@ fn best_effort_recovers_object_with_comment_between_header_tokens() {
     let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(7, 0)),
-        Some(&XrefOffset::Offset(obj7_offset))
+        Some(&XrefEntry::Uncompressed {
+            offset: obj7_offset
+        })
     );
 }
 
@@ -1116,7 +1128,9 @@ fn best_effort_recovers_plus_prefixed_object_number() {
     let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(7, 0)),
-        Some(&XrefOffset::Offset(object_offset))
+        Some(&XrefEntry::Uncompressed {
+            offset: object_offset
+        })
     );
 }
 
@@ -1140,7 +1154,9 @@ fn best_effort_reconstruction_applies_qpdf_100_byte_token_limit() {
     let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(7, 0)),
-        Some(&XrefOffset::Offset(object_7_offset))
+        Some(&XrefEntry::Uncompressed {
+            offset: object_7_offset
+        })
     );
     assert!(!loaded.entries.contains_key(&ObjectRef::new(8, 0)));
 }
@@ -1172,7 +1188,7 @@ fn best_effort_line_scan_honours_qpdf_reconstruct_guards() {
     let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(&XrefOffset::Offset(9))
+        Some(&XrefEntry::Uncompressed { offset: 9 })
     );
     assert!(!loaded.entries.contains_key(&ObjectRef::new(0, 0)));
     assert!(!loaded.entries.contains_key(&ObjectRef::new(2, 65535)));
@@ -1273,7 +1289,7 @@ fn repair_diagnostics_report_only_the_triggering_error() {
     // Recovery still produced usable entries and a trailer.
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(&XrefOffset::Offset(9))
+        Some(&XrefEntry::Uncompressed { offset: 9 })
     );
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
 }
@@ -1326,7 +1342,7 @@ fn repair_reports_non_parse_trigger_error_via_display() {
     // Recovery still produced usable entries and a trailer.
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(&XrefOffset::Offset(9))
+        Some(&XrefEntry::Uncompressed { offset: 9 })
     );
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
 }
@@ -1393,7 +1409,9 @@ fn with_repair_appends_diagnostic_when_stream_parse_succeeds() {
     // The stream's own entries are present (e.g. object 1 at its offset).
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(&XrefOffset::Offset(xref_offset))
+        Some(&XrefEntry::Uncompressed {
+            offset: xref_offset
+        })
     );
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
 }
@@ -1435,7 +1453,9 @@ fn circular_prev_recovers_with_repair_and_rejected_strict() {
     let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(&XrefOffset::Offset(obj1_offset as u64))
+        Some(&XrefEntry::Uncompressed {
+            offset: obj1_offset as u64
+        })
     );
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
 }
@@ -1471,11 +1491,15 @@ fn circular_prev_xref_stream_recovers_without_classic_trailer() {
     let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(&XrefOffset::Offset(catalog_offset))
+        Some(&XrefEntry::Uncompressed {
+            offset: catalog_offset
+        })
     );
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(2, 0)),
-        Some(&XrefOffset::Offset(xref_offset))
+        Some(&XrefEntry::Uncompressed {
+            offset: xref_offset
+        })
     );
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
     let messages: Vec<_> = loaded
@@ -1565,7 +1589,9 @@ fn merge_failure_falls_back_to_linear_scan() {
     );
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(&XrefOffset::Offset(obj1_offset as u64))
+        Some(&XrefEntry::Uncompressed {
+            offset: obj1_offset as u64
+        })
     );
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
 }
@@ -1971,7 +1997,7 @@ fn xref_stream_index_zero_count_range_skipped() {
         .expect("zero-count index chunk should be skipped, load should succeed");
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(&XrefOffset::Offset(0x14))
+        Some(&XrefEntry::Uncompressed { offset: 0x14 })
     );
     // Object 0 came only from the skipped zero-count chunk, so it is absent.
     assert_eq!(loaded.entries.get(&ObjectRef::new(0, 0)), None);
@@ -1979,7 +2005,7 @@ fn xref_stream_index_zero_count_range_skipped() {
 
 /// `parse_xref_entries`: a `/W` with `w0 == 0` (`[0 3 1]`) takes the
 /// `object_type` default-to-1 arm, so every entry is treated as a type-1
-/// in-use entry yielding `XrefOffset::Offset`. Loading succeeds.
+/// in-use entry yielding `XrefEntry::Uncompressed`. Loading succeeds.
 #[test]
 fn loads_xref_stream_with_w0_zero_defaults_type_one() {
     // w0 == 0: no type byte; field1 = offset (3 bytes), field2 = generation (1).
@@ -2000,11 +2026,11 @@ fn loads_xref_stream_with_w0_zero_defaults_type_one() {
         .expect("w0 == 0 should default to type 1, load should succeed");
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(0, 0)),
-        Some(&XrefOffset::Offset(0x0A))
+        Some(&XrefEntry::Uncompressed { offset: 0x0A })
     );
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(&XrefOffset::Offset(0x14))
+        Some(&XrefEntry::Uncompressed { offset: 0x14 })
     );
 }
 

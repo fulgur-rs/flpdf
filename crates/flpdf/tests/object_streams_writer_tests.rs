@@ -11,7 +11,7 @@ use flate2::Compression;
 use flpdf::ObjectStreamMode;
 use flpdf::{
     check_reader, load_xref_and_trailer, write_pdf_with_options, Object, ObjectRef, Pdf,
-    WriteOptions, XrefOffset,
+    WriteOptions, XrefEntry,
 };
 use std::io::{Cursor, Write};
 
@@ -262,7 +262,7 @@ fn nostream_130_generate_has_two_66_member_containers_with_dense_indices() {
             .entries
             .values()
             .filter_map(|entry| match entry {
-                XrefOffset::Compressed { stream, index } if *stream == container => Some(*index),
+                XrefEntry::Compressed { stream, index } if *stream == container => Some(*index),
                 _ => None,
             })
             .collect();

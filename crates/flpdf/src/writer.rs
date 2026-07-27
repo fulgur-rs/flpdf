@@ -16,7 +16,7 @@ use serialize::{
 use crate::parser::Parser;
 use crate::pdf_version::{parse_pdf_version, PdfVersion, PDF_1_2, PDF_1_5};
 use crate::tokenizer::Tokenizer;
-use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefForm, XrefOffset};
+use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefEntry, XrefForm};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, Write};
 
@@ -1409,14 +1409,22 @@ fn merge_source_and_touched_offsets(
 }
 
 fn merge_source_and_touched_offsets_for_xref_stream(
-    source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
+    source_offsets: &BTreeMap<u32, (u16, XrefEntry)>,
     touched_offsets: &BTreeMap<u32, (u16, usize)>,
     deleted_object_refs: &[ObjectRef],
     compressed_members: &BTreeMap<u32, (u32, u32)>,
-) -> BTreeMap<u32, (u16, XrefOffset)> {
+) -> BTreeMap<u32, (u16, XrefEntry)> {
     let mut merged = source_offsets.clone();
     for (number, (generation, offset)) in touched_offsets {
-        merged.insert(*number, (*generation, XrefOffset::Offset(*offset as u64)));
+        merged.insert(
+            *number,
+            (
+                *generation,
+                XrefEntry::Uncompressed {
+                    offset: *offset as u64,
+                },
+            ),
+        );
     }
     for (number, (stream, index)) in compressed_members {
         merged.insert(
@@ -1424,7 +1432,7 @@ fn merge_source_and_touched_offsets_for_xref_stream(
             (
                 // Type-2 (compressed) xref entries require the object's generation to be 0 (ISO 32000-1 §7.5.8.3); the third field carries the ObjStm index, not a generation.
                 0,
-                XrefOffset::Compressed {
+                XrefEntry::Compressed {
                     stream: *stream,
                     index: *index,
                 },
@@ -1432,7 +1440,7 @@ fn merge_source_and_touched_offsets_for_xref_stream(
         );
     }
     for (number, (generation, next)) in build_deleted_entries(source_offsets, deleted_object_refs) {
-        merged.insert(number, (generation, XrefOffset::Free { next }));
+        merged.insert(number, (generation, XrefEntry::Free { next }));
     }
     merged
 }
@@ -1446,7 +1454,7 @@ fn build_deleted_table_entries<R: Read + Seek>(
 }
 
 fn build_deleted_entries(
-    source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
+    source_offsets: &BTreeMap<u32, (u16, XrefEntry)>,
     deleted_object_refs: &[ObjectRef],
 ) -> BTreeMap<u32, (u16, u32)> {
     if deleted_object_refs.is_empty() {
@@ -1481,15 +1489,15 @@ fn build_deleted_entries(
     entries
 }
 
-fn source_free_head(source_offsets: &BTreeMap<u32, (u16, XrefOffset)>) -> u32 {
+fn source_free_head(source_offsets: &BTreeMap<u32, (u16, XrefEntry)>) -> u32 {
     match source_offsets.get(&0) {
-        Some((_, XrefOffset::Free { next })) => *next,
+        Some((_, XrefEntry::Free { next })) => *next,
         _ => 0,
     }
 }
 
 fn current_generation(
-    source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
+    source_offsets: &BTreeMap<u32, (u16, XrefEntry)>,
     object_ref: ObjectRef,
 ) -> u16 {
     source_offsets
@@ -1530,9 +1538,7 @@ pub(crate) fn is_source_structural_container(obj: &Object) -> bool {
     )
 }
 
-fn next_xref_stream_object_number(
-    source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
-) -> Result<u32> {
+fn next_xref_stream_object_number(source_offsets: &BTreeMap<u32, (u16, XrefEntry)>) -> Result<u32> {
     source_offsets
         .keys()
         .copied()
@@ -1548,7 +1554,7 @@ fn next_xref_stream_object_number(
 ///
 /// Wired into the incremental write path by `write_pdf_incremental`.
 fn allocate_incremental_objstm_container(
-    source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
+    source_offsets: &BTreeMap<u32, (u16, XrefEntry)>,
     touched: &[ObjectRef],
     deleted: &[ObjectRef],
     declared_size: usize,
@@ -1608,8 +1614,8 @@ fn write_incremental_objstm<R: Read + Seek>(
 }
 
 fn build_source_xref_offsets(
-    source_offsets: BTreeMap<ObjectRef, XrefOffset>,
-) -> BTreeMap<u32, (u16, XrefOffset)> {
+    source_offsets: BTreeMap<ObjectRef, XrefEntry>,
+) -> BTreeMap<u32, (u16, XrefEntry)> {
     let mut offsets = BTreeMap::new();
     for (object_ref, xref_offset) in source_offsets {
         offsets.insert(object_ref.number, (object_ref.generation, xref_offset));
@@ -1655,7 +1661,7 @@ fn resolve_object_count(
 
 fn resolve_xref_stream_object_count(
     declared_size: Option<&crate::Object>,
-    source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
+    source_offsets: &BTreeMap<u32, (u16, XrefEntry)>,
 ) -> usize {
     let max_object_number = source_offsets.keys().next_back().copied().unwrap_or(0) as usize;
     let declared = declared_size
@@ -1725,7 +1731,7 @@ fn write_incremental_xref(
 fn write_incremental_xref_stream(
     bytes: &mut Vec<u8>,
     trailer: &Dictionary,
-    source_offsets: &BTreeMap<u32, (u16, XrefOffset)>,
+    source_offsets: &BTreeMap<u32, (u16, XrefEntry)>,
     root_ref: &ObjectRef,
     xref_object_number: u32,
     object_count: usize,
@@ -1740,14 +1746,20 @@ fn write_incremental_xref_stream(
     }
 
     let mut offsets = source_offsets.clone();
-    offsets.insert(0, (65535, XrefOffset::Free { next: 0 }));
+    offsets.insert(0, (65535, XrefEntry::Free { next: 0 }));
     offsets.insert(
         xref_object_number,
         (
             0,
-            XrefOffset::Offset(u64::try_from(xref_offset).map_err(|_| {
-                crate::Error::Unsupported("xref stream object offset does not fit u64".to_string())
-            })?),
+            XrefEntry::Uncompressed {
+                offset: u64::try_from(xref_offset).map_err(|_| {
+                    // cov:ignore-start: Rust supports no target whose usize is wider than u64.
+                    crate::Error::Unsupported(
+                        "xref stream object offset does not fit u64".to_string(),
+                    )
+                })?,
+                // cov:ignore-end
+            },
         ),
     );
 
@@ -1825,7 +1837,7 @@ fn write_incremental_xref_stream(
 }
 
 fn build_xref_stream_bytes(
-    offsets: &BTreeMap<u32, (u16, XrefOffset)>,
+    offsets: &BTreeMap<u32, (u16, XrefEntry)>,
     ranges: &[(u32, u32)],
 ) -> Result<Vec<u8>> {
     let mut stream_data = Vec::new();
@@ -1841,22 +1853,22 @@ fn build_xref_stream_bytes(
             })?;
 
             let object_type = match (object_number, xref_offset) {
-                (0, _) | (_, XrefOffset::Free { .. }) => 0,
-                (_, XrefOffset::Compressed { .. }) => 2,
+                (0, _) | (_, XrefEntry::Free { .. }) => 0,
+                (_, XrefEntry::Compressed { .. }) => 2,
                 _ => 1,
             };
 
             stream_data.push(object_type);
             match xref_offset {
-                XrefOffset::Free { next } => {
+                XrefEntry::Free { next } => {
                     stream_data.extend_from_slice(&(u64::from(*next).to_be_bytes()[0..8]));
                     stream_data.extend_from_slice(&u32::from(*generation).to_be_bytes()[0..4]);
                 }
-                XrefOffset::Offset(offset) => {
+                XrefEntry::Uncompressed { offset } => {
                     stream_data.extend_from_slice(&((*offset).to_be_bytes()[0..8]));
                     stream_data.extend_from_slice(&u32::from(*generation).to_be_bytes()[0..4]);
                 }
-                XrefOffset::Compressed { stream, index } => {
+                XrefEntry::Compressed { stream, index } => {
                     stream_data.extend_from_slice(&(u64::from(*stream).to_be_bytes()[0..8]));
                     stream_data.extend_from_slice(&u32::to_be_bytes(*index)[0..4]);
                 }
@@ -4063,8 +4075,8 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             // matches the structure a reader expects from a non-incremental
             // xref stream.
             let final_object_count = (xref_object_number as usize).saturating_add(1);
-            let mut xref_entries: BTreeMap<u32, (u16, XrefOffset)> = BTreeMap::new();
-            xref_entries.insert(0, (65535, XrefOffset::Free { next: 0 }));
+            let mut xref_entries: BTreeMap<u32, (u16, XrefEntry)> = BTreeMap::new();
+            xref_entries.insert(0, (65535, XrefEntry::Free { next: 0 }));
             for number in 1..xref_object_number {
                 if let Some(&(gen, off)) = offsets.get(&number) {
                     // Regular indirect object (plain or ObjStm container).
@@ -4072,11 +4084,15 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                         number,
                         (
                             gen,
-                            XrefOffset::Offset(u64::try_from(off).map_err(|_| {
-                                crate::Error::Unsupported(
-                                    "xref offset does not fit u64".to_string(),
-                                )
-                            })?),
+                            XrefEntry::Uncompressed {
+                                offset: u64::try_from(off).map_err(|_| {
+                                    // cov:ignore-start: Rust supports no target whose usize is wider than u64.
+                                    crate::Error::Unsupported(
+                                        "xref offset does not fit u64".to_string(),
+                                    )
+                                })?,
+                                // cov:ignore-end
+                            },
                         ),
                     );
                 } else if let Some(&(container_num, index_in_batch)) =
@@ -4090,7 +4106,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                         number,
                         (
                             0,
-                            XrefOffset::Compressed {
+                            XrefEntry::Compressed {
                                 stream: container_num,
                                 index: index_in_batch,
                             },
@@ -4099,16 +4115,24 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                 } else {
                     // Gap in emitted objects — emit as a free entry so the
                     // xref stream covers `[0, /Size)` contiguously.
-                    xref_entries.insert(number, (0, XrefOffset::Free { next: 0 }));
+                    // cov:ignore-start: Catalog-first numbering is contiguous and every number is emitted or assigned to an ObjStm.
+                    xref_entries.insert(number, (0, XrefEntry::Free { next: 0 }));
+                    // cov:ignore-end
                 }
             }
             xref_entries.insert(
                 xref_object_number,
                 (
                     0,
-                    XrefOffset::Offset(u64::try_from(xref_offset).map_err(|_| {
-                        crate::Error::Unsupported("xref stream offset does not fit u64".to_string())
-                    })?),
+                    XrefEntry::Uncompressed {
+                        offset: u64::try_from(xref_offset).map_err(|_| {
+                            // cov:ignore-start: Rust supports no target whose usize is wider than u64.
+                            crate::Error::Unsupported(
+                                "xref stream offset does not fit u64".to_string(),
+                            )
+                        })?,
+                        // cov:ignore-end
+                    },
                 ),
             );
 
@@ -5957,9 +5981,9 @@ mod tests {
         // Max source key = 11, max touched num = 9, max deleted num = 15.
         // The container must sit strictly above every input number so it can
         // never collide with a delete_object free entry: 15 + 1 = 16.
-        let source_offsets: BTreeMap<u32, (u16, XrefOffset)> = BTreeMap::from([
-            (4, (0, XrefOffset::Offset(100))),
-            (11, (0, XrefOffset::Offset(200))),
+        let source_offsets: BTreeMap<u32, (u16, XrefEntry)> = BTreeMap::from([
+            (4, (0, XrefEntry::Uncompressed { offset: 100 })),
+            (11, (0, XrefEntry::Uncompressed { offset: 200 })),
         ]);
         let touched = vec![ObjectRef::new(7, 0), ObjectRef::new(9, 0)];
         let deleted = vec![ObjectRef::new(15, 0), ObjectRef::new(3, 0)];
@@ -5981,8 +6005,8 @@ mod tests {
         // Source/touched/deleted are all tiny, but declared /Size = 30 means
         // numbers up to 29 are reserved; the container must be 30, i.e.
         // declared_size.saturating_sub(1) + 1.
-        let source_offsets: BTreeMap<u32, (u16, XrefOffset)> =
-            BTreeMap::from([(2, (0, XrefOffset::Offset(50)))]);
+        let source_offsets: BTreeMap<u32, (u16, XrefEntry)> =
+            BTreeMap::from([(2, (0, XrefEntry::Uncompressed { offset: 50 }))]);
         let touched = vec![ObjectRef::new(1, 0)];
         let deleted = vec![ObjectRef::new(3, 0)];
 
@@ -6002,7 +6026,7 @@ mod tests {
         // Empty source/touched/deleted and declared_size = 0 pins the lower
         // boundary: every max() collapses to 0, declared_size.saturating_sub(1)
         // is 0, and base + 1 = 1 -> ObjectRef::new(1, 0).
-        let source_offsets: BTreeMap<u32, (u16, XrefOffset)> = BTreeMap::new();
+        let source_offsets: BTreeMap<u32, (u16, XrefEntry)> = BTreeMap::new();
         let touched: Vec<ObjectRef> = Vec::new();
         let deleted: Vec<ObjectRef> = Vec::new();
 
@@ -6020,17 +6044,17 @@ mod tests {
     #[test]
     fn merge_source_and_touched_offsets_for_xref_stream_handles_compressed() {
         // Source-only entry (must pass through unchanged).
-        let mut source_offsets: BTreeMap<u32, (u16, XrefOffset)> = BTreeMap::new();
-        source_offsets.insert(5, (0, XrefOffset::Offset(42)));
+        let mut source_offsets: BTreeMap<u32, (u16, XrefEntry)> = BTreeMap::new();
+        source_offsets.insert(5, (0, XrefEntry::Uncompressed { offset: 42 }));
 
-        // Plain touched entry -> XrefOffset::Offset.
+        // Plain touched entry -> XrefEntry::Uncompressed.
         let mut touched: BTreeMap<u32, (u16, usize)> = BTreeMap::new();
         touched.insert(7, (0, 100));
 
-        // Deleted ref -> XrefOffset::Free.
+        // Deleted ref -> XrefEntry::Free.
         let deleted = vec![ObjectRef::new(5, 0)];
 
-        // Compressed (ObjStm member) entries -> XrefOffset::Compressed, gen 0.
+        // Compressed (ObjStm member) entries -> XrefEntry::Compressed, gen 0.
         let mut compressed: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
         compressed.insert(9, (20, 3));
 
@@ -6046,7 +6070,7 @@ mod tests {
             merged.get(&9),
             Some(&(
                 0,
-                XrefOffset::Compressed {
+                XrefEntry::Compressed {
                     stream: 20,
                     index: 3
                 }
@@ -6057,19 +6081,19 @@ mod tests {
         // (ii) plain touched entry still becomes Offset.
         assert_eq!(
             merged.get(&7),
-            Some(&(0, XrefOffset::Offset(100))),
+            Some(&(0, XrefEntry::Uncompressed { offset: 100 })),
             "plain touched entry must still become an Offset entry"
         );
 
         // (iii) deleted ref still becomes Free.
         match merged.get(&5) {
-            Some((_, XrefOffset::Free { .. })) => {}
+            Some((_, XrefEntry::Free { .. })) => {}
             other => panic!("deleted ref must become a Free entry, got {other:?}"),
         }
 
         // (iv) source-only entry passes through unchanged when not touched/deleted.
-        let mut source_only: BTreeMap<u32, (u16, XrefOffset)> = BTreeMap::new();
-        source_only.insert(11, (2, XrefOffset::Offset(999)));
+        let mut source_only: BTreeMap<u32, (u16, XrefEntry)> = BTreeMap::new();
+        source_only.insert(11, (2, XrefEntry::Uncompressed { offset: 999 }));
         let passthrough = merge_source_and_touched_offsets_for_xref_stream(
             &source_only,
             &BTreeMap::new(),
@@ -6078,7 +6102,7 @@ mod tests {
         );
         assert_eq!(
             passthrough.get(&11),
-            Some(&(2, XrefOffset::Offset(999))),
+            Some(&(2, XrefEntry::Uncompressed { offset: 999 })),
             "untouched source-only entry must pass through unchanged"
         );
     }
@@ -6090,7 +6114,7 @@ mod tests {
         //           The compressed loop runs after the touched loop, so it must win.
         // Object 9: present in BOTH compressed_members AND deleted_object_refs.
         //           The deleted loop runs last, so Free must win.
-        let source_offsets: BTreeMap<u32, (u16, XrefOffset)> = BTreeMap::new();
+        let source_offsets: BTreeMap<u32, (u16, XrefEntry)> = BTreeMap::new();
 
         let mut touched: BTreeMap<u32, (u16, usize)> = BTreeMap::new();
         touched.insert(8, (0, 100));
@@ -6113,7 +6137,7 @@ mod tests {
             merged.get(&8),
             Some(&(
                 0,
-                XrefOffset::Compressed {
+                XrefEntry::Compressed {
                     stream: 20,
                     index: 3
                 }
@@ -6123,7 +6147,7 @@ mod tests {
 
         // Object 9: deleted loop runs last -> Free wins over Compressed.
         match merged.get(&9) {
-            Some((_, XrefOffset::Free { .. })) => {}
+            Some((_, XrefEntry::Free { .. })) => {}
             other => panic!(
                 "object in both compressed and deleted must resolve to Free (deleted loop runs last), got {other:?}"
             ),
@@ -7872,7 +7896,7 @@ mod tests {
             .source_xref_entries()
             .into_iter()
             .filter_map(|(member, offset)| match offset {
-                XrefOffset::Compressed { stream, .. } => Some((member, stream)),
+                XrefEntry::Compressed { stream, .. } => Some((member, stream)),
                 _ => None,
             })
             .collect();

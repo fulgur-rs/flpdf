@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::num::NonZeroUsize;
 
 use crate::object::{Dictionary, Object, ObjectRef};
-use crate::XrefOffset;
+use crate::XrefEntry;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -474,7 +474,7 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
     let mut groups: BTreeMap<u32, Vec<(u32, ObjectRef)>> = BTreeMap::new();
 
     for (obj_ref, offset) in &entries {
-        if let XrefOffset::Compressed { stream, index } = offset {
+        if let XrefEntry::Compressed { stream, index } = offset {
             groups.entry(*stream).or_default().push((*index, *obj_ref));
         }
     }
@@ -534,7 +534,7 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
     let free_refs: BTreeSet<ObjectRef> = source_entries
         .iter()
         .filter_map(|(r, offset)| {
-            if matches!(offset, XrefOffset::Free { .. }) {
+            if matches!(offset, XrefEntry::Free { .. }) {
                 Some(*r)
             } else {
                 None

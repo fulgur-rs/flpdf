@@ -157,6 +157,7 @@ pub mod thread_bead_p;
 pub(crate) mod tokenizer;
 pub mod writer;
 pub mod xref;
+pub mod xref_entry;
 
 // Internal security primitives — not part of the public API.
 pub(crate) mod security;
@@ -265,8 +266,9 @@ pub use writer::{
 };
 pub use xref::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
-    LoadedXref, XrefForm, XrefOffset,
+    LoadedXref, XrefForm,
 };
+pub use xref_entry::XrefEntry;
 
 /// Crate version, mirroring `Cargo.toml`'s `[package].version`.
 pub fn version() -> &'static str {

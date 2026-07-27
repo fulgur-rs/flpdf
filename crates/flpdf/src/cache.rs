@@ -1,5 +1,5 @@
 //! qpdf correspondence: QPDF.cc xref-backed object cache represented as a standalone Rust module.
-use crate::{Object, ObjectRef, XrefOffset};
+use crate::{Object, ObjectRef, XrefEntry};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
@@ -19,14 +19,16 @@ pub struct ObjectCache {
 }
 
 impl ObjectCache {
-    pub fn from_offsets(offsets: &BTreeMap<ObjectRef, XrefOffset>) -> Self {
+    pub fn from_offsets(offsets: &BTreeMap<ObjectRef, XrefEntry>) -> Self {
         let entries = offsets
             .iter()
             .map(|(object_ref, offset)| {
                 let entry = match offset {
-                    XrefOffset::Free { .. } => CacheEntry::Deleted,
-                    XrefOffset::Offset(offset) => CacheEntry::Unresolved { offset: *offset },
-                    XrefOffset::Compressed { stream, index } => CacheEntry::Compressed {
+                    XrefEntry::Free { .. } => CacheEntry::Deleted,
+                    XrefEntry::Uncompressed { offset } => {
+                        CacheEntry::Unresolved { offset: *offset }
+                    }
+                    XrefEntry::Compressed { stream, index } => CacheEntry::Compressed {
                         stream: *stream,
                         index: *index,
                     },

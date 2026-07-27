@@ -24,7 +24,7 @@
 
 use flpdf::{
     load_xref_and_trailer, write_pdf_with_options, NewlineBeforeEndstream, Object, ObjectRef,
-    ObjectStreamMode, Pdf, StreamDataMode, WriteOptions, XrefOffset,
+    ObjectStreamMode, Pdf, StreamDataMode, WriteOptions, XrefEntry,
 };
 use std::io::Cursor;
 use std::path::Path;
@@ -255,14 +255,14 @@ fn preserve_nonmonotonic_source_indices_match_qpdf_source_number_order() {
     let source_xref = load_xref_and_trailer(&mut Cursor::new(&source)).unwrap();
     assert_eq!(
         source_xref.entries.get(&ObjectRef::new(3, 0)),
-        Some(&XrefOffset::Compressed {
+        Some(&XrefEntry::Compressed {
             stream: 4,
             index: 0,
         })
     );
     assert_eq!(
         source_xref.entries.get(&ObjectRef::new(2, 0)),
-        Some(&XrefOffset::Compressed {
+        Some(&XrefEntry::Compressed {
             stream: 4,
             index: 1,
         })
@@ -274,14 +274,14 @@ fn preserve_nonmonotonic_source_indices_match_qpdf_source_number_order() {
     let output_xref = load_xref_and_trailer(&mut Cursor::new(&actual)).unwrap();
     assert_eq!(
         output_xref.entries.get(&ObjectRef::new(3, 0)),
-        Some(&XrefOffset::Compressed {
+        Some(&XrefEntry::Compressed {
             stream: 2,
             index: 0,
         })
     );
     assert_eq!(
         output_xref.entries.get(&ObjectRef::new(4, 0)),
-        Some(&XrefOffset::Compressed {
+        Some(&XrefEntry::Compressed {
             stream: 2,
             index: 1,
         })

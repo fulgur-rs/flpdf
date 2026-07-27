@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDF.cc xref loading and repair plus QPDFXRefEntry.cc data representation.
+//! qpdf correspondence: QPDF.cc xref loading and repair.
 use crate::diagnostics::Diagnostic;
 use crate::object::collect_qpdf_object_references;
 use crate::parser::{parse_indirect_object, Parser};
@@ -7,7 +7,7 @@ use crate::reader::file_object::{
     ResolvedStreamLength,
 };
 use crate::tokenizer::{Token, TokenType, Tokenizer};
-use crate::{filters, Diagnostics, Dictionary, Error, Object, ObjectRef, Result};
+use crate::{filters, Diagnostics, Dictionary, Error, Object, ObjectRef, Result, XrefEntry};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 
@@ -15,7 +15,7 @@ use std::io::{Read, Seek, SeekFrom};
 pub struct LoadedXref {
     pub version: String,
     pub startxref: u64,
-    pub entries: BTreeMap<ObjectRef, XrefOffset>,
+    pub entries: BTreeMap<ObjectRef, XrefEntry>,
     pub trailer: Dictionary,
     pub last_xref_form: XrefForm,
     pub repair_diagnostics: Diagnostics,
@@ -26,13 +26,6 @@ pub(crate) struct LoadedXrefState {
     pub(crate) loaded: LoadedXref,
     pub(crate) trailer_references: BTreeSet<ObjectRef>,
     pub(crate) parsed_xref_streams: BTreeMap<ObjectRef, Object>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum XrefOffset {
-    Free { next: u32 },
-    Offset(u64),
-    Compressed { stream: u32, index: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,7 +205,7 @@ fn merge_previous_xref_sections(
         for (object_ref, object) in previous.parsed_xref_streams {
             let newer_live = matches!(
                 loaded.loaded.entries.get(&object_ref),
-                Some(XrefOffset::Offset(_) | XrefOffset::Compressed { .. })
+                Some(XrefEntry::Uncompressed { .. } | XrefEntry::Compressed { .. })
             );
             if !newer_live {
                 loaded
@@ -332,7 +325,7 @@ pub fn load_xref_and_trailer_best_effort<R: Read + Seek>(reader: &mut R) -> Resu
 /// tokens per line — never re-parsing a body to end-of-file — makes the scan
 /// linear in the file size, unlike a per-candidate full-object parse which an
 /// unterminated literal string can drive to quadratic cost.
-fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefOffset>> {
+fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefEntry>> {
     let mut entries = BTreeMap::new();
     let mut line_start = 0usize;
     while line_start < bytes.len() {
@@ -340,7 +333,7 @@ fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefOffset>>
         if let Some((object_ref, offset)) =
             scan_object_header_at_line(bytes, line_start, next_line_start)
         {
-            entries.insert(object_ref, XrefOffset::Offset(offset));
+            entries.insert(object_ref, XrefEntry::Uncompressed { offset });
         }
         line_start = next_line_start;
     }
@@ -370,7 +363,7 @@ fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefOffset>>
 const MAX_OBJSTM_RECOVERY_FALLBACKS: u32 = 64;
 
 /// Recover the compressed objects packed in any recovered `/Type /ObjStm`,
-/// emitting `XrefOffset::Compressed` entries that point back at the stream.
+/// emitting `XrefEntry::Compressed` entries that point back at the stream.
 ///
 /// Each recovered object is parsed within the window that ends at the next
 /// recovered object's offset (or end-of-file for the last). The windows are
@@ -381,12 +374,12 @@ const MAX_OBJSTM_RECOVERY_FALLBACKS: u32 = 64;
 /// it retries against the rest of the file so the stream's own `/Length`
 /// delimits it. Those retries are capped by [`MAX_OBJSTM_RECOVERY_FALLBACKS`] so
 /// a flood of stream-like candidates cannot reintroduce quadratic cost.
-fn recover_objstm_compressed_entries(bytes: &[u8], entries: &mut BTreeMap<ObjectRef, XrefOffset>) {
-    // The line scan only ever inserts `XrefOffset::Offset`, so every entry here is
+fn recover_objstm_compressed_entries(bytes: &[u8], entries: &mut BTreeMap<ObjectRef, XrefEntry>) {
+    // The line scan only ever inserts `XrefEntry::Uncompressed`, so every entry here is
     // an uncompressed object whose offset bounds a window.
     let mut offsets: Vec<u64> = Vec::new();
     for entry in entries.values() {
-        if let XrefOffset::Offset(offset) = entry {
+        if let XrefEntry::Uncompressed { offset } = entry {
             offsets.push(*offset);
         }
     }
@@ -415,7 +408,7 @@ fn recover_objstm_compressed_entries(bytes: &[u8], entries: &mut BTreeMap<Object
 /// packed objects' compressed entries. Returns `false` only when `slice` did not
 /// contain a complete object (a parse error) — the signal that a bounded window
 /// may have truncated a real stream and a wider retry is worthwhile.
-fn try_recover_objstm_in(entries: &mut BTreeMap<ObjectRef, XrefOffset>, slice: &[u8]) -> bool {
+fn try_recover_objstm_in(entries: &mut BTreeMap<ObjectRef, XrefEntry>, slice: &[u8]) -> bool {
     match parse_indirect_object(slice) {
         Ok((object_ref, Object::Stream(stream))) => {
             if let Some(Object::Name(type_name)) = stream.dict.get("Type") {
@@ -431,7 +424,7 @@ fn try_recover_objstm_in(entries: &mut BTreeMap<ObjectRef, XrefOffset>, slice: &
 }
 
 fn recover_compressed_offsets_from_objstm(
-    entries: &mut BTreeMap<ObjectRef, XrefOffset>,
+    entries: &mut BTreeMap<ObjectRef, XrefEntry>,
     stream_ref: ObjectRef,
     stream: &crate::Stream,
 ) {
@@ -467,7 +460,7 @@ fn recover_compressed_offsets_from_objstm(
                 if parse_non_negative_i64(offset, "ObjStm object offset").is_err() {
                     return;
                 }
-                entries.entry(object_ref).or_insert(XrefOffset::Compressed {
+                entries.entry(object_ref).or_insert(XrefEntry::Compressed {
                     stream: stream_ref.number,
                     index: u32::try_from(index).unwrap_or(u32::MAX),
                 });
@@ -622,7 +615,7 @@ fn scan_object_header_at_line(
 fn parse_xref_table(
     cursor: &mut ByteCursor<'_>,
     bytes: &[u8],
-) -> Result<(BTreeMap<ObjectRef, XrefOffset>, Dictionary)> {
+) -> Result<(BTreeMap<ObjectRef, XrefEntry>, Dictionary)> {
     let mut entries = BTreeMap::new();
     loop {
         let first_token = cursor.read_token()?;
@@ -644,7 +637,7 @@ fn parse_xref_table(
                 b'f' => {
                     entries.insert(
                         ObjectRef::new(first + index, generation),
-                        XrefOffset::Free {
+                        XrefEntry::Free {
                             next: u32::try_from(offset).map_err(|_| {
                                 Error::parse(0, "free xref next object does not fit u32")
                             })?,
@@ -654,7 +647,7 @@ fn parse_xref_table(
                 b'n' => {
                     entries.insert(
                         ObjectRef::new(first + index, generation),
-                        XrefOffset::Offset(offset),
+                        XrefEntry::Uncompressed { offset },
                     );
                 }
                 _ => return Err(Error::parse(0, "xref table entry status is not f or n")),
@@ -826,7 +819,7 @@ fn parse_xref_entries(
     size: u32,
     ranges: &[(u32, u32)],
     widths: XrefWidths,
-) -> Result<BTreeMap<ObjectRef, XrefOffset>> {
+) -> Result<BTreeMap<ObjectRef, XrefEntry>> {
     let (w0, w1, w2) = widths;
     let entry_width = w0 + w1 + w2;
     if entry_width == 0 {
@@ -868,7 +861,7 @@ fn parse_xref_entries(
                         .map_err(|_| Error::parse(0, "generation does not fit u16"))?;
                     entries.insert(
                         ObjectRef::new(object_number, generation),
-                        XrefOffset::Free { next },
+                        XrefEntry::Free { next },
                     );
                 }
                 1 => {
@@ -876,7 +869,7 @@ fn parse_xref_entries(
                         .map_err(|_| Error::parse(0, "generation does not fit u16"))?;
                     entries.insert(
                         ObjectRef::new(object_number, generation),
-                        XrefOffset::Offset(field1),
+                        XrefEntry::Uncompressed { offset: field1 },
                     );
                 }
                 2 => {
@@ -887,7 +880,7 @@ fn parse_xref_entries(
                         .map_err(|_| Error::parse(0, "xref stream index does not fit u32"))?;
                     entries.insert(
                         ObjectRef::new(object_number, 0),
-                        XrefOffset::Compressed { stream, index },
+                        XrefEntry::Compressed { stream, index },
                     );
                 }
                 _ => {
