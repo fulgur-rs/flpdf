@@ -3252,6 +3252,36 @@ fn one_page_pdf_with_content(content: &[u8]) -> Vec<u8> {
     ])
 }
 
+fn one_page_pdf_with_duplicate_content_array(content: &[u8]) -> Vec<u8> {
+    let stream = [
+        format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents [4 0 R 4 0 R] >>\nendobj\n",
+        stream.as_slice(),
+    ])
+}
+
+fn one_page_pdf_with_stale_length_and_content(content: &[u8]) -> Vec<u8> {
+    let stream = [
+        b"4 0 obj\n<< /Length 99 >>\nstream\n".to_vec(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>\nendobj\n",
+        stream.as_slice(),
+    ])
+}
+
 fn two_page_pdf_with_shared_content(content: &[u8]) -> Vec<u8> {
     let stream = [
         format!("5 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
@@ -3963,6 +3993,93 @@ fn rewrite_normalize_content_shared_bad_stream_warns_once() {
         );
 
     assert!(output.exists());
+}
+
+#[test]
+fn rewrite_normalize_content_duplicate_array_stream_warns_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("duplicate-array-bad-content.pdf");
+    let output = temp.path().join("normalized.pdf");
+    std::fs::write(&input, one_page_pdf_with_duplicate_content_array(b"<0g")).unwrap();
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--normalize-content=y", "--compress-streams=n"])
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(3));
+    assert!(output.exists(), "qpdf warning exit must retain output");
+    assert_eq!(
+        String::from_utf8(result.stderr).unwrap(),
+        format!(
+            "WARNING: {}: content normalization encountered bad tokens\n\
+             WARNING: {}: normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
+             WARNING: {}: Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
+             flpdf: operation succeeded with warnings; resulting file may have some problems\n",
+            input.display(),
+            input.display(),
+            input.display(),
+        )
+    );
+}
+
+#[test]
+fn rewrite_normalize_content_keeps_lazy_repair_warnings_before_normalization_warnings() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("lazy-and-bad-content.pdf");
+    let output = temp.path().join("normalized.pdf");
+    std::fs::write(&input, one_page_pdf_with_stale_length_and_content(b"<0g")).unwrap();
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--normalize-content=y", "--compress-streams=n"])
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(3));
+    assert!(output.exists(), "qpdf warning exit must retain output");
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    let lines: Vec<_> = stderr.lines().collect();
+    let normalization_start = lines
+        .iter()
+        .position(|line| line.ends_with("content normalization encountered bad tokens"))
+        .unwrap();
+    for suffix in [
+        "expected endstream",
+        "attempting to recover stream length",
+        "recovered stream length: 4",
+    ] {
+        assert!(
+            lines[..normalization_start]
+                .iter()
+                .any(|line| line.ends_with(suffix)),
+            "missing lazy warning ending with {suffix:?} before normalization warnings: {stderr}"
+        );
+    }
+    assert_eq!(
+        &lines[normalization_start..],
+        [
+            format!(
+                "WARNING: {}: content normalization encountered bad tokens",
+                input.display()
+            ),
+            format!(
+                "WARNING: {}: normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents",
+                input.display()
+            ),
+            format!(
+                "WARNING: {}: Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.",
+                input.display()
+            ),
+            "flpdf: operation succeeded with warnings; resulting file may have some problems"
+                .to_string(),
+        ]
+    );
 }
 
 // ── coalesce-contents ─────────────────────────────────────────────────────────
