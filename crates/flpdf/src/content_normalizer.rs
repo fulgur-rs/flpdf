@@ -131,6 +131,80 @@ pub fn normalize_content_stream(input: &[u8]) -> ContentNormalization {
 mod tests {
     use super::*;
     use crate::tokenizer::TokenType;
+    use std::fmt::Write as _;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn normalizer_oracle_cases() -> [(&'static str, &'static [u8]); 12] {
+        [
+            ("layout-comments-crlf", b"% keep\r\nBT  /N#61me Q"),
+            ("string-control", b"(\x01) Tj"),
+            ("string-newline", b"(a\rb) Tj"),
+            ("iso-latin-literal", b"<a061626364> Tj"),
+            ("iso-latin-hex", b"<a0616263> Tj"),
+            ("bad-recovers", b"<0g> q"),
+            ("bad-at-eof", b"<0g"),
+            ("id-at-eof", b"ID"),
+            ("id-crlf-separator", b"BI ID\r\nraw EI Q"),
+            ("inline-false-ei", b"BI /W 1 ID one EI A1 two EI Q"),
+            ("inline-binary", b"BI /W 1 ID \0\xff EI Q"),
+            ("all-space", b"q \t\0\x0c\r\r\n\nQ"),
+        ]
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(encoded, "{byte:02x}").unwrap();
+        }
+        encoded
+    }
+
+    fn normalizer_record(input: &[u8]) -> String {
+        let result = normalize_content_stream(input);
+        format!(
+            "output\t{}\nany_bad_tokens\t{}\nlast_token_was_bad\t{}\n",
+            hex_encode(result.as_bytes()),
+            u8::from(result.any_bad_tokens()),
+            u8::from(result.last_token_was_bad()),
+        )
+    }
+
+    fn run_normalizer_probe(probe: &Path, name: &str, input: &[u8]) -> String {
+        let output = Command::new(probe)
+            .args([
+                "--mode",
+                "normalize",
+                "--input-hex",
+                &hex_encode(input),
+                "--allow-eof",
+                "1",
+                "--include-ignorable",
+                "1",
+                "--allow-bad",
+                "1",
+                "--max-len",
+                "0",
+                "--inline-offset",
+                "none",
+            ])
+            .output()
+            // cov:ignore-start: the script supplies a verified executable; this is failure-only harness diagnostics
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to execute qpdf content normalizer probe {} for {name}: {error}",
+                    probe.display()
+                )
+            });
+        // cov:ignore-end
+        assert!(
+            output.status.success(),
+            "qpdf content normalizer probe failed for {name} ({}):\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr), // cov:ignore: failure-only assert diagnostic
+        );
+        String::from_utf8(output.stdout).expect("probe records are ASCII")
+    }
 
     #[test]
     fn preserves_layout_comments_and_only_normalizes_qpdf_token_forms() {
@@ -219,4 +293,20 @@ mod tests {
             vec![TokenType::Word, TokenType::Eof, TokenType::BraceOpen]
         );
     }
+
+    #[test]
+    #[ignore = "live qpdf 11.9.0 content normalizer oracle"]
+    // cov:ignore-start: ignored live entry point; ordinary tests cover every authored case locally
+    fn qpdf_content_normalizer_differential() {
+        let probe = std::env::var_os("QPDF_TOKENIZER_PROBE")
+            .expect("set QPDF_TOKENIZER_PROBE to the built qpdf 11.9.0 probe");
+        for (name, input) in normalizer_oracle_cases() {
+            assert_eq!(
+                normalizer_record(input),
+                run_normalizer_probe(std::path::Path::new(&probe), name, input),
+                "case {name}"
+            );
+        }
+    }
+    // cov:ignore-end
 }

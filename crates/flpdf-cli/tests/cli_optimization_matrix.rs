@@ -6,8 +6,8 @@
 //!
 //! Tests five matrix cells via `flpdf rewrite`:
 //!
-//! 1. **normalize-content=y/n** — re-parses the decoded page content stream and
-//!    asserts semantic equivalence using `flpdf::normalize_content_stream`.
+//! 1. **normalize-content=y/n** — asserts exact decoded-content byte parity with
+//!    qpdf 11.9.0 for normalization and unchanged decoded bytes when disabled.
 //! 2. **coalesce-contents** — a page with `/Contents [2 0 R 3 0 R]` becomes a
 //!    single `/Contents` reference after rewriting.
 //! 3. **remove-unreferenced-resources=auto|yes|no** — on a plain rewrite qpdf
@@ -22,11 +22,10 @@
 //! 5. **newline-before-endstream=y/n** — raw output bytes are inspected for the
 //!    presence/absence of `\n` before every `endstream` keyword.
 //!
-//! # Observability strategy
+//! # Comparison strategy
 //!
-//! These tests use **observable equivalence**, not byte equality:
-//!
-//! - Content streams are compared after `normalize_content_stream` application.
+//! - Content normalization is compared by exact decoded bytes from real qpdf and
+//!   flpdf CLI outputs, including malformed content and warning exits.
 //! - Stream encoding is compared by decoded payload bytes.
 //! - Resource dictionaries are compared by key sets.
 //! - Raw byte patterns (newlines) are searched via `memchr`-style scans.
@@ -68,6 +67,44 @@ fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(COMPAT_FIXTURE_DIR)
         .join(name)
+}
+
+fn one_page_content_pdf(content: &[u8]) -> Vec<u8> {
+    let stream = [
+        format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    let objects: [&[u8]; 4] = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>\nendobj\n",
+        stream.as_slice(),
+    ];
+
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for object in objects {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(object);
+    }
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
+fn single_page_content(path: &Path) -> Vec<u8> {
+    let bytes = std::fs::read(path).unwrap();
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let page = page_refs(&mut pdf).unwrap()[0];
+    page_content_bytes(&mut pdf, page).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +240,104 @@ fn normalize_content_y_produces_canonical_form() {
     if !skip_if_qpdf_missing() {
         assert_qpdf_check(&output);
     }
+}
+
+#[test]
+fn normalize_content_y_matches_qpdf_11_9_decoded_bytes() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let version = ShellCommand::new("qpdf")
+        .arg("--version")
+        .output()
+        .expect("run qpdf --version");
+    let version = String::from_utf8(version.stdout).unwrap();
+    assert_eq!(version.lines().next(), Some("qpdf version 11.9.0"));
+
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("input.pdf");
+    let qpdf_output = tmp.path().join("qpdf.pdf");
+    let flpdf_output = tmp.path().join("flpdf.pdf");
+    std::fs::write(
+        &input,
+        one_page_content_pdf(b"% keep\r\nBT  /N#61me (a\rb) Tj\rBI /W 1 ID raw EI Q"),
+    )
+    .unwrap();
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args([
+            "--normalize-content=y",
+            "--stream-data=uncompress",
+            "--object-streams=disable",
+        ])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("run qpdf content normalization");
+    assert!(
+        qpdf.status.success(),
+        "qpdf failed:\n{}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    run_rewrite(
+        &input,
+        &flpdf_output,
+        &[
+            "--full-rewrite",
+            "--normalize-content=y",
+            "--compress-streams=n",
+        ],
+    );
+
+    assert_eq!(
+        single_page_content(&flpdf_output),
+        single_page_content(&qpdf_output)
+    );
+}
+
+#[test]
+fn normalize_content_bad_tokens_match_qpdf_bytes_and_warning_exit() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let tmp = tempdir().unwrap();
+    let input = tmp.path().join("bad-input.pdf");
+    let qpdf_output = tmp.path().join("qpdf-bad.pdf");
+    let flpdf_output = tmp.path().join("flpdf-bad.pdf");
+    std::fs::write(&input, one_page_content_pdf(b"\r<0g")).unwrap();
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args([
+            "--normalize-content=y",
+            "--stream-data=uncompress",
+            "--object-streams=disable",
+        ])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("run qpdf malformed content normalization");
+    assert_eq!(qpdf.status.code(), Some(3));
+
+    let mut flpdf = CargoCommand::cargo_bin("flpdf").unwrap();
+    let flpdf = flpdf
+        .args([
+            "rewrite",
+            "--full-rewrite",
+            "--normalize-content=y",
+            "--compress-streams=n",
+        ])
+        .arg(&input)
+        .arg(&flpdf_output)
+        .output()
+        .expect("run flpdf malformed content normalization");
+    assert_eq!(flpdf.status.code(), Some(3));
+
+    assert_eq!(
+        single_page_content(&flpdf_output),
+        single_page_content(&qpdf_output)
+    );
 }
 
 // ---------------------------------------------------------------------------

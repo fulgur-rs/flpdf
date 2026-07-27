@@ -1,4 +1,7 @@
 #include <qpdf/BufferInputSource.hh>
+#include <qpdf/ContentNormalizer.hh>
+#include <qpdf/Pl_Buffer.hh>
+#include <qpdf/Pl_QPDFTokenizer.hh>
 #include <qpdf/QPDF.hh>
 #include <qpdf/QPDFObjectHandle.hh>
 #include <qpdf/QPDFTokenizer.hh>
@@ -36,7 +39,7 @@ namespace
         }
         std::cerr
             << "usage: qpdf_tokenizer_probe"
-               " --mode pull|push|pull-inline|push-inline|between|content"
+               " --mode pull|push|pull-inline|push-inline|between|content|normalize"
                " --input-hex HEX --allow-eof 0|1 --include-ignorable 0|1"
                " --allow-bad 0|1 --max-len N --inline-offset none|N\n";
         std::exit(2);
@@ -163,7 +166,8 @@ namespace
         }
         if (options.mode != "pull" && options.mode != "push" &&
             options.mode != "pull-inline" && options.mode != "push-inline" &&
-            options.mode != "between" && options.mode != "content") {
+            options.mode != "between" && options.mode != "content" &&
+            options.mode != "normalize") {
             usage("invalid mode " + options.mode);
         }
         options.input = hex_decode(*input_hex);
@@ -436,6 +440,22 @@ namespace
         ContentCallbacks callbacks;
         stream.parseAsContents(&callbacks);
     }
+
+    void
+    dump_normalize(Options const& options)
+    {
+        Pl_Buffer output("content normalizer output");
+        ContentNormalizer normalizer;
+        Pl_QPDFTokenizer tokenizer("content normalizer", &normalizer, &output);
+        tokenizer.write(
+            reinterpret_cast<unsigned char const*>(options.input.data()),
+            options.input.size());
+        tokenizer.finish();
+        std::cout << "output\t" << hex_encode(output.getString()) << '\n'
+                  << "any_bad_tokens\t" << static_cast<int>(normalizer.anyBadTokens()) << '\n'
+                  << "last_token_was_bad\t"
+                  << static_cast<int>(normalizer.lastTokenWasBad()) << '\n';
+    }
 } // namespace
 
 int
@@ -453,6 +473,8 @@ main(int argc, char* argv[])
             dump_push(options, true);
         } else if (options.mode == "content") {
             dump_content(options);
+        } else if (options.mode == "normalize") {
+            dump_normalize(options);
         } else {
             dump_between(options);
         }

@@ -184,11 +184,21 @@ printf '\n' >>"${CONTRACT_LOG}"
 
 output=
 saw_old_dtags=0
+saw_normalizer_include=0
+saw_normalizer_source=0
 while (($#)); do
   case "$1" in
     -o)
       output="$2"
       shift 2
+      ;;
+    "-I${FIXTURE_SOURCE}/libqpdf")
+      saw_normalizer_include=1
+      shift
+      ;;
+    "${FIXTURE_SOURCE}/libqpdf/ContentNormalizer.cc")
+      saw_normalizer_source=1
+      shift
       ;;
     -Wl,--disable-new-dtags)
       saw_old_dtags=1
@@ -202,6 +212,14 @@ done
 [[ "${saw_old_dtags}" == 1 ]] || {
   echo "missing -Wl,--disable-new-dtags" >&2
   exit 93
+}
+[[ "${saw_normalizer_include}" == 1 ]] || {
+  echo "missing private ContentNormalizer include path" >&2
+  exit 95
+}
+[[ "${saw_normalizer_source}" == 1 ]] || {
+  echo "missing private ContentNormalizer source" >&2
+  exit 96
 }
 printf '#!/usr/bin/env bash\nexit 0\n' >"${output}"
 chmod +x "${output}"
@@ -227,10 +245,21 @@ set -euo pipefail
 printf 'cargo' >>"${CONTRACT_LOG}"
 printf ' <%s>' "$@" >>"${CONTRACT_LOG}"
 printf '\n' >>"${CONTRACT_LOG}"
-[[ " $* " == *" test -p flpdf --lib tokenizer::tests::qpdf_tokenizer_differential_all_modes -- --ignored --exact "* ]] || {
-  echo "cargo did not select the exact ignored library test" >&2
+if (($# != 8)) ||
+  [[ "$1" != test || "$2" != -p || "$3" != flpdf || "$4" != --lib ||
+    "$6" != -- || "$7" != --ignored || "$8" != --exact ]]; then
+  echo "cargo did not select one exact ignored library test" >&2
   exit 94
-}
+fi
+case "$5" in
+  tokenizer::tests::qpdf_tokenizer_differential_all_modes | \
+    content_normalizer::tests::qpdf_content_normalizer_differential)
+    ;;
+  *)
+    echo "cargo selected an unexpected ignored library test" >&2
+    exit 94
+    ;;
+esac
 EOF
 chmod +x \
   "${fake_bin}/stat" \
@@ -536,7 +565,7 @@ TMPDIR="${parallel_tmp}" run_fixture >"${fixture_root}/parallel-2.out" 2>&1 &
 second_pid=$!
 wait "${first_pid}"
 wait "${second_pid}"
-[[ "$(grep -c '^cargo' "${contract_log}")" == 2 ]]
+[[ "$(grep -c '^cargo' "${contract_log}")" == 4 ]]
 
 git -C "${fixture_source}" checkout -q -- sentinel
 : >"${contract_log}"
