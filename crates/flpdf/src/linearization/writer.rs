@@ -2581,7 +2581,7 @@ pub fn write_linearized<R: Read + Seek>(
     // pushed (e.g. a caller that reuses one handle for both steps). Runs after
     // the option guards above so an invalid option combination returns its
     // error without mutating the caller's `Pdf` first.
-    crate::linearization::inherited_attrs::push_inherited_attributes_to_pages(pdf)?;
+    crate::optimization::Optimization::push_inherited_attributes_to_pages(pdf)?;
 
     // Reconcile the caller-built plan/renumber pair with the writer's effective
     // object-stream mode. The historical `from_pdf(bool)` API maps `false` to
@@ -3815,7 +3815,7 @@ mod tests {
     // rejects a deep tree first; and even with write_linearized's own push
     // removed, the downstream page walk (pages::page_refs and friends) raises a
     // byte-identical depth-overflow error. The push in isolation is covered by
-    // inherited_attrs.rs::excessive_depth_returns_unsupported_error.
+    // pages::repair::tests::excessive_depth_returns_unsupported_error.
     // -----------------------------------------------------------------------
 
     /// A `/Pages` chain `DEFAULT_MAX_PAGE_TREE_DEPTH + 1` nodes deep, ending in

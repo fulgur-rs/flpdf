@@ -107,18 +107,13 @@ impl Optimization {
 
         let prepared = crate::pages::repair::prepare_for_optimization(pdf)?;
         if let Some(ref prepared) = prepared {
-            inherited_attrs::push_inherited_attributes_to_pages(
-                pdf,
-                prepared,
-                allow_changes,
-                false,
-            )?;
+            inherited_attrs::push(pdf, prepared, allow_changes, false)?;
         }
         let page_refs = prepared
             .as_ref()
             .map(|prepared| prepared.pages.as_slice())
             .unwrap_or_default();
-        let mut maps = Self::build_after_inherited(pdf, page_refs, skip_stream_parameters)?;
+        let mut maps = Self::build_maps(pdf, page_refs, skip_stream_parameters)?;
         maps.filter_compressed_objects(object_stream_data);
         Ok(maps)
     }
@@ -129,7 +124,7 @@ impl Optimization {
         let Some(prepared) = crate::pages::repair::prepare_for_optimization(pdf)? else {
             return Ok(());
         };
-        inherited_attrs::push_inherited_attributes_to_pages(pdf, &prepared, true, false)
+        inherited_attrs::push(pdf, &prepared, true, false)
     }
 
     pub(crate) fn filter_compressed_objects(&mut self, object_stream_data: &BTreeMap<u32, u32>) {
@@ -160,7 +155,7 @@ impl Optimization {
         users
     }
 
-    pub(crate) fn build_after_inherited<R, F>(
+    fn build_maps<R, F>(
         pdf: &mut Pdf<R>,
         page_refs: &[ObjectRef],
         mut skip_stream_parameters: F,
@@ -432,10 +427,7 @@ mod tests {
     }
 
     fn build_maps(pdf: &mut Pdf<Cursor<Vec<u8>>>, skip_level: u8) -> Optimization {
-        crate::linearization::inherited_attrs::push_inherited_attributes_to_pages(pdf)
-            .expect("inherited attributes should materialize");
-        let pages = crate::pages::page_refs(pdf).expect("pages should enumerate");
-        Optimization::build_after_inherited(pdf, &pages, |_| skip_level)
+        Optimization::optimize(pdf, &BTreeMap::new(), true, |_| skip_level)
             .expect("object-user maps should build")
     }
 
@@ -824,12 +816,12 @@ mod tests {
         let mut without_root =
             Pdf::open_mem_owned(without_root).expect("rootless fixture should parse");
         assert!(without_root.root_ref().is_none());
-        let maps = Optimization::build_after_inherited(&mut without_root, &[], |_| 1)
+        let maps = Optimization::build_maps(&mut without_root, &[], |_| 1)
             .expect("rootless document should build empty maps");
         assert!(maps.objects_for(&ObjectUser::Root).is_empty());
 
         let mut non_dictionary_root = open_pdf(&[(1, b"42")], b"");
-        let maps = Optimization::build_after_inherited(&mut non_dictionary_root, &[], |_| 1)
+        let maps = Optimization::build_maps(&mut non_dictionary_root, &[], |_| 1)
             .expect("non-dictionary root should retain its identity");
         assert_eq!(
             maps.objects_for(&ObjectUser::Root),
@@ -852,7 +844,7 @@ mod tests {
             b"/CustomTrailer 5 0 R",
         );
         trailer_pdf.set_object(ObjectRef::new(5, 0), too_deep_object());
-        let error = Optimization::build_after_inherited(&mut trailer_pdf, &[], |_| 1)
+        let error = Optimization::build_maps(&mut trailer_pdf, &[], |_| 1)
             .expect_err("trailer traversal error must propagate");
         assert!(matches!(error, crate::Error::Unsupported(_)));
 
@@ -869,7 +861,7 @@ mod tests {
             b"",
         );
         catalog_pdf.set_object(ObjectRef::new(5, 0), too_deep_object());
-        let error = Optimization::build_after_inherited(&mut catalog_pdf, &[], |_| 1)
+        let error = Optimization::build_maps(&mut catalog_pdf, &[], |_| 1)
             .expect_err("catalog traversal error must propagate");
         assert!(matches!(error, crate::Error::Unsupported(_)));
     }
@@ -887,8 +879,7 @@ mod tests {
             ],
             b"",
         );
-        crate::linearization::inherited_attrs::push_inherited_attributes_to_pages(&mut pdf)
-            .unwrap();
+        Optimization::push_inherited_attributes_to_pages(&mut pdf).unwrap();
         let pages = crate::pages::page_refs(&mut pdf).unwrap();
         let mut page = pdf
             .resolve(ObjectRef::new(3, 0))
@@ -898,7 +889,7 @@ mod tests {
         page.insert("Deep", too_deep_object());
         pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
 
-        let error = Optimization::build_after_inherited(&mut pdf, &pages, |_| 1)
+        let error = Optimization::build_maps(&mut pdf, &pages, |_| 1)
             .expect_err("excessive direct nesting must fail");
         assert!(
             matches!(error, crate::Error::Unsupported(ref message) if message.contains("inline object nesting exceeds maximum")),

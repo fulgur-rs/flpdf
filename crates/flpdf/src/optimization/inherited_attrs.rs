@@ -11,7 +11,7 @@ use crate::{Error, Pdf, Result};
 const INHERITABLE_KEYS: [&[u8]; 4] = [b"CropBox", b"MediaBox", b"Resources", b"Rotate"];
 const MAX_DEPTH: usize = crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 
-pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(
+pub(crate) fn push<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     prepared: &PreparedPages,
     allow_changes: bool,
@@ -248,8 +248,7 @@ mod tests {
             .unwrap();
         let before = pdf.resolve(prepared.root).unwrap();
 
-        let error =
-            push_inherited_attributes_to_pages(&mut pdf, &prepared, false, false).unwrap_err();
+        let error = push(&mut pdf, &prepared, false, false).unwrap_err();
 
         assert!(error.to_string().contains("inheritable attribute"));
         assert_eq!(pdf.resolve(prepared.root).unwrap(), before);
@@ -262,7 +261,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        push_inherited_attributes_to_pages(&mut pdf, &prepared, true, true).unwrap();
+        push(&mut pdf, &prepared, true, true).unwrap();
 
         assert!(pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
             diagnostic.message.contains("Unknown key /Unknown")
