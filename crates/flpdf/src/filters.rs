@@ -861,7 +861,7 @@ fn object_debug_repr(object: &Object) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::primitives::rc4;
+    use crate::security::rc4::Rc4;
     use crate::security::standard::StringCipher;
     use aes::{Aes128, Aes256};
     use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
@@ -900,7 +900,7 @@ mod tests {
         let dict = flate_dict();
         let plaintext = b"stream plaintext after flate";
         let mut encrypted = encode_stream_data(&dict, plaintext).unwrap();
-        rc4(b"Key", &mut encrypted).unwrap();
+        Rc4::new(b"Key").unwrap().process_in_place(&mut encrypted);
 
         let decoded = decode_stream_data_with_decryption(
             &dict,
@@ -916,7 +916,7 @@ mod tests {
     fn decode_stream_data_with_decryption_handles_no_filter_rc4_streams() {
         let dict = Dictionary::new();
         let mut encrypted = b"raw encrypted stream".to_vec();
-        rc4(b"Key", &mut encrypted).unwrap();
+        Rc4::new(b"Key").unwrap().process_in_place(&mut encrypted);
 
         let decoded = decode_stream_data_with_decryption(
             &dict,
