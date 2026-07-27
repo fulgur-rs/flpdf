@@ -2,7 +2,7 @@
 
 use std::io::{BufRead, BufReader, Cursor, ErrorKind, Read};
 
-use super::{Json, JsonError};
+use super::{Json, JsonError, JsonMessage};
 
 /// Receives qpdf-style events while a JSON value is parsed.
 pub trait Reactor {
@@ -180,8 +180,20 @@ impl<'reader, 'reactor, R: Read> Parser<'reader, 'reactor, R> {
         self.ignore();
     }
 
-    fn error(&self, message: impl Into<String>) -> JsonError {
+    fn error(&self, message: impl Into<JsonMessage>) -> JsonError {
         JsonError::Parse(message.into())
+    }
+
+    fn error_with_byte(&self, prefix: String, byte: u8) -> JsonError {
+        let mut message = prefix.into_bytes();
+        message.push(byte);
+        self.error(message)
+    }
+
+    fn error_with_bytes(&self, prefix: String, bytes: &[u8]) -> JsonError {
+        let mut message = prefix.into_bytes();
+        message.extend_from_slice(bytes);
+        self.error(message)
     }
 
     fn token_error(&mut self) -> Result<(), JsonError> {
@@ -196,17 +208,17 @@ impl<'reader, 'reactor, R: Read> Parser<'reader, 'reactor, R> {
                 "JSON: offset {}: \\u must be followed by four hex digits",
                 offset - self.u_count as i64 - 1
             ))),
-            LexState::Alpha => Err(self.error(format!(
-                "JSON: offset {offset}: keyword: unexpected character {}",
-                printable_byte(byte)
-            ))),
+            LexState::Alpha => Err(self.error_with_byte(
+                format!("JSON: offset {offset}: keyword: unexpected character "),
+                byte,
+            )),
             LexState::String => Err(self.error(format!(
                 "JSON: offset {offset}: control character in string (missing \"?)"
             ))),
-            LexState::Backslash => Err(self.error(format!(
-                "JSON: offset {offset}: invalid character after backslash: {}",
-                printable_byte(byte)
-            ))),
+            LexState::Backslash => Err(self.error_with_byte(
+                format!("JSON: offset {offset}: invalid character after backslash: "),
+                byte,
+            )),
             _ => match byte {
                 b'.' => {
                     if matches!(
@@ -232,10 +244,10 @@ impl<'reader, 'reactor, R: Read> Parser<'reader, 'reactor, R> {
                     .error(format!(
                         "JSON: offset {offset}: numeric literal: incomplete number"
                     ))),
-                _ => Err(self.error(format!(
-                    "JSON: offset {offset}: numeric literal: unexpected character {}",
-                    printable_byte(byte)
-                ))),
+                _ => Err(self.error_with_byte(
+                    format!("JSON: offset {offset}: numeric literal: unexpected character "),
+                    byte,
+                )),
             },
         }
     }
@@ -383,11 +395,13 @@ impl<'reader, 'reactor, R: Read> Parser<'reader, 'reactor, R> {
                             b'1'..=b'9' => self.append_state(LexState::NumberBeforePoint, byte),
                             b'0' => self.append_state(LexState::NumberLeadingZero, byte),
                             _ => {
-                                return Err(self.error(format!(
-                                    "JSON: offset {}: unexpected character {}",
-                                    self.offset(),
-                                    printable_byte(byte)
-                                )));
+                                return Err(self.error_with_byte(
+                                    format!(
+                                        "JSON: offset {}: unexpected character ",
+                                        self.offset()
+                                    ),
+                                    byte,
+                                ));
                             }
                         }
                     }
@@ -530,11 +544,13 @@ impl<'reader, 'reactor, R: Read> Parser<'reader, 'reactor, R> {
         }
 
         if self.parse_state == ParseState::Done {
-            return Err(self.error(format!(
-                "JSON: offset {}: material follows end of object: {}",
-                self.offset(),
-                String::from_utf8_lossy(&self.token)
-            )));
+            return Err(self.error_with_bytes(
+                format!(
+                    "JSON: offset {}: material follows end of object: ",
+                    self.offset()
+                ),
+                &self.token,
+            ));
         }
 
         let state = std::mem::replace(&mut self.state, LexState::Top);
@@ -622,11 +638,10 @@ impl<'reader, 'reactor, R: Read> Parser<'reader, 'reactor, R> {
                 b"false" => Json::make_bool(false),
                 b"null" => Json::make_null(),
                 _ => {
-                    return Err(self.error(format!(
-                        "JSON: offset {}: invalid keyword {}",
-                        self.offset(),
-                        String::from_utf8_lossy(&self.token)
-                    )));
+                    return Err(self.error_with_bytes(
+                        format!("JSON: offset {}: invalid keyword ", self.offset()),
+                        &self.token,
+                    ));
                 }
             },
             LexState::AfterString => {
@@ -767,8 +782,4 @@ fn append_utf8(out: &mut Vec<u8>, codepoint: u32) {
     let character = char::from_u32(codepoint).expect("JSON UTF-16 code point is valid Unicode");
     let mut buf = [0; 4];
     out.extend_from_slice(character.encode_utf8(&mut buf).as_bytes());
-}
-
-fn printable_byte(byte: u8) -> char {
-    char::from(byte)
 }

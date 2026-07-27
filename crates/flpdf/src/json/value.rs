@@ -5,12 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::rc::Rc;
 
+use super::JsonMessage;
+
 #[derive(Debug, thiserror::Error)]
 pub enum JsonError {
     #[error("{0}")]
-    Type(String),
+    Type(JsonMessage),
     #[error("{0}")]
-    Parse(String),
+    Parse(JsonMessage),
     #[error(transparent)]
     Io(#[from] io::Error),
 }

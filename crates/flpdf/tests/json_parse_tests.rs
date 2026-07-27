@@ -1,4 +1,4 @@
-use flpdf::json::{parse_reader, Json, Reactor};
+use flpdf::json::{parse_reader, Json, JsonError, Reactor};
 use std::collections::VecDeque;
 use std::io::{self, Cursor, Read};
 
@@ -51,6 +51,13 @@ impl Reactor for RecordingReactor {
 #[derive(Default)]
 struct KeepingArrayReactor {
     events: Vec<String>,
+}
+
+fn parse_error_bytes(input: &[u8]) -> Vec<u8> {
+    match Json::parse(input).unwrap_err() {
+        JsonError::Parse(message) => message.as_bytes().to_vec(),
+        other => panic!("expected parse error, got {other:?}"),
+    }
 }
 
 impl Reactor for KeepingArrayReactor {
@@ -213,6 +220,42 @@ fn parser_reports_qpdf_scalar_lexical_errors() {
             "{input:?}"
         );
     }
+}
+
+#[test]
+fn parser_preserves_raw_bytes_in_lexical_diagnostics() {
+    for (input, expected) in [
+        (
+            b"\x80".as_slice(),
+            b"JSON: offset 0: unexpected character \x80".as_slice(),
+        ),
+        (
+            b"a\xff".as_slice(),
+            b"JSON: offset 1: keyword: unexpected character \xff".as_slice(),
+        ),
+        (
+            b"1\x80".as_slice(),
+            b"JSON: offset 1: numeric literal: unexpected character \x80".as_slice(),
+        ),
+        (
+            b"\"\\\xff\"".as_slice(),
+            b"JSON: offset 2: invalid character after backslash: \xff".as_slice(),
+        ),
+        (
+            b"true \"\xff\"".as_slice(),
+            b"JSON: offset 8: material follows end of object: \xff".as_slice(),
+        ),
+    ] {
+        assert_eq!(parse_error_bytes(input), expected, "{input:?}");
+    }
+}
+
+#[test]
+fn json_message_exposes_exact_owned_bytes_and_lossy_display() {
+    let message = flpdf::json::JsonMessage::from_bytes(vec![b'x', 0xff]);
+    assert_eq!(message.as_bytes(), b"x\xff");
+    assert_eq!(message.to_string(), "x\u{fffd}");
+    assert_eq!(message.into_bytes(), b"x\xff");
 }
 
 #[test]

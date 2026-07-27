@@ -23,6 +23,7 @@
 | `crates/flpdf/src/filters.rs` | correspondence | Pl_Flate, Pl_LZWDecoder, predictor, and stream-filter responsibilities combined in one Rust pipeline |
 | `crates/flpdf/src/fonts.rs` | correspondence | flpdf-only font-resource inspection surface |
 | `crates/flpdf/src/json/legacy.rs` | correspondence | JSON.cc value model and materialized writer; parser, schema validation, and streaming writer remain incomplete |
+| `crates/flpdf/src/json/message.rs` | correspondence | JSON.cc and JSONHandler.cc use byte-oriented std::string diagnostics |
 | `crates/flpdf/src/json/mod.rs` | correspondence | JSON.cc and JSONHandler.cc responsibilities split across the json module tree |
 | `crates/flpdf/src/json/parser.rs` | correspondence | JSON.cc parser state machine and Reactor event responsibilities |
 | `crates/flpdf/src/json/value.rs` | correspondence | JSON.cc shared value model and mutation and accessor responsibilities |

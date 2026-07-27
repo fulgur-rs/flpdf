@@ -8,10 +8,12 @@
 //! container items to keep them out of the returned tree.
 
 mod legacy;
+mod message;
 mod parser;
 mod value;
 mod writer;
 
 pub use legacy::{write, JsonValue};
+pub use message::JsonMessage;
 pub use parser::{parse, parse_reader, Reactor};
 pub use value::{Json, JsonError};
