@@ -113,6 +113,18 @@ fn short_name_tree_pair_pdf() -> Vec<u8> {
     )
 }
 
+fn lazy_malformed_orphan_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Broken [1 2"),
+        ],
+        1,
+    )
+}
+
 fn escaped_raw_dictionary_names_pdf() -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let off1 = pdf.len();
@@ -215,6 +227,43 @@ fn json_fatal_preserves_partial_output_file() {
     assert!(bytes.starts_with(b"{\n  \"version\": 2,"));
     assert!(!bytes.ends_with(b"}\n"));
     assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_err());
+}
+
+#[test]
+fn lazy_object_failure_keeps_qpdf_maxobjectid_value_prefix() {
+    if !is_qpdf_available() {
+        return;
+    }
+
+    let input = write_temp_pdf(&lazy_malformed_orphan_pdf());
+    let args = ["--json=2", "--json-key=qpdf"];
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    let marker = b"      \"maxobjectid\": ";
+    let marker_end = qpdf
+        .stdout
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("qpdf 11.9.0 must emit qpdf metadata before object preparation")
+        + marker.len();
+    let qpdf_prefix = &qpdf.stdout[..marker_end];
+    assert_eq!(
+        qpdf_prefix,
+        b"{\n  \"version\": 2,\n  \"parameters\": {\n    \"decodelevel\": \"generalized\"\n  },\n  \"qpdf\": [\n    {\n      \"jsonversion\": 2,\n      \"pdfversion\": \"1.7\",\n      \"pushedinheritedpageresources\": false,\n      \"calledgetallpages\": false,\n      \"maxobjectid\": "
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+
+    assert!(!flpdf.status.success());
+    assert_eq!(flpdf.stdout, qpdf_prefix);
 }
 
 fn assert_same_json_output_is_rejected_without_modifying_input(

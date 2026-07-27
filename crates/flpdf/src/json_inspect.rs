@@ -2676,16 +2676,6 @@ fn write_qpdf_section<R: Read + Seek>(
     out: &mut (impl Write + ?Sized),
     top_first: &mut bool,
 ) -> Result<(), JsonOutputError> {
-    let prepared = pdf
-        .prepare_qpdf_json_objects()
-        .map_err(ConvertError::from)?;
-    let metadata = QpdfMetadata {
-        pdf_version: pdf.version().to_string(),
-        max_object_id: prepared.max_object_id,
-        pushed_inherited_page_resources: false,
-        called_get_all_pages: pdf.ever_called_get_all_pages(),
-    };
-
     Json::write_dictionary_key(out, top_first, b"qpdf", 1)?;
     let mut qpdf_first = true;
     Json::write_array_open(out, &mut qpdf_first, 1)?;
@@ -2703,30 +2693,28 @@ fn write_qpdf_section<R: Read + Seek>(
         out,
         &mut metadata_first,
         b"pdfversion",
-        &Json::make_string(metadata.pdf_version),
+        &Json::make_string(pdf.version()),
         3,
     )?;
     Json::write_dictionary_item(
         out,
         &mut metadata_first,
         b"pushedinheritedpageresources",
-        &Json::make_bool(metadata.pushed_inherited_page_resources),
+        &Json::make_bool(false),
         3,
     )?;
     Json::write_dictionary_item(
         out,
         &mut metadata_first,
         b"calledgetallpages",
-        &Json::make_bool(metadata.called_get_all_pages),
+        &Json::make_bool(pdf.ever_called_get_all_pages()),
         3,
     )?;
-    Json::write_dictionary_item(
-        out,
-        &mut metadata_first,
-        b"maxobjectid",
-        &Json::make_int(i64::from(metadata.max_object_id)),
-        3,
-    )?;
+    Json::write_dictionary_key(out, &mut metadata_first, b"maxobjectid", 3)?;
+    let prepared = pdf
+        .prepare_qpdf_json_objects()
+        .map_err(ConvertError::from)?;
+    Json::make_int(i64::from(prepared.max_object_id)).write(out, 3)?;
     Json::write_dictionary_close(out, metadata_first, 2)?;
 
     Json::write_next(out, &mut qpdf_first, 2)?;
@@ -2920,7 +2908,8 @@ fn write_file_mode_stream_value<R: Read + Seek, W: Write>(
 ///
 /// The envelope and selected sections are emitted in qpdf's fixed order.
 /// Object selectors affect only the raw `qpdf` object map; qpdf metadata is
-/// still computed after preparing every live object.
+/// still computed by preparing every live object at the `maxobjectid` value
+/// boundary.
 ///
 /// On conversion or I/O failure, bytes already accepted by `out` remain as a
 /// partial JSON prefix; this function does not roll back or truncate the sink.
