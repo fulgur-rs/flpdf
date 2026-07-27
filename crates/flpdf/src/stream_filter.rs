@@ -1,7 +1,13 @@
 //! qpdf correspondence: QPDFStreamFilter.cc and QPDF_Stream.cc filter-name,
 //! DecodeParms-alignment, and decode-pipeline construction responsibilities.
 
+use crate::pipeline::buffer::Buffer;
+use crate::pipeline::flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE};
+use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 use crate::{Error, Object, Result};
+
+pub(crate) const DECODE_OUTPUT_LIMIT_PREFIX: &str =
+    "decoded output exceeds configured limit of";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FilterSpec<'a> {
@@ -77,10 +83,97 @@ pub(crate) fn decode_filter_specs<'a>(
         .collect())
 }
 
+struct OutputBuffer {
+    data: Vec<u8>,
+    max_output: Option<usize>,
+}
+
+impl OutputBuffer {
+    fn new(max_output: Option<usize>) -> Self {
+        Self {
+            data: Vec::new(),
+            max_output,
+        }
+    }
+}
+
+impl Pipeline for OutputBuffer {
+    fn identifier(&self) -> &str {
+        "stream data buffer"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        if let Some(limit) = self.max_output {
+            if data.len() > limit.saturating_sub(self.data.len()) {
+                return Err(PipelineError::runtime(format!(
+                    "{DECODE_OUTPUT_LIMIT_PREFIX} {limit} bytes"
+                )));
+            }
+        }
+        self.data.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
+fn map_pipeline_error(error: PipelineError) -> Error {
+    Error::Unsupported(error.to_string())
+}
+
+fn decode_flate_chunks<'a>(
+    chunks: impl IntoIterator<Item = &'a [u8]>,
+    max_output: Option<usize>,
+    warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+) -> Result<Vec<u8>> {
+    let mut sink = OutputBuffer::new(max_output);
+    {
+        let mut flate = Flate::new(
+            "stream inflate",
+            &mut sink,
+            FlateAction::Inflate,
+            DEFAULT_OUT_BUFFER_SIZE,
+        )
+        .map_err(map_pipeline_error)?;
+        flate.set_warn_callback(|message, code| warn(message, code));
+        for chunk in chunks {
+            flate.write(chunk).map_err(map_pipeline_error)?;
+        }
+        flate.finish().map_err(map_pipeline_error)?;
+    }
+    Ok(sink.data)
+}
+
+pub(crate) fn decode_flate(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>> {
+    decode_flate_chunks([data], max_output, &mut |_, _| Ok(()))
+}
+
+pub(crate) fn encode_flate(data: &[u8]) -> Result<Vec<u8>> {
+    let mut sink = Buffer::new("stream data buffer", None);
+    {
+        let mut flate = Flate::new(
+            "compress stream",
+            &mut sink,
+            FlateAction::Deflate,
+            DEFAULT_OUT_BUFFER_SIZE,
+        )
+        .map_err(map_pipeline_error)?;
+        flate.write(data).map_err(map_pipeline_error)?;
+        flate.finish().map_err(map_pipeline_error)?;
+    }
+    sink.take_buffer().map_err(map_pipeline_error)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::decode_filter_specs;
+    use super::{
+        decode_filter_specs, decode_flate, decode_flate_chunks, encode_flate,
+        DECODE_OUTPUT_LIMIT_PREFIX,
+    };
     use crate::{Dictionary, Error, Object};
+    use std::cell::RefCell;
 
     #[test]
     fn scalar_decode_parms_are_reused_for_each_filter() {
@@ -177,5 +270,96 @@ mod tests {
             let specs = decode_filter_specs(Some(&filter), None).unwrap();
             assert_eq!(specs[0].normalized_name(), expected);
         }
+    }
+
+    #[test]
+    fn flate_decode_is_invariant_across_input_chunks() {
+        let encoded = encode_flate(b"chunk boundaries must not matter").unwrap();
+        let whole =
+            decode_flate_chunks([encoded.as_slice()], None, &mut |_, _| Ok(())).unwrap();
+        let split = decode_flate_chunks(encoded.chunks(1), None, &mut |_, _| Ok(())).unwrap();
+
+        assert_eq!(whole, b"chunk boundaries must not matter");
+        assert_eq!(split, whole);
+    }
+
+    #[test]
+    fn flate_limit_rejects_one_byte_over_but_accepts_exact_boundary() {
+        let encoded = encode_flate(&vec![b'A'; 2_000]).unwrap();
+
+        let error = decode_flate(&encoded, Some(1_999)).unwrap_err();
+
+        assert!(matches!(error, Error::Unsupported(_)));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "unsupported PDF feature: {DECODE_OUTPUT_LIMIT_PREFIX} {} bytes",
+                1_999
+            )
+        );
+        assert_eq!(decode_flate(&encoded, Some(2_000)).unwrap().len(), 2_000);
+    }
+
+    #[test]
+    fn incomplete_input_reports_qpdf_warning_before_downstream_finish() {
+        let warnings = RefCell::new(Vec::new());
+
+        let decoded = decode_flate_chunks(
+            [b"\x78".as_slice()],
+            None,
+            &mut |message, code| {
+                warnings.borrow_mut().push((message.to_string(), code));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(decoded.is_empty());
+        assert_eq!(
+            warnings.into_inner(),
+            vec![(
+                "input stream is complete but output may still be valid".to_string(),
+                -5,
+            )]
+        );
+    }
+
+    #[test]
+    fn empty_inflate_skips_codec_and_warning_like_qpdf() {
+        let warnings = RefCell::new(Vec::new());
+
+        let decoded = decode_flate_chunks(
+            std::iter::empty(),
+            None,
+            &mut |message, code| {
+                warnings.borrow_mut().push((message.to_string(), code));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(decoded.is_empty());
+        assert!(warnings.into_inner().is_empty());
+    }
+
+    #[test]
+    fn malformed_flate_header_retains_qpdf_pipeline_identifier_and_timing() {
+        let error = decode_flate_chunks(
+            [b"\x78\x00".as_slice(), b"not reached".as_slice()],
+            None,
+            &mut |_, _| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Unsupported(_)));
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream inflate: inflate: data: incorrect header check"
+        );
+    }
+
+    #[test]
+    fn empty_encode_skips_codec_and_emits_no_wrapper_like_qpdf() {
+        assert!(encode_flate(b"").unwrap().is_empty());
     }
 }
