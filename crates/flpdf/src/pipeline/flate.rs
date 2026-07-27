@@ -294,17 +294,13 @@ impl<'a> Flate<'a> {
                     }
                 }
                 InflatePhase::Trailer { .. } => {
-                    input_offset += self.consume_zlib_trailer(&data[input_offset..]);
+                    self.consume_zlib_trailer(&data[input_offset..]);
                     if matches!(self.inflate_state.phase, InflatePhase::Trailer { .. })
                         && flush == FlushDecompress::Finish
                     {
                         self.warn(BUF_ERROR_WARNING, Z_BUF_ERROR)?;
                     }
-                    if input_offset == data.len()
-                        || matches!(self.inflate_state.phase, InflatePhase::Ended)
-                    {
-                        return Ok(());
-                    }
+                    return Ok(());
                 }
                 InflatePhase::Ended => return Ok(()),
                 InflatePhase::Body => {}
@@ -823,8 +819,8 @@ mod tests {
                 Ok(())
             });
             flate.initialize_codec();
-            flate.write_deflate(&[], FlushCompress::None).unwrap();
             flate.output.clear();
+            flate.write_deflate(b"x", FlushCompress::None).unwrap();
             assert_eq!(
                 flate
                     .write_deflate(&[], FlushCompress::Finish)
@@ -835,10 +831,7 @@ mod tests {
         }
         let warnings = warnings.borrow();
         assert_eq!(warnings[0], (BUF_ERROR_WARNING.to_owned(), -5));
-        #[cfg(not(feature = "qpdf-zlib-compat"))]
         assert_eq!(warnings.len(), 2);
-        #[cfg(feature = "qpdf-zlib-compat")]
-        assert_eq!(warnings.len(), 1);
     }
 
     #[test]
