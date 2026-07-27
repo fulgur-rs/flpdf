@@ -22,9 +22,8 @@ impl<'a> Buffer<'a> {
 
     pub(crate) fn take_buffer(&mut self) -> PipelineResult<Vec<u8>> {
         if !self.ready {
-            return Err(PipelineError::state(
-                &self.identifier,
-                "buffer requested before finish",
+            return Err(PipelineError::logic(
+                "Pl_Buffer::getBuffer() called when not ready",
             ));
         }
         Ok(std::mem::take(&mut self.data))
@@ -57,7 +56,7 @@ impl Pipeline for Buffer<'_> {
 #[cfg(test)]
 mod tests {
     use super::Buffer;
-    use crate::pipeline::{Pipeline, PipelineError, PipelineErrorKind, PipelineResult};
+    use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 
     #[derive(Default)]
     struct RecordingSink {
@@ -93,7 +92,10 @@ mod tests {
         }
 
         fn finish(&mut self) -> PipelineResult<()> {
-            Err(PipelineError::state(self.identifier(), "finish failed"))
+            Err(PipelineError::logic(format!(
+                "{}: finish failed",
+                self.identifier()
+            )))
         }
     }
 
@@ -102,8 +104,8 @@ mod tests {
         let mut buffer = Buffer::new("buffer", None);
         buffer.write(b"ab").unwrap();
         assert_eq!(
-            buffer.take_buffer().unwrap_err().kind(),
-            PipelineErrorKind::State
+            buffer.take_buffer().unwrap_err().to_string(),
+            "Pl_Buffer::getBuffer() called when not ready"
         );
         buffer.finish().unwrap();
         assert_eq!(buffer.take_buffer().unwrap(), b"ab");
@@ -138,10 +140,10 @@ mod tests {
         let mut buffer = Buffer::new("buffer", Some(&mut sink));
         buffer.write(b"ab").unwrap();
 
-        assert_eq!(
-            buffer.finish().unwrap_err().kind(),
-            PipelineErrorKind::State
-        );
+        assert!(matches!(
+            buffer.finish().unwrap_err(),
+            PipelineError::Logic(_)
+        ));
         assert_eq!(buffer.take_buffer().unwrap(), b"ab");
     }
 }

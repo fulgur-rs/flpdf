@@ -13,8 +13,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// entries that the spec mandates, e.g. `/Root` on the trailer.
 /// [`Error::Encrypted`] covers all encryption-related failures; its subkind is
 /// carried by [`EncryptedError`].
-/// [`Error::Pipeline`] reports a failed internal streaming stage without
-/// exposing dependency-specific error types.
+/// [`Error::Internal`] and [`Error::System`] mirror qpdf's public classification
+/// of `std::logic_error` and `std::runtime_error`, respectively.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("I/O error: {0}")]
@@ -32,13 +32,11 @@ pub enum Error {
     #[error("encrypted PDF: {0}")]
     Encrypted(#[from] EncryptedError),
 
-    #[error("{stage}: {message}")]
-    Pipeline {
-        stage: String,
-        message: String,
-        #[source]
-        source: Option<Box<dyn std::error::Error + Send + Sync>>,
-    },
+    #[error("{0}")]
+    Internal(String),
+
+    #[error("{0}")]
+    System(String),
 }
 
 impl Error {
@@ -70,11 +68,9 @@ impl Error {
 
 impl From<crate::pipeline::PipelineError> for Error {
     fn from(error: crate::pipeline::PipelineError) -> Self {
-        let (stage, message, source) = error.into_parts();
-        Self::Pipeline {
-            stage,
-            message,
-            source,
+        match error {
+            crate::pipeline::PipelineError::Logic(message) => Self::Internal(message),
+            crate::pipeline::PipelineError::Runtime(message) => Self::System(message),
         }
     }
 }
@@ -151,13 +147,26 @@ mod tests {
     use crate::security::primitives::PrimitiveError;
 
     #[test]
-    fn pipeline_error_maps_without_exposing_dependency_error() {
+    fn pipeline_logic_error_maps_to_qpdf_internal_category() {
         let public: Error =
-            crate::pipeline::PipelineError::codec("hint flate", "data error").into();
+            crate::pipeline::PipelineError::logic("Pl_Buffer::getBuffer() called when not ready")
+                .into();
         assert!(matches!(
             public,
-            Error::Pipeline { ref stage, ref message, .. }
-                if stage == "hint flate" && message == "data error"
+            Error::Internal(ref message)
+                if message == "Pl_Buffer::getBuffer() called when not ready"
+        ));
+    }
+
+    #[test]
+    fn pipeline_runtime_error_maps_to_qpdf_system_category() {
+        let public: Error =
+            crate::pipeline::PipelineError::runtime("inflate: inflate: data: corrupt stream")
+                .into();
+        assert!(matches!(
+            public,
+            Error::System(ref message)
+                if message == "inflate: inflate: data: corrupt stream"
         ));
     }
 

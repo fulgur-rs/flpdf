@@ -224,22 +224,12 @@ Expected: `Push complete.`
 ```rust
 pub(crate) type PipelineResult<T> = std::result::Result<T, PipelineError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PipelineErrorKind {
-    State,
-    Io,
-    Codec,
-    Callback,
-}
-
 #[derive(Debug, thiserror::Error)]
-#[error("{stage}: {message}")]
-pub(crate) struct PipelineError {
-    stage: String,
-    kind: PipelineErrorKind,
-    message: String,
-    #[source]
-    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+pub(crate) enum PipelineError {
+    #[error("{0}")]
+    Logic(String),
+    #[error("{0}")]
+    Runtime(String),
 }
 
 pub(crate) trait Pipeline {
@@ -252,15 +242,12 @@ pub(crate) trait Pipeline {
 - Adds public boundary:
 
 ```rust
-Pipeline {
-    stage: String,
-    message: String,
-    #[source]
-    source: Option<Box<dyn std::error::Error + Send + Sync>>,
-}
+Internal(String),
+System(String),
 ```
 
-- Adds `impl From<PipelineError> for crate::Error`; dependency-specific errors never appear in the public API.
+- Adds `impl From<PipelineError> for crate::Error`; qpdf logic/runtime exceptions map to
+  `Internal`/`System`, matching qpdf's C adapter.
 
 - [ ] **Step 1: Write failing lifecycle and public mapping tests**
 
@@ -284,7 +271,7 @@ mod tests {
 
         fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
             self.writes += 1;
-            Err(PipelineError::state(self.id, "write failed"))
+            Err(PipelineError::logic(format!("{}: write failed", self.id)))
         }
 
         fn finish(&mut self) -> PipelineResult<()> {
@@ -294,11 +281,13 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_error_retains_stage_kind_and_message() {
-        let err = PipelineError::codec("flate", "data error");
-        assert_eq!(err.stage(), "flate");
-        assert_eq!(err.kind(), PipelineErrorKind::Codec);
-        assert_eq!(err.to_string(), "flate: data error");
+    fn pipeline_error_retains_qpdf_exception_category_and_message() {
+        let err = PipelineError::runtime("flate: inflate: data: incorrect header check");
+        assert!(matches!(err, PipelineError::Runtime(_)));
+        assert_eq!(
+            err.to_string(),
+            "flate: inflate: data: incorrect header check"
+        );
     }
 }
 ```
@@ -307,12 +296,12 @@ Add to `error.rs`:
 
 ```rust
 #[test]
-fn pipeline_error_maps_without_exposing_dependency_error() {
-    let public: Error = crate::pipeline::PipelineError::codec("hint flate", "data error").into();
+fn pipeline_runtime_error_maps_to_qpdf_system_category() {
+    let public: Error =
+        crate::pipeline::PipelineError::runtime("inflate: inflate: data: corrupt stream").into();
     assert!(matches!(
         public,
-        Error::Pipeline { ref stage, ref message, .. }
-            if stage == "hint flate" && message == "data error"
+        Error::System(ref message) if message == "inflate: inflate: data: corrupt stream"
     ));
 }
 ```
@@ -322,16 +311,16 @@ fn pipeline_error_maps_without_exposing_dependency_error() {
 Run:
 
 ```bash
-cargo test -p flpdf pipeline::tests::pipeline_error_retains_stage_kind_and_message -- --exact
-cargo test -p flpdf error::tests::pipeline_error_maps_without_exposing_dependency_error -- --exact
+cargo test -p flpdf pipeline::tests::pipeline_error_retains_qpdf_exception_category_and_message -- --exact
+cargo test -p flpdf error::tests::pipeline_runtime_error_maps_to_qpdf_system_category -- --exact
 ```
 
-Expected: compile failure because `pipeline`, `PipelineError`, and `Error::Pipeline` do not exist.
+Expected: compile failure because `pipeline`, `PipelineError`, `Error::Internal`, and
+`Error::System` do not exist.
 
 - [ ] **Step 3: Implement the minimal contract**
 
-Create `pipeline.rs` with the exact interfaces above, constructors
-`state`, `io`, `codec`, and `callback`, plus accessors `stage` and `kind`.
+Create `pipeline.rs` with the exact interfaces above and `logic`/`runtime` constructors.
 Add:
 
 ```rust
@@ -345,19 +334,17 @@ and `pub(crate) mod count;`; Task 3 adds `pub(crate) mod flate;`. Add
 ```rust
 impl From<crate::pipeline::PipelineError> for Error {
     fn from(error: crate::pipeline::PipelineError) -> Self {
-        let (stage, message, source) = error.into_parts();
-        Self::Pipeline {
-            stage,
-            message,
-            source,
+        match error {
+            crate::pipeline::PipelineError::Logic(message) => Self::Internal(message),
+            crate::pipeline::PipelineError::Runtime(message) => Self::System(message),
         }
     }
 }
 ```
 
-Expose crate-private `message()` and `into_parts()` accessors; do not make `PipelineError`
-public. `PipelineError::io` stores the original `std::io::Error`, and codec/callback constructors
-store a source when the dependency supplies one.
+Expose a crate-private `message()` accessor; do not make `PipelineError` public. Construct the
+complete qpdf `what()`-equivalent message at each error site, and propagate downstream or callback
+errors unchanged.
 
 - [ ] **Step 4: Run focused and error tests**
 
@@ -433,7 +420,10 @@ impl<'a> Count<'a> {
 fn buffer_requires_finish_then_takes_and_resets() {
     let mut buffer = Buffer::new("buffer", None);
     buffer.write(b"ab").unwrap();
-    assert_eq!(buffer.take_buffer().unwrap_err().kind(), PipelineErrorKind::State);
+    assert_eq!(
+        buffer.take_buffer().unwrap_err().to_string(),
+        "Pl_Buffer::getBuffer() called when not ready"
+    );
     buffer.finish().unwrap();
     assert_eq!(buffer.take_buffer().unwrap(), b"ab");
     assert_eq!(buffer.take_buffer().unwrap(), b"");
@@ -476,9 +466,8 @@ Implement the exact qpdf state transitions:
 ```rust
 pub(crate) fn take_buffer(&mut self) -> PipelineResult<Vec<u8>> {
     if !self.ready {
-        return Err(PipelineError::state(
-            &self.identifier,
-            "buffer requested before finish",
+        return Err(PipelineError::logic(
+            "Pl_Buffer::getBuffer() called when not ready",
         ));
     }
     Ok(std::mem::take(&mut self.data))
@@ -625,13 +614,15 @@ fn deflate_is_invariant_to_input_chunking_and_finishes_zlib_stream() {
 }
 
 #[test]
-fn write_after_finish_reports_stage_state_error() {
+fn write_after_finish_matches_qpdf_logic_error() {
     let mut sink = Buffer::new("sink", None);
     let mut flate = Flate::new("flate", &mut sink, FlateAction::Deflate, 8).unwrap();
     flate.finish().unwrap();
     let err = flate.write(b"x").unwrap_err();
-    assert_eq!(err.stage(), "flate");
-    assert_eq!(err.kind(), PipelineErrorKind::State);
+    assert_eq!(
+        err.to_string(),
+        "flate: Pl_Flate: write() called after finish() called"
+    );
 }
 ```
 
@@ -644,7 +635,7 @@ Run:
 
 ```bash
 cargo test -p flpdf pipeline::flate::tests::deflate_is_invariant_to_input_chunking_and_finishes_zlib_stream -- --exact
-cargo test -p flpdf pipeline::flate::tests::write_after_finish_reports_stage_state_error -- --exact
+cargo test -p flpdf pipeline::flate::tests::write_after_finish_matches_qpdf_logic_error -- --exact
 ```
 
 Expected: compile failure because `Flate` is absent.
@@ -682,7 +673,11 @@ fn codec_finish_error_still_finishes_downstream_and_keeps_first_error() {
     let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 8).unwrap();
     flate.write(b"not zlib").unwrap_or(());
     let err = flate.finish().unwrap_err();
-    assert_eq!(err.stage(), "inflate");
+    assert!(matches!(err, PipelineError::Runtime(_)));
+    assert_eq!(
+        err.to_string(),
+        "inflate: inflate: data: incorrect header check"
+    );
     assert_eq!(sink.finishes, 1);
 }
 ```
@@ -694,20 +689,27 @@ the resulting bytes/messages as flpdf-authored constants, not copied qpdf fixtur
 - [ ] **Step 5: Implement full inflate and cleanup behavior**
 
 Use `flate2::Decompress` with `FlushDecompress::Sync` on write and
-`FlushDecompress::Finish` on finish. Route codec failures through
-`PipelineError::codec`, callback failures through `PipelineError::callback`, and use:
+`FlushDecompress::Finish` on finish. Construct qpdf's complete runtime-error message at codec
+failure sites, and propagate callback failures unchanged. On successful local finalization,
+terminalize the codec before finishing downstream. On local failure, preserve the codec state,
+best-effort finish downstream, and return the local failure as a runtime error:
 
 ```rust
-let local_result = self.finish_codec();
-let downstream_result = self.next.finish();
-match (local_result, downstream_result) {
-    (Err(first), _) => Err(first),
-    (Ok(()), Err(downstream)) => Err(downstream),
-    (Ok(()), Ok(())) => Ok(()),
+match self.finish_codec() {
+    Ok(()) => {
+        self.finished = true;
+        self.codec = None;
+        self.next.finish()
+    }
+    Err(first) => {
+        let _ = self.next.finish();
+        Err(PipelineError::runtime(first.to_string()))
+    }
 }
 ```
 
-Set codec state to finished before returning either result so a later write always fails.
+This retains qpdf's failed-FDICT behavior: repeated `finish` and later `write` repeat the same
+runtime error, and every failed `finish` still calls downstream `finish`.
 
 - [ ] **Step 6: Run all Flate tests and oracle comparisons**
 
@@ -971,17 +973,17 @@ pub fn encode_hint_stream(
 - [ ] **Step 1: Add a failing production-route test**
 
 Add a test that uses a fault-injecting pipeline through a test-only
-`encode_hint_sections` helper and asserts the `Error::Pipeline` stage name. Also retain the
+`encode_hint_sections` helper and asserts the qpdf public error category and message. Also retain the
 existing expected byte vectors for page/shared/outline tables unchanged:
 
 ```rust
 #[test]
-fn hint_encoding_uses_pipeline_error_boundary() {
+fn hint_encoding_maps_pipeline_logic_error_to_qpdf_internal_category() {
     let err = encode_hint_sections_for_test(&minimal_tables(), FailingSink::new("hint sink"))
         .unwrap_err();
     assert!(matches!(
         err,
-        crate::Error::Pipeline { ref stage, .. } if stage == "hint sink"
+        crate::Error::Internal(ref message) if message == "hint sink: write failed"
     ));
 }
 ```

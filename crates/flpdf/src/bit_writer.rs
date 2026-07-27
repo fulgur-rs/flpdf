@@ -70,10 +70,7 @@ impl<'a> BitWriter<'a> {
 
     fn validate_width(&self, bits: usize) -> PipelineResult<()> {
         if bits > 32 {
-            return Err(PipelineError::state(
-                "bit writer",
-                "write_bits: too many bits requested",
-            ));
+            return Err(PipelineError::logic("write_bits: too many bits requested"));
         }
         Ok(())
     }
@@ -83,7 +80,7 @@ impl<'a> BitWriter<'a> {
 mod tests {
     use super::BitWriter;
     use crate::bit_stream::BitStream;
-    use crate::pipeline::{Pipeline, PipelineError, PipelineErrorKind, PipelineResult};
+    use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 
     #[derive(Default)]
     struct TestSink {
@@ -100,7 +97,10 @@ mod tests {
         fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
             if self.fail_writes_remaining > 0 {
                 self.fail_writes_remaining -= 1;
-                return Err(PipelineError::state(self.identifier(), "write failed"));
+                return Err(PipelineError::logic(format!(
+                    "{}: write failed",
+                    self.identifier()
+                )));
             }
             self.bytes.extend_from_slice(data);
             Ok(())
@@ -165,7 +165,7 @@ mod tests {
                 writer.write_bits_signed(-1, 33),
                 writer.write_bits_i32(-1, 33),
             ] {
-                assert_eq!(result.unwrap_err().kind(), PipelineErrorKind::State);
+                assert!(matches!(result.unwrap_err(), PipelineError::Logic(_)));
             }
             writer.flush().unwrap();
         }
@@ -228,7 +228,7 @@ mod tests {
         {
             let mut writer = BitWriter::new(&mut complete_sink);
             let complete_error = writer.write_bits(0xa5, 8).unwrap_err();
-            assert_eq!(complete_error.kind(), PipelineErrorKind::State);
+            assert!(matches!(complete_error, PipelineError::Logic(_)));
             writer.write_bits(0xa5, 8).unwrap();
         }
         assert_eq!(complete_sink.bytes, [0xa5]);
@@ -244,7 +244,7 @@ mod tests {
             let mut writer = BitWriter::new(&mut partial_sink);
             writer.write_bits(0b101, 3).unwrap();
             let partial_error = writer.flush().unwrap_err();
-            assert_eq!(partial_error.kind(), PipelineErrorKind::State);
+            assert!(matches!(partial_error, PipelineError::Logic(_)));
             writer.flush().unwrap();
         }
         assert_eq!(partial_sink.bytes, [0b1010_0000]);

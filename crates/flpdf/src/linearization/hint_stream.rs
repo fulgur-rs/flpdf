@@ -661,7 +661,10 @@ mod tests {
 
         fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
             if self.fail_at_write == Some(self.writes) {
-                return Err(PipelineError::state(self.identifier(), "write failed"));
+                return Err(PipelineError::logic(format!(
+                    "{}: write failed",
+                    self.identifier()
+                )));
             }
             self.writes += 1;
             Ok(())
@@ -669,7 +672,10 @@ mod tests {
 
         fn finish(&mut self) -> PipelineResult<()> {
             if self.fail_finish {
-                Err(PipelineError::state(self.identifier(), "finish failed"))
+                Err(PipelineError::logic(format!(
+                    "{}: finish failed",
+                    self.identifier()
+                )))
             } else {
                 Ok(())
             }
@@ -753,12 +759,12 @@ mod tests {
     }
 
     #[test]
-    fn hint_encoding_uses_pipeline_error_boundary() {
+    fn hint_encoding_maps_pipeline_logic_error_to_qpdf_internal_category() {
         let err = encode_hint_sections_for_test(&minimal_tables(), FailingSink::new("hint sink"))
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Pipeline { ref stage, .. } if stage == "hint sink"
+            crate::Error::Internal(ref message) if message == "hint sink: write failed"
         ));
     }
 
@@ -773,14 +779,15 @@ mod tests {
     }
 
     #[test]
-    fn hint_encoding_propagates_flate_constructor_error_stage() {
+    fn hint_encoding_maps_flate_runtime_error_to_qpdf_system_category() {
         let tables = minimal_tables();
         let err = encode_hint_stream_with_out_buffer_size(&tables.0, &tables.1, None, 0)
             .err()
             .expect("zero output buffer must fail");
         assert!(matches!(
             err,
-            crate::Error::Pipeline { ref stage, .. } if stage == "compress hint stream"
+            crate::Error::System(ref message)
+                if message == "Pl_Flate: output buffer size must be greater than zero"
         ));
     }
 
@@ -797,7 +804,7 @@ mod tests {
             .unwrap_err();
             assert!(matches!(
                 err,
-                crate::Error::Pipeline { ref stage, .. } if stage == "hint sink"
+                crate::Error::Internal(ref message) if message == "hint sink: write failed"
             ));
         }
 
@@ -811,7 +818,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Pipeline { ref stage, .. } if stage == "hint sink"
+            crate::Error::Internal(ref message) if message == "hint sink: finish failed"
         ));
     }
 

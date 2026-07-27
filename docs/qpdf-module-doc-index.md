@@ -82,7 +82,7 @@
 | `crates/flpdf/src/parser.rs` | correspondence | QPDFParser.cc object parsing with tokenizer responsibilities still shared elsewhere |
 | `crates/flpdf/src/pdf_version.rs` | mirror | libqpdf/PDFVersion.cc |
 | `crates/flpdf/src/permissions.rs` | correspondence | QPDF_encryption.cc permission-bit encoding split from the Standard security handler |
-| `crates/flpdf/src/pipeline.rs` | correspondence | Pipeline.cc write/finish chaining lifecycle represented by a crate-private Rust trait; PipelineError stage, kind, and source transport is flpdf-specific |
+| `crates/flpdf/src/pipeline.rs` | correspondence | Pipeline.cc write/finish chaining lifecycle represented by a crate-private Rust trait; PipelineError models qpdf's logic_error/runtime_error exception channel |
 | `crates/flpdf/src/pipeline/buffer.rs` | correspondence | Pl_Buffer.cc accumulation, optional pass-through, finish readiness, and getBuffer reset ownership; Rust take_buffer returns the moved Vec directly |
 | `crates/flpdf/src/pipeline/count.rs` | correspondence | Pl_Count.cc byte-count, last-byte, forwarding, and finish responsibilities |
 | `crates/flpdf/src/pipeline/flate.rs` | correspondence | Pl_Flate.cc streaming inflate, deflate, warning callback, compression-level, and finish responsibilities via flate2 |

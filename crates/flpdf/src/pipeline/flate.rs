@@ -2,7 +2,6 @@
 
 use super::{Pipeline, PipelineError, PipelineResult};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
-use std::fmt;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 #[allow(dead_code)]
@@ -70,17 +69,6 @@ impl InflateState {
     }
 }
 
-#[derive(Debug)]
-struct ZlibFormatError(&'static str);
-
-impl fmt::Display for ZlibFormatError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
-    }
-}
-
-impl std::error::Error for ZlibFormatError {}
-
 type WarnCallback<'a> = dyn FnMut(&str, i32) -> PipelineResult<()> + 'a;
 
 pub(crate) struct Flate<'a> {
@@ -104,15 +92,13 @@ impl<'a> Flate<'a> {
     ) -> PipelineResult<Self> {
         let identifier = identifier.into();
         if out_buffer_size == 0 {
-            return Err(PipelineError::state(
-                identifier,
-                "output buffer size must be greater than zero",
+            return Err(PipelineError::runtime(
+                "Pl_Flate: output buffer size must be greater than zero",
             ));
         }
         if out_buffer_size > u32::MAX as usize {
-            return Err(PipelineError::state(
-                identifier,
-                "zlib doesn't support buffer sizes larger than unsigned int",
+            return Err(PipelineError::runtime(
+                "Pl_Flate: zlib doesn't support buffer sizes larger than unsigned int",
             ));
         }
 
@@ -130,9 +116,8 @@ impl<'a> Flate<'a> {
 
     pub(crate) fn set_compression_level(level: i32) -> PipelineResult<()> {
         if level != -1 && !(1..=9).contains(&level) {
-            return Err(PipelineError::state(
-                "flate",
-                "compression level must be -1 or between 1 and 9",
+            return Err(PipelineError::runtime(
+                "Pl_Flate: compression level must be -1 or between 1 and 9",
             ));
         }
         COMPRESSION_LEVEL.store(level, Ordering::Relaxed);
@@ -150,13 +135,7 @@ impl<'a> Flate<'a> {
         let Some(callback) = self.warn_callback.as_mut() else {
             return Ok(());
         };
-        callback(message, code).map_err(|source| {
-            PipelineError::callback_with_source(
-                &self.identifier,
-                format!("warning callback failed: {source}"),
-                source,
-            )
-        })
+        callback(message, code)
     }
 
     fn handle_buf_error(&mut self, status: Status) -> PipelineResult<bool> {
@@ -186,11 +165,7 @@ impl<'a> Flate<'a> {
     }
 
     fn zlib_format_error(&self, detail: &'static str) -> PipelineError {
-        PipelineError::codec_with_source(
-            &self.identifier,
-            format!("inflate: data: {detail}"),
-            ZlibFormatError(detail),
-        )
+        PipelineError::runtime(format!("{}: inflate: data: {detail}", self.identifier))
     }
 
     fn consume_zlib_header(&mut self, data: &[u8]) -> PipelineResult<usize> {
@@ -263,8 +238,8 @@ impl<'a> Flate<'a> {
             input_offset += consumed;
             let identifier = &self.identifier;
             let detail = "deflate: data: zlib compression error";
-            let status = result
-                .map_err(|source| PipelineError::codec_with_source(identifier, detail, source))?;
+            let status =
+                result.map_err(|_| PipelineError::runtime(format!("{identifier}: {detail}")))?;
 
             if produced > 0 {
                 self.next.write(&self.output[..produced])?;
@@ -337,11 +312,10 @@ impl<'a> Flate<'a> {
                 Ok(status) => status,
                 Err(source) => {
                     let detail = source.message().unwrap_or("zlib decompression error");
-                    return Err(PipelineError::codec_with_source(
-                        &self.identifier,
-                        format!("inflate: data: {detail}"),
-                        source,
-                    ));
+                    return Err(PipelineError::runtime(format!(
+                        "{}: inflate: data: {detail}",
+                        self.identifier
+                    )));
                 }
             };
 
@@ -404,10 +378,10 @@ impl Pipeline for Flate<'_> {
 
     fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
         if self.finished {
-            return Err(PipelineError::state(
-                &self.identifier,
-                "write called after finish",
-            ));
+            return Err(PipelineError::logic(format!(
+                "{}: Pl_Flate: write() called after finish() called",
+                self.identifier
+            )));
         }
         if data.is_empty() {
             return Ok(());
@@ -418,18 +392,20 @@ impl Pipeline for Flate<'_> {
     }
 
     fn finish(&mut self) -> PipelineResult<()> {
-        let local_result = if self.finished {
-            Ok(())
-        } else {
-            self.finish_codec()
-        };
-        self.finished = true;
-        self.codec = None;
-        let downstream_result = self.next.finish();
-        match (local_result, downstream_result) {
-            (Err(first), _) => Err(first),
-            (Ok(()), Err(downstream)) => Err(downstream),
-            (Ok(()), Ok(())) => Ok(()),
+        if self.finished {
+            return self.next.finish();
+        }
+
+        match self.finish_codec() {
+            Ok(()) => {
+                self.finished = true;
+                self.codec = None;
+                self.next.finish()
+            }
+            Err(first) => {
+                let _ = self.next.finish();
+                Err(PipelineError::runtime(first.to_string()))
+            }
         }
     }
 }
@@ -438,9 +414,8 @@ impl Pipeline for Flate<'_> {
 mod tests {
     use super::{Flate, FlateAction, BUF_ERROR_WARNING, Z_BUF_ERROR};
     use crate::pipeline::buffer::Buffer;
-    use crate::pipeline::{Pipeline, PipelineError, PipelineErrorKind, PipelineResult};
+    use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
     use std::cell::RefCell;
-    use std::error::Error as _;
     use std::rc::Rc;
     use std::sync::Mutex;
 
@@ -536,7 +511,10 @@ mod tests {
 
         fn finish(&mut self) -> PipelineResult<()> {
             self.finishes += 1;
-            Err(PipelineError::state(self.identifier(), "finish failed"))
+            Err(PipelineError::logic(format!(
+                "{}: finish failed",
+                self.identifier()
+            )))
         }
     }
 
@@ -554,13 +532,15 @@ mod tests {
     }
 
     #[test]
-    fn write_after_finish_reports_stage_state_error() {
+    fn write_after_finish_matches_qpdf_logic_error() {
         let mut sink = Buffer::new("sink", None);
         let mut flate = Flate::new("flate", &mut sink, FlateAction::Deflate, 8).unwrap();
         flate.finish().unwrap();
         let err = flate.write(b"x").unwrap_err();
-        assert_eq!(err.stage(), "flate");
-        assert_eq!(err.kind(), PipelineErrorKind::State);
+        assert_eq!(
+            err.to_string(),
+            "flate: Pl_Flate: write() called after finish() called"
+        );
     }
 
     #[test]
@@ -601,19 +581,26 @@ mod tests {
         let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 8).unwrap();
         flate.write(b"not zlib").unwrap_or(());
         let err = flate.finish().unwrap_err();
-        assert_eq!(err.stage(), "inflate");
+        assert!(matches!(err, PipelineError::Runtime(_)));
+        assert_eq!(
+            err.to_string(),
+            "inflate: inflate: data: incorrect header check"
+        );
         drop(flate);
         assert_eq!(sink.finishes, 1);
     }
 
     #[test]
-    fn zero_output_buffer_is_rejected_as_state_error() {
+    fn zero_output_buffer_is_rejected_as_runtime_error() {
         let mut sink = RecordingSink::default();
         let err = Flate::new("flate", &mut sink, FlateAction::Inflate, 0)
             .err()
             .unwrap();
-        assert_eq!(err.stage(), "flate");
-        assert_eq!(err.kind(), PipelineErrorKind::State);
+        assert!(matches!(err, PipelineError::Runtime(_)));
+        assert_eq!(
+            err.to_string(),
+            "Pl_Flate: output buffer size must be greater than zero"
+        );
     }
 
     #[cfg(target_pointer_width = "64")]
@@ -628,11 +615,10 @@ mod tests {
         )
         .err()
         .expect("the zlib output-buffer domain ends at u32::MAX");
-        assert_eq!(err.stage(), "oversized flate");
-        assert_eq!(err.kind(), PipelineErrorKind::State);
+        assert!(matches!(err, PipelineError::Runtime(_)));
         assert_eq!(
             err.message(),
-            "zlib doesn't support buffer sizes larger than unsigned int"
+            "Pl_Flate: zlib doesn't support buffer sizes larger than unsigned int"
         );
         assert!(sink.chunks.is_empty());
         assert_eq!(sink.finishes, 0);
@@ -688,8 +674,8 @@ mod tests {
         let mut sink = RecordingSink::default();
         let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 3).unwrap();
         let err = flate.write(&INVALID_STORED_BLOCK).unwrap_err();
-        assert_eq!(err.stage(), "inflate");
-        assert_eq!(err.kind(), PipelineErrorKind::Codec);
+        assert!(matches!(err, PipelineError::Runtime(_)));
+        assert!(err.to_string().starts_with("inflate: inflate: data: "));
     }
 
     #[test]
@@ -712,9 +698,8 @@ mod tests {
             assert_eq!(sink.identifier(), "recording");
             let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 3).unwrap();
             let err = flate.write(&header).unwrap_err();
-            assert_eq!(err.kind(), PipelineErrorKind::Codec);
-            assert_eq!(err.message(), format!("inflate: data: {detail}"));
-            assert_eq!(err.source().unwrap().to_string(), detail);
+            assert!(matches!(err, PipelineError::Runtime(_)));
+            assert_eq!(err.message(), format!("inflate: inflate: data: {detail}"));
         }
     }
 
@@ -773,10 +758,11 @@ mod tests {
         let err = flate
             .write(&[0x78, 0x20, 0x00, 0x00, 0x00, 0x01])
             .unwrap_err();
-        assert_eq!(err.stage(), "oracle inflate");
-        assert_eq!(err.kind(), PipelineErrorKind::Codec);
-        assert_eq!(err.message(), "inflate: data: zlib unknown error (2)");
-        assert_eq!(err.source().unwrap().to_string(), "zlib unknown error (2)");
+        assert!(matches!(err, PipelineError::Runtime(_)));
+        assert_eq!(
+            err.message(),
+            "oracle inflate: inflate: data: zlib unknown error (2)"
+        );
         drop(flate);
         assert!(sink.chunks.is_empty());
     }
@@ -791,9 +777,11 @@ mod tests {
                 Flate::new("oracle inflate", &mut sink, FlateAction::Inflate, 3).unwrap();
             flate.write(&FDICT_STREAM[..split]).unwrap();
             let err = flate.write(&FDICT_STREAM[split..]).unwrap_err();
-            assert_eq!(err.stage(), "oracle inflate");
-            assert_eq!(err.kind(), PipelineErrorKind::Codec);
-            assert_eq!(err.message(), "inflate: data: zlib unknown error (2)");
+            assert!(matches!(err, PipelineError::Runtime(_)));
+            assert_eq!(
+                err.message(),
+                "oracle inflate: inflate: data: zlib unknown error (2)"
+            );
         }
     }
 
@@ -806,15 +794,35 @@ mod tests {
                 .write(&[0x78, 0x20, 0x00, 0x00, 0x00, 0x01])
                 .unwrap_err()
                 .message(),
-            "inflate: data: zlib unknown error (2)"
+            "oracle inflate: inflate: data: zlib unknown error (2)"
         );
 
         let err = flate.finish().unwrap_err();
-        assert_eq!(err.stage(), "oracle inflate");
-        assert_eq!(err.kind(), PipelineErrorKind::Codec);
-        assert_eq!(err.message(), "inflate: data: zlib unknown error (2)");
+        assert!(matches!(err, PipelineError::Runtime(_)));
+        assert_eq!(
+            err.message(),
+            "oracle inflate: inflate: data: zlib unknown error (2)"
+        );
         drop(flate);
         assert_eq!(sink.finishes, 1);
+    }
+
+    #[test]
+    fn failed_fdict_finish_retains_qpdf_state_for_repeat_finish_and_write() {
+        const FDICT_STREAM: [u8; 6] = [0x78, 0x20, 0x00, 0x00, 0x00, 0x01];
+        const EXPECTED: &str = "oracle inflate: inflate: data: zlib unknown error (2)";
+
+        let mut sink = RecordingSink::default();
+        let mut flate = Flate::new("oracle inflate", &mut sink, FlateAction::Inflate, 3).unwrap();
+        assert_eq!(
+            flate.write(&FDICT_STREAM).unwrap_err().to_string(),
+            EXPECTED
+        );
+        assert_eq!(flate.finish().unwrap_err().to_string(), EXPECTED);
+        assert_eq!(flate.finish().unwrap_err().to_string(), EXPECTED);
+        assert_eq!(flate.write(b"x").unwrap_err().to_string(), EXPECTED);
+        drop(flate);
+        assert_eq!(sink.finishes, 2);
     }
 
     #[test]
@@ -908,7 +916,8 @@ mod tests {
         let mut flate = Flate::new("flate", &mut sink, FlateAction::Deflate, 8).unwrap();
         flate.write(b"x").unwrap();
         let err = flate.finish().unwrap_err();
-        assert_eq!(err.stage(), "finish-fault");
+        assert!(matches!(err, PipelineError::Logic(_)));
+        assert_eq!(err.to_string(), "finish-fault: finish failed");
         drop(flate);
         assert_eq!(sink.finishes, 1);
     }
@@ -936,42 +945,42 @@ mod tests {
             flate.write(b"x").unwrap();
             flate.finish().unwrap();
             flate.finish().unwrap();
-            assert_eq!(
-                flate.write(b"y").unwrap_err().kind(),
-                PipelineErrorKind::State
-            );
+            assert!(matches!(
+                flate.write(b"y").unwrap_err(),
+                PipelineError::Logic(_)
+            ));
         }
         assert_eq!(sink.finishes, 2);
     }
 
     #[test]
-    fn warn_callback_error_is_wrapped_with_stage_and_source() {
+    fn warn_callback_error_propagates_unchanged_like_qpdf() {
         const ENCODED_PREFIX: [u8; 4] = [0x78, 0x9c, 0x4b, 0x04];
         let mut sink = RecordingSink::default();
         let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 1).unwrap();
         flate.set_warn_callback(|_, _| {
-            Err(PipelineError::state(
-                "warning consumer",
-                "callback rejected warning",
+            Err(PipelineError::logic(
+                "warning consumer: callback rejected warning",
             ))
         });
 
         let err = flate.write(&ENCODED_PREFIX).unwrap_err();
-        assert_eq!(err.stage(), "inflate");
-        assert_eq!(err.kind(), PipelineErrorKind::Callback);
         assert_eq!(
-            err.source().unwrap().to_string(),
+            err.to_string(),
             "warning consumer: callback rejected warning"
         );
+        assert!(matches!(err, PipelineError::Logic(_)));
     }
 
     #[test]
-    fn malformed_input_codec_error_preserves_dependency_source() {
+    fn malformed_input_is_a_qpdf_runtime_error() {
         let mut sink = RecordingSink::default();
         let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 8).unwrap();
         let err = flate.write(b"not zlib").unwrap_err();
-        assert_eq!(err.stage(), "inflate");
-        assert_eq!(err.kind(), PipelineErrorKind::Codec);
-        assert!(err.source().is_some());
+        assert!(matches!(err, PipelineError::Runtime(_)));
+        assert_eq!(
+            err.to_string(),
+            "inflate: inflate: data: incorrect header check"
+        );
     }
 }

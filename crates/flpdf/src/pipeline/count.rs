@@ -39,10 +39,9 @@ impl Pipeline for Count<'_> {
             return Ok(());
         }
 
-        self.count = self
-            .count
-            .checked_add(data.len() as u64)
-            .ok_or_else(|| PipelineError::state(&self.identifier, "byte count overflow"))?;
+        self.count = self.count.checked_add(data.len() as u64).ok_or_else(|| {
+            PipelineError::runtime(format!("{}: byte count overflow", self.identifier))
+        })?;
         self.last_byte = data[data.len() - 1];
         self.next.write(data)
     }
@@ -55,7 +54,7 @@ impl Pipeline for Count<'_> {
 #[cfg(test)]
 mod tests {
     use super::Count;
-    use crate::pipeline::{Pipeline, PipelineErrorKind, PipelineResult};
+    use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 
     #[derive(Default)]
     struct RecordingSink {
@@ -113,10 +112,10 @@ mod tests {
         let mut count = Count::new("count", &mut sink);
         count.count = u64::MAX;
 
-        assert_eq!(
-            count.write(b"x").unwrap_err().kind(),
-            PipelineErrorKind::State
-        );
+        assert!(matches!(
+            count.write(b"x").unwrap_err(),
+            PipelineError::Runtime(_)
+        ));
         assert_eq!(count.count(), u64::MAX);
         assert_eq!(count.last_byte(), 0);
         drop(count);

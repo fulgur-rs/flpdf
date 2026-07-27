@@ -132,32 +132,33 @@ full-Pipeline Epic.
 
 ### Error model
 
-Pipeline errors are internal but structured:
+Rust's `Result` channel represents qpdf's C++ exception channel directly:
 
 ```rust
-enum PipelineErrorKind {
-    State,
-    Io,
-    Codec,
-    Callback,
+enum PipelineError {
+    Logic(String),
+    Runtime(String),
 }
 ```
 
-Each error carries the responsible stage identifier and preserves its source where available.
-The public boundary maps it to a dedicated `flpdf::Error::Pipeline` representation rather than
-panicking or collapsing it into an unrelated parse error.
+`Logic` corresponds to qpdf's `std::logic_error`; `Runtime` corresponds to
+`std::runtime_error`. Each throw-equivalent site constructs the same complete message qpdf
+would return from `what()`. Downstream and warning-callback errors propagate unchanged instead of
+being wrapped with a second stage. At the public boundary they map to `flpdf::Error::Internal`
+and `flpdf::Error::System`, matching qpdf 11.9.0's C adapter classification.
 
 Error propagation rules:
 
 - the first failure is the returned failure;
 - a codec `finish` failure still makes a best-effort downstream `finish` call;
 - a secondary downstream failure never replaces the first failure;
-- a write after a non-reusable stage has finished is a state error containing that stage's
-  identifier;
+- failed codec finalization retains its state, so repeated `finish` and later `write` repeat the
+  same qpdf runtime error;
+- a write after a successfully finished non-reusable stage returns qpdf's matching logic error;
 - `Drop` neither finishes nor suppresses a missing finish.
 
-This follows qpdf's `Pl_Flate::finish` cleanup behavior while making the first-error rule explicit
-in Rust.
+This follows qpdf's `Pl_Flate::finish` cleanup, failed-finalization state, and exception behavior
+while expressing the exception channel as Rust results.
 
 ## Foundation slice: separate BitStream and BitWriter
 
