@@ -91,6 +91,7 @@ pub(crate) struct QpdfTokenizer<'a> {
     identifier: String,
     filter: &'a mut dyn TokenFilter,
     next: Option<&'a mut dyn Pipeline>,
+    filter_output_attached: bool,
     data: Vec<u8>,
 }
 
@@ -105,10 +106,14 @@ impl<'a> QpdfTokenizer<'a> {
 
 - `QpdfTokenizer` implements `Pipeline`.
 - Each `finish` takes and clears the buffered input before token delivery, matching
-  `Pl_Buffer::getBuffer`. A successful stage is reusable: another `finish` delivers an empty-input
-  EOF cycle and another downstream finish, while a later `write` starts a new input cycle.
-- If a filter callback fails, the taken input remains consumed, `handle_eof` and downstream
-  `finish` are skipped, and a later `finish` processes a new empty cycle.
+  `Pl_Buffer::getBuffer`. Another `finish` delivers an empty-input EOF cycle and another downstream
+  finish, while a later `write` starts a new input cycle.
+- Downstream ownership and filter-output attachment are separate. The first successful
+  `handle_eof` permanently detaches filter output before downstream `finish`; later cycles still
+  deliver callbacks and finish the retained downstream, but filter writes are discarded.
+- If a token callback or `handle_eof` fails, the taken input remains consumed, downstream `finish`
+  is skipped, and filter output retains its current attachment for the next empty cycle. A
+  downstream finish failure occurs after detachment, so retry remains detached.
 - Later tasks must not bypass these interfaces with direct `Tokenizer` loops.
 
 - [ ] **Step 1: Extend the oracle probe contract with an exact token-filter record mode**
@@ -255,6 +260,11 @@ Add an ignored `qpdf_token_filter_differential` test that compares qpdf probe re
 - inline-image false-`EI` candidates;
 - one chunk, bytewise chunks, and split points around `ID` and `EI`.
 
+Add a separate ignored `qpdf_token_filter_lifecycle_differential` mode that performs repeated
+`finish`, write-after-finish, and fail-once downstream-finish retry. It records callback counts,
+finish attempts, and output bytes, proving that qpdf forwards output only through the first
+successful `handle_eof` cycle.
+
 - [ ] **Step 4: Run the focused Rust tests and verify RED**
 
 Run:
@@ -308,43 +318,36 @@ loop {
         .map_err(|error| PipelineError::runtime(format!("{}: {error}", self.identifier)))?;
     let is_eof = token.token_type == TokenType::Eof;
     let is_id = token.is_word_value(b"ID");
-    {
-        let mut output = TokenFilterOutput::new(self.next.as_deref_mut());
-        self.filter.handle_token(&token, &mut output)?;
-    }
+    self.handle_token(&token)?;
     if is_eof {
         break;
     }
     if is_id {
         let separator = tokenizer.consume_one_byte_or(b' ');
         let space = Token::new(TokenType::Space, vec![separator]);
-        {
-            let mut output = TokenFilterOutput::new(self.next.as_deref_mut());
-            self.filter.handle_token(&space, &mut output)?;
-        }
+        self.handle_token(&space)?;
         tokenizer
             .expect_inline_image()
             .map_err(|error| PipelineError::logic(format!("{}: {error:?}", self.identifier)))?;
     }
 }
-{
-    let mut output = TokenFilterOutput::new(self.next.as_deref_mut());
-    self.filter.handle_eof(&mut output)?;
-}
+self.handle_eof()?; // permanently detaches filter output on success
 if let Some(next) = self.next.as_deref_mut() {
     next.finish()?;
 }
 Ok(())
 ```
 
-Add tests proving a second `finish` delivers an empty-input EOF cycle and finishes downstream
-again, a write after finish starts a fresh cycle, and a callback failure consumes the failed
-cycle without finishing downstream.
+Implement `handle_token`/`handle_eof` helpers that lend `next` to `TokenFilterOutput` only while
+`filter_output_attached` is true and always restore downstream ownership before returning a
+callback result. Add tests proving repeated finish and write-after-finish still deliver callbacks
+and downstream finishes but emit output only in the first cycle; callback failures retain
+attachment, while downstream-finish failure retry remains detached.
 
 - [ ] **Step 7: Complete the C++ probe, shell driver, and contract**
 
-Implement `token-filter` mode and `--chunks`. Update every existing probe invocation in Rust tests
-to pass `--chunks all`. Add the ignored differential invocation to
+Implement `token-filter`, `token-filter-lifecycle`, and `--chunks`. Update every existing probe
+invocation in Rust tests to pass `--chunks all`. Add both ignored differential invocations to
 `scripts/qpdf-tokenizer-diff.sh`.
 
 Run:
@@ -395,20 +398,17 @@ git commit -m "feat(pipeline): add qpdf tokenizer stage"
 - Produces:
 
 ```rust
-pub(crate) type ResourceNames = BTreeSet<Vec<u8>>;
 pub(crate) type ResourceNamesByType =
     BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, BTreeSet<usize>>>;
 
 #[derive(Debug, Default)]
 pub(crate) struct ResourceFinder {
     last_name: Option<(Vec<u8>, usize)>,
-    names: ResourceNames,
     names_by_resource_type: ResourceNamesByType,
     had_diagnostics: bool,
 }
 
 impl ResourceFinder {
-    pub(crate) fn names(&self) -> &ResourceNames;
     pub(crate) fn names_by_resource_type(&self) -> &ResourceNamesByType;
     pub(crate) fn had_diagnostics(&self) -> bool;
 }
@@ -438,7 +438,9 @@ fn records_qpdf_operator_table_with_raw_name_offsets() {
                BTreeSet::from([input.windows(3).position(|w| w == b"/F1").unwrap()]));
     assert_eq!(finder.names_by_resource_type()[b"XObject".as_slice()]
                .keys().cloned().collect::<Vec<_>>(), vec![b"X1".to_vec()]);
-    assert_eq!(finder.names().len(), 10);
+    let flat_names = finder.names_by_resource_type().values()
+        .flat_map(|by_name| by_name.keys()).collect::<BTreeSet<_>>();
+    assert_eq!(flat_names.len(), 10);
 }
 
 #[test]
@@ -497,8 +499,10 @@ fn resource_type_for_operator(operator: &[u8]) -> Option<&'static [u8]> {
 
 In `handle_object`, record `Object::Name(name)` as `(name, offset)`. For
 `Object::Operator(operator)`, if both the table lookup and `last_name` exist, insert the name and
-offset into both result views. Do not clear `last_name`. Ignore other objects. Set
-`had_diagnostics = true` from `handle_diagnostic`; `handle_eof` returns `Ok(())`.
+offset into `names_by_resource_type`. Do not clear `last_name`. Ignore other objects. Set
+`had_diagnostics = true` from `handle_diagnostic`; `handle_eof` returns `Ok(())`. The qpdf
+`getNames()`-shaped flat oracle view is derived in tests from the categorized map's key union; do
+not retain a duplicate production flat set.
 
 - [ ] **Step 4: Add and run a live ResourceFinder oracle mode**
 
@@ -669,19 +673,22 @@ fn handle_token(
         .flatten()
         .and_then(|offsets| offsets.get(&self.offset));
     if let Some(new_name) = replacement {
-        output.write_token(&Token::new(TokenType::Name, new_name.clone()))?;
+        let replacement = name_token_from_decoded_body(new_name);
+        output.write_token(&replacement)?;
+        self.advance_offset(token)?;
     } else {
+        self.advance_offset(token)?;
         output.write_token(token)?;
     }
-    self.offset = self
-        .offset
-        .checked_add(token.raw.len())
-        .ok_or_else(|| PipelineError::runtime("ResourceReplacer offset overflow"))?;
     Ok(())
 }
 ```
 
-`handle_eof` keeps the default no-op. The EOF raw length is zero.
+Build both lookup keys and replacement tokens from decoded name bodies by prepending the canonical
+name sigil without stripping a leading body slash; the serializer then escapes that body slash as
+`#2f`. Match qpdf's failure ordering exactly: a replacement advances after its write succeeds,
+while a non-replacement advances before attempting the raw write. `handle_eof` keeps the default
+no-op. The EOF raw length is zero.
 
 - [ ] **Step 4: Implement shared immediate orchestration**
 
@@ -1185,6 +1192,7 @@ Change `ResourceCallbacks` to contain:
 ```rust
 finder: ResourceFinder,
 inline_header: Option<Vec<Object>>,
+valid_xobjects: Vec<Vec<u8>>,
 complete: bool,
 ```
 
@@ -1194,24 +1202,28 @@ For every object callback:
 2. retain only the pruning-specific `BI`/`ID` header validation and inline ColorSpace collection;
 3. do not classify ordinary resource operators locally.
 
-After successful parsing:
+For each ordinary `Do` event received while collection is still complete and outside an inline
+header, append the finder's current name to `valid_xobjects`. A diagnostic permanently closes this
+valid traversal prefix. After parsing:
 
 ```rust
-if callbacks.finder.had_diagnostics() {
-    return Ok(false);
-}
+let mut complete =
+    parse_result.is_ok() && !callbacks.finder.had_diagnostics() && callbacks.complete;
 let names = callbacks.finder.names_by_resource_type();
-record_direct_names(ctx.used, names, scope.record_direct);
-for name in names
-    .get(b"XObject".as_slice())
-    .into_iter()
-    .flat_map(|by_name| by_name.keys())
-{
+if complete {
+    record_direct_names(ctx.used, names, scope.record_direct);
+}
+let mut traversed = BTreeSet::new();
+for name in &callbacks.valid_xobjects {
+    if !traversed.insert(name.as_slice()) {
+        continue;
+    }
     if !recurse_form_xobject(ctx, name, scope, depth)? {
-        return Ok(false);
+        complete = false;
+        break;
     }
 }
-Ok(callbacks.complete)
+Ok(complete)
 ```
 
 `record_direct_names` copies all seven categories when `record_direct` is true, skips builtin
@@ -1223,20 +1235,11 @@ validation because `ResourceFinder` intentionally has no `ID -> ColorSpace` rule
 
 - [ ] **Step 4: Preserve structural error ordering explicitly**
 
-Iterate XObject names in first raw-offset order, not lexical name order:
-
-```rust
-let mut xobjects = names
-    .get(b"XObject".as_slice())
-    .into_iter()
-    .flat_map(|by_name| by_name.iter())
-    .map(|(name, offsets)| (offsets.iter().next().copied().unwrap_or(usize::MAX), name))
-    .collect::<Vec<_>>();
-xobjects.sort_by_key(|(offset, _)| *offset);
-```
-
-This keeps the first failing Form resolution aligned with content order while still deduplicating
-names through the finder map.
+Traverse the callback-order `valid_xobjects` prefix, deduplicated by name. Do not rebuild traversal
+from every name in the final finder map after incomplete parsing: `/Fm0 Do <0g>` must still surface
+the earlier Form/object structural error, while `<0g> /Fm0 Do` must stop before the later `Do`.
+Likewise, operators seen inside an invalid inline-image header and `Do`-looking bytes in an opaque
+inline-image payload must never become Form traversals.
 
 - [ ] **Step 5: Run focused resource-pruning tests**
 

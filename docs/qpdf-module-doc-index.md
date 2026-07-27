@@ -15,7 +15,7 @@
 | `crates/flpdf/src/bit_writer.rs` | correspondence | BitWriter.cc and bits_functions.hh MSB-first bit packing into a Pipeline stage |
 | `crates/flpdf/src/cache.rs` | correspondence | QPDF.cc xref-backed object cache represented as a standalone Rust module |
 | `crates/flpdf/src/check.rs` | correspondence | QPDFJob.cc document-check surface over reader diagnostics |
-| `crates/flpdf/src/content_normalizer.rs` | mirror | libqpdf/Pl_QPDFTokenizer.cc, libqpdf/ContentNormalizer.cc |
+| `crates/flpdf/src/content_normalizer.rs` | mirror | libqpdf/ContentNormalizer.cc |
 | `crates/flpdf/src/content_stream.rs` | correspondence | QPDFParser.cc content callbacks |
 | `crates/flpdf/src/default_appearance.rs` | correspondence | QPDFFormFieldObjectHelper.cc default-appearance parsing split from the form-field helper |
 | `crates/flpdf/src/diagnostics.rs` | correspondence | QPDFLogger.cc diagnostic routing represented as Rust values |
@@ -61,7 +61,7 @@
 | `crates/flpdf/src/outline_document_helper.rs` | correspondence | QPDFOutlineDocumentHelper.cc and QPDFOutlineObjectHelper.cc responsibilities split with outline.rs |
 | `crates/flpdf/src/overlay.rs` | correspondence | QPDFPageObjectHelper.cc placement and QPDFJob.cc overlay orchestration responsibilities |
 | `crates/flpdf/src/overlay_annotations.rs` | correspondence | QPDFPageObjectHelper.cc, QPDFAcroFormDocumentHelper.cc, ResourceFinder.cc, and QPDFObjectHandle.cc overlay responsibilities |
-| `crates/flpdf/src/overlay_appearance_stream.rs` | correspondence | QPDFAcroFormDocumentHelper.cc appearance adjustment plus ResourceFinder.cc token rewriting |
+| `crates/flpdf/src/overlay_appearance_stream.rs` | correspondence | QPDFAcroFormDocumentHelper.cc adjustAppearanceStream consuming resource_replacer.rs |
 | `crates/flpdf/src/page_annotation_enum.rs` | correspondence | QPDFPageObjectHelper.cc and QPDFAnnotationObjectHelper.cc annotation enumeration |
 | `crates/flpdf/src/page_annotation_flatten.rs` | correspondence | QPDFPageObjectHelper.cc annotation flattening split from the page helper |
 | `crates/flpdf/src/page_closure.rs` | correspondence | QPDF.cc copyForeignObject graph closure split from object copying |

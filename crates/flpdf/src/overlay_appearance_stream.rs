@@ -1,6 +1,6 @@
-//! qpdf correspondence: QPDFAcroFormDocumentHelper.cc appearance adjustment plus ResourceFinder.cc token rewriting.
-//! Port of qpdf's `AcroForm::adjustAppearanceStream` and its
-//! `ResourceReplacer` / `ResourceFinder` token filter
+//! qpdf correspondence: QPDFAcroFormDocumentHelper.cc adjustAppearanceStream consuming resource_replacer.rs.
+//! Port of qpdf's `AcroForm::adjustAppearanceStream`, consuming the shared
+//! `ResourceReplacer` / `ResourceFinder` resource-replacement pipeline
 //! (`libqpdf/QPDFAcroFormDocumentHelper.cc:628-849`, `libqpdf/ResourceFinder.cc`),
 //! called from [`crate::overlay_annotations`]'s `transform_annot_ap_streams`
 //! once per (already per-placement-dup'd) `/AP` appearance stream whenever a

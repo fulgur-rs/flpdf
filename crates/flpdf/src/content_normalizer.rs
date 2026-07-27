@@ -1,4 +1,4 @@
-//! Mirrors qpdf 11.9.0 libqpdf/Pl_QPDFTokenizer.cc, libqpdf/ContentNormalizer.cc.
+//! Mirrors qpdf 11.9.0 libqpdf/ContentNormalizer.cc.
 
 use crate::{
     pipeline::{buffer::Buffer, qpdf_tokenizer::QpdfTokenizer, Pipeline, PipelineResult},

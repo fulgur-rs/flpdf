@@ -71,8 +71,9 @@ The output helper wraps `Option<&mut dyn Pipeline>`:
 - `write_token` forwards a token's raw bytes;
 - constructing a canonical string or name token remains the filter's responsibility.
 
-The filter receives the output helper explicitly for each callback. Rust therefore does not need
-qpdf's mutable hidden pipeline pointer or a shared-ownership graph.
+The filter receives the output helper explicitly for each callback. `QpdfTokenizer` separately
+tracks the retained downstream borrow and whether filter output is still attached, reproducing
+qpdf's hidden pipeline pointer without a shared-ownership graph.
 
 ### QpdfTokenizer pipeline stage
 
@@ -85,13 +86,18 @@ qpdf's mutable hidden pipeline pointer or a shared-ownership graph.
   then one opaque inline-image token;
 - the EOF token is delivered before `handle_eof`;
 - filter output is forwarded or discarded through the output helper;
-- after successful filter callbacks, an optional downstream pipeline is finished;
+- the first successful `handle_eof` permanently detaches filter output before the retained
+  downstream pipeline is finished;
+- repeated finish and write-after-finish still deliver callbacks and finish downstream, but their
+  filter output is discarded;
 - callback/tokenization failures are returned unchanged and do not finish downstream;
+- token callback and `handle_eof` failures retain attachment, while downstream-finish failure
+  occurs after detachment and remains detached on retry;
 - chunk boundaries do not affect tokens, offsets, or output.
 
 The stage follows observed qpdf reuse behavior rather than adding a global Pipeline state machine.
-Oracle tests fix repeated `finish`, write-after-finish, and failed-finish behavior before production
-code chooses the corresponding retained/reset state.
+A live qpdf lifecycle probe fixes repeated `finish`, write-after-finish, and downstream-finish retry
+behavior, including the distinction between downstream ownership and filter-output attachment.
 
 ### ResourceFinder
 
@@ -100,9 +106,11 @@ code chooses the corresponding retained/reset state.
 
 It records:
 
-- the set of all resource names;
 - `resource type -> name -> raw start offsets`;
 - whether parser recovery diagnostics occurred.
+
+The flat `getNames()` view needed by the live qpdf oracle is the categorized map's key union and is
+derived only in tests; production does not retain a duplicate set.
 
 It tracks the most recently observed name and its offset. Like qpdf, unrelated operands do not clear
 that name, and a resource operator consults it without clearing it. The resource types are:
@@ -141,12 +149,15 @@ replacement[old name][raw offset] = new name
 For each token, it:
 
 1. checks a name token against the replacement table at the current raw offset;
-2. writes a canonical escaped replacement name when selected;
+2. converts the replacement's decoded name body to an unambiguous canonical name value and writes
+   its escaped token, including when the decoded body itself begins with `/`;
 3. otherwise writes the original raw token;
 4. increments its offset by the original token's raw length.
 
 Whitespace, comments, malformed tokens retained by the tokenizer, and opaque inline-image bytes pass
 through exactly. Replacement length never changes the source-offset counter.
+Matching qpdf's error ordering, a selected replacement advances after its write succeeds, while a
+non-replacement advances before attempting its downstream write.
 
 ## Consumer cutover
 
@@ -208,6 +219,11 @@ which discovered names belong to the current page scope and which `Do` names res
 XObjects that must be traversed. Parser diagnostics or errors make collection incomplete and retain
 the affected resource group.
 
+Form traversal follows the callback-order `Do` prefix observed before the first diagnostic, so an
+earlier Form/object structural error still propagates even when later content is malformed. A
+diagnostic permanently closes that prefix: later `Do` operators, operators inside an invalid inline
+header, and `Do`-looking bytes inside opaque inline-image payloads are never traversed.
+
 Inline-image header color spaces remain pruning-specific because qpdf's `ResourceFinder` does not
 classify the `ID` operator as a color-space consumer. This is not a duplicate general operator
 table.
@@ -217,7 +233,9 @@ table.
 - Pipeline and callback errors keep their original `PipelineError` category and message.
 - The first filter/tokenization failure is returned.
 - Downstream `finish` is called only after token delivery and `handle_eof` succeed.
-- A downstream finish failure is returned unchanged.
+- Successful `handle_eof` permanently detaches filter output before downstream `finish`.
+- Token callback and `handle_eof` failures retain attachment; a downstream finish failure is
+  returned unchanged with output already detached.
 - No finish is triggered from `Drop`.
 - Finder parse diagnostics are data-quality state, not structural Rust errors.
 - Overlay transforms retain original bytes when finder results are incomplete.
@@ -236,7 +254,8 @@ table.
 - `ID` separator and inline image behavior match qpdf;
 - empty input, malformed tokens, and terminal `ID` match qpdf;
 - filter callback failure and downstream finish failure occur at qpdf-compatible times;
-- repeated finish and write-after-finish are fixed by live qpdf probes.
+- repeated finish, write-after-finish, and downstream-finish retry/detachment are fixed by a live
+  qpdf lifecycle probe.
 
 ### ResourceFinder / ResourceReplacer tests
 
@@ -248,6 +267,8 @@ table.
 - repeated names record every offset;
 - replacements are selected by both name and offset;
 - canonical escaping is used for replacement names;
+- decoded replacement bodies beginning with `/` keep that byte as escaped name content;
+- replacement and non-replacement write failures preserve qpdf's offset-update ordering;
 - non-selected tokens and inline-image payloads remain byte-identical;
 - malformed-token and parser-diagnostic behavior is conservative.
 
