@@ -3,7 +3,7 @@ use crate::ascii85;
 use crate::ascii_hex;
 use crate::run_length;
 use crate::stream_filter::{
-    decode_filter_specs, decode_flate, encode_flate, DECODE_OUTPUT_LIMIT_PREFIX,
+    decode_filter_specs, encode_flate, stream_filter_for, DECODE_OUTPUT_LIMIT_PREFIX,
 };
 use crate::{Dictionary, Error, Object, Result};
 
@@ -176,8 +176,18 @@ where
         if filter_name == b"Crypt" {
             decoded = decrypt_crypt(spec.decode_params, &decoded)?;
         } else {
-            decoded = if filter_name == b"FlateDecode" {
-                decode_flate(&decoded, limits.max_output)?
+            decoded = if let Some(mut filter) = stream_filter_for(filter_name) {
+                if !filter.set_decode_params(spec.decode_params) {
+                    return Err(Error::Unsupported(format!(
+                        "stream filter {} does not support supplied /DecodeParms",
+                        String::from_utf8_lossy(filter_name)
+                    )));
+                }
+                // qpdf validates DecodeParms before constructing or writing to
+                // the codec pipeline. Predictor migration remains in qynx.5.3,
+                // but its existing validation must retain that error timing.
+                extract_predictor_params(spec.decode_params)?;
+                filter.pipe_decode(&decoded, limits.max_output, &mut |_, _| Ok(()))?
             } else {
                 apply_single_filter_decode(
                     filter_name,
@@ -790,6 +800,21 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "unsupported PDF feature: stream inflate: inflate: data: incorrect header check"
+        );
+    }
+    #[test]
+    fn invalid_flate_decode_params_fail_before_malformed_stream_data() {
+        let mut params = Dictionary::new();
+        params.insert("Predictor", Object::Integer(9));
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        dict.insert("DecodeParms", Object::Dictionary(params));
+
+        let error = decode_stream_data(&dict, b"not deflate data").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: unsupported /DecodeParms /Predictor 9"
         );
     }
     #[test]

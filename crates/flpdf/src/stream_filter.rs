@@ -1,13 +1,11 @@
-//! qpdf correspondence: QPDFStreamFilter.cc and QPDF_Stream.cc filter-name,
-//! DecodeParms-alignment, and decode-pipeline construction responsibilities.
+//! qpdf correspondence: QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities.
 
 use crate::pipeline::buffer::Buffer;
 use crate::pipeline::flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE};
 use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 use crate::{Error, Object, Result};
 
-pub(crate) const DECODE_OUTPUT_LIMIT_PREFIX: &str =
-    "decoded output exceeds configured limit of";
+pub(crate) const DECODE_OUTPUT_LIMIT_PREFIX: &str = "decoded output exceeds configured limit of";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FilterSpec<'a> {
@@ -123,6 +121,69 @@ fn map_pipeline_error(error: PipelineError) -> Error {
     Error::Unsupported(error.to_string())
 }
 
+/// Rust equivalent of qpdf's `QPDFStreamFilter` extension boundary.
+///
+/// `pipe_decode` owns construction and completion of the filter's decode
+/// pipeline. A whole-buffer result keeps flpdf's public API stable while the
+/// individual codecs are migrated to incremental `Pipeline` stages.
+pub(crate) trait StreamFilter {
+    fn set_decode_params(&mut self, decode_params: Option<&Object>) -> bool {
+        decode_params.is_none_or(|params| matches!(params, Object::Null))
+    }
+
+    fn pipe_decode(
+        &mut self,
+        data: &[u8],
+        max_output: Option<usize>,
+        warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+    ) -> Result<Vec<u8>>;
+
+    // flpdf's current public decode API always requests full decoding, so
+    // classification becomes a production decision only when decode levels
+    // are introduced. Keep the qpdf extension contract available to later
+    // registered filters.
+    #[allow(dead_code)]
+    fn is_specialized_compression(&self) -> bool {
+        false
+    }
+
+    #[allow(dead_code)]
+    fn is_lossy_compression(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Default)]
+struct FlateStreamFilter {
+    decode_params: Option<Object>,
+}
+
+impl StreamFilter for FlateStreamFilter {
+    fn set_decode_params(&mut self, decode_params: Option<&Object>) -> bool {
+        // SF_FlateLzwDecode::setDecodeParms asks getKeys() for every non-null
+        // object. qpdf warns and treats a non-dictionary as an empty
+        // dictionary, so it remains filterable.
+        self.decode_params = decode_params.cloned();
+        true
+    }
+
+    fn pipe_decode(
+        &mut self,
+        data: &[u8],
+        max_output: Option<usize>,
+        warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+    ) -> Result<Vec<u8>> {
+        decode_flate_chunks([data], max_output, warn)
+    }
+}
+
+pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilter>> {
+    match filter_name {
+        b"FlateDecode" => Some(Box::new(FlateStreamFilter::default())),
+        _ => None,
+    }
+}
+
 fn decode_flate_chunks<'a>(
     chunks: impl IntoIterator<Item = &'a [u8]>,
     max_output: Option<usize>,
@@ -146,7 +207,8 @@ fn decode_flate_chunks<'a>(
     Ok(sink.data)
 }
 
-pub(crate) fn decode_flate(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>> {
+#[cfg(test)]
+fn decode_flate(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>> {
     decode_flate_chunks([data], max_output, &mut |_, _| Ok(()))
 }
 
@@ -169,7 +231,7 @@ pub(crate) fn encode_flate(data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_filter_specs, decode_flate, decode_flate_chunks, encode_flate,
+        decode_filter_specs, decode_flate, decode_flate_chunks, encode_flate, stream_filter_for,
         DECODE_OUTPUT_LIMIT_PREFIX,
     };
     use crate::{Dictionary, Error, Object};
@@ -275,8 +337,7 @@ mod tests {
     #[test]
     fn flate_decode_is_invariant_across_input_chunks() {
         let encoded = encode_flate(b"chunk boundaries must not matter").unwrap();
-        let whole =
-            decode_flate_chunks([encoded.as_slice()], None, &mut |_, _| Ok(())).unwrap();
+        let whole = decode_flate_chunks([encoded.as_slice()], None, &mut |_, _| Ok(())).unwrap();
         let split = decode_flate_chunks(encoded.chunks(1), None, &mut |_, _| Ok(())).unwrap();
 
         assert_eq!(whole, b"chunk boundaries must not matter");
@@ -304,14 +365,10 @@ mod tests {
     fn incomplete_input_reports_qpdf_warning_before_downstream_finish() {
         let warnings = RefCell::new(Vec::new());
 
-        let decoded = decode_flate_chunks(
-            [b"\x78".as_slice()],
-            None,
-            &mut |message, code| {
-                warnings.borrow_mut().push((message.to_string(), code));
-                Ok(())
-            },
-        )
+        let decoded = decode_flate_chunks([b"\x78".as_slice()], None, &mut |message, code| {
+            warnings.borrow_mut().push((message.to_string(), code));
+            Ok(())
+        })
         .unwrap();
 
         assert!(decoded.is_empty());
@@ -328,14 +385,10 @@ mod tests {
     fn empty_inflate_skips_codec_and_warning_like_qpdf() {
         let warnings = RefCell::new(Vec::new());
 
-        let decoded = decode_flate_chunks(
-            std::iter::empty(),
-            None,
-            &mut |message, code| {
-                warnings.borrow_mut().push((message.to_string(), code));
-                Ok(())
-            },
-        )
+        let decoded = decode_flate_chunks(std::iter::empty(), None, &mut |message, code| {
+            warnings.borrow_mut().push((message.to_string(), code));
+            Ok(())
+        })
         .unwrap();
 
         assert!(decoded.is_empty());
@@ -361,5 +414,32 @@ mod tests {
     #[test]
     fn empty_encode_skips_codec_and_emits_no_wrapper_like_qpdf() {
         assert!(encode_flate(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn flate_factory_exposes_qpdf_stream_filter_contract() {
+        let mut filter = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
+
+        assert!(filter.set_decode_params(None));
+        assert!(!filter.is_specialized_compression());
+        assert!(!filter.is_lossy_compression());
+
+        let encoded = encode_flate(b"factory pipeline").unwrap();
+        let decoded = filter
+            .pipe_decode(&encoded, None, &mut |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(decoded, b"factory pipeline");
+    }
+
+    #[test]
+    fn flate_factory_treats_non_dictionary_decode_params_as_empty_like_qpdf() {
+        let mut filter = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
+
+        assert!(filter.set_decode_params(Some(&Object::Integer(1))));
+    }
+
+    #[test]
+    fn factory_returns_none_for_not_yet_migrated_filters() {
+        assert!(stream_filter_for(b"ASCII85Decode").is_none());
     }
 }
