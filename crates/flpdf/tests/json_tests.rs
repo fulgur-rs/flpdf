@@ -182,6 +182,55 @@ fn qpdf_blob_streams_base64_without_one_full_encoded_write() {
 }
 
 #[test]
+fn blob_callback_can_reenter_the_same_callback() {
+    let holder = Rc::new(RefCell::new(None::<Json>));
+    let weak_holder = Rc::downgrade(&holder);
+    let nested = Rc::new(Cell::new(false));
+    let blob = Json::make_blob({
+        let nested = nested.clone();
+        move |out| {
+            if nested.replace(true) {
+                out.write_all(b"x")?;
+            } else {
+                let blob = weak_holder
+                    .upgrade()
+                    .expect("holder is alive")
+                    .borrow()
+                    .as_ref()
+                    .expect("blob is installed")
+                    .clone();
+                blob.write(out, 0)?;
+            }
+            Ok(())
+        }
+    });
+    *holder.borrow_mut() = Some(blob.clone());
+
+    assert_eq!(blob.unparse().unwrap(), b"\"ImVBPT0i\"");
+    holder.borrow_mut().take();
+}
+
+#[test]
+fn blob_error_does_not_finalize_a_partial_base64_group() {
+    for (raw, expected) in [
+        (b"x".as_slice(), b"\"".as_slice()),
+        (b"abcd".as_slice(), b"\"YWJj".as_slice()),
+    ] {
+        let raw = raw.to_vec();
+        let blob = Json::make_blob(move |out| {
+            out.write_all(&raw)?;
+            Err(io::Error::other("producer failed"))
+        });
+        let mut bytes = Vec::new();
+
+        let error = blob.write(&mut bytes, 0).unwrap_err();
+
+        assert_eq!(error.to_string(), "producer failed");
+        assert_eq!(bytes, expected);
+    }
+}
+
+#[test]
 fn dictionary_writer_rereads_value_after_key_output() {
     let dictionary = Json::make_dictionary();
     dictionary

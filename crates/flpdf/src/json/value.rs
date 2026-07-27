@@ -18,7 +18,7 @@ pub enum JsonError {
 #[derive(Clone, Default)]
 pub struct Json(Option<Rc<RefCell<Members>>>);
 
-type BlobWriter = Rc<RefCell<Box<dyn FnMut(&mut dyn io::Write) -> io::Result<()>>>>;
+type BlobWriter = Rc<dyn Fn(&mut dyn io::Write) -> io::Result<()>>;
 
 impl std::fmt::Debug for Json {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -173,8 +173,8 @@ impl Json {
         Self::with_value(Value::Null)
     }
 
-    pub fn make_blob(callback: impl FnMut(&mut dyn io::Write) -> io::Result<()> + 'static) -> Self {
-        Self::with_value(Value::Blob(Rc::new(RefCell::new(Box::new(callback)))))
+    pub fn make_blob(callback: impl Fn(&mut dyn io::Write) -> io::Result<()> + 'static) -> Self {
+        Self::with_value(Value::Blob(Rc::new(callback)))
     }
 
     pub fn is_array(&self) -> bool {
@@ -510,9 +510,7 @@ mod tests {
 
     #[test]
     fn blob_writer_base64_encodes_the_bytes_produced_by_its_callback() {
-        let blob = Json::with_value(Value::Blob(Rc::new(std::cell::RefCell::new(Box::new(
-            |out| out.write_all(b"\x00\xff"),
-        )))));
+        let blob = Json::with_value(Value::Blob(Rc::new(|out| out.write_all(b"\x00\xff"))));
 
         assert_eq!(blob.unparse().unwrap(), b"\"AP8=\"");
     }

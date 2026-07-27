@@ -2,10 +2,78 @@
 
 use std::io::{self, Write};
 
-use base64::{engine::general_purpose::STANDARD, write::EncoderWriter};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 use super::value::{ContainerOrBlobSnapshot, ValueSnapshot};
 use super::Json;
+
+struct Base64Writer<'a, W: Write + ?Sized> {
+    out: &'a mut W,
+    pending: [u8; 3],
+    pending_len: usize,
+}
+
+impl<'a, W: Write + ?Sized> Base64Writer<'a, W> {
+    fn new(out: &'a mut W) -> Self {
+        Self {
+            out,
+            pending: [0; 3],
+            pending_len: 0,
+        }
+    }
+
+    fn write_group(&mut self, group: &[u8; 3]) -> io::Result<()> {
+        let mut encoded = [0; 4];
+        STANDARD
+            .encode_slice(group, &mut encoded)
+            .expect("three input bytes always encode into four output bytes");
+        self.out.write_all(&encoded)
+    }
+
+    fn finish(self) -> io::Result<()> {
+        if self.pending_len != 0 {
+            let encoded = STANDARD.encode(&self.pending[..self.pending_len]);
+            self.out.write_all(encoded.as_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write + ?Sized> Write for Base64Writer<'_, W> {
+    fn write(&mut self, mut input: &[u8]) -> io::Result<usize> {
+        let input_len = input.len();
+
+        if self.pending_len != 0 {
+            let needed = 3 - self.pending_len;
+            let copied = needed.min(input.len());
+            self.pending[self.pending_len..self.pending_len + copied]
+                .copy_from_slice(&input[..copied]);
+            self.pending_len += copied;
+            input = &input[copied..];
+            if self.pending_len == 3 {
+                let group = self.pending;
+                self.write_group(&group)?;
+                self.pending_len = 0;
+            }
+        }
+
+        while input.len() >= 3 {
+            let group: [u8; 3] = input[..3]
+                .try_into()
+                .expect("three-byte slice has fixed length");
+            self.write_group(&group)?;
+            input = &input[3..];
+        }
+
+        self.pending[..input.len()].copy_from_slice(input);
+        self.pending_len = input.len();
+        Ok(input_len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
+    }
+}
 
 impl Json {
     pub fn write_dictionary_open(
@@ -169,9 +237,9 @@ fn write_container_or_blob(
         }
         ContainerOrBlobSnapshot::Blob(writer) => {
             out.write_all(b"\"")?;
-            let mut encoder = EncoderWriter::new(&mut *out, &STANDARD);
-            writer.borrow_mut()(&mut encoder)?;
-            let out = encoder.finish()?;
+            let mut encoder = Base64Writer::new(&mut *out);
+            writer(&mut encoder)?;
+            encoder.finish()?;
             out.write_all(b"\"")
         }
     }
