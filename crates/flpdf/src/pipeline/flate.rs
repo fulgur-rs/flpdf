@@ -146,6 +146,10 @@ impl<'a> Flate<'a> {
         })
     }
 
+    fn handle_buf_error(&mut self) -> PipelineResult<()> {
+        self.warn(BUF_ERROR_WARNING, Z_BUF_ERROR)
+    }
+
     fn initialize_codec(&mut self) {
         if self.codec.is_some() {
             return;
@@ -214,13 +218,12 @@ impl<'a> Flate<'a> {
         }
     }
 
-    fn write_deflate(&mut self, data: &[u8], flush: FlushCompress) -> PipelineResult<()> {
-        let Some(FlateCodec::Deflate(codec)) = self.codec.as_mut() else {
-            return Err(PipelineError::state(
-                &self.identifier,
-                "deflate codec is unavailable",
-            ));
-        };
+    fn write_deflate(
+        &mut self,
+        codec: &mut Compress,
+        data: &[u8],
+        flush: FlushCompress,
+    ) -> PipelineResult<()> {
         let mut input_offset = 0;
 
         loop {
@@ -236,14 +239,7 @@ impl<'a> Flate<'a> {
                 .map_err(|source| PipelineError::codec_with_source(identifier, detail, source))?;
 
             if status == Status::BufError {
-                self.warn(BUF_ERROR_WARNING, Z_BUF_ERROR)?;
-                if flush == FlushCompress::Finish {
-                    return Err(PipelineError::codec(
-                        &self.identifier,
-                        "deflate: End: zlib data error",
-                    ));
-                }
-                return Ok(());
+                return self.handle_buf_error();
             }
 
             if produced > 0 {
@@ -262,7 +258,12 @@ impl<'a> Flate<'a> {
         }
     }
 
-    fn write_inflate(&mut self, data: &[u8], flush: FlushDecompress) -> PipelineResult<()> {
+    fn write_inflate(
+        &mut self,
+        codec: &mut Decompress,
+        data: &[u8],
+        flush: FlushDecompress,
+    ) -> PipelineResult<()> {
         let mut input_offset = 0;
 
         loop {
@@ -292,12 +293,6 @@ impl<'a> Flate<'a> {
                 InflatePhase::Body => {}
             }
 
-            let Some(FlateCodec::Inflate(codec)) = self.codec.as_mut() else {
-                return Err(PipelineError::state(
-                    &self.identifier,
-                    "inflate codec is unavailable",
-                ));
-            };
             let before_in = codec.total_in();
             let before_out = codec.total_out();
             let result = codec.decompress(&data[input_offset..], &mut self.output, flush);
@@ -317,8 +312,7 @@ impl<'a> Flate<'a> {
             };
 
             if status == Status::BufError {
-                self.warn(BUF_ERROR_WARNING, Z_BUF_ERROR)?;
-                return Ok(());
+                return self.handle_buf_error();
             }
 
             if produced > 0 {
@@ -336,19 +330,42 @@ impl<'a> Flate<'a> {
         }
     }
 
+    fn process_codec(&mut self, data: &[u8], finishing: bool) -> PipelineResult<()> {
+        let Some(mut codec) = self.codec.take() else {
+            return Ok(());
+        };
+        let result = match &mut codec {
+            FlateCodec::Inflate(codec) => {
+                if matches!(self.inflate_state.phase, InflatePhase::Ended) {
+                    Ok(())
+                } else {
+                    self.write_inflate(
+                        codec,
+                        data,
+                        if finishing {
+                            FlushDecompress::Finish
+                        } else {
+                            FlushDecompress::Sync
+                        },
+                    )
+                }
+            }
+            FlateCodec::Deflate(codec) => self.write_deflate(
+                codec,
+                data,
+                if finishing {
+                    FlushCompress::Finish
+                } else {
+                    FlushCompress::None
+                },
+            ),
+        };
+        self.codec = Some(codec);
+        result
+    }
+
     fn finish_codec(&mut self) -> PipelineResult<()> {
-        match self.action {
-            FlateAction::Deflate if self.codec.is_some() => {
-                self.write_deflate(&[], FlushCompress::Finish)
-            }
-            FlateAction::Inflate
-                if self.codec.is_some()
-                    && !matches!(self.inflate_state.phase, InflatePhase::Ended) =>
-            {
-                self.write_inflate(&[], FlushDecompress::Finish)
-            }
-            FlateAction::Inflate | FlateAction::Deflate => Ok(()),
-        }
+        self.process_codec(&[], true)
     }
 }
 
@@ -369,10 +386,7 @@ impl Pipeline for Flate<'_> {
         }
 
         self.initialize_codec();
-        match self.action {
-            FlateAction::Inflate => self.write_inflate(data, FlushDecompress::Sync),
-            FlateAction::Deflate => self.write_deflate(data, FlushCompress::None),
-        }
+        self.process_codec(data, false)
     }
 
     fn finish(&mut self) -> PipelineResult<()> {
@@ -650,7 +664,26 @@ mod tests {
             let err = flate.write(&header).unwrap_err();
             assert_eq!(err.kind(), PipelineErrorKind::Codec);
             assert_eq!(err.message(), format!("inflate: data: {detail}"));
+            assert_eq!(err.source().unwrap().to_string(), detail);
         }
+    }
+
+    #[test]
+    fn preset_dictionary_stream_is_rejected_before_raw_body_decode() {
+        let mut sink = RecordingSink::default();
+        let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 3).unwrap();
+        let err = flate
+            .write(&[0x78, 0x20, 0x00, 0x00, 0x00, 0x01])
+            .unwrap_err();
+        assert_eq!(err.kind(), PipelineErrorKind::Codec);
+        assert_eq!(
+            err.message(),
+            "inflate: data: preset dictionary is not supported"
+        );
+        assert_eq!(
+            err.source().unwrap().to_string(),
+            "preset dictionary is not supported"
+        );
     }
 
     #[test]
