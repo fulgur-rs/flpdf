@@ -4346,43 +4346,13 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
     page_ref: ObjectRef,
     seen: &mut HashSet<ObjectRef>,
 ) -> CliResult<Vec<bool>> {
-    // Resolve the page dictionary to find its /Contents value.
-    let page_obj = pdf.resolve_borrowed(page_ref)?;
-    let Object::Dictionary(page_dict) = page_obj else {
-        return Ok(Vec::new()); // Not a page dict — skip silently.
-    };
-
-    let contents = match page_dict.get("Contents").cloned() {
-        None => return Ok(Vec::new()), // Empty page — nothing to normalize.
-        Some(c) => c,
-    };
-
     let mut warnings = Vec::new();
-    match contents {
-        Object::Reference(stream_ref) => {
-            if let Some(last_bad) = normalize_and_store_stream(pdf, stream_ref, seen)? {
+    for (stream_ref, stream) in pages::page_content_stream_entries(pdf, page_ref)? {
+        if let Some(stream_ref) = stream_ref {
+            if let Some(last_bad) = normalize_and_store_stream(pdf, stream_ref, stream, seen)? {
                 warnings.push(last_bad);
             }
         }
-        Object::Array(elems) => {
-            // Multiple content streams — normalize each one in-place.
-            // (If --coalesce-contents was also given, this is already a
-            // single stream; but we handle the array case for safety.)
-            for elem in elems {
-                if let Object::Reference(r) = elem {
-                    if let Some(last_bad) = normalize_and_store_stream(pdf, r, seen)? {
-                        warnings.push(last_bad);
-                    }
-                }
-                // Direct-stream elements are unusual in real PDFs; skip them
-                // (they have no separate object to patch).
-            }
-        }
-        Object::Stream(_) => {
-            // Direct (inline) stream on the page dict itself — no separate
-            // object ref to patch; skip silently.
-        }
-        _ => {}
     }
     Ok(warnings)
 }
@@ -4392,16 +4362,12 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
 fn normalize_and_store_stream<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
     stream_ref: ObjectRef,
+    stream: Stream,
     seen: &mut HashSet<ObjectRef>,
 ) -> CliResult<Option<bool>> {
     if !seen.insert(stream_ref) {
         return Ok(None);
     }
-
-    let resolved = pdf.resolve_borrowed(stream_ref)?;
-    let Object::Stream(stream) = resolved else {
-        return Ok(None); // Not a stream — skip.
-    };
 
     // Decode the stored bytes through the declared filter pipeline.
     let decoded = filters::decode_stream_data(&stream.dict, &stream.data)?;
@@ -5714,6 +5680,63 @@ mod tests {
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn apply_normalize_content_follows_two_hop_holder_chain() {
+        let mut pdf = Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        )
+        .unwrap();
+        let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
+        let holder_ref = ObjectRef::new(100, 0);
+        let stream_ref = ObjectRef::new(101, 0);
+
+        let mut page = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+        page.insert("Contents", Object::Reference(holder_ref));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+        pdf.set_object(holder_ref, Object::Reference(stream_ref));
+
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert("Length", Object::Integer(4));
+        pdf.set_object(
+            stream_ref,
+            Object::Stream(Stream::new(stream_dict, b"\r<0g".to_vec())),
+        );
+
+        let mut seen = HashSet::new();
+        let warnings = apply_normalize_content(&mut pdf, page_ref, &mut seen).unwrap();
+
+        assert_eq!(warnings, vec![true]);
+        assert_eq!(seen, HashSet::from([stream_ref]));
+        let stream = pdf.resolve(stream_ref).unwrap().into_stream().unwrap();
+        assert_eq!(stream.data, b"\n<0g");
+    }
+
+    #[test]
+    fn apply_normalize_content_leaves_direct_stream_unchanged() {
+        let mut pdf = Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        )
+        .unwrap();
+        let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
+        let direct_stream = Stream::new(Dictionary::new(), b"\r<0g".to_vec());
+        let mut page = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+        page.insert("Contents", Object::Stream(direct_stream));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+
+        let mut seen = HashSet::new();
+        let warnings = apply_normalize_content(&mut pdf, page_ref, &mut seen).unwrap();
+
+        assert!(warnings.is_empty());
+        assert!(seen.is_empty());
+        let page = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+        assert_eq!(
+            page.get("Contents")
+                .and_then(Object::as_stream)
+                .map(|stream| stream.data.as_slice()),
+            Some(&b"\r<0g"[..])
+        );
     }
 
     #[cfg(unix)]

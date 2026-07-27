@@ -3252,6 +3252,42 @@ fn one_page_pdf_with_content(content: &[u8]) -> Vec<u8> {
     ])
 }
 
+fn one_page_pdf_with_indirect_contents_array(content: &[u8]) -> Vec<u8> {
+    let stream = [
+        format!("5 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>\nendobj\n",
+        b"4 0 obj\n[5 0 R]\nendobj\n",
+        stream.as_slice(),
+    ])
+}
+
+fn one_page_pdf_with_indirect_filtered_contents_array(content: &[u8]) -> Vec<u8> {
+    let stream = [
+        format!(
+            "5 0 obj\n<< /Filter /FlateDecode /Length {} >>\nstream\n",
+            content.len()
+        )
+        .into_bytes(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>\nendobj\n",
+        b"4 0 obj\n[5 0 R]\nendobj\n",
+        stream.as_slice(),
+    ])
+}
+
 fn one_page_pdf_with_duplicate_content_array(content: &[u8]) -> Vec<u8> {
     let stream = [
         format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
@@ -3297,6 +3333,24 @@ fn two_page_pdf_with_shared_content(content: &[u8]) -> Vec<u8> {
         stream.as_slice(),
     ];
     build_classic_pdf(&objects)
+}
+
+fn two_page_pdf_with_indirect_content_aliases(content: &[u8]) -> Vec<u8> {
+    let stream = [
+        format!("7 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 5 0 R >>\nendobj\n",
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 6 0 R >>\nendobj\n",
+        b"5 0 obj\n[7 0 R]\nendobj\n",
+        b"6 0 obj\n[7 0 R]\nendobj\n",
+        stream.as_slice(),
+    ])
 }
 
 fn empty_object_json_pdf() -> Vec<u8> {
@@ -3946,6 +4000,70 @@ fn rewrite_normalize_content_bad_token_writes_output_warns_and_exits_three() {
 }
 
 #[test]
+fn rewrite_normalize_content_follows_indirect_contents_array() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("indirect-array-bad-content.pdf");
+    let output = temp.path().join("normalized.pdf");
+    std::fs::write(&input, one_page_pdf_with_indirect_contents_array(b"\r<0g")).unwrap();
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--normalize-content=y", "--compress-streams=n"])
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(3));
+    assert!(output.exists(), "qpdf warning exit must retain output");
+    assert_eq!(
+        String::from_utf8(result.stderr).unwrap(),
+        format!(
+            "WARNING: {}: content normalization encountered bad tokens\n\
+             WARNING: {}: normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
+             WARNING: {}: Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
+             flpdf: operation succeeded with warnings; resulting file may have some problems\n",
+            input.display(),
+            input.display(),
+            input.display(),
+        )
+    );
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let page = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    assert_eq!(
+        flpdf::pages::page_content_bytes(&mut pdf, page).unwrap(),
+        b"\n<0g"
+    );
+}
+
+#[test]
+fn rewrite_normalize_content_propagates_indirect_stream_decode_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("indirect-array-corrupt-flate.pdf");
+    let output = temp.path().join("normalized.pdf");
+    std::fs::write(
+        &input,
+        one_page_pdf_with_indirect_filtered_contents_array(b"not a zlib stream"),
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--normalize-content=y", "--compress-streams=n"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("deflate"));
+
+    assert!(
+        !output.exists(),
+        "decode failure must abort before creating output"
+    );
+}
+
+#[test]
 fn rewrite_normalize_content_recovered_bad_token_omits_terminal_warning() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("recovered-content.pdf");
@@ -4024,6 +4142,45 @@ fn rewrite_normalize_content_duplicate_array_stream_warns_once() {
             input.display(),
         )
     );
+}
+
+#[test]
+fn rewrite_normalize_content_deduplicates_terminal_stream_aliases() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("aliased-bad-content.pdf");
+    let output = temp.path().join("normalized.pdf");
+    std::fs::write(&input, two_page_pdf_with_indirect_content_aliases(b"\r<0g")).unwrap();
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--normalize-content=y", "--compress-streams=n"])
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(3));
+    assert!(output.exists(), "qpdf warning exit must retain output");
+    assert_eq!(
+        String::from_utf8(result.stderr).unwrap(),
+        format!(
+            "WARNING: {}: content normalization encountered bad tokens\n\
+             WARNING: {}: normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
+             WARNING: {}: Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
+             flpdf: operation succeeded with warnings; resulting file may have some problems\n",
+            input.display(),
+            input.display(),
+            input.display(),
+        )
+    );
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    for page in flpdf::pages::page_refs(&mut pdf).unwrap() {
+        assert_eq!(
+            flpdf::pages::page_content_bytes(&mut pdf, page).unwrap(),
+            b"\n<0g"
+        );
+    }
 }
 
 #[test]

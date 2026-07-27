@@ -100,11 +100,75 @@ fn one_page_content_pdf(content: &[u8]) -> Vec<u8> {
     pdf
 }
 
+fn classic_pdf(objects: &[&[u8]]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for object in objects {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(object);
+    }
+    let size = offsets.len() + 1;
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    pdf
+}
+
+fn one_page_indirect_contents_array_pdf(content: &[u8]) -> Vec<u8> {
+    let stream = [
+        format!("5 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>\nendobj\n",
+        b"4 0 obj\n[5 0 R]\nendobj\n",
+        stream.as_slice(),
+    ])
+}
+
+fn two_page_indirect_contents_alias_pdf(content: &[u8]) -> Vec<u8> {
+    let stream = [
+        format!("7 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 5 0 R >>\nendobj\n",
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 6 0 R >>\nendobj\n",
+        b"5 0 obj\n[7 0 R]\nendobj\n",
+        b"6 0 obj\n[7 0 R]\nendobj\n",
+        stream.as_slice(),
+    ])
+}
+
 fn single_page_content(path: &Path) -> Vec<u8> {
     let bytes = std::fs::read(path).unwrap();
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
     let page = page_refs(&mut pdf).unwrap()[0];
     page_content_bytes(&mut pdf, page).unwrap()
+}
+
+fn all_page_content(path: &Path) -> Vec<Vec<u8>> {
+    let bytes = std::fs::read(path).unwrap();
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    page_refs(&mut pdf)
+        .unwrap()
+        .into_iter()
+        .map(|page| page_content_bytes(&mut pdf, page).unwrap())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +402,103 @@ fn normalize_content_bad_tokens_match_qpdf_bytes_and_warning_exit() {
         single_page_content(&flpdf_output),
         single_page_content(&qpdf_output)
     );
+}
+
+#[test]
+fn normalize_content_indirect_forms_match_qpdf_11_9() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let version = ShellCommand::new("qpdf")
+        .arg("--version")
+        .output()
+        .expect("run qpdf --version");
+    let version = String::from_utf8(version.stdout).unwrap();
+    assert_eq!(version.lines().next(), Some("qpdf version 11.9.0"));
+
+    let tmp = tempdir().unwrap();
+    let cases = [
+        (
+            "indirect-array",
+            one_page_indirect_contents_array_pdf(b"\r<0g"),
+            vec![b"\n<0g".to_vec()],
+        ),
+        (
+            "terminal-alias",
+            two_page_indirect_contents_alias_pdf(b"\r<0g"),
+            vec![b"\n<0g".to_vec(), b"\n<0g".to_vec()],
+        ),
+    ];
+
+    for (name, bytes, expected) in cases {
+        let input = tmp.path().join(format!("{name}-input.pdf"));
+        let qpdf_output = tmp.path().join(format!("{name}-qpdf.pdf"));
+        let flpdf_output = tmp.path().join(format!("{name}-flpdf.pdf"));
+        std::fs::write(&input, bytes).unwrap();
+
+        let qpdf = ShellCommand::new("qpdf")
+            .args([
+                "--normalize-content=y",
+                "--stream-data=uncompress",
+                "--object-streams=disable",
+            ])
+            .arg(&input)
+            .arg(&qpdf_output)
+            .output()
+            .expect("run qpdf indirect content normalization");
+        assert_eq!(
+            qpdf.status.code(),
+            Some(3),
+            "{name}: qpdf stderr:\n{}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+
+        let flpdf = CargoCommand::cargo_bin("flpdf")
+            .unwrap()
+            .args([
+                "rewrite",
+                "--full-rewrite",
+                "--normalize-content=y",
+                "--compress-streams=n",
+            ])
+            .arg(&input)
+            .arg(&flpdf_output)
+            .output()
+            .expect("run flpdf indirect content normalization");
+        assert_eq!(
+            flpdf.status.code(),
+            Some(3),
+            "{name}: flpdf stderr:\n{}",
+            String::from_utf8_lossy(&flpdf.stderr)
+        );
+
+        let qpdf_stderr = String::from_utf8(qpdf.stderr).unwrap();
+        let mut last_position = 0;
+        for warning in [
+            "content normalization encountered bad tokens",
+            "normalized content ended with a bad token",
+            "Resulting stream data may be corrupted but is may still useful",
+        ] {
+            assert_eq!(
+                qpdf_stderr.matches(warning).count(),
+                1,
+                "{name}: {qpdf_stderr}"
+            );
+            let position = qpdf_stderr.find(warning).unwrap();
+            assert!(
+                position >= last_position,
+                "{name}: qpdf warning order: {qpdf_stderr}"
+            );
+            last_position = position;
+        }
+
+        assert_eq!(all_page_content(&qpdf_output), expected, "{name}: qpdf");
+        assert_eq!(
+            all_page_content(&flpdf_output),
+            all_page_content(&qpdf_output),
+            "{name}: flpdf/qpdf"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

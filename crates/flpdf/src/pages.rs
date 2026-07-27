@@ -174,7 +174,7 @@ pub fn page_content_bytes<R: Read + Seek>(
 /// - [`Error::Unsupported`] when `page_ref` is not a `/Type /Page` dictionary, or
 ///   when a `/Contents` element does not resolve to a stream.
 /// - Any [`Error`] propagated from [`Pdf::resolve`].
-pub(crate) fn page_content_stream_entries<R: Read + Seek>(
+pub fn page_content_stream_entries<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> Result<Vec<(Option<ObjectRef>, Stream)>> {
