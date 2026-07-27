@@ -82,8 +82,10 @@ mod tests {
     #[test]
     fn count_ignores_empty_writes_and_is_reusable_after_finish() {
         let mut sink = RecordingSink::default();
+        assert_eq!(sink.identifier(), "recording");
         {
             let mut count = Count::new("count", &mut sink);
+            assert_eq!(count.identifier(), "count");
             count.write(b"abc").unwrap();
             count.write(b"").unwrap();
             assert_eq!(count.count(), 3);

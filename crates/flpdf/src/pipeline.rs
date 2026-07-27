@@ -164,21 +164,47 @@ mod tests {
 
     #[test]
     fn dependency_error_constructors_retain_the_source_chain() {
+        let io = PipelineError::io("file", std::io::Error::other("io dependency"));
         let codec = PipelineError::codec_with_source(
             "flate",
             "data error",
             std::io::Error::other("codec dependency"),
         );
+        let callback_without_source = PipelineError::callback("consumer", "callback declined");
         let callback = PipelineError::callback_with_source(
             "consumer",
             "callback failed",
             std::io::Error::other("callback dependency"),
         );
 
+        assert_eq!(io.kind(), PipelineErrorKind::Io);
+        assert_eq!(io.message(), "io dependency");
+        assert_eq!(io.source().unwrap().to_string(), "io dependency");
         assert_eq!(codec.source().unwrap().to_string(), "codec dependency");
+        assert_eq!(callback_without_source.kind(), PipelineErrorKind::Callback);
+        assert_eq!(callback_without_source.message(), "callback declined");
+        assert!(callback_without_source.source().is_none());
         assert_eq!(
             callback.source().unwrap().to_string(),
             "callback dependency"
         );
+    }
+
+    #[test]
+    fn fault_sink_exercises_the_pipeline_trait_contract() {
+        let mut sink = FaultSink {
+            id: "fault",
+            writes: 0,
+            finishes: 0,
+        };
+
+        assert_eq!(sink.identifier(), "fault");
+        assert_eq!(
+            sink.write(b"payload").unwrap_err().message(),
+            "write failed"
+        );
+        assert_eq!(sink.writes, 1);
+        sink.finish().unwrap();
+        assert_eq!(sink.finishes, 1);
     }
 }

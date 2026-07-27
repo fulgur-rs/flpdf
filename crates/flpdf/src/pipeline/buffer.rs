@@ -113,9 +113,11 @@ mod tests {
     #[test]
     fn buffer_retains_and_passes_through_exact_chunks() {
         let mut sink = RecordingSink::default();
+        assert_eq!(sink.identifier(), "recording");
         let retained;
         {
             let mut buffer = Buffer::new("tee", Some(&mut sink));
+            assert_eq!(buffer.identifier(), "tee");
             buffer.write(b"ab").unwrap();
             buffer.write(b"").unwrap();
             buffer.write(b"cd").unwrap();
