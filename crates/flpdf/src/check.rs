@@ -689,6 +689,28 @@ mod tests {
         )
     }
 
+    fn truncated_flate_then_invalid_ascii85_content_pdf() -> Vec<u8> {
+        let mut flate_dict = Dictionary::new();
+        flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        // Generate the compressed bytes in-process, then remove only the zlib
+        // trailer: Flate emits the invalid ASCII85 byte before warning that its
+        // input ended incomplete, so the next declared decoder still runs.
+        let mut encoded = encode_stream_data(&flate_dict, b"\x7f").unwrap();
+        encoded.pop();
+
+        let mut object = Vec::new();
+        object.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Filter [/FlateDecode /ASCII85Decode] /Length {} >>\nstream\n",
+                encoded.len()
+            )
+            .as_bytes(),
+        );
+        object.extend_from_slice(&encoded);
+        object.extend_from_slice(b"\nendstream\nendobj\n");
+        content_pdf("4 0 R", &[(4, object)])
+    }
+
     fn corrupt_ascii85_content_pdf() -> Vec<u8> {
         // ASCII85Decode framing over a byte that is invalid in an ASCII85 body.
         content_pdf(
@@ -1005,6 +1027,34 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.severity == Severity::Error));
+    }
+
+    #[test]
+    fn truncated_flate_warning_survives_later_ascii85_error() {
+        let report = check_reader_with_options(
+            Cursor::new(truncated_flate_then_invalid_ascii85_content_pdf()),
+            PdfOpenOptions {
+                repair: false,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!report.valid);
+        assert!(report.diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic.message.contains("content stream object 4 0")
+                && diagnostic
+                    .message
+                    .contains("input stream is complete but output may still be valid")
+        }));
+        assert!(report.diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Error
+                && diagnostic.message.contains("content stream object 4 0")
+                && diagnostic
+                    .message
+                    .contains("errors while decoding content stream")
+        }));
     }
 
     #[test]
