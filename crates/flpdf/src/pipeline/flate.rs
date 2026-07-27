@@ -76,6 +76,8 @@ impl fmt::Display for ZlibFormatError {
 
 impl std::error::Error for ZlibFormatError {}
 
+type WarnCallback<'a> = dyn FnMut(&str, i32) -> PipelineResult<()> + 'a;
+
 pub(crate) struct Flate<'a> {
     identifier: String,
     next: &'a mut dyn Pipeline,
@@ -84,7 +86,7 @@ pub(crate) struct Flate<'a> {
     inflate_state: InflateState,
     finished: bool,
     output: Vec<u8>,
-    warn_callback: Option<Box<dyn FnMut(&str, i32) -> PipelineResult<()> + 'a>>,
+    warn_callback: Option<Box<WarnCallback<'a>>>,
 }
 
 #[allow(dead_code)]

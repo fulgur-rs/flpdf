@@ -1,3 +1,55 @@
+use super::{Pipeline, PipelineError, PipelineResult};
+
+pub(crate) struct Count<'a> {
+    identifier: String,
+    next: &'a mut dyn Pipeline,
+    count: u64,
+    last_byte: u8,
+}
+
+#[allow(dead_code)]
+impl<'a> Count<'a> {
+    pub(crate) fn new(identifier: impl Into<String>, next: &'a mut dyn Pipeline) -> Self {
+        Self {
+            identifier: identifier.into(),
+            next,
+            count: 0,
+            last_byte: 0,
+        }
+    }
+
+    pub(crate) fn count(&self) -> u64 {
+        self.count
+    }
+
+    pub(crate) fn last_byte(&self) -> u8 {
+        self.last_byte
+    }
+}
+
+impl Pipeline for Count<'_> {
+    fn identifier(&self) -> &str {
+        &self.identifier
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        self.count = self
+            .count
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| PipelineError::state(&self.identifier, "byte count overflow"))?;
+        self.last_byte = data[data.len() - 1];
+        self.next.write(data)
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        self.next.finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Count;
@@ -65,57 +117,5 @@ mod tests {
         assert_eq!(count.last_byte(), 0);
         drop(count);
         assert!(sink.chunks.is_empty());
-    }
-}
-
-use super::{Pipeline, PipelineError, PipelineResult};
-
-pub(crate) struct Count<'a> {
-    identifier: String,
-    next: &'a mut dyn Pipeline,
-    count: u64,
-    last_byte: u8,
-}
-
-#[allow(dead_code)]
-impl<'a> Count<'a> {
-    pub(crate) fn new(identifier: impl Into<String>, next: &'a mut dyn Pipeline) -> Self {
-        Self {
-            identifier: identifier.into(),
-            next,
-            count: 0,
-            last_byte: 0,
-        }
-    }
-
-    pub(crate) fn count(&self) -> u64 {
-        self.count
-    }
-
-    pub(crate) fn last_byte(&self) -> u8 {
-        self.last_byte
-    }
-}
-
-impl Pipeline for Count<'_> {
-    fn identifier(&self) -> &str {
-        &self.identifier
-    }
-
-    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        self.count = self
-            .count
-            .checked_add(data.len() as u64)
-            .ok_or_else(|| PipelineError::state(&self.identifier, "byte count overflow"))?;
-        self.last_byte = data[data.len() - 1];
-        self.next.write(data)
-    }
-
-    fn finish(&mut self) -> PipelineResult<()> {
-        self.next.finish()
     }
 }
