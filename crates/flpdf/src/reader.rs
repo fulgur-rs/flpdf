@@ -9,9 +9,7 @@ use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
 use crate::parser::parse_qpdf_file_object;
-use crate::pipeline::buffer::Buffer;
 use crate::pipeline::rc4::PlRc4;
-use crate::pipeline::Pipeline;
 use crate::security::password::{normalize_password, PasswordMode};
 use crate::security::standard::{
     check_owner_password, check_owner_password_r5, check_owner_password_r6,
@@ -1759,14 +1757,7 @@ fn decrypt_stream_bytes(
                 u32::from(object_ref.generation),
                 ObjectKeyAlg::Rc4,
             );
-            let mut output = Buffer::new("RC4 stream decryption output", None);
-            {
-                let mut rc4 = PlRc4::new("RC4 stream decryption", &mut output, &key)?;
-                rc4.write(bytes)?;
-                rc4.finish()?;
-            }
-            *bytes = output.take_buffer()?;
-            Ok(())
+            PlRc4::transform_in_place("RC4 stream decryption", bytes, &key).map_err(Into::into)
         }
         EncryptionMode::Aes128 => {
             let key = per_object_key(
@@ -2628,6 +2619,27 @@ mod tests {
         )
         .expect("RC4 encryption");
         ciphertext
+    }
+
+    #[test]
+    fn rc4_stream_decryption_preserves_payload_allocation() {
+        let object_ref = ObjectRef::new(7, 0);
+        let file_key = [0x11, 0x22, 0x33, 0x44, 0x55];
+        let plaintext = vec![0x42; crate::pipeline::rc4::DEFAULT_OUT_BUFFER_SIZE + 17];
+        let mut bytes = plaintext.clone();
+        let original_ptr = bytes.as_ptr();
+        let original_capacity = bytes.capacity();
+
+        decrypt_stream_bytes(object_ref, &mut bytes, EncryptionMode::Rc4, &file_key)
+            .expect("RC4 transform");
+        assert_eq!(bytes.as_ptr(), original_ptr);
+        assert_eq!(bytes.capacity(), original_capacity);
+        assert_ne!(bytes, plaintext);
+
+        decrypt_stream_bytes(object_ref, &mut bytes, EncryptionMode::Rc4, &file_key)
+            .expect("RC4 inverse transform");
+        assert_eq!(bytes.as_ptr(), original_ptr);
+        assert_eq!(bytes, plaintext);
     }
 
     fn flate_encoded(plaintext: &[u8]) -> Vec<u8> {

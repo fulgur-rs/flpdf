@@ -13,6 +13,22 @@ pub(crate) struct PlRc4<'a> {
     outbuf: Option<Vec<u8>>,
 }
 
+struct DiscardSink;
+
+impl Pipeline for DiscardSink {
+    fn identifier(&self) -> &str {
+        "discard in-place RC4 output"
+    }
+
+    fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
 #[allow(dead_code)]
 impl<'a> PlRc4<'a> {
     pub(crate) fn new(
@@ -68,6 +84,32 @@ impl<'a> PlRc4<'a> {
             outbuf: Some(vec![0; out_buffer_size]),
         })
     }
+
+    pub(crate) fn transform_in_place(
+        identifier: impl Into<String>,
+        data: &mut [u8],
+        key: &[u8],
+    ) -> PipelineResult<()> {
+        let mut sink = DiscardSink;
+        let mut stage = PlRc4::new(identifier, &mut sink, key)?;
+        stage.write_in_place(data)?;
+        stage.finish()
+    }
+
+    pub(crate) fn write_in_place(&mut self, data: &mut [u8]) -> PipelineResult<()> {
+        let identifier = &self.identifier;
+        let chunk_size = self.outbuf.as_ref().map(Vec::len).ok_or_else(|| {
+            PipelineError::logic(format!(
+                "{identifier}: Pl_RC4: write() called after finish() called"
+            ))
+        })?;
+
+        for chunk in data.chunks_mut(chunk_size) {
+            self.rc4.process_in_place(chunk);
+            self.next.write(chunk)?;
+        }
+        Ok(())
+    }
 }
 
 impl Pipeline for PlRc4<'_> {
@@ -100,7 +142,7 @@ impl Pipeline for PlRc4<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PlRc4, DEFAULT_OUT_BUFFER_SIZE};
+    use super::{DiscardSink, PlRc4, DEFAULT_OUT_BUFFER_SIZE};
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
     use crate::security::rc4::Rc4;
     use std::ffi::{CStr, CString};
@@ -219,6 +261,31 @@ mod tests {
         }
         assert_eq!(sink.chunk_lengths(), vec![DEFAULT_OUT_BUFFER_SIZE, 1]);
         assert_eq!(sink.bytes().len(), input.len());
+    }
+
+    #[test]
+    fn in_place_write_preserves_allocation_and_forwards_qpdf_chunks() {
+        assert_eq!(DiscardSink.identifier(), "discard in-place RC4 output");
+        let mut data = vec![0x42; DEFAULT_OUT_BUFFER_SIZE + 17];
+        let original_ptr = data.as_ptr();
+        let mut expected = data.clone();
+        Rc4::new(b"Key")
+            .unwrap()
+            .process_in_place(expected.as_mut_slice());
+        let mut sink = RecordingSink::default();
+
+        {
+            let mut stage = PlRc4::new("rc4", &mut sink, b"Key").unwrap();
+            stage.write_in_place(&mut data).unwrap();
+            stage.finish().unwrap();
+            assert!(stage.write_in_place(&mut data).is_err());
+        }
+
+        assert_eq!(data.as_ptr(), original_ptr);
+        assert_eq!(data, expected);
+        assert_eq!(sink.bytes(), expected);
+        assert_eq!(sink.chunk_lengths(), vec![DEFAULT_OUT_BUFFER_SIZE, 17]);
+        assert_eq!(sink.finishes, 1);
     }
 
     #[test]
