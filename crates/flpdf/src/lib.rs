@@ -138,6 +138,7 @@ pub mod pages;
 pub mod parser;
 pub mod pdf_version;
 pub mod permissions;
+pub(crate) mod pipeline;
 pub mod qdf_fix;
 pub(crate) mod qpdf_null;
 pub mod reader;

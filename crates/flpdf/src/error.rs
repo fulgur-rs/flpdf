@@ -13,6 +13,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// entries that the spec mandates, e.g. `/Root` on the trailer.
 /// [`Error::Encrypted`] covers all encryption-related failures; its subkind is
 /// carried by [`EncryptedError`].
+/// [`Error::Pipeline`] reports a failed internal streaming stage without
+/// exposing dependency-specific error types.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("I/O error: {0}")]
@@ -29,6 +31,14 @@ pub enum Error {
 
     #[error("encrypted PDF: {0}")]
     Encrypted(#[from] EncryptedError),
+
+    #[error("{stage}: {message}")]
+    Pipeline {
+        stage: String,
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
 }
 
 impl Error {
@@ -54,6 +64,17 @@ impl Error {
                 message,
             },
             other => other,
+        }
+    }
+}
+
+impl From<crate::pipeline::PipelineError> for Error {
+    fn from(error: crate::pipeline::PipelineError) -> Self {
+        let (stage, message, source) = error.into_parts();
+        Self::Pipeline {
+            stage,
+            message,
+            source,
         }
     }
 }
@@ -128,6 +149,17 @@ impl EncryptedError {
 mod tests {
     use super::*;
     use crate::security::primitives::PrimitiveError;
+
+    #[test]
+    fn pipeline_error_maps_without_exposing_dependency_error() {
+        let public: Error =
+            crate::pipeline::PipelineError::codec("hint flate", "data error").into();
+        assert!(matches!(
+            public,
+            Error::Pipeline { ref stage, ref message, .. }
+                if stage == "hint flate" && message == "data error"
+        ));
+    }
 
     #[test]
     fn encrypted_error_display_bad_password() {
