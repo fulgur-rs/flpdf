@@ -1,5 +1,4 @@
-//! Mirrors qpdf 11.9.0 libqpdf/Pl_QPDFTokenizer.cc,
-//! libqpdf/ContentNormalizer.cc.
+//! Mirrors qpdf 11.9.0 libqpdf/Pl_QPDFTokenizer.cc, libqpdf/ContentNormalizer.cc.
 
 use crate::tokenizer::{Token, TokenType, Tokenizer};
 

@@ -874,6 +874,7 @@ class RepositoryPolicyTests(unittest.TestCase):
 
         self.assertEqual(
             {
+                "crates/flpdf/src/content_normalizer.rs",
                 "crates/flpdf/src/matrix.rs",
                 "crates/flpdf/src/pdf_version.rs",
                 "crates/flpdf/src/tokenizer.rs",
