@@ -18,6 +18,8 @@ pub(crate) struct ResourceFinder {
     names: ResourceNames,
     names_by_resource_type: ResourceNamesByType,
     had_diagnostics: bool,
+    pending_operands: bool,
+    last_operator_started_at_boundary: bool,
 }
 
 impl ResourceFinder {
@@ -31,6 +33,29 @@ impl ResourceFinder {
 
     pub(crate) fn had_diagnostics(&self) -> bool {
         self.had_diagnostics
+    }
+
+    pub(crate) fn last_operator_started_at_boundary(&self) -> bool {
+        self.last_operator_started_at_boundary
+    }
+
+    pub(crate) fn has_pending_operands(&self) -> bool {
+        self.pending_operands
+    }
+
+    pub(crate) fn record_resource_name(
+        &mut self,
+        resource_type: &[u8],
+        name: &[u8],
+        offset: usize,
+    ) {
+        self.names.insert(name.to_vec());
+        self.names_by_resource_type
+            .entry(resource_type.to_vec())
+            .or_default()
+            .entry(name.to_vec())
+            .or_default()
+            .insert(offset);
     }
 }
 
@@ -55,22 +80,22 @@ impl ParserCallbacks for ResourceFinder {
         _length: usize,
     ) -> Result<ParseControl> {
         match object {
-            Object::Name(name) => self.last_name = Some((name, offset)),
+            Object::Name(name) => {
+                self.pending_operands = true;
+                self.last_name = Some((name, offset));
+            }
             Object::Operator(operator) => {
+                self.last_operator_started_at_boundary = !self.pending_operands;
+                self.pending_operands = false;
                 if let (Some(resource_type), Some((name, name_offset))) = (
                     resource_type_for_operator(&operator),
-                    self.last_name.as_ref(),
+                    self.last_name.clone(),
                 ) {
-                    self.names.insert(name.clone());
-                    self.names_by_resource_type
-                        .entry(resource_type.to_vec())
-                        .or_default()
-                        .entry(name.clone())
-                        .or_default()
-                        .insert(*name_offset);
+                    self.record_resource_name(resource_type, &name, name_offset);
                 }
             }
-            _ => {}
+            Object::InlineImage(_) => {}
+            _ => self.pending_operands = true,
         }
         Ok(ParseControl::Continue)
     }
