@@ -1455,22 +1455,28 @@ mod tests {
                             .join(" ")
                     ),
                 ),
-                Object::Dictionary(dictionary) => (
-                    "dictionary",
-                    format!(
-                        "<< {} >>",
-                        dictionary
-                            .iter()
-                            .filter(|(_, value)| !matches!(value, Object::Null))
-                            .map(|(key, value)| format!(
+                Object::Dictionary(dictionary) => {
+                    let items = dictionary
+                        .iter()
+                        .filter(|(_, value)| !matches!(value, Object::Null))
+                        .map(|(key, value)| {
+                            format!(
                                 "/{} {}",
                                 String::from_utf8_lossy(key),
                                 qpdf_unparse(value).1
-                            ))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    ),
-                ),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    (
+                        "dictionary",
+                        if items.is_empty() {
+                            "<< >>".to_string()
+                        } else {
+                            format!("<< {items} >>")
+                        },
+                    )
+                }
                 other => panic!("unexpected content oracle object: {other:?}"),
             }
         }
@@ -1509,6 +1515,10 @@ mod tests {
             (
                 "dictionary-key-and-premature-close-recovery",
                 b"<< /QPDFFake1 9 7 } /A >> cm".as_slice(),
+            ),
+            (
+                "dictionary-close-good-token-streak",
+                b"[ } } } } } << >> 1 2 } ]".as_slice(),
             ),
             ("bad-token-limit", b"[ } } } } } } 1 ]".as_slice()),
         ] {

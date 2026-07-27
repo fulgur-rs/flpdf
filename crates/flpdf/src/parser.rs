@@ -312,6 +312,7 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
         loop {
             let token = self.next_token()?;
             if token.token_type == TokenType::DictClose {
+                self.content_good_count += 1;
                 return Ok(self.finish_content_dictionary(dict, missing_key_values, frame_offset));
             }
             if token.token_type == TokenType::Eof {
@@ -643,6 +644,35 @@ mod content_mode_tests {
             .expect("array");
         assert!(matches!(object, Object::Array(_)));
         assert_eq!(parser.diagnostics.len(), 10);
+        assert!(
+            !parser
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message
+                    == "too many errors; giving up on reading object")
+        );
+    }
+
+    #[test]
+    fn content_mode_counts_normal_dictionary_close_in_qpdf_good_token_streak() {
+        let mut tokenizer = Tokenizer::new(b"[ } } } } } << >> 1 2 } ]");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        assert_eq!(
+            parser.parse_content_object().expect("recovered object"),
+            Some(Object::Array(vec![
+                Object::Null,
+                Object::Null,
+                Object::Null,
+                Object::Null,
+                Object::Null,
+                Object::Dictionary(crate::Dictionary::new()),
+                Object::Integer(1),
+                Object::Integer(2),
+                Object::Null,
+            ]))
+        );
+        assert_eq!(parser.position(), 25);
         assert!(
             !parser
                 .diagnostics
