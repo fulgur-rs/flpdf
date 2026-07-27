@@ -110,7 +110,8 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
 | `QPDF_encryption.cc` | 1410 | `security/standard.rs`(1879) + `writer.rs` の encryption context(~700) + `encrypt_setup.rs`(213) + `permissions.rs`(206) + `security/password.rs`(100: `normalize_password` — auto/bytes/hex-bytes/unicode、SASLprep、revision 依存の切り詰め。`PasswordMode` は `lib.rs:233` から re-export され CLI の `--password-mode` が選択、`reader.rs:604` が呼ぶ) | 🔀 |
-| `rijndael.cc` / `AES_PDF_native` / `RC4_native` / `MD5_native` / `SHA2_native` | 1716 | `security/primitives.rs`(188)（外部 crate） | ⚪ |
+| `rijndael.cc` / `AES_PDF_native` / `MD5_native` / `SHA2_native` | 1668 | `security/primitives.rs`(188)（外部 crate） | ⚪ |
+| `RC4.cc` / `RC4_native.cc` | 63 | `security/rc4.rs`(320)（明示長キー / C-string キー、state 保持、separate / in-place processing） | ✅ |
 | `QPDFCryptoProvider.cc` / `QPDFCrypto_*` | 774 | provider 抽象が無い | ⚪ |
 | ランダム源 3 ファイル | 185 | `writer.rs` の `fresh_id_bytes` 等に散在 | 🔀 |
 
@@ -124,7 +125,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `Pl_ASCII85Decoder` | 108 | `ascii85.rs`(163) | ✅ |
 | `Pl_ASCIIHexDecoder` | 96 | `ascii_hex.rs`(85) | ✅ |
 | `Pl_RunLength` | 146 | `run_length.rs`(140) | ✅ |
-| `Pl_AES_PDF` / `Pl_RC4` | 243 | `writer.rs` の `encrypt_stream_payload_for_writer` に埋没 | 🔀 |
+| `Pl_AES_PDF` / `Pl_RC4` | 243 | `writer.rs` の `encrypt_stream_payload_for_writer` に埋没。`Pl_RC4` Pipeline 統合は `flpdf-qynx.2.2` | 🔀 |
 | `Pl_QPDFTokenizer.cc` / `ContentNormalizer.cc` | 141 | `content_normalizer.rs`（既存 `tokenizer.rs` を駆動する token-filter runner、EOF-token → `handle_eof`、`ID` separator 注入、inline-image 切替、raw-token normalization、bad-token state、CR/string/name normalization） | ✅ |
 | `QPDFStreamFilter.cc` | 19 | filter 登録機構が無い | ❌ |
 | `Pl_DCT.cc` | 326 | 無し。`json_inspect.rs` の `DecodeLevel::All`(758) が DCT デコードを doc で約束しつつ encoded バイトへフォールバックしている | ❌ 消費者あり |
@@ -175,7 +176,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `QUtil.cc` | 2003 | 各所に散在 | 🔀 |
 | `QTC.cc` | 50 | 無し | ❌ |
 | `BitStream.cc` / `BitWriter.cc` | 111 | `linearization/hint_stream.rs` に埋没 | 🔀 |
-| `Buffer.cc` / `MD5.cc` / `RC4.cc` | 301 | `Vec<u8>` / 外部 crate | ⚪ |
+| `Buffer.cc` / `MD5.cc` | 286 | `Vec<u8>` / 外部 crate | ⚪ |
 | `qpdf-c.cc` / `qpdfjob-c.cc` / `qpdflogger-c.cc` | 2237 | — | ➖ |
 
 ---

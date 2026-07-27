@@ -91,7 +91,8 @@
 | `crates/flpdf/src/run_length.rs` | correspondence | Pl_RunLength.cc codec semantics via whole-buffer functions; the qpdf Pipeline component boundary is not mirrored |
 | `crates/flpdf/src/security/mod.rs` | correspondence | QPDF_encryption.cc responsibilities split across the Rust security module tree |
 | `crates/flpdf/src/security/password.rs` | correspondence | QPDF_encryption.cc password normalization and revision-specific truncation |
-| `crates/flpdf/src/security/primitives.rs` | correspondence | Rust crypto-crate substitution for qpdf AES, RC4, MD5, and SHA2 native implementations |
+| `crates/flpdf/src/security/primitives.rs` | correspondence | Rust crypto-crate substitution for qpdf AES, MD5, and SHA2 native implementations |
+| `crates/flpdf/src/security/rc4.rs` | correspondence | Mirrors qpdf 11.9.0 libqpdf/RC4.cc and libqpdf/RC4_native.cc |
 | `crates/flpdf/src/security/standard.rs` | correspondence | QPDF_encryption.cc Standard security handler algorithms split from writer setup |
 | `crates/flpdf/src/signatures.rs` | correspondence | QPDFAcroFormDocumentHelper.cc signature disabling and QPDF.cc restriction removal plus flpdf-only inspection |
 | `crates/flpdf/src/standard_font_metrics.rs` | correspondence | flpdf-only Standard 14 font metrics with no qpdf library component |
