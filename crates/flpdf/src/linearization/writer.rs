@@ -1559,18 +1559,19 @@ struct OutlineHintInfo {
 ///
 /// # Errors
 ///
-/// Propagates reader errors from the outline closure or catalog resolution.
+/// Propagates reader errors from catalog resolution.
 fn compute_outline_hint_info<R: Read + Seek>(
+    outlines: &std::collections::BTreeSet<ObjectRef>,
     pdf: &mut Pdf<R>,
     renumber: &RenumberMap,
     objstm_layout: &ObjStmLayout,
 ) -> Result<Option<OutlineHintInfo>> {
-    let outlines = crate::linearization::plan::outlines_set(pdf)?;
     if outlines.is_empty() {
         return Ok(None);
     }
     // The /Outlines dictionary reference (the first outline unit qpdf places).
-    // This helper runs only when outlines_set is non-empty (⟹ a /Outlines key),
+    // This helper runs only when the retained outline set is non-empty
+    // (therefore a /Outlines key exists),
     // so the catalog is always a resolvable dictionary here.
     let outlines_ref = pdf.root_ref().and_then(|r| match pdf.resolve_borrowed(r) {
         Ok(Object::Dictionary(d)) => d.get_ref("Outlines"),
@@ -1579,7 +1580,7 @@ fn compute_outline_hint_info<R: Read + Seek>(
     let Some(outlines_ref) = outlines_ref else {
         // Defensive: a non-empty outline closure implies a /Outlines ref, so this
         // is unreachable for a well-formed catalog.
-        return Ok(None); // cov:ignore: outlines_set non-empty ⟹ catalog /Outlines ref present
+        return Ok(None); // cov:ignore: retained outline set non-empty implies catalog /Outlines ref present
     };
     // Map an outline object to its output unit: its ObjStm container's new number
     // when compressed, else its own renumbered number. The objstm corpus
@@ -2894,7 +2895,12 @@ pub fn write_linearized<R: Read + Seek>(
     // Outlines Hint Table inputs (qpdf in_outlines / calculateHOutline). Loop-
     // invariant; `None` when the document has no outlines, in which case no `/O`
     // key or outline table is emitted (byte-identical to the no-outline path).
-    let outline_info = compute_outline_hint_info(pdf, renumber, &objstm_layout)?;
+    let outlines = plan
+        .optimization
+        .as_ref()
+        .map(|optimization| optimization.objects_for_root_key(b"Outlines"))
+        .unwrap_or_default();
+    let outline_info = compute_outline_hint_info(&outlines, pdf, renumber, &objstm_layout)?;
     // Initial placeholder outline table (offset/length zero): emitting it from
     // iteration 0 means the hint stream already carries the outline section, so
     // the convergence loop only has to settle the back-patched offset/length
