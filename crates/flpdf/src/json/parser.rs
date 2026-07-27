@@ -10,17 +10,37 @@ pub trait Reactor {
     fn array_start(&mut self);
     fn container_end(&mut self, value: &Json);
     fn top_level_scalar(&mut self);
+    /// Observe a dictionary member.
+    ///
+    /// Scalar members are complete when this is called. For a child dictionary
+    /// or array, this is called first with an empty shared child handle, then
+    /// [`Reactor::dictionary_start`] or [`Reactor::array_start`] is called.
+    /// Subsequent child item events fill that same handle before
+    /// [`Reactor::container_end`] reports the completed child.
+    ///
+    /// Return `true` to consume the member, keeping it out of the parsed
+    /// dictionary, or `false` to retain it in the returned [`Json`] tree.
     fn dictionary_item(&mut self, key: &[u8], value: &Json) -> bool;
+    /// Observe an array element.
+    ///
+    /// Scalar elements are complete when this is called. For a child dictionary
+    /// or array, this is called first with an empty shared child handle, then
+    /// [`Reactor::dictionary_start`] or [`Reactor::array_start`] is called.
+    /// Subsequent child item events fill that same handle before
+    /// [`Reactor::container_end`] reports the completed child.
+    ///
+    /// Return `true` to consume the element, keeping it out of the parsed
+    /// array, or `false` to retain it in the returned [`Json`] tree.
     fn array_item(&mut self, value: &Json) -> bool;
 }
 
-/// Parse a scalar JSON value from bytes.
+/// Parse a JSON value from bytes.
 pub fn parse(input: &[u8]) -> Result<Json, JsonError> {
     let mut cursor = Cursor::new(input);
     parse_reader(&mut cursor, None)
 }
 
-/// Parse a scalar JSON value from a reader.
+/// Parse a JSON value from a reader.
 pub fn parse_reader<R: Read>(
     reader: &mut R,
     reactor: Option<&mut dyn Reactor>,
