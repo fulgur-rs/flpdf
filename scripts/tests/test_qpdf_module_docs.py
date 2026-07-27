@@ -47,6 +47,16 @@ class ClassificationTests(unittest.TestCase):
             (result.kind, result.text),
         )
 
+    def test_accepts_multiple_mirror_files_joined_by_and(self):
+        result = self.module.classify_source(
+            Path("crates/flpdf/src/security/rc4.rs"),
+            "//! Mirrors qpdf 11.9.0 libqpdf/RC4.cc and libqpdf/RC4_native.cc.\n",
+        )
+        self.assertEqual(
+            ("mirror", "libqpdf/RC4.cc, libqpdf/RC4_native.cc"),
+            (result.kind, result.text),
+        )
+
     def test_accepts_non_mirror_reason(self):
         result = self.module.classify_source(
             Path("crates/flpdf/src/fonts.rs"),
@@ -877,6 +887,7 @@ class RepositoryPolicyTests(unittest.TestCase):
                 "crates/flpdf/src/content_normalizer.rs",
                 "crates/flpdf/src/matrix.rs",
                 "crates/flpdf/src/pdf_version.rs",
+                "crates/flpdf/src/security/rc4.rs",
                 "crates/flpdf/src/tokenizer.rs",
             },
             mirrors,

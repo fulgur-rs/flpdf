@@ -19,7 +19,12 @@ namespace
         std::vector<unsigned char> result;
         result.reserve(value.size() / 2 + 1);
         for (size_t i = 0; i < value.size(); i += 2) {
-            auto byte = std::stoul(value.substr(i, 2), nullptr, 16);
+            auto const encoded_byte = value.substr(i, 2);
+            size_t consumed = 0;
+            auto byte = std::stoul(encoded_byte, &consumed, 16);
+            if (consumed != encoded_byte.size()) {
+                throw std::runtime_error("invalid hex");
+            }
             result.push_back(static_cast<unsigned char>(byte));
         }
         return result;
@@ -62,12 +67,17 @@ main(int argc, char* argv[])
         }
         auto key = decode(argv[2]);
         auto input = decode(argv[3]);
-        size_t split_at = std::stoull(argv[4]);
+        size_t consumed = 0;
+        size_t split_at = std::stoull(argv[4], &consumed);
+        if (consumed != std::string(argv[4]).size()) {
+            throw std::runtime_error("invalid split");
+        }
         if (split_at > input.size()) {
             throw std::runtime_error("split exceeds input");
         }
         if (key.empty()) {
-            throw std::runtime_error("empty explicit key");
+            throw std::runtime_error(
+                c_string ? "empty C-string key" : "empty explicit key");
         }
         if (c_string && key.front() == 0) {
             throw std::runtime_error("empty C-string key");

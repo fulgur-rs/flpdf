@@ -111,7 +111,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 |---|---|---|---|
 | `QPDF_encryption.cc` | 1410 | `security/standard.rs`(1879) + `writer.rs` の encryption context(~700) + `encrypt_setup.rs`(213) + `permissions.rs`(206) + `security/password.rs`(100: `normalize_password` — auto/bytes/hex-bytes/unicode、SASLprep、revision 依存の切り詰め。`PasswordMode` は `lib.rs:233` から re-export され CLI の `--password-mode` が選択、`reader.rs:604` が呼ぶ) | 🔀 |
 | `rijndael.cc` / `AES_PDF_native` / `MD5_native` / `SHA2_native` | 1668 | `security/primitives.rs`(188)（外部 crate） | ⚪ |
-| `RC4.cc` / `RC4_native.cc` | 63 | `security/rc4.rs`(320)（明示長キー / C-string キー、state 保持、separate / in-place processing） | ✅ |
+| `RC4.cc` / `RC4_native.cc` | 63 | `security/rc4.rs`(80)（明示長キー / C-string キー、state 保持、separate / in-place processing） | ✅ |
 | `QPDFCryptoProvider.cc` / `QPDFCrypto_*` | 774 | provider 抽象が無い | ⚪ |
 | ランダム源 3 ファイル | 185 | `writer.rs` の `fresh_id_bytes` 等に散在 | 🔀 |
 
@@ -305,14 +305,14 @@ CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れてい
 ## 逸脱候補（⚪）— 要承認
 
 `CLAUDE.md` は DEFLATE バックエンドを「唯一の例外」とし「逸脱は必ず明示」を求めている。
-⚪ に分類した約 6,900 行は提案であり決定ではない。
+⚪ に分類した 7,099 行は提案であり決定ではない。
 
 | 逸脱候補 | qpdf 行数 | byte 影響 |
 |---|---|---|
 | `InputSource` 階層 → `Read + Seek` ジェネリクス | 625 | 無し（入力側のみ） |
 | `QPDFArgParser` / `QPDFJob_*` → clap | 3,164 | 無し（CLI 挙動 parity は別途必要） |
-| crypto provider 抽象 → 外部 crate 直接利用 | 2,490 | 無し（アルゴリズムは同一） |
-| `Buffer` / `Pl_Buffer` / 汎用 `Pl_*` → `Vec<u8>` / `Write` | 933 | 無し |
+| crypto provider 抽象 → 外部 crate 直接利用 | 2,442 | 無し（アルゴリズムは同一） |
+| `Buffer` / `Pl_Buffer` / 汎用 `Pl_*` → `Vec<u8>` / `Write` | 856 | 無し |
 | `QPDFDocumentHelper` / `QPDFObjectHelper` 基底 → トレイト無し | 12 | 無し |
 
 現時点の証拠ではいずれも出力バイトに影響しない。
@@ -325,7 +325,7 @@ CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れてい
 - **(A) 出力バイトを変える逸脱** — DEFLATE 実装のみ（従来どおり唯一）
 - **(B) 出力バイトを変えない内部構造の代替** — 条件付きで許容（新設）
 
-上表の 7,162 行はすべて (B) に該当する。ただし (B) は無条件ではなく、
+上表の 7,099 行はすべて (B) に該当する。ただし (B) は無条件ではなく、
 `CLAUDE.md` の 3 条件を満たす必要がある。
 
 1. 出力バイトに影響しないこと（証明責任は提案側。gated byte テストで担保。
@@ -342,10 +342,10 @@ CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れてい
 
 | 状態 | qpdf 側の該当行数 | 内訳 |
 |---|---|---|
-| ✅ mirrors | 2,944 | 責務境界も一致。触らない |
+| ✅ mirrors | 3,007 | 責務境界も一致。触らない |
 | 🔀 smeared | 28,493 | 再配置の主対象。qpdf 全体の 69% |
 | ❌ missing | 623 | `Pipeline.cc`(114) / `Pl_Count`+`Pl_MD5`(114) / `QPDFStreamFilter`(19) / `Pl_DCT`(326) / `QTC`(50) |
-| ⚪ 逸脱候補 | 7,162 | 要承認（下記の方針矛盾を参照） |
+| ⚪ 逸脱候補 | 7,099 | 要承認（下記の方針矛盾を参照） |
 | ➖ 対象外 | 2,237 | C API |
 | **合計** | **41,459** | qpdf `libqpdf/*.cc` の実測 41,459 行と一致 |
 

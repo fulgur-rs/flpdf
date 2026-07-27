@@ -1,8 +1,8 @@
 # qpdf Stateful RC4 Core Design
 
-**Issue:** `flpdf-qynx.2.1`  
-**Date:** 2026-07-28  
-**Oracle:** qpdf 11.9.0 (`v11.9.0`, commit `3b97c9bd`)  
+**Issue:** `flpdf-qynx.2.1`<br>
+**Date:** 2026-07-28<br>
+**Oracle:** qpdf 11.9.0 (`v11.9.0`, commit `3b97c9bd`)<br>
 **Oracle source:** `scripts/fetch-qpdf-source.sh --print-path`
 
 ## Problem
@@ -128,11 +128,12 @@ each distinct key, matching the existing algorithm and qpdf behavior. They do
 not reuse state between different passes. Stateful reuse is exercised by the
 component tests and becomes the primitive used by the later `PlRc4` adapter.
 
-Test helpers in `filters.rs`, `reader.rs`, `writer.rs`, and
-`security/standard.rs` are updated to the new component API where they
-directly generate RC4 ciphertext. Public `EncryptParams::rc4` constructors and
-RC4 enum variants are configuration APIs, not cipher implementations, and
-remain unchanged.
+Test helpers in `filters.rs` and `security/standard.rs`, plus the integration
+helper in `crates/flpdf/tests/reader_tests.rs`, are updated to the new component
+API where they directly generate RC4 ciphertext. Production reader and writer
+callsites were unchanged. Public `EncryptParams::rc4` constructors and RC4 enum
+variants are configuration APIs, not cipher implementations, and remain
+unchanged.
 
 After migration, repository searches must find none of the following:
 

@@ -1,4 +1,4 @@
-//! qpdf correspondence: Mirrors qpdf 11.9.0 libqpdf/RC4.cc and libqpdf/RC4_native.cc.
+//! Mirrors qpdf 11.9.0 libqpdf/RC4.cc and libqpdf/RC4_native.cc.
 //! Stateful RC4 compatibility component for legacy PDF encryption.
 
 use std::ffi::CStr;

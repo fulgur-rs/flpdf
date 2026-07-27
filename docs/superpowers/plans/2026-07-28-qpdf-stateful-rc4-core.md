@@ -55,7 +55,7 @@ Add `pub(crate) mod rc4;` next to `password`, `primitives`, and `standard` in
 tests below, but without defining `Rc4` yet:
 
 ```rust
-//! qpdf correspondence: Mirrors qpdf 11.9.0 libqpdf/RC4.cc and libqpdf/RC4_native.cc.
+//! Mirrors qpdf 11.9.0 libqpdf/RC4.cc and libqpdf/RC4_native.cc.
 //! Stateful RC4 compatibility component for legacy PDF encryption.
 
 use std::ffi::CStr;
