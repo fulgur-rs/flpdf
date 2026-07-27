@@ -16,7 +16,7 @@
 - `Rc4::from_c_str` uses the bytes before the terminating NUL and rejects an empty C string.
 - `process` and `process_in_place` retain state across calls; empty input does not advance state.
 - Every PDF Algorithm 3/5/6/7 pass constructs a fresh `Rc4`; state must not cross distinct keys or passes.
-- No `security::primitives::rc4` compatibility wrapper, external `rc4` crate use, duplicate KSA/PRGA, provider trait, `PlRc4`, or pipeline chunking may remain or be introduced.
+- In the final state, no `security::primitives::rc4` compatibility wrapper, external `rc4` crate use, duplicate KSA/PRGA, provider trait, `PlRc4`, or pipeline chunking may remain. Task 1 temporarily retains the old one-shot function so every intermediate commit builds; Task 3 migrates all consumers and deletes it atomically.
 - qpdf behavior is taken from the pinned source tree resolved by `scripts/fetch-qpdf-source.sh --print-path`; the tree is read-only and must remain clean.
 - Changed executable lines under `crates/flpdf/src` and `crates/flpdf-cli/src` must have 100% patch coverage against `origin/main`.
 - Keep the existing RC4 weak-crypto policy and the public `EncryptParams::rc4` configuration API unchanged.
@@ -29,7 +29,7 @@
 |---|---|
 | `crates/flpdf/src/security/rc4.rs` | Sole RC4 KSA/PRGA implementation, stateful API, unit tests, and Rust side of the qpdf differential |
 | `crates/flpdf/src/security/mod.rs` | Declare the crate-private `rc4` module and describe the internal security boundary |
-| `crates/flpdf/src/security/primitives.rs` | Retain AES/MD5/SHA2 and `PrimitiveError`; remove RC4 implementation and tests |
+| `crates/flpdf/src/security/primitives.rs` | Retain AES/MD5/SHA2 and `PrimitiveError`; Task 3 removes the old RC4 implementation and tests atomically with consumer cutover |
 | `crates/flpdf/src/security/standard.rs` | Route all production PDF RC4 password, string, and stream operations directly through `Rc4` |
 | `crates/flpdf/src/filters.rs` | Route RC4-generating test helpers through `Rc4` |
 | `tests/oracle/qpdf_rc4_probe.cc` | Exercise qpdf `RC4_native` in explicit/C-string, one-shot/split, and separate/in-place modes |
@@ -43,7 +43,6 @@
 **Files:**
 - Create: `crates/flpdf/src/security/rc4.rs`
 - Modify: `crates/flpdf/src/security/mod.rs:1-10`
-- Modify: `crates/flpdf/src/security/primitives.rs:1-92,208-246`
 
 **Interfaces:**
 - Consumes: `crate::security::primitives::PrimitiveError`
@@ -264,38 +263,44 @@ cargo fmt --all -- --check
 
 Expected: all nine RC4 component tests pass and formatting is clean.
 
-- [ ] **Step 5: Remove the old primitive implementation and its duplicate tests**
+- [ ] **Step 5: Preserve a buildable transition until consumer cutover**
 
-Delete `security::primitives::rc4`, its KSA/PRGA comments, the module-level RC4
-notice/link, and the four RC4 tests from `primitives.rs`. Change its first
-correspondence line to:
-
-```rust
-//! qpdf correspondence: Rust crypto-crate substitution for qpdf AES, MD5, and SHA2 native implementations.
-```
-
-Keep `PrimitiveError` in `primitives.rs`; `Rc4` imports it from there. Do not
-change the `From<PrimitiveError> for Error` bridge.
-
-- [ ] **Step 6: Verify the sole-implementation boundary and commit**
+Do not edit `security/primitives.rs` in this task. Its old one-shot function
+must remain temporarily because `security/standard.rs` and `filters.rs` still
+compile against it. Task 3 deletes that implementation, its tests, and its
+documentation in the same commit that migrates every consumer.
 
 Run:
 
 ```bash
-rg -n "pub\\(crate\\) fn rc4|Key Scheduling Algorithm|Pseudo-Random Generation Algorithm" crates/flpdf/src
+cargo test -p flpdf --lib security::primitives::tests::rc4
+cargo check -p flpdf
+```
+
+Expected: the legacy characterization tests and the crate build still pass.
+The temporary duplicate exists only across Task 1 and Task 2 commits and is
+removed by Task 3.
+
+- [ ] **Step 6: Verify the new component boundary and commit**
+
+Run:
+
+```bash
 rg -n "struct Rc4|process_in_place" crates/flpdf/src/security
 cargo test -p flpdf --lib security::rc4::tests
 cargo test -p flpdf --lib security::primitives::tests
+cargo check -p flpdf
 git diff --check
 ```
 
-Expected: the first search has no matches; the second search points only to
-`security/rc4.rs`; both focused suites pass.
+Expected: the new stateful type appears only in `security/rc4.rs`; both
+focused suites and the crate build pass. The old function remains reachable
+only until Task 3.
 
 Commit:
 
 ```bash
-git add crates/flpdf/src/security/mod.rs crates/flpdf/src/security/primitives.rs crates/flpdf/src/security/rc4.rs
+git add crates/flpdf/src/security/mod.rs crates/flpdf/src/security/rc4.rs
 git commit -m "feat(rc4): add qpdf stateful core"
 ```
 
@@ -699,6 +704,7 @@ git commit -m "test(rc4): compare state machine with qpdf"
 ### Task 3: Consumer cutover and old-route deletion
 
 **Files:**
+- Modify: `crates/flpdf/src/security/primitives.rs:1-92,208-246`
 - Modify: `crates/flpdf/src/security/standard.rs:45-46,568-688,738-887,1497-1525,1615-1632,1953-2078`
 - Modify: `crates/flpdf/src/filters.rs:861-928`
 - Modify: `Cargo.toml:25-40`
@@ -808,7 +814,20 @@ Use the actual local buffer name at each site (`nested`, `in_dict`,
 `in_stream_dict`, `secret`, `rc4_string`, or `encrypted`). Do not add a test
 wrapper that recreates the deleted one-shot API.
 
-- [ ] **Step 5: Verify consumer GREEN before dependency cleanup**
+- [ ] **Step 5: Delete the old primitive implementation and duplicate tests**
+
+Delete `security::primitives::rc4`, its KSA/PRGA comments, the module-level
+RC4 notice/link, and the four RC4 tests from `primitives.rs`. Change its first
+correspondence line to:
+
+```rust
+//! qpdf correspondence: Rust crypto-crate substitution for qpdf AES, MD5, and SHA2 native implementations.
+```
+
+Keep `PrimitiveError` in `primitives.rs`; `Rc4` imports it from there. Do not
+change the `From<PrimitiveError> for Error` bridge.
+
+- [ ] **Step 6: Verify consumer GREEN before dependency cleanup**
 
 Run:
 
@@ -824,7 +843,7 @@ cargo test -p flpdf-cli --test encrypt_decrypt_matrix_tests
 
 Expected: the same characterization suites remain GREEN after direct cutover.
 
-- [ ] **Step 6: Remove the external dependency and update the lockfile**
+- [ ] **Step 7: Remove the external dependency and update the lockfile**
 
 Delete:
 
@@ -847,7 +866,7 @@ cargo check -p flpdf
 Inspect the lock diff. The `rc4` package entry must disappear; unrelated
 package versions must not change.
 
-- [ ] **Step 7: Enforce the negative contract and commit**
+- [ ] **Step 8: Enforce the negative contract and commit**
 
 Run:
 
@@ -871,21 +890,20 @@ constructors; KSA/PRGA state manipulation appears only in `security/rc4.rs`.
 Commit:
 
 ```bash
-git add Cargo.toml Cargo.lock crates/flpdf/Cargo.toml crates/flpdf/src/security/standard.rs crates/flpdf/src/filters.rs
+git add Cargo.toml Cargo.lock crates/flpdf/Cargo.toml crates/flpdf/src/security/primitives.rs crates/flpdf/src/security/standard.rs crates/flpdf/src/filters.rs
 git commit -m "refactor(rc4): cut consumers over to stateful core"
 ```
 
-### Task 4: Correspondence docs, complete verification, and publication
+### Task 4: Correspondence docs and complete verification
 
 **Files:**
 - Modify: `crates/flpdf/src/security/mod.rs:1-7`
 - Modify: `docs/qpdf-correspondence.md:105-130,170-182`
 - Modify: `docs/qpdf-module-doc-index.md`
-- Modify: `docs/superpowers/plans/2026-07-28-qpdf-stateful-rc4-core.md` only to check completed steps
 
 **Interfaces:**
 - Consumes: completed implementation and cutover from Tasks 1-3
-- Produces: truthful qpdf correspondence, regenerated module index, CI-equivalent evidence, closed/pushed Bead, and pushed Git branch
+- Produces: truthful qpdf correspondence, regenerated module index, CI-equivalent evidence, and a clean committed branch ready for the required whole-branch review
 
 - [ ] **Step 1: Update the human-maintained correspondence**
 
@@ -952,12 +970,10 @@ git diff --check
 
 Expected: every command exits zero.
 
-- [ ] **Step 5: Commit documentation and the checked plan**
-
-Mark completed plan checkboxes, then commit:
+- [ ] **Step 5: Commit documentation**
 
 ```bash
-git add crates/flpdf/src/security/mod.rs docs/qpdf-correspondence.md docs/qpdf-module-doc-index.md docs/superpowers/plans/2026-07-28-qpdf-stateful-rc4-core.md
+git add crates/flpdf/src/security/mod.rs docs/qpdf-correspondence.md docs/qpdf-module-doc-index.md
 git commit -m "docs(rc4): record qpdf component parity"
 ```
 
@@ -1002,7 +1018,19 @@ Expected: the worktree and pinned qpdf tree are clean; `Rc4` is the sole
 state-machine implementation; old routes and dependencies are absent;
 `Pl_RC4` remains explicitly incomplete and assigned to `.2.2`.
 
-- [ ] **Step 8: Close Beads state and push both stores**
+### Task 5: Controller-owned final review and publication
+
+These steps are controller-owned and run only after the Task 4 scoped review
+is clean.
+
+- [ ] **Step 1: Run the required whole-branch review**
+
+Generate a review package from the branch start to `HEAD`, dispatch the
+most-capable final reviewer, and complete the single permitted fix wave plus
+scoped re-review if findings exist. Do not close the Bead while any
+load-bearing finding remains.
+
+- [ ] **Step 2: Close Beads state and push both stores**
 
 Record exact test and coverage evidence, close only `flpdf-qynx.2.1`, and keep
 the parent and `.2.2` open:
@@ -1014,10 +1042,10 @@ bd dolt push
 git push
 ```
 
-Before pushing, state that the branch contains the four scoped commits and that
+Before pushing, state that the branch contains the scoped commits and that
 the Bead will be closed. Expected: both pushes succeed.
 
-- [ ] **Step 9: Verify remote publication**
+- [ ] **Step 3: Verify remote publication**
 
 Run:
 
