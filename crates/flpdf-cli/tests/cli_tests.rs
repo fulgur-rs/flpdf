@@ -3237,6 +3237,38 @@ fn build_classic_pdf(objects: &[&[u8]]) -> Vec<u8> {
     bytes
 }
 
+fn one_page_pdf_with_content(content: &[u8]) -> Vec<u8> {
+    let stream = [
+        format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>\nendobj\n",
+        stream.as_slice(),
+    ])
+}
+
+fn two_page_pdf_with_shared_content(content: &[u8]) -> Vec<u8> {
+    let stream = [
+        format!("5 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    let objects: [&[u8]; 5] = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 5 0 R >>\nendobj\n",
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 5 0 R >>\nendobj\n",
+        stream.as_slice(),
+    ];
+    build_classic_pdf(&objects)
+}
+
 fn empty_object_json_pdf() -> Vec<u8> {
     build_classic_pdf(&[
         b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Probe 7 0 R >>\nendobj\n",
@@ -3844,6 +3876,93 @@ fn rewrite_normalize_content_n_accepted_and_produces_valid_output() {
         .args(["--check", output.to_str().unwrap()])
         .assert()
         .success();
+}
+
+#[test]
+fn rewrite_normalize_content_bad_token_writes_output_warns_and_exits_three() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("bad-content.pdf");
+    let output = temp.path().join("normalized.pdf");
+    std::fs::write(&input, one_page_pdf_with_content(b"\r<0g")).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--normalize-content=y", "--compress-streams=n"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {}: content normalization encountered bad tokens",
+            input.display()
+        )))
+        .stderr(predicate::str::contains(
+            "normalized content ended with a bad token",
+        ))
+        .stderr(predicate::str::contains(
+            "Resulting stream data may be corrupted but is may still useful",
+        ))
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings; resulting file may have some problems",
+        ));
+
+    assert!(output.exists(), "qpdf warning exit must retain output");
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let page = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    assert_eq!(
+        flpdf::pages::page_content_bytes(&mut pdf, page).unwrap(),
+        b"\n<0g"
+    );
+}
+
+#[test]
+fn rewrite_normalize_content_recovered_bad_token_omits_terminal_warning() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("recovered-content.pdf");
+    let output = temp.path().join("normalized.pdf");
+    std::fs::write(&input, one_page_pdf_with_content(b"<0g> q")).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--normalize-content=y", "--compress-streams=n"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "content normalization encountered bad tokens",
+        ))
+        .stderr(predicate::str::contains("normalized content ended").not())
+        .stderr(predicate::str::contains(
+            "Resulting stream data may be corrupted but is may still useful",
+        ));
+
+    assert!(output.exists());
+}
+
+#[test]
+fn rewrite_normalize_content_shared_bad_stream_warns_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("shared-bad-content.pdf");
+    let output = temp.path().join("normalized.pdf");
+    std::fs::write(&input, two_page_pdf_with_shared_content(b"<0g")).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--normalize-content=y", "--compress-streams=n"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("content normalization encountered bad tokens").count(1))
+        .stderr(
+            predicate::str::contains(
+                "Resulting stream data may be corrupted but is may still useful",
+            )
+            .count(1),
+        );
+
+    assert!(output.exists());
 }
 
 // ── coalesce-contents ─────────────────────────────────────────────────────────

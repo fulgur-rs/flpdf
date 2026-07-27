@@ -3097,6 +3097,9 @@ fn run_rewrite(
             options.full_rewrite = true;
         }
 
+        let mut normalization_last_bad = Vec::new();
+        let mut normalized_streams = HashSet::new();
+
         // Step 1: coalesce per-page /Contents arrays into a single stream.
         if coalesce_contents {
             let page_refs = pages::page_refs(&mut pdf)?;
@@ -3113,7 +3116,11 @@ fn run_rewrite(
         if normalize_content {
             let page_refs = pages::page_refs(&mut pdf)?;
             for page_ref in page_refs {
-                apply_normalize_content(&mut pdf, page_ref)?;
+                normalization_last_bad.extend(apply_normalize_content(
+                    &mut pdf,
+                    page_ref,
+                    &mut normalized_streams,
+                )?);
             }
         }
 
@@ -3230,7 +3237,7 @@ fn run_rewrite(
         // (exit 0, valid output, no diagnostic) — nothing was restricted,
         // matching qpdf's lenient handling of --remove-restrictions on
         // unencrypted files.
-        finish_lazy_warnings(&input, &pdf, diagnostics_start)?;
+        finish_rewrite_warnings(&input, &pdf, diagnostics_start, &normalization_last_bad)?;
     }
     Ok(())
 }
@@ -4337,21 +4344,25 @@ fn page_ops_active(p: &PageOpArgs) -> bool {
 fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
-) -> CliResult<()> {
+    seen: &mut HashSet<ObjectRef>,
+) -> CliResult<Vec<bool>> {
     // Resolve the page dictionary to find its /Contents value.
     let page_obj = pdf.resolve_borrowed(page_ref)?;
     let Object::Dictionary(page_dict) = page_obj else {
-        return Ok(()); // Not a page dict — skip silently.
+        return Ok(Vec::new()); // Not a page dict — skip silently.
     };
 
     let contents = match page_dict.get("Contents").cloned() {
-        None => return Ok(()), // Empty page — nothing to normalize.
+        None => return Ok(Vec::new()), // Empty page — nothing to normalize.
         Some(c) => c,
     };
 
+    let mut warnings = Vec::new();
     match contents {
         Object::Reference(stream_ref) => {
-            normalize_and_store_stream(pdf, stream_ref)?;
+            if let Some(last_bad) = normalize_and_store_stream(pdf, stream_ref, seen)? {
+                warnings.push(last_bad);
+            }
         }
         Object::Array(elems) => {
             // Multiple content streams — normalize each one in-place.
@@ -4359,7 +4370,9 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
             // single stream; but we handle the array case for safety.)
             for elem in elems {
                 if let Object::Reference(r) = elem {
-                    normalize_and_store_stream(pdf, r)?;
+                    if let Some(last_bad) = normalize_and_store_stream(pdf, r, seen)? {
+                        warnings.push(last_bad);
+                    }
                 }
                 // Direct-stream elements are unusual in real PDFs; skip them
                 // (they have no separate object to patch).
@@ -4371,7 +4384,7 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
         }
         _ => {}
     }
-    Ok(())
+    Ok(warnings)
 }
 
 /// Normalize the raw decoded bytes of the indirect stream at `stream_ref`
@@ -4379,17 +4392,26 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
 fn normalize_and_store_stream<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
     stream_ref: ObjectRef,
-) -> CliResult<()> {
+    seen: &mut HashSet<ObjectRef>,
+) -> CliResult<Option<bool>> {
+    if !seen.insert(stream_ref) {
+        return Ok(None);
+    }
+
     let resolved = pdf.resolve_borrowed(stream_ref)?;
     let Object::Stream(stream) = resolved else {
-        return Ok(()); // Not a stream — skip.
+        return Ok(None); // Not a stream — skip.
     };
 
     // Decode the stored bytes through the declared filter pipeline.
     let decoded = filters::decode_stream_data(&stream.dict, &stream.data)?;
 
     // Normalize the decoded content stream bytes.
-    let normalized = normalize_content_stream(&decoded).into_bytes();
+    let normalized = normalize_content_stream(&decoded);
+    let warning = normalized
+        .any_bad_tokens()
+        .then(|| normalized.last_token_was_bad());
+    let normalized = normalized.into_bytes();
 
     // Build a new stream dict with the updated /Length.
     let mut new_dict: Dictionary = stream.dict.clone();
@@ -4401,7 +4423,7 @@ fn normalize_and_store_stream<R: std::io::Read + std::io::Seek>(
 
     let new_stream = Stream::new(new_dict, normalized);
     pdf.set_object(stream_ref, Object::Stream(new_stream));
-    Ok(())
+    Ok(warning)
 }
 
 fn run_qdf(
@@ -5255,6 +5277,53 @@ fn finish_lazy_warnings<R: Read + Seek>(
     }
     emit_warnings_since(input, pdf, diagnostics_start);
     eprintln!("{}: operation succeeded with warnings", progname());
+    Err(Box::new(CliExitError {
+        code: ExitCode::Warnings,
+        message: String::new(),
+    }))
+}
+
+fn emit_content_normalization_warnings(input: &Path, last_token_was_bad: bool) {
+    let location = diagnostic_location(input, None);
+    eprintln!("WARNING: {location}: content normalization encountered bad tokens");
+    if last_token_was_bad {
+        eprintln!(
+            "WARNING: {location}: normalized content ended with a bad token; \
+             you may be able to resolve this by coalescing content streams in \
+             combination with normalizing content. From the command line, \
+             specify --coalesce-contents"
+        );
+    }
+    eprintln!(
+        "WARNING: {location}: Resulting stream data may be corrupted but is may \
+         still useful for manual inspection. For more information on this \
+         warning, search for content normalization in the manual."
+    );
+}
+
+fn finish_rewrite_warnings<R: Read + Seek>(
+    input: &Path,
+    pdf: &Pdf<R>,
+    diagnostics_start: usize,
+    normalization_last_bad: &[bool],
+) -> CliResult<()> {
+    let has_lazy = pdf.repair_diagnostics().entries().len() != diagnostics_start;
+    if has_lazy {
+        emit_warnings_since(input, pdf, diagnostics_start);
+    }
+    for &last_bad in normalization_last_bad {
+        emit_content_normalization_warnings(input, last_bad);
+    }
+    if !normalization_last_bad.is_empty() {
+        eprintln!(
+            "{}: operation succeeded with warnings; resulting file may have some problems",
+            progname()
+        );
+    } else if has_lazy {
+        eprintln!("{}: operation succeeded with warnings", progname());
+    } else {
+        return Ok(());
+    }
     Err(Box::new(CliExitError {
         code: ExitCode::Warnings,
         message: String::new(),
