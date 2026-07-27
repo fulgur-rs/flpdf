@@ -691,7 +691,7 @@ git add crates/flpdf/src/lib.rs crates/flpdf/src/stream_filter.rs \
 git commit -m "docs: record stream filter cutover"
 ```
 
-- [ ] **Step 7: Persist and publish**
+- [x] **Step 7: Persist and publish**
 
 After all verification succeeds:
 
