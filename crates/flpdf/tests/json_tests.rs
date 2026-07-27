@@ -45,6 +45,23 @@ impl<F: FnMut(&[u8])> io::Write for CallbackSink<F> {
     }
 }
 
+struct FlushSink {
+    bytes: Vec<u8>,
+    flushes: Rc<Cell<usize>>,
+}
+
+impl io::Write for FlushSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flushes.set(self.flushes.get() + 1);
+        Ok(())
+    }
+}
+
 #[test]
 fn incremental_writer_matches_qpdf_nested_bytes() {
     let mut out = Vec::new();
@@ -179,6 +196,21 @@ fn qpdf_blob_streams_base64_without_one_full_encoded_write() {
 
     let expected = format!("\"{}\"", STANDARD.encode(bytes)).into_bytes();
     assert_eq!(out.bytes, expected);
+}
+
+#[test]
+fn blob_callback_flushes_its_underlying_sink() {
+    let flushes = Rc::new(Cell::new(0));
+    let blob = Json::make_blob(|out| out.flush());
+    let mut out = FlushSink {
+        bytes: Vec::new(),
+        flushes: flushes.clone(),
+    };
+
+    blob.write(&mut out, 0).unwrap();
+
+    assert_eq!(out.bytes, b"\"\"");
+    assert_eq!(flushes.get(), 1);
 }
 
 #[test]
