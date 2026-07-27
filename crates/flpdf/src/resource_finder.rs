@@ -192,6 +192,21 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn write_test_probe(path: &Path, source: &str) {
+        use std::fs::{self, File};
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = File::create(path).unwrap();
+        std::io::Write::write_all(&mut file, source.as_bytes()).unwrap();
+        std::io::Write::flush(&mut file).unwrap();
+        drop(file);
+
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn resource_finder_probe_passes_exact_arguments_and_returns_stdout() {
         assert_eq!(
@@ -223,12 +238,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resource_finder_probe_failure_reports_status_and_stderr() {
-        let panic = std::panic::catch_unwind(|| {
-            run_qpdf_resource_finder_probe(Path::new("/bin/false"), b"/F1 12 Tf")
-        })
-        .unwrap_err();
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        write_test_probe(
+            &probe,
+            "#!/bin/sh\nprintf 'resource finder probe stderr' >&2\nexit 1\n",
+        );
+
+        let panic =
+            std::panic::catch_unwind(|| run_qpdf_resource_finder_probe(&probe, b"/F1 12 Tf"))
+                .unwrap_err();
         let message = panic.downcast_ref::<String>().unwrap();
         assert!(message.contains("qpdf resource finder probe failed (exit status: 1)"));
+        assert!(message.contains("resource finder probe stderr"));
     }
 
     #[test]
