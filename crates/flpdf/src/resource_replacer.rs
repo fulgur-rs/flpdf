@@ -1,0 +1,159 @@
+//! qpdf correspondence: `QPDFAcroFormDocumentHelper.cc` `ResourceReplacer`.
+
+use std::collections::BTreeMap;
+
+use crate::content_stream::parse_content_stream_data;
+use crate::pipeline::buffer::Buffer;
+use crate::pipeline::qpdf_tokenizer::QpdfTokenizer;
+use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
+use crate::resource_finder::{ResourceFinder, ResourceNamesByType};
+use crate::token_filter::{TokenFilter, TokenFilterOutput};
+use crate::tokenizer::{Token, TokenType};
+
+pub(crate) type ResourceRenames = BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>;
+
+pub(crate) struct ResourceReplacer {
+    offset: usize,
+    to_replace: BTreeMap<Vec<u8>, BTreeMap<usize, Vec<u8>>>,
+}
+
+impl ResourceReplacer {
+    pub(crate) fn new(renames: &ResourceRenames, names: &ResourceNamesByType) -> Self {
+        let mut to_replace = BTreeMap::new();
+
+        for (resource_type, renamed_names) in renames {
+            let Some(names_by_name) = names.get(resource_type) else {
+                continue;
+            };
+            for (old_name, new_name) in renamed_names {
+                let Some(offsets) = names_by_name.get(old_name) else {
+                    continue;
+                };
+                let mut old_token_value = Vec::with_capacity(old_name.len() + 1);
+                old_token_value.push(b'/');
+                old_token_value.extend_from_slice(old_name);
+                for offset in offsets {
+                    to_replace
+                        .entry(old_token_value.clone())
+                        .or_insert_with(BTreeMap::new)
+                        .insert(*offset, new_name.clone());
+                }
+            }
+        }
+
+        Self {
+            offset: 0,
+            to_replace,
+        }
+    }
+}
+
+impl TokenFilter for ResourceReplacer {
+    fn handle_token(
+        &mut self,
+        token: &Token,
+        output: &mut TokenFilterOutput<'_>,
+    ) -> PipelineResult<()> {
+        let replacement = (token.token_type == TokenType::Name)
+            .then(|| self.to_replace.get(&token.value))
+            .flatten()
+            .and_then(|offsets| offsets.get(&self.offset));
+        if let Some(new_name) = replacement {
+            output.write_token(&Token::new(TokenType::Name, new_name.clone()))?;
+        } else {
+            output.write_token(token)?;
+        }
+        self.offset = self
+            .offset
+            .checked_add(token.raw.len())
+            .ok_or_else(|| PipelineError::runtime("ResourceReplacer offset overflow"))?;
+        Ok(())
+    }
+}
+
+pub(crate) fn replace_resource_names(
+    input: &[u8],
+    renames: &ResourceRenames,
+) -> crate::Result<Option<Vec<u8>>> {
+    if renames.is_empty() {
+        return Ok(Some(input.to_vec()));
+    }
+
+    let mut finder = ResourceFinder::default();
+    if parse_content_stream_data(input, &mut finder).is_err() || finder.had_diagnostics() {
+        return Ok(None);
+    }
+
+    let mut buffer = Buffer::new("ResourceReplacer buffer", None);
+    let mut replacer = ResourceReplacer::new(renames, finder.names_by_resource_type());
+    let mut tokenizer = QpdfTokenizer::new(
+        "ResourceReplacer tokenizer",
+        &mut replacer,
+        Some(&mut buffer),
+    );
+    tokenizer.write(input)?;
+    tokenizer.finish()?;
+    drop(tokenizer);
+
+    Ok(Some(buffer.take_buffer()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn font_renames(old_name: &[u8], new_name: &[u8]) -> ResourceRenames {
+        let mut renames = ResourceRenames::new();
+        renames
+            .entry(b"Font".to_vec())
+            .or_default()
+            .insert(old_name.to_vec(), new_name.to_vec());
+        renames
+    }
+
+    #[test]
+    fn rewrites_only_name_and_offset_pairs_selected_by_finder() {
+        let input = b"/F1 9 Tf /F1 10 Tj /F1 11 Tf";
+        let mut renames = ResourceRenames::new();
+        renames
+            .entry(b"Font".to_vec())
+            .or_default()
+            .insert(b"F1".to_vec(), b"F A_1".to_vec());
+        assert_eq!(
+            replace_resource_names(input, &renames).unwrap().unwrap(),
+            b"/F#20A_1 9 Tf /F1 10 Tj /F#20A_1 11 Tf"
+        );
+    }
+
+    #[test]
+    fn replacement_length_does_not_shift_source_offset_matching() {
+        let input = b"/A 1 Tf /A 2 Tf";
+        let mut renames = ResourceRenames::new();
+        renames
+            .entry(b"Font".to_vec())
+            .or_default()
+            .insert(b"A".to_vec(), b"MuchLonger".to_vec());
+        assert_eq!(
+            replace_resource_names(input, &renames).unwrap().unwrap(),
+            b"/MuchLonger 1 Tf /MuchLonger 2 Tf"
+        );
+    }
+
+    #[test]
+    fn inline_image_payload_and_unselected_tokens_are_byte_identical() {
+        let input = b"%c\r\nBI ID /F1 8 Tf EI /F1 9 Tf";
+        let renames = font_renames(b"F1", b"F2");
+        assert_eq!(
+            replace_resource_names(input, &renames).unwrap().unwrap(),
+            b"%c\r\nBI ID /F1 8 Tf EI /F2 9 Tf"
+        );
+    }
+
+    #[test]
+    fn incomplete_finder_returns_none_without_partial_replacement() {
+        let renames = font_renames(b"F1", b"F2");
+        assert!(replace_resource_names(b"<0g> /F1 9 Tf", &renames)
+            .unwrap()
+            .is_none());
+    }
+}
