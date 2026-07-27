@@ -1,3 +1,5 @@
+//! qpdf correspondence: Pl_Buffer.cc buffering, optional pass-through, finish, and takeBuffer responsibilities.
+
 use super::{Pipeline, PipelineError, PipelineResult};
 
 pub(crate) struct Buffer<'a> {

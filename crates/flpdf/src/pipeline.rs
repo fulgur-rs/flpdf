@@ -1,4 +1,4 @@
-//! Mirrors qpdf 11.9.0 libqpdf/Pipeline.cc.
+//! qpdf correspondence: Pipeline.cc lifecycle and stage-error responsibilities represented by a crate-private Rust trait.
 
 pub(crate) mod buffer;
 

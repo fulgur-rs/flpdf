@@ -1,3 +1,5 @@
+//! qpdf correspondence: Pl_Flate.cc streaming inflate, deflate, warning callback, compression-level, and finish responsibilities via flate2.
+
 use super::{Pipeline, PipelineError, PipelineResult};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use std::fmt;

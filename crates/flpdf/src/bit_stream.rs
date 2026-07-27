@@ -1,3 +1,5 @@
+//! qpdf correspondence: BitStream.cc and bits_functions.hh MSB-first bit reading with Rust error values.
+
 use std::cmp::min;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

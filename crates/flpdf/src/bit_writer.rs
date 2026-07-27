@@ -1,4 +1,4 @@
-//! Mirrors qpdf 11.9.0 `BitWriter.cc` and `bits_functions.hh` bit packing.
+//! qpdf correspondence: BitWriter.cc and bits_functions.hh MSB-first bit packing into a Pipeline stage.
 
 use std::cmp::min;
 

@@ -11,6 +11,8 @@
 | `crates/flpdf/src/ascii85.rs` | correspondence | Pl_ASCII85Decoder.cc decode semantics plus a flpdf encoder; the qpdf Pipeline component boundary is not mirrored |
 | `crates/flpdf/src/ascii_hex.rs` | correspondence | Pl_ASCIIHexDecoder.cc decode semantics plus a flpdf encoder; the qpdf Pipeline component boundary is not mirrored |
 | `crates/flpdf/src/attachment_list.rs` | correspondence | QPDFJob.cc attachment enumeration and display formatting |
+| `crates/flpdf/src/bit_stream.rs` | correspondence | BitStream.cc and bits_functions.hh MSB-first bit reading with Rust error values |
+| `crates/flpdf/src/bit_writer.rs` | correspondence | BitWriter.cc and bits_functions.hh MSB-first bit packing into a Pipeline stage |
 | `crates/flpdf/src/cache.rs` | correspondence | QPDF.cc xref-backed object cache represented as a standalone Rust module |
 | `crates/flpdf/src/check.rs` | correspondence | QPDFJob.cc document-check surface over reader diagnostics |
 | `crates/flpdf/src/content_normalizer.rs` | mirror | libqpdf/Pl_QPDFTokenizer.cc, libqpdf/ContentNormalizer.cc |
@@ -80,6 +82,10 @@
 | `crates/flpdf/src/parser.rs` | correspondence | QPDFParser.cc object parsing with tokenizer responsibilities still shared elsewhere |
 | `crates/flpdf/src/pdf_version.rs` | mirror | libqpdf/PDFVersion.cc |
 | `crates/flpdf/src/permissions.rs` | correspondence | QPDF_encryption.cc permission-bit encoding split from the Standard security handler |
+| `crates/flpdf/src/pipeline.rs` | correspondence | Pipeline.cc lifecycle and stage-error responsibilities represented by a crate-private Rust trait |
+| `crates/flpdf/src/pipeline/buffer.rs` | correspondence | Pl_Buffer.cc buffering, optional pass-through, finish, and takeBuffer responsibilities |
+| `crates/flpdf/src/pipeline/count.rs` | correspondence | Pl_Count.cc byte-count, last-byte, forwarding, and finish responsibilities |
+| `crates/flpdf/src/pipeline/flate.rs` | correspondence | Pl_Flate.cc streaming inflate, deflate, warning callback, compression-level, and finish responsibilities via flate2 |
 | `crates/flpdf/src/qdf_fix.rs` | correspondence | qpdf/fix-qdf.cc tool behavior outside libqpdf |
 | `crates/flpdf/src/qpdf_null.rs` | correspondence | QPDFObjectHandle.cc isNull resolution plus QPDFWriter.cc null-valued dictionary visibility |
 | `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc document reading, object resolution, recovery, and authentication responsibilities |

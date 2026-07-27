@@ -1,3 +1,5 @@
+//! qpdf correspondence: Pl_Count.cc byte-count, last-byte, forwarding, and finish responsibilities.
+
 use super::{Pipeline, PipelineError, PipelineResult};
 
 pub(crate) struct Count<'a> {
