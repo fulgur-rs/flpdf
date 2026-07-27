@@ -5,7 +5,9 @@
 //! enabled), report parser warnings, and flag a few high-level invariants that would
 //! cause downstream tools to fail.
 
-use crate::filters::{decode_stream_data_with_limits, is_decode_output_limit_error, DecodeLimits};
+use crate::filters::{
+    decode_stream_data_with_limits_and_warnings, is_decode_output_limit_error, DecodeLimits,
+};
 use crate::{Diagnostic, Diagnostics, Dictionary, Error, Object, Pdf, PdfOpenOptions};
 use std::io::{Read, Seek};
 
@@ -320,6 +322,28 @@ fn check_content_streams<R: Read + Seek>(
             if !content_filter_chain_is_generalized(&stream.dict) {
                 continue;
             }
+            // qpdf renders the location as "content stream object N G" (no
+            // trailing " R"); format the number/generation pair directly.
+            let location = match stream_ref {
+                Some(r) => format!("content stream object {} {}", r.number, r.generation),
+                None => "inline content stream".to_string(),
+            };
+            let mut decode_warnings = Vec::new();
+            let result = decode_stream_data_with_limits_and_warnings(
+                &stream.dict,
+                &stream.data,
+                limits,
+                &mut |message, _code| {
+                    decode_warnings.push(message.to_string());
+                    Ok(())
+                },
+            );
+            for warning in decode_warnings {
+                diagnostics.push(Diagnostic::warning(
+                    format!("page {page_number}: {location}: {warning}"),
+                    None,
+                ));
+            }
             // A decode `Err` is one of two things:
             //   * the opt-in output cap tripped — the stream is intact, just
             //     larger than the configured limit, so this is a deliberate
@@ -328,13 +352,7 @@ fn check_content_streams<R: Read + Seek>(
             //   * any other failure means the stream cannot be decoded as
             //     declared (corrupt payload, `/Filter` chain past the cap, bad
             //     `/DecodeParms`) — a genuine stream-encoding ERROR.
-            if let Err(error) = decode_stream_data_with_limits(&stream.dict, &stream.data, limits) {
-                // qpdf renders the location as "content stream object N G" (no
-                // trailing " R"); format the number/generation pair directly.
-                let location = match stream_ref {
-                    Some(r) => format!("content stream object {} {}", r.number, r.generation),
-                    None => "inline content stream".to_string(),
-                };
+            if let Err(error) = result {
                 if is_decode_output_limit_error(&error) {
                     // The guard only trips when a cap is set, so `max_output` is
                     // always `Some` here; `unwrap_or_default` echoes the cap into
@@ -664,6 +682,13 @@ mod tests {
         )
     }
 
+    fn truncated_flate_content_pdf() -> Vec<u8> {
+        content_pdf(
+            "4 0 R",
+            &[(4, corrupt_filtered_object(4, "FlateDecode", b"\x78"))],
+        )
+    }
+
     fn corrupt_ascii85_content_pdf() -> Vec<u8> {
         // ASCII85Decode framing over a byte that is invalid in an ASCII85 body.
         content_pdf(
@@ -954,6 +979,32 @@ mod tests {
             .entries()
             .iter()
             .any(|d| d.message.contains("errors while decoding content stream")));
+    }
+
+    #[test]
+    fn truncated_flate_content_is_a_warning_not_an_error() {
+        let report = check_reader_with_options(
+            Cursor::new(truncated_flate_content_pdf()),
+            PdfOpenOptions {
+                repair: false,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report.valid);
+        assert!(report.diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic.message.contains("content stream object 4 0")
+                && diagnostic
+                    .message
+                    .contains("input stream is complete but output may still be valid")
+        }));
+        assert!(!report
+            .diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Error));
     }
 
     #[test]
