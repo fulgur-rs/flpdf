@@ -582,8 +582,7 @@ mod content_mode_tests {
         assert_eq!(parser.parse_content_object().unwrap(), None);
     }
 
-    #[test]
-    fn content_mode_preserves_the_object_nesting_guard() {
+    fn assert_content_mode_preserves_the_object_nesting_guard() {
         let depth = 501;
         let mut input = vec![b'['; depth];
         input.extend(std::iter::repeat_n(b']', depth));
@@ -595,6 +594,22 @@ mod content_mode_tests {
             .expect_err("over-limit content object must fail");
         assert!(matches!(error, Error::Parse { .. }));
         assert!(error.to_string().contains("object nesting too deep"));
+    }
+
+    #[test]
+    fn content_mode_preserves_the_object_nesting_guard() {
+        assert_content_mode_preserves_the_object_nesting_guard();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn content_mode_nesting_guard_fits_the_regression_stack_budget() {
+        std::thread::Builder::new()
+            .stack_size(1_920 * 1_024)
+            .spawn(assert_content_mode_preserves_the_object_nesting_guard)
+            .expect("nesting-guard test thread must start")
+            .join()
+            .expect("nesting guard must return an error before exhausting the stack");
     }
 
     #[test]

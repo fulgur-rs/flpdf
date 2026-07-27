@@ -83,136 +83,11 @@
 
 use super::hint_page::PageOffsetHintTable;
 use super::hint_shared::SharedObjectHintTable;
-use flate2::write::ZlibEncoder;
-use flate2::Compression;
-use std::io::Write;
-
-// ---------------------------------------------------------------------------
-// HintStreamBuilder — MSB-first bit-packing buffer
-// ---------------------------------------------------------------------------
-
-/// A write-only MSB-first bit-packing buffer.
-///
-/// Bits are appended from the most-significant position of the current byte
-/// downward.  When a byte is full it is flushed to the internal `Vec<u8>`.
-///
-/// Calling [`HintStreamBuilder::align_to_byte`] pads with zero bits until the
-/// current byte boundary is reached.
-pub struct HintStreamBuilder {
-    buf: Vec<u8>,
-    /// Number of bits already written into the *current* (pending) byte.
-    /// Range: 0..=7.  When `0` there is no pending byte.
-    pending_bits: u32,
-    /// The pending byte, partially filled.
-    /// The top `pending_bits` bits hold the data written so far;
-    /// the remaining `(8 - pending_bits)` low bits are zero.
-    pending_byte: u8,
-}
-
-impl HintStreamBuilder {
-    /// Create a new, empty builder.
-    pub fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            pending_bits: 0,
-            pending_byte: 0,
-        }
-    }
-
-    /// Append the `bits` least-significant bits of `value`, MSB-first.
-    ///
-    /// `bits = 0` is a no-op (used for placeholder fields whose bit-width
-    /// has not yet been back-patched and is therefore still 0).
-    pub fn write_bits(&mut self, value: u64, bits: u32) {
-        if bits == 0 {
-            return;
-        }
-
-        // We iterate from the most significant requested bit to the least,
-        // filling `pending_byte` one bit at a time and flushing to `buf`
-        // whenever it becomes full.
-        //
-        // For efficiency we work in chunks: determine how many bits fit into
-        // the current pending slot, fill them, flush, then continue.
-        //
-        // `remaining` tracks how many bits of `value` (from the LSB side,
-        // counting the `bits` least-significant bits of `value`) are still
-        // to be written.
-        let mut remaining = bits;
-
-        while remaining > 0 {
-            // How many free bit positions remain in the current pending byte?
-            let free = 8 - self.pending_bits;
-
-            if remaining >= free {
-                // Fill the remaining `free` positions of the current byte.
-                //
-                // We need the `free` bits from `value` that correspond to
-                // positions [remaining-1 .. remaining-free] (0-indexed from LSB).
-                let shift = remaining - free;
-                // Extract those `free` bits; mask to `free` bits wide.
-                // Use u64 arithmetic throughout to avoid overflow.
-                let mask_u64: u64 = if free >= 64 {
-                    u64::MAX
-                } else {
-                    (1u64 << free) - 1
-                };
-                let chunk = ((value >> shift) & mask_u64) as u8;
-                self.pending_byte |= chunk;
-                self.buf.push(self.pending_byte);
-                self.pending_byte = 0;
-                self.pending_bits = 0;
-                remaining -= free;
-            } else {
-                // Remaining bits fit entirely within the current pending byte.
-                // Place them in the top `remaining` of the `free` available
-                // positions (i.e. shift them left by `free - remaining`).
-                let shift = free - remaining;
-                let mask_u64: u64 = if remaining >= 64 {
-                    u64::MAX
-                } else {
-                    (1u64 << remaining) - 1
-                };
-                let chunk = (value & mask_u64) as u8;
-                self.pending_byte |= chunk << shift;
-                self.pending_bits += remaining;
-                remaining = 0;
-            }
-        }
-    }
-
-    /// Pad with zero bits until the current byte boundary.
-    ///
-    /// If the builder is already on a byte boundary this is a no-op.
-    pub fn align_to_byte(&mut self) {
-        if self.pending_bits > 0 {
-            self.buf.push(self.pending_byte);
-            self.pending_byte = 0;
-            self.pending_bits = 0;
-        }
-    }
-
-    /// Consume the builder and return the fully byte-aligned output.
-    ///
-    /// Calls [`Self::align_to_byte`] before returning.
-    pub fn finish(mut self) -> Vec<u8> {
-        self.align_to_byte();
-        self.buf
-    }
-
-    /// Current byte length of already-completed (flushed) bytes.
-    ///
-    /// Does *not* count a partial pending byte.
-    pub fn byte_len(&self) -> usize {
-        self.buf.len()
-    }
-}
-
-impl Default for HintStreamBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+use crate::bit_writer::BitWriter;
+use crate::pipeline::buffer::Buffer;
+use crate::pipeline::count::Count;
+use crate::pipeline::flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE};
+use crate::pipeline::{Pipeline, PipelineResult};
 
 // ---------------------------------------------------------------------------
 // HintStreamBytes — result type
@@ -267,9 +142,9 @@ pub struct OutlineHintTable {
 /// `Unsupported` error.  `field_name` is included in the error so the caller
 /// can identify which Annex F field overflowed.
 fn write_bits_checked(
-    b: &mut HintStreamBuilder,
+    writer: &mut BitWriter<'_>,
     value: u64,
-    slot_bits: u32,
+    slot_bits: usize,
     field_name: &str,
 ) -> crate::Result<()> {
     let max = if slot_bits >= 64 {
@@ -283,12 +158,12 @@ fn write_bits_checked(
              (max {max}) — file likely exceeds 4 GiB or has a malformed plan"
         )));
     }
-    b.write_bits(value, slot_bits);
+    writer.write_bits(value, slot_bits)?;
     Ok(())
 }
 
 fn encode_page_offset_header(
-    b: &mut HintStreamBuilder,
+    writer: &mut BitWriter<'_>,
     t: &PageOffsetHintTable,
 ) -> crate::Result<()> {
     let h = &t.header;
@@ -296,66 +171,79 @@ fn encode_page_offset_header(
     // 5 × 32-bit fields + 8 × 16-bit fields = 5×4 + 8×2 = 36 bytes total.
     //
     // Item 1: least_object_count (32-bit)
-    write_bits_checked(b, h.least_object_count as u64, 32, "least_object_count")?;
+    write_bits_checked(
+        writer,
+        h.least_object_count as u64,
+        32,
+        "least_object_count",
+    )?;
     // Item 2: location_of_first_page (32-bit)
-    write_bits_checked(b, h.location_of_first_page, 32, "location_of_first_page")?;
+    write_bits_checked(
+        writer,
+        h.location_of_first_page,
+        32,
+        "location_of_first_page",
+    )?;
     // Item 3: bits_object_count_delta (16-bit)
     write_bits_checked(
-        b,
+        writer,
         h.bits_object_count_delta as u64,
         16,
         "bits_object_count_delta",
     )?;
     // Item 4: least_page_length (32-bit)
-    write_bits_checked(b, h.least_page_length, 32, "least_page_length")?;
+    write_bits_checked(writer, h.least_page_length, 32, "least_page_length")?;
     // Item 5: bits_page_length_delta (16-bit)
     write_bits_checked(
-        b,
+        writer,
         h.bits_page_length_delta as u64,
         16,
         "bits_page_length_delta",
     )?;
     // Item 6: least_content_offset (32-bit)
-    write_bits_checked(b, h.least_content_offset, 32, "least_content_offset")?;
+    write_bits_checked(writer, h.least_content_offset, 32, "least_content_offset")?;
     // Item 7: bits_content_offset_delta (16-bit)
     write_bits_checked(
-        b,
+        writer,
         h.bits_content_offset_delta as u64,
         16,
         "bits_content_offset_delta",
     )?;
     // Item 8: least_content_length (32-bit)
-    write_bits_checked(b, h.least_content_length, 32, "least_content_length")?;
+    write_bits_checked(writer, h.least_content_length, 32, "least_content_length")?;
     // Item 9: bits_content_length_delta (16-bit)
     write_bits_checked(
-        b,
+        writer,
         h.bits_content_length_delta as u64,
         16,
         "bits_content_length_delta",
     )?;
     // Item 10: bits_shared_object_count (16-bit)
     write_bits_checked(
-        b,
+        writer,
         h.bits_shared_object_count as u64,
         16,
         "bits_shared_object_count",
     )?;
     // Item 11: bits_shared_object_id (16-bit)
     write_bits_checked(
-        b,
+        writer,
         h.bits_shared_object_id as u64,
         16,
         "bits_shared_object_id",
     )?;
     // Item 12: bits_numerator (16-bit)
-    write_bits_checked(b, h.bits_numerator as u64, 16, "bits_numerator")?;
+    write_bits_checked(writer, h.bits_numerator as u64, 16, "bits_numerator")?;
     // Item 13: denominator (16-bit)
-    write_bits_checked(b, h.denominator as u64, 16, "denominator")?;
+    write_bits_checked(writer, h.denominator as u64, 16, "denominator")?;
     // Header total: 5×32 + 8×16 = 160 + 128 = 288 bits = 36 bytes (always aligned).
     Ok(())
 }
 
-fn encode_page_offset_entries(b: &mut HintStreamBuilder, t: &PageOffsetHintTable) {
+fn encode_page_offset_entries(
+    writer: &mut BitWriter<'_>,
+    t: &PageOffsetHintTable,
+) -> PipelineResult<()> {
     let h = &t.header;
 
     // qpdf reads the page-offset section in **column order** via
@@ -375,52 +263,65 @@ fn encode_page_offset_entries(b: &mut HintStreamBuilder, t: &PageOffsetHintTable
 
     // col 1
     for entry in &t.entries {
-        b.write_bits(
+        writer.write_bits(
             entry.object_count_minus_least as u64,
-            h.bits_object_count_delta,
-        );
+            h.bits_object_count_delta as usize,
+        )?;
     }
-    b.align_to_byte();
+    writer.flush()?;
 
     // col 2
     for entry in &t.entries {
-        b.write_bits(entry.page_length_minus_least, h.bits_page_length_delta);
+        writer.write_bits(
+            entry.page_length_minus_least,
+            h.bits_page_length_delta as usize,
+        )?;
     }
-    b.align_to_byte();
+    writer.flush()?;
 
     // col 3
     for entry in &t.entries {
-        b.write_bits(entry.shared_object_count as u64, h.bits_shared_object_count);
+        writer.write_bits(
+            entry.shared_object_count as u64,
+            h.bits_shared_object_count as usize,
+        )?;
     }
-    b.align_to_byte();
+    writer.flush()?;
 
     // col 4: per-page shared identifiers (variable-length per page)
     for entry in &t.entries {
         for &id in &entry.shared_object_ids {
-            b.write_bits(id as u64, h.bits_shared_object_id);
+            writer.write_bits(id as u64, h.bits_shared_object_id as usize)?;
         }
     }
-    b.align_to_byte();
+    writer.flush()?;
 
     // col 5: per-page shared numerators
     for entry in &t.entries {
         for &num in &entry.shared_object_numerators {
-            b.write_bits(num as u64, h.bits_numerator);
+            writer.write_bits(num as u64, h.bits_numerator as usize)?;
         }
     }
-    b.align_to_byte();
+    writer.flush()?;
 
     // col 6
     for entry in &t.entries {
-        b.write_bits(entry.content_stream_offset, h.bits_content_offset_delta);
+        writer.write_bits(
+            entry.content_stream_offset,
+            h.bits_content_offset_delta as usize,
+        )?;
     }
-    b.align_to_byte();
+    writer.flush()?;
 
     // col 7
     for entry in &t.entries {
-        b.write_bits(entry.content_stream_length, h.bits_content_length_delta);
+        writer.write_bits(
+            entry.content_stream_length,
+            h.bits_content_length_delta as usize,
+        )?;
     }
-    b.align_to_byte();
+    writer.flush()?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -428,34 +329,39 @@ fn encode_page_offset_entries(b: &mut HintStreamBuilder, t: &PageOffsetHintTable
 // ---------------------------------------------------------------------------
 
 fn encode_shared_object_header(
-    b: &mut HintStreamBuilder,
+    writer: &mut BitWriter<'_>,
     t: &SharedObjectHintTable,
 ) -> crate::Result<()> {
     let h = &t.header;
     // Items numbered as in Annex F.3.2, Table F.9.
     write_bits_checked(
-        b,
+        writer,
         h.first_object_number as u64,
         32,
         "shared.first_object_number",
     )?;
-    write_bits_checked(b, h.location, 32, "shared.location")?;
+    write_bits_checked(writer, h.location, 32, "shared.location")?;
     write_bits_checked(
-        b,
+        writer,
         h.first_page_entries as u64,
         32,
         "shared.first_page_entries",
     )?;
-    write_bits_checked(b, h.section_entries as u64, 32, "shared.section_entries")?;
     write_bits_checked(
-        b,
+        writer,
+        h.section_entries as u64,
+        32,
+        "shared.section_entries",
+    )?;
+    write_bits_checked(
+        writer,
         h.bits_group_object_count as u64,
         16,
         "shared.bits_group_object_count",
     )?;
-    write_bits_checked(b, h.least_length, 32, "shared.least_length")?;
+    write_bits_checked(writer, h.least_length, 32, "shared.least_length")?;
     write_bits_checked(
-        b,
+        writer,
         h.bits_length_delta as u64,
         16,
         "shared.bits_length_delta",
@@ -464,14 +370,24 @@ fn encode_shared_object_header(
     Ok(())
 }
 
-fn encode_shared_object_groups(b: &mut HintStreamBuilder, t: &SharedObjectHintTable) {
+fn encode_shared_object_groups(
+    writer: &mut BitWriter<'_>,
+    t: &SharedObjectHintTable,
+) -> PipelineResult<()> {
     let h = &t.header;
     for group in &t.groups {
-        b.write_bits(group.object_count as u64, h.bits_group_object_count);
+        writer.write_bits(
+            group.object_count as u64,
+            h.bits_group_object_count as usize,
+        )?;
     }
+    Ok(())
 }
 
-fn encode_shared_object_entries(b: &mut HintStreamBuilder, t: &SharedObjectHintTable) {
+fn encode_shared_object_entries(
+    writer: &mut BitWriter<'_>,
+    t: &SharedObjectHintTable,
+) -> PipelineResult<()> {
     let h = &t.header;
 
     // qpdf reads shared-object entries column-wise (per `Lin::readHSharedObject`):
@@ -487,33 +403,107 @@ fn encode_shared_object_entries(b: &mut HintStreamBuilder, t: &SharedObjectHintT
 
     // col 1: delta_group_length
     for entry in &t.objects {
-        b.write_bits(entry.length_minus_least as u64, h.bits_length_delta);
+        writer.write_bits(
+            entry.length_minus_least as u64,
+            h.bits_length_delta as usize,
+        )?;
     }
-    b.align_to_byte();
+    writer.flush()?;
 
     // col 2: signature_present (1 bit per entry, plus 128-bit signature if set)
     for entry in &t.objects {
-        b.write_bits(if entry.signature_present { 1 } else { 0 }, 1);
+        writer.write_bits(if entry.signature_present { 1 } else { 0 }, 1)?;
         if entry.signature_present {
             if let Some(sig) = &entry.signature {
                 for &byte in sig {
-                    b.write_bits(byte as u64, 8);
+                    writer.write_bits(byte as u64, 8)?;
                 }
             }
         }
     }
-    b.align_to_byte();
+    writer.flush()?;
 
     // col 3: nobjects_minus_one
     for entry in &t.objects {
-        b.write_bits(entry.nobjects_minus_one as u64, h.bits_group_object_count);
+        writer.write_bits(
+            entry.nobjects_minus_one as u64,
+            h.bits_group_object_count as usize,
+        )?;
     }
-    b.align_to_byte();
+    writer.flush()?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+fn encode_page_section(
+    writer: &mut BitWriter<'_>,
+    page_offset: &PageOffsetHintTable,
+) -> crate::Result<()> {
+    encode_page_offset_header(writer, page_offset)?;
+    writer.flush()?;
+    encode_page_offset_entries(writer, page_offset)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn encode_shared_section(
+    writer: &mut BitWriter<'_>,
+    shared_object: &SharedObjectHintTable,
+) -> crate::Result<()> {
+    encode_shared_object_header(writer, shared_object)?;
+    writer.flush()?;
+    encode_shared_object_groups(writer, shared_object)?;
+    writer.flush()?;
+    encode_shared_object_entries(writer, shared_object)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn encode_outline_section(
+    writer: &mut BitWriter<'_>,
+    outline: &OutlineHintTable,
+) -> PipelineResult<()> {
+    writer.write_bits(outline.first_object as u64, 32)?;
+    writer.write_bits(outline.first_object_offset as u64, 32)?;
+    writer.write_bits(outline.nobjects as u64, 32)?;
+    writer.write_bits(outline.group_length as u64, 32)?;
+    writer.flush()
+}
+
+fn checked_hint_offset<T>(count: u64, key: &str) -> crate::Result<T>
+where
+    T: TryFrom<u64>,
+{
+    T::try_from(count).map_err(|_| {
+        crate::Error::Unsupported(format!(
+            "hint {key} offset does not fit {}",
+            std::any::type_name::<T>()
+        ))
+    })
+}
+
+#[cfg(test)]
+fn encode_hint_sections_for_test(
+    tables: &(PageOffsetHintTable, SharedObjectHintTable),
+    mut terminal: impl Pipeline,
+) -> crate::Result<()> {
+    let mut count = Count::new("count hint stream", &mut terminal);
+    {
+        let mut writer = BitWriter::new(&mut count);
+        encode_page_section(&mut writer, &tables.0)?;
+        writer.flush()?;
+    }
+    {
+        let mut writer = BitWriter::new(&mut count);
+        encode_shared_section(&mut writer, &tables.1)?;
+        writer.flush()?;
+    }
+    count.finish()?;
+    Ok(())
+}
 
 /// Encode a Page Offset Hint Table and a Shared Object Hint Table into a
 /// single hint stream, compressed with FlateDecode (zlib deflate).
@@ -529,7 +519,7 @@ fn encode_shared_object_entries(b: &mut HintStreamBuilder, t: &SharedObjectHintT
 /// - Bit order: MSB-first (most-significant bit first within each byte)
 /// - Section alignment: each hint-table section begins on a byte boundary
 /// - Per-entry alignment: each per-page and per-object entry begins on a byte boundary
-/// - Compression: `flate2::ZlibEncoder` with `Compression::default()` (level 6)
+/// - Compression: the qpdf-shaped Flate pipeline at the default level (6)
 ///
 /// # Placeholder fields
 ///
@@ -550,75 +540,59 @@ pub fn encode_hint_stream(
     shared_object: &SharedObjectHintTable,
     outline: Option<&OutlineHintTable>,
 ) -> crate::Result<HintStreamBytes> {
-    let mut builder = HintStreamBuilder::new();
+    encode_hint_stream_with_out_buffer_size(
+        page_offset,
+        shared_object,
+        outline,
+        DEFAULT_OUT_BUFFER_SIZE,
+    )
+}
 
-    // -----------------------------------------------------------------------
-    // Section 1: Page Offset Hint Table (starts at byte offset 0)
-    // -----------------------------------------------------------------------
-    encode_page_offset_header(&mut builder, page_offset)?;
-    // The 13-field header is exactly 288 bits = 36 bytes (already aligned).
-    // We call align_to_byte for defensive correctness in case future changes
-    // alter the field widths.
-    builder.align_to_byte();
-    encode_page_offset_entries(&mut builder, page_offset);
-    // Ensure byte alignment before recording the shared section offset.
-    builder.align_to_byte();
-
-    // -----------------------------------------------------------------------
-    // Section 2: Shared Object Hint Table — record its byte offset as /S
-    // -----------------------------------------------------------------------
-    let shared_section_offset = builder.byte_len();
-
-    encode_shared_object_header(&mut builder, shared_object)?;
-    builder.align_to_byte();
-    encode_shared_object_groups(&mut builder, shared_object);
-    builder.align_to_byte();
-    encode_shared_object_entries(&mut builder, shared_object);
-    builder.align_to_byte();
-
-    // -----------------------------------------------------------------------
-    // Section 3 (optional): Outlines Hint Table — record its byte offset as /O
-    // -----------------------------------------------------------------------
-    // qpdf only emits this table (and the /O key) when there are outlines
-    // (`if (m->outline_hints.nobjects > 0)`, QPDF_linearization.cc:1789).
-    let outline_section_offset = match outline {
-        Some(o) => {
-            let offset = builder.byte_len();
-            // qpdf's writeHGeneric: four fixed 32-bit MSB-first fields. Each field
-            // is a `u32` written into a 32-bit slot, so it cannot overflow — no
-            // `write_bits_checked` guard is needed (qpdf uses unchecked
-            // `writeBitsInt`/`writeBits` here too).
-            builder.write_bits(o.first_object as u64, 32);
-            builder.write_bits(o.first_object_offset as u64, 32);
-            builder.write_bits(o.nobjects as u64, 32);
-            builder.write_bits(o.group_length as u64, 32);
-            builder.align_to_byte();
-            Some(offset)
+fn encode_hint_stream_with_out_buffer_size(
+    page_offset: &PageOffsetHintTable,
+    shared_object: &SharedObjectHintTable,
+    outline: Option<&OutlineHintTable>,
+    out_buffer_size: usize,
+) -> crate::Result<HintStreamBytes> {
+    let mut compressed_sink = Buffer::new("compressed hint stream", None);
+    let uncompressed;
+    let shared_section_offset;
+    let outline_section_offset;
+    {
+        let mut flate = Flate::new(
+            "compress hint stream",
+            &mut compressed_sink,
+            FlateAction::Deflate,
+            out_buffer_size,
+        )?;
+        let mut raw = Buffer::new("raw hint stream", Some(&mut flate));
+        {
+            let mut count = Count::new("count hint stream", &mut raw);
+            {
+                let mut writer = BitWriter::new(&mut count);
+                encode_page_section(&mut writer, page_offset)?;
+                writer.flush()?;
+            }
+            shared_section_offset = checked_hint_offset(count.count(), "/S")?;
+            {
+                let mut writer = BitWriter::new(&mut count);
+                encode_shared_section(&mut writer, shared_object)?;
+                writer.flush()?;
+            }
+            outline_section_offset = if let Some(outline) = outline {
+                let offset = checked_hint_offset(count.count(), "/O")?;
+                let mut writer = BitWriter::new(&mut count);
+                encode_outline_section(&mut writer, outline)?;
+                writer.flush()?;
+                Some(offset)
+            } else {
+                None
+            };
+            count.finish()?;
         }
-        None => None,
-    };
-
-    // -----------------------------------------------------------------------
-    // Finalise uncompressed stream
-    // -----------------------------------------------------------------------
-    let uncompressed = builder.finish();
-
-    // -----------------------------------------------------------------------
-    // Compress with FlateDecode (zlib, level 6 = Compression::default())
-    //
-    // qpdf also defaults to zlib level 6 (Z_DEFAULT_COMPRESSION). Verified by
-    // round-tripping a content stream through compress2() and flate2: with the
-    // `qpdf-zlib-compat` feature (flate2 linked against classic libz1g) the
-    // output is byte-identical to qpdf's. Under default features the size
-    // matches but internal bytes differ (miniz_oxide vs classic zlib internals).
-    // -----------------------------------------------------------------------
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder
-        .write_all(&uncompressed)
-        .expect("ZlibEncoder::write_all on Vec<u8> must not fail");
-    let compressed = encoder
-        .finish()
-        .expect("ZlibEncoder::finish on Vec<u8> must not fail");
+        uncompressed = raw.take_buffer()?;
+    }
+    let compressed = compressed_sink.take_buffer()?;
 
     Ok(HintStreamBytes {
         uncompressed,
@@ -636,10 +610,77 @@ pub fn encode_hint_stream(
 mod tests {
     use super::*;
     use crate::linearization::hint_page::PageOffsetHintTable;
-    use crate::linearization::hint_shared::SharedObjectHintTable;
+    use crate::linearization::hint_shared::{
+        SharedGroupEntry, SharedObjectEntry, SharedObjectHintTable,
+    };
     use crate::linearization::plan::{LinearizationPlan, PageHintEntry, SharedObjectHintEntry};
     use crate::linearization::renumber::RenumberMap;
+    use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
     use crate::ObjectRef;
+
+    struct FailingSink {
+        identifier: &'static str,
+        fail_at_write: Option<usize>,
+        writes: usize,
+        fail_finish: bool,
+    }
+
+    impl FailingSink {
+        fn new(identifier: &'static str) -> Self {
+            Self {
+                identifier,
+                fail_at_write: Some(0),
+                writes: 0,
+                fail_finish: false,
+            }
+        }
+
+        fn at_write(identifier: &'static str, fail_at_write: usize) -> Self {
+            Self {
+                identifier,
+                fail_at_write: Some(fail_at_write),
+                writes: 0,
+                fail_finish: false,
+            }
+        }
+
+        fn at_finish(identifier: &'static str) -> Self {
+            Self {
+                identifier,
+                fail_at_write: None,
+                writes: 0,
+                fail_finish: true,
+            }
+        }
+    }
+
+    impl Pipeline for FailingSink {
+        fn identifier(&self) -> &str {
+            self.identifier
+        }
+
+        fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+            if self.fail_at_write == Some(self.writes) {
+                return Err(PipelineError::logic(format!(
+                    "{}: write failed",
+                    self.identifier()
+                )));
+            }
+            self.writes += 1;
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            if self.fail_finish {
+                Err(PipelineError::logic(format!(
+                    "{}: finish failed",
+                    self.identifier()
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Fixture helpers
@@ -662,6 +703,123 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    fn minimal_tables() -> (PageOffsetHintTable, SharedObjectHintTable) {
+        let plan = single_page_plan();
+        let renumber = RenumberMap::from_plan(&plan);
+        let page_offset = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        let shared_object = SharedObjectHintTable::from_plan(
+            &plan,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        (page_offset, shared_object)
+    }
+
+    fn nonzero_tables() -> (PageOffsetHintTable, SharedObjectHintTable) {
+        let (mut page_offset, mut shared_object) = minimal_tables();
+        page_offset.header.bits_object_count_delta = 8;
+        page_offset.header.bits_page_length_delta = 8;
+        page_offset.header.bits_shared_object_count = 8;
+        page_offset.header.bits_shared_object_id = 8;
+        page_offset.header.bits_numerator = 8;
+        page_offset.header.bits_content_offset_delta = 8;
+        page_offset.header.bits_content_length_delta = 8;
+        let page = &mut page_offset.entries[0];
+        page.object_count_minus_least = 1;
+        page.page_length_minus_least = 1;
+        page.shared_object_count = 1;
+        page.shared_object_ids = vec![1];
+        page.shared_object_numerators = vec![1];
+        page.content_stream_offset = 1;
+        page.content_stream_length = 1;
+
+        shared_object.header.first_page_entries = 1;
+        shared_object.header.section_entries = 1;
+        shared_object.header.bits_group_object_count = 8;
+        shared_object.header.bits_length_delta = 8;
+        shared_object.groups = vec![SharedGroupEntry { object_count: 1 }];
+        shared_object.objects = vec![SharedObjectEntry {
+            length_minus_least: 1,
+            signature_present: true,
+            signature: Some([0xA5; 16]),
+            nobjects_minus_one: 1,
+        }];
+        (page_offset, shared_object)
+    }
+
+    #[test]
+    fn hint_encoding_maps_pipeline_logic_error_to_qpdf_internal_category() {
+        let err = encode_hint_sections_for_test(&minimal_tables(), FailingSink::new("hint sink"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Internal(ref message) if message == "hint sink: write failed"
+        ));
+    }
+
+    #[test]
+    fn checked_hint_offset_maps_conversion_failure_to_the_target_type() {
+        let err = checked_hint_offset::<u8>(u64::from(u8::MAX) + 1, "/S").unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported(ref message)
+                if message == "hint /S offset does not fit u8"
+        ));
+    }
+
+    #[test]
+    fn hint_encoding_maps_flate_runtime_error_to_qpdf_system_category() {
+        let tables = minimal_tables();
+        let err = encode_hint_stream_with_out_buffer_size(&tables.0, &tables.1, None, 0)
+            .err()
+            .expect("zero output buffer must fail");
+        assert!(matches!(
+            err,
+            crate::Error::System(ref message)
+                if message == "Pl_Flate: output buffer size must be greater than zero"
+        ));
+    }
+
+    #[test]
+    fn hint_encoding_propagates_page_and_shared_section_write_and_finish_errors() {
+        let tables = nonzero_tables();
+        let encoded = encode_hint_stream(&tables.0, &tables.1, None).unwrap();
+
+        for fail_at_write in 0..encoded.uncompressed.len() {
+            let err = encode_hint_sections_for_test(
+                &tables,
+                FailingSink::at_write("hint sink", fail_at_write),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                crate::Error::Internal(ref message) if message == "hint sink: write failed"
+            ));
+        }
+
+        encode_hint_sections_for_test(
+            &tables,
+            FailingSink::at_write("hint sink", encoded.uncompressed.len()),
+        )
+        .unwrap();
+
+        let err = encode_hint_sections_for_test(&tables, FailingSink::at_finish("hint sink"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Internal(ref message) if message == "hint sink: finish failed"
+        ));
     }
 
     /// Two-page plan with two shared objects referenced by both pages.
@@ -697,107 +855,6 @@ mod tests {
             ],
             ..Default::default()
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // HintStreamBuilder unit tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn builder_write_zero_bits_is_noop() {
-        let mut b = HintStreamBuilder::new();
-        b.write_bits(0xFF, 0); // should not change state
-        let out = b.finish();
-        assert!(out.is_empty(), "write_bits(x, 0) must be a no-op");
-    }
-
-    #[test]
-    fn builder_write_8_bits_produces_one_byte() {
-        let mut b = HintStreamBuilder::new();
-        b.write_bits(0xAB, 8);
-        let out = b.finish();
-        assert_eq!(out, vec![0xAB]);
-    }
-
-    #[test]
-    fn builder_write_16_bits_produces_two_bytes() {
-        let mut b = HintStreamBuilder::new();
-        b.write_bits(0xABCD, 16);
-        let out = b.finish();
-        assert_eq!(out, vec![0xAB, 0xCD]);
-    }
-
-    #[test]
-    fn builder_write_4_plus_4_bits() {
-        let mut b = HintStreamBuilder::new();
-        b.write_bits(0b1010, 4); // upper nibble = 0xA
-        b.write_bits(0b0101, 4); // lower nibble = 0x5
-        let out = b.finish();
-        assert_eq!(out, vec![0xA5]);
-    }
-
-    #[test]
-    fn builder_write_1_bit_msb_first() {
-        let mut b = HintStreamBuilder::new();
-        // Write bits: 1 0 1 0 0 0 0 0 → 0b1010_0000 = 0xA0
-        b.write_bits(1, 1);
-        b.write_bits(0, 1);
-        b.write_bits(1, 1);
-        b.write_bits(0, 1);
-        b.write_bits(0, 1);
-        b.write_bits(0, 1);
-        b.write_bits(0, 1);
-        b.write_bits(0, 1);
-        let out = b.finish();
-        assert_eq!(out, vec![0xA0]);
-    }
-
-    #[test]
-    fn builder_align_to_byte_pads_with_zeros() {
-        let mut b = HintStreamBuilder::new();
-        b.write_bits(1, 1); // 1 bit written → top bit = 1 → 0b1000_0000 = 0x80
-        b.align_to_byte();
-        let out = b.finish();
-        assert_eq!(out, vec![0x80]);
-    }
-
-    #[test]
-    fn builder_align_on_boundary_is_noop() {
-        let mut b = HintStreamBuilder::new();
-        b.write_bits(0xAB, 8); // exactly one byte — already on boundary
-        b.align_to_byte(); // should NOT add an extra byte
-        let out = b.finish();
-        assert_eq!(out, vec![0xAB]);
-    }
-
-    #[test]
-    fn builder_cross_byte_boundary() {
-        // Write 12 bits: 0b1100_1010_0011
-        //   First byte:  1100_1010 = 0xCA
-        //   Second byte: 0011_xxxx → 0011_0000 = 0x30 (padded with zeros on finish)
-        let mut b = HintStreamBuilder::new();
-        b.write_bits(0b1100_1010_0011, 12);
-        let out = b.finish();
-        assert_eq!(out, vec![0xCA, 0x30]);
-    }
-
-    #[test]
-    fn builder_write_32_bits() {
-        let mut b = HintStreamBuilder::new();
-        b.write_bits(0xDEAD_BEEF, 32);
-        let out = b.finish();
-        assert_eq!(out, vec![0xDE, 0xAD, 0xBE, 0xEF]);
-    }
-
-    #[test]
-    fn builder_sequence_3_bits_then_5_bits() {
-        // 3 bits: 0b101  → occupies top 3 bits of byte: 101x_xxxx
-        // 5 bits: 0b10110 → fills remaining 5 bits:      101_10110 = 0xB6
-        let mut b = HintStreamBuilder::new();
-        b.write_bits(0b101, 3);
-        b.write_bits(0b10110, 5);
-        let out = b.finish();
-        assert_eq!(out, vec![0b1011_0110]); // 0xB6
     }
 
     // -----------------------------------------------------------------------

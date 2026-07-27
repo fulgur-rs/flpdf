@@ -13,6 +13,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// entries that the spec mandates, e.g. `/Root` on the trailer.
 /// [`Error::Encrypted`] covers all encryption-related failures; its subkind is
 /// carried by [`EncryptedError`].
+/// [`Error::Internal`] and [`Error::System`] mirror qpdf's public classification
+/// of `std::logic_error` and `std::runtime_error`, respectively.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("I/O error: {0}")]
@@ -29,6 +31,12 @@ pub enum Error {
 
     #[error("encrypted PDF: {0}")]
     Encrypted(#[from] EncryptedError),
+
+    #[error("{0}")]
+    Internal(String),
+
+    #[error("{0}")]
+    System(String),
 }
 
 impl Error {
@@ -54,6 +62,15 @@ impl Error {
                 message,
             },
             other => other,
+        }
+    }
+}
+
+impl From<crate::pipeline::PipelineError> for Error {
+    fn from(error: crate::pipeline::PipelineError) -> Self {
+        match error {
+            crate::pipeline::PipelineError::Logic(message) => Self::Internal(message),
+            crate::pipeline::PipelineError::Runtime(message) => Self::System(message),
         }
     }
 }
@@ -128,6 +145,30 @@ impl EncryptedError {
 mod tests {
     use super::*;
     use crate::security::primitives::PrimitiveError;
+
+    #[test]
+    fn pipeline_logic_error_maps_to_qpdf_internal_category() {
+        let public: Error =
+            crate::pipeline::PipelineError::logic("Pl_Buffer::getBuffer() called when not ready")
+                .into();
+        assert!(matches!(
+            public,
+            Error::Internal(ref message)
+                if message == "Pl_Buffer::getBuffer() called when not ready"
+        ));
+    }
+
+    #[test]
+    fn pipeline_runtime_error_maps_to_qpdf_system_category() {
+        let public: Error =
+            crate::pipeline::PipelineError::runtime("inflate: inflate: data: corrupt stream")
+                .into();
+        assert!(matches!(
+            public,
+            Error::System(ref message)
+                if message == "inflate: inflate: data: corrupt stream"
+        ));
+    }
 
     #[test]
     fn encrypted_error_display_bad_password() {

@@ -32,7 +32,7 @@ pub use hint_page::{bits_needed, PageOffsetEntry, PageOffsetHeader, PageOffsetHi
 pub use hint_shared::{
     SharedGroupEntry, SharedObjectEntry, SharedObjectHeader, SharedObjectHintTable,
 };
-pub use hint_stream::{encode_hint_stream, HintStreamBuilder, HintStreamBytes};
+pub use hint_stream::{encode_hint_stream, HintStreamBytes};
 pub use part1::{Part1Bytes, Part1Placeholders, PLACEHOLDER_WIDTH};
 pub use plan::{LinearizationPlan, PageHintEntry, SharedObjectHintEntry};
 pub use renumber::{ObjStmRelocation, RenumberMap};
