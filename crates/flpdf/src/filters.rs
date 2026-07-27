@@ -1,10 +1,10 @@
 //! qpdf correspondence: Pl_LZWDecoder, predictor, and not-yet-migrated stream-filter codec responsibilities; QPDFStreamFilter dispatch and Pl_Flate execution are delegated to stream_filter.
 use crate::ascii85;
 use crate::ascii_hex;
+use crate::pipeline::{PipelineError, PipelineResult};
 use crate::run_length;
 use crate::stream_filter::{
-    decode_filter_specs, encode_flate, ignore_warning, stream_filter_for,
-    DECODE_OUTPUT_LIMIT_PREFIX,
+    decode_filter_specs, encode_flate, stream_filter_for, DECODE_OUTPUT_LIMIT_PREFIX,
 };
 use crate::{Dictionary, Error, Object, Result};
 
@@ -65,11 +65,11 @@ pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
 /// - an implemented codec fails on malformed input — corrupt deflate, LZW,
 ///   ASCII85, ASCIIHex, or RunLength data, or a corrupt PNG-predictor stream.
 pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
-    decode_stream_data_with_filters(
-        dict.get("Filter"),
-        dict.get("DecodeParms"),
+    decode_stream_data_with_limits_and_warnings(
+        dict,
         stream_data,
         DecodeLimits::default(),
+        &mut reject_decode_warning,
     )
 }
 
@@ -88,6 +88,27 @@ pub struct DecodeLimits {
     /// Maximum decompressed byte count permitted out of any single
     /// `FlateDecode` / `LZWDecode` stage. `None` (default) is unlimited.
     pub max_output: Option<usize>,
+}
+
+fn reject_decode_warning(message: &str, code: i32) -> PipelineResult<()> {
+    Err(PipelineError::runtime(format!(
+        "stream inflate: {message} (zlib error {code})"
+    )))
+}
+
+pub(crate) fn decode_stream_data_with_limits_and_warnings(
+    dict: &Dictionary,
+    stream_data: &[u8],
+    limits: DecodeLimits,
+    warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+) -> Result<Vec<u8>> {
+    decode_stream_data_with_filters(
+        dict.get("Filter"),
+        dict.get("DecodeParms"),
+        stream_data,
+        limits,
+        warn,
+    )
 }
 
 /// Returns `true` when `error` is the limit-exceeded signal raised when a
@@ -118,11 +139,11 @@ pub fn decode_stream_data_with_limits(
     stream_data: &[u8],
     limits: DecodeLimits,
 ) -> Result<Vec<u8>> {
-    decode_stream_data_with_filters(
-        dict.get("Filter"),
-        dict.get("DecodeParms"),
+    decode_stream_data_with_limits_and_warnings(
+        dict,
         stream_data,
         limits,
+        &mut reject_decode_warning,
     )
 }
 
@@ -145,6 +166,7 @@ fn decode_stream_data_with_filters(
     decode_params: Option<&Object>,
     stream_data: &[u8],
     limits: DecodeLimits,
+    warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
 ) -> Result<Vec<u8>> {
     decode_stream_data_with_filters_and_crypt(
         filter,
@@ -156,6 +178,7 @@ fn decode_stream_data_with_filters(
                 "unsupported stream filter: Crypt".to_string(),
             ))
         },
+        warn,
     )
 }
 
@@ -165,6 +188,7 @@ fn decode_stream_data_with_filters_and_crypt<F>(
     stream_data: &[u8],
     limits: DecodeLimits,
     decrypt_crypt: &mut F,
+    warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
 ) -> Result<Vec<u8>>
 where
     F: FnMut(Option<&Object>, &[u8]) -> Result<Vec<u8>>,
@@ -188,7 +212,7 @@ where
                 // the codec pipeline. Predictor migration remains in qynx.5.3,
                 // but its existing validation must retain that error timing.
                 extract_predictor_params(spec.decode_params)?;
-                filter.pipe_decode(&decoded, limits.max_output, &mut ignore_warning)?
+                filter.pipe_decode(&decoded, limits.max_output, warn)?
             } else {
                 apply_single_filter_decode(
                     filter_name,
@@ -803,6 +827,17 @@ mod tests {
             "unsupported PDF feature: stream inflate: inflate: data: incorrect header check"
         );
     }
+    #[test]
+    fn decode_stream_data_rejects_truncated_flate_warning() {
+        let error = decode_stream_data(&flate_dict(), b"\x78").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream inflate: \
+             input stream is complete but output may still be valid (zlib error -5)"
+        );
+    }
+
     #[test]
     fn invalid_flate_decode_params_fail_before_malformed_stream_data() {
         let mut params = Dictionary::new();
