@@ -146,8 +146,12 @@ impl<'a> Flate<'a> {
         })
     }
 
-    fn handle_buf_error(&mut self) -> PipelineResult<()> {
-        self.warn(BUF_ERROR_WARNING, Z_BUF_ERROR)
+    fn handle_buf_error(&mut self, status: Status) -> PipelineResult<bool> {
+        if status != Status::BufError {
+            return Ok(false);
+        }
+        self.warn(BUF_ERROR_WARNING, Z_BUF_ERROR)?;
+        Ok(true)
     }
 
     fn initialize_codec(&mut self) {
@@ -238,15 +242,11 @@ impl<'a> Flate<'a> {
             let status = result
                 .map_err(|source| PipelineError::codec_with_source(identifier, detail, source))?;
 
-            if status == Status::BufError {
-                return self.handle_buf_error();
-            }
-
             if produced > 0 {
                 self.next.write(&self.output[..produced])?;
             }
 
-            if status == Status::StreamEnd {
+            if status == Status::StreamEnd || self.handle_buf_error(status)? {
                 return Ok(());
             }
             if flush != FlushCompress::Finish
@@ -311,8 +311,8 @@ impl<'a> Flate<'a> {
                 }
             };
 
-            if status == Status::BufError {
-                return self.handle_buf_error();
+            if self.handle_buf_error(status)? {
+                return Ok(());
             }
 
             if produced > 0 {
@@ -335,21 +335,15 @@ impl<'a> Flate<'a> {
             return Ok(());
         };
         let result = match &mut codec {
-            FlateCodec::Inflate(codec) => {
-                if matches!(self.inflate_state.phase, InflatePhase::Ended) {
-                    Ok(())
+            FlateCodec::Inflate(codec) => self.write_inflate(
+                codec,
+                data,
+                if finishing {
+                    FlushDecompress::Finish
                 } else {
-                    self.write_inflate(
-                        codec,
-                        data,
-                        if finishing {
-                            FlushDecompress::Finish
-                        } else {
-                            FlushDecompress::Sync
-                        },
-                    )
-                }
-            }
+                    FlushDecompress::Sync
+                },
+            ),
             FlateCodec::Deflate(codec) => self.write_deflate(
                 codec,
                 data,
