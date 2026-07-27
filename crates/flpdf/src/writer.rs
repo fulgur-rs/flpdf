@@ -1757,8 +1757,8 @@ fn write_incremental_xref_stream(
                     crate::Error::Unsupported(
                         "xref stream object offset does not fit u64".to_string(),
                     )
-                    // cov:ignore-end
                 })?,
+                // cov:ignore-end
             },
         ),
     );
@@ -4090,8 +4090,8 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                                     crate::Error::Unsupported(
                                         "xref offset does not fit u64".to_string(),
                                     )
-                                    // cov:ignore-end
                                 })?,
+                                // cov:ignore-end
                             },
                         ),
                     );
@@ -4130,8 +4130,8 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                             crate::Error::Unsupported(
                                 "xref stream offset does not fit u64".to_string(),
                             )
-                            // cov:ignore-end
                         })?,
+                        // cov:ignore-end
                     },
                 ),
             );
