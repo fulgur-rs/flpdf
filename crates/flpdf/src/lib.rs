@@ -146,6 +146,7 @@ pub mod qdf_fix;
 pub(crate) mod qpdf_null;
 pub mod reader;
 pub(crate) mod ref_chain;
+mod resource_finder;
 pub mod resources;
 pub(crate) mod rewrite_renumber;
 pub mod rotate_spec;

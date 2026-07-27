@@ -5,6 +5,7 @@
 #include <qpdf/QPDF.hh>
 #include <qpdf/QPDFObjectHandle.hh>
 #include <qpdf/QPDFTokenizer.hh>
+#include <qpdf/ResourceFinder.hh>
 
 #include <cstdio>
 #include <cstdlib>
@@ -41,7 +42,7 @@ namespace
         }
         std::cerr
             << "usage: qpdf_tokenizer_probe"
-               " --mode pull|push|pull-inline|push-inline|between|content|normalize|token-filter"
+               " --mode pull|push|pull-inline|push-inline|between|content|normalize|token-filter|resource-finder"
                " --input-hex HEX --allow-eof 0|1 --include-ignorable 0|1"
                " --allow-bad 0|1 --max-len N --inline-offset none|N --chunks all|N[,N...]\n";
         std::exit(2);
@@ -173,7 +174,8 @@ namespace
         if (options.mode != "pull" && options.mode != "push" &&
             options.mode != "pull-inline" && options.mode != "push-inline" &&
             options.mode != "between" && options.mode != "content" &&
-            options.mode != "normalize" && options.mode != "token-filter") {
+            options.mode != "normalize" && options.mode != "token-filter" &&
+            options.mode != "resource-finder") {
             usage("invalid mode " + options.mode);
         }
         options.input = hex_decode(*input_hex);
@@ -539,6 +541,28 @@ namespace
         tokenizer.finish();
         std::cout << "output\t" << hex_encode(output.getString()) << '\n';
     }
+
+    void
+    dump_resource_finder(Options const& options)
+    {
+        QPDF qpdf;
+        qpdf.emptyPDF();
+        auto stream = qpdf.newStream(options.input);
+        ResourceFinder finder;
+        stream.parseAsContents(&finder);
+
+        for (auto const& name: finder.getNames()) {
+            std::cout << "name\t" << hex_encode(name) << '\n';
+        }
+        for (auto const& [resource_type, names]: finder.getNamesByResourceType()) {
+            for (auto const& [name, offsets]: names) {
+                for (auto offset: offsets) {
+                    std::cout << "resource\t" << hex_encode(resource_type) << '\t'
+                              << hex_encode(name) << '\t' << offset << '\n';
+                }
+            }
+        }
+    }
 } // namespace
 
 int
@@ -560,6 +584,8 @@ main(int argc, char* argv[])
             dump_normalize(options);
         } else if (options.mode == "token-filter") {
             dump_token_filter(options);
+        } else if (options.mode == "resource-finder") {
+            dump_resource_finder(options);
         } else {
             dump_between(options);
         }

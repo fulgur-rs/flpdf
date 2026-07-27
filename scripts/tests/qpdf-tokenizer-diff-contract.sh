@@ -6,8 +6,11 @@ probe_source="${repo_root}/tests/oracle/qpdf_tokenizer_probe.cc"
 script_source="${repo_root}/scripts/qpdf-tokenizer-diff.sh"
 
 grep -F 'token-filter' "${probe_source}"
+grep -F 'resource-finder' "${probe_source}"
 grep -F -- '--chunks' "${probe_source}"
 grep -F 'pipeline::qpdf_tokenizer::tests::qpdf_token_filter_differential' "${script_source}"
+grep -F 'ResourceFinder.cc' "${script_source}"
+grep -F 'resource_finder::tests::qpdf_resource_finder_differential' "${script_source}"
 
 fixture_root="$(mktemp -d)"
 
@@ -193,6 +196,7 @@ output=
 saw_old_dtags=0
 saw_normalizer_include=0
 saw_normalizer_source=0
+saw_resource_finder_source=0
 while (($#)); do
   case "$1" in
     -o)
@@ -205,6 +209,10 @@ while (($#)); do
       ;;
     "${FIXTURE_SOURCE}/libqpdf/ContentNormalizer.cc")
       saw_normalizer_source=1
+      shift
+      ;;
+    "${FIXTURE_SOURCE}/libqpdf/ResourceFinder.cc")
+      saw_resource_finder_source=1
       shift
       ;;
     -Wl,--disable-new-dtags)
@@ -227,6 +235,10 @@ done
 [[ "${saw_normalizer_source}" == 1 ]] || {
   echo "missing private ContentNormalizer source" >&2
   exit 96
+}
+[[ "${saw_resource_finder_source}" == 1 ]] || {
+  echo "missing private ResourceFinder source" >&2
+  exit 97
 }
 printf '#!/usr/bin/env bash\nexit 0\n' >"${output}"
 chmod +x "${output}"
@@ -261,7 +273,8 @@ fi
 case "$5" in
   tokenizer::tests::qpdf_tokenizer_differential_all_modes | \
     pipeline::qpdf_tokenizer::tests::qpdf_token_filter_differential | \
-    content_normalizer::tests::qpdf_content_normalizer_differential)
+    content_normalizer::tests::qpdf_content_normalizer_differential | \
+    resource_finder::tests::qpdf_resource_finder_differential)
     ;;
   *)
     echo "cargo selected an unexpected ignored library test" >&2
@@ -573,7 +586,7 @@ TMPDIR="${parallel_tmp}" run_fixture >"${fixture_root}/parallel-2.out" 2>&1 &
 second_pid=$!
 wait "${first_pid}"
 wait "${second_pid}"
-[[ "$(grep -c '^cargo' "${contract_log}")" == 6 ]]
+[[ "$(grep -c '^cargo' "${contract_log}")" == 8 ]]
 [[ "$(
   grep -Fxc \
     'cargo <test> <-p> <flpdf> <--lib> <tokenizer::tests::qpdf_tokenizer_differential_all_modes> <--> <--ignored> <--exact>' \
@@ -587,6 +600,11 @@ wait "${second_pid}"
 [[ "$(
   grep -Fxc \
     'cargo <test> <-p> <flpdf> <--lib> <content_normalizer::tests::qpdf_content_normalizer_differential> <--> <--ignored> <--exact>' \
+    "${contract_log}"
+)" == 2 ]]
+[[ "$(
+  grep -Fxc \
+    'cargo <test> <-p> <flpdf> <--lib> <resource_finder::tests::qpdf_resource_finder_differential> <--> <--ignored> <--exact>' \
     "${contract_log}"
 )" == 2 ]]
 
