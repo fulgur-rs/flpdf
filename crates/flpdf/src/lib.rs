@@ -89,6 +89,7 @@ pub mod appearance;
 pub(crate) mod ascii85;
 pub(crate) mod ascii_hex;
 pub mod attachment_list;
+pub(crate) mod bit_stream;
 pub mod cache;
 pub mod check;
 pub mod content_normalizer;
