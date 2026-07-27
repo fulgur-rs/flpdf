@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use crate::{object::write_name_escaped, object::write_string_value, Error, Result};
+use crate::{object::write_name_escaped, Error, Result};
 
 #[allow(dead_code)] // Space, Comment, and InlineImage are produced by Task 2's state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,8 +99,55 @@ fn canonical_name_raw(value: &[u8]) -> Vec<u8> {
 
 #[allow(dead_code)] // Used by synthetic owned string tokens.
 fn canonical_string_raw(value: &[u8]) -> Vec<u8> {
-    let mut raw = Vec::new();
-    write_string_value(&mut raw, value);
+    let mut non_ascii = 0usize;
+    let mut force_hex = false;
+    for &byte in value {
+        if byte > 126 {
+            non_ascii += 1;
+        } else if byte >= 32 {
+            continue;
+        } else if byte >= 24 {
+            non_ascii += 1;
+        } else if !matches!(byte, b'\n' | b'\r' | b'\t' | b'\x08' | b'\x0c') {
+            force_hex = true;
+            break;
+        }
+    }
+    let use_hex = force_hex || 5 * non_ascii > value.len();
+    if use_hex {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut raw = Vec::with_capacity(value.len() * 2 + 2);
+        raw.push(b'<');
+        for &byte in value {
+            raw.push(HEX[(byte >> 4) as usize]);
+            raw.push(HEX[(byte & 0x0f) as usize]);
+        }
+        raw.push(b'>');
+        return raw;
+    }
+
+    let mut raw = Vec::with_capacity(value.len() + 2);
+    raw.push(b'(');
+    for &byte in value {
+        match byte {
+            b'\n' => raw.extend_from_slice(br"\n"),
+            b'\r' => raw.extend_from_slice(br"\r"),
+            b'\t' => raw.extend_from_slice(br"\t"),
+            b'\x08' => raw.extend_from_slice(br"\b"),
+            b'\x0c' => raw.extend_from_slice(br"\f"),
+            b'(' => raw.extend_from_slice(br"\("),
+            b')' => raw.extend_from_slice(br"\)"),
+            b'\\' => raw.extend_from_slice(br"\\"),
+            32..=126 | 160..=255 => raw.push(byte),
+            _ => {
+                raw.push(b'\\');
+                raw.push(b'0' + ((byte >> 6) & 0x07));
+                raw.push(b'0' + ((byte >> 3) & 0x07));
+                raw.push(b'0' + (byte & 0x07));
+            }
+        }
+    }
+    raw.push(b')');
     raw
 }
 
@@ -825,6 +872,15 @@ impl<'a> Tokenizer<'a> {
         self.pos += 1;
         self.reset();
         Ok(())
+    }
+
+    pub(crate) fn consume_one_byte_or(&mut self, default: u8) -> u8 {
+        let byte = self.input.get(self.pos).copied().unwrap_or(default);
+        if self.pos < self.input.len() {
+            self.pos += 1;
+        }
+        self.reset();
+        byte
     }
 
     pub(crate) fn skip_ignorable(&mut self) -> Result<()> {
@@ -2232,12 +2288,42 @@ mod tests {
     }
 
     #[test]
-    fn constructed_name_and_string_tokens_have_canonical_pdf_raw_values() {
+    fn constructed_name_and_string_tokens_have_qpdf_canonical_raw_values() {
         let name = Token::new(TokenType::Name, b"/text/plain".to_vec());
         assert_eq!(name.raw, b"/text#2fplain");
 
-        let string = Token::new(TokenType::String, b"a(b".to_vec());
-        assert_eq!(string.raw, br"(a\(b)");
+        for (value, expected) in [
+            (b"a(b".as_slice(), br"(a\(b)".as_slice()),
+            (b"a\nb".as_slice(), br"(a\nb)".as_slice()),
+            (b"a\rb".as_slice(), br"(a\rb)".as_slice()),
+            (b"a\tb".as_slice(), br"(a\tb)".as_slice()),
+            (b"a\x08b".as_slice(), br"(a\bb)".as_slice()),
+            (b"a\x0cb".as_slice(), br"(a\fb)".as_slice()),
+            (b"a)b".as_slice(), br"(a\)b)".as_slice()),
+            (b"a\\b".as_slice(), br"(a\\b)".as_slice()),
+            (b"\x01".as_slice(), b"<01>".as_slice()),
+            (b"\x18abcd".as_slice(), br"(\030abcd)".as_slice()),
+            (b"\xa0abcd".as_slice(), b"(\xa0abcd)".as_slice()),
+            (b"\xa0abc".as_slice(), b"<a0616263>".as_slice()),
+        ] {
+            assert_eq!(
+                Token::new(TokenType::String, value.to_vec()).raw,
+                expected,
+                "value {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn consume_one_byte_or_returns_input_then_default_without_advancing_past_eof() {
+        let mut tokenizer = Tokenizer::new(b"xy");
+
+        assert_eq!(tokenizer.consume_one_byte_or(b' '), b'x');
+        assert_eq!(tokenizer.position(), 1);
+        assert_eq!(tokenizer.consume_one_byte_or(b' '), b'y');
+        assert_eq!(tokenizer.position(), 2);
+        assert_eq!(tokenizer.consume_one_byte_or(b' '), b' ');
+        assert_eq!(tokenizer.position(), 2);
     }
 
     #[test]

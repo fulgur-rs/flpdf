@@ -3097,6 +3097,9 @@ fn run_rewrite(
             options.full_rewrite = true;
         }
 
+        let mut normalization_last_bad = Vec::new();
+        let mut normalized_streams = HashSet::new();
+
         // Step 1: coalesce per-page /Contents arrays into a single stream.
         if coalesce_contents {
             let page_refs = pages::page_refs(&mut pdf)?;
@@ -3113,7 +3116,11 @@ fn run_rewrite(
         if normalize_content {
             let page_refs = pages::page_refs(&mut pdf)?;
             for page_ref in page_refs {
-                apply_normalize_content(&mut pdf, page_ref)?;
+                normalization_last_bad.extend(apply_normalize_content(
+                    &mut pdf,
+                    page_ref,
+                    &mut normalized_streams,
+                )?);
             }
         }
 
@@ -3230,7 +3237,7 @@ fn run_rewrite(
         // (exit 0, valid output, no diagnostic) — nothing was restricted,
         // matching qpdf's lenient handling of --remove-restrictions on
         // unencrypted files.
-        finish_lazy_warnings(&input, &pdf, diagnostics_start)?;
+        finish_rewrite_warnings(&input, &pdf, diagnostics_start, &normalization_last_bad)?;
     }
     Ok(())
 }
@@ -4337,41 +4344,17 @@ fn page_ops_active(p: &PageOpArgs) -> bool {
 fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
-) -> CliResult<()> {
-    // Resolve the page dictionary to find its /Contents value.
-    let page_obj = pdf.resolve_borrowed(page_ref)?;
-    let Object::Dictionary(page_dict) = page_obj else {
-        return Ok(()); // Not a page dict — skip silently.
-    };
-
-    let contents = match page_dict.get("Contents").cloned() {
-        None => return Ok(()), // Empty page — nothing to normalize.
-        Some(c) => c,
-    };
-
-    match contents {
-        Object::Reference(stream_ref) => {
-            normalize_and_store_stream(pdf, stream_ref)?;
-        }
-        Object::Array(elems) => {
-            // Multiple content streams — normalize each one in-place.
-            // (If --coalesce-contents was also given, this is already a
-            // single stream; but we handle the array case for safety.)
-            for elem in elems {
-                if let Object::Reference(r) = elem {
-                    normalize_and_store_stream(pdf, r)?;
-                }
-                // Direct-stream elements are unusual in real PDFs; skip them
-                // (they have no separate object to patch).
+    seen: &mut HashSet<ObjectRef>,
+) -> CliResult<Vec<bool>> {
+    let mut warnings = Vec::new();
+    for (stream_ref, stream) in pages::page_content_stream_entries_tolerant(pdf, page_ref)? {
+        if let Some(stream_ref) = stream_ref {
+            if let Some(last_bad) = normalize_and_store_stream(pdf, stream_ref, stream, seen)? {
+                warnings.push(last_bad);
             }
         }
-        Object::Stream(_) => {
-            // Direct (inline) stream on the page dict itself — no separate
-            // object ref to patch; skip silently.
-        }
-        _ => {}
     }
-    Ok(())
+    Ok(warnings)
 }
 
 /// Normalize the raw decoded bytes of the indirect stream at `stream_ref`
@@ -4379,17 +4362,22 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
 fn normalize_and_store_stream<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
     stream_ref: ObjectRef,
-) -> CliResult<()> {
-    let resolved = pdf.resolve_borrowed(stream_ref)?;
-    let Object::Stream(stream) = resolved else {
-        return Ok(()); // Not a stream — skip.
-    };
+    stream: Stream,
+    seen: &mut HashSet<ObjectRef>,
+) -> CliResult<Option<bool>> {
+    if !seen.insert(stream_ref) {
+        return Ok(None);
+    }
 
     // Decode the stored bytes through the declared filter pipeline.
     let decoded = filters::decode_stream_data(&stream.dict, &stream.data)?;
 
     // Normalize the decoded content stream bytes.
-    let normalized = normalize_content_stream(&decoded)?;
+    let normalized = normalize_content_stream(&decoded);
+    let warning = normalized
+        .any_bad_tokens()
+        .then(|| normalized.last_token_was_bad());
+    let normalized = normalized.into_bytes();
 
     // Build a new stream dict with the updated /Length.
     let mut new_dict: Dictionary = stream.dict.clone();
@@ -4401,7 +4389,7 @@ fn normalize_and_store_stream<R: std::io::Read + std::io::Seek>(
 
     let new_stream = Stream::new(new_dict, normalized);
     pdf.set_object(stream_ref, Object::Stream(new_stream));
-    Ok(())
+    Ok(warning)
 }
 
 fn run_qdf(
@@ -5261,6 +5249,53 @@ fn finish_lazy_warnings<R: Read + Seek>(
     }))
 }
 
+fn emit_content_normalization_warnings(input: &Path, last_token_was_bad: bool) {
+    let location = diagnostic_location(input, None);
+    eprintln!("WARNING: {location}: content normalization encountered bad tokens");
+    if last_token_was_bad {
+        eprintln!(
+            "WARNING: {location}: normalized content ended with a bad token; \
+             you may be able to resolve this by coalescing content streams in \
+             combination with normalizing content. From the command line, \
+             specify --coalesce-contents"
+        );
+    }
+    eprintln!(
+        "WARNING: {location}: Resulting stream data may be corrupted but is may \
+         still useful for manual inspection. For more information on this \
+         warning, search for content normalization in the manual."
+    );
+}
+
+fn finish_rewrite_warnings<R: Read + Seek>(
+    input: &Path,
+    pdf: &Pdf<R>,
+    diagnostics_start: usize,
+    normalization_last_bad: &[bool],
+) -> CliResult<()> {
+    let has_lazy = pdf.repair_diagnostics().entries().len() != diagnostics_start;
+    if has_lazy {
+        emit_warnings_since(input, pdf, diagnostics_start);
+    }
+    for &last_bad in normalization_last_bad {
+        emit_content_normalization_warnings(input, last_bad);
+    }
+    if !normalization_last_bad.is_empty() {
+        eprintln!(
+            "{}: operation succeeded with warnings; resulting file may have some problems",
+            progname()
+        );
+    } else if has_lazy {
+        eprintln!("{}: operation succeeded with warnings", progname());
+    } else {
+        return Ok(());
+    }
+    Err(Box::new(CliExitError {
+        code: ExitCode::Warnings,
+        message: String::new(),
+    }))
+}
+
 /// Prefix a fatal error with the input path so main() renders the observed
 /// qpdf shape `<progname>: <file>: <msg>` for open failures.
 ///
@@ -5645,6 +5680,63 @@ mod tests {
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn apply_normalize_content_follows_two_hop_holder_chain() {
+        let mut pdf = Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        )
+        .unwrap();
+        let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
+        let holder_ref = ObjectRef::new(100, 0);
+        let stream_ref = ObjectRef::new(101, 0);
+
+        let mut page = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+        page.insert("Contents", Object::Reference(holder_ref));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+        pdf.set_object(holder_ref, Object::Reference(stream_ref));
+
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert("Length", Object::Integer(4));
+        pdf.set_object(
+            stream_ref,
+            Object::Stream(Stream::new(stream_dict, b"\r<0g".to_vec())),
+        );
+
+        let mut seen = HashSet::new();
+        let warnings = apply_normalize_content(&mut pdf, page_ref, &mut seen).unwrap();
+
+        assert_eq!(warnings, vec![true]);
+        assert_eq!(seen, HashSet::from([stream_ref]));
+        let stream = pdf.resolve(stream_ref).unwrap().into_stream().unwrap();
+        assert_eq!(stream.data, b"\n<0g");
+    }
+
+    #[test]
+    fn apply_normalize_content_leaves_direct_stream_unchanged() {
+        let mut pdf = Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        )
+        .unwrap();
+        let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
+        let direct_stream = Stream::new(Dictionary::new(), b"\r<0g".to_vec());
+        let mut page = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+        page.insert("Contents", Object::Stream(direct_stream));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+
+        let mut seen = HashSet::new();
+        let warnings = apply_normalize_content(&mut pdf, page_ref, &mut seen).unwrap();
+
+        assert!(warnings.is_empty());
+        assert!(seen.is_empty());
+        let page = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+        assert_eq!(
+            page.get("Contents")
+                .and_then(Object::as_stream)
+                .map(|stream| stream.data.as_slice()),
+            Some(&b"\r<0g"[..])
+        );
     }
 
     #[cfg(unix)]

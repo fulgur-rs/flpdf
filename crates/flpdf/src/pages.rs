@@ -160,7 +160,7 @@ pub fn page_content_bytes<R: Read + Seek>(
 /// Resolve a `Page`'s `/Contents` into its content streams, each paired with the
 /// terminal [`ObjectRef`] of the indirect chain that produced it (`None` for a
 /// direct inline stream). Holder chains (`ref -> ref -> stream`) are followed via
-/// [`resolve_ref_chain`], so a doubly-indirect `/Contents` is not dropped.
+/// `resolve_ref_chain`, so a doubly-indirect `/Contents` is not dropped.
 ///
 /// Every legal `/Contents` shape is accepted: a direct stream, an (indirect)
 /// reference to a stream, an array of stream references, or a reference to such
@@ -174,9 +174,31 @@ pub fn page_content_bytes<R: Read + Seek>(
 /// - [`Error::Unsupported`] when `page_ref` is not a `/Type /Page` dictionary, or
 ///   when a `/Contents` element does not resolve to a stream.
 /// - Any [`Error`] propagated from [`Pdf::resolve`].
-pub(crate) fn page_content_stream_entries<R: Read + Seek>(
+pub fn page_content_stream_entries<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
+) -> Result<Vec<(Option<ObjectRef>, Stream)>> {
+    page_content_stream_entries_with_policy(pdf, page_ref, false)
+}
+
+/// Resolve a `Page`'s `/Contents` streams while ignoring entries that do not
+/// resolve to streams.
+///
+/// This mirrors qpdf's writer-side content normalization: valid stream entries
+/// are normalized even when a damaged `/Contents` array also contains `null` or
+/// another non-stream value. Reference-resolution and page-structure errors
+/// remain fatal.
+pub fn page_content_stream_entries_tolerant<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<Vec<(Option<ObjectRef>, Stream)>> {
+    page_content_stream_entries_with_policy(pdf, page_ref, true)
+}
+
+fn page_content_stream_entries_with_policy<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+    ignore_non_streams: bool,
 ) -> Result<Vec<(Option<ObjectRef>, Stream)>> {
     let page_obj = pdf.resolve_borrowed(page_ref)?;
     let Some(page_dict) = page_obj.as_dict() else {
@@ -196,7 +218,7 @@ pub(crate) fn page_content_stream_entries<R: Read + Seek>(
         None => return Ok(Vec::new()),
         Some(c) => c,
     };
-    collect_content_stream_entries(pdf, &contents, page_ref)
+    collect_content_stream_entries(pdf, &contents, page_ref, ignore_non_streams)
 }
 
 /// Resolve a `/Contents` value into a flat list of `(terminal ref, Stream)`
@@ -211,6 +233,7 @@ fn collect_content_stream_entries<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     contents: &Object,
     page_ref: ObjectRef,
+    ignore_non_streams: bool,
 ) -> Result<Vec<(Option<ObjectRef>, Stream)>> {
     match contents {
         // Direct inline stream — valid per spec (§7.8.2 note) and used in test PDFs.
@@ -224,7 +247,10 @@ fn collect_content_stream_entries<R: Read + Seek>(
             let (resolved, last) = resolve_ref_chain(pdf, contents)?;
             match resolved {
                 Object::Stream(s) => Ok(vec![(last, s)]),
-                Object::Array(elems) => collect_content_array_entries(pdf, &elems, page_ref),
+                Object::Array(elems) => {
+                    collect_content_array_entries(pdf, &elems, page_ref, ignore_non_streams)
+                }
+                _ if ignore_non_streams => Ok(Vec::new()),
                 other => Err(Error::Unsupported(format!(
                     "/Contents reference on page {page_ref} resolves to {}, not a stream or array",
                     object_type_name(&other)
@@ -233,8 +259,11 @@ fn collect_content_stream_entries<R: Read + Seek>(
         }
 
         // Array — each element must be a Reference to a stream (or a direct stream).
-        Object::Array(elems) => collect_content_array_entries(pdf, elems, page_ref),
+        Object::Array(elems) => {
+            collect_content_array_entries(pdf, elems, page_ref, ignore_non_streams)
+        }
 
+        _ if ignore_non_streams => Ok(Vec::new()),
         other => Err(Error::Unsupported(format!(
             "/Contents entry on page {page_ref} has unexpected type {}",
             object_type_name(other)
@@ -252,6 +281,7 @@ fn collect_content_array_entries<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     elems: &[Object],
     page_ref: ObjectRef,
+    ignore_non_streams: bool,
 ) -> Result<Vec<(Option<ObjectRef>, Stream)>> {
     let mut out = Vec::with_capacity(elems.len());
     for elem in elems {
@@ -262,20 +292,22 @@ fn collect_content_array_entries<R: Read + Seek>(
                 let (obj, last) = resolve_ref_chain(pdf, elem)?;
                 match obj.into_stream() {
                     Some(s) => out.push((last, s)),
-                    None => {
+                    None if !ignore_non_streams => {
                         return Err(Error::Unsupported(format!(
                             "/Contents array element {r} on page {page_ref} does not resolve to a stream"
                         )));
                     }
+                    None => {}
                 }
             }
             Object::Stream(s) => out.push((None, s.clone())),
-            other => {
+            other if !ignore_non_streams => {
                 let type_name = object_type_name(other);
                 return Err(Error::Unsupported(format!(
                     "/Contents array element of type {type_name} on page {page_ref} is not a stream or reference"
                 )));
             }
+            _ => {}
         }
     }
     Ok(out)
@@ -291,10 +323,12 @@ fn collect_content_streams<R: Read + Seek>(
     contents: &Object,
     page_ref: ObjectRef,
 ) -> Result<Vec<Stream>> {
-    Ok(collect_content_stream_entries(pdf, contents, page_ref)?
-        .into_iter()
-        .map(|(_, s)| s)
-        .collect())
+    Ok(
+        collect_content_stream_entries(pdf, contents, page_ref, false)?
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect(),
+    )
 }
 
 /// Coalesce a page's `/Contents` array into a single stream.
@@ -1240,6 +1274,34 @@ mod tests {
             matches!(&err, Error::Unsupported(msg) if msg.contains("is not a stream or reference")),
             "expected Unsupported(\"…is not a stream or reference\"), got {err:?}"
         );
+    }
+
+    #[test]
+    fn tolerant_content_stream_entries_skip_mixed_array_non_streams() {
+        let bytes = build_pdf_with_binary_extras(
+            "[ 4 0 R null 5 0 R 42 ]",
+            &[
+                (4, flate_content_object_bytes(4)),
+                (5, b"5 0 obj\n42\nendobj\n".to_vec()),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let entries = page_content_stream_entries_tolerant(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, Some(ObjectRef::new(4, 0)));
+    }
+
+    #[test]
+    fn tolerant_content_stream_entries_skip_non_stream_contents() {
+        for bytes in [
+            build_pdf_with_contents("42", &[]),
+            build_pdf_with_binary_extras("5 0 R", &[(5, b"5 0 obj\n42\nendobj\n".to_vec())]),
+        ] {
+            let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+            let entries =
+                page_content_stream_entries_tolerant(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+            assert!(entries.is_empty());
+        }
     }
 
     #[test]

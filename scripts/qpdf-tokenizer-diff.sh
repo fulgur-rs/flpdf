@@ -329,7 +329,9 @@ cmake --build "${build_dir}" --target libqpdf --parallel
 c++ -std=c++17 \
   -DPOINTERHOLDER_TRANSITION=4 \
   -I"${qpdf_source}/include" \
+  -I"${qpdf_source}/libqpdf" \
   "${repo_root}/tests/oracle/qpdf_tokenizer_probe.cc" \
+  "${qpdf_source}/libqpdf/ContentNormalizer.cc" \
   -L"${build_dir}/libqpdf" \
   -Wl,--disable-new-dtags \
   "-Wl,-rpath,${build_dir}/libqpdf" \
@@ -361,4 +363,9 @@ LD_LIBRARY_PATH="${probe_library_path}" \
   QPDF_TOKENIZER_PROBE="${probe_binary}" \
   cargo test -p flpdf --lib \
   tokenizer::tests::qpdf_tokenizer_differential_all_modes \
+  -- --ignored --exact
+LD_LIBRARY_PATH="${probe_library_path}" \
+  QPDF_TOKENIZER_PROBE="${probe_binary}" \
+  cargo test -p flpdf --lib \
+  content_normalizer::tests::qpdf_content_normalizer_differential \
   -- --ignored --exact
