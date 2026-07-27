@@ -491,7 +491,33 @@ fn unhandled_value_reports_the_qpdf_method_specific_path() {
     );
     assert_eq!(
         error,
-        flpdf::json::JsonHandlerError("JSON handler: value at . is not of expected type".into())
+        flpdf::json::JsonHandlerError(flpdf::json::JsonMessage::from(
+            "JSON handler: value at . is not of expected type",
+        ))
+    );
+}
+
+#[test]
+fn handler_errors_preserve_non_utf8_key_and_path_bytes() {
+    let handler = JsonHandler::new();
+    handler.add_dictionary_handlers(|_, _| {}, |_| {});
+
+    let dictionary = Json::make_dictionary();
+    dictionary
+        .add_dictionary_member(b"\xff", Json::make_null())
+        .unwrap();
+    let error = handler.handle(b".\x80", dictionary).unwrap_err();
+
+    assert_eq!(
+        error.0.as_bytes(),
+        b"JSON handler found unexpected key \xff in object at .\x80"
+    );
+
+    let scalar = JsonHandler::new();
+    let error = scalar.handle(b".\xff", Json::make_null()).unwrap_err();
+    assert_eq!(
+        error.0.as_bytes(),
+        b"JSON handler: value at .\xff is not of expected type"
     );
 }
 

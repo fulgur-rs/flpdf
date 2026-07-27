@@ -4,11 +4,11 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::{Rc, Weak};
 
-use super::Json;
+use super::{Json, JsonMessage};
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 #[error("{0}")]
-pub struct JsonHandlerError(pub String);
+pub struct JsonHandlerError(pub JsonMessage);
 
 type JsonCallback = Rc<dyn Fn(&[u8], Json)>;
 type BytesCallback = Rc<dyn Fn(&[u8], &[u8])>;
@@ -232,16 +232,16 @@ impl WeakJsonHandler {
 }
 
 fn unexpected_key(key: &[u8], path: &[u8]) -> JsonHandlerError {
-    JsonHandlerError(format!(
-        "JSON handler found unexpected key {} in object at {}",
-        String::from_utf8_lossy(key),
-        String::from_utf8_lossy(path)
-    ))
+    let mut message = b"JSON handler found unexpected key ".to_vec();
+    message.extend_from_slice(key);
+    message.extend_from_slice(b" in object at ");
+    message.extend_from_slice(path);
+    JsonHandlerError(JsonMessage::from_bytes(message))
 }
 
 fn unexpected_type(path: &[u8]) -> JsonHandlerError {
-    JsonHandlerError(format!(
-        "JSON handler: value at {} is not of expected type",
-        String::from_utf8_lossy(path)
-    ))
+    let mut message = b"JSON handler: value at ".to_vec();
+    message.extend_from_slice(path);
+    message.extend_from_slice(b" is not of expected type");
+    JsonHandlerError(JsonMessage::from_bytes(message))
 }
