@@ -29,6 +29,7 @@
 //! `H_length` added before display (qpdf's `adjusted_offset`).
 
 use super::check::find_first_object_ref;
+use crate::bit_stream::{BitStream, BitStreamError};
 use crate::filters::decode_stream_data;
 use crate::{Object, ObjectRef, Pdf};
 use std::fmt;
@@ -79,6 +80,14 @@ impl From<std::io::Error> for ShowLinearizationError {
     }
 }
 
+impl From<BitStreamError> for ShowLinearizationError {
+    fn from(error: BitStreamError) -> Self {
+        ShowLinearizationError::Malformed {
+            message: error.to_string(),
+        }
+    }
+}
+
 /// Shorthand result type for the decoder.
 type ShowResult<T> = std::result::Result<T, ShowLinearizationError>;
 
@@ -87,98 +96,6 @@ macro_rules! malformed {
     ($($arg:tt)*) => {
         ShowLinearizationError::Malformed { message: format!($($arg)*) }
     };
-}
-
-// ---------------------------------------------------------------------------
-// MSB-first BitReader — inverse of BitWriter
-// ---------------------------------------------------------------------------
-
-/// A read-only MSB-first bit reader over an in-memory buffer.
-///
-/// Bits are consumed from the most-significant position of the current byte
-/// downward — the inverse of [`crate::bit_writer::BitWriter`].
-/// [`BitReader::skip_to_next_byte`] advances to the next byte boundary,
-/// mirroring the encoder's `flush`.
-struct BitReader<'a> {
-    buf: &'a [u8],
-    /// Index of the byte currently being read.
-    byte_pos: usize,
-    /// Number of bits already consumed from `buf[byte_pos]` (0..=7).
-    bit_pos: u32,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self {
-            buf,
-            byte_pos: 0,
-            bit_pos: 0,
-        }
-    }
-
-    /// Read `bits` bits MSB-first and return them as a `u64`.
-    ///
-    /// `bits == 0` is a no-op returning `0`, mirroring `write_bits(_, 0)`.
-    /// Returns [`ShowLinearizationError::Malformed`] if the buffer is exhausted
-    /// before `bits` bits are read, or if `bits > 64`.
-    fn get_bits(&mut self, bits: u32) -> ShowResult<u64> {
-        if bits == 0 {
-            return Ok(0);
-        }
-        if bits > 64 {
-            return Err(malformed!(
-                "hint stream requests {bits}-bit field (exceeds 64-bit limit)"
-            ));
-        }
-        let mut result: u64 = 0;
-        let mut remaining = bits;
-        while remaining > 0 {
-            if self.byte_pos >= self.buf.len() {
-                return Err(malformed!(
-                    "hint stream truncated: ran out of bits while reading a {bits}-bit field"
-                ));
-            }
-            // Bits still available in the current byte.
-            let avail = 8 - self.bit_pos;
-            let take = remaining.min(avail);
-            // The current byte's not-yet-consumed bits occupy positions
-            // [0 .. avail) counting from the LSB of the still-available window;
-            // shift the whole byte right so the next-to-read bit is at the top
-            // of an `avail`-wide window, then mask to `avail` bits.
-            let cur = (self.buf[self.byte_pos] as u64) & ((1u64 << avail) - 1);
-            // Take the top `take` bits of that `avail`-wide window.
-            let shift = avail - take;
-            let chunk = cur >> shift;
-            result = (result << take) | chunk;
-            self.bit_pos += take;
-            if self.bit_pos == 8 {
-                self.bit_pos = 0;
-                self.byte_pos += 1;
-            }
-            remaining -= take;
-        }
-        Ok(result)
-    }
-
-    /// Read `bits` bits and return them as a `u32`.
-    ///
-    /// Returns [`ShowLinearizationError::Malformed`] if the decoded value does
-    /// not fit in a `u32` (i.e. `bits > 32` with a value above `u32::MAX`).
-    fn get_bits_u32(&mut self, bits: u32) -> ShowResult<u32> {
-        let v = self.get_bits(bits)?;
-        u32::try_from(v).map_err(|_| malformed!("hint stream field {v} does not fit in u32"))
-    }
-
-    /// Advance to the next byte boundary if not already aligned.
-    ///
-    /// Mirrors [`crate::bit_writer::BitWriter::flush`] and qpdf's
-    /// `skipToNextByte`.
-    fn skip_to_next_byte(&mut self) {
-        if self.bit_pos != 0 {
-            self.bit_pos = 0;
-            self.byte_pos += 1;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -274,23 +191,23 @@ struct HGeneric {
 // ---------------------------------------------------------------------------
 
 fn read_h_page_offset(buf: &[u8], npages: u32) -> ShowResult<HPageOffset> {
-    let mut h = BitReader::new(buf);
+    let mut bits = BitStream::new(buf);
 
     // 13 header fields (5×32 + 8×16 = 288 bits = 36 bytes, leaving the reader
     // byte-aligned).  Order is qpdf's readHPageOffset.
-    let min_nobjects = h.get_bits_u32(32)?;
-    let first_page_offset = h.get_bits(32)?;
-    let nbits_delta_nobjects = h.get_bits_u32(16)?;
-    let min_page_length = h.get_bits(32)?;
-    let nbits_delta_page_length = h.get_bits_u32(16)?;
-    let min_content_offset = h.get_bits(32)?;
-    let nbits_delta_content_offset = h.get_bits_u32(16)?;
-    let min_content_length = h.get_bits(32)?;
-    let nbits_delta_content_length = h.get_bits_u32(16)?;
-    let nbits_nshared_objects = h.get_bits_u32(16)?;
-    let nbits_shared_identifier = h.get_bits_u32(16)?;
-    let nbits_shared_numerator = h.get_bits_u32(16)?;
-    let shared_denominator = h.get_bits_u32(16)?;
+    let min_nobjects = bits.get_bits_i32(32)? as u32;
+    let first_page_offset = bits.get_bits_i32(32)? as u32 as u64;
+    let nbits_delta_nobjects = bits.get_bits_i32(16)? as u32;
+    let min_page_length = bits.get_bits_i32(32)? as u32 as u64;
+    let nbits_delta_page_length = bits.get_bits_i32(16)? as u32;
+    let min_content_offset = bits.get_bits_i32(32)? as u32 as u64;
+    let nbits_delta_content_offset = bits.get_bits_i32(16)? as u32;
+    let min_content_length = bits.get_bits_i32(32)? as u32 as u64;
+    let nbits_delta_content_length = bits.get_bits_i32(16)? as u32;
+    let nbits_nshared_objects = bits.get_bits_i32(16)? as u32;
+    let nbits_shared_identifier = bits.get_bits_i32(16)? as u32;
+    let nbits_shared_numerator = bits.get_bits_i32(16)? as u32;
+    let shared_denominator = bits.get_bits_i32(16)? as u32;
 
     let n = npages as usize;
     let mut entries: Vec<HPageOffsetEntry> = (0..n)
@@ -307,27 +224,25 @@ fn read_h_page_offset(buf: &[u8], npages: u32) -> ShowResult<HPageOffset> {
 
     // (a) delta_nobjects
     for e in entries.iter_mut() {
-        e.delta_nobjects = h.get_bits(nbits_delta_nobjects)?;
+        e.delta_nobjects = bits.get_bits_i32(nbits_delta_nobjects as usize)? as u32 as u64;
     }
-    h.skip_to_next_byte();
+    bits.skip_to_next_byte()?;
     // (b) delta_page_length
     for e in entries.iter_mut() {
-        e.delta_page_length = h.get_bits(nbits_delta_page_length)?;
+        e.delta_page_length = bits.get_bits_i32(nbits_delta_page_length as usize)? as u32 as u64;
     }
-    h.skip_to_next_byte();
+    bits.skip_to_next_byte()?;
     // (c) nshared_objects
     for e in entries.iter_mut() {
-        e.nshared_objects = h.get_bits_u32(nbits_nshared_objects)?;
+        e.nshared_objects = bits.get_bits_i32(nbits_nshared_objects as usize)? as u32;
     }
-    h.skip_to_next_byte();
+    bits.skip_to_next_byte()?;
     // Bound the per-page shared-object refs before the nested (d)/(e) loops.
     // With zero-width identifier/numerator fields each push reads 0 bits and
     // never advances the reader, so an untrusted `nshared_objects` could
     // otherwise drive unbounded time/allocation from a tiny stream. Cap the
     // total against the bits remaining, keeping work O(stream length).
-    let remaining_bits = (h.buf.len() - h.byte_pos)
-        .saturating_mul(8)
-        .saturating_sub(h.bit_pos as usize);
+    let remaining_bits = bits.bits_available();
     let total_shared: u64 = entries.iter().map(|e| e.nshared_objects as u64).sum();
     if total_shared > remaining_bits as u64 {
         return Err(malformed!(
@@ -338,28 +253,30 @@ fn read_h_page_offset(buf: &[u8], npages: u32) -> ShowResult<HPageOffset> {
     for e in entries.iter_mut() {
         for _ in 0..e.nshared_objects {
             e.shared_identifiers
-                .push(h.get_bits(nbits_shared_identifier)?);
+                .push(bits.get_bits_i32(nbits_shared_identifier as usize)? as u32 as u64);
         }
     }
-    h.skip_to_next_byte();
+    bits.skip_to_next_byte()?;
     // (e) shared_numerators — nested
     for e in entries.iter_mut() {
         for _ in 0..e.nshared_objects {
             e.shared_numerators
-                .push(h.get_bits(nbits_shared_numerator)?);
+                .push(bits.get_bits_i32(nbits_shared_numerator as usize)? as u32 as u64);
         }
     }
-    h.skip_to_next_byte();
+    bits.skip_to_next_byte()?;
     // (f) delta_content_offset
     for e in entries.iter_mut() {
-        e.delta_content_offset = h.get_bits(nbits_delta_content_offset)?;
+        e.delta_content_offset =
+            bits.get_bits_i32(nbits_delta_content_offset as usize)? as u32 as u64;
     }
-    h.skip_to_next_byte();
+    bits.skip_to_next_byte()?;
     // (g) delta_content_length
     for e in entries.iter_mut() {
-        e.delta_content_length = h.get_bits(nbits_delta_content_length)?;
+        e.delta_content_length =
+            bits.get_bits_i32(nbits_delta_content_length as usize)? as u32 as u64;
     }
-    h.skip_to_next_byte();
+    bits.skip_to_next_byte()?;
 
     Ok(HPageOffset {
         min_nobjects,
@@ -384,24 +301,22 @@ fn read_h_page_offset(buf: &[u8], npages: u32) -> ShowResult<HPageOffset> {
 // ---------------------------------------------------------------------------
 
 fn read_h_shared_object(buf: &[u8]) -> ShowResult<HSharedObject> {
-    let mut h = BitReader::new(buf);
+    let mut bits = BitStream::new(buf);
 
     // 7 header fields.
-    let first_shared_obj = h.get_bits(32)?;
-    let first_shared_offset = h.get_bits(32)?;
-    let nshared_first_page = h.get_bits_u32(32)?;
-    let nshared_total = h.get_bits_u32(32)?;
-    let nbits_nobjects = h.get_bits_u32(16)?;
-    let min_group_length = h.get_bits(32)?;
-    let nbits_delta_group_length = h.get_bits_u32(16)?;
+    let first_shared_obj = bits.get_bits_i32(32)? as u32 as u64;
+    let first_shared_offset = bits.get_bits_i32(32)? as u32 as u64;
+    let nshared_first_page = bits.get_bits_i32(32)? as u32;
+    let nshared_total = bits.get_bits_i32(32)? as u32;
+    let nbits_nobjects = bits.get_bits_i32(16)? as u32;
+    let min_group_length = bits.get_bits_i32(32)? as u32 as u64;
+    let nbits_delta_group_length = bits.get_bits_i32(16)? as u32;
 
     // Each entry consumes at least one bit (the signature_present column below),
     // so a well-formed table cannot claim more entries than there are bits left
     // in the stream. Guard before allocating so a malformed `nshared_total`
     // (up to u32::MAX) cannot drive a multi-gigabyte pre-allocation (OOM DoS).
-    let remaining_bits = (h.buf.len() - h.byte_pos)
-        .saturating_mul(8)
-        .saturating_sub(h.bit_pos as usize);
+    let remaining_bits = bits.bits_available();
     if nshared_total as usize > remaining_bits {
         return Err(malformed!(
             "shared-object hint table claims {nshared_total} entries but only {remaining_bits} bits remain"
@@ -419,28 +334,28 @@ fn read_h_shared_object(buf: &[u8]) -> ShowResult<HSharedObject> {
 
     // (a) delta_group_length
     for e in entries.iter_mut() {
-        e.delta_group_length = h.get_bits(nbits_delta_group_length)?;
+        e.delta_group_length = bits.get_bits_i32(nbits_delta_group_length as usize)? as u32 as u64;
     }
-    h.skip_to_next_byte();
+    bits.skip_to_next_byte()?;
     // (b) signature_present (1 bit each)
     for e in entries.iter_mut() {
-        e.signature_present = h.get_bits(1)? != 0;
+        e.signature_present = bits.get_bits_i32(1)? != 0;
     }
-    h.skip_to_next_byte();
+    bits.skip_to_next_byte()?;
     // (c) inline 128-bit signature skip per set flag (no alignment around it),
     // matching qpdf's loop between the signature_present and nobjects columns.
     for e in entries.iter() {
         if e.signature_present {
             for _ in 0..4 {
-                let _ = h.get_bits(32)?;
+                let _ = bits.get_bits(32)?;
             }
         }
     }
     // (d) nobjects_minus_one
     for e in entries.iter_mut() {
-        e.nobjects_minus_one = h.get_bits(nbits_nobjects)?;
+        e.nobjects_minus_one = bits.get_bits_i32(nbits_nobjects as usize)? as u32 as u64;
     }
-    h.skip_to_next_byte();
+    bits.skip_to_next_byte()?;
 
     Ok(HSharedObject {
         first_shared_obj,
@@ -459,11 +374,11 @@ fn read_h_shared_object(buf: &[u8]) -> ShowResult<HSharedObject> {
 // ---------------------------------------------------------------------------
 
 fn read_h_generic(buf: &[u8]) -> ShowResult<HGeneric> {
-    let mut h = BitReader::new(buf);
-    let first_object = h.get_bits(32)?;
-    let first_object_offset = h.get_bits(32)?;
-    let nobjects = h.get_bits_u32(32)?;
-    let group_length = h.get_bits(32)?;
+    let mut bits = BitStream::new(buf);
+    let first_object = bits.get_bits_i32(32)? as u32 as u64;
+    let first_object_offset = bits.get_bits_i32(32)? as u32 as u64;
+    let nobjects = bits.get_bits_i32(32)? as u32;
+    let group_length = bits.get_bits_i32(32)? as u32 as u64;
     Ok(HGeneric {
         first_object,
         first_object_offset,
@@ -1003,11 +918,8 @@ mod tests {
     use crate::pipeline::buffer::Buffer;
     use crate::pipeline::{Pipeline, PipelineResult};
 
-    // -----------------------------------------------------------------------
-    // BitReader: write via BitWriter, read back. Covers cross-byte
-    // patterns and byte alignment (inverse of the encoder).
-    // -----------------------------------------------------------------------
-
+    /// Build a show-specific synthetic hint fixture through the production
+    /// bit-writer pipeline.
     fn bit_writer_bytes(write: impl FnOnce(&mut BitWriter<'_>) -> PipelineResult<()>) -> Vec<u8> {
         let mut sink = Buffer::new("show test bit writer", None);
         {
@@ -1017,81 +929,6 @@ mod tests {
         }
         sink.finish().expect("finish test bitstream");
         sink.take_buffer().expect("take test bitstream")
-    }
-
-    #[test]
-    fn bitreader_reads_back_msb_first_patterns() {
-        let buf = bit_writer_bytes(|writer| {
-            writer.write_bits(0xDEAD_BEEF, 32)?;
-            writer.write_bits(0b101, 3)?;
-            writer.write_bits(0b10110, 5)?;
-            writer.write_bits(0b1100_1010_0011, 12)
-        });
-
-        let mut r = BitReader::new(&buf);
-        assert_eq!(r.get_bits(32).unwrap(), 0xDEAD_BEEF);
-        assert_eq!(r.get_bits(3).unwrap(), 0b101);
-        assert_eq!(r.get_bits(5).unwrap(), 0b10110);
-        assert_eq!(r.get_bits(12).unwrap(), 0b1100_1010_0011);
-    }
-
-    #[test]
-    fn bitreader_zero_bits_is_noop() {
-        let buf = [0xABu8];
-        let mut r = BitReader::new(&buf);
-        assert_eq!(r.get_bits(0).unwrap(), 0);
-        // Still able to read the full byte afterwards.
-        assert_eq!(r.get_bits(8).unwrap(), 0xAB);
-    }
-
-    #[test]
-    fn bitreader_skip_to_next_byte_matches_align() {
-        // Write 1 bit then align (pad to byte), then a full byte.
-        let buf = bit_writer_bytes(|writer| {
-            writer.write_bits(1, 1)?;
-            writer.flush()?;
-            writer.write_bits(0x5A, 8)
-        });
-
-        let mut r = BitReader::new(&buf);
-        assert_eq!(r.get_bits(1).unwrap(), 1);
-        r.skip_to_next_byte();
-        assert_eq!(r.get_bits(8).unwrap(), 0x5A);
-    }
-
-    #[test]
-    fn bitreader_skip_on_boundary_is_noop() {
-        let buf = bit_writer_bytes(|writer| {
-            writer.write_bits(0xAB, 8)?;
-            writer.write_bits(0xCD, 8)
-        });
-
-        let mut r = BitReader::new(&buf);
-        assert_eq!(r.get_bits(8).unwrap(), 0xAB);
-        r.skip_to_next_byte(); // already aligned — must not skip the second byte
-        assert_eq!(r.get_bits(8).unwrap(), 0xCD);
-    }
-
-    #[test]
-    fn bitreader_truncated_errors() {
-        let buf = [0xFFu8];
-        let mut r = BitReader::new(&buf);
-        assert!(r.get_bits(16).is_err(), "reading past end must error");
-    }
-
-    #[test]
-    fn bitreader_rejects_more_than_64_bits() {
-        let buf = [0u8; 16];
-        let mut r = BitReader::new(&buf);
-        assert!(r.get_bits(65).is_err());
-    }
-
-    #[test]
-    fn bitreader_get_bits_u32_rejects_oversized_value() {
-        // 40 bits all set → value > u32::MAX → must error.
-        let buf = [0xFFu8; 5];
-        let mut r = BitReader::new(&buf);
-        assert!(r.get_bits_u32(40).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -1584,6 +1421,14 @@ mod tests {
     // -----------------------------------------------------------------------
     // Error arms on the byte-level API.
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn truncated_hint_uses_bit_stream_error_text() {
+        let err = read_h_page_offset(&[0xff], 1)
+            .err()
+            .expect("truncated hint must fail");
+        assert!(err.to_string().contains("overflow reading bit stream"));
+    }
 
     /// A minimal, valid but non-linearized PDF.
     fn non_linearized_pdf() -> Vec<u8> {
