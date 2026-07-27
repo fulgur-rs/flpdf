@@ -15,7 +15,7 @@ mod schema;
 mod value;
 mod writer;
 
-pub use handler::{JsonHandler, JsonHandlerError, SharedJsonHandler};
+pub use handler::{JsonHandler, JsonHandlerError, WeakJsonHandler};
 pub use legacy::{write, JsonValue};
 pub use message::JsonMessage;
 pub use parser::{parse, parse_reader, Reactor};
