@@ -125,6 +125,17 @@ pub(crate) fn ignore_warning(_: &str, _: i32) -> PipelineResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static EXPECTED_FIRST_INPUT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn expect_first_filter_input(data: &[u8]) {
+    EXPECTED_FIRST_INPUT.set(data.as_ptr() as usize);
+}
+
 /// Rust equivalent of qpdf's `QPDFStreamFilter` extension boundary.
 ///
 /// `pipe_decode` owns construction and completion of the filter's decode
@@ -196,11 +207,31 @@ impl StreamFilter for TestStreamFilter {
     }
 }
 
+#[cfg(test)]
+struct BorrowedInputProbe;
+
+#[cfg(test)]
+impl StreamFilter for BorrowedInputProbe {
+    fn pipe_decode(
+        &mut self,
+        data: &[u8],
+        _: Option<usize>,
+        _: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+    ) -> Result<Vec<u8>> {
+        EXPECTED_FIRST_INPUT.with(|expected| {
+            assert_eq!(data.as_ptr() as usize, expected.get());
+        });
+        Ok(data.to_vec())
+    }
+}
+
 pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilter>> {
     match filter_name {
         b"FlateDecode" => Some(Box::new(FlateStreamFilter::default())),
         #[cfg(test)]
         b"TestRejectDecode" => Some(Box::new(TestStreamFilter)),
+        #[cfg(test)]
+        b"TestBorrowedInput" => Some(Box::new(BorrowedInputProbe)),
         _ => None,
     }
 }

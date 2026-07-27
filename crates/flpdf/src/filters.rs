@@ -1,8 +1,12 @@
 //! qpdf correspondence: Pl_LZWDecoder, predictor, and not-yet-migrated stream-filter codec responsibilities; QPDFStreamFilter dispatch and Pl_Flate execution are delegated to stream_filter.
+use std::borrow::Cow;
+
 use crate::ascii85;
 use crate::ascii_hex;
 use crate::pipeline::{PipelineError, PipelineResult};
 use crate::run_length;
+#[cfg(test)]
+use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
     decode_filter_specs, encode_flate, stream_filter_for, DECODE_OUTPUT_LIMIT_PREFIX,
 };
@@ -195,13 +199,13 @@ where
 {
     let specs = decode_filter_specs(filter, decode_params)?;
     validate_filter_chain_count(specs.len())?;
-    let mut decoded = stream_data.to_vec();
+    let mut decoded = Cow::Borrowed(stream_data);
     for spec in specs {
         let filter_name = spec.normalized_name();
-        if filter_name == b"Crypt" {
-            decoded = decrypt_crypt(spec.decode_params, &decoded)?;
+        let next = if filter_name == b"Crypt" {
+            decrypt_crypt(spec.decode_params, decoded.as_ref())?
         } else {
-            decoded = if let Some(mut filter) = stream_filter_for(filter_name) {
+            let stage = if let Some(mut filter) = stream_filter_for(filter_name) {
                 if !filter.set_decode_params(spec.decode_params) {
                     return Err(Error::Unsupported(format!(
                         "stream filter {} does not support supplied /DecodeParms",
@@ -212,20 +216,21 @@ where
                 // the codec pipeline. Predictor migration remains in qynx.5.3,
                 // but its existing validation must retain that error timing.
                 extract_predictor_params(spec.decode_params)?;
-                filter.pipe_decode(&decoded, limits.max_output, warn)?
+                filter.pipe_decode(decoded.as_ref(), limits.max_output, warn)?
             } else {
                 apply_single_filter_decode(
                     filter_name,
-                    &decoded,
+                    decoded.as_ref(),
                     spec.decode_params,
                     limits.max_output,
                 )
                 .map_err(Error::Unsupported)?
             };
-            decoded = apply_decode_params(spec.decode_params, &decoded)?;
-        }
+            apply_decode_params(spec.decode_params, &stage)?
+        };
+        decoded = Cow::Owned(next);
     }
-    Ok(decoded)
+    Ok(decoded.into_owned())
 }
 
 fn encode_stream_data_with_filters(
@@ -796,6 +801,16 @@ mod tests {
         let decoded = decode_stream_data(&abbreviated, &encoded).unwrap();
 
         assert_eq!(decoded, b"abbreviated filter");
+    }
+
+    #[test]
+    fn first_filter_borrows_the_callers_encoded_input() {
+        let input = b"borrowed first-stage input";
+        expect_first_filter_input(input);
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"TestBorrowedInput".to_vec()));
+
+        assert_eq!(decode_stream_data(&dict, input).unwrap(), input);
     }
 
     #[test]
