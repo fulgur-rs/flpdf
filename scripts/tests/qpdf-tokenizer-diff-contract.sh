@@ -566,6 +566,16 @@ second_pid=$!
 wait "${first_pid}"
 wait "${second_pid}"
 [[ "$(grep -c '^cargo' "${contract_log}")" == 4 ]]
+[[ "$(
+  grep -Fxc \
+    'cargo <test> <-p> <flpdf> <--lib> <tokenizer::tests::qpdf_tokenizer_differential_all_modes> <--> <--ignored> <--exact>' \
+    "${contract_log}"
+)" == 2 ]]
+[[ "$(
+  grep -Fxc \
+    'cargo <test> <-p> <flpdf> <--lib> <content_normalizer::tests::qpdf_content_normalizer_differential> <--> <--ignored> <--exact>' \
+    "${contract_log}"
+)" == 2 ]]
 
 git -C "${fixture_source}" checkout -q -- sentinel
 : >"${contract_log}"
