@@ -187,6 +187,11 @@ stream, normalize it, remove stale filter keys, update `/Length`, and store the
 new raw bytes. The CLI consumes `ContentNormalization::into_bytes()` instead
 of the old `Result<Vec<u8>>`.
 
+As qpdf's writer does with its `normalized_streams` object-generation set,
+the CLI normalizes each distinct indirect content stream reference once.
+Pages or `/Contents` arrays that share the same stream therefore neither
+normalize it repeatedly nor duplicate its bad-token warnings.
+
 After writing a normalized stream whose result reports bad tokens, the CLI
 emits qpdf's warning payloads in this order:
 
@@ -268,6 +273,7 @@ A malformed-content CLI fixture verifies that:
 - normalized bytes match qpdf;
 - the first and third warnings always appear for any bad token;
 - the second warning appears only when the last non-EOF token was bad.
+- a bad content stream shared by multiple pages is normalized and warned once;
 - the process exits 3 after emitting qpdf's warning-success summary.
 
 qpdf-qtest fixtures remain in the separate `flpdf-qtest` repository and are
