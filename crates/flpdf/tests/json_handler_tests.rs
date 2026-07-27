@@ -533,11 +533,6 @@ fn unconfigured_type_handlers_reject_null_bool_and_containers() {
             "JSON handler: value at .null is not of expected type",
         ),
         (
-            b".bool".as_slice(),
-            Json::make_bool(true),
-            "JSON handler: value at .bool is not of expected type",
-        ),
-        (
             b".dictionary".as_slice(),
             Json::make_dictionary(),
             "JSON handler: value at .dictionary is not of expected type",
@@ -553,6 +548,12 @@ fn unconfigured_type_handlers_reject_null_bool_and_containers() {
             expected
         );
     }
+
+    let error = handler.handle(b".bool", Json::make_bool(true)).unwrap_err();
+    assert_eq!(
+        error.0.as_bytes(),
+        b"JSON handler: value at .bool is not of expected type"
+    );
 }
 
 #[test]
