@@ -140,6 +140,55 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_every_supported_resource_operator() {
+        let cases = [
+            (
+                b"ColorSpace".as_slice(),
+                b"CS1".as_slice(),
+                b"/CS1 CS".as_slice(),
+                b"/Renamed CS".as_slice(),
+            ),
+            (b"ColorSpace", b"CS1", b"/CS1 cs", b"/Renamed cs"),
+            (b"ExtGState", b"GS1", b"/GS1 gs", b"/Renamed gs"),
+            (b"Font", b"F1", b"/F1 12 Tf", b"/Renamed 12 Tf"),
+            (b"Pattern", b"P1", b"/P1 SCN", b"/Renamed SCN"),
+            (b"Pattern", b"P1", b"/P1 scn", b"/Renamed scn"),
+            (b"Shading", b"Sh1", b"/Sh1 sh", b"/Renamed sh"),
+            (b"XObject", b"X1", b"/X1 Do", b"/Renamed Do"),
+        ];
+
+        for (resource_type, old_name, input, expected) in cases {
+            let mut renames = ResourceRenames::new();
+            renames
+                .entry(resource_type.to_vec())
+                .or_default()
+                .insert(old_name.to_vec(), b"Renamed".to_vec());
+            assert_eq!(
+                replace_resource_names(input, &renames).unwrap().unwrap(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn rewrites_properties_name_for_bdc_and_dp() {
+        let mut renames = ResourceRenames::new();
+        renames
+            .entry(b"Properties".to_vec())
+            .or_default()
+            .insert(b"P1".to_vec(), b"P1_1".to_vec());
+        for (input, expected) in [
+            (b"/Span /P1 BDC".as_slice(), b"/Span /P1_1 BDC".as_slice()),
+            (b"/Span /P1 DP", b"/Span /P1_1 DP"),
+        ] {
+            assert_eq!(
+                replace_resource_names(input, &renames).unwrap().unwrap(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
     fn inline_image_payload_and_unselected_tokens_are_byte_identical() {
         let input = b"%c\r\nBI ID /F1 8 Tf EI /F1 9 Tf";
         let renames = font_renames(b"F1", b"F2");
