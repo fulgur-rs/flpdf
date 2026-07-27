@@ -83,10 +83,9 @@ impl ParserCallbacks for ResourceFinder {
             Object::Operator(operator) => {
                 self.last_operator_started_at_boundary = !self.pending_operands;
                 self.pending_operands = false;
-                if let (Some(resource_type), Some((name, name_offset))) = (
-                    operator_resource_type(&operator),
-                    self.last_name.clone(),
-                ) {
+                if let (Some(resource_type), Some((name, name_offset))) =
+                    (operator_resource_type(&operator), self.last_name.clone())
+                {
                     self.record_resource_name(resource_type, &name, name_offset);
                 }
             }
@@ -189,7 +188,47 @@ mod tests {
             output.status,
             String::from_utf8_lossy(&output.stderr),
         );
-        String::from_utf8(output.stdout).expect("probe records are ASCII")
+        String::from_utf8(output.stdout).expect("probe records are ASCII") // cov:ignore: the pinned qpdf probe emits ASCII records by contract
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_finder_probe_passes_exact_arguments_and_returns_stdout() {
+        assert_eq!(
+            run_qpdf_resource_finder_probe(Path::new("/bin/echo"), b"/F1 12 Tf"),
+            "--mode resource-finder --input-hex 2f4631203132205466 --allow-eof 1 \
+             --include-ignorable 0 --allow-bad 1 --max-len 0 --inline-offset none \
+             --chunks all\n"
+        );
+        assert_eq!(
+            dump_flpdf_resource_finder(b"/F1 12 Tf"),
+            "name\t2f4631\nresource\t2f466f6e74\t2f4631\t0\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_finder_probe_spawn_failure_reports_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("missing-probe");
+
+        let panic =
+            std::panic::catch_unwind(|| run_qpdf_resource_finder_probe(&probe, b"/F1 12 Tf"))
+                .unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("failed to execute qpdf resource finder probe"));
+        assert!(message.contains(probe.to_str().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_finder_probe_failure_reports_status_and_stderr() {
+        let panic = std::panic::catch_unwind(|| {
+            run_qpdf_resource_finder_probe(Path::new("/bin/false"), b"/F1 12 Tf")
+        })
+        .unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("qpdf resource finder probe failed (exit status: 1)"));
     }
 
     #[test]
