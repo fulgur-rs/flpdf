@@ -170,8 +170,8 @@ fn dictionary_dispatch_rereads_end_handler_after_item_replaces_root_handlers() {
 #[test]
 fn dictionary_handler_calls_start_items_and_end_in_order_with_original_value() {
     let seen = Rc::new(RefCell::new(Vec::new()));
-    let item = JsonHandler::shared();
-    item.borrow_mut().add_any_handler({
+    let item = JsonHandler::new();
+    item.add_any_handler({
         let seen = seen.clone();
         move |path, value| {
             seen.borrow_mut().push(format!(
@@ -182,7 +182,7 @@ fn dictionary_handler_calls_start_items_and_end_in_order_with_original_value() {
         }
     });
 
-    let mut handler = JsonHandler::new();
+    let handler = JsonHandler::new();
     handler.add_dictionary_handlers(
         {
             let seen = seen.clone();

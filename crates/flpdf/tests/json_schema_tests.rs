@@ -73,8 +73,11 @@ fn dictionary_schema_paths_preserve_escaped_keys() {
 
     assert!(!value.check_schema(&schema, &mut errors));
     assert_eq!(
-        errors,
-        ["json key \".line\\n\": key \"needed\" is present in schema but missing in object"]
+        error_bytes(&errors),
+        [
+            b"json key \".line\\n\": key \"needed\" is present in schema but missing in object"
+                .as_slice()
+        ]
     );
 }
 
@@ -86,10 +89,11 @@ fn dictionary_errors_follow_validation_passes_not_message_sort_order() {
 
     assert!(!value.check_schema(&schema, &mut errors));
     assert_eq!(
-        errors,
+        error_bytes(&errors),
         [
-            "top-level object: key \"z\" is present in schema but missing in object",
-            "top-level object: key \"a\" is not present in schema but appears in object",
+            b"top-level object: key \"z\" is present in schema but missing in object".as_slice(),
+            b"top-level object: key \"a\" is not present in schema but appears in object"
+                .as_slice(),
         ]
     );
 }
