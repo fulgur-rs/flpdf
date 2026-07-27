@@ -415,7 +415,7 @@ mod tests {
     use super::{Flate, FlateAction, BUF_ERROR_WARNING, Z_BUF_ERROR};
     use crate::pipeline::buffer::Buffer;
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::sync::Mutex;
 
@@ -515,6 +515,32 @@ mod tests {
                 "{}: finish failed",
                 self.identifier()
             )))
+        }
+    }
+
+    struct ArmedWriteFaultSink {
+        armed: Rc<Cell<bool>>,
+        finishes: usize,
+    }
+
+    impl Pipeline for ArmedWriteFaultSink {
+        fn identifier(&self) -> &str {
+            "armed-write-fault"
+        }
+
+        fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+            if self.armed.get() {
+                return Err(PipelineError::logic(format!(
+                    "{}: write failed",
+                    self.identifier()
+                )));
+            }
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            self.finishes += 1;
+            Ok(())
         }
     }
 
@@ -918,6 +944,45 @@ mod tests {
         let err = flate.finish().unwrap_err();
         assert!(matches!(err, PipelineError::Logic(_)));
         assert_eq!(err.to_string(), "finish-fault: finish failed");
+        drop(flate);
+        assert_eq!(sink.finishes, 1);
+    }
+
+    #[test]
+    fn finish_callback_logic_is_reconstructed_as_runtime_like_qpdf() {
+        let mut sink = RecordingSink::default();
+        let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 3).unwrap();
+        flate.set_warn_callback(|_, _| {
+            Err(PipelineError::logic(
+                "warning consumer: finish callback rejected warning",
+            ))
+        });
+        flate.write(&[0x78]).unwrap();
+
+        let err = flate.finish().unwrap_err();
+        assert!(matches!(err, PipelineError::Runtime(_)));
+        assert_eq!(
+            err.to_string(),
+            "warning consumer: finish callback rejected warning"
+        );
+        drop(flate);
+        assert_eq!(sink.finishes, 1);
+    }
+
+    #[test]
+    fn finish_downstream_write_logic_is_reconstructed_as_runtime_like_qpdf() {
+        let armed = Rc::new(Cell::new(false));
+        let mut sink = ArmedWriteFaultSink {
+            armed: Rc::clone(&armed),
+            finishes: 0,
+        };
+        let mut flate = Flate::new("flate", &mut sink, FlateAction::Deflate, 8).unwrap();
+        flate.write(b"x").unwrap();
+        armed.set(true);
+
+        let err = flate.finish().unwrap_err();
+        assert!(matches!(err, PipelineError::Runtime(_)));
+        assert_eq!(err.to_string(), "armed-write-fault: write failed");
         drop(flate);
         assert_eq!(sink.finishes, 1);
     }
