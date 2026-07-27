@@ -142,9 +142,11 @@ mod tests {
     }
 
     impl Pipeline for FailOnceWriteSink {
+        // cov:ignore-start: mandatory test-sink metadata has no behavioral role
         fn identifier(&self) -> &str {
             "fail-once write sink"
         }
+        // cov:ignore-end
 
         fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
             if !self.failed {
@@ -155,9 +157,11 @@ mod tests {
             Ok(())
         }
 
+        // cov:ignore-start: mandatory test-sink finish is intentionally a no-op
         fn finish(&mut self) -> PipelineResult<()> {
             Ok(())
         }
+        // cov:ignore-end
     }
 
     #[test]
