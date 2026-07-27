@@ -156,6 +156,7 @@ pub(crate) mod stream_filter;
 pub mod struct_tree_pg;
 pub mod subset_prune;
 pub mod thread_bead_p;
+pub(crate) mod token_filter;
 pub(crate) mod tokenizer;
 pub mod writer;
 pub mod xref;

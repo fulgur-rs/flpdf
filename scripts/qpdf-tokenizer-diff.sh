@@ -367,5 +367,10 @@ LD_LIBRARY_PATH="${probe_library_path}" \
 LD_LIBRARY_PATH="${probe_library_path}" \
   QPDF_TOKENIZER_PROBE="${probe_binary}" \
   cargo test -p flpdf --lib \
+  pipeline::qpdf_tokenizer::tests::qpdf_token_filter_differential \
+  -- --ignored --exact
+LD_LIBRARY_PATH="${probe_library_path}" \
+  QPDF_TOKENIZER_PROBE="${probe_binary}" \
+  cargo test -p flpdf --lib \
   content_normalizer::tests::qpdf_content_normalizer_differential \
   -- --ignored --exact

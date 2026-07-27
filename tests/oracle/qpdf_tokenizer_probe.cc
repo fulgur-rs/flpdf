@@ -17,6 +17,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -29,6 +30,7 @@ namespace
         bool allow_bad{false};
         size_t max_len{0};
         std::optional<size_t> inline_offset;
+        std::string chunks;
     };
 
     [[noreturn]] void
@@ -39,9 +41,9 @@ namespace
         }
         std::cerr
             << "usage: qpdf_tokenizer_probe"
-               " --mode pull|push|pull-inline|push-inline|between|content|normalize"
+               " --mode pull|push|pull-inline|push-inline|between|content|normalize|token-filter"
                " --input-hex HEX --allow-eof 0|1 --include-ignorable 0|1"
-               " --allow-bad 0|1 --max-len N --inline-offset none|N\n";
+               " --allow-bad 0|1 --max-len N --inline-offset none|N --chunks all|N[,N...]\n";
         std::exit(2);
     }
 
@@ -126,6 +128,7 @@ namespace
         bool saw_allow_bad = false;
         bool saw_max_len = false;
         bool saw_inline_offset = false;
+        bool saw_chunks = false;
 
         for (int i = 1; i < argc; ++i) {
             std::string flag = argv[i];
@@ -154,6 +157,9 @@ namespace
                     options.inline_offset = parse_size(value, flag);
                 }
                 saw_inline_offset = true;
+            } else if (flag == "--chunks") {
+                options.chunks = value;
+                saw_chunks = true;
             } else {
                 usage("unknown flag " + flag);
             }
@@ -161,13 +167,13 @@ namespace
 
         if (options.mode.empty() || !input_hex || !saw_allow_eof ||
             !saw_include_ignorable || !saw_allow_bad || !saw_max_len ||
-            !saw_inline_offset) {
+            !saw_inline_offset || !saw_chunks) {
             usage("all flags are required");
         }
         if (options.mode != "pull" && options.mode != "push" &&
             options.mode != "pull-inline" && options.mode != "push-inline" &&
             options.mode != "between" && options.mode != "content" &&
-            options.mode != "normalize") {
+            options.mode != "normalize" && options.mode != "token-filter") {
             usage("invalid mode " + options.mode);
         }
         options.input = hex_decode(*input_hex);
@@ -183,6 +189,9 @@ namespace
              options.mode == "between") &&
             options.max_len != 0) {
             usage("max length is a pull-only QPDFTokenizer API");
+        }
+        if (options.mode != "token-filter" && options.chunks != "all") {
+            usage("only token-filter mode accepts chunked input");
         }
         return options;
     }
@@ -456,6 +465,80 @@ namespace
                   << "last_token_was_bad\t"
                   << static_cast<int>(normalizer.lastTokenWasBad()) << '\n';
     }
+
+    std::vector<size_t>
+    token_filter_chunks(Options const& options)
+    {
+        if (options.chunks == "all") {
+            return {options.input.size()};
+        }
+
+        std::vector<size_t> result;
+        size_t offset = 0;
+        while (offset < options.chunks.size()) {
+            auto next = options.chunks.find(',', offset);
+            auto length = next == std::string::npos ? options.chunks.size() - offset : next - offset;
+            if (length == 0) {
+                usage("--chunks has an empty chunk length");
+            }
+            auto chunk = parse_size(options.chunks.substr(offset, length), "--chunks");
+            if (chunk == 0 || chunk > options.input.size() ||
+                result.size() > options.input.size()) {
+                usage("--chunks must contain positive lengths totaling the input length");
+            }
+            result.push_back(chunk);
+            if (next == std::string::npos) {
+                break;
+            }
+            offset = next + 1;
+        }
+
+        size_t total = 0;
+        for (auto chunk: result) {
+            if (chunk > options.input.size() - total) {
+                usage("--chunks must contain positive lengths totaling the input length");
+            }
+            total += chunk;
+        }
+        if (result.empty() || total != options.input.size()) {
+            usage("--chunks must contain positive lengths totaling the input length");
+        }
+        return result;
+    }
+
+    class RecordingTokenFilter final: public QPDFObjectHandle::TokenFilter
+    {
+      public:
+        void
+        handleToken(QPDFTokenizer::Token const& token) override
+        {
+            std::cout << "token\t" << token_type_name(token.getType()) << '\t'
+                      << hex_encode(token.getRawValue()) << '\n';
+            writeToken(token);
+        }
+
+        void
+        handleEOF() override
+        {
+            std::cout << "eof-callback\n";
+        }
+    };
+
+    void
+    dump_token_filter(Options const& options)
+    {
+        Pl_Buffer output("token filter output");
+        RecordingTokenFilter filter;
+        Pl_QPDFTokenizer tokenizer("token filter", &filter, &output);
+        size_t offset = 0;
+        for (auto chunk: token_filter_chunks(options)) {
+            tokenizer.write(
+                reinterpret_cast<unsigned char const*>(options.input.data() + offset), chunk);
+            offset += chunk;
+        }
+        tokenizer.finish();
+        std::cout << "output\t" << hex_encode(output.getString()) << '\n';
+    }
 } // namespace
 
 int
@@ -475,6 +558,8 @@ main(int argc, char* argv[])
             dump_content(options);
         } else if (options.mode == "normalize") {
             dump_normalize(options);
+        } else if (options.mode == "token-filter") {
+            dump_token_filter(options);
         } else {
             dump_between(options);
         }

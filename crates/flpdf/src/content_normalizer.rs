@@ -216,6 +216,8 @@ mod tests {
                 "0",
                 "--inline-offset",
                 "none",
+                "--chunks",
+                "all",
             ])
             .output()
             // cov:ignore-start: the script supplies a verified executable; this is failure-only harness diagnostics
@@ -404,7 +406,7 @@ mod tests {
             run_normalizer_probe(&probe, name, input),
             "--mode\nnormalize\n--input-hex\n4249202f5720312049442000ff2045492051\n\
              --allow-eof\n1\n--include-ignorable\n1\n--allow-bad\n1\n--max-len\n0\n\
-             --inline-offset\nnone\n"
+             --inline-offset\nnone\n--chunks\nall\n"
         );
     }
 

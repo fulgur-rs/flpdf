@@ -2,6 +2,13 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd -P)"
+probe_source="${repo_root}/tests/oracle/qpdf_tokenizer_probe.cc"
+script_source="${repo_root}/scripts/qpdf-tokenizer-diff.sh"
+
+grep -F 'token-filter' "${probe_source}"
+grep -F -- '--chunks' "${probe_source}"
+grep -F 'pipeline::qpdf_tokenizer::tests::qpdf_token_filter_differential' "${script_source}"
+
 fixture_root="$(mktemp -d)"
 
 fixture_repo="${fixture_root}/repo"
@@ -253,6 +260,7 @@ if (($# != 8)) ||
 fi
 case "$5" in
   tokenizer::tests::qpdf_tokenizer_differential_all_modes | \
+    pipeline::qpdf_tokenizer::tests::qpdf_token_filter_differential | \
     content_normalizer::tests::qpdf_content_normalizer_differential)
     ;;
   *)
@@ -565,10 +573,15 @@ TMPDIR="${parallel_tmp}" run_fixture >"${fixture_root}/parallel-2.out" 2>&1 &
 second_pid=$!
 wait "${first_pid}"
 wait "${second_pid}"
-[[ "$(grep -c '^cargo' "${contract_log}")" == 4 ]]
+[[ "$(grep -c '^cargo' "${contract_log}")" == 6 ]]
 [[ "$(
   grep -Fxc \
     'cargo <test> <-p> <flpdf> <--lib> <tokenizer::tests::qpdf_tokenizer_differential_all_modes> <--> <--ignored> <--exact>' \
+    "${contract_log}"
+)" == 2 ]]
+[[ "$(
+  grep -Fxc \
+    'cargo <test> <-p> <flpdf> <--lib> <pipeline::qpdf_tokenizer::tests::qpdf_token_filter_differential> <--> <--ignored> <--exact>' \
     "${contract_log}"
 )" == 2 ]]
 [[ "$(
