@@ -1,6 +1,10 @@
 //! Mirrors qpdf 11.9.0 libqpdf/Pl_QPDFTokenizer.cc, libqpdf/ContentNormalizer.cc.
 
-use crate::tokenizer::{Token, TokenType, Tokenizer};
+use crate::{
+    pipeline::{buffer::Buffer, qpdf_tokenizer::QpdfTokenizer, Pipeline, PipelineResult},
+    token_filter::{TokenFilter, TokenFilterOutput},
+    tokenizer::{Token, TokenType},
+};
 
 /// Holds normalized content-stream bytes and qpdf-compatible bad-token state.
 ///
@@ -44,60 +48,33 @@ impl ContentNormalization {
     }
 }
 
-trait TokenFilter {
-    fn handle_token(&mut self, token: &Token);
-    fn handle_eof(&mut self);
-}
-
-fn run_token_filter(input: &[u8], filter: &mut impl TokenFilter) {
-    let mut tokenizer = Tokenizer::new(input);
-    tokenizer.allow_eof();
-    tokenizer.include_ignorable();
-
-    loop {
-        let token = tokenizer
-            .read_token(true, 0)
-            .expect("allow-bad qpdf tokenization is input-infallible");
-        let is_eof = token.token_type == TokenType::Eof;
-        let is_id = token.is_word_value(b"ID");
-        filter.handle_token(&token);
-        if is_eof {
-            break;
-        }
-        if is_id {
-            let separator = tokenizer.consume_one_byte_or(b' ');
-            filter.handle_token(&Token::new(TokenType::Space, vec![separator]));
-            tokenizer
-                .expect_inline_image()
-                .expect("ID handling leaves the tokenizer between tokens");
-        }
-    }
-    filter.handle_eof();
-}
-
 #[derive(Default)]
 struct ContentNormalizer {
-    output: Vec<u8>,
     any_bad_tokens: bool,
     last_token_was_bad: bool,
 }
 
 impl ContentNormalizer {
-    fn write_space(&mut self, raw: &[u8]) {
+    fn write_space(
+        &mut self,
+        raw: &[u8],
+        output: &mut TokenFilterOutput<'_>,
+    ) -> PipelineResult<()> {
         for (index, &byte) in raw.iter().enumerate() {
             if byte == b'\r' {
                 if raw.get(index + 1) != Some(&b'\n') {
-                    self.output.push(b'\n');
+                    output.write(b"\n")?;
                 }
             } else {
-                self.output.push(byte);
+                output.write(std::slice::from_ref(&byte))?;
             }
         }
+        Ok(())
     }
 
-    fn finish(self) -> ContentNormalization {
+    fn finish(self, bytes: Vec<u8>) -> ContentNormalization {
         ContentNormalization {
-            bytes: self.output,
+            bytes,
             any_bad_tokens: self.any_bad_tokens,
             last_token_was_bad: self.last_token_was_bad,
         }
@@ -105,7 +82,11 @@ impl ContentNormalizer {
 }
 
 impl TokenFilter for ContentNormalizer {
-    fn handle_token(&mut self, token: &Token) {
+    fn handle_token(
+        &mut self,
+        token: &Token,
+        output: &mut TokenFilterOutput<'_>,
+    ) -> PipelineResult<()> {
         if token.token_type == TokenType::Bad {
             self.any_bad_tokens = true;
             self.last_token_was_bad = true;
@@ -114,22 +95,20 @@ impl TokenFilter for ContentNormalizer {
         }
 
         match token.token_type {
-            TokenType::Space => self.write_space(&token.raw),
+            TokenType::Space => self.write_space(&token.raw, output)?,
             TokenType::String | TokenType::Name => {
-                let canonical = Token::new(token.token_type, token.value.clone());
-                self.output.extend_from_slice(&canonical.raw);
+                output.write_token(&Token::new(token.token_type, token.value.clone()))?;
             }
-            _ => self.output.extend_from_slice(&token.raw),
+            _ => output.write_token(token)?,
         }
 
         if matches!(token.token_type, TokenType::String | TokenType::Name)
             && token.raw.iter().any(|byte| matches!(*byte, b'\r' | b'\n'))
         {
-            self.output.push(b'\n');
+            output.write(b"\n")?;
         }
+        Ok(())
     }
-
-    fn handle_eof(&mut self) {}
 }
 
 /// Normalizes decoded PDF content-stream bytes using qpdf 11.9.0 token rules.
@@ -149,14 +128,30 @@ impl TokenFilter for ContentNormalizer {
 /// ```
 #[must_use]
 pub fn normalize_content_stream(input: &[u8]) -> ContentNormalization {
+    let mut output = Buffer::new("content normalizer output", None);
     let mut normalizer = ContentNormalizer::default();
-    run_token_filter(input, &mut normalizer);
-    normalizer.finish()
+    {
+        let mut tokenizer =
+            QpdfTokenizer::new("content normalizer", &mut normalizer, Some(&mut output));
+        tokenizer
+            .write(input)
+            .expect("buffer-backed tokenizer write is infallible");
+        tokenizer
+            .finish()
+            .expect("allow-bad tokenizer finish is infallible");
+    }
+    let bytes = output
+        .take_buffer()
+        .expect("finished output buffer is ready");
+    normalizer.finish(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::buffer::Buffer;
+    use crate::pipeline::qpdf_tokenizer::QpdfTokenizer;
+    use crate::pipeline::Pipeline;
     use crate::tokenizer::TokenType;
     use std::fmt::Write as _;
     use std::path::Path;
@@ -306,19 +301,30 @@ mod tests {
     struct RecordingFilter(Vec<TokenType>);
 
     impl TokenFilter for RecordingFilter {
-        fn handle_token(&mut self, token: &Token) {
+        fn handle_token(
+            &mut self,
+            token: &Token,
+            output: &mut TokenFilterOutput<'_>,
+        ) -> PipelineResult<()> {
             self.0.push(token.token_type);
+            output.write_token(token)
         }
 
-        fn handle_eof(&mut self) {
+        fn handle_eof(&mut self, _output: &mut TokenFilterOutput<'_>) -> PipelineResult<()> {
             self.0.push(TokenType::BraceOpen);
+            Ok(())
         }
     }
 
     #[test]
-    fn runner_delivers_eof_token_before_handle_eof() {
+    fn shared_pipeline_delivers_eof_token_before_handle_eof() {
+        let mut output = Buffer::new("normalized", None);
         let mut filter = RecordingFilter::default();
-        run_token_filter(b"q", &mut filter);
+        {
+            let mut tokenizer = QpdfTokenizer::new("normalizer", &mut filter, Some(&mut output));
+            tokenizer.write(b"q").unwrap();
+            tokenizer.finish().unwrap();
+        }
         assert_eq!(
             filter.0,
             vec![TokenType::Word, TokenType::Eof, TokenType::BraceOpen]
