@@ -1,6 +1,4 @@
-//! qpdf correspondence: complete mirror of qpdf 11.9.0 QPDFTokenizer.cc across push, pull, normal, and inline-image modes.
-//!
-//! Mirrors qpdf 11.9.0 `libqpdf/QPDFTokenizer.cc`.
+//! Mirrors qpdf 11.9.0 libqpdf/QPDFTokenizer.cc.
 
 use std::ops::Range;
 

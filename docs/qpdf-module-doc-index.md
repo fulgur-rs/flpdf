@@ -90,7 +90,7 @@
 | `crates/flpdf/src/struct_tree_pg.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for structure elements |
 | `crates/flpdf/src/subset_prune.rs` | correspondence | QPDFPageObjectHelper.cc resource pruning plus QPDFWriter.cc full-rewrite reachability |
 | `crates/flpdf/src/thread_bead_p.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for article beads |
-| `crates/flpdf/src/tokenizer.rs` | correspondence | QPDFTokenizer.cc normal mode; additional qpdf tokenizer modes remain incomplete |
+| `crates/flpdf/src/tokenizer.rs` | mirror | libqpdf/QPDFTokenizer.cc |
 | `crates/flpdf/src/writer.rs` | correspondence | QPDFWriter.cc responsibilities shared with writer submodules and linearization |
 | `crates/flpdf/src/writer/object_streams.rs` | correspondence | QPDF.cc getCompressibleObjGens plus QPDFWriter.cc object-stream planning and emission |
 | `crates/flpdf/src/writer/plain/body.rs` | correspondence | QPDFWriter.cc plain object-body emission split from planning and xref output |
