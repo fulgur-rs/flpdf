@@ -459,6 +459,60 @@ fn callback_pipeline_skips_comments_and_preserves_scalar_operands() {
 }
 
 #[test]
+fn inline_image_events_preserve_qpdf_payload_boundaries_and_offsets() {
+    for (input, expected_payload, expected_offset, expected_length) in [
+        (
+            b"BI /W 1 ID \nraw EI".as_slice(),
+            b"\nraw ".as_slice(),
+            11,
+            5,
+        ),
+        (
+            b"BI /W 1 ID\r\nraw\r\nEI".as_slice(),
+            b"\nraw\r\n".as_slice(),
+            11,
+            6,
+        ),
+        (
+            b"BI /W 1 ID payload}EI Q".as_slice(),
+            b"payload}".as_slice(),
+            11,
+            8,
+        ),
+        (
+            b"BI /W 1 ID raw\xff EI".as_slice(),
+            b"raw\xff ".as_slice(),
+            11,
+            5,
+        ),
+        (b"BI /W 1 ID  EI".as_slice(), b" ".as_slice(), 11, 1),
+        (
+            b"BI /W 1 ID one EI A1 two EI Q".as_slice(),
+            b"one EI A1 two ".as_slice(),
+            11,
+            14,
+        ),
+    ] {
+        let mut callbacks = RecordingCallbacks::default();
+        parse_content_stream_data(input, &mut callbacks).expect("parse inline image");
+        let event = callbacks
+            .objects
+            .iter()
+            .find(|(object, _, _)| object.as_inline_image().is_some())
+            .expect("inline image event");
+        assert_eq!(
+            event,
+            &(
+                Object::InlineImage(expected_payload.to_vec()),
+                expected_offset,
+                expected_length,
+            ),
+            "input {input:?}"
+        );
+    }
+}
+
+#[test]
 fn public_normalizer_reexport_preserves_qpdf_token_layout() {
     let result = flpdf::normalize_content_stream(b"% c\r\nBT  /N#61me Q");
     assert_eq!(result.as_bytes(), b"% c\nBT  /Name Q");
