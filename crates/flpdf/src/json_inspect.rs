@@ -5,7 +5,7 @@
 //! returns a [`Json`] that the caller can extend with per-section data
 //! (pages, objects, …) in later subtasks.
 
-use crate::json::Json;
+use crate::json::{Json, QpdfStdioWriter};
 use crate::object::{Dictionary, Object, ObjectRef, Stream};
 use crate::reader::Pdf;
 use std::borrow::Cow;
@@ -79,6 +79,15 @@ fn side_file_io_error(
         message,
         source,
     }
+}
+
+fn finish_file_mode_side_file<W: Write>(
+    side_file: &mut QpdfStdioWriter<W>,
+    side_path: &str,
+) -> Result<(), JsonOutputError> {
+    side_file
+        .finish()
+        .map_err(|source| side_file_io_error("flush", side_path, source))
 }
 
 fn json_array(values: impl IntoIterator<Item = Json>) -> Result<Json, ConvertError> {
@@ -2850,8 +2859,9 @@ fn write_file_mode_object_entry<R: Read + Seek>(
             Json::write_dictionary_key(out, &mut object_first, b"stream", 4)?;
 
             let side_path = format_json_side_file_path(prefix, object_ref.number);
-            let mut side_file = File::create(&side_path)
+            let side_file = File::create(&side_path)
                 .map_err(|source| side_file_io_error("open", &side_path, source))?;
+            let mut side_file = QpdfStdioWriter::new(side_file);
             write_file_mode_stream_value(
                 pdf,
                 &stream,
@@ -2860,6 +2870,7 @@ fn write_file_mode_object_entry<R: Read + Seek>(
                 &mut side_file,
                 out,
             )?;
+            finish_file_mode_side_file(&mut side_file, &side_path)?;
             Json::write_dictionary_close(out, object_first, 3)?;
         }
         other => {
@@ -2896,9 +2907,6 @@ fn write_file_mode_stream_value<R: Read + Seek, W: Write>(
     side_file
         .write_all(payload.bytes.as_ref())
         .map_err(|source| side_file_io_error("write", side_path, source))?;
-    side_file
-        .flush()
-        .map_err(|source| side_file_io_error("flush", side_path, source))?;
 
     let dict = normalized_emitted_stream_dict(stream, payload.decode_succeeded);
     let dict_json = ordered_qpdf_dict(pdf, &dict)?;
@@ -3029,6 +3037,7 @@ mod tests {
 
     struct FlushFails {
         bytes: Vec<u8>,
+        flush_calls: usize,
     }
 
     impl std::io::Write for FlushFails {
@@ -3038,7 +3047,20 @@ mod tests {
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
+            self.flush_calls += 1;
             Err(std::io::Error::other("flush full"))
+        }
+    }
+
+    struct ErrnoSink(i32);
+
+    impl std::io::Write for ErrnoSink {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(self.0))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(self.0))
         }
     }
 
@@ -3591,43 +3613,52 @@ mod tests {
     }
 
     #[test]
-    fn file_mode_payload_flush_failure_leaves_complete_datafile_before_dict() {
+    fn file_mode_stream_value_does_not_finish_the_side_sink_before_dict() {
         let mut pdf = load_one_page_pdf();
         let stream = Stream::new(Dictionary::new(), b"payload".to_vec());
-        let mut side_file = FlushFails { bytes: Vec::new() };
+        let mut side_file = FlushFails {
+            bytes: Vec::new(),
+            flush_calls: 0,
+        };
         let mut out = Vec::new();
 
-        let result = write_file_mode_stream_value(
+        write_file_mode_stream_value(
             &mut pdf,
             &stream,
             DecodeLevel::None,
             "side-file",
             &mut side_file,
             &mut out,
-        );
+        )
+        .unwrap();
 
-        let error = result.unwrap_err();
-        assert_eq!(error.to_string(), "flush side-file: flush full");
+        assert_eq!(side_file.bytes, b"payload");
+        assert_eq!(side_file.flush_calls, 0);
+        assert!(out.windows(br#""dict""#.len()).any(|w| w == br#""dict""#));
+        assert!(out.ends_with(b"\n        }"));
+    }
+
+    #[test]
+    fn file_mode_final_enospc_is_ignored_at_the_integration_boundary() {
+        let mut side_file = QpdfStdioWriter::new(ErrnoSink(28));
+        side_file.write_all(b"small payload").unwrap();
+        finish_file_mode_side_file(&mut side_file, "side-file").unwrap();
+    }
+
+    #[test]
+    fn file_mode_final_ebadf_keeps_qpdf_flush_error_context() {
+        let mut side_file = QpdfStdioWriter::new(ErrnoSink(9));
+        side_file.write_all(b"small payload").unwrap();
+        let error = finish_file_mode_side_file(&mut side_file, "side-file").unwrap_err();
         assert!(matches!(
             error,
             JsonOutputError::SideFileIo {
                 operation: "flush",
                 ref path,
-                ref message,
                 ref source,
-            } if path == "side-file" && message == "flush full" && source.to_string() == "flush full"
+                ..
+            } if path == "side-file" && source.raw_os_error() == Some(9)
         ));
-        assert_eq!(side_file.bytes, b"payload");
-        assert!(
-            out.windows(br#""datafile": "side-file""#.len())
-                .any(|window| window == br#""datafile": "side-file""#),
-            "{out:?}"
-        );
-        assert!(
-            !out.windows(br#""dict""#.len())
-                .any(|window| window == br#""dict""#),
-            "{out:?}"
-        );
     }
 
     #[test]

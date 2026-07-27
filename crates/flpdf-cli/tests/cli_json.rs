@@ -1012,6 +1012,48 @@ fn unfiltered_file_stream_json_and_payload_are_qpdf_exact() {
     assert_stream_json_is_qpdf_exact(&one_page_pdf_with_stream(), "file");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn file_stream_to_dev_full_matches_qpdf_success_and_complete_json() {
+    use std::os::unix::fs::symlink;
+
+    if !is_qpdf_available() {
+        return;
+    }
+
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let temp = tempfile::tempdir().unwrap();
+    let prefix = temp.path().join("stream");
+    symlink("/dev/full", temp.path().join("stream-4")).unwrap();
+    let prefix_arg = format!("--json-stream-prefix={}", prefix.display());
+    let args = [
+        "--json=2",
+        "--json-key=qpdf",
+        "--json-object=4",
+        "--json-stream-data=file",
+        prefix_arg.as_str(),
+    ];
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(qpdf.status.success(), "{qpdf:?}");
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(input.path())
+        .output()
+        .unwrap();
+
+    assert!(flpdf.status.success(), "{flpdf:?}");
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    serde_json::from_slice::<serde_json::Value>(&flpdf.stdout).unwrap();
+}
+
 #[test]
 fn filtered_file_stream_json_and_payload_are_qpdf_exact() {
     assert_stream_json_is_qpdf_exact(

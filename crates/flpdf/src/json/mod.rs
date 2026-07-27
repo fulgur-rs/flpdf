@@ -11,7 +11,6 @@ mod handler;
 mod message;
 mod parser;
 mod schema;
-#[allow(dead_code)] // Consumed by the JSON side-file integration follow-up.
 mod stdio;
 mod value;
 mod writer;
@@ -20,6 +19,5 @@ pub use handler::{JsonHandler, JsonHandlerError, WeakJsonHandler};
 pub use message::JsonMessage;
 pub use parser::{parse, parse_reader, Reactor};
 pub use schema::SchemaFlags;
-#[allow(unused_imports)] // Consumed by the JSON side-file integration follow-up.
 pub(crate) use stdio::QpdfStdioWriter;
 pub use value::{Json, JsonError};
