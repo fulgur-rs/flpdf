@@ -91,6 +91,7 @@ pub(crate) mod ascii_hex;
 pub mod attachment_list;
 pub mod cache;
 pub mod check;
+pub mod content_normalizer;
 pub mod content_stream;
 pub mod default_appearance;
 pub mod diagnostics;
