@@ -87,6 +87,7 @@
 | `crates/flpdf/src/pipeline/buffer.rs` | correspondence | Pl_Buffer.cc accumulation, optional pass-through, finish readiness, and getBuffer reset ownership; Rust take_buffer returns the moved Vec directly |
 | `crates/flpdf/src/pipeline/count.rs` | correspondence | Pl_Count.cc byte-count, last-byte, forwarding, and finish responsibilities |
 | `crates/flpdf/src/pipeline/flate.rs` | correspondence | Pl_Flate.cc streaming inflate, deflate, warning callback, compression-level, and finish responsibilities via flate2 |
+| `crates/flpdf/src/pipeline/rc4.rs` | correspondence | Pl_RC4.cc bounded streaming over one retained RC4 state |
 | `crates/flpdf/src/qdf_fix.rs` | correspondence | qpdf/fix-qdf.cc tool behavior outside libqpdf |
 | `crates/flpdf/src/qpdf_null.rs` | correspondence | QPDFObjectHandle.cc isNull resolution plus QPDFWriter.cc null-valued dictionary visibility |
 | `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc document reading, object resolution, recovery, and authentication responsibilities |
