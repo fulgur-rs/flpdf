@@ -202,6 +202,13 @@ The warning prefix and stream context use the existing flpdf CLI diagnostic
 convention. The payload text and conditional second warning mirror qpdf
 11.9.0, including its wording.
 
+If any normalized stream reports a bad token, the CLI finishes writing the
+output, emits
+`<progname>: operation succeeded with warnings; resulting file may have some problems`,
+and exits with qpdf's warning status 3. This is the observed qpdf 11.9.0
+behavior for `content-stream-errors.pdf`; the output file remains available
+for inspection.
+
 Filter decode failures remain errors because they occur before the content
 normalizer receives bytes. Normalization itself does not reject malformed
 content.
@@ -261,6 +268,7 @@ A malformed-content CLI fixture verifies that:
 - normalized bytes match qpdf;
 - the first and third warnings always appear for any bad token;
 - the second warning appears only when the last non-EOF token was bad.
+- the process exits 3 after emitting qpdf's warning-success summary.
 
 qpdf-qtest fixtures remain in the separate `flpdf-qtest` repository and are
 not vendored into flpdf.
