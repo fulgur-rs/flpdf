@@ -2929,6 +2929,50 @@ fn malformed_page_content_midstream_retains_resources() {
     );
 }
 
+#[test]
+fn standalone_id_operator_retains_all_page_resources() {
+    let extra = vec![
+        (4u32, stream_obj(4, b"ID /F1 12 Tf EI")),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >>",
+            ),
+        ),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect("standalone ID must conservatively retain resources");
+
+    let keys = font_dict_keys(&mut pdf, ObjectRef::new(5, 0));
+    assert_eq!(keys, ["F1".to_string(), "F2".to_string()]);
+}
+
+#[test]
+fn unterminated_array_content_retains_all_page_resources() {
+    let extra = vec![
+        (4u32, stream_obj(4, b"[ /F1")),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >>",
+            ),
+        ),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect("unterminated array must conservatively retain resources");
+
+    let keys = font_dict_keys(&mut pdf, ObjectRef::new(5, 0));
+    assert_eq!(keys, ["F1".to_string(), "F2".to_string()]);
+}
+
 // Exercises the AncestorInline branch of the `protected_groups` prune-loop skip
 // (step 5): a corrupt page inheriting its /Resources from an ancestor /Pages
 // node (AncestorInline loc) poisons that group, so the ancestor's inline

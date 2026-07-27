@@ -1,4 +1,6 @@
 #include <qpdf/BufferInputSource.hh>
+#include <qpdf/QPDF.hh>
+#include <qpdf/QPDFObjectHandle.hh>
 #include <qpdf/QPDFTokenizer.hh>
 
 #include <cstdio>
@@ -34,7 +36,7 @@ namespace
         }
         std::cerr
             << "usage: qpdf_tokenizer_probe"
-               " --mode pull|push|pull-inline|push-inline|between"
+               " --mode pull|push|pull-inline|push-inline|between|content"
                " --input-hex HEX --allow-eof 0|1 --include-ignorable 0|1"
                " --allow-bad 0|1 --max-len N --inline-offset none|N\n";
         std::exit(2);
@@ -161,7 +163,7 @@ namespace
         }
         if (options.mode != "pull" && options.mode != "push" &&
             options.mode != "pull-inline" && options.mode != "push-inline" &&
-            options.mode != "between") {
+            options.mode != "between" && options.mode != "content") {
             usage("invalid mode " + options.mode);
         }
         options.input = hex_decode(*input_hex);
@@ -407,6 +409,33 @@ namespace
             ++event;
         }
     }
+
+    class ContentCallbacks final: public QPDFObjectHandle::ParserCallbacks
+    {
+      public:
+        void
+        handleObject(QPDFObjectHandle object, size_t offset, size_t length) override
+        {
+            std::cout << offset << '\t' << length << '\t'
+                      << object.getTypeName() << '\t' << object.unparse() << '\n';
+        }
+
+        void
+        handleEOF() override
+        {
+            std::cout << "eof\n";
+        }
+    };
+
+    void
+    dump_content(Options const& options)
+    {
+        QPDF qpdf;
+        qpdf.emptyPDF();
+        auto stream = qpdf.newStream(options.input);
+        ContentCallbacks callbacks;
+        stream.parseAsContents(&callbacks);
+    }
 } // namespace
 
 int
@@ -422,6 +451,8 @@ main(int argc, char* argv[])
             dump_push(options, false);
         } else if (options.mode == "push-inline") {
             dump_push(options, true);
+        } else if (options.mode == "content") {
+            dump_content(options);
         } else {
             dump_between(options);
         }

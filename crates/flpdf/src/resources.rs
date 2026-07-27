@@ -717,6 +717,11 @@ impl<R: Read + Seek> ResourceCallbacks<'_, '_, '_, R> {
 }
 
 impl<R: Read + Seek> ParserCallbacks for ResourceCallbacks<'_, '_, '_, R> {
+    fn handle_diagnostic(&mut self, _offset: usize, _message: &str) -> Result<()> {
+        self.complete = false;
+        Ok(())
+    }
+
     fn handle_object(
         &mut self,
         object: Object,
@@ -741,6 +746,7 @@ impl<R: Read + Seek> ParserCallbacks for ResourceCallbacks<'_, '_, '_, R> {
                 self.inline_header = Some(Vec::new());
                 Ok(ParseControl::Continue)
             }
+            Object::Operator(operator) if operator == b"ID" => self.stop_incomplete(),
             Object::Operator(operator) => {
                 let operands = std::mem::take(&mut self.operands);
                 match process_operator(self.ctx, &operator, &operands, self.scope, self.depth) {

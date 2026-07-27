@@ -127,6 +127,9 @@ pub(crate) struct Parser<'tokenizer, 'input> {
     /// to bound recursion against adversarially deep input.
     depth: usize,
     diagnostics: Vec<ParserDiagnostic>,
+    content_good_count: usize,
+    content_bad_count: usize,
+    content_give_up: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +176,9 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
             top_level_no_reference: false,
             depth: 0,
             diagnostics: Vec::new(),
+            content_good_count: 0,
+            content_bad_count: 0,
+            content_give_up: false,
         }
     }
 
@@ -199,6 +205,10 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
         self.object().map(Some)
     }
 
+    pub(crate) fn take_diagnostics(&mut self) -> Vec<ParserDiagnostic> {
+        std::mem::take(&mut self.diagnostics)
+    }
+
     pub(crate) fn object(&mut self) -> Result<Object> {
         // `object` is the sole recursion hub: `dictionary` values and `array`
         // elements recurse only through it, and leaf parsers do not recurse.
@@ -219,9 +229,22 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
 
     fn object_inner(&mut self) -> Result<Object> {
         let token = self.next_token()?;
+        if self.mode == ParserMode::Content && self.depth > 1 {
+            self.content_good_count += 1;
+        }
         match token.token_type {
-            TokenType::DictOpen => self.dictionary(),
-            TokenType::ArrayOpen => self.array(),
+            TokenType::DictOpen => {
+                self.reset_content_recovery_at_top_level();
+                if self.mode == ParserMode::Content {
+                    self.content_dictionary(self.position())
+                } else {
+                    self.dictionary()
+                }
+            }
+            TokenType::ArrayOpen => {
+                self.reset_content_recovery_at_top_level();
+                self.array()
+            }
             TokenType::Name => Ok(Object::Name(token.value[1..].to_vec())),
             TokenType::String => Ok(Object::String(token.value)),
             TokenType::Bool => Ok(Object::Boolean(token.value == b"true")),
@@ -230,6 +253,29 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
             TokenType::Real => self.real_object(token),
             TokenType::Word if self.mode == ParserMode::Content => {
                 Ok(Object::Operator(token.value))
+            }
+            TokenType::Bad if self.mode == ParserMode::Content => {
+                let message = token
+                    .error_message
+                    .as_deref()
+                    .map(|message| String::from_utf8_lossy(message).into_owned())
+                    .unwrap_or_else(|| "bad token".to_string());
+                Ok(self.recover_content_null(&token, message))
+            }
+            TokenType::BraceOpen | TokenType::BraceClose if self.mode == ParserMode::Content => {
+                Ok(self.recover_content_null(
+                    &token,
+                    "treating unexpected brace token as null".to_string(),
+                ))
+            }
+            TokenType::ArrayClose if self.mode == ParserMode::Content => Ok(self
+                .recover_content_null(
+                    &token,
+                    "treating unexpected array close token as null".to_string(),
+                )),
+            TokenType::DictClose if self.mode == ParserMode::Content => {
+                Ok(self
+                    .recover_content_null(&token, "unexpected dictionary close token".to_string()))
             }
             TokenType::Bad => Err(Error::parse(
                 token.error_offset,
@@ -260,19 +306,127 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
         }
     }
 
+    fn content_dictionary(&mut self, frame_offset: usize) -> Result<Object> {
+        let mut dict = Dictionary::new();
+        let mut missing_key_values = Vec::new();
+        loop {
+            let token = self.next_token()?;
+            if token.token_type == TokenType::DictClose {
+                return Ok(self.finish_content_dictionary(dict, missing_key_values, frame_offset));
+            }
+            if token.token_type == TokenType::Eof {
+                return Err(Error::parse(token.start, "unexpected EOF in dictionary"));
+            }
+            if token.token_type == TokenType::Name {
+                self.content_good_count += 1;
+                let key = token.value[1..].to_vec();
+                let value_token = self.peek_token()?;
+                if value_token.token_type == TokenType::DictClose {
+                    let _ = self.next_token()?;
+                    self.content_good_count += 1;
+                    self.diagnostics.push(ParserDiagnostic {
+                        relative_offset: frame_offset,
+                        message: "dictionary ended prematurely; using null as value for last key"
+                            .to_string(),
+                    });
+                    dict.insert(key, Object::Null);
+                    return Ok(self.finish_content_dictionary(
+                        dict,
+                        missing_key_values,
+                        frame_offset,
+                    ));
+                }
+                let value = self.object()?;
+                if self.content_give_up {
+                    return Ok(Object::Null);
+                }
+                dict.insert(key, value);
+            } else {
+                self.unread_token(token);
+                missing_key_values.push(self.object()?);
+                if self.content_give_up {
+                    return Ok(Object::Null);
+                }
+            }
+        }
+    }
+
+    fn finish_content_dictionary(
+        &mut self,
+        mut dict: Dictionary,
+        missing_key_values: Vec<Object>,
+        frame_offset: usize,
+    ) -> Object {
+        let mut next_fake_key = 1;
+        for value in missing_key_values {
+            let key = loop {
+                let candidate = format!("QPDFFake{next_fake_key}");
+                next_fake_key += 1;
+                if dict.get(candidate.as_bytes()).is_none() {
+                    break candidate;
+                }
+            };
+            self.diagnostics.push(ParserDiagnostic {
+                relative_offset: frame_offset,
+                message: format!(
+                    "expected dictionary key but found non-name object; inserting key /{key}"
+                ),
+            });
+            dict.insert(key, value);
+        }
+        Object::Dictionary(dict)
+    }
+
     fn array(&mut self) -> Result<Object> {
         let mut values = Vec::new();
         loop {
             let token = self.peek_token()?;
             if token.token_type == TokenType::ArrayClose {
                 let _ = self.next_token()?;
+                if self.mode == ParserMode::Content {
+                    self.content_good_count += 1;
+                }
                 return Ok(Object::Array(values));
             }
             if token.token_type == TokenType::Eof {
                 return Err(Error::parse(token.start, "unexpected EOF in array"));
             }
             values.push(self.object()?);
+            if self.content_give_up {
+                return Ok(Object::Null);
+            }
         }
+    }
+
+    fn reset_content_recovery_at_top_level(&mut self) {
+        if self.mode == ParserMode::Content && self.depth == 1 {
+            self.content_good_count = 0;
+            self.content_bad_count = 0;
+            self.content_give_up = false;
+        }
+    }
+
+    fn recover_content_null(&mut self, token: &Token, message: String) -> Object {
+        self.diagnostics.push(ParserDiagnostic {
+            relative_offset: token.error_offset,
+            message,
+        });
+        if self.depth > 1 {
+            if self.content_good_count <= 4 {
+                self.content_bad_count += 1;
+            } else {
+                self.content_bad_count = 1;
+            }
+            self.content_good_count = 0;
+            if self.content_bad_count > 5 {
+                self.diagnostics.push(ParserDiagnostic {
+                    relative_offset: token.error_offset,
+                    message: "too many errors; giving up on reading object".to_string(),
+                });
+                self.content_give_up = true;
+            }
+        }
+        Object::Null
     }
 
     fn integer_or_ref(&mut self, first_token: Token) -> Result<Object> {
@@ -443,17 +597,138 @@ mod content_mode_tests {
     }
 
     #[test]
-    fn content_mode_preserves_bad_token_offset_and_diagnostic() {
+    fn content_mode_recovers_bad_token_as_null_with_offset_and_diagnostic() {
         let mut tokenizer = Tokenizer::new(b"  <0g>");
         let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
 
-        let error = parser
-            .parse_content_object()
-            .expect_err("bad content token must fail");
         assert_eq!(
-            error.to_string(),
-            "parse error at byte 2: invalid character (g) in hexstring"
+            parser.parse_content_object().expect("recovered object"),
+            Some(Object::Null)
         );
+        assert_eq!(
+            parser.diagnostics,
+            vec![super::ParserDiagnostic {
+                relative_offset: 2,
+                message: "invalid character (g) in hexstring".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn content_mode_applies_qpdf_bad_token_limit_inside_container() {
+        let mut tokenizer = Tokenizer::new(b"[ } } } } } } 1 ]");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        assert_eq!(
+            parser.parse_content_object().expect("recovered object"),
+            Some(Object::Null)
+        );
+        assert_eq!(
+            parser
+                .diagnostics
+                .last()
+                .map(|diagnostic| diagnostic.message.as_str()),
+            Some("too many errors; giving up on reading object")
+        );
+    }
+
+    #[test]
+    fn content_mode_resets_qpdf_bad_streak_after_enough_good_tokens() {
+        let mut tokenizer = Tokenizer::new(b"[ } } } } } 1 2 3 4 } } } } } 6 ]");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        let object = parser
+            .parse_content_object()
+            .expect("recovered object")
+            .expect("array");
+        assert!(matches!(object, Object::Array(_)));
+        assert_eq!(parser.diagnostics.len(), 10);
+        assert!(
+            !parser
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message
+                    == "too many errors; giving up on reading object")
+        );
+    }
+
+    #[test]
+    fn content_mode_recovers_unexpected_top_level_closes_as_null() {
+        for (input, expected_message) in [
+            (
+                b"]".as_slice(),
+                "treating unexpected array close token as null",
+            ),
+            (b">>".as_slice(), "unexpected dictionary close token"),
+        ] {
+            let mut tokenizer = Tokenizer::new(input);
+            let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+            assert_eq!(
+                parser.parse_content_object().expect("recovered object"),
+                Some(Object::Null)
+            );
+            assert_eq!(parser.diagnostics[0].message, expected_message);
+        }
+    }
+
+    #[test]
+    fn content_mode_matches_qpdf_dictionary_recovery() {
+        let mut tokenizer = Tokenizer::new(b"<< /QPDFFake1 9 7 } /A >>");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        let dictionary = parser
+            .parse_content_object()
+            .expect("recovered object")
+            .expect("dictionary")
+            .into_dict()
+            .expect("dictionary object");
+        assert_eq!(dictionary.get("QPDFFake1"), Some(&Object::Integer(9)));
+        assert_eq!(dictionary.get("QPDFFake2"), Some(&Object::Integer(7)));
+        assert_eq!(dictionary.get("QPDFFake3"), Some(&Object::Null));
+        assert_eq!(dictionary.get("A"), Some(&Object::Null));
+        assert!(parser.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("dictionary ended prematurely; using null as value for last key")
+        }));
+    }
+
+    #[test]
+    fn content_mode_rejects_eof_while_waiting_for_another_dictionary_key() {
+        let mut tokenizer = Tokenizer::new(b"<< /A 1");
+        let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+        assert_eq!(
+            parser
+                .parse_content_object()
+                .expect_err("unterminated dictionary must fail")
+                .to_string(),
+            "parse error at byte 7: unexpected EOF in dictionary"
+        );
+    }
+
+    #[test]
+    fn content_mode_gives_up_from_dictionary_key_or_value_recovery() {
+        for input in [
+            b"<< } } } } } } >>".as_slice(),
+            b"<< /A [ } } } } } } ] >>".as_slice(),
+        ] {
+            let mut tokenizer = Tokenizer::new(input);
+            let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
+
+            assert_eq!(
+                parser.parse_content_object().expect("recovered object"),
+                Some(Object::Null)
+            );
+            assert_eq!(
+                parser
+                    .diagnostics
+                    .last()
+                    .map(|diagnostic| diagnostic.message.as_str()),
+                Some("too many errors; giving up on reading object")
+            );
+        }
     }
 }
 

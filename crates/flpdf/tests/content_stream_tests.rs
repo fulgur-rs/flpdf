@@ -10,6 +10,7 @@ use flpdf::{
 struct RecordingCallbacks {
     size: Option<usize>,
     objects: Vec<(Object, usize, usize)>,
+    diagnostics: Vec<(usize, String)>,
     eof: bool,
     stop_after: Option<usize>,
 }
@@ -32,6 +33,11 @@ impl ParserCallbacks for RecordingCallbacks {
         } else {
             ParseControl::Continue
         })
+    }
+
+    fn handle_diagnostic(&mut self, offset: usize, message: &str) -> flpdf::Result<()> {
+        self.diagnostics.push((offset, message.to_string()));
+        Ok(())
     }
 
     fn handle_eof(&mut self) -> flpdf::Result<()> {
@@ -106,6 +112,46 @@ fn operation_adapter_recovers_at_parser_token_boundaries() {
     .unwrap();
 
     assert_eq!(operators, vec![b"add".to_vec(), b"sub".to_vec()]);
+}
+
+#[test]
+fn operation_adapter_preserves_qpdf_recovered_null_operands() {
+    let mut seen = Vec::new();
+    parse_content_operations(b"1 } cm [1 } 2] cm", |operands, operator| {
+        seen.push((operands.to_vec(), operator.to_vec()));
+        Ok(ParseControl::Continue)
+    })
+    .unwrap();
+
+    assert_eq!(
+        seen,
+        vec![
+            (vec![Object::Integer(1), Object::Null], b"cm".to_vec(),),
+            (
+                vec![Object::Array(vec![
+                    Object::Integer(1),
+                    Object::Null,
+                    Object::Integer(2),
+                ])],
+                b"cm".to_vec(),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn callbacks_receive_qpdf_recovery_diagnostics_and_nulls() {
+    let mut callbacks = RecordingCallbacks::default();
+    parse_content_stream_data(b"<< /A } /B 2 >> cm", &mut callbacks).unwrap();
+
+    let mut expected = flpdf::Dictionary::new();
+    expected.insert("A", Object::Null);
+    expected.insert("B", Object::Integer(2));
+    assert_eq!(callbacks.objects[0].0, Object::Dictionary(expected));
+    assert_eq!(
+        callbacks.diagnostics,
+        vec![(6, "treating unexpected brace token as null".to_string())]
+    );
 }
 
 #[test]
@@ -275,18 +321,25 @@ fn unterminated_inline_image_reports_the_qpdf_diagnostic_at_data_start() {
 #[test]
 fn bad_content_token_preserves_its_qpdf_offset_and_message() {
     let mut callbacks = RecordingCallbacks::default();
-    let error = parse_content_stream_data(b"q <0g>", &mut callbacks)
-        .expect_err("bad content token must fail");
+    parse_content_stream_data(b"q <0g>", &mut callbacks)
+        .expect("bad content token is a recoverable qpdf null");
 
     assert_eq!(
-        error.to_string(),
-        "parse error at byte 2: invalid character (g) in hexstring"
+        callbacks.diagnostics,
+        vec![
+            (2, "invalid character (g) in hexstring".to_string()),
+            (5, "EOF while reading token".to_string()),
+        ]
     );
     assert_eq!(
         callbacks.objects,
-        vec![(Object::Operator(b"q".to_vec()), 0, 1)]
+        vec![
+            (Object::Operator(b"q".to_vec()), 0, 1),
+            (Object::Null, 2, 3),
+            (Object::Null, 5, 1),
+        ]
     );
-    assert!(!callbacks.eof);
+    assert!(callbacks.eof);
 }
 
 fn operations(input: &[u8]) -> Vec<(Vec<Object>, Vec<u8>)> {

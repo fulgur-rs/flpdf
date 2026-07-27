@@ -40,6 +40,11 @@ pub trait ParserCallbacks {
         length: usize,
     ) -> Result<ParseControl>;
 
+    /// Receive a non-fatal qpdf parser recovery diagnostic.
+    fn handle_diagnostic(&mut self, _offset: usize, _message: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Receive normal content EOF.
     fn handle_eof(&mut self) -> Result<()>;
 }
@@ -55,13 +60,12 @@ pub trait ParserCallbacks {
 /// after `ID`, an unterminated inline image, or invalid tokenizer state.
 /// Callback errors are propagated unchanged.
 pub fn parse_content_stream_data(input: &[u8], callbacks: &mut impl ParserCallbacks) -> Result<()> {
-    parse_content_stream_data_impl(input, callbacks, false)
+    parse_content_stream_data_impl(input, callbacks)
 }
 
 fn parse_content_stream_data_impl(
     input: &[u8],
     callbacks: &mut impl ParserCallbacks,
-    recover_object_errors: bool,
 ) -> Result<()> {
     callbacks.content_size(input.len())?;
 
@@ -77,22 +81,14 @@ fn parse_content_stream_data_impl(
         tokenizer.set_position(offset)?;
 
         let mut parser = Parser::with_tokenizer_content(&mut tokenizer);
-        let object = match parser.parse_content_object() {
-            Ok(Some(object)) => object,
-            Ok(None) => break,
-            Err(_) if recover_object_errors && parser.position() > offset => {
-                // qpdf turns bad top-level content tokens into recoverable null
-                // objects and continues at the tokenizer-owned boundary
-                // (libqpdf/QPDFParser.cc:49-67). The operation adapter retains
-                // flpdf's established "skip malformed, last-wins" contract by
-                // discarding that failed object. Crucially, forward progress
-                // comes from the shared parser/tokenizer cursor; this layer
-                // never scans or skips input bytes itself.
-                continue;
-            }
-            Err(error) => return Err(error),
+        let object = match parser.parse_content_object()? {
+            Some(object) => object,
+            None => break,
         };
         let length = parser.position() - offset;
+        for diagnostic in parser.take_diagnostics() {
+            callbacks.handle_diagnostic(diagnostic.relative_offset, &diagnostic.message)?;
+        }
         let is_id = object.as_operator() == Some(b"ID");
 
         if callbacks.handle_object(object, offset, length)? == ParseControl::Stop {
@@ -197,7 +193,7 @@ where
         operands: Vec::new(),
         on_operation,
     };
-    parse_content_stream_data_impl(input, &mut callbacks, true)
+    parse_content_stream_data_impl(input, &mut callbacks)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

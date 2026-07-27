@@ -1431,9 +1431,119 @@ mod tests {
     #[ignore = "live qpdf 11.9.0 tokenizer oracle"]
     // cov:ignore-start: ignored live entry point; ordinary tests cover the comparison loop and fake-probe boundary
     fn qpdf_tokenizer_differential_all_modes() {
+        use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
+        use crate::Object;
+
+        #[derive(Default)]
+        struct ContentRecords(String);
+
+        fn qpdf_unparse(object: &Object) -> (&'static str, String) {
+            match object {
+                Object::Integer(value) => ("integer", value.to_string()),
+                Object::Null => ("null", "null".to_string()),
+                Object::Operator(value) => {
+                    ("operator", String::from_utf8_lossy(value).into_owned())
+                }
+                Object::Array(values) => (
+                    "array",
+                    format!(
+                        "[ {} ]",
+                        values
+                            .iter()
+                            .map(|value| qpdf_unparse(value).1)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ),
+                ),
+                Object::Dictionary(dictionary) => (
+                    "dictionary",
+                    format!(
+                        "<< {} >>",
+                        dictionary
+                            .iter()
+                            .filter(|(_, value)| !matches!(value, Object::Null))
+                            .map(|(key, value)| format!(
+                                "/{} {}",
+                                String::from_utf8_lossy(key),
+                                qpdf_unparse(value).1
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ),
+                ),
+                other => panic!("unexpected content oracle object: {other:?}"),
+            }
+        }
+
+        impl ParserCallbacks for ContentRecords {
+            fn handle_object(
+                &mut self,
+                object: Object,
+                offset: usize,
+                length: usize,
+            ) -> crate::Result<ParseControl> {
+                let (type_name, value) = qpdf_unparse(&object);
+                writeln!(self.0, "{offset}\t{length}\t{type_name}\t{value}").unwrap();
+                Ok(ParseControl::Continue)
+            }
+
+            fn handle_eof(&mut self) -> crate::Result<()> {
+                writeln!(self.0, "eof").unwrap();
+                Ok(())
+            }
+        }
+
         let probe = std::env::var_os("QPDF_TOKENIZER_PROBE")
             .expect("set QPDF_TOKENIZER_PROBE to the built qpdf 11.9.0 probe");
         assert_qpdf_oracle_matches(|case| run_qpdf_probe(Path::new(&probe), case));
+
+        for (name, content) in [
+            (
+                "top-level-and-array-recovery",
+                b"1 } cm [1 } 2] cm".as_slice(),
+            ),
+            (
+                "dictionary-nested-recovery",
+                b"<< /A [1 } 2] /B 2 >> cm".as_slice(),
+            ),
+            (
+                "dictionary-key-and-premature-close-recovery",
+                b"<< /QPDFFake1 9 7 } /A >> cm".as_slice(),
+            ),
+            ("bad-token-limit", b"[ } } } } } } 1 ]".as_slice()),
+        ] {
+            let qpdf = Command::new(&probe)
+                .args([
+                    "--mode",
+                    "content",
+                    "--input-hex",
+                    &hex_encode(content),
+                    "--allow-eof",
+                    "0",
+                    "--include-ignorable",
+                    "0",
+                    "--allow-bad",
+                    "1",
+                    "--max-len",
+                    "0",
+                    "--inline-offset",
+                    "none",
+                ])
+                .output()
+                .expect("execute content parser probe");
+            assert!(
+                qpdf.status.success(),
+                "content parser probe failed for {name}: {}",
+                String::from_utf8_lossy(&qpdf.stderr)
+            );
+            let mut flpdf = ContentRecords::default();
+            parse_content_stream_data(content, &mut flpdf).unwrap();
+            assert_eq!(
+                String::from_utf8(qpdf.stdout).unwrap(),
+                flpdf.0,
+                "content parser case {name}"
+            );
+        }
     }
     // cov:ignore-end
 
