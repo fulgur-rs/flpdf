@@ -2972,8 +2972,8 @@ mod tests {
 
     /// `/DA (/GS1 gs)` uses the ExtGState category. `merge_resources_shallow`
     /// may rename `/ExtGState/GS1`; the operator `gs` picks up its NAME arg
-    /// from the tracked `last_name`, same shape as `Tf` — verify the
-    /// tokenizer does not stop after finding a Font-only rewrite.
+    /// from `ResourceFinder`'s tracked `last_name`, same shape as `Tf` —
+    /// verify the shared finder/replacer is not limited to Font rewrites.
     #[test]
     fn adjust_default_appearance_rewrites_extgstate_via_gs_operator() {
         let dr_map = category_dr_map(b"ExtGState", &[("GS1", "GS1_1")]);
@@ -2986,7 +2986,7 @@ mod tests {
 
     /// `/DA (/Im1 Do)` uses an XObject reference. Even though `Do` in
     /// `/DA` is atypical (widget /DA usually just sets fonts and colours),
-    /// the qpdf operator table maps it, so the tokenizer must too.
+    /// the qpdf operator table maps it, so the shared replacer must too.
     #[test]
     fn adjust_default_appearance_rewrites_xobject_via_do_operator() {
         let dr_map = category_dr_map(b"XObject", &[("Im1", "Im1_1")]);
@@ -3012,7 +3012,7 @@ mod tests {
 
     /// `BDC` consumes its SECOND name arg as a Properties entry — the tag
     /// (`/Span`) sets `last_name` first and is then overwritten by the
-    /// properties name (`/MC1`), so the tokenizer's single-name tracker
+    /// properties name (`/MC1`), so `ResourceFinder`'s single-name tracker
     /// picks up `/MC1` at BDC time. Renaming `Properties/MC1 → MC1_1`
     /// must follow into the marked-content wrapper.
     #[test]

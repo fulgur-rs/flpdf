@@ -23,10 +23,6 @@ pub(crate) struct ResourceFinder {
 }
 
 impl ResourceFinder {
-    pub(crate) fn names(&self) -> &ResourceNames {
-        &self.names
-    }
-
     pub(crate) fn names_by_resource_type(&self) -> &ResourceNamesByType {
         &self.names_by_resource_type
     }
@@ -59,7 +55,7 @@ impl ResourceFinder {
     }
 }
 
-fn resource_type_for_operator(operator: &[u8]) -> Option<&'static [u8]> {
+fn operator_resource_type(operator: &[u8]) -> Option<&'static [u8]> {
     match operator {
         b"CS" | b"cs" => Some(b"ColorSpace"),
         b"gs" => Some(b"ExtGState"),
@@ -88,7 +84,7 @@ impl ParserCallbacks for ResourceFinder {
                 self.last_operator_started_at_boundary = !self.pending_operands;
                 self.pending_operands = false;
                 if let (Some(resource_type), Some((name, name_offset))) = (
-                    resource_type_for_operator(&operator),
+                    operator_resource_type(&operator),
                     self.last_name.clone(),
                 ) {
                     self.record_resource_name(resource_type, &name, name_offset);
@@ -141,7 +137,7 @@ mod tests {
     fn dump_flpdf_resource_finder(input: &[u8]) -> String {
         let finder = find(input).unwrap();
         let mut records = String::new();
-        for name in finder.names() {
+        for name in &finder.names {
             writeln!(records, "name\t{}", qpdf_name_hex(name)).unwrap();
         }
         for (resource_type, names) in finder.names_by_resource_type() {
@@ -212,7 +208,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![b"X1".to_vec()]
         );
-        assert_eq!(finder.names().len(), 10);
+        assert_eq!(finder.names.len(), 10);
     }
 
     #[test]

@@ -1017,13 +1017,6 @@ fn is_token_delimiter(byte: u8) -> bool {
     is_ws(byte) || is_delimiter(byte)
 }
 
-pub(crate) fn starts_number_token(input: &[u8]) -> bool {
-    let mut tokenizer = Tokenizer::new(input);
-    tokenizer
-        .read_token(true, 0)
-        .is_ok_and(|token| matches!(token.token_type, TokenType::Integer | TokenType::Real))
-}
-
 fn token_description(token: &Token) -> String {
     if token.token_type == TokenType::Eof {
         "EOF".into()
