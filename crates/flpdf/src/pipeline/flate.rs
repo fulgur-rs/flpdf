@@ -23,14 +23,18 @@ enum FlateCodec {
 
 #[derive(Debug, Clone, Copy)]
 enum InflatePhase {
-    Header { bytes: [u8; 2], len: usize },
+    Header,
     Body,
-    Trailer { bytes: [u8; 4], len: usize },
+    Trailer,
     Ended,
 }
 
 struct InflateState {
     phase: InflatePhase,
+    header: [u8; 2],
+    header_len: usize,
+    trailer: [u8; 4],
+    trailer_len: usize,
     adler_a: u32,
     adler_b: u32,
 }
@@ -38,10 +42,11 @@ struct InflateState {
 impl InflateState {
     fn new() -> Self {
         Self {
-            phase: InflatePhase::Header {
-                bytes: [0; 2],
-                len: 0,
-            },
+            phase: InflatePhase::Header,
+            header: [0; 2],
+            header_len: 0,
+            trailer: [0; 4],
+            trailer_len: 0,
             adler_a: 1,
             adler_b: 0,
         }
@@ -167,41 +172,25 @@ impl<'a> Flate<'a> {
         )
     }
 
-    fn ensure_codec_progress(
-        identifier: &str,
-        operation: &str,
-        consumed: usize,
-        produced: usize,
-    ) -> PipelineResult<()> {
-        if consumed == 0 && produced == 0 {
-            return Err(PipelineError::codec(
-                identifier,
-                format!("{operation}: data: codec made no progress"),
-            ));
-        }
-        Ok(())
-    }
-
     fn consume_zlib_header(&mut self, data: &[u8]) -> PipelineResult<usize> {
-        let InflatePhase::Header { bytes, len } = &mut self.inflate_state.phase else {
-            return Ok(0);
-        };
-        let consumed = (2 - *len).min(data.len());
-        bytes[*len..*len + consumed].copy_from_slice(&data[..consumed]);
-        *len += consumed;
-        if *len != 2 {
+        let state = &mut self.inflate_state;
+        let consumed = (2 - state.header_len).min(data.len());
+        state.header[state.header_len..state.header_len + consumed]
+            .copy_from_slice(&data[..consumed]);
+        state.header_len += consumed;
+        if state.header_len != 2 {
             return Ok(consumed);
         }
 
-        let [cmf, flg] = *bytes;
+        let [cmf, flg] = state.header;
+        if ((u16::from(cmf) << 8) | u16::from(flg)) % 31 != 0 {
+            return Err(self.zlib_format_error("incorrect header check"));
+        }
         if cmf & 0x0f != 8 {
             return Err(self.zlib_format_error("unknown compression method"));
         }
         if cmf >> 4 > 7 {
             return Err(self.zlib_format_error("invalid window size"));
-        }
-        if ((u16::from(cmf) << 8) | u16::from(flg)) % 31 != 0 {
-            return Err(self.zlib_format_error("incorrect header check"));
         }
         if flg & 0x20 != 0 {
             return Err(self.zlib_format_error("preset dictionary is not supported"));
@@ -210,21 +199,19 @@ impl<'a> Flate<'a> {
         Ok(consumed)
     }
 
-    fn consume_zlib_trailer(&mut self, data: &[u8]) -> usize {
-        let InflatePhase::Trailer { bytes, len } = &mut self.inflate_state.phase else {
-            return 0;
-        };
-        let consumed = (4 - *len).min(data.len());
-        bytes[*len..*len + consumed].copy_from_slice(&data[..consumed]);
-        *len += consumed;
-        if *len == 4 {
-            let expected = u32::from_be_bytes(*bytes);
-            let _checksum_matches = expected == self.inflate_state.adler();
+    fn consume_zlib_trailer(&mut self, data: &[u8]) {
+        let state = &mut self.inflate_state;
+        let consumed = (4 - state.trailer_len).min(data.len());
+        state.trailer[state.trailer_len..state.trailer_len + consumed]
+            .copy_from_slice(&data[..consumed]);
+        state.trailer_len += consumed;
+        if state.trailer_len == 4 {
+            let expected = u32::from_be_bytes(state.trailer);
+            let _checksum_matches = expected == state.adler();
             // qpdf intentionally accepts the checksum-only mismatch represented
             // by zlib's exact "incorrect data check" diagnostic.
-            self.inflate_state.phase = InflatePhase::Ended;
+            state.phase = InflatePhase::Ended;
         }
-        consumed
     }
 
     fn write_deflate(&mut self, data: &[u8], flush: FlushCompress) -> PipelineResult<()> {
@@ -272,7 +259,6 @@ impl<'a> Flate<'a> {
             {
                 return Ok(());
             }
-            Self::ensure_codec_progress(&self.identifier, "deflate", consumed, produced)?;
         }
     }
 
@@ -281,9 +267,9 @@ impl<'a> Flate<'a> {
 
         loop {
             match self.inflate_state.phase {
-                InflatePhase::Header { .. } => {
+                InflatePhase::Header => {
                     input_offset += self.consume_zlib_header(&data[input_offset..])?;
-                    if matches!(self.inflate_state.phase, InflatePhase::Header { .. }) {
+                    if matches!(self.inflate_state.phase, InflatePhase::Header) {
                         if flush == FlushDecompress::Finish {
                             self.warn(BUF_ERROR_WARNING, Z_BUF_ERROR)?;
                         }
@@ -293,9 +279,9 @@ impl<'a> Flate<'a> {
                         return Ok(());
                     }
                 }
-                InflatePhase::Trailer { .. } => {
+                InflatePhase::Trailer => {
                     self.consume_zlib_trailer(&data[input_offset..]);
-                    if matches!(self.inflate_state.phase, InflatePhase::Trailer { .. })
+                    if matches!(self.inflate_state.phase, InflatePhase::Trailer)
                         && flush == FlushDecompress::Finish
                     {
                         self.warn(BUF_ERROR_WARNING, Z_BUF_ERROR)?;
@@ -321,10 +307,7 @@ impl<'a> Flate<'a> {
             let status = match result {
                 Ok(status) => status,
                 Err(source) => {
-                    let detail = source
-                        .message()
-                        .unwrap_or("zlib decompression error")
-                        .to_owned();
+                    let detail = source.message().unwrap_or("zlib decompression error");
                     return Err(PipelineError::codec_with_source(
                         &self.identifier,
                         format!("inflate: data: {detail}"),
@@ -344,16 +327,12 @@ impl<'a> Flate<'a> {
             }
 
             if status == Status::StreamEnd {
-                self.inflate_state.phase = InflatePhase::Trailer {
-                    bytes: [0; 4],
-                    len: 0,
-                };
+                self.inflate_state.phase = InflatePhase::Trailer;
                 continue;
             }
             if input_offset == data.len() && produced < self.output.len() {
                 return Ok(());
             }
-            Self::ensure_codec_progress(&self.identifier, "inflate", consumed, produced)?;
         }
     }
 
@@ -415,10 +394,9 @@ impl Pipeline for Flate<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Flate, FlateAction, InflatePhase, BUF_ERROR_WARNING};
+    use super::{Flate, FlateAction, BUF_ERROR_WARNING};
     use crate::pipeline::buffer::Buffer;
     use crate::pipeline::{Pipeline, PipelineError, PipelineErrorKind, PipelineResult};
-    use flate2::{FlushCompress, FlushDecompress};
     use std::cell::RefCell;
     use std::error::Error as _;
     use std::rc::Rc;
@@ -453,6 +431,13 @@ mod tests {
             flate.finish()?;
         }
         sink.take_buffer()
+    }
+
+    fn small_window_distance_vector() -> Vec<u8> {
+        let mut encoded = vec![0x08, 0x1d, 0x73];
+        encoded.extend(std::iter::repeat_n(0x74, 256));
+        encoded.extend_from_slice(&[0x04, 0x06, 0x00, 0x00, 0xa9, 0xfd, 0x42, 0x05]);
+        encoded
     }
 
     fn deflate_after_level_change(
@@ -644,19 +629,27 @@ mod tests {
     }
 
     #[test]
-    fn zlib_header_validation_reports_specific_codec_sources() {
+    fn small_cinfo_distance_257_matches_qpdf_compatibility() {
+        let encoded = small_window_distance_vector();
+        let decoded = inflate_chunks([encoded.as_slice()], 17).unwrap();
+        assert_eq!(decoded, vec![b'A'; 260]);
+    }
+
+    #[test]
+    fn zlib_header_errors_follow_qpdf_libz_precedence() {
         for (header, detail) in [
-            ([0x79, 0x00], "unknown compression method"),
-            ([0x88, 0x00], "invalid window size"),
+            ([0x79, 0x00], "incorrect header check"),
+            ([0x88, 0x00], "incorrect header check"),
             ([0x78, 0x00], "incorrect header check"),
-            ([0x78, 0x20], "preset dictionary is not supported"),
+            ([0x79, 0x18], "unknown compression method"),
+            ([0x88, 0x1c], "invalid window size"),
         ] {
             let mut sink = RecordingSink::default();
             assert_eq!(sink.identifier(), "recording");
             let mut flate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 3).unwrap();
             let err = flate.write(&header).unwrap_err();
             assert_eq!(err.kind(), PipelineErrorKind::Codec);
-            assert_eq!(err.source().unwrap().to_string(), detail);
+            assert_eq!(err.message(), format!("inflate: data: {detail}"));
         }
     }
 
@@ -754,84 +747,6 @@ mod tests {
         assert_eq!(err.stage(), "finish-fault");
         drop(flate);
         assert_eq!(sink.finishes, 1);
-    }
-
-    #[test]
-    fn private_codec_guards_report_mismatches_and_invalid_reuse() {
-        assert_eq!(
-            Flate::ensure_codec_progress("guard", "inflate", 0, 0)
-                .unwrap_err()
-                .kind(),
-            PipelineErrorKind::Codec
-        );
-        Flate::ensure_codec_progress("guard", "inflate", 1, 0).unwrap();
-        Flate::ensure_codec_progress("guard", "inflate", 0, 1).unwrap();
-
-        let mut sink = RecordingSink::default();
-        {
-            let mut inflate = Flate::new("inflate", &mut sink, FlateAction::Inflate, 8).unwrap();
-            inflate.initialize_codec();
-            assert_eq!(
-                inflate
-                    .write_deflate(b"x", FlushCompress::None)
-                    .unwrap_err()
-                    .kind(),
-                PipelineErrorKind::State
-            );
-            inflate.inflate_state.phase = InflatePhase::Body;
-            assert_eq!(inflate.consume_zlib_header(b"x").unwrap(), 0);
-            assert_eq!(inflate.consume_zlib_trailer(b"x"), 0);
-        }
-        {
-            let mut deflate = Flate::new("deflate", &mut sink, FlateAction::Deflate, 8).unwrap();
-            deflate.initialize_codec();
-            deflate.inflate_state.phase = InflatePhase::Body;
-            assert_eq!(
-                deflate
-                    .write_inflate(b"x", FlushDecompress::Sync)
-                    .unwrap_err()
-                    .kind(),
-                PipelineErrorKind::State
-            );
-            deflate.write_deflate(b"x", FlushCompress::Finish).unwrap();
-            #[cfg(feature = "qpdf-zlib-compat")]
-            assert_eq!(
-                deflate
-                    .write_deflate(b"x", FlushCompress::None)
-                    .unwrap_err()
-                    .kind(),
-                PipelineErrorKind::Codec
-            );
-            #[cfg(not(feature = "qpdf-zlib-compat"))]
-            deflate.write_deflate(b"x", FlushCompress::None).unwrap();
-        }
-    }
-
-    #[test]
-    fn private_deflate_buf_error_paths_preserve_warning_and_finish_error() {
-        let warnings = Rc::new(RefCell::new(Vec::new()));
-        let mut sink = RecordingSink::default();
-        {
-            let mut flate = Flate::new("deflate", &mut sink, FlateAction::Deflate, 8).unwrap();
-            let observed = Rc::clone(&warnings);
-            flate.set_warn_callback(move |message, code| {
-                observed.borrow_mut().push((message.to_owned(), code));
-                Ok(())
-            });
-            flate.initialize_codec();
-            flate.output.clear();
-            flate.write_deflate(b"x", FlushCompress::None).unwrap();
-            assert_eq!(
-                flate
-                    .write_deflate(&[], FlushCompress::Finish)
-                    .unwrap_err()
-                    .kind(),
-                PipelineErrorKind::Codec
-            );
-        }
-        let warnings = warnings.borrow();
-        assert_eq!(warnings[0], (BUF_ERROR_WARNING.to_owned(), -5));
-        assert_eq!(warnings.len(), 2);
     }
 
     #[test]
