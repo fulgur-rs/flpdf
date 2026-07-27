@@ -162,11 +162,12 @@ fn push_internal<R: Read + Seek>(
     }
 
     for key in own_keys {
-        if let Some(stack) = key_ancestors.get_mut(key) {
-            stack.pop();
-            if stack.is_empty() {
-                key_ancestors.remove(key);
-            }
+        let stack = key_ancestors
+            .get_mut(key)
+            .expect("own inherited key must have an ancestor stack");
+        stack.pop();
+        if stack.is_empty() {
+            key_ancestors.remove(key);
         }
     }
     Ok(())
@@ -187,7 +188,7 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Object, Pdf};
+    use crate::{Dictionary, Object, Pdf};
 
     fn pdf_bytes(bodies: &[(u32, &[u8])]) -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
@@ -271,5 +272,43 @@ mod tests {
             pdf.resolve(prepared.pages[0]).unwrap(),
             Object::Dictionary(ref page) if page.get("MediaBox").is_some()
         ));
+    }
+
+    #[test]
+    fn excessive_depth_error_propagates_from_a_child_pages_node() {
+        let mut pdf = Pdf::open_mem_owned(pdf_bytes(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Kids [] /Count 0 >>"),
+        ]))
+        .unwrap();
+        for depth in 0..MAX_DEPTH {
+            let number = 2 + depth as u32;
+            let child = number + 1;
+            let mut node = Dictionary::new();
+            node.insert("Type", Object::Name(b"Pages".to_vec()));
+            node.insert(
+                "Kids",
+                Object::Array(vec![Object::Reference(ObjectRef::new(child, 0))]),
+            );
+            node.insert("Count", Object::Integer(0));
+            pdf.set_object(ObjectRef::new(number, 0), Object::Dictionary(node));
+        }
+        let mut boundary = Dictionary::new();
+        boundary.insert("Type", Object::Name(b"Pages".to_vec()));
+        boundary.insert("Kids", Object::Array(Vec::new()));
+        boundary.insert("Count", Object::Integer(0));
+        pdf.set_object(
+            ObjectRef::new(2 + MAX_DEPTH as u32, 0),
+            Object::Dictionary(boundary),
+        );
+        let prepared = PreparedPages {
+            root: ObjectRef::new(2, 0),
+            pages: Vec::new(),
+        };
+
+        let error = push(&mut pdf, &prepared, true, false).unwrap_err();
+
+        assert!(matches!(error, Error::Unsupported(ref message)
+                if message.contains("page tree depth exceeds maximum")));
     }
 }

@@ -490,6 +490,17 @@ mod tests {
     }
 
     #[test]
+    fn optimize_accepts_a_non_dictionary_root_without_outline_rewrite() {
+        let mut pdf = open_pdf(&[(1, b"null")], b"");
+        let root = pdf.root_ref().unwrap();
+
+        let maps = Optimization::optimize(&mut pdf, &BTreeMap::new(), true, |_| 1).unwrap();
+
+        assert!(maps.users_for(root).contains(&ObjectUser::Root));
+        assert!(matches!(pdf.resolve(root).unwrap(), Object::Null));
+    }
+
+    #[test]
     fn filter_compressed_objects_rekeys_both_maps_to_container() {
         let member = ObjectRef::new(7, 3);
         let container = ObjectRef::new(20, 0);
