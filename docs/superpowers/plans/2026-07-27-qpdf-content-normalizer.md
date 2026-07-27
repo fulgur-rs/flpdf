@@ -1,6 +1,6 @@
 # qpdf Content Normalizer Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Beads is the source of truth for execution status; the numbered steps below are procedural instructions.
 
 **Goal:** Replace flpdf's object-reconstructing content normalization with byte-for-byte qpdf 11.9.0 `Pl_QPDFTokenizer` plus `ContentNormalizer` behavior in the library and CLI.
 
@@ -51,7 +51,7 @@
 - Consumes: existing `Token::new(TokenType, Vec<u8>)`, `Tokenizer::position`, and private `Tokenizer::reset`.
 - Produces: qpdf-faithful `Token::new(TokenType::String, value).raw` and `Tokenizer::consume_one_byte_or(default: u8) -> u8` for Task 2.
 
-- [ ] **Step 1: Expand the constructed-token test with hand-derived qpdf literals**
+#### Step 1: Expand the constructed-token test with hand-derived qpdf literals
 
 Replace the narrow `constructed_name_and_string_tokens_have_canonical_pdf_raw_values` body with:
 
@@ -80,7 +80,7 @@ fn constructed_name_and_string_tokens_have_qpdf_canonical_raw_values() {
 
 This test catches replacing qpdf's PDFDoc/ISO-Latin-1 heuristic with flpdf's existing printable-ASCII-only object serializer.
 
-- [ ] **Step 2: Run the constructed-token test and verify RED**
+#### Step 2: Run the constructed-token test and verify RED
 
 Run:
 
@@ -91,7 +91,7 @@ cargo test -p flpdf --lib tokenizer::tests::constructed_name_and_string_tokens_h
 Expected: the assertion fails because newline/control/ISO-Latin-1 spellings
 differ.
 
-- [ ] **Step 3: Implement qpdf's constructed-string spelling without changing `Object::write_pdf`**
+#### Step 3: Implement qpdf's constructed-string spelling without changing `Object::write_pdf`
 
 Remove `object::write_string_value` from the imports. Replace `canonical_string_raw` with:
 
@@ -152,7 +152,7 @@ fn canonical_string_raw(value: &[u8]) -> Vec<u8> {
 
 Keep the object serializer unchanged so this task does not absorb the separate `good9` writer-format issue.
 
-- [ ] **Step 4: Run the constructed-token test and verify GREEN**
+#### Step 4: Run the constructed-token test and verify GREEN
 
 Run:
 
@@ -162,7 +162,7 @@ cargo test -p flpdf --lib tokenizer::tests::constructed_name_and_string_tokens_h
 
 Expected: pass.
 
-- [ ] **Step 5: Add the missing cursor test**
+#### Step 5: Add the missing cursor test
 
 Add beside the constructed-token test:
 
@@ -182,7 +182,7 @@ fn consume_one_byte_or_returns_input_then_default_without_advancing_past_eof() {
 
 This catches advancing beyond EOF or returning no qpdf-compatible default byte after a terminal `ID`.
 
-- [ ] **Step 6: Run the cursor test and verify RED**
+#### Step 6: Run the cursor test and verify RED
 
 Run:
 
@@ -192,7 +192,7 @@ cargo test -p flpdf --lib tokenizer::tests::consume_one_byte_or_returns_input_th
 
 Expected: compilation fails because `consume_one_byte_or` does not exist.
 
-- [ ] **Step 7: Add the qpdf-compatible byte primitive**
+#### Step 7: Add the qpdf-compatible byte primitive
 
 Add next to `consume_one_byte`:
 
@@ -209,7 +209,7 @@ pub(crate) fn consume_one_byte_or(&mut self, default: u8) -> u8 {
 
 It retrieves bytes only. It must not classify whitespace, look for `EI`, or alter `allow_eof`/`include_ignorable`.
 
-- [ ] **Step 8: Run focused and tokenizer tests and verify GREEN**
+#### Step 8: Run focused and tokenizer tests and verify GREEN
 
 Run:
 
@@ -221,7 +221,7 @@ cargo test -p flpdf --lib tokenizer::tests
 
 Expected: all pass.
 
-- [ ] **Step 9: Format, inspect, and commit**
+#### Step 9: Format, inspect, and commit
 
 Run:
 
@@ -250,7 +250,7 @@ git commit -m "fix(tokenizer): mirror qpdf constructed tokens"
   - methods `as_bytes`, `into_bytes`, `any_bad_tokens`, `last_token_was_bad`.
 - Task 3 initially consumes this API through `flpdf::content_normalizer`; the crate-root re-export remains on the old function until the cutover.
 
-- [ ] **Step 1: Declare the module and add RED tests for qpdf byte behavior**
+#### Step 1: Declare the module and add RED tests for qpdf byte behavior
 
 Add `pub mod content_normalizer;` immediately before `pub mod content_stream;` in `lib.rs`.
 
@@ -362,7 +362,7 @@ mod tests {
 
 The `BraceOpen` marker is test-only and distinguishes `handle_eof` from the real EOF token without a mock.
 
-- [ ] **Step 2: Run the new tests and verify RED**
+#### Step 2: Run the new tests and verify RED
 
 Run:
 
@@ -372,7 +372,7 @@ cargo test -p flpdf --lib content_normalizer::tests
 
 Expected: compilation fails because the result type, filter runner, and normalizer do not exist.
 
-- [ ] **Step 3: Implement the result and private filter contract**
+#### Step 3: Implement the result and private filter contract
 
 Add:
 
@@ -414,7 +414,7 @@ trait TokenFilter {
 }
 ```
 
-- [ ] **Step 4: Implement the qpdf `Pl_QPDFTokenizer` runner**
+#### Step 4: Implement the qpdf `Pl_QPDFTokenizer` runner
 
 Add:
 
@@ -448,7 +448,7 @@ fn run_token_filter(input: &[u8], filter: &mut impl TokenFilter) {
 
 This must reuse `Tokenizer::expect_inline_image`; do not scan `input` in this module.
 
-- [ ] **Step 5: Implement the qpdf `ContentNormalizer` state and token rules**
+#### Step 5: Implement the qpdf `ContentNormalizer` state and token rules
 
 Add:
 
@@ -518,7 +518,7 @@ pub fn normalize_content_stream(input: &[u8]) -> ContentNormalization {
 }
 ```
 
-- [ ] **Step 6: Run the focused tests and verify GREEN**
+#### Step 6: Run the focused tests and verify GREEN
 
 Run:
 
@@ -529,7 +529,7 @@ cargo test -p flpdf --lib tokenizer::tests
 
 Expected: all pass. If a literal differs, verify it against the pinned qpdf probe/source rather than adapting the production behavior to the old flpdf output.
 
-- [ ] **Step 7: Refactor only after GREEN**
+#### Step 7: Refactor only after GREEN
 
 Inspect the module and confirm:
 
@@ -547,7 +547,7 @@ cargo clippy -p flpdf --lib -- -D warnings
 git diff --check
 ```
 
-- [ ] **Step 8: Commit the focused component**
+#### Step 8: Commit the focused component
 
 ```bash
 git add crates/flpdf/src/content_normalizer.rs crates/flpdf/src/lib.rs
@@ -573,7 +573,7 @@ git commit -m "feat(content): add qpdf token normalizer"
 - Produces: crate-root `flpdf::normalize_content_stream(&[u8]) -> ContentNormalization`; no production `NormalizationBridge`.
 - Task 4 consumes `any_bad_tokens`/`last_token_was_bad` in the CLI.
 
-- [ ] **Step 1: Write the public re-export regression before changing exports**
+#### Step 1: Write the public re-export regression before changing exports
 
 Replace the normalization-only section in `content_stream_tests.rs` with:
 
@@ -588,7 +588,7 @@ fn public_normalizer_reexport_preserves_qpdf_token_layout() {
 
 Remove `use flpdf::content_stream::normalize_content_stream;`. Keep all callback/parser tests outside the deleted normalization section unchanged.
 
-- [ ] **Step 2: Run and verify RED**
+#### Step 2: Run and verify RED
 
 Run:
 
@@ -598,7 +598,7 @@ cargo test -p flpdf --test content_stream_tests public_normalizer_reexport_prese
 
 Expected: compilation fails because the crate-root function still returns `Result<Vec<u8>>`.
 
-- [ ] **Step 3: Move the public export**
+#### Step 3: Move the public export
 
 In `lib.rs`, add:
 
@@ -608,7 +608,7 @@ pub use content_normalizer::{normalize_content_stream, ContentNormalization};
 
 and remove `normalize_content_stream` from the `pub use content_stream::{...}` list.
 
-- [ ] **Step 4: Delete the transitional normalizer**
+#### Step 4: Delete the transitional normalizer
 
 From `content_stream.rs`, delete:
 
@@ -626,7 +626,7 @@ Change the module correspondence header to:
 
 Do not change `parse_content_stream_data`, `OperationCallbacks`, or `parse_content_operations`.
 
-- [ ] **Step 5: Make the CLI compile against the new result**
+#### Step 5: Make the CLI compile against the new result
 
 In `normalize_and_store_stream`, replace:
 
@@ -649,7 +649,7 @@ let normalized_out = normalize_content_stream(&out_content).into_bytes();
 
 Do not add warnings in this task; Task 4 adds the status-aware CLI flow under its own RED tests.
 
-- [ ] **Step 6: Run focused crate and CLI tests and verify GREEN**
+#### Step 6: Run focused crate and CLI tests and verify GREEN
 
 Run:
 
@@ -662,7 +662,7 @@ cargo test -p flpdf-cli --test cli_tests rewrite_normalize_content
 
 Expected: all pass.
 
-- [ ] **Step 7: Verify the old implementation is gone**
+#### Step 7: Verify the old implementation is gone
 
 Run:
 
@@ -672,7 +672,7 @@ rg -n "NormalizationBridge|NormalizationState|one-operator-per-line|normalize_on
 
 Expected: no production or active-test matches. Stale historical design/plan docs outside these paths are not edited.
 
-- [ ] **Step 8: Format and commit**
+#### Step 8: Format and commit
 
 ```bash
 cargo fmt --all
@@ -698,7 +698,7 @@ git commit -m "refactor(content): replace object normalizer"
   - `finish_rewrite_warnings(..., normalization_last_bad: &[bool])`;
   - output-preserving qpdf exit 3 behavior.
 
-- [ ] **Step 1: Add a test-built page-content fixture**
+#### Step 1: Add a test-built page-content fixture
 
 Near `build_classic_pdf` in `cli_tests.rs`, add:
 
@@ -742,7 +742,7 @@ fn two_page_pdf_with_shared_content(content: &[u8]) -> Vec<u8> {
 }
 ```
 
-- [ ] **Step 2: Add RED tests for recovered and terminal bad-token cases**
+#### Step 2: Add RED tests for recovered and terminal bad-token cases
 
 Add:
 
@@ -842,7 +842,7 @@ fn rewrite_normalize_content_shared_bad_stream_warns_once() {
 
 These tests catch aborting before output, returning exit 0/1/2, applying the terminal warning to every bad-token stream, or normalizing and warning twice for one stream shared by multiple pages.
 
-- [ ] **Step 3: Run and verify RED**
+#### Step 3: Run and verify RED
 
 Run:
 
@@ -856,7 +856,7 @@ Expected: all fail because the current object normalizer treats malformed
 content as a fatal rewrite error (normally exit 2), does not retain the
 requested output, and emits none of qpdf's normalization-warning sequence.
 
-- [ ] **Step 4: Return bad-token status while storing normalized bytes**
+#### Step 4: Return bad-token status while storing normalized bytes
 
 Change signatures:
 
@@ -904,7 +904,7 @@ Store the bytes exactly as before, then return `Ok(warning)`. Aggregate
 shared stream produce one qpdf-equivalent normalization pipeline and one
 warning sequence.
 
-- [ ] **Step 5: Accumulate normalization warning state in `run_rewrite`**
+#### Step 5: Accumulate normalization warning state in `run_rewrite`
 
 Before the content mutation passes:
 
@@ -934,7 +934,7 @@ finish_rewrite_warnings(
 )?;
 ```
 
-- [ ] **Step 6: Implement exact warning payloads and summary selection**
+#### Step 6: Implement exact warning payloads and summary selection
 
 Add:
 
@@ -991,7 +991,7 @@ fn finish_rewrite_warnings<R: Read + Seek>(
 
 Keep `finish_lazy_warnings` for other command paths.
 
-- [ ] **Step 7: Run focused CLI tests and verify GREEN**
+#### Step 7: Run focused CLI tests and verify GREEN
 
 Run:
 
@@ -1002,7 +1002,7 @@ cargo test -p flpdf-cli --test cli_check_exitcodes rewrite_repair_warnings_use_q
 
 Expected: all pass; repair-only warning summary remains unchanged.
 
-- [ ] **Step 8: Format and commit**
+#### Step 8: Format and commit
 
 ```bash
 cargo fmt --all
@@ -1030,7 +1030,7 @@ git commit -m "fix(cli): mirror qpdf normalization warnings"
   - ignored test `content_normalizer::tests::qpdf_content_normalizer_differential`;
   - exact qpdf/flpdf decoded-content CLI parity test.
 
-- [ ] **Step 1: Add the C++ oracle mode**
+#### Step 1: Add the C++ oracle mode
 
 Add includes:
 
@@ -1063,7 +1063,7 @@ dump_normalize(Options const& options)
 
 Dispatch `options.mode == "normalize"` before the final `dump_between` arm.
 
-- [ ] **Step 2: Add the Rust differential matrix before changing the build script**
+#### Step 2: Add the Rust differential matrix before changing the build script
 
 In `content_normalizer.rs` tests, add literal cases:
 
@@ -1174,7 +1174,7 @@ fn qpdf_content_normalizer_differential() {
 
 Before production changes in this task, run the ignored test with any existing tokenizer probe and verify RED: it must fail because `normalize` is not yet a supported probe mode.
 
-- [ ] **Step 3: Extend the secure probe build**
+#### Step 3: Extend the secure probe build
 
 In the `c++` command in `scripts/qpdf-tokenizer-diff.sh`, add:
 
@@ -1195,7 +1195,7 @@ LD_LIBRARY_PATH="${probe_library_path}" \
   -- --ignored --exact
 ```
 
-- [ ] **Step 4: Update and run the driver contract**
+#### Step 4: Update and run the driver contract
 
 Change the fake `cargo` command to accept exactly either ignored test path and
 reject any other selector. Extend the fake `c++` check to require both:
@@ -1217,7 +1217,7 @@ scripts/tests/qpdf-tokenizer-diff-contract.sh
 
 Expected: `qpdf-tokenizer-diff contract: PASS`.
 
-- [ ] **Step 5: Run the live pinned differential**
+#### Step 5: Run the live pinned differential
 
 Run:
 
@@ -1231,7 +1231,7 @@ Expected:
 - new content-normalizer oracle passes all 12 cases;
 - pinned qpdf source remains clean.
 
-- [ ] **Step 6: Add a CLI qpdf byte-parity E2E**
+#### Step 6: Add a CLI qpdf byte-parity E2E
 
 In `cli_optimization_matrix.rs`, add a local classic-PDF builder that computes
 `/Length`, object offsets, xref entries, and `startxref`:
@@ -1393,7 +1393,7 @@ Use these literal inputs and real CLI outputs; do not calculate expected bytes
 with `normalize_content_stream`. The valid case must exit 0 and the malformed
 case must retain both output files while both tools exit 3.
 
-- [ ] **Step 7: Remove stale observable-only prose and update existing assertions**
+#### Step 7: Remove stale observable-only prose and update existing assertions
 
 Delete the `.12.2` byte-divergence section and change the normalization observability description to exact decoded-content byte parity with qpdf. Keep unrelated compression divergence documentation.
 
@@ -1405,7 +1405,7 @@ cargo test -p flpdf-cli --test cli_optimization_matrix normalize_content -- --no
 
 Expected: library-driven and qpdf CLI parity tests pass.
 
-- [ ] **Step 8: Format and commit**
+#### Step 8: Format and commit
 
 ```bash
 cargo fmt --all
@@ -1428,7 +1428,7 @@ git commit -m "test(content): gate qpdf normalizer parity"
 - Consumes: Tasks 1-5 complete implementation and tests.
 - Produces: mirrored correspondence status, complete verification evidence, closed/pushed Beads state, pushed Git branch.
 
-- [ ] **Step 1: Update the correspondence table**
+#### Step 1: Update the correspondence table
 
 Change the `Pl_QPDFTokenizer.cc / ContentNormalizer.cc` row to:
 
@@ -1438,7 +1438,7 @@ Change the `Pl_QPDFTokenizer.cc / ContentNormalizer.cc` row to:
 
 Ensure `content_stream.rs` is described only as parser callback orchestration.
 
-- [ ] **Step 2: Regenerate and verify the module index**
+#### Step 2: Regenerate and verify the module index
 
 Run:
 
@@ -1450,7 +1450,7 @@ python3 -m unittest scripts/tests/test_qpdf_module_docs.py
 
 Expected: all pass and the index contains `content_normalizer.rs` as a mirror of the two qpdf files.
 
-- [ ] **Step 3: Run focused gates**
+#### Step 3: Run focused gates
 
 Run:
 
@@ -1466,7 +1466,7 @@ scripts/qpdf-tokenizer-diff.sh
 
 Expected: all pass.
 
-- [ ] **Step 4: Run crate, workspace, documentation, and lint gates**
+#### Step 4: Run crate, workspace, documentation, and lint gates
 
 Run:
 
@@ -1480,7 +1480,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 Expected: all pass with no warnings.
 
-- [ ] **Step 5: Commit documentation and any gate-only corrections**
+#### Step 5: Commit documentation and any gate-only corrections
 
 ```bash
 git diff --check
@@ -1490,7 +1490,7 @@ git commit -m "docs(content): mark qpdf normalizer mirrored"
 
 If a gate required a source/test correction, commit that correction separately with its affected tests before this documentation commit; do not fold unreviewed code into the docs commit.
 
-- [ ] **Step 6: Run fresh 100% patch coverage on the committed tree**
+#### Step 6: Run fresh 100% patch coverage on the committed tree
 
 Run:
 
@@ -1500,7 +1500,7 @@ scripts/patch-coverage.sh --base origin/main
 
 Expected: 100% of changed executable lines under `crates/flpdf/src` and no uncovered gated lines. Do not reuse an older lcov report.
 
-- [ ] **Step 7: Audit final scope and repository state**
+#### Step 7: Audit final scope and repository state
 
 Run:
 
@@ -1519,7 +1519,7 @@ Expected:
 - only `flpdf-qxba.7` files are changed;
 - worktree is clean.
 
-- [ ] **Step 8: Close and persist Beads**
+#### Step 8: Close and persist Beads
 
 ```bash
 bd close flpdf-qxba.7 --reason="Ported qpdf 11.9.0 Pl_QPDFTokenizer and ContentNormalizer with exact differential, CLI warning, and 100% patch-coverage gates."
@@ -1528,7 +1528,7 @@ bd dolt push
 
 Expected: issue is closed and `Push complete.`
 
-- [ ] **Step 9: Rebase, rerun the fast post-rebase gate, and push Git**
+#### Step 9: Rebase, rerun the fast post-rebase gate, and push Git
 
 State before push: this publishes the completed feature branch; no destructive command is involved.
 
@@ -1542,7 +1542,7 @@ git push -u origin feature/flpdf-qxba-7-content-normalizer
 
 Expected: rebase succeeds, focused tests remain green, and the remote branch is updated successfully.
 
-- [ ] **Step 10: Record final evidence**
+#### Step 10: Record final evidence
 
 Run:
 

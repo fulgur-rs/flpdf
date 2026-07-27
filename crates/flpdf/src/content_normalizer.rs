@@ -2,6 +2,11 @@
 
 use crate::tokenizer::{Token, TokenType, Tokenizer};
 
+/// Holds normalized content-stream bytes and qpdf-compatible bad-token state.
+///
+/// Values are produced by [`normalize_content_stream`]. The status accessors
+/// allow callers to distinguish clean normalization from best-effort output
+/// that contains malformed PDF tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentNormalization {
     bytes: Vec<u8>,
@@ -10,21 +15,29 @@ pub struct ContentNormalization {
 }
 
 impl ContentNormalization {
+    /// Borrows the normalized output bytes without consuming this result.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 
+    /// Consumes this result and returns its normalized output allocation.
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
 
+    /// Reports whether normalization encountered at least one bad token.
     #[must_use]
     pub fn any_bad_tokens(&self) -> bool {
         self.any_bad_tokens
     }
 
+    /// Reports whether the final non-EOF token was bad.
+    ///
+    /// This mirrors qpdf's `lastTokenWasBad` state and indicates that
+    /// coalescing adjacent page-content streams may recover a token split
+    /// across a stream boundary.
     #[must_use]
     pub fn last_token_was_bad(&self) -> bool {
         self.last_token_was_bad
@@ -119,6 +132,21 @@ impl TokenFilter for ContentNormalizer {
     fn handle_eof(&mut self) {}
 }
 
+/// Normalizes decoded PDF content-stream bytes using qpdf 11.9.0 token rules.
+///
+/// The operation is input-infallible: malformed tokens are retained in the
+/// returned bytes and reported through [`ContentNormalization::any_bad_tokens`]
+/// and [`ContentNormalization::last_token_was_bad`].
+///
+/// # Examples
+///
+/// ```
+/// use flpdf::normalize_content_stream;
+///
+/// let normalized = normalize_content_stream(b"q\rQ");
+/// assert_eq!(normalized.as_bytes(), b"q\nQ");
+/// assert!(!normalized.any_bad_tokens());
+/// ```
 #[must_use]
 pub fn normalize_content_stream(input: &[u8]) -> ContentNormalization {
     let mut normalizer = ContentNormalizer::default();

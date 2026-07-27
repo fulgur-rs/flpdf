@@ -69,37 +69,6 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn one_page_content_pdf(content: &[u8]) -> Vec<u8> {
-    let stream = [
-        format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
-        content.to_vec(),
-        b"\nendstream\nendobj\n".to_vec(),
-    ]
-    .concat();
-    let objects: [&[u8]; 4] = [
-        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
-        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>\nendobj\n",
-        stream.as_slice(),
-    ];
-
-    let mut pdf = b"%PDF-1.7\n".to_vec();
-    let mut offsets = Vec::new();
-    for object in objects {
-        offsets.push(pdf.len());
-        pdf.extend_from_slice(object);
-    }
-    let xref_start = pdf.len();
-    pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
-    for offset in offsets {
-        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-    }
-    pdf.extend_from_slice(
-        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
-    );
-    pdf
-}
-
 fn classic_pdf(objects: &[&[u8]]) -> Vec<u8> {
     let mut pdf = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
@@ -118,6 +87,21 @@ fn classic_pdf(objects: &[&[u8]]) -> Vec<u8> {
             .as_bytes(),
     );
     pdf
+}
+
+fn one_page_content_pdf(content: &[u8]) -> Vec<u8> {
+    let stream = [
+        format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>\nendobj\n",
+        stream.as_slice(),
+    ])
 }
 
 fn one_page_indirect_contents_array_pdf(content: &[u8]) -> Vec<u8> {
@@ -202,6 +186,26 @@ fn skip_if_qpdf_missing() -> bool {
         on_ci
     );
     true
+}
+
+/// Returns `true` when qpdf is unavailable locally; otherwise requires the
+/// pinned 11.9.0 behavioral oracle.
+#[must_use]
+fn require_qpdf_11_9_or_skip_missing() -> bool {
+    if skip_if_qpdf_missing() {
+        return true;
+    }
+    let version = ShellCommand::new("qpdf")
+        .arg("--version")
+        .output()
+        .expect("run qpdf --version");
+    let version = String::from_utf8(version.stdout).expect("qpdf version must be UTF-8");
+    assert_eq!(
+        version.lines().next(),
+        Some("qpdf version 11.9.0"),
+        "content-normalization parity requires the pinned qpdf 11.9.0 oracle"
+    );
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -308,15 +312,9 @@ fn normalize_content_y_produces_canonical_form() {
 
 #[test]
 fn normalize_content_y_matches_qpdf_11_9_decoded_bytes() {
-    if skip_if_qpdf_missing() {
+    if require_qpdf_11_9_or_skip_missing() {
         return;
     }
-    let version = ShellCommand::new("qpdf")
-        .arg("--version")
-        .output()
-        .expect("run qpdf --version");
-    let version = String::from_utf8(version.stdout).unwrap();
-    assert_eq!(version.lines().next(), Some("qpdf version 11.9.0"));
 
     let tmp = tempdir().unwrap();
     let input = tmp.path().join("input.pdf");
@@ -362,7 +360,7 @@ fn normalize_content_y_matches_qpdf_11_9_decoded_bytes() {
 
 #[test]
 fn normalize_content_bad_tokens_match_qpdf_bytes_and_warning_exit() {
-    if skip_if_qpdf_missing() {
+    if require_qpdf_11_9_or_skip_missing() {
         return;
     }
 
@@ -406,15 +404,9 @@ fn normalize_content_bad_tokens_match_qpdf_bytes_and_warning_exit() {
 
 #[test]
 fn normalize_content_indirect_forms_match_qpdf_11_9() {
-    if skip_if_qpdf_missing() {
+    if require_qpdf_11_9_or_skip_missing() {
         return;
     }
-    let version = ShellCommand::new("qpdf")
-        .arg("--version")
-        .output()
-        .expect("run qpdf --version");
-    let version = String::from_utf8(version.stdout).unwrap();
-    assert_eq!(version.lines().next(), Some("qpdf version 11.9.0"));
 
     let tmp = tempdir().unwrap();
     let cases = [
