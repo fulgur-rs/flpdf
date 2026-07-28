@@ -1,6 +1,8 @@
 use flpdf::pipeline::{
-    Base64Action, Pipeline, PipelineError, PipelineResult, PlBase64, PlConcatenate, PlString,
+    Base64Action, Pipeline, PipelineError, PipelineResult, PlBase64, PlConcatenate, PlOStream,
+    PlString,
 };
+use std::io::Cursor;
 
 struct ExternalSink(Vec<u8>);
 
@@ -42,4 +44,16 @@ fn downstream_crates_can_implement_pipeline_and_construct_public_pipeline_stages
     base64.finish().unwrap();
 
     assert_eq!(PipelineError::runtime("failure").message(), "failure");
+}
+
+#[test]
+fn downstream_crates_can_construct_pl_ostream_with_an_external_writer() {
+    let mut writer = Cursor::new(Vec::new());
+    {
+        let mut stage = PlOStream::new("ostream", &mut writer);
+        assert_eq!(stage.identifier(), "ostream");
+        stage.write(b"payload").unwrap();
+        stage.finish().unwrap();
+    }
+    assert_eq!(writer.into_inner(), b"payload");
 }

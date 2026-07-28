@@ -13,6 +13,8 @@ pub mod base64;
 
 pub mod concatenate;
 
+pub mod ostream;
+
 pub(crate) mod count;
 
 pub(crate) mod flate;
@@ -39,6 +41,7 @@ pub(crate) mod test_support;
 pub use base64::{Base64Action, PlBase64};
 pub mod string;
 pub use concatenate::PlConcatenate;
+pub use ostream::PlOStream;
 pub use string::PlString;
 
 pub type PipelineResult<T> = std::result::Result<T, PipelineError>;
