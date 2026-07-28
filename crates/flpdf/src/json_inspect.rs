@@ -4606,10 +4606,11 @@ mod tests {
                 ..
             } if path == &side_path && source.kind() == std::io::ErrorKind::NotFound
         ));
-        assert_eq!(
-            error.to_string(),
-            format!("open {side_path}: No such file or directory")
-        );
+        let source = match &error {
+            JsonOutputError::SideFileIo { message, .. } => message,
+            _ => unreachable!("variant checked above"),
+        };
+        assert_eq!(error.to_string(), format!("open {side_path}: {source}"));
         assert!(out.ends_with(b"\"stream\": "), "{out:?}");
         assert!(
             out.windows(br#""obj:7 0 R""#.len())
