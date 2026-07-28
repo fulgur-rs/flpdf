@@ -33,10 +33,19 @@
 | Layer | Branch | PR base | Patch-coverage base | Deliverable |
 |---|---|---|---|---|
 | 1 | `feature/flpdf-qynx-6-json-pipeline` | `main` | `origin/main` | Public core stages, JSON/raw writer cutover, library output coordinator |
-| 2 | `feature/flpdf-qynx-6-json-stdio` | Layer 1 branch | final Layer 1 commit | `PlStdioFile`, top-level/side-file lifecycle cutover, legacy stdio deletion |
+| 2 | `feature/flpdf-qynx-6-json-stdio` | immutable Layer 1 remote PR head SHA | same immutable Layer 1 remote PR head SHA | `PlStdioFile`, top-level/side-file lifecycle cutover, legacy stdio deletion |
 
 The design commit `73e13cf7` already starts Layer 1. Create Layer 2 only after
-Layer 1 is committed, verified, pushed, and its exact tip is recorded.
+Layer 1 is committed, verified, pushed, and its exact remote PR head is
+recorded.
+
+The review-correction implementation and coverage tip is
+`effca8d22e29fe29e37409432f92a803913351f0`. Fresh Layer 1 coverage at that
+commit was 100%. This plan-record commit necessarily follows that commit and
+therefore does not call it the final Layer 1 branch tip: a commit cannot record
+its own SHA. At publication, record the immutable remote branch SHA/PR head in
+Beads and the Task 9 report. Layer 2 must branch from that recorded SHA, not
+from the mutable Layer 1 branch name.
 
 ## File and Responsibility Map
 
@@ -1330,13 +1339,16 @@ git commit -m "refactor(cli): delegate JSON terminals to library"
 
 **Files:**
 - Modify: module docs in every changed/new Rust module
-- Regenerate: `docs/qpdf-correspondence.md`
+- Regenerate: `docs/qpdf-module-doc-index.md`
+- Manually update: `docs/qpdf-correspondence.md`
 - Modify: `docs/superpowers/plans/2026-07-28-qpdf-json-pipeline-cutover.md`
 
 **Interfaces:**
 - Produces a reviewable Layer 1 tip with no Write-based JSON serializer and
   no external Base64 dependency.
-- Records the exact Layer 1 commit for the Layer 2 branch and coverage base.
+- Records the verified implementation/coverage commit in this plan.
+- Records the final immutable Layer 1 remote SHA/PR head externally at
+  publication for the Layer 2 branch and coverage base.
 
 - [ ] **Step 1: Update correspondence annotations and public docs**
 
@@ -1344,6 +1356,13 @@ Every new module starts with a `//! qpdf correspondence:` line naming its
 qpdf source responsibility. Update `json/mod.rs`, `json/writer.rs`, and
 `json_inspect.rs` docs to state that callers own the outer finish boundary and
 that the CLI-facing coordinator accepts ordinary handles.
+
+`scripts/qpdf-module-docs.py` generates
+`docs/qpdf-module-doc-index.md` from the module-level
+`//! qpdf correspondence:` annotations. It does not generate
+`docs/qpdf-correspondence.md`; that file is the manually curated
+responsibility/status table and must be reviewed separately against the
+current implementation.
 
 Run:
 
@@ -1400,21 +1419,28 @@ scripts/patch-coverage.sh --base origin/main \
 
 Expected: changed executable lines under the enforced paths are exactly 100%.
 If a line is uncovered, add a focused behavioral test, commit it, regenerate
-the LCOV file from the new committed tip, and rerun the gate.
+the LCOV file from the new committed tip, and rerun the gate. Commit a
+test-only coverage correction before the documentation record commit, then
+record that verified implementation/coverage commit SHA in the documentation
+record. Do not attempt to record a commit's own SHA inside itself.
 
-- [ ] **Step 5: Record and push the exact Layer 1 tip**
+- [ ] **Step 5: Push and externally record the exact Layer 1 tip**
 
 Run:
 
 ```bash
 git status --short
-git rev-parse HEAD
 bd dolt push
 git push origin feature/flpdf-qynx-6-json-pipeline
+git fetch origin feature/flpdf-qynx-6-json-pipeline
+git rev-parse HEAD
+git rev-parse origin/feature/flpdf-qynx-6-json-pipeline
 ```
 
 Expected: status is clean, Beads push succeeds, and local Layer 1 equals its
-remote branch.
+remote branch. Record that immutable remote SHA/PR head in Beads and the Task 9
+report. Those external records, rather than self-referential tracked prose,
+define the exact Layer 1 base for Layer 2.
 
 - [ ] **Step 6: Open the Layer 1 draft PR**
 
@@ -1458,14 +1484,15 @@ Run:
 
 ```bash
 git status --short
-git switch -c feature/flpdf-qynx-6-json-stdio
-git merge-base --is-ancestor \
-  feature/flpdf-qynx-6-json-pipeline \
-  feature/flpdf-qynx-6-json-stdio
+layer1_tip=<immutable SHA recorded in Beads and the Task 9 report>
+git fetch origin
+git switch -c feature/flpdf-qynx-6-json-stdio "${layer1_tip}"
+test "$(git rev-parse HEAD)" = "${layer1_tip}"
 ```
 
 Expected: the working tree is clean and the new branch is exactly stacked on
-Layer 1.
+the immutable Layer 1 remote PR head, without resolving the mutable Layer 1
+branch name.
 
 - [ ] **Step 2: Add failing direct-write and buffered-boundary tests**
 

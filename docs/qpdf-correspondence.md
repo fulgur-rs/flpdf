@@ -119,8 +119,9 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `Pipeline.cc`（積層シンク基盤のみ。個々の `Pl_*` は下記の各行で個別に分類） | 114 | 抽象が無い。`Vec<u8>` バッファ + `out.len()` 直参照 | ❌ |
-| `Pl_Count.cc` / `Pl_MD5.cc` | 114 | 無し（バッファから同等の値は取得可能） | ❌ |
+| `Pipeline.cc`（積層シンク基盤のみ。個々の `Pl_*` は下記の各行で個別に分類） | 114 | `pipeline.rs`（public `Pipeline` trait、identifier/write/finish lifecycle、logic/runtime error channel） | ✅ |
+| `Pl_Count.cc` | 48 | `pipeline/count.rs`（byte count、last byte、forwarding、finish lifecycle） | ✅ |
+| `Pl_MD5.cc` | 66 | 専用 Pipeline stage は無い | ❌ |
 | `Pl_Flate` / `SF_FlateLzwDecode` | 946 | `pipeline/flate.rs` + `stream_filter.rs` の `FlateLzwStreamFilter`（`/Predictor` `/Columns` `/Colors` `/BitsPerComponent` `/EarlyChange` の解釈、codec → predictor の chain 構築、`QIntC::to_uint` の range error timing） | ✅ |
 | `Pl_LZWDecoder` | 189 | `pipeline/lzw.rs`（3-byte rotating buffer、1 入力 byte あたり 1 code、table 成長と code 幅遷移、eod latch、qpdf の 7 種の診断文言）+ `stream_filter.rs` 経由の production decode | ✅ |
 | `Pl_PNGFilter` | 232 | `pipeline/png_filter.rs`（32-bit wrapping の row 幅算出、constructor の 3 種 rejection、未知 filter byte の無視、finish の zero-pad row、Up 固定 encoder）+ `filters.rs` / `writer/serialize.rs` の production consumer。⚪ row buffer の確保だけは constructor ではなく最初の write まで遅延（出力バイト・呼び出し境界・エラー timing に影響しない） | ✅ |
@@ -133,7 +134,9 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `Pl_QPDFTokenizer.cc` / `ContentNormalizer.cc` | 141 | `pipeline/qpdf_tokenizer.rs`（optional downstream を持つ token-filter runner、EOF-token → `handle_eof`、`ID` separator 注入、inline-image 切替、raw token/discard/output、`handle_eof` 成功後の永久 detach と finish/error timing）+ production consumer `content_normalizer.rs`（bad-token state、CR/string/name normalization） | ✅ |
 | `QPDFStreamFilter.cc` | 19 | `stream_filter.rs`（`set_decode_params`、decode pipeline factory、specialized / lossy の既定分類） | ✅ |
 | `Pl_DCT.cc` | 326 | 無し。`json_inspect.rs` の `DecodeLevel::All`(758) が DCT デコードを doc で約束しつつ encoded バイトへフォールバックしている | ❌ 消費者あり |
-| `Pl_Base64` / `Pl_Concatenate` / `Pl_Discard` / `Pl_Function` / `Pl_OStream` / `Pl_StdioFile` / `Pl_String` / `Pl_SHA2` / `Pl_Buffer` | 570 | Rust の `Write` で代替 | ⚪ |
+| `Pl_Base64` / `Pl_Concatenate` / `Pl_OStream` / `Pl_String` | 282 | `pipeline/base64.rs` / `pipeline/concatenate.rs` / `pipeline/ostream.rs` / `pipeline/string.rs`（JSON serialization/output の本番 consumer を含む） | ✅ |
+| `Pl_Buffer` | 82 | `pipeline/buffer.rs`（accumulation、optional pass-through、finish readiness、buffer ownership transfer） | ✅ |
+| `Pl_Discard` / `Pl_Function` / `Pl_StdioFile` / `Pl_SHA2` | 206 | 専用 stage は未実装。`Pl_StdioFile` は JSON cutover Layer 2、他は使用箇所ごとの discard / closure / digest 実装 | ⚪ |
 
 `/ID` が qpdf と非 parity だった原因は **アルゴリズム**（qpdf は 2 段階 MD5 で seed を
 作る）であり、Pipeline 抽象の有無ではない。flpdf は全体をバッファするので任意の
@@ -347,10 +350,10 @@ CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れてい
 
 | 状態 | qpdf 側の該当行数 | 内訳 |
 |---|---|---|
-| ✅ mirrors | 3,026 | 責務境界も一致。触らない |
+| ✅ mirrors | 3,552 | 責務境界も一致。触らない |
 | 🔀 smeared | 28,493 | 再配置の主対象。qpdf 全体の 69% |
-| ❌ missing | 604 | `Pipeline.cc`(114) / `Pl_Count`+`Pl_MD5`(114) / `Pl_DCT`(326) / `QTC`(50) |
-| ⚪ 逸脱候補 | 7,099 | 要承認（下記の方針矛盾を参照） |
+| ❌ missing | 442 | `Pl_MD5`(66) / `Pl_DCT`(326) / `QTC`(50) |
+| ⚪ 逸脱候補 | 6,735 | 要承認（下記の方針矛盾を参照） |
 | ➖ 対象外 | 2,237 | C API |
 | **合計** | **41,459** | qpdf `libqpdf/*.cc` の実測 41,459 行と一致 |
 
