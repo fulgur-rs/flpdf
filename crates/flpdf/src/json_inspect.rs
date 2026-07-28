@@ -3726,7 +3726,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(JsonOutputError::Pipeline(PipelineError::Runtime(ref message)))
-                if message == "sink full"
+                if message.as_bytes() == b"sink full"
         ));
         assert!(out.bytes.ends_with(stream_key), "{:?}", out.bytes);
         assert_eq!(std::fs::read(&side_path).unwrap(), b"");
@@ -3783,7 +3783,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(JsonOutputError::Pipeline(PipelineError::Runtime(ref message)))
-                if message == "sink full"
+                if message.as_bytes() == b"sink full"
         ));
         assert!(out.bytes.ends_with(b"\"stream\": {"), "{:?}", out.bytes);
         assert_eq!(std::fs::read(&side_path).unwrap(), b"");
@@ -3970,7 +3970,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(JsonOutputError::Pipeline(PipelineError::Runtime(ref message)))
-                if message == "sink full"
+                if message.as_bytes() == b"sink full"
         ));
         assert!(out
             .bytes
@@ -4162,7 +4162,7 @@ mod tests {
         assert!(matches!(
             error,
             JsonOutputError::Pipeline(PipelineError::Runtime(ref message))
-                if message == "sink full"
+                if message.as_bytes() == b"sink full"
         ));
         assert!(!out.bytes.ends_with(b"\n}\n"));
         assert_eq!(out.finishes, 0);
@@ -4200,7 +4200,7 @@ mod tests {
                 matches!(
                     error,
                     JsonOutputError::Pipeline(PipelineError::Runtime(ref message))
-                        if message == "sink full"
+                        if message.as_bytes() == b"sink full"
                 ),
                 "remaining={remaining}: {error}"
             );
@@ -4255,7 +4255,7 @@ mod tests {
         assert!(matches!(
             error,
             JsonOutputError::Pipeline(PipelineError::Runtime(ref message))
-                if message == "raw writer runtime failure"
+                if message.as_bytes() == b"raw writer runtime failure"
         ));
         assert_eq!(out.bytes, b"{\n  \"version\": 2,\n  ");
     }

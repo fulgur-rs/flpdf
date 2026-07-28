@@ -95,7 +95,7 @@ fn hex(bytes: &[u8]) -> String {
 fn status(result: PipelineResult<()>) -> String {
     result
         .map(|()| "ok".to_owned())
-        .unwrap_or_else(|error| error.message().to_owned())
+        .unwrap_or_else(|error| error.message().to_string())
 }
 
 fn record(

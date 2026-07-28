@@ -44,9 +44,6 @@ pub use concatenate::PlConcatenate;
 pub use ostream::PlOStream;
 pub use string::PlString;
 
-#[cfg(test)]
-pub(crate) mod test_support;
-
 pub type PipelineResult<T> = std::result::Result<T, PipelineError>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
