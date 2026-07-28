@@ -131,7 +131,9 @@ impl Pipeline for PlBase64<'_> {
     fn finish(&mut self) -> PipelineResult<()> {
         if self.position > 0 {
             if self.finished {
+                // cov:ignore-start: a successful quantum clears position before finished is set
                 return Err(PipelineError::logic("Pl_Base64 used after finished"));
+                // cov:ignore-end
             }
             if self.action == Base64Action::Decode {
                 self.buffer[self.position..].fill(b'=');
@@ -165,89 +167,19 @@ fn encode_value(value: u8) -> u8 {
         52..=61 => b'0' + value - 52,
         62 => b'+',
         63 => b'/',
-        _ => unreachable!("six-bit value"),
+        _ => unreachable!("six-bit value"), // cov:ignore: all callers mask or shift to six bits
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Base64Action, PlBase64};
+    use crate::pipeline::test_support::{shared_trace, RecordingSink, TraceCall};
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 
-    #[derive(Default)]
-    struct RecordingSink {
-        data: Vec<u8>,
-        finishes: usize,
-    }
-
-    impl Pipeline for RecordingSink {
-        fn identifier(&self) -> &str {
-            "recording"
-        }
-
-        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
-            self.data.extend_from_slice(data);
-            Ok(())
-        }
-
-        fn finish(&mut self) -> PipelineResult<()> {
-            self.finishes += 1;
-            Ok(())
-        }
-    }
-
-    struct FailFirstWriteSink {
-        attempts: Vec<Vec<u8>>,
-        data: Vec<u8>,
-        finishes: usize,
-    }
-
-    impl Pipeline for FailFirstWriteSink {
-        fn identifier(&self) -> &str {
-            "fail-write"
-        }
-
-        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
-            self.attempts.push(data.to_vec());
-            if self.attempts.len() == 1 {
-                Err(PipelineError::runtime("downstream write failed"))
-            } else {
-                self.data.extend_from_slice(data);
-                Ok(())
-            }
-        }
-
-        fn finish(&mut self) -> PipelineResult<()> {
-            self.finishes += 1;
-            Ok(())
-        }
-    }
-
-    struct FailFirstFinishSink {
-        finishes: usize,
-    }
-
-    impl Pipeline for FailFirstFinishSink {
-        fn identifier(&self) -> &str {
-            "fail-finish"
-        }
-
-        fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
-            Ok(())
-        }
-
-        fn finish(&mut self) -> PipelineResult<()> {
-            self.finishes += 1;
-            if self.finishes == 1 {
-                Err(PipelineError::runtime("downstream finish failed"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
     fn run(action: Base64Action, chunks: &[&[u8]]) -> PipelineResult<Vec<u8>> {
-        let mut sink = RecordingSink::default();
+        let trace = shared_trace();
+        let mut sink = RecordingSink::with_trace(trace.clone(), &[], &[]);
         {
             let mut stage = PlBase64::new("base64", &mut sink, action);
             for chunk in chunks {
@@ -255,7 +187,8 @@ mod tests {
             }
             stage.finish()?;
         }
-        Ok(sink.data)
+        let output = trace.borrow().output.clone();
+        Ok(output)
     }
 
     #[test]
@@ -299,7 +232,8 @@ mod tests {
 
     #[test]
     fn decode_rejects_data_after_padding_after_preserving_prior_output() {
-        let mut sink = RecordingSink::default();
+        let trace = shared_trace();
+        let mut sink = RecordingSink::with_trace(trace.clone(), &[], &[]);
         let error = {
             let mut stage = PlBase64::new("decoder", &mut sink, Base64Action::Decode);
             stage.write(b"TQ==AAAA").unwrap_err()
@@ -310,7 +244,7 @@ mod tests {
             error.message(),
             "decoder: base64 decode: data follows pad characters"
         );
-        assert_eq!(sink.data, b"M");
+        assert_eq!(trace.borrow().output, b"M");
     }
 
     #[test]
@@ -331,7 +265,7 @@ mod tests {
 
     #[test]
     fn write_after_finish_is_logic_error() {
-        let mut sink = RecordingSink::default();
+        let mut sink = RecordingSink::new(&[], &[]);
         let mut stage = PlBase64::new("base64", &mut sink, Base64Action::Encode);
         stage.finish().unwrap();
 
@@ -342,46 +276,63 @@ mod tests {
 
     #[test]
     fn repeated_finish_with_no_pending_data_finishes_downstream_each_time() {
-        let mut sink = RecordingSink::default();
+        let mut sink = RecordingSink::new(&[], &[]);
+        let trace = sink.trace();
         {
             let mut stage = PlBase64::new("base64", &mut sink, Base64Action::Encode);
             stage.finish().unwrap();
             stage.finish().unwrap();
         }
 
-        assert_eq!(sink.finishes, 2);
+        assert_eq!(
+            trace.borrow().calls,
+            [
+                TraceCall::Finish { failed: false },
+                TraceCall::Finish { failed: false },
+            ]
+        );
     }
 
     #[test]
     fn finish_write_failure_retains_quantum_for_a_retry() {
-        let mut sink = FailFirstWriteSink {
-            attempts: Vec::new(),
-            data: Vec::new(),
-            finishes: 0,
-        };
+        let trace = shared_trace();
+        let mut sink = RecordingSink::with_trace(trace.clone(), &[1], &[]);
         {
             let mut stage = PlBase64::new("base64", &mut sink, Base64Action::Encode);
             stage.write(b"M").unwrap();
             assert_eq!(
                 stage.finish().unwrap_err().message(),
-                "downstream write failed"
+                "sink write failure 1"
             );
             stage.finish().unwrap();
         }
 
-        assert_eq!(sink.attempts, [b"TQ==".to_vec(), b"TQ==".to_vec()]);
-        assert_eq!(sink.data, b"TQ==");
-        assert_eq!(sink.finishes, 1);
+        assert_eq!(
+            trace.borrow().calls,
+            [
+                TraceCall::Write {
+                    data: b"TQ==".to_vec(),
+                    failed: true,
+                },
+                TraceCall::Write {
+                    data: b"TQ==".to_vec(),
+                    failed: false,
+                },
+                TraceCall::Finish { failed: false },
+            ]
+        );
+        assert_eq!(trace.borrow().output, b"TQ==");
     }
 
     #[test]
     fn finish_failure_from_downstream_leaves_stage_finished() {
-        let mut sink = FailFirstFinishSink { finishes: 0 };
+        let trace = shared_trace();
+        let mut sink = RecordingSink::with_trace(trace.clone(), &[], &[1]);
         {
             let mut stage = PlBase64::new("base64", &mut sink, Base64Action::Encode);
             assert_eq!(
                 stage.finish().unwrap_err().message(),
-                "downstream finish failed"
+                "sink finish failure 1"
             );
             assert_eq!(
                 stage.write(b"").unwrap_err().message(),
@@ -390,7 +341,13 @@ mod tests {
             stage.finish().unwrap();
         }
 
-        assert_eq!(sink.finishes, 2);
+        assert_eq!(
+            trace.borrow().calls,
+            [
+                TraceCall::Finish { failed: true },
+                TraceCall::Finish { failed: false },
+            ]
+        );
     }
 
     #[test]

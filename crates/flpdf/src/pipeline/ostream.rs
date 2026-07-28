@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn dropping_pl_ostream_does_not_flush_or_close() {
-        let mut writer = ScriptedWriter::new([WriteStep::Accept(2)]);
+        let mut writer = ScriptedWriter::new(std::iter::empty::<WriteStep>());
         {
             let mut stage = PlOStream::new("ostream", &mut writer);
             stage.write(b"ab").unwrap();

@@ -3015,6 +3015,7 @@ pub fn write_qpdf_json_v2_selected_objects_to_output_with_options<R: Read + Seek
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::test_support::{shared_trace, RecordingSink, TraceCall};
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult, PlString};
 
     fn number(value: impl ToString) -> serde_json::Value {
@@ -3083,9 +3084,11 @@ mod tests {
     }
 
     impl Pipeline for FailAfterPipeline {
+        // cov:ignore-start: identifier is a trait obligation; the raw writer never queries downstream identifiers
         fn identifier(&self) -> &str {
             "fail-after"
         }
+        // cov:ignore-end
 
         fn write(&mut self, buffer: &[u8]) -> PipelineResult<()> {
             let written = self.remaining.min(buffer.len());
@@ -3097,32 +3100,12 @@ mod tests {
             Ok(())
         }
 
+        // cov:ignore-start: tests assert the raw writer leaves this caller-owned finish boundary untouched
         fn finish(&mut self) -> PipelineResult<()> {
             self.finishes += 1;
             Ok(())
         }
-    }
-
-    #[derive(Default)]
-    struct RecordingPipeline {
-        bytes: Vec<u8>,
-        finishes: usize,
-    }
-
-    impl Pipeline for RecordingPipeline {
-        fn identifier(&self) -> &str {
-            "recording"
-        }
-
-        fn write(&mut self, buffer: &[u8]) -> PipelineResult<()> {
-            self.bytes.extend_from_slice(buffer);
-            Ok(())
-        }
-
-        fn finish(&mut self) -> PipelineResult<()> {
-            self.finishes += 1;
-            Ok(())
-        }
+        // cov:ignore-end
     }
 
     struct FailOnParameters {
@@ -3137,9 +3120,11 @@ mod tests {
     }
 
     impl Pipeline for FailOnParameters {
+        // cov:ignore-start: identifier is a trait obligation; the raw writer never queries downstream identifiers
         fn identifier(&self) -> &str {
             "fail-on-parameters"
         }
+        // cov:ignore-end
 
         fn write(&mut self, buffer: &[u8]) -> PipelineResult<()> {
             if buffer.starts_with(b"\"parameters\"") {
@@ -3152,9 +3137,11 @@ mod tests {
             Ok(())
         }
 
+        // cov:ignore-start: tests assert the raw writer leaves this caller-owned finish boundary untouched
         fn finish(&mut self) -> PipelineResult<()> {
             Ok(())
         }
+        // cov:ignore-end
     }
 
     struct ErrnoSink(i32);
@@ -4139,6 +4126,25 @@ mod tests {
     }
 
     #[test]
+    fn selected_vector_writer_propagates_conversion_errors() {
+        let mut pdf = empty_pdf();
+
+        let error = write_selected_to_vec(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Pages],
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            JsonOutputError::Convert(ConvertError::PdfError(_))
+        ));
+    }
+
+    #[test]
     fn sink_writer_pipeline_error_stops_without_finishing_document() {
         let mut pdf = load_one_page_pdf();
         let mut out = FailAfterPipeline {
@@ -4209,7 +4215,8 @@ mod tests {
     #[test]
     fn raw_writer_does_not_finish_supplied_pipeline() {
         let mut pdf = load_one_page_pdf();
-        let mut out = RecordingPipeline::default();
+        let trace = shared_trace();
+        let mut out = RecordingSink::with_trace(trace.clone(), &[], &[]);
 
         write_qpdf_json_v2_selected_objects_with_options(
             &mut pdf,
@@ -4221,8 +4228,12 @@ mod tests {
         )
         .unwrap();
 
-        assert!(out.bytes.ends_with(b"}\n"));
-        assert_eq!(out.finishes, 0);
+        assert!(trace.borrow().output.ends_with(b"}\n"));
+        assert!(!trace
+            .borrow()
+            .calls
+            .iter()
+            .any(|call| matches!(call, TraceCall::Finish { .. })));
     }
 
     #[test]

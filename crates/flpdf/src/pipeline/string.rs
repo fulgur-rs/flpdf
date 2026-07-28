@@ -46,62 +46,8 @@ impl Pipeline for PlString<'_> {
 #[cfg(test)]
 mod tests {
     use super::PlString;
-    use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
-
-    #[derive(Default)]
-    struct RecordingSink {
-        chunks: Vec<Vec<u8>>,
-        finishes: usize,
-    }
-
-    impl Pipeline for RecordingSink {
-        fn identifier(&self) -> &str {
-            "recording"
-        }
-
-        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
-            self.chunks.push(data.to_vec());
-            Ok(())
-        }
-
-        fn finish(&mut self) -> PipelineResult<()> {
-            self.finishes += 1;
-            Ok(())
-        }
-    }
-
-    struct WriteErrorSink(Vec<u8>);
-
-    impl Pipeline for WriteErrorSink {
-        fn identifier(&self) -> &str {
-            "write-error"
-        }
-
-        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
-            self.0.extend_from_slice(data);
-            Err(PipelineError::runtime("downstream rejected chunk"))
-        }
-
-        fn finish(&mut self) -> PipelineResult<()> {
-            Ok(())
-        }
-    }
-
-    struct FinishErrorSink;
-
-    impl Pipeline for FinishErrorSink {
-        fn identifier(&self) -> &str {
-            "finish-error"
-        }
-
-        fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
-            Ok(())
-        }
-
-        fn finish(&mut self) -> PipelineResult<()> {
-            Err(PipelineError::logic("downstream rejected finish"))
-        }
-    }
+    use crate::pipeline::test_support::{shared_trace, RecordingSink, TraceCall};
+    use crate::pipeline::Pipeline;
 
     #[test]
     fn pl_string_appends_without_next_and_needs_no_finish() {
@@ -118,21 +64,29 @@ mod tests {
     #[test]
     fn pl_string_appends_before_downstream_write_error() {
         let mut destination = Vec::new();
-        let mut sink = WriteErrorSink(Vec::new());
+        let trace = shared_trace();
+        let mut sink = RecordingSink::with_trace(trace.clone(), &[1], &[]);
         let error = {
             let mut stage = PlString::new("capture", Some(&mut sink), &mut destination);
             stage.write(b"prefix").unwrap_err()
         };
 
-        assert_eq!(error.message(), "downstream rejected chunk");
+        assert_eq!(error.message(), "sink write failure 1");
         assert_eq!(destination, b"prefix");
-        assert_eq!(sink.0, b"prefix");
+        assert_eq!(
+            trace.borrow().calls,
+            [TraceCall::Write {
+                data: b"prefix".to_vec(),
+                failed: true,
+            }]
+        );
     }
 
     #[test]
     fn pl_string_forwards_empty_and_nonempty_chunks_and_finish() {
         let mut destination = Vec::new();
-        let mut sink = RecordingSink::default();
+        let trace = shared_trace();
+        let mut sink = RecordingSink::with_trace(trace.clone(), &[], &[]);
         {
             let mut stage = PlString::new("capture", Some(&mut sink), &mut destination);
             stage.write(b"first").unwrap();
@@ -143,22 +97,38 @@ mod tests {
 
         assert_eq!(destination, b"firstsecond");
         assert_eq!(
-            sink.chunks,
-            vec![b"first".to_vec(), Vec::new(), b"second".to_vec()]
+            trace.borrow().calls,
+            [
+                TraceCall::Write {
+                    data: b"first".to_vec(),
+                    failed: false,
+                },
+                TraceCall::Write {
+                    data: Vec::new(),
+                    failed: false,
+                },
+                TraceCall::Write {
+                    data: b"second".to_vec(),
+                    failed: false,
+                },
+                TraceCall::Finish { failed: false },
+            ]
         );
-        assert_eq!(sink.finishes, 1);
+        assert_eq!(trace.borrow().output, b"firstsecond");
     }
 
     #[test]
     fn pl_string_propagates_downstream_finish_error() {
         let mut destination = Vec::new();
-        let mut sink = FinishErrorSink;
+        let trace = shared_trace();
+        let mut sink = RecordingSink::with_trace(trace.clone(), &[], &[1]);
         let error = {
             let mut stage = PlString::new("capture", Some(&mut sink), &mut destination);
             stage.finish().unwrap_err()
         };
 
-        assert_eq!(error.message(), "downstream rejected finish");
+        assert_eq!(error.message(), "sink finish failure 1");
+        assert_eq!(trace.borrow().calls, [TraceCall::Finish { failed: true }]);
     }
 
     #[test]
