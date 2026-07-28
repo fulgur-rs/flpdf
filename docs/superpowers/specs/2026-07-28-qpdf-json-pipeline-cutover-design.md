@@ -1,7 +1,7 @@
 # qpdf JSON Pipeline Complete Cutover Design
 
-**Issue:** `flpdf-qynx.6`  
-**Date:** 2026-07-28  
+**Issue:** `flpdf-qynx.6`
+**Date:** 2026-07-28
 **Status:** Approved design
 
 ## 1. Purpose
