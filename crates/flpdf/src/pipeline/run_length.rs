@@ -421,17 +421,12 @@ mod tests {
                 RunLength::new("runlength encode", &mut sink, RunLengthAction::Encode);
             encoder.state = State::Top;
             encoder.length = 2;
-            match encoder.write(b"X").unwrap_err() {
-                PipelineError::Logic(message) => {
-                    assert_eq!(
-                        message.as_bytes(),
-                        b"Pl_RunLength::encode: state/length inconsistency"
-                    )
-                }
-                PipelineError::Runtime(message) => {
-                    panic!("expected logic error, got runtime error: {message}")
-                }
-            }
+            let error = encoder.write(b"X").unwrap_err();
+            assert!(matches!(error, PipelineError::Logic(_)));
+            assert_eq!(
+                error.message_bytes(),
+                b"Pl_RunLength::encode: state/length inconsistency"
+            );
         }
 
         for length in [1, 129] {
@@ -439,17 +434,12 @@ mod tests {
                 RunLength::new("runlength encode", &mut sink, RunLengthAction::Encode);
             encoder.state = State::Run;
             encoder.length = length;
-            match encoder.finish().unwrap_err() {
-                PipelineError::Logic(message) => {
-                    assert_eq!(
-                        message.as_bytes(),
-                        b"Pl_RunLength: invalid length in flush_encode for run"
-                    )
-                }
-                PipelineError::Runtime(message) => {
-                    panic!("expected logic error, got runtime error: {message}")
-                }
-            }
+            let error = encoder.finish().unwrap_err();
+            assert!(matches!(error, PipelineError::Logic(_)));
+            assert_eq!(
+                error.message_bytes(),
+                b"Pl_RunLength: invalid length in flush_encode for run"
+            );
         }
     }
 

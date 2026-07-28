@@ -998,15 +998,11 @@ mod tests {
             "DecodeParms",
             Object::Array(vec![Object::Null, Object::Dictionary(Dictionary::new())]),
         );
-        let warnings = std::cell::RefCell::new(Vec::new());
         let error = decode_stream_data_with_limits_and_warnings(
             &dict,
             b"\x78",
             DecodeLimits::default(),
-            &mut |message, code| {
-                warnings.borrow_mut().push((message.to_string(), code));
-                Ok(())
-            },
+            &mut reject_decode_warning,
         )
         .unwrap_err();
 
@@ -1014,7 +1010,6 @@ mod tests {
             error.to_string(),
             "unsupported PDF feature: stream filter ASCIIHexDecode does not support supplied /DecodeParms"
         );
-        assert_eq!(warnings.into_inner(), Vec::<(String, i32)>::new());
     }
 
     #[test]

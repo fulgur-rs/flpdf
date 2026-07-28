@@ -174,14 +174,8 @@ mod tests {
             ]
             .concat();
 
-            match &error {
-                crate::pipeline::PipelineError::Runtime(detail) => {
-                    assert_eq!(detail.as_bytes(), expected)
-                }
-                crate::pipeline::PipelineError::Logic(_) => {
-                    panic!("ASCIIHex range errors must be runtime errors")
-                }
-            }
+            assert!(matches!(error, crate::pipeline::PipelineError::Runtime(_)));
+            assert_eq!(error.message_bytes(), expected);
             assert_eq!(
                 error.to_string(),
                 "character out of range during base Hex decode: \u{fffd}"
