@@ -69,8 +69,12 @@ impl Error {
 impl From<crate::pipeline::PipelineError> for Error {
     fn from(error: crate::pipeline::PipelineError) -> Self {
         match error {
-            crate::pipeline::PipelineError::Logic(message) => Self::Internal(message),
-            crate::pipeline::PipelineError::Runtime(message) => Self::System(message),
+            crate::pipeline::PipelineError::Logic(message) => {
+                Self::Internal(message.into_string_lossy())
+            }
+            crate::pipeline::PipelineError::Runtime(message) => {
+                Self::System(message.into_string_lossy())
+            }
         }
     }
 }

@@ -69,14 +69,11 @@ impl Pipeline for AsciiHexDecoder<'_> {
                     }
                 }
                 _ => {
-                    let suffix = if ch == 0 {
-                        String::new()
-                    } else {
-                        char::from(ch).to_string()
-                    };
-                    return Err(PipelineError::runtime(format!(
-                        "character out of range during base Hex decode: {suffix}"
-                    )));
+                    let mut detail = b"character out of range during base Hex decode: ".to_vec();
+                    if ch != 0 {
+                        detail.push(ch);
+                    }
+                    return Err(PipelineError::runtime_bytes(detail));
                 }
             }
             if self.eod {
@@ -163,6 +160,33 @@ mod tests {
             decoder.write(b"4G").unwrap_err().to_string(),
             "character out of range during base Hex decode: G"
         );
+    }
+
+    #[test]
+    fn invalid_high_bytes_remain_raw_internally_and_display_lossily() {
+        for byte in [0x80, 0xff] {
+            let mut sink = RecordingSink::new(&[], &[]);
+            let mut decoder = AsciiHexDecoder::new("asciihex", &mut sink);
+            let error = decoder.write(&[byte]).unwrap_err();
+            let expected = [
+                b"character out of range during base Hex decode: ".as_slice(),
+                &[byte],
+            ]
+            .concat();
+
+            match &error {
+                crate::pipeline::PipelineError::Runtime(detail) => {
+                    assert_eq!(detail.as_bytes(), expected)
+                }
+                crate::pipeline::PipelineError::Logic(_) => {
+                    panic!("ASCIIHex range errors must be runtime errors")
+                }
+            }
+            assert_eq!(
+                error.to_string(),
+                "character out of range during base Hex decode: \u{fffd}"
+            );
+        }
     }
 
     #[test]

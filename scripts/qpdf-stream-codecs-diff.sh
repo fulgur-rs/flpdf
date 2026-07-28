@@ -29,7 +29,9 @@ check_source_state() {
     echo "qpdf-stream-codecs-diff.sh: pinned source is not at ${qpdf_commit}" >&2
     return 1
   fi
-  if ! source_status="$(git -C "${qpdf_source}" status --porcelain --untracked-files=no)"; then
+  if ! source_status="$(
+    git -C "${qpdf_source}" status --porcelain --untracked-files=all --ignored
+  )"; then
     echo "qpdf-stream-codecs-diff.sh: unable to verify pinned source cleanliness" >&2
     return 1
   fi

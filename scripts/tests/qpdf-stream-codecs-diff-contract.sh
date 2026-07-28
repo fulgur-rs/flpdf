@@ -181,6 +181,12 @@ printf 'dirty\n' >>"${fixture_source}/sentinel"
 assert_fails_and_cleans dirty-before "${safe_tmp}" run_fixture
 
 reset_fixture
+mkdir -p "${fixture_source}/include/qpdf"
+printf 'shadow\n' >"${fixture_source}/include/qpdf/Pipeline.hh"
+assert_fails_and_cleans untracked-shadow-header "${safe_tmp}" run_fixture
+[[ ! -s "${log}" ]]
+
+reset_fixture
 FAIL_CXX=1 assert_fails_and_cleans compiler-failure "${safe_tmp}" run_fixture
 
 reset_fixture

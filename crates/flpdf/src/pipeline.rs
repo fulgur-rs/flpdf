@@ -1,5 +1,8 @@
 //! qpdf correspondence: Pipeline.cc write/finish chaining lifecycle represented by a crate-private Rust trait; PipelineError models qpdf's logic_error/runtime_error exception channel.
 
+use std::borrow::Cow;
+use std::fmt;
+
 pub(crate) mod ascii85;
 
 pub(crate) mod ascii_hex;
@@ -25,28 +28,69 @@ pub(crate) mod test_support;
 #[allow(dead_code)]
 pub(crate) type PipelineResult<T> = std::result::Result<T, PipelineError>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PipelineErrorDetail(Vec<u8>);
+
+impl PipelineErrorDetail {
+    fn new(message: impl AsRef<[u8]>) -> Self {
+        Self(message.as_ref().to_vec())
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub(crate) fn into_string_lossy(self) -> String {
+        String::from_utf8_lossy(&self.0).into_owned()
+    }
+}
+
+impl fmt::Display for PipelineErrorDetail {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&String::from_utf8_lossy(&self.0))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PipelineError {
     #[error("{0}")]
-    Logic(String),
+    Logic(PipelineErrorDetail),
 
     #[error("{0}")]
-    Runtime(String),
+    Runtime(PipelineErrorDetail),
 }
 
 #[allow(dead_code)]
 impl PipelineError {
-    pub(crate) fn logic(message: impl Into<String>) -> Self {
-        Self::Logic(message.into())
+    pub(crate) fn logic(message: impl AsRef<[u8]>) -> Self {
+        Self::Logic(PipelineErrorDetail::new(message))
     }
 
-    pub(crate) fn runtime(message: impl Into<String>) -> Self {
-        Self::Runtime(message.into())
+    pub(crate) fn runtime(message: impl AsRef<[u8]>) -> Self {
+        Self::Runtime(PipelineErrorDetail::new(message))
     }
 
-    pub(crate) fn message(&self) -> &str {
+    pub(crate) fn runtime_bytes(message: impl Into<Vec<u8>>) -> Self {
+        Self::Runtime(PipelineErrorDetail(message.into()))
+    }
+
+    pub(crate) fn message(&self) -> Cow<'_, str> {
         match self {
-            Self::Logic(message) | Self::Runtime(message) => message,
+            Self::Logic(message) | Self::Runtime(message) => {
+                String::from_utf8_lossy(message.as_bytes())
+            }
+        }
+    }
+
+    pub(crate) fn message_bytes(&self) -> &[u8] {
+        match self {
+            Self::Logic(message) | Self::Runtime(message) => message.as_bytes(),
+        }
+    }
+
+    pub(crate) fn into_string_lossy(self) -> String {
+        match self {
+            Self::Logic(message) | Self::Runtime(message) => message.into_string_lossy(),
         }
     }
 }
@@ -106,6 +150,15 @@ mod tests {
     fn message_accessor_is_category_independent() {
         assert_eq!(PipelineError::logic("logic").message(), "logic");
         assert_eq!(PipelineError::runtime("runtime").message(), "runtime");
+    }
+
+    #[test]
+    fn byte_detail_is_exact_internally_and_lossy_only_at_string_boundaries() {
+        let error = PipelineError::runtime_bytes([b'x', 0xff]);
+
+        assert_eq!(error.message_bytes(), &[b'x', 0xff]);
+        assert_eq!(error.message(), "x\u{fffd}");
+        assert_eq!(error.to_string(), "x\u{fffd}");
     }
 
     #[test]

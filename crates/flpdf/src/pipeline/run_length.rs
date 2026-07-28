@@ -153,7 +153,7 @@ impl Pipeline for RunLength<'_> {
 mod tests {
     use super::{RunLength, RunLengthAction, State};
     use crate::pipeline::test_support::{RecordingSink, Trace, TraceCall};
-    use crate::pipeline::Pipeline;
+    use crate::pipeline::{Pipeline, PipelineError};
 
     fn decode_trace(
         operation: impl FnOnce(&mut RunLength<'_>),
@@ -421,10 +421,17 @@ mod tests {
                 RunLength::new("runlength encode", &mut sink, RunLengthAction::Encode);
             encoder.state = State::Top;
             encoder.length = 2;
-            assert_eq!(
-                encoder.write(b"X").unwrap_err().to_string(),
-                "Pl_RunLength::encode: state/length inconsistency"
-            );
+            match encoder.write(b"X").unwrap_err() {
+                PipelineError::Logic(message) => {
+                    assert_eq!(
+                        message.as_bytes(),
+                        b"Pl_RunLength::encode: state/length inconsistency"
+                    )
+                }
+                PipelineError::Runtime(message) => {
+                    panic!("expected logic error, got runtime error: {message}")
+                }
+            }
         }
 
         for length in [1, 129] {
@@ -432,10 +439,17 @@ mod tests {
                 RunLength::new("runlength encode", &mut sink, RunLengthAction::Encode);
             encoder.state = State::Run;
             encoder.length = length;
-            assert_eq!(
-                encoder.finish().unwrap_err().to_string(),
-                "Pl_RunLength: invalid length in flush_encode for run"
-            );
+            match encoder.finish().unwrap_err() {
+                PipelineError::Logic(message) => {
+                    assert_eq!(
+                        message.as_bytes(),
+                        b"Pl_RunLength: invalid length in flush_encode for run"
+                    )
+                }
+                PipelineError::Runtime(message) => {
+                    panic!("expected logic error, got runtime error: {message}")
+                }
+            }
         }
     }
 

@@ -125,7 +125,7 @@ impl Pipeline for OutputBuffer {
 }
 
 fn map_pipeline_error(error: PipelineError) -> Error {
-    Error::Unsupported(error.to_string())
+    Error::Unsupported(error.into_string_lossy())
 }
 
 #[cfg(test)]

@@ -200,38 +200,95 @@ where
     }
     let specs = decode_filter_specs(filter, decode_params)?;
     validate_filter_chain_count(specs.len())?;
+    let prepared = prepare_decode_filters(specs)?;
     let mut decoded = Cow::Borrowed(stream_data);
-    for spec in specs {
-        let filter_name = spec.normalized_name();
+    for mut stage in prepared {
+        let filter_name = stage.filter_name;
         let next = if filter_name == b"Crypt" {
-            decrypt_crypt(spec.decode_params, decoded.as_ref())?
+            decrypt_crypt(stage.decode_params, decoded.as_ref())?
         } else {
-            let stage = if let Some(mut filter) = stream_filter_for(filter_name) {
-                if !filter.set_decode_params(spec.decode_params) {
-                    return Err(Error::Unsupported(format!(
-                        "stream filter {} does not support supplied /DecodeParms",
-                        String::from_utf8_lossy(filter_name)
-                    )));
-                }
-                // qpdf validates DecodeParms before constructing or writing to
-                // the codec pipeline. Predictor migration remains in qynx.5.3,
-                // but its existing validation must retain that error timing.
-                extract_predictor_params(spec.decode_params)?;
+            let codec_output = if let Some(filter) = stage.adapter.as_mut() {
                 filter.pipe_decode(decoded.as_ref(), limits.max_output, warn)?
             } else {
                 apply_single_filter_decode(
                     filter_name,
                     decoded.as_ref(),
-                    spec.decode_params,
+                    stage.decode_params,
                     limits.max_output,
                 )
                 .map_err(Error::Unsupported)?
             };
-            apply_decode_params(spec.decode_params, &stage)?
+            apply_prepared_decode_params(stage.predictor, &codec_output)?
         };
         decoded = Cow::Owned(next);
     }
     Ok(decoded.into_owned())
+}
+
+struct PreparedDecodeFilter<'a> {
+    filter_name: &'a [u8],
+    decode_params: Option<&'a Object>,
+    adapter: Option<Box<dyn crate::stream_filter::StreamFilter>>,
+    predictor: Option<(u8, usize, usize)>,
+}
+
+fn prepare_decode_filters<'a>(
+    specs: Vec<crate::stream_filter::FilterSpec<'a>>,
+) -> Result<Vec<PreparedDecodeFilter<'a>>> {
+    let mut prepared = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let filter_name = crate::stream_filter::normalize_filter_name(spec.name);
+        if filter_name == b"Crypt" {
+            prepared.push(PreparedDecodeFilter {
+                filter_name,
+                decode_params: spec.decode_params,
+                adapter: None,
+                predictor: None,
+            });
+            continue;
+        }
+
+        let adapter = if let Some(mut adapter) = stream_filter_for(filter_name) {
+            if !adapter.set_decode_params(spec.decode_params) {
+                return Err(Error::Unsupported(format!(
+                    "stream filter {} does not support supplied /DecodeParms",
+                    String::from_utf8_lossy(filter_name)
+                )));
+            }
+            Some(adapter)
+        } else {
+            validate_legacy_decode_filter(filter_name)?;
+            None
+        };
+
+        // qpdf configures every QPDFStreamFilter before constructing or
+        // writing any decode pipeline. Predictor migration remains in
+        // qynx.5.3; extracting it here preserves that validation timing while
+        // retaining filters.rs ownership.
+        let predictor = extract_predictor_params(spec.decode_params)?;
+        prepared.push(PreparedDecodeFilter {
+            filter_name,
+            decode_params: spec.decode_params,
+            adapter,
+            predictor,
+        });
+    }
+    Ok(prepared)
+}
+
+fn validate_legacy_decode_filter(filter_name: &[u8]) -> Result<()> {
+    if filter_name == b"LZWDecode" {
+        return Ok(());
+    }
+    if let Some(label) = passthrough_codec_label(filter_name) {
+        return Err(Error::Unsupported(format!(
+            "passthrough codec {label}: image/binary stream data is not decoded by flpdf (preserved verbatim)"
+        )));
+    }
+    Err(Error::Unsupported(format!(
+        "unsupported stream filter: {}",
+        std::str::from_utf8(filter_name).unwrap_or("<binary>")
+    )))
 }
 
 fn encode_stream_data_with_filters(
@@ -339,8 +396,11 @@ fn extract_predictor_params(decode_params: Option<&Object>) -> Result<Option<(u8
     Ok(Some((predictor, row_bytes, bytes_per_pixel)))
 }
 
-fn apply_decode_params(decode_params: Option<&Object>, stream_data: &[u8]) -> Result<Vec<u8>> {
-    match extract_predictor_params(decode_params)? {
+fn apply_prepared_decode_params(
+    predictor: Option<(u8, usize, usize)>,
+    stream_data: &[u8],
+) -> Result<Vec<u8>> {
+    match predictor {
         None => Ok(stream_data.to_vec()),
         Some((_predictor, row_bytes, bytes_per_pixel)) => {
             decode_png_predictor(stream_data, row_bytes, bytes_per_pixel)
@@ -870,6 +930,93 @@ mod tests {
             "unsupported PDF feature: stream filter TestRejectDecode does not support supplied /DecodeParms"
         );
     }
+
+    #[test]
+    fn invalid_later_filter_params_win_before_malformed_earlier_codec_data() {
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"ASCII85Decode".to_vec()),
+                Object::Name(b"RunLengthDecode".to_vec()),
+            ]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![Object::Null, Object::Dictionary(Dictionary::new())]),
+        );
+
+        let error = decode_stream_data(&dict, b"~X").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream filter RunLengthDecode does not support supplied /DecodeParms"
+        );
+    }
+
+    #[test]
+    fn invalid_later_filter_params_win_before_earlier_expansion_limit() {
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"RunLengthDecode".to_vec()),
+                Object::Name(b"ASCIIHexDecode".to_vec()),
+            ]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![Object::Null, Object::Dictionary(Dictionary::new())]),
+        );
+
+        let error = decode_stream_data_with_limits(
+            &dict,
+            &[0xf9, b'A'],
+            DecodeLimits {
+                max_output: Some(0),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream filter ASCIIHexDecode does not support supplied /DecodeParms"
+        );
+    }
+
+    #[test]
+    fn invalid_later_filter_params_prevent_earlier_codec_warnings() {
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"ASCIIHexDecode".to_vec()),
+            ]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![Object::Null, Object::Dictionary(Dictionary::new())]),
+        );
+        let warnings = std::cell::RefCell::new(Vec::new());
+        let error = decode_stream_data_with_limits_and_warnings(
+            &dict,
+            b"\x78",
+            DecodeLimits::default(),
+            &mut |message, code| {
+                warnings.borrow_mut().push((message.to_string(), code));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream filter ASCIIHexDecode does not support supplied /DecodeParms"
+        );
+        assert_eq!(warnings.into_inner(), Vec::<(String, i32)>::new());
+    }
+
     #[test]
     fn decode_stream_data_without_decryption_keeps_plaintext_behavior() {
         let dict = flate_dict();
