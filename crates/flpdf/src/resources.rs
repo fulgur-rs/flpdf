@@ -721,7 +721,9 @@ impl ParserCallbacks for ResourceCallbacks {
         offset: usize,
         length: usize,
     ) -> Result<ParseControl> {
-        self.finder.handle_object(object.clone(), offset, length)?;
+        if !matches!(&object, Object::InlineImage(_)) {
+            self.finder.handle_object(object.clone(), offset, length)?;
+        }
         match object {
             Object::Operator(operator) if self.inline_header.is_some() => {
                 let header = self

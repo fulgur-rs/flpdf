@@ -46,13 +46,44 @@ impl ResourceFinder {
         resource_type: &[u8],
         name: &[u8],
         offset: usize,
-    ) {
-        self.names_by_resource_type
+    ) -> bool {
+        Self::insert_resource_name(
+            &mut self.names_by_resource_type,
+            resource_type,
+            name,
+            offset,
+        )
+    }
+
+    fn insert_resource_name(
+        names_by_resource_type: &mut ResourceNamesByType,
+        resource_type: &[u8],
+        name: &[u8],
+        offset: usize,
+    ) -> bool {
+        if names_by_resource_type
+            .get(resource_type)
+            .and_then(|names| names.get(name))
+            .is_some_and(|offsets| offsets.contains(&offset))
+        {
+            return false;
+        }
+
+        names_by_resource_type
             .entry(resource_type.to_vec())
             .or_default()
             .entry(name.to_vec())
             .or_default()
-            .insert(offset);
+            .insert(offset)
+    }
+
+    fn record_last_name(&mut self, resource_type: &[u8]) {
+        let (Some((name, offset)), names_by_resource_type) =
+            (&self.last_name, &mut self.names_by_resource_type)
+        else {
+            return;
+        };
+        Self::insert_resource_name(names_by_resource_type, resource_type, name, *offset);
     }
 }
 
@@ -84,10 +115,8 @@ impl ParserCallbacks for ResourceFinder {
             Object::Operator(operator) => {
                 self.last_operator_started_at_boundary = !self.pending_operands;
                 self.pending_operands = false;
-                if let (Some(resource_type), Some((name, name_offset))) =
-                    (operator_resource_type(&operator), self.last_name.clone())
-                {
-                    self.record_resource_name(resource_type, &name, name_offset);
+                if let Some(resource_type) = operator_resource_type(&operator) {
+                    self.record_last_name(resource_type);
                 }
             }
             Object::InlineImage(_) => {}
@@ -299,6 +328,14 @@ mod tests {
             finder.names_by_resource_type()[b"Font".as_slice()][b"F1".as_slice()].len(),
             1
         );
+    }
+
+    #[test]
+    fn duplicate_resource_record_reports_no_insertion() {
+        let mut finder = ResourceFinder::default();
+
+        assert!(finder.record_resource_name(b"XObject", b"VeryLongFormName", 0));
+        assert!(!finder.record_resource_name(b"XObject", b"VeryLongFormName", 0));
     }
 
     #[test]
