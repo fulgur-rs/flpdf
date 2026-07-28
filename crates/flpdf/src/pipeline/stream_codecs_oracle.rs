@@ -724,8 +724,8 @@ fn qpdf_probe_execution_failure_reports_the_case() {
 #[cfg(unix)]
 #[test]
 fn qpdf_path_comparison_uses_the_probe_boundary() {
-    let panic = std::panic::catch_unwind(|| assert_qpdf_oracle_matches(Path::new("/bin/true")))
-        .unwrap_err();
+    let panic =
+        std::panic::catch_unwind(|| assert_qpdf_oracle_matches(Path::new("true"))).unwrap_err();
     let message = panic.downcast_ref::<String>().unwrap();
     assert!(message.contains("ascii85-all-whitespace-and-nul"));
     assert!(message.contains("protocol corruption"));
