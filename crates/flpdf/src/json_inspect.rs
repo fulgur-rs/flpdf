@@ -3717,10 +3717,10 @@ mod tests {
         )
         .unwrap();
 
+        let write_count = output.write_lengths.len();
         assert!(
-            output.write_lengths.len() <= 6,
-            "expected buffered file writes, got {} calls",
-            output.write_lengths.len()
+            write_count <= 6,
+            "expected buffered file writes, got {write_count} calls"
         );
         serde_json::from_slice::<serde_json::Value>(&output.bytes).unwrap();
     }
