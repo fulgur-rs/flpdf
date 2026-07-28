@@ -288,6 +288,19 @@ Mirroring qpdf:
 
 Integer values are clamped to `i32` exactly as `getIntValueAsInt` clamps.
 
+### Chain construction timing
+
+`QPDF_Stream::pipeStreamData` constructs every filter's decode pipeline —
+walking the filters in reverse — before it writes the first byte. flpdf runs its
+chain stage by stage over whole buffers, so construction is reproduced as a
+separate `preflight_decode_pipeline` pass over the prepared chain, in the same
+reverse order, before any stage decodes. A later stage whose geometry cannot
+form a pipeline is therefore reported even when an earlier stage would fail
+first, including when the decoded-output cap stops that earlier stage.
+
+The preflight, `pipe_decode`, and the encode path share one geometry resolver so
+all three reject exactly the same parameters.
+
 ### pipe_decode
 
 Mirroring `getDecodePipeline`, the chain is built from the sink outward:
