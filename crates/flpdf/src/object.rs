@@ -689,15 +689,40 @@ pub(crate) fn write_id_style_value(out: &mut Vec<u8>, obj: &Object) {
     obj.write_pdf(out);
 }
 
-/// Returns `true` when `value` can be emitted as a single-line literal string
-/// `(...)`. qpdf uses the literal form whenever every byte is printable ASCII
-/// (0x20–0x7e) even if the value contains `(`, `)`, or `\` — those simply
-/// need escaping. We mirror that: only CR / LF force the hex fallback because
-/// flpdf does not currently emit multi-line literals.
-pub(crate) fn is_printable_string(value: &[u8]) -> bool {
-    value
-        .iter()
-        .all(|byte| (0x20..=0x7e).contains(byte) && !matches!(*byte, b'\r' | b'\n'))
+/// Returns `true` when `value` must be emitted as a hex string `<...>` rather
+/// than a literal `(...)`.
+///
+/// Port of qpdf's `QPDF_String::useHexString` (libqpdf/QPDF_String.cc:72-90):
+/// a control byte with no backslash escape forces hex outright, and otherwise
+/// hex is used only once non-ASCII bytes exceed a fifth of the string. There
+/// `ch` is a signed char, so bytes >= 0x80 are negative and reach `non_ascii`
+/// through the `ch < 0` arm rather than `ch > 126`; both arms increment the
+/// same counter, so the unsigned form below is equivalent.
+pub(crate) fn use_hex_string(value: &[u8]) -> bool {
+    let mut non_ascii = 0usize;
+    for byte in value {
+        if *byte > 126 {
+            non_ascii += 1;
+        } else if *byte >= 32 {
+            continue;
+        } else if *byte >= 24 {
+            non_ascii += 1;
+        } else if !LITERAL_ESCAPED_CONTROLS.contains(byte) {
+            return true;
+        }
+    }
+    5 * non_ascii > value.len()
+}
+
+/// Control characters qpdf's literal-string branch has a backslash escape for.
+/// Their presence never forces a hex string.
+const LITERAL_ESCAPED_CONTROLS: &[u8] = &[b'\n', b'\r', b'\t', 0x08, 0x0c];
+
+/// qpdf's `is_iso_latin1_printable` (libqpdf/QPDF_String.cc:10-13). Bytes
+/// outside these ranges — including `0x7f` and the 128..=159 gap — are written
+/// as octal escapes inside a literal string.
+fn is_iso_latin1_printable(byte: u8) -> bool {
+    (32..=126).contains(&byte) || byte >= 160
 }
 
 pub(crate) fn write_literal_string(out: &mut Vec<u8>, value: &[u8]) {
@@ -708,17 +733,26 @@ pub(crate) fn write_literal_string(out: &mut Vec<u8>, value: &[u8]) {
                 out.push(b'\\');
                 out.push(*byte);
             }
-            _ => out.push(*byte),
+            b'\n' => out.extend_from_slice(br"\n"),
+            b'\r' => out.extend_from_slice(br"\r"),
+            b'\t' => out.extend_from_slice(br"\t"),
+            0x08 => out.extend_from_slice(br"\b"),
+            0x0c => out.extend_from_slice(br"\f"),
+            _ if is_iso_latin1_printable(*byte) => out.push(*byte),
+            _ => {
+                out.push(b'\\');
+                out.extend_from_slice(format!("{byte:03o}").as_bytes());
+            }
         }
     }
     out.push(b')');
 }
 
 pub(crate) fn write_string_value(out: &mut Vec<u8>, value: &[u8]) {
-    if is_printable_string(value) {
-        write_literal_string(out, value);
-    } else {
+    if use_hex_string(value) {
         write_hex_string(out, value);
+    } else {
+        write_literal_string(out, value);
     }
 }
 
@@ -1283,6 +1317,106 @@ mod name_serialization_tests {
 
         assert_eq!(out, b"/a#1x");
         assert_eq!(crate::parse_object(&out).unwrap(), object);
+    }
+}
+
+#[cfg(test)]
+mod string_serialization_qpdf_parity_tests {
+    use super::*;
+
+    /// qpdf's `QPDF_String::useHexString` (libqpdf/QPDF_String.cc:72-90) does
+    /// not force a hex string for `\n`; the literal branch escapes it as `\n`.
+    /// Observed in `qpdf --static-id` output for a `(a\nb)` source string.
+    #[test]
+    fn newline_stays_literal_and_is_escaped() {
+        let mut out = Vec::new();
+        Object::String(b"a\nb".to_vec()).write_pdf(&mut out);
+        assert_eq!(out, br"(a\nb)");
+    }
+
+    /// The five control characters qpdf's literal branch has escapes for
+    /// (`\n \r \t \b \f`) never force a hex string. Expected value observed in
+    /// qpdf's `good13.out` for the `nesting, strings, names` fixture.
+    #[test]
+    fn escapable_control_characters_stay_literal() {
+        let mut out = Vec::new();
+        Object::String(b"a\x0c\x08\x09\x0d\x0ab".to_vec()).write_pdf(&mut out);
+        assert_eq!(out, br"(a\f\b\t\r\nb)");
+    }
+
+    /// Non-ASCII bytes only force a hex string once they exceed a fifth of the
+    /// string (`5 * non_ascii > len`). Two of twenty-four stays under, so qpdf
+    /// emits a literal carrying the raw bytes.
+    #[test]
+    fn sub_threshold_non_ascii_stays_literal() {
+        let value = b"caf\xc3\xa9 latte and teas xyz";
+        assert_eq!(value.len(), 24);
+        let mut out = Vec::new();
+        Object::String(value.to_vec()).write_pdf(&mut out);
+        assert_eq!(out, b"(caf\xc3\xa9 latte and teas xyz)");
+    }
+
+    /// A byte that survives the hex threshold but is not ISO-Latin-1 printable
+    /// (`32..=126` or `>= 160`) is written as a three-digit octal escape.
+    /// `0x9f` sits in the 128..=159 gap; verified against `qpdf --static-id`,
+    /// which emits `(aaaaaaaaa\237a)`.
+    #[test]
+    fn non_latin1_byte_below_threshold_uses_three_digit_octal() {
+        let value = b"aaaaaaaaa\x9fa";
+        assert_eq!(value.len(), 11);
+        let mut out = Vec::new();
+        Object::String(value.to_vec()).write_pdf(&mut out);
+        assert_eq!(out, br"(aaaaaaaaa\237a)");
+    }
+
+    /// `0x7f` counts toward the hex threshold but is not ISO-Latin-1 printable,
+    /// so a string that stays under the threshold still octal-escapes it.
+    /// `qpdf --static-id` emits `(aaaaaaaaa\177a)`.
+    #[test]
+    fn del_byte_below_threshold_uses_octal() {
+        let mut out = Vec::new();
+        Object::String(b"aaaaaaaaa\x7fa".to_vec()).write_pdf(&mut out);
+        assert_eq!(out, br"(aaaaaaaaa\177a)");
+    }
+
+    /// The threshold is strict: hex needs `5 * non_ascii > len`, so an exact
+    /// `5 * 2 == 10` still yields a literal. `qpdf --static-id` confirms.
+    #[test]
+    fn threshold_is_strict_so_exact_ratio_stays_literal() {
+        let value = b"ab\xc3\xa9cdefgh";
+        assert_eq!(value.len(), 10);
+        let mut out = Vec::new();
+        Object::String(value.to_vec()).write_pdf(&mut out);
+        assert_eq!(out, b"(ab\xc3\xa9cdefgh)");
+    }
+
+    /// One byte shorter and the same two non-ASCII bytes tip it over
+    /// (`5 * 2 > 9`), so qpdf switches to hex.
+    #[test]
+    fn just_over_threshold_switches_to_hex() {
+        let value = b"ab\xc3\xa9cdefg";
+        assert_eq!(value.len(), 9);
+        let mut out = Vec::new();
+        Object::String(value.to_vec()).write_pdf(&mut out);
+        assert_eq!(out, b"<6162c3a96364656667>");
+    }
+
+    /// A control byte with no literal escape forces hex no matter how small a
+    /// fraction of the string it is. `good13.out` shows `<410042>` for `A\0B`.
+    #[test]
+    fn unescapable_control_byte_forces_hex() {
+        let mut out = Vec::new();
+        Object::String(b"A\x00B".to_vec()).write_pdf(&mut out);
+        assert_eq!(out, b"<410042>");
+    }
+
+    /// Above the ratio, hex wins even with no control bytes at all.
+    /// `good13.out` shows `<24a2>`.
+    #[test]
+    fn majority_non_ascii_uses_hex() {
+        let mut out = Vec::new();
+        Object::String(b"\x24\xa2".to_vec()).write_pdf(&mut out);
+        assert_eq!(out, b"<24a2>");
     }
 }
 
