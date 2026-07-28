@@ -719,6 +719,214 @@ fn top_level_linearize_rewrites_output() {
     assert!(std::fs::metadata(output).unwrap().len() > 0);
 }
 
+fn first_page_content(path: &std::path::Path) -> Vec<u8> {
+    let mut pdf = Pdf::open(BufReader::new(File::open(path).unwrap())).unwrap();
+    let page = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    flpdf::pages::page_content_bytes(&mut pdf, page).unwrap()
+}
+
+#[test]
+fn top_level_normalize_content_y_routes_to_content_normalizer() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("crlf-content.pdf");
+    let output = temp.path().join("normalized.pdf");
+    std::fs::write(&input, one_page_pdf_with_content(b"q\rQ")).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--normalize-content=y")
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert_eq!(first_page_content(&output), b"q\nQ");
+}
+
+#[test]
+fn top_level_linearize_normalize_content_y_mutates_before_planning() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("crlf-content.pdf");
+    let output = temp.path().join("normalized-linearized.pdf");
+    // CRLF collapses to LF, changing the stream length. If only the write
+    // graph is normalized while the planning graph is left untouched, the
+    // linearization offsets/hints are computed for the wrong object size.
+    std::fs::write(&input, one_page_pdf_with_content(b"q\r\nQ")).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--linearize", "--normalize-content=y"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert_eq!(first_page_content(&output), b"q\nQ");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("check-linearization")
+        .arg(&output)
+        .assert()
+        .success();
+}
+
+#[test]
+fn top_level_linearize_normalize_content_preserves_warning_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("bad-content.pdf");
+    let output = temp.path().join("normalized-linearized.pdf");
+    std::fs::write(&input, one_page_pdf_with_content(b"\r<0g")).unwrap();
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--linearize", "--normalize-content=y"])
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(3));
+    assert!(output.exists(), "qpdf warning exit must retain output");
+    assert_eq!(first_page_content(&output), b"\n<0g");
+    assert_eq!(
+        String::from_utf8(result.stderr).unwrap(),
+        format!(
+            "WARNING: {}: content normalization encountered bad tokens\n\
+             WARNING: {}: normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
+             WARNING: {}: Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
+             flpdf: operation succeeded with warnings; resulting file may have some problems\n",
+            input.display(),
+            input.display(),
+            input.display(),
+        )
+    );
+}
+
+#[test]
+fn top_level_linearize_normalize_content_warning_writes_pass1_copy() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("bad-content.pdf");
+    let output = temp.path().join("normalized-linearized.pdf");
+    let pass1 = temp.path().join("pass1.pdf");
+    std::fs::write(&input, one_page_pdf_with_content(b"\r<0g")).unwrap();
+    std::fs::write(&pass1, b"stale pass1").unwrap();
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--linearize", "--normalize-content=y"])
+        .arg(format!("--linearize-pass1={}", pass1.display()))
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(3));
+    assert!(output.exists(), "warning exit must retain the final output");
+    assert_eq!(
+        std::fs::read(&pass1).unwrap(),
+        std::fs::read(&output).unwrap(),
+        "warning exit must replace a stale pass-1 file with the final output"
+    );
+}
+
+#[test]
+fn top_level_qdf_defaults_to_content_normalization() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("crlf-content.pdf");
+    let output = temp.path().join("default-qdf.pdf");
+    std::fs::write(&input, one_page_pdf_with_content(b"q\rQ")).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--qdf")
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert_eq!(first_page_content(&output), b"q\nQ");
+}
+
+#[test]
+fn top_level_qdf_explicit_normalize_content_n_overrides_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("crlf-content.pdf");
+    let output = temp.path().join("not-normalized-qdf.pdf");
+    std::fs::write(&input, one_page_pdf_with_content(b"q\rQ")).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--qdf", "--normalize-content=n"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert_eq!(first_page_content(&output), b"q\rQ");
+}
+
+#[test]
+fn top_level_normalize_content_y_rejects_unwired_page_operation_path() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--normalize-content=y",
+            "in.pdf",
+            "--pages",
+            ".",
+            "1",
+            "--",
+            "out.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "--normalize-content is not applied in the \
+             --pages/--rotate/--split-pages/--collate pipeline",
+        ));
+}
+
+#[test]
+fn top_level_normalize_content_y_rejects_unwired_mutating_attachment_paths() {
+    let cases: &[&[&str]] = &[
+        &[
+            "--normalize-content=y",
+            "--remove-attachment=key",
+            "in.pdf",
+            "out.pdf",
+        ],
+        &[
+            "--normalize-content=y",
+            "--add-attachment",
+            "attachment.bin",
+            "--",
+            "in.pdf",
+            "out.pdf",
+        ],
+        &[
+            "--normalize-content=y",
+            "in.pdf",
+            "--copy-attachments-from",
+            "donor.pdf",
+            "--",
+            "out.pdf",
+        ],
+    ];
+
+    for args in cases {
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(*args)
+            .assert()
+            .failure()
+            .code(1)
+            .stderr(predicate::str::contains(
+                "--normalize-content is not applied by attachment mutation operations",
+            ));
+    }
+}
+
 #[test]
 fn top_level_linearize_accepts_compress_streams_and_pass1() {
     // Mirrors the COMMAND from upstream qpdf's linearize-pass1.test:
