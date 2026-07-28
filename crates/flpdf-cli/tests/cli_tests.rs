@@ -861,6 +861,46 @@ fn top_level_normalize_content_y_rejects_unwired_page_operation_path() {
 }
 
 #[test]
+fn top_level_normalize_content_y_rejects_unwired_mutating_attachment_paths() {
+    let cases: &[&[&str]] = &[
+        &[
+            "--normalize-content=y",
+            "--remove-attachment=key",
+            "in.pdf",
+            "out.pdf",
+        ],
+        &[
+            "--normalize-content=y",
+            "--add-attachment",
+            "attachment.bin",
+            "--",
+            "in.pdf",
+            "out.pdf",
+        ],
+        &[
+            "--normalize-content=y",
+            "in.pdf",
+            "--copy-attachments-from",
+            "donor.pdf",
+            "--",
+            "out.pdf",
+        ],
+    ];
+
+    for args in cases {
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(*args)
+            .assert()
+            .failure()
+            .code(1)
+            .stderr(predicate::str::contains(
+                "--normalize-content is not applied by attachment mutation operations",
+            ));
+    }
+}
+
+#[test]
 fn top_level_linearize_accepts_compress_streams_and_pass1() {
     // Mirrors the COMMAND from upstream qpdf's linearize-pass1.test:
     //   qpdf --linearize --static-id --compress-streams=n \

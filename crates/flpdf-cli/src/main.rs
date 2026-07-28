@@ -1522,6 +1522,24 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Attachment add/remove/copy operations rewrite through their own
+    // serializers before the shared rewrite branch. qpdf applies writer
+    // normalization to those outputs, but flpdf cannot yet do so without
+    // duplicating the consumer. Reject effective `y` until those serializers
+    // delegate to the shared rewrite path; list/show are read-only and remain
+    // accepted, matching qpdf.
+    if normalize_content
+        && (args.remove_attachment.is_some()
+            || !args.add_attachment.is_empty()
+            || !args.copy_attachments_from.is_empty())
+    {
+        eprintln!(
+            "flpdf: --normalize-content is not applied by attachment mutation operations; \
+             rerun with --normalize-content=n or without the attachment operation"
+        );
+        std::process::exit(1);
+    }
+
     // `--overlay`/`--underlay` groups are stripped from argv before clap by
     // `extract_overlay_groups`, so a stripped group leaves no trace for the
     // dispatch chain. Only the rewrite paths (the `Rewrite` subcommand and the

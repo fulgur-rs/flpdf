@@ -16,7 +16,9 @@
 - Apply normalization before a linearization plan is computed, and apply it identically to the independent write graph.
 - Preserve qpdf's acceptance of writer-only options on non-writing inspection
   modes. Reject an effective `y` on flpdf's page-operation pipeline while that
-  pipeline cannot consume the transformation, rather than silently dropping it.
+  pipeline cannot consume the transformation, and on mutating attachment
+  operations while their serializers remain separate, rather than silently
+  dropping it.
 - Keep `--stream-data`, `--decode-level`, and specialized filter work out of scope.
 - Follow RED→GREEN→REFACTOR and finish with fresh 100% changed executable-line coverage against `origin/main`.
 
