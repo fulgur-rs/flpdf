@@ -1,4 +1,7 @@
 //! qpdf correspondence: Pl_StdioFile.cc terminal adapter for an externally owned stdio writer.
+//!
+//! Partial progress is retried, but writer errors (including `Interrupted`) are
+//! reported immediately, matching qpdf's zero-result `fwrite` error path.
 
 use std::io::{self, Write};
 
@@ -41,7 +44,6 @@ impl Pipeline for PlStdioFile<'_> {
                     return Err(self.write_error(source));
                 }
                 Ok(written) => data = &data[written..],
-                Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
                 Err(source) => return Err(self.write_error(source)),
             }
         }
@@ -119,7 +121,10 @@ mod tests {
                     Ok(written)
                 }
                 Some(WriteStep::Error(kind, message)) => Err(io::Error::new(kind, message)),
-                Some(WriteStep::Interrupted) => Err(io::ErrorKind::Interrupted.into()),
+                Some(WriteStep::Interrupted) => Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Interrupted system call",
+                )),
                 Some(WriteStep::Zero) => Ok(0),
                 None => {
                     self.bytes.extend_from_slice(data);
@@ -200,16 +205,25 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_write_is_retried() {
+    fn interrupted_write_is_reported_without_retry() {
         let mut writer =
             ScriptedWriter::with_write_steps([WriteStep::Interrupted, WriteStep::Accept(3)]);
-        {
+        let error = {
             let mut stage = PlStdioFile::new("stdio", &mut writer);
-            stage.write(b"abc").unwrap();
-        }
+            stage.write(b"abc").unwrap_err()
+        };
 
-        assert_eq!(writer.bytes, b"abc");
-        assert_eq!(input_lengths(&writer), [3, 3]);
+        assert!(matches!(error, PipelineError::Runtime(_)));
+        assert_eq!(
+            error.to_string(),
+            "stdio: Pl_StdioFile::write: Interrupted system call"
+        );
+        assert!(writer.bytes.is_empty());
+        assert_eq!(input_lengths(&writer), [3]);
+        assert!(matches!(
+            writer.write_steps.front(),
+            Some(WriteStep::Accept(3))
+        ));
     }
 
     #[test]

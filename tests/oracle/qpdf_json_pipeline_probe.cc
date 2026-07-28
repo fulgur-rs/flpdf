@@ -265,7 +265,6 @@ namespace
         std::vector<size_t> write_lengths;
         std::vector<size_t> finish_lengths;
         std::vector<size_t> close_lengths;
-        bool capture_bytes{true};
         bool unexpected_phase{false};
     };
 
@@ -292,23 +291,21 @@ namespace
         switch (step.kind) {
         case WriteStepKind::accept: {
             auto const accepted = std::min(step.count, len);
-            if (cookie.capture_bytes) {
-                cookie.bytes.insert(
-                    cookie.bytes.end(),
-                    reinterpret_cast<unsigned char const*>(data),
-                    reinterpret_cast<unsigned char const*>(data) + accepted);
-            }
+            cookie.bytes.insert(
+                cookie.bytes.end(),
+                reinterpret_cast<unsigned char const*>(data),
+                reinterpret_cast<unsigned char const*>(data) + accepted);
             return static_cast<ssize_t>(accepted);
         }
         case WriteStepKind::interrupted:
             errno = EINTR;
-            return -1;
+            return 0;
         case WriteStepKind::zero:
             errno = step.error;
             return 0;
         case WriteStepKind::error:
             errno = step.error;
-            return -1;
+            return 0;
         }
         throw std::logic_error("unreachable cookie write step");
     }
@@ -336,9 +333,20 @@ namespace
         Cookie const& cookie,
         std::vector<size_t> const& write_lengths,
         std::vector<size_t> const& finish_lengths,
-        std::vector<size_t> const& close_lengths)
+        std::vector<size_t> const& close_lengths,
+        std::deque<WriteStep> const& remaining_steps)
     {
-        if (cookie.unexpected_phase || !cookie.steps.empty() ||
+        auto const steps_match =
+            (cookie.steps.size() == remaining_steps.size()) &&
+            std::equal(
+                cookie.steps.begin(),
+                cookie.steps.end(),
+                remaining_steps.begin(),
+                [](WriteStep const& lhs, WriteStep const& rhs) {
+                    return (lhs.kind == rhs.kind) &&
+                        (lhs.count == rhs.count) && (lhs.error == rhs.error);
+                });
+        if (cookie.unexpected_phase || !steps_match ||
             (cookie.write_lengths != write_lengths) ||
             (cookie.finish_lengths != finish_lengths) ||
             (cookie.close_lengths != close_lengths)) {
@@ -494,7 +502,7 @@ namespace
             });
             close_cookie(file, cookie);
             verify_cookie_lifecycle(
-                "stdio-partial-write", cookie, {4096}, {3072}, {});
+                "stdio-partial-write", cookie, {4096}, {3072}, {}, {});
             emit(
                 "stdio-partial-write",
                 case_status,
@@ -505,10 +513,9 @@ namespace
 
         {
             Cookie cookie;
-            // glibc retries EINTR with an internal fopencookie buffer whose
-            // contents are not a stable observable. This case records the
-            // callback lifecycle only, avoiding a fixture of process memory.
-            cookie.capture_bytes = false;
+            // A fopencookie write callback reports errors with 0, never -1.
+            // Returning -1 here violates the GNU contract and makes glibc
+            // expose an unstable internal buffer during a fictitious retry.
             cookie.steps.push_back({WriteStepKind::interrupted, 0, EINTR});
             cookie.steps.push_back({WriteStepKind::accept, 4096, 0});
             std::array<char, 4096> buffer{};
@@ -520,9 +527,19 @@ namespace
                     stage.write(payload.data(), payload.size());
                 });
             });
+            if (case_status !=
+                "stdio: Pl_StdioFile::write: Interrupted system call") {
+                throw std::runtime_error(
+                    "stdio-interrupted-write: unexpected qpdf runtime error");
+            }
             close_cookie(file, cookie);
             verify_cookie_lifecycle(
-                "stdio-interrupted-write", cookie, {4096, 4096}, {}, {1});
+                "stdio-interrupted-write",
+                cookie,
+                {4096},
+                {},
+                {},
+                {{WriteStepKind::accept, 4096, 0}});
             emit(
                 "stdio-interrupted-write",
                 case_status,
@@ -550,7 +567,7 @@ namespace
             }
             close_cookie(file, cookie);
             verify_cookie_lifecycle(
-                "stdio-zero-progress", cookie, {4096}, {}, {});
+                "stdio-zero-progress", cookie, {4096}, {}, {}, {});
             emit(
                 "stdio-zero-progress",
                 "runtime",
@@ -574,7 +591,7 @@ namespace
             });
             close_cookie(file, cookie);
             verify_cookie_lifecycle(
-                "stdio-finish-ebadf", cookie, {}, {3}, {});
+                "stdio-finish-ebadf", cookie, {}, {3}, {}, {});
             emit(
                 "stdio-finish-ebadf",
                 case_status,
@@ -598,7 +615,7 @@ namespace
             });
             close_cookie(file, cookie);
             verify_cookie_lifecycle(
-                "stdio-finish-enospc", cookie, {}, {3}, {});
+                "stdio-finish-enospc", cookie, {}, {3}, {}, {});
             emit(
                 "stdio-finish-enospc",
                 case_status,
@@ -626,7 +643,7 @@ namespace
             });
             close_cookie(file, cookie);
             verify_cookie_lifecycle(
-                "stdio-repeated-finish", cookie, {}, {6, 5}, {});
+                "stdio-repeated-finish", cookie, {}, {6, 5}, {}, {});
             emit(
                 "stdio-repeated-finish",
                 case_status,

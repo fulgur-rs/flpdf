@@ -286,7 +286,10 @@ fn rust_stdio_records() -> String {
                     self.bytes.extend_from_slice(&data[..accepted]);
                     Ok(accepted)
                 }
-                Some(StdioWriteStep::Interrupted) => Err(io::ErrorKind::Interrupted.into()),
+                Some(StdioWriteStep::Interrupted) => Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Interrupted system call",
+                )),
                 Some(StdioWriteStep::Zero) => Ok(0),
                 Some(StdioWriteStep::Error(error)) => Err(error),
                 None => {
@@ -338,6 +341,7 @@ fn rust_stdio_records() -> String {
         expected_buffered_len: usize,
         write_lengths: &[usize],
         finish_lengths: &[usize],
+        remaining_accept_limits: &[usize],
     ) {
         assert_eq!(
             buffered_bytes
@@ -345,7 +349,13 @@ fn rust_stdio_records() -> String {
                 .len(),
             expected_buffered_len
         );
-        assert!(sink.steps.is_empty(), "unconsumed stdio write steps");
+        assert_eq!(sink.steps.len(), remaining_accept_limits.len());
+        for (step, expected_limit) in sink.steps.iter().zip(remaining_accept_limits) {
+            match step {
+                StdioWriteStep::Accept(limit) => assert_eq!(limit, expected_limit),
+                _ => panic!("unexpected remaining stdio write step"),
+            }
+        }
         assert_eq!(sink.phase.get(), StdioPhase::None);
         assert_eq!(sink.write_lengths, write_lengths);
         assert_eq!(sink.finish_lengths, finish_lengths);
@@ -378,7 +388,7 @@ fn rust_stdio_records() -> String {
         status(result.and_then(|()| pipeline_finish(&mut stage, &phase, &mut operations)))
     };
     let (sink, buffered_bytes) = buffered.into_parts();
-    verify_stdio_lifecycle(&sink, buffered_bytes, 4095, &[], &[4095]);
+    verify_stdio_lifecycle(&sink, buffered_bytes, 4095, &[], &[4095], &[]);
     records.push(record(
         "stdio-4095-enospc",
         &case_status,
@@ -404,7 +414,7 @@ fn rust_stdio_records() -> String {
         ))
     };
     let (sink, buffered_bytes) = buffered.into_parts();
-    verify_stdio_lifecycle(&sink, buffered_bytes, 0, &[4096], &[]);
+    verify_stdio_lifecycle(&sink, buffered_bytes, 0, &[4096], &[], &[]);
     records.push(record(
         "stdio-4096-enospc",
         &case_status,
@@ -423,7 +433,7 @@ fn rust_stdio_records() -> String {
         status(result.and_then(|()| pipeline_finish(&mut stage, &phase, &mut operations)))
     };
     let (sink, buffered_bytes) = buffered.into_parts();
-    verify_stdio_lifecycle(&sink, buffered_bytes, 0, &[4097], &[]);
+    verify_stdio_lifecycle(&sink, buffered_bytes, 0, &[4097], &[], &[]);
     records.push(record(
         "stdio-4097-success",
         &case_status,
@@ -449,7 +459,7 @@ fn rust_stdio_records() -> String {
         status(result.and_then(|()| pipeline_finish(&mut stage, &phase, &mut operations)))
     };
     let (sink, buffered_bytes) = buffered.into_parts();
-    verify_stdio_lifecycle(&sink, buffered_bytes, 3072, &[4096], &[3072]);
+    verify_stdio_lifecycle(&sink, buffered_bytes, 3072, &[4096], &[3072], &[]);
     records.push(record(
         "stdio-partial-write",
         &case_status,
@@ -475,13 +485,16 @@ fn rust_stdio_records() -> String {
             &payload,
         ))
     };
+    assert_eq!(
+        case_status,
+        "stdio: Pl_StdioFile::write: Interrupted system call"
+    );
     let (sink, buffered_bytes) = buffered.into_parts();
-    verify_stdio_lifecycle(&sink, buffered_bytes, 0, &[4096, 4096], &[]);
-    assert_eq!(sink.bytes, payload);
+    verify_stdio_lifecycle(&sink, buffered_bytes, 0, &[4096], &[], &[4096]);
     records.push(record(
         "stdio-interrupted-write",
         &case_status,
-        &[],
+        &sink.bytes,
         operations.write_count,
         operations.finish_count,
     ));
@@ -501,7 +514,7 @@ fn rust_stdio_records() -> String {
         "stdio: Pl_StdioFile::write: failed to write buffered data"
     );
     let (sink, buffered_bytes) = buffered.into_parts();
-    verify_stdio_lifecycle(&sink, buffered_bytes, 0, &[4096], &[]);
+    verify_stdio_lifecycle(&sink, buffered_bytes, 0, &[4096], &[], &[]);
     records.push(record(
         "stdio-zero-progress",
         "runtime",
@@ -525,7 +538,7 @@ fn rust_stdio_records() -> String {
         status(result.and_then(|()| pipeline_finish(&mut stage, &phase, &mut operations)))
     };
     let (sink, buffered_bytes) = buffered.into_parts();
-    verify_stdio_lifecycle(&sink, buffered_bytes, 3, &[], &[3]);
+    verify_stdio_lifecycle(&sink, buffered_bytes, 3, &[], &[3], &[]);
     records.push(record(
         "stdio-finish-ebadf",
         &case_status,
@@ -547,7 +560,7 @@ fn rust_stdio_records() -> String {
         status(result.and_then(|()| pipeline_finish(&mut stage, &phase, &mut operations)))
     };
     let (sink, buffered_bytes) = buffered.into_parts();
-    verify_stdio_lifecycle(&sink, buffered_bytes, 3, &[], &[3]);
+    verify_stdio_lifecycle(&sink, buffered_bytes, 3, &[], &[3], &[]);
     records.push(record(
         "stdio-finish-enospc",
         &case_status,
@@ -568,7 +581,7 @@ fn rust_stdio_records() -> String {
         status(result.and_then(|()| pipeline_finish(&mut stage, &phase, &mut operations)))
     };
     let (sink, buffered_bytes) = buffered.into_parts();
-    verify_stdio_lifecycle(&sink, buffered_bytes, 0, &[], &[6, 5]);
+    verify_stdio_lifecycle(&sink, buffered_bytes, 0, &[], &[6, 5], &[]);
     records.push(record(
         "stdio-repeated-finish",
         &case_status,

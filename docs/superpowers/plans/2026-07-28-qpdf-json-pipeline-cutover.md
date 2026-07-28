@@ -1497,12 +1497,20 @@ review and CI are green.
 **Interfaces:**
 - Produces `pub struct PlStdioFile<'a>`.
 - Produces `PlStdioFile::new(identifier, writer: &mut dyn Write)`.
-- Direct writes loop over partial progress, retry `Interrupted`, and convert
-  zero/error to `PipelineError::Runtime`.
+- Direct writes loop over partial progress and convert zero/error, including
+  `Interrupted`, to `PipelineError::Runtime` without retrying the error.
 - `finish` converts only raw `EBADF` (`9`) to exact `PipelineError::Logic`
   and ignores every other flush error.
 - A 4096-capacity `BufWriter` supplied by the output coordinator represents
   C stdio buffering; `PlStdioFile` itself does not own or close the handle.
+
+Oracle correction: the original Task 10 draft required retrying `Interrupted`,
+but qpdf 11.9.0 `libqpdf/Pl_StdioFile.cc:29-36` throws whenever `fwrite`
+returns zero; it has no EINTR retry branch. A GNU `fopencookie` write callback
+must report every error by returning zero (negative returns violate its
+contract). With a valid zero return and `errno = EINTR`, qpdf makes one write
+callback and reports `Pl_StdioFile::write: Interrupted system call`. Therefore
+qpdf parity takes precedence over the earlier Rust-style retry instruction.
 
 - [ ] **Step 1: Branch from the recorded Layer 1 tip**
 
@@ -1526,7 +1534,7 @@ Add direct scripted-writer tests:
 
 ```rust
 partial_writes_are_retried_until_the_full_input_is_written
-interrupted_write_is_retried
+interrupted_write_is_reported_without_retry
 zero_progress_is_runtime_error_with_identifier_and_operation
 write_error_is_runtime_error_with_identifier_and_operation
 finish_ebadf_is_exact_stream_already_closed_logic_error
@@ -1592,7 +1600,6 @@ impl Pipeline for PlStdioFile<'_> {
                     return Err(self.write_error(source));
                 }
                 Ok(written) => data = &data[written..],
-                Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
                 Err(source) => return Err(self.write_error(source)),
             }
         }
@@ -1935,13 +1942,19 @@ cookie_io_functions_t io{
     .close = nullptr,
 };
 FILE* file = fopencookie(&cookie, "wb", io);
-setvbuf(file, nullptr, _IOFBF, 4096);
+std::array<char, 4096> buffer{};
+setvbuf(file, buffer.data(), _IOFBF, buffer.size());
 ```
 
-`cookie_write` returns the scripted partial count, returns `-1` with
-`errno = EINTR` for interruption, or returns `0` with `errno = ENOSPC` for
-zero progress. The runner skips the live stdio differential on non-Linux
-hosts; checked Rust records remain platform-independent.
+`cookie_write` returns the scripted partial count, or returns `0` with the
+scripted `errno` for interruption and other errors. This intentionally
+corrects the original draft's `-1` return: GNU `fopencookie(3)` prohibits a
+negative write callback result, and the invalid return caused glibc to expose
+unstable internal-buffer bytes during a fictitious retry. The caller-owned
+array also makes the requested 4096-byte buffering real; glibc's
+`setvbuf(file, nullptr, ..., 4096)` may allocate a different internal size.
+The runner skips the live stdio differential on non-Linux hosts; checked Rust
+records remain platform-independent.
 
 The runner executes both exact ignored tests:
 
