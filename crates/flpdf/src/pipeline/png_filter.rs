@@ -109,16 +109,10 @@ impl<'a> PngFilter<'a> {
         let has_prev = self.has_prev;
         if self.cur_is_first {
             let previous = self.buf2.as_slice();
-            (
-                self.buf1.as_mut_slice(),
-                has_prev.then_some(previous),
-            )
+            (self.buf1.as_mut_slice(), has_prev.then_some(previous))
         } else {
             let previous = self.buf1.as_slice();
-            (
-                self.buf2.as_mut_slice(),
-                has_prev.then_some(previous),
-            )
+            (self.buf2.as_mut_slice(), has_prev.then_some(previous))
         }
     }
 
@@ -529,10 +523,7 @@ mod tests {
             &BYTE_ROW,
             &[&[0, 0x01, 0x02, 0x03, 0x04, 0, 0xff]],
         );
-        assert_eq!(
-            output,
-            vec![0x01, 0x02, 0x03, 0x04, 0xff, 0x00, 0x00, 0x00]
-        );
+        assert_eq!(output, vec![0x01, 0x02, 0x03, 0x04, 0xff, 0x00, 0x00, 0x00]);
         assert_eq!(
             calls,
             vec![
@@ -757,7 +748,10 @@ mod tests {
                 PngFilter::new("png", &mut sink, PngFilterAction::Decode, 4, 1, 8).unwrap();
             stage.write(&[0, 0x01]).unwrap();
             assert_eq!(
-                stage.finish().expect_err("partial row write fails").to_string(),
+                stage
+                    .finish()
+                    .expect_err("partial row write fails")
+                    .to_string(),
                 "sink write failure 1"
             );
         }

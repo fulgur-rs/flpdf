@@ -121,7 +121,10 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 |---|---|---|---|
 | `Pipeline.cc`（積層シンク基盤のみ。個々の `Pl_*` は下記の各行で個別に分類） | 114 | 抽象が無い。`Vec<u8>` バッファ + `out.len()` 直参照 | ❌ |
 | `Pl_Count.cc` / `Pl_MD5.cc` | 114 | 無し（バッファから同等の値は取得可能） | ❌ |
-| `Pl_Flate` / `Pl_LZWDecoder` / `Pl_PNGFilter` / `Pl_TIFFPredictor` / `SF_FlateLzwDecode` | 946 | Flate は `pipeline/flate.rs` + `stream_filter.rs`、未移行の LZW / predictor は `filters.rs` | 🔀 |
+| `Pl_Flate` / `SF_FlateLzwDecode` | 946 | `pipeline/flate.rs` + `stream_filter.rs` の `FlateLzwStreamFilter`（`/Predictor` `/Columns` `/Colors` `/BitsPerComponent` `/EarlyChange` の解釈、codec → predictor の chain 構築、`QIntC::to_uint` の range error timing） | ✅ |
+| `Pl_LZWDecoder` | 189 | `pipeline/lzw.rs`（3-byte rotating buffer、1 入力 byte あたり 1 code、table 成長と code 幅遷移、eod latch、qpdf の 7 種の診断文言）+ `stream_filter.rs` 経由の production decode | ✅ |
+| `Pl_PNGFilter` | 232 | `pipeline/png_filter.rs`（32-bit wrapping の row 幅算出、constructor の 3 種 rejection、未知 filter byte の無視、finish の zero-pad row、Up 固定 encoder）+ `filters.rs` / `writer/serialize.rs` の production consumer。⚪ row buffer の確保だけは constructor ではなく最初の write まで遅延（出力バイト・呼び出し境界・エラー timing に影響しない） | ✅ |
+| `Pl_TIFFPredictor` | 175 | 無し。`/Predictor 2` は pipeline 構築時点で `Error::Unsupported` として拒否する（明示的逸脱） | ❌ |
 | `Pl_ASCII85Decoder` / `SF_ASCII85Decode` | 108 + 31 | `pipeline/ascii85.rs` + `stream_filter.rs` | ✅ |
 | `Pl_ASCIIHexDecoder` / `SF_ASCIIHexDecode` | 96 + 31 | `pipeline/ascii_hex.rs` + `stream_filter.rs` | ✅ |
 | `Pl_RunLength` / `SF_RunLengthDecode` | 146 + 38 | `pipeline/run_length.rs` + `stream_filter.rs` | ✅ |

@@ -569,7 +569,11 @@ mod tests {
         let trace = trace.borrow();
         assert_eq!(trace.output, b"AB");
         assert_eq!(
-            trace.calls.iter().filter(|call| matches!(call, TraceCall::Finish { .. })).count(),
+            trace
+                .calls
+                .iter()
+                .filter(|call| matches!(call, TraceCall::Finish { .. }))
+                .count(),
             2
         );
     }
@@ -593,12 +597,10 @@ mod tests {
     #[test]
     fn every_input_split_produces_the_same_output() {
         let stream = pack(&[256, 0x41, 0x42, 258, 259, 257], true);
-        let (whole, _) = decode_chunks(&[stream.clone()], true);
+        let (whole, _) = decode_chunks(std::slice::from_ref(&stream), true);
         for split in 0..=stream.len() {
-            let (parts, _) = decode_chunks(
-                &[stream[..split].to_vec(), stream[split..].to_vec()],
-                true,
-            );
+            let (parts, _) =
+                decode_chunks(&[stream[..split].to_vec(), stream[split..].to_vec()], true);
             assert_eq!(parts, whole, "split at {split}");
         }
     }
@@ -648,6 +650,9 @@ mod tests {
             decoder.write(b"").unwrap();
             decoder.finish().unwrap();
         }
-        assert_eq!(trace.borrow().calls, vec![TraceCall::Finish { failed: false }]);
+        assert_eq!(
+            trace.borrow().calls,
+            vec![TraceCall::Finish { failed: false }]
+        );
     }
 }

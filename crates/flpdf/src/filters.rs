@@ -1,4 +1,4 @@
-//! qpdf correspondence: Pl_LZWDecoder, predictor, and legacy stream-filter encoder responsibilities; QPDFStreamFilter dispatch and Pipeline decoder execution are delegated to stream_filter.
+//! qpdf correspondence: QPDF_Stream filter-chain orchestration; QPDFStreamFilter dispatch, codec construction, and Pipeline execution are delegated to stream_filter.
 use std::borrow::Cow;
 
 use crate::ascii85;
@@ -54,7 +54,10 @@ pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
 }
 
 /// Decode `stream_data` by applying the stream dictionary's `/Filter` chain,
-/// honoring any `/DecodeParms` (including PNG/TIFF predictors).
+/// honoring any `/DecodeParms`.
+///
+/// PNG predictors (`/Predictor 10` through `/Predictor 15`) are applied as part
+/// of the chain. The TIFF predictor (`/Predictor 2`) is rejected.
 ///
 /// # Errors
 ///
@@ -64,10 +67,14 @@ pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
 /// - `/Filter` is neither a name nor an array of names.
 /// - a `/Filter` array declares more than 16 stages (the decode-path chain-length
 ///   cap, which rejects pathological multiplicative-expansion chains).
-/// - a `/DecodeParms` entry has an invalid value (e.g. a non-integer or
-///   negative predictor parameter, or a predictor configuration that overflows).
+/// - `/DecodeParms` selects a `/Predictor` outside `1`, `2`, and `10..=15`, or
+///   gives a non-integer value for a parameter the filter reads.
+/// - `/Predictor` is `2`, which selects the unsupported TIFF predictor.
+/// - a predictor's row geometry is invalid: a negative `/Columns`, `/Colors`, or
+///   `/BitsPerComponent`, a `/BitsPerComponent` outside `1`, `2`, `4`, `8`, and
+///   `16`, or a row width that is zero.
 /// - an implemented codec fails on malformed input — corrupt deflate, LZW,
-///   ASCII85, ASCIIHex, or RunLength data, or a corrupt PNG-predictor stream.
+///   ASCII85, ASCIIHex, or RunLength data.
 pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
     decode_stream_data_with_limits_and_warnings(
         dict,
@@ -88,7 +95,8 @@ pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DecodeLimits {
     /// Maximum decoded byte count permitted out of any single supported filter
-    /// stage. `None` (default) is unlimited.
+    /// stage, counted after that stage's predictor if it has one. `None`
+    /// (default) is unlimited.
     pub max_output: Option<usize>,
 }
 
@@ -152,13 +160,18 @@ pub fn decode_stream_data_with_limits(
 /// Encode `stream_data` by applying the stream dictionary's `/Filter` chain,
 /// the inverse of [`decode_stream_data`].
 ///
+/// Every PNG predictor encodes with the Up row filter, so `/Predictor 10`
+/// through `/Predictor 15` produce identical output. The predictor number is
+/// still recorded in the dictionary and the result decodes correctly, because
+/// decoding selects a filter per row from the row's own leading byte.
+///
 /// # Errors
 ///
 /// Returns [`Error::Unsupported`] when:
 /// - a `/Filter` entry is an unknown or unimplemented codec.
 /// - `/Filter` is neither a name nor an array of names.
-/// - a `/DecodeParms` entry has an invalid value (e.g. a non-integer or
-///   negative predictor parameter, or a predictor configuration that overflows).
+/// - `/DecodeParms` selects an unsupported `/Predictor` or an invalid row
+///   geometry, on the same terms as [`decode_stream_data`].
 pub fn encode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
     encode_stream_data_with_filters(dict.get("Filter"), dict.get("DecodeParms"), stream_data)
 }
@@ -295,12 +308,6 @@ fn encode_stream_data_with_filters(
     Ok(encoded)
 }
 
-/// Apply a single PNG filter to one byte and return the encoded (filtered) byte.
-///
-/// Shared between the optimum-cost loop and the per-row encoding loop so that
-/// the filter logic exists in exactly one place.
-#[inline]
-
 /// Apply the PNG predictor selected by `/DecodeParms`, if any.
 fn apply_encode_params(
     filter_name: &[u8],
@@ -309,14 +316,12 @@ fn apply_encode_params(
 ) -> Result<Vec<u8>> {
     match crate::stream_filter::png_encode_geometry(filter_name, decode_params)? {
         None => Ok(stream_data.to_vec()),
-        Some((columns, colors, bits_per_component)) => {
-            crate::stream_filter::encode_png_predictor(
-                stream_data,
-                columns,
-                colors,
-                bits_per_component,
-            )
-        }
+        Some((columns, colors, bits_per_component)) => crate::stream_filter::encode_png_predictor(
+            stream_data,
+            columns,
+            colors,
+            bits_per_component,
+        ),
     }
 }
 
@@ -999,6 +1004,124 @@ mod tests {
         assert_eq!(decoded, raw);
     }
 
+    /// Flate-compress `raw` with no predictor, for building predicted fixtures.
+    fn flate_only(raw: &[u8]) -> Vec<u8> {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        encode_stream_data(&dict, raw).expect("flate encode")
+    }
+
+    /// qpdf's `Pl_PNGFilter` encoder always emits the Up row filter, so the
+    /// predictor number selects only whether the predictor runs.
+    #[test]
+    fn every_png_predictor_encodes_up_rows() {
+        let raw = sample_raw_4x2();
+        let reference = encode_stream_data(&png_predictor_dict(12, 4), &raw).unwrap();
+
+        for predictor in [10, 11, 13, 14, 15] {
+            assert_eq!(
+                encode_stream_data(&png_predictor_dict(predictor, 4), &raw).unwrap(),
+                reference,
+                "predictor {predictor}"
+            );
+        }
+    }
+
+    /// A predicted stream whose data stops mid-row decodes the partial row
+    /// zero-padded instead of failing.
+    #[test]
+    fn png_predicted_stream_with_a_truncated_final_row_decodes_zero_padded() {
+        let encoded = flate_only(&[0, 0x01, 0x02, 0x03, 0x04, 0, 0xff]);
+
+        let decoded = decode_stream_data(&png_predictor_dict(12, 4), &encoded).unwrap();
+
+        assert_eq!(
+            decoded,
+            vec![0x01, 0x02, 0x03, 0x04, 0xff, 0x00, 0x00, 0x00]
+        );
+    }
+
+    /// An unrecognized row filter byte leaves the row unchanged.
+    #[test]
+    fn png_predicted_stream_ignores_an_unknown_row_filter_byte() {
+        let encoded = flate_only(&[9, 0x01, 0x02, 0x03, 0x04]);
+
+        let decoded = decode_stream_data(&png_predictor_dict(12, 4), &encoded).unwrap();
+
+        assert_eq!(decoded, vec![0x01, 0x02, 0x03, 0x04]);
+    }
+
+    /// `/Columns` defaults to 1, so a predictor without it decodes one-byte rows.
+    #[test]
+    fn png_predictor_without_columns_uses_the_default_single_byte_row() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(12));
+        dict.insert("DecodeParms", Object::Dictionary(parms));
+        let encoded = flate_only(&[0, 0x41, 0, 0x42]);
+
+        assert_eq!(decode_stream_data(&dict, &encoded).unwrap(), b"AB");
+    }
+
+    #[test]
+    fn encoding_rejects_a_predictor_outside_the_supported_set() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(9));
+        dict.insert("DecodeParms", Object::Dictionary(parms));
+
+        assert_eq!(
+            encode_stream_data(&dict, b"data").unwrap_err().to_string(),
+            "unsupported PDF feature: stream filter FlateDecode does not support supplied /DecodeParms"
+        );
+    }
+
+    #[test]
+    fn encoding_reports_the_tiff_predictor_restriction() {
+        assert_eq!(
+            encode_stream_data(&png_predictor_dict(2, 4), b"data")
+                .unwrap_err()
+                .to_string(),
+            "unsupported PDF feature: /DecodeParms /Predictor 2 is not supported for this stream type"
+        );
+    }
+
+    #[test]
+    fn encoding_rejects_negative_predictor_geometry() {
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(12));
+        parms.insert("Columns", Object::Integer(4));
+        parms.insert("Colors", Object::Integer(-1));
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        dict.insert("DecodeParms", Object::Dictionary(parms));
+
+        assert_eq!(
+            encode_stream_data(&dict, b"data").unwrap_err().to_string(),
+            "unsupported PDF feature: integer out of range converting -1 \
+             from a 4-byte signed type to a 4-byte unsigned type"
+        );
+    }
+
+    #[test]
+    fn encoding_rejects_an_unsupported_bit_depth() {
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(12));
+        parms.insert("Columns", Object::Integer(4));
+        parms.insert("BitsPerComponent", Object::Integer(3));
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        dict.insert("DecodeParms", Object::Dictionary(parms));
+
+        assert_eq!(
+            encode_stream_data(&dict, b"data").unwrap_err().to_string(),
+            "unsupported PDF feature: PNGFilter created with invalid bits_per_sample \
+             not 1, 2, 4, 8, or 16"
+        );
+    }
+
     /// The widest row a `/Columns` value can select before qpdf's 32-bit row
     /// arithmetic wraps to the rejected zero width. Two buffers of this size
     /// would be a gigabyte, so a stage that carries no data must not allocate.
@@ -1285,8 +1408,6 @@ mod tests {
 
         assert_eq!(decode_lzw(&stream).unwrap(), b"AB");
     }
-
-
 
     // ----- Task 1: /Filter chain length cap (flpdf-hn1g.4) -----
 

@@ -585,8 +585,7 @@ mod tests {
     use super::{
         decode_filter_specs, decode_flate, decode_flate_chunks, encode_flate, encode_run_length,
         ignore_warning, normalize_filter_name, stream_filter_for, FlateLzwStreamFilter,
-        OutputBuffer, Pipeline, StreamFilter,
-        DECODE_OUTPUT_LIMIT_PREFIX,
+        OutputBuffer, Pipeline, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
     };
     use crate::{Dictionary, Error, Object};
     use std::cell::RefCell;
@@ -961,7 +960,10 @@ mod tests {
 
         // A value outside {0, 1} makes an LZW stream unfilterable.
         assert!(!accepts(true, &[("EarlyChange", Object::Integer(7))]));
-        assert!(!accepts(true, &[("EarlyChange", Object::Name(b"1".to_vec()))]));
+        assert!(!accepts(
+            true,
+            &[("EarlyChange", Object::Name(b"1".to_vec()))]
+        ));
 
         // The same parameters are ignored entirely on a Flate stream.
         let mut flate = FlateLzwStreamFilter::new(false);
@@ -1089,7 +1091,10 @@ mod tests {
             .pipe_decode(&encoded, None, &mut ignore_warning)
             .expect("predicted flate decode");
 
-        assert_eq!(decoded, vec![0x01, 0x02, 0x03, 0x04, 0x02, 0x03, 0x04, 0x05]);
+        assert_eq!(
+            decoded,
+            vec![0x01, 0x02, 0x03, 0x04, 0x02, 0x03, 0x04, 0x05]
+        );
     }
 
     #[test]

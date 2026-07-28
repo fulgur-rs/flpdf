@@ -11,7 +11,9 @@ use super::{Pipeline, PipelineError, PipelineResult};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Codec {
-    Lzw { early_code_change: bool },
+    Lzw {
+        early_code_change: bool,
+    },
     Png {
         action: PngFilterAction,
         columns: u32,
@@ -377,11 +379,12 @@ fn oracle_cases() -> Vec<OracleCase> {
             fail_finishes: vec![],
             operations: {
                 let data: Vec<u8> = vec![
-                    1, 0x01, 0x01, 0x01, 0x01, 2, 0x01, 0x01, 0x01, 0x01, 4, 0x00, 0x00, 0x00,
-                    0x00,
+                    1, 0x01, 0x01, 0x01, 0x01, 2, 0x01, 0x01, 0x01, 0x01, 4, 0x00, 0x00, 0x00, 0x00,
                 ];
-                let mut operations: Vec<Operation> =
-                    data.iter().map(|byte| Operation::Write(vec![*byte])).collect();
+                let mut operations: Vec<Operation> = data
+                    .iter()
+                    .map(|byte| Operation::Write(vec![*byte]))
+                    .collect();
                 operations.push(Operation::Finish);
                 operations
             },
@@ -391,9 +394,7 @@ fn oracle_cases() -> Vec<OracleCase> {
             codec: BYTE_ROW,
             fail_writes: vec![1],
             fail_finishes: vec![],
-            operations: write_all(vec![
-                2, 0x01, 0x02, 0x03, 0x04, 2, 0x01, 0x02, 0x03, 0x04,
-            ]),
+            operations: write_all(vec![2, 0x01, 0x02, 0x03, 0x04, 2, 0x01, 0x02, 0x03, 0x04]),
         },
         OracleCase {
             name: "png-decode-partial-row-write-failure",
@@ -408,6 +409,46 @@ fn oracle_cases() -> Vec<OracleCase> {
             fail_writes: vec![],
             fail_finishes: vec![1],
             operations: write_all(vec![0, 0x01, 0x02, 0x03, 0x04]),
+        },
+        OracleCase {
+            name: "png-decode-empty-write-before-a-row",
+            codec: BYTE_ROW,
+            fail_writes: vec![],
+            fail_finishes: vec![],
+            operations: vec![
+                Operation::Write(vec![]),
+                Operation::Write(vec![1, 0x01, 0x01, 0x01, 0x01]),
+                Operation::Write(vec![]),
+                Operation::Finish,
+            ],
+        },
+        OracleCase {
+            name: "png-encode-empty-write-before-a-row",
+            codec: BYTE_ROW_ENCODE,
+            fail_writes: vec![],
+            fail_finishes: vec![],
+            operations: vec![
+                Operation::Write(vec![]),
+                Operation::Write(vec![0x01, 0x02, 0x03, 0x04]),
+                Operation::Write(vec![]),
+                Operation::Finish,
+            ],
+        },
+        OracleCase {
+            name: "png-encode-split-writes",
+            codec: BYTE_ROW_ENCODE,
+            fail_writes: vec![],
+            fail_finishes: vec![],
+            operations: {
+                let data: Vec<u8> =
+                    vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a];
+                let mut operations: Vec<Operation> = data
+                    .iter()
+                    .map(|byte| Operation::Write(vec![*byte]))
+                    .collect();
+                operations.push(Operation::Finish);
+                operations
+            },
         },
         OracleCase {
             name: "png-encode-two-rows",
@@ -858,7 +899,10 @@ mod tests {
             ("ctor\t0\tok\t\nop\t0\tok\t\noutput\t\u{80}\n", "non-ASCII"),
             ("ctor\t0\tok\t\nop\t0\tok\t\noutput\t", "no final newline"),
             ("ctor\t0\tok\t\n", "missing output record"),
-            ("ctor\t0\tbad\t\nop\t0\tok\t\noutput\t\n", "bad ctor category"),
+            (
+                "ctor\t0\tbad\t\nop\t0\tok\t\noutput\t\n",
+                "bad ctor category",
+            ),
             ("ctor\t1\tok\t\nop\t0\tok\t\noutput\t\n", "bad ctor index"),
             ("ctor\t0\tok\tab\nop\t0\tok\t\noutput\t\n", "ok with detail"),
             (
@@ -896,7 +940,8 @@ mod tests {
 
     #[test]
     fn failed_writes_are_excluded_from_the_output_record() {
-        let trace = "ctor\t0\tok\t\nop\t0\tok\t\ncall\twrite\t1\t1\t41\ncall\tfinish\t0\t0\t\noutput\t\n";
+        let trace =
+            "ctor\t0\tok\t\nop\t0\tok\t\ncall\twrite\t1\t1\t41\ncall\tfinish\t0\t0\t\noutput\t\n";
         assert_eq!(validate_trace_protocol(trace, 1), Ok(()));
     }
 

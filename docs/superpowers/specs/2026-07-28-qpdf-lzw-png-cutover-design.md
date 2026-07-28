@@ -334,11 +334,16 @@ This is a deliberate, documented change. `check.rs`'s cap documentation and
 
 ### writer/serialize.rs
 
-Replace `png_up_predict` with a `PngFilter::Encode` collector. The writer's
-row geometry is `columns = Σ /W`, `colors = 1`, `bits_per_component = 8`, and
-`build_rows` always emits an exact multiple of the row width, so the component
-never reaches its partial-row path. That invariant is asserted, and the
-cutover must be byte-neutral: `deterministic_id_xref_stream_tests`,
+Reduce `png_up_predict` to a `PngFilter::Encode` call. The name is kept as a
+geometry adapter — it converts the writer's `/W` widths to the component's
+`(columns, colors, bits_per_sample)` arguments, asserts the row-multiple
+invariant, and collapses a `Result` that cannot fail for writer-controlled
+geometry — but it no longer contains a predictor implementation.
+
+The writer's row geometry is `columns = Σ /W`, `colors = 1`,
+`bits_per_component = 8`, and `build_rows` always emits an exact multiple of the
+row width, so the component never reaches its partial-row path. That invariant
+is asserted, and the cutover must be byte-neutral: `deterministic_id_xref_stream_tests`,
 `cmp_linearize_objstm_tests`, and the `qpdf-zlib-compat` `compat_baseline_*`
 byte tests must stay green with no re-blessing.
 
@@ -346,8 +351,9 @@ byte tests must stay green with no re-blessing.
 
 The final source search must prove:
 
-- no `lzw_decode`, `decode_png_predictor`, `encode_png_predictor`,
-  `png_filter_byte`, or `png_up_predict` definition remains;
+- no `lzw_decode`, `decode_png_predictor`, `encode_png_predictor`, or
+  `png_filter_byte` definition remains, and `png_up_predict` retains no
+  predictor logic of its own;
 - no production call reaches a predictor helper outside `pipeline::png_filter`;
 - `LZWDecode` resolves through `stream_filter_for`;
 - `extract_predictor_params` exists only as adapter state.
@@ -366,6 +372,13 @@ Recorded here, in the module docs, and in `docs/qpdf-correspondence.md`:
    shared with the `flpdf-qynx.5.2` adapters, unchanged by this issue.
 3. **Decoded-output cap** — flpdf enforces a caller-supplied output limit that
    qpdf does not have. Its enforcement point moves to the end of the chain.
+4. **Lazy row-buffer allocation** — qpdf's `Pl_PNGFilter` constructor allocates
+   both row buffers immediately. flpdf allocates them on the first byte written.
+   This is a category (B) substitution: an unused stage never reads a row, so
+   output bytes, downstream call boundaries, and error timing are unchanged, and
+   the live differential covers empty writes in both directions. It keeps a
+   stream that carries no data from allocating two buffers sized by an untrusted
+   `/Columns`, which the deleted whole-buffer helpers guarded against.
 
 ## Tests
 
