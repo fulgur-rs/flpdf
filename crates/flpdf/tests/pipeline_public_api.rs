@@ -2,6 +2,7 @@ use flpdf::pipeline::{
     Base64Action, Pipeline, PipelineError, PipelineResult, PlBase64, PlConcatenate, PlOStream,
     PlStdioFile, PlString,
 };
+use std::collections::VecDeque;
 use std::io::{self, Cursor, Write};
 
 struct ExternalSink(Vec<u8>);
@@ -221,6 +222,206 @@ fn rust_core_records() -> String {
     records.join("\n") + "\n"
 }
 
+fn rust_stdio_records() -> String {
+    const EBADF_ERRNO: i32 = 9;
+    const ENOSPC_ERRNO: i32 = 28;
+
+    enum StdioWriteStep {
+        Accept(usize),
+        Interrupted,
+        Zero,
+        Error(io::Error),
+    }
+
+    #[derive(Default)]
+    struct StdioSink {
+        bytes: Vec<u8>,
+        steps: VecDeque<StdioWriteStep>,
+    }
+
+    impl StdioSink {
+        fn with_steps(steps: impl IntoIterator<Item = StdioWriteStep>) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl Write for StdioSink {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            match self.steps.pop_front() {
+                Some(StdioWriteStep::Accept(limit)) => {
+                    let accepted = limit.min(data.len());
+                    self.bytes.extend_from_slice(&data[..accepted]);
+                    Ok(accepted)
+                }
+                Some(StdioWriteStep::Interrupted) => Err(io::ErrorKind::Interrupted.into()),
+                Some(StdioWriteStep::Zero) => Ok(0),
+                Some(StdioWriteStep::Error(error)) => Err(error),
+                None => {
+                    self.bytes.extend_from_slice(data);
+                    Ok(data.len())
+                }
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn no_space_message() -> io::Error {
+        io::Error::other("No space left on device")
+    }
+
+    fn no_space_os_error() -> io::Error {
+        io::Error::from_raw_os_error(ENOSPC_ERRNO)
+    }
+
+    fn patterned_bytes(count: usize) -> Vec<u8> {
+        (0..count).map(|index| (index % 251) as u8).collect()
+    }
+
+    let mut records = Vec::new();
+
+    let sink = StdioSink::with_steps([StdioWriteStep::Error(no_space_os_error())]);
+    let mut buffered = io::BufWriter::with_capacity(4096, sink);
+    let case_status = {
+        let mut stage = PlStdioFile::new("stdio", &mut buffered);
+        status(stage.write(&vec![b'x'; 4095]).and_then(|()| stage.finish()))
+    };
+    let (sink, _) = buffered.into_parts();
+    records.push(record("stdio-4095-enospc", &case_status, &sink.bytes, 1, 1));
+
+    let sink = StdioSink::with_steps([StdioWriteStep::Error(no_space_message())]);
+    let mut buffered = io::BufWriter::with_capacity(4096, sink);
+    let case_status = {
+        let mut stage = PlStdioFile::new("stdio", &mut buffered);
+        status(stage.write(&vec![b'x'; 4096]))
+    };
+    let (sink, _) = buffered.into_parts();
+    records.push(record("stdio-4096-enospc", &case_status, &sink.bytes, 1, 0));
+
+    let payload = patterned_bytes(4097);
+    let mut buffered = io::BufWriter::with_capacity(4096, StdioSink::default());
+    let case_status = {
+        let mut stage = PlStdioFile::new("stdio", &mut buffered);
+        status(stage.write(&payload).and_then(|()| stage.finish()))
+    };
+    let (sink, _) = buffered.into_parts();
+    records.push(record(
+        "stdio-4097-success",
+        &case_status,
+        &sink.bytes,
+        1,
+        1,
+    ));
+
+    let payload = patterned_bytes(4096);
+    let sink = StdioSink::with_steps([
+        StdioWriteStep::Accept(1024),
+        StdioWriteStep::Error(no_space_os_error()),
+    ]);
+    let mut buffered = io::BufWriter::with_capacity(4096, sink);
+    let case_status = {
+        let mut stage = PlStdioFile::new("stdio", &mut buffered);
+        status(stage.write(&payload).and_then(|()| stage.finish()))
+    };
+    let (sink, _) = buffered.into_parts();
+    records.push(record(
+        "stdio-partial-write",
+        &case_status,
+        &sink.bytes,
+        1,
+        1,
+    ));
+
+    let sink = StdioSink::with_steps([StdioWriteStep::Interrupted, StdioWriteStep::Zero]);
+    let mut buffered = io::BufWriter::with_capacity(4096, sink);
+    let case_status = {
+        let mut stage = PlStdioFile::new("stdio", &mut buffered);
+        status(stage.write(b"abc").and_then(|()| stage.finish()))
+    };
+    let (sink, _) = buffered.into_parts();
+    records.push(record(
+        "stdio-interrupted-write",
+        &case_status,
+        &sink.bytes,
+        1,
+        1,
+    ));
+
+    let sink = StdioSink::with_steps([StdioWriteStep::Zero]);
+    let mut buffered = io::BufWriter::with_capacity(4096, sink);
+    let case_status = {
+        let mut stage = PlStdioFile::new("stdio", &mut buffered);
+        status(stage.write(b"abc").and_then(|()| stage.finish()))
+    };
+    let (sink, _) = buffered.into_parts();
+    records.push(record(
+        "stdio-zero-progress",
+        &case_status,
+        &sink.bytes,
+        1,
+        1,
+    ));
+
+    let sink = StdioSink::with_steps([StdioWriteStep::Error(io::Error::from_raw_os_error(
+        EBADF_ERRNO,
+    ))]);
+    let mut buffered = io::BufWriter::with_capacity(4096, sink);
+    let case_status = {
+        let mut stage = PlStdioFile::new("stdio", &mut buffered);
+        status(stage.write(b"abc").and_then(|()| stage.finish()))
+    };
+    let (sink, _) = buffered.into_parts();
+    records.push(record(
+        "stdio-finish-ebadf",
+        &case_status,
+        &sink.bytes,
+        1,
+        1,
+    ));
+
+    let sink = StdioSink::with_steps([StdioWriteStep::Error(no_space_os_error())]);
+    let mut buffered = io::BufWriter::with_capacity(4096, sink);
+    let case_status = {
+        let mut stage = PlStdioFile::new("stdio", &mut buffered);
+        status(stage.write(b"abc").and_then(|()| stage.finish()))
+    };
+    let (sink, _) = buffered.into_parts();
+    records.push(record(
+        "stdio-finish-enospc",
+        &case_status,
+        &sink.bytes,
+        1,
+        1,
+    ));
+
+    let mut buffered = io::BufWriter::with_capacity(4096, StdioSink::default());
+    let case_status = {
+        let mut stage = PlStdioFile::new("stdio", &mut buffered);
+        status(
+            stage
+                .write(b"before")
+                .and_then(|()| stage.finish())
+                .and_then(|()| stage.write(b"after"))
+                .and_then(|()| stage.finish()),
+        )
+    };
+    let (sink, _) = buffered.into_parts();
+    records.push(record(
+        "stdio-repeated-finish",
+        &case_status,
+        &sink.bytes,
+        2,
+        2,
+    ));
+
+    records.join("\n") + "\n"
+}
+
 #[test]
 fn downstream_crates_can_implement_pipeline_and_construct_public_pipeline_stages() {
     let mut captured = Vec::new();
@@ -279,6 +480,14 @@ fn checked_qpdf_core_records_match_rust() {
 }
 
 #[test]
+fn checked_qpdf_stdio_records_match_rust() {
+    assert_eq!(
+        rust_stdio_records(),
+        include_str!("../../../tests/oracle/qpdf_json_pipeline_stdio_records.tsv")
+    );
+}
+
+#[test]
 #[ignore = "live pinned qpdf 11.9.0 JSON pipeline oracle"]
 fn live_qpdf_core_records_match_rust() {
     let probe = std::env::var("QPDF_JSON_PIPELINE_PROBE").unwrap();
@@ -290,5 +499,20 @@ fn live_qpdf_core_records_match_rust() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         rust_core_records()
+    );
+}
+
+#[test]
+#[ignore = "live pinned qpdf 11.9.0 Pl_StdioFile oracle"]
+fn live_qpdf_stdio_records_match_rust() {
+    let probe = std::env::var("QPDF_JSON_PIPELINE_PROBE").unwrap();
+    let output = std::process::Command::new(probe)
+        .arg("stdio")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        rust_stdio_records()
     );
 }

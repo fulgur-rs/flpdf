@@ -1,10 +1,18 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+# define _GNU_SOURCE
+#endif
+
 #include <qpdf/Pipeline.hh>
 #include <qpdf/Pl_Base64.hh>
 #include <qpdf/Pl_Concatenate.hh>
 #include <qpdf/Pl_OStream.hh>
+#include <qpdf/Pl_StdioFile.hh>
 #include <qpdf/Pl_String.hh>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <deque>
 #include <exception>
 #include <iomanip>
 #include <iostream>
@@ -12,6 +20,7 @@
 #include <stdexcept>
 #include <streambuf>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -220,17 +229,340 @@ namespace
                 stream_buffer.finish_count);
         }
     }
+
+#ifdef __linux__
+    enum class WriteStepKind
+    {
+        accept,
+        interrupted,
+        zero,
+        error
+    };
+
+    struct WriteStep
+    {
+        WriteStepKind kind;
+        size_t count{0};
+        int error{0};
+    };
+
+    struct Cookie
+    {
+        std::vector<unsigned char> bytes;
+        std::deque<WriteStep> steps;
+    };
+
+    ssize_t cookie_write(void* opaque, char const* data, size_t len)
+    {
+        auto& cookie = *static_cast<Cookie*>(opaque);
+        WriteStep step{WriteStepKind::accept, len, 0};
+        if (!cookie.steps.empty()) {
+            step = cookie.steps.front();
+            cookie.steps.pop_front();
+        }
+
+        switch (step.kind) {
+        case WriteStepKind::accept: {
+            auto const accepted = std::min(step.count, len);
+            cookie.bytes.insert(
+                cookie.bytes.end(),
+                reinterpret_cast<unsigned char const*>(data),
+                reinterpret_cast<unsigned char const*>(data) + accepted);
+            return static_cast<ssize_t>(accepted);
+        }
+        case WriteStepKind::interrupted:
+            errno = EINTR;
+            return -1;
+        case WriteStepKind::zero:
+            errno = step.error;
+            return 0;
+        case WriteStepKind::error:
+            errno = step.error;
+            return -1;
+        }
+        throw std::logic_error("unreachable cookie write step");
+    }
+
+    FILE* open_cookie(Cookie& cookie)
+    {
+        cookie_io_functions_t io{
+            .read = nullptr,
+            .write = cookie_write,
+            .seek = nullptr,
+            .close = nullptr,
+        };
+        auto* file = fopencookie(&cookie, "wb", io);
+        if (file == nullptr) {
+            throw std::runtime_error("fopencookie failed");
+        }
+        if (setvbuf(file, nullptr, _IOFBF, 4096) != 0) {
+            fclose(file);
+            throw std::runtime_error("setvbuf failed");
+        }
+        return file;
+    }
+
+    FILE* open_buffered(char const* path)
+    {
+        auto* file = fopen(path, "w+b");
+        if (file == nullptr) {
+            throw std::runtime_error(std::string("fopen failed: ") + path);
+        }
+        if (setvbuf(file, nullptr, _IOFBF, 4096) != 0) {
+            fclose(file);
+            throw std::runtime_error("setvbuf failed");
+        }
+        return file;
+    }
+
+    std::string read_regular_file(FILE* file)
+    {
+        if (fseek(file, 0, SEEK_SET) != 0) {
+            throw std::runtime_error("fseek failed");
+        }
+        std::string bytes;
+        char buffer[4096];
+        while (auto const count = fread(buffer, 1, sizeof(buffer), file)) {
+            bytes.append(buffer, count);
+        }
+        if (ferror(file)) {
+            throw std::runtime_error("fread failed");
+        }
+        return bytes;
+    }
+
+    std::vector<unsigned char> patterned_bytes(size_t count)
+    {
+        std::vector<unsigned char> result;
+        result.reserve(count);
+        for (size_t index = 0; index < count; ++index) {
+            result.push_back(static_cast<unsigned char>(index % 251));
+        }
+        return result;
+    }
+
+    void run_stdio()
+    {
+        {
+            auto* file = open_buffered("/dev/full");
+            Pl_StdioFile stage("stdio", file);
+            size_t write_count = 0;
+            size_t finish_count = 0;
+            std::vector<unsigned char> payload(4095, 'x');
+            auto const case_status = status([&]() {
+                ++write_count;
+                stage.write(payload.data(), payload.size());
+                ++finish_count;
+                stage.finish();
+            });
+            emit("stdio-4095-enospc", case_status, "", write_count, finish_count);
+            fclose(file);
+        }
+
+        {
+            auto* file = open_buffered("/dev/full");
+            Pl_StdioFile stage("stdio", file);
+            size_t write_count = 0;
+            size_t finish_count = 0;
+            std::vector<unsigned char> payload(4096, 'x');
+            auto const case_status = status([&]() {
+                ++write_count;
+                stage.write(payload.data(), payload.size());
+                ++finish_count;
+                stage.finish();
+            });
+            emit("stdio-4096-enospc", case_status, "", write_count, finish_count);
+            fclose(file);
+        }
+
+        {
+            auto* file = tmpfile();
+            if (file == nullptr) {
+                throw std::runtime_error("tmpfile failed");
+            }
+            if (setvbuf(file, nullptr, _IOFBF, 4096) != 0) {
+                fclose(file);
+                throw std::runtime_error("setvbuf failed");
+            }
+            Pl_StdioFile stage("stdio", file);
+            size_t write_count = 0;
+            size_t finish_count = 0;
+            auto const payload = patterned_bytes(4097);
+            auto const case_status = status([&]() {
+                ++write_count;
+                stage.write(payload.data(), payload.size());
+                ++finish_count;
+                stage.finish();
+            });
+            auto const bytes = read_regular_file(file);
+            emit(
+                "stdio-4097-success",
+                case_status,
+                bytes,
+                write_count,
+                finish_count);
+            fclose(file);
+        }
+
+        {
+            Cookie cookie;
+            cookie.steps.push_back({WriteStepKind::accept, 1024, 0});
+            cookie.steps.push_back({WriteStepKind::error, 0, ENOSPC});
+            auto* file = open_cookie(cookie);
+            Pl_StdioFile stage("stdio", file);
+            size_t write_count = 0;
+            size_t finish_count = 0;
+            auto const payload = patterned_bytes(4096);
+            auto const case_status = status([&]() {
+                ++write_count;
+                stage.write(payload.data(), payload.size());
+                ++finish_count;
+                stage.finish();
+            });
+            emit(
+                "stdio-partial-write",
+                case_status,
+                std::string(cookie.bytes.begin(), cookie.bytes.end()),
+                write_count,
+                finish_count);
+            fclose(file);
+        }
+
+        {
+            Cookie cookie;
+            cookie.steps.push_back({WriteStepKind::interrupted, 0, EINTR});
+            cookie.steps.push_back({WriteStepKind::zero, 0, ENOSPC});
+            auto* file = open_cookie(cookie);
+            Pl_StdioFile stage("stdio", file);
+            size_t write_count = 0;
+            size_t finish_count = 0;
+            auto const case_status = status([&]() {
+                ++write_count;
+                stage.writeCStr("abc");
+                ++finish_count;
+                stage.finish();
+            });
+            emit(
+                "stdio-interrupted-write",
+                case_status,
+                std::string(cookie.bytes.begin(), cookie.bytes.end()),
+                write_count,
+                finish_count);
+            fclose(file);
+        }
+
+        {
+            Cookie cookie;
+            cookie.steps.push_back({WriteStepKind::zero, 0, ENOSPC});
+            auto* file = open_cookie(cookie);
+            Pl_StdioFile stage("stdio", file);
+            size_t write_count = 0;
+            size_t finish_count = 0;
+            auto const case_status = status([&]() {
+                ++write_count;
+                stage.writeCStr("abc");
+                ++finish_count;
+                stage.finish();
+            });
+            emit(
+                "stdio-zero-progress",
+                case_status,
+                std::string(cookie.bytes.begin(), cookie.bytes.end()),
+                write_count,
+                finish_count);
+            fclose(file);
+        }
+
+        {
+            Cookie cookie;
+            cookie.steps.push_back({WriteStepKind::error, 0, EBADF});
+            auto* file = open_cookie(cookie);
+            Pl_StdioFile stage("stdio", file);
+            size_t write_count = 0;
+            size_t finish_count = 0;
+            auto const case_status = status([&]() {
+                ++write_count;
+                stage.writeCStr("abc");
+                ++finish_count;
+                stage.finish();
+            });
+            emit(
+                "stdio-finish-ebadf",
+                case_status,
+                std::string(cookie.bytes.begin(), cookie.bytes.end()),
+                write_count,
+                finish_count);
+            fclose(file);
+        }
+
+        {
+            Cookie cookie;
+            cookie.steps.push_back({WriteStepKind::error, 0, ENOSPC});
+            auto* file = open_cookie(cookie);
+            Pl_StdioFile stage("stdio", file);
+            size_t write_count = 0;
+            size_t finish_count = 0;
+            auto const case_status = status([&]() {
+                ++write_count;
+                stage.writeCStr("abc");
+                ++finish_count;
+                stage.finish();
+            });
+            emit(
+                "stdio-finish-enospc",
+                case_status,
+                std::string(cookie.bytes.begin(), cookie.bytes.end()),
+                write_count,
+                finish_count);
+            fclose(file);
+        }
+
+        {
+            Cookie cookie;
+            auto* file = open_cookie(cookie);
+            Pl_StdioFile stage("stdio", file);
+            size_t write_count = 0;
+            size_t finish_count = 0;
+            auto const case_status = status([&]() {
+                ++write_count;
+                stage.writeCStr("before");
+                ++finish_count;
+                stage.finish();
+                ++write_count;
+                stage.writeCStr("after");
+                ++finish_count;
+                stage.finish();
+            });
+            emit(
+                "stdio-repeated-finish",
+                case_status,
+                std::string(cookie.bytes.begin(), cookie.bytes.end()),
+                write_count,
+                finish_count);
+            fclose(file);
+        }
+    }
+#endif
 }
 
 int main(int argc, char* argv[])
 {
-    if ((argc != 2) || (std::string(argv[1]) != "core")) {
-        std::cerr << "qpdf_json_pipeline_probe: usage: core\n";
+    if ((argc != 2) ||
+        ((std::string(argv[1]) != "core") && (std::string(argv[1]) != "stdio"))) {
+        std::cerr << "qpdf_json_pipeline_probe: usage: core|stdio\n";
         return 2;
     }
 
     try {
-        run_core();
+        if (std::string(argv[1]) == "core") {
+            run_core();
+        } else {
+#ifdef __linux__
+            run_stdio();
+#else
+            throw std::runtime_error("stdio mode requires Linux");
+#endif
+        }
         return 0;
     } catch (std::exception const& error) {
         std::cerr << "qpdf_json_pipeline_probe: " << error.what() << '\n';

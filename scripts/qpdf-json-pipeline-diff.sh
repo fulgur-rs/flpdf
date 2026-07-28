@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export LC_ALL=C
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
 qpdf_source="$(
@@ -15,6 +16,7 @@ root_anchor_device=
 root_anchor_owner=
 runner_pid="${BASHPID}"
 temp_base=
+qpdf_config_include=
 
 path_is_within() {
   local child="$1"
@@ -293,7 +295,7 @@ cleanup() {
   exit "${status}"
 }
 
-for required_command in git mktemp realpath stat; do
+for required_command in git mkdir mktemp realpath stat touch uname; do
   if ! command -v "${required_command}" >/dev/null; then
     echo "qpdf-json-pipeline-diff.sh: ${required_command} is required" >&2
     exit 1
@@ -317,8 +319,14 @@ if ! check_source_state "pinned source has tracked-file changes"; then
   exit 1
 fi
 
+qpdf_config_include="${build_dir_fd_path}/generated-include"
+mkdir -p -m 700 "${qpdf_config_include}/qpdf"
+touch "${qpdf_config_include}/qpdf/qpdf-config.h"
+verify_build_directory_identity
+
 probe="${build_dir_fd_path}/qpdf_json_pipeline_probe"
-c++ -std=c++17 \
+c++ -std=c++17 -ffunction-sections -fdata-sections -Wl,--gc-sections \
+  -I"${qpdf_config_include}" \
   -I"${qpdf_source}/libqpdf" \
   -I"${qpdf_source}/include" \
   "${repo_root}/tests/oracle/qpdf_json_pipeline_probe.cc" \
@@ -327,6 +335,9 @@ c++ -std=c++17 \
   "${qpdf_source}/libqpdf/Pl_Concatenate.cc" \
   "${qpdf_source}/libqpdf/Pl_Base64.cc" \
   "${qpdf_source}/libqpdf/Pl_OStream.cc" \
+  "${qpdf_source}/libqpdf/Pl_StdioFile.cc" \
+  "${qpdf_source}/libqpdf/QUtil.cc" \
+  "${qpdf_source}/libqpdf/QPDFSystemError.cc" \
   -o "${probe}"
 
 if ! check_source_state ||
@@ -340,8 +351,16 @@ if ! check_source_state ||
 fi
 
 "${probe}" core >/dev/null
+if [[ "$(uname -s)" == Linux ]]; then
+  "${probe}" stdio >/dev/null
+fi
 
 cd "${repo_root}"
 QPDF_JSON_PIPELINE_PROBE="${probe}" \
   cargo test -p flpdf --test pipeline_public_api \
   live_qpdf_core_records_match_rust -- --ignored --exact
+if [[ "$(uname -s)" == Linux ]]; then
+  QPDF_JSON_PIPELINE_PROBE="${probe}" \
+    cargo test -p flpdf --test pipeline_public_api \
+    live_qpdf_stdio_records_match_rust -- --ignored --exact
+fi

@@ -124,6 +124,9 @@ require_argument "${FIXTURE_SOURCE}/libqpdf/Pl_String.cc" "$@"
 require_argument "${FIXTURE_SOURCE}/libqpdf/Pl_Concatenate.cc" "$@"
 require_argument "${FIXTURE_SOURCE}/libqpdf/Pl_Base64.cc" "$@"
 require_argument "${FIXTURE_SOURCE}/libqpdf/Pl_OStream.cc" "$@"
+require_argument "${FIXTURE_SOURCE}/libqpdf/Pl_StdioFile.cc" "$@"
+require_argument "${FIXTURE_SOURCE}/libqpdf/QUtil.cc" "$@"
+require_argument "${FIXTURE_SOURCE}/libqpdf/QPDFSystemError.cc" "$@"
 
 if [[ "${FAIL_CXX:-0}" == 1 ]]; then
   exit 97
@@ -160,11 +163,15 @@ printf '\n' >>"${CONTRACT_LOG}"
 if [[ "${FAIL_PROBE:-0}" == 1 ]]; then
   exit 96
 fi
-if (($# != 1)) || [[ "$1" != core ]]; then
-  echo "fake probe: expected core selector" >&2
+if (($# != 1)) || [[ "$1" != core && "$1" != stdio ]]; then
+  echo "fake probe: expected core or stdio selector" >&2
   exit 98
 fi
-printf 'string-null\tok\t6162\t1\t0\n'
+if [[ "$1" == core ]]; then
+  printf 'string-null\tok\t6162\t1\t0\n'
+else
+  printf 'stdio-4095-enospc\tok\t\t1\t1\n'
+fi
 PROBE
 chmod +x "${output}"
 
@@ -190,8 +197,9 @@ if [[ "${QPDF_JSON_PIPELINE_PROBE:-}" != "${expected_probe}" ||
   echo "fake cargo: QPDF_JSON_PIPELINE_PROBE must name the executable probe" >&2
   exit 98
 fi
-if ! grep -qx 'probe <core>' "${CONTRACT_LOG}"; then
-  echo "fake cargo: probe core validation must run before cargo" >&2
+if ! grep -qx 'probe <core>' "${CONTRACT_LOG}" ||
+  ! grep -qx 'probe <stdio>' "${CONTRACT_LOG}"; then
+  echo "fake cargo: probe validations must run before cargo" >&2
   exit 98
 fi
 if (($# != 9)) ||
@@ -200,13 +208,20 @@ if (($# != 9)) ||
     "$3" != flpdf ||
     "$4" != --test ||
     "$5" != pipeline_public_api ||
-    "$6" != live_qpdf_core_records_match_rust ||
     "$7" != -- ||
     "$8" != --ignored ||
     "$9" != --exact ]]; then
   echo "fake cargo: unexpected differential selector arguments" >&2
   exit 98
 fi
+case "$6" in
+  live_qpdf_core_records_match_rust | live_qpdf_stdio_records_match_rust)
+    ;;
+  *)
+    echo "fake cargo: unexpected differential selector arguments" >&2
+    exit 98
+    ;;
+esac
 
 if [[ "${FAIL_CARGO:-0}" == 1 ]]; then
   exit 95
@@ -313,8 +328,18 @@ success_tmp="${fixture_root}/success-tmp"
 mkdir -m 700 "${success_tmp}"
 reset_fixture
 run_fixture "${success_tmp}" >"${fixture_root}/success.out" 2>&1
-if [[ "$(cut -d' ' -f1 "${contract_log}")" != $'c++\nprobe\ncargo' ]]; then
+if [[ "$(cut -d' ' -f1 "${contract_log}")" != \
+  $'c++\nprobe\nprobe\ncargo\ncargo' ]]; then
   echo "qpdf-json-pipeline-diff contract: success tool order is wrong" >&2
+  exit 1
+fi
+if ! grep -Fqx \
+  'cargo <test> <-p> <flpdf> <--test> <pipeline_public_api> <live_qpdf_core_records_match_rust> <--> <--ignored> <--exact>' \
+  "${contract_log}" ||
+  ! grep -Fqx \
+    'cargo <test> <-p> <flpdf> <--test> <pipeline_public_api> <live_qpdf_stdio_records_match_rust> <--> <--ignored> <--exact>' \
+    "${contract_log}"; then
+  echo "qpdf-json-pipeline-diff contract: exact selectors are incomplete" >&2
   exit 1
 fi
 assert_build_removed "successful"
@@ -460,8 +485,20 @@ assert_runner_mutation_rejected \
   "missing-ostream-source" \
   '\|libqpdf/Pl_OStream\.cc|d'
 assert_runner_mutation_rejected \
+  "missing-stdio-source" \
+  '\|libqpdf/Pl_StdioFile\.cc|d'
+assert_runner_mutation_rejected \
+  "missing-qutil-source" \
+  '\|libqpdf/QUtil\.cc|d'
+assert_runner_mutation_rejected \
+  "missing-system-error-source" \
+  '\|libqpdf/QPDFSystemError\.cc|d'
+assert_runner_mutation_rejected \
   "missing-probe-execution" \
   '\|core >/dev/null|d'
+assert_runner_mutation_rejected \
+  "missing-stdio-probe-execution" \
+  '\|stdio >/dev/null|d'
 assert_runner_mutation_rejected \
   "missing-probe-env" \
   '\|QPDF_JSON_PIPELINE_PROBE=|d'
@@ -471,6 +508,9 @@ assert_runner_mutation_rejected \
 assert_runner_mutation_rejected \
   "wrong-selector-scope" \
   's|live_qpdf_core_records_match_rust|pipeline_public_api::live_qpdf_core_records_match_rust|'
+assert_runner_mutation_rejected \
+  "wrong-stdio-selector-scope" \
+  's|live_qpdf_stdio_records_match_rust|pipeline_public_api::live_qpdf_stdio_records_match_rust|'
 
 source_fail_tmp="${fixture_root}/source-fail-tmp"
 mkdir -m 700 "${source_fail_tmp}"
