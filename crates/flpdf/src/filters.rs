@@ -275,6 +275,15 @@ fn prepare_decode_filters<'a>(
             stage: PreparedStage::Codec { adapter },
         });
     }
+
+    // QPDF_Stream::pipeStreamData constructs the whole chain before piping any
+    // data, walking the filters in reverse, so a later stage with unusable
+    // parameters is reported even when an earlier stage would fail on the data.
+    for stage in prepared.iter().rev() {
+        if let PreparedStage::Codec { adapter } = &stage.stage {
+            adapter.preflight_decode_pipeline()?;
+        }
+    }
     Ok(prepared)
 }
 
@@ -1024,6 +1033,78 @@ mod tests {
         assert_eq!(
             decoded,
             vec![0x01, 0x02, 0x03, 0x04, 0xff, 0x00, 0x00, 0x00]
+        );
+    }
+
+    /// A later stage with unusable predictor parameters is rejected even when
+    /// an earlier stage would have tripped the output cap first.
+    #[test]
+    fn invalid_geometry_in_a_later_stage_is_reported_before_decoding() {
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(12));
+        parms.insert("Columns", Object::Integer(4));
+        parms.insert("BitsPerComponent", Object::Integer(3));
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"ASCII85Decode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![Object::Null, Object::Dictionary(parms)]),
+        );
+
+        // The ASCII85 stage alone would exceed this cap, so before the
+        // preflight the Flate stage's geometry was never examined.
+        let error = decode_stream_data_with_limits(
+            &dict,
+            b"9jqo^9jqo^~>",
+            DecodeLimits {
+                max_output: Some(1),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: PNGFilter created with invalid bits_per_sample \
+             not 1, 2, 4, 8, or 16"
+        );
+        assert!(!is_decode_output_limit_error(&error));
+    }
+
+    /// The preflight walks the chain in reverse, as qpdf's pipeline
+    /// construction does, so the last unusable stage is reported first.
+    #[test]
+    fn preflight_reports_the_last_unusable_stage_first() {
+        let mut first = Dictionary::new();
+        first.insert("Predictor", Object::Integer(12));
+        first.insert("Columns", Object::Integer(4));
+        first.insert("Colors", Object::Integer(-1));
+        let mut second = Dictionary::new();
+        second.insert("Predictor", Object::Integer(12));
+        second.insert("Columns", Object::Integer(4));
+        second.insert("BitsPerComponent", Object::Integer(3));
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![Object::Dictionary(first), Object::Dictionary(second)]),
+        );
+
+        assert_eq!(
+            decode_stream_data(&dict, b"").unwrap_err().to_string(),
+            "unsupported PDF feature: PNGFilter created with invalid bits_per_sample \
+             not 1, 2, 4, 8, or 16"
         );
     }
 

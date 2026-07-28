@@ -156,6 +156,16 @@ pub(crate) trait StreamFilter {
         decode_params.is_none_or(|params| matches!(params, Object::Null))
     }
 
+    /// Build the filter's decode pipeline without decoding anything.
+    ///
+    /// `QPDF_Stream::pipeStreamData` constructs every filter's decode pipeline
+    /// before it writes the first byte, so a stage whose parameters cannot form
+    /// a pipeline is rejected even when an earlier stage would have failed on
+    /// the data itself.
+    fn preflight_decode_pipeline(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn pipe_decode(
         &mut self,
         data: &[u8],
@@ -283,42 +293,77 @@ impl StreamFilter for FlateLzwStreamFilter {
         filterable
     }
 
+    fn preflight_decode_pipeline(&self) -> Result<()> {
+        if let Some((columns, colors, bits_per_component)) = self.decode_predictor_geometry()? {
+            let mut sink = OutputBuffer::new(None);
+            PngFilter::new(
+                "png decode",
+                &mut sink,
+                PngFilterAction::Decode,
+                columns,
+                colors,
+                bits_per_component,
+            )
+            .map_err(map_pipeline_error)?;
+        }
+        Ok(())
+    }
+
     fn pipe_decode(
         &mut self,
         data: &[u8],
         max_output: Option<usize>,
         warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
     ) -> Result<Vec<u8>> {
+        let geometry = self.decode_predictor_geometry()?;
         let mut sink = OutputBuffer::new(max_output);
         // SF_FlateLzwDecode::getDecodePipeline builds the chain from the sink
         // outward, so the predictor stage is constructed before the codec and
         // any construction failure precedes every codec write.
-        if (10..=15).contains(&self.predictor) {
-            let mut predictor = PngFilter::new(
-                "png decode",
-                &mut sink,
-                PngFilterAction::Decode,
-                to_uint(self.columns)?,
-                to_uint(self.colors)?,
-                to_uint(self.bits_per_component)?,
-            )
-            .map_err(map_pipeline_error)?;
-            self.pipe_codec(&mut predictor, data, warn)?;
-        } else if self.predictor == 2 {
-            // Declared deviation: qpdf builds Pl_TIFFPredictor here. flpdf has
-            // no TIFF predictor component yet and reports the restriction at
-            // qpdf's construction point.
-            return Err(Error::Unsupported(
-                "/DecodeParms /Predictor 2 is not supported for this stream type".to_string(),
-            ));
-        } else {
-            self.pipe_codec(&mut sink, data, warn)?;
+        match geometry {
+            Some((columns, colors, bits_per_component)) => {
+                let mut predictor = PngFilter::new(
+                    "png decode",
+                    &mut sink,
+                    PngFilterAction::Decode,
+                    columns,
+                    colors,
+                    bits_per_component,
+                )
+                .map_err(map_pipeline_error)?;
+                self.pipe_codec(&mut predictor, data, warn)?;
+            }
+            None => self.pipe_codec(&mut sink, data, warn)?,
         }
         Ok(sink.data)
     }
 }
 
 impl FlateLzwStreamFilter {
+    /// Resolve the predictor geometry the decode chain needs, if any.
+    ///
+    /// This reproduces the failures `SF_FlateLzwDecode::getDecodePipeline`
+    /// raises while constructing the chain, so both the preflight and the
+    /// decode itself reject exactly the same parameters.
+    fn decode_predictor_geometry(&self) -> Result<Option<(u32, u32, u32)>> {
+        if (10..=15).contains(&self.predictor) {
+            return Ok(Some((
+                to_uint(self.columns)?,
+                to_uint(self.colors)?,
+                to_uint(self.bits_per_component)?,
+            )));
+        }
+        if self.predictor == 2 {
+            // Declared deviation: qpdf builds Pl_TIFFPredictor here. flpdf has
+            // no TIFF predictor component yet and reports the restriction at
+            // qpdf's construction point.
+            return Err(Error::Unsupported(
+                "/DecodeParms /Predictor 2 is not supported for this stream type".to_string(),
+            ));
+        }
+        Ok(None)
+    }
+
     fn pipe_codec(
         &self,
         next: &mut dyn Pipeline,
@@ -527,19 +572,7 @@ pub(crate) fn png_encode_geometry(
             String::from_utf8_lossy(filter_name)
         )));
     }
-    if (10..=15).contains(&filter.predictor) {
-        return Ok(Some((
-            to_uint(filter.columns)?,
-            to_uint(filter.colors)?,
-            to_uint(filter.bits_per_component)?,
-        )));
-    }
-    if filter.predictor == 2 {
-        return Err(Error::Unsupported(
-            "/DecodeParms /Predictor 2 is not supported for this stream type".to_string(),
-        ));
-    }
-    Ok(None)
+    filter.decode_predictor_geometry()
 }
 
 /// Apply the PNG predictor to unencoded stream data.
