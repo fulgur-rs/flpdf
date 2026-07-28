@@ -1,4 +1,4 @@
-//! qpdf correspondence: Pipeline.cc write/finish chaining lifecycle represented by a crate-private Rust trait; PipelineError models qpdf's logic_error/runtime_error exception channel.
+//! qpdf correspondence: Pipeline.cc write/finish chaining lifecycle represented by a public Rust trait; PipelineError models qpdf's logic_error/runtime_error exception channel.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -32,11 +32,13 @@ mod stream_codecs_oracle;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-#[allow(dead_code)]
-pub(crate) type PipelineResult<T> = std::result::Result<T, PipelineError>;
+pub mod string;
+pub use string::PlString;
+
+pub type PipelineResult<T> = std::result::Result<T, PipelineError>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PipelineErrorDetail(Vec<u8>);
+pub struct PipelineErrorDetail(Vec<u8>);
 
 impl PipelineErrorDetail {
     fn new(message: impl AsRef<[u8]>) -> Self {
@@ -59,7 +61,7 @@ impl fmt::Display for PipelineErrorDetail {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum PipelineError {
+pub enum PipelineError {
     #[error("{0}")]
     Logic(PipelineErrorDetail),
 
@@ -69,11 +71,11 @@ pub(crate) enum PipelineError {
 
 #[allow(dead_code)]
 impl PipelineError {
-    pub(crate) fn logic(message: impl AsRef<[u8]>) -> Self {
+    pub fn logic(message: impl AsRef<[u8]>) -> Self {
         Self::Logic(PipelineErrorDetail::new(message))
     }
 
-    pub(crate) fn runtime(message: impl AsRef<[u8]>) -> Self {
+    pub fn runtime(message: impl AsRef<[u8]>) -> Self {
         Self::Runtime(PipelineErrorDetail::new(message))
     }
 
@@ -81,7 +83,7 @@ impl PipelineError {
         Self::Runtime(PipelineErrorDetail(message.into()))
     }
 
-    pub(crate) fn message(&self) -> Cow<'_, str> {
+    pub fn message(&self) -> Cow<'_, str> {
         match self {
             Self::Logic(message) | Self::Runtime(message) => {
                 String::from_utf8_lossy(message.as_bytes())
@@ -102,8 +104,7 @@ impl PipelineError {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) trait Pipeline {
+pub trait Pipeline {
     fn identifier(&self) -> &str;
     fn write(&mut self, data: &[u8]) -> PipelineResult<()>;
     fn finish(&mut self) -> PipelineResult<()>;
