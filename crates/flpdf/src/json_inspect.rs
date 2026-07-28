@@ -552,41 +552,232 @@ fn qpdf_dict_to_json<R: Read + Seek>(
     json_dictionary(pairs)
 }
 
-/// A prepared raw-PDF value whose dictionaries retain [`Dictionary`]'s raw
-/// name order until the sink escapes each key. This is intentionally separate
-/// from generic [`Json`] dictionaries, whose encoded keys remain map-sorted.
+/// A prepared raw-PDF value that retains both container order and PDF scalar
+/// type until emission. This is intentionally separate from generic [`Json`],
+/// whose scalar writer coalesces each value into one pipeline write.
 ///
-/// qpdf 11.9.0 `QPDF_Dictionary::writeJSON` iterates the raw name map and
-/// escapes each key only at emission (`libqpdf/QPDF_Dictionary.cc:72-94`).
+/// qpdf 11.9.0 dispatches every PDF object to its type-specific `writeJSON`
+/// implementation through one shared `JSON::Writer`. That writer's start,
+/// next, and end methods also define observable pipeline-write boundaries.
 enum OrderedPdfJson {
-    Json(Json),
+    Scalar(RawPdfJsonScalar),
     Array(Vec<OrderedPdfJson>),
-    Dictionary(Vec<(Vec<u8>, OrderedPdfJson)>),
+    Dictionary(Vec<(RawPdfJsonKey, OrderedPdfJson)>),
+}
+
+enum RawPdfJsonScalar {
+    Null,
+    Boolean(bool),
+    Integer(i64),
+    Real(Vec<u8>),
+    Name(RawPdfName),
+    String(RawPdfString),
+    Reference(Vec<u8>),
+}
+
+enum RawPdfJsonKey {
+    PdfName(RawPdfName),
+    Literal(Vec<u8>),
+}
+
+struct RawPdfName {
+    non_utf8: bool,
+    encoded: Vec<u8>,
+}
+
+struct RawPdfString {
+    unicode: bool,
+    encoded: Vec<u8>,
+}
+
+impl RawPdfName {
+    fn from_decoded(bytes: &[u8]) -> Self {
+        let rendered = qpdf_name_to_json_string(bytes).into_bytes();
+        let (non_utf8, value) = match rendered.strip_prefix(b"n:") {
+            Some(value) => (true, value),
+            None => (false, rendered.as_slice()),
+        };
+        Self {
+            non_utf8,
+            encoded: encode_raw_pdf_json_string(value),
+        }
+    }
+}
+
+impl RawPdfString {
+    fn from_pdf_bytes(bytes: &[u8]) -> Self {
+        let rendered = pdf_string_to_json_string(bytes).into_bytes();
+        let (unicode, value) = if let Some(value) = rendered.strip_prefix(b"u:") {
+            (true, value)
+        } else {
+            (
+                false,
+                rendered
+                    .strip_prefix(b"b:")
+                    .expect("PDF JSON strings always have a u: or b: prefix"),
+            )
+        };
+        Self {
+            unicode,
+            encoded: encode_raw_pdf_json_string(value),
+        }
+    }
+}
+
+fn encode_raw_pdf_json_string(value: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(value.len());
+    for &byte in value {
+        match byte {
+            b'\\' => encoded.extend_from_slice(b"\\\\"),
+            b'"' => encoded.extend_from_slice(b"\\\""),
+            b'\x08' => encoded.extend_from_slice(b"\\b"),
+            b'\x0c' => encoded.extend_from_slice(b"\\f"),
+            b'\n' => encoded.extend_from_slice(b"\\n"),
+            b'\r' => encoded.extend_from_slice(b"\\r"),
+            b'\t' => encoded.extend_from_slice(b"\\t"),
+            0x00..=0x1f => {
+                encoded.extend_from_slice(if byte < 0x10 { b"\\u000" } else { b"\\u001" });
+                encoded.push(b"0123456789abcdef"[(byte & 0x0f) as usize]);
+            }
+            _ => encoded.push(byte),
+        }
+    }
+    encoded
+}
+
+struct RawPdfJsonWriter<'a> {
+    out: &'a mut dyn Pipeline,
+    first: bool,
+    indent: usize,
+}
+
+impl<'a> RawPdfJsonWriter<'a> {
+    const SPACES: &'static [u8; 52] = b",\n                                                  ";
+    const SPACE_BLOCK: usize = Self::SPACES.len() - 2;
+
+    fn new(out: &'a mut dyn Pipeline, depth: usize) -> Self {
+        Self {
+            out,
+            first: true,
+            indent: 2 * depth,
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), PipelineError> {
+        self.out.write(bytes)
+    }
+
+    fn write_next(&mut self) -> Result<(), PipelineError> {
+        let spaces = self.indent;
+        let remainder = spaces % Self::SPACE_BLOCK;
+        if self.first {
+            self.first = false;
+            self.write(&Self::SPACES[1..remainder + 2])?;
+        } else {
+            self.write(&Self::SPACES[..remainder + 2])?;
+        }
+        let mut remaining = spaces;
+        while remaining >= Self::SPACE_BLOCK {
+            self.write(&Self::SPACES[2..])?;
+            remaining -= Self::SPACE_BLOCK;
+        }
+        Ok(())
+    }
+
+    fn write_start(&mut self, delimiter: u8) -> Result<(), PipelineError> {
+        self.write(&[delimiter])?;
+        self.first = true;
+        self.indent += 2;
+        Ok(())
+    }
+
+    fn write_end(&mut self, delimiter: u8) -> Result<(), PipelineError> {
+        if self.indent > 1 {
+            self.indent -= 2;
+        }
+        if !self.first {
+            self.first = true;
+            self.write_next()?;
+        }
+        self.first = false;
+        self.write(&[delimiter])
+    }
+
+    fn write_name(&mut self, name: &RawPdfName, suffix: &[u8]) -> Result<(), PipelineError> {
+        self.write(if name.non_utf8 { b"\"n:" } else { b"\"" })?;
+        self.write(&name.encoded)?;
+        self.write(suffix)
+    }
+
+    fn write_key(&mut self, key: &RawPdfJsonKey) -> Result<(), PipelineError> {
+        self.write_next()?;
+        match key {
+            RawPdfJsonKey::PdfName(name) => self.write_name(name, b"\": "),
+            RawPdfJsonKey::Literal(encoded) => {
+                self.write(b"\"")?;
+                self.write(encoded)?;
+                self.write(b"\": ")
+            }
+        }
+    }
+
+    fn write_scalar(&mut self, scalar: &RawPdfJsonScalar) -> Result<(), PipelineError> {
+        match scalar {
+            RawPdfJsonScalar::Null => self.write(b"null"),
+            RawPdfJsonScalar::Boolean(value) => self.write(if *value { b"true" } else { b"false" }),
+            RawPdfJsonScalar::Integer(value) => self.write(value.to_string().as_bytes()),
+            RawPdfJsonScalar::Real(value) => {
+                if let Some(tail) = value.strip_prefix(b"-.") {
+                    self.write(b"-0.")?;
+                    self.write(tail)
+                } else if value.starts_with(b".") {
+                    self.write(b"0")?;
+                    self.write(value)
+                } else {
+                    self.write(value)
+                }
+            }
+            RawPdfJsonScalar::Name(name) => self.write_name(name, b"\""),
+            RawPdfJsonScalar::String(value) => {
+                self.write(if value.unicode { b"\"u:" } else { b"\"b:" })?;
+                self.write(&value.encoded)?;
+                self.write(b"\"")
+            }
+            RawPdfJsonScalar::Reference(reference) => {
+                self.write(b"\"")?;
+                self.write(reference)?;
+                self.write(b"\"")
+            }
+        }
+    }
+
+    fn write_value(&mut self, value: &OrderedPdfJson) -> Result<(), PipelineError> {
+        match value {
+            OrderedPdfJson::Scalar(value) => self.write_scalar(value)?,
+            OrderedPdfJson::Array(values) => {
+                self.write_start(b'[')?;
+                for value in values {
+                    self.write_next()?;
+                    self.write_value(value)?;
+                }
+                self.write_end(b']')?;
+            }
+            OrderedPdfJson::Dictionary(entries) => {
+                self.write_start(b'{')?;
+                for (key, value) in entries {
+                    self.write_key(key)?;
+                    self.write_value(value)?;
+                }
+                self.write_end(b'}')?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl OrderedPdfJson {
     fn write(&self, out: &mut dyn Pipeline, depth: usize) -> Result<(), JsonOutputError> {
-        match self {
-            Self::Json(value) => value.write(out, depth)?,
-            Self::Array(values) => {
-                let mut first = true;
-                Json::write_array_open(out, &mut first, depth)?;
-                for value in values {
-                    Json::write_next(out, &mut first, depth + 1)?;
-                    value.write(out, depth + 1)?;
-                }
-                Json::write_array_close(out, first, depth)?;
-            }
-            Self::Dictionary(entries) => {
-                let mut first = true;
-                Json::write_dictionary_open(out, &mut first, depth)?;
-                for (key, value) in entries {
-                    Json::write_qpdf_dictionary_key(out, &mut first, key, depth + 1)?;
-                    value.write(out, depth + 1)?;
-                }
-                Json::write_dictionary_close(out, first, depth)?;
-            }
-        }
+        RawPdfJsonWriter::new(out, depth).write_value(self)?;
         Ok(())
     }
 }
@@ -601,7 +792,7 @@ fn ordered_qpdf_dict<R: Read + Seek>(
             continue;
         }
         entries.push((
-            qpdf_name_to_json_string(raw_key).into_bytes(),
+            RawPdfJsonKey::PdfName(RawPdfName::from_decoded(raw_key)),
             ordered_qpdf_object(pdf, value)?,
         ));
     }
@@ -614,12 +805,11 @@ fn ordered_qpdf_object<R: Read + Seek>(
 ) -> Result<OrderedPdfJson, ConvertError> {
     match object {
         Object::Reference(reference) if !crate::qpdf_null::reference_is_valid(*reference) => {
-            Ok(OrderedPdfJson::Json(Json::make_null()))
+            Ok(OrderedPdfJson::Scalar(RawPdfJsonScalar::Null))
         }
-        Object::Reference(reference) => Ok(OrderedPdfJson::Json(Json::make_string(format!(
-            "{} {} R",
-            reference.number, reference.generation
-        )))),
+        Object::Reference(reference) => Ok(OrderedPdfJson::Scalar(RawPdfJsonScalar::Reference(
+            format!("{} {} R", reference.number, reference.generation).into_bytes(),
+        ))),
         Object::Array(items) => Ok(OrderedPdfJson::Array(
             items
                 .iter()
@@ -628,13 +818,39 @@ fn ordered_qpdf_object<R: Read + Seek>(
         )),
         Object::Dictionary(dict) => ordered_qpdf_dict(pdf, dict),
         Object::Stream(stream) => Ok(OrderedPdfJson::Dictionary(vec![(
-            b"stream".to_vec(),
+            RawPdfJsonKey::Literal(b"stream".to_vec()),
             OrderedPdfJson::Dictionary(vec![(
-                b"dict".to_vec(),
+                RawPdfJsonKey::Literal(b"dict".to_vec()),
                 ordered_qpdf_dict(pdf, &stream.dict)?,
             )]),
         )])),
-        other => Ok(OrderedPdfJson::Json(pdf_object_to_json(other)?)),
+        Object::Null | Object::Operator(_) | Object::InlineImage(_) => {
+            Ok(OrderedPdfJson::Scalar(RawPdfJsonScalar::Null))
+        }
+        Object::Boolean(value) => Ok(OrderedPdfJson::Scalar(RawPdfJsonScalar::Boolean(*value))),
+        Object::Integer(value) => Ok(OrderedPdfJson::Scalar(RawPdfJsonScalar::Integer(*value))),
+        Object::Real(value) => {
+            if !value.is_finite() {
+                return Err(ConvertError::NonFiniteFloat);
+            }
+            Ok(OrderedPdfJson::Scalar(RawPdfJsonScalar::Real(
+                value.to_string().into_bytes(),
+            )))
+        }
+        Object::RealLiteral { value, .. } => {
+            if !value.is_finite() {
+                return Err(ConvertError::NonFiniteFloat);
+            }
+            let mut encoded = Vec::new();
+            object.write_pdf(&mut encoded);
+            Ok(OrderedPdfJson::Scalar(RawPdfJsonScalar::Real(encoded)))
+        }
+        Object::Name(value) => Ok(OrderedPdfJson::Scalar(RawPdfJsonScalar::Name(
+            RawPdfName::from_decoded(value),
+        ))),
+        Object::String(value) => Ok(OrderedPdfJson::Scalar(RawPdfJsonScalar::String(
+            RawPdfString::from_pdf_bytes(value),
+        ))),
     }
 }
 
@@ -3648,6 +3864,366 @@ mod tests {
     }
 
     #[test]
+    fn ordered_qpdf_raw_container_end_and_empty_chunks_match_writer_literals() {
+        let mut pdf = empty_pdf();
+        let nonempty =
+            super::ordered_qpdf_object(&mut pdf, &Object::Array(vec![Object::Null])).unwrap();
+        let mut out = FailOnExactChunk {
+            bytes: Vec::new(),
+            chunks: Vec::new(),
+            fail_on: b"not a qpdf chunk",
+            category: ErrorCategory::Runtime,
+            finishes: 0,
+        };
+
+        nonempty.write(&mut out, 0).unwrap();
+
+        assert_eq!(
+            out.chunks,
+            [
+                b"[".to_vec(),
+                b"\n  ".to_vec(),
+                b"null".to_vec(),
+                b"\n".to_vec(),
+                b"]".to_vec(),
+            ]
+        );
+        assert_eq!(out.bytes, b"[\n  null\n]");
+        assert_eq!(out.finishes, 0);
+
+        let empty = super::ordered_qpdf_object(&mut pdf, &Object::Array(Vec::new())).unwrap();
+        let mut out = FailOnExactChunk {
+            bytes: Vec::new(),
+            chunks: Vec::new(),
+            fail_on: b"not a qpdf chunk",
+            category: ErrorCategory::Runtime,
+            finishes: 0,
+        };
+
+        empty.write(&mut out, 0).unwrap();
+
+        assert_eq!(out.chunks, [b"[".to_vec(), b"]".to_vec()]);
+        assert_eq!(out.bytes, b"[]");
+        assert_eq!(out.finishes, 0);
+    }
+
+    #[test]
+    fn ordered_qpdf_raw_container_end_failure_keeps_layout_prefix_and_category() {
+        for (category, expected_message) in [
+            (ErrorCategory::Logic, "raw key logic failure"),
+            (ErrorCategory::Runtime, "raw key runtime failure"),
+        ] {
+            let mut pdf = empty_pdf();
+            let value =
+                super::ordered_qpdf_object(&mut pdf, &Object::Array(vec![Object::Null])).unwrap();
+            let mut out = FailOnExactChunk {
+                bytes: Vec::new(),
+                chunks: Vec::new(),
+                fail_on: b"]",
+                category,
+                finishes: 0,
+            };
+
+            let error = value.write(&mut out, 0).unwrap_err();
+
+            assert_eq!(error.to_string(), expected_message);
+            match category {
+                ErrorCategory::Logic => assert!(matches!(
+                    error,
+                    JsonOutputError::Pipeline(PipelineError::Logic(_))
+                )),
+                ErrorCategory::Runtime => assert!(matches!(
+                    error,
+                    JsonOutputError::Pipeline(PipelineError::Runtime(_))
+                )),
+            }
+            assert_eq!(
+                out.chunks,
+                [
+                    b"[".to_vec(),
+                    b"\n  ".to_vec(),
+                    b"null".to_vec(),
+                    b"\n".to_vec(),
+                    b"]".to_vec(),
+                ]
+            );
+            assert_eq!(out.bytes, b"[\n  null\n");
+            assert_eq!(out.finishes, 0);
+        }
+    }
+
+    #[test]
+    fn ordered_qpdf_raw_next_uses_fifty_space_blocks_at_reachable_depth() {
+        const FIFTY_SPACES: &[u8; 50] = b"                                                  ";
+
+        let mut object = Object::Array(vec![Object::Null, Object::Null]);
+        for _ in 1..25 {
+            object = Object::Array(vec![object]);
+        }
+        let mut pdf = empty_pdf();
+        let value = super::ordered_qpdf_object(&mut pdf, &object).unwrap();
+        let mut out = FailOnExactChunk {
+            bytes: Vec::new(),
+            chunks: Vec::new(),
+            fail_on: b"not a qpdf chunk",
+            category: ErrorCategory::Runtime,
+            finishes: 0,
+        };
+
+        value.write(&mut out, 0).unwrap();
+
+        let boundary = [
+            b"[".to_vec(),
+            b"\n".to_vec(),
+            FIFTY_SPACES.to_vec(),
+            b"null".to_vec(),
+            b",\n".to_vec(),
+            FIFTY_SPACES.to_vec(),
+            b"null".to_vec(),
+            b"\n                                                ".to_vec(),
+            b"]".to_vec(),
+        ];
+        assert!(out
+            .chunks
+            .windows(boundary.len())
+            .any(|window| window == boundary));
+        assert_eq!(out.finishes, 0);
+    }
+
+    #[test]
+    fn ordered_qpdf_raw_next_block_failure_keeps_reachable_depth_prefix() {
+        const FIFTY_SPACES: &[u8; 50] = b"                                                  ";
+
+        let mut object = Object::Array(vec![Object::Null]);
+        for _ in 1..25 {
+            object = Object::Array(vec![object]);
+        }
+        let mut pdf = empty_pdf();
+        let value = super::ordered_qpdf_object(&mut pdf, &object).unwrap();
+        let mut out = FailOnExactChunk {
+            bytes: Vec::new(),
+            chunks: Vec::new(),
+            fail_on: FIFTY_SPACES,
+            category: ErrorCategory::Runtime,
+            finishes: 0,
+        };
+
+        let error = value.write(&mut out, 0).unwrap_err();
+
+        assert!(matches!(
+            error,
+            JsonOutputError::Pipeline(PipelineError::Runtime(_))
+        ));
+        assert_eq!(error.to_string(), "raw key runtime failure");
+        assert_eq!(out.chunks.last(), Some(&FIFTY_SPACES.to_vec()));
+        assert!(out.bytes.ends_with(b"[\n"));
+        assert_eq!(out.finishes, 0);
+    }
+
+    #[test]
+    fn ordered_qpdf_pdf_scalar_chunks_match_type_specific_write_json_literals() {
+        let cases = [
+            (Object::Null, vec![b"null".to_vec()]),
+            (Object::Boolean(true), vec![b"true".to_vec()]),
+            (Object::Boolean(false), vec![b"false".to_vec()]),
+            (Object::Integer(-42), vec![b"-42".to_vec()]),
+            (Object::Real(1.5), vec![b"1.5".to_vec()]),
+            (
+                Object::RealLiteral {
+                    value: 1.5,
+                    literal: b"1.500".to_vec(),
+                },
+                vec![b"1.500".to_vec()],
+            ),
+            (
+                Object::RealLiteral {
+                    value: 0.4,
+                    literal: b".400".to_vec(),
+                },
+                vec![b"0".to_vec(), b".400".to_vec()],
+            ),
+            (
+                Object::RealLiteral {
+                    value: -0.4,
+                    literal: b"-.400".to_vec(),
+                },
+                vec![b"-0.".to_vec(), b"400".to_vec()],
+            ),
+            (
+                Object::Name(b"Type".to_vec()),
+                vec![b"\"".to_vec(), b"/Type".to_vec(), b"\"".to_vec()],
+            ),
+            (
+                Object::Name(b"line\n".to_vec()),
+                vec![b"\"".to_vec(), b"/line\\n".to_vec(), b"\"".to_vec()],
+            ),
+            (
+                Object::Name(b"\\\"\x08\x0c\n\r\t\x01\x1f".to_vec()),
+                vec![
+                    b"\"".to_vec(),
+                    b"/\\\\\\\"\\b\\f\\n\\r\\t\\u0001\\u001f".to_vec(),
+                    b"\"".to_vec(),
+                ],
+            ),
+            (
+                Object::Name(vec![0xff]),
+                vec![b"\"n:".to_vec(), b"/#ff".to_vec(), b"\"".to_vec()],
+            ),
+            (
+                Object::String(b"hello".to_vec()),
+                vec![b"\"u:".to_vec(), b"hello".to_vec(), b"\"".to_vec()],
+            ),
+            (
+                Object::String(vec![0x01]),
+                vec![b"\"b:".to_vec(), b"01".to_vec(), b"\"".to_vec()],
+            ),
+            (
+                Object::Reference(crate::ObjectRef::new(2, 0)),
+                vec![b"\"".to_vec(), b"2 0 R".to_vec(), b"\"".to_vec()],
+            ),
+            (
+                Object::Reference(crate::ObjectRef::new(0, 0)),
+                vec![b"null".to_vec()],
+            ),
+            (Object::Operator(b"cm".to_vec()), vec![b"null".to_vec()]),
+            (
+                Object::InlineImage(b"BI ID EI".to_vec()),
+                vec![b"null".to_vec()],
+            ),
+        ];
+
+        for (object, expected_chunks) in cases {
+            let mut pdf = empty_pdf();
+            let value = super::ordered_qpdf_object(&mut pdf, &object).unwrap();
+            let mut out = FailOnExactChunk {
+                bytes: Vec::new(),
+                chunks: Vec::new(),
+                fail_on: b"not a qpdf chunk",
+                category: ErrorCategory::Runtime,
+                finishes: 0,
+            };
+
+            value.write(&mut out, 0).unwrap();
+
+            assert_eq!(out.chunks, expected_chunks, "object={object:?}");
+            assert_eq!(out.finishes, 0, "object={object:?}");
+        }
+    }
+
+    #[test]
+    fn ordered_qpdf_pdf_scalar_failure_keeps_type_prefix_category_and_no_finish() {
+        let cases = [
+            (
+                Object::Name(b"Type".to_vec()),
+                b"/Type".as_slice(),
+                ErrorCategory::Logic,
+                b"\"".as_slice(),
+                "raw key logic failure",
+            ),
+            (
+                Object::String(b"hello".to_vec()),
+                b"hello".as_slice(),
+                ErrorCategory::Runtime,
+                b"\"u:".as_slice(),
+                "raw key runtime failure",
+            ),
+            (
+                Object::Reference(crate::ObjectRef::new(2, 0)),
+                b"2 0 R".as_slice(),
+                ErrorCategory::Logic,
+                b"\"".as_slice(),
+                "raw key logic failure",
+            ),
+            (
+                Object::RealLiteral {
+                    value: 0.4,
+                    literal: b".400".to_vec(),
+                },
+                b".400".as_slice(),
+                ErrorCategory::Runtime,
+                b"0".as_slice(),
+                "raw key runtime failure",
+            ),
+        ];
+
+        for (object, fail_on, category, expected_prefix, expected_message) in cases {
+            let mut pdf = empty_pdf();
+            let value = super::ordered_qpdf_object(&mut pdf, &object).unwrap();
+            let mut out = FailOnExactChunk {
+                bytes: Vec::new(),
+                chunks: Vec::new(),
+                fail_on,
+                category,
+                finishes: 0,
+            };
+
+            let error = value.write(&mut out, 0).unwrap_err();
+
+            assert_eq!(error.to_string(), expected_message, "object={object:?}");
+            match category {
+                ErrorCategory::Logic => assert!(matches!(
+                    error,
+                    JsonOutputError::Pipeline(PipelineError::Logic(_))
+                )),
+                ErrorCategory::Runtime => assert!(matches!(
+                    error,
+                    JsonOutputError::Pipeline(PipelineError::Runtime(_))
+                )),
+            }
+            assert_eq!(out.bytes, expected_prefix, "object={object:?}");
+            assert_eq!(out.finishes, 0, "object={object:?}");
+        }
+    }
+
+    #[test]
+    fn ordered_qpdf_dictionary_key_chunks_split_utf8_and_non_utf8_literals() {
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(b"A", Object::Integer(1));
+        dictionary.insert(b"line\n", Object::Integer(2));
+        dictionary.insert(vec![0xff], Object::Integer(3));
+        let mut pdf = empty_pdf();
+        let value = super::ordered_qpdf_object(&mut pdf, &Object::Dictionary(dictionary)).unwrap();
+        let mut out = FailOnExactChunk {
+            bytes: Vec::new(),
+            chunks: Vec::new(),
+            fail_on: b"not a qpdf chunk",
+            category: ErrorCategory::Runtime,
+            finishes: 0,
+        };
+
+        value.write(&mut out, 0).unwrap();
+
+        assert_eq!(
+            out.chunks,
+            [
+                b"{".to_vec(),
+                b"\n  ".to_vec(),
+                b"\"".to_vec(),
+                b"/A".to_vec(),
+                b"\": ".to_vec(),
+                b"1".to_vec(),
+                b",\n  ".to_vec(),
+                b"\"".to_vec(),
+                b"/line\\n".to_vec(),
+                b"\": ".to_vec(),
+                b"2".to_vec(),
+                b",\n  ".to_vec(),
+                b"\"n:".to_vec(),
+                b"/#ff".to_vec(),
+                b"\": ".to_vec(),
+                b"3".to_vec(),
+                b"\n".to_vec(),
+                b"}".to_vec(),
+            ]
+        );
+        assert_eq!(
+            out.bytes,
+            b"{\n  \"/A\": 1,\n  \"/line\\n\": 2,\n  \"n:/#ff\": 3\n}"
+        );
+        assert_eq!(out.finishes, 0);
+    }
+
+    #[test]
     fn ordered_qpdf_nested_dictionary_keys_use_qpdf_write_chunks() {
         let mut inner = Dictionary::new();
         inner.insert(b"\"", Object::Integer(1));
@@ -3686,8 +4262,10 @@ mod tests {
                 b"/A".to_vec(),
                 b"\": ".to_vec(),
                 b"2".to_vec(),
-                b"\n  }".to_vec(),
-                b"\n}".to_vec(),
+                b"\n  ".to_vec(),
+                b"}".to_vec(),
+                b"\n".to_vec(),
+                b"}".to_vec(),
             ]
         );
         assert_eq!(
@@ -3712,16 +4290,26 @@ mod tests {
 
         trailer.write(&mut out, 4).unwrap();
 
-        let root_key = [b"\"".to_vec(), b"/Root".to_vec(), b"\": ".to_vec()];
-        assert!(out
-            .chunks
-            .windows(root_key.len())
-            .any(|window| window == root_key));
-        let size_key = [b"\"".to_vec(), b"/Size".to_vec(), b"\": ".to_vec()];
-        assert!(out
-            .chunks
-            .windows(size_key.len())
-            .any(|window| window == size_key));
+        assert_eq!(
+            out.chunks,
+            [
+                b"{".to_vec(),
+                b"\n          ".to_vec(),
+                b"\"".to_vec(),
+                b"/Root".to_vec(),
+                b"\": ".to_vec(),
+                b"\"".to_vec(),
+                b"1 0 R".to_vec(),
+                b"\"".to_vec(),
+                b",\n          ".to_vec(),
+                b"\"".to_vec(),
+                b"/Size".to_vec(),
+                b"\": ".to_vec(),
+                b"2".to_vec(),
+                b"\n        ".to_vec(),
+                b"}".to_vec(),
+            ]
+        );
         assert_eq!(
             out.bytes,
             b"{\n          \"/Root\": \"1 0 R\",\n          \"/Size\": 2\n        }"
@@ -3731,15 +4319,15 @@ mod tests {
 
     #[test]
     fn ordered_qpdf_key_suffix_error_keeps_exact_prefix_and_category() {
-        let value = OrderedPdfJson::Dictionary(vec![(
-            b"line\n".to_vec(),
-            OrderedPdfJson::Json(Json::make_int(1)),
-        )]);
-
         for (category, expected_message) in [
             (ErrorCategory::Logic, "raw key logic failure"),
             (ErrorCategory::Runtime, "raw key runtime failure"),
         ] {
+            let mut dictionary = Dictionary::new();
+            dictionary.insert(b"line\n", Object::Integer(1));
+            let mut pdf = empty_pdf();
+            let value =
+                super::ordered_qpdf_object(&mut pdf, &Object::Dictionary(dictionary)).unwrap();
             let mut out = FailOnExactChunk {
                 bytes: Vec::new(),
                 chunks: Vec::new(),
@@ -3767,11 +4355,11 @@ mod tests {
                     b"{".to_vec(),
                     b"\n  ".to_vec(),
                     b"\"".to_vec(),
-                    b"line\\n".to_vec(),
+                    b"/line\\n".to_vec(),
                     b"\": ".to_vec(),
                 ]
             );
-            assert_eq!(out.bytes, b"{\n  \"line\\n");
+            assert_eq!(out.bytes, b"{\n  \"/line\\n");
             assert_eq!(out.finishes, 0);
         }
     }

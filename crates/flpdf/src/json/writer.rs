@@ -5,7 +5,7 @@
 
 use crate::pipeline::{Base64Action, Pipeline, PipelineResult, PlBase64, PlConcatenate, PlString};
 
-use super::value::{encode_string, ContainerOrBlobSnapshot, ValueSnapshot};
+use super::value::{ContainerOrBlobSnapshot, ValueSnapshot};
 use super::Json;
 
 impl Json {
@@ -68,18 +68,6 @@ impl Json {
         item.extend_from_slice(encoded_key);
         item.extend_from_slice(b"\": ");
         out.write(&item)
-    }
-
-    pub(crate) fn write_qpdf_dictionary_key(
-        out: &mut dyn Pipeline,
-        first: &mut bool,
-        key: &[u8],
-        depth: usize,
-    ) -> PipelineResult<()> {
-        Self::write_next(out, first, depth)?;
-        out.write(b"\"")?;
-        out.write(&encode_string(key))?;
-        out.write(b"\": ")
     }
 
     pub fn write_array_item(
