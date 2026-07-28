@@ -5,8 +5,8 @@
 **Goal:** qtest `basic-parsing.test` の 21 件の `test_driver N goodM.pdf` subtest を救済する。
 現状はいずれも `TestDriver->runtest: unable to run command` / exit 2 で FAIL している。
 
-**Beads:** flpdf-n9t0.2（実装）/ flpdf-n9t0.3（shim）/ flpdf-n9t0.4（前提バグ）/ flpdf-n9t0.5（前提 chore）。
-親 epic は flpdf-n9t0。
+**Beads:** flpdf-n9t0.2（実装）/ flpdf-n9t0.3（shim）/ flpdf-n9t0.4（前提バグ、PR #584 で完了）/
+flpdf-n9t0.5（前提 chore）。親 epic は flpdf-n9t0。
 
 **Oracle:** qpdf v11.9.0 `qpdf/test_driver.cc`（`test_0_1` = 20 件、`test_3` = good14 の 1 件）。
 本物の `test_driver` バイナリで `good1.out` / `good21.out` の再現を実測確認済み。
@@ -37,26 +37,35 @@ flpdf-n9t0.4 (P1 bug)          flpdf-n9t0.5 (chore)
 ```
 
 n9t0.4 と n9t0.5 は互いに独立で並行可。bd 側に `blocked-by` を張ってあるので
-`bd ready` には 4 と 5 だけが出る。
+`bd ready` には 4 と 5 だけが出る。**n9t0.4 は PR #584（`b7bfbad9`）でマージ済み**
+なので、残る前提は n9t0.5 だけ。
 
-### 1.1 なぜ n9t0.4 が前提なのか
+### 1.1 なぜ n9t0.4 が前提だったのか
 
-`Object::write_pdf` は qpdf の `QPDFObjectHandle::unparse` と一致していない。
-`crates/flpdf/src/object.rs:697` の `is_printable_string` は「全バイトが `0x20..=0x7e`」で
-hex/literal を選ぶが、qpdf の `QPDF_String::useHexString`（`libqpdf/QPDF_String.cc:72-90`）は
+`Object::write_pdf` は qpdf の `QPDFObjectHandle::unparse` と一致していなかった。
+`crates/flpdf/src/object.rs` の `is_printable_string` は「全バイトが `0x20..=0x7e`」で
+hex/literal を選んでいたが、qpdf の `QPDF_String::useHexString`（`libqpdf/QPDF_String.cc:72-90`）は
 
 - `\b \t \n \f \r` を hex 強制の対象にしない（リテラル内でエスケープする）
 - 非 ASCII は `5 * non_ascii > len` の閾値を超えたときだけ hex にする
+- 閾値を生き延びたが ISO-Latin-1 印字不可なバイトは 3 桁 8 進エスケープにする
 
 実測（qpdf 11.9.0 vs flpdf @ eef2bbc4、`flpdf rewrite --static-id` と `qpdf --static-id`）:
 
-| 入力の文字列 | qpdf | flpdf |
+| 入力の文字列 | qpdf | flpdf（修正前） |
 |---|---|---|
 | `(a\nb)` | `(a\nb)` | `<610a62>` |
 | 24 バイト中 2 バイトが非 ASCII | `(caf<C3><A9> latte and teas xyz)` | `<636166c3a9…>` |
 
-`good13` の QDF 差分はこの 2 箇所と、その帰結である xref オフセットの一律 +4 ずれだけ。
-したがって n9t0.4 の修正で basic-parsing の subtest 38 / 39 が byte-identical になる見込み。
+`good13` の QDF 差分はこの 2 箇所と、その帰結である xref オフセットの一律 +4 ずれだけだった。
+
+**修正後の実測**（`b7bfbad9`）: `good1..good21` を `qpdf --static-id -qdf` と
+`flpdf rewrite --qdf --static-id` で比較したとき byte-identical な数が
+good{1,5,6,8,12,20,21} の **7 件**から good{1,5,6,8,**9**,12,**13**,20,21} の
+**9 件**になった。good9（string）と good13（nesting, strings, names）が反転し、
+既に一致していたものの回帰はゼロ。実装は `use_hex_string` として
+`QPDF_String::useHexString` を移植し、リテラル側に 5 文字のエスケープと 8 進
+フォールバックを追加したもの。
 
 ## 2. crate レイアウト
 
@@ -184,8 +193,9 @@ from a dictionary returns the null object"）。これが subtest 1 "implicit nu
 flpdf の `Object` には 0/1/13/14 に相当する variant が無いので、enum の判別子ではなく
 明示テーブルで書く。
 
-**`unparse` / `unparse_resolved`** — n9t0.4 修正後の `Object::write_pdf` を再利用し、
-**stream だけ特例**（`QPDF_Stream::unparse` は間接参照を返す。`good12` の
+**`unparse` / `unparse_resolved`** — `Object::write_pdf` を再利用し（n9t0.4 で
+qpdf の `unparse` と一致済み）、**stream だけ特例**（`QPDF_Stream::unparse` は
+間接参照を返す。`good12` の
 `unparseResolved: 7 0 R` が根拠）。入れ子は解決しない — `good21` の
 `[ /literal null /indirect 8 0 R /undefined 10 0 R ]` の通り配列要素の参照は `N G R` のまま残り、
 これは `write_pdf` の `Object::Reference` 分岐と一致する。
@@ -213,7 +223,7 @@ unparseResolved: <…>
 
 この 20 subtest は既存の flpdf 公開 API だけで完結する — `Pdf::open_mem` / `trailer()` /
 `resolve_borrowed()` / `Stream { pub dict, pub data }` / `decode_stream_data` /
-n9t0.4 修正後の `write_pdf`。
+`write_pdf`。
 
 ## 6. `test_3` は n9t0.2 から切り出す
 
@@ -277,23 +287,30 @@ tests/fixtures/test_driver/
 ### 7.1 カバレッジ
 
 `flpdf-qtest-tools` は `scripts/patch-coverage.sh` の `REPORT_PREFIXES`（報告のみ）。
-一方 **n9t0.4 は `crates/flpdf/src/` を触るので変更行 100% ゲートの対象**。
+一方 **n9t0.4 は `crates/flpdf/src/` を触ったので変更行 100% ゲートの対象**だった
+（変更 82 行 / 未カバー 0 で PASS）。
 
 ## 8. 残るリスク
 
-1. **n9t0.4 に既存のセーフティネットが無い。** `cargo test --workspace
-   --features qpdf-zlib-compat --no-fail-fast` は 132 テストバイナリすべて緑
-   （2026-07-29 実測）。つまり既存 golden はどれもこの経路を通っていない。
-   修正と同時に回帰網を作らないと、次に壊れたとき誰も気づかない。
-2. **n9t0.5 のクロスリポジトリ順序。** flpdf-qtest の
+1. **n9t0.5 のクロスリポジトリ順序。** flpdf-qtest の
    `scripts/run.sh:84` と `.github/workflows/ci.yml:81` が
    `cargo build --release -p flpdf-test-compare` と package 名を直に書いている。
    flpdf-qtest 側を先にマージしないと CI に破断ウィンドウができる。
-3. **`write_pdf` と `QPDFObjectHandle::unparse` の一致は全網羅では未検証。**
+2. **`write_pdf` と `QPDFObjectHandle::unparse` の一致は全網羅では未検証。**
    real / name / dict / array は good7/8/10/11/13/15/21 で実測一致を確認したが、
    本当の担保は probe で全 fixture を突き合わせること。
-4. **good13 の subtest 38/39 が n9t0.4 で緑になるのは見込み。** QDF 差分がそれだけで
-   あることは確認済みだが、qtest 実走までは確定ではない。
+3. **basic-parsing の subtest 38 / 39 が緑になるかは未確認。** n9t0.4 で good13 の
+   QDF 出力が qpdf と byte-identical になることは確認したが、qtest 実走で subtest の
+   判定まで見たわけではない。n9t0.3 の shim 設置時に併せて確認する。
+
+### 8.1 解消済み
+
+- ~~**n9t0.4 に既存のセーフティネットが無い。**~~ 着手前の実測では
+  `cargo test --workspace --features qpdf-zlib-compat --no-fail-fast` が 132
+  テストバイナリすべて緑で、既存 golden はどれも当該経路を通っていなかった。
+  n9t0.4 で qpdf オラクル由来の 9 テスト（境界値・hex 強制・8 進フォールバックを含む）
+  を新設して解消。
+- ~~**good13 の QDF が緑になるのは見込み。**~~ `b7bfbad9` で byte-identical を確認済み。
 
 ## 9. スコープ外
 
