@@ -510,13 +510,13 @@ mod tests {
                     bytes.extend(0_u8..128);
                     bytes
                 }
-                129 => {
+                other => {
+                    assert_eq!(other, 129);
                     let mut bytes = vec![0x7f];
                     bytes.extend(0_u8..128);
                     bytes.extend([0x00, 0x80]);
                     bytes
                 }
-                _ => unreachable!(),
             };
             expected.push(0x80);
 
@@ -559,13 +559,13 @@ mod tests {
                     bytes.extend([0xff, 127]);
                     bytes
                 }
-                129 => {
+                other => {
+                    assert_eq!(other, 129);
                     let mut bytes = vec![0x7f];
                     bytes.extend(0_u8..128);
                     bytes.extend([0xff, 128]);
                     bytes
                 }
-                _ => unreachable!(),
             };
             expected.push(0x80);
 
