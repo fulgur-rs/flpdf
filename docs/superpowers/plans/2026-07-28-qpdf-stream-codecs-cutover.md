@@ -1160,17 +1160,19 @@ Run:
 
 ```bash
 rg -n \
-  'ascii85::decode|ascii_hex::decode|run_length::(decode|encode)|pub\\(crate\\) fn decode' \
+  'ascii85::decode|ascii_hex::decode|run_length::(decode|encode)' \
   crates/flpdf/src
+rg -n 'pub\\(crate\\) fn decode\\(' \
+  crates/flpdf/src/ascii85.rs crates/flpdf/src/ascii_hex.rs
 rg -n 'mod run_length' crates/flpdf/src
 rg -n 'ascii85::encode|ascii_hex::encode|encode_run_length' crates/flpdf/src
 ```
 
 Expected:
 
-- first command: no matches;
-- second command: only `pipeline.rs`;
-- third command: ASCII encoders occur only on write/test paths and
+- first two commands: no matches;
+- third command: only `pipeline.rs`;
+- fourth command: ASCII encoders occur only on write/test paths and
   `encode_run_length` is the sole production RunLength encoder.
 
 - [ ] **Step 6: Run focused and workspace tests**
@@ -1431,16 +1433,18 @@ Run:
 
 ```bash
 rg -n \
-  'ascii85::decode|ascii_hex::decode|run_length::(decode|encode)|pub\\(crate\\) fn decode' \
+  'ascii85::decode|ascii_hex::decode|run_length::(decode|encode)' \
   crates/flpdf/src
+rg -n 'pub\\(crate\\) fn decode\\(' \
+  crates/flpdf/src/ascii85.rs crates/flpdf/src/ascii_hex.rs
 rg -n 'mod run_length' crates/flpdf/src
 git diff --check main...HEAD
 git diff --name-status main...HEAD
 ```
 
-Expected: no old decoder/helper matches; only the Pipeline RunLength module;
-no whitespace errors; only files listed by this plan plus the approved design
-and plan documents.
+Expected: no old decoder/helper or whole-buffer decoder definition matches;
+only the Pipeline RunLength module; no whitespace errors; only files listed by
+this plan plus the approved design and plan documents.
 
 - [ ] **Step 4: Run formatting, lint, and strict rustdoc**
 

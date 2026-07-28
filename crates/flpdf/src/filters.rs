@@ -7,7 +7,8 @@ use crate::pipeline::{PipelineError, PipelineResult};
 #[cfg(test)]
 use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
-    decode_filter_specs, encode_flate, stream_filter_for, DECODE_OUTPUT_LIMIT_PREFIX,
+    decode_filter_specs, encode_flate, encode_run_length, stream_filter_for,
+    DECODE_OUTPUT_LIMIT_PREFIX,
 };
 use crate::{Dictionary, Error, Object, Result};
 
@@ -743,7 +744,7 @@ fn apply_single_filter_encode(
     }
 
     if filter_name == b"RunLengthDecode" {
-        return Ok(crate::run_length::encode(stream_data));
+        return encode_run_length(stream_data).map_err(|error| error.to_string());
     }
 
     // LZWEncode is not supported: flpdf writes stream compression as FlateDecode only
@@ -1041,6 +1042,26 @@ mod tests {
         let mut dict = Dictionary::new();
         dict.insert("Filter", Object::Name(b"RunLengthDecode".to_vec()));
         dict
+    }
+
+    #[test]
+    fn encode_stream_data_run_length_qpdf_packets() {
+        let dict = run_length_dict();
+
+        assert_eq!(
+            encode_stream_data(&dict, b"AA").unwrap(),
+            [0xff, b'A', 0x80]
+        );
+
+        for length in [127, 128, 129] {
+            let plaintext = vec![b'R'; length];
+            let encoded = encode_stream_data(&dict, &plaintext).unwrap();
+            assert_eq!(
+                decode_stream_data(&dict, &encoded).unwrap(),
+                plaintext,
+                "length: {length}"
+            );
+        }
     }
 
     #[test]

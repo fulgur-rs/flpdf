@@ -362,15 +362,30 @@ pub(crate) fn encode_flate(data: &[u8]) -> Result<Vec<u8>> {
     sink.take_buffer().map_err(map_pipeline_error)
 }
 
+pub(crate) fn encode_run_length(data: &[u8]) -> Result<Vec<u8>> {
+    let mut sink = Buffer::new("stream data buffer", None);
+    {
+        let mut stage = RunLength::new("compress stream", &mut sink, RunLengthAction::Encode);
+        stage.write(data).map_err(map_pipeline_error)?;
+        stage.finish().map_err(map_pipeline_error)?;
+    }
+    sink.take_buffer().map_err(map_pipeline_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_filter_specs, decode_flate, decode_flate_chunks, encode_flate, ignore_warning,
-        stream_filter_for, FlateStreamFilter, OutputBuffer, Pipeline, StreamFilter,
+        decode_filter_specs, decode_flate, decode_flate_chunks, encode_flate, encode_run_length,
+        ignore_warning, stream_filter_for, FlateStreamFilter, OutputBuffer, Pipeline, StreamFilter,
         DECODE_OUTPUT_LIMIT_PREFIX,
     };
     use crate::{Dictionary, Error, Object};
     use std::cell::RefCell;
+
+    #[test]
+    fn run_length_encoder_uses_qpdf_two_byte_run() {
+        assert_eq!(encode_run_length(b"AA").unwrap(), [0xff, b'A', 0x80]);
+    }
 
     #[test]
     fn scalar_decode_parms_are_reused_for_each_filter() {

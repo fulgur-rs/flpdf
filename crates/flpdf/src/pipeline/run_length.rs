@@ -2,7 +2,6 @@
 
 use super::{Pipeline, PipelineError, PipelineResult};
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RunLengthAction {
     Encode,
@@ -25,7 +24,6 @@ pub(crate) struct RunLength<'a> {
     buf: [u8; 128],
 }
 
-#[allow(dead_code)]
 impl<'a> RunLength<'a> {
     pub(crate) fn new(
         identifier: impl Into<String>,
