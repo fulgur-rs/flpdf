@@ -54,9 +54,11 @@ impl RecordingSink {
 }
 
 impl Pipeline for RecordingSink {
+    // cov:ignore-start: identifier is a trait obligation; stages do not query downstream identifiers
     fn identifier(&self) -> &str {
         "recording"
     }
+    // cov:ignore-end
 
     fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
         self.write_attempts += 1;

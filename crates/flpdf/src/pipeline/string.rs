@@ -38,7 +38,7 @@ impl Pipeline for PlString<'_> {
     fn finish(&mut self) -> PipelineResult<()> {
         if let Some(next) = self.next.as_deref_mut() {
             next.finish()?;
-        }
+        } // cov:ignore: llvm-cov gap-region artifact; successful downstream finish is asserted by trace
         Ok(())
     }
 }
