@@ -7,7 +7,7 @@
 
 use crate::json::{Json, QpdfStdioWriter};
 use crate::object::{Dictionary, Object, ObjectRef, Stream};
-use crate::pipeline::{Pipeline, PipelineError};
+use crate::pipeline::{Pipeline, PipelineError, PlOStream};
 use crate::reader::Pdf;
 use std::borrow::Cow;
 use std::fs::File;
@@ -61,6 +61,14 @@ pub enum JsonOutputError {
         #[source]
         source: std::io::Error,
     },
+}
+
+/// Ordinary output handle supplied at the qpdf JSON command boundary.
+pub enum JsonOutput<'a> {
+    /// Standard output, which is finished at the command boundary.
+    Stdout(&'a mut dyn Write),
+    /// A top-level output file, whose terminal stage is not explicitly finished.
+    File(&'a mut dyn Write),
 }
 
 fn side_file_io_error(
@@ -2958,6 +2966,47 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
     Ok(())
 }
 
+/// Write selected qpdf JSON v2 output to an ordinary command-boundary handle.
+///
+/// Standard output finishes its terminal stage so buffered output is flushed at
+/// the command boundary. A top-level file intentionally leaves the stage
+/// unfinished, matching qpdf's file-output lifecycle.
+pub fn write_qpdf_json_v2_selected_objects_to_output_with_options<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    decode_level: DecodeLevel,
+    stream_mode: &StreamDataMode,
+    keys: &[JsonKey],
+    objects: &[JsonObjectSelector],
+    output: JsonOutput<'_>,
+) -> Result<(), JsonOutputError> {
+    match output {
+        JsonOutput::Stdout(writer) => {
+            let mut terminal = PlOStream::new("json output", writer);
+            write_qpdf_json_v2_selected_objects_with_options(
+                pdf,
+                decode_level,
+                stream_mode,
+                keys,
+                objects,
+                &mut terminal,
+            )?;
+            terminal.finish()?;
+            Ok(())
+        }
+        JsonOutput::File(writer) => {
+            let mut terminal = PlOStream::new("json output", writer);
+            write_qpdf_json_v2_selected_objects_with_options(
+                pdf,
+                decode_level,
+                stream_mode,
+                keys,
+                objects,
+                &mut terminal,
+            )
+        }
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3002,6 +3051,24 @@ mod tests {
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FlushProbe {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl std::io::Write for FlushProbe {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
             Ok(())
         }
     }
@@ -3297,6 +3364,126 @@ mod tests {
             .enumerate()
             .filter_map(|(position, window)| (window == needle).then_some(position))
             .collect()
+    }
+
+    #[test]
+    fn coordinator_stdout_matches_raw_pipeline_bytes() {
+        let mut expected_pdf = load_one_page_pdf();
+        let expected = write_selected_to_vec(
+            &mut expected_pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Pages],
+            &[],
+        )
+        .unwrap();
+        let mut actual_pdf = load_one_page_pdf();
+        let mut actual = Vec::new();
+
+        write_qpdf_json_v2_selected_objects_to_output_with_options(
+            &mut actual_pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Pages],
+            &[],
+            JsonOutput::Stdout(&mut actual),
+        )
+        .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn coordinator_file_matches_raw_pipeline_bytes() {
+        let mut expected_pdf = load_one_page_pdf();
+        let expected = write_selected_to_vec(
+            &mut expected_pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Pages],
+            &[],
+        )
+        .unwrap();
+        let mut actual_pdf = load_one_page_pdf();
+        let mut actual = Vec::new();
+
+        write_qpdf_json_v2_selected_objects_to_output_with_options(
+            &mut actual_pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Pages],
+            &[],
+            JsonOutput::File(&mut actual),
+        )
+        .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn coordinator_stdout_flushes_at_command_boundary() {
+        let mut pdf = load_one_page_pdf();
+        let mut output = FlushProbe::default();
+
+        write_qpdf_json_v2_selected_objects_to_output_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Pages],
+            &[],
+            JsonOutput::Stdout(&mut output),
+        )
+        .unwrap();
+
+        assert_eq!(output.flushes, 1);
+    }
+
+    #[test]
+    fn coordinator_file_does_not_explicitly_flush() {
+        let mut pdf = load_one_page_pdf();
+        let mut output = FlushProbe::default();
+
+        write_qpdf_json_v2_selected_objects_to_output_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Pages],
+            &[],
+            JsonOutput::File(&mut output),
+        )
+        .unwrap();
+
+        assert_eq!(output.flushes, 0);
+    }
+
+    #[test]
+    fn coordinator_ostream_failure_is_nonfatal_and_preserves_prefix() {
+        let mut expected_pdf = load_one_page_pdf();
+        let expected = write_selected_to_vec(
+            &mut expected_pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Pages],
+            &[],
+        )
+        .unwrap();
+        let mut pdf = load_one_page_pdf();
+        let mut output = FailAfterWriter {
+            remaining: 24,
+            bytes: Vec::new(),
+        };
+
+        write_qpdf_json_v2_selected_objects_to_output_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Pages],
+            &[],
+            JsonOutput::Stdout(&mut output),
+        )
+        .unwrap();
+
+        assert_eq!(output.bytes, expected[..24]);
     }
 
     #[test]

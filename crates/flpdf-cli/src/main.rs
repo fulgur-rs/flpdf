@@ -16,8 +16,8 @@ use flpdf::{
     flatten_annotations, flatten_rotation_on_pages, fonts, generate_button_field_appearance,
     generate_choice_field_appearance, generate_text_field_appearance,
     json_inspect::{
-        write_qpdf_json_v2_selected_objects_with_options, DecodeLevel, JsonKey, JsonObjectSelector,
-        JsonOutputError, StreamDataMode as JsonStreamDataMode,
+        write_qpdf_json_v2_selected_objects_to_output_with_options, DecodeLevel, JsonKey,
+        JsonObjectSelector, JsonOutput, StreamDataMode as JsonStreamDataMode,
     },
     linearization::{
         check_linearization_path, show_linearization_path, write_linearized,
@@ -1988,19 +1988,19 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     // 6. Write JSON incrementally.
     //
     // `decode_level` governs both inline `data` payloads and file-mode side files
-    // emitted by write_qpdf_json_v2_selected_objects_with_options.
+    // emitted by write_qpdf_json_v2_selected_objects_to_output_with_options.
     let decode_level = DecodeLevel::Generalized;
     let diagnostics_start = pdf.repair_diagnostics().entries().len();
     let had_open_warnings = diagnostics_start > 0;
     let json_result = if let Some(ref path) = cli.json_output {
         match open_verified_json_output(&input_identity, path) {
-            Ok(mut file) => write_qpdf_json_v2_selected_objects_with_options(
+            Ok(mut file) => write_qpdf_json_v2_selected_objects_to_output_with_options(
                 &mut pdf,
                 decode_level,
                 &stream_mode,
                 &json_keys,
                 &json_objects,
-                &mut file,
+                JsonOutput::File(&mut file),
             ),
             Err(error) => {
                 emit_warnings_since(input, &pdf, diagnostics_start);
@@ -2010,21 +2010,14 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     } else {
         let stdout = std::io::stdout();
         let mut locked = stdout.lock();
-        let write_result: Result<(), JsonOutputError> =
-            write_qpdf_json_v2_selected_objects_with_options(
-                &mut pdf,
-                decode_level,
-                &stream_mode,
-                &json_keys,
-                &json_objects,
-                &mut locked,
-            );
-        let flush_result = locked.flush().map_err(JsonOutputError::from);
-        match (write_result, flush_result) {
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error), // cov:ignore: real stdout flush failure cannot be induced in-process
-            (Ok(()), Ok(())) => Ok(()),
-        }
+        write_qpdf_json_v2_selected_objects_to_output_with_options(
+            &mut pdf,
+            decode_level,
+            &stream_mode,
+            &json_keys,
+            &json_objects,
+            JsonOutput::Stdout(&mut locked),
+        )
     };
     match json_result {
         Ok(()) => {}
@@ -4016,7 +4009,7 @@ fn pages_progress_filename(p: &std::path::Path) -> String {
 
 /// Run the `--pages` extraction pipeline.
 ///
-/// Pipeline order is fixed as follows:
+/// Processing order is fixed as follows:
 ///   1. page_combine / page_collate → selected ObjectRef list
 ///   2. page_tree_rebuild::rebuild_page_tree → RebuildResult
 ///   3. apply_rotate_to_pages (on the rebuilt OUTPUT leaves; qpdf-observed)

@@ -183,6 +183,58 @@ fn json_flag_outputs_json_to_stdout() {
         .stderr(predicate::str::is_empty());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn json_stdout_to_dev_full_matches_qpdf_success() {
+    use std::fs::File;
+    use std::process::Stdio;
+
+    if !is_qpdf_available() {
+        return;
+    }
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--json=2"])
+        .arg(input.path())
+        .stdout(Stdio::from(File::create("/dev/full").unwrap()))
+        .output()
+        .unwrap();
+    let flpdf = ShellCommand::new(assert_cmd::cargo_bin!("flpdf"))
+        .args(["--json=2"])
+        .arg(input.path())
+        .stdout(Stdio::from(File::create("/dev/full").unwrap()))
+        .output()
+        .unwrap();
+    assert!(qpdf.status.success(), "{qpdf:?}");
+    assert!(flpdf.status.success(), "{flpdf:?}");
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn json_output_dev_full_matches_qpdf_success() {
+    if !is_qpdf_available() {
+        return;
+    }
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--json=2"])
+        .arg(input.path())
+        .arg("/dev/full")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--json-output=/dev/full"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(qpdf.status.success(), "{qpdf:?}");
+    assert!(flpdf.status.success(), "{flpdf:?}");
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
 #[test]
 fn json_fatal_preserves_partial_stdout() {
     let input = write_temp_pdf(&short_name_tree_pair_pdf());
