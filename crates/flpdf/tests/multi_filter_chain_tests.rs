@@ -189,3 +189,29 @@ fn chain_null_decode_parms_is_ignored() {
         "bare null DecodeParms must be treated as no-op predictor"
     );
 }
+
+#[test]
+fn scalar_decode_parms_are_reused_across_public_multi_filter_round_trip() {
+    let raw = b"scalar DecodeParms must reach every declared filter";
+    let mut params = Dictionary::new();
+    params.insert("Predictor", Object::Integer(12));
+    params.insert("Columns", Object::Integer(1));
+    params.insert("Colors", Object::Integer(1));
+    params.insert("BitsPerComponent", Object::Integer(8));
+
+    let mut dict = Dictionary::new();
+    dict.insert(
+        "Filter",
+        Object::Array(vec![
+            Object::Name(b"ASCII85Decode".to_vec()),
+            Object::Name(b"FlateDecode".to_vec()),
+        ]),
+    );
+    dict.insert("DecodeParms", Object::Dictionary(params));
+
+    let encoded = filters::encode_stream_data(&dict, raw).expect("encode scalar parameter chain");
+    let decoded =
+        filters::decode_stream_data(&dict, &encoded).expect("decode scalar parameter chain");
+
+    assert_eq!(decoded, raw);
+}

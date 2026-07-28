@@ -23,7 +23,7 @@
 | `crates/flpdf/src/encrypt_setup.rs` | correspondence | QPDF_encryption.cc writer-side encryption configuration split from the security handler |
 | `crates/flpdf/src/error.rs` | correspondence | QPDFExc.cc and QPDFSystemError.cc concepts combined with flpdf-specific errors; public APIs are incomplete |
 | `crates/flpdf/src/filespec_helper.rs` | correspondence | QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc partial helper surface; public APIs are incomplete |
-| `crates/flpdf/src/filters.rs` | correspondence | Pl_Flate, Pl_LZWDecoder, predictor, and stream-filter responsibilities combined in one Rust pipeline |
+| `crates/flpdf/src/filters.rs` | correspondence | Pl_LZWDecoder, predictor, and not-yet-migrated stream-filter codec responsibilities; QPDFStreamFilter dispatch and Pl_Flate execution are delegated to stream_filter |
 | `crates/flpdf/src/fonts.rs` | correspondence | flpdf-only font-resource inspection surface |
 | `crates/flpdf/src/json/handler.rs` | correspondence | JSONHandler.cc recursive dispatch responsibilities with Rust shared ownership |
 | `crates/flpdf/src/json/message.rs` | correspondence | JSON.cc and JSONHandler.cc use byte-oriented std::string diagnostics |
@@ -104,6 +104,7 @@
 | `crates/flpdf/src/security/standard.rs` | correspondence | QPDF_encryption.cc Standard security handler algorithms split from writer setup |
 | `crates/flpdf/src/signatures.rs` | correspondence | QPDFAcroFormDocumentHelper.cc signature disabling and QPDF.cc restriction removal plus flpdf-only inspection |
 | `crates/flpdf/src/standard_font_metrics.rs` | correspondence | flpdf-only Standard 14 font metrics with no qpdf library component |
+| `crates/flpdf/src/stream_filter.rs` | correspondence | QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities |
 | `crates/flpdf/src/struct_tree_pg.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for structure elements |
 | `crates/flpdf/src/subset_prune.rs` | correspondence | QPDFPageObjectHelper.cc resource pruning plus QPDFWriter.cc full-rewrite reachability |
 | `crates/flpdf/src/thread_bead_p.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for article beads |

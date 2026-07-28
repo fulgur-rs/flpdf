@@ -1,12 +1,16 @@
-//! qpdf correspondence: Pl_Flate, Pl_LZWDecoder, predictor, and stream-filter responsibilities combined in one Rust pipeline.
+//! qpdf correspondence: Pl_LZWDecoder, predictor, and not-yet-migrated stream-filter codec responsibilities; QPDFStreamFilter dispatch and Pl_Flate execution are delegated to stream_filter.
+use std::borrow::Cow;
+
 use crate::ascii85;
 use crate::ascii_hex;
+use crate::pipeline::{PipelineError, PipelineResult};
 use crate::run_length;
+#[cfg(test)]
+use crate::stream_filter::expect_first_filter_input;
+use crate::stream_filter::{
+    decode_filter_specs, encode_flate, stream_filter_for, DECODE_OUTPUT_LIMIT_PREFIX,
+};
 use crate::{Dictionary, Error, Object, Result};
-use flate2::read::ZlibDecoder;
-use flate2::write::ZlibEncoder;
-use flate2::Compression;
-use std::io::{Read, Write};
 
 /// Maximum number of stages a `/Filter` chain may declare on the **decode**
 /// path. Real PDFs use at most a few stages; this rejects only pathological
@@ -17,10 +21,13 @@ use std::io::{Read, Write};
 const MAX_FILTER_CHAIN_LEN: usize = 16;
 
 pub(crate) fn validate_filter_chain_len(filters: &[Object]) -> Result<()> {
-    if filters.len() > MAX_FILTER_CHAIN_LEN {
+    validate_filter_chain_count(filters.len())
+}
+
+fn validate_filter_chain_count(count: usize) -> Result<()> {
+    if count > MAX_FILTER_CHAIN_LEN {
         return Err(Error::Unsupported(format!(
-            "filter chain length {} exceeds maximum of {MAX_FILTER_CHAIN_LEN}",
-            filters.len()
+            "filter chain length {count} exceeds maximum of {MAX_FILTER_CHAIN_LEN}"
         )));
     }
     Ok(())
@@ -62,11 +69,11 @@ pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
 /// - an implemented codec fails on malformed input — corrupt deflate, LZW,
 ///   ASCII85, ASCIIHex, or RunLength data, or a corrupt PNG-predictor stream.
 pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
-    decode_stream_data_with_filters(
-        dict.get("Filter"),
-        dict.get("DecodeParms"),
+    decode_stream_data_with_limits_and_warnings(
+        dict,
         stream_data,
         DecodeLimits::default(),
+        &mut reject_decode_warning,
     )
 }
 
@@ -87,12 +94,26 @@ pub struct DecodeLimits {
     pub max_output: Option<usize>,
 }
 
-/// Message prefix shared by every bounded-decode site that aborts because the
-/// decoded output would exceed [`DecodeLimits::max_output`]. Producers build
-/// their message as `"{DECODE_OUTPUT_LIMIT_PREFIX} {limit} bytes"`, and
-/// [`is_decode_output_limit_error`] matches on this prefix. Keeping both on one
-/// constant stops the message and the matcher from drifting apart.
-pub(crate) const DECODE_OUTPUT_LIMIT_PREFIX: &str = "decoded output exceeds configured limit of";
+fn reject_decode_warning(message: &str, code: i32) -> PipelineResult<()> {
+    Err(PipelineError::runtime(format!(
+        "stream inflate: {message} (zlib error {code})"
+    )))
+}
+
+pub(crate) fn decode_stream_data_with_limits_and_warnings(
+    dict: &Dictionary,
+    stream_data: &[u8],
+    limits: DecodeLimits,
+    warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+) -> Result<Vec<u8>> {
+    decode_stream_data_with_filters(
+        dict.get("Filter"),
+        dict.get("DecodeParms"),
+        stream_data,
+        limits,
+        warn,
+    )
+}
 
 /// Returns `true` when `error` is the limit-exceeded signal raised when a
 /// `FlateDecode`/`LZWDecode` stage aborts because its output would exceed
@@ -122,11 +143,11 @@ pub fn decode_stream_data_with_limits(
     stream_data: &[u8],
     limits: DecodeLimits,
 ) -> Result<Vec<u8>> {
-    decode_stream_data_with_filters(
-        dict.get("Filter"),
-        dict.get("DecodeParms"),
+    decode_stream_data_with_limits_and_warnings(
+        dict,
         stream_data,
         limits,
+        &mut reject_decode_warning,
     )
 }
 
@@ -149,6 +170,7 @@ fn decode_stream_data_with_filters(
     decode_params: Option<&Object>,
     stream_data: &[u8],
     limits: DecodeLimits,
+    warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
 ) -> Result<Vec<u8>> {
     decode_stream_data_with_filters_and_crypt(
         filter,
@@ -160,6 +182,7 @@ fn decode_stream_data_with_filters(
                 "unsupported stream filter: Crypt".to_string(),
             ))
         },
+        warn,
     )
 }
 
@@ -169,56 +192,48 @@ fn decode_stream_data_with_filters_and_crypt<F>(
     stream_data: &[u8],
     limits: DecodeLimits,
     decrypt_crypt: &mut F,
+    warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
 ) -> Result<Vec<u8>>
 where
     F: FnMut(Option<&Object>, &[u8]) -> Result<Vec<u8>>,
 {
-    match filter {
-        None => Ok(stream_data.to_vec()),
-        Some(filter) => {
-            if let Some(filter_name) = filter.as_name() {
-                if filter_name == b"Crypt" {
-                    return decrypt_crypt(get_decode_params(decode_params, 0), stream_data);
-                }
-                let params = get_decode_params(decode_params, 0);
-                let decoded =
-                    apply_single_filter_decode(filter_name, stream_data, params, limits.max_output)
-                        .map_err(Error::Unsupported)?;
-                return apply_decode_params(params, &decoded);
-            }
-
-            if let Some(filters) = filter.as_array() {
-                validate_filter_chain_len(filters)?;
-                let mut decoded = stream_data.to_vec();
-                for (index, filter) in filters.iter().enumerate() {
-                    let Some(filter_name) = filter.as_name() else {
-                        return Err(Error::Unsupported(
-                            "unsupported stream filter type: expected name".to_string(),
-                        ));
-                    };
-                    if filter_name == b"Crypt" {
-                        decoded = decrypt_crypt(get_decode_params(decode_params, index), &decoded)?;
-                    } else {
-                        let params = get_decode_params(decode_params, index);
-                        decoded = apply_single_filter_decode(
-                            filter_name,
-                            &decoded,
-                            params,
-                            limits.max_output,
-                        )
-                        .map_err(Error::Unsupported)?;
-                        decoded = apply_decode_params(params, &decoded)?;
-                    }
-                }
-                return Ok(decoded);
-            }
-
-            Err(Error::Unsupported(format!(
-                "unsupported stream filter syntax: {}",
-                object_debug_repr(filter)
-            )))
-        }
+    if let Some(Object::Array(filters)) = filter {
+        validate_filter_chain_len(filters)?;
     }
+    let specs = decode_filter_specs(filter, decode_params)?;
+    validate_filter_chain_count(specs.len())?;
+    let mut decoded = Cow::Borrowed(stream_data);
+    for spec in specs {
+        let filter_name = spec.normalized_name();
+        let next = if filter_name == b"Crypt" {
+            decrypt_crypt(spec.decode_params, decoded.as_ref())?
+        } else {
+            let stage = if let Some(mut filter) = stream_filter_for(filter_name) {
+                if !filter.set_decode_params(spec.decode_params) {
+                    return Err(Error::Unsupported(format!(
+                        "stream filter {} does not support supplied /DecodeParms",
+                        String::from_utf8_lossy(filter_name)
+                    )));
+                }
+                // qpdf validates DecodeParms before constructing or writing to
+                // the codec pipeline. Predictor migration remains in qynx.5.3,
+                // but its existing validation must retain that error timing.
+                extract_predictor_params(spec.decode_params)?;
+                filter.pipe_decode(decoded.as_ref(), limits.max_output, warn)?
+            } else {
+                apply_single_filter_decode(
+                    filter_name,
+                    decoded.as_ref(),
+                    spec.decode_params,
+                    limits.max_output,
+                )
+                .map_err(Error::Unsupported)?
+            };
+            apply_decode_params(spec.decode_params, &stage)?
+        };
+        decoded = Cow::Owned(next);
+    }
+    Ok(decoded.into_owned())
 }
 
 fn encode_stream_data_with_filters(
@@ -226,49 +241,20 @@ fn encode_stream_data_with_filters(
     decode_params: Option<&Object>,
     stream_data: &[u8],
 ) -> Result<Vec<u8>> {
-    match filter {
-        None => Ok(stream_data.to_vec()),
-        Some(filter) => {
-            if let Some(filter_name) = filter.as_name() {
-                let params = get_decode_params(decode_params, 0);
-                let after_predictor = apply_encode_params(params, stream_data)?;
-                return apply_single_filter_encode(filter_name, &after_predictor)
-                    .map_err(Error::Unsupported);
-            }
-
-            if let Some(filters) = filter.as_array() {
-                // ISO 32000-1 §7.4.2: the /Filter array names filters in *decode*
-                // order, so encoding must apply them in reverse for round-tripping.
-                let mut encoded = stream_data.to_vec();
-                for (index, filter) in filters.iter().enumerate().rev() {
-                    let Some(filter_name) = filter.as_name() else {
-                        return Err(Error::Unsupported(
-                            "unsupported stream filter type: expected name".to_string(),
-                        ));
-                    };
-                    let params = get_decode_params(decode_params, index);
-                    encoded = apply_encode_params(params, &encoded)?;
-                    encoded = apply_single_filter_encode(filter_name, &encoded)
-                        .map_err(Error::Unsupported)?;
-                }
-                return Ok(encoded);
-            }
-
-            Err(Error::Unsupported(format!(
-                "unsupported stream filter syntax: {}",
-                object_debug_repr(filter)
-            )))
-        }
+    let specs = decode_filter_specs(filter, decode_params)?;
+    // ISO 32000-1 §7.4.2: the /Filter array names filters in *decode*
+    // order, so encoding must apply them in reverse for round-tripping.
+    let mut encoded = stream_data.to_vec();
+    for spec in specs.into_iter().rev() {
+        let after_predictor = apply_encode_params(spec.decode_params, &encoded)?;
+        encoded = if spec.normalized_name() == b"FlateDecode" {
+            encode_flate(&after_predictor)?
+        } else {
+            apply_single_filter_encode(spec.normalized_name(), &after_predictor)
+                .map_err(Error::Unsupported)?
+        };
     }
-}
-
-fn get_decode_params(params: Option<&Object>, index: usize) -> Option<&Object> {
-    let param = params?;
-    if param.as_dict().is_some() {
-        Some(param)
-    } else {
-        param.as_array()?.get(index)
-    }
+    Ok(encoded)
 }
 
 fn integer_decode_param(params: &Dictionary, key: &str) -> Result<Option<i64>> {
@@ -584,32 +570,6 @@ fn apply_single_filter_decode(
     decode_params: Option<&Object>,
     max_output: Option<usize>,
 ) -> std::result::Result<Vec<u8>, String> {
-    if filter_name == b"FlateDecode" {
-        let mut decoded = Vec::new();
-        match max_output {
-            Some(limit) => {
-                // Bound the allocation during decode: a post-hoc length check
-                // cannot help because read_to_end would OOM first on a bomb.
-                // take(limit+1) lets output of exactly `limit` succeed while one
-                // byte over is read as truncated and rejected. saturating_add
-                // guards the (absurd) usize::MAX limit from overflowing.
-                ZlibDecoder::new(stream_data)
-                    .take((limit as u64).saturating_add(1))
-                    .read_to_end(&mut decoded)
-                    .map_err(|error| error.to_string())?;
-                if decoded.len() > limit {
-                    return Err(format!("{DECODE_OUTPUT_LIMIT_PREFIX} {limit} bytes"));
-                }
-            }
-            None => {
-                ZlibDecoder::new(stream_data)
-                    .read_to_end(&mut decoded)
-                    .map_err(|error| error.to_string())?;
-            }
-        }
-        return Ok(decoded);
-    }
-
     if filter_name == b"LZWDecode" {
         // EarlyChange (default 1 per PDF spec): when 1, the code width increases
         // one symbol *before* the table fills; when 0, it increases *after*.
@@ -789,15 +749,6 @@ fn apply_single_filter_encode(
     filter_name: &[u8],
     stream_data: &[u8],
 ) -> std::result::Result<Vec<u8>, String> {
-    if filter_name == b"FlateDecode" {
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder
-            .write_all(stream_data)
-            .map_err(|error| error.to_string())?;
-        let encoded = encoder.finish().map_err(|error| error.to_string())?;
-        return Ok(encoded);
-    }
-
     if filter_name == b"ASCII85Decode" {
         return Ok(ascii85::encode(stream_data));
     }
@@ -834,17 +785,6 @@ fn apply_single_filter_encode(
     ))
 }
 
-fn object_debug_repr(object: &Object) -> &'static str {
-    match object {
-        Object::Name(name) if name == b"FlateDecode" => "FlateDecode",
-        Object::Name(name) if name == b"ASCII85Decode" => "ASCII85Decode",
-        Object::Name(name) if name == b"ASCIIHexDecode" => "ASCIIHexDecode",
-        Object::Name(name) if name == b"LZWDecode" => "LZWDecode",
-        Object::Name(name) if name == b"RunLengthDecode" => "RunLengthDecode",
-        _ => "unsupported",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,6 +795,95 @@ mod tests {
         dict
     }
 
+    #[test]
+    fn decode_stream_data_accepts_qpdf_flate_abbreviation() {
+        let encoded = encode_stream_data(&flate_dict(), b"abbreviated filter").unwrap();
+        let mut abbreviated = Dictionary::new();
+        abbreviated.insert("Filter", Object::Name(b"Fl".to_vec()));
+
+        let decoded = decode_stream_data(&abbreviated, &encoded).unwrap();
+
+        assert_eq!(decoded, b"abbreviated filter");
+    }
+
+    #[test]
+    fn first_filter_borrows_the_callers_encoded_input() {
+        let input = b"borrowed first-stage input";
+        expect_first_filter_input(input);
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"TestBorrowedInput".to_vec()));
+
+        assert_eq!(decode_stream_data(&dict, input).unwrap(), input);
+    }
+
+    #[test]
+    fn decode_stream_data_rejects_misaligned_decode_parms_before_codec_runs() {
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"ASCII85Decode".to_vec()),
+            ]),
+        );
+        dict.insert("DecodeParms", Object::Array(vec![Object::Null]));
+
+        let error = decode_stream_data(&dict, b"not zlib").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream /DecodeParms length is inconsistent with filters"
+        );
+    }
+
+    #[test]
+    fn decode_stream_data_exposes_plflate_malformed_header_timing() {
+        let error = decode_stream_data(&flate_dict(), b"\x78\x00").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream inflate: inflate: data: incorrect header check"
+        );
+    }
+    #[test]
+    fn decode_stream_data_rejects_truncated_flate_warning() {
+        let error = decode_stream_data(&flate_dict(), b"\x78").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream inflate: \
+             input stream is complete but output may still be valid (zlib error -5)"
+        );
+    }
+
+    #[test]
+    fn invalid_flate_decode_params_fail_before_malformed_stream_data() {
+        let mut params = Dictionary::new();
+        params.insert("Predictor", Object::Integer(9));
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        dict.insert("DecodeParms", Object::Dictionary(params));
+
+        let error = decode_stream_data(&dict, b"not deflate data").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: unsupported /DecodeParms /Predictor 9"
+        );
+    }
+    #[test]
+    fn registered_filter_rejects_unsupported_decode_params_before_pipeline() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"TestRejectDecode".to_vec()));
+        dict.insert("DecodeParms", Object::Integer(1));
+
+        let error = decode_stream_data(&dict, b"not decoded").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream filter TestRejectDecode does not support supplied /DecodeParms"
+        );
+    }
     #[test]
     fn decode_stream_data_without_decryption_keeps_plaintext_behavior() {
         let dict = flate_dict();
@@ -1241,9 +1270,9 @@ mod tests {
     #[test]
     fn encode_stream_data_png_predictor_empty_input_round_trips_without_oom() {
         // Mirrors the reported DoS: empty stream data plus a PNG predictor with a
-        // huge /Columns. Encoding must succeed (Flate-wrapping the empty
-        // predictor output) instead of aborting on an enormous allocation, and
-        // the result must round-trip back to the empty input.
+        // huge /Columns. Encoding must succeed instead of aborting on an
+        // enormous allocation. qpdf's Pl_Flate leaves its codec uninitialized
+        // when it receives no bytes, so the encoded stream is also empty.
         let mut dict = Dictionary::new();
         dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
         let mut parms = Dictionary::new();
@@ -1257,10 +1286,7 @@ mod tests {
         dict.insert("DecodeParms", Object::Dictionary(parms));
 
         let encoded = encode_stream_data(&dict, &[]).unwrap();
-        assert!(
-            !encoded.is_empty(),
-            "empty raw input is still Flate-wrapped, so the stream is non-empty"
-        );
+        assert!(encoded.is_empty(), "qpdf Pl_Flate emits no empty wrapper");
 
         let decoded = decode_stream_data(&dict, &encoded).unwrap();
         assert!(decoded.is_empty(), "round-trips back to the empty input");
@@ -1564,6 +1590,21 @@ mod tests {
         assert!(
             matches!(err, Err(Error::Unsupported(ref m)) if m.contains("filter chain length")),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_overlong_filter_chain_before_malformed_item() {
+        let mut filters = vec![Object::Name(b"FlateDecode".to_vec()); 16];
+        filters.push(Object::Integer(1));
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Array(filters));
+
+        let error = decode_stream_data(&dict, b"anything").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: filter chain length 17 exceeds maximum of 16"
         );
     }
 

@@ -152,6 +152,7 @@ pub mod rotate_spec;
 pub(crate) mod run_length;
 pub mod signatures;
 pub mod standard_font_metrics;
+pub(crate) mod stream_filter;
 pub mod struct_tree_pg;
 pub mod subset_prune;
 pub mod thread_bead_p;

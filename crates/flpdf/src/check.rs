@@ -5,7 +5,10 @@
 //! enabled), report parser warnings, and flag a few high-level invariants that would
 //! cause downstream tools to fail.
 
-use crate::filters::{decode_stream_data_with_limits, is_decode_output_limit_error, DecodeLimits};
+use crate::filters::{
+    decode_stream_data_with_limits_and_warnings, is_decode_output_limit_error, DecodeLimits,
+};
+use crate::stream_filter::normalize_filter_name;
 use crate::{Diagnostic, Diagnostics, Dictionary, Error, Object, Pdf, PdfOpenOptions};
 use std::io::{Read, Seek};
 
@@ -264,7 +267,7 @@ const GENERALIZED_FILTERS: [&[u8]; 5] = [
 /// reported as a stream-encoding error).
 fn content_filter_chain_is_generalized(dict: &Dictionary) -> bool {
     fn is_generalized(name: &[u8]) -> bool {
-        GENERALIZED_FILTERS.contains(&name)
+        GENERALIZED_FILTERS.contains(&normalize_filter_name(name))
     }
     // An indirect `/Filter` on a content stream is essentially never seen;
     // treating it conservatively as "skip" trades a vanishing parity gap for
@@ -320,6 +323,28 @@ fn check_content_streams<R: Read + Seek>(
             if !content_filter_chain_is_generalized(&stream.dict) {
                 continue;
             }
+            // qpdf renders the location as "content stream object N G" (no
+            // trailing " R"); format the number/generation pair directly.
+            let location = match stream_ref {
+                Some(r) => format!("content stream object {} {}", r.number, r.generation),
+                None => "inline content stream".to_string(),
+            };
+            let mut decode_warnings = Vec::new();
+            let result = decode_stream_data_with_limits_and_warnings(
+                &stream.dict,
+                &stream.data,
+                limits,
+                &mut |message, _code| {
+                    decode_warnings.push(message.to_string());
+                    Ok(())
+                },
+            );
+            for warning in decode_warnings {
+                diagnostics.push(Diagnostic::warning(
+                    format!("page {page_number}: {location}: {warning}"),
+                    None,
+                ));
+            }
             // A decode `Err` is one of two things:
             //   * the opt-in output cap tripped — the stream is intact, just
             //     larger than the configured limit, so this is a deliberate
@@ -328,13 +353,7 @@ fn check_content_streams<R: Read + Seek>(
             //   * any other failure means the stream cannot be decoded as
             //     declared (corrupt payload, `/Filter` chain past the cap, bad
             //     `/DecodeParms`) — a genuine stream-encoding ERROR.
-            if let Err(error) = decode_stream_data_with_limits(&stream.dict, &stream.data, limits) {
-                // qpdf renders the location as "content stream object N G" (no
-                // trailing " R"); format the number/generation pair directly.
-                let location = match stream_ref {
-                    Some(r) => format!("content stream object {} {}", r.number, r.generation),
-                    None => "inline content stream".to_string(),
-                };
+            if let Err(error) = result {
                 if is_decode_output_limit_error(&error) {
                     // The guard only trips when a cap is set, so `max_output` is
                     // always `Some` here; `unwrap_or_default` echoes the cap into
@@ -363,7 +382,7 @@ fn check_content_streams<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::filters::encode_stream_data;
-    use crate::{ObjectRef, Severity};
+    use crate::{ObjectRef, Severity, Stream};
     use std::io::Cursor;
 
     #[test]
@@ -664,6 +683,46 @@ mod tests {
         )
     }
 
+    fn truncated_flate_content_pdf() -> Vec<u8> {
+        content_pdf(
+            "4 0 R",
+            &[(4, corrupt_filtered_object(4, "FlateDecode", b"\x78"))],
+        )
+    }
+
+    fn truncated_abbreviated_flate_content_pdf() -> Vec<u8> {
+        content_pdf("4 0 R", &[(4, corrupt_filtered_object(4, "Fl", b"\x78"))])
+    }
+
+    fn malformed_header_abbreviated_flate_content_pdf() -> Vec<u8> {
+        content_pdf(
+            "4 0 R",
+            &[(4, corrupt_filtered_object(4, "Fl", b"\x78\x00"))],
+        )
+    }
+
+    fn truncated_flate_then_invalid_ascii85_content_pdf() -> Vec<u8> {
+        let mut flate_dict = Dictionary::new();
+        flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        // Generate the compressed bytes in-process, then remove only the zlib
+        // trailer: Flate emits the invalid ASCII85 byte before warning that its
+        // input ended incomplete, so the next declared decoder still runs.
+        let mut encoded = encode_stream_data(&flate_dict, b"\x7f").unwrap();
+        encoded.pop();
+
+        let mut object = Vec::new();
+        object.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Filter [/FlateDecode /ASCII85Decode] /Length {} >>\nstream\n",
+                encoded.len()
+            )
+            .as_bytes(),
+        );
+        object.extend_from_slice(&encoded);
+        object.extend_from_slice(b"\nendstream\nendobj\n");
+        content_pdf("4 0 R", &[(4, object)])
+    }
+
     fn corrupt_ascii85_content_pdf() -> Vec<u8> {
         // ASCII85Decode framing over a byte that is invalid in an ASCII85 body.
         content_pdf(
@@ -954,6 +1013,127 @@ mod tests {
             .entries()
             .iter()
             .any(|d| d.message.contains("errors while decoding content stream")));
+    }
+
+    #[test]
+    fn truncated_flate_content_is_a_warning_not_an_error() {
+        let report = check_reader_with_options(
+            Cursor::new(truncated_flate_content_pdf()),
+            PdfOpenOptions {
+                repair: false,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report.valid);
+        assert!(report.diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic.message.contains("content stream object 4 0")
+                && diagnostic
+                    .message
+                    .contains("input stream is complete but output may still be valid")
+        }));
+        assert!(!report
+            .diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Error));
+    }
+
+    #[test]
+    fn abbreviated_truncated_flate_content_is_a_warning_not_an_error() {
+        let report = check_reader_with_options(
+            Cursor::new(truncated_abbreviated_flate_content_pdf()),
+            PdfOpenOptions {
+                repair: false,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report.valid);
+        assert!(report.diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic.message.contains("content stream object 4 0")
+                && diagnostic
+                    .message
+                    .contains("input stream is complete but output may still be valid")
+        }));
+        assert!(!report
+            .diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Error));
+    }
+
+    #[test]
+    fn abbreviated_malformed_flate_header_is_a_content_stream_error() {
+        let report =
+            check_reader_strict(Cursor::new(malformed_header_abbreviated_flate_content_pdf()))
+                .unwrap();
+
+        assert!(!report.valid);
+        assert!(report.diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Error
+                && diagnostic.message.contains("content stream object 4 0")
+                && diagnostic
+                    .message
+                    .contains("errors while decoding content stream")
+        }));
+    }
+
+    #[test]
+    fn truncated_flate_warning_survives_later_ascii85_error() {
+        let report = check_reader_with_options(
+            Cursor::new(truncated_flate_then_invalid_ascii85_content_pdf()),
+            PdfOpenOptions {
+                repair: false,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!report.valid);
+        assert!(report.diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic.message.contains("content stream object 4 0")
+                && diagnostic
+                    .message
+                    .contains("input stream is complete but output may still be valid")
+        }));
+        assert!(report.diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Error
+                && diagnostic.message.contains("content stream object 4 0")
+                && diagnostic
+                    .message
+                    .contains("errors while decoding content stream")
+        }));
+    }
+
+    #[test]
+    fn direct_content_stream_warning_names_inline_location() {
+        let mut pdf = Pdf::open(Cursor::new(clean_flate_content_pdf())).unwrap();
+        let mut flate_dict = Dictionary::new();
+        flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let mut page = Dictionary::new();
+        page.insert("Type", Object::Name(b"Page".to_vec()));
+        page.insert(
+            "Contents",
+            Object::Stream(Stream::new(flate_dict, b"\x78".to_vec())),
+        );
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+        let mut diagnostics = Diagnostics::default();
+        check_content_streams(&mut pdf, &mut diagnostics, DecodeLimits::default());
+
+        assert!(diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic.message.contains("inline content stream")
+                && diagnostic
+                    .message
+                    .contains("input stream is complete but output may still be valid")
+        }));
     }
 
     #[test]

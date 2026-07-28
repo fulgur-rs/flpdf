@@ -121,14 +121,14 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 |---|---|---|---|
 | `Pipeline.cc`（積層シンク基盤のみ。個々の `Pl_*` は下記の各行で個別に分類） | 114 | 抽象が無い。`Vec<u8>` バッファ + `out.len()` 直参照 | ❌ |
 | `Pl_Count.cc` / `Pl_MD5.cc` | 114 | 無し（バッファから同等の値は取得可能） | ❌ |
-| `Pl_Flate` / `Pl_LZWDecoder` / `Pl_PNGFilter` / `Pl_TIFFPredictor` / `SF_FlateLzwDecode` | 946 | `filters.rs`(859) | 🔀 |
+| `Pl_Flate` / `Pl_LZWDecoder` / `Pl_PNGFilter` / `Pl_TIFFPredictor` / `SF_FlateLzwDecode` | 946 | Flate は `pipeline/flate.rs` + `stream_filter.rs`、未移行の LZW / predictor は `filters.rs` | 🔀 |
 | `Pl_ASCII85Decoder` | 108 | `ascii85.rs`(163) | ✅ |
 | `Pl_ASCIIHexDecoder` | 96 | `ascii_hex.rs`(85) | ✅ |
 | `Pl_RunLength` | 146 | `run_length.rs`(140) | ✅ |
 | `Pl_AES_PDF` | 200 | `security/standard.rs` の AES single-buffer helper と `writer.rs` の stream consumer に分散。Pipeline 統合は `flpdf-qynx.10` | 🔀 |
 | `Pl_RC4` | 43 | `pipeline/rc4.rs`（65,536-byte既定buffer、stateful `security/rc4.rs`、write/finish lifecycle）+ `reader.rs` / `writer.rs` の本番stream consumer | ✅ |
 | `Pl_QPDFTokenizer.cc` / `ContentNormalizer.cc` | 141 | `content_normalizer.rs`（既存 `tokenizer.rs` を駆動する token-filter runner、EOF-token → `handle_eof`、`ID` separator 注入、inline-image 切替、raw-token normalization、bad-token state、CR/string/name normalization） | ✅ |
-| `QPDFStreamFilter.cc` | 19 | filter 登録機構が無い | ❌ |
+| `QPDFStreamFilter.cc` | 19 | `stream_filter.rs`（`set_decode_params`、decode pipeline factory、specialized / lossy の既定分類） | ✅ |
 | `Pl_DCT.cc` | 326 | 無し。`json_inspect.rs` の `DecodeLevel::All`(758) が DCT デコードを doc で約束しつつ encoded バイトへフォールバックしている | ❌ 消費者あり |
 | `Pl_Base64` / `Pl_Concatenate` / `Pl_Discard` / `Pl_Function` / `Pl_OStream` / `Pl_StdioFile` / `Pl_String` / `Pl_SHA2` / `Pl_Buffer` | 570 | Rust の `Write` で代替 | ⚪ |
 
@@ -343,9 +343,9 @@ CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れてい
 
 | 状態 | qpdf 側の該当行数 | 内訳 |
 |---|---|---|
-| ✅ mirrors | 3,007 | 責務境界も一致。触らない |
+| ✅ mirrors | 3,026 | 責務境界も一致。触らない |
 | 🔀 smeared | 28,493 | 再配置の主対象。qpdf 全体の 69% |
-| ❌ missing | 623 | `Pipeline.cc`(114) / `Pl_Count`+`Pl_MD5`(114) / `QPDFStreamFilter`(19) / `Pl_DCT`(326) / `QTC`(50) |
+| ❌ missing | 604 | `Pipeline.cc`(114) / `Pl_Count`+`Pl_MD5`(114) / `Pl_DCT`(326) / `QTC`(50) |
 | ⚪ 逸脱候補 | 7,099 | 要承認（下記の方針矛盾を参照） |
 | ➖ 対象外 | 2,237 | C API |
 | **合計** | **41,459** | qpdf `libqpdf/*.cc` の実測 41,459 行と一致 |
