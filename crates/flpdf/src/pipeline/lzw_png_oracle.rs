@@ -975,29 +975,107 @@ mod tests {
         assert_eq!(validate_trace_protocol(trace, 1), Ok(()));
     }
 
+    /// Write a stand-in probe script.
+    ///
+    /// The script is handed to `/bin/sh` as an argument rather than executed
+    /// directly, so a still-open write handle cannot make the spawn fail with
+    /// `ETXTBSY`.
+    #[cfg(unix)]
+    fn write_test_probe(path: &Path, source: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, source).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn run_test_probe(probe: &Path, case: &OracleCase) -> String {
+        let mut command = Command::new("/bin/sh");
+        command.arg(probe);
+        run_qpdf_probe_command(command, case)
+    }
+
+    #[cfg(unix)]
+    fn test_probe_panic_message(source: &str) -> String {
+        let directory = tempfile::tempdir().unwrap();
+        let probe = directory.path().join("probe");
+        write_test_probe(&probe, source);
+
+        let panic = std::panic::catch_unwind(|| run_test_probe(&probe, &fake_case())).unwrap_err();
+        panic.downcast_ref::<String>().unwrap().clone()
+    }
+
+    #[cfg(unix)]
     #[test]
     fn probe_receives_exact_positional_arguments() {
-        let case = fake_case();
-        let mut command = Command::new("printf");
-        command.arg("ctor\t0\tok\t\nop\t0\tok\t\nop\t1\tok\t\noutput\t\n");
-        // `printf` ignores the extra operands after its format string, so the
-        // recorded argument list is what the real probe would receive.
-        let arguments: Vec<String> = std::iter::once(case.codec.as_probe_arg())
-            .chain([super::csv_or_dash(&case.fail_writes)])
-            .chain([super::csv_or_dash(&case.fail_finishes)])
-            .chain(case.operations.iter().map(Operation::as_probe_arg))
-            .collect();
-        assert_eq!(arguments, vec!["lzw:1", "2", "3", "w:8010", "f"]);
+        let directory = tempfile::tempdir().unwrap();
+        let probe = directory.path().join("probe");
+        let arguments = directory.path().join("probe.args");
+        write_test_probe(
+            &probe,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >\"$0.args\"\nprintf 'ctor\\t0\\tok\\t\\nop\\t0\\tok\\t\\nop\\t1\\tok\\t\\noutput\\t\\n'\n",
+        );
+
         assert_eq!(
-            run_qpdf_probe_command(command, &case),
+            run_test_probe(&probe, &fake_case()),
+            "ctor\t0\tok\t\nop\t0\tok\t\nop\t1\tok\t\noutput\t\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(arguments).unwrap(),
+            "lzw:1\n2\n3\nw:8010\nf\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_that_is_still_open_for_writing_still_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let probe = directory.path().join("probe");
+        write_test_probe(
+            &probe,
+            "#!/bin/sh\nprintf 'ctor\\t0\\tok\\t\\nop\\t0\\tok\\t\\nop\\t1\\tok\\t\\noutput\\t\\n'\n",
+        );
+        let _write_open = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&probe)
+            .unwrap();
+
+        assert_eq!(
+            run_test_probe(&probe, &fake_case()),
             "ctor\t0\tok\t\nop\t0\tok\t\nop\t1\tok\t\noutput\t\n"
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    #[should_panic(expected = "qpdf LZW/PNG probe failed for fake")]
-    fn probe_failure_reports_the_case_and_status() {
-        run_qpdf_probe_command(Command::new("false"), &fake_case());
+    fn probe_failure_reports_the_case_stderr_and_status() {
+        let message = test_probe_panic_message("#!/bin/sh\nprintf 'probe stderr' >&2\nexit 7\n");
+
+        assert!(message.contains("fake"), "{message}");
+        assert!(message.contains("probe stderr"), "{message}");
+        assert!(message.contains("exit status: 7"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_protocol_corruption_reports_the_case() {
+        let message = test_probe_panic_message("#!/bin/sh\nprintf 'garbage\\n'\n");
+
+        assert!(
+            message.contains("qpdf LZW/PNG probe protocol corruption for fake"),
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_non_utf8_stdout_reports_the_case() {
+        let message = test_probe_panic_message("#!/bin/sh\nprintf '\\377'\n");
+
+        assert!(message.contains("fake"), "{message}");
+        assert!(message.contains("non-UTF-8 ASCII protocol"), "{message}");
     }
 
     #[test]
@@ -1007,22 +1085,6 @@ mod tests {
             Command::new("/nonexistent/flpdf-lzw-png-probe"),
             &fake_case(),
         );
-    }
-
-    #[test]
-    #[should_panic(expected = "qpdf LZW/PNG probe protocol corruption for fake")]
-    fn probe_protocol_corruption_reports_the_case() {
-        let mut command = Command::new("printf");
-        command.arg("garbage\n");
-        run_qpdf_probe_command(command, &fake_case());
-    }
-
-    #[test]
-    #[should_panic(expected = "non-UTF-8 ASCII protocol for fake")]
-    fn probe_non_utf8_stdout_reports_the_case() {
-        let mut command = Command::new("printf");
-        command.arg("\\377\n");
-        run_qpdf_probe_command(command, &fake_case());
     }
 
     /// Every case is replayed against flpdf itself, which both completes the
