@@ -3163,35 +3163,12 @@ mod tests {
             Ok(())
         }
 
+        // cov:ignore-start: tests assert the raw writer leaves this caller-owned finish boundary untouched
         fn finish(&mut self) -> PipelineResult<()> {
             self.finishes += 1;
             Ok(())
         }
-    }
-
-    fn successful_write_chunks(calls: &[TraceCall]) -> Vec<&[u8]> {
-        calls
-            .iter()
-            .map(|call| match call {
-                TraceCall::Write {
-                    data,
-                    failed: false,
-                } => data.as_slice(),
-                other => panic!("expected only successful writes, got {other:?}"),
-            })
-            .collect()
-    }
-
-    fn assert_key_write_chunks(calls: &[TraceCall], key: &[u8]) {
-        let chunks = successful_write_chunks(calls);
-        let key_position = chunks
-            .iter()
-            .position(|chunk| *chunk == key)
-            .unwrap_or_else(|| panic!("missing key chunk {key:?} in {chunks:?}"));
-        assert_eq!(
-            &chunks[key_position - 1..=key_position + 1],
-            [b"\"".as_slice(), key, b"\": ".as_slice()]
-        );
+        // cov:ignore-end
     }
 
     struct ErrnoSink(i32);
@@ -3679,38 +3656,45 @@ mod tests {
         outer.insert(b"Nested", Object::Dictionary(inner));
         let mut pdf = empty_pdf();
         let ordered = super::ordered_qpdf_object(&mut pdf, &Object::Dictionary(outer)).unwrap();
-        let trace = shared_trace();
-        let mut out = RecordingSink::with_trace(trace.clone(), &[], &[]);
+        let mut out = FailOnExactChunk {
+            bytes: Vec::new(),
+            chunks: Vec::new(),
+            fail_on: b"not a qpdf chunk",
+            category: ErrorCategory::Runtime,
+            finishes: 0,
+        };
+        assert_eq!(out.identifier(), "fail-on-exact-chunk");
 
         ordered.write(&mut out, 0).unwrap();
 
         assert_eq!(
-            successful_write_chunks(&trace.borrow().calls),
+            out.chunks,
             vec![
-                b"{".as_slice(),
-                b"\n  ".as_slice(),
-                b"\"".as_slice(),
-                b"/Nested".as_slice(),
-                b"\": ".as_slice(),
-                b"{".as_slice(),
-                b"\n    ".as_slice(),
-                b"\"".as_slice(),
-                b"/\\\"".as_slice(),
-                b"\": ".as_slice(),
-                b"1".as_slice(),
-                b",\n    ".as_slice(),
-                b"\"".as_slice(),
-                b"/A".as_slice(),
-                b"\": ".as_slice(),
-                b"2".as_slice(),
-                b"\n  }".as_slice(),
-                b"\n}".as_slice(),
+                b"{".to_vec(),
+                b"\n  ".to_vec(),
+                b"\"".to_vec(),
+                b"/Nested".to_vec(),
+                b"\": ".to_vec(),
+                b"{".to_vec(),
+                b"\n    ".to_vec(),
+                b"\"".to_vec(),
+                b"/\\\"".to_vec(),
+                b"\": ".to_vec(),
+                b"1".to_vec(),
+                b",\n    ".to_vec(),
+                b"\"".to_vec(),
+                b"/A".to_vec(),
+                b"\": ".to_vec(),
+                b"2".to_vec(),
+                b"\n  }".to_vec(),
+                b"\n}".to_vec(),
             ]
         );
         assert_eq!(
-            trace.borrow().output,
+            out.bytes,
             b"{\n  \"/Nested\": {\n    \"/\\\"\": 1,\n    \"/A\": 2\n  }\n}"
         );
+        assert_eq!(out.finishes, 0);
     }
 
     #[test]
@@ -3718,22 +3702,31 @@ mod tests {
         let mut pdf = empty_pdf();
         let trailer_dictionary = pdf.trailer().clone();
         let trailer = super::ordered_qpdf_dict(&mut pdf, &trailer_dictionary).unwrap();
-        let trace = shared_trace();
-        let mut out = RecordingSink::with_trace(trace.clone(), &[], &[]);
+        let mut out = FailOnExactChunk {
+            bytes: Vec::new(),
+            chunks: Vec::new(),
+            fail_on: b"not a qpdf chunk",
+            category: ErrorCategory::Runtime,
+            finishes: 0,
+        };
 
         trailer.write(&mut out, 4).unwrap();
 
-        assert_key_write_chunks(&trace.borrow().calls, b"/Root");
-        assert_key_write_chunks(&trace.borrow().calls, b"/Size");
-        assert!(!trace
-            .borrow()
-            .calls
-            .iter()
-            .any(|call| matches!(call, TraceCall::Finish { .. })));
+        let root_key = [b"\"".to_vec(), b"/Root".to_vec(), b"\": ".to_vec()];
+        assert!(out
+            .chunks
+            .windows(root_key.len())
+            .any(|window| window == root_key));
+        let size_key = [b"\"".to_vec(), b"/Size".to_vec(), b"\": ".to_vec()];
+        assert!(out
+            .chunks
+            .windows(size_key.len())
+            .any(|window| window == size_key));
         assert_eq!(
-            trace.borrow().output,
+            out.bytes,
             b"{\n          \"/Root\": \"1 0 R\",\n          \"/Size\": 2\n        }"
         );
+        assert_eq!(out.finishes, 0);
     }
 
     #[test]
