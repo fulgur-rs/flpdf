@@ -7,6 +7,7 @@
 
 use crate::json::{Json, QpdfStdioWriter};
 use crate::object::{Dictionary, Object, ObjectRef, Stream};
+use crate::pipeline::{Pipeline, PipelineError};
 use crate::reader::Pdf;
 use std::borrow::Cow;
 use std::fs::File;
@@ -52,6 +53,8 @@ pub enum JsonOutputError {
     Convert(#[from] ConvertError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Pipeline(#[from] PipelineError),
     #[error("{operation} {path}: {message}")]
     SideFileIo {
         operation: &'static str,
@@ -553,7 +556,7 @@ enum OrderedPdfJson {
 }
 
 impl OrderedPdfJson {
-    fn write(&self, out: &mut (impl Write + ?Sized), depth: usize) -> Result<(), JsonOutputError> {
+    fn write(&self, out: &mut dyn Pipeline, depth: usize) -> Result<(), JsonOutputError> {
         match self {
             Self::Json(value) => value.write(out, depth)?,
             Self::Array(values) => {
@@ -571,7 +574,7 @@ impl OrderedPdfJson {
                 for (key, value) in entries {
                     Json::write_next(out, &mut first, depth + 1)?;
                     Json::make_string(key).write(out, depth + 1)?;
-                    out.write_all(b": ")?;
+                    out.write(b": ")?;
                     value.write(out, depth + 1)?;
                 }
                 Json::write_dictionary_close(out, first, depth)?;
@@ -930,7 +933,7 @@ fn build_qpdf_object_entry<R: Read + Seek>(
                     let dict = normalized_emitted_stream_dict(stream, payload.decode_succeeded);
                     let dict_json = qpdf_dict_to_json(pdf, &dict)?;
                     let bytes = payload.bytes.into_owned();
-                    let data = Json::make_blob(move |out| out.write_all(&bytes));
+                    let data = Json::make_blob(move |out| out.write(&bytes));
                     json_dictionary([("data".to_string(), data), ("dict".to_string(), dict_json)])?
                 }
                 StreamDataMode::File { prefix } => {
@@ -2603,7 +2606,7 @@ fn build_parameters(decode_level: DecodeLevel) -> Result<Json, ConvertError> {
 }
 
 fn emit_section(
-    out: &mut (impl Write + ?Sized),
+    out: &mut dyn Pipeline,
     first: &mut bool,
     name: &[u8],
     keys: &[JsonKey],
@@ -2641,7 +2644,7 @@ fn write_qpdf_section<R: Read + Seek>(
     decode_level: DecodeLevel,
     stream_mode: &StreamDataMode,
     objects: &[JsonObjectSelector],
-    out: &mut (impl Write + ?Sized),
+    out: &mut dyn Pipeline,
     top_first: &mut bool,
 ) -> Result<(), JsonOutputError> {
     Json::write_dictionary_key(out, top_first, b"qpdf", 1)?;
@@ -2747,7 +2750,7 @@ fn write_non_file_mode_object_entry<R: Read + Seek>(
     object_ref: ObjectRef,
     decode_level: DecodeLevel,
     stream_mode: NonFileStreamDataMode,
-    out: &mut (impl Write + ?Sized),
+    out: &mut dyn Pipeline,
     objects_first: &mut bool,
 ) -> Result<(), JsonOutputError> {
     let object = qpdf_resolve_top_level_object(pdf, object_ref)?;
@@ -2763,7 +2766,7 @@ fn write_non_file_mode_object_entry<R: Read + Seek>(
                     let ordered = ordered_qpdf_dict(pdf, &dict)?;
                     let bytes = payload.bytes.into_owned();
                     (
-                        Some(Json::make_blob(move |sink| sink.write_all(&bytes))),
+                        Some(Json::make_blob(move |sink| sink.write(&bytes))),
                         ordered,
                     )
                 }
@@ -2801,7 +2804,7 @@ fn write_file_mode_object_entry<R: Read + Seek>(
     object_ref: ObjectRef,
     decode_level: DecodeLevel,
     prefix: &str,
-    out: &mut (impl Write + ?Sized),
+    out: &mut dyn Pipeline,
     objects_first: &mut bool,
 ) -> Result<(), JsonOutputError> {
     let object = qpdf_resolve_top_level_object(pdf, object_ref)?;
@@ -2848,7 +2851,7 @@ fn write_file_mode_stream_value<R: Read + Seek, W: Write>(
     decode_level: DecodeLevel,
     side_path: &str,
     side_file: &mut W,
-    out: &mut (impl Write + ?Sized),
+    out: &mut dyn Pipeline,
 ) -> Result<(), JsonOutputError> {
     let payload = stream_payload_with_decode_status(stream, decode_level);
     let mut stream_first = true;
@@ -2879,8 +2882,9 @@ fn write_file_mode_stream_value<R: Read + Seek, W: Write>(
 /// still computed by preparing every live object at the `maxobjectid` value
 /// boundary.
 ///
-/// On conversion or I/O failure, bytes already accepted by `out` remain as a
-/// partial JSON prefix; this function does not roll back or truncate the sink.
+/// On conversion, pipeline, or side-file I/O failure, bytes already accepted
+/// by `out` remain as a partial JSON prefix; this function does not roll back
+/// or truncate the sink.
 ///
 /// # Migration from the 0.4 materialized API
 ///
@@ -2891,14 +2895,14 @@ fn write_file_mode_stream_value<R: Read + Seek, W: Write>(
 /// materialized `build_qpdf_key*` APIs could not preserve both contracts.
 /// Call this incremental writer instead; select sections with `keys`, select
 /// raw objects with `objects`, and inspect or transform the accepted bytes at
-/// the supplied `Write` sink.
+/// the supplied [`Pipeline`] sink.
 pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     decode_level: DecodeLevel,
     stream_mode: &StreamDataMode,
     keys: &[JsonKey],
     objects: &[JsonObjectSelector],
-    out: &mut (impl Write + ?Sized),
+    out: &mut dyn Pipeline,
 ) -> Result<(), JsonOutputError> {
     let mut first = true;
     Json::write_dictionary_open(out, &mut first, 0)?;
@@ -2952,7 +2956,7 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
         write_qpdf_section(pdf, decode_level, stream_mode, objects, out, &mut first)?;
     }
     Json::write_dictionary_close(out, first, 0)?;
-    out.write_all(b"\n")?;
+    out.write(b"\n")?;
     Ok(())
 }
 
@@ -2961,6 +2965,7 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::{Pipeline, PipelineError, PipelineResult, PlString};
 
     fn number(value: impl ToString) -> serde_json::Value {
         serde_json::from_str(&value.to_string()).expect("number must serialize")
@@ -2982,12 +2987,12 @@ mod tests {
             .collect()
     }
 
-    struct FailAfter {
+    struct FailAfterWriter {
         remaining: usize,
         bytes: Vec<u8>,
     }
 
-    impl std::io::Write for FailAfter {
+    impl std::io::Write for FailAfterWriter {
         fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
             if self.remaining == 0 {
                 return Err(std::io::Error::other("sink full"));
@@ -2999,6 +3004,87 @@ mod tests {
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailAfterPipeline {
+        remaining: usize,
+        bytes: Vec<u8>,
+        finishes: usize,
+    }
+
+    impl Pipeline for FailAfterPipeline {
+        fn identifier(&self) -> &str {
+            "fail-after"
+        }
+
+        fn write(&mut self, buffer: &[u8]) -> PipelineResult<()> {
+            let written = self.remaining.min(buffer.len());
+            self.bytes.extend_from_slice(&buffer[..written]);
+            self.remaining -= written;
+            if written != buffer.len() {
+                return Err(PipelineError::runtime("sink full"));
+            }
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            self.finishes += 1;
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingPipeline {
+        bytes: Vec<u8>,
+        finishes: usize,
+    }
+
+    impl Pipeline for RecordingPipeline {
+        fn identifier(&self) -> &str {
+            "recording"
+        }
+
+        fn write(&mut self, buffer: &[u8]) -> PipelineResult<()> {
+            self.bytes.extend_from_slice(buffer);
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            self.finishes += 1;
+            Ok(())
+        }
+    }
+
+    struct FailOnParameters {
+        bytes: Vec<u8>,
+        category: ErrorCategory,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ErrorCategory {
+        Logic,
+        Runtime,
+    }
+
+    impl Pipeline for FailOnParameters {
+        fn identifier(&self) -> &str {
+            "fail-on-parameters"
+        }
+
+        fn write(&mut self, buffer: &[u8]) -> PipelineResult<()> {
+            if self.bytes == b"{\n  \"version\": 2,\n  " && buffer == b"\"" {
+                return Err(match self.category {
+                    ErrorCategory::Logic => PipelineError::logic("raw writer logic failure"),
+                    ErrorCategory::Runtime => PipelineError::runtime("raw writer runtime failure"),
+                });
+            }
+            self.bytes.extend_from_slice(buffer);
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
             Ok(())
         }
     }
@@ -3084,6 +3170,28 @@ mod tests {
         project(super::build_encrypt_section(pdf)?)
     }
 
+    fn write_selected_to_vec<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        decode_level: DecodeLevel,
+        stream_mode: &StreamDataMode,
+        keys: &[JsonKey],
+        objects: &[JsonObjectSelector],
+    ) -> Result<Vec<u8>, JsonOutputError> {
+        let mut bytes = Vec::new();
+        {
+            let mut output = PlString::new("json test output", None, &mut bytes);
+            write_qpdf_json_v2_selected_objects_with_options(
+                pdf,
+                decode_level,
+                stream_mode,
+                keys,
+                objects,
+                &mut output,
+            )?;
+        }
+        Ok(bytes)
+    }
+
     fn build_test_document_selected_objects<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         decode_level: DecodeLevel,
@@ -3091,16 +3199,8 @@ mod tests {
         keys: &[JsonKey],
         objects: &[JsonObjectSelector],
     ) -> Result<serde_json::Value, String> {
-        let mut out = Vec::new();
-        write_qpdf_json_v2_selected_objects_with_options(
-            pdf,
-            decode_level,
-            stream_mode,
-            keys,
-            objects,
-            &mut out,
-        )
-        .map_err(|error| error.to_string())?;
+        let out = write_selected_to_vec(pdf, decode_level, stream_mode, keys, objects)
+            .map_err(|error| error.to_string())?;
         serde_json::from_slice(&out).map_err(|error| error.to_string())
     }
 
@@ -3204,14 +3304,12 @@ mod tests {
     #[test]
     fn selected_sink_writer_emits_envelope_then_selected_section() {
         let mut pdf = load_one_page_pdf();
-        let mut out = Vec::new();
-        write_qpdf_json_v2_selected_objects_with_options(
+        let out = write_selected_to_vec(
             &mut pdf,
             DecodeLevel::Generalized,
             &StreamDataMode::None,
             &[JsonKey::Pages],
             &[],
-            &mut out,
         )
         .unwrap();
 
@@ -3234,14 +3332,12 @@ mod tests {
     #[test]
     fn sink_writer_preserves_qpdf_metadata_field_order() {
         let mut pdf = load_one_page_pdf();
-        let mut out = Vec::new();
-        write_qpdf_json_v2_selected_objects_with_options(
+        let out = write_selected_to_vec(
             &mut pdf,
             DecodeLevel::Generalized,
             &StreamDataMode::None,
             &[JsonKey::Qpdf],
             &[JsonObjectSelector::Trailer],
-            &mut out,
         )
         .unwrap();
 
@@ -3266,8 +3362,7 @@ mod tests {
     #[test]
     fn sink_writer_keeps_missing_selector_object_map_expanded() {
         let mut pdf = load_one_page_pdf();
-        let mut out = Vec::new();
-        write_qpdf_json_v2_selected_objects_with_options(
+        let out = write_selected_to_vec(
             &mut pdf,
             DecodeLevel::Generalized,
             &StreamDataMode::None,
@@ -3276,7 +3371,6 @@ mod tests {
                 number: 999,
                 generation: 0,
             }],
-            &mut out,
         )
         .unwrap();
 
@@ -3298,8 +3392,7 @@ mod tests {
             },
         ] {
             let mut pdf = escaped_raw_dictionary_names_pdf();
-            let mut out = Vec::new();
-            write_qpdf_json_v2_selected_objects_with_options(
+            let out = write_selected_to_vec(
                 &mut pdf,
                 DecodeLevel::Generalized,
                 &stream_mode,
@@ -3311,7 +3404,6 @@ mod tests {
                     },
                     JsonObjectSelector::Trailer,
                 ],
-                &mut out,
             )
             .unwrap();
 
@@ -3338,8 +3430,14 @@ mod tests {
         let mut pdf = empty_pdf();
 
         let ordered = super::ordered_qpdf_object(&mut pdf, &object).unwrap();
-        let mut out = Vec::new();
-        ordered.write(&mut out, 0).unwrap();
+        let out = {
+            let mut bytes = Vec::new();
+            {
+                let mut output = PlString::new("ordered qpdf object", None, &mut bytes);
+                ordered.write(&mut output, 0).unwrap();
+            }
+            bytes
+        };
 
         assert_eq!(
             out,
@@ -3370,8 +3468,7 @@ mod tests {
         .unwrap();
         let temp = tempfile::tempdir().unwrap();
         let prefix = temp.path().join("side").to_string_lossy().into_owned();
-        let mut out = Vec::new();
-        write_qpdf_json_v2_selected_objects_with_options(
+        let out = write_selected_to_vec(
             &mut pdf,
             DecodeLevel::None,
             &StreamDataMode::File {
@@ -3388,7 +3485,6 @@ mod tests {
                     generation: 0,
                 },
             ],
-            &mut out,
         )
         .unwrap();
 
@@ -3416,8 +3512,7 @@ mod tests {
         assert_eq!(reference_prefix.len(), prefix.len());
 
         let mut complete_pdf = load_one_page_pdf();
-        let mut complete = Vec::new();
-        write_qpdf_json_v2_selected_objects_with_options(
+        let complete = write_selected_to_vec(
             &mut complete_pdf,
             DecodeLevel::None,
             &StreamDataMode::File {
@@ -3428,7 +3523,6 @@ mod tests {
                 number: 7,
                 generation: 0,
             }],
-            &mut complete,
         )
         .unwrap();
         let stream_key = b"\"stream\": ";
@@ -3440,9 +3534,10 @@ mod tests {
 
         let side_path = format_json_side_file_path(&prefix, 7);
         let mut pdf = load_one_page_pdf();
-        let mut out = FailAfter {
+        let mut out = FailAfterPipeline {
             remaining: fail_after,
             bytes: Vec::new(),
+            finishes: 0,
         };
         let result = write_qpdf_json_v2_selected_objects_with_options(
             &mut pdf,
@@ -3458,7 +3553,8 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(JsonOutputError::Io(ref error)) if error.to_string() == "sink full"
+            Err(JsonOutputError::Pipeline(PipelineError::Runtime(ref message)))
+                if message == "sink full"
         ));
         assert!(out.bytes.ends_with(stream_key), "{:?}", out.bytes);
         assert_eq!(std::fs::read(&side_path).unwrap(), b"");
@@ -3472,8 +3568,7 @@ mod tests {
         assert_eq!(reference_prefix.len(), prefix.len());
 
         let mut complete_pdf = load_one_page_pdf();
-        let mut complete = Vec::new();
-        write_qpdf_json_v2_selected_objects_with_options(
+        let complete = write_selected_to_vec(
             &mut complete_pdf,
             DecodeLevel::None,
             &StreamDataMode::File {
@@ -3484,7 +3579,6 @@ mod tests {
                 number: 7,
                 generation: 0,
             }],
-            &mut complete,
         )
         .unwrap();
         let stream_key = b"\"stream\": ";
@@ -3497,9 +3591,10 @@ mod tests {
 
         let side_path = format_json_side_file_path(&prefix, 7);
         let mut pdf = load_one_page_pdf();
-        let mut out = FailAfter {
+        let mut out = FailAfterPipeline {
             remaining: fail_after,
             bytes: Vec::new(),
+            finishes: 0,
         };
         let result = write_qpdf_json_v2_selected_objects_with_options(
             &mut pdf,
@@ -3515,7 +3610,8 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(JsonOutputError::Io(ref error)) if error.to_string() == "sink full"
+            Err(JsonOutputError::Pipeline(PipelineError::Runtime(ref message)))
+                if message == "sink full"
         ));
         assert!(out.bytes.ends_with(b"\"stream\": {"), "{:?}", out.bytes);
         assert_eq!(std::fs::read(&side_path).unwrap(), b"");
@@ -3525,20 +3621,22 @@ mod tests {
     fn file_mode_payload_writer_failure_leaves_complete_datafile_before_dict() {
         let mut pdf = load_one_page_pdf();
         let stream = Stream::new(Dictionary::new(), b"payload".to_vec());
-        let mut side_file = FailAfter {
+        let mut side_file = FailAfterWriter {
             remaining: 0,
             bytes: Vec::new(),
         };
         let mut out = Vec::new();
-
-        let result = write_file_mode_stream_value(
-            &mut pdf,
-            &stream,
-            DecodeLevel::None,
-            "side-file",
-            &mut side_file,
-            &mut out,
-        );
+        let result = {
+            let mut output = PlString::new("file-mode main output", None, &mut out);
+            write_file_mode_stream_value(
+                &mut pdf,
+                &stream,
+                DecodeLevel::None,
+                "side-file",
+                &mut side_file,
+                &mut output,
+            )
+        };
 
         let error = result.unwrap_err();
         assert_eq!(error.to_string(), "write side-file: sink full");
@@ -3570,15 +3668,18 @@ mod tests {
         let mut side_file = std::io::BufWriter::with_capacity(4096, Vec::new());
         let mut out = Vec::new();
 
-        write_file_mode_stream_value(
-            &mut pdf,
-            &stream,
-            DecodeLevel::None,
-            "side-file",
-            &mut side_file,
-            &mut out,
-        )
-        .unwrap();
+        {
+            let mut output = PlString::new("file-mode main output", None, &mut out);
+            write_file_mode_stream_value(
+                &mut pdf,
+                &stream,
+                DecodeLevel::None,
+                "side-file",
+                &mut side_file,
+                &mut output,
+            )
+            .unwrap();
+        }
 
         assert_eq!(side_file.buffer(), b"payload");
         assert!(side_file.get_ref().is_empty());
@@ -3623,8 +3724,7 @@ mod tests {
                 b"second stream payload".to_vec(),
             )),
         );
-        let mut complete = Vec::new();
-        write_qpdf_json_v2_selected_objects_with_options(
+        let complete = write_selected_to_vec(
             &mut complete_pdf,
             DecodeLevel::None,
             &StreamDataMode::File {
@@ -3641,7 +3741,6 @@ mod tests {
                     generation: 0,
                 },
             ],
-            &mut complete,
         )
         .unwrap();
         let second_object_marker = b"\"obj:8 0 R\"";
@@ -3671,9 +3770,10 @@ mod tests {
                 b"second stream payload".to_vec(),
             )),
         );
-        let mut out = FailAfter {
+        let mut out = FailAfterPipeline {
             remaining: fail_after,
             bytes: Vec::new(),
+            finishes: 0,
         };
         let result = write_qpdf_json_v2_selected_objects_with_options(
             &mut pdf,
@@ -3697,7 +3797,8 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(JsonOutputError::Io(ref error)) if error.to_string() == "sink full"
+            Err(JsonOutputError::Pipeline(PipelineError::Runtime(ref message)))
+                if message == "sink full"
         ));
         assert!(out
             .bytes
@@ -3727,9 +3828,8 @@ mod tests {
         .unwrap();
         let temp = tempfile::tempdir().unwrap();
         let prefix = temp.path().join("side").to_string_lossy().into_owned();
-        let mut out = Vec::new();
 
-        write_qpdf_json_v2_selected_objects_with_options(
+        let out = write_selected_to_vec(
             &mut pdf,
             DecodeLevel::None,
             &StreamDataMode::File {
@@ -3746,7 +3846,6 @@ mod tests {
                     generation: 0,
                 },
             ],
-            &mut out,
         )
         .unwrap();
 
@@ -3768,8 +3867,7 @@ mod tests {
     #[test]
     fn selected_sink_writer_inlines_stream() {
         let mut pdf = load_one_page_pdf();
-        let mut out = Vec::new();
-        write_qpdf_json_v2_selected_objects_with_options(
+        let out = write_selected_to_vec(
             &mut pdf,
             DecodeLevel::None,
             &StreamDataMode::Inline,
@@ -3778,7 +3876,6 @@ mod tests {
                 number: 7,
                 generation: 0,
             }],
-            &mut out,
         )
         .unwrap();
 
@@ -3791,14 +3888,12 @@ mod tests {
     #[test]
     fn full_sink_writer_emits_all_sections_in_qpdf_order() {
         let mut pdf = load_one_page_pdf();
-        let mut out = Vec::new();
-        write_qpdf_json_v2_selected_objects_with_options(
+        let out = write_selected_to_vec(
             &mut pdf,
             DecodeLevel::Generalized,
             &StreamDataMode::None,
             &[],
             &[],
-            &mut out,
         )
         .unwrap();
 
@@ -3833,6 +3928,36 @@ mod tests {
     fn sink_writer_conversion_error_stops_before_selected_section_key() {
         let mut pdf = empty_pdf();
         let mut out = Vec::new();
+        let error = {
+            let mut output = PlString::new("conversion error output", None, &mut out);
+            write_qpdf_json_v2_selected_objects_with_options(
+                &mut pdf,
+                DecodeLevel::Generalized,
+                &StreamDataMode::None,
+                &[JsonKey::Pages],
+                &[],
+                &mut output,
+            )
+            .unwrap_err()
+        };
+
+        assert!(matches!(
+            error,
+            JsonOutputError::Convert(ConvertError::PdfError(_))
+        ));
+        assert!(!out
+            .windows(b"\"pages\"".len())
+            .any(|window| window == b"\"pages\""));
+    }
+
+    #[test]
+    fn sink_writer_pipeline_error_stops_without_finishing_document() {
+        let mut pdf = load_one_page_pdf();
+        let mut out = FailAfterPipeline {
+            remaining: 24,
+            bytes: Vec::new(),
+            finishes: 0,
+        };
         let error = write_qpdf_json_v2_selected_objects_with_options(
             &mut pdf,
             DecodeLevel::Generalized,
@@ -3845,54 +3970,31 @@ mod tests {
 
         assert!(matches!(
             error,
-            JsonOutputError::Convert(ConvertError::PdfError(_))
+            JsonOutputError::Pipeline(PipelineError::Runtime(ref message))
+                if message == "sink full"
         ));
-        assert!(!out
-            .windows(b"\"pages\"".len())
-            .any(|window| window == b"\"pages\""));
-    }
-
-    #[test]
-    fn sink_writer_io_error_stops_without_finishing_document() {
-        let mut pdf = load_one_page_pdf();
-        let mut out = FailAfter {
-            remaining: 24,
-            bytes: Vec::new(),
-        };
-        let error = write_qpdf_json_v2_selected_objects_with_options(
-            &mut pdf,
-            DecodeLevel::Generalized,
-            &StreamDataMode::None,
-            &[JsonKey::Pages],
-            &[],
-            &mut out,
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, JsonOutputError::Io(ref io) if io.to_string() == "sink full"));
         assert!(!out.bytes.ends_with(b"\n}\n"));
-        std::io::Write::flush(&mut out).unwrap();
+        assert_eq!(out.finishes, 0);
     }
 
     #[test]
     fn sink_writer_propagates_failures_at_every_incremental_write_boundary() {
         let mut complete_pdf = load_one_page_pdf();
-        let mut complete = Vec::new();
-        write_qpdf_json_v2_selected_objects_with_options(
+        let complete = write_selected_to_vec(
             &mut complete_pdf,
             DecodeLevel::Generalized,
             &StreamDataMode::None,
             &[],
             &[],
-            &mut complete,
         )
         .unwrap();
 
         for remaining in 0..complete.len() {
             let mut pdf = load_one_page_pdf();
-            let mut out = FailAfter {
+            let mut out = FailAfterPipeline {
                 remaining,
                 bytes: Vec::new(),
+                finishes: 0,
             };
             let error = write_qpdf_json_v2_selected_objects_with_options(
                 &mut pdf,
@@ -3904,9 +4006,97 @@ mod tests {
             )
             .unwrap_err();
             assert!(
-                matches!(error, JsonOutputError::Io(ref io) if io.to_string() == "sink full"),
+                matches!(
+                    error,
+                    JsonOutputError::Pipeline(PipelineError::Runtime(ref message))
+                        if message == "sink full"
+                ),
                 "remaining={remaining}: {error}"
             );
+            assert_eq!(&out.bytes, &complete[..remaining]);
+            assert_eq!(out.finishes, 0);
+        }
+    }
+
+    #[test]
+    fn raw_writer_does_not_finish_supplied_pipeline() {
+        let mut pdf = load_one_page_pdf();
+        let mut out = RecordingPipeline::default();
+
+        write_qpdf_json_v2_selected_objects_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Pages],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+
+        assert!(out.bytes.ends_with(b"}\n"));
+        assert_eq!(out.finishes, 0);
+    }
+
+    #[test]
+    fn raw_writer_retains_prefix_on_pipeline_runtime_error() {
+        let mut pdf = load_one_page_pdf();
+        let mut out = FailOnParameters {
+            bytes: Vec::new(),
+            category: ErrorCategory::Runtime,
+        };
+
+        let error = write_qpdf_json_v2_selected_objects_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            JsonOutputError::Pipeline(PipelineError::Runtime(ref message))
+                if message == "raw writer runtime failure"
+        ));
+        assert_eq!(out.bytes, b"{\n  \"version\": 2,\n  ");
+    }
+
+    #[test]
+    fn raw_writer_retains_pipeline_error_category() {
+        for (category, expected_message) in [
+            (ErrorCategory::Logic, "raw writer logic failure"),
+            (ErrorCategory::Runtime, "raw writer runtime failure"),
+        ] {
+            let mut pdf = load_one_page_pdf();
+            let mut out = FailOnParameters {
+                bytes: Vec::new(),
+                category,
+            };
+
+            let error = write_qpdf_json_v2_selected_objects_with_options(
+                &mut pdf,
+                DecodeLevel::Generalized,
+                &StreamDataMode::None,
+                &[],
+                &[],
+                &mut out,
+            )
+            .unwrap_err();
+
+            assert_eq!(error.to_string(), expected_message);
+            match category {
+                ErrorCategory::Logic => assert!(matches!(
+                    error,
+                    JsonOutputError::Pipeline(PipelineError::Logic(_))
+                )),
+                ErrorCategory::Runtime => assert!(matches!(
+                    error,
+                    JsonOutputError::Pipeline(PipelineError::Runtime(_))
+                )),
+            }
+            assert_eq!(out.bytes, b"{\n  \"version\": 2,\n  ");
         }
     }
 

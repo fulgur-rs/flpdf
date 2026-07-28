@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::rc::Rc;
 
+use crate::pipeline::{Pipeline, PipelineResult};
+
 use super::JsonMessage;
 
 #[derive(Debug, thiserror::Error)]
@@ -20,7 +22,7 @@ pub enum JsonError {
 #[derive(Clone, Default)]
 pub struct Json(Option<Rc<RefCell<Members>>>);
 
-type BlobWriter = Rc<dyn Fn(&mut dyn io::Write) -> io::Result<()>>;
+type BlobWriter = Rc<dyn Fn(&mut dyn Pipeline) -> PipelineResult<()>>;
 
 impl std::fmt::Debug for Json {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -175,7 +177,7 @@ impl Json {
         Self::with_value(Value::Null)
     }
 
-    pub fn make_blob(callback: impl Fn(&mut dyn io::Write) -> io::Result<()> + 'static) -> Self {
+    pub fn make_blob(callback: impl Fn(&mut dyn Pipeline) -> PipelineResult<()> + 'static) -> Self {
         Self::with_value(Value::Blob(Rc::new(callback)))
     }
 
@@ -512,7 +514,7 @@ mod tests {
 
     #[test]
     fn blob_writer_base64_encodes_the_bytes_produced_by_its_callback() {
-        let blob = Json::with_value(Value::Blob(Rc::new(|out| out.write_all(b"\x00\xff"))));
+        let blob = Json::with_value(Value::Blob(Rc::new(|out| out.write(b"\x00\xff"))));
 
         assert_eq!(blob.unparse().unwrap(), b"\"AP8=\"");
     }
