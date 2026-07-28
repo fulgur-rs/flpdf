@@ -13,6 +13,13 @@ pub(crate) mod count;
 
 pub(crate) mod flate;
 
+pub(crate) mod lzw;
+
+#[cfg(test)]
+mod lzw_png_oracle;
+
+pub(crate) mod png_filter;
+
 pub(crate) mod rc4;
 
 pub(crate) mod qpdf_tokenizer;
