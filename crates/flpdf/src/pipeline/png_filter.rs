@@ -19,6 +19,7 @@ pub(crate) struct PngFilter<'a> {
     action: PngFilterAction,
     bytes_per_row: usize,
     bytes_per_pixel: usize,
+    row_capacity: usize,
     buf1: Vec<u8>,
     buf2: Vec<u8>,
     cur_is_first: bool,
@@ -81,13 +82,26 @@ impl<'a> PngFilter<'a> {
             action,
             bytes_per_row,
             bytes_per_pixel: bytes_per_pixel as usize,
-            buf1: vec![0; row_capacity],
-            buf2: vec![0; row_capacity],
+            row_capacity,
+            // qpdf allocates both row buffers in its constructor. flpdf defers
+            // that to the first byte written, which cannot change output bytes,
+            // downstream call boundaries, or error timing because an unused
+            // stage never reads a row. It keeps a stream that carries no data
+            // from allocating two buffers sized by an untrusted `/Columns`.
+            buf1: Vec::new(),
+            buf2: Vec::new(),
             cur_is_first: true,
             has_prev: true,
             pos: 0,
             incoming,
         })
+    }
+
+    fn ensure_row_buffers(&mut self) {
+        if self.buf1.is_empty() {
+            self.buf1 = vec![0; self.row_capacity];
+            self.buf2 = vec![0; self.row_capacity];
+        }
     }
 
     /// Borrow the current row for mutation together with the previous row.
@@ -252,6 +266,11 @@ impl Pipeline for PngFilter<'_> {
     }
 
     fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.ensure_row_buffers();
+
         let mut left = self.incoming - self.pos;
         let mut offset = 0;
         let mut len = data.len();
