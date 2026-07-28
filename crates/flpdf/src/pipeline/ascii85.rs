@@ -166,6 +166,14 @@ mod tests {
     }
 
     #[test]
+    fn identifiers_expose_pipeline_names() {
+        let mut sink = RecordingSink::new(&[], &[]);
+        assert_eq!(sink.identifier(), "recording");
+        let decoder = Ascii85Decoder::new("ascii85", &mut sink);
+        assert_eq!(decoder.identifier(), "ascii85");
+    }
+
+    #[test]
     fn split_writes_preserve_a_single_full_group_flush() {
         let input = b"9jqo^~>";
         for split in 0..=input.len() {
@@ -239,10 +247,11 @@ mod tests {
     }
 
     #[test]
-    fn ignores_data_after_completed_eod() {
+    fn ignores_data_from_a_later_write_after_completed_eod() {
         let trace = trace_after(
             |decoder| {
-                decoder.write(b"9jqo^~>ignored").unwrap();
+                decoder.write(b"9jqo^~>").unwrap();
+                decoder.write(b"ignored").unwrap();
                 decoder.finish().unwrap();
             },
             &[],
@@ -257,6 +266,26 @@ mod tests {
                     data: b"Man ".to_vec(),
                     failed: false,
                 },
+                TraceCall::Finish { failed: false },
+            ]
+        );
+    }
+
+    #[test]
+    fn recording_sink_finish_failure_is_recorded_and_retryable() {
+        let mut sink = RecordingSink::new(&[], &[1]);
+        let trace = sink.trace();
+
+        assert_eq!(
+            sink.finish().unwrap_err().to_string(),
+            "sink finish failure 1"
+        );
+        sink.finish().unwrap();
+
+        assert_eq!(
+            trace.borrow().calls,
+            vec![
+                TraceCall::Finish { failed: true },
                 TraceCall::Finish { failed: false },
             ]
         );
