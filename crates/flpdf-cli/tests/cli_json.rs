@@ -24,6 +24,7 @@ fn is_qpdf_available() -> bool {
 }
 
 const EXPECTED_QPDF_ORACLE_VERSION: &str = "11.9.0";
+const QPDF_ORACLE_SKIP_CHILD: &str = "FLPDF_QPDF_ORACLE_SKIP_CHILD";
 
 #[derive(Debug, PartialEq, Eq)]
 enum QpdfOracleAction {
@@ -68,7 +69,9 @@ fn skip_unless_qpdf_11_9() -> bool {
     match action {
         QpdfOracleAction::Run => false,
         QpdfOracleAction::Skip(reason) => {
-            eprintln!("skipping qpdf JSON /dev/full oracle: {reason}");
+            let mut stderr = std::io::stderr().lock();
+            writeln!(stderr, "skipping qpdf JSON /dev/full oracle: {reason}")
+                .expect("write qpdf JSON oracle skip reason");
             true
         }
         QpdfOracleAction::ConfigurationFailure(reason) => {
@@ -116,6 +119,33 @@ fn qpdf_oracle_guard_reports_missing_binary_locally_and_fails_ci() {
         QpdfOracleAction::ConfigurationFailure(
             "unable to run qpdf --version: qpdf not found".to_string()
         )
+    );
+}
+
+#[test]
+fn qpdf_oracle_guard_local_skip_child() {
+    if std::env::var_os(QPDF_ORACLE_SKIP_CHILD).is_none() {
+        return;
+    }
+    assert!(skip_unless_qpdf_11_9());
+}
+
+#[test]
+fn qpdf_oracle_guard_exposes_local_skip_reason_without_nocapture() {
+    let empty_path = tempfile::tempdir().unwrap();
+    let output = ShellCommand::new(std::env::current_exe().unwrap())
+        .args(["--exact", "qpdf_oracle_guard_local_skip_child"])
+        .env(QPDF_ORACLE_SKIP_CHILD, "1")
+        .env("PATH", empty_path.path())
+        .env_remove("CI")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("skipping qpdf JSON /dev/full oracle: unable to run qpdf --version:"),
+        "{output:?}"
     );
 }
 
