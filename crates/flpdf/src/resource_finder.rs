@@ -143,7 +143,9 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use crate::content_stream::parse_content_stream_data;
+    use crate::content_stream::{
+        parse_content_stream_data, parse_content_stream_data_recovering_inline_image_eof,
+    };
     use crate::Result;
 
     fn find(input: &[u8]) -> Result<ResourceFinder> {
@@ -164,7 +166,8 @@ mod tests {
     }
 
     fn dump_flpdf_resource_finder(input: &[u8]) -> String {
-        let finder = find(input).unwrap();
+        let mut finder = ResourceFinder::default();
+        parse_content_stream_data_recovering_inline_image_eof(input, &mut finder).unwrap();
         let mut records = String::new();
         let flat_names = finder
             .names_by_resource_type()
@@ -370,6 +373,10 @@ mod tests {
             (
                 "inline-image",
                 b"/F1 12 Tf BI /W 1 ID \x00x EI /X1 Do".as_slice(),
+            ),
+            (
+                "incomplete-inline-image-keeps-prefix",
+                b"/F1 12 Tf BI ID".as_slice(),
             ),
         ] {
             assert_eq!(

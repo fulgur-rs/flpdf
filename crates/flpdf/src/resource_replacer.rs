@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::content_stream::parse_content_stream_data;
+use crate::content_stream::parse_content_stream_data_recovering_inline_image_eof;
 use crate::pipeline::buffer::Buffer;
 use crate::pipeline::qpdf_tokenizer::QpdfTokenizer;
 use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
@@ -94,7 +94,7 @@ pub(crate) fn replace_resource_names(
     }
 
     let mut finder = ResourceFinder::default();
-    if parse_content_stream_data(input, &mut finder).is_err() {
+    if parse_content_stream_data_recovering_inline_image_eof(input, &mut finder).is_err() {
         return Ok(None);
     }
 
@@ -321,9 +321,31 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_inline_image_returns_none_without_replacement() {
+    fn incomplete_inline_image_keeps_prefix_replacement_and_qpdf_separator() {
         let renames = font_renames(b"F1", b"F2");
-        assert!(replace_resource_names(b"BI ID", &renames)
+        assert_eq!(
+            replace_resource_names(b"/F1 12 Tf BI ID", &renames)
+                .unwrap()
+                .unwrap(),
+            b"/F2 12 Tf BI ID "
+        );
+    }
+
+    #[test]
+    fn incomplete_inline_image_payload_keeps_prefix_replacement_only() {
+        let renames = font_renames(b"F1", b"F2");
+        assert_eq!(
+            replace_resource_names(b"/F1 12 Tf BI ID /F1 8 Tf", &renames)
+                .unwrap()
+                .unwrap(),
+            b"/F2 12 Tf BI ID /F1 8 Tf"
+        );
+    }
+
+    #[test]
+    fn fatal_structure_error_discards_collected_prefix_replacement() {
+        let renames = font_renames(b"F1", b"F2");
+        assert!(replace_resource_names(b"/F1 12 Tf [", &renames)
             .unwrap()
             .is_none());
     }

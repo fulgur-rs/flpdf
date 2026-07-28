@@ -421,9 +421,19 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_inline_image_retains_original_appearance_bytes() {
+    fn incomplete_inline_image_appearance_keeps_prefix_replacement_and_qpdf_separator() {
         let dr_map = DrMap::for_test(b"Font", b"F1", b"F1_1");
-        let content = b"BI ID";
+        let content = b"/F1 12 Tf BI ID";
+        assert_eq!(
+            rewrite_appearance_content(content, &dr_map),
+            b"/F1_1 12 Tf BI ID "
+        );
+    }
+
+    #[test]
+    fn fatal_structure_error_keeps_appearance_content_byte_identical() {
+        let dr_map = DrMap::for_test(b"Font", b"F1", b"F1_1");
+        let content = b"/F1 12 Tf [";
         assert_eq!(rewrite_appearance_content(content, &dr_map), content);
     }
 
@@ -584,6 +594,38 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(orig_font.get("F1"), Some(&Object::Reference(font_ref)));
+    }
+
+    #[test]
+    fn adjust_appearance_stream_incomplete_inline_image_keeps_resources_and_prefix_consistent() {
+        let mut pdf = open_minimal();
+        let font_ref = ObjectRef::new(5, 0);
+        pdf.set_object(font_ref, Object::Dictionary(Dictionary::new()));
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F1", Object::Reference(font_ref));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", Object::Dictionary(font_dict));
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[("Resources", Object::Dictionary(resources))],
+            b"/F1 12 Tf BI ID",
+        );
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+
+        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(stream.data, b"/F1_1 12 Tf BI ID ");
+        let font = stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .and_then(|resources| resources.get("Font"))
+            .and_then(Object::as_dict)
+            .expect("appearance stream should retain a Font resource dictionary");
+        assert_eq!(font.get("F1_1"), Some(&Object::Reference(font_ref)));
+        assert!(font.get("F1").is_none());
     }
 
     #[test]

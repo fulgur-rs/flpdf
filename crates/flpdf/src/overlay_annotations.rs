@@ -894,8 +894,8 @@ fn duplicate_field_tree<R: Read + Seek>(
 
 /// Rewrite renamed resource names in a copied field's `/DA` string, using
 /// the same `ResourceFinder`/`ResourceReplacer` path as appearance streams.
-/// Malformed content stays byte-identical: the shared replacer returns
-/// `None` instead of applying a partial replacement.
+/// Fatal structural errors stay byte-identical. qpdf-warning-only inline-image
+/// EOF preserves replacements found before the diagnostic.
 fn adjust_default_appearance(da: &[u8], dr_map: &DrMap) -> Result<Vec<u8>> {
     Ok(replace_resource_names(da, dr_map.renames())?.unwrap_or_else(|| da.to_vec()))
 }
@@ -2934,6 +2934,15 @@ mod tests {
         let dr_map = category_dr_map(b"Font", &[("F1", "F1_1")]);
         let da: &[u8] = b"(bad /F1 18 Tf";
         assert_eq!(adjust_default_appearance(da, &dr_map).unwrap(), da.to_vec());
+    }
+
+    #[test]
+    fn incomplete_inline_image_da_keeps_prefix_replacement_and_qpdf_separator() {
+        let dr_map = category_dr_map(b"Font", &[("F1", "F1_1")]);
+        assert_eq!(
+            adjust_default_appearance(b"/F1 12 Tf BI ID", &dr_map).unwrap(),
+            b"/F1_1 12 Tf BI ID ".to_vec()
+        );
     }
 
     #[test]
