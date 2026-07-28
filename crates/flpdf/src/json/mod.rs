@@ -4,6 +4,8 @@
 //!
 //! [`Reactor`] callbacks expose qpdf's incremental parse order and may consume
 //! container items to keep them out of the returned tree.
+//! Serialization APIs write to caller-supplied pipelines without finishing the
+//! outer pipeline; callers retain ownership of that finish boundary.
 
 mod handler;
 mod message;

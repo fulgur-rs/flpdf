@@ -4,6 +4,9 @@
 //! Provides the structural frame for qpdf `--json` output.  Each builder
 //! returns a [`Json`] that the caller can extend with per-section data
 //! (pages, objects, …) in later subtasks.
+//! Pipeline-facing writers leave the outer finish boundary to their caller.
+//! The CLI-facing coordinator instead accepts ordinary stdout/file handles and
+//! owns the terminal pipeline lifecycle for each output mode.
 
 use crate::json::{Json, QpdfStdioWriter};
 use crate::object::{Dictionary, Object, ObjectRef, Stream};

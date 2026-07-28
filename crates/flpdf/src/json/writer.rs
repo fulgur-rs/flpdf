@@ -1,4 +1,7 @@
 //! qpdf correspondence: JSON.cc incremental serialization and blob Base64 responsibilities.
+//!
+//! Writers leave the caller-supplied outer pipeline unfinished. Blob
+//! serialization finishes only its internally owned Base64 stage.
 
 use crate::pipeline::{Base64Action, Pipeline, PipelineResult, PlBase64, PlConcatenate, PlString};
 
