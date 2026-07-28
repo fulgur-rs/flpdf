@@ -758,6 +758,15 @@ impl LinearizationPlan {
         // preparations may mint indirect objects.
         let optimization =
             crate::optimization::Optimization::optimize(pdf, &BTreeMap::new(), true, |_| 1)?;
+        if pdf.root_ref().is_some()
+            && optimization
+                .objects_for(&crate::optimization::ObjectUser::Page(0))
+                .is_empty()
+        {
+            return Err(crate::Error::Unsupported(
+                "no pages found while calculating linearization data".to_string(),
+            ));
+        }
 
         // ----------------------------------------------------------------
         // Step 1: collect all known object refs (Part 4 initial state).
@@ -2689,6 +2698,45 @@ mod tests {
     fn open_tiny_pdf() -> Pdf<Cursor<Vec<u8>>> {
         let bytes = tiny_pdf_bytes();
         Pdf::open(Cursor::new(bytes)).expect("tiny PDF should parse")
+    }
+
+    /// Malformed catalog whose `/Pages` entry points directly at a page
+    /// dictionary. qpdf 11.9.0 does not admit this as page zero during
+    /// `getAllPages()` and reports "no pages found while calculating
+    /// linearization data".
+    fn direct_page_root_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Page /MediaBox [0 0 612 792] >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn direct_page_root_reports_qpdf_no_pages_error() {
+        let mut pdf = Pdf::open(Cursor::new(direct_page_root_pdf_bytes())).expect("fixture parses");
+
+        let err = LinearizationPlan::from_pdf(&mut pdf, false).unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref message)
+                if message == "no pages found while calculating linearization data"),
+            "direct /Type /Page root must fail like qpdf instead of reaching hint construction; \
+             got {err:?}"
+        );
     }
 
     /// Build a two-page PDF with a shared font.

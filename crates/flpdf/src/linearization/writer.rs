@@ -2573,15 +2573,15 @@ pub fn write_linearized<R: Read + Seek>(
     // same source bytes (every real caller — the CLI, and this module's own
     // `build_linearized()` test helper — re-opens the input for writing rather
     // than reusing the planning handle: "Re-open the PDF so write_linearized
-    // can seek/read objects independently"). Push here too, on THIS handle, so
-    // the objects this function actually resolves and writes match what the
-    // plan assumed — including any newly minted object for a direct
-    // non-scalar inherited attribute, which otherwise resolves to a dangling
-    // `Object::Null` on this handle. Idempotent: a no-op if `pdf` was already
-    // pushed (e.g. a caller that reuses one handle for both steps). Runs after
-    // the option guards above so an invalid option combination returns its
-    // error without mutating the caller's `Pdf` first.
-    crate::optimization::Optimization::push_inherited_attributes_to_pages(pdf)?;
+    // can seek/read objects independently"). Run qpdf's complete optimization
+    // preparation prefix here too, on THIS handle, so direct `/Outlines`,
+    // page-tree repairs, and inherited-attribute minting happen in the same
+    // order and allocate the same object numbers the plan assumed. Idempotent:
+    // a no-op if `pdf` was already prepared (e.g. a caller that reuses one
+    // handle for both steps). Runs after the option guards above so an invalid
+    // option combination returns its error without mutating the caller's `Pdf`
+    // first.
+    crate::optimization::Optimization::prepare_for_linearized_write(pdf)?;
 
     // Reconcile the caller-built plan/renumber pair with the writer's effective
     // object-stream mode. The historical `from_pdf(bool)` API maps `false` to
@@ -3658,6 +3658,39 @@ mod tests {
         Pdf::open(Cursor::new(tiny_pdf_bytes())).expect("tiny PDF should parse")
     }
 
+    /// Minimal one-page PDF whose catalog contains a direct `/Outlines`
+    /// dictionary. qpdf's optimization prefix makes it indirect before both
+    /// planning and writing.
+    fn direct_outlines_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+              /Outlines << /Type /Outlines /Count 0 >> >>\nendobj\n",
+        );
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
     fn pdf_without_root() -> Pdf<Cursor<Vec<u8>>> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let off1 = pdf.len() as u64;
@@ -3686,6 +3719,37 @@ mod tests {
     #[test]
     fn write_linearized_succeeds() {
         let _doc = build_linearized();
+    }
+
+    #[test]
+    fn separate_write_handle_indirectizes_direct_outlines_like_plan_handle() {
+        let bytes = direct_outlines_pdf_bytes();
+        let mut planning_pdf = Pdf::open(Cursor::new(bytes.clone())).expect("fixture parses");
+        let plan = LinearizationPlan::from_pdf(&mut planning_pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+
+        let mut writing_pdf = Pdf::open(Cursor::new(bytes)).expect("write fixture parses");
+        let options = WriteOptions {
+            object_streams: crate::writer::ObjectStreamMode::Disable,
+            ..WriteOptions::default()
+        };
+        let mut document = write_linearized(&plan, &renumber, &mut writing_pdf, &options)
+            .expect("linearized write");
+        document.back_patch().expect("back-patch");
+
+        let mut output =
+            Pdf::open(Cursor::new(document.bytes)).expect("linearized output should parse");
+        let root_ref = output.root_ref().expect("output has /Root");
+        let root = output.resolve(root_ref).expect("output catalog resolves");
+        let Object::Dictionary(root) = root else {
+            panic!("output root must be a dictionary");
+        };
+        assert!(
+            matches!(root.get("Outlines"), Some(Object::Reference(_))),
+            "qpdf optimization makes a direct /Outlines dictionary indirect before writing; \
+             got {:?}",
+            root.get("Outlines")
+        );
     }
 
     #[test]
@@ -3798,7 +3862,7 @@ mod tests {
     // 1b. write_linearized surfaces a too-deep `/Pages` tree as an
     //     Error::Unsupported — not a panic, hang, or stack overflow.
     //
-    // write_linearized re-runs push_inherited_attributes_to_pages on its own
+    // write_linearized re-runs the optimization preparation prefix on its own
     // write-handle (writer.rs, right after the option guards) before it emits
     // the layout. A `/Pages` chain deeper than DEFAULT_MAX_PAGE_TREE_DEPTH makes
     // that push return Error::Unsupported, which the `?` propagates out.

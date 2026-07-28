@@ -94,6 +94,20 @@ impl Optimization {
         R: Read + Seek,
         F: FnMut(&Stream) -> u8,
     {
+        let prepared = Self::prepare_pdf(pdf, allow_changes)?;
+        let page_refs = prepared
+            .as_ref()
+            .map(|prepared| prepared.pages.as_slice())
+            .unwrap_or_default();
+        let mut maps = Self::build_maps(pdf, page_refs, skip_stream_parameters)?;
+        maps.filter_compressed_objects(object_stream_data);
+        Ok(maps)
+    }
+
+    fn prepare_pdf<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        allow_changes: bool,
+    ) -> crate::Result<Option<crate::pages::repair::PreparedPages>> {
         if let Some(root_ref) = pdf.root_ref() {
             if let Object::Dictionary(mut root) = pdf.resolve(root_ref)? {
                 if let Some(Object::Dictionary(outlines)) = root.get("Outlines").cloned() {
@@ -109,22 +123,13 @@ impl Optimization {
         if let Some(ref prepared) = prepared {
             inherited_attrs::push(pdf, prepared, allow_changes, false)?;
         }
-        let page_refs = prepared
-            .as_ref()
-            .map(|prepared| prepared.pages.as_slice())
-            .unwrap_or_default();
-        let mut maps = Self::build_maps(pdf, page_refs, skip_stream_parameters)?;
-        maps.filter_compressed_objects(object_stream_data);
-        Ok(maps)
+        Ok(prepared)
     }
 
-    pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(
+    pub(crate) fn prepare_for_linearized_write<R: Read + Seek>(
         pdf: &mut Pdf<R>,
     ) -> crate::Result<()> {
-        let Some(prepared) = crate::pages::repair::prepare_for_optimization(pdf)? else {
-            return Ok(());
-        };
-        inherited_attrs::push(pdf, &prepared, true, false)
+        Self::prepare_pdf(pdf, true).map(|_| ())
     }
 
     pub(crate) fn filter_compressed_objects(&mut self, object_stream_data: &BTreeMap<u32, u32>) {
@@ -890,7 +895,7 @@ mod tests {
             ],
             b"",
         );
-        Optimization::push_inherited_attributes_to_pages(&mut pdf).unwrap();
+        Optimization::prepare_for_linearized_write(&mut pdf).unwrap();
         let pages = crate::pages::page_refs(&mut pdf).unwrap();
         let mut page = pdf
             .resolve(ObjectRef::new(3, 0))
