@@ -42,6 +42,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         bytes: Vec<u8>,
+        writes: usize,
         finishes: usize,
     }
 
@@ -51,6 +52,7 @@ mod tests {
         }
 
         fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            self.writes += 1;
             self.bytes.extend_from_slice(data);
             Ok(())
         }
@@ -115,6 +117,7 @@ mod tests {
             concatenate.write(b"").unwrap();
         }
         assert_eq!(sink.bytes, b"");
+        assert_eq!(sink.writes, 1);
     }
 
     #[test]
