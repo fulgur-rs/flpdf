@@ -1267,6 +1267,7 @@ fn file_stream_to_dev_full_matches_qpdf_success_and_complete_json() {
         .output()
         .unwrap();
     assert!(qpdf.status.success(), "{qpdf:?}");
+    serde_json::from_slice::<serde_json::Value>(&qpdf.stdout).unwrap();
 
     let flpdf = Command::cargo_bin("flpdf")
         .unwrap()
