@@ -748,7 +748,10 @@ fn top_level_linearize_normalize_content_y_mutates_before_planning() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("crlf-content.pdf");
     let output = temp.path().join("normalized-linearized.pdf");
-    std::fs::write(&input, one_page_pdf_with_content(b"q\rQ")).unwrap();
+    // CRLF collapses to LF, changing the stream length. If only the write
+    // graph is normalized while the planning graph is left untouched, the
+    // linearization offsets/hints are computed for the wrong object size.
+    std::fs::write(&input, one_page_pdf_with_content(b"q\r\nQ")).unwrap();
 
     Command::cargo_bin("flpdf")
         .unwrap()
@@ -759,6 +762,12 @@ fn top_level_linearize_normalize_content_y_mutates_before_planning() {
         .success();
 
     assert_eq!(first_page_content(&output), b"q\nQ");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("check-linearization")
+        .arg(&output)
+        .assert()
+        .success();
 }
 
 #[test]
@@ -827,6 +836,28 @@ fn top_level_qdf_explicit_normalize_content_n_overrides_default() {
         .success();
 
     assert_eq!(first_page_content(&output), b"q\rQ");
+}
+
+#[test]
+fn top_level_normalize_content_y_rejects_unwired_page_operation_path() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--normalize-content=y",
+            "in.pdf",
+            "--pages",
+            ".",
+            "1",
+            "--",
+            "out.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "--normalize-content is not applied in the \
+             --pages/--rotate/--split-pages/--collate pipeline",
+        ));
 }
 
 #[test]

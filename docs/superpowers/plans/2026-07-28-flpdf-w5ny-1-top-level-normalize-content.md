@@ -14,7 +14,9 @@
 - Reuse `CliYesNo`, `run_rewrite`, `apply_normalize_content`, and `normalize_content_stream`; do not add another normalizer or parser-only compatibility option.
 - Preserve `unset` separately from explicit `n`: `--qdf` defaults to normalization, while `--qdf --normalize-content=n` disables it.
 - Apply normalization before a linearization plan is computed, and apply it identically to the independent write graph.
-- Reject unsupported dispatch combinations rather than silently dropping the requested transformation.
+- Preserve qpdf's acceptance of writer-only options on non-writing inspection
+  modes. Reject an effective `y` on flpdf's page-operation pipeline while that
+  pipeline cannot consume the transformation, rather than silently dropping it.
 - Keep `--stream-data`, `--decode-level`, and specialized filter work out of scope.
 - Follow RED→GREEN→REFACTOR and finish with fresh 100% changed executable-line coverage against `origin/main`.
 
@@ -30,7 +32,9 @@
 - [x] Add integration tests using a repository-authored one-page PDF whose content bytes visibly differ after normalization. Assert top-level explicit `y` transforms, explicit `n` preserves, QDF unset behaves like `y`, and QDF explicit `n` overrides that default.
 - [x] Run the focused tests and verify RED because top-level Clap rejects `--normalize-content`.
 - [x] Add `normalize_content: Option<CliYesNo>` to `Cli` and a small resolver that maps `(option, qdf)` to the effective boolean without collapsing explicitness early.
-- [x] Replace both top-level hard-coded `false` arguments with the resolved policy and keep inspection/page-operation conflicts explicit.
+- [x] Replace both top-level hard-coded `false` arguments with the resolved
+  policy; preserve qpdf inspection acceptance and make the unwired
+  page-operation case explicit.
 - [x] Run focused tests to GREEN, refactor only shared policy duplication, and re-run.
 
 ## Task 2: Preserve normalization through linearization
@@ -46,10 +50,10 @@
 
 ## Task 3: Verify qtest gain and delivery gates
 
-- [ ] Run `cargo fmt -- --check`.
-- [ ] Run `cargo test -p flpdf-cli --test cli_tests`.
-- [ ] Run qtest `basic-parsing` and confirm subtests 64 and 65 pass without regressions.
-- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
-- [ ] Run `cargo test`.
-- [ ] Produce fresh LLVM coverage and run `scripts/patch-coverage.sh origin/main`; require 100%.
+- [x] Run `cargo fmt -- --check`.
+- [x] Run `cargo test -p flpdf-cli --test cli_tests`.
+- [x] Run qtest `basic-parsing` and confirm subtests 64 and 65 pass without regressions.
+- [x] Run `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+- [x] Run `cargo test`.
+- [x] Produce fresh LLVM coverage and run `scripts/patch-coverage.sh origin/main`; require 100%.
 - [ ] Commit and push the feature branch, then push Beads state. Leave the Bead open until merged-main evidence exists.

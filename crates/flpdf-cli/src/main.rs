@@ -1506,6 +1506,22 @@ fn main() {
         std::process::exit(1);
     }
 
+    // qpdf applies content normalization in its writer after page selection.
+    // flpdf's page-operation pipelines currently own serialization directly
+    // and do not run the shared rewrite mutation pass, so accepting an
+    // effective `y` here would silently discard the requested transform.
+    // Mirror the native `rewrite` surface's explicit unsupported-combination
+    // diagnostic until that pipeline grows the same consumer. Explicit `n`
+    // remains accepted because it requests no transformation.
+    if normalize_content && page_ops_active(&args.page_ops) {
+        eprintln!(
+            "flpdf: --normalize-content is not applied in the \
+             --pages/--rotate/--split-pages/--collate pipeline; \
+             rerun with --normalize-content=n or without the page operation"
+        );
+        std::process::exit(1);
+    }
+
     // `--overlay`/`--underlay` groups are stripped from argv before clap by
     // `extract_overlay_groups`, so a stripped group leaves no trace for the
     // dispatch chain. Only the rewrite paths (the `Rewrite` subcommand and the
@@ -3048,7 +3064,12 @@ fn run_rewrite(
         // never reaches here; on unsigned unencrypted input there is nothing
         // to de-restrict. Per qpdf-lenient behaviour that diagnostic is
         // omitted.
-        finish_rewrite_warnings(&input, &pdf, diagnostics_start, &normalization_last_bad)?;
+        // Preserve the pre-existing no-normalization linearize behavior:
+        // warning finalization is part of this content-mutation consumer,
+        // rather than a broad change to all repaired linearized rewrites.
+        if normalize_content {
+            finish_rewrite_warnings(&input, &pdf, diagnostics_start, &normalization_last_bad)?;
+        }
     } else {
         let mut pdf = open_pdf(&input, repair, password)?;
         let diagnostics_start = pdf.repair_diagnostics().entries().len();
