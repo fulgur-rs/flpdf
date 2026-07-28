@@ -85,6 +85,30 @@ impl ResourceFinder {
         };
         Self::insert_resource_name(names_by_resource_type, resource_type, name, *offset);
     }
+
+    pub(crate) fn handle_object_borrowed(
+        &mut self,
+        object: &Object,
+        offset: usize,
+        _length: usize,
+    ) -> Result<ParseControl> {
+        match object {
+            Object::Name(name) => {
+                self.pending_operands = true;
+                self.last_name = Some((name.clone(), offset));
+            }
+            Object::Operator(operator) => {
+                self.last_operator_started_at_boundary = !self.pending_operands;
+                self.pending_operands = false;
+                if let Some(resource_type) = operator_resource_type(operator) {
+                    self.record_last_name(resource_type);
+                }
+            }
+            Object::InlineImage(_) => {}
+            _ => self.pending_operands = true,
+        }
+        Ok(ParseControl::Continue)
+    }
 }
 
 fn operator_resource_type(operator: &[u8]) -> Option<&'static [u8]> {
@@ -105,24 +129,9 @@ impl ParserCallbacks for ResourceFinder {
         &mut self,
         object: Object,
         offset: usize,
-        _length: usize,
+        length: usize,
     ) -> Result<ParseControl> {
-        match object {
-            Object::Name(name) => {
-                self.pending_operands = true;
-                self.last_name = Some((name, offset));
-            }
-            Object::Operator(operator) => {
-                self.last_operator_started_at_boundary = !self.pending_operands;
-                self.pending_operands = false;
-                if let Some(resource_type) = operator_resource_type(&operator) {
-                    self.record_last_name(resource_type);
-                }
-            }
-            Object::InlineImage(_) => {}
-            _ => self.pending_operands = true,
-        }
-        Ok(ParseControl::Continue)
+        self.handle_object_borrowed(&object, offset, length)
     }
 
     fn handle_diagnostic(&mut self, _offset: usize, _message: &str) -> Result<()> {
@@ -152,6 +161,40 @@ mod tests {
         let mut finder = ResourceFinder::default();
         parse_content_stream_data(input, &mut finder)?;
         Ok(finder)
+    }
+
+    #[test]
+    fn borrowed_large_operand_remains_owned_by_the_caller() {
+        let operand = Object::String(vec![b'x'; 1024 * 1024]);
+        let original_ptr = operand.as_string().unwrap().as_ptr();
+        let mut finder = ResourceFinder::default();
+
+        finder
+            .handle_object_borrowed(&operand, 17, 1024 * 1024)
+            .unwrap();
+
+        assert!(finder.has_pending_operands());
+        assert_eq!(operand.as_string().unwrap().as_ptr(), original_ptr);
+        assert_eq!(operand.as_string().unwrap().len(), 1024 * 1024);
+    }
+
+    #[test]
+    fn borrowed_name_is_retained_for_the_following_operator() {
+        let name = Object::Name(b"F1".to_vec());
+        let operator = Object::Operator(b"Tf".to_vec());
+        let mut finder = ResourceFinder::default();
+
+        finder.handle_object_borrowed(&name, 23, 3).unwrap();
+        finder.handle_object_borrowed(&operator, 27, 2).unwrap();
+
+        assert_eq!(name.as_name(), Some(b"F1".as_slice()));
+        assert!(finder
+            .names_by_resource_type()
+            .get(b"Font".as_slice())
+            .unwrap()
+            .get(b"F1".as_slice())
+            .unwrap()
+            .contains(&23));
     }
 
     fn hex_encode(bytes: &[u8]) -> String {
