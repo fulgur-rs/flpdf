@@ -164,10 +164,11 @@ impl<'a> LzwDecoder<'a> {
                 // Add the entry the encoder created last time: what was read
                 // last, extended by the first character of what is read now.
                 let table_size = self.table.len() as u32;
-                let mut next_char = 0u8;
-                if code < CLEAR_CODE {
-                    next_char = code as u8;
-                } else if code > EOD_CODE {
+                let next_char = if code < CLEAR_CODE {
+                    code as u8
+                } else {
+                    // The enclosing branch already excluded the two reserved
+                    // codes, so any remaining code is table-backed.
                     let index = (code - FIRST_TABLE_CODE) as usize;
                     if index > table_size as usize {
                         return Err(PipelineError::runtime("LZWDecoder: bad code received"));
@@ -175,11 +176,11 @@ impl<'a> LzwDecoder<'a> {
                         // The encoder would have just created this entry, so its
                         // first character matches the first character of the
                         // previous entry.
-                        next_char = self.get_first_char(self.last_code)?;
+                        self.get_first_char(self.last_code)?
                     } else {
-                        next_char = self.get_first_char(code)?;
+                        self.get_first_char(code)?
                     }
-                }
+                };
                 let new_index = FIRST_TABLE_CODE + table_size;
                 if new_index == TABLE_LIMIT {
                     return Err(PipelineError::runtime("LZWDecoder: table full"));

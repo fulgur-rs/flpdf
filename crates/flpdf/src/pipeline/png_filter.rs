@@ -153,25 +153,22 @@ impl<'a> PngFilter<'a> {
     }
 
     fn encode_row(&mut self) -> PipelineResult<()> {
-        self.next.write(&[2])?;
         let bytes_per_row = self.bytes_per_row;
-        if self.has_prev {
+        let has_prev = self.has_prev;
+        let (current, previous) = if self.cur_is_first {
+            (&self.buf1, &self.buf2)
+        } else {
+            (&self.buf2, &self.buf1)
+        };
+        let next = &mut *self.next;
+
+        next.write(&[2])?;
+        if has_prev {
             for index in 0..bytes_per_row {
-                let (current, previous) = if self.cur_is_first {
-                    (&self.buf1, &self.buf2)
-                } else {
-                    (&self.buf2, &self.buf1)
-                };
-                let byte = current[index].wrapping_sub(previous[index]);
-                self.next.write(&[byte])?;
+                next.write(&[current[index].wrapping_sub(previous[index])])?;
             }
         } else {
-            let current = if self.cur_is_first {
-                &self.buf1
-            } else {
-                &self.buf2
-            };
-            self.next.write(&current[..bytes_per_row])?;
+            next.write(&current[..bytes_per_row])?;
         }
         Ok(())
     }
@@ -446,6 +443,24 @@ mod tests {
                 0x09, 0x09, 0x09, 0x09,
             ]
         );
+    }
+
+    /// Paeth returns whichever of left, up, and upper-left is nearest the
+    /// initial estimate. This row selects `up` at index 0 and `upper_left` at
+    /// index 1, the two arms the tie-break order reaches after `left` loses.
+    #[test]
+    fn paeth_selects_up_and_upper_left_when_left_is_not_nearest() {
+        let geometry = Geometry {
+            columns: 2,
+            colors: 1,
+            bits: 8,
+        };
+        let (output, _) = run(
+            PngFilterAction::Decode,
+            &geometry,
+            &[&[0, 100, 200, 4, 156, 0]],
+        );
+        assert_eq!(output, vec![100, 200, 0, 100]);
     }
 
     #[test]

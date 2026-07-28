@@ -308,6 +308,18 @@ fn oracle_cases() -> Vec<OracleCase> {
             ]),
         },
         OracleCase {
+            name: "png-decode-paeth-tie-breaks",
+            codec: Codec::Png {
+                action: PngFilterAction::Decode,
+                columns: 2,
+                colors: 1,
+                bits_per_component: 8,
+            },
+            fail_writes: vec![],
+            fail_finishes: vec![],
+            operations: write_all(vec![0, 100, 200, 4, 156, 0]),
+        },
+        OracleCase {
             name: "png-decode-unknown-filter-byte",
             codec: BYTE_ROW,
             fail_writes: vec![],
@@ -762,6 +774,7 @@ fn assert_qpdf_oracle_matches_with(mut qpdf_trace: impl FnMut(&OracleCase) -> St
     }
 }
 
+// cov:ignore-start: ignored live entry point; ordinary tests cover case generation, local traces, probe arguments, failures, and comparison
 #[test]
 #[ignore = "live qpdf 11.9.0 LZW/PNG oracle"]
 fn qpdf_lzw_png_differential() {
@@ -769,6 +782,7 @@ fn qpdf_lzw_png_differential() {
         .expect("set QPDF_LZW_PNG_PROBE to the qpdf 11.9.0 probe");
     assert_qpdf_oracle_matches(Path::new(&probe));
 }
+// cov:ignore-end
 
 fn assert_qpdf_oracle_matches(probe: &Path) {
     assert_qpdf_oracle_matches_with(|case| run_qpdf_probe(probe, case));
@@ -778,8 +792,8 @@ fn assert_qpdf_oracle_matches(probe: &Path) {
 mod tests {
     use super::{
         assert_qpdf_oracle_matches, assert_qpdf_oracle_matches_with, construction_record,
-        flpdf_trace, oracle_cases, run_qpdf_probe_command, validate_trace_protocol, Codec,
-        Operation, OracleCase, PipelineError,
+        flpdf_trace, operation_record, oracle_cases, run_qpdf_probe_command,
+        validate_trace_protocol, Codec, Operation, OracleCase, PipelineError,
     };
     use crate::pipeline::png_filter::PngFilterAction;
     use std::path::Path;
@@ -838,6 +852,19 @@ mod tests {
     }
 
     #[test]
+    fn operation_records_bind_exact_error_categories() {
+        assert_eq!(operation_record(3, Ok(())), "op\t3\tok\t\n");
+        assert_eq!(
+            operation_record(3, Err(PipelineError::runtime("ab"))),
+            "op\t3\truntime\t6162\n"
+        );
+        assert_eq!(
+            operation_record(3, Err(PipelineError::logic("ab"))),
+            "op\t3\tlogic\t6162\n"
+        );
+    }
+
+    #[test]
     fn construction_records_bind_exact_error_categories() {
         assert_eq!(construction_record(&Ok(())), "ctor\t0\tok\t\n");
         assert_eq!(
@@ -873,9 +900,12 @@ mod tests {
                 "case {} trace: {trace:?}",
                 case.name
             );
-            validate_trace_protocol(&trace, case.operations.len()).unwrap_or_else(|error| {
-                panic!("case {} produced an invalid trace: {error}", case.name)
-            });
+            assert_eq!(
+                validate_trace_protocol(&trace, case.operations.len()),
+                Ok(()),
+                "case {}",
+                case.name
+            );
         }
     }
 

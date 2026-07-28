@@ -216,14 +216,12 @@ where
     let prepared = prepare_decode_filters(specs)?;
     let mut decoded = Cow::Borrowed(stream_data);
     for mut stage in prepared {
-        let filter_name = stage.filter_name;
-        let next = if filter_name == b"Crypt" {
-            decrypt_crypt(stage.decode_params, decoded.as_ref())?
-        } else {
-            if let Some(filter) = stage.adapter.as_mut() {
-                filter.pipe_decode(decoded.as_ref(), limits.max_output, warn)?
-            } else {
-                apply_single_filter_decode(filter_name).map_err(Error::Unsupported)?
+        let next = match &mut stage.stage {
+            PreparedStage::Crypt { decode_params } => {
+                decrypt_crypt(*decode_params, decoded.as_ref())?
+            }
+            PreparedStage::Codec { adapter } => {
+                adapter.pipe_decode(decoded.as_ref(), limits.max_output, warn)?
             }
         };
         decoded = Cow::Owned(next);
@@ -231,10 +229,21 @@ where
     Ok(decoded.into_owned())
 }
 
+/// A filter-chain stage with its decode route already resolved.
+///
+/// Every name flpdf decodes resolves to a registered `StreamFilter`;
+/// `Crypt` is the one stage the caller decrypts instead.
+enum PreparedStage<'a> {
+    Crypt {
+        decode_params: Option<&'a Object>,
+    },
+    Codec {
+        adapter: Box<dyn crate::stream_filter::StreamFilter>,
+    },
+}
+
 struct PreparedDecodeFilter<'a> {
-    filter_name: &'a [u8],
-    decode_params: Option<&'a Object>,
-    adapter: Option<Box<dyn crate::stream_filter::StreamFilter>>,
+    stage: PreparedStage<'a>,
 }
 
 fn prepare_decode_filters<'a>(
@@ -245,45 +254,41 @@ fn prepare_decode_filters<'a>(
         let filter_name = crate::stream_filter::normalize_filter_name(spec.name);
         if filter_name == b"Crypt" {
             prepared.push(PreparedDecodeFilter {
-                filter_name,
-                decode_params: spec.decode_params,
-                adapter: None,
+                stage: PreparedStage::Crypt {
+                    decode_params: spec.decode_params,
+                },
             });
             continue;
         }
 
-        let adapter = if let Some(mut adapter) = stream_filter_for(filter_name) {
-            if !adapter.set_decode_params(spec.decode_params) {
-                return Err(Error::Unsupported(format!(
-                    "stream filter {} does not support supplied /DecodeParms",
-                    String::from_utf8_lossy(filter_name)
-                )));
-            }
-            Some(adapter)
-        } else {
-            validate_legacy_decode_filter(filter_name)?;
-            None
+        let Some(mut adapter) = stream_filter_for(filter_name) else {
+            return Err(undecodable_filter_error(filter_name));
         };
+        if !adapter.set_decode_params(spec.decode_params) {
+            return Err(Error::Unsupported(format!(
+                "stream filter {} does not support supplied /DecodeParms",
+                String::from_utf8_lossy(filter_name)
+            )));
+        }
 
         prepared.push(PreparedDecodeFilter {
-            filter_name,
-            decode_params: spec.decode_params,
-            adapter,
+            stage: PreparedStage::Codec { adapter },
         });
     }
     Ok(prepared)
 }
 
-fn validate_legacy_decode_filter(filter_name: &[u8]) -> Result<()> {
+/// Report why a filter name has no decode route.
+fn undecodable_filter_error(filter_name: &[u8]) -> Error {
     if let Some(label) = passthrough_codec_label(filter_name) {
-        return Err(Error::Unsupported(format!(
+        return Error::Unsupported(format!(
             "passthrough codec {label}: image/binary stream data is not decoded by flpdf (preserved verbatim)"
-        )));
+        ));
     }
-    Err(Error::Unsupported(format!(
+    Error::Unsupported(format!(
         "unsupported stream filter: {}",
         std::str::from_utf8(filter_name).unwrap_or("<binary>")
-    )))
+    ))
 }
 
 fn encode_stream_data_with_filters(
@@ -323,25 +328,6 @@ fn apply_encode_params(
             bits_per_component,
         ),
     }
-}
-
-/// Report why a filter name has no decode route.
-///
-/// Every codec flpdf implements is reached through `stream_filter_for`, so this
-/// runs only for passthrough and unknown filter names.
-fn apply_single_filter_decode(filter_name: &[u8]) -> std::result::Result<Vec<u8>, String> {
-    // Passthrough codecs: flpdf does not decode image/binary streams.
-    // The writer preserves these streams verbatim (qpdf parity).
-    if let Some(label) = passthrough_codec_label(filter_name) {
-        return Err(format!(
-            "passthrough codec {label}: image/binary stream data is not decoded by flpdf (preserved verbatim)"
-        ));
-    }
-
-    Err(format!(
-        "unsupported stream filter: {}",
-        std::str::from_utf8(filter_name).unwrap_or("<binary>")
-    ))
 }
 
 /// Apply a single encode filter to `stream_data`.
