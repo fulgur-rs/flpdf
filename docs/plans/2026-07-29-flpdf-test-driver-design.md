@@ -1,0 +1,302 @@
+# qpdf `test_driver` 相当バイナリの設計
+
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:writing-plans to turn this design into a task-by-task plan before implementing.
+
+**Goal:** qtest `basic-parsing.test` の 21 件の `test_driver N goodM.pdf` subtest を救済する。
+現状はいずれも `TestDriver->runtest: unable to run command` / exit 2 で FAIL している。
+
+**Beads:** flpdf-n9t0.2（実装）/ flpdf-n9t0.3（shim）/ flpdf-n9t0.4（前提バグ）/ flpdf-n9t0.5（前提 chore）。
+親 epic は flpdf-n9t0。
+
+**Oracle:** qpdf v11.9.0 `qpdf/test_driver.cc`（`test_0_1` = 20 件、`test_3` = good14 の 1 件）。
+本物の `test_driver` バイナリで `good1.out` / `good21.out` の再現を実測確認済み。
+
+---
+
+## 0. 責務の所在
+
+`test_driver` は flpdf-cli（qpdf CLI 互換）の話ではない。qpdf の **ライブラリ API**
+（`QPDF` / `QPDFObjectHandle`）を直接叩く C++ テストツールであり、必要なのは
+
+- (a) flpdf-qtest 側の PATH shim（flpdf-n9t0.3）
+- (b) qpdf のオブジェクトハンドル意味論を露出するテスト用バイナリ（flpdf-n9t0.2）
+
+の 2 つ。`flpdf-qtest/shim/` には現在 `qpdf` / `qpdf-test-compare` / `fix-qdf` /
+`zlib-flate` の 4 つしか無い。
+
+## 1. 依存順序
+
+```
+flpdf-n9t0.4 (P1 bug)          flpdf-n9t0.5 (chore)
+  文字列 unparse の qpdf 一致      crate リネーム・ヘルパー集約
+        └──────────┬──────────────────┘
+                   ▼
+            flpdf-n9t0.2  test_driver 実装（test_0_1）
+                   ▼
+            flpdf-n9t0.3  flpdf-qtest に shim 設置
+```
+
+n9t0.4 と n9t0.5 は互いに独立で並行可。bd 側に `blocked-by` を張ってあるので
+`bd ready` には 4 と 5 だけが出る。
+
+### 1.1 なぜ n9t0.4 が前提なのか
+
+`Object::write_pdf` は qpdf の `QPDFObjectHandle::unparse` と一致していない。
+`crates/flpdf/src/object.rs:697` の `is_printable_string` は「全バイトが `0x20..=0x7e`」で
+hex/literal を選ぶが、qpdf の `QPDF_String::useHexString`（`libqpdf/QPDF_String.cc:72-90`）は
+
+- `\b \t \n \f \r` を hex 強制の対象にしない（リテラル内でエスケープする）
+- 非 ASCII は `5 * non_ascii > len` の閾値を超えたときだけ hex にする
+
+実測（qpdf 11.9.0 vs flpdf @ eef2bbc4、`flpdf rewrite --static-id` と `qpdf --static-id`）:
+
+| 入力の文字列 | qpdf | flpdf |
+|---|---|---|
+| `(a\nb)` | `(a\nb)` | `<610a62>` |
+| 24 バイト中 2 バイトが非 ASCII | `(caf<C3><A9> latte and teas xyz)` | `<636166c3a9…>` |
+
+`good13` の QDF 差分はこの 2 箇所と、その帰結である xref オフセットの一律 +4 ずれだけ。
+したがって n9t0.4 の修正で basic-parsing の subtest 38 / 39 が byte-identical になる見込み。
+
+## 2. crate レイアウト
+
+n9t0.5 で `crates/flpdf-test-compare` を `crates/flpdf-qtest-tools` にリネームし、
+qtest ハーネス用のヘルパーバイナリを 1 crate に集約する。**binary 名は据え置く**
+（flpdf-qtest の shim は `FLPDF_TEST_COMPARE_BIN` 経由で `target/release/flpdf-test-compare`
+という binary 名しか見ていない）。
+
+```
+crates/flpdf-qtest-tools/
+  Cargo.toml
+    [[bin]] name = "flpdf-test-compare"   path = "src/main.rs"       # 既存
+    [[bin]] name = "flpdf-test-driver"    path = "src/bin/driver.rs" # 新規
+  src/
+    lib.rs           既存 + driver モジュールの re-export
+    common.rs        新規 — program_name(argv0) を main.rs から移動
+    clean.rs         既存（compare 専用）
+    compare.rs       既存
+    orchestrator.rs  既存
+    output.rs        既存 + バイナリ書き出しヘルパー
+    main.rs          既存 compare — program_name を common に委譲
+    driver/
+      mod.rs         runtest ディスパッチ / "test N done" / invalid test
+      handle.rs      Handle 型と QPDFObjectHandle 意味論
+      test_0_1.rs
+```
+
+既存ファイルは移動しない。n9t0.2 が `main.rs` に触るのは `program_name` の移設 1 点。
+
+`program_name` を共有するのは整形上の都合ではなく仕様。qpdf の `main` は compare 側も
+test_driver 側も `strrchr(argv[0], '/') + 1` で `whoami` を作り、それが usage と
+エラー行の接頭辞になる。複製すると片方だけ直る事故が起きる。
+
+qpdf 自身は `compare-for-test/qpdf-test-compare.cc` と `qpdf/test_driver.cc` を
+別ディレクトリ・別ターゲットに置いている。1 crate への集約は出力バイトに影響しない
+ビルド構成の差であり、CLAUDE.md の逸脱分類 (B) に該当する。
+`docs/qpdf-correspondence.md` に ⚪ 行を 1 行記載すること。
+
+## 3. CLI 契約とディスパッチ順序
+
+```
+test_driver <n> <filename1> [arg2]
+```
+
+`test_driver.cc:3571-3593` より:
+
+- `argc < 3 || argc > 4` → stderr に `Usage: <whoami> n filename1 [arg2]`、exit 2
+- 例外は `e.what()` を stderr に 1 行、exit 2
+- 正常終了は exit 0
+
+`runtest`（`test_driver.cc:3457-3569`）の順序:
+
+```
+1. QPDF pdf;
+2. n による読込分岐            ← 先
+3. test_functions.find(n)      ← 後
+     見つからなければ throw std::runtime_error("invalid test " + n)
+4. 関数呼び出し
+5. stdout に "test <n> done"
+```
+
+**読込がルックアップより先**である点が重要。壊れた PDF を未実装番号に食わせると
+`invalid test 50` ではなく parse エラーが出る。「番号を先に検証して早期リターン」は
+qpdf と挙動が変わるので避けること。
+
+読込分岐は `n % 2 == 1` → メモリ、`n % 4 == 0` → パス、それ以外の偶数 → `FILE*`。
+実装対象の 1 と 3 はどちらも奇数なので実際に通るのはメモリ経路（`Pdf::open_mem`）だけだが、
+分岐そのものは qpdf の形で書く。
+
+### 3.1 fail-loud
+
+実装していない番号は `invalid test <n>` を stderr に出して exit 2。
+n9t0.3 で shim を PATH に置いた瞬間、basic-parsing 以外の `.test` が呼ぶ ~97 個の
+test 番号すべてにこれが効く。黙って成功させると記録済みベースライン
+（Passes 140 / allowlist 39/39 PASS / 回帰 0）が静かに動く。
+
+### 3.2 バッファリング
+
+qpdf は `QUtil::setLineBuf(stdout)` = `setvbuf(_IOLBF)`。Rust の `io::Stdout` は
+`LineWriter` なので既定で一致する。ただし **stderr に書く前に必ず stdout を flush** する。
+`good14.out` が `<610062> (MOO)WARNING: good14.pdf (offset 628): …` と改行なしで繋がっており、
+qtest は両ストリームを 1 本に束ねて捕捉するため、flush 規律を外すと順序が入れ替わる。
+
+## 4. `Handle` — QPDFObjectHandle 意味論
+
+```rust
+struct Handle {
+    resolved: Object,            // 解決済みの値
+    indirect: Option<ObjectRef>, // 間接参照だったならその参照
+}
+```
+
+qpdf の `QPDFObjectHandle` は未解決の参照を保持したまま型を聞かれると解決するハンドル。
+`get_key` の時点で解決し参照を `indirect` に残せば、`isIndirect()` / `unparse()` /
+`unparseResolved()` の 3 つを賄える。
+
+意味論は flpdf 本体ではなくこの crate 側に置く。flpdf の `Option` ベース API と
+二重化させないため。
+
+**`get_key`** — 欠落キーは `Handle { resolved: Object::Null, indirect: None }`。
+根拠は `QPDF_Dictionary::getKey` のコメント（"PDF spec says fetching a non-existent key
+from a dictionary returns the null object"）。これが subtest 1 "implicit null" の中身。
+
+**`has_key`** — `QPDF_Dictionary::hasKey`（`QPDF_Dictionary.cc:98-101`）は
+`items.count(key) > 0 && !items[key].isNull()`。`isNull()` が間接参照を解決するため、
+`good2`（直接 null）・`good3`（dangling ref）・`good4`（実在する null）が揃って `false` になり、
+3 つとも `/QTest is implicit` を出す。flpdf 側は `Pdf::resolve_borrowed` の既存挙動
+（「unknown / freed / broken な参照は Null に解決」、`reader.rs:1131`）がそのまま `good3` に対応する。
+
+**`type_code` / `type_name`** — `Constants.h:108-128` の `qpdf_object_type_e` の並びが
+そのまま数値。名前は各 `QPDF_*.cc` の `QPDFValue(::ot_X, "…")` が真。
+
+| code | name | 実測元 |
+|---|---|---|
+| 0 / 1 | `uninitialized` / `reserved` | flpdf に対応物なし |
+| 2 | `null` | good1/2/3/4 |
+| 3 | `boolean` | good5 |
+| 4 / 5 | `integer` / `real` | good7 / good8 |
+| 6 / 7 | `string` / `name` | good9 / good15 |
+| 8 / 9 / 10 | `array` / `dictionary` / `stream` | good21 / good11 / good12 |
+| 11 / 12 | `operator` / `inline-image` | — |
+| 13 / 14 | `unresolved` / `destroyed` | flpdf に対応物なし |
+
+`ot_inlineimage` の名前は `"inlineimage"` ではなく **`"inline-image"`**（ハイフン入り）。
+flpdf の `Object` には 0/1/13/14 に相当する variant が無いので、enum の判別子ではなく
+明示テーブルで書く。
+
+**`unparse` / `unparse_resolved`** — n9t0.4 修正後の `Object::write_pdf` を再利用し、
+**stream だけ特例**（`QPDF_Stream::unparse` は間接参照を返す。`good12` の
+`unparseResolved: 7 0 R` が根拠）。入れ子は解決しない — `good21` の
+`[ /literal null /indirect 8 0 R /undefined 10 0 R ]` の通り配列要素の参照は `N G R` のまま残り、
+これは `write_pdf` の `Object::Reference` 分岐と一致する。
+
+## 5. `test_0_1`（20 subtest）
+
+出力は 5 パート固定:
+
+```
+[hasKey が false なら] /QTest is implicit
+/QTest is {in,}direct and has type <name> (<code>)
+<型別の 1〜N 行>
+unparse: <…>
+unparseResolved: <…>
+```
+
+型別行で注意する点:
+
+- `real` はリテラルをそのまま保持する（`good10`: `unparse: [ 1 (2) 8 0 R 0.0 -0.0 0. -0. ]`）。
+  flpdf の `Object::RealLiteral { value, literal }` が既に対応済み
+- `stream` は `"/QTest is a stream.  Dictionary: "` — **ピリオドの後がスペース 2 つ**
+- stream は raw（`Stream.data` をそのまま）と decoded（`decode_stream_data`）を両方 stdout へ。
+  decode 失敗時は `Stream data is not filterable.`
+- `array` / `dictionary` は要素ごとに `  item N is {in,}direct` / `  /key is {in,}direct`
+
+この 20 subtest は既存の flpdf 公開 API だけで完結する — `Pdf::open_mem` / `trailer()` /
+`resolve_borrowed()` / `Stream { pub dict, pub data }` / `decode_stream_data` /
+n9t0.4 修正後の `write_pdf`。
+
+## 6. `test_3` は n9t0.2 から切り出す
+
+`good14` だけが使う経路（subtest 40）。`/QStreams` 配列を回して各 stream を正規化しながら
+stdout に流し、期待出力には qpdf の警告が本文中に割り込む:
+
+```
+WARNING: good14.pdf (offset 628): content normalization encountered bad tokens
+```
+
+出所は `QPDF_Stream.cc:624-634` の 3 連 `warn(...)`。`QPDF_Stream::warn` は
+`qpdf->warn(qpdf_e_damaged_pdf, "", this->parsed_offset, message)` で、書式は
+`QPDFExc::createWhat`（`QPDFExc.cc:18-41`）の `<filename> (offset <N>): <message>`。
+
+必要になるのは 3 つで、flpdf に無いのは 1 番目:
+
+1. **stream オブジェクトの `parsed_offset`** — 警告に載るファイル内オフセット
+2. 警告文の逐語再現 — qpdf 側のタイポ `"may be corrupted but is may still useful"` も含めて
+3. stdout flush 規律（3.2）
+
+判定フラグ自体は flpdf の `ContentNormalization::any_bad_tokens()` /
+`last_token_was_bad()` が既に持っている。
+
+**21 件中 1 件のために別種の作業（オフセット追跡 + 警告文言の移植）を要求するため、
+n9t0.2 は `test_0_1` に限定し `test_3` は別 issue に切る。** `invalid test 3` で
+fail-loud するのでベースラインは静かに動かない。
+
+## 7. fixture とテスト
+
+```
+tests/fixtures/test_driver/
+  README.md        flpdf-authored の license 注記（compare_for_test/README.md に倣う）
+  generate.sh      PDF は python3 で生成、期待出力は本物の test_driver で生成
+  implicit_null.{pdf,out}        欠落キー
+  direct_null.{pdf,out}          /QTest null
+  dangling_ref.{pdf,out}         存在しないオブジェクトへの参照
+  indirect_null.{pdf,out}        実在する null オブジェクト
+  indirect_bool.{pdf,out}        hasKey が true になる対照
+  int_real.{pdf,out}             RealLiteral の verbatim 保持（0.0 -0.0 0. -0.）
+  string_hex_literal.{pdf,out}   n9t0.4 の境界（\n 入り・閾値ちょうど・8 進フォールバック）
+  name_escape.{pdf,out}          /hex#20strings 相当
+  array_indirect.{pdf,out}       要素ごとの direct/indirect
+  dict_keys.{pdf,out}            キーの lexicographic 順
+  stream_flate.{pdf,out}         raw / uncompressed / dict unparse
+  stream_unfilterable.{pdf,out}  Stream data is not filterable.
+```
+
+`flpdf-qtest/vendor/qpdf-qtest/` からのコピーは一切しない
+（`tests/fixtures/compare_for_test/README.md` の方針）。
+
+`scripts/qpdf-test-driver-diff.sh` を既存の
+`qpdf-{tokenizer,rc4,lzw-png,stream-codecs}-diff.sh` と同じ形で追加する。
+`scripts/fetch-qpdf-source.sh` で pinned source を取り `test_driver` をビルドして
+全 fixture を `flpdf-test-driver` と突き合わせる。期待出力はコミット済みなので
+通常の `cargo test` は qpdf ビルド不要で回る。
+
+**flpdf を出力生成に使う場面では必ず `flpdf rewrite` を使う。** トップレベルの
+`flpdf in out` は完全な書き直しをせず入力にバイトを追記する別経路で、qpdf の
+`qpdf in out` とは挙動が違う（epic の good17 非 QDF 失敗 67/68/69 と符合する）。
+
+### 7.1 カバレッジ
+
+`flpdf-qtest-tools` は `scripts/patch-coverage.sh` の `REPORT_PREFIXES`（報告のみ）。
+一方 **n9t0.4 は `crates/flpdf/src/` を触るので変更行 100% ゲートの対象**。
+
+## 8. 残るリスク
+
+1. **n9t0.4 に既存のセーフティネットが無い。** `cargo test --workspace
+   --features qpdf-zlib-compat --no-fail-fast` は 132 テストバイナリすべて緑
+   （2026-07-29 実測）。つまり既存 golden はどれもこの経路を通っていない。
+   修正と同時に回帰網を作らないと、次に壊れたとき誰も気づかない。
+2. **n9t0.5 のクロスリポジトリ順序。** flpdf-qtest の
+   `scripts/run.sh:84` と `.github/workflows/ci.yml:81` が
+   `cargo build --release -p flpdf-test-compare` と package 名を直に書いている。
+   flpdf-qtest 側を先にマージしないと CI に破断ウィンドウができる。
+3. **`write_pdf` と `QPDFObjectHandle::unparse` の一致は全網羅では未検証。**
+   real / name / dict / array は good7/8/10/11/13/15/21 で実測一致を確認したが、
+   本当の担保は probe で全 fixture を突き合わせること。
+4. **good13 の subtest 38/39 が n9t0.4 で緑になるのは見込み。** QDF 差分がそれだけで
+   あることは確認済みだが、qtest 実走までは確定ではない。
+
+## 9. スコープ外
+
+- `test_driver` の残り ~97 個の test 関数（fail-loud で `invalid test N`）
+- flpdf 本体への `ObjectHandle` 公開 API の追加
+- binary 名の変更、compare アルゴリズムの変更
