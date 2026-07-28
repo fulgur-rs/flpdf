@@ -103,21 +103,22 @@ pub fn check_reader_with_options<R: Read + Seek>(
 /// limit.
 ///
 /// Behaves like [`check_reader_with_options`], but bounds each page content
-/// stream's `FlateDecode`/`LZWDecode` output to [`DecodeLimits::max_output`]. A
-/// stream whose decoded output would exceed that cap is reported as a warning
-/// (a decompression-bomb guard trip), not a stream-encoding error: the stream
-/// is intact, merely larger than the caller allowed. With
+/// stream's `FlateDecode`, `LZWDecode`, `ASCII85Decode`, `ASCIIHexDecode`, or
+/// `RunLengthDecode` output to [`DecodeLimits::max_output`]. A stream whose
+/// decoded output would exceed that cap is reported as a warning (a
+/// decompression-bomb guard trip), not a stream-encoding error: the stream is
+/// intact, merely larger than the caller allowed. With
 /// [`DecodeLimits::default`] (no cap) this is identical to
 /// [`check_reader_with_options`].
 ///
 /// # Limitations
 ///
-/// A capped stream is not fully decoded, so errors that only a complete decode
-/// would surface — invalid `/DecodeParms` (e.g. an unsupported `/Predictor`) or
-/// corruption past the cap — are not reported for that stream while a cap is in
-/// effect; with [`DecodeLimits::default`] they still surface as errors. Content
-/// streams carrying an explicit `/Crypt` filter are decoded during object
-/// resolution and are not bounded by this cap.
+/// A stream capped in any of the codecs above is not fully decoded, so errors
+/// that only a complete decode would surface — invalid `/DecodeParms` (e.g. an
+/// unsupported `/Predictor`) or corruption past the cap — are not reported for
+/// that stream while a cap is in effect; with [`DecodeLimits::default`] they
+/// still surface as errors. Content streams carrying an explicit `/Crypt`
+/// filter are decoded during object resolution and are not bounded by this cap.
 ///
 /// # Errors
 ///
