@@ -2,6 +2,8 @@
 
 pub(crate) mod ascii85;
 
+pub(crate) mod ascii_hex;
+
 pub(crate) mod buffer;
 
 pub(crate) mod count;
