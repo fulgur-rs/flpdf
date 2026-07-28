@@ -37,8 +37,8 @@ impl Pipeline for PlConcatenate<'_> {
 #[cfg(test)]
 mod tests {
     use super::PlConcatenate;
-    use crate::pipeline::test_support::{shared_trace, RecordingSink, TraceCall};
-    use crate::pipeline::Pipeline;
+    use crate::pipeline::test_support::{shared_trace, FailureCategory, RecordingSink, TraceCall};
+    use crate::pipeline::{Pipeline, PipelineError};
 
     #[test]
     fn ordinary_finish_is_suppressed_but_manual_finish_is_forwarded() {
@@ -89,11 +89,13 @@ mod tests {
     fn pl_concatenate_propagates_write_error_unchanged() {
         let trace = shared_trace();
         let mut sink = RecordingSink::with_trace(trace.clone(), &[1], &[]);
+        assert_eq!(sink.identifier(), "recording");
         let error = {
             let mut concatenate = PlConcatenate::new("cat", &mut sink);
             concatenate.write(b"payload").unwrap_err()
         };
 
+        assert!(matches!(error, PipelineError::Runtime(_)));
         assert_eq!(error.message(), "sink write failure 1");
         assert_eq!(
             trace.borrow().calls,
@@ -117,12 +119,14 @@ mod tests {
     #[test]
     fn pl_concatenate_manual_finish_propagates_error_unchanged() {
         let trace = shared_trace();
-        let mut sink = RecordingSink::with_trace(trace.clone(), &[], &[1]);
+        let mut sink = RecordingSink::with_trace(trace.clone(), &[], &[1])
+            .with_failure_categories(FailureCategory::Runtime, FailureCategory::Logic);
         let error = {
             let mut concatenate = PlConcatenate::new("cat", &mut sink);
             concatenate.manual_finish().unwrap_err()
         };
 
+        assert!(matches!(error, PipelineError::Logic(_)));
         assert_eq!(error.message(), "sink finish failure 1");
         assert_eq!(trace.borrow().calls, [TraceCall::Finish { failed: true }]);
     }

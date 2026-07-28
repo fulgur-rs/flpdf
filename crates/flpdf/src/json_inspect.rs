@@ -3084,11 +3084,9 @@ mod tests {
     }
 
     impl Pipeline for FailAfterPipeline {
-        // cov:ignore-start: identifier is a trait obligation; the raw writer never queries downstream identifiers
         fn identifier(&self) -> &str {
             "fail-after"
         }
-        // cov:ignore-end
 
         fn write(&mut self, buffer: &[u8]) -> PipelineResult<()> {
             let written = self.remaining.min(buffer.len());
@@ -3120,11 +3118,9 @@ mod tests {
     }
 
     impl Pipeline for FailOnParameters {
-        // cov:ignore-start: identifier is a trait obligation; the raw writer never queries downstream identifiers
         fn identifier(&self) -> &str {
             "fail-on-parameters"
         }
-        // cov:ignore-end
 
         fn write(&mut self, buffer: &[u8]) -> PipelineResult<()> {
             if buffer.starts_with(b"\"parameters\"") {
@@ -3714,6 +3710,7 @@ mod tests {
             bytes: Vec::new(),
             finishes: 0,
         };
+        assert_eq!(out.identifier(), "fail-after");
         let result = write_qpdf_json_v2_selected_objects_with_options(
             &mut pdf,
             DecodeLevel::None,
@@ -4243,6 +4240,7 @@ mod tests {
             bytes: Vec::new(),
             category: ErrorCategory::Runtime,
         };
+        assert_eq!(out.identifier(), "fail-on-parameters");
 
         let error = write_qpdf_json_v2_selected_objects_with_options(
             &mut pdf,

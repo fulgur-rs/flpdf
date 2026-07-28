@@ -17,6 +17,21 @@ pub(crate) enum TraceCall {
     Finish { failed: bool },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailureCategory {
+    Logic,
+    Runtime,
+}
+
+impl FailureCategory {
+    fn error(self, message: String) -> PipelineError {
+        match self {
+            Self::Logic => PipelineError::logic(message),
+            Self::Runtime => PipelineError::runtime(message),
+        }
+    }
+}
+
 pub(crate) fn shared_trace() -> Rc<RefCell<Trace>> {
     Rc::new(RefCell::new(Trace::default()))
 }
@@ -27,6 +42,8 @@ pub(crate) struct RecordingSink {
     fail_finishes: Vec<usize>,
     write_attempts: usize,
     finish_attempts: usize,
+    write_failure_category: FailureCategory,
+    finish_failure_category: FailureCategory,
 }
 
 impl RecordingSink {
@@ -45,7 +62,19 @@ impl RecordingSink {
             fail_finishes: fail_finishes.to_vec(),
             write_attempts: 0,
             finish_attempts: 0,
+            write_failure_category: FailureCategory::Runtime,
+            finish_failure_category: FailureCategory::Runtime,
         }
+    }
+
+    pub(crate) fn with_failure_categories(
+        mut self,
+        write: FailureCategory,
+        finish: FailureCategory,
+    ) -> Self {
+        self.write_failure_category = write;
+        self.finish_failure_category = finish;
+        self
     }
 
     pub(crate) fn trace(&self) -> Rc<RefCell<Trace>> {
@@ -54,11 +83,9 @@ impl RecordingSink {
 }
 
 impl Pipeline for RecordingSink {
-    // cov:ignore-start: identifier is a trait obligation; stages do not query downstream identifiers
     fn identifier(&self) -> &str {
         "recording"
     }
-    // cov:ignore-end
 
     fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
         self.write_attempts += 1;
@@ -69,10 +96,9 @@ impl Pipeline for RecordingSink {
             failed,
         });
         if failed {
-            return Err(PipelineError::runtime(format!(
-                "sink write failure {}",
-                self.write_attempts
-            )));
+            return Err(self
+                .write_failure_category
+                .error(format!("sink write failure {}", self.write_attempts)));
         }
         trace.output.extend_from_slice(data);
         Ok(())
@@ -86,10 +112,9 @@ impl Pipeline for RecordingSink {
             .calls
             .push(TraceCall::Finish { failed });
         if failed {
-            return Err(PipelineError::runtime(format!(
-                "sink finish failure {}",
-                self.finish_attempts
-            )));
+            return Err(self
+                .finish_failure_category
+                .error(format!("sink finish failure {}", self.finish_attempts)));
         }
         Ok(())
     }
