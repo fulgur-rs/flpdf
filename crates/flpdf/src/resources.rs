@@ -675,7 +675,7 @@ struct Scope<'a> {
 struct ResourceCallbacks {
     finder: ResourceFinder,
     inline_header: Option<Vec<Object>>,
-    valid_xobjects: Vec<Vec<u8>>,
+    valid_xobjects: BTreeSet<Vec<u8>>,
     complete: bool,
 }
 
@@ -744,7 +744,9 @@ impl ParserCallbacks for ResourceCallbacks {
             Object::Operator(operator) => {
                 if operator == b"Do" && self.complete {
                     if let Some(name) = self.finder.last_name() {
-                        self.valid_xobjects.push(name.to_vec());
+                        if !self.valid_xobjects.contains(name) {
+                            self.valid_xobjects.insert(name.to_vec());
+                        }
                     }
                 }
                 Ok(ParseControl::Continue)
@@ -793,7 +795,7 @@ fn collect_from_stream<R: Read + Seek>(
     let mut callbacks = ResourceCallbacks {
         finder: ResourceFinder::default(),
         inline_header: None,
-        valid_xobjects: Vec::new(),
+        valid_xobjects: BTreeSet::new(),
         complete: true,
     };
     let parse_result = parse_content_stream_data(stream_bytes, &mut callbacks);
@@ -1722,6 +1724,24 @@ mod tests {
         let (complete, _) = collect_test_content(&mut pdf, b"<0g>", None)
             .expect("content syntax errors are conservative, not structural");
         assert!(!complete);
+    }
+
+    #[test]
+    fn resource_callbacks_deduplicate_repeated_xobject_names_before_traversal() {
+        let mut callbacks = ResourceCallbacks {
+            finder: ResourceFinder::default(),
+            inline_header: None,
+            valid_xobjects: Default::default(),
+            complete: true,
+        };
+
+        parse_content_stream_data(b"/VeryLongFormName Do Do Do", &mut callbacks).unwrap();
+
+        assert_eq!(callbacks.valid_xobjects.len(), 1);
+        assert_eq!(
+            callbacks.valid_xobjects.iter().next().unwrap(),
+            b"VeryLongFormName"
+        );
     }
 
     #[test]

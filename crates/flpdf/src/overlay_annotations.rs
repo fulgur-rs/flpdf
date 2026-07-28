@@ -2865,11 +2865,11 @@ mod tests {
     }
 
     #[test]
-    fn malformed_da_is_retained_without_partial_replacement() {
+    fn malformed_da_preserves_diagnostic_bytes_and_rewrites_later_name() {
         let dr_map = category_dr_map(b"Font", &[("F1", "F1_1")]);
         assert_eq!(
             adjust_default_appearance(b"<0g> /F1 12 Tf", &dr_map).unwrap(),
-            b"<0g> /F1 12 Tf".to_vec()
+            b"<0g> /F1_1 12 Tf".to_vec()
         );
     }
 
@@ -2916,16 +2916,21 @@ mod tests {
     }
 
     #[test]
-    fn malformed_da_with_stray_delimiter_is_retained_verbatim() {
-        // A malformed content fragment must not receive a partial rewrite.
+    fn malformed_da_with_stray_delimiter_rewrites_later_name() {
+        // qpdf reports the stray delimiter but continues with the valid
+        // ResourceFinder offset that follows it.
         let dr_map = category_dr_map(b"Font", &[("F1", "F1_1")]);
         let da: &[u8] = b") /F1 18 Tf";
-        assert_eq!(adjust_default_appearance(da, &dr_map).unwrap(), da.to_vec());
+        assert_eq!(
+            adjust_default_appearance(da, &dr_map).unwrap(),
+            b") /F1_1 18 Tf".to_vec()
+        );
     }
 
     #[test]
     fn malformed_da_with_unterminated_string_is_retained_verbatim() {
-        // ResourceReplacer rejects the whole malformed fragment.
+        // The apparent `/F1` is part of the unterminated string, so the
+        // finder has no resource-name offset to replace.
         let dr_map = category_dr_map(b"Font", &[("F1", "F1_1")]);
         let da: &[u8] = b"(bad /F1 18 Tf";
         assert_eq!(adjust_default_appearance(da, &dr_map).unwrap(), da.to_vec());

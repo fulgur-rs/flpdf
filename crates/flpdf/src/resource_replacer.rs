@@ -94,7 +94,7 @@ pub(crate) fn replace_resource_names(
     }
 
     let mut finder = ResourceFinder::default();
-    if parse_content_stream_data(input, &mut finder).is_err() || finder.had_diagnostics() {
+    if parse_content_stream_data(input, &mut finder).is_err() {
         return Ok(None);
     }
 
@@ -310,9 +310,20 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_finder_returns_none_without_partial_replacement() {
+    fn recoverable_finder_diagnostic_keeps_later_replacements() {
         let renames = font_renames(b"F1", b"F2");
-        assert!(replace_resource_names(b"<0g> /F1 9 Tf", &renames)
+        assert_eq!(
+            replace_resource_names(b"<0g> /F1 9 Tf", &renames)
+                .unwrap()
+                .unwrap(),
+            b"<0g> /F2 9 Tf"
+        );
+    }
+
+    #[test]
+    fn incomplete_inline_image_returns_none_without_replacement() {
+        let renames = font_renames(b"F1", b"F2");
+        assert!(replace_resource_names(b"BI ID", &renames)
             .unwrap()
             .is_none());
     }

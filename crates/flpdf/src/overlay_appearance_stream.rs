@@ -411,9 +411,19 @@ mod tests {
     }
 
     #[test]
-    fn resource_replacement_retains_all_bytes_when_scan_is_incomplete() {
+    fn resource_replacement_preserves_diagnostic_bytes_and_rewrites_later_name() {
         let dr_map = DrMap::for_test(b"Font", b"F1", b"F1_1");
         let content = b"<0g> /F1 12 Tf";
+        assert_eq!(
+            rewrite_appearance_content(content, &dr_map),
+            b"<0g> /F1_1 12 Tf"
+        );
+    }
+
+    #[test]
+    fn incomplete_inline_image_retains_original_appearance_bytes() {
+        let dr_map = DrMap::for_test(b"Font", b"F1", b"F1_1");
+        let content = b"BI ID";
         assert_eq!(rewrite_appearance_content(content, &dr_map), content);
     }
 
