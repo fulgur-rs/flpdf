@@ -35,6 +35,8 @@ pub(crate) mod run_length;
 #[cfg(test)]
 mod stream_codecs_oracle;
 
+pub mod stdio_file;
+
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -42,6 +44,7 @@ pub use base64::{Base64Action, PlBase64};
 pub mod string;
 pub use concatenate::PlConcatenate;
 pub use ostream::PlOStream;
+pub use stdio_file::PlStdioFile;
 pub use string::PlString;
 
 pub type PipelineResult<T> = std::result::Result<T, PipelineError>;

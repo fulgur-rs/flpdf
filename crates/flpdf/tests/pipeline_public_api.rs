@@ -1,6 +1,6 @@
 use flpdf::pipeline::{
     Base64Action, Pipeline, PipelineError, PipelineResult, PlBase64, PlConcatenate, PlOStream,
-    PlString,
+    PlStdioFile, PlString,
 };
 use std::io::{self, Cursor, Write};
 
@@ -252,6 +252,18 @@ fn downstream_crates_can_construct_pl_ostream_with_an_external_writer() {
     {
         let mut stage = PlOStream::new("ostream", &mut writer);
         assert_eq!(stage.identifier(), "ostream");
+        stage.write(b"payload").unwrap();
+        stage.finish().unwrap();
+    }
+    assert_eq!(writer.into_inner(), b"payload");
+}
+
+#[test]
+fn downstream_crates_can_construct_pl_stdio_file_with_an_external_writer() {
+    let mut writer = Cursor::new(Vec::new());
+    {
+        let mut stage = PlStdioFile::new("stdio", &mut writer);
+        assert_eq!(stage.identifier(), "stdio");
         stage.write(b"payload").unwrap();
         stage.finish().unwrap();
     }
