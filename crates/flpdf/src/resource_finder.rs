@@ -236,8 +236,12 @@ mod tests {
         records
     }
 
-    fn run_qpdf_resource_finder_probe(probe: &Path, input: &[u8]) -> String {
-        let output = Command::new(probe)
+    fn run_qpdf_resource_finder_probe_command(
+        mut command: Command,
+        probe: &Path,
+        input: &[u8],
+    ) -> String {
+        let output = command
             .args([
                 "--mode",
                 "resource-finder",
@@ -272,19 +276,31 @@ mod tests {
         String::from_utf8(output.stdout).expect("probe records are ASCII") // cov:ignore: the pinned qpdf probe emits ASCII records by contract
     }
 
+    fn run_qpdf_resource_finder_probe(probe: &Path, input: &[u8]) -> String {
+        run_qpdf_resource_finder_probe_command(Command::new(probe), probe, input)
+    }
+
+    /// Write a stand-in probe script.
+    ///
+    /// The script is handed to `/bin/sh` as an argument rather than executed
+    /// directly, so a still-open write handle cannot make the spawn fail with
+    /// `ETXTBSY`.
     #[cfg(unix)]
     fn write_test_probe(path: &Path, source: &str) {
-        use std::fs::{self, File};
+        use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
-        let mut file = File::create(path).unwrap();
-        std::io::Write::write_all(&mut file, source.as_bytes()).unwrap();
-        std::io::Write::flush(&mut file).unwrap();
-        drop(file);
-
+        fs::write(path, source).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn run_test_probe(probe: &Path, input: &[u8]) -> String {
+        let mut command = Command::new("/bin/sh");
+        command.arg(probe);
+        run_qpdf_resource_finder_probe_command(command, probe, input)
     }
 
     #[cfg(unix)]
@@ -297,7 +313,7 @@ mod tests {
             "#!/bin/sh\nprintf '%s' \"$1\"\nshift\nprintf ' %s' \"$@\"\nprintf '\\n'\n",
         );
         assert_eq!(
-            run_qpdf_resource_finder_probe(&probe, b"/F1 12 Tf"),
+            run_test_probe(&probe, b"/F1 12 Tf"),
             "--mode resource-finder --input-hex 2f4631203132205466 --allow-eof 1 \
              --include-ignorable 0 --allow-bad 1 --max-len 0 --inline-offset none \
              --chunks all\n"
@@ -306,6 +322,20 @@ mod tests {
             dump_flpdf_resource_finder(b"/F1 12 Tf"),
             "name\t2f4631\nresource\t2f466f6e74\t2f4631\t0\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_finder_probe_that_is_still_open_for_writing_still_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        write_test_probe(&probe, "#!/bin/sh\nprintf 'name\\t2f4631\\n'\n");
+        let _write_open = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&probe)
+            .unwrap();
+
+        assert_eq!(run_test_probe(&probe, b"/F1 12 Tf"), "name\t2f4631\n");
     }
 
     #[cfg(unix)]
@@ -335,9 +365,7 @@ mod tests {
             "#!/bin/sh\nprintf 'resource finder probe stderr' >&2\nexit 1\n",
         );
 
-        let panic =
-            std::panic::catch_unwind(|| run_qpdf_resource_finder_probe(&probe, b"/F1 12 Tf"))
-                .unwrap_err();
+        let panic = std::panic::catch_unwind(|| run_test_probe(&probe, b"/F1 12 Tf")).unwrap_err();
         let message = panic.downcast_ref::<String>().unwrap();
         assert!(message.contains("qpdf resource finder probe failed (exit status: 1)"));
         assert!(message.contains("resource finder probe stderr"));
