@@ -14,6 +14,8 @@ pub(crate) mod rc4;
 
 pub(crate) mod qpdf_tokenizer;
 
+pub(crate) mod run_length;
+
 #[cfg(test)]
 pub(crate) mod test_support;
 
