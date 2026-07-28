@@ -11,6 +11,7 @@ contract_state="${fixture_root}/state"
 contract_log="${fixture_root}/contract.log"
 build_path_file="${contract_state}/build-path"
 git_status_count_file="${contract_state}/git-status-count"
+runner_template="${contract_state}/qpdf-rc4-diff.sh"
 
 cleanup() {
   rm -rf -- "${fixture_root}"
@@ -19,7 +20,7 @@ trap cleanup EXIT
 
 mkdir -p \
   "${fixture_repo}/scripts" \
-  "${fixture_repo}/tests/oracle" \
+  "${fixture_repo}/tests/oracle/qpdf_pl_rc4_shim/qpdf" \
   "${fixture_source}/include/qpdf" \
   "${fixture_source}/libqpdf" \
   "${fixture_home}/.cache" \
@@ -31,6 +32,8 @@ cp "${repo_root}/scripts/qpdf-rc4-diff.sh" \
   "${fixture_repo}/scripts/qpdf-rc4-diff.sh"
 cp "${repo_root}/tests/oracle/qpdf_rc4_probe.cc" \
   "${fixture_repo}/tests/oracle/qpdf_rc4_probe.cc"
+cp "${repo_root}/tests/oracle/qpdf_pl_rc4_shim/qpdf/RC4.hh" \
+  "${fixture_repo}/tests/oracle/qpdf_pl_rc4_shim/qpdf/RC4.hh"
 
 real_git="$(command -v git)"
 real_mktemp="$(command -v mktemp)"
@@ -45,6 +48,7 @@ fixture_commit="$("${real_git}" -C "${fixture_source}" rev-parse HEAD)"
 sed -i \
   "s/qpdf_commit=\"[0-9a-f]*\"/qpdf_commit=\"${fixture_commit}\"/" \
   "${fixture_repo}/scripts/qpdf-rc4-diff.sh"
+cp "${fixture_repo}/scripts/qpdf-rc4-diff.sh" "${runner_template}"
 
 cat >"${fixture_repo}/scripts/fetch-qpdf-source.sh" <<EOF
 #!/usr/bin/env bash
@@ -95,6 +99,25 @@ printf 'c++' >>"${CONTRACT_LOG}"
 printf ' <%s>' "$@" >>"${CONTRACT_LOG}"
 printf '\n' >>"${CONTRACT_LOG}"
 
+require_argument() {
+  local expected="$1"
+  shift
+  local argument
+  for argument in "$@"; do
+    if [[ "${argument}" == "${expected}" ]]; then
+      return 0
+    fi
+  done
+  echo "fake c++: missing required argument: ${expected}" >&2
+  exit 98
+}
+
+require_argument \
+  "-I${FIXTURE_REPO}/tests/oracle/qpdf_pl_rc4_shim" \
+  "$@"
+require_argument "${FIXTURE_SOURCE}/libqpdf/Pipeline.cc" "$@"
+require_argument "${FIXTURE_SOURCE}/libqpdf/Pl_RC4.cc" "$@"
+
 if [[ "${FAIL_CXX:-0}" == 1 ]]; then
   exit 97
 fi
@@ -119,21 +142,49 @@ cat >"${output}" <<'PROBE'
 #!/usr/bin/env bash
 set -euo pipefail
 
-case "${1:-}|${2:-}|${3:-}|${4:-}" in
-  "explicit|||0")
+case "${1:-}|${2:-}|${3:-}|${4:-}|${5:-}|${6:-}" in
+  "explicit|||0||")
     echo "qpdf_rc4_probe: empty explicit key" >&2
     exit 2
     ;;
-  "cstr|||0" | "cstr|00||0")
+  "cstr|||0||" | "cstr|00||0||")
     echo "qpdf_rc4_probe: empty C-string key" >&2
     exit 2
     ;;
-  "explicit|0g||0")
+  "explicit|0g||0||")
     echo "qpdf_rc4_probe: invalid hex" >&2
     exit 2
     ;;
-  "explicit|00||0junk")
+  "explicit|00||0junk||")
     echo "qpdf_rc4_probe: invalid split" >&2
+    exit 2
+    ;;
+  "pipeline|explicit||0|0|65536")
+    echo "qpdf_rc4_probe: empty explicit key" >&2
+    exit 2
+    ;;
+  "pipeline|cstr|00|0|0|65536")
+    echo "qpdf_rc4_probe: empty C-string key" >&2
+    exit 2
+    ;;
+  "pipeline|explicit|00|0junk|0|65536")
+    echo "qpdf_rc4_probe: invalid input length" >&2
+    exit 2
+    ;;
+  "pipeline|explicit|00|0|0junk|65536")
+    echo "qpdf_rc4_probe: invalid write split" >&2
+    exit 2
+    ;;
+  "pipeline|explicit|00|0|0|1junk")
+    echo "qpdf_rc4_probe: invalid output buffer size" >&2
+    exit 2
+    ;;
+  "pipeline|explicit|00|0|1|65536")
+    echo "qpdf_rc4_probe: write split exceeds input" >&2
+    exit 2
+    ;;
+  "pipeline|explicit|00|0|0|0")
+    echo "qpdf_rc4_probe: zero output buffer size" >&2
     exit 2
     ;;
 esac
@@ -151,6 +202,23 @@ printf 'cargo' >>"${CONTRACT_LOG}"
 printf ' <%s>' "$@" >>"${CONTRACT_LOG}"
 printf '\n' >>"${CONTRACT_LOG}"
 
+if [[ "${QPDF_RC4_PROBE:-}" != "${QPDF_PL_RC4_PROBE:-}" ||
+  ! -x "${QPDF_RC4_PROBE:-}" ]]; then
+  echo "fake cargo: both probe variables must name the executable probe" >&2
+  exit 98
+fi
+if (($# != 7)) ||
+  [[ "$1" != test ||
+    "$2" != -p ||
+    "$3" != flpdf ||
+    "$4" != --lib ||
+    "$5" != qpdf_rc4_differential ||
+    "$6" != -- ||
+    "$7" != --ignored ]]; then
+  echo "fake cargo: unexpected differential selector arguments" >&2
+  exit 98
+fi
+
 if [[ "${MUTATE_HEAD_STAGE:-}" == cargo ]]; then
   printf 'cargo mutation\n' >>"${FIXTURE_SOURCE}/sentinel"
   "${REAL_GIT}" -C "${FIXTURE_SOURCE}" add sentinel
@@ -166,6 +234,7 @@ chmod +x \
 
 reset_fixture() {
   "${real_git}" -C "${fixture_source}" checkout -q "${fixture_commit}"
+  cp "${runner_template}" "${fixture_repo}/scripts/qpdf-rc4-diff.sh"
   : >"${contract_log}"
   rm -f -- "${build_path_file}" "${git_status_count_file}"
 }
@@ -183,6 +252,7 @@ run_fixture() {
     GIT_STATUS_COUNT_FILE="${git_status_count_file}" \
     REAL_GIT="${real_git}" \
     REAL_MKTEMP="${real_mktemp}" \
+    FIXTURE_REPO="${fixture_repo}" \
     FIXTURE_SOURCE="${fixture_source}" \
     FIXTURE_VICTIM="${FIXTURE_VICTIM:-}" \
     SWAP_MKTEMP_LEAF="${SWAP_MKTEMP_LEAF:-0}" \
@@ -200,6 +270,20 @@ assert_failed() {
     echo "qpdf-rc4-diff contract: ${scenario} unexpectedly succeeded" >&2
     exit 1
   fi
+}
+
+assert_runner_mutation_rejected() {
+  local scenario="$1"
+  local expression="$2"
+  local mutation_tmp="${fixture_root}/mutation-${scenario}"
+  local mutation_status=0
+
+  mkdir -m 700 "${mutation_tmp}"
+  reset_fixture
+  sed -i "${expression}" "${fixture_repo}/scripts/qpdf-rc4-diff.sh"
+  run_fixture "${mutation_tmp}" >"${mutation_tmp}/output" 2>&1 ||
+    mutation_status=$?
+  assert_failed "${mutation_status}" "runner mutation ${scenario}"
 }
 
 swap_tmp="${fixture_root}/swap-tmp"
@@ -240,6 +324,22 @@ case "${configured_build}/" in
     exit 1
     ;;
 esac
+
+assert_runner_mutation_rejected \
+  "missing-shim-include" \
+  '\|qpdf_pl_rc4_shim|d'
+assert_runner_mutation_rejected \
+  "missing-pipeline-source" \
+  '\|libqpdf/Pipeline\.cc|d'
+assert_runner_mutation_rejected \
+  "missing-pl-rc4-source" \
+  '\|libqpdf/Pl_RC4\.cc|d'
+assert_runner_mutation_rejected \
+  "missing-pipeline-probe-env" \
+  '\|QPDF_PL_RC4_PROBE=|d'
+assert_runner_mutation_rejected \
+  "primitive-only-selector" \
+  's|qpdf_rc4_differential -- --ignored|security::rc4::tests::qpdf_rc4_differential -- --ignored --exact|'
 
 source_fail_tmp="${fixture_root}/source-fail-tmp"
 mkdir -m 700 "${source_fail_tmp}"

@@ -317,9 +317,12 @@ fi
 
 probe="${build_dir_fd_path}/qpdf_rc4_probe"
 c++ -std=c++17 \
+  -I"${repo_root}/tests/oracle/qpdf_pl_rc4_shim" \
   -I"${qpdf_source}/libqpdf" \
   -I"${qpdf_source}/include" \
   "${repo_root}/tests/oracle/qpdf_rc4_probe.cc" \
+  "${qpdf_source}/libqpdf/Pipeline.cc" \
+  "${qpdf_source}/libqpdf/Pl_RC4.cc" \
   "${qpdf_source}/libqpdf/RC4_native.cc" \
   -o "${probe}"
 
@@ -350,8 +353,16 @@ assert_rejected_argument "empty C-string key" cstr "" "" 0
 assert_rejected_argument "empty C-string key" cstr 00 "" 0
 assert_rejected_argument "invalid hex" explicit 0g "" 0
 assert_rejected_argument "invalid split" explicit 00 "" 0junk
+assert_rejected_argument "empty explicit key" pipeline explicit "" 0 0 65536
+assert_rejected_argument "empty C-string key" pipeline cstr 00 0 0 65536
+assert_rejected_argument "invalid input length" pipeline explicit 00 0junk 0 65536
+assert_rejected_argument "invalid write split" pipeline explicit 00 0 0junk 65536
+assert_rejected_argument "invalid output buffer size" pipeline explicit 00 0 0 1junk
+assert_rejected_argument "write split exceeds input" pipeline explicit 00 0 1 65536
+assert_rejected_argument "zero output buffer size" pipeline explicit 00 0 0 0
 
 cd "${repo_root}"
 QPDF_RC4_PROBE="${probe}" \
+  QPDF_PL_RC4_PROBE="${probe}" \
   cargo test -p flpdf --lib \
-  security::rc4::tests::qpdf_rc4_differential -- --ignored --exact
+  qpdf_rc4_differential -- --ignored

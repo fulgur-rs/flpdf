@@ -125,7 +125,8 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `Pl_ASCII85Decoder` | 108 | `ascii85.rs`(163) | ✅ |
 | `Pl_ASCIIHexDecoder` | 96 | `ascii_hex.rs`(85) | ✅ |
 | `Pl_RunLength` | 146 | `run_length.rs`(140) | ✅ |
-| `Pl_AES_PDF` / `Pl_RC4` | 243 | `writer.rs` の `encrypt_stream_payload_for_writer` に埋没。`Pl_RC4` Pipeline 統合は `flpdf-qynx.2.2` | 🔀 |
+| `Pl_AES_PDF` | 200 | `security/standard.rs` の AES single-buffer helper と `writer.rs` の stream consumer に分散。Pipeline 統合は `flpdf-qynx.10` | 🔀 |
+| `Pl_RC4` | 43 | `pipeline/rc4.rs`（65,536-byte既定buffer、stateful `security/rc4.rs`、write/finish lifecycle）+ `reader.rs` / `writer.rs` の本番stream consumer | ✅ |
 | `Pl_QPDFTokenizer.cc` / `ContentNormalizer.cc` | 141 | `content_normalizer.rs`（既存 `tokenizer.rs` を駆動する token-filter runner、EOF-token → `handle_eof`、`ID` separator 注入、inline-image 切替、raw-token normalization、bad-token state、CR/string/name normalization） | ✅ |
 | `QPDFStreamFilter.cc` | 19 | filter 登録機構が無い | ❌ |
 | `Pl_DCT.cc` | 326 | 無し。`json_inspect.rs` の `DecodeLevel::All`(758) が DCT デコードを doc で約束しつつ encoded バイトへフォールバックしている | ❌ 消費者あり |

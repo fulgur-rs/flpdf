@@ -2814,6 +2814,7 @@ fn encrypt_stream_payload_for_writer(
     stream: &mut crate::Stream,
     ctx: &EncryptionContext,
 ) -> Result<()> {
+    use crate::pipeline::rc4::PlRc4;
     use crate::security::standard::{
         encrypt_cipher_bytes, per_object_key, ObjectKeyAlg, StringEncryptCipher,
     };
@@ -2852,10 +2853,12 @@ fn encrypt_stream_payload_for_writer(
                     encrypt_cipher_bytes(&mut stream.data, cipher, &iv)?;
                 }
                 ObjectKeyAlg::Rc4 => {
-                    let cipher = StringEncryptCipher::Rc4 {
-                        key: per_obj_key.as_slice(),
-                    };
-                    encrypt_cipher_bytes(&mut stream.data, cipher, &iv)?;
+                    PlRc4::transform_in_place(
+                        "rc4 stream encryption",
+                        &mut stream.data,
+                        per_obj_key.as_slice(),
+                    )
+                    .expect("Algorithm 1 always derives a non-empty RC4 key");
                 }
             }
         }
@@ -6581,6 +6584,39 @@ mod tests {
     /// with flpdf under EACH password and confirm `/Title` and the stream
     /// decrypt to plaintext. The reader gates RC4 behind weak-crypto, so the
     /// re-open sets `allow_weak_crypto = true`.
+    #[test]
+    fn rc4_stream_encryption_preserves_payload_allocation() {
+        let object_ref = ObjectRef::new(7, 0);
+        let ctx = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11, 0x22, 0x33, 0x44, 0x55],
+            cipher: WriteCipher::PerObject(crate::security::standard::ObjectKeyAlg::Rc4),
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: Vec::new(),
+            static_aes_iv: false,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+        let plaintext = vec![0x42; crate::pipeline::rc4::DEFAULT_OUT_BUFFER_SIZE + 17];
+        let mut stream = crate::Stream::new(Dictionary::new(), plaintext.clone());
+        let original_ptr = stream.data.as_ptr();
+        let original_capacity = stream.data.capacity();
+
+        encrypt_stream_payload_for_writer(object_ref, &mut stream, &ctx).expect("RC4 transform");
+        assert_eq!(stream.data.as_ptr(), original_ptr);
+        assert_eq!(stream.data.capacity(), original_capacity);
+        assert_ne!(stream.data, plaintext);
+        assert_eq!(
+            stream.dict.get("Length"),
+            Some(&Object::Integer(stream.data.len() as i64))
+        );
+
+        encrypt_stream_payload_for_writer(object_ref, &mut stream, &ctx)
+            .expect("RC4 inverse transform");
+        assert_eq!(stream.data.as_ptr(), original_ptr);
+        assert_eq!(stream.data, plaintext);
+    }
+
     #[test]
     fn rc4_methods_round_trip_string_and_stream_via_reader() {
         use crate::encrypt_setup::{EncryptMethod, EncryptParams};

@@ -1042,8 +1042,6 @@ mod tests {
     use std::fmt::Write as _;
     use std::path::Path;
     use std::process::Command;
-    #[cfg(unix)]
-    use std::{fs, os::unix::fs::PermissionsExt};
 
     use super::{PushedToken, Token, TokenType, Tokenizer, TokenizerStateError};
 
@@ -1435,11 +1433,12 @@ mod tests {
         }
     }
 
-    fn run_qpdf_probe(probe: &Path, case: &OracleCase) -> String {
+    fn run_qpdf_probe_command(mut command: Command, case: &OracleCase) -> String {
         let inline_offset = case
             .inline_offset
             .map_or_else(|| "none".into(), |offset| offset.to_string());
-        let output = Command::new(probe)
+        let program = command.get_program().to_string_lossy().into_owned();
+        let output = command
             .args([
                 "--mode",
                 case.mode.as_arg(),
@@ -1459,10 +1458,7 @@ mod tests {
             .output()
             // cov:ignore-start: script supplies a verified executable; spawn failure is only a harness diagnostic
             .unwrap_or_else(|error| {
-                panic!(
-                    "failed to execute qpdf tokenizer probe {}: {error}",
-                    probe.display()
-                )
+                panic!("failed to execute qpdf tokenizer probe {program}: {error}")
             });
         // cov:ignore-end
         assert!(
@@ -1473,6 +1469,10 @@ mod tests {
             String::from_utf8_lossy(&output.stderr), // cov:ignore: failure-only assert diagnostic
         );
         String::from_utf8(output.stdout).expect("probe records are ASCII")
+    }
+
+    fn run_qpdf_probe(probe: &Path, case: &OracleCase) -> String {
+        run_qpdf_probe_command(Command::new(probe), case)
     }
 
     fn assert_qpdf_oracle_matches(mut qpdf_records: impl FnMut(&OracleCase) -> String) {
@@ -1689,28 +1689,22 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_test_probe(path: &Path, source: &str) {
-        fs::write(path, source).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(path, permissions).unwrap();
-    }
-
-    #[cfg(unix)]
     #[test]
     fn qpdf_probe_command_passes_exact_case_arguments_and_returns_stdout() {
-        let dir = tempfile::tempdir().unwrap();
-        let probe = dir.path().join("probe");
-        write_test_probe(&probe, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+        let command = || {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "printf '%s\\n' \"$@\"", "probe"]);
+            command
+        };
         let cases = qpdf_oracle_cases();
 
         assert_eq!(
-            run_qpdf_probe(&probe, &cases[5]),
+            run_qpdf_probe_command(command(), &cases[5]),
             "--mode\npull\n--input-hex\n616263646566676820\n--allow-eof\n1\n\
              --include-ignorable\n0\n--allow-bad\n1\n--max-len\n5\n--inline-offset\nnone\n"
         );
         assert_eq!(
-            run_qpdf_probe(&probe, &cases[9]),
+            run_qpdf_probe_command(command(), &cases[9]),
             "--mode\npull-inline\n--input-hex\n58582061626320454920016261642045492051\n\
              --allow-eof\n1\n--include-ignorable\n0\n--allow-bad\n1\n--max-len\n0\n\
              --inline-offset\n3\n"
@@ -1719,13 +1713,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn qpdf_probe_failure_reports_case_status_and_stderr() {
-        let dir = tempfile::tempdir().unwrap();
-        let probe = dir.path().join("probe");
-        write_test_probe(&probe, "#!/bin/sh\nprintf 'probe stderr' >&2\nexit 7\n");
+    fn qpdf_probe_wrapper_executes_requested_path() {
         let case = &qpdf_oracle_cases()[5];
 
-        let panic = std::panic::catch_unwind(|| run_qpdf_probe(&probe, case)).unwrap_err();
+        assert_eq!(run_qpdf_probe(Path::new("true"), case), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_probe_failure_reports_case_status_and_stderr() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'probe stderr' >&2; exit 7", "probe"]);
+        let case = &qpdf_oracle_cases()[5];
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_qpdf_probe_command(command, case)
+        }))
+        .unwrap_err();
         let message = panic.downcast_ref::<String>().unwrap();
         assert!(message.contains("qpdf tokenizer probe failed for pull-max-length"));
         assert!(message.contains("exit status: 7"));
@@ -1735,12 +1739,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn qpdf_probe_rejects_non_utf8_stdout() {
-        let dir = tempfile::tempdir().unwrap();
-        let probe = dir.path().join("probe");
-        write_test_probe(&probe, "#!/bin/sh\nprintf '\\377'\n");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '\\377'", "probe"]);
         let case = &qpdf_oracle_cases()[5];
 
-        let panic = std::panic::catch_unwind(|| run_qpdf_probe(&probe, case)).unwrap_err();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_qpdf_probe_command(command, case)
+        }))
+        .unwrap_err();
         let message = panic.downcast_ref::<String>().unwrap();
         assert!(message.contains("probe records are ASCII"));
     }
