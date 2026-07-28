@@ -3,13 +3,92 @@
 //! Partial progress is retried, but writer errors (including `Interrupted`) are
 //! reported immediately, matching qpdf's zero-result `fwrite` error path.
 //! Finish maps only raw `EBADF` to a logic error and ignores other flush
-//! failures; the caller owns buffering and close/drop.
+//! failures. `StdioBuffer` supplies the caller-owned 4096-byte stdio boundary
+//! without Rust's automatic `Interrupted` retry.
 
 use std::io::{self, Write};
 
 use super::{Pipeline, PipelineError, PipelineResult};
 
 const EBADF_ERRNO: i32 = 9;
+const STDIO_BUFFER_CAPACITY: usize = 4096;
+
+pub(crate) struct StdioBuffer<'a> {
+    writer: &'a mut dyn Write,
+    buffer: Vec<u8>,
+    panicked: bool,
+}
+
+impl<'a> StdioBuffer<'a> {
+    pub(crate) fn new(writer: &'a mut dyn Write) -> Self {
+        Self {
+            writer,
+            buffer: Vec::with_capacity(STDIO_BUFFER_CAPACITY),
+            panicked: false,
+        }
+    }
+
+    fn spare_capacity(&self) -> usize {
+        STDIO_BUFFER_CAPACITY - self.buffer.len()
+    }
+
+    fn flush_buffer(&mut self) -> io::Result<()> {
+        let mut written = 0;
+        while written < self.buffer.len() {
+            self.panicked = true;
+            let result = self.writer.write(&self.buffer[written..]);
+            self.panicked = false;
+            match result {
+                Ok(0) => {
+                    self.buffer.clear();
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write buffered data",
+                    ));
+                }
+                Ok(count) => written += count,
+                Err(error) => {
+                    self.buffer.clear();
+                    return Err(error);
+                }
+            }
+        }
+        self.buffer.clear();
+        Ok(())
+    }
+}
+
+impl Write for StdioBuffer<'_> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if data.len() > self.spare_capacity() {
+            self.flush_buffer()?;
+        }
+
+        if self.buffer.is_empty() && data.len() >= STDIO_BUFFER_CAPACITY {
+            self.panicked = true;
+            let result = self.writer.write(data);
+            self.panicked = false;
+            result
+        } else {
+            let count = data.len().min(self.spare_capacity());
+            self.buffer.extend_from_slice(&data[..count]);
+            Ok(count)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_buffer()?;
+        self.writer.flush()
+    }
+}
+
+impl Drop for StdioBuffer<'_> {
+    fn drop(&mut self) {
+        if !self.panicked {
+            let _ = self.flush_buffer();
+        }
+    }
+}
 
 pub struct PlStdioFile<'a> {
     identifier: String,
@@ -68,9 +147,9 @@ impl Pipeline for PlStdioFile<'_> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::io::{self, BufWriter, Write};
+    use std::io::{self, Write};
 
-    use super::PlStdioFile;
+    use super::{PlStdioFile, StdioBuffer};
     use crate::pipeline::{Pipeline, PipelineError};
 
     const EBADF_ERRNO: i32 = 9;
@@ -147,6 +226,7 @@ mod tests {
     enum ProbeWriteStep {
         Accept(usize),
         RawError(i32),
+        Zero,
     }
 
     #[derive(Default)]
@@ -176,6 +256,7 @@ mod tests {
                     Ok(written)
                 }
                 Some(ProbeWriteStep::RawError(errno)) => Err(io::Error::from_raw_os_error(errno)),
+                Some(ProbeWriteStep::Zero) => Ok(0),
                 None => {
                     self.bytes.extend_from_slice(data);
                     Ok(data.len())
@@ -313,30 +394,27 @@ mod tests {
 
     #[test]
     fn buffered_4095_byte_enospc_is_deferred_to_finish_and_ignored() {
-        let sink = ProbeSink::with_write_steps([ProbeWriteStep::RawError(ENOSPC_ERRNO)]);
-        let mut buffered = BufWriter::with_capacity(4096, sink);
+        let mut sink = ProbeSink::with_write_steps([ProbeWriteStep::RawError(ENOSPC_ERRNO)]);
         {
+            let mut buffered = StdioBuffer::new(&mut sink);
             let mut stage = PlStdioFile::new("stdio", &mut buffered);
             stage.write(&vec![b'x'; 4095]).unwrap();
             stage.finish().unwrap();
         }
-        let (sink, buffered_bytes) = buffered.into_parts();
 
         assert_eq!(sink.write_lengths, [4095]);
         assert!(sink.bytes.is_empty());
-        assert_eq!(buffered_bytes.unwrap(), vec![b'x'; 4095]);
         assert_eq!(sink.flush_calls, 0);
     }
 
     #[test]
     fn buffered_4096_byte_enospc_is_a_write_runtime_error() {
-        let sink = ProbeSink::with_write_steps([ProbeWriteStep::RawError(ENOSPC_ERRNO)]);
-        let mut buffered = BufWriter::with_capacity(4096, sink);
+        let mut sink = ProbeSink::with_write_steps([ProbeWriteStep::RawError(ENOSPC_ERRNO)]);
         let error = {
+            let mut buffered = StdioBuffer::new(&mut sink);
             let mut stage = PlStdioFile::new("stdio", &mut buffered);
             stage.write(&vec![b'x'; 4096]).unwrap_err()
         };
-        let (sink, buffered_bytes) = buffered.into_parts();
 
         assert!(matches!(error, PipelineError::Runtime(_)));
         assert!(error
@@ -344,7 +422,6 @@ mod tests {
             .starts_with("stdio: Pl_StdioFile::write: "));
         assert_eq!(sink.write_lengths, [4096]);
         assert!(sink.bytes.is_empty());
-        assert!(buffered_bytes.unwrap().is_empty());
         assert_eq!(sink.flush_calls, 0);
     }
 
@@ -353,17 +430,16 @@ mod tests {
         let payload = (0..4097)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
-        let mut buffered = BufWriter::with_capacity(4096, ProbeSink::default());
+        let mut sink = ProbeSink::default();
         {
+            let mut buffered = StdioBuffer::new(&mut sink);
             let mut stage = PlStdioFile::new("stdio", &mut buffered);
             stage.write(&payload).unwrap();
             stage.finish().unwrap();
         }
-        let (sink, buffered_bytes) = buffered.into_parts();
 
         assert_eq!(sink.bytes, payload);
         assert_eq!(sink.write_lengths, [4097]);
-        assert!(buffered_bytes.unwrap().is_empty());
         assert_eq!(sink.flush_calls, 1);
     }
 
@@ -372,21 +448,39 @@ mod tests {
         let payload = (0..4096)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
-        let sink = ProbeSink::with_write_steps([
+        let mut sink = ProbeSink::with_write_steps([
             ProbeWriteStep::Accept(1024),
             ProbeWriteStep::RawError(ENOSPC_ERRNO),
         ]);
-        let mut buffered = BufWriter::with_capacity(4096, sink);
         {
+            let mut buffered = StdioBuffer::new(&mut sink);
             let mut stage = PlStdioFile::new("stdio", &mut buffered);
             stage.write(&payload).unwrap();
             stage.finish().unwrap();
         }
-        let (sink, buffered_bytes) = buffered.into_parts();
 
         assert_eq!(sink.bytes, payload[..1024]);
         assert_eq!(sink.write_lengths, [4096, 3072]);
-        assert_eq!(buffered_bytes.unwrap(), payload[1024..]);
+        assert_eq!(sink.flush_calls, 0);
+    }
+
+    #[test]
+    fn buffered_zero_progress_during_finish_is_ignored_without_retry() {
+        let mut sink =
+            ProbeSink::with_write_steps([ProbeWriteStep::Zero, ProbeWriteStep::Accept(4095)]);
+        {
+            let mut buffered = StdioBuffer::new(&mut sink);
+            let mut stage = PlStdioFile::new("stdio", &mut buffered);
+            stage.write(&vec![b'x'; 4095]).unwrap();
+            stage.finish().unwrap();
+        }
+
+        assert_eq!(sink.write_lengths, [4095]);
+        assert!(sink.bytes.is_empty());
+        assert!(matches!(
+            sink.write_steps.front(),
+            Some(ProbeWriteStep::Accept(4095))
+        ));
         assert_eq!(sink.flush_calls, 0);
     }
 }

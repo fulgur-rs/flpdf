@@ -12,11 +12,12 @@
 
 use crate::json::Json;
 use crate::object::{Dictionary, Object, ObjectRef, Stream};
+use crate::pipeline::stdio_file::StdioBuffer;
 use crate::pipeline::{Pipeline, PipelineError, PlOStream, PlStdioFile};
 use crate::reader::Pdf;
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, Write};
+use std::io::{Read, Seek, Write};
 
 // ── ConvertError ──────────────────────────────────────────────────────────────
 
@@ -3060,7 +3061,7 @@ fn write_file_mode_side_file<R: Read + Seek>(
     side_file: &mut dyn Write,
     out: &mut dyn Pipeline,
 ) -> Result<(), JsonOutputError> {
-    let mut buffered = BufWriter::with_capacity(4096, side_file);
+    let mut buffered = StdioBuffer::new(side_file);
     let mut terminal = PlStdioFile::new("stream data", &mut buffered);
     write_file_mode_stream_value(pdf, stream, decode_level, side_path, &mut terminal, out)?;
     terminal.finish()?;
@@ -3208,7 +3209,7 @@ pub fn write_qpdf_json_v2_selected_objects_to_output_with_options<R: Read + Seek
             Ok(())
         }
         JsonOutput::File(writer) => {
-            let mut buffered = BufWriter::with_capacity(4096, writer);
+            let mut buffered = StdioBuffer::new(writer);
             {
                 let mut terminal = PlStdioFile::new("json output", &mut buffered);
                 write_qpdf_json_v2_selected_objects_with_options(
@@ -3272,6 +3273,32 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct SingleAttemptInterruptedWriter {
+        write_lengths: Vec<usize>,
+    }
+
+    impl std::io::Write for SingleAttemptInterruptedWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.write_lengths.push(buffer.len());
+            assert_eq!(
+                self.write_lengths.len(),
+                1,
+                "Interrupted stdio write must not be retried"
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Interrupted system call",
+            ))
+        }
+
+        // cov:ignore-start: the regressions require an interrupted drain to stop before inner flush
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        // cov:ignore-end
     }
 
     #[derive(Default)]
@@ -3786,6 +3813,33 @@ mod tests {
         assert_eq!(output.bytes, expected[..24]);
         assert_eq!(output.write_lengths, [4095, 4071]);
         assert_eq!(output.flushes, 0);
+    }
+
+    #[test]
+    fn coordinator_file_buffered_drop_does_not_retry_interrupted_write() {
+        let empty_output = selected_string_output(0);
+        let payload_length = 4095usize
+            .checked_sub(empty_output.len())
+            .expect("selected-string JSON envelope must fit in 4095 bytes");
+        assert_eq!(selected_string_output(payload_length).len(), 4095);
+
+        let mut pdf = pdf_with_selected_string(payload_length);
+        let mut output = SingleAttemptInterruptedWriter::default();
+
+        write_qpdf_json_v2_selected_objects_to_output_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Qpdf],
+            &[JsonObjectSelector::Object {
+                number: 2,
+                generation: 0,
+            }],
+            JsonOutput::File(&mut output),
+        )
+        .unwrap();
+
+        assert_eq!(output.write_lengths, [4095]);
     }
 
     #[test]
@@ -4808,6 +4862,29 @@ mod tests {
             .iter()
             .any(|call| matches!(call, TraceCall::Finish { .. })));
         assert_eq!(side_file.flushes, 0);
+    }
+
+    #[test]
+    fn side_file_buffer_does_not_retry_interrupted_finish_write() {
+        let mut pdf = empty_pdf();
+        let stream = Stream::new(Dictionary::new(), vec![b'x'; 4095]);
+        let mut side_file = SingleAttemptInterruptedWriter::default();
+        let mut out = Vec::new();
+        {
+            let mut output = PlString::new("file-mode main output", None, &mut out);
+            write_file_mode_side_file(
+                &mut pdf,
+                &stream,
+                DecodeLevel::None,
+                "side-file",
+                &mut side_file,
+                &mut output,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(side_file.write_lengths, [4095]);
+        assert_eq!(out, COMPLETE_SIDE_FILE_STREAM_JSON);
     }
 
     #[test]

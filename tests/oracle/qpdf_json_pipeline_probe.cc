@@ -442,6 +442,37 @@ namespace
         }
 
         {
+            Cookie cookie;
+            // A sub-buffer payload reaches the cookie only during finish.
+            // qpdf ignores non-EBADF finish errors, and fclose must not retry
+            // the interrupted write that finish already attempted.
+            cookie.steps.push_back({WriteStepKind::interrupted, 0, EINTR});
+            cookie.steps.push_back({WriteStepKind::accept, 4095, 0});
+            std::array<char, 4096> buffer{};
+            auto* file = open_cookie(cookie, buffer);
+            Pl_StdioFile stage("stdio", file);
+            std::vector<unsigned char> payload(4095, 'x');
+            auto const case_status = status([&]() {
+                during(cookie, CookiePhase::write, [&]() {
+                    stage.write(payload.data(), payload.size());
+                });
+                during(cookie, CookiePhase::finish, [&]() { stage.finish(); });
+            });
+            close_cookie(file, cookie);
+            if (case_status != "ok" || !cookie.bytes.empty()) {
+                throw std::runtime_error(
+                    "stdio-4095-interrupted-finish: unexpected qpdf result");
+            }
+            verify_cookie_lifecycle(
+                "stdio-4095-interrupted-finish",
+                cookie,
+                {},
+                {4095},
+                {},
+                {{WriteStepKind::accept, 4095, 0}});
+        }
+
+        {
             auto* file = open_buffered("/dev/full");
             Pl_StdioFile stage("stdio", file);
             size_t write_count = 0;
