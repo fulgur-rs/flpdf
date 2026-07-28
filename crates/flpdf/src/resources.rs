@@ -24,6 +24,7 @@
 use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
 use crate::filters::decode_stream_data;
 use crate::ref_chain::{resolve_ref_chain, terminal_ref_of_chain};
+use crate::resource_finder::{ResourceFinder, ResourceNamesByType};
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -664,24 +665,22 @@ struct Scope<'a> {
     owner: ObjectRef,
 }
 
-/// Parser callback that groups resource-operator operands and tracks the
-/// special `BI`...`ID` inline-image header scope.
+/// Parser callback that delegates ordinary resource classification to
+/// [`ResourceFinder`] and tracks the special `BI`...`ID` inline-image header
+/// scope.
 ///
 /// Inline-image payload objects are deliberately ignored. Header names are
 /// ordinary parser object events, so `/CS` and `/ColorSpace` are interpreted
 /// here without recreating byte or token boundaries.
-struct ResourceCallbacks<'callback, 'pdf, 'scope, R: Read + Seek> {
-    ctx: &'callback mut CollectCtx<'pdf, R>,
-    scope: Scope<'scope>,
-    depth: usize,
-    operands: Vec<Object>,
+struct ResourceCallbacks {
+    finder: ResourceFinder,
     inline_header: Option<Vec<Object>>,
+    valid_xobjects: BTreeMap<Vec<u8>, usize>,
     complete: bool,
-    structural_error: Option<Error>,
 }
 
-impl<R: Read + Seek> ResourceCallbacks<'_, '_, '_, R> {
-    fn finish_inline_header(&mut self, header: Vec<Object>) -> bool {
+impl ResourceCallbacks {
+    fn finish_inline_header(&mut self, header: Vec<Object>, offset: usize) -> bool {
         let mut chunks = header.chunks_exact(2);
         let mut color_space = None;
         for pair in &mut chunks {
@@ -696,17 +695,10 @@ impl<R: Read + Seek> ResourceCallbacks<'_, '_, '_, R> {
             return false;
         }
 
-        if self.scope.record_direct {
-            if let Some(name) = color_space {
-                if !is_builtin_inline_image_cs(&name) {
-                    self.ctx
-                        .used
-                        .entry(b"ColorSpace".to_vec())
-                        .or_default()
-                        .insert(name);
-                }
-            } // cov:ignore: llvm-cov gap region after the covered ColorSpace insertion
-        }
+        if let Some(name) = color_space.filter(|name| !is_builtin_inline_image_cs(name)) {
+            self.finder
+                .record_resource_name(b"ColorSpace", &name, offset);
+        } // cov:ignore: llvm-cov gap region after the covered ColorSpace insertion
         true
     }
 
@@ -716,8 +708,9 @@ impl<R: Read + Seek> ResourceCallbacks<'_, '_, '_, R> {
     }
 }
 
-impl<R: Read + Seek> ParserCallbacks for ResourceCallbacks<'_, '_, '_, R> {
-    fn handle_diagnostic(&mut self, _offset: usize, _message: &str) -> Result<()> {
+impl ParserCallbacks for ResourceCallbacks {
+    fn handle_diagnostic(&mut self, offset: usize, message: &str) -> Result<()> {
+        self.finder.handle_diagnostic(offset, message)?;
         self.complete = false;
         Ok(())
     }
@@ -725,22 +718,24 @@ impl<R: Read + Seek> ParserCallbacks for ResourceCallbacks<'_, '_, '_, R> {
     fn handle_object(
         &mut self,
         object: Object,
-        _offset: usize,
-        _length: usize,
+        offset: usize,
+        length: usize,
     ) -> Result<ParseControl> {
+        self.finder
+            .handle_object_borrowed(&object, offset, length)?;
         match object {
             Object::Operator(operator) if self.inline_header.is_some() => {
                 let header = self
                     .inline_header
                     .take()
                     .expect("inline_header guard guarantees a header");
-                if operator != b"ID" || !self.finish_inline_header(header) {
+                if operator != b"ID" || !self.finish_inline_header(header, offset) {
                     return self.stop_incomplete();
                 }
                 Ok(ParseControl::Continue)
             }
             Object::Operator(operator) if operator == b"BI" => {
-                if !self.operands.is_empty() {
+                if !self.finder.last_operator_started_at_boundary() {
                     return self.stop_incomplete();
                 }
                 self.inline_header = Some(Vec::new());
@@ -748,22 +743,19 @@ impl<R: Read + Seek> ParserCallbacks for ResourceCallbacks<'_, '_, '_, R> {
             }
             Object::Operator(operator) if operator == b"ID" => self.stop_incomplete(),
             Object::Operator(operator) => {
-                let operands = std::mem::take(&mut self.operands);
-                match process_operator(self.ctx, &operator, &operands, self.scope, self.depth) {
-                    Ok(true) => Ok(ParseControl::Continue),
-                    Ok(false) => self.stop_incomplete(),
-                    Err(error) => {
-                        self.structural_error = Some(error);
-                        Ok(ParseControl::Stop)
+                if operator == b"Do" && self.complete {
+                    if let Some(name) = self.finder.last_name() {
+                        if !self.valid_xobjects.contains_key(name) {
+                            self.valid_xobjects.insert(name.to_vec(), offset);
+                        }
                     }
                 }
+                Ok(ParseControl::Continue)
             }
             Object::InlineImage(_) => Ok(ParseControl::Continue),
             operand => {
                 if let Some(header) = &mut self.inline_header {
                     header.push(operand);
-                } else {
-                    self.operands.push(operand);
                 }
                 Ok(ParseControl::Continue)
             }
@@ -771,7 +763,8 @@ impl<R: Read + Seek> ParserCallbacks for ResourceCallbacks<'_, '_, '_, R> {
     }
 
     fn handle_eof(&mut self) -> Result<()> {
-        if self.inline_header.is_some() || !self.operands.is_empty() {
+        self.finder.handle_eof()?;
+        if self.inline_header.is_some() || self.finder.has_pending_operands() {
             self.complete = false;
         }
         Ok(())
@@ -801,111 +794,50 @@ fn collect_from_stream<R: Read + Seek>(
     depth: usize,
 ) -> Result<bool> {
     let mut callbacks = ResourceCallbacks {
-        ctx,
-        scope,
-        depth,
-        operands: Vec::new(),
+        finder: ResourceFinder::default(),
         inline_header: None,
+        valid_xobjects: BTreeMap::new(),
         complete: true,
-        structural_error: None,
     };
     let parse_result = parse_content_stream_data(stream_bytes, &mut callbacks);
-    if let Some(error) = callbacks.structural_error {
-        return Err(error);
+    let mut complete =
+        parse_result.is_ok() && !callbacks.finder.had_diagnostics() && callbacks.complete;
+
+    let names = callbacks.finder.names_by_resource_type();
+    if complete {
+        record_direct_names(ctx.used, names, scope.record_direct);
     }
-    match parse_result {
-        Ok(()) => Ok(callbacks.complete),
-        // Content syntax failures make the used-name set incomplete and retain
-        // the whole resource group. Structural errors from recursive lookups
-        // were captured separately above and still propagate.
-        Err(_) => Ok(false),
+
+    let mut valid_xobjects = callbacks.valid_xobjects.iter().collect::<Vec<_>>();
+    valid_xobjects.sort_unstable_by_key(|(_, offset)| *offset);
+    for (name, _) in valid_xobjects {
+        if !recurse_form_xobject(ctx, name, scope, depth)? {
+            complete = false;
+            break;
+        }
     }
+    Ok(complete)
 }
 
-/// Process a single content-stream operator and record any resource references
-/// into `ctx.used`.
-///
-/// Returns the completeness flag of any nested Form XObject recursion (`true`
-/// for non-recursing operators): `false` propagates an incomplete collection up
-/// so the page is conservatively retained.
-fn process_operator<R: Read + Seek>(
-    ctx: &mut CollectCtx<'_, R>,
-    operator: &[u8],
-    operands: &[Object],
-    scope: Scope<'_>,
-    depth: usize,
-) -> Result<bool> {
-    // /XObject — `name Do` is the only recursing operator. Recurse into Form
-    // XObjects regardless of `record_direct` (a Form nested in an own-resources
-    // Form may still be resource-less and page-relevant), but attribute the
-    // XObject name itself to `ctx.used` only when this stream's names are
-    // page-relevant.
-    if operator == b"Do" {
-        if let Some(name) = operands.first().and_then(Object::as_name) {
-            if scope.record_direct {
-                ctx.used
-                    .entry(b"XObject".to_vec())
-                    .or_default()
-                    .insert(name.to_vec());
+fn record_direct_names(used: &mut UsedNames, names: &ResourceNamesByType, record_direct: bool) {
+    if !record_direct {
+        return;
+    }
+    for &category in RESOURCE_CATEGORIES {
+        let category = category.as_bytes();
+        for name in names
+            .get(category)
+            .into_iter()
+            .flat_map(|by_name| by_name.keys())
+        {
+            if category == b"ColorSpace" && is_builtin_color_space_cs_op(name) {
+                continue;
             }
-            // Recurse into Form XObjects, propagating their completeness.
-            return recurse_form_xobject(ctx, name, scope, depth);
+            used.entry(category.to_vec())
+                .or_default()
+                .insert(name.clone());
         }
-        return Ok(true);
     }
-
-    // Every remaining operator only *records* a name; none recurse. When this
-    // stream is a Form with its own /Resources, those names resolve against the
-    // Form's own scope and are irrelevant to page-level pruning, so skip them.
-    if !scope.record_direct {
-        return Ok(true);
-    }
-
-    // Map operator → (resource category, referenced name). The operand carrying
-    // the name — and, for `cs`/`CS`, an extra built-in filter — vary per operator;
-    // the recording into `ctx.used` is otherwise uniform.
-    let recorded: Option<(&[u8], &[u8])> = match operator {
-        // `name size Tf`
-        b"Tf" => operands
-            .first()
-            .and_then(Object::as_name)
-            .map(|n| (&b"Font"[..], n)),
-        // `name gs`
-        b"gs" => operands
-            .first()
-            .and_then(Object::as_name)
-            .map(|n| (&b"ExtGState"[..], n)),
-        // `name cs` (non-stroking) / `name CS` (stroking) — skip built-in names.
-        b"cs" | b"CS" => operands
-            .first()
-            .and_then(Object::as_name)
-            .filter(|n| !is_builtin_color_space_cs_op(n))
-            .map(|n| (&b"ColorSpace"[..], n)),
-        // `scn` / `SCN` — the *last* operand may be a pattern name.
-        b"scn" | b"SCN" => operands
-            .last()
-            .and_then(Object::as_name)
-            .map(|n| (&b"Pattern"[..], n)),
-        // `name sh`
-        b"sh" => operands
-            .first()
-            .and_then(Object::as_name)
-            .map(|n| (&b"Shading"[..], n)),
-        // `tag props BDC` / `tag props DP` — operand 1 may be a /Properties name
-        // (a direct `<< … >>` dict is not a /Properties ref, so it is skipped).
-        b"BDC" | b"DP" => operands
-            .get(1)
-            .and_then(Object::as_name)
-            .map(|n| (&b"Properties"[..], n)),
-        _ => None,
-    };
-    if let Some((category, name)) = recorded {
-        ctx.used
-            .entry(category.to_vec())
-            .or_default()
-            .insert(name.to_vec());
-    }
-    Ok(true)
 }
 
 /// Whether an (already resource-resolved) XObject stream dict is a Form XObject
@@ -1747,6 +1679,19 @@ mod tests {
         Ok((complete, used))
     }
 
+    fn malformed_form_pdf_and_resources() -> (Pdf<Cursor<Vec<u8>>>, Dictionary) {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /MediaBox [0 0 612 792] >>",
+            "<0g>",
+        );
+        let pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let mut xobjects = Dictionary::new();
+        xobjects.insert("Fm0", Object::Reference(ObjectRef::new(4, 0)));
+        let mut resources = Dictionary::new();
+        resources.insert("XObject", Object::Dictionary(xobjects));
+        (pdf, resources)
+    }
+
     #[test]
     fn resource_callbacks_reject_malformed_inline_image_protocol() {
         let bytes = build_page_with_resources_carrier_pdf(
@@ -1784,6 +1729,24 @@ mod tests {
     }
 
     #[test]
+    fn resource_callbacks_deduplicate_repeated_xobject_names_before_traversal() {
+        let mut callbacks = ResourceCallbacks {
+            finder: ResourceFinder::default(),
+            inline_header: None,
+            valid_xobjects: Default::default(),
+            complete: true,
+        };
+
+        parse_content_stream_data(b"/VeryLongFormName Do Do Do", &mut callbacks).unwrap();
+
+        assert_eq!(callbacks.valid_xobjects.len(), 1);
+        assert_eq!(
+            callbacks.valid_xobjects.keys().next().unwrap(),
+            b"VeryLongFormName"
+        );
+    }
+
+    #[test]
     fn resource_callbacks_propagate_form_resolution_errors() {
         let bytes = build_page_with_resources_carrier_pdf(
             "<< /Type /Page /MediaBox [0 0 612 792] >>",
@@ -1797,6 +1760,75 @@ mod tests {
 
         let error = collect_test_content(&mut pdf, b"/Fm0 Do", Some(&resources))
             .expect_err("malformed Form object is a structural error");
+        assert!(matches!(error, Error::Parse { .. }));
+    }
+
+    #[test]
+    fn form_error_before_later_parser_diagnostic_is_propagated() {
+        let (mut pdf, resources) = malformed_form_pdf_and_resources();
+
+        let error = collect_test_content(&mut pdf, b"/Fm0 Do <0g>", Some(&resources))
+            .expect_err("the valid earlier Do must surface its structural Form error");
+        assert!(matches!(error, Error::Parse { .. }));
+    }
+
+    #[test]
+    fn parser_diagnostic_before_form_use_stops_later_traversal() {
+        let (mut pdf, resources) = malformed_form_pdf_and_resources();
+
+        let (complete, _) = collect_test_content(&mut pdf, b"<0g> /Fm0 Do", Some(&resources))
+            .expect("the later Do is outside the valid parser-event prefix");
+        assert!(!complete);
+    }
+
+    #[test]
+    fn invalid_inline_header_do_does_not_trigger_form_traversal() {
+        let (mut pdf, resources) = malformed_form_pdf_and_resources();
+
+        let (complete, _) = collect_test_content(&mut pdf, b"BI /Fm0 Do", Some(&resources))
+            .expect("an invalid inline-image header is incomplete, not a Form traversal");
+        assert!(!complete);
+    }
+
+    #[test]
+    fn inline_image_payload_do_is_opaque_to_form_traversal() {
+        let (mut pdf, resources) = malformed_form_pdf_and_resources();
+
+        let (complete, used) =
+            collect_test_content(&mut pdf, b"BI /W 1 ID /Fm0 Do EI Q", Some(&resources))
+                .expect("inline-image payload bytes are opaque");
+        assert!(complete);
+        assert!(!used.contains_key(b"XObject".as_slice()));
+    }
+
+    #[test]
+    fn pruning_uses_shared_resource_finder_last_name_semantics() {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /MediaBox [0 0 612 792] >>",
+            "null",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let (complete, used) =
+            collect_test_content(&mut pdf, b"/Shared 12 Tf 99 gs", None).unwrap();
+        assert!(complete);
+        assert!(used[b"Font".as_slice()].contains(b"Shared".as_slice()));
+        assert!(used[b"ExtGState".as_slice()].contains(b"Shared".as_slice()));
+    }
+
+    #[test]
+    fn pruning_recurses_each_shared_finder_xobject_name() {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /MediaBox [0 0 612 792] >>",
+            "<0g>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let mut xobjects = Dictionary::new();
+        xobjects.insert("Fm0", Object::Reference(ObjectRef::new(4, 0)));
+        let mut resources = Dictionary::new();
+        resources.insert("XObject", Object::Dictionary(xobjects));
+
+        let error = collect_test_content(&mut pdf, b"/Fm0 12 Tf 99 Do", Some(&resources))
+            .expect_err("retained last name must route Do to the malformed Form");
         assert!(matches!(error, Error::Parse { .. }));
     }
 }

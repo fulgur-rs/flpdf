@@ -1017,13 +1017,6 @@ fn is_token_delimiter(byte: u8) -> bool {
     is_ws(byte) || is_delimiter(byte)
 }
 
-pub(crate) fn starts_number_token(input: &[u8]) -> bool {
-    let mut tokenizer = Tokenizer::new(input);
-    tokenizer
-        .read_token(true, 0)
-        .is_ok_and(|token| matches!(token.token_type, TokenType::Integer | TokenType::Real))
-}
-
 fn token_description(token: &Token) -> String {
     if token.token_type == TokenType::Eof {
         "EOF".into()
@@ -1454,6 +1447,8 @@ mod tests {
                 &case.max_len.to_string(),
                 "--inline-offset",
                 &inline_offset,
+                "--chunks",
+                "all",
             ])
             .output()
             // cov:ignore-start: script supplies a verified executable; spawn failure is only a harness diagnostic
@@ -1594,6 +1589,8 @@ mod tests {
                     "0",
                     "--inline-offset",
                     "none",
+                    "--chunks",
+                    "all",
                 ])
                 .output()
                 .expect("execute content parser probe");
@@ -1701,13 +1698,13 @@ mod tests {
         assert_eq!(
             run_qpdf_probe_command(command(), &cases[5]),
             "--mode\npull\n--input-hex\n616263646566676820\n--allow-eof\n1\n\
-             --include-ignorable\n0\n--allow-bad\n1\n--max-len\n5\n--inline-offset\nnone\n"
+             --include-ignorable\n0\n--allow-bad\n1\n--max-len\n5\n--inline-offset\nnone\n--chunks\nall\n"
         );
         assert_eq!(
             run_qpdf_probe_command(command(), &cases[9]),
             "--mode\npull-inline\n--input-hex\n58582061626320454920016261642045492051\n\
              --allow-eof\n1\n--include-ignorable\n0\n--allow-bad\n1\n--max-len\n0\n\
-             --inline-offset\n3\n"
+             --inline-offset\n3\n--chunks\nall\n"
         );
     }
 

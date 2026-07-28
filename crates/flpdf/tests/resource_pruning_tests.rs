@@ -1469,6 +1469,34 @@ fn test_form_decode_failure_retains_page() {
     );
 }
 
+#[test]
+fn earlier_xobject_resolution_error_is_not_hidden_by_later_incomplete_form() {
+    let bad_form_body = b"this is not valid flate data";
+    let bad_form = {
+        let mut bytes = format!(
+            "7 0 obj\n<< /Subtype /Form /Filter /FlateDecode /Length {} >>\nstream\n",
+            bad_form_body.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(bad_form_body);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    let extra = vec![
+        (4u32, stream_obj(4, b"/Z Do /A Do")),
+        (5, obj_bytes(5, "<< /XObject << /Z 6 0 R /A 7 0 R >> >>")),
+        (6, obj_bytes(6, "<0g>")),
+        (7, bad_form),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+
+    let error = remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect_err("the first-seen structural error must propagate");
+
+    assert!(matches!(error, flpdf::Error::Parse { .. }), "{error:?}");
+}
+
 // A page-level inline image referencing a NON-built-in colour space records that
 // name in the page's used set, keeping it while an unused sibling is pruned.
 // (flpdf-u79t: covers the inline-image /CS recording under record_direct.)

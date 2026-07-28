@@ -8,6 +8,8 @@ pub(crate) mod flate;
 
 pub(crate) mod rc4;
 
+pub(crate) mod qpdf_tokenizer;
+
 #[allow(dead_code)]
 pub(crate) type PipelineResult<T> = std::result::Result<T, PipelineError>;
 

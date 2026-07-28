@@ -135,7 +135,6 @@ pub(crate) struct Parser<'tokenizer, 'input> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParserMode {
     Object,
-    NoReference,
     Content,
 }
 
@@ -150,15 +149,6 @@ const MAX_PARSE_DEPTH: usize = 500;
 impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
     pub(crate) fn with_tokenizer(tokenizer: &'tokenizer mut Tokenizer<'input>) -> Self {
         Self::with_mode(tokenizer, ParserMode::Object)
-    }
-
-    /// Like [`with_tokenizer`](Self::with_tokenizer) but in
-    /// [`ParserMode::NoReference`] mode, which leaves `N G R` as separate
-    /// objects instead of constructing an indirect reference.
-    pub(crate) fn with_tokenizer_no_reference(
-        tokenizer: &'tokenizer mut Tokenizer<'input>,
-    ) -> Self {
-        Self::with_mode(tokenizer, ParserMode::NoReference)
     }
 
     /// Construct a parser in qpdf content-stream mode over the caller's
@@ -188,13 +178,6 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
             .map_or_else(|| self.tokenizer.position(), |token| token.start)
     }
 
-    /// Parse a single direct object at the current position (after leading
-    /// whitespace/comments). Exact-byte overlay token filters use this to share
-    /// the parser's operand grammar.
-    pub(crate) fn parse_one_object(&mut self) -> Result<Object> {
-        self.object()
-    }
-
     /// Parse one qpdf content-stream object, returning `None` at content EOF.
     pub(crate) fn parse_content_object(&mut self) -> Result<Option<Object>> {
         let token = self.next_token()?;
@@ -214,9 +197,9 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
         // elements recurse only through it, and leaf parsers do not recurse.
         // A symmetric increment/decrement here therefore bounds every nesting
         // path. Decrementing on the error early-return AND on the normal return
-        // keeps `depth` balanced across both, so repeated `parse_one_object`
-        // calls from the content-stream tokenizer (which reuse one parser) do
-        // not accumulate depth.
+        // keeps `depth` balanced across both, so repeated
+        // `parse_content_object` calls from the content-stream tokenizer
+        // (which reuse one parser) do not accumulate depth.
         self.depth += 1;
         if self.depth > MAX_PARSE_DEPTH {
             self.depth -= 1;
@@ -432,9 +415,7 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
 
     fn integer_or_ref(&mut self, first_token: Token) -> Result<Object> {
         let first = parse_integer_token(&first_token)?;
-        if matches!(self.mode, ParserMode::NoReference | ParserMode::Content)
-            || (self.top_level_no_reference && self.depth == 1)
-        {
+        if self.mode == ParserMode::Content || (self.top_level_no_reference && self.depth == 1) {
             return Ok(Object::Integer(first));
         }
 

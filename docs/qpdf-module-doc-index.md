@@ -15,7 +15,7 @@
 | `crates/flpdf/src/bit_writer.rs` | correspondence | BitWriter.cc and bits_functions.hh MSB-first bit packing into a Pipeline stage |
 | `crates/flpdf/src/cache.rs` | correspondence | QPDF.cc xref-backed object cache represented as a standalone Rust module |
 | `crates/flpdf/src/check.rs` | correspondence | QPDFJob.cc document-check surface over reader diagnostics |
-| `crates/flpdf/src/content_normalizer.rs` | mirror | libqpdf/Pl_QPDFTokenizer.cc, libqpdf/ContentNormalizer.cc |
+| `crates/flpdf/src/content_normalizer.rs` | mirror | libqpdf/ContentNormalizer.cc |
 | `crates/flpdf/src/content_stream.rs` | correspondence | QPDFParser.cc content callbacks |
 | `crates/flpdf/src/default_appearance.rs` | correspondence | QPDFFormFieldObjectHelper.cc default-appearance parsing split from the form-field helper |
 | `crates/flpdf/src/diagnostics.rs` | correspondence | QPDFLogger.cc diagnostic routing represented as Rust values |
@@ -61,7 +61,7 @@
 | `crates/flpdf/src/outline_document_helper.rs` | correspondence | QPDFOutlineDocumentHelper.cc and QPDFOutlineObjectHelper.cc responsibilities split with outline.rs |
 | `crates/flpdf/src/overlay.rs` | correspondence | QPDFPageObjectHelper.cc placement and QPDFJob.cc overlay orchestration responsibilities |
 | `crates/flpdf/src/overlay_annotations.rs` | correspondence | QPDFPageObjectHelper.cc, QPDFAcroFormDocumentHelper.cc, ResourceFinder.cc, and QPDFObjectHandle.cc overlay responsibilities |
-| `crates/flpdf/src/overlay_appearance_stream.rs` | correspondence | QPDFAcroFormDocumentHelper.cc appearance adjustment plus ResourceFinder.cc token rewriting |
+| `crates/flpdf/src/overlay_appearance_stream.rs` | correspondence | QPDFAcroFormDocumentHelper.cc adjustAppearanceStream consuming resource_replacer.rs |
 | `crates/flpdf/src/page_annotation_enum.rs` | correspondence | QPDFPageObjectHelper.cc and QPDFAnnotationObjectHelper.cc annotation enumeration |
 | `crates/flpdf/src/page_annotation_flatten.rs` | correspondence | QPDFPageObjectHelper.cc annotation flattening split from the page helper |
 | `crates/flpdf/src/page_closure.rs` | correspondence | QPDF.cc copyForeignObject graph closure split from object copying |
@@ -88,12 +88,15 @@
 | `crates/flpdf/src/pipeline/buffer.rs` | correspondence | Pl_Buffer.cc accumulation, optional pass-through, finish readiness, and getBuffer reset ownership; Rust take_buffer returns the moved Vec directly |
 | `crates/flpdf/src/pipeline/count.rs` | correspondence | Pl_Count.cc byte-count, last-byte, forwarding, and finish responsibilities |
 | `crates/flpdf/src/pipeline/flate.rs` | correspondence | Pl_Flate.cc streaming inflate, deflate, warning callback, compression-level, and finish responsibilities via flate2 |
+| `crates/flpdf/src/pipeline/qpdf_tokenizer.rs` | correspondence | Pl_QPDFTokenizer.cc buffered token-filter pipeline |
 | `crates/flpdf/src/pipeline/rc4.rs` | correspondence | Pl_RC4.cc bounded streaming over one retained RC4 state |
 | `crates/flpdf/src/qdf_fix.rs` | correspondence | qpdf/fix-qdf.cc tool behavior outside libqpdf |
 | `crates/flpdf/src/qpdf_null.rs` | correspondence | QPDFObjectHandle.cc isNull resolution plus QPDFWriter.cc null-valued dictionary visibility |
 | `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc document reading, object resolution, recovery, and authentication responsibilities |
 | `crates/flpdf/src/reader/file_object.rs` | correspondence | QPDF.cc readObject/readStream framing and recovery split from the document reader |
 | `crates/flpdf/src/ref_chain.rs` | correspondence | QPDF.cc indirect-reference resolution represented as a bounded shared primitive |
+| `crates/flpdf/src/resource_finder.rs` | correspondence | \`ResourceFinder.cc\` |
+| `crates/flpdf/src/resource_replacer.rs` | correspondence | \`QPDFAcroFormDocumentHelper.cc\` \`ResourceReplacer\` |
 | `crates/flpdf/src/resources.rs` | correspondence | QPDFPageObjectHelper.cc removeUnreferencedResources traversal split from the page helper |
 | `crates/flpdf/src/rewrite_renumber.rs` | correspondence | QPDFWriter.cc object renumbering shared by plain and linearized writers |
 | `crates/flpdf/src/rotate_spec.rs` | correspondence | QPDFJob.cc rotate-spec parsing split from page rotation |
@@ -109,6 +112,7 @@
 | `crates/flpdf/src/struct_tree_pg.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for structure elements |
 | `crates/flpdf/src/subset_prune.rs` | correspondence | QPDFPageObjectHelper.cc resource pruning plus QPDFWriter.cc full-rewrite reachability |
 | `crates/flpdf/src/thread_bead_p.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for article beads |
+| `crates/flpdf/src/token_filter.rs` | correspondence | QPDFObjectHandle::TokenFilter callback boundary |
 | `crates/flpdf/src/tokenizer.rs` | mirror | libqpdf/QPDFTokenizer.cc |
 | `crates/flpdf/src/writer.rs` | correspondence | QPDFWriter.cc responsibilities shared with writer submodules and linearization |
 | `crates/flpdf/src/writer/object_streams.rs` | correspondence | QPDF.cc getCompressibleObjGens plus QPDFWriter.cc object-stream planning and emission |

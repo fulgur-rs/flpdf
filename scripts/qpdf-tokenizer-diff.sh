@@ -332,6 +332,7 @@ c++ -std=c++17 \
   -I"${qpdf_source}/libqpdf" \
   "${repo_root}/tests/oracle/qpdf_tokenizer_probe.cc" \
   "${qpdf_source}/libqpdf/ContentNormalizer.cc" \
+  "${qpdf_source}/libqpdf/ResourceFinder.cc" \
   -L"${build_dir}/libqpdf" \
   -Wl,--disable-new-dtags \
   "-Wl,-rpath,${build_dir}/libqpdf" \
@@ -367,5 +368,20 @@ LD_LIBRARY_PATH="${probe_library_path}" \
 LD_LIBRARY_PATH="${probe_library_path}" \
   QPDF_TOKENIZER_PROBE="${probe_binary}" \
   cargo test -p flpdf --lib \
+  pipeline::qpdf_tokenizer::tests::qpdf_token_filter_differential \
+  -- --ignored --exact
+LD_LIBRARY_PATH="${probe_library_path}" \
+  QPDF_TOKENIZER_PROBE="${probe_binary}" \
+  cargo test -p flpdf --lib \
+  pipeline::qpdf_tokenizer::tests::qpdf_token_filter_lifecycle_differential \
+  -- --ignored --exact
+LD_LIBRARY_PATH="${probe_library_path}" \
+  QPDF_TOKENIZER_PROBE="${probe_binary}" \
+  cargo test -p flpdf --lib \
   content_normalizer::tests::qpdf_content_normalizer_differential \
+  -- --ignored --exact
+LD_LIBRARY_PATH="${probe_library_path}" \
+  QPDF_TOKENIZER_PROBE="${probe_binary}" \
+  cargo test -p flpdf --lib \
+  resource_finder::tests::qpdf_resource_finder_differential \
   -- --ignored --exact
