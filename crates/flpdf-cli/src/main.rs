@@ -362,6 +362,18 @@ struct Cli {
     #[arg(long = "qdf")]
     qdf: bool,
 
+    /// Normalize PDF page content streams (qpdf --normalize-content=y|n).
+    ///
+    /// The absence of this option is distinct from an explicit `n`: qpdf
+    /// enables normalization by default in QDF mode, but an explicit `n`
+    /// overrides that QDF default.
+    #[arg(
+        long = "normalize-content",
+        value_enum,
+        help = "Normalize page content streams (qpdf default: n; --qdf default: y)"
+    )]
+    normalize_content: Option<CliYesNo>,
+
     /// Coalesce multiple /Contents streams into a single stream per page
     /// (top-level alias of `flpdf rewrite --coalesce-contents`; qpdf
     /// `--coalesce-contents` equivalent). Requires a full rewrite of the
@@ -1291,6 +1303,20 @@ enum CliYesNo {
     No,
 }
 
+/// Resolve qpdf's two-bit content-normalization state.
+///
+/// qpdf's `QPDFJob` only calls `QPDFWriter::setContentNormalization` for an
+/// explicit `--normalize-content` option. The writer then enables normalization
+/// for QDF only when no explicit value was set, so `--qdf
+/// --normalize-content=n` must remain distinguishable from an absent option.
+fn normalize_content_enabled(setting: Option<CliYesNo>, qdf: bool) -> bool {
+    match setting {
+        Some(CliYesNo::Yes) => true,
+        Some(CliYesNo::No) => false,
+        None => qdf,
+    }
+}
+
 /// `--newline-before-endstream=y|n|never` (qpdf default: never).
 ///
 /// Adds a third `never` variant on top of `y|n` so the CLI can request qpdf's
@@ -1445,6 +1471,7 @@ fn main() {
         }
     };
     let args = Cli::parse_from(residual_args);
+    let normalize_content = normalize_content_enabled(args.normalize_content, args.qdf);
 
     // --static-id produces a fixed, non-unique trailer /ID. It exists only
     // for deterministic test/parity output. The native `rewrite --static-id`
@@ -1631,7 +1658,7 @@ fn main() {
             true,
             args.remove_restrictions,
             args.decrypt,
-            false, // normalize_content
+            normalize_content,
             args.coalesce_contents,
             CliRemoveUnreferencedResources::No, // remove_unreferenced (no-op for linearize path)
             false,                              // generate_appearances (not on top-level surface)
@@ -1793,7 +1820,7 @@ fn main() {
             false,
             args.remove_restrictions,
             args.decrypt,
-            false, // normalize_content
+            normalize_content,
             args.coalesce_contents,
             CliRemoveUnreferencedResources::No, // remove_unreferenced (top-level alias is no-op)
             false,                              // generate_appearances (not on top-level surface)
@@ -2961,6 +2988,7 @@ fn run_rewrite(
     if linearize {
         let mut pdf = open_pdf(&input, repair, password)?;
         reject_encrypted_write(&pdf)?;
+        let diagnostics_start = pdf.repair_diagnostics().entries().len();
         // --remove-restrictions must strip signatures BEFORE the linearization
         // plan is computed: disable_digital_signatures deletes signature dicts and
         // erases /Sig fields from /Fields, changing the reachable/first-page object
@@ -2977,6 +3005,15 @@ fn run_rewrite(
         } else {
             false
         };
+        // Linearization plans object membership and sizes from this graph.
+        // Apply content normalization before planning, then repeat it on the
+        // independently opened write graph below so plan and emitted objects
+        // describe the same transformed document.
+        let normalization_last_bad = if normalize_content {
+            normalize_page_contents(&mut pdf)?
+        } else {
+            Vec::new()
+        };
         let plan =
             LinearizationPlan::from_pdf_with_object_stream_mode(&mut pdf, options.object_streams)?;
         let renumber = RenumberMap::from_plan(&plan);
@@ -2989,6 +3026,9 @@ fn run_rewrite(
         // pdf2 matches pdf's post-strip graph regardless of whether it changed.
         if remove_restrictions {
             disable_digital_signatures(&mut pdf2)?;
+        }
+        if normalize_content {
+            normalize_page_contents(&mut pdf2)?;
         }
         if had_signatures {
             options.full_rewrite = true;
@@ -3008,6 +3048,7 @@ fn run_rewrite(
         // never reaches here; on unsigned unencrypted input there is nothing
         // to de-restrict. Per qpdf-lenient behaviour that diagnostic is
         // omitted.
+        finish_rewrite_warnings(&input, &pdf, diagnostics_start, &normalization_last_bad)?;
     } else {
         let mut pdf = open_pdf(&input, repair, password)?;
         let diagnostics_start = pdf.repair_diagnostics().entries().len();
@@ -3097,9 +3138,6 @@ fn run_rewrite(
             options.full_rewrite = true;
         }
 
-        let mut normalization_last_bad = Vec::new();
-        let mut normalized_streams = HashSet::new();
-
         // Step 1: coalesce per-page /Contents arrays into a single stream.
         if coalesce_contents {
             let page_refs = pages::page_refs(&mut pdf)?;
@@ -3113,16 +3151,11 @@ fn run_rewrite(
         // normalized bytes. We fetch each page's /Contents reference(s), decode
         // the stored stream data, normalize, and write the result back via
         // set_object (same pattern as coalesce_page_contents).
-        if normalize_content {
-            let page_refs = pages::page_refs(&mut pdf)?;
-            for page_ref in page_refs {
-                normalization_last_bad.extend(apply_normalize_content(
-                    &mut pdf,
-                    page_ref,
-                    &mut normalized_streams,
-                )?);
-            }
-        }
+        let normalization_last_bad = if normalize_content {
+            normalize_page_contents(&mut pdf)?
+        } else {
+            Vec::new()
+        };
 
         // (No resource-entry pruning on the plain rewrite path — see the
         // "Content mutation pass" note above. qpdf prunes /Resources entries only
@@ -4330,6 +4363,21 @@ fn run_rewrite_with_page_ops(
 /// trigger this on its own.
 fn page_ops_active(p: &PageOpArgs) -> bool {
     !p.pages.is_empty() || !p.rotate.is_empty() || p.split_pages.is_some() || p.empty
+}
+
+/// Normalize all page content streams in an in-memory PDF graph.
+///
+/// Shared by the plain and linearized rewrite paths so both use the same page
+/// traversal, indirect `/Contents` handling, alias deduplication, and warning
+/// order.
+fn normalize_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<Vec<bool>> {
+    let mut warnings = Vec::new();
+    let mut seen = HashSet::new();
+    let page_refs = pages::page_refs(pdf)?;
+    for page_ref in page_refs {
+        warnings.extend(apply_normalize_content(pdf, page_ref, &mut seen)?);
+    }
+    Ok(warnings)
 }
 
 /// Normalize the content stream(s) for a single page.
