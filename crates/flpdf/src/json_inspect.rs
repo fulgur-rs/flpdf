@@ -3208,7 +3208,7 @@ pub fn write_qpdf_json_v2_selected_objects_to_output_with_options<R: Read + Seek
         JsonOutput::File(writer) => {
             let mut buffered = BufWriter::with_capacity(4096, writer);
             {
-                let mut terminal = PlOStream::new("json output", &mut buffered);
+                let mut terminal = PlStdioFile::new("json output", &mut buffered);
                 write_qpdf_json_v2_selected_objects_with_options(
                     pdf,
                     decode_level,
@@ -3264,6 +3264,48 @@ mod tests {
             let written = self.remaining.min(buffer.len());
             self.bytes.extend_from_slice(&buffer[..written]);
             self.remaining -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailOnWriteLength {
+        rejected_length: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl std::io::Write for FailOnWriteLength {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if buffer.len() == self.rejected_length {
+                return Err(std::io::Error::other("sink full"));
+            }
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PartialThenFailWriter {
+        accepted: usize,
+        bytes: Vec<u8>,
+        write_lengths: Vec<usize>,
+    }
+
+    impl std::io::Write for PartialThenFailWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.write_lengths.push(buffer.len());
+            if self.accepted == 0 {
+                return Err(std::io::Error::other("sink full"));
+            }
+            let written = self.accepted.min(buffer.len());
+            self.bytes.extend_from_slice(&buffer[..written]);
+            self.accepted -= written;
             Ok(written)
         }
 
@@ -3494,6 +3536,30 @@ mod tests {
         Ok(bytes)
     }
 
+    fn pdf_with_selected_string(payload_length: usize) -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::String(vec![b'x'; payload_length]),
+        );
+        pdf
+    }
+
+    fn selected_string_output(payload_length: usize) -> Vec<u8> {
+        let mut pdf = pdf_with_selected_string(payload_length);
+        write_selected_to_vec(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Qpdf],
+            &[JsonObjectSelector::Object {
+                number: 2,
+                generation: 0,
+            }],
+        )
+        .unwrap()
+    }
+
     fn build_test_document_selected_objects<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         decode_level: DecodeLevel,
@@ -3658,7 +3724,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_stdout_flushes_at_command_boundary() {
+    fn coordinator_stdout_still_uses_ostream_finish() {
         let mut pdf = load_one_page_pdf();
         let mut output = FlushProbe::default();
 
@@ -3676,7 +3742,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_file_does_not_explicitly_flush() {
+    fn coordinator_file_does_not_call_pipeline_finish() {
         let mut pdf = load_one_page_pdf();
         let mut output = FlushProbe::default();
 
@@ -3721,6 +3787,67 @@ mod tests {
             "expected buffered file writes, got {write_count} calls"
         );
         serde_json::from_slice::<serde_json::Value>(&output.bytes).unwrap();
+    }
+
+    #[test]
+    fn coordinator_file_4095_bytes_are_flushed_on_buffered_drop() {
+        let empty_output = selected_string_output(0);
+        let payload_length = 4095usize
+            .checked_sub(empty_output.len())
+            .expect("selected-string JSON envelope must fit in 4095 bytes");
+        let expected = selected_string_output(payload_length);
+        assert_eq!(expected.len(), 4095);
+
+        let mut pdf = pdf_with_selected_string(payload_length);
+        let mut output = PartialThenFailWriter {
+            accepted: 24,
+            bytes: Vec::new(),
+            write_lengths: Vec::new(),
+        };
+
+        write_qpdf_json_v2_selected_objects_to_output_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Qpdf],
+            &[JsonObjectSelector::Object {
+                number: 2,
+                generation: 0,
+            }],
+            JsonOutput::File(&mut output),
+        )
+        .unwrap();
+
+        assert_eq!(output.bytes, expected[..24]);
+        assert_eq!(output.write_lengths, [4095, 4071]);
+    }
+
+    #[test]
+    fn coordinator_file_4096_write_failure_is_pipeline_runtime_error() {
+        let mut pdf = pdf_with_selected_string(4095);
+        let mut output = FailOnWriteLength {
+            rejected_length: 4096,
+            bytes: Vec::new(),
+        };
+
+        let error = write_qpdf_json_v2_selected_objects_to_output_with_options(
+            &mut pdf,
+            DecodeLevel::Generalized,
+            &StreamDataMode::None,
+            &[JsonKey::Qpdf],
+            &[JsonObjectSelector::Object {
+                number: 2,
+                generation: 0,
+            }],
+            JsonOutput::File(&mut output),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            JsonOutputError::Pipeline(PipelineError::Runtime(ref message))
+                if message.as_bytes().starts_with(b"json output: Pl_StdioFile::write: ")
+        ));
     }
 
     #[test]
