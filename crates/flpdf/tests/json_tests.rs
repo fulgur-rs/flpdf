@@ -77,6 +77,26 @@ impl<F: FnMut(&[u8])> Pipeline for CallbackPipeline<F> {
     }
 }
 
+#[derive(Default)]
+struct ChunkRecordingPipeline {
+    chunks: Vec<Vec<u8>>,
+}
+
+impl Pipeline for ChunkRecordingPipeline {
+    fn identifier(&self) -> &str {
+        "chunk-recording"
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> PipelineResult<()> {
+        self.chunks.push(bytes.to_vec());
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
 struct FailOnChunkPipeline {
     bytes: Vec<u8>,
     fail_on: &'static [u8],
@@ -166,6 +186,19 @@ fn incremental_writer_writes_dictionary_keys_that_are_already_encoded() {
     });
 
     assert_eq!(out, b"{\n  \"line\\n\": 1\n}");
+}
+
+#[test]
+fn dictionary_key_is_one_qpdf_pipeline_write_after_layout() {
+    let mut out = ChunkRecordingPipeline::default();
+    let mut first = true;
+
+    Json::write_dictionary_key(&mut out, &mut first, b"line\\n", 1).unwrap();
+
+    assert_eq!(
+        out.chunks,
+        [b"\n".to_vec(), b"  ".to_vec(), b"\"line\\n\": ".to_vec(),]
+    );
 }
 
 #[test]

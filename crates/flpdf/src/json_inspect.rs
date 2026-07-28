@@ -3074,7 +3074,7 @@ mod tests {
         }
 
         fn write(&mut self, buffer: &[u8]) -> PipelineResult<()> {
-            if self.bytes == b"{\n  \"version\": 2,\n  " && buffer == b"\"" {
+            if buffer.starts_with(b"\"parameters\"") {
                 return Err(match self.category {
                     ErrorCategory::Logic => PipelineError::logic("raw writer logic failure"),
                     ErrorCategory::Runtime => PipelineError::runtime("raw writer runtime failure"),

@@ -60,9 +60,11 @@ impl Json {
         depth: usize,
     ) -> PipelineResult<()> {
         Self::write_next(out, first, depth)?;
-        out.write(b"\"")?;
-        out.write(encoded_key)?;
-        out.write(b"\": ")
+        let mut item = Vec::with_capacity(encoded_key.len() + 4);
+        item.push(b'"');
+        item.extend_from_slice(encoded_key);
+        item.extend_from_slice(b"\": ");
+        out.write(&item)
     }
 
     pub fn write_array_item(
