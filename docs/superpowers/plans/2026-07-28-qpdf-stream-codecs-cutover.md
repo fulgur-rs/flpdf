@@ -109,7 +109,6 @@ dirty source after compile
 dirty source after cargo
 git status failure before compile
 git status failure after cargo
-unsafe TMPDIR inside the repository
 mktemp leaf replaced by a symlink
 ```
 
