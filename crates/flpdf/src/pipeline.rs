@@ -9,6 +9,8 @@ pub(crate) mod ascii_hex;
 
 pub(crate) mod buffer;
 
+pub mod base64;
+
 pub mod concatenate;
 
 pub(crate) mod count;
@@ -34,6 +36,7 @@ mod stream_codecs_oracle;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use base64::{Base64Action, PlBase64};
 pub mod string;
 pub use concatenate::PlConcatenate;
 pub use string::PlString;

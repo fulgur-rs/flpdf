@@ -1,4 +1,6 @@
-use flpdf::pipeline::{Pipeline, PipelineError, PipelineResult, PlConcatenate, PlString};
+use flpdf::pipeline::{
+    Base64Action, Pipeline, PipelineError, PipelineResult, PlBase64, PlConcatenate, PlString,
+};
 
 struct ExternalSink(Vec<u8>);
 
@@ -33,5 +35,11 @@ fn downstream_crates_can_implement_pipeline_and_construct_public_pipeline_stages
     assert_eq!(concatenate.identifier(), "concatenate");
     concatenate.finish().unwrap();
     concatenate.manual_finish().unwrap();
+
+    let mut base64 = PlBase64::new("base64", &mut sink, Base64Action::Encode);
+    assert_eq!(base64.identifier(), "base64");
+    base64.write(b"M").unwrap();
+    base64.finish().unwrap();
+
     assert_eq!(PipelineError::runtime("failure").message(), "failure");
 }
