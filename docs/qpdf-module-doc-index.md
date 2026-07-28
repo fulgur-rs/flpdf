@@ -8,8 +8,8 @@
 | `crates/flpdf/src/acroform_field_prune.rs` | correspondence | QPDFJob.cc removal of unreferenced form fields after page selection |
 | `crates/flpdf/src/annotation_helper.rs` | correspondence | QPDFAnnotationObjectHelper.cc and QPDFFormFieldObjectHelper.cc responsibilities split across helper modules |
 | `crates/flpdf/src/appearance.rs` | correspondence | QPDFFormFieldObjectHelper.cc appearance generation shared with annotation helpers |
-| `crates/flpdf/src/ascii85.rs` | correspondence | Pl_ASCII85Decoder.cc decode semantics plus a flpdf encoder; the qpdf Pipeline component boundary is not mirrored |
-| `crates/flpdf/src/ascii_hex.rs` | correspondence | Pl_ASCIIHexDecoder.cc decode semantics plus a flpdf encoder; the qpdf Pipeline component boundary is not mirrored |
+| `crates/flpdf/src/ascii85.rs` | correspondence | flpdf-specific ASCII85 encoder for PDF stream write paths; qpdf 11.9.0 has Pl_ASCII85Decoder but no matching encoder component |
+| `crates/flpdf/src/ascii_hex.rs` | correspondence | flpdf-specific ASCIIHex encoder for PDF stream write paths; qpdf 11.9.0 has Pl_ASCIIHexDecoder but no matching encoder component |
 | `crates/flpdf/src/attachment_list.rs` | correspondence | QPDFJob.cc attachment enumeration and display formatting |
 | `crates/flpdf/src/bit_stream.rs` | correspondence | BitStream.cc and bits_functions.hh MSB-first bit reading with Rust error values |
 | `crates/flpdf/src/bit_writer.rs` | correspondence | BitWriter.cc and bits_functions.hh MSB-first bit packing into a Pipeline stage |
@@ -23,7 +23,7 @@
 | `crates/flpdf/src/encrypt_setup.rs` | correspondence | QPDF_encryption.cc writer-side encryption configuration split from the security handler |
 | `crates/flpdf/src/error.rs` | correspondence | QPDFExc.cc and QPDFSystemError.cc concepts combined with flpdf-specific errors; public APIs are incomplete |
 | `crates/flpdf/src/filespec_helper.rs` | correspondence | QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc partial helper surface; public APIs are incomplete |
-| `crates/flpdf/src/filters.rs` | correspondence | Pl_LZWDecoder, predictor, and not-yet-migrated stream-filter codec responsibilities; QPDFStreamFilter dispatch and Pl_Flate execution are delegated to stream_filter |
+| `crates/flpdf/src/filters.rs` | correspondence | Pl_LZWDecoder, predictor, and legacy stream-filter encoder responsibilities; QPDFStreamFilter dispatch and Pipeline decoder execution are delegated to stream_filter |
 | `crates/flpdf/src/fonts.rs` | correspondence | flpdf-only font-resource inspection surface |
 | `crates/flpdf/src/json/handler.rs` | correspondence | JSONHandler.cc recursive dispatch responsibilities with Rust shared ownership |
 | `crates/flpdf/src/json/message.rs` | correspondence | JSON.cc and JSONHandler.cc use byte-oriented std::string diagnostics |
@@ -85,11 +85,16 @@
 | `crates/flpdf/src/pdf_version.rs` | mirror | libqpdf/PDFVersion.cc |
 | `crates/flpdf/src/permissions.rs` | correspondence | QPDF_encryption.cc permission-bit encoding split from the Standard security handler |
 | `crates/flpdf/src/pipeline.rs` | correspondence | Pipeline.cc write/finish chaining lifecycle represented by a crate-private Rust trait; PipelineError models qpdf's logic_error/runtime_error exception channel |
+| `crates/flpdf/src/pipeline/ascii85.rs` | correspondence | Pl_ASCII85Decoder.cc incremental decode state, output, error, and finish semantics |
+| `crates/flpdf/src/pipeline/ascii_hex.rs` | correspondence | Pl_ASCIIHexDecoder.cc incremental decode state, output, error, and finish semantics |
 | `crates/flpdf/src/pipeline/buffer.rs` | correspondence | Pl_Buffer.cc accumulation, optional pass-through, finish readiness, and getBuffer reset ownership; Rust take_buffer returns the moved Vec directly |
 | `crates/flpdf/src/pipeline/count.rs` | correspondence | Pl_Count.cc byte-count, last-byte, forwarding, and finish responsibilities |
 | `crates/flpdf/src/pipeline/flate.rs` | correspondence | Pl_Flate.cc streaming inflate, deflate, warning callback, compression-level, and finish responsibilities via flate2 |
 | `crates/flpdf/src/pipeline/qpdf_tokenizer.rs` | correspondence | Pl_QPDFTokenizer.cc buffered token-filter pipeline |
 | `crates/flpdf/src/pipeline/rc4.rs` | correspondence | Pl_RC4.cc bounded streaming over one retained RC4 state |
+| `crates/flpdf/src/pipeline/run_length.rs` | correspondence | Pl_RunLength.cc incremental encode and decode state, output, error, and finish semantics |
+| `crates/flpdf/src/pipeline/stream_codecs_oracle.rs` | correspondence | live differential instrumentation for Pl_ASCII85Decoder.cc, Pl_ASCIIHexDecoder.cc, and Pl_RunLength.cc |
+| `crates/flpdf/src/pipeline/test_support.rs` | correspondence | flpdf-only test instrumentation for observable Pipeline downstream calls and failures |
 | `crates/flpdf/src/qdf_fix.rs` | correspondence | qpdf/fix-qdf.cc tool behavior outside libqpdf |
 | `crates/flpdf/src/qpdf_null.rs` | correspondence | QPDFObjectHandle.cc isNull resolution plus QPDFWriter.cc null-valued dictionary visibility |
 | `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc document reading, object resolution, recovery, and authentication responsibilities |
@@ -100,7 +105,6 @@
 | `crates/flpdf/src/resources.rs` | correspondence | QPDFPageObjectHelper.cc removeUnreferencedResources traversal split from the page helper |
 | `crates/flpdf/src/rewrite_renumber.rs` | correspondence | QPDFWriter.cc object renumbering shared by plain and linearized writers |
 | `crates/flpdf/src/rotate_spec.rs` | correspondence | QPDFJob.cc rotate-spec parsing split from page rotation |
-| `crates/flpdf/src/run_length.rs` | correspondence | Pl_RunLength.cc codec semantics via whole-buffer functions; the qpdf Pipeline component boundary is not mirrored |
 | `crates/flpdf/src/security/mod.rs` | correspondence | QPDF_encryption.cc responsibilities split across the Rust security module tree |
 | `crates/flpdf/src/security/password.rs` | correspondence | QPDF_encryption.cc password normalization and revision-specific truncation |
 | `crates/flpdf/src/security/primitives.rs` | correspondence | Rust crypto-crate substitution for qpdf AES, MD5, and SHA2 native implementations |

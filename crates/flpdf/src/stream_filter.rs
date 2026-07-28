@@ -1,7 +1,10 @@
 //! qpdf correspondence: QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities.
 
+use crate::pipeline::ascii85::Ascii85Decoder;
+use crate::pipeline::ascii_hex::AsciiHexDecoder;
 use crate::pipeline::buffer::Buffer;
 use crate::pipeline::flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE};
+use crate::pipeline::run_length::{RunLength, RunLengthAction};
 use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 use crate::{Error, Object, Result};
 
@@ -122,7 +125,7 @@ impl Pipeline for OutputBuffer {
 }
 
 fn map_pipeline_error(error: PipelineError) -> Error {
-    Error::Unsupported(error.to_string())
+    Error::Unsupported(error.into_string_lossy())
 }
 
 #[cfg(test)]
@@ -195,6 +198,49 @@ impl StreamFilter for FlateStreamFilter {
     }
 }
 
+struct Ascii85StreamFilter;
+
+impl StreamFilter for Ascii85StreamFilter {
+    fn pipe_decode(
+        &mut self,
+        data: &[u8],
+        max_output: Option<usize>,
+        _warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+    ) -> Result<Vec<u8>> {
+        decode_ascii85(data, max_output)
+    }
+}
+
+struct AsciiHexStreamFilter;
+
+impl StreamFilter for AsciiHexStreamFilter {
+    fn pipe_decode(
+        &mut self,
+        data: &[u8],
+        max_output: Option<usize>,
+        _warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+    ) -> Result<Vec<u8>> {
+        decode_ascii_hex(data, max_output)
+    }
+}
+
+struct RunLengthStreamFilter;
+
+impl StreamFilter for RunLengthStreamFilter {
+    fn pipe_decode(
+        &mut self,
+        data: &[u8],
+        max_output: Option<usize>,
+        _warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+    ) -> Result<Vec<u8>> {
+        decode_run_length(data, max_output)
+    }
+
+    fn is_specialized_compression(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 struct TestStreamFilter;
 
@@ -231,12 +277,45 @@ impl StreamFilter for BorrowedInputProbe {
 pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilter>> {
     match filter_name {
         b"FlateDecode" => Some(Box::new(FlateStreamFilter)),
+        b"ASCII85Decode" => Some(Box::new(Ascii85StreamFilter)),
+        b"ASCIIHexDecode" => Some(Box::new(AsciiHexStreamFilter)),
+        b"RunLengthDecode" => Some(Box::new(RunLengthStreamFilter)),
         #[cfg(test)]
         b"TestRejectDecode" => Some(Box::new(TestStreamFilter)),
         #[cfg(test)]
         b"TestBorrowedInput" => Some(Box::new(BorrowedInputProbe)),
         _ => None,
     }
+}
+
+fn decode_ascii85(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>> {
+    let mut sink = OutputBuffer::new(max_output);
+    {
+        let mut stage = Ascii85Decoder::new("ascii85 decode", &mut sink);
+        stage.write(data).map_err(map_pipeline_error)?;
+        stage.finish().map_err(map_pipeline_error)?;
+    }
+    Ok(sink.data)
+}
+
+fn decode_ascii_hex(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>> {
+    let mut sink = OutputBuffer::new(max_output);
+    {
+        let mut stage = AsciiHexDecoder::new("asciiHex decode", &mut sink);
+        stage.write(data).map_err(map_pipeline_error)?;
+        stage.finish().map_err(map_pipeline_error)?;
+    }
+    Ok(sink.data)
+}
+
+fn decode_run_length(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>> {
+    let mut sink = OutputBuffer::new(max_output);
+    {
+        let mut stage = RunLength::new("runlength decode", &mut sink, RunLengthAction::Decode);
+        stage.write(data).map_err(map_pipeline_error)?;
+        stage.finish().map_err(map_pipeline_error)?;
+    }
+    Ok(sink.data)
 }
 
 fn decode_flate_chunks<'a>(
@@ -283,15 +362,30 @@ pub(crate) fn encode_flate(data: &[u8]) -> Result<Vec<u8>> {
     sink.take_buffer().map_err(map_pipeline_error)
 }
 
+pub(crate) fn encode_run_length(data: &[u8]) -> Result<Vec<u8>> {
+    let mut sink = Buffer::new("stream data buffer", None);
+    {
+        let mut stage = RunLength::new("compress stream", &mut sink, RunLengthAction::Encode);
+        stage.write(data).map_err(map_pipeline_error)?;
+        stage.finish().map_err(map_pipeline_error)?;
+    }
+    sink.take_buffer().map_err(map_pipeline_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_filter_specs, decode_flate, decode_flate_chunks, encode_flate, ignore_warning,
-        stream_filter_for, FlateStreamFilter, OutputBuffer, Pipeline, StreamFilter,
+        decode_filter_specs, decode_flate, decode_flate_chunks, encode_flate, encode_run_length,
+        ignore_warning, stream_filter_for, FlateStreamFilter, OutputBuffer, Pipeline, StreamFilter,
         DECODE_OUTPUT_LIMIT_PREFIX,
     };
     use crate::{Dictionary, Error, Object};
     use std::cell::RefCell;
+
+    #[test]
+    fn run_length_encoder_uses_qpdf_two_byte_run() {
+        assert_eq!(encode_run_length(b"AA").unwrap(), [0xff, b'A', 0x80]);
+    }
 
     #[test]
     fn scalar_decode_parms_are_reused_for_each_filter() {
@@ -527,8 +621,85 @@ mod tests {
     }
 
     #[test]
-    fn factory_returns_none_for_not_yet_migrated_filters() {
-        assert!(stream_filter_for(b"ASCII85Decode").is_none());
+    fn factory_returns_all_production_stream_filters() {
+        for name in [
+            b"FlateDecode".as_slice(),
+            b"ASCII85Decode",
+            b"ASCIIHexDecode",
+            b"RunLengthDecode",
+        ] {
+            assert!(stream_filter_for(name).is_some(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn ascii_and_run_length_factories_expose_qpdf_stream_filter_contract() {
+        for (name, specialized) in [
+            (b"ASCII85Decode".as_slice(), false),
+            (b"ASCIIHexDecode".as_slice(), false),
+            (b"RunLengthDecode".as_slice(), true),
+        ] {
+            let mut filter = stream_filter_for(name).expect("registered stream filter");
+
+            assert!(filter.set_decode_params(None), "{name:?}");
+            assert!(filter.set_decode_params(Some(&Object::Null)), "{name:?}");
+            assert!(
+                !filter.set_decode_params(Some(&Object::Dictionary(Dictionary::new()))),
+                "{name:?}"
+            );
+            assert!(
+                !filter.set_decode_params(Some(&Object::Integer(1))),
+                "{name:?}"
+            );
+            assert_eq!(filter.is_specialized_compression(), specialized, "{name:?}");
+            assert!(!filter.is_lossy_compression(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn ascii_and_run_length_factories_decode_through_pipelines() {
+        let cases: &[(&[u8], &[u8], &[u8])] = &[
+            (b"ASCII85Decode", b"z~>", &[0, 0, 0, 0]),
+            (b"ASCIIHexDecode", b"4142>", b"AB"),
+            (b"RunLengthDecode", &[0xff, b'A', 0x80], b"AA"),
+        ];
+
+        for &(name, encoded, expected) in cases {
+            let decoded = stream_filter_for(name)
+                .expect("registered stream filter")
+                .pipe_decode(encoded, None, &mut ignore_warning)
+                .unwrap();
+
+            assert_eq!(decoded, expected, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn ascii_and_run_length_factories_enforce_output_limit_boundaries() {
+        let cases: &[(&[u8], &[u8], &[u8])] = &[
+            (b"ASCII85Decode", b"z~>", &[0, 0, 0, 0]),
+            (b"ASCIIHexDecode", b"4142>", b"AB"),
+            (b"RunLengthDecode", &[0xff, b'A', 0x80], b"AA"),
+        ];
+
+        for &(name, encoded, expected) in cases {
+            let below = expected.len() - 1;
+            let error = stream_filter_for(name)
+                .expect("registered stream filter")
+                .pipe_decode(encoded, Some(below), &mut ignore_warning)
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("unsupported PDF feature: {DECODE_OUTPUT_LIMIT_PREFIX} {below} bytes"),
+                "{name:?}"
+            );
+
+            let decoded = stream_filter_for(name)
+                .expect("registered stream filter")
+                .pipe_decode(encoded, Some(expected.len()), &mut ignore_warning)
+                .unwrap();
+            assert_eq!(decoded, expected, "{name:?}");
+        }
     }
 
     #[test]

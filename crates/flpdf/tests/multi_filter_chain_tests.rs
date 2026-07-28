@@ -6,6 +6,7 @@
 //!   (c) [/ASCII85Decode /FlateDecode] — with DecodeParms array [null <<Predictor 12...>>]
 //!   (d) [/FlateDecode /RunLengthDecode] — round-trip, no DecodeParms
 //!   (e) DecodeParms as a bare null Object — must not panic; filters apply without predictor
+//!   (f) [/ASCII85Decode /FlateDecode /RunLengthDecode] — mixed registered decoder chain
 
 use flpdf::{filters, Dictionary, Object};
 
@@ -159,6 +160,44 @@ fn chain_flate_then_run_length_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
+// (f) [/ASCII85Decode /FlateDecode /RunLengthDecode] — mixed registered chain
+// ---------------------------------------------------------------------------
+
+#[test]
+fn chain_ascii85_then_flate_then_run_length_decodes_asymmetric_payload() {
+    let raw = b"\x00AAABCDEEEEEEEE-tail-\xff";
+
+    let mut run_length_dict = Dictionary::new();
+    run_length_dict.insert("Filter", Object::Name(b"RunLengthDecode".to_vec()));
+    let run_length_encoded =
+        filters::encode_stream_data(&run_length_dict, raw).expect("RunLength encode");
+
+    let mut flate_dict = Dictionary::new();
+    flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let flate_encoded =
+        filters::encode_stream_data(&flate_dict, &run_length_encoded).expect("Flate encode");
+
+    let mut ascii85_dict = Dictionary::new();
+    ascii85_dict.insert("Filter", Object::Name(b"ASCII85Decode".to_vec()));
+    let encoded =
+        filters::encode_stream_data(&ascii85_dict, &flate_encoded).expect("ASCII85 encode");
+
+    let mut chain_dict = Dictionary::new();
+    chain_dict.insert(
+        "Filter",
+        Object::Array(vec![
+            Object::Name(b"ASCII85Decode".to_vec()),
+            Object::Name(b"FlateDecode".to_vec()),
+            Object::Name(b"RunLengthDecode".to_vec()),
+        ]),
+    );
+
+    let decoded = filters::decode_stream_data(&chain_dict, &encoded).expect("decode mixed chain");
+
+    assert_eq!(decoded, raw);
+}
+
+// ---------------------------------------------------------------------------
 // (e) DecodeParms as a bare Object::Null — must not error; filters apply without predictor
 // ---------------------------------------------------------------------------
 
@@ -191,7 +230,7 @@ fn chain_null_decode_parms_is_ignored() {
 }
 
 #[test]
-fn scalar_decode_parms_are_reused_across_public_multi_filter_round_trip() {
+fn scalar_decode_parms_are_reused_across_public_multi_filter_path() {
     let raw = b"scalar DecodeParms must reach every declared filter";
     let mut params = Dictionary::new();
     params.insert("Predictor", Object::Integer(12));
@@ -207,11 +246,13 @@ fn scalar_decode_parms_are_reused_across_public_multi_filter_round_trip() {
             Object::Name(b"FlateDecode".to_vec()),
         ]),
     );
+
+    let encoded = filters::encode_stream_data(&dict, raw).expect("encode filter chain");
     dict.insert("DecodeParms", Object::Dictionary(params));
+    let error = filters::decode_stream_data(&dict, &encoded).unwrap_err();
 
-    let encoded = filters::encode_stream_data(&dict, raw).expect("encode scalar parameter chain");
-    let decoded =
-        filters::decode_stream_data(&dict, &encoded).expect("decode scalar parameter chain");
-
-    assert_eq!(decoded, raw);
+    assert_eq!(
+        error.to_string(),
+        "unsupported PDF feature: stream filter ASCII85Decode does not support supplied /DecodeParms"
+    );
 }

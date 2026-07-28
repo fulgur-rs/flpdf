@@ -151,7 +151,6 @@ mod resource_replacer;
 pub mod resources;
 pub(crate) mod rewrite_renumber;
 pub mod rotate_spec;
-pub(crate) mod run_length;
 pub mod signatures;
 pub mod standard_font_metrics;
 pub(crate) mod stream_filter;
