@@ -1378,7 +1378,8 @@ Run:
 
 ```bash
 python3 scripts/qpdf-module-docs.py --write
-python3 -m unittest scripts/tests/test_qpdf_module_docs.py
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest scripts/tests/test_qpdf_module_docs.py
 python3 scripts/qpdf-module-docs.py --check
 ```
 
@@ -1409,14 +1410,21 @@ Expected: every command exits zero.
 - [ ] **Step 3: Commit docs and any test-only coverage correction**
 
 ```bash
+git status --short
 git add docs/qpdf-module-doc-index.md docs/qpdf-correspondence.md \
   docs/superpowers/plans/2026-07-28-qpdf-json-pipeline-cutover.md \
-  crates/flpdf/src crates/flpdf/tests crates/flpdf-cli/src \
-  crates/flpdf-cli/tests scripts tests/oracle Cargo.toml crates/flpdf/Cargo.toml
+  crates/flpdf/src/json/mod.rs crates/flpdf/src/json/writer.rs \
+  crates/flpdf/src/json_inspect.rs
+git diff --cached --name-only
+git diff --cached --check
 git commit -m "docs(pipeline): record JSON stage correspondence"
 ```
 
-If the index is empty, do not create an empty commit.
+If `git status --short` shows a focused test-only coverage correction, inspect
+it and run a separate `git add` naming every intended file path explicitly
+before the cached-diff checks above. Never pass a directory, glob, `scripts`,
+or `git add -u`; leave every unrelated path unstaged. If the index is empty,
+do not create an empty commit.
 
 - [ ] **Step 4: Obtain fresh committed Layer 1 patch coverage**
 
@@ -1993,7 +2001,8 @@ Run:
 
 ```bash
 python3 scripts/qpdf-module-docs.py --write
-python3 -m unittest scripts/tests/test_qpdf_module_docs.py
+PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest scripts/tests/test_qpdf_module_docs.py
 python3 scripts/qpdf-module-docs.py --check
 ```
 
@@ -2041,14 +2050,21 @@ Expected: every command exits zero.
 - [ ] **Step 4: Commit docs and any focused coverage correction**
 
 ```bash
+git status --short
 git add docs/qpdf-module-doc-index.md docs/qpdf-correspondence.md \
   docs/superpowers/plans/2026-07-28-qpdf-json-pipeline-cutover.md \
-  crates/flpdf/src crates/flpdf/tests crates/flpdf-cli/tests scripts \
-  tests/oracle
+  crates/flpdf/src/pipeline/stdio_file.rs \
+  crates/flpdf/src/json/mod.rs crates/flpdf/src/json_inspect.rs
+git diff --cached --name-only
+git diff --cached --check
 git commit -m "docs(pipeline): record JSON stdio correspondence"
 ```
 
-If the index is empty, do not create an empty commit.
+If `git status --short` shows a focused test-only coverage correction, inspect
+it and run a separate `git add` naming every intended file path explicitly
+before the cached-diff checks above. Never pass a directory, glob, `scripts`,
+or `git add -u`; leave every unrelated path unstaged. If the index is empty,
+do not create an empty commit.
 
 - [ ] **Step 5: Obtain fresh committed Layer 2 patch coverage**
 
