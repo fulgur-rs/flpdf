@@ -113,8 +113,12 @@ unsafe TMPDIR inside the repository
 mktemp leaf replaced by a symlink
 ```
 
-Each case also asserts that a validated external build directory is removed
-and a victim directory is untouched.
+Each failure case also asserts that a validated external build directory is
+removed and a victim directory is untouched. A repository-local unsafe
+`TMPDIR` is deliberately not a failure case: the runner must warn, continue
+through a safe external directory, remove that directory after success, and
+leave the victim untouched. The contract must assert the warning, external
+build placement/cleanup, and victim preservation for this fallback.
 
 - [ ] **Step 2: Run the contract to verify RED**
 

@@ -204,7 +204,13 @@ grep -q '^cargo' "${log}"
 inside_repo="${fixture_repo}/inside-repo-tmp"
 mkdir -m 700 "${inside_repo}"
 reset_fixture
-run_fixture "${inside_repo}"
+inside_repo_output="${fixture_root}/inside-repo.out"
+if ! run_fixture "${inside_repo}" >"${inside_repo_output}" 2>&1; then
+  echo 'repository-local TMPDIR fallback unexpectedly failed' >&2
+  exit 1
+fi
+grep -F 'qpdf-stream-codecs-diff.sh: unsafe' "${inside_repo_output}"
+grep -F 'using an external fallback' "${inside_repo_output}"
 build_path="$(<"${build_path_file}")"
 case "${build_path}" in "${fixture_repo}"/*) echo 'used repository TMPDIR' >&2; exit 1;; esac
 assert_cleaned_build
