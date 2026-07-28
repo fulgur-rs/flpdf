@@ -122,9 +122,9 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `Pipeline.cc`（積層シンク基盤のみ。個々の `Pl_*` は下記の各行で個別に分類） | 114 | 抽象が無い。`Vec<u8>` バッファ + `out.len()` 直参照 | ❌ |
 | `Pl_Count.cc` / `Pl_MD5.cc` | 114 | 無し（バッファから同等の値は取得可能） | ❌ |
 | `Pl_Flate` / `Pl_LZWDecoder` / `Pl_PNGFilter` / `Pl_TIFFPredictor` / `SF_FlateLzwDecode` | 946 | Flate は `pipeline/flate.rs` + `stream_filter.rs`、未移行の LZW / predictor は `filters.rs` | 🔀 |
-| `Pl_ASCII85Decoder` | 108 | `ascii85.rs`(163) | ✅ |
-| `Pl_ASCIIHexDecoder` | 96 | `ascii_hex.rs`(85) | ✅ |
-| `Pl_RunLength` | 146 | `run_length.rs`(140) | ✅ |
+| `Pl_ASCII85Decoder` / `SF_ASCII85Decode` | 108 + 31 | `pipeline/ascii85.rs` + `stream_filter.rs` | ✅ |
+| `Pl_ASCIIHexDecoder` / `SF_ASCIIHexDecode` | 96 + 31 | `pipeline/ascii_hex.rs` + `stream_filter.rs` | ✅ |
+| `Pl_RunLength` / `SF_RunLengthDecode` | 146 + 38 | `pipeline/run_length.rs` + `stream_filter.rs` | ✅ |
 | `Pl_AES_PDF` | 200 | `security/standard.rs` の AES single-buffer helper と `writer.rs` の stream consumer に分散。Pipeline 統合は `flpdf-qynx.10` | 🔀 |
 | `Pl_RC4` | 43 | `pipeline/rc4.rs`（65,536-byte既定buffer、stateful `security/rc4.rs`、write/finish lifecycle）+ `reader.rs` / `writer.rs` の本番stream consumer | ✅ |
 | `Pl_QPDFTokenizer.cc` / `ContentNormalizer.cc` | 141 | `pipeline/qpdf_tokenizer.rs`（optional downstream を持つ token-filter runner、EOF-token → `handle_eof`、`ID` separator 注入、inline-image 切替、raw token/discard/output、`handle_eof` 成功後の永久 detach と finish/error timing）+ production consumer `content_normalizer.rs`（bad-token state、CR/string/name normalization） | ✅ |

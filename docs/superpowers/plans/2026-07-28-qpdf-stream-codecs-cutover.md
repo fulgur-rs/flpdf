@@ -1446,7 +1446,25 @@ Expected: no old decoder/helper or whole-buffer decoder definition matches;
 only the Pipeline RunLength module; no whitespace errors; only files listed by
 this plan plus the approved design and plan documents.
 
-- [ ] **Step 4: Run formatting, lint, and strict rustdoc**
+- [ ] **Step 4: Commit documentation and plan-order correction**
+
+`scripts/patch-coverage.sh` requires a clean worktree. Commit the generated
+documentation and this executable-order correction before running any
+authoritative fresh coverage:
+
+```bash
+git add \
+  docs/qpdf-correspondence.md \
+  docs/qpdf-module-doc-index.md \
+  docs/superpowers/plans/2026-07-28-qpdf-stream-codecs-cutover.md
+git commit -m "docs: map qpdf stream codec pipelines"
+git status --short --branch
+```
+
+Expected: the documentation and plan correction are committed and the feature
+worktree is clean.
+
+- [ ] **Step 5: Run formatting, lint, and strict rustdoc**
 
 Run:
 
@@ -1459,7 +1477,7 @@ RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_l
 
 Expected: PASS.
 
-- [ ] **Step 5: Run focused tests and the live oracle from a clean test state**
+- [ ] **Step 6: Run focused tests and the live oracle from a clean test state**
 
 Run:
 
@@ -1482,7 +1500,7 @@ Expected: PASS. `compat_matrix_tests` may report its documented skip only if
 the qpdf executable is unavailable; the live source differential must not
 skip.
 
-- [ ] **Step 6: Run workspace and Linux byte-parity gates**
+- [ ] **Step 7: Run workspace and Linux byte-parity gates**
 
 Run:
 
@@ -1505,7 +1523,7 @@ cargo test -p flpdf-test-compare --features qpdf-zlib-compat --test e2e
 
 Expected: PASS.
 
-- [ ] **Step 7: Generate fresh coverage and require 100% changed lines**
+- [ ] **Step 8: Generate fresh coverage and require 100% changed lines**
 
 Refresh the remote base, then run without reusing an old LCOV file:
 
@@ -1520,16 +1538,10 @@ Expected: fresh `cargo llvm-cov` execution and:
 Patch coverage: 100.00%
 ```
 
-Do not add coverage exclusions for executable branches that can be exercised
-by deterministic unit tests. The only ignored block is the external live
-entry point whose logic is covered through ordinary fake-probe tests.
-
-- [ ] **Step 8: Commit generated documentation**
-
-```bash
-git add docs/qpdf-correspondence.md docs/qpdf-module-doc-index.md
-git commit -m "docs: map qpdf stream codec pipelines"
-```
+Do not use `--allow-dirty` or reuse an old LCOV file. Do not add coverage
+exclusions for executable branches that can be exercised by deterministic
+unit tests. The only ignored block is the external live entry point whose
+logic is covered through ordinary fake-probe tests.
 
 - [ ] **Step 9: Final clean-tree verification**
 
