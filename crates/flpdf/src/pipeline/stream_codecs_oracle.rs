@@ -383,8 +383,8 @@ fn validate_trace_protocol(trace: &str, operation_count: usize) -> Result<(), St
     Ok(())
 }
 
-fn run_qpdf_probe(probe: &Path, case: &OracleCase) -> String {
-    let output = Command::new(probe)
+fn run_qpdf_probe_command(mut command: Command, case: &OracleCase) -> String {
+    let output = command
         .arg(case.codec.as_probe_arg())
         .arg(csv_or_dash(&case.fail_writes))
         .arg(csv_or_dash(&case.fail_finishes))
@@ -413,6 +413,10 @@ fn run_qpdf_probe(probe: &Path, case: &OracleCase) -> String {
         )
     });
     trace
+}
+
+fn run_qpdf_probe(probe: &Path, case: &OracleCase) -> String {
+    run_qpdf_probe_command(Command::new(probe), case)
 }
 
 fn assert_qpdf_oracle_matches_with(mut qpdf_trace: impl FnMut(&OracleCase) -> String) {
@@ -596,6 +600,33 @@ fn fake_probe_case() -> OracleCase {
 }
 
 #[cfg(unix)]
+fn run_test_probe(probe: &Path, case: &OracleCase) -> String {
+    let mut command = Command::new("/bin/sh");
+    command.arg(probe);
+    run_qpdf_probe_command(command, case)
+}
+
+#[cfg(unix)]
+#[test]
+fn qpdf_test_probe_does_not_direct_exec_write_open_script() {
+    let directory = tempfile::tempdir().unwrap();
+    let probe = directory.path().join("probe");
+    write_test_probe(
+        &probe,
+        "#!/bin/sh\nprintf 'op\\t0\\tok\\t\\nop\\t1\\tok\\t\\noutput\\t\\n'\n",
+    );
+    let _write_open = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&probe)
+        .unwrap();
+
+    assert_eq!(
+        run_test_probe(&probe, &fake_probe_case()),
+        "op\t0\tok\t\nop\t1\tok\t\noutput\t\n"
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn qpdf_probe_receives_exact_positional_arguments() {
     let directory = tempfile::tempdir().unwrap();
@@ -607,7 +638,7 @@ fn qpdf_probe_receives_exact_positional_arguments() {
     );
 
     assert_eq!(
-        run_qpdf_probe(&probe, &fake_probe_case()),
+        run_test_probe(&probe, &fake_probe_case()),
         "op\t0\tok\t\nop\t1\tok\t\noutput\t\n"
     );
     assert_eq!(
@@ -624,7 +655,7 @@ fn qpdf_probe_failure_reports_case_stderr_and_exit_status() {
     write_test_probe(&probe, "#!/bin/sh\nprintf 'probe stderr' >&2\nexit 7\n");
 
     let panic =
-        std::panic::catch_unwind(|| run_qpdf_probe(&probe, &fake_probe_case())).unwrap_err();
+        std::panic::catch_unwind(|| run_test_probe(&probe, &fake_probe_case())).unwrap_err();
     let message = panic.downcast_ref::<String>().unwrap();
     assert!(message.contains("fake-probe"));
     assert!(message.contains("probe stderr"));
@@ -639,7 +670,7 @@ fn qpdf_probe_rejects_non_utf8_stdout() {
     write_test_probe(&probe, "#!/bin/sh\nprintf '\\377'\n");
 
     let panic =
-        std::panic::catch_unwind(|| run_qpdf_probe(&probe, &fake_probe_case())).unwrap_err();
+        std::panic::catch_unwind(|| run_test_probe(&probe, &fake_probe_case())).unwrap_err();
     let message = panic.downcast_ref::<String>().unwrap();
     assert!(message.contains("fake-probe"));
     assert!(message.contains("UTF-8 ASCII protocol"));
@@ -656,7 +687,7 @@ fn qpdf_probe_rejects_stdout_protocol_corruption() {
     );
 
     let panic =
-        std::panic::catch_unwind(|| run_qpdf_probe(&probe, &fake_probe_case())).unwrap_err();
+        std::panic::catch_unwind(|| run_test_probe(&probe, &fake_probe_case())).unwrap_err();
     let message = panic.downcast_ref::<String>().unwrap();
     assert!(message.contains("fake-probe"));
     assert!(message.contains("protocol corruption"));
