@@ -394,7 +394,7 @@ fn format_qpdf_real(value: f64) -> String {
     encoded
 }
 
-fn encode_string(value: &[u8]) -> Vec<u8> {
+pub(super) fn encode_string(value: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(value.len());
     for &byte in value {
         match byte {

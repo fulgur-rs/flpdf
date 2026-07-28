@@ -5,7 +5,7 @@
 
 use crate::pipeline::{Base64Action, Pipeline, PipelineResult, PlBase64, PlConcatenate, PlString};
 
-use super::value::{ContainerOrBlobSnapshot, ValueSnapshot};
+use super::value::{encode_string, ContainerOrBlobSnapshot, ValueSnapshot};
 use super::Json;
 
 impl Json {
@@ -70,6 +70,18 @@ impl Json {
         out.write(&item)
     }
 
+    pub(crate) fn write_qpdf_dictionary_key(
+        out: &mut dyn Pipeline,
+        first: &mut bool,
+        key: &[u8],
+        depth: usize,
+    ) -> PipelineResult<()> {
+        Self::write_next(out, first, depth)?;
+        out.write(b"\"")?;
+        out.write(&encode_string(key))?;
+        out.write(b"\": ")
+    }
+
     pub fn write_array_item(
         out: &mut dyn Pipeline,
         first: &mut bool,
@@ -85,13 +97,13 @@ impl Json {
         first: &mut bool,
         depth: usize,
     ) -> PipelineResult<()> {
-        if *first {
+        let prefix = if *first {
             *first = false;
-            out.write(b"\n")?;
+            b"\n".as_slice()
         } else {
-            out.write(b",\n")?;
-        }
-        write_indent(out, depth)
+            b",\n".as_slice()
+        };
+        write_indented(out, prefix, depth, b"")
     }
 
     pub fn write(&self, out: &mut dyn Pipeline, depth: usize) -> PipelineResult<()> {
@@ -101,9 +113,11 @@ impl Json {
             Some(ValueSnapshot::Bool(value)) => out.write(if value { b"true" } else { b"false" }),
             Some(ValueSnapshot::Null) => out.write(b"null"),
             Some(ValueSnapshot::String(encoded)) => {
-                out.write(b"\"")?;
-                out.write(&encoded)?;
-                out.write(b"\"")
+                let mut quoted = Vec::with_capacity(encoded.len() + 2);
+                quoted.push(b'"');
+                quoted.extend_from_slice(&encoded);
+                quoted.push(b'"');
+                out.write(&quoted)
             }
             Some(other) => write_container_or_blob(
                 self,
@@ -133,8 +147,7 @@ fn write_close(
     delimiter: &[u8],
 ) -> PipelineResult<()> {
     if !first {
-        out.write(b"\n")?;
-        write_indent(out, depth)?;
+        return write_indented(out, b"\n", depth, delimiter);
     }
     out.write(delimiter)
 }
@@ -185,9 +198,17 @@ fn write_container_or_blob(
     }
 }
 
-fn write_indent(out: &mut dyn Pipeline, depth: usize) -> PipelineResult<()> {
+fn write_indented(
+    out: &mut dyn Pipeline,
+    prefix: &[u8],
+    depth: usize,
+    suffix: &[u8],
+) -> PipelineResult<()> {
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(prefix);
     for _ in 0..depth {
-        out.write(b"  ")?;
+        chunk.extend_from_slice(b"  ");
     }
-    Ok(())
+    chunk.extend_from_slice(suffix);
+    out.write(&chunk)
 }

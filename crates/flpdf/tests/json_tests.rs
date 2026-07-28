@@ -188,16 +188,44 @@ fn incremental_writer_writes_dictionary_keys_that_are_already_encoded() {
 }
 
 #[test]
-fn dictionary_key_is_one_qpdf_pipeline_write_after_layout() {
+fn quoted_string_is_one_qpdf_pipeline_write() {
+    let mut out = ChunkRecordingPipeline::default();
+
+    Json::make_string(b"line\n\\\"").write(&mut out, 0).unwrap();
+
+    assert_eq!(out.chunks, [b"\"line\\n\\\\\\\"\"".to_vec()]);
+}
+
+#[test]
+fn layout_newline_and_indentation_are_one_qpdf_pipeline_write() {
+    let mut out = ChunkRecordingPipeline::default();
+    let mut first = true;
+
+    Json::write_next(&mut out, &mut first, 2).unwrap();
+    Json::write_next(&mut out, &mut first, 2).unwrap();
+
+    assert!(!first);
+    assert_eq!(out.chunks, [b"\n    ".to_vec(), b",\n    ".to_vec()]);
+}
+
+#[test]
+fn non_empty_container_close_is_one_qpdf_pipeline_write() {
+    let mut out = ChunkRecordingPipeline::default();
+
+    Json::write_dictionary_close(&mut out, false, 1).unwrap();
+    Json::write_array_close(&mut out, false, 2).unwrap();
+
+    assert_eq!(out.chunks, [b"\n  }".to_vec(), b"\n    ]".to_vec()]);
+}
+
+#[test]
+fn dictionary_key_uses_qpdf_layout_and_key_pipeline_writes() {
     let mut out = ChunkRecordingPipeline::default();
     let mut first = true;
 
     Json::write_dictionary_key(&mut out, &mut first, b"line\\n", 1).unwrap();
 
-    assert_eq!(
-        out.chunks,
-        [b"\n".to_vec(), b"  ".to_vec(), b"\"line\\n\": ".to_vec(),]
-    );
+    assert_eq!(out.chunks, [b"\n  ".to_vec(), b"\"line\\n\": ".to_vec()]);
 }
 
 #[test]
