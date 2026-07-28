@@ -1,4 +1,4 @@
-//! qpdf correspondence: Pl_LZWDecoder, predictor, and legacy stream-filter encoder responsibilities; QPDFStreamFilter dispatch and Pipeline decoder execution are delegated to stream_filter.
+//! qpdf correspondence: QPDF_Stream filter-chain orchestration; QPDFStreamFilter dispatch, codec construction, and Pipeline execution are delegated to stream_filter.
 use std::borrow::Cow;
 
 use crate::ascii85;
@@ -54,7 +54,10 @@ pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
 }
 
 /// Decode `stream_data` by applying the stream dictionary's `/Filter` chain,
-/// honoring any `/DecodeParms` (including PNG/TIFF predictors).
+/// honoring any `/DecodeParms`.
+///
+/// PNG predictors (`/Predictor 10` through `/Predictor 15`) are applied as part
+/// of the chain. The TIFF predictor (`/Predictor 2`) is rejected.
 ///
 /// # Errors
 ///
@@ -64,10 +67,14 @@ pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
 /// - `/Filter` is neither a name nor an array of names.
 /// - a `/Filter` array declares more than 16 stages (the decode-path chain-length
 ///   cap, which rejects pathological multiplicative-expansion chains).
-/// - a `/DecodeParms` entry has an invalid value (e.g. a non-integer or
-///   negative predictor parameter, or a predictor configuration that overflows).
+/// - `/DecodeParms` selects a `/Predictor` outside `1`, `2`, and `10..=15`, or
+///   gives a non-integer value for a parameter the filter reads.
+/// - `/Predictor` is `2`, which selects the unsupported TIFF predictor.
+/// - a predictor's row geometry is invalid: a negative `/Columns`, `/Colors`, or
+///   `/BitsPerComponent`, a `/BitsPerComponent` outside `1`, `2`, `4`, `8`, and
+///   `16`, or a row width that is zero.
 /// - an implemented codec fails on malformed input — corrupt deflate, LZW,
-///   ASCII85, ASCIIHex, or RunLength data, or a corrupt PNG-predictor stream.
+///   ASCII85, ASCIIHex, or RunLength data.
 pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
     decode_stream_data_with_limits_and_warnings(
         dict,
@@ -88,7 +95,8 @@ pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DecodeLimits {
     /// Maximum decoded byte count permitted out of any single supported filter
-    /// stage. `None` (default) is unlimited.
+    /// stage, counted after that stage's predictor if it has one. `None`
+    /// (default) is unlimited.
     pub max_output: Option<usize>,
 }
 
@@ -152,13 +160,18 @@ pub fn decode_stream_data_with_limits(
 /// Encode `stream_data` by applying the stream dictionary's `/Filter` chain,
 /// the inverse of [`decode_stream_data`].
 ///
+/// Every PNG predictor encodes with the Up row filter, so `/Predictor 10`
+/// through `/Predictor 15` produce identical output. The predictor number is
+/// still recorded in the dictionary and the result decodes correctly, because
+/// decoding selects a filter per row from the row's own leading byte.
+///
 /// # Errors
 ///
 /// Returns [`Error::Unsupported`] when:
 /// - a `/Filter` entry is an unknown or unimplemented codec.
 /// - `/Filter` is neither a name nor an array of names.
-/// - a `/DecodeParms` entry has an invalid value (e.g. a non-integer or
-///   negative predictor parameter, or a predictor configuration that overflows).
+/// - `/DecodeParms` selects an unsupported `/Predictor` or an invalid row
+///   geometry, on the same terms as [`decode_stream_data`].
 pub fn encode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
     encode_stream_data_with_filters(dict.get("Filter"), dict.get("DecodeParms"), stream_data)
 }
@@ -203,33 +216,34 @@ where
     let prepared = prepare_decode_filters(specs)?;
     let mut decoded = Cow::Borrowed(stream_data);
     for mut stage in prepared {
-        let filter_name = stage.filter_name;
-        let next = if filter_name == b"Crypt" {
-            decrypt_crypt(stage.decode_params, decoded.as_ref())?
-        } else {
-            let codec_output = if let Some(filter) = stage.adapter.as_mut() {
-                filter.pipe_decode(decoded.as_ref(), limits.max_output, warn)?
-            } else {
-                apply_single_filter_decode(
-                    filter_name,
-                    decoded.as_ref(),
-                    stage.decode_params,
-                    limits.max_output,
-                )
-                .map_err(Error::Unsupported)?
-            };
-            apply_prepared_decode_params(stage.predictor, &codec_output)?
+        let next = match &mut stage.stage {
+            PreparedStage::Crypt { decode_params } => {
+                decrypt_crypt(*decode_params, decoded.as_ref())?
+            }
+            PreparedStage::Codec { adapter } => {
+                adapter.pipe_decode(decoded.as_ref(), limits.max_output, warn)?
+            }
         };
         decoded = Cow::Owned(next);
     }
     Ok(decoded.into_owned())
 }
 
+/// A filter-chain stage with its decode route already resolved.
+///
+/// Every name flpdf decodes resolves to a registered `StreamFilter`;
+/// `Crypt` is the one stage the caller decrypts instead.
+enum PreparedStage<'a> {
+    Crypt {
+        decode_params: Option<&'a Object>,
+    },
+    Codec {
+        adapter: Box<dyn crate::stream_filter::StreamFilter>,
+    },
+}
+
 struct PreparedDecodeFilter<'a> {
-    filter_name: &'a [u8],
-    decode_params: Option<&'a Object>,
-    adapter: Option<Box<dyn crate::stream_filter::StreamFilter>>,
-    predictor: Option<(u8, usize, usize)>,
+    stage: PreparedStage<'a>,
 }
 
 fn prepare_decode_filters<'a>(
@@ -240,55 +254,50 @@ fn prepare_decode_filters<'a>(
         let filter_name = crate::stream_filter::normalize_filter_name(spec.name);
         if filter_name == b"Crypt" {
             prepared.push(PreparedDecodeFilter {
-                filter_name,
-                decode_params: spec.decode_params,
-                adapter: None,
-                predictor: None,
+                stage: PreparedStage::Crypt {
+                    decode_params: spec.decode_params,
+                },
             });
             continue;
         }
 
-        let adapter = if let Some(mut adapter) = stream_filter_for(filter_name) {
-            if !adapter.set_decode_params(spec.decode_params) {
-                return Err(Error::Unsupported(format!(
-                    "stream filter {} does not support supplied /DecodeParms",
-                    String::from_utf8_lossy(filter_name)
-                )));
-            }
-            Some(adapter)
-        } else {
-            validate_legacy_decode_filter(filter_name)?;
-            None
+        let Some(mut adapter) = stream_filter_for(filter_name) else {
+            return Err(undecodable_filter_error(filter_name));
         };
+        if !adapter.set_decode_params(spec.decode_params) {
+            return Err(Error::Unsupported(format!(
+                "stream filter {} does not support supplied /DecodeParms",
+                String::from_utf8_lossy(filter_name)
+            )));
+        }
 
-        // qpdf configures every QPDFStreamFilter before constructing or
-        // writing any decode pipeline. Predictor migration remains in
-        // qynx.5.3; extracting it here preserves that validation timing while
-        // retaining filters.rs ownership.
-        let predictor = extract_predictor_params(spec.decode_params)?;
         prepared.push(PreparedDecodeFilter {
-            filter_name,
-            decode_params: spec.decode_params,
-            adapter,
-            predictor,
+            stage: PreparedStage::Codec { adapter },
         });
+    }
+
+    // QPDF_Stream::pipeStreamData constructs the whole chain before piping any
+    // data, walking the filters in reverse, so a later stage with unusable
+    // parameters is reported even when an earlier stage would fail on the data.
+    for stage in prepared.iter().rev() {
+        if let PreparedStage::Codec { adapter } = &stage.stage {
+            adapter.preflight_decode_pipeline()?;
+        }
     }
     Ok(prepared)
 }
 
-fn validate_legacy_decode_filter(filter_name: &[u8]) -> Result<()> {
-    if filter_name == b"LZWDecode" {
-        return Ok(());
-    }
+/// Report why a filter name has no decode route.
+fn undecodable_filter_error(filter_name: &[u8]) -> Error {
     if let Some(label) = passthrough_codec_label(filter_name) {
-        return Err(Error::Unsupported(format!(
+        return Error::Unsupported(format!(
             "passthrough codec {label}: image/binary stream data is not decoded by flpdf (preserved verbatim)"
-        )));
+        ));
     }
-    Err(Error::Unsupported(format!(
+    Error::Unsupported(format!(
         "unsupported stream filter: {}",
         std::str::from_utf8(filter_name).unwrap_or("<binary>")
-    )))
+    ))
 }
 
 fn encode_stream_data_with_filters(
@@ -301,7 +310,8 @@ fn encode_stream_data_with_filters(
     // order, so encoding must apply them in reverse for round-tripping.
     let mut encoded = stream_data.to_vec();
     for spec in specs.into_iter().rev() {
-        let after_predictor = apply_encode_params(spec.decode_params, &encoded)?;
+        let after_predictor =
+            apply_encode_params(spec.normalized_name(), spec.decode_params, &encoded)?;
         encoded = if spec.normalized_name() == b"FlateDecode" {
             encode_flate(&after_predictor)?
         } else {
@@ -312,475 +322,21 @@ fn encode_stream_data_with_filters(
     Ok(encoded)
 }
 
-fn integer_decode_param(params: &Dictionary, key: &str) -> Result<Option<i64>> {
-    let Some(value) = params.get(key) else {
-        return Ok(None);
-    };
-    value
-        .as_integer()
-        .map(Some)
-        .ok_or_else(|| Error::Unsupported(format!("/DecodeParms /{key} must be integer")))
-}
-
-fn non_negative_usize_param(params: &Dictionary, key: &str) -> Result<Option<usize>> {
-    integer_decode_param(params, key)?
-        .map(|value| {
-            usize::try_from(value).map_err(|_| {
-                Error::Unsupported(format!("/DecodeParms /{key} must be non-negative"))
-            })
-        })
-        .transpose()
-}
-
-fn non_negative_u8_param(params: &Dictionary, key: &str) -> Result<Option<u8>> {
-    integer_decode_param(params, key)?
-        .map(|value| {
-            u8::try_from(value).map_err(|_| {
-                Error::Unsupported(format!("/DecodeParms /{key} must be non-negative"))
-            })
-        })
-        .transpose()
-}
-
-/// Extract PNG predictor parameters from a DecodeParms dictionary.
-///
-/// Returns `Ok(None)` when no predictor is needed (no dict, no Predictor key, or Predictor ≤ 1).
-/// Returns `Ok(Some((predictor, row_bytes, bytes_per_pixel)))` for PNG predictors 10..=15.
-/// Returns `Err` for Predictor 2 or any other unsupported value.
-fn extract_predictor_params(decode_params: Option<&Object>) -> Result<Option<(u8, usize, usize)>> {
-    let Some(params) = decode_params.and_then(Object::as_dict) else {
-        return Ok(None);
-    };
-
-    let Some(predictor) = non_negative_u8_param(params, "Predictor")? else {
-        return Ok(None);
-    };
-
-    if predictor <= 1 {
-        return Ok(None);
-    }
-
-    if predictor == 2 {
-        return Err(Error::Unsupported(
-            "/DecodeParms /Predictor 2 is not supported for this stream type".to_string(),
-        ));
-    }
-
-    if !(10..=15).contains(&predictor) {
-        return Err(Error::Unsupported(format!(
-            "unsupported /DecodeParms /Predictor {predictor}"
-        )));
-    }
-
-    let colors = non_negative_usize_param(params, "Colors")?.unwrap_or(1);
-    let bits_per_component = non_negative_usize_param(params, "BitsPerComponent")?.unwrap_or(8);
-    let columns = non_negative_usize_param(params, "Columns")?.ok_or_else(|| {
-        Error::Unsupported("/DecodeParms /Columns required for PNG predictor".to_string())
-    })?;
-
-    let row_bits = columns
-        .checked_mul(colors)
-        .and_then(|value| value.checked_mul(bits_per_component))
-        .ok_or_else(|| Error::Unsupported("/DecodeParms /Predictor overflow".to_string()))?;
-    let row_bytes = row_bits.div_ceil(8);
-    if row_bytes == 0 {
-        return Err(Error::Unsupported(
-            "/DecodeParms /Predictor produced zero row width".to_string(),
-        ));
-    }
-    let bits_per_pixel = colors
-        .checked_mul(bits_per_component)
-        .ok_or_else(|| Error::Unsupported("/DecodeParms /Predictor overflow".to_string()))?;
-    let bytes_per_pixel = bits_per_pixel.div_ceil(8).max(1);
-
-    Ok(Some((predictor, row_bytes, bytes_per_pixel)))
-}
-
-fn apply_prepared_decode_params(
-    predictor: Option<(u8, usize, usize)>,
-    stream_data: &[u8],
-) -> Result<Vec<u8>> {
-    match predictor {
-        None => Ok(stream_data.to_vec()),
-        Some((_predictor, row_bytes, bytes_per_pixel)) => {
-            decode_png_predictor(stream_data, row_bytes, bytes_per_pixel)
-        }
-    }
-}
-
-fn apply_encode_params(decode_params: Option<&Object>, stream_data: &[u8]) -> Result<Vec<u8>> {
-    match extract_predictor_params(decode_params)? {
-        None => Ok(stream_data.to_vec()),
-        Some((predictor, row_bytes, bytes_per_pixel)) => {
-            encode_png_predictor(stream_data, row_bytes, bytes_per_pixel, predictor)
-        }
-    }
-}
-
-fn decode_png_predictor(bytes: &[u8], row_bytes: usize, bytes_per_pixel: usize) -> Result<Vec<u8>> {
-    let row_size = row_bytes
-        .checked_add(1)
-        .ok_or_else(|| Error::Unsupported("PNG predictor row size overflow".to_string()))?;
-    if !bytes.len().is_multiple_of(row_size) {
-        return Err(Error::Unsupported(
-            "corrupt PNG predictor stream".to_string(),
-        ));
-    }
-
-    // Empty input decodes to zero rows; return before allocating the per-row
-    // buffer. `0` is divisible by any nonzero `row_size`, so without this guard
-    // a crafted /DecodeParms with a huge /Columns would force the
-    // `vec![0u8; row_bytes]` allocation below to take gigabytes for an empty
-    // stream (allocation-abort DoS on the untrusted decode path).
-    if bytes.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let row_count = bytes.len() / row_size;
-    let mut decoded = Vec::with_capacity(row_count * row_bytes);
-    let mut previous_row = vec![0u8; row_bytes];
-
-    for row in bytes.chunks_exact(row_size) {
-        let filter = row[0];
-        let raw = &row[1..];
-        let mut current = vec![0u8; row_bytes];
-
-        for i in 0..row_bytes {
-            let raw_byte = raw[i];
-            let left = if i >= bytes_per_pixel {
-                current[i - bytes_per_pixel]
-            } else {
-                0
-            };
-            let above = previous_row[i];
-            let upper_left = if i >= bytes_per_pixel {
-                previous_row[i - bytes_per_pixel]
-            } else {
-                0
-            };
-
-            current[i] = match filter {
-                0 => raw_byte,
-                1 => raw_byte.wrapping_add(left),
-                2 => raw_byte.wrapping_add(above),
-                3 => {
-                    let average = (u16::from(left) + u16::from(above)) / 2;
-                    raw_byte.wrapping_add(average as u8)
-                }
-                4 => {
-                    let p = left as i16 + above as i16 - upper_left as i16;
-                    let pa = (p - left as i16).abs();
-                    let pb = (p - above as i16).abs();
-                    let pc = (p - upper_left as i16).abs();
-
-                    let predictor = if pa <= pb && pa <= pc {
-                        left
-                    } else if pb <= pc {
-                        above
-                    } else {
-                        upper_left
-                    };
-
-                    raw_byte.wrapping_add(predictor)
-                }
-                _ => {
-                    return Err(Error::Unsupported(
-                        "unsupported PNG predictor filter".to_string(),
-                    ))
-                }
-            };
-        }
-
-        decoded.extend_from_slice(&current);
-        previous_row = current;
-    }
-
-    Ok(decoded)
-}
-
-/// Apply a single PNG filter to one byte and return the encoded (filtered) byte.
-///
-/// Shared between the optimum-cost loop and the per-row encoding loop so that
-/// the filter logic exists in exactly one place.
-#[inline]
-fn png_filter_byte(filter: u8, raw: u8, left: u8, above: u8, upper_left: u8) -> u8 {
-    match filter {
-        0 => raw,
-        1 => raw.wrapping_sub(left),
-        2 => raw.wrapping_sub(above),
-        3 => {
-            let avg = ((u16::from(left) + u16::from(above)) / 2) as u8;
-            raw.wrapping_sub(avg)
-        }
-        4 => {
-            let p = i16::from(left) + i16::from(above) - i16::from(upper_left);
-            let pa = (p - i16::from(left)).abs();
-            let pb = (p - i16::from(above)).abs();
-            let pc = (p - i16::from(upper_left)).abs();
-            let predictor_val = if pa <= pb && pa <= pc {
-                left
-            } else if pb <= pc {
-                above
-            } else {
-                upper_left
-            };
-            raw.wrapping_sub(predictor_val)
-        }
-        _ => unreachable!("png_filter_byte expects filter in 0..=4"),
-    }
-}
-
-fn encode_png_predictor(
-    bytes: &[u8],
-    row_bytes: usize,
-    bytes_per_pixel: usize,
-    predictor: u8,
-) -> Result<Vec<u8>> {
-    if row_bytes == 0 || !bytes.len().is_multiple_of(row_bytes) {
-        return Err(Error::Unsupported(
-            "raw data not divisible by row_bytes".to_string(),
-        ));
-    }
-
-    // Empty input is zero rows: there is nothing to filter, so return before
-    // allocating the per-row buffer. `0` is divisible by any nonzero
-    // `row_bytes`, so without this guard a crafted /DecodeParms with a huge
-    // /Columns would force `vec![0u8; row_bytes]` to allocate gigabytes for a
-    // stream that produces no output (allocation-abort DoS). Non-empty input is
-    // already bounded: `len % row_bytes == 0` with `len > 0` implies
-    // `row_bytes <= len`.
-    if bytes.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let row_count = bytes.len() / row_bytes;
-    // Each encoded row = 1 filter byte + row_bytes of filtered data
-    let mut encoded = Vec::with_capacity(row_count * (row_bytes + 1));
-    let mut previous_row = vec![0u8; row_bytes];
-
-    for raw_row in bytes.chunks_exact(row_bytes) {
-        // Determine which filter byte to use for this row. For predictor 15
-        // (Optimum) we accumulate all 5 filters' costs in a single pass over
-        // the row to avoid iterating 5× and recomputing neighbor values for
-        // each filter (libpng minimum-sum heuristic).
-        let filter_byte = if predictor == 15 {
-            let mut costs = [0u64; 5];
-            for i in 0..row_bytes {
-                let raw = raw_row[i];
-                let left = if i >= bytes_per_pixel {
-                    raw_row[i - bytes_per_pixel]
-                } else {
-                    0
-                };
-                let above = previous_row[i];
-                let upper_left = if i >= bytes_per_pixel {
-                    previous_row[i - bytes_per_pixel]
-                } else {
-                    0
-                };
-                for (f, cost) in costs.iter_mut().enumerate() {
-                    let filtered = png_filter_byte(f as u8, raw, left, above, upper_left);
-                    *cost += u64::from((filtered as i8).unsigned_abs());
-                }
-            }
-            costs
-                .iter()
-                .enumerate()
-                .min_by_key(|&(_, &c)| c)
-                .map(|(i, _)| i as u8)
-                .expect("costs has 5 entries")
-        } else {
-            // Fixed filter: Predictor 10→0, 11→1, 12→2, 13→3, 14→4
-            predictor - 10
-        };
-
-        encoded.push(filter_byte);
-
-        for i in 0..row_bytes {
-            let raw = raw_row[i];
-            let left = if i >= bytes_per_pixel {
-                raw_row[i - bytes_per_pixel]
-            } else {
-                0
-            };
-            let above = previous_row[i];
-            let upper_left = if i >= bytes_per_pixel {
-                previous_row[i - bytes_per_pixel]
-            } else {
-                0
-            };
-            encoded.push(png_filter_byte(filter_byte, raw, left, above, upper_left));
-        }
-
-        // Reuse previous_row's buffer instead of allocating a fresh Vec each
-        // row. previous_row was initialised with `row_bytes` zeros and
-        // raw_row is row_bytes long (guaranteed by `chunks_exact(row_bytes)`),
-        // so the lengths always match.
-        previous_row.copy_from_slice(raw_row);
-    }
-
-    Ok(encoded)
-}
-
-fn apply_single_filter_decode(
+/// Apply the PNG predictor selected by `/DecodeParms`, if any.
+fn apply_encode_params(
     filter_name: &[u8],
-    stream_data: &[u8],
     decode_params: Option<&Object>,
-    max_output: Option<usize>,
-) -> std::result::Result<Vec<u8>, String> {
-    if filter_name == b"LZWDecode" {
-        // EarlyChange (default 1 per PDF spec): when 1, the code width increases
-        // one symbol *before* the table fills; when 0, it increases *after*.
-        let early_change = match decode_params {
-            Some(Object::Dictionary(params)) => match params.get("EarlyChange") {
-                Some(Object::Integer(v)) => *v != 0,
-                _ => true, // default EarlyChange = 1
-            },
-            _ => true, // no DecodeParms → default EarlyChange = 1
-        };
-        return lzw_decode(stream_data, early_change, max_output);
+    stream_data: &[u8],
+) -> Result<Vec<u8>> {
+    match crate::stream_filter::png_encode_geometry(filter_name, decode_params)? {
+        None => Ok(stream_data.to_vec()),
+        Some((columns, colors, bits_per_component)) => crate::stream_filter::encode_png_predictor(
+            stream_data,
+            columns,
+            colors,
+            bits_per_component,
+        ),
     }
-
-    // Passthrough codecs: flpdf does not decode image/binary streams.
-    // The writer preserves these streams verbatim (qpdf parity).
-    if let Some(label) = passthrough_codec_label(filter_name) {
-        return Err(format!(
-            "passthrough codec {label}: image/binary stream data is not decoded by flpdf (preserved verbatim)"
-        ));
-    }
-
-    Err(format!(
-        "unsupported stream filter: {}",
-        std::str::from_utf8(filter_name).unwrap_or("<binary>")
-    ))
-}
-
-/// Decode an LZW-compressed byte stream as defined by PDF §7.4.4 (LZWDecode).
-///
-/// PDF's LZW variant:
-/// - Starts at 9-bit codes; maximum code width is 12 bits.
-/// - Code 256 = ClearTable (resets the table to the initial state and next code
-///   width to 9 bits).
-/// - Code 257 = EOD (end of data; any remaining bits in the current byte are
-///   discarded).
-/// - `early_change`: when `true` (PDF default / EarlyChange=1), the code width
-///   increments one code *before* the table is full (i.e. when the next code
-///   to be added would exceed the current code width capacity).  When `false`
-///   (EarlyChange=0), the width increments *after* the table fills.
-fn lzw_decode(
-    data: &[u8],
-    early_change: bool,
-    max_output: Option<usize>,
-) -> std::result::Result<Vec<u8>, String> {
-    const CLEAR_CODE: u16 = 256;
-    const EOD_CODE: u16 = 257;
-    const FIRST_CODE: u16 = 258;
-    const MAX_BITS: u32 = 12;
-    const MAX_TABLE_SIZE: usize = 1 << MAX_BITS; // 4096
-
-    // The string table: each entry is the byte sequence it represents.
-    // Entries 0–255 are the literal single-byte strings; 256 and 257 are
-    // control codes (not stored in the table as strings).
-    let mut table: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
-    // Pad to index 258 so FIRST_CODE aligns with the next push.
-    table.push(vec![]); // slot 256 (ClearCode sentinel — never looked up)
-    table.push(vec![]); // slot 257 (EOD sentinel — never looked up)
-
-    let mut output = Vec::new();
-    let mut bit_buf: u64 = 0;
-    let mut bits_in_buf: u32 = 0;
-    let mut code_bits: u32 = 9;
-
-    // The "next table index" at which the width bumps.  With early_change=true
-    // the bump triggers when next_entry == (1 << code_bits) - 1 (one slot before
-    // the table fills); with early_change=false it triggers when
-    // next_entry == (1 << code_bits) (table exactly full).
-    let early_offset: usize = if early_change { 1 } else { 0 };
-
-    let mut prev_entry: Option<Vec<u8>> = None;
-
-    let mut byte_pos = 0usize;
-
-    loop {
-        // Fill the bit buffer until it has at least `code_bits` bits.
-        while bits_in_buf < code_bits {
-            if byte_pos >= data.len() {
-                // Ran out of input before EOD code — treat as implicit EOD.
-                return Ok(output);
-            }
-            bit_buf = (bit_buf << 8) | u64::from(data[byte_pos]);
-            bits_in_buf += 8;
-            byte_pos += 1;
-        }
-
-        // Extract the next `code_bits`-wide code from the MSB side.
-        let shift = bits_in_buf - code_bits;
-        let code = ((bit_buf >> shift) & ((1u64 << code_bits) - 1)) as u16;
-        bits_in_buf -= code_bits;
-        bit_buf &= (1u64 << bits_in_buf) - 1;
-
-        if code == EOD_CODE {
-            break;
-        }
-
-        if code == CLEAR_CODE {
-            // Reset: truncate the table back to the 256 literals + 2 sentinels.
-            table.truncate(FIRST_CODE as usize);
-            code_bits = 9;
-            prev_entry = None;
-            continue;
-        }
-
-        // Resolve the code to its string.
-        let entry: Vec<u8> = if (code as usize) < table.len() {
-            table[code as usize].clone()
-        } else if code as usize == table.len() {
-            // The classic "KwKwK" case: the code being added is the one we're
-            // currently processing.  Its string is prev + first_byte(prev).
-            match &prev_entry {
-                Some(prev) => {
-                    let mut s = prev.clone();
-                    s.push(prev[0]);
-                    s
-                }
-                None => {
-                    return Err(format!(
-                        "LZWDecode: code {code} is one past table end but no previous entry"
-                    ))
-                }
-            }
-        } else {
-            return Err(format!(
-                "LZWDecode: code {code} out of range (table size {})",
-                table.len()
-            ));
-        };
-
-        output.extend_from_slice(&entry);
-        if let Some(limit) = max_output {
-            if output.len() > limit {
-                return Err(format!("{DECODE_OUTPUT_LIMIT_PREFIX} {limit} bytes"));
-            }
-        }
-
-        // Add a new entry = prev_string + first_byte(current_string).
-        if let Some(ref prev) = prev_entry {
-            if table.len() < MAX_TABLE_SIZE {
-                let mut new_entry = prev.clone();
-                new_entry.push(entry[0]);
-                table.push(new_entry);
-
-                // Bump code width when the table reaches the trigger threshold.
-                if code_bits < MAX_BITS && table.len() == (1usize << code_bits) - early_offset {
-                    code_bits += 1;
-                }
-            }
-        }
-
-        prev_entry = Some(entry);
-    }
-
-    Ok(output)
 }
 
 /// Apply a single encode filter to `stream_data`.
@@ -912,11 +468,14 @@ mod tests {
 
         let error = decode_stream_data(&dict, b"not deflate data").unwrap_err();
 
+        // A predictor outside {1, 2, 10..=15} makes the stream unfilterable, so
+        // the rejection precedes any attempt to inflate the body.
         assert_eq!(
             error.to_string(),
-            "unsupported PDF feature: unsupported /DecodeParms /Predictor 9"
+            "unsupported PDF feature: stream filter FlateDecode does not support supplied /DecodeParms"
         );
     }
+
     #[test]
     fn registered_filter_rejects_unsupported_decode_params_before_pipeline() {
         let mut dict = Dictionary::new();
@@ -1440,29 +999,226 @@ mod tests {
         assert_eq!(decoded, raw);
     }
 
+    /// Flate-compress `raw` with no predictor, for building predicted fixtures.
+    fn flate_only(raw: &[u8]) -> Vec<u8> {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        encode_stream_data(&dict, raw).expect("flate encode")
+    }
+
+    /// qpdf's `Pl_PNGFilter` encoder always emits the Up row filter, so the
+    /// predictor number selects only whether the predictor runs.
     #[test]
-    fn encode_png_predictor_empty_input_skips_huge_row_allocation() {
-        // `0` is divisible by any nonzero `row_bytes`, so an empty stream with a
-        // crafted huge row width must return before `vec![0u8; row_bytes]` and
-        // not attempt a gigabyte allocation for zero rows.
-        // `usize::MAX / 2`, not `1 << 60`: the latter is a compile-time overflow
-        // on 32-bit targets (shift >= type width). This stays huge on both
-        // widths (~9.2e18 on 64-bit, ~2 GiB on 32-bit) so a broken guard still
-        // aborts on the allocation.
-        let huge_row_bytes = usize::MAX / 2;
-        let encoded = encode_png_predictor(&[], huge_row_bytes, 1, 10).unwrap();
+    fn every_png_predictor_encodes_up_rows() {
+        let raw = sample_raw_4x2();
+        let reference = encode_stream_data(&png_predictor_dict(12, 4), &raw).unwrap();
+
+        for predictor in [10, 11, 13, 14, 15] {
+            assert_eq!(
+                encode_stream_data(&png_predictor_dict(predictor, 4), &raw).unwrap(),
+                reference,
+                "predictor {predictor}"
+            );
+        }
+    }
+
+    /// A predicted stream whose data stops mid-row decodes the partial row
+    /// zero-padded instead of failing.
+    #[test]
+    fn png_predicted_stream_with_a_truncated_final_row_decodes_zero_padded() {
+        let encoded = flate_only(&[0, 0x01, 0x02, 0x03, 0x04, 0, 0xff]);
+
+        let decoded = decode_stream_data(&png_predictor_dict(12, 4), &encoded).unwrap();
+
+        assert_eq!(
+            decoded,
+            vec![0x01, 0x02, 0x03, 0x04, 0xff, 0x00, 0x00, 0x00]
+        );
+    }
+
+    /// A later stage with unusable predictor parameters is rejected even when
+    /// an earlier stage would have tripped the output cap first.
+    #[test]
+    fn invalid_geometry_in_a_later_stage_is_reported_before_decoding() {
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(12));
+        parms.insert("Columns", Object::Integer(4));
+        parms.insert("BitsPerComponent", Object::Integer(3));
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"ASCII85Decode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![Object::Null, Object::Dictionary(parms)]),
+        );
+
+        // The ASCII85 stage alone would exceed this cap, so before the
+        // preflight the Flate stage's geometry was never examined.
+        let error = decode_stream_data_with_limits(
+            &dict,
+            b"9jqo^9jqo^~>",
+            DecodeLimits {
+                max_output: Some(1),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: PNGFilter created with invalid bits_per_sample \
+             not 1, 2, 4, 8, or 16"
+        );
+        assert!(!is_decode_output_limit_error(&error));
+    }
+
+    /// The preflight walks the chain in reverse, as qpdf's pipeline
+    /// construction does, so the last unusable stage is reported first.
+    #[test]
+    fn preflight_reports_the_last_unusable_stage_first() {
+        let mut first = Dictionary::new();
+        first.insert("Predictor", Object::Integer(12));
+        first.insert("Columns", Object::Integer(4));
+        first.insert("Colors", Object::Integer(-1));
+        let mut second = Dictionary::new();
+        second.insert("Predictor", Object::Integer(12));
+        second.insert("Columns", Object::Integer(4));
+        second.insert("BitsPerComponent", Object::Integer(3));
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![Object::Dictionary(first), Object::Dictionary(second)]),
+        );
+
+        assert_eq!(
+            decode_stream_data(&dict, b"").unwrap_err().to_string(),
+            "unsupported PDF feature: PNGFilter created with invalid bits_per_sample \
+             not 1, 2, 4, 8, or 16"
+        );
+    }
+
+    /// An unrecognized row filter byte leaves the row unchanged.
+    #[test]
+    fn png_predicted_stream_ignores_an_unknown_row_filter_byte() {
+        let encoded = flate_only(&[9, 0x01, 0x02, 0x03, 0x04]);
+
+        let decoded = decode_stream_data(&png_predictor_dict(12, 4), &encoded).unwrap();
+
+        assert_eq!(decoded, vec![0x01, 0x02, 0x03, 0x04]);
+    }
+
+    /// `/Columns` defaults to 1, so a predictor without it decodes one-byte rows.
+    #[test]
+    fn png_predictor_without_columns_uses_the_default_single_byte_row() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(12));
+        dict.insert("DecodeParms", Object::Dictionary(parms));
+        let encoded = flate_only(&[0, 0x41, 0, 0x42]);
+
+        assert_eq!(decode_stream_data(&dict, &encoded).unwrap(), b"AB");
+    }
+
+    #[test]
+    fn encoding_rejects_a_predictor_outside_the_supported_set() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(9));
+        dict.insert("DecodeParms", Object::Dictionary(parms));
+
+        assert_eq!(
+            encode_stream_data(&dict, b"data").unwrap_err().to_string(),
+            "unsupported PDF feature: stream filter FlateDecode does not support supplied /DecodeParms"
+        );
+    }
+
+    #[test]
+    fn encoding_reports_the_tiff_predictor_restriction() {
+        assert_eq!(
+            encode_stream_data(&png_predictor_dict(2, 4), b"data")
+                .unwrap_err()
+                .to_string(),
+            "unsupported PDF feature: /DecodeParms /Predictor 2 is not supported for this stream type"
+        );
+    }
+
+    #[test]
+    fn encoding_rejects_negative_predictor_geometry() {
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(12));
+        parms.insert("Columns", Object::Integer(4));
+        parms.insert("Colors", Object::Integer(-1));
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        dict.insert("DecodeParms", Object::Dictionary(parms));
+
+        assert_eq!(
+            encode_stream_data(&dict, b"data").unwrap_err().to_string(),
+            "unsupported PDF feature: integer out of range converting -1 \
+             from a 4-byte signed type to a 4-byte unsigned type"
+        );
+    }
+
+    #[test]
+    fn encoding_rejects_an_unsupported_bit_depth() {
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(12));
+        parms.insert("Columns", Object::Integer(4));
+        parms.insert("BitsPerComponent", Object::Integer(3));
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        dict.insert("DecodeParms", Object::Dictionary(parms));
+
+        assert_eq!(
+            encode_stream_data(&dict, b"data").unwrap_err().to_string(),
+            "unsupported PDF feature: PNGFilter created with invalid bits_per_sample \
+             not 1, 2, 4, 8, or 16"
+        );
+    }
+
+    /// The widest row a `/Columns` value can select before qpdf's 32-bit row
+    /// arithmetic wraps to the rejected zero width. Two buffers of this size
+    /// would be a gigabyte, so a stage that carries no data must not allocate.
+    const WIDEST_ROW_COLUMNS: i64 = 0x1fff_ffff;
+
+    #[test]
+    fn png_predictor_encode_of_empty_input_skips_the_row_allocation() {
+        let encoded = crate::stream_filter::encode_png_predictor(
+            &[],
+            u32::try_from(WIDEST_ROW_COLUMNS).unwrap(),
+            1,
+            8,
+        )
+        .unwrap();
         assert!(encoded.is_empty(), "empty input encodes to zero rows");
     }
 
     #[test]
-    fn decode_png_predictor_empty_input_skips_huge_row_allocation() {
+    fn png_predictor_decode_of_empty_input_skips_the_row_allocation() {
         // Same guard on the untrusted decode path.
-        // `usize::MAX / 2`, not `1 << 60`: the latter is a compile-time overflow
-        // on 32-bit targets (shift >= type width). This stays huge on both
-        // widths (~9.2e18 on 64-bit, ~2 GiB on 32-bit) so a broken guard still
-        // aborts on the allocation.
-        let huge_row_bytes = usize::MAX / 2;
-        let decoded = decode_png_predictor(&[], huge_row_bytes, 1).unwrap();
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(12));
+        parms.insert("Columns", Object::Integer(WIDEST_ROW_COLUMNS));
+        dict.insert("DecodeParms", Object::Dictionary(parms));
+
+        let encoded = encode_stream_data(&dict, &[]).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+
         assert!(decoded.is_empty(), "empty input decodes to zero rows");
     }
 
@@ -1654,124 +1410,70 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // CARRY-OVER flpdf-9hc.7.1: LZW malformed-rejection unit tests
+    // LZWDecode malformed-code diagnostics
     //
-    // Verifies that lzw_decode (via decode_stream_data) returns Err for
-    // inputs containing out-of-range codes (review-pattern #3: external
-    // integer values must not cause silent wrap-around or panic).
+    // qpdf's Pl_LZWDecoder distinguishes a code that is past the end of the
+    // table from a code the table cannot resolve at all, and the public decode
+    // path reports each verbatim.
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// A 9-bit LZW stream containing a code that is one past the current table
-    /// end (code 258, "KwKwK" scenario with no previous entry) must return Err.
-    /// This exercises the "one past table end but no previous entry" branch in
-    /// lzw_decode (~L610-613).
-    #[test]
-    fn lzw_decode_malformed_one_past_end_without_prev_returns_err() {
-        // Craft a minimal LZW stream:
-        //   9-bit codes, no ClearCode prefix (so table has entries 0-257 only,
-        //   next entry == 258).  Emit code 258 directly; since there is no
-        //   previous entry, this must Err.
-        //
-        // Code 258 in 9-bit big-endian MSB-first packing:
-        //   0b100_000_010 = 0x102
-        //   Packed into two bytes at the start of the bit buffer:
-        //     bits 8..0 of code 258 across two bytes:
-        //     byte 0: bits [8..1] = 0b1000_0001 = 0x81
-        //     byte 1: bits [0]   = 0b0_0000000 + EOD code...
-        //   Simpler: pack [ClearCode=256][code=258][EOD=257].
-        //   ClearCode resets the table but also clears prev_entry; then code 258
-        //   comes in with no prev → Err.
-        //
-        //   Bit layout (9 bits each, MSB first):
-        //     ClearCode 256 = 0b100000000 → 9 bits
-        //     code 258      = 0b100000010 → 9 bits
-        //     EOD 257       = 0b100000001 → 9 bits (never reached)
-        //   Total = 27 bits → 4 bytes.
-        //
-        //   Byte packing (MSB first across bytes):
-        //     256 = 1 00000000
-        //     258 = 1 00000010
-        //     Concatenated 18 bits: 1_00000000_1_00000010 = 0x10082 padded to 3 bytes
-        //     byte0 = 0x80, byte1 = 0x40 (256 = 0x100 >> 1, then 258 = 0x102 << 0)
-        //   Let's compute manually:
-        //     bit buffer: 1 00000000 | 1 00000010 = 0b10000000010000001_0
-        //       byte0 = bits [17..10] = 0b10000000 = 0x80
-        //       byte1 = bits [9..2]   = 0b01000000 = 0x40  (0b0_10000001 >> 1)
-        //       byte2 = bits [1..0]   = 0b10 << 6  = 0x80
-        //
-        //   Verified against the lzw_decode bit-extraction logic.
-        let malformed: &[u8] = &[0x80, 0x40, 0x80];
+    fn decode_lzw(stream: &[u8]) -> Result<Vec<u8>> {
         let mut dict = Dictionary::new();
         dict.insert("Filter", Object::Name(b"LZWDecode".to_vec()));
-        let result = decode_stream_data(&dict, malformed);
-        assert!(
-            result.is_err(),
-            "LZWDecode: code-258-after-clear-with-no-prev must return Err"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("LZWDecode"),
-            "error must mention LZWDecode; got: {msg}"
-        );
-        assert!(
-            msg.contains("no previous entry") || msg.contains("out of range"),
-            "error must describe the out-of-range / no-prev condition; got: {msg}"
+        decode_stream_data(&dict, stream)
+    }
+
+    /// A table-backed code emitted while the table is still empty cannot be
+    /// resolved. Both `[clear, 258]` and `[clear, 259]` reach that lookup,
+    /// because a clear code suppresses the entry the next code would add.
+    #[test]
+    fn lzw_unresolvable_code_after_clear_reports_table_overflow() {
+        for stream in [
+            [0x80, 0x40, 0x80].as_slice(), // clear, 258
+            [0x80, 0x40, 0xc0].as_slice(), // clear, 259
+        ] {
+            assert_eq!(
+                decode_lzw(stream).unwrap_err().to_string(),
+                "unsupported PDF feature: Pl_LZWDecoder::handleCode: table overflow",
+                "{stream:?}"
+            );
+        }
+    }
+
+    /// A code more than one past the last allocated entry is rejected before
+    /// the table is consulted.
+    #[test]
+    fn lzw_code_beyond_the_next_table_entry_is_rejected() {
+        // clear, 'A', 259 - one entry exists, so index 1 is two past the end.
+        assert_eq!(
+            decode_lzw(&[0x80, 0x10, 0x60, 0x60])
+                .unwrap_err()
+                .to_string(),
+            "unsupported PDF feature: LZWDecoder: bad code received"
         );
     }
 
-    /// A 9-bit LZW stream containing a genuinely out-of-range code (≥ 259 when
-    /// table has only 258 entries) must return Err with an "out of range" message.
-    /// This exercises the explicit range-check in lzw_decode (~L615-619).
+    /// The decoder stops allocating at index 4096 rather than silently
+    /// continuing with a frozen table.
     #[test]
-    fn lzw_decode_malformed_genuinely_out_of_range_code_returns_err() {
-        // We want code 259 (0b100000011) to appear AFTER code 258 has been
-        // added by processing one normal code, making table size == 259.
-        // That is complicated; instead use the simpler path:
-        //   Emit ClearCode (resets table to 258 entries), then code 259.
-        //   Table size after clear is 258; code 259 > 258 → "out of range".
-        //
-        // Bit layout (9 bits each, MSB first):
-        //   ClearCode 256 = 0b100000000
-        //   code 259      = 0b100000011
-        //   = 18 bits: 1_00000000_1_00000011
-        //   byte0 = top 8 bits = 0b10000000 = 0x80
-        //   byte1 = next 8     = 0b01000000 = 0x40  (wait — need 259 after)
-        //
-        //   Concatenate 9+9 = 18 bits:
-        //     0b1_0000_0000_1_0000_0011
-        //     split into bytes:
-        //       byte0 = 0b1000_0000 = 0x80
-        //       byte1 = 0b0100_0000 = 0x40  [wrong: 0b01_00000011 >> 1 = 0b0010...]
-        //
-        //   Correct bit-level packing (MSB first):
-        //     bits: 1 0000_0000  1 0000_0011  (18 bits total)
-        //     byte 0: bits[17..10] = 1000_0000 = 0x80
-        //     byte 1: bits[9..2]   = 0100_0000 | (0b00_1100_0000 >> 2)...
-        //   Let's just do it directly:
-        //     value = (256 << 9) | 259 = 0x20103
-        //     byte0 = (0x20103 >> 10) & 0xFF = 0x80
-        //     byte1 = (0x20103 >> 2)  & 0xFF = 0x40
-        //     byte2 = (0x20103 << 6)  & 0xFF = 0xC0  (bits[1..0]=0b11, shifted left 6)
-        //
-        //   After ClearCode the table has entries 0..=257 (size 258).
-        //   Code 259 > 258 → "out of range" branch.
-        let malformed: &[u8] = &[0x80, 0x40, 0xC0];
-        let mut dict = Dictionary::new();
-        dict.insert("Filter", Object::Name(b"LZWDecode".to_vec()));
-        let result = decode_stream_data(&dict, malformed);
-        assert!(
-            result.is_err(),
-            "LZWDecode: genuinely out-of-range code after ClearCode must return Err"
+    fn lzw_table_full_is_reported() {
+        let mut codes = vec![256u32];
+        codes.extend(std::iter::repeat_n(0x41u32, 3840));
+        let stream = crate::pipeline::lzw::pack_codes(&codes, true);
+
+        assert_eq!(
+            decode_lzw(&stream).unwrap_err().to_string(),
+            "unsupported PDF feature: LZWDecoder: table full"
         );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("LZWDecode"),
-            "error must mention LZWDecode; got: {msg}"
-        );
-        assert!(
-            msg.contains("out of range") || msg.contains("no previous entry"),
-            "error must describe the out-of-range condition; got: {msg}"
-        );
+    }
+
+    /// Trailing bits that do not complete a code are discarded without an
+    /// error, and the bytes decoded before them are returned.
+    #[test]
+    fn lzw_truncated_trailing_bits_decode_without_an_error() {
+        let stream = crate::pipeline::lzw::pack_codes(&[256, 0x41, 0x42], true);
+
+        assert_eq!(decode_lzw(&stream).unwrap(), b"AB");
     }
 
     // ----- Task 1: /Filter chain length cap (flpdf-hn1g.4) -----

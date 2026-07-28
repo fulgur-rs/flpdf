@@ -183,17 +183,21 @@ pub(crate) mod xref_stream {
     /// Apply the PNG "Up" predictor (`/Predictor 12`): prefix each `cols`-byte row
     /// with the filter-type tag `2` and replace each byte with the difference from
     /// the byte directly above (the first row predicts against an all-zero row).
+    ///
+    /// `rows` always holds a whole number of `cols`-byte rows, because
+    /// `build_rows` emits exactly `/W` bytes per entry.
     fn png_up_predict(rows: &[u8], cols: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(rows.len() + rows.len() / cols.max(1));
-        let mut previous = vec![0u8; cols];
-        for row in rows.chunks(cols) {
-            out.push(2);
-            for (i, &byte) in row.iter().enumerate() {
-                out.push(byte.wrapping_sub(previous[i]));
-            }
-            previous.copy_from_slice(row);
-        }
-        out
+        debug_assert!(
+            cols > 0 && rows.len().is_multiple_of(cols),
+            "xref rows must be a whole number of {cols}-byte rows"
+        );
+        crate::stream_filter::encode_png_predictor(
+            rows,
+            u32::try_from(cols).expect("xref row width is bounded by the /W field widths"),
+            1,
+            8,
+        )
+        .expect("xref row geometry is always a valid PNG predictor configuration")
     }
 
     /// Flate-compress with zlib at `Compression::default()` (level 6), matching

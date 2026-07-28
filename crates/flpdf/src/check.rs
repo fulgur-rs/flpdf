@@ -114,10 +114,11 @@ pub fn check_reader_with_options<R: Read + Seek>(
 /// # Limitations
 ///
 /// A stream capped in any of the codecs above is not fully decoded, so errors
-/// that only a complete decode would surface — invalid `/DecodeParms` (e.g. an
-/// unsupported `/Predictor`) or corruption past the cap — are not reported for
-/// that stream while a cap is in effect; with [`DecodeLimits::default`] they
-/// still surface as errors. Content streams carrying an explicit `/Crypt`
+/// that only a complete decode would surface — corruption past the cap — are
+/// not reported for that stream while a cap is in effect; with
+/// [`DecodeLimits::default`] they still surface as errors. Invalid
+/// `/DecodeParms` are unaffected, because the filter validates its parameters
+/// and builds its pipeline before decoding any bytes. Content streams carrying an explicit `/Crypt`
 /// filter are decoded during object resolution and are not bounded by this cap.
 ///
 /// # Errors
