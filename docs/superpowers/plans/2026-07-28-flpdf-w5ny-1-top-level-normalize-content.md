@@ -58,4 +58,4 @@
 - [x] Run `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 - [x] Run `cargo test`.
 - [x] Produce fresh LLVM coverage and run `scripts/patch-coverage.sh origin/main`; require 100%.
-- [ ] Commit and push the feature branch, then push Beads state. Leave the Bead open until merged-main evidence exists.
+- [x] Commit and push the feature branch, then push Beads state. Leave the Bead open until merged-main evidence exists.
