@@ -1,10 +1,9 @@
-//! qpdf correspondence: Pl_LZWDecoder, predictor, and not-yet-migrated stream-filter codec responsibilities; QPDFStreamFilter dispatch and Pl_Flate execution are delegated to stream_filter.
+//! qpdf correspondence: Pl_LZWDecoder, predictor, and legacy stream-filter encoder responsibilities; QPDFStreamFilter dispatch and Pipeline decoder execution are delegated to stream_filter.
 use std::borrow::Cow;
 
 use crate::ascii85;
 use crate::ascii_hex;
 use crate::pipeline::{PipelineError, PipelineResult};
-use crate::run_length;
 #[cfg(test)]
 use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
@@ -81,16 +80,14 @@ pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u
 ///
 /// Default is unlimited, matching [`decode_stream_data`]. Embedders processing
 /// untrusted input can set [`max_output`](Self::max_output) to bound the
-/// decompressed size of each `FlateDecode` / `LZWDecode` stage (qpdf's
-/// `Pl_Flate::setMemoryLimit` analogue), trading completeness for a per-stage
-/// bound on those codecs. It is a per-`FlateDecode`/`LZWDecode`-stage limit, not
-/// a ceiling on total output: a later non-decompressing stage (e.g. a
-/// `RunLengthDecode` following a bounded `FlateDecode`) is not itself capped and
-/// can re-expand its input.
+/// decoded size of each `FlateDecode`, `LZWDecode`, `ASCII85Decode`,
+/// `ASCIIHexDecode`, or `RunLengthDecode` stage, trading completeness for a
+/// per-stage bound. It is not a ceiling on the total work or cumulative output
+/// across a filter chain.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DecodeLimits {
-    /// Maximum decompressed byte count permitted out of any single
-    /// `FlateDecode` / `LZWDecode` stage. `None` (default) is unlimited.
+    /// Maximum decoded byte count permitted out of any single supported filter
+    /// stage. `None` (default) is unlimited.
     pub max_output: Option<usize>,
 }
 
@@ -116,7 +113,7 @@ pub(crate) fn decode_stream_data_with_limits_and_warnings(
 }
 
 /// Returns `true` when `error` is the limit-exceeded signal raised when a
-/// `FlateDecode`/`LZWDecode` stage aborts because its output would exceed
+/// supported filter stage aborts because its output would exceed
 /// [`DecodeLimits::max_output`].
 ///
 /// Both limit-exceeded and genuine decode failures surface as
@@ -135,7 +132,7 @@ pub(crate) fn is_decode_output_limit_error(error: &Error) -> bool {
 /// # Errors
 ///
 /// Returns [`Error::Unsupported`] for the same reasons as [`decode_stream_data`],
-/// plus when a `FlateDecode` / `LZWDecode` stage's decompressed output exceeds
+/// plus when a supported filter stage's decoded output exceeds
 /// [`DecodeLimits::max_output`], or when the `/Filter` chain exceeds the fixed
 /// stage cap.
 pub fn decode_stream_data_with_limits(
@@ -583,18 +580,6 @@ fn apply_single_filter_decode(
         return lzw_decode(stream_data, early_change, max_output);
     }
 
-    if filter_name == b"ASCII85Decode" {
-        return ascii85::decode(stream_data);
-    }
-
-    if filter_name == b"ASCIIHexDecode" {
-        return ascii_hex::decode(stream_data);
-    }
-
-    if filter_name == b"RunLengthDecode" {
-        return run_length::decode(stream_data);
-    }
-
     // Passthrough codecs: flpdf does not decode image/binary streams.
     // The writer preserves these streams verbatim (qpdf parity).
     if let Some(label) = passthrough_codec_label(filter_name) {
@@ -758,7 +743,7 @@ fn apply_single_filter_encode(
     }
 
     if filter_name == b"RunLengthDecode" {
-        return Ok(run_length::encode(stream_data));
+        return Ok(crate::run_length::encode(stream_data));
     }
 
     // LZWEncode is not supported: flpdf writes stream compression as FlateDecode only
@@ -938,6 +923,21 @@ mod tests {
         assert_eq!(decoded, plaintext.as_slice());
     }
 
+    #[test]
+    fn decode_stream_data_ascii_hex_uses_qpdf_whitespace_and_error_semantics() {
+        assert_eq!(
+            decode_stream_data(&ascii_hex_dict(), b"4\x0b142>").unwrap(),
+            b"AB"
+        );
+
+        let error = decode_stream_data(&ascii_hex_dict(), b"41\0").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: character out of range during base Hex decode: "
+        );
+    }
+
     // ----- ASCII85Decode filter integration tests -----
 
     fn ascii85_dict() -> Dictionary {
@@ -1008,13 +1008,30 @@ mod tests {
         // Feed a hand-crafted stream: "9jqov~>" where 'v' is out-of-range
         let invalid_stream = b"9jqov~>";
 
-        let result = decode_stream_data(&dict, invalid_stream);
+        let error = decode_stream_data(&dict, invalid_stream).unwrap_err();
 
-        assert!(result.is_err(), "expected error for out-of-range byte");
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("ASCII85Decode"),
-            "error message should contain 'ASCII85Decode', got: {msg}"
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: character out of range during base 85 decode"
+        );
+    }
+
+    #[test]
+    fn decode_stream_data_ascii85_uses_qpdf_overflow_and_whitespace_semantics() {
+        assert_eq!(
+            decode_stream_data(&ascii85_dict(), b"uuuuu").unwrap(),
+            [0x08, 0x78, 0x0e, 0xc4]
+        );
+        assert_eq!(
+            decode_stream_data(&ascii85_dict(), b"9j\x0bqo^").unwrap(),
+            b"Man "
+        );
+
+        let error = decode_stream_data(&ascii85_dict(), b"!\0").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: character out of range during base 85 decode"
         );
     }
 
@@ -1063,22 +1080,41 @@ mod tests {
     }
 
     #[test]
-    fn decode_stream_data_run_length_rejects_truncated_literal() {
-        let dict = run_length_dict();
-        // Hand-crafted truncated stream: header says 6 literals (l=5) but only 3 follow.
-        let truncated_stream = vec![0x05u8, b'A', b'B', b'C']; // 3 bytes instead of 6
-
-        let result = decode_stream_data(&dict, &truncated_stream);
-
-        assert!(
-            result.is_err(),
-            "expected error for truncated literal stream"
+    fn decode_stream_data_run_length_uses_qpdf_partial_packet_and_eod_semantics() {
+        assert_eq!(
+            decode_stream_data(&run_length_dict(), &[0x05, b'A', b'B', b'C']).unwrap(),
+            b"ABC"
         );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("RunLengthDecode"),
-            "error message should contain 'RunLengthDecode', got: {msg}"
+        assert_eq!(
+            decode_stream_data(&run_length_dict(), &[0x80, 0x00, b'Z']).unwrap(),
+            b"Z"
         );
+    }
+
+    #[test]
+    fn ascii_and_run_length_filters_reject_decode_params_before_codec_work() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"ASCII85Decode", b"z"),
+            (b"ASCIIHexDecode", b"41>"),
+            (b"RunLengthDecode", &[0xff, b'A', 0x80]),
+        ];
+
+        for &(name, encoded) in cases {
+            let mut dict = Dictionary::new();
+            dict.insert("Filter", Object::Name(name.to_vec()));
+            dict.insert("DecodeParms", Object::Dictionary(Dictionary::new()));
+
+            let error = decode_stream_data(&dict, encoded).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "unsupported PDF feature: stream filter {} does not support supplied /DecodeParms",
+                    String::from_utf8_lossy(name)
+                ),
+                "{name:?}"
+            );
+        }
     }
 
     // ----- Array filter chain round-trip tests (regression for flpdf-fh8) -----
