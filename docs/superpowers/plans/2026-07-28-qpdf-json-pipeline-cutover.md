@@ -47,6 +47,12 @@ its own SHA. At publication, record the immutable remote branch SHA/PR head in
 Beads and the Task 9 report. Layer 2 must branch from that recorded SHA, not
 from the mutable Layer 1 branch name.
 
+If Layer 1 is rebased after verification, invalidate the previously recorded
+SHA. Rerun the full Task 9 gates and fresh Layer 1 coverage on the rebased
+commit, push it, record the resulting final remote SHA in Beads and the Task 9
+report, and push the updated Beads state. Only then create or recreate Layer 2
+from that exact immutable SHA.
+
 ## File and Responsibility Map
 
 ### Layer 1
@@ -70,7 +76,9 @@ from the mutable Layer 1 branch name.
 - Create `scripts/qpdf-json-pipeline-diff.sh`: pinned-source probe builder and Rust differential runner.
 - Create `scripts/tests/qpdf-json-pipeline-diff-contract.sh`: non-live harness contract.
 - Modify `Cargo.toml` and `crates/flpdf/Cargo.toml`: remove `base64`.
-- Regenerate `docs/qpdf-correspondence.md`.
+- Regenerate `docs/qpdf-module-doc-index.md` with
+  `scripts/qpdf-module-docs.py`.
+- Manually update `docs/qpdf-correspondence.md`.
 
 ### Layer 2
 
@@ -83,7 +91,9 @@ from the mutable Layer 1 branch name.
 - Extend `tests/oracle/qpdf_json_pipeline_probe.cc`: stdio records.
 - Create `tests/oracle/qpdf_json_pipeline_stdio_records.tsv`: checked-in qpdf stdio records.
 - Extend `scripts/qpdf-json-pipeline-diff.sh` and its contract test for the Layer 2 ignored differential.
-- Regenerate `docs/qpdf-correspondence.md`.
+- Regenerate `docs/qpdf-module-doc-index.md` with
+  `scripts/qpdf-module-docs.py`.
+- Manually update `docs/qpdf-correspondence.md`.
 
 ---
 
@@ -1372,7 +1382,9 @@ python3 -m unittest scripts/tests/test_qpdf_module_docs.py
 python3 scripts/qpdf-module-docs.py --check
 ```
 
-Expected: 55 checker tests pass and correspondence is current.
+Expected: 55 checker tests pass, the generated module index is current, and
+the manually curated correspondence table has been reviewed against the Layer
+1 implementation.
 
 - [ ] **Step 2: Run Layer 1 focused and workspace gates**
 
@@ -1397,9 +1409,10 @@ Expected: every command exits zero.
 - [ ] **Step 3: Commit docs and any test-only coverage correction**
 
 ```bash
-git add docs/qpdf-correspondence.md crates/flpdf/src crates/flpdf/tests \
-  crates/flpdf-cli/src crates/flpdf-cli/tests scripts tests/oracle Cargo.toml \
-  crates/flpdf/Cargo.toml
+git add docs/qpdf-module-doc-index.md docs/qpdf-correspondence.md \
+  docs/superpowers/plans/2026-07-28-qpdf-json-pipeline-cutover.md \
+  crates/flpdf/src crates/flpdf/tests crates/flpdf-cli/src \
+  crates/flpdf-cli/tests scripts tests/oracle Cargo.toml crates/flpdf/Cargo.toml
 git commit -m "docs(pipeline): record JSON stage correspondence"
 ```
 
@@ -1430,17 +1443,22 @@ Run:
 
 ```bash
 git status --short
-bd dolt push
 git push origin feature/flpdf-qynx-6-json-pipeline
 git fetch origin feature/flpdf-qynx-6-json-pipeline
-git rev-parse HEAD
-git rev-parse origin/feature/flpdf-qynx-6-json-pipeline
+layer1_tip="$(git rev-parse HEAD)"
+test "${layer1_tip}" = \
+  "$(git rev-parse origin/feature/flpdf-qynx-6-json-pipeline)"
+bd update flpdf-qynx.6 --append-notes \
+  "Layer 1 immutable remote SHA/PR head: ${layer1_tip}"
+# Manually record the same layer1_tip in the Task 9 report.
+bd dolt push
 ```
 
-Expected: status is clean, Beads push succeeds, and local Layer 1 equals its
-remote branch. Record that immutable remote SHA/PR head in Beads and the Task 9
-report. Those external records, rather than self-referential tracked prose,
-define the exact Layer 1 base for Layer 2.
+Expected: status is clean and local Layer 1 equals its remote branch. Record
+that immutable remote SHA/PR head in Beads and the Task 9 report before
+`bd dolt push`; then confirm the Beads push succeeds. Those external records,
+rather than self-referential tracked prose, define the exact Layer 1 base for
+Layer 2.
 
 - [ ] **Step 6: Open the Layer 1 draft PR**
 
@@ -1960,7 +1978,8 @@ git commit -m "test(pipeline): cover qpdf stdio lifecycle oracle"
 **Files:**
 - Modify: module docs in `pipeline/stdio_file.rs`, `json/mod.rs`, and
   `json_inspect.rs`
-- Regenerate: `docs/qpdf-correspondence.md`
+- Regenerate: `docs/qpdf-module-doc-index.md`
+- Manually update: `docs/qpdf-correspondence.md`
 - Modify: `docs/superpowers/plans/2026-07-28-qpdf-json-pipeline-cutover.md`
 
 **Interfaces:**
@@ -1968,7 +1987,7 @@ git commit -m "test(pipeline): cover qpdf stdio lifecycle oracle"
 - Leaves `flpdf-qynx.6` in progress until both PRs merge and merged `main` is
   verified.
 
-- [ ] **Step 1: Regenerate and validate correspondence docs**
+- [ ] **Step 1: Regenerate the module index and validate correspondence docs**
 
 Run:
 
@@ -1978,7 +1997,9 @@ python3 -m unittest scripts/tests/test_qpdf_module_docs.py
 python3 scripts/qpdf-module-docs.py --check
 ```
 
-Expected: checker tests and generated correspondence pass.
+Expected: 55 checker tests pass, the generated module index is current, and
+the manually curated correspondence table has been reviewed against the Layer
+2 implementation.
 
 - [ ] **Step 2: Run deletion and responsibility audits**
 
@@ -2020,8 +2041,10 @@ Expected: every command exits zero.
 - [ ] **Step 4: Commit docs and any focused coverage correction**
 
 ```bash
-git add docs/qpdf-correspondence.md crates/flpdf/src crates/flpdf/tests \
-  crates/flpdf-cli/tests scripts tests/oracle
+git add docs/qpdf-module-doc-index.md docs/qpdf-correspondence.md \
+  docs/superpowers/plans/2026-07-28-qpdf-json-pipeline-cutover.md \
+  crates/flpdf/src crates/flpdf/tests crates/flpdf-cli/tests scripts \
+  tests/oracle
 git commit -m "docs(pipeline): record JSON stdio correspondence"
 ```
 
@@ -2029,19 +2052,27 @@ If the index is empty, do not create an empty commit.
 
 - [ ] **Step 5: Obtain fresh committed Layer 2 patch coverage**
 
-Set the exact Layer 1 tip recorded in Task 9:
+Manually inject the exact immutable Layer 1 SHA recorded externally by Task
+9. Do not resolve it from the mutable Layer 1 branch name:
 
 ```bash
-layer1_tip="$(git rev-parse feature/flpdf-qynx-6-json-pipeline)"
+layer1_tip="<paste immutable Layer 1 SHA recorded by Task 9>"
+test "${layer1_tip}" != "<paste immutable Layer 1 SHA recorded by Task 9>"
+git cat-file -e "${layer1_tip}^{commit}"
+coverage_base="${layer1_tip}"
+layer2_merge_base="$(git merge-base HEAD "${layer1_tip}")"
+test "${layer2_merge_base}" = "${coverage_base}"
 cargo llvm-cov clean --workspace
 cargo llvm-cov --workspace --features qpdf-zlib-compat --ignore-run-fail \
   --lcov --output-path target/qynx-6-layer2.lcov
-scripts/patch-coverage.sh --base "${layer1_tip}" \
+scripts/patch-coverage.sh --base "${coverage_base}" \
   --lcov target/qynx-6-layer2.lcov
 ```
 
-Expected: Layer 2 changed executable lines are exactly 100%. Add and commit
-focused tests for any uncovered line, regenerate the LCOV file, and rerun.
+Expected: the Layer 2 branch merge-base and patch-coverage base are the same
+externally recorded immutable Layer 1 SHA, and Layer 2 changed executable lines
+are exactly 100%. Add and commit focused tests for any uncovered line,
+regenerate the LCOV file, and rerun.
 
 - [ ] **Step 6: Push Beads and Layer 2**
 
