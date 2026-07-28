@@ -280,7 +280,7 @@ namespace
         } else {
             cookie.unexpected_phase = true;
             errno = EIO;
-            return -1;
+            return 0;
         }
         WriteStep step{WriteStepKind::accept, len, 0};
         if (!cookie.steps.empty()) {

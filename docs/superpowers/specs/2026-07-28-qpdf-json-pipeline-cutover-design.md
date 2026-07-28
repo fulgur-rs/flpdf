@@ -206,7 +206,8 @@ Contract:
 
 - writes loop across partial writes;
 - zero-progress writes are runtime errors;
-- interrupted writes are retried as qpdf's stdio behavior requires;
+- interrupted writes are runtime errors without retry, matching qpdf's
+  zero-result `fwrite` path;
 - write failures become `PipelineError::Runtime` with the stage identifier and
   operation;
 - `finish` maps an already-closed/`EBADF` condition to
