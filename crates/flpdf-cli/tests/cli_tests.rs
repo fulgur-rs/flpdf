@@ -803,6 +803,33 @@ fn top_level_linearize_normalize_content_preserves_warning_exit() {
 }
 
 #[test]
+fn top_level_linearize_normalize_content_warning_writes_pass1_copy() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("bad-content.pdf");
+    let output = temp.path().join("normalized-linearized.pdf");
+    let pass1 = temp.path().join("pass1.pdf");
+    std::fs::write(&input, one_page_pdf_with_content(b"\r<0g")).unwrap();
+    std::fs::write(&pass1, b"stale pass1").unwrap();
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--linearize", "--normalize-content=y"])
+        .arg(format!("--linearize-pass1={}", pass1.display()))
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(3));
+    assert!(output.exists(), "warning exit must retain the final output");
+    assert_eq!(
+        std::fs::read(&pass1).unwrap(),
+        std::fs::read(&output).unwrap(),
+        "warning exit must replace a stale pass-1 file with the final output"
+    );
+}
+
+#[test]
 fn top_level_qdf_defaults_to_content_normalization() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("crlf-content.pdf");

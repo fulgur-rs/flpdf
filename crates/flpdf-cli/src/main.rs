@@ -1702,7 +1702,13 @@ fn main() {
             args.verbose,
             options,
         );
-        if result.is_ok() {
+        let output_was_written = match &result {
+            Ok(()) => true,
+            Err(error) => error
+                .downcast_ref::<CliExitError>()
+                .is_some_and(|error| error.code == ExitCode::Warnings),
+        };
+        if output_was_written {
             if let (Some(pass1), Some(output)) =
                 (args.linearize_pass1.as_ref(), args.output.as_ref())
             {
