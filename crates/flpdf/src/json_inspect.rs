@@ -3032,19 +3032,9 @@ fn write_file_mode_object_entry<R: Read + Seek>(
             Json::write_dictionary_key(out, &mut object_first, b"stream", 4)?;
 
             let side_path = format_json_side_file_path(prefix, object_ref.number);
-            let side_file = File::create(&side_path)
+            let mut side_file = File::create(&side_path)
                 .map_err(|source| side_file_io_error("open", &side_path, source))?;
-            let mut buffered = BufWriter::with_capacity(4096, side_file);
-            let mut terminal = PlStdioFile::new("stream data", &mut buffered);
-            write_file_mode_stream_value(
-                pdf,
-                &stream,
-                decode_level,
-                &side_path,
-                &mut terminal,
-                out,
-            )?;
-            terminal.finish()?;
+            write_file_mode_side_file(pdf, &stream, decode_level, &side_path, &mut side_file, out)?;
             Json::write_dictionary_close(out, object_first, 3)?;
         }
         other => {
@@ -3057,6 +3047,21 @@ fn write_file_mode_object_entry<R: Read + Seek>(
             Json::write_dictionary_close(out, object_first, 3)?;
         }
     }
+    Ok(())
+}
+
+fn write_file_mode_side_file<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    stream: &Stream,
+    decode_level: DecodeLevel,
+    side_path: &str,
+    side_file: &mut dyn Write,
+    out: &mut dyn Pipeline,
+) -> Result<(), JsonOutputError> {
+    let mut buffered = BufWriter::with_capacity(4096, side_file);
+    let mut terminal = PlStdioFile::new("stream data", &mut buffered);
+    write_file_mode_stream_value(pdf, stream, decode_level, side_path, &mut terminal, out)?;
+    terminal.finish()?;
     Ok(())
 }
 
@@ -3224,7 +3229,7 @@ pub fn write_qpdf_json_v2_selected_objects_to_output_with_options<R: Read + Seek
 mod tests {
     use super::*;
     use crate::pipeline::test_support::{shared_trace, RecordingSink, TraceCall};
-    use crate::pipeline::{Pipeline, PipelineError, PipelineResult, PlStdioFile, PlString};
+    use crate::pipeline::{Pipeline, PipelineError, PipelineResult, PlString};
 
     fn number(value: impl ToString) -> serde_json::Value {
         serde_json::from_str(&value.to_string()).expect("number must serialize")
@@ -3394,6 +3399,9 @@ mod tests {
             Ok(())
         }
     }
+
+    const COMPLETE_SIDE_FILE_STREAM_JSON: &[u8] =
+        b"{\n          \"datafile\": \"side-file\",\n          \"dict\": {}\n        }";
 
     fn project(value: Json) -> Result<serde_json::Value, ConvertError> {
         test_value(&value)
@@ -4634,16 +4642,14 @@ mod tests {
     fn side_file_pipeline_write_failure_keeps_datafile_prefix() {
         let mut pdf = load_one_page_pdf();
         let stream = Stream::new(Dictionary::new(), vec![b'x'; 4096]);
-        let side_file = FailAfterWriter {
+        let mut side_file = FailAfterWriter {
             remaining: 0,
             bytes: Vec::new(),
         };
-        let mut buffered = std::io::BufWriter::with_capacity(4096, side_file);
         let mut out = Vec::new();
         let result = {
-            let mut side_file = PlStdioFile::new("stream data", &mut buffered);
             let mut output = PlString::new("file-mode main output", None, &mut out);
-            write_file_mode_stream_value(
+            write_file_mode_side_file(
                 &mut pdf,
                 &stream,
                 DecodeLevel::None,
@@ -4676,23 +4682,69 @@ mod tests {
 
     #[test]
     fn side_file_explicit_finish_ignores_enospc() {
-        let mut buffered = std::io::BufWriter::with_capacity(4096, ErrnoSink(28));
-        let mut side_file = PlStdioFile::new("stream data", &mut buffered);
-        side_file.write(b"small payload").unwrap();
-        side_file.finish().unwrap();
+        let mut pdf = empty_pdf();
+        let stream = Stream::new(Dictionary::new(), b"small payload".to_vec());
+        let mut side_file = ErrnoSink(28);
+        let trace = shared_trace();
+        let mut out = RecordingSink::with_trace(trace.clone(), &[], &[]);
+
+        write_file_mode_side_file(
+            &mut pdf,
+            &stream,
+            DecodeLevel::None,
+            "side-file",
+            &mut side_file,
+            &mut out,
+        )
+        .unwrap();
+
+        let trace = trace.borrow();
+        assert_eq!(trace.output, COMPLETE_SIDE_FILE_STREAM_JSON);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&trace.output).unwrap(),
+            serde_json::json!({
+                "datafile": "side-file",
+                "dict": {},
+            })
+        );
+        assert!(!trace
+            .calls
+            .iter()
+            .any(|call| matches!(call, TraceCall::Finish { .. })));
     }
 
     #[test]
     fn side_file_explicit_finish_reports_ebadf_logic_error() {
-        let mut buffered = std::io::BufWriter::with_capacity(4096, ErrnoSink(9));
-        let mut side_file = PlStdioFile::new("stream data", &mut buffered);
-        side_file.write(b"small payload").unwrap();
-        let error = side_file.finish().unwrap_err();
-        assert!(matches!(error, PipelineError::Logic(_)));
+        let mut pdf = empty_pdf();
+        let stream = Stream::new(Dictionary::new(), b"small payload".to_vec());
+        let mut side_file = ErrnoSink(9);
+        let trace = shared_trace();
+        let mut out = RecordingSink::with_trace(trace.clone(), &[], &[]);
+
+        let error = write_file_mode_side_file(
+            &mut pdf,
+            &stream,
+            DecodeLevel::None,
+            "side-file",
+            &mut side_file,
+            &mut out,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            JsonOutputError::Pipeline(PipelineError::Logic(_))
+        ));
         assert_eq!(
             error.to_string(),
             "stream data: Pl_StdioFile::finish: stream already closed"
         );
+        let trace = trace.borrow();
+        assert_eq!(trace.output, COMPLETE_SIDE_FILE_STREAM_JSON);
+        assert!(!trace
+            .calls
+            .iter()
+            .any(|call| matches!(call, TraceCall::Finish { .. })));
     }
 
     #[test]
