@@ -3741,15 +3741,8 @@ mod tests {
             Pdf::open(Cursor::new(document.bytes)).expect("linearized output should parse");
         let root_ref = output.root_ref().expect("output has /Root");
         let root = output.resolve(root_ref).expect("output catalog resolves");
-        let Object::Dictionary(root) = root else {
-            panic!("output root must be a dictionary");
-        };
-        assert!(
-            matches!(root.get("Outlines"), Some(Object::Reference(_))),
-            "qpdf optimization makes a direct /Outlines dictionary indirect before writing; \
-             got {:?}",
-            root.get("Outlines")
-        );
+        let root = root.into_dict().expect("output root must be a dictionary");
+        assert!(matches!(root.get("Outlines"), Some(Object::Reference(_))));
     }
 
     #[test]
