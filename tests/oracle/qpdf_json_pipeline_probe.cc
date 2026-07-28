@@ -10,6 +10,7 @@
 #include <qpdf/Pl_String.hh>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdio>
 #include <deque>
@@ -246,15 +247,42 @@ namespace
         int error{0};
     };
 
+    enum class CookiePhase
+    {
+        none,
+        write,
+        finish,
+        close
+    };
+
     struct Cookie
     {
         std::vector<unsigned char> bytes;
         std::deque<WriteStep> steps;
+        CookiePhase phase{CookiePhase::none};
+        size_t pipeline_write_count{0};
+        size_t pipeline_finish_count{0};
+        std::vector<size_t> write_lengths;
+        std::vector<size_t> finish_lengths;
+        std::vector<size_t> close_lengths;
+        bool capture_bytes{true};
+        bool unexpected_phase{false};
     };
 
     ssize_t cookie_write(void* opaque, char const* data, size_t len)
     {
         auto& cookie = *static_cast<Cookie*>(opaque);
+        if (cookie.phase == CookiePhase::write) {
+            cookie.write_lengths.push_back(len);
+        } else if (cookie.phase == CookiePhase::finish) {
+            cookie.finish_lengths.push_back(len);
+        } else if (cookie.phase == CookiePhase::close) {
+            cookie.close_lengths.push_back(len);
+        } else {
+            cookie.unexpected_phase = true;
+            errno = EIO;
+            return -1;
+        }
         WriteStep step{WriteStepKind::accept, len, 0};
         if (!cookie.steps.empty()) {
             step = cookie.steps.front();
@@ -264,10 +292,12 @@ namespace
         switch (step.kind) {
         case WriteStepKind::accept: {
             auto const accepted = std::min(step.count, len);
-            cookie.bytes.insert(
-                cookie.bytes.end(),
-                reinterpret_cast<unsigned char const*>(data),
-                reinterpret_cast<unsigned char const*>(data) + accepted);
+            if (cookie.capture_bytes) {
+                cookie.bytes.insert(
+                    cookie.bytes.end(),
+                    reinterpret_cast<unsigned char const*>(data),
+                    reinterpret_cast<unsigned char const*>(data) + accepted);
+            }
             return static_cast<ssize_t>(accepted);
         }
         case WriteStepKind::interrupted:
@@ -283,7 +313,51 @@ namespace
         throw std::logic_error("unreachable cookie write step");
     }
 
-    FILE* open_cookie(Cookie& cookie)
+    template <typename F>
+    void during(Cookie& cookie, CookiePhase phase, F&& operation)
+    {
+        cookie.phase = phase;
+        if (phase == CookiePhase::write) {
+            ++cookie.pipeline_write_count;
+        } else if (phase == CookiePhase::finish) {
+            ++cookie.pipeline_finish_count;
+        }
+        try {
+            operation();
+            cookie.phase = CookiePhase::none;
+        } catch (...) {
+            cookie.phase = CookiePhase::none;
+            throw;
+        }
+    }
+
+    void verify_cookie_lifecycle(
+        char const* case_name,
+        Cookie const& cookie,
+        std::vector<size_t> const& write_lengths,
+        std::vector<size_t> const& finish_lengths,
+        std::vector<size_t> const& close_lengths)
+    {
+        if (cookie.unexpected_phase || !cookie.steps.empty() ||
+            (cookie.write_lengths != write_lengths) ||
+            (cookie.finish_lengths != finish_lengths) ||
+            (cookie.close_lengths != close_lengths)) {
+            throw std::runtime_error(
+                std::string(case_name) + ": cookie lifecycle mismatch");
+        }
+    }
+
+    void close_cookie(FILE* file, Cookie& cookie)
+    {
+        cookie.phase = CookiePhase::close;
+        auto const close_status = fclose(file);
+        cookie.phase = CookiePhase::none;
+        if (close_status != 0) {
+            throw std::runtime_error("fclose failed");
+        }
+    }
+
+    FILE* open_cookie(Cookie& cookie, std::array<char, 4096>& buffer)
     {
         cookie_io_functions_t io{
             .read = nullptr,
@@ -295,7 +369,7 @@ namespace
         if (file == nullptr) {
             throw std::runtime_error("fopencookie failed");
         }
-        if (setvbuf(file, nullptr, _IOFBF, 4096) != 0) {
+        if (setvbuf(file, buffer.data(), _IOFBF, buffer.size()) != 0) {
             fclose(file);
             throw std::runtime_error("setvbuf failed");
         }
@@ -408,138 +482,157 @@ namespace
             Cookie cookie;
             cookie.steps.push_back({WriteStepKind::accept, 1024, 0});
             cookie.steps.push_back({WriteStepKind::error, 0, ENOSPC});
-            auto* file = open_cookie(cookie);
+            std::array<char, 4096> buffer{};
+            auto* file = open_cookie(cookie, buffer);
             Pl_StdioFile stage("stdio", file);
-            size_t write_count = 0;
-            size_t finish_count = 0;
             auto const payload = patterned_bytes(4096);
             auto const case_status = status([&]() {
-                ++write_count;
-                stage.write(payload.data(), payload.size());
-                ++finish_count;
-                stage.finish();
+                during(cookie, CookiePhase::write, [&]() {
+                    stage.write(payload.data(), payload.size());
+                });
+                during(cookie, CookiePhase::finish, [&]() { stage.finish(); });
             });
+            close_cookie(file, cookie);
+            verify_cookie_lifecycle(
+                "stdio-partial-write", cookie, {4096}, {3072}, {});
             emit(
                 "stdio-partial-write",
                 case_status,
                 std::string(cookie.bytes.begin(), cookie.bytes.end()),
-                write_count,
-                finish_count);
-            fclose(file);
+                cookie.pipeline_write_count,
+                cookie.pipeline_finish_count);
         }
 
         {
             Cookie cookie;
+            // glibc retries EINTR with an internal fopencookie buffer whose
+            // contents are not a stable observable. This case records the
+            // callback lifecycle only, avoiding a fixture of process memory.
+            cookie.capture_bytes = false;
             cookie.steps.push_back({WriteStepKind::interrupted, 0, EINTR});
-            cookie.steps.push_back({WriteStepKind::zero, 0, ENOSPC});
-            auto* file = open_cookie(cookie);
+            cookie.steps.push_back({WriteStepKind::accept, 4096, 0});
+            std::array<char, 4096> buffer{};
+            auto* file = open_cookie(cookie, buffer);
             Pl_StdioFile stage("stdio", file);
-            size_t write_count = 0;
-            size_t finish_count = 0;
+            auto const payload = patterned_bytes(4096);
             auto const case_status = status([&]() {
-                ++write_count;
-                stage.writeCStr("abc");
-                ++finish_count;
-                stage.finish();
+                during(cookie, CookiePhase::write, [&]() {
+                    stage.write(payload.data(), payload.size());
+                });
             });
+            close_cookie(file, cookie);
+            verify_cookie_lifecycle(
+                "stdio-interrupted-write", cookie, {4096, 4096}, {}, {1});
             emit(
                 "stdio-interrupted-write",
                 case_status,
                 std::string(cookie.bytes.begin(), cookie.bytes.end()),
-                write_count,
-                finish_count);
-            fclose(file);
+                cookie.pipeline_write_count,
+                cookie.pipeline_finish_count);
         }
 
         {
             Cookie cookie;
             cookie.steps.push_back({WriteStepKind::zero, 0, ENOSPC});
-            auto* file = open_cookie(cookie);
+            std::array<char, 4096> buffer{};
+            auto* file = open_cookie(cookie, buffer);
             Pl_StdioFile stage("stdio", file);
-            size_t write_count = 0;
-            size_t finish_count = 0;
-            auto const case_status = status([&]() {
-                ++write_count;
-                stage.writeCStr("abc");
-                ++finish_count;
-                stage.finish();
+            auto const payload = patterned_bytes(4096);
+            auto const raw_status = status([&]() {
+                during(cookie, CookiePhase::write, [&]() {
+                    stage.write(payload.data(), payload.size());
+                });
             });
+            if (raw_status !=
+                "stdio: Pl_StdioFile::write: No space left on device") {
+                throw std::runtime_error(
+                    "stdio-zero-progress: unexpected qpdf runtime error");
+            }
+            close_cookie(file, cookie);
+            verify_cookie_lifecycle(
+                "stdio-zero-progress", cookie, {4096}, {}, {});
             emit(
                 "stdio-zero-progress",
-                case_status,
+                "runtime",
                 std::string(cookie.bytes.begin(), cookie.bytes.end()),
-                write_count,
-                finish_count);
-            fclose(file);
+                cookie.pipeline_write_count,
+                cookie.pipeline_finish_count);
         }
 
         {
             Cookie cookie;
             cookie.steps.push_back({WriteStepKind::error, 0, EBADF});
-            auto* file = open_cookie(cookie);
+            std::array<char, 4096> buffer{};
+            auto* file = open_cookie(cookie, buffer);
             Pl_StdioFile stage("stdio", file);
-            size_t write_count = 0;
-            size_t finish_count = 0;
             auto const case_status = status([&]() {
-                ++write_count;
-                stage.writeCStr("abc");
-                ++finish_count;
-                stage.finish();
+                during(
+                    cookie,
+                    CookiePhase::write,
+                    [&]() { stage.writeCStr("abc"); });
+                during(cookie, CookiePhase::finish, [&]() { stage.finish(); });
             });
+            close_cookie(file, cookie);
+            verify_cookie_lifecycle(
+                "stdio-finish-ebadf", cookie, {}, {3}, {});
             emit(
                 "stdio-finish-ebadf",
                 case_status,
                 std::string(cookie.bytes.begin(), cookie.bytes.end()),
-                write_count,
-                finish_count);
-            fclose(file);
+                cookie.pipeline_write_count,
+                cookie.pipeline_finish_count);
         }
 
         {
             Cookie cookie;
             cookie.steps.push_back({WriteStepKind::error, 0, ENOSPC});
-            auto* file = open_cookie(cookie);
+            std::array<char, 4096> buffer{};
+            auto* file = open_cookie(cookie, buffer);
             Pl_StdioFile stage("stdio", file);
-            size_t write_count = 0;
-            size_t finish_count = 0;
             auto const case_status = status([&]() {
-                ++write_count;
-                stage.writeCStr("abc");
-                ++finish_count;
-                stage.finish();
+                during(
+                    cookie,
+                    CookiePhase::write,
+                    [&]() { stage.writeCStr("abc"); });
+                during(cookie, CookiePhase::finish, [&]() { stage.finish(); });
             });
+            close_cookie(file, cookie);
+            verify_cookie_lifecycle(
+                "stdio-finish-enospc", cookie, {}, {3}, {});
             emit(
                 "stdio-finish-enospc",
                 case_status,
                 std::string(cookie.bytes.begin(), cookie.bytes.end()),
-                write_count,
-                finish_count);
-            fclose(file);
+                cookie.pipeline_write_count,
+                cookie.pipeline_finish_count);
         }
 
         {
             Cookie cookie;
-            auto* file = open_cookie(cookie);
+            std::array<char, 4096> buffer{};
+            auto* file = open_cookie(cookie, buffer);
             Pl_StdioFile stage("stdio", file);
-            size_t write_count = 0;
-            size_t finish_count = 0;
             auto const case_status = status([&]() {
-                ++write_count;
-                stage.writeCStr("before");
-                ++finish_count;
-                stage.finish();
-                ++write_count;
-                stage.writeCStr("after");
-                ++finish_count;
-                stage.finish();
+                during(
+                    cookie,
+                    CookiePhase::write,
+                    [&]() { stage.writeCStr("before"); });
+                during(cookie, CookiePhase::finish, [&]() { stage.finish(); });
+                during(
+                    cookie,
+                    CookiePhase::write,
+                    [&]() { stage.writeCStr("after"); });
+                during(cookie, CookiePhase::finish, [&]() { stage.finish(); });
             });
+            close_cookie(file, cookie);
+            verify_cookie_lifecycle(
+                "stdio-repeated-finish", cookie, {}, {6, 5}, {});
             emit(
                 "stdio-repeated-finish",
                 case_status,
                 std::string(cookie.bytes.begin(), cookie.bytes.end()),
-                write_count,
-                finish_count);
-            fclose(file);
+                cookie.pipeline_write_count,
+                cookie.pipeline_finish_count);
         }
     }
 #endif

@@ -2,8 +2,10 @@ use flpdf::pipeline::{
     Base64Action, Pipeline, PipelineError, PipelineResult, PlBase64, PlConcatenate, PlOStream,
     PlStdioFile, PlString,
 };
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io::{self, Cursor, Write};
+use std::rc::Rc;
 
 struct ExternalSink(Vec<u8>);
 
@@ -233,23 +235,51 @@ fn rust_stdio_records() -> String {
         Error(io::Error),
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    enum StdioPhase {
+        #[default]
+        None,
+        Write,
+        Finish,
+    }
+
     struct StdioSink {
         bytes: Vec<u8>,
         steps: VecDeque<StdioWriteStep>,
+        phase: Rc<Cell<StdioPhase>>,
+        write_lengths: Vec<usize>,
+        finish_lengths: Vec<usize>,
     }
 
     impl StdioSink {
-        fn with_steps(steps: impl IntoIterator<Item = StdioWriteStep>) -> Self {
+        fn new(phase: Rc<Cell<StdioPhase>>) -> Self {
+            Self {
+                bytes: Vec::new(),
+                steps: VecDeque::new(),
+                phase,
+                write_lengths: Vec::new(),
+                finish_lengths: Vec::new(),
+            }
+        }
+
+        fn with_steps(
+            phase: Rc<Cell<StdioPhase>>,
+            steps: impl IntoIterator<Item = StdioWriteStep>,
+        ) -> Self {
             Self {
                 steps: steps.into_iter().collect(),
-                ..Self::default()
+                ..Self::new(phase)
             }
         }
     }
 
     impl Write for StdioSink {
         fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            match self.phase.get() {
+                StdioPhase::Write => self.write_lengths.push(data.len()),
+                StdioPhase::Finish => self.finish_lengths.push(data.len()),
+                StdioPhase::None => panic!("stdio sink write outside a pipeline operation"),
+            }
             match self.steps.pop_front() {
                 Some(StdioWriteStep::Accept(limit)) => {
                     let accepted = limit.min(data.len());
@@ -271,6 +301,56 @@ fn rust_stdio_records() -> String {
         }
     }
 
+    #[derive(Default)]
+    struct OperationTrace {
+        write_count: usize,
+        finish_count: usize,
+    }
+
+    fn pipeline_write(
+        stage: &mut PlStdioFile<'_>,
+        phase: &Cell<StdioPhase>,
+        operations: &mut OperationTrace,
+        data: &[u8],
+    ) -> PipelineResult<()> {
+        operations.write_count += 1;
+        phase.set(StdioPhase::Write);
+        let result = stage.write(data);
+        phase.set(StdioPhase::None);
+        result
+    }
+
+    fn pipeline_finish(
+        stage: &mut PlStdioFile<'_>,
+        phase: &Cell<StdioPhase>,
+        operations: &mut OperationTrace,
+    ) -> PipelineResult<()> {
+        operations.finish_count += 1;
+        phase.set(StdioPhase::Finish);
+        let result = stage.finish();
+        phase.set(StdioPhase::None);
+        result
+    }
+
+    fn verify_stdio_lifecycle(
+        sink: &StdioSink,
+        buffered_bytes: Result<Vec<u8>, io::WriterPanicked>,
+        expected_buffered_len: usize,
+        write_lengths: &[usize],
+        finish_lengths: &[usize],
+    ) {
+        assert_eq!(
+            buffered_bytes
+                .expect("stdio buffer writer must not panic")
+                .len(),
+            expected_buffered_len
+        );
+        assert!(sink.steps.is_empty(), "unconsumed stdio write steps");
+        assert_eq!(sink.phase.get(), StdioPhase::None);
+        assert_eq!(sink.write_lengths, write_lengths);
+        assert_eq!(sink.finish_lengths, finish_lengths);
+    }
+
     fn no_space_message() -> io::Error {
         io::Error::other("No space left on device")
     }
@@ -285,138 +365,216 @@ fn rust_stdio_records() -> String {
 
     let mut records = Vec::new();
 
-    let sink = StdioSink::with_steps([StdioWriteStep::Error(no_space_os_error())]);
+    let phase = Rc::new(Cell::new(StdioPhase::None));
+    let sink = StdioSink::with_steps(
+        Rc::clone(&phase),
+        [StdioWriteStep::Error(no_space_os_error())],
+    );
     let mut buffered = io::BufWriter::with_capacity(4096, sink);
+    let mut operations = OperationTrace::default();
     let case_status = {
         let mut stage = PlStdioFile::new("stdio", &mut buffered);
-        status(stage.write(&vec![b'x'; 4095]).and_then(|()| stage.finish()))
+        let result = pipeline_write(&mut stage, &phase, &mut operations, &vec![b'x'; 4095]);
+        status(result.and_then(|()| pipeline_finish(&mut stage, &phase, &mut operations)))
     };
-    let (sink, _) = buffered.into_parts();
-    records.push(record("stdio-4095-enospc", &case_status, &sink.bytes, 1, 1));
+    let (sink, buffered_bytes) = buffered.into_parts();
+    verify_stdio_lifecycle(&sink, buffered_bytes, 4095, &[], &[4095]);
+    records.push(record(
+        "stdio-4095-enospc",
+        &case_status,
+        &sink.bytes,
+        operations.write_count,
+        operations.finish_count,
+    ));
 
-    let sink = StdioSink::with_steps([StdioWriteStep::Error(no_space_message())]);
+    let phase = Rc::new(Cell::new(StdioPhase::None));
+    let sink = StdioSink::with_steps(
+        Rc::clone(&phase),
+        [StdioWriteStep::Error(no_space_message())],
+    );
     let mut buffered = io::BufWriter::with_capacity(4096, sink);
+    let mut operations = OperationTrace::default();
     let case_status = {
         let mut stage = PlStdioFile::new("stdio", &mut buffered);
-        status(stage.write(&vec![b'x'; 4096]))
+        status(pipeline_write(
+            &mut stage,
+            &phase,
+            &mut operations,
+            &vec![b'x'; 4096],
+        ))
     };
-    let (sink, _) = buffered.into_parts();
-    records.push(record("stdio-4096-enospc", &case_status, &sink.bytes, 1, 0));
+    let (sink, buffered_bytes) = buffered.into_parts();
+    verify_stdio_lifecycle(&sink, buffered_bytes, 0, &[4096], &[]);
+    records.push(record(
+        "stdio-4096-enospc",
+        &case_status,
+        &sink.bytes,
+        operations.write_count,
+        operations.finish_count,
+    ));
 
     let payload = patterned_bytes(4097);
-    let mut buffered = io::BufWriter::with_capacity(4096, StdioSink::default());
+    let phase = Rc::new(Cell::new(StdioPhase::None));
+    let mut buffered = io::BufWriter::with_capacity(4096, StdioSink::new(Rc::clone(&phase)));
+    let mut operations = OperationTrace::default();
     let case_status = {
         let mut stage = PlStdioFile::new("stdio", &mut buffered);
-        status(stage.write(&payload).and_then(|()| stage.finish()))
+        let result = pipeline_write(&mut stage, &phase, &mut operations, &payload);
+        status(result.and_then(|()| pipeline_finish(&mut stage, &phase, &mut operations)))
     };
-    let (sink, _) = buffered.into_parts();
+    let (sink, buffered_bytes) = buffered.into_parts();
+    verify_stdio_lifecycle(&sink, buffered_bytes, 0, &[4097], &[]);
     records.push(record(
         "stdio-4097-success",
         &case_status,
         &sink.bytes,
-        1,
-        1,
+        operations.write_count,
+        operations.finish_count,
     ));
 
     let payload = patterned_bytes(4096);
-    let sink = StdioSink::with_steps([
-        StdioWriteStep::Accept(1024),
-        StdioWriteStep::Error(no_space_os_error()),
-    ]);
+    let phase = Rc::new(Cell::new(StdioPhase::None));
+    let sink = StdioSink::with_steps(
+        Rc::clone(&phase),
+        [
+            StdioWriteStep::Accept(1024),
+            StdioWriteStep::Error(no_space_os_error()),
+        ],
+    );
     let mut buffered = io::BufWriter::with_capacity(4096, sink);
+    let mut operations = OperationTrace::default();
     let case_status = {
         let mut stage = PlStdioFile::new("stdio", &mut buffered);
-        status(stage.write(&payload).and_then(|()| stage.finish()))
+        let result = pipeline_write(&mut stage, &phase, &mut operations, &payload);
+        status(result.and_then(|()| pipeline_finish(&mut stage, &phase, &mut operations)))
     };
-    let (sink, _) = buffered.into_parts();
+    let (sink, buffered_bytes) = buffered.into_parts();
+    verify_stdio_lifecycle(&sink, buffered_bytes, 3072, &[4096], &[3072]);
     records.push(record(
         "stdio-partial-write",
         &case_status,
         &sink.bytes,
-        1,
-        1,
+        operations.write_count,
+        operations.finish_count,
     ));
 
-    let sink = StdioSink::with_steps([StdioWriteStep::Interrupted, StdioWriteStep::Zero]);
+    let payload = patterned_bytes(4096);
+    let phase = Rc::new(Cell::new(StdioPhase::None));
+    let sink = StdioSink::with_steps(
+        Rc::clone(&phase),
+        [StdioWriteStep::Interrupted, StdioWriteStep::Accept(4096)],
+    );
     let mut buffered = io::BufWriter::with_capacity(4096, sink);
+    let mut operations = OperationTrace::default();
     let case_status = {
         let mut stage = PlStdioFile::new("stdio", &mut buffered);
-        status(stage.write(b"abc").and_then(|()| stage.finish()))
+        status(pipeline_write(
+            &mut stage,
+            &phase,
+            &mut operations,
+            &payload,
+        ))
     };
-    let (sink, _) = buffered.into_parts();
+    let (sink, buffered_bytes) = buffered.into_parts();
+    verify_stdio_lifecycle(&sink, buffered_bytes, 0, &[4096, 4096], &[]);
+    assert_eq!(sink.bytes, payload);
     records.push(record(
         "stdio-interrupted-write",
         &case_status,
-        &sink.bytes,
-        1,
-        1,
+        &[],
+        operations.write_count,
+        operations.finish_count,
     ));
 
-    let sink = StdioSink::with_steps([StdioWriteStep::Zero]);
+    let payload = patterned_bytes(4096);
+    let phase = Rc::new(Cell::new(StdioPhase::None));
+    let sink = StdioSink::with_steps(Rc::clone(&phase), [StdioWriteStep::Zero]);
     let mut buffered = io::BufWriter::with_capacity(4096, sink);
-    let case_status = {
+    let mut operations = OperationTrace::default();
+    let error = {
         let mut stage = PlStdioFile::new("stdio", &mut buffered);
-        status(stage.write(b"abc").and_then(|()| stage.finish()))
+        pipeline_write(&mut stage, &phase, &mut operations, &payload).unwrap_err()
     };
-    let (sink, _) = buffered.into_parts();
+    assert!(matches!(error, PipelineError::Runtime(_)));
+    assert_eq!(
+        error.to_string(),
+        "stdio: Pl_StdioFile::write: failed to write buffered data"
+    );
+    let (sink, buffered_bytes) = buffered.into_parts();
+    verify_stdio_lifecycle(&sink, buffered_bytes, 0, &[4096], &[]);
     records.push(record(
         "stdio-zero-progress",
-        &case_status,
+        "runtime",
         &sink.bytes,
-        1,
-        1,
+        operations.write_count,
+        operations.finish_count,
     ));
 
-    let sink = StdioSink::with_steps([StdioWriteStep::Error(io::Error::from_raw_os_error(
-        EBADF_ERRNO,
-    ))]);
+    let phase = Rc::new(Cell::new(StdioPhase::None));
+    let sink = StdioSink::with_steps(
+        Rc::clone(&phase),
+        [StdioWriteStep::Error(io::Error::from_raw_os_error(
+            EBADF_ERRNO,
+        ))],
+    );
     let mut buffered = io::BufWriter::with_capacity(4096, sink);
+    let mut operations = OperationTrace::default();
     let case_status = {
         let mut stage = PlStdioFile::new("stdio", &mut buffered);
-        status(stage.write(b"abc").and_then(|()| stage.finish()))
+        let result = pipeline_write(&mut stage, &phase, &mut operations, b"abc");
+        status(result.and_then(|()| pipeline_finish(&mut stage, &phase, &mut operations)))
     };
-    let (sink, _) = buffered.into_parts();
+    let (sink, buffered_bytes) = buffered.into_parts();
+    verify_stdio_lifecycle(&sink, buffered_bytes, 3, &[], &[3]);
     records.push(record(
         "stdio-finish-ebadf",
         &case_status,
         &sink.bytes,
-        1,
-        1,
+        operations.write_count,
+        operations.finish_count,
     ));
 
-    let sink = StdioSink::with_steps([StdioWriteStep::Error(no_space_os_error())]);
+    let phase = Rc::new(Cell::new(StdioPhase::None));
+    let sink = StdioSink::with_steps(
+        Rc::clone(&phase),
+        [StdioWriteStep::Error(no_space_os_error())],
+    );
     let mut buffered = io::BufWriter::with_capacity(4096, sink);
+    let mut operations = OperationTrace::default();
     let case_status = {
         let mut stage = PlStdioFile::new("stdio", &mut buffered);
-        status(stage.write(b"abc").and_then(|()| stage.finish()))
+        let result = pipeline_write(&mut stage, &phase, &mut operations, b"abc");
+        status(result.and_then(|()| pipeline_finish(&mut stage, &phase, &mut operations)))
     };
-    let (sink, _) = buffered.into_parts();
+    let (sink, buffered_bytes) = buffered.into_parts();
+    verify_stdio_lifecycle(&sink, buffered_bytes, 3, &[], &[3]);
     records.push(record(
         "stdio-finish-enospc",
         &case_status,
         &sink.bytes,
-        1,
-        1,
+        operations.write_count,
+        operations.finish_count,
     ));
 
-    let mut buffered = io::BufWriter::with_capacity(4096, StdioSink::default());
+    let phase = Rc::new(Cell::new(StdioPhase::None));
+    let mut buffered = io::BufWriter::with_capacity(4096, StdioSink::new(Rc::clone(&phase)));
+    let mut operations = OperationTrace::default();
     let case_status = {
         let mut stage = PlStdioFile::new("stdio", &mut buffered);
-        status(
-            stage
-                .write(b"before")
-                .and_then(|()| stage.finish())
-                .and_then(|()| stage.write(b"after"))
-                .and_then(|()| stage.finish()),
-        )
+        let result = pipeline_write(&mut stage, &phase, &mut operations, b"before");
+        let result = result.and_then(|()| pipeline_finish(&mut stage, &phase, &mut operations));
+        let result =
+            result.and_then(|()| pipeline_write(&mut stage, &phase, &mut operations, b"after"));
+        status(result.and_then(|()| pipeline_finish(&mut stage, &phase, &mut operations)))
     };
-    let (sink, _) = buffered.into_parts();
+    let (sink, buffered_bytes) = buffered.into_parts();
+    verify_stdio_lifecycle(&sink, buffered_bytes, 0, &[], &[6, 5]);
     records.push(record(
         "stdio-repeated-finish",
         &case_status,
         &sink.bytes,
-        2,
-        2,
+        operations.write_count,
+        operations.finish_count,
     ));
 
     records.join("\n") + "\n"
