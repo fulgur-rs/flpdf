@@ -675,7 +675,7 @@ struct Scope<'a> {
 struct ResourceCallbacks {
     finder: ResourceFinder,
     inline_header: Option<Vec<Object>>,
-    valid_xobjects: BTreeSet<Vec<u8>>,
+    valid_xobjects: BTreeMap<Vec<u8>, usize>,
     complete: bool,
 }
 
@@ -746,8 +746,8 @@ impl ParserCallbacks for ResourceCallbacks {
             Object::Operator(operator) => {
                 if operator == b"Do" && self.complete {
                     if let Some(name) = self.finder.last_name() {
-                        if !self.valid_xobjects.contains(name) {
-                            self.valid_xobjects.insert(name.to_vec());
+                        if !self.valid_xobjects.contains_key(name) {
+                            self.valid_xobjects.insert(name.to_vec(), offset);
                         }
                     }
                 }
@@ -797,7 +797,7 @@ fn collect_from_stream<R: Read + Seek>(
     let mut callbacks = ResourceCallbacks {
         finder: ResourceFinder::default(),
         inline_header: None,
-        valid_xobjects: BTreeSet::new(),
+        valid_xobjects: BTreeMap::new(),
         complete: true,
     };
     let parse_result = parse_content_stream_data(stream_bytes, &mut callbacks);
@@ -809,9 +809,10 @@ fn collect_from_stream<R: Read + Seek>(
         record_direct_names(ctx.used, names, scope.record_direct);
     }
 
-    let mut traversed = BTreeSet::new();
-    for name in &callbacks.valid_xobjects {
-        if traversed.insert(name.as_slice()) && !recurse_form_xobject(ctx, name, scope, depth)? {
+    let mut valid_xobjects = callbacks.valid_xobjects.iter().collect::<Vec<_>>();
+    valid_xobjects.sort_unstable_by_key(|(_, offset)| *offset);
+    for (name, _) in valid_xobjects {
+        if !recurse_form_xobject(ctx, name, scope, depth)? {
             complete = false;
             break;
         }
@@ -1741,7 +1742,7 @@ mod tests {
 
         assert_eq!(callbacks.valid_xobjects.len(), 1);
         assert_eq!(
-            callbacks.valid_xobjects.iter().next().unwrap(),
+            callbacks.valid_xobjects.keys().next().unwrap(),
             b"VeryLongFormName"
         );
     }
