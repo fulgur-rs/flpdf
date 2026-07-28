@@ -2,7 +2,7 @@ use std::env;
 use std::process::ExitCode;
 
 // Shared helpers live in the library crate; the binary reaches them via
-// `use flpdf_test_compare::...`. Duplicating them with `mod output;` here would
+// `use flpdf_qtest_tools::...`. Duplicating them with `mod output;` here would
 // compile them twice into the binary and add dead-code the compiler can
 // rightly warn about.
 
@@ -53,7 +53,7 @@ fn run(args: &[String]) -> ExitCode {
         }
     };
 
-    let diff = match flpdf_test_compare::compare_files(&actual_bytes, &expected_bytes, password) {
+    let diff = match flpdf_qtest_tools::compare_files(&actual_bytes, &expected_bytes, password) {
         Ok(d) => d,
         Err(err) => {
             // qpdf's `main()` catches `std::exception` from `compare()` (e.g.
@@ -78,7 +78,7 @@ fn run(args: &[String]) -> ExitCode {
         }
     };
 
-    if let Err(err) = flpdf_test_compare::output::dump_file_to_stdout(to_output) {
+    if let Err(err) = flpdf_qtest_tools::output::dump_file_to_stdout(to_output) {
         eprintln!("{whoami}: {err}");
         return ExitCode::from(2);
     }

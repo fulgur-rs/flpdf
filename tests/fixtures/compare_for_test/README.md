@@ -1,7 +1,7 @@
 # flpdf-test-compare fixtures
 
-Small, deterministic PDFs used by the `flpdf-test-compare` crate's end-to-end
-test suite (`crates/flpdf-test-compare/tests/e2e.rs`). Each pair exercises a
+Small, deterministic PDFs used by the `flpdf-test-compare` binary's end-to-end
+test suite (`crates/flpdf-qtest-tools/tests/e2e.rs`). Each pair exercises a
 specific branch of the compare tool's semantics that the unit tests can't
 reach at the CLI level (stdout is byte-verbatim, exit codes, argv wiring).
 

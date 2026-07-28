@@ -194,7 +194,7 @@ write("flate_zlib.pdf", build_flate_fixture(compressed_high))
 # obj 2 as "2 0: object contents differ".
 #
 # This is a byte-copy of the MINIMAL_PDF / MINIMAL_PDF_COUNT1 constants in
-# crates/flpdf-test-compare/tests/orchestrator.rs, promoted to a fixture
+# crates/flpdf-qtest-tools/tests/orchestrator.rs, promoted to a fixture
 # file so the CLI test can prove the "diff -> cat actual" branch dumps the
 # actual file byte-verbatim.
 # --------------------------------------------------------------------------
