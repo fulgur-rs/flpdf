@@ -16,7 +16,7 @@ impl<'a> AsciiHexDecoder<'a> {
         Self {
             identifier: identifier.into(),
             next,
-            inbuf: [b'0', b'0'],
+            inbuf: *b"00",
             pos: 0,
             eod: false,
         }
@@ -38,7 +38,7 @@ impl<'a> AsciiHexDecoder<'a> {
         let output = [(digits[0] << 4) + digits[1]];
 
         self.pos = 0;
-        self.inbuf = [b'0', b'0'];
+        self.inbuf = *b"00";
         self.next.write(&output)
     }
 }
