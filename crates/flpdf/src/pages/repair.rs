@@ -1,31 +1,13 @@
-//! qpdf correspondence: QPDF_pages.cc and QPDF_optimization.cc page-tree repair responsibilities.
-//! Push inherited page attributes down to `/Page` leaves and strip them from
-//! interior `/Pages` nodes, mirroring qpdf's `pushInheritedAttributesToPage`
-//! (`QPDF_optimization.cc:127-156`) together with the page-tree repairs its
-//! `getAllPages` call performs first (`QPDF_pages.cc:39-138`). Linearization
-//! runs this unconditionally before computing the linearization plan — qpdf
-//! calls `optimize(..., allow_changes=true)` for linearized output
-//! (`QPDFWriter.cc:2553`, in `QPDFWriter::writeLinearized`). The normal
-//! (non-linearized) write path never performs this step and must keep emitting
-//! `/Pages` nodes verbatim.
+//! qpdf correspondence: QPDF_pages.cc page-tree preparation responsibilities.
+//! Repairs the page tree before optimization and returns qpdf's effective page
+//! order. The normal non-linearized writer does not call this path.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
 use crate::object::{Dictionary, Object, ObjectRef};
 use crate::ref_chain::terminal_ref_of_chain;
 use crate::{Error, Pdf, Result};
-
-/// The four page attributes a `/Pages` node may pass down to its descendants
-/// (ISO 32000-2 §7.7.3.4 Table 30, "Inheritable").
-// Alphabetical order, matching qpdf's own iteration order: `cur_pages.getKeys()`
-// (QPDF_Dictionary.cc) returns keys via a sorted `std::set<std::string>`, so
-// `QPDF_pages.cc`'s push loop visits inheritable keys as CropBox, MediaBox,
-// Resources, Rotate. When a single node needs to mint more than one of these
-// in the same visit (direct, non-indirect values), the mint order — and thus
-// which new object number each gets — must match qpdf's, so this array is
-// kept in that same order rather than declaration-convenient order.
-const INHERITABLE_KEYS: [&[u8]; 4] = [b"CropBox", b"MediaBox", b"Resources", b"Rotate"];
 
 /// Defensive cycle/depth bound. qpdf relies on an earlier `cache()` pass (which
 /// repairs duplicate page objects and detects loops) before its own recursive
@@ -34,22 +16,29 @@ const INHERITABLE_KEYS: [&[u8]; 4] = [b"CropBox", b"MediaBox", b"Resources", b"R
 /// in this crate ([`crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH`]).
 const MAX_DEPTH: usize = crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 
-/// Push inherited attributes to every `/Page` leaf and strip them from interior
-/// `/Pages` nodes, mutating `pdf` in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedPages {
+    pub(crate) root: ObjectRef,
+    pub(crate) pages: Vec<ObjectRef>,
+}
+
+/// Repair the `/Pages` tree and return its effective root and leaf order.
 ///
 /// # Errors
 ///
 /// Propagates any [`Error`] from resolving an object while walking the tree, and
 /// returns [`Error::Unsupported`] if the tree exceeds [`MAX_DEPTH`].
-pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
+pub(crate) fn prepare_for_optimization<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<Option<PreparedPages>> {
     let Some(root_ref) = pdf.root_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(mut pages_ref) = (match pdf.resolve_borrowed(root_ref)? {
         Object::Dictionary(d) => d.get_ref("Pages"),
         _ => None,
     }) else {
-        return Ok(());
+        return Ok(None);
     };
 
     // qpdf's `pushInheritedAttributesToPage` calls `getAllPages` first
@@ -104,173 +93,29 @@ pub(crate) fn push_inherited_attributes_to_pages<R: Read + Seek>(pdf: &mut Pdf<R
         pages_ref = corrected;
     }
 
-    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut clone_visited: BTreeSet<ObjectRef> = BTreeSet::new();
     // Compute the first free object number once and carry it through the
     // walk, incrementing per clone. Re-deriving it with `next_object_ref`
     // for every clone would rescan all object refs each time, making a
     // `/Kids` array with many duplicate leaves quadratic.
-    let mut next_clone = next_object_ref(pdf)?;
-    repair_page_tree(
-        pdf,
-        pages_ref,
-        &mut seen,
-        &mut clone_visited,
-        &mut next_clone,
-        0,
-        false,
-    )?;
+    let mut state = RepairState {
+        seen: BTreeSet::new(),
+        visited: BTreeSet::new(),
+        next_clone: next_object_ref(pdf)?,
+        pages: Vec::new(),
+    };
+    repair_page_tree(pdf, pages_ref, &mut state, 0, false)?;
 
-    let mut key_ancestors: BTreeMap<&'static [u8], Vec<Object>> = BTreeMap::new();
-    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-    push_internal(pdf, pages_ref, &mut key_ancestors, &mut visited, 0)?;
-    debug_assert!(
-        key_ancestors.values().all(Vec::is_empty),
-        "key_ancestors not empty after pushing inherited attributes to pages"
-    );
-    Ok(())
+    Ok(Some(PreparedPages {
+        root: pages_ref,
+        pages: state.pages,
+    }))
 }
 
-fn push_internal<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    node_ref: ObjectRef,
-    key_ancestors: &mut BTreeMap<&'static [u8], Vec<Object>>,
-    visited: &mut BTreeSet<ObjectRef>,
-    depth: usize,
-) -> Result<()> {
-    if depth >= MAX_DEPTH {
-        return Err(Error::Unsupported(format!(
-            "page tree depth exceeds maximum of {MAX_DEPTH} at {node_ref}"
-        )));
-    }
-    if !visited.insert(node_ref) {
-        // Cycle guard: a node already on the path back to /Root. qpdf relies on
-        // an earlier repair pass to make this unreachable; flpdf has none, so
-        // this function defends itself. A well-formed tree never hits this.
-        return Ok(());
-    }
-
-    let Object::Dictionary(mut dict) = pdf.resolve(node_ref)? else {
-        return Ok(()); // Non-dictionary node: leave untouched (matches PageWalk's silent skip).
-    };
-
-    // Only an interior /Pages node has attributes to push down; a /Page leaf
-    // reached here directly (e.g. a malformed /Root/Pages pointing straight at
-    // a /Page, which flpdf's PageWalk tolerates leniently) has no /Kids to
-    // push its own attributes to, so stripping them would drop real content.
-    // qpdf never reaches an equivalent state: `Pages::cache()` (called before
-    // its own push) throws on a /Kids-less root, or force-retypes a /Kids-
-    // bearing one to /Pages first (QPDF_pages.cc) — flpdf has no matching
-    // repair step, so guard here instead.
-    let is_pages_node =
-        matches!(dict.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Pages");
-    if !is_pages_node {
-        return Ok(());
-    }
-
-    let mut own_keys: Vec<&'static [u8]> = Vec::new();
-    for &key in &INHERITABLE_KEYS {
-        let Some(value) = dict.remove(key) else {
-            continue;
-        };
-        // qpdf's collection loop iterates `cur_pages.getKeys()`
-        // (QPDF_Dictionary.cc), which filters out any key whose value
-        // resolves — following the FULL indirect-reference chain, not just
-        // one hop — to null. Such a key is invisible to qpdf's loop, so it is
-        // neither erased from this node nor pushed to descendants. Put a null
-        // value back and skip it here to match: otherwise a null-valued key
-        // on an interior /Pages node would shadow a real ancestor value
-        // further up the stack instead of being transparent to it.
-        let is_null = match &value {
-            Object::Null => true,
-            Object::Reference(r) => {
-                let terminal = terminal_ref_of_chain(pdf, *r)?;
-                matches!(pdf.resolve_borrowed(terminal)?, Object::Null)
-            }
-            _ => false,
-        };
-        if is_null {
-            dict.insert(key, value);
-            continue;
-        }
-        let value = match value {
-            Object::Reference(_) => value, // already indirect: descendants share this ref
-            Object::Array(_) | Object::Dictionary(_) => {
-                // Direct (non-indirect) non-scalar value: mint a new indirect
-                // object so descendants share ONE object instead of each
-                // duplicating the structure inline (mirrors qpdf's
-                // makeIndirectObject call in QPDF_optimization.cc:186-196).
-                let new_ref = next_object_ref(pdf)?;
-                pdf.set_object(new_ref, value);
-                Object::Reference(new_ref)
-            }
-            // Integer/Real/Boolean/Name/String/Null: copy by value, no minting.
-            scalar => scalar,
-        };
-        key_ancestors.entry(key).or_default().push(value);
-        own_keys.push(key);
-    }
-
-    let kids = dict
-        .get("Kids")
-        .and_then(Object::as_array)
-        .map(<[Object]>::to_vec);
-    pdf.set_object(node_ref, Object::Dictionary(dict));
-
-    if let Some(kids) = kids {
-        for kid in &kids {
-            let Object::Reference(kid_ref) = kid else {
-                continue;
-            };
-            let is_pages_node = matches!(
-                pdf.resolve_borrowed(*kid_ref)?,
-                Object::Dictionary(d)
-                    if matches!(d.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Pages")
-            );
-            if is_pages_node {
-                push_internal(pdf, *kid_ref, key_ancestors, visited, depth + 1)?;
-            } else {
-                let Object::Dictionary(mut leaf) = pdf.resolve(*kid_ref)? else {
-                    continue;
-                };
-                for (&key, values) in key_ancestors.iter() {
-                    // A direct or indirect `null` counts as absent, matching
-                    // qpdf's `contains()` (`!(*this)[key].null()` — resolves
-                    // the FULL reference chain, not just one hop). Otherwise
-                    // an explicit `/Resources null` leaf would keep the null
-                    // instead of inheriting the ancestor's real value.
-                    let leaf_value_is_present = match leaf.get(key) {
-                        None | Some(Object::Null) => false,
-                        Some(Object::Reference(r)) => {
-                            let terminal = terminal_ref_of_chain(pdf, *r)?;
-                            !matches!(pdf.resolve_borrowed(terminal)?, Object::Null)
-                        }
-                        Some(_) => true,
-                    };
-                    if !leaf_value_is_present {
-                        if let Some(v) = values.last() {
-                            leaf.insert(key, v.clone());
-                        }
-                    }
-                }
-                pdf.set_object(*kid_ref, Object::Dictionary(leaf));
-            }
-        }
-    }
-
-    for key in own_keys {
-        if let Some(stack) = key_ancestors.get_mut(key) {
-            stack.pop();
-            if stack.is_empty() {
-                key_ancestors.remove(key);
-            }
-        } // cov:ignore: unreachable — `own_keys` holds exactly the keys this
-          // frame pushed onto `key_ancestors` above; every nested `push_internal`
-          // call pops what it pushes before returning (balanced push/pop) and
-          // any early `?` return skips this cleanup loop entirely, so the
-          // stack for a key in `own_keys` is always still present here.
-    }
-    Ok(())
+struct RepairState {
+    seen: BTreeSet<ObjectRef>,
+    visited: BTreeSet<ObjectRef>,
+    next_clone: ObjectRef,
+    pages: Vec<ObjectRef>,
 }
 
 /// Partial mirror of qpdf 11.9.0 `getAllPagesInternal` (QPDF_pages.cc:77-138):
@@ -322,9 +167,7 @@ fn push_internal<R: Read + Seek>(
 fn repair_page_tree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     node_ref: ObjectRef,
-    seen: &mut BTreeSet<ObjectRef>,
-    visited: &mut BTreeSet<ObjectRef>,
-    next_clone: &mut ObjectRef,
+    state: &mut RepairState,
     depth: usize,
     media_box: bool,
 ) -> Result<()> {
@@ -333,7 +176,7 @@ fn repair_page_tree<R: Read + Seek>(
             "page tree depth exceeds maximum of {MAX_DEPTH} at {node_ref}"
         )));
     }
-    if !visited.insert(node_ref) {
+    if !state.visited.insert(node_ref) {
         // Cycle guard: qpdf throws here; flpdf tolerates (matching PageWalk) and
         // stops descending. A well-formed tree never hits this.
         return Ok(());
@@ -393,12 +236,12 @@ fn repair_page_tree<R: Read + Seek>(
             // existing leaf branch below apply the default to the now-indirect
             // object yields the SAME object content and — since defaulting never
             // mints — the SAME object numbers, so this reordering is byte-faithful.
-            let new_ref = *next_clone;
+            let new_ref = state.next_clone;
             let next_num = new_ref
                 .number
                 .checked_add(1)
                 .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
-            *next_clone = ObjectRef::new(next_num, 0);
+            state.next_clone = ObjectRef::new(next_num, 0);
             // Move the inline dict out of the /Kids entry WITHOUT cloning; the
             // moved dict carries no /Parent and makeIndirectObject adds none.
             let owned = std::mem::replace(kid, Object::Reference(new_ref));
@@ -418,15 +261,7 @@ fn repair_page_tree<R: Read + Seek>(
         };
         if has_kids {
             // Interior /Pages node: descend, threading the /MediaBox flag.
-            repair_page_tree(
-                pdf,
-                kid_ref,
-                seen,
-                visited,
-                next_clone,
-                depth + 1,
-                media_box,
-            )?;
+            repair_page_tree(pdf, kid_ref, state, depth + 1, media_box)?;
             continue;
         }
         // Leaf branch.
@@ -454,18 +289,18 @@ fn repair_page_tree<R: Read + Seek>(
         // (:131-134), so both flow through the (2l) override below. The clone is
         // taken from the (possibly defaulted) original via `resolve`, so it
         // inherits any /MediaBox default applied just above.
-        let leaf_ref = if seen.insert(kid_ref) {
+        let leaf_ref = if state.seen.insert(kid_ref) {
             kid_ref // First occurrence of this leaf.
         } else {
             let clone = pdf.resolve(kid_ref)?; // Owned copy of the leaf dict.
-            let new_ref = *next_clone;
+            let new_ref = state.next_clone;
             let next_num = new_ref
                 .number
                 .checked_add(1)
                 .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
-            *next_clone = ObjectRef::new(next_num, 0);
+            state.next_clone = ObjectRef::new(next_num, 0);
             pdf.set_object(new_ref, clone);
-            seen.insert(new_ref);
+            state.seen.insert(new_ref);
             *kid = Object::Reference(new_ref);
             changed = true;
             new_ref
@@ -483,6 +318,7 @@ fn repair_page_tree<R: Read + Seek>(
                 pdf.set_object(leaf_ref, Object::Dictionary(leaf));
             }
         }
+        state.pages.push(leaf_ref);
     }
     if changed {
         dict.insert("Kids", Object::Array(kids));
@@ -580,6 +416,13 @@ mod tests {
     use crate::Pdf;
     use std::io::Cursor;
 
+    fn push_for_test<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
+        let Some(prepared) = prepare_for_optimization(pdf)? else {
+            return Ok(());
+        };
+        crate::optimization::inherited_attrs::push(pdf, &prepared, true, false)
+    }
+
     /// One `/Pages` node, one `/Page` leaf, no inheritable keys anywhere.
     /// Object layout: 1 Catalog, 2 Pages, 3 Page.
     fn pdf_with_no_inheritable_keys() -> Vec<u8> {
@@ -615,7 +458,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         let before_count = pdf.object_refs().len();
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         assert_eq!(
             pdf.object_refs().len(),
@@ -669,7 +512,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         let before_count = pdf.object_refs().len();
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         assert_eq!(
             pdf.object_refs().len(),
@@ -741,7 +584,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         let before_count = pdf.object_refs().len();
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         assert_eq!(
             pdf.object_refs().len(),
@@ -818,7 +661,7 @@ mod tests {
         let bytes = pdf_with_two_direct_non_scalar_keys_on_one_node();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -892,7 +735,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         let before_count = pdf.object_refs().len();
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         assert_eq!(
             pdf.object_refs().len(),
@@ -966,7 +809,7 @@ mod tests {
         let bytes = pdf_with_leaf_local_resources_override();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let page = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
         let Object::Dictionary(page_dict) = page else {
@@ -1040,7 +883,7 @@ mod tests {
         let bytes = pdf_with_three_level_nearest_ancestor_wins();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(6, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -1107,7 +950,7 @@ mod tests {
 
         // Must return (Ok or Err), not hang. The test harness's own timeout
         // is the real backstop; this assertion documents the expected outcome.
-        let result = push_inherited_attributes_to_pages(&mut pdf);
+        let result = push_for_test(&mut pdf);
         assert!(
             result.is_ok(),
             "a self-referential /Kids entry must be skipped, not error"
@@ -1143,14 +986,14 @@ mod tests {
         let bytes = pdf_with_non_dictionary_pages_root();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        let result = push_inherited_attributes_to_pages(&mut pdf);
+        let result = push_for_test(&mut pdf);
         assert!(
             result.is_ok(),
             "a non-dictionary /Pages root must be a no-op, not an error: {result:?}"
         );
     }
 
-    /// Trailer has no `/Root` entry at all. `push_inherited_attributes_to_pages`
+    /// Trailer has no `/Root` entry at all. `push_for_test`
     /// must bail out via its very first guard (`pdf.root_ref()` returns `None`).
     fn pdf_without_root() -> Vec<u8> {
         let mut pdf = Vec::new();
@@ -1177,7 +1020,7 @@ mod tests {
             "fixture must have no /Root for this test to be meaningful"
         );
 
-        let result = push_inherited_attributes_to_pages(&mut pdf);
+        let result = push_for_test(&mut pdf);
         assert!(
             result.is_ok(),
             "a document with no /Root must be a no-op, not an error: {result:?}"
@@ -1185,7 +1028,7 @@ mod tests {
     }
 
     /// `/Root` (1) itself resolves to a non-dictionary object (a bare integer),
-    /// rather than a Catalog. `push_inherited_attributes_to_pages` must bail out
+    /// rather than a Catalog. `push_for_test` must bail out
     /// via its "root did not resolve to a dictionary" match arm.
     fn pdf_with_non_dictionary_root() -> Vec<u8> {
         let mut pdf = Vec::new();
@@ -1210,7 +1053,7 @@ mod tests {
         let mut pdf =
             Pdf::open(Cursor::new(bytes)).expect("valid PDF even with a non-dictionary /Root");
 
-        let result = push_inherited_attributes_to_pages(&mut pdf);
+        let result = push_for_test(&mut pdf);
         assert!(
             result.is_ok(),
             "a non-dictionary /Root must be a no-op, not an error: {result:?}"
@@ -1218,7 +1061,7 @@ mod tests {
     }
 
     /// `/Root` (1) is a dictionary (a Catalog) but has no `/Pages` key at all.
-    /// `push_inherited_attributes_to_pages` must bail out via the "no /Pages
+    /// `push_for_test` must bail out via the "no /Pages
     /// entry" branch, distinct from the non-dictionary-root case above.
     fn pdf_with_root_missing_pages_key() -> Vec<u8> {
         let mut pdf = Vec::new();
@@ -1243,7 +1086,7 @@ mod tests {
         let mut pdf =
             Pdf::open(Cursor::new(bytes)).expect("valid PDF even with /Root lacking /Pages");
 
-        let result = push_inherited_attributes_to_pages(&mut pdf);
+        let result = push_for_test(&mut pdf);
         assert!(
             result.is_ok(),
             "a /Root dictionary with no /Pages key must be a no-op, not an error: {result:?}"
@@ -1280,7 +1123,7 @@ mod tests {
         let bytes = pdf_with_pages_node_missing_kids();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        let result = push_inherited_attributes_to_pages(&mut pdf);
+        let result = push_for_test(&mut pdf);
         assert!(
             result.is_ok(),
             "a /Pages node without /Kids must be a no-op, not an error: {result:?}"
@@ -1336,7 +1179,7 @@ mod tests {
         let bytes = pdf_with_malformed_kids_entries();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(4, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -1407,7 +1250,7 @@ mod tests {
         let bytes = pdf_with_excessive_pages_depth();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        let result = push_inherited_attributes_to_pages(&mut pdf);
+        let result = push_for_test(&mut pdf);
         assert!(
             matches!(result, Err(Error::Unsupported(_))),
             "a /Pages tree deeper than MAX_DEPTH must error, not stack-overflow: {result:?}"
@@ -1455,7 +1298,7 @@ mod tests {
         let bytes = pdf_with_leaf_direct_scalar_override();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -1518,7 +1361,7 @@ mod tests {
         let bytes = pdf_with_leaf_direct_null_resources();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -1585,7 +1428,7 @@ mod tests {
         let bytes = pdf_with_leaf_indirect_null_resources();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -1660,7 +1503,7 @@ mod tests {
             Object::Reference(ObjectRef::new(7, 0)),
         );
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -1708,7 +1551,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         let before_count = pdf.object_refs().len();
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed, not error");
+        push_for_test(&mut pdf).expect("push must succeed, not error");
 
         assert_eq!(
             pdf.object_refs().len(),
@@ -1791,7 +1634,7 @@ mod tests {
         let bytes = pdf_with_ancestor_direct_null_resources();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let child = pdf.resolve(ObjectRef::new(3, 0)).expect("child resolves");
         let Object::Dictionary(child_dict) = child else {
@@ -1875,7 +1718,7 @@ mod tests {
         let bytes = pdf_with_ancestor_indirect_null_resources();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let child = pdf.resolve(ObjectRef::new(3, 0)).expect("child resolves");
         let Object::Dictionary(child_dict) = child else {
@@ -1966,7 +1809,7 @@ mod tests {
             Object::Reference(ObjectRef::new(8, 0)),
         );
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let child = pdf.resolve(ObjectRef::new(3, 0)).expect("child resolves");
         let Object::Dictionary(child_dict) = child else {
@@ -2047,7 +1890,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         let before_count = pdf.object_refs().len();
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         // Exactly one clone minted (object 7 = next after the highest, 6).
         assert_eq!(
@@ -2162,7 +2005,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         let before_count = pdf.object_refs().len();
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         assert_eq!(
             pdf.object_refs().len(),
@@ -2215,7 +2058,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         let before_count = pdf.object_refs().len();
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         assert_eq!(
             pdf.object_refs().len(),
@@ -2274,7 +2117,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         let before_count = pdf.object_refs().len();
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         assert_eq!(
             pdf.object_refs().len(),
@@ -2288,9 +2131,9 @@ mod tests {
         let bytes = pdf_with_leaf_shared_by_two_parents();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("first push");
+        push_for_test(&mut pdf).expect("first push");
         let after_first = pdf.object_refs().len();
-        push_inherited_attributes_to_pages(&mut pdf).expect("second push");
+        push_for_test(&mut pdf).expect("second push");
 
         assert_eq!(
             pdf.object_refs().len(),
@@ -2340,7 +2183,7 @@ mod tests {
         );
         let before_count = pdf.object_refs().len();
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         // qpdf 11.9.0's getAllPagesInternal has no reconstruction gate, so the
         // duplicate leaf is cloned even for a reconstructed input (mirroring the
@@ -2406,7 +2249,7 @@ mod tests {
             "fixture must actually reconstruct its xref for this test to be meaningful"
         );
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         // qpdf 11.9.0's getAllPagesInternal overrides a mistyped interior /Type
         // unconditionally (QPDF_pages.cc:89-92, no reconstruction gate), so the
@@ -2443,7 +2286,7 @@ mod tests {
         );
         let before_count = pdf.object_refs().len();
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         assert_eq!(
             pdf.object_refs().len(),
@@ -2518,7 +2361,7 @@ mod tests {
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let interior = pdf
             .resolve(ObjectRef::new(3, 0))
@@ -2579,11 +2422,28 @@ mod tests {
     }
 
     #[test]
+    fn page_preparation_repairs_the_tree_before_optimization_policy() {
+        let mut pdf =
+            Pdf::open_mem_owned(pdf_with_leaf_type_not_page()).expect("fixture must open");
+
+        let prepared = prepare_for_optimization(&mut pdf)
+            .expect("preparation must succeed")
+            .expect("fixture has a page tree");
+
+        assert_eq!(prepared.pages, vec![ObjectRef::new(3, 0)]);
+        assert!(matches!(
+            pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves"),
+            Object::Dictionary(ref dict)
+                if matches!(dict.get("Type"), Some(Object::Name(name)) if name == b"Page")
+        ));
+    }
+
+    #[test]
     fn leaf_type_not_page_is_overridden() {
         let bytes = pdf_with_leaf_type_not_page();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -2604,7 +2464,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         let before_count = pdf.object_refs().len();
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         assert_eq!(
             pdf.object_refs().len(),
@@ -2669,7 +2529,7 @@ mod tests {
         let bytes = pdf_with_missing_types();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let interior = pdf
             .resolve(ObjectRef::new(3, 0))
@@ -2733,7 +2593,7 @@ mod tests {
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -2797,7 +2657,7 @@ mod tests {
         let bytes = pdf_with_ancestor_mediabox_no_leaf_mediabox();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(4, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -2858,7 +2718,7 @@ mod tests {
         let bytes = pdf_with_invalid_mediabox_leaf();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -2913,7 +2773,7 @@ mod tests {
         let bytes = pdf_with_valid_mediabox_leaf();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -2973,7 +2833,7 @@ mod tests {
         let bytes = pdf_with_indirect_reference_mediabox_leaf();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -3030,7 +2890,7 @@ mod tests {
         let bytes = pdf_with_indirect_element_mediabox_leaf();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -3090,7 +2950,7 @@ mod tests {
         let bytes = pdf_with_reference_non_rectangle_mediabox_leaf();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -3171,7 +3031,7 @@ mod tests {
         let bytes = pdf_with_shared_leaf_mediabox_default();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         // The duplicate leaf is cloned during the repair pass (which runs before the
         // push), so the clone takes the first free object number, 7. Parent B's
@@ -3264,7 +3124,7 @@ mod tests {
         let bytes = pdf_with_non_numeric_mediabox_leaf();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -3319,7 +3179,7 @@ mod tests {
         let bytes = pdf_with_real_mediabox_leaf();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
@@ -3385,7 +3245,7 @@ mod tests {
     fn indirect_real_literal_mediabox_elem_is_recognized_and_not_defaulted() {
         let bytes = pdf_with_indirect_real_literal_mediabox_elem();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
         let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
@@ -3455,7 +3315,7 @@ mod tests {
         );
         let before_count = pdf.object_refs().len();
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         assert_eq!(
             pdf.object_refs().len(),
@@ -3561,7 +3421,7 @@ mod tests {
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         // The minted leaf takes the next free object number (4).
         let leaf = pdf
@@ -3640,7 +3500,7 @@ mod tests {
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 
-        let result = push_inherited_attributes_to_pages(&mut pdf);
+        let result = push_for_test(&mut pdf);
         assert!(
             result.is_ok(),
             "a direct interior node must be skipped, not panic or error: {result:?}"
@@ -3697,7 +3557,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         let before_count = pdf.object_refs().len();
 
-        let result = push_inherited_attributes_to_pages(&mut pdf);
+        let result = push_for_test(&mut pdf);
         assert!(
             result.is_ok(),
             "a direct non-dictionary /Kids entry must be skipped, not panic or error: {result:?}"
@@ -3773,7 +3633,7 @@ mod tests {
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let catalog = pdf.resolve(ObjectRef::new(1, 0)).expect("catalog resolves");
         let Object::Dictionary(catalog_dict) = catalog else {
@@ -3841,7 +3701,7 @@ mod tests {
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         // The walk must climb BOTH hops (4 -> 3 -> 2) to the true root, not stop at
         // the first parent (3). A "stop after one hop" bug would leave /Pages at 3.
@@ -3865,7 +3725,7 @@ mod tests {
         let bytes = pdf_with_no_inheritable_keys();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         let catalog = pdf.resolve(ObjectRef::new(1, 0)).expect("catalog resolves");
         let Object::Dictionary(catalog_dict) = catalog else {
@@ -3931,7 +3791,7 @@ mod tests {
         // correction's walk up the chain must terminate on the loop guard, not
         // hang. The harness timeout is the real backstop; this assertion documents
         // the expected outcome (pins the loop guard).
-        let result = push_inherited_attributes_to_pages(&mut pdf);
+        let result = push_for_test(&mut pdf);
         assert!(
             result.is_ok(),
             "a /Parent cycle above the page tree root must terminate, not error: {result:?}"
@@ -3998,7 +3858,7 @@ mod tests {
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 
-        push_inherited_attributes_to_pages(&mut pdf).expect("push must succeed");
+        push_for_test(&mut pdf).expect("push must succeed");
 
         // A non-reference /Parent is a stop condition for the /Parent walk: the
         // catalog's /Pages must be left pointing at the same object (2 0 R), not

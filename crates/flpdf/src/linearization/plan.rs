@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDF_linearization.cc and QPDF_optimization.cc object classification and layout planning.
+//! qpdf correspondence: QPDF_linearization.cc object classification and layout planning.
 //! `LinearizationPlan` — pure data model for PDF linearization layout.
 //!
 //! A `LinearizationPlan` partitions all objects in a document into the four
@@ -752,15 +752,21 @@ impl LinearizationPlan {
             object_stream_mode,
             crate::writer::ObjectStreamMode::Generate
         );
-        // Push inherited page attributes (/MediaBox /CropBox /Resources
-        // /Rotate) down to /Page leaves and strip them from interior /Pages
-        // nodes, mirroring qpdf's pushInheritedAttributesToPage — this always
-        // runs for linearized output (QPDF_linearization.cc:127-130, called
-        // only from QPDFWriter::writeLinearized). Must run before every step
-        // below: closure computation and object-ref collection both need to
-        // see the already-pushed tree, and any newly minted object must
-        // already exist by the time `pdf.object_refs()` is captured.
-        crate::linearization::inherited_attrs::push_inherited_attributes_to_pages(pdf)?;
+        // qpdf optimization performs direct-outline normalization, page-tree
+        // preparation, inherited-attribute push, and object-user traversal in
+        // this order. It must run before object-ref capture because those
+        // preparations may mint indirect objects.
+        let optimization =
+            crate::optimization::Optimization::optimize(pdf, &BTreeMap::new(), true, |_| 1)?;
+        if pdf.root_ref().is_some()
+            && optimization
+                .objects_for(&crate::optimization::ObjectUser::Page(0))
+                .is_empty()
+        {
+            return Err(crate::Error::Unsupported(
+                "no pages found while calculating linearization data".to_string(),
+            ));
+        }
 
         // ----------------------------------------------------------------
         // Step 1: collect all known object refs (Part 4 initial state).
@@ -870,8 +876,6 @@ impl LinearizationPlan {
         // produce an empty page_hints (which would corrupt downstream hint tables).
         // ----------------------------------------------------------------
         let page_refs: Vec<ObjectRef> = crate::pages::page_refs(pdf)?;
-        let optimization =
-            crate::optimization::Optimization::build_after_inherited(pdf, &page_refs, |_| 1)?;
 
         // The live object set is invariant across every page's closure; compute it
         // once so the per-page `compute_closure` calls below do not each re-scan
@@ -2064,7 +2068,6 @@ impl LinearizationPlan {
         let containers = objstm_membership_linearized(pdf, &assigned)?;
         let routes = route_objstm_containers(
             optimization,
-            &self.all_referenced_pages,
             !self.outline_first_page_members.is_empty(),
             &containers,
         );
@@ -2184,7 +2187,6 @@ impl LinearizationPlan {
 
         let routes = route_objstm_containers(
             optimization,
-            &self.all_referenced_pages,
             !self.outline_first_page_members.is_empty(),
             &containers,
         );
@@ -2495,76 +2497,57 @@ fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::
 ///
 pub(crate) fn route_objstm_containers(
     optimization: &crate::optimization::Optimization,
-    referenced_pages: &BTreeMap<ObjectRef, BTreeSet<u32>>,
     outlines_in_first_page: bool,
     containers: &[Vec<ObjectRef>],
 ) -> Vec<ContainerPart> {
-    // in_outlines takes precedence over in_open_document and in_first_page
-    // (QPDF_linearization.cc:1118-1122).
     containers
         .iter()
         .map(|members| {
-            // in_outlines is checked first (QPDF_linearization.cc:1118-1122).
-            if members_have_user(optimization, members, is_outline_user) {
-                return if outlines_in_first_page {
-                    ContainerPart::FirstPageOutlines
-                } else {
-                    ContainerPart::Rest
-                };
-            }
-            // in_open_document takes precedence over every page category.
-            if members_have_user(optimization, members, is_open_document_user) {
-                return ContainerPart::OpenDocument;
-            }
-            if members_have_user(optimization, members, is_first_page_user) {
-                let has_other_page = members.iter().any(|member| {
-                    referenced_pages
-                        .get(member)
-                        .is_some_and(|pages| pages.iter().any(|&page| page != 0))
-                });
-                let has_document_other =
-                    members_have_user(optimization, members, is_document_other_user);
-                let has_thumbnail = members_have_user(optimization, members, is_thumbnail_user);
-                return if has_other_page || has_document_other || has_thumbnail {
-                    ContainerPart::FirstPageShared
-                } else {
-                    ContainerPart::FirstPagePrivate
-                };
-            }
-            let mut other_pages: BTreeSet<u32> = BTreeSet::new();
-            for m in members {
-                if let Some(pages) = referenced_pages.get(m) {
-                    other_pages.extend(pages.iter().copied().filter(|&p| p != 0));
-                }
-            }
-            match other_pages.len() {
-                0 => ContainerPart::Rest,
-                // other_pages==1 is lc_other_page_private (part7) ONLY when the
-                // union has others==0 (QPDF_linearization.cc:1128). A member in
-                // A document-other user makes others>0, so the container is
-                // lc_other (part9) instead (flpdf-zda0 gate, generate path).
-                1 if members_have_user(optimization, members, is_document_other_user)
-                    || members_have_user(optimization, members, is_thumbnail_user) =>
-                {
-                    ContainerPart::Rest
-                }
-                1 => ContainerPart::OtherPagePrivate,
-                // other_pages>1 is lc_other_page_shared (part8) regardless of
-                // others (QPDF_linearization.cc:1130), so no gate here.
-                _ => ContainerPart::OtherPageShared,
-            }
+            let users = optimization.users_for_members(members.iter());
+            classify_container_users(&users, outlines_in_first_page)
         })
         .collect()
 }
 
-fn members_have_user(
-    optimization: &crate::optimization::Optimization,
-    members: &[ObjectRef],
-    predicate: fn(&crate::optimization::ObjectUser) -> bool,
-) -> bool {
-    members
+fn classify_container_users(
+    users: &BTreeSet<crate::optimization::ObjectUser>,
+    outlines_in_first_page: bool,
+) -> ContainerPart {
+    if users.iter().any(is_outline_user) {
+        return if outlines_in_first_page {
+            ContainerPart::FirstPageOutlines
+        } else {
+            ContainerPart::Rest
+        };
+    }
+    if users.iter().any(is_open_document_user) {
+        return ContainerPart::OpenDocument;
+    }
+
+    let page_numbers: BTreeSet<u32> = users
         .iter()
-        .any(|member| optimization.users_for(*member).iter().any(predicate))
+        .filter_map(|user| match user {
+            crate::optimization::ObjectUser::Page(page_number) => Some(*page_number),
+            _ => None,
+        })
+        .collect();
+    let has_document_other = users.iter().any(is_document_other_user);
+    let has_thumbnail = users.iter().any(is_thumbnail_user);
+    if page_numbers.contains(&0) {
+        return if page_numbers.iter().any(|&page| page != 0) || has_document_other || has_thumbnail
+        {
+            ContainerPart::FirstPageShared
+        } else {
+            ContainerPart::FirstPagePrivate
+        };
+    }
+
+    match page_numbers.len() {
+        0 => ContainerPart::Rest,
+        1 if has_document_other || has_thumbnail => ContainerPart::Rest,
+        1 => ContainerPart::OtherPagePrivate,
+        _ => ContainerPart::OtherPageShared,
+    }
 }
 
 fn is_outline_user(user: &crate::optimization::ObjectUser) -> bool {
@@ -2572,10 +2555,6 @@ fn is_outline_user(user: &crate::optimization::ObjectUser) -> bool {
         user,
         crate::optimization::ObjectUser::RootKey(key) if key == b"Outlines"
     )
-}
-
-fn is_first_page_user(user: &crate::optimization::ObjectUser) -> bool {
-    matches!(user, crate::optimization::ObjectUser::Page(0))
 }
 
 fn is_thumbnail_user(user: &crate::optimization::ObjectUser) -> bool {
@@ -2600,7 +2579,6 @@ mod tests {
             plan.optimization
                 .as_ref()
                 .expect("test plan must have an optimization snapshot"),
-            &plan.all_referenced_pages,
             !plan.outline_first_page_members.is_empty(),
             containers,
         )
@@ -2720,6 +2698,45 @@ mod tests {
     fn open_tiny_pdf() -> Pdf<Cursor<Vec<u8>>> {
         let bytes = tiny_pdf_bytes();
         Pdf::open(Cursor::new(bytes)).expect("tiny PDF should parse")
+    }
+
+    /// Malformed catalog whose `/Pages` entry points directly at a page
+    /// dictionary. qpdf 11.9.0 does not admit this as page zero during
+    /// `getAllPages()` and reports "no pages found while calculating
+    /// linearization data".
+    fn direct_page_root_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Page /MediaBox [0 0 612 792] >>\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn direct_page_root_reports_qpdf_no_pages_error() {
+        let mut pdf = Pdf::open(Cursor::new(direct_page_root_pdf_bytes())).expect("fixture parses");
+
+        let err = LinearizationPlan::from_pdf(&mut pdf, false).unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref message)
+                if message == "no pages found while calculating linearization data"),
+            "direct /Type /Page root must fail like qpdf instead of reaching hint construction; \
+             got {err:?}"
+        );
     }
 
     /// Build a two-page PDF with a shared font.
@@ -6113,6 +6130,20 @@ mod tests {
                 ContainerPart::FirstPagePrivate,
                 ContainerPart::FirstPageShared,
             ]
+        );
+    }
+
+    #[test]
+    fn generated_objstm_classification_consumes_one_member_user_union() {
+        let users = BTreeSet::from([
+            crate::optimization::ObjectUser::Page(0),
+            crate::optimization::ObjectUser::Page(1),
+            crate::optimization::ObjectUser::Thumbnail(0),
+        ]);
+
+        assert_eq!(
+            classify_container_users(&users, false),
+            ContainerPart::FirstPageShared
         );
     }
 

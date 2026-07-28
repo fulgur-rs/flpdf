@@ -10,7 +10,6 @@ pub mod check;
 pub mod hint_page;
 pub mod hint_shared;
 pub mod hint_stream;
-pub(crate) mod inherited_attrs;
 pub mod part1;
 pub mod plan;
 pub mod renumber;

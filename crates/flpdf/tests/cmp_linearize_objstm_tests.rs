@@ -308,7 +308,7 @@ fn non_dictionary_leaf_parent_is_ignored_by_user_traversal() {
 }
 
 #[test]
-fn deeply_nested_direct_page_value_is_rejected_before_user_traversal() {
+fn deeply_nested_direct_page_value_is_rejected_by_optimization_traversal() {
     let nested = format!("{}{}", "[".repeat(257), "]".repeat(257));
     let bytes = pdf_from_object_bodies(&[
         "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
@@ -319,7 +319,7 @@ fn deeply_nested_direct_page_value_is_rejected_before_user_traversal() {
     let err = LinearizationPlan::from_pdf(&mut pdf, false).unwrap_err();
     assert!(
         err.to_string()
-            .contains("plain rewrite: inline object nesting exceeds MAX_INLINE_DEPTH"),
+            .contains("optimization: inline object nesting exceeds maximum of 256"),
         "unexpected error: {err}"
     );
 }

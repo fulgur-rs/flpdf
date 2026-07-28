@@ -40,10 +40,9 @@
 | `crates/flpdf/src/linearization/hint_page.rs` | correspondence | QPDF_linearization.cc page-offset hint planning split into a data module |
 | `crates/flpdf/src/linearization/hint_shared.rs` | correspondence | QPDF_linearization.cc shared-object hint planning split into a data module |
 | `crates/flpdf/src/linearization/hint_stream.rs` | correspondence | QPDF_linearization.cc plus BitStream.cc and BitWriter.cc hint encoding responsibilities |
-| `crates/flpdf/src/linearization/inherited_attrs.rs` | correspondence | QPDF_pages.cc and QPDF_optimization.cc page-tree repair responsibilities |
 | `crates/flpdf/src/linearization/mod.rs` | correspondence | QPDF_linearization.cc responsibilities split across the linearization module tree |
 | `crates/flpdf/src/linearization/part1.rs` | correspondence | QPDFWriter.cc first-part linearized output split from the writer |
-| `crates/flpdf/src/linearization/plan.rs` | correspondence | QPDF_linearization.cc and QPDF_optimization.cc object classification and layout planning |
+| `crates/flpdf/src/linearization/plan.rs` | correspondence | QPDF_linearization.cc object classification and layout planning |
 | `crates/flpdf/src/linearization/renumber.rs` | correspondence | QPDFWriter.cc linearized object renumbering layered over the shared rewrite renumberer |
 | `crates/flpdf/src/linearization/show.rs` | correspondence | QPDF_linearization.cc hint decoding plus QPDFJob.cc display formatting |
 | `crates/flpdf/src/linearization/writer.rs` | correspondence | QPDFWriter.cc linearized write path split from the standard writer |
@@ -55,7 +54,8 @@
 | `crates/flpdf/src/object.rs` | correspondence | QPDFObjectHandle.cc and the QPDFObject/QPDFValue type family combined in one Rust object model |
 | `crates/flpdf/src/object_copy.rs` | correspondence | QPDF.cc copyForeignObject responsibility split into copy and closure modules |
 | `crates/flpdf/src/objr_obj_annot_p.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for OBJR annotations |
-| `crates/flpdf/src/optimization.rs` | correspondence | QPDF_optimization.cc object-user map portion |
+| `crates/flpdf/src/optimization.rs` | correspondence | QPDF_optimization.cc optimization orchestration, inherited-page preparation, object-user maps, and compressed-object folding |
+| `crates/flpdf/src/optimization/inherited_attrs.rs` | correspondence | QPDF_optimization.cc inherited-page-attribute push |
 | `crates/flpdf/src/outline.rs` | correspondence | QPDFOutlineObjectHelper.cc compatibility surface split from the document helper |
 | `crates/flpdf/src/outline_dest_remap.rs` | correspondence | QPDFJob.cc page selection and QPDFWriter.cc null visibility specialized for surviving destinations |
 | `crates/flpdf/src/outline_document_helper.rs` | correspondence | QPDFOutlineDocumentHelper.cc and QPDFOutlineObjectHelper.cc responsibilities split with outline.rs |
@@ -80,6 +80,7 @@
 | `crates/flpdf/src/page_split.rs` | correspondence | QPDFJob.cc split-pages orchestration and output naming |
 | `crates/flpdf/src/page_tree_rebuild.rs` | correspondence | QPDF_pages.cc page-tree repair plus QPDFJob.cc page-selection rebuilding |
 | `crates/flpdf/src/pages.rs` | correspondence | QPDF_pages.cc traversal responsibilities shared with page-tree rebuild and linearization repair |
+| `crates/flpdf/src/pages/repair.rs` | correspondence | QPDF_pages.cc page-tree preparation responsibilities |
 | `crates/flpdf/src/parser.rs` | correspondence | QPDFParser.cc object parsing with tokenizer responsibilities still shared elsewhere |
 | `crates/flpdf/src/pdf_version.rs` | mirror | libqpdf/PDFVersion.cc |
 | `crates/flpdf/src/permissions.rs` | correspondence | QPDF_encryption.cc permission-bit encoding split from the Standard security handler |
