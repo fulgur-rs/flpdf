@@ -14,7 +14,7 @@ use crate::pipeline::{Pipeline, PipelineError, PlOStream};
 use crate::reader::Pdf;
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::{Read, Seek, Write};
+use std::io::{BufWriter, Read, Seek, Write};
 
 // ── ConvertError ──────────────────────────────────────────────────────────────
 
@@ -3211,15 +3211,19 @@ pub fn write_qpdf_json_v2_selected_objects_to_output_with_options<R: Read + Seek
             Ok(())
         }
         JsonOutput::File(writer) => {
-            let mut terminal = PlOStream::new("json output", writer);
-            write_qpdf_json_v2_selected_objects_with_options(
-                pdf,
-                decode_level,
-                stream_mode,
-                keys,
-                objects,
-                &mut terminal,
-            )
+            let mut buffered = BufWriter::with_capacity(4096, writer);
+            {
+                let mut terminal = PlOStream::new("json output", &mut buffered);
+                write_qpdf_json_v2_selected_objects_with_options(
+                    pdf,
+                    decode_level,
+                    stream_mode,
+                    keys,
+                    objects,
+                    &mut terminal,
+                )?;
+            }
+            Ok(())
         }
     }
 }
@@ -3277,10 +3281,12 @@ mod tests {
     struct FlushProbe {
         bytes: Vec<u8>,
         flushes: usize,
+        write_lengths: Vec<usize>,
     }
 
     impl std::io::Write for FlushProbe {
         fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.write_lengths.push(buffer.len());
             self.bytes.extend_from_slice(buffer);
             Ok(buffer.len())
         }
@@ -3687,6 +3693,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.flushes, 0);
+    }
+
+    #[test]
+    fn coordinator_file_batches_inline_stream_output() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Stream(Stream::new(Dictionary::new(), vec![b'x'; 12 * 1024])),
+        );
+        let mut output = FlushProbe::default();
+
+        write_qpdf_json_v2_selected_objects_to_output_with_options(
+            &mut pdf,
+            DecodeLevel::None,
+            &StreamDataMode::Inline,
+            &[JsonKey::Qpdf],
+            &[JsonObjectSelector::Object {
+                number: 2,
+                generation: 0,
+            }],
+            JsonOutput::File(&mut output),
+        )
+        .unwrap();
+
+        assert!(
+            output.write_lengths.len() <= 6,
+            "expected buffered file writes, got {} calls",
+            output.write_lengths.len()
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.bytes).unwrap();
     }
 
     #[test]
