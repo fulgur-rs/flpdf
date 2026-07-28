@@ -4111,6 +4111,26 @@ mod tests {
     }
 
     #[test]
+    fn ordered_qpdf_non_finite_scalars_fail_during_raw_conversion() {
+        for object in [
+            Object::Real(f64::NAN),
+            Object::RealLiteral {
+                value: f64::NEG_INFINITY,
+                literal: b"-inf".to_vec(),
+            },
+        ] {
+            let mut pdf = empty_pdf();
+            let error = super::ordered_qpdf_object(&mut pdf, &object).err();
+
+            assert_eq!(
+                error,
+                Some(ConvertError::NonFiniteFloat),
+                "object={object:?}"
+            );
+        }
+    }
+
+    #[test]
     fn ordered_qpdf_pdf_scalar_failure_keeps_type_prefix_category_and_no_finish() {
         let cases = [
             (
