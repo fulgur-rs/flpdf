@@ -52,8 +52,6 @@ pub enum JsonOutputError {
     #[error(transparent)]
     Convert(#[from] ConvertError),
     #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
     Pipeline(#[from] PipelineError),
     #[error("{operation} {path}: {message}")]
     SideFileIo {

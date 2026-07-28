@@ -2,7 +2,6 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
 use std::rc::Rc;
 
 use crate::pipeline::{Pipeline, PipelineResult};
@@ -15,8 +14,6 @@ pub enum JsonError {
     Type(JsonMessage),
     #[error("{0}")]
     Parse(JsonMessage),
-    #[error(transparent)]
-    Io(#[from] io::Error),
 }
 
 #[derive(Clone, Default)]

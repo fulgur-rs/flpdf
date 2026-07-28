@@ -1,7 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use flpdf::json::Json;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineResult, PlString};
 
@@ -289,7 +288,7 @@ fn qpdf_blob_batches_base64_into_bounded_writes() {
 
     blob.write(&mut out, 0).unwrap();
 
-    let expected = format!("\"{}\"", STANDARD.encode(bytes)).into_bytes();
+    let expected = format!("\"{}Wg==\"", "Wlpa".repeat(1365)).into_bytes();
     assert_eq!(out.bytes, expected);
     assert_eq!(out.write_sizes.first(), Some(&1));
     assert_eq!(out.write_sizes.last(), Some(&1));

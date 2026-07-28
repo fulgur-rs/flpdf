@@ -174,7 +174,7 @@ impl<'reader, 'reactor, R: Read> Parser<'reader, 'reactor, R> {
             match self.reader.fill_buf() {
                 Ok(input) => return Ok(input.first().copied()),
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(JsonError::Parse(error.to_string().into())),
             }
         }
     }
