@@ -194,8 +194,13 @@ mod tests {
         )
     }
 
-    fn run_normalizer_probe(probe: &Path, name: &str, input: &[u8]) -> String {
-        let output = Command::new(probe)
+    fn run_normalizer_probe_command(
+        mut command: Command,
+        probe: &Path,
+        name: &str,
+        input: &[u8],
+    ) -> String {
+        let output = command
             .args([
                 "--mode",
                 "normalize",
@@ -230,6 +235,22 @@ mod tests {
             String::from_utf8_lossy(&output.stderr), // cov:ignore: failure-only assert diagnostic
         );
         String::from_utf8(output.stdout).expect("probe records are ASCII")
+    }
+
+    fn run_normalizer_probe(probe: &Path, name: &str, input: &[u8]) -> String {
+        run_normalizer_probe_command(Command::new(probe), probe, name, input)
+    }
+
+    /// Run a stand-in probe script.
+    ///
+    /// The script is handed to `/bin/sh` as an argument rather than executed
+    /// directly, so a still-open write handle cannot make the spawn fail with
+    /// `ETXTBSY`.
+    #[cfg(unix)]
+    fn run_test_probe(probe: &Path, name: &str, input: &[u8]) -> String {
+        let mut command = Command::new("/bin/sh");
+        command.arg(probe);
+        run_normalizer_probe_command(command, probe, name, input)
     }
 
     #[test]
@@ -409,11 +430,34 @@ mod tests {
 
         let (name, input) = normalizer_oracle_cases()[10];
         assert_eq!(
-            run_normalizer_probe(&probe, name, input),
+            run_test_probe(&probe, name, input),
             "--mode\nnormalize\n--input-hex\n4249202f5720312049442000ff2045492051\n\
              --allow-eof\n1\n--include-ignorable\n1\n--allow-bad\n1\n--max-len\n0\n\
              --inline-offset\nnone\n--chunks\nall\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalizer_probe_that_is_still_open_for_writing_still_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        fs::write(&probe, "#!/bin/sh\nprintf 'output\\t\\n'\n").unwrap();
+        let mut permissions = fs::metadata(&probe).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&probe, permissions).unwrap();
+        let _write_open = fs::OpenOptions::new().write(true).open(&probe).unwrap();
+
+        let (name, input) = normalizer_oracle_cases()[10];
+        assert_eq!(run_test_probe(&probe, name, input), "output\t\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalizer_probe_wrapper_executes_requested_path() {
+        let (name, input) = normalizer_oracle_cases()[10];
+
+        assert_eq!(run_normalizer_probe(Path::new("true"), name, input), "");
     }
 
     #[test]

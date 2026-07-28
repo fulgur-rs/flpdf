@@ -174,12 +174,12 @@ mod tests {
         )
     }
 
-    fn run_qpdf_probe(probe: &Path, case: &OracleCase) -> String {
+    fn run_qpdf_probe_command(mut command: Command, case: &OracleCase) -> String {
         let mode = match case.mode {
             OracleKeyMode::Explicit => "explicit",
             OracleKeyMode::CStr => "cstr",
         };
-        let output = Command::new(probe)
+        let output = command
             .args([
                 mode,
                 &hex(&case.key),
@@ -195,6 +195,10 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).expect("probe output is ASCII")
+    }
+
+    fn run_qpdf_probe(probe: &Path, case: &OracleCase) -> String {
+        run_qpdf_probe_command(Command::new(probe), case)
     }
 
     fn assert_qpdf_oracle_matches(mut qpdf_records: impl FnMut(&OracleCase) -> String) {
@@ -229,12 +233,24 @@ mod tests {
         }
     }
 
+    /// Write a stand-in probe script.
+    ///
+    /// The script is handed to `/bin/sh` as an argument rather than executed
+    /// directly, so a still-open write handle cannot make the spawn fail with
+    /// `ETXTBSY`.
     #[cfg(unix)]
     fn write_test_probe(path: &Path, source: &str) {
         fs::write(path, source).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn run_test_probe(probe: &Path, case: &OracleCase) -> String {
+        let mut command = Command::new("/bin/sh");
+        command.arg(probe);
+        run_qpdf_probe_command(command, case)
     }
 
     #[cfg(unix)]
@@ -252,7 +268,7 @@ mod tests {
             split: 1,
         };
         assert_eq!(
-            run_qpdf_probe(&probe, &explicit),
+            run_test_probe(&probe, &explicit),
             "explicit\n01ab\n00ff\n1\n"
         );
 
@@ -263,7 +279,28 @@ mod tests {
             input: vec![b'A'],
             split: 0,
         };
-        assert_eq!(run_qpdf_probe(&probe, &c_string), "cstr\n4b005a\n41\n0\n");
+        assert_eq!(run_test_probe(&probe, &c_string), "cstr\n4b005a\n41\n0\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_that_is_still_open_for_writing_still_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        write_test_probe(&probe, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+        let _write_open = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&probe)
+            .unwrap();
+
+        let case = OracleCase {
+            name: "write-open-probe",
+            mode: OracleKeyMode::Explicit,
+            key: vec![0x01],
+            input: vec![0x02],
+            split: 0,
+        };
+        assert_eq!(run_test_probe(&probe, &case), "explicit\n01\n02\n0\n");
     }
 
     #[cfg(unix)]
@@ -280,7 +317,7 @@ mod tests {
             split: 0,
         };
 
-        let panic = std::panic::catch_unwind(|| run_qpdf_probe(&probe, &case)).unwrap_err();
+        let panic = std::panic::catch_unwind(|| run_test_probe(&probe, &case)).unwrap_err();
         let message = panic.downcast_ref::<String>().unwrap();
         assert!(message.contains("qpdf RC4 probe failed for failure-case"));
         assert!(message.contains("probe stderr"));
@@ -300,9 +337,27 @@ mod tests {
             split: 0,
         };
 
-        let panic = std::panic::catch_unwind(|| run_qpdf_probe(&probe, &case)).unwrap_err();
+        let panic = std::panic::catch_unwind(|| run_test_probe(&probe, &case)).unwrap_err();
         let message = panic.downcast_ref::<String>().unwrap();
         assert!(message.contains("probe output is ASCII"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qpdf_probe_spawn_failure_reports_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("missing-probe");
+        let case = OracleCase {
+            name: "spawn-failure",
+            mode: OracleKeyMode::Explicit,
+            key: vec![1],
+            input: vec![],
+            split: 0,
+        };
+
+        let panic = std::panic::catch_unwind(|| run_qpdf_probe(&probe, &case)).unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("execute qpdf RC4 probe"), "{message}");
     }
 
     #[test]
