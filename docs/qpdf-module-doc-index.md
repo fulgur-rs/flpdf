@@ -27,13 +27,12 @@
 | `crates/flpdf/src/fonts.rs` | correspondence | flpdf-only font-resource inspection surface |
 | `crates/flpdf/src/json/handler.rs` | correspondence | JSONHandler.cc recursive dispatch responsibilities with Rust shared ownership |
 | `crates/flpdf/src/json/message.rs` | correspondence | JSON.cc and JSONHandler.cc use byte-oriented std::string diagnostics |
-| `crates/flpdf/src/json/mod.rs` | correspondence | JSON.cc and JSONHandler.cc responsibilities split across the json module tree |
+| `crates/flpdf/src/json/mod.rs` | correspondence | JSON.cc and JSONHandler.cc pipeline-native value, parse, callback, and serialization responsibilities |
 | `crates/flpdf/src/json/parser.rs` | correspondence | JSON.cc parser state machine and Reactor event responsibilities |
 | `crates/flpdf/src/json/schema.rs` | correspondence | JSON.cc schema validation responsibilities |
-| `crates/flpdf/src/json/stdio.rs` | correspondence | Pl_StdioFile.cc write and finish semantics for JSON side files |
 | `crates/flpdf/src/json/value.rs` | correspondence | JSON.cc shared value model and mutation and accessor responsibilities |
 | `crates/flpdf/src/json/writer.rs` | correspondence | JSON.cc incremental serialization and blob Base64 responsibilities |
-| `crates/flpdf/src/json_inspect.rs` | correspondence | QPDF_json.cc responsibilities represented by the JSON v2 inspection builders |
+| `crates/flpdf/src/json_inspect.rs` | correspondence | QPDF_json.cc JSON v2 selection, serialization, and side-file lifecycle responsibilities |
 | `crates/flpdf/src/lib.rs` | correspondence | crate root aggregating multiple qpdf library components and flpdf-only APIs |
 | `crates/flpdf/src/linearization/back_patch.rs` | correspondence | QPDFWriter.cc linearization back-patching split from the writer |
 | `crates/flpdf/src/linearization/check.rs` | correspondence | QPDF_linearization.cc structural validation represented as a standalone checker |
@@ -99,6 +98,7 @@
 | `crates/flpdf/src/pipeline/qpdf_tokenizer.rs` | correspondence | Pl_QPDFTokenizer.cc buffered token-filter pipeline |
 | `crates/flpdf/src/pipeline/rc4.rs` | correspondence | Pl_RC4.cc bounded streaming over one retained RC4 state |
 | `crates/flpdf/src/pipeline/run_length.rs` | correspondence | Pl_RunLength.cc incremental encode and decode state, output, error, and finish semantics |
+| `crates/flpdf/src/pipeline/stdio_file.rs` | correspondence | Pl_StdioFile.cc partial-write, error, and finish semantics for an externally owned writer |
 | `crates/flpdf/src/pipeline/stream_codecs_oracle.rs` | correspondence | live differential instrumentation for Pl_ASCII85Decoder.cc, Pl_ASCIIHexDecoder.cc, and Pl_RunLength.cc |
 | `crates/flpdf/src/pipeline/string.rs` | correspondence | Pl_String.cc accumulation, optional pass-through, and finish forwarding |
 | `crates/flpdf/src/pipeline/test_support.rs` | correspondence | flpdf-only test instrumentation for observable Pipeline downstream calls and failures |

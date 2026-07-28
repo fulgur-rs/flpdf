@@ -4,7 +4,7 @@
 （`scripts/fetch-qpdf-source.sh` で取得。パスは `--print-path` で解決する。
 本表のファイル名・行数はすべてこのツリーに対するもの。将来 v12 に追従する際は
 `git log v11.9.0..v12.0.0 -- libqpdf/` が移植差分になる）
-**調査日:** 2026-07-25
+**調査日:** 2026-07-29
 **関連:** `flpdf-qxba`（部品積み上げによる責務分割）/
 [設計書](superpowers/specs/2026-07-25-qpdf-component-bottom-up-refactor-design.md)
 
@@ -135,8 +135,9 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `QPDFStreamFilter.cc` | 19 | `stream_filter.rs`（`set_decode_params`、decode pipeline factory、specialized / lossy の既定分類） | ✅ |
 | `Pl_DCT.cc` | 326 | 無し。`json_inspect.rs` の `DecodeLevel::All`(758) が DCT デコードを doc で約束しつつ encoded バイトへフォールバックしている | ❌ 消費者あり |
 | `Pl_Base64` / `Pl_Concatenate` / `Pl_OStream` / `Pl_String` | 282 | `pipeline/base64.rs` / `pipeline/concatenate.rs` / `pipeline/ostream.rs` / `pipeline/string.rs`（JSON serialization/output の本番 consumer を含む） | ✅ |
+| `Pl_StdioFile.cc` | 46 | `pipeline/stdio_file.rs`（positive partial write の継続、zero/error—including `Interrupted`—の即時 Runtime 化、`EBADF` finish のみ Logic 化）+ `json_inspect.rs`（4096-byte buffer、top-level file は close/drop、side file は explicit finish） | ✅ |
 | `Pl_Buffer` | 82 | `pipeline/buffer.rs`（accumulation、optional pass-through、finish readiness、buffer ownership transfer） | ✅ |
-| `Pl_Discard` / `Pl_Function` / `Pl_StdioFile` / `Pl_SHA2` | 206 | 専用 stage は未実装。`Pl_StdioFile` は JSON cutover Layer 2、他は使用箇所ごとの discard / closure / digest 実装 | ⚪ |
+| `Pl_Discard` / `Pl_Function` / `Pl_SHA2` | 160 | 専用 stage は未実装。使用箇所ごとの discard / closure / digest 実装 | ⚪ |
 
 `/ID` が qpdf と非 parity だった原因は **アルゴリズム**（qpdf は 2 段階 MD5 で seed を
 作る）であり、Pipeline 抽象の有無ではない。flpdf は全体をバッファするので任意の
@@ -165,9 +166,9 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `JSON.cc` | 1401 | `json/` | ✅ |
+| `JSON.cc` | 1401 | `json/`（全 write helper、blob callback、unparse が public `Pipeline` 境界を使用。serializer は caller-owned outer pipeline を finish しない） | ✅ |
 | `JSONHandler.cc` | 189 | `json/` | ✅ |
-| `QPDF_json.cc` | 946 | `json_inspect.rs`(2661) の一部 | 🔀 |
+| `QPDF_json.cc` | 946 | `json_inspect.rs`（JSON v2 key/object selection、raw incremental serialization、inline/file stream data。side file は `PlStdioFile` explicit finish） | 🔀 schema-content gap は別 Bead |
 
 ## 9. Job / CLI
 

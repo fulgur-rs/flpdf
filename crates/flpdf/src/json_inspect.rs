@@ -1,12 +1,14 @@
-//! qpdf correspondence: QPDF_json.cc responsibilities represented by the JSON v2 inspection builders.
-//! qpdf JSON v2 inspection builders.
+//! qpdf correspondence: QPDF_json.cc JSON v2 selection, serialization, and side-file lifecycle responsibilities.
+//! qpdf JSON v2 inspection builders and command-boundary output coordinator.
 //!
 //! Provides the structural frame for qpdf `--json` output.  Each builder
 //! returns a [`Json`] that the caller can extend with per-section data
 //! (pages, objects, …) in later subtasks.
 //! Pipeline-facing writers leave the outer finish boundary to their caller.
-//! The CLI-facing coordinator instead accepts ordinary stdout/file handles and
-//! owns the terminal pipeline lifecycle for each output mode.
+//! The CLI-facing coordinator accepts ordinary stdout/file handles: stdout
+//! explicitly finishes `PlOStream`, a top-level file relies on buffered
+//! close/drop without finishing `PlStdioFile`, and each side file explicitly
+//! finishes `PlStdioFile` before close/drop.
 
 use crate::json::Json;
 use crate::object::{Dictionary, Object, ObjectRef, Stream};
@@ -3272,58 +3274,34 @@ mod tests {
         }
     }
 
-    struct FailOnWriteLength {
-        rejected_length: usize,
-        bytes: Vec<u8>,
-    }
-
-    impl std::io::Write for FailOnWriteLength {
-        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-            if buffer.len() == self.rejected_length {
-                return Err(std::io::Error::other("sink full"));
-            }
-            self.bytes.extend_from_slice(buffer);
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    struct PartialThenFailWriter {
-        accepted: usize,
-        bytes: Vec<u8>,
-        write_lengths: Vec<usize>,
-    }
-
-    impl std::io::Write for PartialThenFailWriter {
-        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-            self.write_lengths.push(buffer.len());
-            if self.accepted == 0 {
-                return Err(std::io::Error::other("sink full"));
-            }
-            let written = self.accepted.min(buffer.len());
-            self.bytes.extend_from_slice(&buffer[..written]);
-            self.accepted -= written;
-            Ok(written)
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     #[derive(Default)]
     struct FlushProbe {
         bytes: Vec<u8>,
         flushes: usize,
         write_lengths: Vec<usize>,
+        rejected_length: Option<usize>,
+        remaining: Option<usize>,
+        errno: Option<i32>,
     }
 
     impl std::io::Write for FlushProbe {
         fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
             self.write_lengths.push(buffer.len());
+            if let Some(errno) = self.errno {
+                return Err(std::io::Error::from_raw_os_error(errno));
+            }
+            if self.rejected_length == Some(buffer.len()) {
+                return Err(std::io::Error::other("sink full"));
+            }
+            if let Some(remaining) = self.remaining.as_mut() {
+                if *remaining == 0 {
+                    return Err(std::io::Error::other("sink full"));
+                }
+                let written = (*remaining).min(buffer.len());
+                self.bytes.extend_from_slice(&buffer[..written]);
+                *remaining -= written;
+                return Ok(written);
+            }
             self.bytes.extend_from_slice(buffer);
             Ok(buffer.len())
         }
@@ -3428,18 +3406,6 @@ mod tests {
             Ok(())
         }
         // cov:ignore-end
-    }
-
-    struct ErrnoSink(i32);
-
-    impl std::io::Write for ErrnoSink {
-        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::from_raw_os_error(self.0))
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
 
     const COMPLETE_SIDE_FILE_STREAM_JSON: &[u8] =
@@ -3799,10 +3765,9 @@ mod tests {
         assert_eq!(expected.len(), 4095);
 
         let mut pdf = pdf_with_selected_string(payload_length);
-        let mut output = PartialThenFailWriter {
-            accepted: 24,
-            bytes: Vec::new(),
-            write_lengths: Vec::new(),
+        let mut output = FlushProbe {
+            remaining: Some(24),
+            ..FlushProbe::default()
         };
 
         write_qpdf_json_v2_selected_objects_to_output_with_options(
@@ -3820,14 +3785,15 @@ mod tests {
 
         assert_eq!(output.bytes, expected[..24]);
         assert_eq!(output.write_lengths, [4095, 4071]);
+        assert_eq!(output.flushes, 0);
     }
 
     #[test]
     fn coordinator_file_4096_write_failure_is_pipeline_runtime_error() {
         let mut pdf = pdf_with_selected_string(4095);
-        let mut output = FailOnWriteLength {
-            rejected_length: 4096,
-            bytes: Vec::new(),
+        let mut output = FlushProbe {
+            rejected_length: Some(4096),
+            ..FlushProbe::default()
         };
 
         let error = write_qpdf_json_v2_selected_objects_to_output_with_options(
@@ -3848,6 +3814,7 @@ mod tests {
             JsonOutputError::Pipeline(PipelineError::Runtime(ref message))
                 if message.as_bytes().starts_with(b"json output: Pl_StdioFile::write: ")
         ));
+        assert_eq!(output.flushes, 0);
     }
 
     #[test]
@@ -4811,7 +4778,10 @@ mod tests {
     fn side_file_explicit_finish_ignores_enospc() {
         let mut pdf = empty_pdf();
         let stream = Stream::new(Dictionary::new(), b"small payload".to_vec());
-        let mut side_file = ErrnoSink(28);
+        let mut side_file = FlushProbe {
+            errno: Some(28),
+            ..FlushProbe::default()
+        };
         let trace = shared_trace();
         let mut out = RecordingSink::with_trace(trace.clone(), &[], &[]);
 
@@ -4838,13 +4808,41 @@ mod tests {
             .calls
             .iter()
             .any(|call| matches!(call, TraceCall::Finish { .. })));
+        assert_eq!(side_file.flushes, 0);
+    }
+
+    #[test]
+    fn side_file_explicit_finish_flushes_empty_payload() {
+        let mut pdf = empty_pdf();
+        let stream = Stream::new(Dictionary::new(), Vec::new());
+        let mut side_file = FlushProbe::default();
+        let mut out = Vec::new();
+        {
+            let mut output = PlString::new("file-mode main output", None, &mut out);
+            write_file_mode_side_file(
+                &mut pdf,
+                &stream,
+                DecodeLevel::None,
+                "side-file",
+                &mut side_file,
+                &mut output,
+            )
+            .unwrap();
+        }
+
+        assert!(side_file.bytes.is_empty());
+        assert_eq!(side_file.flushes, 1);
+        assert_eq!(out, COMPLETE_SIDE_FILE_STREAM_JSON);
     }
 
     #[test]
     fn side_file_explicit_finish_reports_ebadf_logic_error() {
         let mut pdf = empty_pdf();
         let stream = Stream::new(Dictionary::new(), b"small payload".to_vec());
-        let mut side_file = ErrnoSink(9);
+        let mut side_file = FlushProbe {
+            errno: Some(9),
+            ..FlushProbe::default()
+        };
         let trace = shared_trace();
         let mut out = RecordingSink::with_trace(trace.clone(), &[], &[]);
 
@@ -4872,6 +4870,7 @@ mod tests {
             .calls
             .iter()
             .any(|call| matches!(call, TraceCall::Finish { .. })));
+        assert_eq!(side_file.flushes, 0);
     }
 
     #[test]

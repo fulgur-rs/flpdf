@@ -1139,7 +1139,7 @@ Run:
 cargo test -p flpdf --test json_tests
 cargo test -p flpdf json_inspect::tests
 cargo test -p flpdf --test json_parse_tests
-! rg -n 'Base64Writer|base64::|base64\\.workspace|JsonError::Io|JsonOutputError::Io' \
+! rg -n 'Base64Writer|^[[:space:]]*use base64::|base64::engine|base64\\.workspace|JsonError::Io|JsonOutputError::Io' \
   crates/flpdf/src Cargo.toml crates/flpdf/Cargo.toml
 ! rg -n 'out: &mut \\(impl Write|out: &mut dyn Write' \
   crates/flpdf/src/json/writer.rs
@@ -2029,7 +2029,7 @@ Run:
 
 ```bash
 test ! -e crates/flpdf/src/json/stdio.rs
-! rg -n 'Base64Writer|QpdfStdioWriter|base64::|base64\\.workspace' \
+! rg -n 'Base64Writer|QpdfStdioWriter|^[[:space:]]*use base64::|base64::engine|base64\\.workspace' \
   Cargo.toml crates/flpdf/Cargo.toml crates/flpdf/src
 ! rg -n 'out: &mut \\(impl Write|out: &mut dyn Write' \
   crates/flpdf/src/json/writer.rs

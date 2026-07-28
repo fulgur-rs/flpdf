@@ -1,7 +1,9 @@
-//! qpdf correspondence: Pl_StdioFile.cc terminal adapter for an externally owned stdio writer.
+//! qpdf correspondence: Pl_StdioFile.cc partial-write, error, and finish semantics for an externally owned writer.
 //!
 //! Partial progress is retried, but writer errors (including `Interrupted`) are
 //! reported immediately, matching qpdf's zero-result `fwrite` error path.
+//! Finish maps only raw `EBADF` to a logic error and ignores other flush
+//! failures; the caller owns buffering and close/drop.
 
 use std::io::{self, Write};
 

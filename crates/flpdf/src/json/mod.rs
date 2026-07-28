@@ -1,11 +1,12 @@
-//! qpdf correspondence: JSON.cc and JSONHandler.cc responsibilities split across the json module tree.
+//! qpdf correspondence: JSON.cc and JSONHandler.cc pipeline-native value, parse, callback, and serialization responsibilities.
 //! Public APIs: qpdf 11.9.0 `include/qpdf/JSON.hh` and
 //! `libqpdf/qpdf/JSONHandler.hh`.
 //!
 //! [`Reactor`] callbacks expose qpdf's incremental parse order and may consume
 //! container items to keep them out of the returned tree.
-//! Serialization APIs write to caller-supplied pipelines without finishing the
-//! outer pipeline; callers retain ownership of that finish boundary.
+//! Serialization APIs, including blob callbacks, write only to caller-supplied
+//! pipelines without finishing the outer pipeline; callers retain ownership of
+//! that finish boundary.
 
 mod handler;
 mod message;
