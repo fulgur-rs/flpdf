@@ -1025,6 +1025,13 @@ mod tests {
         run_qpdf_probe_command(command, &fake_case());
     }
 
+    /// Every case is replayed against flpdf itself, which both completes the
+    /// comparison loop and proves each trace is reproducible.
+    #[test]
+    fn comparison_accepts_an_agreeing_oracle() {
+        assert_qpdf_oracle_matches_with(flpdf_trace);
+    }
+
     #[test]
     #[should_panic(expected = "case lzw-clear-and-eod-only")]
     fn comparison_rejects_a_disagreeing_oracle() {
