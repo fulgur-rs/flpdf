@@ -9,6 +9,8 @@ pub(crate) mod ascii_hex;
 
 pub(crate) mod buffer;
 
+pub mod concatenate;
+
 pub(crate) mod count;
 
 pub(crate) mod flate;
@@ -33,6 +35,7 @@ mod stream_codecs_oracle;
 pub(crate) mod test_support;
 
 pub mod string;
+pub use concatenate::PlConcatenate;
 pub use string::PlString;
 
 pub type PipelineResult<T> = std::result::Result<T, PipelineError>;
