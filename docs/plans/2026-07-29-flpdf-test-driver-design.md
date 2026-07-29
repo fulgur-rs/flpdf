@@ -114,6 +114,15 @@ qpdf 自身は `compare-for-test/qpdf-test-compare.cc` と `qpdf/test_driver.cc`
 CLAUDE.md (B) 条件 3 の「モジュール doc に 1 行」は `crates/flpdf-qtest-tools/src/lib.rs`
 の crate doc で満たしている。
 
+**n9t0.3 は shim 設置だけでなく、flpdf-qtest 側のビルドコマンドの更新も含む。**
+flpdf-qtest#22（マージ済み）で `scripts/run.sh` と `.github/workflows/ci.yml` は
+`cargo build --release --bin flpdf --bin flpdf-test-compare` に固定した
+（`--bin` は「指定した 1 バイナリだけをビルドする」— `cargo build --help` の定義どおり）。
+`flpdf-test-driver` を同じ crate に `[[bin]]` として追加しても、この 2 箇所の
+コマンドに `--bin flpdf-test-driver` を足さない限り、クリーンな checkout では
+生成されない。shim（n9t0.3）をいくら正しく配線しても、実行対象のバイナリが
+存在しなければ 21 件は依然として失敗する。n9t0.3 の作業内容にこの更新を含める。
+
 ## 3. CLI 契約とディスパッチ順序
 
 ```
@@ -142,8 +151,22 @@ test_driver <n> <filename1> [arg2]
 qpdf と挙動が変わるので避けること。
 
 読込分岐は `n % 2 == 1` → メモリ、`n % 4 == 0` → パス、それ以外の偶数 → `FILE*`。
-実装対象の 1 と 3 はどちらも奇数なので実際に通るのはメモリ経路（`Pdf::open_mem`）だけだが、
-分岐そのものは qpdf の形で書く。
+
+**`test_functions` は `test_0_1` を id 0 と id 1 の両方に登録している**
+（`test_driver.cc` の `{0, test_0_1}, {1, test_0_1}, {2, test_2}, …`）。
+id 0 は偶数なので `n % 4 == 0` → パス経由の `processFile(filename1)`（メモリではない）
+を通り、さらに `runtest` 冒頭の `if (n == 0) { pdf.setAttemptRecovery(false); }` で
+recovery を無効化する — id 1（recovery 既定値のままメモリ読込）とは読込経路も
+recovery 設定も異なる。id 3（`test_3`）は奇数なのでメモリ経路。
+
+**basic-parsing.test は id 0 を一度も呼ばない**（`%goodtest_overrides` は good14 の
+`3` だけで、他はすべて既定の `1`）ので、n9t0.2 の 20 subtest 自体は id 1 の
+メモリ経路だけで完結する。ただし id 0 は「未実装の別関数」ではなく test_0_1 と
+**同一の関数**なので、`invalid test 0` を fail-loud で返すと qpdf の実際の
+サポート範囲より狭くなる（§3.1 の ~97 個の他 `.test` 呼び出しに影響しうる）。
+id 0 のパス経由・no-recovery 読込は本 issue の検証範囲外（flpdf 側のどの
+`Pdf::open*` が qpdf の `setAttemptRecovery(false)` と一致するか未確認）のため、
+**n9t0.2 では明示的にスコープ外とする**（§9 参照）。分岐そのものは qpdf の形で書く。
 
 ### 3.1 fail-loud
 
@@ -507,5 +530,10 @@ CI/`cargo test` はコミット済み `.out` に対する `driver_goldens.rs` �
 ## 9. スコープ外
 
 - `test_driver` の残り ~97 個の test 関数（fail-loud で `invalid test N`）
+- **id 0（`test_0_1` のもう一方の登録先）** — basic-parsing.test は呼ばないため
+  n9t0.2 の 20 subtest には無関係。パス経由・no-recovery の読込に対応する
+  flpdf 側 API が未検証（§3 参照）。実装するまでの間、id 0 は
+  `invalid test 0` を返す — qpdf の実際のサポート範囲より狭いことは
+  承知の上でのスコープ判断（follow-up 候補）
 - flpdf 本体への `ObjectHandle` 公開 API の追加
 - binary 名の変更、compare アルゴリズムの変更
