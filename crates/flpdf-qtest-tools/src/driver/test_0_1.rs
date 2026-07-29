@@ -22,25 +22,49 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
         writeln!(stdout, "/QTest is implicit")?;
     }
 
-    writeln!(
-        stdout,
-        "/QTest is {}direct and has type {} ({})",
-        if qtest.is_indirect() { "in" } else { "" },
-        qtest.type_name(),
-        qtest.type_code()
-    )?;
+    let direct_prefix = if qtest.is_indirect() { "in" } else { "" };
+    let type_name = qtest.type_name();
+    let type_code = qtest.type_code();
+    write!(stdout, "/QTest is {direct_prefix}direct and has type ")?;
+    writeln!(stdout, "{type_name} ({type_code})")?;
 
+    let details = write_object_details(
+        pdf,
+        source,
+        filename,
+        stdout,
+        stderr,
+        diagnostics_written,
+        &qtest,
+    );
+    details?;
+
+    write!(stdout, "unparse: ")?;
+    write_bytes(stdout, &qtest.unparse())?;
+    writeln!(stdout)?;
+    write!(stdout, "unparseResolved: ")?;
+    write_bytes(stdout, &qtest.unparse_resolved())?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
+fn write_object_details<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    source: &[u8],
+    filename: &str,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
+    qtest: &Handle,
+) -> flpdf::Result<()> {
     match qtest.resolved() {
         Object::Null => writeln!(stdout, "/QTest is null")?,
         Object::Boolean(_) => {
             let value = qtest
                 .as_bool()
                 .expect("boolean branch must retain a boolean value");
-            writeln!(
-                stdout,
-                "/QTest is Boolean with value {}",
-                if value { "true" } else { "false" }
-            )?;
+            let value = if value { "true" } else { "false" };
+            writeln!(stdout, "/QTest is Boolean with value {value}")?;
         }
         Object::Integer(value) => {
             writeln!(stdout, "/QTest is an integer with value {value}")?;
@@ -63,11 +87,8 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
         Object::Array(values) => {
             writeln!(stdout, "/QTest is an array with {} items", values.len())?;
             for (index, item) in qtest.array_items(pdf)?.iter().enumerate() {
-                writeln!(
-                    stdout,
-                    "  item {index} is {}direct",
-                    if item.is_indirect() { "in" } else { "" }
-                )?;
+                let direct_prefix = if item.is_indirect() { "in" } else { "" };
+                writeln!(stdout, "  item {index} is {direct_prefix}direct")?;
             }
         }
         Object::Dictionary(_) => {
@@ -77,11 +98,8 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
                 let mut name = Vec::new();
                 Object::Name(key).write_pdf(&mut name);
                 write_bytes(stdout, &name)?;
-                writeln!(
-                    stdout,
-                    " is {}direct",
-                    if value.is_indirect() { "in" } else { "" }
-                )?;
+                let direct_prefix = if value.is_indirect() { "in" } else { "" };
+                writeln!(stdout, " is {direct_prefix}direct")?;
             }
         }
         Object::Stream(stream) => {
@@ -122,20 +140,18 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
             writeln!(stdout, "/QTest is an unknown object")?;
         }
     }
-
-    write!(stdout, "unparse: ")?;
-    write_bytes(stdout, &qtest.unparse())?;
-    writeln!(stdout)?;
-    write!(stdout, "unparseResolved: ")?;
-    write_bytes(stdout, &qtest.unparse_resolved())?;
-    writeln!(stdout)?;
     Ok(())
 }
 
 fn stream_data_offset(source: &[u8], object_ref: Option<ObjectRef>) -> Option<u64> {
     let object_ref = object_ref?;
     let header = format!("{} {} obj", object_ref.number, object_ref.generation);
-    let object_start = find_bytes(source, header.as_bytes())?;
+    let line_header = format!("\n{header}");
+    let object_start = if source.starts_with(header.as_bytes()) {
+        0
+    } else {
+        find_bytes(source, line_header.as_bytes())? + 1
+    };
     let stream_marker = find_bytes(&source[object_start..], b"stream")? + object_start;
     let after_marker = &source[stream_marker + b"stream".len()..];
     let eol_length = if after_marker.starts_with(b"\r\n") {
@@ -156,8 +172,9 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_test_0_1, stream_data_offset};
-    use flpdf::{Pdf, PdfOpenOptions};
+    use super::{run_test_0_1, stream_data_offset, write_object_details};
+    use crate::driver::handle::Handle;
+    use flpdf::{Object, Pdf, PdfOpenOptions};
 
     fn pdf_with_qtest(qtest: &[u8], extras: &[(u32, Vec<u8>)]) -> Vec<u8> {
         let max_object = extras.iter().map(|(number, _)| *number).max().unwrap_or(2);
@@ -375,6 +392,37 @@ mod tests {
             Some(21)
         );
         assert_eq!(stream_data_offset(b"6 0 obj\n<<>>", object_ref), None);
+        assert_eq!(
+            stream_data_offset(b"16 0 obj\nnull\n6 0 obj\n<<>>\nstream\nabc", object_ref),
+            Some(34)
+        );
+        assert_eq!(
+            stream_data_offset(b"6 0 obj\n<<>>\nstreamXabc", object_ref),
+            None
+        );
         assert_eq!(stream_data_offset(b"", None), None);
+    }
+
+    #[test]
+    fn content_only_object_uses_the_unknown_object_branch() {
+        let bytes = pdf_with_qtest(b"null", &[]);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open operator test PDF");
+        let qtest =
+            Handle::from_value(&mut pdf, Object::Operator(b"q".to_vec())).expect("operator handle");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+        write_object_details(
+            &mut pdf,
+            &[],
+            "fixture.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+            &qtest,
+        )
+        .expect("write operator details");
+        assert_eq!(stdout, b"/QTest is an unknown object\n");
+        assert!(stderr.is_empty());
     }
 }

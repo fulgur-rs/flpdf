@@ -48,6 +48,7 @@ mod tests {
     fn write_bytes_retries_short_writes_until_all_bytes_are_written() {
         let mut out = ShortWriter::default();
         write_bytes(&mut out, b"abcdef").expect("write bytes");
+        out.flush().expect("flush short writer");
         assert_eq!(out.bytes, b"abcdef");
     }
 }

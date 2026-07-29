@@ -76,3 +76,23 @@ fn id_zero_is_an_explicit_fail_loud_scope_boundary() {
         .stdout("")
         .stderr("invalid test 0\n");
 }
+
+#[test]
+fn non_numeric_test_id_reports_parse_error() {
+    driver()
+        .args(["not-a-number", minimal_pdf()])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr("invalid digit found in string\n");
+}
+
+#[test]
+fn missing_input_reports_read_error() {
+    driver()
+        .args(["1", "/definitely/missing/flpdf-test-driver.pdf"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains("No such file or directory"));
+}

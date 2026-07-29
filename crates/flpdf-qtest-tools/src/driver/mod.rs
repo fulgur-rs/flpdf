@@ -113,3 +113,99 @@ fn write_stderr_line(
     stdout.flush()?;
     writeln!(stderr, "{message}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::run;
+    use std::io::{self, Write};
+
+    fn fixture(name: &str) -> String {
+        format!(
+            "{}/../../tests/fixtures/test_driver/{name}.pdf",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
+    struct FlushFailure;
+
+    impl Write for FlushFailure {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("flush failed"))
+        }
+    }
+
+    struct WriteFailure;
+
+    impl Write for WriteFailure {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("write failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FooterFailure {
+        bytes: Vec<u8>,
+    }
+
+    impl Write for FooterFailure {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.windows(b"test ".len()).any(|window| window == b"test ") {
+                return Err(io::Error::other("footer failed"));
+            }
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn repair_warning_flush_failure_exits_two() {
+        let args = vec![
+            "flpdf-test-driver".to_string(),
+            "1".to_string(),
+            fixture("repairable_input"),
+        ];
+        let mut stdout = FlushFailure;
+        let mut stderr = Vec::new();
+        assert_eq!(run(&args, &mut stdout, &mut stderr), 2);
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn test_body_write_failure_is_reported_and_exits_two() {
+        let args = vec![
+            "flpdf-test-driver".to_string(),
+            "1".to_string(),
+            fixture("direct_null"),
+        ];
+        let mut stdout = WriteFailure;
+        let mut stderr = Vec::new();
+        assert_eq!(run(&args, &mut stdout, &mut stderr), 2);
+        assert_eq!(stderr, b"I/O error: write failed\n");
+    }
+
+    #[test]
+    fn footer_write_failure_exits_two() {
+        let args = vec![
+            "flpdf-test-driver".to_string(),
+            "1".to_string(),
+            fixture("direct_null"),
+        ];
+        let mut stdout = FooterFailure::default();
+        let mut stderr = Vec::new();
+        assert_eq!(run(&args, &mut stdout, &mut stderr), 2);
+        assert!(stderr.is_empty());
+        assert!(stdout.bytes.ends_with(b"unparseResolved: null\n"));
+    }
+}

@@ -84,37 +84,27 @@ impl Handle {
     }
 
     pub(crate) fn type_code(&self) -> u8 {
-        match self.resolved {
-            Object::Null => 2,
-            Object::Boolean(_) => 3,
-            Object::Integer(_) => 4,
-            Object::Real(_) | Object::RealLiteral { .. } => 5,
-            Object::String(_) => 6,
-            Object::Name(_) => 7,
-            Object::Array(_) => 8,
-            Object::Dictionary(_) => 9,
-            Object::Stream(_) => 10,
-            Object::Operator(_) => 11,
-            Object::InlineImage(_) => 12,
-            Object::Reference(_) => 13,
-        }
+        self.type_info().0
     }
 
     pub(crate) fn type_name(&self) -> &'static str {
-        match self.type_code() {
-            2 => "null",
-            3 => "boolean",
-            4 => "integer",
-            5 => "real",
-            6 => "string",
-            7 => "name",
-            8 => "array",
-            9 => "dictionary",
-            10 => "stream",
-            11 => "operator",
-            12 => "inline-image",
-            13 => "unresolved",
-            _ => unreachable!("type_code only returns the qpdf object table"),
+        self.type_info().1
+    }
+
+    fn type_info(&self) -> (u8, &'static str) {
+        match self.resolved {
+            Object::Null => (2, "null"),
+            Object::Boolean(_) => (3, "boolean"),
+            Object::Integer(_) => (4, "integer"),
+            Object::Real(_) | Object::RealLiteral { .. } => (5, "real"),
+            Object::String(_) => (6, "string"),
+            Object::Name(_) => (7, "name"),
+            Object::Array(_) => (8, "array"),
+            Object::Dictionary(_) => (9, "dictionary"),
+            Object::Stream(_) => (10, "stream"),
+            Object::Operator(_) => (11, "operator"),
+            Object::InlineImage(_) => (12, "inline-image"),
+            Object::Reference(_) => (13, "unresolved"),
         }
     }
 
@@ -325,6 +315,12 @@ mod tests {
             assert_eq!(handle.type_code(), code);
             assert_eq!(handle.type_name(), name);
         }
+        let unresolved = Handle {
+            resolved: Object::Reference(ObjectRef::new(99, 0)),
+            indirect: None,
+        };
+        assert_eq!(unresolved.type_code(), 13);
+        assert_eq!(unresolved.type_name(), "unresolved");
     }
 
     #[test]
@@ -393,5 +389,46 @@ mod tests {
             .expect("resolved DecodeParms dictionary");
         assert_eq!(params.get(b"Predictor"), Some(&Object::Integer(15)));
         assert_eq!(params.get(b"Columns"), Some(&Object::Integer(3)));
+    }
+
+    #[test]
+    fn reference_chain_accepts_64_hops_and_rejects_65() {
+        fn install_chain(pdf: &mut Pdf<Cursor<Vec<u8>>>, hops: u32) {
+            for index in 0..hops {
+                let object_ref = ObjectRef::new(100 + index, 0);
+                let value = if index + 1 == hops {
+                    Object::Boolean(true)
+                } else {
+                    Object::Reference(ObjectRef::new(101 + index, 0))
+                };
+                pdf.set_object(object_ref, value);
+            }
+        }
+
+        let mut accepted = handle_pdf(b"");
+        install_chain(&mut accepted, 64);
+        let handle = Handle::from_value(&mut accepted, Object::Reference(ObjectRef::new(100, 0)))
+            .expect("64-hop reference chain");
+        assert_eq!(handle.as_bool(), Some(true));
+
+        let mut rejected = handle_pdf(b"");
+        install_chain(&mut rejected, 65);
+        let result = Handle::from_value(&mut rejected, Object::Reference(ObjectRef::new(100, 0)));
+        let error = match result {
+            Ok(_) => panic!("65-hop reference chain was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exceeds 64 hops"));
+    }
+
+    #[test]
+    fn stream_parameter_nesting_rejects_depth_64() {
+        let mut pdf = handle_pdf(b"");
+        let nested = (0..64).fold(Object::Integer(1), |value, _| Object::Array(vec![value]));
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(b"DecodeParms", nested);
+        let error = resolve_stream_dictionary(&mut pdf, &dictionary)
+            .expect_err("64-level stream parameter nesting");
+        assert!(error.to_string().contains("exceeds 64 levels"));
     }
 }
