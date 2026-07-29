@@ -834,6 +834,23 @@ mod tests {
     }
 
     #[test]
+    fn recovering_decode_keeps_final_data_after_a_prior_runtime_error() {
+        let dict = array_filter_dict(&[b"FlateDecode", b"ASCIIHexDecode"]);
+        let (mut compressed, _) = valid_prefix_then_invalid_stored_block();
+        compressed[7..10].copy_from_slice(b"41G");
+
+        let outcome = decode_stream_data_recovering(&dict, &compressed).unwrap();
+
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Data(data), StreamDecodeEvent::Error(error)]
+                if data == b"A"
+                    && error.to_string()
+                        .starts_with("unsupported PDF feature: stream inflate: inflate: data:")
+        ));
+    }
+
+    #[test]
     fn recovering_decode_keeps_filterability_failures_in_outer_result() {
         let mut dict = Dictionary::new();
         dict.insert("Filter", Object::Name(b"BogusDecode".to_vec()));
