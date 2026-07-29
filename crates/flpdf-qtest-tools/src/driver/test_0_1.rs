@@ -117,7 +117,7 @@ fn write_object_details<R: Read + Seek>(
                         || message == "stream /DecodeParms length is inconsistent with filters" =>
                 {
                     let offset = qtest
-                        .indirect_ref()
+                        .terminal_indirect_ref()
                         .map(|object_ref| pdf.source_stream_data_offset(object_ref))
                         .transpose()?
                         .flatten();
@@ -378,6 +378,50 @@ mod tests {
         assert_eq!(
             stderr,
             b"WARNING: fixture.pdf (offset 202): stream /DecodeParms length is inconsistent with filters\n"
+        );
+    }
+
+    #[test]
+    fn chained_stream_warning_uses_terminal_stream_offset() {
+        let stream = b"<< /Filter [ /FlateDecode /FlateDecode ] \
+                       /DecodeParms [ null ] /Length 3 >>\n\
+                       stream\nabc\nendstream"
+            .to_vec();
+        let bytes = pdf_with_qtest(b"6 0 R", &[(6, b"7 0 R".to_vec()), (7, stream)]);
+        let options = PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        };
+        let mut pdf =
+            Pdf::open_mem_owned_with_options(bytes, options).expect("open chained stream fixture");
+        pdf.set_object(
+            flpdf::ObjectRef::new(6, 0),
+            Object::Reference(flpdf::ObjectRef::new(7, 0)),
+        );
+        let terminal_offset = pdf
+            .source_stream_data_offset(flpdf::ObjectRef::new(7, 0))
+            .expect("locate terminal stream")
+            .expect("terminal stream offset");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
+
+        run_test_0_1(
+            &mut pdf,
+            "fixture.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run chained stream fixture");
+
+        assert_eq!(
+            stderr,
+            format!(
+                "WARNING: fixture.pdf (offset {terminal_offset}): \
+                 stream /DecodeParms length is inconsistent with filters\n"
+            )
+            .into_bytes()
         );
     }
 

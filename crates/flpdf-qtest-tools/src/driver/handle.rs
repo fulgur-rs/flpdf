@@ -7,6 +7,7 @@ const MAX_REF_CHAIN_DEPTH: usize = 64;
 pub(crate) struct Handle {
     resolved: Object,
     indirect: Option<ObjectRef>,
+    terminal_indirect: Option<ObjectRef>,
 }
 
 impl Handle {
@@ -14,8 +15,12 @@ impl Handle {
         pdf: &mut Pdf<R>,
         value: Object,
     ) -> flpdf::Result<Self> {
-        let (resolved, indirect) = resolve_chain(pdf, value)?;
-        Ok(Self { resolved, indirect })
+        let (resolved, indirect, terminal_indirect) = resolve_chain(pdf, value)?;
+        Ok(Self {
+            resolved,
+            indirect,
+            terminal_indirect,
+        })
     }
 
     pub(crate) fn get_key<R: Read + Seek>(
@@ -40,6 +45,10 @@ impl Handle {
 
     pub(crate) fn indirect_ref(&self) -> Option<ObjectRef> {
         self.indirect
+    }
+
+    pub(crate) fn terminal_indirect_ref(&self) -> Option<ObjectRef> {
+        self.terminal_indirect
     }
 
     pub(crate) fn is_null(&self) -> bool {
@@ -186,13 +195,15 @@ fn write_qpdf_object_into<R: Read + Seek>(
 fn resolve_chain<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mut value: Object,
-) -> flpdf::Result<(Object, Option<ObjectRef>)> {
+) -> flpdf::Result<(Object, Option<ObjectRef>, Option<ObjectRef>)> {
     let mut indirect = None;
+    let mut terminal_indirect = None;
     for _ in 0..MAX_REF_CHAIN_DEPTH {
         let Object::Reference(reference) = value else {
-            return Ok((value, indirect));
+            return Ok((value, indirect, terminal_indirect));
         };
         indirect.get_or_insert(reference);
+        terminal_indirect = Some(reference);
         value = pdf.resolve_borrowed(reference)?.clone();
     }
     if matches!(value, Object::Reference(_)) {
@@ -201,7 +212,7 @@ fn resolve_chain<R: Read + Seek>(
             format!("object reference chain exceeds {MAX_REF_CHAIN_DEPTH} hops"),
         ))
     } else {
-        Ok((value, indirect))
+        Ok((value, indirect, terminal_indirect))
     }
 }
 
@@ -232,7 +243,7 @@ fn resolve_nested<R: Read + Seek>(
             format!("stream parameter nesting exceeds {MAX_REF_CHAIN_DEPTH} levels"),
         ));
     }
-    let (resolved, _) = resolve_chain(pdf, value)?;
+    let (resolved, _, _) = resolve_chain(pdf, value)?;
     match resolved {
         Object::Array(values) => {
             let values = values
@@ -374,6 +385,7 @@ mod tests {
         let unresolved = Handle {
             resolved: Object::Reference(ObjectRef::new(99, 0)),
             indirect: None,
+            terminal_indirect: None,
         };
         assert_eq!(unresolved.type_code(), 13);
         assert_eq!(unresolved.type_name(), "unresolved");
