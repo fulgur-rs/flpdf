@@ -135,12 +135,12 @@ lcov_mode = sys.argv[4] if len(sys.argv) > 4 else "fresh"
 GATE_PREFIX = "crates/flpdf/src/"                 # 100% gate
 # Report-only crates: any src/ tree under one of these prefixes gets a
 # coverage report but is not gated. flpdf-cli is release-shipped tooling
-# whose UI wiring is hard to unit-cover; flpdf-test-compare is test-only
-# tooling (publish = false) whose binary shape is validated by its own
+# whose UI wiring is hard to unit-cover; flpdf-qtest-tools is test-only
+# tooling (publish = false) whose binary shapes are validated by their own
 # integration tests, so the same lightweight treatment applies.
 REPORT_PREFIXES = (
     "crates/flpdf-cli/src/",
-    "crates/flpdf-test-compare/src/",
+    "crates/flpdf-qtest-tools/src/",
 )
 
 # 1. lcov -> {relpath: {line: hits}}.  Only lines with a DA record are

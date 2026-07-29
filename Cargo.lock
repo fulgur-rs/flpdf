@@ -352,7 +352,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "flpdf-test-compare"
+name = "flpdf-qtest-tools"
 version = "0.0.0"
 dependencies = [
  "assert_cmd",

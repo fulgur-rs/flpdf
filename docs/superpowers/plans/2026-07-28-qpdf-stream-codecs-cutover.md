@@ -1518,7 +1518,7 @@ cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_byte_identical
 cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_byte_identical_overlay
 cargo test -p flpdf-cli --features qpdf-zlib-compat --test compat_baseline_static_id -- --nocapture
 cargo test -p flpdf-cli --features qpdf-zlib-compat --test compat_matrix_baseline -- --nocapture
-cargo test -p flpdf-test-compare --features qpdf-zlib-compat --test e2e
+cargo test -p flpdf-qtest-tools --features qpdf-zlib-compat --test e2e
 ```
 
 Expected: PASS.
