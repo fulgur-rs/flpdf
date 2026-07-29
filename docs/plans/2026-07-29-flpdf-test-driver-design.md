@@ -277,10 +277,18 @@ unparseResolved: <…>
   - **配列要素も同様。** `/Filter [8 0 R]`（配列要素が間接参照）は
     `decode_filter_specs`（`stream_filter.rs:47-53`）が各要素へ直接 `as_name()` を
     呼ぶだけなので、要素ごとに §4 のチェーン解決を適用してから渡す必要がある。
+  - **`/DecodeParms` 辞書の値も同様。** `/DecodeParms << /Predictor 8 0 R
+    /Columns 9 0 R >>` のように **辞書の値**が間接参照だと、
+    `FlateLzwStreamFilter::set_decode_params`（`stream_filter.rs:238-`）が
+    `params.iter()` で得た値をそのまま `clamped_int_param`（`value.as_integer()`
+    を呼ぶだけで解決しない）に渡すため `None` になり、`filterable = false`。
+    `/Filter` / `/DecodeParms` の解決は「値そのもの」だけでなく、値が
+    dictionary なら**そのエントリ値も**チェーン解決してから渡す必要がある。
   
-  qpdf は `QPDFObjectHandle::isName()` の自動 dereference で top-level・配列要素
-  いずれもチェーンの終端まで解決するので、flpdf 側も**値の形（直接参照か配列か）で
-  分岐せず、resolve 対象を毎回 §4 の同じチェーン解決子に通す**のが正しい設計。
+  qpdf は `QPDFObjectHandle::isName()` / `getIntValueAsInt()` の自動 dereference で
+  top-level・配列要素・辞書エントリのいずれもチェーンの終端まで解決するので、
+  flpdf 側も**値の形（直接参照か配列か辞書か）で分岐せず、resolve 対象を毎回
+  §4 の同じチェーン解決子に通す**のが正しい設計。
   既存の `flpdf-qtest-tools`（旧 `flpdf-test-compare`）の `compare.rs` の
   `resolve_stream_keys` は全く同じ理由で存在するが 1 hop しか見ておらず
   （top-level・配列要素どちらも未対応）、この限界は `flpdf-qtest-tools` 側の
@@ -364,6 +372,9 @@ tests/fixtures/test_driver/
   stream_indirect_filter_array.{pdf,out} /Filter が [8 0 R] のように配列要素が
                                           間接参照のストリーム（§5 参照。
                                           top-level 1 hop の resolve では救えない）
+  stream_indirect_decode_parms.{pdf,out}  /DecodeParms << /Predictor 8 0 R
+                                          /Columns 9 0 R >> のように辞書の
+                                          エントリ値が間接参照のストリーム（§5 参照）
   stream_unfilterable.{pdf,out}  Stream data is not filterable.
 ```
 
@@ -377,11 +388,22 @@ tests/fixtures/test_driver/
 **通常の `cargo test` が実際にこの比較を行う経路**: `crates/flpdf-qtest-tools/tests/driver_goldens.rs`
 がコミット済みの `tests/fixtures/test_driver/*.{pdf,out}` を読み、`flpdf-test-driver` を
 `assert_cmd` 経由で起動して stdout を `.out` と突き合わせ、**かつ `.assert().success()`
-で exit code 0 もアサートする**（qpdf ビルド不要）。`assert_cmd::Command::output()` は
-非 0 終了でも stdout を返すため、stdout 比較だけでは「期待どおりのバイトを出力してから
-exit 2 する」回帰を見逃す — qtest 自身は `basic-parsing.test` の
-`EXIT_STATUS => 0` で終了コードを見ているので、golden テスト側もこれを見ないと
-qtest が FAIL とみなすケースを golden が PASS させてしまう。
+で exit code 0 も、stderr が空であることも**アサートする（qpdf ビルド不要）。
+`assert_cmd::Command::output()` は非 0 終了でも stdout を返すため、stdout 比較だけでは
+「期待どおりのバイトを出力してから exit 2 する」回帰を見逃す — qtest 自身は
+`basic-parsing.test` の `EXIT_STATUS => 0` で終了コードを見ているので、golden テスト側
+もこれを見ないと qtest が FAIL とみなすケースを golden が PASS させてしまう。stderr も
+同様: qtest は stdout/stderr を両方まとめて期待出力と突き合わせるので、
+stdout・exit code が正しいまま stderr にだけ余計な warning/diagnostic が出る回帰は、
+stderr を見ない golden では検出できない。
+
+**fail-loud dispatch（§3.1）の契約もこの golden スイートで検証する。** 成功ケース
+（`test_0_1` fixture）だけでなく、未実装番号を渡したときに `invalid test <n>` +
+exit 2 になることを確認する negative test と、§3 の「読込がルックアップより先」
+（壊れた PDF を未実装番号に食わせると parse エラーが優先される）を確認する test を
+`driver_goldens.rs` に加える。n9t0.3 で shim を PATH に置いた瞬間、basic-parsing 以外の
+`.test` が呼ぶ ~97 個の test 番号すべてに fail-loud の契約が効くため、ここが黙って
+壊れると golden 全緑のまま互換性ベースラインだけが動く。
 `scripts/qpdf-test-driver-diff.sh`（既存の `qpdf-{tokenizer,rc4,lzw-png,stream-codecs}-diff.sh`
 と同じ形）は別役割で、`scripts/fetch-qpdf-source.sh` で pinned source を取り本物の
 `test_driver` をビルドして fixture を再生成・オラクル照合するための開発者ツール。
