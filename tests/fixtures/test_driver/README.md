@@ -28,6 +28,14 @@ its `G` write error; the golden fixes that data-before-warning relationship.
 the first nested array as an invalid immediate filter item; it warns and
 continues instead of traversing the nested structure.
 
+`stream_decode_parms_direct_null` and `stream_decode_parms_indirect_null`
+place a null `/Predictor` directly and behind one indirect reference. qpdf's
+dictionary `getKeys()` omits both, so the Flate decoder uses its defaults.
+
+`stream_unsupported_filter_skips_decode_parms` pairs a valid-looking Flate
+stage with `/BogusDecode` and puts a 65-hop diagnostic reference behind
+`/DecodeParms`. qpdf rejects the chain before looking up that parameter.
+
 ## Regeneration
 
 ```sh

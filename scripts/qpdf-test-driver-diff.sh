@@ -41,6 +41,8 @@ fixture_names=(
     stream_indirect_filter_array
     stream_indirect_decode_parms
     stream_indirect_decode_parms_container
+    stream_decode_parms_direct_null
+    stream_decode_parms_indirect_null
     stream_decode_parms_length_mismatch
     stream_offset_false_markers
     stream_unknown_decode_param
@@ -51,6 +53,7 @@ fixture_names=(
     stream_asciihex_data_before_error
     stream_asciihex_downstream_cleanup_after_error
     stream_unfilterable
+    stream_unsupported_filter_skips_decode_parms
 )
 
 check_source() {

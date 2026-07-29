@@ -4,6 +4,25 @@ use flpdf::{Dictionary, Error, Object, ObjectRef, Pdf};
 
 const MAX_REF_CHAIN_DEPTH: usize = 64;
 
+pub(crate) struct ResolvedStreamDictionary {
+    dictionary: Dictionary,
+    filterable: bool,
+}
+
+impl ResolvedStreamDictionary {
+    pub(crate) fn is_filterable(&self) -> bool {
+        self.filterable
+    }
+}
+
+impl std::ops::Deref for ResolvedStreamDictionary {
+    type Target = Dictionary;
+
+    fn deref(&self) -> &Self::Target {
+        &self.dictionary
+    }
+}
+
 pub(crate) struct Handle {
     resolved: Object,
     indirect: Option<ObjectRef>,
@@ -218,13 +237,20 @@ fn resolve_chain<R: Read + Seek>(
 pub(crate) fn resolve_stream_dictionary<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     source: &Dictionary,
-) -> flpdf::Result<Dictionary> {
+) -> flpdf::Result<ResolvedStreamDictionary> {
     let filter = source
         .get(b"Filter")
         .cloned()
         .map(|value| resolve_filter_structure(pdf, value))
         .transpose()?;
     let filter_names = filter.as_ref().and_then(resolved_filter_names);
+    // QPDF_Stream::filterable checks every name against its factory table
+    // before it asks for /DecodeParms. In particular, an unknown later name
+    // prevents a preceding known filter from traversing a diagnostic parameter
+    // reference chain.
+    let filterable = filter_names
+        .as_deref()
+        .is_none_or(|names| names.iter().all(|name| qpdf_filter_factory_exists(name)));
 
     let mut resolved = Dictionary::new();
     for (key, value) in source.iter() {
@@ -232,15 +258,19 @@ pub(crate) fn resolve_stream_dictionary<R: Read + Seek>(
             filter.clone().unwrap_or_else(|| value.clone())
         } else if key == b"DecodeParms" {
             match filter_names.as_deref() {
-                Some(names) => resolve_decode_params(pdf, names, value.clone())?,
+                Some(names) if filterable => resolve_decode_params(pdf, names, value.clone())?,
                 None => value.clone(),
+                Some(_) => value.clone(),
             }
         } else {
             value.clone()
         };
         resolved.insert(key, value);
     }
-    Ok(resolved)
+    Ok(ResolvedStreamDictionary {
+        dictionary: resolved,
+        filterable,
+    })
 }
 
 fn resolved_filter_names(filter: &Object) -> Option<Vec<&[u8]>> {
@@ -254,10 +284,28 @@ fn resolved_filter_names(filter: &Object) -> Option<Vec<&[u8]>> {
 
 fn normalized_filter_name(name: &[u8]) -> &[u8] {
     match name {
+        b"AHx" => b"ASCIIHexDecode",
+        b"A85" => b"ASCII85Decode",
         b"Fl" => b"FlateDecode",
         b"LZW" => b"LZWDecode",
+        b"RL" => b"RunLengthDecode",
+        b"CCF" => b"CCITTFaxDecode",
+        b"DCT" => b"DCTDecode",
         name => name,
     }
+}
+
+fn qpdf_filter_factory_exists(name: &[u8]) -> bool {
+    matches!(
+        normalized_filter_name(name),
+        b"Crypt"
+            | b"FlateDecode"
+            | b"LZWDecode"
+            | b"RunLengthDecode"
+            | b"DCTDecode"
+            | b"ASCII85Decode"
+            | b"ASCIIHexDecode"
+    )
 }
 
 fn filter_consumes_decode_key(filter: &[u8], key: &[u8]) -> bool {
@@ -285,15 +333,20 @@ fn resolve_decode_param_dict<R: Read + Seek>(
         .collect();
     let mut resolved = Dictionary::new();
     for (key, value) in entries {
-        let value = if filters
+        let consumed = filters
             .iter()
-            .any(|filter| filter_consumes_decode_key(filter, &key))
-        {
+            .any(|filter| filter_consumes_decode_key(filter, &key));
+        let value = if consumed {
             resolve_chain(pdf, value)?.0
         } else {
             value
         };
-        resolved.insert(key, value);
+        // QPDFObjectHandle::getKeys omits direct values and indirect values
+        // resolving to null. Keep that visibility rule for keys consumed by
+        // the decoder so a null /Predictor (etc.) uses qpdf's default.
+        if !consumed || !value.is_null() {
+            resolved.insert(key, value);
+        }
     }
     Ok(Object::Dictionary(resolved))
 }
@@ -598,6 +651,67 @@ mod tests {
     }
 
     #[test]
+    fn known_decode_parameter_nulls_are_omitted_after_direct_or_indirect_resolution() {
+        for predictor in [Object::Null, Object::Reference(ObjectRef::new(21, 0))] {
+            let mut pdf = handle_pdf(b"");
+            pdf.set_object(ObjectRef::new(21, 0), Object::Null);
+            let mut params = Dictionary::new();
+            params.insert(b"Predictor", predictor);
+            let mut dictionary = Dictionary::new();
+            dictionary.insert(b"Filter", Object::Name(b"FlateDecode".to_vec()));
+            dictionary.insert(b"DecodeParms", Object::Dictionary(params));
+
+            let resolved = resolve_stream_dictionary(&mut pdf, &dictionary)
+                .expect("resolve DecodeParms with a null known key");
+            let params = resolved
+                .get(b"DecodeParms")
+                .and_then(Object::as_dict)
+                .expect("resolved DecodeParms dictionary");
+            assert!(
+                params.get(b"Predictor").is_none(),
+                "a resolved null /Predictor must be absent so qpdf defaults apply"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_filter_chain_skips_decode_parameter_resolution() {
+        let mut pdf = handle_pdf(b"");
+        for index in 0..65 {
+            let reference = ObjectRef::new(100 + index, 0);
+            let value = if index == 64 {
+                Object::Null
+            } else {
+                Object::Reference(ObjectRef::new(101 + index, 0))
+            };
+            pdf.set_object(reference, value);
+        }
+        let mut params = Dictionary::new();
+        params.insert(b"Predictor", Object::Reference(ObjectRef::new(100, 0)));
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(
+            b"Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"BogusDecode".to_vec()),
+            ]),
+        );
+        dictionary.insert(b"DecodeParms", Object::Dictionary(params.clone()));
+
+        let resolved = resolve_stream_dictionary(&mut pdf, &dictionary)
+            .expect("unsupported filters must not resolve DecodeParms");
+        assert!(
+            !resolved.is_filterable(),
+            "an unsupported filter anywhere in the chain must stop filtering before DecodeParms"
+        );
+        assert_eq!(
+            resolved.get(b"DecodeParms"),
+            Some(&Object::Dictionary(params)),
+            "the diagnostic reference must remain untouched behind an unsupported filter chain"
+        );
+    }
+
+    #[test]
     fn early_change_is_resolved_for_lzw_but_not_flate() {
         for (filter, expected_early_change) in [
             (
@@ -671,15 +785,12 @@ mod tests {
         let mut lzw_params = Dictionary::new();
         lzw_params.insert(b"Predictor", Object::Reference(ObjectRef::new(14, 0)));
         lzw_params.insert(b"EarlyChange", Object::Reference(ObjectRef::new(20, 0)));
-        let mut unknown_params = Dictionary::new();
-        unknown_params.insert(b"Predictor", Object::Reference(ObjectRef::new(13, 0)));
         let mut dictionary = Dictionary::new();
         dictionary.insert(
             b"Filter",
             Object::Array(vec![
                 Object::Name(b"FlateDecode".to_vec()),
                 Object::Name(b"LZWDecode".to_vec()),
-                Object::Name(b"BogusDecode".to_vec()),
                 Object::Name(b"FlateDecode".to_vec()),
             ]),
         );
@@ -688,7 +799,6 @@ mod tests {
             Object::Array(vec![
                 Object::Dictionary(flate_params),
                 Object::Dictionary(lzw_params),
-                Object::Dictionary(unknown_params),
                 Object::Null,
             ]),
         );
@@ -708,12 +818,7 @@ mod tests {
         let lzw_params = params[1].as_dict().expect("LZW parameters");
         assert_eq!(lzw_params.get(b"Predictor"), Some(&Object::Integer(3)));
         assert_eq!(lzw_params.get(b"EarlyChange"), Some(&Object::Integer(0)));
-        let unknown_params = params[2].as_dict().expect("unknown parameters");
-        assert_eq!(
-            unknown_params.get(b"Predictor"),
-            Some(&Object::Reference(ObjectRef::new(13, 0)))
-        );
-        assert_eq!(params[3], Object::Null);
+        assert_eq!(params[2], Object::Null);
     }
 
     #[test]

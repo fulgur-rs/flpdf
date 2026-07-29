@@ -113,6 +113,11 @@ fn write_object_details<R: Read + Seek>(
             writeln!(stdout)?;
             writeln!(stdout, "Uncompressed stream data:")?;
 
+            if !decode_dictionary.is_filterable() {
+                writeln!(stdout, "Stream data is not filterable.")?;
+                return Ok(());
+            }
+
             match flpdf::filters::decode_stream_data_recovering(&decode_dictionary, &stream.data) {
                 Ok(decoded) => {
                     let terminal_ref = qtest.terminal_indirect_ref();
