@@ -67,9 +67,9 @@ pub fn load_xref_and_trailer<R: Read + Seek>(reader: &mut R) -> Result<LoadedXre
 ///   `/Prev` chain is malformed (including offsets that do not fit `usize` and a
 ///   circular `/Prev` chain).
 /// - [`Error::OpenFailure`] when `allow_repair` is `true`, repair diagnostics
-///   were accumulated, and the linear scan still cannot recover a trailer or
-///   cross-reference entries. [`Error::open_failure`] exposes both the terminal
-///   source error and the preceding diagnostics.
+///   were accumulated, and the linear scan still cannot recover a trailer.
+///   [`Error::open_failure`] exposes both the terminal source error and the
+///   preceding diagnostics.
 /// - [`Error::Missing`] when a required cross-reference stream entry (such as
 ///   `/Size` or `/W`) is absent and `allow_repair` is `false`.
 /// - [`Error::Unsupported`] when a cross-reference stream uses an unsupported
@@ -322,7 +322,7 @@ fn merge_recovered_qpdf_state(
 /// - [`Error::Parse`] when the PDF header is missing or its version is not
 ///   UTF-8 before repair begins.
 /// - [`Error::OpenFailure`] when repair diagnostics were accumulated but the
-///   linear scan cannot recover a trailer or cross-reference entries.
+///   linear scan cannot recover a trailer.
 ///   [`Error::open_failure`] exposes both the terminal source error and the
 ///   preceding diagnostics.
 pub fn load_xref_and_trailer_best_effort<R: Read + Seek>(reader: &mut R) -> Result<LoadedXref> {
@@ -357,13 +357,6 @@ fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefEntry>> 
     // `/Type /ObjStm` so they remain resolvable without a usable xref; this extra
     // pass is bounded per object to keep recovery linear (see below).
     recover_objstm_compressed_entries(bytes, &mut entries);
-
-    if entries.is_empty() {
-        return Err(Error::parse(
-            0,
-            "unable to recover xref entries by linear scan",
-        ));
-    }
 
     Ok(entries)
 }
@@ -1094,18 +1087,29 @@ mod tests {
     }
 
     #[test]
-    fn failed_entry_repair_retains_qpdf_warning_sequence() {
+    fn empty_entry_repair_retains_qpdf_warning_sequence() {
         let mut input =
             Cursor::new(b"%PDF-1.7\ntrailer\n<< /Size 1 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n");
-        let error =
-            load_xref_and_trailer_with_repair(&mut input, true).expect_err("repair must fail");
-        let (source, diagnostics) = error
-            .open_failure()
-            .expect("repair failure carries diagnostics");
+        let loaded = load_xref_and_trailer_with_repair(&mut input, true)
+            .expect("qpdf accepts a recovered trailer with no xref entries");
 
-        assert_eq!(diagnostics.entries().len(), 3);
-        assert!(source
-            .to_string()
-            .contains("unable to recover xref entries by linear scan"));
+        assert!(loaded.entries.is_empty());
+        assert_eq!(
+            loaded.trailer.get_ref("Root"),
+            Some(crate::ObjectRef::new(1, 0))
+        );
+        assert_eq!(
+            loaded
+                .repair_diagnostics
+                .entries()
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "file is damaged",
+                "can't find startxref",
+                "Attempting to reconstruct cross-reference table",
+            ]
+        );
     }
 }

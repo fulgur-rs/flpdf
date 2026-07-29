@@ -63,3 +63,13 @@ fn open_repair_failure_matches_qpdf_output_and_exit_two() {
     assert_eq!(status, Some(2));
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn empty_reconstructed_xref_matches_qpdf_output_and_exit_zero() {
+    let expected = fs::read(fixture_dir().join("empty_reconstructed_xref.out"))
+        .expect("read qpdf oracle output");
+    let (status, actual) = run_fixture("empty_reconstructed_xref");
+
+    assert_eq!(status, Some(0));
+    assert_eq!(actual, expected);
+}

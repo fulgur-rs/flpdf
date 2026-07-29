@@ -956,11 +956,10 @@ fn best_effort_objstm_non_integer_offset_yields_no_compressed_entry() {
     assert_no_compressed_entry(bytes, objstm);
 }
 
-/// When the linear scan finds no indirect objects at all, recovery must fail
-/// with the "unable to recover xref entries" error (`recover_xref_entries`
-/// empty-map branch).
+/// qpdf accepts a recovered trailer even when the linear scan finds no
+/// indirect objects.
 #[test]
-fn best_effort_errors_when_no_objects_to_recover() {
+fn best_effort_accepts_recovered_trailer_without_objects() {
     // Header + corrupt xref + trailer, but zero indirect objects to scan.
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let start_xref = bytes.len();
@@ -969,18 +968,23 @@ fn best_effort_errors_when_no_objects_to_recover() {
         format!("trailer\n<< /Size 1 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
     );
 
-    let err = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
-        .expect_err("no recoverable objects should fail");
-    let message = format!("{err}");
-    assert!(
-        message.contains("unable to recover xref entries"),
-        "got {message}"
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("recovered trailer is sufficient");
+    assert!(loaded.entries.is_empty());
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+    assert_eq!(
+        loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "file is damaged",
+            "expected integer",
+            "Attempting to reconstruct cross-reference table",
+        ]
     );
-    let (source, diagnostics) = err
-        .open_failure()
-        .expect("terminal repair failure carries warnings");
-    assert!(matches!(source, Error::Parse { .. }), "got {source:?}");
-    assert_eq!(diagnostics.entries().len(), 3);
 }
 
 /// Build a damaged document that strict parsing rejects (corrupt `xref` keyword)
@@ -1531,7 +1535,7 @@ fn circular_prev_xref_stream_recovers_without_classic_trailer() {
 }
 
 #[test]
-fn circular_prev_repair_propagates_linear_scan_failure() {
+fn circular_prev_repair_accepts_empty_linear_scan() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let xref_offset = bytes.len();
     bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
@@ -1542,13 +1546,22 @@ fn circular_prev_repair_propagates_linear_scan_failure() {
         .as_bytes(),
     );
 
-    let error = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
-        .expect_err("repair cannot reconstruct a file without indirect objects");
-    assert!(
-        error
-            .to_string()
-            .contains("unable to recover xref entries by linear scan"),
-        "{error}"
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("recovered trailer is sufficient despite an empty object scan");
+    assert!(loaded.entries.is_empty());
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+    assert_eq!(
+        loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "file is damaged",
+            "loop detected following xref tables",
+            "Attempting to reconstruct cross-reference table",
+        ]
     );
 }
 

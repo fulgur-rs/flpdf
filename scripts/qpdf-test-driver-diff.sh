@@ -21,6 +21,7 @@ build_dir=
 fixture_names=(
     repairable_input
     open_repair_failure
+    empty_reconstructed_xref
     implicit_null
     direct_null
     dangling_ref
