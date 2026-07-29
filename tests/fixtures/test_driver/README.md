@@ -6,6 +6,11 @@ compares the Rust binary with the committed `.out` files during ordinary
 `cargo test`; `scripts/qpdf-test-driver-diff.sh` regenerates or checks those
 outputs against the pinned qpdf source.
 
+`stream_flate_error` deliberately declares `/FlateDecode` for the literal
+payload `abc`. It captures qpdf's recoverable codec-error behavior: the stream
+is filterable, the decoder warning is emitted at the stream-data offset, and
+the filtered pipeline is still finished.
+
 ## Regeneration
 
 ```sh

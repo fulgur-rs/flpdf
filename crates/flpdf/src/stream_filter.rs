@@ -130,6 +130,64 @@ fn map_pipeline_error(error: PipelineError) -> Error {
     Error::Unsupported(error.into_string_lossy())
 }
 
+pub(crate) struct FilterDecodeOutcome {
+    pub(crate) data: Vec<u8>,
+    pub(crate) error: Option<FilterDecodeError>,
+}
+
+pub(crate) struct FilterDecodeError {
+    pub(crate) error: Error,
+    pub(crate) during_write: bool,
+}
+
+impl FilterDecodeOutcome {
+    #[cfg(test)]
+    fn complete(data: Vec<u8>) -> Self {
+        Self { data, error: None }
+    }
+
+    #[cfg(test)]
+    fn into_strict_result(self) -> Result<Vec<u8>> {
+        match self.error {
+            Some(error) => Err(error.error),
+            None => Ok(self.data),
+        }
+    }
+}
+
+/// Pipe one complete encoded buffer through a stage with qpdf's error cleanup.
+///
+/// `QPDF::pipeStreamData` calls `finish` after a failed `write`, ignores that
+/// secondary result, and keeps the original exception. The stage's sink remains
+/// owned by its caller, so bytes forwarded before the failure stay accessible.
+struct StagePipelineError {
+    error: PipelineError,
+    during_write: bool,
+}
+
+fn write_and_finish(stage: &mut dyn Pipeline, data: &[u8]) -> Option<StagePipelineError> {
+    match stage.write(data) {
+        Ok(()) => stage.finish().err().map(|error| StagePipelineError {
+            error,
+            during_write: false,
+        }),
+        Err(error) => {
+            let _ = stage.finish();
+            Some(StagePipelineError {
+                error,
+                during_write: true,
+            })
+        }
+    }
+}
+
+fn map_stage_error(error: StagePipelineError) -> FilterDecodeError {
+    FilterDecodeError {
+        error: map_pipeline_error(error.error),
+        during_write: error.during_write,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn ignore_warning(_: &str, _: i32) -> PipelineResult<()> {
     Ok(())
@@ -166,12 +224,23 @@ pub(crate) trait StreamFilter {
         Ok(())
     }
 
+    fn pipe_decode_recovering(
+        &mut self,
+        data: &[u8],
+        max_output: Option<usize>,
+        warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+    ) -> Result<FilterDecodeOutcome>;
+
+    #[cfg(test)]
     fn pipe_decode(
         &mut self,
         data: &[u8],
         max_output: Option<usize>,
         warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
-    ) -> Result<Vec<u8>>;
+    ) -> Result<Vec<u8>> {
+        self.pipe_decode_recovering(data, max_output, warn)?
+            .into_strict_result()
+    }
 
     // flpdf's current public decode API always requests full decoding, so
     // classification becomes a production decision only when decode levels
@@ -309,18 +378,18 @@ impl StreamFilter for FlateLzwStreamFilter {
         Ok(())
     }
 
-    fn pipe_decode(
+    fn pipe_decode_recovering(
         &mut self,
         data: &[u8],
         max_output: Option<usize>,
         warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<FilterDecodeOutcome> {
         let geometry = self.decode_predictor_geometry()?;
         let mut sink = OutputBuffer::new(max_output);
         // SF_FlateLzwDecode::getDecodePipeline builds the chain from the sink
         // outward, so the predictor stage is constructed before the codec and
         // any construction failure precedes every codec write.
-        match geometry {
+        let error = match geometry {
             Some((columns, colors, bits_per_component)) => {
                 let mut predictor = PngFilter::new(
                     "png decode",
@@ -331,11 +400,14 @@ impl StreamFilter for FlateLzwStreamFilter {
                     bits_per_component,
                 )
                 .map_err(map_pipeline_error)?;
-                self.pipe_codec(&mut predictor, data, warn)?;
+                self.pipe_codec(&mut predictor, data, warn)?
             }
             None => self.pipe_codec(&mut sink, data, warn)?,
-        }
-        Ok(sink.data)
+        };
+        Ok(FilterDecodeOutcome {
+            data: sink.data,
+            error,
+        })
     }
 }
 
@@ -369,11 +441,10 @@ impl FlateLzwStreamFilter {
         next: &mut dyn Pipeline,
         data: &[u8],
         warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
-    ) -> Result<()> {
-        if self.lzw {
+    ) -> Result<Option<FilterDecodeError>> {
+        let error = if self.lzw {
             let mut stage = LzwDecoder::new("lzw decode", next, self.early_code_change);
-            stage.write(data).map_err(map_pipeline_error)?;
-            stage.finish().map_err(map_pipeline_error)?;
+            write_and_finish(&mut stage, data)
         } else {
             let mut stage = Flate::new(
                 "stream inflate",
@@ -383,22 +454,21 @@ impl FlateLzwStreamFilter {
             )
             .map_err(map_pipeline_error)?;
             stage.set_warn_callback(|message, code| warn(message, code));
-            stage.write(data).map_err(map_pipeline_error)?;
-            stage.finish().map_err(map_pipeline_error)?;
-        }
-        Ok(())
+            write_and_finish(&mut stage, data)
+        };
+        Ok(error.map(map_stage_error))
     }
 }
 
 struct Ascii85StreamFilter;
 
 impl StreamFilter for Ascii85StreamFilter {
-    fn pipe_decode(
+    fn pipe_decode_recovering(
         &mut self,
         data: &[u8],
         max_output: Option<usize>,
         _warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<FilterDecodeOutcome> {
         decode_ascii85(data, max_output)
     }
 }
@@ -406,12 +476,12 @@ impl StreamFilter for Ascii85StreamFilter {
 struct AsciiHexStreamFilter;
 
 impl StreamFilter for AsciiHexStreamFilter {
-    fn pipe_decode(
+    fn pipe_decode_recovering(
         &mut self,
         data: &[u8],
         max_output: Option<usize>,
         _warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<FilterDecodeOutcome> {
         decode_ascii_hex(data, max_output)
     }
 }
@@ -419,12 +489,12 @@ impl StreamFilter for AsciiHexStreamFilter {
 struct RunLengthStreamFilter;
 
 impl StreamFilter for RunLengthStreamFilter {
-    fn pipe_decode(
+    fn pipe_decode_recovering(
         &mut self,
         data: &[u8],
         max_output: Option<usize>,
         _warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<FilterDecodeOutcome> {
         decode_run_length(data, max_output)
     }
 
@@ -438,13 +508,13 @@ struct TestStreamFilter;
 
 #[cfg(test)]
 impl StreamFilter for TestStreamFilter {
-    fn pipe_decode(
+    fn pipe_decode_recovering(
         &mut self,
         data: &[u8],
         _: Option<usize>,
         _: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
-    ) -> Result<Vec<u8>> {
-        Ok(data.to_vec())
+    ) -> Result<FilterDecodeOutcome> {
+        Ok(FilterDecodeOutcome::complete(data.to_vec()))
     }
 }
 
@@ -453,16 +523,16 @@ struct BorrowedInputProbe;
 
 #[cfg(test)]
 impl StreamFilter for BorrowedInputProbe {
-    fn pipe_decode(
+    fn pipe_decode_recovering(
         &mut self,
         data: &[u8],
         _: Option<usize>,
         _: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<FilterDecodeOutcome> {
         EXPECTED_FIRST_INPUT.with(|expected| {
             assert_eq!(data.as_ptr() as usize, expected.get());
         });
-        Ok(data.to_vec())
+        Ok(FilterDecodeOutcome::complete(data.to_vec()))
     }
 }
 
@@ -481,34 +551,40 @@ pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilt
     }
 }
 
-fn decode_ascii85(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>> {
+fn decode_ascii85(data: &[u8], max_output: Option<usize>) -> Result<FilterDecodeOutcome> {
     let mut sink = OutputBuffer::new(max_output);
-    {
+    let error = {
         let mut stage = Ascii85Decoder::new("ascii85 decode", &mut sink);
-        stage.write(data).map_err(map_pipeline_error)?;
-        stage.finish().map_err(map_pipeline_error)?;
-    }
-    Ok(sink.data)
+        write_and_finish(&mut stage, data).map(map_stage_error)
+    };
+    Ok(FilterDecodeOutcome {
+        data: sink.data,
+        error,
+    })
 }
 
-fn decode_ascii_hex(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>> {
+fn decode_ascii_hex(data: &[u8], max_output: Option<usize>) -> Result<FilterDecodeOutcome> {
     let mut sink = OutputBuffer::new(max_output);
-    {
+    let error = {
         let mut stage = AsciiHexDecoder::new("asciiHex decode", &mut sink);
-        stage.write(data).map_err(map_pipeline_error)?;
-        stage.finish().map_err(map_pipeline_error)?;
-    }
-    Ok(sink.data)
+        write_and_finish(&mut stage, data).map(map_stage_error)
+    };
+    Ok(FilterDecodeOutcome {
+        data: sink.data,
+        error,
+    })
 }
 
-fn decode_run_length(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>> {
+fn decode_run_length(data: &[u8], max_output: Option<usize>) -> Result<FilterDecodeOutcome> {
     let mut sink = OutputBuffer::new(max_output);
-    {
+    let error = {
         let mut stage = RunLength::new("runlength decode", &mut sink, RunLengthAction::Decode);
-        stage.write(data).map_err(map_pipeline_error)?;
-        stage.finish().map_err(map_pipeline_error)?;
-    }
-    Ok(sink.data)
+        write_and_finish(&mut stage, data).map(map_stage_error)
+    };
+    Ok(FilterDecodeOutcome {
+        data: sink.data,
+        error,
+    })
 }
 
 #[cfg(test)]

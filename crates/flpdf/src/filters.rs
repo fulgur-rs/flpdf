@@ -84,6 +84,56 @@ pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u
     )
 }
 
+/// A non-fatal warning emitted while decoding a stream codec.
+///
+/// The message and numeric code correspond to qpdf's `Pl_Flate` warning
+/// callback. In particular, truncated Flate input reports zlib code `-5`
+/// without turning a successfully built filter chain into an outer error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamDecodeWarning {
+    /// qpdf-compatible warning text without document/object location context.
+    pub message: String,
+    /// Codec-specific numeric error code (a zlib code for Flate warnings).
+    pub code: i32,
+}
+
+/// Data and diagnostics produced by an opt-in recoverable stream decode.
+///
+/// An outer [`Result::Err`] from [`decode_stream_data_recovering`] means the
+/// filter chain could not be interpreted or constructed. Once construction
+/// succeeds, a codec failure is stored in [`error`](Self::error), and
+/// [`data`](Self::data) retains bytes already emitted before that failure.
+#[derive(Debug)]
+pub struct StreamDecodeOutcome {
+    /// Bytes emitted by the constructed decode pipeline.
+    pub data: Vec<u8>,
+    /// Non-fatal codec warnings in emission order.
+    pub warnings: Vec<StreamDecodeWarning>,
+    /// The first runtime codec failure, if decoding did not complete cleanly.
+    pub error: Option<Error>,
+    events: Vec<StreamDecodeEvent>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StreamDecodeEvent {
+    Warning(usize),
+    Error,
+}
+
+/// Decode a stream while preserving output emitted before a codec failure.
+///
+/// Unlike [`decode_stream_data`], this opt-in boundary separates filter-chain
+/// interpretation/construction from runtime codec failure. Unsupported filter
+/// shapes, names, and decode parameters return an outer [`Error`]. A runtime
+/// error after successful construction returns [`StreamDecodeOutcome`] with
+/// its partial bytes and error populated.
+pub fn decode_stream_data_recovering(
+    dict: &Dictionary,
+    stream_data: &[u8],
+) -> Result<StreamDecodeOutcome> {
+    decode_stream_data_recovering_with_limits(dict, stream_data, DecodeLimits::default())
+}
+
 /// Opt-in limits applied while decoding a stream's filter chain.
 ///
 /// Default is unlimited, matching [`decode_stream_data`]. Embedders processing
@@ -112,12 +162,35 @@ pub(crate) fn decode_stream_data_with_limits_and_warnings(
     limits: DecodeLimits,
     warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
 ) -> Result<Vec<u8>> {
+    let outcome = decode_stream_data_recovering_with_limits(dict, stream_data, limits)?;
+    let mut runtime_error = outcome.error;
+    for event in outcome.events {
+        match event {
+            StreamDecodeEvent::Warning(index) => {
+                let warning = &outcome.warnings[index];
+                warn(&warning.message, warning.code)
+                    .map_err(|error| Error::Unsupported(error.into_string_lossy()))?;
+            }
+            StreamDecodeEvent::Error => {
+                return Err(runtime_error
+                    .take()
+                    .expect("runtime event must retain the first codec error"));
+            }
+        }
+    }
+    Ok(outcome.data)
+}
+
+fn decode_stream_data_recovering_with_limits(
+    dict: &Dictionary,
+    stream_data: &[u8],
+    limits: DecodeLimits,
+) -> Result<StreamDecodeOutcome> {
     decode_stream_data_with_filters(
         dict.get("Filter"),
         dict.get("DecodeParms"),
         stream_data,
         limits,
-        warn,
     )
 }
 
@@ -181,8 +254,7 @@ fn decode_stream_data_with_filters(
     decode_params: Option<&Object>,
     stream_data: &[u8],
     limits: DecodeLimits,
-    warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
-) -> Result<Vec<u8>> {
+) -> Result<StreamDecodeOutcome> {
     decode_stream_data_with_filters_and_crypt(
         filter,
         decode_params,
@@ -193,7 +265,6 @@ fn decode_stream_data_with_filters(
                 "unsupported stream filter: Crypt".to_string(),
             ))
         },
-        warn,
     )
 }
 
@@ -203,8 +274,7 @@ fn decode_stream_data_with_filters_and_crypt<F>(
     stream_data: &[u8],
     limits: DecodeLimits,
     decrypt_crypt: &mut F,
-    warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
-) -> Result<Vec<u8>>
+) -> Result<StreamDecodeOutcome>
 where
     F: FnMut(Option<&Object>, &[u8]) -> Result<Vec<u8>>,
 {
@@ -215,18 +285,53 @@ where
     validate_filter_chain_count(specs.len())?;
     let prepared = prepare_decode_filters(specs)?;
     let mut decoded = Cow::Borrowed(stream_data);
+    let mut warnings = Vec::new();
+    let mut first_error = None;
+    let mut events = Vec::new();
     for mut stage in prepared {
         let next = match &mut stage.stage {
             PreparedStage::Crypt { decode_params } => {
                 decrypt_crypt(*decode_params, decoded.as_ref())?
             }
             PreparedStage::Codec { adapter } => {
-                adapter.pipe_decode(decoded.as_ref(), limits.max_output, warn)?
+                let warning_start = warnings.len();
+                let outcome = adapter.pipe_decode_recovering(
+                    decoded.as_ref(),
+                    limits.max_output,
+                    &mut |message, code| {
+                        warnings.push(StreamDecodeWarning {
+                            message: message.to_string(),
+                            code,
+                        });
+                        Ok(())
+                    },
+                )?; // cov:ignore: adapters are already preflighted and this recovery warning sink is infallible
+                let warning_end = warnings.len();
+                if let Some(stage_error) = outcome.error {
+                    if stage_error.during_write {
+                        events.push(StreamDecodeEvent::Error);
+                    }
+                    events.extend((warning_start..warning_end).map(StreamDecodeEvent::Warning));
+                    if !stage_error.during_write {
+                        events.push(StreamDecodeEvent::Error);
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(stage_error.error);
+                    }
+                } else {
+                    events.extend((warning_start..warning_end).map(StreamDecodeEvent::Warning));
+                }
+                outcome.data
             }
         };
         decoded = Cow::Owned(next);
     }
-    Ok(decoded.into_owned())
+    Ok(StreamDecodeOutcome {
+        data: decoded.into_owned(),
+        warnings,
+        error: first_error,
+        events,
+    })
 }
 
 /// A filter-chain stage with its decode route already resolved.
@@ -397,6 +502,22 @@ mod tests {
         dict
     }
 
+    fn valid_prefix_then_invalid_stored_block() -> (Vec<u8>, Vec<u8>) {
+        let mut encoded = vec![
+            0x78, 0x01, // zlib header
+            0x00, 0xff, 0xff, 0x00, 0x00, // non-final stored block, 65,535 bytes
+        ];
+        encoded.extend(std::iter::repeat_n(b'A', 65_535));
+        encoded.extend_from_slice(&[
+            0x00, 0x02, 0x00, 0xfd, 0xff, b'B', b'C', // valid non-final two-byte block
+            0x01, 0x01, 0x00, 0x00, 0x00, // final block with invalid LEN/NLEN
+        ]);
+
+        let mut decoded = vec![b'A'; 65_535];
+        decoded.extend_from_slice(b"BC");
+        (encoded, decoded)
+    }
+
     #[test]
     fn decode_stream_data_accepts_qpdf_flate_abbreviation() {
         let encoded = encode_stream_data(&flate_dict(), b"abbreviated filter").unwrap();
@@ -447,6 +568,100 @@ mod tests {
             "unsupported PDF feature: stream inflate: inflate: data: incorrect header check"
         );
     }
+
+    #[test]
+    fn recovering_decode_retains_partial_bytes_after_codec_error() {
+        let (encoded, decoded_prefix) = valid_prefix_then_invalid_stored_block();
+
+        let outcome = decode_stream_data_recovering(&flate_dict(), &encoded).unwrap();
+
+        assert_eq!(outcome.data, decoded_prefix[..65_536]);
+        assert!(outcome.warnings.is_empty());
+        assert!(
+            outcome
+                .error
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .starts_with("unsupported PDF feature: stream inflate: inflate: data:"),
+            "{:?}",
+            outcome.error
+        );
+    }
+
+    #[test]
+    fn recovering_decode_reports_blank_partial_for_malformed_header() {
+        let outcome = decode_stream_data_recovering(&flate_dict(), b"abc").unwrap();
+
+        assert!(outcome.data.is_empty());
+        assert!(outcome.warnings.is_empty());
+        assert_eq!(
+            outcome.error.as_ref().unwrap().to_string(),
+            "unsupported PDF feature: stream inflate: inflate: data: incorrect header check"
+        );
+    }
+
+    #[test]
+    fn strict_decode_keeps_the_recovering_codec_error_contract() {
+        let (encoded, _) = valid_prefix_then_invalid_stored_block();
+        let outcome = decode_stream_data_recovering(&flate_dict(), &encoded).unwrap();
+        let recovering_error = outcome.error.unwrap().to_string();
+
+        let strict_error = decode_stream_data(&flate_dict(), &encoded).unwrap_err();
+
+        assert_eq!(strict_error.to_string(), recovering_error);
+    }
+
+    #[test]
+    fn recovering_decode_collects_nonfatal_flate_warnings() {
+        let outcome = decode_stream_data_recovering(&flate_dict(), b"\x78").unwrap();
+
+        assert!(outcome.data.is_empty());
+        assert!(outcome.error.is_none());
+        assert_eq!(
+            outcome.warnings,
+            [StreamDecodeWarning {
+                message: "input stream is complete but output may still be valid".to_string(),
+                code: -5,
+            }]
+        );
+    }
+
+    #[test]
+    fn recovering_decode_records_finish_time_output_limit_after_partial_input() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"ASCIIHexDecode".to_vec()));
+
+        let outcome = decode_stream_data_recovering_with_limits(
+            &dict,
+            b"F",
+            DecodeLimits {
+                max_output: Some(0),
+            },
+        )
+        .unwrap();
+
+        assert!(outcome.data.is_empty());
+        assert!(outcome.warnings.is_empty());
+        assert_eq!(
+            outcome.error.unwrap().to_string(),
+            "unsupported PDF feature: decoded output exceeds configured limit of 0 bytes"
+        );
+    }
+
+    #[test]
+    fn recovering_decode_keeps_filterability_failures_in_outer_result() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"BogusDecode".to_vec()));
+
+        let error = decode_stream_data_recovering(&dict, b"abc").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: unsupported stream filter: BogusDecode"
+        );
+    }
+
     #[test]
     fn decode_stream_data_rejects_truncated_flate_warning() {
         let error = decode_stream_data(&flate_dict(), b"\x78").unwrap_err();

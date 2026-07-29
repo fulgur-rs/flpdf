@@ -40,6 +40,7 @@ fixture_names=(
     stream_decode_parms_length_mismatch
     stream_offset_false_markers
     stream_unknown_decode_param
+    stream_flate_error
     stream_unfilterable
 )
 
@@ -233,6 +234,10 @@ write(
 write(
     "stream_unfilterable",
     build_pdf(b"6 0 R", {6: stream(b"/Filter /BogusDecode", b"abc")}),
+)
+write(
+    "stream_flate_error",
+    build_pdf(b"6 0 R", {6: stream(b"/Filter /FlateDecode", b"abc")}),
 )
 
 metadata = b"1"

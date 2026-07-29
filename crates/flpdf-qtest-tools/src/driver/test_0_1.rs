@@ -105,10 +105,48 @@ fn write_object_details<R: Read + Seek>(
             writeln!(stdout)?;
             writeln!(stdout, "Uncompressed stream data:")?;
 
-            match flpdf::filters::decode_stream_data(&decode_dictionary, &stream.data) {
+            match flpdf::filters::decode_stream_data_recovering(&decode_dictionary, &stream.data) {
                 Ok(decoded) => {
+                    let terminal_ref = qtest.terminal_indirect_ref();
+                    let offset = terminal_ref
+                        .map(|object_ref| pdf.source_stream_data_offset(object_ref))
+                        .transpose()?
+                        .flatten();
                     stdout.flush()?;
-                    write_bytes(stdout, &decoded)?;
+                    write_bytes(stdout, &decoded.data)?;
+                    for warning in decoded.warnings {
+                        write_warning(
+                            filename,
+                            &Diagnostic::warning(warning.message, offset),
+                            stdout,
+                            stderr,
+                        )?;
+                    }
+                    if let Some(error) = decoded.error {
+                        let object_ref = terminal_ref.ok_or_else(|| {
+                            Error::System(
+                                "decoded stream has no terminal indirect object".to_string(),
+                            )
+                        })?;
+                        let detail = match error {
+                            Error::Unsupported(message)
+                            | Error::Internal(message)
+                            | Error::System(message) => message,
+                            error => error.to_string(),
+                        };
+                        write_warning(
+                            filename,
+                            &Diagnostic::warning(
+                                format!(
+                                    "error decoding stream data for object {} {}: {detail}",
+                                    object_ref.number, object_ref.generation
+                                ),
+                                offset,
+                            ),
+                            stdout,
+                            stderr,
+                        )?;
+                    }
                     writeln!(stdout)?;
                     writeln!(stdout, "End of stream data")?;
                 }
@@ -386,6 +424,35 @@ mod tests {
         assert!(actual
             .windows(b"\nabc\nEnd of stream data\n".len())
             .any(|line| { line == b"\nabc\nEnd of stream data\n" }));
+    }
+
+    #[test]
+    fn corrupt_flate_is_filterable_and_finishes_after_warning() {
+        let (stdout, stderr) = output_channels(
+            b"7 0 R",
+            &[(
+                7,
+                b"<< /Filter /FlateDecode /Length 3 >>\nstream\nabc\nendstream".to_vec(),
+            )],
+        );
+
+        assert_eq!(
+            stdout,
+            b"/QTest is indirect and has type stream (10)\n\
+              /QTest is a stream.  Dictionary: << /Filter /FlateDecode /Length 3 >>\n\
+              Raw stream data:\n\
+              abc\n\
+              Uncompressed stream data:\n\
+              \n\
+              End of stream data\n\
+              unparse: 7 0 R\n\
+              unparseResolved: 7 0 R\n"
+        );
+        assert_eq!(
+            stderr,
+            b"WARNING: fixture.pdf (offset 163): error decoding stream data for object 7 0: \
+              stream inflate: inflate: data: incorrect header check\n"
+        );
     }
 
     #[test]

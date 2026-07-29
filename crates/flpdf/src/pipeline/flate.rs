@@ -457,6 +457,22 @@ mod tests {
         encoded
     }
 
+    fn valid_prefix_then_invalid_stored_block() -> (Vec<u8>, Vec<u8>) {
+        let mut encoded = vec![
+            0x78, 0x01, // zlib header
+            0x00, 0xff, 0xff, 0x00, 0x00, // non-final stored block, 65,535 bytes
+        ];
+        encoded.extend(std::iter::repeat_n(b'A', 65_535));
+        encoded.extend_from_slice(&[
+            0x00, 0x02, 0x00, 0xfd, 0xff, b'B', b'C', // valid non-final two-byte block
+            0x01, 0x01, 0x00, 0x00, 0x00, // final block with invalid LEN/NLEN
+        ]);
+
+        let mut decoded = vec![b'A'; 65_535];
+        decoded.extend_from_slice(b"BC");
+        (encoded, decoded)
+    }
+
     fn deflate_after_level_change(
         input: &[u8],
         level_at_new: i32,
@@ -702,6 +718,27 @@ mod tests {
         let err = flate.write(&INVALID_STORED_BLOCK).unwrap_err();
         assert!(matches!(err, PipelineError::Runtime(_)));
         assert!(err.to_string().starts_with("inflate: inflate: data: "));
+    }
+
+    #[test]
+    fn codec_error_keeps_forwarded_prefix_and_finishes_downstream_once() {
+        let (encoded, decoded_prefix) = valid_prefix_then_invalid_stored_block();
+        let mut sink = RecordingSink::default();
+        {
+            let mut flate =
+                Flate::new("stream inflate", &mut sink, FlateAction::Inflate, 65_536).unwrap();
+            let error = flate.write(&encoded).unwrap_err();
+            assert!(
+                error
+                    .message()
+                    .starts_with("stream inflate: inflate: data:"),
+                "{error}"
+            );
+            let _ = flate.finish();
+        }
+
+        assert_eq!(sink.chunks.concat(), decoded_prefix[..65_536]);
+        assert_eq!(sink.finishes, 1);
     }
 
     #[test]
