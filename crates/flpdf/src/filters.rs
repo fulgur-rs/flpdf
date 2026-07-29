@@ -195,13 +195,7 @@ pub(crate) fn decode_stream_data_with_limits_and_warnings(
     )?;
     let mut first_error = None;
     for event in outcome.events {
-        let event_error = match event {
-            StreamDecodeEvent::Data(_) => None,
-            StreamDecodeEvent::Warning(warning) => warn(&warning.message, warning.code)
-                .err()
-                .map(|error| Error::Unsupported(error.into_string_lossy())),
-            StreamDecodeEvent::Error(error) => Some(error),
-        };
+        let event_error = replay_strict_decode_event(event, warn);
         if first_error.is_none() {
             first_error = event_error;
         }
@@ -209,6 +203,19 @@ pub(crate) fn decode_stream_data_with_limits_and_warnings(
     match first_error {
         Some(error) => Err(error),
         None => Ok(outcome.data),
+    }
+}
+
+fn replay_strict_decode_event(
+    event: StreamDecodeEvent,
+    warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+) -> Option<Error> {
+    match event {
+        StreamDecodeEvent::Data(_) => None,
+        StreamDecodeEvent::Warning(warning) => warn(&warning.message, warning.code)
+            .err()
+            .map(|error| Error::Unsupported(error.into_string_lossy())),
+        StreamDecodeEvent::Error(error) => Some(error),
     }
 }
 
@@ -834,6 +841,16 @@ mod tests {
                 if warning.message == "input stream is complete but output may still be valid"
                     && warning.code == -5
         ));
+    }
+
+    #[test]
+    fn strict_replay_ignores_a_defensive_data_event() {
+        let error = replay_strict_decode_event(
+            StreamDecodeEvent::Data(b"synthetic recovered data".to_vec()),
+            &mut reject_decode_warning,
+        );
+
+        assert!(error.is_none());
     }
 
     #[test]

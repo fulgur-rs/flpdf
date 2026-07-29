@@ -1076,10 +1076,10 @@ mod tests {
         let (source, diagnostics) = error
             .open_failure()
             .expect("repair failure carries diagnostics");
+        let entries = diagnostics.entries();
 
         assert_eq!(
-            diagnostics
-                .entries()
+            entries
                 .iter()
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
@@ -1089,6 +1089,7 @@ mod tests {
                 "Attempting to reconstruct cross-reference table",
             ]
         );
+        assert_eq!(entries[1].offset, None);
         assert!(source.to_string().contains("trailer dictionary not found"));
     }
 

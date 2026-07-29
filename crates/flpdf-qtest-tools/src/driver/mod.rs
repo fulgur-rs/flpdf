@@ -261,12 +261,8 @@ fn write_warning(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
-    let (message, offset) =
-        if diagnostic.message == "xref not found" && diagnostic.offset == Some(0) {
-            ("can't find startxref", None)
-        } else {
-            (diagnostic.message.as_str(), diagnostic.offset)
-        };
+    let message = diagnostic.message.as_str();
+    let offset = diagnostic.offset;
     let line = if message.starts_with('(') {
         format!("WARNING: {filename} {message}")
     } else if let Some(offset) = offset {
