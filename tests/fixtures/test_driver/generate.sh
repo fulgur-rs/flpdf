@@ -38,6 +38,7 @@ fixture_names=(
     stream_indirect_decode_parms
     stream_indirect_decode_parms_container
     stream_decode_parms_length_mismatch
+    stream_offset_false_markers
     stream_unfilterable
 )
 
@@ -54,7 +55,12 @@ import zlib
 out_dir = sys.argv[1]
 
 
-def build_pdf(qtest: bytes | None, extras: dict[int, bytes], bad_startxref: bool = False) -> bytes:
+def build_pdf(
+    qtest: bytes | None,
+    extras: dict[int, bytes],
+    bad_startxref: bool = False,
+    object_leader: bytes = b"",
+) -> bytes:
     objects: dict[int, bytes] = {
         1: b"<< /Type /Catalog /Pages 2 0 R >>",
         2: b"<< /Type /Pages /Count 0 /Kids [ ] >>",
@@ -64,6 +70,7 @@ def build_pdf(qtest: bytes | None, extras: dict[int, bytes], bad_startxref: bool
     data = bytearray(b"%PDF-1.7\n")
     offsets: dict[int, int] = {}
     for number in sorted(objects):
+        data += object_leader
         offsets[number] = len(data)
         data += f"{number} 0 obj\n".encode("ascii")
         data += objects[number]
@@ -206,6 +213,20 @@ write(
                 b"abc",
             ),
         },
+    ),
+)
+write(
+    "stream_offset_false_markers",
+    build_pdf(
+        b"6 0 R",
+        {
+            6: stream(
+                b"/Note (first\nstream\nsecond) "
+                b"/Filter [ /FlateDecode /FlateDecode ] /DecodeParms [ null ]",
+                b"abc",
+            ),
+        },
+        object_leader=b" ",
     ),
 )
 write(

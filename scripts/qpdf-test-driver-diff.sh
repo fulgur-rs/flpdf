@@ -42,6 +42,7 @@ fixture_names=(
     stream_indirect_decode_parms
     stream_indirect_decode_parms_container
     stream_decode_parms_length_mismatch
+    stream_offset_false_markers
     stream_unfilterable
 )
 
@@ -113,11 +114,12 @@ if [[ -L "$oracle" || ! -x "$oracle" ]]; then
     exit 1
 fi
 
-cargo build \
+CARGO_TARGET_DIR="${build_dir}/rust-target" cargo build \
     --manifest-path "${repo_root}/Cargo.toml" \
+    --locked \
     -p flpdf-qtest-tools \
     --bin flpdf-test-driver
-rust_driver="${repo_root}/target/debug/flpdf-test-driver"
+rust_driver="${build_dir}/rust-target/debug/flpdf-test-driver"
 if [[ -L "$rust_driver" || ! -x "$rust_driver" ]]; then
     printf 'qpdf-test-driver-diff.sh: missing flpdf-test-driver build artifact\n' >&2
     exit 1

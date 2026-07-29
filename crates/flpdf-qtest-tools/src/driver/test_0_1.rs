@@ -1,6 +1,6 @@
 use std::io::{Read, Seek, Write};
 
-use flpdf::{Diagnostic, Error, Object, ObjectRef, Pdf};
+use flpdf::{Diagnostic, Error, Object, Pdf};
 
 use super::handle::{resolve_stream_dictionary, write_qpdf_object, Handle};
 use super::{emit_new_diagnostics, write_warning};
@@ -8,7 +8,6 @@ use crate::output::write_bytes;
 
 pub(crate) fn run_test_0_1<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    source: &[u8],
     filename: &str,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -28,15 +27,7 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     write!(stdout, "/QTest is {direct_prefix}direct and has type ")?;
     writeln!(stdout, "{type_name} ({type_code})")?;
 
-    let details = write_object_details(
-        pdf,
-        source,
-        filename,
-        stdout,
-        stderr,
-        diagnostics_written,
-        &qtest,
-    );
+    let details = write_object_details(pdf, filename, stdout, stderr, diagnostics_written, &qtest);
     details?;
 
     write!(stdout, "unparse: ")?;
@@ -50,7 +41,6 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
 
 fn write_object_details<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    source: &[u8],
     filename: &str,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -126,7 +116,11 @@ fn write_object_details<R: Read + Seek>(
                     if message == "stream filter type is not name or array"
                         || message == "stream /DecodeParms length is inconsistent with filters" =>
                 {
-                    let offset = stream_data_offset(source, qtest.indirect_ref());
+                    let offset = qtest
+                        .indirect_ref()
+                        .map(|object_ref| pdf.source_stream_data_offset(object_ref))
+                        .transpose()?
+                        .flatten();
                     let diagnostic = Diagnostic::warning(message, offset);
                     write_warning(filename, &diagnostic, stdout, stderr)?;
                     writeln!(stdout, "Stream data is not filterable.")?;
@@ -141,59 +135,9 @@ fn write_object_details<R: Read + Seek>(
     Ok(())
 }
 
-fn stream_data_offset(source: &[u8], object_ref: Option<ObjectRef>) -> Option<u64> {
-    let object_ref = object_ref?;
-    let header = format!("{} {} obj", object_ref.number, object_ref.generation);
-    let object_start = find_line_token(source, header.as_bytes(), 0)?;
-    let search_start = object_start + header.len();
-
-    for index in search_start..source.len() {
-        if !is_line_start(source, index) {
-            continue;
-        }
-        if source[index..].starts_with(b"endobj") {
-            return None;
-        }
-        if !source[index..].starts_with(b"stream") {
-            continue;
-        }
-        let after_marker = &source[index + b"stream".len()..];
-        let eol_length = if after_marker.starts_with(b"\r\n") {
-            2
-        } else if after_marker.starts_with(b"\n") || after_marker.starts_with(b"\r") {
-            1
-        } else {
-            continue;
-        };
-        return u64::try_from(index + b"stream".len() + eol_length).ok();
-    }
-    None
-}
-
-fn find_line_token(source: &[u8], token: &[u8], start: usize) -> Option<usize> {
-    source[start..]
-        .windows(token.len())
-        .enumerate()
-        .find_map(|(relative, window)| {
-            let index = start + relative;
-            let after = index + token.len();
-            let has_token_boundary = source
-                .get(after)
-                .is_some_and(|byte| matches!(byte, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' '));
-            (window == token && is_line_start(source, index) && has_token_boundary).then_some(index)
-        })
-}
-
-fn is_line_start(source: &[u8], index: usize) -> bool {
-    index == 0
-        || source
-            .get(index - 1)
-            .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{run_test_0_1, stream_data_offset, write_object_details};
+    use super::{run_test_0_1, write_object_details};
     use crate::driver::handle::Handle;
     use flpdf::{Object, Pdf, PdfOpenOptions};
 
@@ -249,7 +193,6 @@ mod tests {
         let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
         run_test_0_1(
             &mut pdf,
-            &[],
             "fixture.pdf",
             &mut stdout,
             &mut stderr,
@@ -434,46 +377,8 @@ mod tests {
         );
         assert_eq!(
             stderr,
-            b"WARNING: fixture.pdf: stream /DecodeParms length is inconsistent with filters\n"
+            b"WARNING: fixture.pdf (offset 202): stream /DecodeParms length is inconsistent with filters\n"
         );
-    }
-
-    #[test]
-    fn stream_data_offsets_accept_pdf_eols_and_skip_non_marker_text() {
-        let object_ref = Some(flpdf::ObjectRef::new(6, 0));
-        assert_eq!(
-            stream_data_offset(b"6 0 obj\n<<>>\nstream\nabc", object_ref),
-            Some(20)
-        );
-        assert_eq!(
-            stream_data_offset(b"6 0 obj\n<<>>\nstream\r\nabc", object_ref),
-            Some(21)
-        );
-        assert_eq!(
-            stream_data_offset(b"6 0 obj\r<<>>\rstream\rabc", object_ref),
-            Some(20)
-        );
-        assert_eq!(
-            stream_data_offset(b"6 0 obj\n<< /Note (stream) >>\nstream\rabc", object_ref),
-            Some(36)
-        );
-        assert_eq!(stream_data_offset(b"6 0 obj\n<<>>", object_ref), None);
-        assert_eq!(
-            stream_data_offset(
-                b"6 0 obj\n<<>>\nendobj\n7 0 obj\n<<>>\nstream\nabc",
-                object_ref
-            ),
-            None
-        );
-        assert_eq!(
-            stream_data_offset(b"16 0 obj\nnull\n6 0 obj\n<<>>\nstream\nabc", object_ref),
-            Some(34)
-        );
-        assert_eq!(
-            stream_data_offset(b"6 0 obj\n<<>>\nstreamXabc", object_ref),
-            None
-        );
-        assert_eq!(stream_data_offset(b"", None), None);
     }
 
     #[test]
@@ -487,7 +392,6 @@ mod tests {
         let mut diagnostics_written = 0;
         write_object_details(
             &mut pdf,
-            &[],
             "fixture.pdf",
             &mut stdout,
             &mut stderr,

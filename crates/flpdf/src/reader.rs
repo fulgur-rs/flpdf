@@ -2,8 +2,8 @@
 pub(crate) mod file_object;
 
 use self::file_object::{
-    finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, PendingFileObject,
-    RecoveryPolicy, ResolvedStreamLength,
+    finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, PendingBody,
+    PendingFileObject, RecoveryPolicy, ResolvedStreamLength,
 };
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
@@ -873,6 +873,35 @@ impl<R: Read + Seek> Pdf<R> {
 
     pub(crate) fn source_xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
         self.source_xref_entries.clone()
+    }
+
+    /// Return the absolute byte offset of an indirect stream's encoded data in
+    /// the original input.
+    ///
+    /// This uses the source xref entry and the same indirect-object parser as
+    /// normal resolution, so `stream` text inside strings, names, comments, or
+    /// earlier stream payloads cannot be mistaken for the stream marker.
+    pub fn source_stream_data_offset(&mut self, object_ref: ObjectRef) -> Result<Option<u64>> {
+        let Some(XrefEntry::Uncompressed { offset }) =
+            self.source_xref_entries.get(&object_ref).copied()
+        else {
+            return Ok(None);
+        };
+        let read_limit = self
+            .next_object_offset(offset)
+            .unwrap_or(u64::MAX)
+            .saturating_sub(offset);
+        self.reader.seek(SeekFrom::Start(offset))?;
+        let mut bytes = Vec::new();
+        self.reader
+            .by_ref()
+            .take(read_limit)
+            .read_to_end(&mut bytes)?;
+        let pending = parse_file_object_syntax(&bytes)?;
+        let PendingBody::Stream { data_start, .. } = pending.body else {
+            return Ok(None);
+        };
+        Ok(Some(offset.saturating_add(data_start as u64)))
     }
 
     pub(crate) fn compressed_parent(&self, object_ref: ObjectRef) -> Option<(ObjectRef, u32)> {
@@ -3218,6 +3247,37 @@ mod tests {
                 b"abc"
             );
         }
+    }
+
+    #[test]
+    fn source_stream_data_offset_comes_from_parsed_object_framing() {
+        let stream_body = b"1 0 obj\n\
+                            << /Note (first\nstream\nsecond) /Length 3 >>\n\
+                            stream\nabc\nendstream\nendobj\n";
+        let direct_body = b"2 0 obj\ntrue\nendobj\n";
+        let bytes = classic_pdf_with_bodies(&[stream_body, direct_body], ObjectRef::new(1, 0));
+        let expected = bytes
+            .windows(b"\nstream\nabc".len())
+            .rposition(|window| window == b"\nstream\nabc")
+            .expect("real stream marker")
+            + b"\nstream\n".len();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream-offset fixture");
+
+        assert_eq!(
+            pdf.source_stream_data_offset(ObjectRef::new(1, 0))
+                .expect("read parsed stream offset"),
+            Some(expected as u64)
+        );
+        assert_eq!(
+            pdf.source_stream_data_offset(ObjectRef::new(2, 0))
+                .expect("direct object has no source stream offset"),
+            None
+        );
+        assert_eq!(
+            pdf.source_stream_data_offset(ObjectRef::new(99, 0))
+                .expect("unknown object has no source stream offset"),
+            None
+        );
     }
 
     #[test]

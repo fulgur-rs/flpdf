@@ -47,14 +47,9 @@ pub fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u
     if n != 1 {
         return write_error(stdout, stderr, &format!("invalid test {n}"));
     }
-    if let Err(error) = test_0_1::run_test_0_1(
-        &mut pdf,
-        &bytes,
-        filename,
-        stdout,
-        stderr,
-        &mut diagnostics_written,
-    ) {
+    if let Err(error) =
+        test_0_1::run_test_0_1(&mut pdf, filename, stdout, stderr, &mut diagnostics_written)
+    {
         return write_error(stdout, stderr, &error.to_string());
     }
     if writeln!(stdout, "test {n} done").is_err() {
