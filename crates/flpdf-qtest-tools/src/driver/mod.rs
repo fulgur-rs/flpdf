@@ -120,8 +120,18 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
+#[cfg(any(test, windows))]
+fn has_interior_nul(filename: &str) -> bool {
+    filename.contains('\0')
+}
+
 #[cfg(windows)]
 fn crt_open_error_message(filename: &str) -> Option<Vec<u8>> {
+    if has_interior_nul(filename) {
+        // `_wfopen_s` would stop at the NUL and probe a different path. With no
+        // CRT evidence for Rust's failed path, preserve the original fallback.
+        return None;
+    }
     let filename: Vec<libc::wchar_t> = filename.encode_utf16().chain(std::iter::once(0)).collect();
     let mode = [b'r' as libc::wchar_t, b'b' as libc::wchar_t, 0];
     let mut file = std::ptr::null_mut();
@@ -273,7 +283,9 @@ fn write_stderr_bytes(
 
 #[cfg(test)]
 mod tests {
-    use super::{crt_open_error_message, open_error_bytes, run, write_error_bytes};
+    use super::{
+        crt_open_error_message, has_interior_nul, open_error_bytes, run, write_error_bytes,
+    };
     use std::io::{self, Write};
 
     fn fixture(name: &str) -> String {
@@ -290,6 +302,12 @@ mod tests {
             open_error_bytes("input.pdf", Some(&[0xff, b'!']), &fallback),
             b"open input.pdf: \xff!"
         );
+    }
+
+    #[test]
+    fn interior_nul_guard_rejects_a_path_that_would_be_truncated_by_the_crt() {
+        assert!(has_interior_nul("before\0after"));
+        assert!(!has_interior_nul("ordinary.pdf"));
     }
 
     #[test]
@@ -336,6 +354,13 @@ mod tests {
         let message = crt_open_error_message(missing.to_str().expect("utf-8 temp path"))
             .expect("_wfopen_s failure must supply strerror bytes");
         assert!(!message.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_crt_probe_skips_an_interior_nul_path() {
+        assert!(has_interior_nul("before\0after"));
+        assert!(crt_open_error_message("before\0after").is_none());
     }
 
     struct FlushFailure;
