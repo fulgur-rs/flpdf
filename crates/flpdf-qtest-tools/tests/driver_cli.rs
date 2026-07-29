@@ -94,5 +94,5 @@ fn missing_input_reports_read_error() {
         .assert()
         .code(2)
         .stdout("")
-        .stderr(predicate::str::contains("No such file or directory"));
+        .stderr(predicate::str::contains("(os error "));
 }
