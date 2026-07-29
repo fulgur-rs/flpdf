@@ -137,6 +137,28 @@ fn recovery_events_keep_downstream_data_before_upstream_write_error() {
 }
 
 #[test]
+fn recovery_events_keep_downstream_cleanup_after_upstream_write_error() {
+    let dictionary = downstream_data_before_upstream_error_dictionary();
+
+    let outcome = decode_stream_data_recovering(&dictionary, b"343G").unwrap();
+
+    assert_eq!(outcome.data, b"@");
+    assert!(matches!(
+        &outcome.events[..],
+        [StreamDecodeEvent::Error(error), StreamDecodeEvent::Data(data)]
+            if error.to_string()
+                == "unsupported PDF feature: character out of range during base Hex decode: G"
+                && data == b"@"
+    ));
+    assert_eq!(
+        decode_stream_data(&dictionary, b"343G")
+            .unwrap_err()
+            .to_string(),
+        "unsupported PDF feature: character out of range during base Hex decode: G"
+    );
+}
+
+#[test]
 fn recovery_events_keep_final_data_and_warning_after_prior_write_error() {
     let dictionary = asciihex_then_flate_dictionary();
     let mut flate_dictionary = Dictionary::new();

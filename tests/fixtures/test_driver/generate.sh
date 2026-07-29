@@ -45,6 +45,7 @@ fixture_names=(
     stream_filter_error_then_warning
     stream_asciihex_odd_nibble_recovery
     stream_asciihex_data_before_error
+    stream_asciihex_downstream_cleanup_after_error
     stream_unfilterable
 )
 
@@ -259,6 +260,13 @@ write(
     build_pdf(
         b"6 0 R",
         {6: stream(b"/Filter [ /AHx /AHx ]", b"3431G")},
+    ),
+)
+write(
+    "stream_asciihex_downstream_cleanup_after_error",
+    build_pdf(
+        b"6 0 R",
+        {6: stream(b"/Filter [ /AHx /AHx ]", b"343G")},
     ),
 )
 
