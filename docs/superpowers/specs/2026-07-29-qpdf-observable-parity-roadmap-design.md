@@ -159,8 +159,8 @@ Deliverables:
 
 - merge and wire the existing test-driver test 1 implementation;
 - port test-driver IDs in responsibility-based slices rather than one monolith;
-- implement the 12 non-C helpers remaining after removing `qpdf-ctest` from
-  `flpdf-egzr`;
+- implement the 11 Linux-applicable non-C helpers remaining after removing
+  `qpdf-ctest` and Windows-only `test_shell_glob` from `flpdf-egzr`;
 - map `qpdf-ctest` underlying behavior to Rust oracle tests; and
 - distinguish shim/infrastructure failures from behavior failures in survey
   output.
@@ -294,8 +294,8 @@ Create issues for:
 - incremental writer byte gate; and
 - final applicable-qtest and three-build stability gate.
 
-Update `flpdf-egzr` to exclude direct `qpdf-ctest` porting and describe the
-remaining 12 helpers and 35 invocations.
+Update `flpdf-egzr` to exclude direct `qpdf-ctest` porting and Windows-only
+`test_shell_glob`, leaving 11 Linux-applicable helpers and 34 invocations.
 
 ### Dependency policy
 
@@ -305,7 +305,9 @@ remaining 12 helpers and 35 invocations.
 - Phase 5 proceeds tuple-by-tuple once the relevant behavior is available; it
   does not wait for every unrelated CLI slice.
 - Phase 6 depends on all preceding phase epics.
-- The root epic depends on Phase 6.
+- The root epic owns all seven phases through parent-child progress; do not add
+  an explicit root-to-Phase-6 blocking edge because Beads propagates a blocked
+  parent's state to its children and would prevent Phase 0 from becoming ready.
 
 Large implementation areas are split into stacked PRs. Each stack layer must
 have its own RED/GREEN evidence and 100% changed executable-line coverage
