@@ -16,9 +16,8 @@
 - `qpdf-ctest` is not ported; its underlying PDF behavior is mapped to Rust oracle tests.
 - `qpdf-zlib-compat` requires byte identity; the Pure Rust default requires semantic and structural identity.
 - Existing Beads remain authoritative and must not be duplicated or reparented.
-- Beads blocking edges connect issues of the same type: epic-to-epic phase
-  ordering and task-to-task implementation readiness are maintained as
-  separate layers; cross-type roadmap links use `relates-to`.
+- Beads blocking edges express actual readiness and may connect mixed issue
+  types. `relates-to` is reserved for non-blocking roadmap associations.
 - New implementation slices use consumer RED, the smallest lower-level primitive, production wiring, old-route deletion, differential verification, and 100% changed executable-line coverage.
 - Beads state and Git commits must both be pushed before handoff.
 
@@ -77,9 +76,10 @@ Acceptance:
 ```text
 All seven phase epics are closed; every applicable qtest passes for three
 independent builds; represented C-API/platform behavior has a passing Rust
-oracle test; qpdf-zlib-compat writer tuples are byte-identical; Pure Rust
-tuples are semantically and structurally identical; no parity-scoped Bead
-remains open.
+oracle test; qpdf-produced qpdf-zlib-compat writer tuples are byte-identical;
+Pure Rust tuples are semantically and structurally identical; incremental
+tuples satisfy their appended-revision invariants; no parity-scoped Bead other
+than this root remains open.
 ```
 
 Use:
@@ -103,8 +103,8 @@ same `--spec-id`:
 | P2 | P1 | qpdf parity P2: object model, parser, and repair convergence | Object consumers have oracle-backed resolution contracts; known parser/xref/page-tree recovery gaps are closed; warning timing, text, attribution, order, and fatality match qpdf on the applicable malformed corpus. |
 | P3 | P1 | qpdf parity P3: stream, filter, and crypto convergence | TIFF, DCT/decode-level, remaining Flate, AES, MD5/SHA/count/discard consumers are wired through qpdf-shaped production paths; replaced routes are deleted; specialized-filter/decode/encryption matrices pass. |
 | P4 | P2 | qpdf parity P4: QPDFJob, CLI, and transform convergence | Applicable argument forms, options, logger routing, warning lifecycle, content concatenation, copy/Form/attachment/annotation transforms match pinned qpdf and no replaced orchestration route remains. |
-| P5 | P1 | qpdf parity P5: writer convergence | Plain, QDF, ObjStm/xref-stream, linearized, encrypted, copy-encryption, and incremental tuples pass Pure Rust semantic/structural comparison and qpdf-zlib-compat byte comparison where supported. |
-| P6 | P1 | qpdf parity P6: applicable parity closure | Every applicable qtest passes for three independent builds; represented behavior points to passing Rust tests; exclusions are approved; divergence allowlists are empty; writer gates pass; no parity-scoped Bead remains open. |
+| P5 | P1 | qpdf parity P5: writer convergence | qpdf-produced plain, QDF, ObjStm/xref-stream, linearized, encrypted, and copy-encryption tuples pass Pure Rust semantic/structural comparison and qpdf-zlib-compat byte comparison; incremental tuples pass final-document semantic/structural comparison and appended-revision invariant checks and are excluded from qpdf byte identity. |
+| P6 | P1 | qpdf parity P6: applicable parity closure | Every applicable qtest passes for three independent builds; represented behavior points to passing Rust tests; exclusions are approved; divergence allowlists are empty; writer gates pass; no parity-scoped implementation Bead outside the root, this Phase 6 epic, and its closure task remains open. |
 
 Use each acceptance cell verbatim as the corresponding epic's
 `--acceptance`. Its description states that it owns that phase of the approved
@@ -155,8 +155,9 @@ Create under `P0_ID`:
 1. P1 task `qtest: applicable manifest and exclusion registry`
    - Classify every qtest-reported subtest as applicable, excluded,
      represented, blocked, passing, or failing.
-   - Record rationale and replacement Rust test for excluded/represented
-     entries.
+   - Record rationale for every excluded entry and a replacement Rust test for
+     represented entries or exclusions that exercise portable PDF behavior.
+     A true ABI-only exclusion requires rationale but no replacement test.
    - Acceptance: counts sum exactly to qtest's reported total; no entry lacks
      a reason, owner, or Bead link.
 2. P1 bug `qtest survey: reconcile 2790 parsed results with 2762 reported`
@@ -173,7 +174,7 @@ Create under `P1_ID`:
    - Acceptance: every invocation points to an existing passing Rust oracle
      test, a new follow-up Bead, or a documented ABI-only exclusion.
 2. P1 task `test_driver: inventory remaining IDs by qpdf responsibility`
-   - Cover IDs 0, 3, 28, 33, 34, 39, 52–71, 76–77, 80, 81, and 85.
+   - Cover IDs 0, 2, 3, 28, 33–36, 39, 52–71, 76–77, 80, 81, and 85.
    - Acceptance: each ID has source range, qtest invocations, consumer
      contract, dependency order, and follow-up Bead IDs.
 
@@ -208,16 +209,22 @@ Create under `P5_ID`:
 1. P2 task `writer parity: encrypted-output semantic and byte gate`
    - Pure Rust semantic comparison and `qpdf-zlib-compat` byte comparison.
    - Include deterministic crypto inputs and supported encryption revisions.
-2. P2 task `writer parity: incremental-output semantic and byte gate`
+2. P2 task `writer parity: incremental-output semantic and append-invariant gate`
    - Compare appended objects, `/Prev`, xref form, generations, trailer/ID,
-     warning status, and final bytes under deterministic inputs.
+     warning status, and final-document semantics and structure under
+     deterministic inputs.
+   - Do not require qpdf byte identity: qpdf 11.9.0 opens output with `wb+` and
+     writes a new header (`libqpdf/QPDFWriter.cc:83-98,2991-3001`), producing no
+     corresponding incremental byte stream.
 
 - [ ] **Step 6: Create the Phase 6 closure task**
 
 Create under `P6_ID`:
 
 1. P1 task `qpdf parity closure: applicable qtest and three-build stability`
-   - Acceptance copies every Phase 6 criterion from the design spec.
+   - Acceptance copies every Phase 6 criterion from the design spec and
+     exempts the root, Phase 6 epic, and the closure task itself from the
+     zero-open condition.
    - The task depends on the Phase 0 manifest task so the denominator cannot
      change silently.
 
@@ -231,9 +238,10 @@ encrypted gate, and incremental gate tasks each depend on both P0 tasks
 the closure task depends on both P0 tasks and all seven preceding gap tasks
 ```
 
-Do not add phase-epic-to-child-task blocking edges: Beads permits blocking
-edges only between issues of the same type. Phase completion is governed by
-child progress plus the epic acceptance criteria.
+These mixed-type blocking edges are deliberate: Beads accepts them, and they
+encode real implementation readiness. Do not replace them with `relates-to`,
+which is non-blocking. Phase completion is governed by child progress plus the
+epic acceptance criteria.
 
 Run:
 
@@ -407,6 +415,8 @@ Expected:
   phases satisfy their acceptance criteria;
 - non-P0 gap tasks wait on both P0 tasks, and the closure task waits on all
   preceding gap tasks;
+- the closure task, P6 epic, and root close in that order, and each zero-open
+  check exempts the still-open items in that closure chain;
 - existing issues retain their original parents;
 - no broken dependency or orphan is introduced.
 

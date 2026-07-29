@@ -49,11 +49,19 @@ replace completed component work or duplicate open issues.
 
 ### Byte identity
 
-- With `qpdf-zlib-compat`, every supported writer route must be byte-identical
-  to qpdf under the same deterministic options.
+- With `qpdf-zlib-compat`, every supported writer route for which qpdf produces
+  the corresponding output route must be byte-identical to qpdf under the same
+  deterministic options.
 - The default Pure Rust build retains `miniz_oxide`; it must be structurally and
   semantically identical but is not required to emit identical deflate bytes.
-- No other output-byte-changing deviation is admitted.
+- Incremental output is an flpdf-specific route: qpdf 11.9.0 opens file output
+  with `wb+` and `writeStandard()` starts by writing a new header
+  (`libqpdf/QPDFWriter.cc:83-98,2991-3001`), so there is no qpdf-produced
+  incremental byte stream to compare. Its gate compares final-document
+  semantics and structure and validates appended-revision invariants including
+  `/Prev`, xref form, generations, trailer/ID handling, and warning status.
+- No other output-byte-changing deviation is admitted for comparable
+  qpdf-produced routes.
 
 ## Current Gap Snapshot
 
@@ -80,7 +88,7 @@ drift is fixed.
 Current observability gaps include:
 
 - `test_driver` implements only test 1; upstream uses additional IDs including
-  0, 3, 28, 33, 34, 39, 52–71, 76–77, 80, 81, and 85;
+  0, 2, 3, 28, 33–36, 39, 52–71, 76–77, 80, 81, and 85;
 - `flpdf-egzr` inventories 13 missing helpers and 88 invocations, of which
   `qpdf-ctest` contributes 53 C-API invocations that are now excluded from
   direct porting; and
@@ -100,7 +108,8 @@ The observable missing or incomplete areas include:
 - repair behavior, diagnostic wording, offsets, and default recovery policy;
 - CLI options and warning lifecycle;
 - QDF/encryption null visibility and other route-specific writer behavior; and
-- byte gates for encrypted and incremental writer routes.
+- an encrypted-writer byte gate and an incremental-writer semantic,
+  structural, and append-invariant gate.
 
 The fact that a responsibility is `smeared` is not by itself a parity bug. It
 becomes roadmap work only when the distribution causes duplicated behavior,
@@ -140,8 +149,9 @@ Deliverables:
 
 - a machine-readable classification for every qtest subtest:
   `applicable`, `excluded`, `represented`, `blocked`, `passing`, or `failing`;
-- an explicit rationale and replacement-test reference for every excluded or
-  represented test;
+- an explicit rationale for every excluded test and a replacement-test
+  reference for every represented test or excluded entry that exercises
+  portable PDF behavior; true ABI-only exclusions require rationale only;
 - a fix for the `2,790 parsed / 2,762 reported` survey drift;
 - one reproducible command that records qpdf pin, flpdf commit, qtest commit,
   applicable denominator, passes, failure clusters, and allowlist regressions;
@@ -228,10 +238,13 @@ The matrix covers:
 - encrypted and copy-encryption output; and
 - incremental output.
 
-Each tuple records semantic comparison for the Pure Rust build and byte
-comparison for `qpdf-zlib-compat`. Encrypted and incremental byte gates are new
-required work. Existing open route-specific issues remain authoritative and
-are dependencies rather than duplicated children.
+Each qpdf-produced tuple records semantic comparison for the Pure Rust build
+and byte comparison for `qpdf-zlib-compat`. The encrypted byte gate is new
+required work. The flpdf-specific incremental tuple records final-document
+semantic and structural comparison plus appended-revision invariants; it is
+explicitly excluded from qpdf byte identity because qpdf produces only a full
+rewrite. Existing open route-specific issues remain authoritative and are
+dependencies rather than duplicated children.
 
 ### Phase 6 — Closure
 
@@ -246,7 +259,10 @@ The root epic closes only when:
   gate;
 - `docs/qpdf-correspondence.md` contains no unexplained missing consumer
   behavior; and
-- no parity-scoped Bead remains open.
+- no parity-scoped implementation Bead outside the ordered closure chain
+  remains open. The final closure task closes first, then the Phase 6 epic,
+  then the root epic; each closure item exempts itself and its still-open
+  closure ancestors when evaluating this condition.
 
 ## Beads Structure
 
@@ -291,7 +307,7 @@ Create issues for:
 - TIFF Predictor 2 cutover;
 - DCT/decode-level cutover;
 - encrypted writer byte gate;
-- incremental writer byte gate; and
+- incremental writer semantic, structural, and append-invariant gate; and
 - final applicable-qtest and three-build stability gate.
 
 Update `flpdf-egzr` to exclude direct `qpdf-ctest` porting and Windows-only
@@ -299,6 +315,9 @@ Update `flpdf-egzr` to exclude direct `qpdf-ctest` porting and Windows-only
 
 ### Dependency policy
 
+- Blocking edges express actual implementation readiness and may connect
+  mixed issue types. `relates-to` is reserved for non-blocking roadmap
+  associations.
 - Phase 0 blocks new parity implementation slices.
 - Phases 2, 3, and 4 may proceed independently after their measurement or
   helper prerequisites exist.
