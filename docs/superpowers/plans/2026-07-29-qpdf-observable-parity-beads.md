@@ -178,7 +178,25 @@ blocked by P0; P6 is blocked by P1–P5.
 - Consume: `P0_ID` through `P6_ID`
 - Produce: ten non-duplicative tasks with exact acceptance criteria
 
-- [ ] **Step 1: Create Phase 0 measurement tasks**
+- [ ] **Step 1: Create and capture the Phase 1 mapping task**
+
+Create or reuse under `P1_ID` the P2 task
+`qpdf-ctest: map C-API-only coverage to Rust oracle tests`, then capture its
+actual ID as `CTEST_MAPPING_ID`.
+
+- Inventory all 53 invocations by underlying behavior.
+- Acceptance: every invocation points to an existing passing Rust oracle test,
+  a newly created non-ABI follow-up that participates in the Phase 1 closure
+  graph, or a documented ABI-only exclusion; counts sum to 53; source ranges
+  and target tests are recorded; every provisional
+  `bead:$CTEST_MAPPING_ID` manifest reference is replaced; the mapping task
+  remains blocked until every generated non-ABI follow-up is closed.
+- Each generated non-ABI follow-up is a child of `P1_ID`, carries `pre-v1` and
+  `qpdf-parity`, uses this roadmap `--spec-id`, satisfies the full
+  implementation-issue acceptance template, and is added as a blocking
+  dependency of `CTEST_MAPPING_ID`.
+
+- [ ] **Step 2: Create Phase 0 measurement tasks**
 
 Create under `P0_ID`:
 
@@ -196,10 +214,11 @@ Create under `P0_ID`:
    - Record rationale for every excluded entry and a concrete Rust-test
      reference for every represented entry. A true ABI-only exclusion requires
      rationale but no replacement test. An excluded direct qpdf-ctest entry
-     that may exercise portable behavior may use `bead:flpdf-25kg.2.1`
-     provisionally during Phase 0; the Phase 1 mapping task must replace every
-     such reference with a Rust test, narrower follow-up Bead, or ABI-only
-     scope rationale.
+     that may exercise portable behavior may use
+     `bead:$CTEST_MAPPING_ID` provisionally during Phase 0; the Phase 1 mapping
+     task must replace every such reference with a Rust test, a generated
+     non-ABI follow-up that blocks `CTEST_MAPPING_ID`, or an ABI-only scope
+     rationale.
    - Own the reproducible full-survey command that records qpdf, flpdf, and
      qtest pins, applicable denominator, passes, failure clusters, and
      allowlist regressions.
@@ -219,21 +238,16 @@ The manifest task depends on the result-accounting bug so its recorded command,
 denominator, and failure categories are generated from the authoritative
 2,762-result set.
 
-- [ ] **Step 2: Create Phase 1 observation tasks**
+- [ ] **Step 3: Create the remaining Phase 1 observation task**
 
 Create under `P1_ID`:
 
-1. P2 task `qpdf-ctest: map C-API-only coverage to Rust oracle tests`
-   - Inventory all 53 invocations by underlying behavior.
-   - Acceptance: every invocation points to an existing passing Rust oracle
-     test, a new follow-up Bead, or a documented ABI-only exclusion, and every
-     provisional `bead:flpdf-25kg.2.1` manifest reference is replaced.
-2. P1 task `test_driver: inventory remaining IDs by qpdf responsibility`
+1. P1 task `test_driver: inventory remaining IDs by qpdf responsibility`
    - Cover IDs 0, 2, 3, 28, 33–36, 39, 52–71, 76–77, 80, 81, and 85.
    - Acceptance: each ID has source range, qtest invocations, consumer
      contract, dependency order, and follow-up Bead IDs.
 
-- [ ] **Step 3: Create the Phase 2 lazy/eager audit**
+- [ ] **Step 4: Create the Phase 2 lazy/eager audit**
 
 Create under `P2_ID`:
 
@@ -244,20 +258,31 @@ Create under `P2_ID`:
      follow-up issue; no broad lazy-object rewrite is proposed without a real
      consumer.
 
-- [ ] **Step 4: Create Phase 3 codec tasks**
+- [ ] **Step 5: Create Phase 3 codec tasks**
 
 Create under `P3_ID`:
 
 1. P1 feature `Pl_TIFFPredictor: qpdf 11.9.0 production cutover`
-   - Acceptance includes streaming chunk boundaries, constructor errors,
-     finish behavior, DecodeParms, production decode wiring, old-route
-     deletion, and a pinned live differential.
+   - Acceptance records the qpdf 11.9.0 source/live-oracle contract; names the
+     production Predictor 2 decode consumer and route; requires deletion of the
+     replaced whole-buffer or unsupported route; covers focused observable
+     fixtures including chunk boundaries, row geometry, DecodeParms,
+     constructor errors, truncated finish, and other failure paths; records
+     differential commands with exact expected bytes, diagnostics, and
+     output/exit behavior; requires fresh 100% changed executable-line
+     coverage; and records full-survey snapshots before and after the slice.
 2. P1 feature `Pl_DCT and decode-level: qpdf 11.9.0 production cutover`
-   - Acceptance includes specialized/generalized/all decode levels, DCT
-     warning/error behavior, JSON/CLI consumers, old fallback deletion, and a
-     pinned live differential.
+   - Acceptance records the qpdf 11.9.0 source/live-oracle contract; names the
+     JSON and CLI production consumers and routes; requires deletion of the
+     encoded-byte fallback; covers focused observable fixtures including
+     specialized/generalized/all decode levels, valid and malformed DCT,
+     multi-filter chains, warning/error behavior, and other failure paths;
+     records differential commands with exact expected bytes, diagnostics,
+     stdout/stderr, and exit status; requires fresh 100% changed
+     executable-line coverage; and records full-survey snapshots before and
+     after the slice.
 
-- [ ] **Step 5: Create Phase 5 byte-gate tasks**
+- [ ] **Step 6: Create Phase 5 byte-gate tasks**
 
 Create under `P5_ID`:
 
@@ -272,7 +297,7 @@ Create under `P5_ID`:
      writes a new header (`libqpdf/QPDFWriter.cc:83-98,2991-3001`), producing no
      corresponding incremental byte stream.
 
-- [ ] **Step 6: Create the Phase 6 closure task**
+- [ ] **Step 7: Create the Phase 6 closure task**
 
 Create under `P6_ID`:
 
@@ -283,7 +308,7 @@ Create under `P6_ID`:
    - The task depends on the Phase 0 manifest task so the denominator cannot
      change silently.
 
-- [ ] **Step 7: Read back all new gap issues**
+- [ ] **Step 8: Read back all new gap issues**
 
 Before readback, add task-to-task blocking dependencies:
 
@@ -499,7 +524,10 @@ Expected:
 - non-P0 gap tasks wait on both P0 tasks, and the closure task waits on all
   preceding gap tasks;
 - the C-API mapping runs after the initial manifest and replaces every
-  provisional mapping-Bead reference before Phase 1 closes;
+  provisional reference to the captured `CTEST_MAPPING_ID` before Phase 1
+  closes; every generated non-ABI follow-up is a labeled Phase 1 child,
+  satisfies the implementation acceptance template, and blocks the mapping
+  task until it closes;
 - required existing parity issues block their owning phase; only explicitly
   non-observable roadmap associations such as `flpdf-mfir` use `relates-to`;
 - each Phase 2–5 completion gate is blocked by the exact required non-epic
@@ -559,7 +587,8 @@ output.
 Run:
 
 ```bash
-git add docs/superpowers/plans/2026-07-29-qpdf-observable-parity-beads.md
+git add docs/superpowers/plans/2026-07-29-qpdf-observable-parity-beads.md \
+  docs/superpowers/specs/2026-07-29-qpdf-observable-parity-roadmap-design.md
 git commit -m "docs: plan qpdf parity roadmap tracking"
 ```
 

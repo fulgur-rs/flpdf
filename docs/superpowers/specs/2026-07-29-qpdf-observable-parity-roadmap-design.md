@@ -162,9 +162,10 @@ Deliverables:
   for every represented test, and—by Phase 1 closure—a concrete Rust test or
   narrower follow-up Bead for every excluded entry that exercises portable PDF
   behavior; true ABI-only exclusions require rationale only. During Phase 0,
-  direct `qpdf-ctest` entries may provisionally reference the Phase 1 mapping
-  Bead; Phase 1 replaces every provisional reference with a Rust test, a
-  narrower follow-up Bead, or an ABI-only scope rationale;
+  direct `qpdf-ctest` entries may provisionally reference the actual
+  created-or-reused Phase 1 mapping Bead ID; Phase 1 replaces every
+  provisional reference with a Rust test, a narrower follow-up Bead, or an
+  ABI-only scope rationale;
 - a fix for the `2,790 parsed / 2,762 reported` survey drift;
 - one reproducible command that records qpdf pin, flpdf commit, qtest commit,
   applicable denominator, passes, failure clusters, and allowlist regressions;
@@ -185,7 +186,10 @@ Deliverables:
 - implement the 11 Linux-applicable non-C helpers remaining after removing
   `qpdf-ctest` and Windows-only `test_shell_glob` from `flpdf-egzr`;
 - map `qpdf-ctest` underlying behavior to Rust oracle tests and eliminate all
-  provisional mapping-Bead references from the manifest; and
+  provisional mapping-Bead references from the manifest. Every uncovered
+  portable behavior becomes a Phase 1 child implementation issue with the
+  roadmap labels, this spec ID, and the full implementation acceptance
+  template; it blocks the mapping task and therefore Phase 1 closure; and
 - distinguish shim/infrastructure failures from behavior failures in survey
   output.
 
