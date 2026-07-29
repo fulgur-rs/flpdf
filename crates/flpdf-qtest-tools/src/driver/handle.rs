@@ -614,4 +614,183 @@ mod tests {
         );
         assert_eq!(resolved_params.get(b"Metadata"), Some(&metadata));
     }
+
+    #[test]
+    fn early_change_is_resolved_for_lzw_but_not_flate() {
+        for (filter, expected_early_change) in [
+            (
+                b"FlateDecode".as_slice(),
+                Object::Reference(ObjectRef::new(20, 0)),
+            ),
+            (b"LZWDecode".as_slice(), Object::Integer(0)),
+        ] {
+            let mut pdf = handle_pdf(b"");
+            pdf.set_object(ObjectRef::new(20, 0), Object::Integer(0));
+            let mut params = Dictionary::new();
+            params.insert(b"EarlyChange", Object::Reference(ObjectRef::new(20, 0)));
+            let mut dictionary = Dictionary::new();
+            dictionary.insert(b"Filter", Object::Name(filter.to_vec()));
+            dictionary.insert(b"DecodeParms", Object::Dictionary(params));
+
+            let resolved = resolve_stream_dictionary(&mut pdf, &dictionary)
+                .expect("resolve stream dictionary");
+            let params = resolved
+                .get(b"DecodeParms")
+                .and_then(Object::as_dict)
+                .expect("resolved DecodeParms dictionary");
+            assert_eq!(params.get(b"EarlyChange"), Some(&expected_early_change));
+        }
+    }
+
+    #[test]
+    fn filter_aliases_resolve_their_consumed_decode_parameters() {
+        for (filter, key, expected) in [
+            (
+                b"Fl".as_slice(),
+                b"Predictor".as_slice(),
+                Object::Integer(15),
+            ),
+            (
+                b"LZW".as_slice(),
+                b"EarlyChange".as_slice(),
+                Object::Integer(0),
+            ),
+        ] {
+            let mut pdf = handle_pdf(b"");
+            pdf.set_object(ObjectRef::new(20, 0), Object::Integer(0));
+            let mut params = Dictionary::new();
+            let value = if key == b"Predictor" {
+                Object::Reference(ObjectRef::new(13, 0))
+            } else {
+                Object::Reference(ObjectRef::new(20, 0))
+            };
+            params.insert(key, value);
+            let mut dictionary = Dictionary::new();
+            dictionary.insert(b"Filter", Object::Name(filter.to_vec()));
+            dictionary.insert(b"DecodeParms", Object::Dictionary(params));
+
+            let resolved = resolve_stream_dictionary(&mut pdf, &dictionary)
+                .expect("resolve stream dictionary");
+            let params = resolved
+                .get(b"DecodeParms")
+                .and_then(Object::as_dict)
+                .expect("resolved DecodeParms dictionary");
+            assert_eq!(params.get(key), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn matching_filter_arrays_resolve_only_their_paired_parameters() {
+        let mut pdf = handle_pdf(b"");
+        pdf.set_object(ObjectRef::new(20, 0), Object::Integer(0));
+        let mut flate_params = Dictionary::new();
+        flate_params.insert(b"Predictor", Object::Reference(ObjectRef::new(13, 0)));
+        flate_params.insert(b"EarlyChange", Object::Reference(ObjectRef::new(20, 0)));
+        let mut lzw_params = Dictionary::new();
+        lzw_params.insert(b"Predictor", Object::Reference(ObjectRef::new(14, 0)));
+        lzw_params.insert(b"EarlyChange", Object::Reference(ObjectRef::new(20, 0)));
+        let mut unknown_params = Dictionary::new();
+        unknown_params.insert(b"Predictor", Object::Reference(ObjectRef::new(13, 0)));
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(
+            b"Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"LZWDecode".to_vec()),
+                Object::Name(b"BogusDecode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        dictionary.insert(
+            b"DecodeParms",
+            Object::Array(vec![
+                Object::Dictionary(flate_params),
+                Object::Dictionary(lzw_params),
+                Object::Dictionary(unknown_params),
+                Object::Null,
+            ]),
+        );
+
+        let resolved =
+            resolve_stream_dictionary(&mut pdf, &dictionary).expect("resolve stream dictionary");
+        let params = resolved
+            .get(b"DecodeParms")
+            .and_then(Object::as_array)
+            .expect("resolved DecodeParms array");
+        let flate_params = params[0].as_dict().expect("Flate parameters");
+        assert_eq!(flate_params.get(b"Predictor"), Some(&Object::Integer(15)));
+        assert_eq!(
+            flate_params.get(b"EarlyChange"),
+            Some(&Object::Reference(ObjectRef::new(20, 0)))
+        );
+        let lzw_params = params[1].as_dict().expect("LZW parameters");
+        assert_eq!(lzw_params.get(b"Predictor"), Some(&Object::Integer(3)));
+        assert_eq!(lzw_params.get(b"EarlyChange"), Some(&Object::Integer(0)));
+        let unknown_params = params[2].as_dict().expect("unknown parameters");
+        assert_eq!(
+            unknown_params.get(b"Predictor"),
+            Some(&Object::Reference(ObjectRef::new(13, 0)))
+        );
+        assert_eq!(params[3], Object::Null);
+    }
+
+    #[test]
+    fn malformed_filter_structure_leaves_decode_parameters_unresolved() {
+        let mut pdf = handle_pdf(b"");
+        let mut filter = Dictionary::new();
+        filter.insert(b"Type", Object::Name(b"FlateDecode".to_vec()));
+        let mut params = Dictionary::new();
+        params.insert(b"Predictor", Object::Reference(ObjectRef::new(13, 0)));
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(b"Filter", Object::Dictionary(filter));
+        dictionary.insert(b"DecodeParms", Object::Dictionary(params));
+
+        let resolved =
+            resolve_stream_dictionary(&mut pdf, &dictionary).expect("resolve stream dictionary");
+        let params = resolved
+            .get(b"DecodeParms")
+            .and_then(Object::as_dict)
+            .expect("preserved DecodeParms dictionary");
+        assert_eq!(
+            params.get(b"Predictor"),
+            Some(&Object::Reference(ObjectRef::new(13, 0)))
+        );
+    }
+
+    #[test]
+    fn null_filter_resolves_parameter_container_but_not_its_values() {
+        let mut pdf = handle_pdf(b"");
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(b"Filter", Object::Null);
+        dictionary.insert(b"DecodeParms", Object::Reference(ObjectRef::new(12, 0)));
+
+        let resolved =
+            resolve_stream_dictionary(&mut pdf, &dictionary).expect("resolve stream dictionary");
+        let params = resolved
+            .get(b"DecodeParms")
+            .and_then(Object::as_dict)
+            .expect("resolved DecodeParms container");
+        assert_eq!(
+            params.get(b"Predictor"),
+            Some(&Object::Reference(ObjectRef::new(13, 0)))
+        );
+        assert_eq!(
+            params.get(b"Columns"),
+            Some(&Object::Reference(ObjectRef::new(14, 0)))
+        );
+    }
+
+    #[test]
+    fn filter_structure_keeps_its_nesting_limit() {
+        let mut pdf = handle_pdf(b"");
+        let filter = (0..64).fold(Object::Name(b"FlateDecode".to_vec()), |value, _| {
+            Object::Array(vec![value])
+        });
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(b"Filter", filter);
+
+        let error =
+            resolve_stream_dictionary(&mut pdf, &dictionary).expect_err("64-level Filter nesting");
+        assert!(error.to_string().contains("exceeds 64 levels"));
+    }
 }
