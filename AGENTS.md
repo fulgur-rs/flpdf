@@ -58,19 +58,20 @@
 - `.beads/issues.jsonl` is tracked by Beads tooling and `.gitignore`d; avoid manual edits unless explicitly requested by issue workflow.
 
 ## 7) Design-doc review scope (`docs/plans/*.md`)
-- A design doc mixes two kinds of content that need different review treatment:
+- A design doc mixes content that needs different review treatment:
   - **Durable decisions** — crate/module layout, dependency ordering, scope boundaries, qpdf oracle facts verified against real source/output. Stable once checked; review these for correctness like any other claim.
-  - **Implementation-detail sketches** — exact algorithms, branch-by-branch pseudocode, edge-case enumeration for code that does not exist yet. These are provisional. Precision here is fragile: sketch-vs-sketch review rounds have produced as many new errors as they removed (see PR #585's history — a "fix" in one round introduced the bug the next round caught). The real check for this tier is TDD once the code exists, not another prose pass.
-- Content between these markers is in the second tier:
+  - **Acceptance criteria** — fixture lists, golden-test assertions (exit code, stderr, stdout), negative/failure-path coverage. Always fully in scope, even inside a section that also contains provisional algorithm content: this is where thorough review actually pays off, since it's what will catch an implementation bug later. Never mark this tier provisional.
+  - **Implementation-detail sketches** — exact algorithms, branch-by-branch pseudocode, resolution order, edge-case enumeration for code that does not exist yet. These are provisional, and the authority for their correctness is qpdf's own behavior (the oracle) — not this document's prose, and not a reviewer's read of the prose. A claim here can only be confirmed or refuted by running real code against the oracle (TDD), which this document cannot do. Precision here is fragile: sketch-vs-sketch review rounds have produced as many new errors as they removed (see PR #585's history — a "fix" in one round introduced the bug the next round caught).
+- Content between these markers is in the third tier:
   > **[provisional — settled by TDD, not by this document]**
   >
   > *(implementation-detail sketch)*
   >
   > **[/provisional]**
-- For marked content:
-  - **Do** flag a claim that misdescribes qpdf's actual behavior (a wrong oracle fact, a citation that doesn't match the cited source) — that's a factual error regardless of tier.
-  - **Do not** flag missing edge cases, unhandled branches, or "this needs more precision" — those are expected to stay open until the corresponding code and tests exist. Re-litigating them in prose is the failure mode this convention exists to avoid.
-- Unmarked content has no such exemption — review it normally.
+- For marked content: the oracle stays authoritative even inside the marker.
+  - **Do** flag a claim that misdescribes qpdf's actual behavior (a wrong oracle fact, a citation that doesn't match the cited source) — that's a factual error, checkable independently of whether the surrounding sketch is complete.
+  - **Do not** flag missing edge cases, unhandled branches, or "this needs more precision" in how the sketch itself is worded — those are expected to stay open until the corresponding code and tests exist and are checked against the oracle. Re-litigating prose precision is the failure mode this convention exists to avoid.
+- Unmarked content — including everything under Acceptance criteria — has no such exemption; review it normally and thoroughly.
 
 ## 8) Session close
 - Before finishing, ensure quality gates ran for changed code, then push both Beads and git:
