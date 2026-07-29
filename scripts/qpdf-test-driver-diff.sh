@@ -47,6 +47,7 @@ fixture_names=(
     stream_deep_invalid_filter
     stream_flate_error
     stream_filter_error_then_warning
+    stream_asciihex_odd_nibble_recovery
     stream_unfilterable
 )
 

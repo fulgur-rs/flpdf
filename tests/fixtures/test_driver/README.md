@@ -16,6 +16,10 @@ the filtered pipeline is still finished.
 `G`; cleanup then finishes Flate. The golden fixes qpdf's diagnostic order:
 the write error precedes Flate's downstream finish warning.
 
+`stream_asciihex_odd_nibble_recovery` decodes `4G ` through `/AHx`. ASCIIHex
+reports the invalid `G` during `write`, then its cleanup flushes the pending
+odd nibble as `@`; the golden fixes the warning-before-cleanup-byte order.
+
 `stream_deep_invalid_filter` has 64 direct nested Filter arrays. qpdf treats
 the first nested array as an invalid immediate filter item; it warns and
 continues instead of traversing the nested structure.

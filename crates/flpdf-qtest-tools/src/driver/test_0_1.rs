@@ -121,9 +121,9 @@ fn write_object_details<R: Read + Seek>(
                         .transpose()?
                         .flatten();
                     stdout.flush()?;
-                    write_bytes(stdout, &decoded.data)?;
                     for event in decoded.events {
                         match event {
+                            StreamDecodeEvent::Data(data) => write_bytes(stdout, &data)?,
                             StreamDecodeEvent::Warning(warning) => {
                                 write_warning(
                                     filename,

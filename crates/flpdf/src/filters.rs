@@ -97,13 +97,15 @@ pub struct StreamDecodeWarning {
     pub code: i32,
 }
 
-/// One ordered diagnostic emitted by an opt-in recoverable stream decode.
+/// One ordered output or diagnostic emitted by an opt-in recoverable stream decode.
 ///
 /// Events retain pipeline emission order. In particular, an error raised by
 /// an outer filter's `write` precedes warnings emitted while its downstream
 /// pipeline is subsequently finished.
 #[derive(Debug)]
 pub enum StreamDecodeEvent {
+    /// A recovered decoded output chunk.
+    Data(Vec<u8>),
     /// A non-fatal codec warning.
     Warning(StreamDecodeWarning),
     /// The first runtime codec failure after successful pipeline construction.
@@ -120,7 +122,7 @@ pub enum StreamDecodeEvent {
 pub struct StreamDecodeOutcome {
     /// Bytes emitted by the constructed decode pipeline.
     pub data: Vec<u8>,
-    /// Non-fatal warnings and the first runtime error in pipeline order.
+    /// Recovered output and diagnostics in pipeline emission order.
     pub events: Vec<StreamDecodeEvent>,
 }
 
@@ -170,6 +172,7 @@ pub(crate) fn decode_stream_data_with_limits_and_warnings(
     let mut first_error = None;
     for event in outcome.events {
         let event_error = match event {
+            StreamDecodeEvent::Data(_) => None,
             StreamDecodeEvent::Warning(warning) => warn(&warning.message, warning.code)
                 .err()
                 .map(|error| Error::Unsupported(error.into_string_lossy())),
@@ -288,13 +291,19 @@ where
     let specs = decode_filter_specs(filter, decode_params)?;
     validate_filter_chain_count(specs.len())?;
     let prepared = prepare_decode_filters(specs)?;
+    let stage_count = prepared.len();
     let mut decoded = Cow::Borrowed(stream_data);
     let mut events = Vec::new();
     let mut has_runtime_error = false;
-    for mut stage in prepared {
+    for (stage_index, mut stage) in prepared.into_iter().enumerate() {
+        let is_last_stage = stage_index + 1 == stage_count;
         let next = match &mut stage.stage {
             PreparedStage::Crypt { decode_params } => {
-                decrypt_crypt(*decode_params, decoded.as_ref())?
+                let data = decrypt_crypt(*decode_params, decoded.as_ref())?;
+                if is_last_stage && !data.is_empty() {
+                    events.push(StreamDecodeEvent::Data(data.clone()));
+                }
+                data
             }
             PreparedStage::Codec { adapter } => {
                 let mut stage_warnings = Vec::new();
@@ -309,20 +318,41 @@ where
                         Ok(())
                     },
                 )?; // cov:ignore: fixed closed-registry adapters were preflighted with unchanged constructor inputs; warning sink is infallible
+                let cleanup_data_start = outcome.cleanup_data_start;
                 if let Some(stage_error) = outcome.error {
                     if has_runtime_error {
+                        if is_last_stage && !outcome.data.is_empty() {
+                            events.push(StreamDecodeEvent::Data(outcome.data.clone()));
+                        }
                         events.extend(stage_warnings);
                     } else {
                         has_runtime_error = true;
-                        if stage_error.during_write {
+                        if is_last_stage && stage_error.during_write {
+                            let (before_cleanup, cleanup) =
+                                outcome.data.split_at(cleanup_data_start);
+                            if !before_cleanup.is_empty() {
+                                events.push(StreamDecodeEvent::Data(before_cleanup.to_vec()));
+                            }
+                            events.push(StreamDecodeEvent::Error(stage_error.error));
+                            if !cleanup.is_empty() {
+                                events.push(StreamDecodeEvent::Data(cleanup.to_vec()));
+                            }
+                            events.extend(stage_warnings);
+                        } else if stage_error.during_write {
                             events.push(StreamDecodeEvent::Error(stage_error.error));
                             events.extend(stage_warnings);
                         } else {
+                            if is_last_stage && !outcome.data.is_empty() {
+                                events.push(StreamDecodeEvent::Data(outcome.data.clone()));
+                            }
                             events.extend(stage_warnings);
                             events.push(StreamDecodeEvent::Error(stage_error.error));
                         }
                     }
                 } else {
+                    if is_last_stage && !outcome.data.is_empty() {
+                        events.push(StreamDecodeEvent::Data(outcome.data.clone()));
+                    }
                     events.extend(stage_warnings);
                 }
                 outcome.data
@@ -330,10 +360,11 @@ where
         };
         decoded = Cow::Owned(next);
     }
-    Ok(StreamDecodeOutcome {
-        data: decoded.into_owned(),
-        events,
-    })
+    let data = decoded.into_owned();
+    if stage_count == 0 && !data.is_empty() {
+        events.push(StreamDecodeEvent::Data(data.clone()));
+    }
+    Ok(StreamDecodeOutcome { data, events })
 }
 
 /// A filter-chain stage with its decode route already resolved.
@@ -578,9 +609,13 @@ mod tests {
         let outcome = decode_stream_data_recovering(&flate_dict(), &encoded).unwrap();
 
         assert_eq!(outcome.data, decoded_prefix[..65_536]);
-        assert_eq!(outcome.events.len(), 1);
+        assert_eq!(outcome.events.len(), 2);
         assert!(matches!(
             &outcome.events[0],
+            StreamDecodeEvent::Data(data) if data == &decoded_prefix[..65_536]
+        ));
+        assert!(matches!(
+            &outcome.events[1],
             StreamDecodeEvent::Error(error)
                 if error
                     .to_string()
@@ -608,11 +643,10 @@ mod tests {
         let outcome = decode_stream_data_recovering(&flate_dict(), &encoded).unwrap();
         let strict_error = decode_stream_data(&flate_dict(), &encoded).unwrap_err();
 
-        assert!(matches!(
-            &outcome.events[0],
-            StreamDecodeEvent::Error(recovering_error)
-                if strict_error.to_string() == recovering_error.to_string()
-        ));
+        assert!(outcome.events.iter().any(|event| {
+            matches!(event, StreamDecodeEvent::Error(recovering_error)
+                if strict_error.to_string() == recovering_error.to_string())
+        }));
     }
 
     #[test]

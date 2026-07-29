@@ -43,6 +43,7 @@ fixture_names=(
     stream_deep_invalid_filter
     stream_flate_error
     stream_filter_error_then_warning
+    stream_asciihex_odd_nibble_recovery
     stream_unfilterable
 )
 
@@ -247,6 +248,10 @@ write(
         b"6 0 R",
         {6: stream(b"/Filter [ /ASCIIHexDecode /FlateDecode ]", b"78G")},
     ),
+)
+write(
+    "stream_asciihex_odd_nibble_recovery",
+    build_pdf(b"6 0 R", {6: stream(b"/Filter /AHx", b"4G ")}),
 )
 
 metadata = b"1"

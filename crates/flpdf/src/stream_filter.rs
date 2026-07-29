@@ -9,6 +9,8 @@ use crate::pipeline::png_filter::{PngFilter, PngFilterAction};
 use crate::pipeline::run_length::{RunLength, RunLengthAction};
 use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 use crate::{Error, Object, Result};
+use std::cell::Cell;
+use std::rc::Rc;
 
 pub(crate) const DECODE_OUTPUT_LIMIT_PREFIX: &str = "decoded output exceeds configured limit of";
 
@@ -93,6 +95,8 @@ pub(crate) fn decode_filter_specs<'a>(
 struct OutputBuffer {
     data: Vec<u8>,
     max_output: Option<usize>,
+    cleanup_data_start: Option<usize>,
+    finish_phase: Rc<Cell<bool>>,
 }
 
 impl OutputBuffer {
@@ -100,7 +104,17 @@ impl OutputBuffer {
         Self {
             data: Vec::new(),
             max_output,
+            cleanup_data_start: None,
+            finish_phase: Rc::new(Cell::new(false)),
         }
+    }
+
+    fn finish_phase(&self) -> Rc<Cell<bool>> {
+        Rc::clone(&self.finish_phase)
+    }
+
+    fn cleanup_data_start(&self) -> usize {
+        self.cleanup_data_start.unwrap_or(self.data.len())
     }
 }
 
@@ -117,6 +131,9 @@ impl Pipeline for OutputBuffer {
                 )));
             }
         }
+        if self.finish_phase.get() && self.cleanup_data_start.is_none() {
+            self.cleanup_data_start = Some(self.data.len());
+        }
         self.data.extend_from_slice(data);
         Ok(())
     }
@@ -132,6 +149,7 @@ fn map_pipeline_error(error: PipelineError) -> Error {
 
 pub(crate) struct FilterDecodeOutcome {
     pub(crate) data: Vec<u8>,
+    pub(crate) cleanup_data_start: usize,
     pub(crate) error: Option<FilterDecodeError>,
 }
 
@@ -143,7 +161,12 @@ pub(crate) struct FilterDecodeError {
 impl FilterDecodeOutcome {
     #[cfg(test)]
     fn complete(data: Vec<u8>) -> Self {
-        Self { data, error: None }
+        let cleanup_data_start = data.len();
+        Self {
+            data,
+            cleanup_data_start,
+            error: None,
+        }
     }
 
     #[cfg(test)]
@@ -165,13 +188,28 @@ struct StagePipelineError {
     during_write: bool,
 }
 
-fn write_and_finish(stage: &mut dyn Pipeline, data: &[u8]) -> Option<StagePipelineError> {
+fn write_and_finish(
+    stage: &mut dyn Pipeline,
+    data: &[u8],
+    finish_phase: Option<&Cell<bool>>,
+) -> Option<StagePipelineError> {
+    if let Some(finish_phase) = finish_phase {
+        finish_phase.set(false);
+    }
     match stage.write(data) {
-        Ok(()) => stage.finish().err().map(|error| StagePipelineError {
-            error,
-            during_write: false,
-        }),
+        Ok(()) => {
+            if let Some(finish_phase) = finish_phase {
+                finish_phase.set(true);
+            }
+            stage.finish().err().map(|error| StagePipelineError {
+                error,
+                during_write: false,
+            })
+        }
         Err(error) => {
+            if let Some(finish_phase) = finish_phase {
+                finish_phase.set(true);
+            }
             let _ = stage.finish();
             Some(StagePipelineError {
                 error,
@@ -405,6 +443,7 @@ impl StreamFilter for FlateLzwStreamFilter {
             None => self.pipe_codec(&mut sink, data, warn)?,
         };
         Ok(FilterDecodeOutcome {
+            cleanup_data_start: sink.cleanup_data_start(),
             data: sink.data,
             error,
         })
@@ -444,7 +483,7 @@ impl FlateLzwStreamFilter {
     ) -> Result<Option<FilterDecodeError>> {
         let error = if self.lzw {
             let mut stage = LzwDecoder::new("lzw decode", next, self.early_code_change);
-            write_and_finish(&mut stage, data)
+            write_and_finish(&mut stage, data, None)
         } else {
             let mut stage = Flate::new(
                 "stream inflate",
@@ -454,7 +493,7 @@ impl FlateLzwStreamFilter {
             )
             .map_err(map_pipeline_error)?;
             stage.set_warn_callback(|message, code| warn(message, code));
-            write_and_finish(&mut stage, data)
+            write_and_finish(&mut stage, data, None)
         };
         Ok(error.map(map_stage_error))
     }
@@ -553,11 +592,13 @@ pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilt
 
 fn decode_ascii85(data: &[u8], max_output: Option<usize>) -> Result<FilterDecodeOutcome> {
     let mut sink = OutputBuffer::new(max_output);
+    let finish_phase = sink.finish_phase();
     let error = {
         let mut stage = Ascii85Decoder::new("ascii85 decode", &mut sink);
-        write_and_finish(&mut stage, data).map(map_stage_error)
+        write_and_finish(&mut stage, data, Some(&finish_phase)).map(map_stage_error)
     };
     Ok(FilterDecodeOutcome {
+        cleanup_data_start: sink.cleanup_data_start(),
         data: sink.data,
         error,
     })
@@ -565,11 +606,13 @@ fn decode_ascii85(data: &[u8], max_output: Option<usize>) -> Result<FilterDecode
 
 fn decode_ascii_hex(data: &[u8], max_output: Option<usize>) -> Result<FilterDecodeOutcome> {
     let mut sink = OutputBuffer::new(max_output);
+    let finish_phase = sink.finish_phase();
     let error = {
         let mut stage = AsciiHexDecoder::new("asciiHex decode", &mut sink);
-        write_and_finish(&mut stage, data).map(map_stage_error)
+        write_and_finish(&mut stage, data, Some(&finish_phase)).map(map_stage_error)
     };
     Ok(FilterDecodeOutcome {
+        cleanup_data_start: sink.cleanup_data_start(),
         data: sink.data,
         error,
     })
@@ -577,11 +620,13 @@ fn decode_ascii_hex(data: &[u8], max_output: Option<usize>) -> Result<FilterDeco
 
 fn decode_run_length(data: &[u8], max_output: Option<usize>) -> Result<FilterDecodeOutcome> {
     let mut sink = OutputBuffer::new(max_output);
+    let finish_phase = sink.finish_phase();
     let error = {
         let mut stage = RunLength::new("runlength decode", &mut sink, RunLengthAction::Decode);
-        write_and_finish(&mut stage, data).map(map_stage_error)
+        write_and_finish(&mut stage, data, Some(&finish_phase)).map(map_stage_error)
     };
     Ok(FilterDecodeOutcome {
+        cleanup_data_start: sink.cleanup_data_start(),
         data: sink.data,
         error,
     })
