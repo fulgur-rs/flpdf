@@ -3309,11 +3309,17 @@ mod tests {
         rejected_length: Option<usize>,
         remaining: Option<usize>,
         errno: Option<i32>,
+        overflow_errno: Option<i32>,
     }
 
     impl std::io::Write for FlushProbe {
         fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
             self.write_lengths.push(buffer.len());
+            if let (Some(remaining), Some(errno)) = (self.remaining, self.overflow_errno) {
+                if buffer.len() > remaining {
+                    return Err(std::io::Error::from_raw_os_error(errno));
+                }
+            }
             if let Some(errno) = self.errno {
                 return Err(std::io::Error::from_raw_os_error(errno));
             }
@@ -4859,6 +4865,35 @@ mod tests {
             .iter()
             .any(|call| matches!(call, TraceCall::Finish { .. })));
         assert_eq!(side_file.flushes, 0);
+    }
+
+    #[test]
+    fn side_file_4097_byte_tail_failure_occurs_after_stream_dictionary() {
+        let mut pdf = empty_pdf();
+        let payload = vec![b'x'; 4097];
+        let stream = Stream::new(Dictionary::new(), payload.clone());
+        let mut side_file = FlushProbe {
+            remaining: Some(4096),
+            overflow_errno: Some(28),
+            ..FlushProbe::default()
+        };
+        let mut out = Vec::new();
+        {
+            let mut output = PlString::new("file-mode main output", None, &mut out);
+            write_file_mode_side_file(
+                &mut pdf,
+                &stream,
+                DecodeLevel::None,
+                "side-file",
+                &mut side_file,
+                &mut output,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(side_file.bytes, payload[..4096]);
+        assert_eq!(side_file.write_lengths, [4096, 1]);
+        assert_eq!(out, COMPLETE_SIDE_FILE_STREAM_JSON);
     }
 
     #[test]

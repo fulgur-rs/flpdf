@@ -397,22 +397,6 @@ namespace
         return file;
     }
 
-    std::string read_regular_file(FILE* file)
-    {
-        if (fseek(file, 0, SEEK_SET) != 0) {
-            throw std::runtime_error("fseek failed");
-        }
-        std::string bytes;
-        char buffer[4096];
-        while (auto const count = fread(buffer, 1, sizeof(buffer), file)) {
-            bytes.append(buffer, count);
-        }
-        if (ferror(file)) {
-            throw std::runtime_error("fread failed");
-        }
-        return bytes;
-    }
-
     std::vector<unsigned char> patterned_bytes(size_t count)
     {
         std::vector<unsigned char> result;
@@ -519,32 +503,32 @@ namespace
         }
 
         {
-            auto* file = tmpfile();
-            if (file == nullptr) {
-                throw std::runtime_error("tmpfile failed");
-            }
-            if (setvbuf(file, nullptr, _IOFBF, 4096) != 0) {
-                fclose(file);
-                throw std::runtime_error("setvbuf failed");
-            }
+            Cookie cookie;
+            std::array<char, 4096> buffer{};
+            auto* file = open_cookie(cookie, buffer);
             Pl_StdioFile stage("stdio", file);
-            size_t write_count = 0;
-            size_t finish_count = 0;
             auto const payload = patterned_bytes(4097);
             auto const case_status = status([&]() {
-                ++write_count;
-                stage.write(payload.data(), payload.size());
-                ++finish_count;
-                stage.finish();
+                during(cookie, CookiePhase::write, [&]() {
+                    stage.write(payload.data(), payload.size());
+                });
+                during(cookie, CookiePhase::finish, [&]() { stage.finish(); });
             });
-            auto const bytes = read_regular_file(file);
+            close_cookie(file, cookie);
+            if ((case_status != "ok") || (cookie.bytes != payload)) {
+                throw std::runtime_error(
+                    "stdio-4097-success: unexpected qpdf result");
+            }
+            verify_cookie_lifecycle(
+                "stdio-4097-success", cookie, {4096}, {1}, {}, {});
+            auto const bytes =
+                std::string(cookie.bytes.begin(), cookie.bytes.end());
             emit(
                 "stdio-4097-success",
                 case_status,
                 bytes,
-                write_count,
-                finish_count);
-            fclose(file);
+                cookie.pipeline_write_count,
+                cookie.pipeline_finish_count);
         }
 
         {

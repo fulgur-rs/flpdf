@@ -89,8 +89,9 @@ impl Write for StdioBuffer<'_> {
         }
 
         if self.buffer.is_empty() && data.len() >= STDIO_BUFFER_CAPACITY {
+            let direct_len = data.len() - (data.len() % STDIO_BUFFER_CAPACITY);
             self.panicked = true;
-            let result = self.writer.write(data);
+            let result = self.writer.write(&data[..direct_len]);
             self.panicked = false;
             result
         } else {
@@ -475,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_4097_bytes_preserve_all_successful_bytes() {
+    fn buffered_4097_bytes_split_at_stdio_block_boundary() {
         let payload = (0..4097)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
@@ -488,7 +489,7 @@ mod tests {
         }
 
         assert_eq!(sink.bytes, payload);
-        assert_eq!(sink.write_lengths, [4097]);
+        assert_eq!(sink.write_lengths, [4096, 1]);
         assert_eq!(sink.flush_calls, 1);
     }
 
