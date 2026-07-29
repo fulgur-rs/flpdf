@@ -112,6 +112,20 @@ pub enum StreamDecodeEvent {
     Error(Error),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DataEventMode {
+    Record,
+    Suppress,
+}
+
+impl DataEventMode {
+    fn push(self, events: &mut Vec<StreamDecodeEvent>, data: &[u8]) {
+        if self == Self::Record && !data.is_empty() {
+            events.push(StreamDecodeEvent::Data(data.to_vec()));
+        }
+    }
+}
+
 /// Data and ordered diagnostics produced by an opt-in recoverable stream decode.
 ///
 /// An outer [`Result::Err`] from [`decode_stream_data_recovering`] means the
@@ -137,7 +151,12 @@ pub fn decode_stream_data_recovering(
     dict: &Dictionary,
     stream_data: &[u8],
 ) -> Result<StreamDecodeOutcome> {
-    decode_stream_data_recovering_with_limits(dict, stream_data, DecodeLimits::default())
+    decode_stream_data_recovering_with_limits_and_mode(
+        dict,
+        stream_data,
+        DecodeLimits::default(),
+        DataEventMode::Record,
+    )
 }
 
 /// Opt-in limits applied while decoding a stream's filter chain.
@@ -168,7 +187,12 @@ pub(crate) fn decode_stream_data_with_limits_and_warnings(
     limits: DecodeLimits,
     warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
 ) -> Result<Vec<u8>> {
-    let outcome = decode_stream_data_recovering_with_limits(dict, stream_data, limits)?;
+    let outcome = decode_stream_data_recovering_with_limits_and_mode(
+        dict,
+        stream_data,
+        limits,
+        DataEventMode::Suppress,
+    )?;
     let mut first_error = None;
     for event in outcome.events {
         let event_error = match event {
@@ -188,16 +212,18 @@ pub(crate) fn decode_stream_data_with_limits_and_warnings(
     }
 }
 
-fn decode_stream_data_recovering_with_limits(
+fn decode_stream_data_recovering_with_limits_and_mode(
     dict: &Dictionary,
     stream_data: &[u8],
     limits: DecodeLimits,
+    data_events: DataEventMode,
 ) -> Result<StreamDecodeOutcome> {
     decode_stream_data_with_filters(
         dict.get("Filter"),
         dict.get("DecodeParms"),
         stream_data,
         limits,
+        data_events,
     )
 }
 
@@ -261,12 +287,14 @@ fn decode_stream_data_with_filters(
     decode_params: Option<&Object>,
     stream_data: &[u8],
     limits: DecodeLimits,
+    data_events: DataEventMode,
 ) -> Result<StreamDecodeOutcome> {
     decode_stream_data_with_filters_and_crypt(
         filter,
         decode_params,
         stream_data,
         limits,
+        data_events,
         &mut |_, _| {
             Err(Error::Unsupported(
                 "unsupported stream filter: Crypt".to_string(),
@@ -280,6 +308,7 @@ fn decode_stream_data_with_filters_and_crypt<F>(
     decode_params: Option<&Object>,
     stream_data: &[u8],
     limits: DecodeLimits,
+    data_events: DataEventMode,
     decrypt_crypt: &mut F,
 ) -> Result<StreamDecodeOutcome>
 where
@@ -302,8 +331,8 @@ where
         let next = match &mut stage.stage {
             PreparedStage::Crypt { decode_params } => {
                 let data = decrypt_crypt(*decode_params, decoded.as_ref())?;
-                if is_last_stage && !data.is_empty() {
-                    events.push(StreamDecodeEvent::Data(data.clone()));
+                if is_last_stage {
+                    data_events.push(&mut events, &data);
                 }
                 if is_last_stage {
                     events.append(&mut pending_events);
@@ -341,13 +370,9 @@ where
                                 .expect("pending recovery data has a codec output boundary")
                                 .0;
                             let (before_pending, after_pending) = outcome.data.split_at(boundary);
-                            if !before_pending.is_empty() {
-                                events.push(StreamDecodeEvent::Data(before_pending.to_vec()));
-                            }
+                            data_events.push(&mut events, before_pending);
                             events.append(&mut pending_events);
-                            if !after_pending.is_empty() {
-                                events.push(StreamDecodeEvent::Data(after_pending.to_vec()));
-                            }
+                            data_events.push(&mut events, after_pending);
                         }
                         events.extend(stage_warnings);
                     } else {
@@ -373,44 +398,32 @@ where
                             let boundary = boundary.min(outcome.data.len());
                             let cleanup_data_start = cleanup_data_start.min(outcome.data.len());
                             let (before_pending, after_pending) = outcome.data.split_at(boundary);
-                            if !before_pending.is_empty() {
-                                events.push(StreamDecodeEvent::Data(before_pending.to_vec()));
-                            }
+                            data_events.push(&mut events, before_pending);
                             events.append(&mut pending_events);
                             if stage_error.during_write {
                                 let cleanup_after_pending =
                                     cleanup_data_start.saturating_sub(boundary);
                                 let (before_cleanup, cleanup) =
                                     after_pending.split_at(cleanup_after_pending);
-                                if !before_cleanup.is_empty() {
-                                    events.push(StreamDecodeEvent::Data(before_cleanup.to_vec()));
-                                }
+                                data_events.push(&mut events, before_cleanup);
                                 events.push(StreamDecodeEvent::Error(stage_error.error));
-                                if !cleanup.is_empty() {
-                                    events.push(StreamDecodeEvent::Data(cleanup.to_vec()));
-                                }
+                                data_events.push(&mut events, cleanup);
                                 events.extend(stage_warnings);
                             } else {
-                                if !after_pending.is_empty() {
-                                    events.push(StreamDecodeEvent::Data(after_pending.to_vec()));
-                                }
+                                data_events.push(&mut events, after_pending);
                                 events.extend(stage_warnings);
                                 events.push(StreamDecodeEvent::Error(stage_error.error));
                             }
                         } else if stage_error.during_write {
                             let (before_cleanup, cleanup) =
                                 outcome.data.split_at(cleanup_data_start);
-                            if !before_cleanup.is_empty() {
-                                events.push(StreamDecodeEvent::Data(before_cleanup.to_vec()));
-                            }
+                            data_events.push(&mut events, before_cleanup);
                             events.push(StreamDecodeEvent::Error(stage_error.error));
-                            if !cleanup.is_empty() {
-                                events.push(StreamDecodeEvent::Data(cleanup.to_vec()));
-                            }
+                            data_events.push(&mut events, cleanup);
                             events.extend(stage_warnings);
                         } else {
-                            if is_last_stage && !outcome.data.is_empty() {
-                                events.push(StreamDecodeEvent::Data(outcome.data.clone()));
+                            if is_last_stage {
+                                data_events.push(&mut events, &outcome.data);
                             }
                             events.extend(stage_warnings);
                             events.push(StreamDecodeEvent::Error(stage_error.error));
@@ -429,15 +442,11 @@ where
                                 .expect("pending recovery data has a codec output boundary")
                                 .0;
                             let (before_pending, after_pending) = outcome.data.split_at(boundary);
-                            if !before_pending.is_empty() {
-                                events.push(StreamDecodeEvent::Data(before_pending.to_vec()));
-                            }
+                            data_events.push(&mut events, before_pending);
                             events.append(&mut pending_events);
-                            if !after_pending.is_empty() {
-                                events.push(StreamDecodeEvent::Data(after_pending.to_vec()));
-                            }
-                        } else if !outcome.data.is_empty() {
-                            events.push(StreamDecodeEvent::Data(outcome.data.clone()));
+                            data_events.push(&mut events, after_pending);
+                        } else {
+                            data_events.push(&mut events, &outcome.data);
                         }
                     }
                     if is_last_stage && !has_runtime_error && next_pending_data_boundary.is_none() {
@@ -456,8 +465,8 @@ where
         decoded = Cow::Owned(next);
     }
     let data = decoded.into_owned();
-    if stage_count == 0 && !data.is_empty() {
-        events.push(StreamDecodeEvent::Data(data.clone()));
+    if stage_count == 0 {
+        data_events.push(&mut events, &data);
     }
     Ok(StreamDecodeOutcome { data, events })
 }
@@ -766,6 +775,38 @@ mod tests {
     }
 
     #[test]
+    fn strict_decode_retains_data_without_recording_a_duplicate_data_event() {
+        let encoded = encode_stream_data(&flate_dict(), b"strict payload").unwrap();
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
+            &flate_dict(),
+            &encoded,
+            DecodeLimits::default(),
+            DataEventMode::Suppress,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data, b"strict payload");
+        assert!(!outcome
+            .events
+            .iter()
+            .any(|event| matches!(event, StreamDecodeEvent::Data(_))));
+    }
+
+    #[test]
+    fn strict_decode_without_filters_suppresses_the_passthrough_data_event() {
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
+            &Dictionary::new(),
+            b"unfiltered payload",
+            DecodeLimits::default(),
+            DataEventMode::Suppress,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data, b"unfiltered payload");
+        assert!(outcome.events.is_empty());
+    }
+
+    #[test]
     fn recovering_decode_retains_only_the_first_filter_runtime_error() {
         let dict = array_filter_dict(&[b"ASCIIHexDecode", b"ASCIIHexDecode"]);
 
@@ -869,12 +910,13 @@ mod tests {
         let mut dict = Dictionary::new();
         dict.insert("Filter", Object::Name(b"ASCIIHexDecode".to_vec()));
 
-        let outcome = decode_stream_data_recovering_with_limits(
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
             &dict,
             b"F",
             DecodeLimits {
                 max_output: Some(0),
             },
+            DataEventMode::Record,
         )
         .unwrap();
 
@@ -893,12 +935,13 @@ mod tests {
         let mut dict = Dictionary::new();
         dict.insert("Filter", Object::Name(b"ASCIIHexDecode".to_vec()));
 
-        let outcome = decode_stream_data_recovering_with_limits(
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
             &dict,
             b"41F",
             DecodeLimits {
                 max_output: Some(1),
             },
+            DataEventMode::Record,
         )
         .unwrap();
 
@@ -916,12 +959,13 @@ mod tests {
     fn recovering_decode_defers_a_nonfinal_finish_time_error_until_after_data() {
         let dict = array_filter_dict(&[b"ASCIIHexDecode", b"ASCIIHexDecode"]);
 
-        let outcome = decode_stream_data_recovering_with_limits(
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
             &dict,
             b"41F",
             DecodeLimits {
                 max_output: Some(1),
             },
+            DataEventMode::Record,
         )
         .unwrap();
 
@@ -985,6 +1029,7 @@ mod tests {
             None,
             &encoded,
             DecodeLimits::default(),
+            DataEventMode::Record,
             &mut decrypt,
         )
         .unwrap();
@@ -1011,6 +1056,7 @@ mod tests {
             None,
             b"47G",
             DecodeLimits::default(),
+            DataEventMode::Record,
             &mut decrypt,
         )
         .unwrap();
@@ -1029,6 +1075,7 @@ mod tests {
             DecodeLimits {
                 max_output: Some(1),
             },
+            DataEventMode::Record,
             &mut decrypt,
         )
         .unwrap();
@@ -1056,6 +1103,7 @@ mod tests {
             None,
             &encoded,
             DecodeLimits::default(),
+            DataEventMode::Record,
             &mut decrypt,
         )
         .unwrap();
@@ -1110,12 +1158,13 @@ mod tests {
             Object::Array(vec![Object::Dictionary(predictor), Object::Null]),
         );
 
-        let outcome = decode_stream_data_recovering_with_limits(
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
             &dict,
             &outer_flate,
             DecodeLimits {
                 max_output: Some(4_000),
             },
+            DataEventMode::Record,
         )
         .unwrap();
 
@@ -1197,12 +1246,13 @@ mod tests {
             ]),
         );
 
-        let outcome = decode_stream_data_recovering_with_limits(
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
             &dict,
             &encoded,
             DecodeLimits {
                 max_output: Some(4),
             },
+            DataEventMode::Record,
         )
         .unwrap();
 
@@ -2321,6 +2371,7 @@ mod tests {
             None,
             b"decrypted",
             DecodeLimits::default(),
+            DataEventMode::Record,
             &mut decrypt,
         )
         .unwrap();
