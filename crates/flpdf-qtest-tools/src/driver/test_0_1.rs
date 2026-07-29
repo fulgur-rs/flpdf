@@ -76,8 +76,8 @@ fn write_object_details<R: Read + Seek>(
         }
         Object::Array(values) => {
             writeln!(stdout, "/QTest is an array with {} items", values.len())?;
-            for (index, item) in qtest.array_items(pdf)?.iter().enumerate() {
-                let direct_prefix = if item.is_indirect() { "in" } else { "" };
+            for (index, is_indirect) in qtest.array_item_indirectness()?.into_iter().enumerate() {
+                let direct_prefix = if is_indirect { "in" } else { "" };
                 writeln!(stdout, "  item {index} is {direct_prefix}direct")?;
             }
         }
@@ -139,7 +139,7 @@ fn write_object_details<R: Read + Seek>(
 mod tests {
     use super::{run_test_0_1, write_object_details};
     use crate::driver::handle::Handle;
-    use flpdf::{Object, Pdf, PdfOpenOptions};
+    use flpdf::{Object, ObjectRef, Pdf, PdfOpenOptions};
 
     fn pdf_with_qtest(qtest: &[u8], extras: &[(u32, Vec<u8>)]) -> Vec<u8> {
         let max_object = extras.iter().map(|(number, _)| *number).max().unwrap_or(2);
@@ -288,6 +288,41 @@ mod tests {
             )
             .as_bytes()
         );
+    }
+
+    #[test]
+    fn array_reports_indirect_child_without_resolving_its_target() {
+        let bytes = pdf_with_qtest(b"[ 100 0 R ]", &[]);
+        let options = PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        };
+        let mut pdf =
+            Pdf::open_mem_owned_with_options(bytes, options).expect("open test_0_1 fixture");
+        for number in 100..=164 {
+            let value = if number == 164 {
+                Object::Boolean(true)
+            } else {
+                Object::Reference(ObjectRef::new(number + 1, 0))
+            };
+            pdf.set_object(ObjectRef::new(number, 0), value);
+        }
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
+        run_test_0_1(
+            &mut pdf,
+            "fixture.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test_0_1");
+
+        assert!(stdout
+            .windows(b"  item 0 is indirect\n".len())
+            .any(|line| line == b"  item 0 is indirect\n"));
     }
 
     #[test]

@@ -63,16 +63,15 @@ impl Handle {
         &self.resolved
     }
 
-    pub(crate) fn array_items<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> flpdf::Result<Vec<Self>> {
+    pub(crate) fn array_item_indirectness(&self) -> flpdf::Result<Vec<bool>> {
         let values = self
             .resolved
             .as_array()
-            .ok_or_else(|| Error::System("array access on non-array object".to_string()))?
-            .to_vec();
-        values
-            .into_iter()
-            .map(|value| Self::from_value(pdf, value))
-            .collect()
+            .ok_or_else(|| Error::System("array access on non-array object".to_string()))?;
+        Ok(values
+            .iter()
+            .map(|value| matches!(value, Object::Reference(_)))
+            .collect())
     }
 
     pub(crate) fn dictionary_items<R: Read + Seek>(
@@ -402,9 +401,12 @@ mod tests {
             ]),
         )
         .expect("array handle");
-        let items = array.array_items(&mut pdf).expect("array items");
-        assert!(!items[0].is_indirect());
-        assert!(items[1].is_indirect());
+        assert_eq!(
+            array
+                .array_item_indirectness()
+                .expect("array item metadata"),
+            vec![false, true]
+        );
 
         let mut dictionary = Dictionary::new();
         dictionary.insert(b"a", Object::Reference(ObjectRef::new(7, 0)));
