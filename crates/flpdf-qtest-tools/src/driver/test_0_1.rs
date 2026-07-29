@@ -368,6 +368,27 @@ mod tests {
     }
 
     #[test]
+    fn flate_ignores_deep_unknown_decode_parameter_values() {
+        let metadata = (0..64).fold(b"1".to_vec(), |value, _| {
+            let mut nested = b"[ ".to_vec();
+            nested.extend_from_slice(&value);
+            nested.extend_from_slice(b" ]");
+            nested
+        });
+        let compressed = b"\x78\x9c\x4b\x4c\x4a\x06\x00\x02\x4d\x01\x27";
+        let mut stream = b"<< /Filter /FlateDecode /DecodeParms << /Metadata ".to_vec();
+        stream.extend_from_slice(&metadata);
+        stream.extend_from_slice(b" >> /Length 11 >>\nstream\n");
+        stream.extend_from_slice(compressed);
+        stream.extend_from_slice(b"\nendstream");
+
+        let actual = output(b"7 0 R", &[(7, stream)]);
+        assert!(actual
+            .windows(b"\nabc\nEnd of stream data\n".len())
+            .any(|line| { line == b"\nabc\nEnd of stream data\n" }));
+    }
+
+    #[test]
     fn unsupported_stream_filter_reports_not_filterable() {
         assert_eq!(
             output(

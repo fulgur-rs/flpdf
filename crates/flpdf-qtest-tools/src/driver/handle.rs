@@ -219,10 +219,22 @@ pub(crate) fn resolve_stream_dictionary<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     source: &Dictionary,
 ) -> flpdf::Result<Dictionary> {
+    let filter = source
+        .get(b"Filter")
+        .cloned()
+        .map(|value| resolve_filter_structure(pdf, value, 0))
+        .transpose()?;
+    let filter_names = filter.as_ref().and_then(resolved_filter_names);
+
     let mut resolved = Dictionary::new();
     for (key, value) in source.iter() {
-        let value = if key == b"Filter" || key == b"DecodeParms" {
-            resolve_nested(pdf, value.clone(), 0)?
+        let value = if key == b"Filter" {
+            filter.clone().unwrap_or_else(|| value.clone())
+        } else if key == b"DecodeParms" {
+            match filter_names.as_deref() {
+                Some(names) => resolve_decode_params(pdf, names, value.clone())?,
+                None => value.clone(),
+            }
         } else {
             value.clone()
         };
@@ -231,7 +243,94 @@ pub(crate) fn resolve_stream_dictionary<R: Read + Seek>(
     Ok(resolved)
 }
 
-fn resolve_nested<R: Read + Seek>(
+fn resolved_filter_names(filter: &Object) -> Option<Vec<&[u8]>> {
+    match filter {
+        Object::Null => Some(Vec::new()),
+        Object::Name(name) => Some(vec![name]),
+        Object::Array(values) => values.iter().map(Object::as_name).collect(),
+        _ => None,
+    }
+}
+
+fn normalized_filter_name(name: &[u8]) -> &[u8] {
+    match name {
+        b"Fl" => b"FlateDecode",
+        b"LZW" => b"LZWDecode",
+        name => name,
+    }
+}
+
+fn filter_consumes_decode_key(filter: &[u8], key: &[u8]) -> bool {
+    match normalized_filter_name(filter) {
+        b"FlateDecode" => matches!(
+            key,
+            b"Predictor" | b"Columns" | b"Colors" | b"BitsPerComponent"
+        ),
+        b"LZWDecode" => matches!(
+            key,
+            b"Predictor" | b"Columns" | b"Colors" | b"BitsPerComponent" | b"EarlyChange"
+        ),
+        _ => false,
+    }
+}
+
+fn resolve_decode_param_dict<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    filters: &[&[u8]],
+    dictionary: Dictionary,
+) -> flpdf::Result<Object> {
+    let entries: Vec<(Vec<u8>, Object)> = dictionary
+        .iter()
+        .map(|(key, value)| (key.to_vec(), value.clone()))
+        .collect();
+    let mut resolved = Dictionary::new();
+    for (key, value) in entries {
+        let value = if filters
+            .iter()
+            .any(|filter| filter_consumes_decode_key(filter, &key))
+        {
+            resolve_chain(pdf, value)?.0
+        } else {
+            value
+        };
+        resolved.insert(key, value);
+    }
+    Ok(Object::Dictionary(resolved))
+}
+
+fn resolve_decode_param_for_filters<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    filters: &[&[u8]],
+    value: Object,
+) -> flpdf::Result<Object> {
+    let value = resolve_chain(pdf, value)?.0;
+    match value {
+        Object::Dictionary(dictionary) => resolve_decode_param_dict(pdf, filters, dictionary),
+        other => Ok(other),
+    }
+}
+
+fn resolve_decode_params<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    filters: &[&[u8]],
+    value: Object,
+) -> flpdf::Result<Object> {
+    let value = resolve_chain(pdf, value)?.0;
+    match value {
+        Object::Array(values) if values.len() == filters.len() => {
+            let values = values
+                .into_iter()
+                .zip(filters.iter().copied())
+                .map(|(value, filter)| resolve_decode_param_for_filters(pdf, &[filter], value))
+                .collect::<flpdf::Result<Vec<_>>>()?;
+            Ok(Object::Array(values))
+        }
+        Object::Array(values) => Ok(Object::Array(values)),
+        other => resolve_decode_param_for_filters(pdf, filters, other),
+    }
+}
+
+fn resolve_filter_structure<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: Object,
     depth: usize,
@@ -247,7 +346,7 @@ fn resolve_nested<R: Read + Seek>(
         Object::Array(values) => {
             let values = values
                 .into_iter()
-                .map(|value| resolve_nested(pdf, value, depth + 1))
+                .map(|value| resolve_filter_structure(pdf, value, depth + 1))
                 .collect::<flpdf::Result<Vec<_>>>()?;
             Ok(Object::Array(values))
         }
@@ -258,7 +357,7 @@ fn resolve_nested<R: Read + Seek>(
                 .collect();
             let mut resolved = Dictionary::new();
             for (key, value) in entries {
-                resolved.insert(key, resolve_nested(pdf, value, depth + 1)?);
+                resolved.insert(key, resolve_filter_structure(pdf, value, depth + 1)?);
             }
             Ok(Object::Dictionary(resolved))
         }
@@ -493,13 +592,26 @@ mod tests {
     }
 
     #[test]
-    fn stream_parameter_nesting_rejects_depth_64() {
+    fn stream_parameter_resolution_ignores_deep_unknown_values() {
         let mut pdf = handle_pdf(b"");
-        let nested = (0..64).fold(Object::Integer(1), |value, _| Object::Array(vec![value]));
+        let metadata = (0..64).fold(Object::Integer(1), |value, _| Object::Array(vec![value]));
+        let mut params = Dictionary::new();
+        params.insert(b"Predictor", Object::Reference(ObjectRef::new(13, 0)));
+        params.insert(b"Metadata", metadata.clone());
         let mut dictionary = Dictionary::new();
-        dictionary.insert(b"DecodeParms", nested);
-        let error = resolve_stream_dictionary(&mut pdf, &dictionary)
-            .expect_err("64-level stream parameter nesting");
-        assert!(error.to_string().contains("exceeds 64 levels"));
+        dictionary.insert(b"Filter", Object::Name(b"FlateDecode".to_vec()));
+        dictionary.insert(b"DecodeParms", Object::Dictionary(params));
+
+        let resolved = resolve_stream_dictionary(&mut pdf, &dictionary)
+            .expect("resolve consumed stream parameters");
+        let resolved_params = resolved
+            .get(b"DecodeParms")
+            .and_then(Object::as_dict)
+            .expect("resolved DecodeParms");
+        assert_eq!(
+            resolved_params.get(b"Predictor"),
+            Some(&Object::Integer(15))
+        );
+        assert_eq!(resolved_params.get(b"Metadata"), Some(&metadata));
     }
 }
