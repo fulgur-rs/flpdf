@@ -938,6 +938,37 @@ mod tests {
     }
 
     #[test]
+    fn recovering_decode_replays_final_cleanup_after_two_write_errors() {
+        let filter = Object::Array(vec![
+            Object::Name(b"ASCII85Decode".to_vec()),
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+        ]);
+        let mut encoded = ascii85::encode(b"4   ");
+        encoded.truncate(encoded.len() - 2);
+        let cleanup = ascii85::encode(b"G");
+        encoded.extend_from_slice(&cleanup[..2]);
+        encoded.push(b'z');
+        let mut decrypt = |_: Option<&Object>, data: &[u8]| Ok(data.to_vec());
+
+        let outcome = decode_stream_data_with_filters_and_crypt(
+            Some(&filter),
+            None,
+            &encoded,
+            DecodeLimits::default(),
+            &mut decrypt,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data, b"@");
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Error(error), StreamDecodeEvent::Data(data)]
+                if error.to_string() == "unsupported PDF feature: unexpected z during base 85 decode"
+                    && data == b"@"
+        ));
+    }
+
+    #[test]
     fn recovering_decode_keeps_filterability_failures_in_outer_result() {
         let mut dict = Dictionary::new();
         dict.insert("Filter", Object::Name(b"BogusDecode".to_vec()));
