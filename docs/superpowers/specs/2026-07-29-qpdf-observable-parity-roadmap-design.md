@@ -147,11 +147,18 @@ Create the permanent parity ledger and stable survey contract.
 
 Deliverables:
 
-- a machine-readable classification for every qtest subtest:
-  `applicable`, `excluded`, `represented`, `blocked`, `passing`, or `failing`;
-- an explicit rationale for every excluded test and a replacement-test
-  reference for every represented test or excluded entry that exercises
-  portable PDF behavior; true ABI-only exclusions require rationale only;
+- one non-overlapping composite `state` for every qtest subtest:
+  `applicable`, `excluded`, `represented`, `blocked`, `passing`, or `failing`.
+  The applicable denominator is the sum of `applicable`, `blocked`, `passing`,
+  and `failing`; `passing` is the current direct-pass count, while `blocked`
+  and `failing` distinguish observation infrastructure from reached behavior;
+- an explicit rationale for every excluded test, a concrete Rust-test reference
+  for every represented test, and—by Phase 1 closure—a concrete Rust test or
+  narrower follow-up Bead for every excluded entry that exercises portable PDF
+  behavior; true ABI-only exclusions require rationale only. During Phase 0,
+  direct `qpdf-ctest` entries may provisionally reference the Phase 1 mapping
+  Bead; Phase 1 replaces every provisional reference with a Rust test, a
+  narrower follow-up Bead, or an ABI-only scope rationale;
 - a fix for the `2,790 parsed / 2,762 reported` survey drift;
 - one reproducible command that records qpdf pin, flpdf commit, qtest commit,
   applicable denominator, passes, failure clusters, and allowlist regressions;
@@ -171,9 +178,15 @@ Deliverables:
 - port test-driver IDs in responsibility-based slices rather than one monolith;
 - implement the 11 Linux-applicable non-C helpers remaining after removing
   `qpdf-ctest` and Windows-only `test_shell_glob` from `flpdf-egzr`;
-- map `qpdf-ctest` underlying behavior to Rust oracle tests; and
+- map `qpdf-ctest` underlying behavior to Rust oracle tests and eliminate all
+  provisional mapping-Bead references from the manifest; and
 - distinguish shim/infrastructure failures from behavior failures in survey
   output.
+
+The Phase 0 manifest task owns the initial machine-readable
+infrastructure-versus-behavior split. Phase 1 consumes that ledger, replaces
+the provisional C-API mapping references, and closes only after no provisional
+reference remains.
 
 Helper ports are not accepted solely because a binary exists on `PATH`; their
 merged output and exit status must match the pinned helper.
@@ -280,20 +293,27 @@ Create seven child epics:
 6. writer convergence; and
 7. parity closure.
 
-Existing epics and issues are dependencies of these phase epics. They are not
-reparented or recreated.
+Existing required epics block their phase epics directly. Because Beads permits
+an epic to be blocked only by another epic, each phase with required non-epic
+work has a child completion-gate task; required tasks and features block that
+gate, and parent-child progress prevents the phase epic from closing early.
+Non-observable refactors may remain non-blocking roadmap associations.
+Existing work is not reparented or recreated.
 
 ### Existing dependency groups
 
 - observation: `flpdf-n9t0`, `flpdf-egzr`;
-- object/parser/repair: `flpdf-9hc.17`, `flpdf-mfir`, `flpdf-ud7r`,
-  `flpdf-xm72`, and existing recovery issues;
-- stream/filter/crypto: `flpdf-qynx.5`, `flpdf-qynx.8`, `flpdf-qynx.9`,
-  `flpdf-qynx.10`;
-- QPDFJob/CLI/transforms: `flpdf-qynx.4`, `flpdf-qynx.7`,
-  `flpdf-9hc.23`, `flpdf-w5ny`, `flpdf-w1cs`;
+- object/parser/repair: phase blocker `flpdf-9hc.17`; completion-gate blockers
+  `flpdf-ud7r`, `flpdf-xm72`, `flpdf-fmb9`, and `flpdf-4zt3`; `flpdf-mfir`
+  remains a non-blocking related refactor because accessor deduplication has no
+  observable parity contract;
+- stream/filter/crypto: phase blocker `flpdf-qynx.5`; completion-gate blockers
+  `flpdf-qynx.8`, `flpdf-qynx.9`, and `flpdf-qynx.10`;
+- QPDFJob/CLI/transforms: phase blocker `flpdf-9hc.23`; completion-gate blockers
+  `flpdf-qynx.4`, `flpdf-qynx.7`, `flpdf-w5ny`, and `flpdf-w1cs`;
 - writer: the completed children of `flpdf-9hc.20` as the existing floor,
-  plus `flpdf-9hc.42`, `flpdf-9hc.29`, `flpdf-cecz`, and `flpdf-j4ph`.
+  with `flpdf-9hc.20` as the phase blocker; completion-gate blockers
+  `flpdf-9hc.42`, `flpdf-9hc.29`, `flpdf-cecz`, and `flpdf-j4ph`.
 
 ### New gap issues
 
@@ -310,14 +330,20 @@ Create issues for:
 - incremental writer semantic, structural, and append-invariant gate; and
 - final applicable-qtest and three-build stability gate.
 
+Create four coordination-only completion-gate tasks under Phases 2–5. These
+tasks add no implementation scope; they mechanically prevent a phase epic from
+closing while one of its required independently owned non-epic issues is open.
+
 Update `flpdf-egzr` to exclude direct `qpdf-ctest` porting and Windows-only
 `test_shell_glob`, leaving 11 Linux-applicable helpers and 34 invocations.
 
 ### Dependency policy
 
-- Blocking edges express actual implementation readiness and may connect
-  mixed issue types. `relates-to` is reserved for non-blocking roadmap
-  associations.
+- Blocking edges express actual implementation readiness. Beads permits
+  epic-to-epic blocking but rejects task/feature-to-epic blocking; non-epic
+  work items may use mixed blocking types. Required non-epic work therefore
+  blocks a child completion-gate task, while `relates-to` is reserved for
+  non-blocking roadmap associations.
 - Phase 0 blocks new parity implementation slices.
 - Phases 2, 3, and 4 may proceed independently after their measurement or
   helper prerequisites exist.

@@ -4,7 +4,7 @@
 
 **Goal:** Materialize the approved qpdf 11.9.0 observable-parity roadmap as a dependency-ordered Beads graph without duplicating existing work.
 
-**Architecture:** Create one convergence root epic, seven phase epics, and ten new gap issues. Existing qtest, repair, Pipeline, CLI, and writer issues remain authoritative and are linked as dependencies; only `flpdf-egzr` is rewritten to reflect the approved C-API exclusion.
+**Architecture:** Create one convergence root epic, seven phase epics, ten new gap issues, and four coordination-only child completion gates. Existing qtest, repair, Pipeline, CLI, and writer issues remain authoritative and are linked through type-compatible blocking dependencies; only `flpdf-egzr` is rewritten to reflect the approved C-API exclusion.
 
 **Tech Stack:** Beads/Dolt (`bd`), Git, Markdown design and plan documents.
 
@@ -16,8 +16,10 @@
 - `qpdf-ctest` is not ported; its underlying PDF behavior is mapped to Rust oracle tests.
 - `qpdf-zlib-compat` requires byte identity; the Pure Rust default requires semantic and structural identity.
 - Existing Beads remain authoritative and must not be duplicated or reparented.
-- Beads blocking edges express actual readiness and may connect mixed issue
-  types. `relates-to` is reserved for non-blocking roadmap associations.
+- Beads permits epic-to-epic blocking but rejects non-epic blockers on an epic.
+  Non-epic tasks, bugs, and features may use mixed blocking types. Required
+  non-epic work blocks a child completion-gate task; `relates-to` is reserved
+  for non-blocking roadmap associations.
 - New implementation slices use consumer RED, the smallest lower-level primitive, production wiring, old-route deletion, differential verification, and 100% changed executable-line coverage.
 - Beads state and Git commits must both be pushed before handoff.
 
@@ -27,7 +29,9 @@
 - `docs/superpowers/plans/2026-07-29-qpdf-observable-parity-beads.md`: reproducible Beads mutation and verification procedure.
 - Beads root epic: owns pre-1.0 observable-parity closure.
 - Beads phase epics: group dependencies and expose readiness without reparenting existing issues.
-- Beads gap tasks: define only work absent from the current tracker.
+- Beads gap tasks: define only implementation work absent from the current tracker.
+- Beads completion-gate tasks: add no implementation scope and prevent phase
+  closure while required independently owned non-epic work remains open.
 - `flpdf-egzr`: retains the helper inventory while excluding direct `qpdf-ctest` porting.
 
 ---
@@ -38,20 +42,46 @@
 - Create: one P1 root epic with label `qpdf-parity`
 - Create: seven child epics under the root
 - Consume: approved design spec path as `--spec-id`
-- Produce: stable issue IDs recorded for Tasks 2–4
+- Produce: stable issue IDs recorded for Tasks 2–5
 
 - [ ] **Step 1: Recheck duplicate titles**
 
-Run:
+Search every proposed exact title:
 
 ```bash
-bd search "pre-v1.0 qpdf 11.9.0 observable parity"
-bd search "Authoritative parity measurement"
-bd search "Applicable parity closure"
+for title in \
+  "pre-v1.0 qpdf 11.9.0 observable parity" \
+  "qpdf parity P0: authoritative measurement" \
+  "qpdf parity P1: unlock upstream observation" \
+  "qpdf parity P2: object model, parser, and repair convergence" \
+  "qpdf parity P3: stream, filter, and crypto convergence" \
+  "qpdf parity P4: QPDFJob, CLI, and transform convergence" \
+  "qpdf parity P5: writer convergence" \
+  "qpdf parity P6: applicable parity closure" \
+  "qtest: applicable manifest and exclusion registry" \
+  "qtest survey: reconcile 2790 parsed results with 2762 reported" \
+  "qpdf-ctest: map C-API-only coverage to Rust oracle tests" \
+  "test_driver: inventory remaining IDs by qpdf responsibility" \
+  "QPDFObjectHandle consumers: audit eager and lazy resolution contracts" \
+  "Pl_TIFFPredictor: qpdf 11.9.0 production cutover" \
+  "Pl_DCT and decode-level: qpdf 11.9.0 production cutover" \
+  "writer parity: encrypted-output semantic and byte gate" \
+  "writer parity: incremental-output semantic and append-invariant gate" \
+  "qpdf parity closure: applicable qtest and three-build stability" \
+  "qpdf parity P2: existing work completion gate" \
+  "qpdf parity P3: existing work completion gate" \
+  "qpdf parity P4: existing work completion gate" \
+  "qpdf parity P5: existing work completion gate"
+do
+  bd search "$title"
+done
 ```
 
-Expected: no existing issue with the exact new title. If an exact issue exists,
-reuse it and verify its scope rather than creating another.
+Expected: each of the 22 searches has no exact match before first creation. If
+an exact issue exists anywhere in the tracker, reuse it and verify its scope
+rather than creating another. Repeat the relevant exact-title search
+immediately before each create so a concurrent worker cannot introduce a
+duplicate between this inventory and creation.
 
 - [ ] **Step 2: Create the root epic**
 
@@ -98,7 +128,7 @@ same `--spec-id`:
 
 | Phase | Priority | Exact title | Exact acceptance |
 |---|---:|---|---|
-| P0 | P1 | qpdf parity P0: authoritative measurement | Every qtest-reported subtest has one machine-readable state and owner; classified counts equal qtest's total; the survey parser count equals qtest's total on two runs; one reproducible command records pins, denominator, passes, clusters, and regressions. |
+| P0 | P1 | qpdf parity P0: authoritative measurement | Every qtest-reported subtest has one non-overlapping composite state and its state-specific ownership or replacement fields; the applicable denominator equals applicable + blocked + passing + failing; classified counts equal qtest's total; the survey parser count equals qtest's total on two runs; one reproducible command records pins, denominator, passes, clusters, and regressions. |
 | P1 | P1 | qpdf parity P1: unlock upstream observation | Applicable test-driver IDs and non-C helpers have pinned merged-output/exit-status differentials; qpdf-ctest behaviors map to Rust tests or explicit ABI-only exclusions; survey output separates infrastructure and behavior failures. |
 | P2 | P1 | qpdf parity P2: object model, parser, and repair convergence | Object consumers have oracle-backed resolution contracts; known parser/xref/page-tree recovery gaps are closed; warning timing, text, attribution, order, and fatality match qpdf on the applicable malformed corpus. |
 | P3 | P1 | qpdf parity P3: stream, filter, and crypto convergence | TIFF, DCT/decode-level, remaining Flate, AES, MD5/SHA/count/discard consumers are wired through qpdf-shaped production paths; replaced routes are deleted; specialized-filter/decode/encryption matrices pass. |
@@ -153,17 +183,35 @@ blocked by P0; P6 is blocked by P1–P5.
 Create under `P0_ID`:
 
 1. P1 task `qtest: applicable manifest and exclusion registry`
-   - Classify every qtest-reported subtest as applicable, excluded,
-     represented, blocked, passing, or failing.
-   - Record rationale for every excluded entry and a replacement Rust test for
-     represented entries or exclusions that exercise portable PDF behavior.
-     A true ABI-only exclusion requires rationale but no replacement test.
-   - Acceptance: counts sum exactly to qtest's reported total; no entry lacks
-     a reason, owner, or Bead link.
+   - Give every qtest-reported subtest exactly one non-overlapping composite
+     state: applicable, excluded, represented, blocked, passing, or failing.
+     Derive the applicable denominator as applicable + blocked + passing +
+     failing, and derive the direct-pass count from passing.
+   - Record rationale for every excluded entry and a concrete Rust-test
+     reference for every represented entry. A true ABI-only exclusion requires
+     rationale but no replacement test. An excluded direct qpdf-ctest entry
+     that may exercise portable behavior may use `bead:flpdf-25kg.2.1`
+     provisionally during Phase 0; the Phase 1 mapping task must replace every
+     such reference with a Rust test, narrower follow-up Bead, or ABI-only
+     scope rationale.
+   - Own the reproducible full-survey command that records qpdf, flpdf, and
+     qtest pins, applicable denominator, passes, failure clusters, and
+     allowlist regressions.
+   - Emit separate machine-readable blocked/infrastructure and
+     failing/behavior counts in the survey manifest summary.
+   - Acceptance: counts sum exactly to qtest's reported total; the applicable
+     denominator and direct-pass count follow the formulas above; no entry
+     lacks its state-specific rationale, owner, Bead, or replacement reference;
+     the recorded command reproduces both stable surveys and the
+     infrastructure/behavior split.
 2. P1 bug `qtest survey: reconcile 2790 parsed results with 2762 reported`
    - Reproduce the 2026-07-29 mismatch without weakening comparison.
    - Acceptance: parser count equals qtest summary count on two independent
      runs and existing 39/39 allowlist status remains unchanged.
+
+The manifest task depends on the result-accounting bug so its recorded command,
+denominator, and failure categories are generated from the authoritative
+2,762-result set.
 
 - [ ] **Step 2: Create Phase 1 observation tasks**
 
@@ -172,7 +220,8 @@ Create under `P1_ID`:
 1. P2 task `qpdf-ctest: map C-API-only coverage to Rust oracle tests`
    - Inventory all 53 invocations by underlying behavior.
    - Acceptance: every invocation points to an existing passing Rust oracle
-     test, a new follow-up Bead, or a documented ABI-only exclusion.
+     test, a new follow-up Bead, or a documented ABI-only exclusion, and every
+     provisional `bead:flpdf-25kg.2.1` manifest reference is replaced.
 2. P1 task `test_driver: inventory remaining IDs by qpdf responsibility`
    - Cover IDs 0, 2, 3, 28, 33–36, 39, 52–71, 76–77, 80, 81, and 85.
    - Acceptance: each ID has source range, qtest invocations, consumer
@@ -233,15 +282,16 @@ Create under `P6_ID`:
 Before readback, add task-to-task blocking dependencies:
 
 ```text
+the Phase 0 manifest task depends on the Phase 0 result-accounting bug
 the qpdf-ctest mapping, test-driver inventory, eager/lazy audit, TIFF, DCT,
 encrypted gate, and incremental gate tasks each depend on both P0 tasks
 the closure task depends on both P0 tasks and all seven preceding gap tasks
 ```
 
-These mixed-type blocking edges are deliberate: Beads accepts them, and they
-encode real implementation readiness. Do not replace them with `relates-to`,
-which is non-blocking. Phase completion is governed by child progress plus the
-epic acceptance criteria.
+These non-epic mixed-type blocking edges are deliberate: Beads accepts them,
+and they encode real implementation readiness. Do not replace them with
+`relates-to`, which is non-blocking. Phase completion is governed by child
+progress plus the epic acceptance criteria.
 
 Run:
 
@@ -259,7 +309,59 @@ duplicate title.
 
 ---
 
-### Task 3: Link existing work and correct the helper inventory
+### Task 3: Create non-epic completion gates
+
+**State:**
+- Create: four coordination-only child tasks under `P2_ID` through `P5_ID`
+- Consume: required independently owned non-epic parity issues
+- Produce: type-compatible blocking paths that prevent premature phase closure
+
+- [ ] **Step 1: Recheck the four gate titles**
+
+Run `bd search` for each exact gate title from Task 1 Step 1 immediately before
+creation. Reuse an exact match rather than creating a duplicate.
+
+- [ ] **Step 2: Create the four child gates**
+
+Create:
+
+| Parent | Priority | Exact title | Exact acceptance |
+|---|---:|---|---|
+| `P2_ID` | P1 | qpdf parity P2: existing work completion gate | flpdf-ud7r, flpdf-xm72, flpdf-fmb9, and flpdf-4zt3 are closed; this task adds no implementation scope. |
+| `P3_ID` | P1 | qpdf parity P3: existing work completion gate | flpdf-qynx.8, flpdf-qynx.9, and flpdf-qynx.10 are closed; this task adds no implementation scope. |
+| `P4_ID` | P2 | qpdf parity P4: existing work completion gate | flpdf-qynx.4, flpdf-qynx.7, flpdf-w5ny, and flpdf-w1cs are closed; this task adds no implementation scope. |
+| `P5_ID` | P1 | qpdf parity P5: existing work completion gate | flpdf-9hc.42, flpdf-9hc.29, flpdf-cecz, and flpdf-j4ph are closed; this task adds no implementation scope. |
+
+Use the same labels and `--spec-id` as the phase epics. Each description states
+that Beads permits only epic blockers on epics, so this child gate translates
+required non-epic completion into parent-child phase progress. Capture the IDs
+as `P2_GATE_ID` through `P5_GATE_ID`.
+
+- [ ] **Step 3: Add gate blockers**
+
+Add blocking dependencies:
+
+```text
+P2_GATE_ID depends on flpdf-ud7r, flpdf-xm72, flpdf-fmb9, and flpdf-4zt3
+P3_GATE_ID depends on flpdf-qynx.8, flpdf-qynx.9, and flpdf-qynx.10
+P4_GATE_ID depends on flpdf-qynx.4, flpdf-qynx.7, flpdf-w5ny, and flpdf-w1cs
+P5_GATE_ID depends on flpdf-9hc.42, flpdf-9hc.29, flpdf-cecz, and flpdf-j4ph
+```
+
+These edges are valid mixed non-epic blockers. Do not attach the existing work
+as direct blockers of the phase epic; Beads rejects non-epic blockers on epics.
+
+- [ ] **Step 4: Read back the gates**
+
+Run `bd show` for all four gate IDs.
+
+Expected: each gate is a child of its phase, blocked by exactly the listed
+existing issues, and contains no implementation acceptance beyond their
+closure.
+
+---
+
+### Task 4: Link existing work and correct the helper inventory
 
 **State:**
 - Modify: Bead `flpdf-egzr`
@@ -294,70 +396,43 @@ P1_ID depends on flpdf-egzr
 
 - [ ] **Step 3: Link Phase 2 existing work**
 
-Add a blocking dependency from `P2_ID` to the existing epic:
+Add the type-compatible phase-level blocking dependency:
 
 ```text
 flpdf-9hc.17
 ```
 
-Add `relates-to` edges from `P2_ID` to the existing tasks:
+Add one non-blocking `relates-to` edge:
 
 ```text
 flpdf-mfir
-flpdf-ud7r
-flpdf-xm72
-flpdf-fmb9
-flpdf-4zt3
 ```
+
+`flpdf-mfir` is accessor deduplication with no observable parity acceptance,
+so it does not gate Phase 2 closure.
 
 - [ ] **Step 4: Link Phase 3 existing work**
 
-Add a blocking dependency from `P3_ID` to the existing epic:
+Add the type-compatible phase-level blocking dependency:
 
 ```text
 flpdf-qynx.5
 ```
 
-Add `relates-to` edges from `P3_ID` to the existing tasks:
-
-```text
-flpdf-qynx.8
-flpdf-qynx.9
-flpdf-qynx.10
-```
-
 - [ ] **Step 5: Link Phase 4 existing work**
 
-Add a blocking dependency from `P4_ID` to the existing epic:
+Add the type-compatible phase-level blocking dependency:
 
 ```text
 flpdf-9hc.23
 ```
 
-Add `relates-to` edges from `P4_ID` to the existing tasks:
-
-```text
-flpdf-qynx.4
-flpdf-qynx.7
-flpdf-w5ny
-flpdf-w1cs
-```
-
 - [ ] **Step 6: Link Phase 5 existing work**
 
-Add a blocking dependency from `P5_ID` to the existing epic:
+Add the type-compatible phase-level blocking dependency:
 
 ```text
 flpdf-9hc.20
-```
-
-Add `relates-to` edges from `P5_ID` to the existing tasks:
-
-```text
-flpdf-9hc.42
-flpdf-9hc.29
-flpdf-cecz
-flpdf-j4ph
 ```
 
 `flpdf-9hc.20` is retained as the historical byte-identical floor even though
@@ -377,7 +452,7 @@ fuzzing that is not part of observable closure.
 
 ---
 
-### Task 4: Validate the tracker graph
+### Task 5: Validate the tracker graph
 
 **State:**
 - Consume: complete new and updated Beads graph
@@ -385,8 +460,8 @@ fuzzing that is not part of observable closure.
 
 - [ ] **Step 1: Validate exact issue content**
 
-Run `bd show` for the root, all seven phases, all ten new gaps, and
-`flpdf-egzr`.
+Run `bd show` for the root, all seven phases, all ten new gaps, all four
+completion gates, and `flpdf-egzr`.
 
 Expected:
 
@@ -409,12 +484,20 @@ bd orphans
 Expected:
 
 - P0 is ready unless another explicit dependency exists;
+- the Phase 0 manifest waits for result-accounting and owns the reproducible
+  command plus machine-readable infrastructure/behavior split;
 - P1–P5 wait on P0;
 - P6 waits on P1–P5;
 - root remains the open parent container and closes only after all seven child
   phases satisfy their acceptance criteria;
 - non-P0 gap tasks wait on both P0 tasks, and the closure task waits on all
   preceding gap tasks;
+- the C-API mapping runs after the initial manifest and replaces every
+  provisional mapping-Bead reference before Phase 1 closes;
+- required existing parity issues block their owning phase; only explicitly
+  non-observable roadmap associations such as `flpdf-mfir` use `relates-to`;
+- each Phase 2–5 completion gate is blocked by the exact required non-epic
+  issues, and its parent phase cannot close while the gate remains open;
 - the closure task, P6 epic, and root close in that order, and each zero-open
   check exempts the still-open items in that closure chain;
 - existing issues retain their original parents;
@@ -446,11 +529,11 @@ warnings do not override a successful Dolt push.
 
 ---
 
-### Task 5: Commit and push the plan
+### Task 6: Commit and push the plan
 
 **Files:**
-- Create: `docs/superpowers/plans/2026-07-29-qpdf-observable-parity-beads.md`
-- Preserve: `docs/superpowers/specs/2026-07-29-qpdf-observable-parity-roadmap-design.md`
+- Modify: `docs/superpowers/plans/2026-07-29-qpdf-observable-parity-beads.md`
+- Modify: `docs/superpowers/specs/2026-07-29-qpdf-observable-parity-roadmap-design.md`
 
 - [ ] **Step 1: Review plan against the approved design**
 
