@@ -414,10 +414,8 @@ mod tests {
         let mut rejected = handle_pdf(b"");
         install_chain(&mut rejected, 65);
         let result = Handle::from_value(&mut rejected, Object::Reference(ObjectRef::new(100, 0)));
-        let error = match result {
-            Ok(_) => panic!("65-hop reference chain was accepted"),
-            Err(error) => error,
-        };
+        assert!(result.is_err(), "65-hop reference chain was accepted");
+        let error = result.err().expect("65-hop error");
         assert!(error.to_string().contains("exceeds 64 hops"));
     }
 

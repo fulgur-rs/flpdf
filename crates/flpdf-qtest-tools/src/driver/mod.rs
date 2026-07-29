@@ -178,6 +178,7 @@ mod tests {
         ];
         let mut stdout = FlushFailure;
         let mut stderr = Vec::new();
+        assert_eq!(stdout.write(b"probe").expect("probe write"), 5);
         assert_eq!(run(&args, &mut stdout, &mut stderr), 2);
         assert!(stderr.is_empty());
     }
@@ -207,5 +208,6 @@ mod tests {
         assert_eq!(run(&args, &mut stdout, &mut stderr), 2);
         assert!(stderr.is_empty());
         assert!(stdout.bytes.ends_with(b"unparseResolved: null\n"));
+        stdout.flush().expect("flush footer writer");
     }
 }
