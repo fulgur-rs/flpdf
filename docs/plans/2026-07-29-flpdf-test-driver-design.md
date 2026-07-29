@@ -424,6 +424,18 @@ WARNING: <filename>: Attempting to reconstruct cross-reference table
 括弧書き `(object, offset)` 部分は出ない — `<filename>: <message>` の形。）
 この fixture の golden は上記 3 行 + 正常な test_0_1 出力（exit 0）を要求する。
 
+**`repairable_input` も good14 と同じ理由でファイル名固定と merged capture が要る。**
+警告文中の `<filename>` は argv[2] の生文字列なので（§6 と同じ argv[2]→description の
+経路。ここは `n % 2 == 1` の `processMemoryFile` 経由で、good14 と同じ「description
+に argv がそのまま載る」形）、working directory を fixture ディレクトリに設定し
+argv には basename だけを渡す。**さらに、stdout/stderr を別バッファでアサートする
+だけでは不十分** — repair の 3 行 warn は test_0_1 が動く**前**（pre-dispatch の
+open 中）に出るべきものなので、正しい実装は「stderr 3 行 → stdout 5 パート」の順で
+書き込む。診断を溜めて test_0_1 の後にまとめて出すような実装は、stdout と stderr を
+別々に比較する Cargo test では両方とも内容が一致するため検出できないが、qtest の
+merged capture（両ストリームをインターリーブしたまま比較）では順序が食い違って
+FAIL する。§6 の merged capture の仕組みをこの fixture にも適用する。
+
 ## 7. fixture とテスト
 
 ```
@@ -434,12 +446,18 @@ tests/fixtures/test_driver/
                                   入力（§5 参照。strict な Pdf::open_mem のままだと
                                   この fixture だけ pre-dispatch で読込エラーになり
                                   test_0_1 に到達しない。stderr が空でない唯一の
-                                  test_0_1 fixture — 3 行の WARNING を要求する）
+                                  test_0_1 fixture — 3 行の WARNING を要求する。
+                                  working directory を fixture ディレクトリに設定し
+                                  argv には basename だけを渡す点、merged capture で
+                                  順序まで検証する点は good14 と同じ扱い）
   implicit_null.{pdf,out}        欠落キー
   direct_null.{pdf,out}          /QTest null
   dangling_ref.{pdf,out}         存在しないオブジェクトへの参照
   indirect_null.{pdf,out}        実在する null オブジェクト
-  indirect_bool.{pdf,out}        hasKey が true になる対照
+  indirect_bool_true.{pdf,out}   hasKey が true になる対照。/QTest = true
+  indirect_bool_false.{pdf,out}  同上、/QTest = false（bool 値そのものを
+                                  出力に含む分岐なので、true 固定で出す
+                                  実装を通してしまわないよう両方必要）
   chained_reference.{pdf,out}    多段間接参照（§4 参照。/QTest 6 0 R -> 7 0 R -> true
                                   のような 2 hop 以上のチェーン）
   integer.{pdf,out}              top-level integer（good7 相当）
@@ -477,6 +495,19 @@ tests/fixtures/test_driver/
                                           — decoded 出力の byte 比較でしか
                                           検出できない）
   stream_unfilterable.{pdf,out}  Stream data is not filterable.
+
+tests/fixtures/test_driver/test_3/
+  tokenizing_pipeline.{pdf,out}  flpdf-authored な test_3 (n9t0.6) 用 fixture。
+                                  good14.pdf 自体は vendor からコピー禁止（下記）
+                                  なので、bad token・コメント・CR/CRLF混在・
+                                  未終端 inline image marker など good14.out が
+                                  例示する normalization の性質を再現する別内容の
+                                  PDF を新規に作る。n9t0.6 の merged capture
+                                  golden（§6）が「qpdf ビルド不要で ordinary
+                                  cargo test が回る」ためにはこの fixture が
+                                  必須 — §6 に merged capture の仕組みだけ書いて
+                                  対象となる入力そのものを inventory に
+                                  加えていなかった
 ```
 
 `test_0_1` は `/QTest` 1 個の型でしか分岐できないため、`integer.pdf` と `real.pdf`
@@ -557,8 +588,11 @@ synthetic fixture しか検証しない — shim の配線ミス（n9t0.3）や�
 
 `n9t0.5` の一部として `scripts/patch-coverage.sh` の `REPORT_PREFIXES` を
 `crates/flpdf-test-compare/src/` から `crates/flpdf-qtest-tools/src/` へ更新する
-（PR #589 で実施済み、§8.1 参照）。一方 **n9t0.4 は `crates/flpdf/src/` を触ったので
-変更行 100% ゲートの対象**だった（変更 82 行 / 未カバー 0 で PASS）。
+（PR #589 で実施・検証済みだが、**PR #589 自体は本稿時点で未マージ**（`gh pr view 589`
+→ `OPEN`）。§2 のレイアウト（`crates/flpdf-qtest-tools/`）は #589 マージ後に main へ
+着地する — n9t0.2 の実装を始める前に #589 のマージ状態を確認すること。§8 参照）。
+一方 **n9t0.4 は `crates/flpdf/src/` を触ったので変更行 100% ゲートの対象**だった
+（変更 82 行 / 未カバー 0 で PASS）。
 
 ## 8. 残るリスク
 
@@ -567,6 +601,12 @@ synthetic fixture しか検証しない — shim の配線ミス（n9t0.3）や�
    本当の担保は probe で全 fixture を突き合わせること。
 2. **辞書キーのエスケープ欠落（flpdf-n9t0.7、follow-up）。** §4 参照。
    n9t0.2 本体はブロックしないが、`dict_keys` fixture の対象範囲を制限する。
+3. **PR #589（crate リネーム）が本稿時点で未マージ。** `gh pr view 589` → `OPEN`。
+   §2 のレイアウト（`crates/flpdf-qtest-tools/`）と §7.1 のカバレッジ prefix
+   更新は #589 のブランチ上では実施・検証済みだが、`origin/main` にはまだ
+   `crates/flpdf-test-compare/` のまま存在する。n9t0.2 の着手前に #589 のマージ
+   状態を確認すること — 未マージのまま §2 のパスを前提に実装を始めると、
+   存在しないディレクトリを探すことになる。
 
 ### 8.1 解消済み
 
@@ -586,8 +626,6 @@ synthetic fixture しか検証しない — shim の配線ミス（n9t0.3）や�
   binary 名は不変なので dual-name 互換は不要。この後 flpdf 側で実際にリネームし
   （PR #589）、バイナリを削除した状態から `FLPDF_DIR` ビルド分岐を実走させて
   `Passes: 34/69`（リネーム前と完全に同一）を確認済み。
-- ~~**カバレッジ prefix の更新漏れ。**~~ PR #589 で `patch-coverage.sh` の
-  `REPORT_PREFIXES` を更新済み、`--allow-dirty` 付きで PASS を確認済み。
 
 ## 9. スコープ外
 
