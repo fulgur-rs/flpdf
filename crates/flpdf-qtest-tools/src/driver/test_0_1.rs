@@ -651,6 +651,29 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_decode_parameters_report_not_filterable() {
+        assert_eq!(
+            output(
+                b"7 0 R",
+                &[(
+                    7,
+                    b"<< /Filter /ASCIIHexDecode /DecodeParms << /Foo 1 >> /Length 3 >>\n\
+                      stream\n41>\nendstream"
+                        .to_vec(),
+                )],
+            ),
+            b"/QTest is indirect and has type stream (10)\n\
+              /QTest is a stream.  Dictionary: << /DecodeParms << /Foo 1 >> /Filter /ASCIIHexDecode /Length 3 >>\n\
+              Raw stream data:\n\
+              41>\n\
+              Uncompressed stream data:\n\
+              Stream data is not filterable.\n\
+              unparse: 7 0 R\n\
+              unparseResolved: 7 0 R\n"
+        );
+    }
+
+    #[test]
     fn decode_parms_length_mismatch_reports_qpdf_warning() {
         let (stdout, stderr) = output_channels(
             b"7 0 R",
