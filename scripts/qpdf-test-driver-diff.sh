@@ -48,6 +48,7 @@ fixture_names=(
     stream_flate_error
     stream_filter_error_then_warning
     stream_asciihex_odd_nibble_recovery
+    stream_asciihex_data_before_error
     stream_unfilterable
 )
 

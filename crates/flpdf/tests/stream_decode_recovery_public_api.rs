@@ -19,6 +19,18 @@ fn odd_nibble_error_dictionary() -> Dictionary {
     dictionary
 }
 
+fn downstream_data_before_upstream_error_dictionary() -> Dictionary {
+    let mut dictionary = Dictionary::new();
+    dictionary.insert(
+        "Filter",
+        Object::Array(vec![
+            Object::Name(b"AHx".to_vec()),
+            Object::Name(b"AHx".to_vec()),
+        ]),
+    );
+    dictionary
+}
+
 #[test]
 fn recovery_events_and_strict_error_share_pipeline_order() {
     let dictionary = error_then_finish_warning_dictionary();
@@ -68,6 +80,32 @@ fn recovery_events_keep_odd_nibble_cleanup_after_write_error() {
     ));
     assert_eq!(
         decode_stream_data(&dictionary, b"4G ")
+            .unwrap_err()
+            .to_string(),
+        "unsupported PDF feature: character out of range during base Hex decode: G"
+    );
+}
+
+#[test]
+fn recovery_events_keep_downstream_data_before_upstream_write_error() {
+    let dictionary = downstream_data_before_upstream_error_dictionary();
+
+    let outcome = decode_stream_data_recovering(&dictionary, b"3431G").unwrap();
+
+    assert_eq!(outcome.data, b"A");
+    assert_eq!(outcome.events.len(), 2);
+    assert!(matches!(
+        &outcome.events[0],
+        StreamDecodeEvent::Data(data) if data == b"A"
+    ));
+    assert!(matches!(
+        &outcome.events[1],
+        StreamDecodeEvent::Error(error)
+            if error.to_string()
+                == "unsupported PDF feature: character out of range during base Hex decode: G"
+    ));
+    assert_eq!(
+        decode_stream_data(&dictionary, b"3431G")
             .unwrap_err()
             .to_string(),
         "unsupported PDF feature: character out of range during base Hex decode: G"

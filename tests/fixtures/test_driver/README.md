@@ -20,6 +20,10 @@ the write error precedes Flate's downstream finish warning.
 reports the invalid `G` during `write`, then its cleanup flushes the pending
 odd nibble as `@`; the golden fixes the warning-before-cleanup-byte order.
 
+`stream_asciihex_data_before_error` decodes `3431G` through `[/AHx /AHx]`.
+The downstream ASCIIHex decoder emits `A` before the upstream decoder reports
+its `G` write error; the golden fixes that data-before-warning relationship.
+
 `stream_deep_invalid_filter` has 64 direct nested Filter arrays. qpdf treats
 the first nested array as an invalid immediate filter item; it warns and
 continues instead of traversing the nested structure.

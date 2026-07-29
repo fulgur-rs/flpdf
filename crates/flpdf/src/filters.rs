@@ -294,6 +294,7 @@ where
     let stage_count = prepared.len();
     let mut decoded = Cow::Borrowed(stream_data);
     let mut events = Vec::new();
+    let mut pending_events = Vec::new();
     let mut has_runtime_error = false;
     for (stage_index, mut stage) in prepared.into_iter().enumerate() {
         let is_last_stage = stage_index + 1 == stage_count;
@@ -302,6 +303,9 @@ where
                 let data = decrypt_crypt(*decode_params, decoded.as_ref())?;
                 if is_last_stage && !data.is_empty() {
                     events.push(StreamDecodeEvent::Data(data.clone()));
+                }
+                if is_last_stage {
+                    events.append(&mut pending_events);
                 }
                 data
             }
@@ -324,10 +328,21 @@ where
                         if is_last_stage && !outcome.data.is_empty() {
                             events.push(StreamDecodeEvent::Data(outcome.data.clone()));
                         }
+                        if is_last_stage {
+                            events.append(&mut pending_events);
+                        }
                         events.extend(stage_warnings);
                     } else {
                         has_runtime_error = true;
-                        if is_last_stage && stage_error.during_write {
+                        if !is_last_stage {
+                            if stage_error.during_write {
+                                pending_events.push(StreamDecodeEvent::Error(stage_error.error));
+                                pending_events.extend(stage_warnings);
+                            } else {
+                                pending_events.extend(stage_warnings);
+                                pending_events.push(StreamDecodeEvent::Error(stage_error.error));
+                            }
+                        } else if stage_error.during_write {
                             let (before_cleanup, cleanup) =
                                 outcome.data.split_at(cleanup_data_start);
                             if !before_cleanup.is_empty() {
@@ -337,9 +352,6 @@ where
                             if !cleanup.is_empty() {
                                 events.push(StreamDecodeEvent::Data(cleanup.to_vec()));
                             }
-                            events.extend(stage_warnings);
-                        } else if stage_error.during_write {
-                            events.push(StreamDecodeEvent::Error(stage_error.error));
                             events.extend(stage_warnings);
                         } else {
                             if is_last_stage && !outcome.data.is_empty() {
@@ -352,6 +364,9 @@ where
                 } else {
                     if is_last_stage && !outcome.data.is_empty() {
                         events.push(StreamDecodeEvent::Data(outcome.data.clone()));
+                    }
+                    if is_last_stage {
+                        events.append(&mut pending_events);
                     }
                     events.extend(stage_warnings);
                 }
@@ -769,6 +784,52 @@ mod tests {
             StreamDecodeEvent::Error(error)
                 if error.to_string()
                     == "unsupported PDF feature: decoded output exceeds configured limit of 0 bytes"
+        ));
+    }
+
+    #[test]
+    fn recovering_decode_emits_data_before_a_finish_time_error() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"ASCIIHexDecode".to_vec()));
+
+        let outcome = decode_stream_data_recovering_with_limits(
+            &dict,
+            b"41F",
+            DecodeLimits {
+                max_output: Some(1),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data, b"A");
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Data(data), StreamDecodeEvent::Error(error)]
+                if data == b"A"
+                    && error.to_string()
+                        == "unsupported PDF feature: decoded output exceeds configured limit of 1 bytes"
+        ));
+    }
+
+    #[test]
+    fn recovering_decode_defers_a_nonfinal_finish_time_error_until_after_data() {
+        let dict = array_filter_dict(&[b"ASCIIHexDecode", b"ASCIIHexDecode"]);
+
+        let outcome = decode_stream_data_recovering_with_limits(
+            &dict,
+            b"41F",
+            DecodeLimits {
+                max_output: Some(1),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Data(data), StreamDecodeEvent::Error(error)]
+                if data == b"\xa0"
+                    && error.to_string()
+                        == "unsupported PDF feature: decoded output exceeds configured limit of 1 bytes"
         ));
     }
 
@@ -1860,6 +1921,27 @@ mod tests {
             matches!(err, Err(Error::Unsupported(ref m)) if m.contains("Crypt")),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn recovering_crypt_stage_emits_final_data_event() {
+        let filter = Object::Name(b"Crypt".to_vec());
+        let mut decrypt = |_: Option<&Object>, data: &[u8]| Ok(data.to_vec());
+
+        let outcome = decode_stream_data_with_filters_and_crypt(
+            Some(&filter),
+            None,
+            b"decrypted",
+            DecodeLimits::default(),
+            &mut decrypt,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data, b"decrypted");
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Data(data)] if data == b"decrypted"
+        ));
     }
 
     #[test]
