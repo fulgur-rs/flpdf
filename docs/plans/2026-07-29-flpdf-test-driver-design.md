@@ -5,8 +5,10 @@
 **Goal:** qtest `basic-parsing.test` の 21 件の `test_driver N goodM.pdf` subtest を救済する。
 現状はいずれも `TestDriver->runtest: unable to run command` / exit 2 で FAIL している。
 
-**Beads:** flpdf-n9t0.2（実装）/ flpdf-n9t0.3（shim）/ flpdf-n9t0.4（前提バグ、PR #584 で完了）/
-flpdf-n9t0.5（前提 chore）。親 epic は flpdf-n9t0。
+**Beads:** flpdf-n9t0.2（実装、`test_0_1` に限定）/ flpdf-n9t0.3（shim）/
+flpdf-n9t0.4（前提バグ、PR #584 で完了）/ flpdf-n9t0.5（前提 chore、PR #22 + #589）/
+flpdf-n9t0.6（`test_3` 実装、n9t0.2 から分離）/ flpdf-n9t0.7（follow-up バグ、§4 参照）。
+親 epic は flpdf-n9t0。
 
 **Oracle:** qpdf v11.9.0 `qpdf/test_driver.cc`（`test_0_1` = 20 件、`test_3` = good14 の 1 件）。
 本物の `test_driver` バイナリで `good1.out` / `good21.out` の再現を実測確認済み。
@@ -102,7 +104,15 @@ test_driver 側も `strrchr(argv[0], '/') + 1` で `whoami` を作り、それ�
 qpdf 自身は `compare-for-test/qpdf-test-compare.cc` と `qpdf/test_driver.cc` を
 別ディレクトリ・別ターゲットに置いている。1 crate への集約は出力バイトに影響しない
 ビルド構成の差であり、CLAUDE.md の逸脱分類 (B) に該当する。
-`docs/qpdf-correspondence.md` に ⚪ 行を 1 行記載すること。
+
+**`docs/qpdf-correspondence.md` への追記は行わない**（PR #589 で判断）。同表は
+`libqpdf/*.cc` を flpdf モジュールへ対応づけるもので、列は `qpdf` / `行` / `flpdf` /
+`状態`（逸脱候補表は `逸脱候補` / `qpdf 行数` / `byte 影響`）。`compare-for-test/`
+配下のテストヘルパーはそもそも 1 行も載っていない。加えて qpdf 自身がこの 2 つを
+1 つの CMake プロジェクトから作っているため、1 cargo package への集約は「qpdf の
+ソースを Rust の機構で置き換えた逸脱」ではなく、むしろ qpdf の構造をなぞったもの。
+CLAUDE.md (B) 条件 3 の「モジュール doc に 1 行」は `crates/flpdf-qtest-tools/src/lib.rs`
+の crate doc で満たしている。
 
 ## 3. CLI 契約とディスパッチ順序
 
@@ -200,6 +210,20 @@ qpdf の `unparse` と一致済み）、**stream だけ特例**（`QPDF_Stream::
 `[ /literal null /indirect 8 0 R /undefined 10 0 R ]` の通り配列要素の参照は `N G R` のまま残り、
 これは `write_pdf` の `Object::Reference` 分岐と一致する。
 
+**既知の欠落（flpdf-n9t0.7、follow-up）**: `Dictionary::write_pdf` は辞書キーを
+一切エスケープしない（`object.rs:834-843`。QDF 経路の `write_pdf_qdf` は
+`write_name_escaped` を正しく呼ぶが、コンパクト経路には無い）。実測
+（`qpdf --static-id` vs `flpdf rewrite --static-id`、`/a#20b (x)` を持つ辞書）:
+
+```
+qpdf:  << /a#20b (x) >>
+flpdf: << /a b (x) >>   ← トークン境界が壊れる
+```
+
+`test_0_1` の dictionary 分岐（`good11`）は幸い `/a` のようなエスケープ不要な
+キーのみなので n9t0.2 の実装自体はブロックされないが、§7 の `dict_keys` fixture に
+エスケープが要るキーを含めることはできない（n9t0.7 が着地するまで）。
+
 ## 5. `test_0_1`（20 subtest）
 
 出力は 5 パート固定:
@@ -220,6 +244,13 @@ unparseResolved: <…>
 - stream は raw（`Stream.data` をそのまま）と decoded（`decode_stream_data`）を両方 stdout へ。
   decode 失敗時は `Stream data is not filterable.`
 - `array` / `dictionary` は要素ごとに `  item N is {in,}direct` / `  /key is {in,}direct`
+- **decode の前に `/Filter` と `/DecodeParms` を解決する。** `decode_stream_data` は
+  `dict.get("Filter")` / `dict.get("DecodeParms")` を直接 `decode_stream_data_with_filters`
+  へ渡すだけで間接参照を解決しない（`filters.rs`）。`Object::Reference` が来ると
+  `decode_filter_specs`（`stream_filter.rs:55-59`）が `Unsupported` を返し、qpdf が
+  正しくフィルタする場面でも `Stream data is not filterable.` になってしまう。既存の
+  `flpdf-qtest-tools`（旧 `flpdf-test-compare`）の `compare.rs` が全く同じ理由で
+  `resolve_stream_keys` を持っているので、同じ解決ステップをここでも呼ぶ
 
 この 20 subtest は既存の flpdf 公開 API だけで完結する — `Pdf::open_mem` / `trailer()` /
 `resolve_borrowed()` / `Stream { pub dict, pub data }` / `decode_stream_data` /
@@ -248,8 +279,8 @@ WARNING: good14.pdf (offset 628): content normalization encountered bad tokens
 `last_token_was_bad()` が既に持っている。
 
 **21 件中 1 件のために別種の作業（オフセット追跡 + 警告文言の移植）を要求するため、
-n9t0.2 は `test_0_1` に限定し `test_3` は別 issue に切る。** `invalid test 3` で
-fail-loud するのでベースラインは静かに動かない。
+n9t0.2 は `test_0_1` に限定し `test_3` は flpdf-n9t0.6 に切り出した。** `invalid test 3`
+で fail-loud するのでベースラインは静かに動かない。
 
 ## 7. fixture とテスト
 
@@ -262,23 +293,34 @@ tests/fixtures/test_driver/
   dangling_ref.{pdf,out}         存在しないオブジェクトへの参照
   indirect_null.{pdf,out}        実在する null オブジェクト
   indirect_bool.{pdf,out}        hasKey が true になる対照
-  int_real.{pdf,out}             RealLiteral の verbatim 保持（0.0 -0.0 0. -0.）
+  integer.{pdf,out}              top-level integer（good7 相当）
+  real.{pdf,out}                 top-level indirect real（good8 相当）
   string_hex_literal.{pdf,out}   n9t0.4 の境界（\n 入り・閾値ちょうど・8 進フォールバック）
   name_escape.{pdf,out}          /hex#20strings 相当
-  array_indirect.{pdf,out}       要素ごとの direct/indirect
-  dict_keys.{pdf,out}            キーの lexicographic 順
+  array_indirect.{pdf,out}       要素ごとの direct/indirect（real literal の
+                                  verbatim 保持 0.0 -0.0 0. -0. も good10 に倣いここで確認）
+  dict_keys.{pdf,out}            キーの lexicographic 順（ASCII-safe キーのみ。
+                                  エスケープが要るキーは flpdf-n9t0.7 が着地するまで
+                                  追加できない — §4 参照）
   stream_flate.{pdf,out}         raw / uncompressed / dict unparse
+  stream_indirect_filter.{pdf,out}  /Filter が間接参照のストリーム（§5 参照）
   stream_unfilterable.{pdf,out}  Stream data is not filterable.
 ```
+
+`test_0_1` は `/QTest` 1 個の型でしか分岐できないため、`integer.pdf` と `real.pdf`
+は分けた別ファイルにする（`good7`/`good8` も qpdf 側で別ファイル）。1 ファイルに
+両方を詰めると array 分岐だけを通り、integer/real 分岐は未検証のまま残る。
 
 `flpdf-qtest/vendor/qpdf-qtest/` からのコピーは一切しない
 （`tests/fixtures/compare_for_test/README.md` の方針）。
 
-`scripts/qpdf-test-driver-diff.sh` を既存の
-`qpdf-{tokenizer,rc4,lzw-png,stream-codecs}-diff.sh` と同じ形で追加する。
-`scripts/fetch-qpdf-source.sh` で pinned source を取り `test_driver` をビルドして
-全 fixture を `flpdf-test-driver` と突き合わせる。期待出力はコミット済みなので
-通常の `cargo test` は qpdf ビルド不要で回る。
+**通常の `cargo test` が実際にこの比較を行う経路**: `crates/flpdf-qtest-tools/tests/driver_goldens.rs`
+がコミット済みの `tests/fixtures/test_driver/*.{pdf,out}` を読み、`flpdf-test-driver` を
+`assert_cmd` 経由で起動して stdout を `.out` と突き合わせる（qpdf ビルド不要）。
+`scripts/qpdf-test-driver-diff.sh`（既存の `qpdf-{tokenizer,rc4,lzw-png,stream-codecs}-diff.sh`
+と同じ形）は別役割で、`scripts/fetch-qpdf-source.sh` で pinned source を取り本物の
+`test_driver` をビルドして fixture を再生成・オラクル照合するための開発者ツール。
+CI/`cargo test` はコミット済み `.out` に対する `driver_goldens.rs` だけを回す。
 
 **flpdf を出力生成に使う場面では必ず `flpdf rewrite` を使う。** トップレベルの
 `flpdf in out` は完全な書き直しをせず入力にバイトを追記する別経路で、qpdf の
@@ -286,22 +328,18 @@ tests/fixtures/test_driver/
 
 ### 7.1 カバレッジ
 
-`flpdf-qtest-tools` は `scripts/patch-coverage.sh` の `REPORT_PREFIXES`（報告のみ）。
-一方 **n9t0.4 は `crates/flpdf/src/` を触ったので変更行 100% ゲートの対象**だった
-（変更 82 行 / 未カバー 0 で PASS）。
+`n9t0.5` の一部として `scripts/patch-coverage.sh` の `REPORT_PREFIXES` を
+`crates/flpdf-test-compare/src/` から `crates/flpdf-qtest-tools/src/` へ更新する
+（PR #589 で実施済み、§8.1 参照）。一方 **n9t0.4 は `crates/flpdf/src/` を触ったので
+変更行 100% ゲートの対象**だった（変更 82 行 / 未カバー 0 で PASS）。
 
 ## 8. 残るリスク
 
-1. **n9t0.5 のクロスリポジトリ順序。** flpdf-qtest の
-   `scripts/run.sh:84` と `.github/workflows/ci.yml:81` が
-   `cargo build --release -p flpdf-test-compare` と package 名を直に書いている。
-   flpdf-qtest 側を先にマージしないと CI に破断ウィンドウができる。
-2. **`write_pdf` と `QPDFObjectHandle::unparse` の一致は全網羅では未検証。**
+1. **`write_pdf` と `QPDFObjectHandle::unparse` の一致は全網羅では未検証。**
    real / name / dict / array は good7/8/10/11/13/15/21 で実測一致を確認したが、
    本当の担保は probe で全 fixture を突き合わせること。
-3. **basic-parsing の subtest 38 / 39 が緑になるかは未確認。** n9t0.4 で good13 の
-   QDF 出力が qpdf と byte-identical になることは確認したが、qtest 実走で subtest の
-   判定まで見たわけではない。n9t0.3 の shim 設置時に併せて確認する。
+2. **辞書キーのエスケープ欠落（flpdf-n9t0.7、follow-up）。** §4 参照。
+   n9t0.2 本体はブロックしないが、`dict_keys` fixture の対象範囲を制限する。
 
 ### 8.1 解消済み
 
@@ -311,6 +349,18 @@ tests/fixtures/test_driver/
   n9t0.4 で qpdf オラクル由来の 9 テスト（境界値・hex 強制・8 進フォールバックを含む）
   を新設して解消。
 - ~~**good13 の QDF が緑になるのは見込み。**~~ `b7bfbad9` で byte-identical を確認済み。
+- ~~**basic-parsing の subtest 38 / 39 が緑になるかは未確認。**~~ flpdf-qtest#22 の
+  検証実走（`FLPDF_DIR` 経由ビルド）で確認済み: `basic-parsing 38 (create qdf) ... PASSED`
+  `basic-parsing 39 (check output) ... PASSED`。
+- ~~**n9t0.5 のクロスリポジトリ順序。**~~ flpdf-qtest の `scripts/run.sh` と
+  `.github/workflows/ci.yml` が package 名（`-p flpdf-test-compare`）を直に
+  書いていた点は事実だが、実際に採った対処は「新旧 package 名の入れ替え」ではなく
+  **package 名依存そのものを外す**こと（`-p` → `--bin`。flpdf-qtest#22、マージ済み）。
+  binary 名は不変なので dual-name 互換は不要。この後 flpdf 側で実際にリネームし
+  （PR #589）、バイナリを削除した状態から `FLPDF_DIR` ビルド分岐を実走させて
+  `Passes: 34/69`（リネーム前と完全に同一）を確認済み。
+- ~~**カバレッジ prefix の更新漏れ。**~~ PR #589 で `patch-coverage.sh` の
+  `REPORT_PREFIXES` を更新済み、`--allow-dirty` 付きで PASS を確認済み。
 
 ## 9. スコープ外
 
