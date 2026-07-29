@@ -336,9 +336,18 @@ unparseResolved: <…>
 
 > **[/provisional]**
 
-この 20 subtest は既存の flpdf 公開 API だけで完結する — `Pdf::open_mem` / `trailer()` /
+この 20 subtest は既存の flpdf 公開 API だけで完結する — `Pdf::open_mem_with_options`
+（**`Pdf::open_mem` ではない**。後者は `Pdf::open(Cursor::new(bytes))` に委譲し
+`PdfOpenOptions::default()`（`repair: false`、strict）を使う。qpdf の `QPDF` は
+`attempt_recovery{true}` がデフォルトメンバ初期化子（`QPDF.hh:1461`）— `runtest` が
+`setAttemptRecovery(false)` を呼ぶのは `n == 0` のときだけなので、id 1（と id 3）は
+recovery 有効のまま読み込む。`repair: true` を明示した `PdfOpenOptions` で
+`open_mem_with_options` を呼ぶ） / `trailer()` /
 `resolve_borrowed()` / `Stream { pub dict, pub data }` / `decode_stream_data` /
-`write_pdf`。
+`write_pdf`。strict な `Pdf::open_mem` のまま実装すると、qpdf が repair で読める
+壊れた xref/trailer を持つ入力に対して test_0_1 を呼ぶ前の読込段階でエラーになり、
+`invalid test N` にも正常な test_0_1 出力にもならない — repairable な壊れ方をする
+fixture を 1 本 fixture 一覧（§7）に加えて検証する。
 
 ## 6. `test_3` は n9t0.2 から切り出す
 
@@ -491,7 +500,13 @@ exit 2 になることを確認する negative test と、§3 の「読込がル
 4 引数を誤って reject する実装は `test_0_1` の成功ケース（3 引数のみ使う。§3 参照）
 では検出できないが、qtest が `test_driver <n> <file> <password>` の形で未実装番号を
 呼ぶ場面（`test_2`, `test_35`, `test_36` 相当）では Usage を返すべきでないところで
-返してしまい、fail-loud の互換性ベースラインを変える。
+返してしまい、fail-loud の互換性ベースラインを変える。**ただし arg2 を id 1 / id 3
+の読込に転用してはならない。** `runtest`（`test_driver.cc:3492-3494`）で `arg2` を
+password として使うのは `n == 35 || n == 36` の分岐だけ（コメント
+`// arg2 is password` 参照）で、id 1・id 3 が通る `else` 分岐
+（`processMemoryFile(filename1, file_buf.get(), size)`）は `arg2` を一切参照しない。
+4 引数形は**構文として受理するだけ**でよく、`PdfOpenOptions::password` へは繋がない
+（暗号化 fixture でのパスワード転送テストは id 35/36 相当を実装する段になってから）。
 `scripts/qpdf-test-driver-diff.sh`（既存の `qpdf-{tokenizer,rc4,lzw-png,stream-codecs}-diff.sh`
 と同じ形）は別役割で、`scripts/fetch-qpdf-source.sh` で pinned source を取り本物の
 `test_driver` をビルドして fixture を再生成・オラクル照合するための開発者ツール。
