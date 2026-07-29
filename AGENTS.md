@@ -54,7 +54,7 @@
 
 ## 6) Repo conventions
 - Use non-interactive shell flags (`cp -f`, `mv -f`, `rm -f`, recursive `-rf`) to avoid hangs.
-- Do not edit `AGENTS.md`/`CLAUDE.md`/`docs/superpowers/...` unless instruction updates are needed.
+- Do not edit `AGENTS.md`/`CLAUDE.md` unless instruction updates are needed.
 - `.beads/issues.jsonl` is tracked by Beads tooling and `.gitignore`d; avoid manual edits unless explicitly requested by issue workflow.
 
 ## 7) Session close
