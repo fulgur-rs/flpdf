@@ -268,17 +268,19 @@ write(
     "stream_unfilterable",
     build_pdf(b"6 0 R", {6: stream(b"/Filter /BogusDecode", b"abc")}),
 )
-unsupported_decode_parms = {
-    number: (f"{number + 1} 0 R".encode("ascii") if number < 71 else b"null")
-    for number in range(7, 72)
-}
-unsupported_decode_parms[6] = stream(
-    b"/Filter [ /FlateDecode /BogusDecode ] /DecodeParms << /Predictor 7 0 R >>",
-    flate_abc,
-)
 write(
     "stream_unsupported_filter_skips_decode_parms",
-    build_pdf(b"6 0 R", unsupported_decode_parms),
+    build_pdf(
+        b"6 0 R",
+        {
+            6: stream(
+                b"/Filter [ /FlateDecode /BogusDecode ] "
+                b"/DecodeParms [ 7 0 R null null ]",
+                flate_abc,
+            ),
+            7: b"<< /Predictor 99 0 R >>",
+        },
+    ),
 )
 write(
     "stream_flate_error",

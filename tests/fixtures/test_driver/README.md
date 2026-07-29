@@ -33,8 +33,9 @@ place a null `/Predictor` directly and behind one indirect reference. qpdf's
 dictionary `getKeys()` omits both, so the Flate decoder uses its defaults.
 
 `stream_unsupported_filter_skips_decode_parms` pairs a valid-looking Flate
-stage with `/BogusDecode` and puts a 65-hop diagnostic reference behind
-`/DecodeParms`. qpdf rejects the chain before looking up that parameter.
+stage with `/BogusDecode` and uses an indirect DecodeParms dictionary whose
+Flate-only `/Predictor` value is dangling. qpdf rejects the chain before
+looking up that dictionary or its consumed key.
 
 ## Regeneration
 
