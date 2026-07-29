@@ -40,6 +40,7 @@ fixture_names=(
     stream_decode_parms_length_mismatch
     stream_offset_false_markers
     stream_unknown_decode_param
+    stream_deep_invalid_filter
     stream_flate_error
     stream_filter_error_then_warning
     stream_unfilterable
@@ -264,6 +265,14 @@ write(
             ),
         },
     ),
+)
+
+deep_invalid_filter = b"/FlateDecode"
+for _ in range(64):
+    deep_invalid_filter = b"[ " + deep_invalid_filter + b" ]"
+write(
+    "stream_deep_invalid_filter",
+    build_pdf(b"6 0 R", {6: stream(b"/Filter " + deep_invalid_filter, b"abc")}),
 )
 PYEOF
 }

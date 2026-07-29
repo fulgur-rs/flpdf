@@ -222,7 +222,7 @@ pub(crate) fn resolve_stream_dictionary<R: Read + Seek>(
     let filter = source
         .get(b"Filter")
         .cloned()
-        .map(|value| resolve_filter_structure(pdf, value, 0))
+        .map(|value| resolve_filter_structure(pdf, value))
         .transpose()?;
     let filter_names = filter.as_ref().and_then(resolved_filter_names);
 
@@ -333,33 +333,15 @@ fn resolve_decode_params<R: Read + Seek>(
 fn resolve_filter_structure<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: Object,
-    depth: usize,
 ) -> flpdf::Result<Object> {
-    if depth >= MAX_REF_CHAIN_DEPTH {
-        return Err(Error::parse(
-            0,
-            format!("stream parameter nesting exceeds {MAX_REF_CHAIN_DEPTH} levels"),
-        ));
-    }
     let (resolved, _, _) = resolve_chain(pdf, value)?;
     match resolved {
         Object::Array(values) => {
             let values = values
                 .into_iter()
-                .map(|value| resolve_filter_structure(pdf, value, depth + 1))
+                .map(|value| resolve_chain(pdf, value).map(|(value, _, _)| value))
                 .collect::<flpdf::Result<Vec<_>>>()?;
             Ok(Object::Array(values))
-        }
-        Object::Dictionary(dictionary) => {
-            let entries: Vec<(Vec<u8>, Object)> = dictionary
-                .iter()
-                .map(|(key, value)| (key.to_vec(), value.clone()))
-                .collect();
-            let mut resolved = Dictionary::new();
-            for (key, value) in entries {
-                resolved.insert(key, resolve_filter_structure(pdf, value, depth + 1)?);
-            }
-            Ok(Object::Dictionary(resolved))
         }
         other => Ok(other),
     }
@@ -781,16 +763,54 @@ mod tests {
     }
 
     #[test]
-    fn filter_structure_keeps_its_nesting_limit() {
+    fn nested_filter_array_stays_opaque_and_leaves_decode_parameters_unresolved() {
         let mut pdf = handle_pdf(b"");
         let filter = (0..64).fold(Object::Name(b"FlateDecode".to_vec()), |value, _| {
             Object::Array(vec![value])
         });
+        let mut params = Dictionary::new();
+        params.insert(b"Predictor", Object::Reference(ObjectRef::new(13, 0)));
         let mut dictionary = Dictionary::new();
-        dictionary.insert(b"Filter", filter);
+        dictionary.insert(b"Filter", filter.clone());
+        dictionary.insert(b"DecodeParms", Object::Dictionary(params));
 
-        let error =
-            resolve_stream_dictionary(&mut pdf, &dictionary).expect_err("64-level Filter nesting");
-        assert!(error.to_string().contains("exceeds 64 levels"));
+        let resolved =
+            resolve_stream_dictionary(&mut pdf, &dictionary).expect("resolve shallow Filter");
+        assert_eq!(resolved.get(b"Filter"), Some(&filter));
+        let params = resolved
+            .get(b"DecodeParms")
+            .and_then(Object::as_dict)
+            .expect("preserved DecodeParms dictionary");
+        assert_eq!(
+            params.get(b"Predictor"),
+            Some(&Object::Reference(ObjectRef::new(13, 0)))
+        );
+    }
+
+    #[test]
+    fn shared_decode_parameters_use_the_union_of_valid_filter_keys() {
+        let mut pdf = handle_pdf(b"");
+        pdf.set_object(ObjectRef::new(20, 0), Object::Integer(0));
+        let mut params = Dictionary::new();
+        params.insert(b"Predictor", Object::Reference(ObjectRef::new(13, 0)));
+        params.insert(b"EarlyChange", Object::Reference(ObjectRef::new(20, 0)));
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(
+            b"Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"LZWDecode".to_vec()),
+            ]),
+        );
+        dictionary.insert(b"DecodeParms", Object::Dictionary(params));
+
+        let resolved =
+            resolve_stream_dictionary(&mut pdf, &dictionary).expect("resolve stream dictionary");
+        let params = resolved
+            .get(b"DecodeParms")
+            .and_then(Object::as_dict)
+            .expect("resolved shared DecodeParms dictionary");
+        assert_eq!(params.get(b"Predictor"), Some(&Object::Integer(15)));
+        assert_eq!(params.get(b"EarlyChange"), Some(&Object::Integer(0)));
     }
 }

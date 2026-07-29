@@ -16,6 +16,10 @@ the filtered pipeline is still finished.
 `G`; cleanup then finishes Flate. The golden fixes qpdf's diagnostic order:
 the write error precedes Flate's downstream finish warning.
 
+`stream_deep_invalid_filter` has 64 direct nested Filter arrays. qpdf treats
+the first nested array as an invalid immediate filter item; it warns and
+continues instead of traversing the nested structure.
+
 ## Regeneration
 
 ```sh
@@ -38,6 +42,7 @@ behavioral oracle.
 The fixtures cover missing/direct/indirect null, booleans, every scalar
 Object kind used by `test_0_1`, array/dictionary child indirectness, raw and
 decoded streams, indirect filter/decode-parameter shapes, malformed
-top-level bare references, unfilterable streams, and pre-dispatch xref repair.
+top-level bare references, shallow-invalid Filter shapes, unfilterable streams,
+and pre-dispatch xref repair.
 The separate `test_3` fixture belongs to Bead `flpdf-n9t0.6` and is not
 generated here.
