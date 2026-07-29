@@ -374,7 +374,13 @@ stderr の警告が改行なしで割り込む**形を要求するため、別�
 テストが偽陽性で通る）。n9t0.6 の golden テストは、子プロセスの stdout と stderr を
 同じファイル記述子へ向けて起動し（Unix なら stderr を stdout の fd に `dup2`
 する、または `std::process::Command` に生の `Stdio` をハンドオフする）、
-端末が見るのと同じバイト列で比較する。
+端末が見るのと同じバイト列で比較する。**merged バイト列の比較だけでなく exit code 0
+もアサートする** — §7 の `driver_goldens.rs` に追加した `.assert().success()`
+要件（round 3）は test_0_1 側にしか書いておらず、merged capture は生の
+`Stdio` を使うため `assert_cmd` の `.assert()` 経由にならない。merged 出力が
+正しいまま exit 2 する回帰（qtest は exit code も見るので FAIL になる）を
+このテストが見逃さないよう、`Command::status()` / `wait()` の終了コードを
+明示的に確認するコードをテストに含める。
 
 **警告に載るファイル名は argv[2] の生文字列そのもの。** `test_driver.cc` の `runtest`
 は `n % 2 == 1`（test_3 が該当）で `processMemoryFile(filename1, …)` を呼び、
@@ -412,7 +418,11 @@ tests/fixtures/test_driver/
   name_escape.{pdf,out}          /hex#20strings 相当
   array_indirect.{pdf,out}       要素ごとの direct/indirect（real literal の
                                   verbatim 保持 0.0 -0.0 0. -0. も good10 に倣いここで確認）
-  dict_keys.{pdf,out}            キーの lexicographic 順（ASCII-safe キーのみ。
+  dict_keys.{pdf,out}            キーの lexicographic 順 **かつ少なくとも 1 つは
+                                  間接値**（`/a 8 0 R` のように）を含む。§5 の
+                                  「  /key is {in,}direct」出力は direct/indirect
+                                  両方を実測しないと、常に direct を返す実装が
+                                  全 golden を通ってしまう（ASCII-safe キーのみ。
                                   エスケープが要るキーは flpdf-n9t0.7 が着地するまで
                                   追加できない — §4 参照）
   stream_flate.{pdf,out}         raw / uncompressed / dict unparse
@@ -486,6 +496,21 @@ exit 2 になることを確認する negative test と、§3 の「読込がル
 と同じ形）は別役割で、`scripts/fetch-qpdf-source.sh` で pinned source を取り本物の
 `test_driver` をビルドして fixture を再生成・オラクル照合するための開発者ツール。
 CI/`cargo test` はコミット済み `.out` に対する `driver_goldens.rs` だけを回す。
+
+**この設計の受け入れ条件は、自作 fixture の golden が全緑になることではなく、
+本物の basic-parsing.test の 21 subtest が実際に PASS することである。**
+`driver_goldens.rs` と `qpdf-test-driver-diff.sh` はどちらも自分で用意した
+synthetic fixture しか検証しない — shim の配線ミス（n9t0.3）や、good1〜good21
+固有の何か（例えば実ファイルのオフセット・エンコーディングの組み合わせ）に
+起因する乖離は、これらのテストが全緑でも見逃しうる。n9t0.3 と n9t0.6 が
+揃った時点で、flpdf-qtest の `FLPDF_DIR` 経由ビルド（本文書で既に basic-parsing
+の subtest 38/39 の PASS を確認したのと同じ手順）で `basic-parsing.test` を
+実走し、`test_driver N goodM.pdf` 形の 21 subtest（`implicit null` 〜
+`array with indirect nulls`、good14 の `tokenizing pipeline` を含む。
+「create qdf」「check output」は qpdf-cli 側で既に PASS 済みの別 subtest なので
+ここには含まない）が **qtest の PASS/FAIL 判定として**すべて PASS することを
+確認する。これが本 epic（flpdf-n9t0）のゴール達成の一次証拠であり、
+`driver_goldens.rs` 全緑はその代理指標に過ぎない。
 
 **flpdf を出力生成に使う場面では必ず `flpdf rewrite` を使う。** トップレベルの
 `flpdf in out` は完全な書き直しをせず入力にバイトを追記する別経路で、qpdf の
