@@ -1,4 +1,7 @@
-use std::io::{self, Write};
+use std::{
+    ffi::CStr,
+    io::{self, Write},
+};
 
 use flpdf::{Diagnostic, Pdf, PdfOpenOptions};
 
@@ -21,14 +24,14 @@ pub fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u
         );
     }
 
-    let n = match args[1].parse::<i32>() {
+    let n = match parse_test_number(&args[1]) {
         Ok(n) => n,
-        Err(error) => return write_error(stdout, stderr, &error.to_string()),
+        Err(error) => return write_error(stdout, stderr, &error),
     };
     let filename = &args[2];
     let bytes = match std::fs::read(filename) {
         Ok(bytes) => bytes,
-        Err(error) => return write_error(stdout, stderr, &error.to_string()),
+        Err(error) => return write_error(stdout, stderr, &format_open_error(filename, &error)),
     };
     let options = PdfOpenOptions {
         repair: true,
@@ -44,7 +47,7 @@ pub fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u
         return 2;
     }
 
-    if n != 1 {
+    if n != 0 && n != 1 {
         return write_error(stdout, stderr, &format!("invalid test {n}"));
     }
     if let Err(error) =
@@ -56,6 +59,88 @@ pub fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u
         return 2;
     }
     0
+}
+
+fn format_open_error(filename: &str, error: &io::Error) -> String {
+    let message = error
+        .raw_os_error()
+        .and_then(system_error_message)
+        .unwrap_or_else(|| error.to_string());
+    format!("open {filename}: {message}")
+}
+
+fn system_error_message(error_code: i32) -> Option<String> {
+    let message = unsafe { libc::strerror(error_code) };
+    (!message.is_null()).then(|| {
+        unsafe { CStr::from_ptr(message) }
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
+fn parse_test_number(input: &str) -> Result<i32, String> {
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+
+    let negative = match bytes.get(index) {
+        Some(b'-') => {
+            index += 1;
+            true
+        }
+        Some(b'+') => {
+            index += 1;
+            false
+        }
+        _ => false,
+    };
+
+    let mut value = 0_u64;
+    let mut consumed_digit = false;
+    while let Some(digit) = bytes.get(index).and_then(|byte| byte.checked_sub(b'0')) {
+        if digit > 9 {
+            break;
+        }
+        consumed_digit = true;
+        value = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u64::from(digit)))
+            .ok_or_else(|| format!("overflow/underflow converting {input} to 64-bit integer"))?;
+        index += 1;
+    }
+
+    if !consumed_digit {
+        return Ok(0);
+    }
+
+    let i64_value = if negative {
+        const I64_MIN_MAGNITUDE: u64 = 9_223_372_036_854_775_808;
+        if value > I64_MIN_MAGNITUDE {
+            return Err(format!(
+                "overflow/underflow converting {input} to 64-bit integer"
+            ));
+        }
+        if value == I64_MIN_MAGNITUDE {
+            i64::MIN
+        } else {
+            -(value as i64)
+        }
+    } else {
+        if value > i64::MAX as u64 {
+            return Err(format!(
+                "overflow/underflow converting {input} to 64-bit integer"
+            ));
+        }
+        value as i64
+    };
+
+    i32::try_from(i64_value).map_err(|_| {
+        format!(
+            "integer out of range converting {i64_value} from a 8-byte signed type to a 4-byte signed type"
+        )
+    })
 }
 
 fn emit_new_diagnostics<R: io::Read + io::Seek>(

@@ -358,6 +358,7 @@ dependencies = [
  "assert_cmd",
  "flate2",
  "flpdf",
+ "libc",
  "predicates",
  "tempfile",
 ]

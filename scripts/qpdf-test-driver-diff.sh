@@ -130,6 +130,39 @@ if [[ -L "$rust_driver" || ! -x "$rust_driver" ]]; then
 fi
 
 mkdir -m 700 "${build_dir}/oracle" "${build_dir}/rust"
+
+run_cli_probe() {
+    local name=$1
+    shift
+    local oracle_actual="${build_dir}/oracle/cli-${name}.out"
+    local rust_actual="${build_dir}/rust/cli-${name}.out"
+    local oracle_status rust_status
+
+    set +e
+    (
+        cd "$fixture_dir"
+        "$oracle" "$@"
+    ) >"$oracle_actual" 2>&1
+    oracle_status=$?
+    (
+        cd "$fixture_dir"
+        "$rust_driver" "$@"
+    ) >"$rust_actual" 2>&1
+    rust_status=$?
+    set -e
+
+    if [[ "$rust_status" -ne "$oracle_status" ]]; then
+        printf \
+            'qpdf-test-driver-diff.sh: CLI %s status mismatch (qpdf=%d flpdf=%d)\n' \
+            "$name" "$oracle_status" "$rust_status" >&2
+        exit 1
+    fi
+    if ! cmp -s -- "$oracle_actual" "$rust_actual"; then
+        diff -u -- "$oracle_actual" "$rust_actual" || true
+        exit 1
+    fi
+}
+
 for name in "${fixture_names[@]}"; do
     pdf="${fixture_dir}/${name}.pdf"
     oracle_actual="${build_dir}/oracle/${name}.out"
@@ -175,8 +208,18 @@ for name in "${fixture_names[@]}"; do
     fi
 done
 
+run_cli_probe decimal_prefix 1x direct_null.pdf
+run_cli_probe signed_prefix $' \t+1trailing' direct_null.pdf
+run_cli_probe no_digits not-a-number direct_null.pdf
+run_cli_probe i32_overflow 2147483648 direct_null.pdf
+run_cli_probe i64_overflow 9223372036854775808 direct_null.pdf
+run_cli_probe i64_underflow -9223372036854775809 direct_null.pdf
+run_cli_probe i64_minimum -9223372036854775808 direct_null.pdf
+run_cli_probe unsupported_test 99 direct_null.pdf
+run_cli_probe missing_path 1 missing-cli-probe.pdf
+
 if [[ "$mode" == --regenerate ]]; then
-    printf 'regenerated and matched %d qpdf test_driver outputs\n' "${#fixture_names[@]}"
+    printf 'regenerated and matched %d qpdf test_driver outputs and 9 CLI probes\n' "${#fixture_names[@]}"
 else
-    printf 'qpdf and flpdf test_driver outputs match %d fixtures\n' "${#fixture_names[@]}"
+    printf 'qpdf and flpdf test_driver outputs match %d fixtures and 9 CLI probes\n' "${#fixture_names[@]}"
 fi
