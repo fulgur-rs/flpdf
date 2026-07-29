@@ -776,6 +776,63 @@ mod tests {
     }
 
     #[test]
+    fn qpdf_factory_aliases_keep_supported_non_predictor_parameters_shallow() {
+        for alias in [b"A85".as_slice(), b"RL".as_slice(), b"DCT".as_slice()] {
+            let mut pdf = handle_pdf(b"");
+            let mut params = Dictionary::new();
+            params.insert(b"Predictor", Object::Reference(ObjectRef::new(13, 0)));
+            let mut dictionary = Dictionary::new();
+            dictionary.insert(b"Filter", Object::Name(alias.to_vec()));
+            dictionary.insert(b"DecodeParms", Object::Dictionary(params));
+
+            let resolved = resolve_stream_dictionary(&mut pdf, &dictionary)
+                .expect("qpdf-supported alias must not reject DecodeParms");
+            assert!(
+                resolved.is_filterable(),
+                "{alias:?} must reach qpdf's supported-filter path"
+            );
+            let params = resolved
+                .get(b"DecodeParms")
+                .and_then(Object::as_dict)
+                .expect("direct DecodeParms dictionary is retained");
+            assert_eq!(
+                params.get(b"Predictor"),
+                Some(&Object::Reference(ObjectRef::new(13, 0))),
+                "{alias:?} must not consume Flate/LZW-only predictor keys"
+            );
+        }
+    }
+
+    #[test]
+    fn ccf_alias_marks_the_chain_unfilterable_without_resolving_decode_parms() {
+        let mut pdf = handle_pdf(b"");
+        for index in 0..65 {
+            let reference = ObjectRef::new(100 + index, 0);
+            let value = if index == 64 {
+                Object::Null
+            } else {
+                Object::Reference(ObjectRef::new(101 + index, 0))
+            };
+            pdf.set_object(reference, value);
+        }
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(b"Filter", Object::Name(b"CCF".to_vec()));
+        dictionary.insert(b"DecodeParms", Object::Reference(ObjectRef::new(100, 0)));
+
+        let resolved = resolve_stream_dictionary(&mut pdf, &dictionary)
+            .expect("unfilterable CCF must not follow DecodeParms");
+        assert!(
+            !resolved.is_filterable(),
+            "qpdf's factory table has no CCITTFaxDecode decoder"
+        );
+        assert_eq!(
+            resolved.get(b"DecodeParms"),
+            Some(&Object::Reference(ObjectRef::new(100, 0))),
+            "the unsupported CCF chain must leave DecodeParms untouched"
+        );
+    }
+
+    #[test]
     fn matching_filter_arrays_resolve_only_their_paired_parameters() {
         let mut pdf = handle_pdf(b"");
         pdf.set_object(ObjectRef::new(20, 0), Object::Integer(0));
