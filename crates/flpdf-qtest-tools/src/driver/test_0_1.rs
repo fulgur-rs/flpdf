@@ -1,0 +1,317 @@
+use std::io::{Read, Seek, Write};
+
+use flpdf::{Object, Pdf};
+
+use super::handle::{resolve_stream_dictionary, Handle};
+use crate::output::write_bytes;
+
+pub(crate) fn run_test_0_1<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    stdout: &mut dyn Write,
+) -> flpdf::Result<()> {
+    let trailer = pdf.trailer().clone();
+    let qtest = Handle::get_key(pdf, &trailer, b"QTest")?;
+
+    if !Handle::has_key(pdf, &trailer, b"QTest")? {
+        writeln!(stdout, "/QTest is implicit")?;
+    }
+
+    writeln!(
+        stdout,
+        "/QTest is {}direct and has type {} ({})",
+        if qtest.is_indirect() { "in" } else { "" },
+        qtest.type_name(),
+        qtest.type_code()
+    )?;
+
+    match qtest.resolved() {
+        Object::Null => writeln!(stdout, "/QTest is null")?,
+        Object::Boolean(_) => {
+            let value = qtest
+                .as_bool()
+                .expect("boolean branch must retain a boolean value");
+            writeln!(
+                stdout,
+                "/QTest is Boolean with value {}",
+                if value { "true" } else { "false" }
+            )?;
+        }
+        Object::Integer(value) => {
+            writeln!(stdout, "/QTest is an integer with value {value}")?;
+        }
+        Object::Real(_) | Object::RealLiteral { .. } => {
+            write!(stdout, "/QTest is a real number with value ")?;
+            write_bytes(stdout, &qtest.unparse_resolved())?;
+            writeln!(stdout)?;
+        }
+        Object::Name(_) => {
+            write!(stdout, "/QTest is a name with value ")?;
+            write_bytes(stdout, &qtest.unparse_resolved())?;
+            writeln!(stdout)?;
+        }
+        Object::String(value) => {
+            write!(stdout, "/QTest is a string with value ")?;
+            write_bytes(stdout, value)?;
+            writeln!(stdout)?;
+        }
+        Object::Array(values) => {
+            writeln!(stdout, "/QTest is an array with {} items", values.len())?;
+            for (index, item) in qtest.array_items(pdf)?.iter().enumerate() {
+                writeln!(
+                    stdout,
+                    "  item {index} is {}direct",
+                    if item.is_indirect() { "in" } else { "" }
+                )?;
+            }
+        }
+        Object::Dictionary(_) => {
+            writeln!(stdout, "/QTest is a dictionary")?;
+            for (key, value) in qtest.dictionary_items(pdf)? {
+                write!(stdout, "  ")?;
+                let mut name = Vec::new();
+                Object::Name(key).write_pdf(&mut name);
+                write_bytes(stdout, &name)?;
+                writeln!(
+                    stdout,
+                    " is {}direct",
+                    if value.is_indirect() { "in" } else { "" }
+                )?;
+            }
+        }
+        Object::Stream(stream) => {
+            let stream = stream.clone();
+            write!(stdout, "/QTest is a stream.  Dictionary: ")?;
+            let mut dictionary = Vec::new();
+            Object::Dictionary(stream.dict.clone()).write_pdf(&mut dictionary);
+            write_bytes(stdout, &dictionary)?;
+            writeln!(stdout)?;
+
+            writeln!(stdout, "Raw stream data:")?;
+            stdout.flush()?;
+            write_bytes(stdout, &stream.data)?;
+            writeln!(stdout)?;
+            writeln!(stdout, "Uncompressed stream data:")?;
+
+            let decode_dictionary = resolve_stream_dictionary(pdf, &stream.dict)?;
+            match flpdf::filters::decode_stream_data(&decode_dictionary, &stream.data) {
+                Ok(decoded) => {
+                    stdout.flush()?;
+                    write_bytes(stdout, &decoded)?;
+                    writeln!(stdout)?;
+                    writeln!(stdout, "End of stream data")?;
+                }
+                Err(_) => writeln!(stdout, "Stream data is not filterable.")?,
+            }
+        }
+        Object::Operator(_) | Object::InlineImage(_) | Object::Reference(_) => {
+            writeln!(stdout, "/QTest is an unknown object")?;
+        }
+    }
+
+    write!(stdout, "unparse: ")?;
+    write_bytes(stdout, &qtest.unparse())?;
+    writeln!(stdout)?;
+    write!(stdout, "unparseResolved: ")?;
+    write_bytes(stdout, &qtest.unparse_resolved())?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_test_0_1;
+    use flpdf::{Pdf, PdfOpenOptions};
+
+    fn pdf_with_qtest(qtest: &[u8], extras: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let max_object = extras.iter().map(|(number, _)| *number).max().unwrap_or(2);
+        let mut objects = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Count 0 /Kids [ ] >>".to_vec()),
+        ];
+        objects.extend(extras.iter().cloned());
+        objects.sort_by_key(|(number, _)| *number);
+
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = vec![None; (max_object + 1) as usize];
+        for (number, body) in objects {
+            offsets[number as usize] = Some(bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(&body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n", max_object + 1).as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets.into_iter().skip(1) {
+            match offset {
+                Some(offset) => {
+                    bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes())
+                }
+                None => bytes.extend_from_slice(b"0000000000 00000 f \n"),
+            }
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size {} /Root 1 0 R", max_object + 1).as_bytes(),
+        );
+        if !qtest.is_empty() {
+            bytes.extend_from_slice(b" /QTest ");
+            bytes.extend_from_slice(qtest);
+        }
+        bytes.extend_from_slice(format!(" >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
+    fn output(qtest: &[u8], extras: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let bytes = pdf_with_qtest(qtest, extras);
+        let options = PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        };
+        let mut pdf =
+            Pdf::open_mem_owned_with_options(bytes, options).expect("open test_0_1 fixture");
+        let mut stdout = Vec::new();
+        run_test_0_1(&mut pdf, &mut stdout).expect("run test_0_1");
+        stdout
+    }
+
+    #[test]
+    fn missing_qtest_has_exact_implicit_null_output() {
+        assert_eq!(
+            output(b"", &[]),
+            b"/QTest is implicit\n\
+              /QTest is direct and has type null (2)\n\
+              /QTest is null\n\
+              unparse: null\n\
+              unparseResolved: null\n"
+        );
+    }
+
+    #[test]
+    fn booleans_emit_their_actual_value() {
+        for (qtest, value) in [(b"true".as_slice(), "true"), (b"false".as_slice(), "false")] {
+            assert_eq!(
+                output(qtest, &[]),
+                format!(
+                    "/QTest is direct and has type boolean (3)\n\
+                     /QTest is Boolean with value {value}\n\
+                     unparse: {value}\n\
+                     unparseResolved: {value}\n"
+                )
+                .into_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn integer_real_name_and_string_outputs_match_qpdf_literals() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (
+                b"42",
+                b"/QTest is direct and has type integer (4)\n\
+                  /QTest is an integer with value 42\n\
+                  unparse: 42\n\
+                  unparseResolved: 42\n",
+            ),
+            (
+                b"1.50",
+                b"/QTest is direct and has type real (5)\n\
+                  /QTest is a real number with value 1.50\n\
+                  unparse: 1.50\n\
+                  unparseResolved: 1.50\n",
+            ),
+            (
+                b"/A#20B",
+                b"/QTest is direct and has type name (7)\n\
+                  /QTest is a name with value /A#20B\n\
+                  unparse: /A#20B\n\
+                  unparseResolved: /A#20B\n",
+            ),
+            (
+                b"(hello)",
+                b"/QTest is direct and has type string (6)\n\
+                  /QTest is a string with value hello\n\
+                  unparse: (hello)\n\
+                  unparseResolved: (hello)\n",
+            ),
+        ];
+        for (qtest, expected) in cases {
+            assert_eq!(output(qtest, &[]), *expected);
+        }
+    }
+
+    #[test]
+    fn array_reports_each_items_indirectness_without_resolving_unparse_children() {
+        assert_eq!(
+            output(b"[ 1 7 0 R 0.0 ]", &[(7, b"true".to_vec())]),
+            concat!(
+                "/QTest is direct and has type array (8)\n",
+                "/QTest is an array with 3 items\n",
+                "  item 0 is direct\n",
+                "  item 1 is indirect\n",
+                "  item 2 is direct\n",
+                "unparse: [ 1 7 0 R 0.0 ]\n",
+                "unparseResolved: [ 1 7 0 R 0.0 ]\n",
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn dictionary_reports_sorted_keys_and_value_indirectness() {
+        assert_eq!(
+            output(b"<< /b false /a 7 0 R >>", &[(7, b"true".to_vec())],),
+            concat!(
+                "/QTest is direct and has type dictionary (9)\n",
+                "/QTest is a dictionary\n",
+                "  /a is indirect\n",
+                "  /b is direct\n",
+                "unparse: << /a 7 0 R /b false >>\n",
+                "unparseResolved: << /a 7 0 R /b false >>\n",
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn flate_stream_emits_raw_and_decoded_bytes_and_indirect_unparse() {
+        let compressed = b"\x78\x9c\x4b\x4c\x4a\x06\x00\x02\x4d\x01\x27";
+        let mut stream = b"<< /Filter /FlateDecode /Length 11 >>\nstream\n".to_vec();
+        stream.extend_from_slice(compressed);
+        stream.extend_from_slice(b"\nendstream");
+
+        let mut expected = b"/QTest is indirect and has type stream (10)\n\
+                             /QTest is a stream.  Dictionary: << /Filter /FlateDecode /Length 11 >>\n\
+                             Raw stream data:\n"
+            .to_vec();
+        expected.extend_from_slice(compressed);
+        expected.extend_from_slice(
+            b"\nUncompressed stream data:\n\
+              abc\n\
+              End of stream data\n\
+              unparse: 7 0 R\n\
+              unparseResolved: 7 0 R\n",
+        );
+        assert_eq!(output(b"7 0 R", &[(7, stream)]), expected);
+    }
+
+    #[test]
+    fn unsupported_stream_filter_reports_not_filterable() {
+        assert_eq!(
+            output(
+                b"7 0 R",
+                &[(
+                    7,
+                    b"<< /Filter /BogusDecode /Length 3 >>\nstream\nabc\nendstream".to_vec(),
+                )],
+            ),
+            b"/QTest is indirect and has type stream (10)\n\
+              /QTest is a stream.  Dictionary: << /Filter /BogusDecode /Length 3 >>\n\
+              Raw stream data:\n\
+              abc\n\
+              Uncompressed stream data:\n\
+              Stream data is not filterable.\n\
+              unparse: 7 0 R\n\
+              unparseResolved: 7 0 R\n"
+        );
+    }
+}
