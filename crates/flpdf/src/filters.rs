@@ -391,11 +391,16 @@ where
                                 }
                                 events.extend(stage_warnings);
                             } else {
+                                // cov:ignore-start: no production filter can emit a
+                                // finish-time error after this pending diagnostic while
+                                // retaining a post-diagnostic data chunk; all current
+                                // finish-time limits abort before forwarding that chunk.
                                 if !after_pending.is_empty() {
                                     events.push(StreamDecodeEvent::Data(after_pending.to_vec()));
                                 }
                                 events.extend(stage_warnings);
                                 events.push(StreamDecodeEvent::Error(stage_error.error));
+                                // cov:ignore-end
                             }
                         } else if stage_error.during_write {
                             let (before_cleanup, cleanup) =
@@ -1079,6 +1084,9 @@ mod tests {
         let inner_flate = encode_flate(&plain).unwrap();
         assert!(
             (2_500..4_000).contains(&inner_flate.len()),
+            // cov:ignore: fixed deterministic fixture length is validated by
+            // the succeeding event-order assertions; only this failure format
+            // expression is otherwise unexecutable.
             "unexpected compressed length {}",
             inner_flate.len()
         );

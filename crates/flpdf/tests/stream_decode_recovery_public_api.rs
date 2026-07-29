@@ -221,3 +221,27 @@ fn recovery_events_keep_nonfinal_warning_between_data_and_cleanup() {
             && cleanup == b"@"
     ));
 }
+
+#[test]
+fn recovery_events_keep_final_cleanup_after_a_nonfinal_warning_and_write_error() {
+    let dictionary = flate_then_asciihex_dictionary();
+    let mut flate_dictionary = Dictionary::new();
+    flate_dictionary.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let compressed = encode_stream_data(&flate_dictionary, b"4G ").unwrap();
+
+    let outcome =
+        decode_stream_data_recovering(&dictionary, &compressed[..compressed.len() - 4]).unwrap();
+
+    assert!(matches!(
+        &outcome.events[..],
+        [
+            StreamDecodeEvent::Warning(warning),
+            StreamDecodeEvent::Error(error),
+            StreamDecodeEvent::Data(cleanup),
+        ] if warning.message == "input stream is complete but output may still be valid"
+            && warning.code == -5
+            && error.to_string()
+                == "unsupported PDF feature: character out of range during base Hex decode: G"
+            && cleanup == b"@"
+    ));
+}
