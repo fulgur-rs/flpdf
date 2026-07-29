@@ -43,6 +43,7 @@ fixture_names=(
     stream_indirect_decode_parms_container
     stream_decode_parms_length_mismatch
     stream_offset_false_markers
+    stream_unknown_decode_param
     stream_unfilterable
 )
 

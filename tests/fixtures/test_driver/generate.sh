@@ -233,6 +233,24 @@ write(
     "stream_unfilterable",
     build_pdf(b"6 0 R", {6: stream(b"/Filter /BogusDecode", b"abc")}),
 )
+
+metadata = b"1"
+for _ in range(64):
+    metadata = b"[ " + metadata + b" ]"
+write(
+    "stream_unknown_decode_param",
+    build_pdf(
+        b"6 0 R",
+        {
+            6: stream(
+                b"/Filter /FlateDecode /DecodeParms << /Metadata "
+                + metadata
+                + b" >>",
+                flate_abc,
+            ),
+        },
+    ),
+)
 PYEOF
 }
 
