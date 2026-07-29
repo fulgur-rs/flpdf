@@ -45,6 +45,18 @@ fn asciihex_then_flate_dictionary() -> Dictionary {
     dictionary
 }
 
+fn flate_then_asciihex_dictionary() -> Dictionary {
+    let mut dictionary = Dictionary::new();
+    dictionary.insert(
+        "Filter",
+        Object::Array(vec![
+            Object::Name(b"FlateDecode".to_vec()),
+            Object::Name(b"AHx".to_vec()),
+        ]),
+    );
+    dictionary
+}
+
 fn asciihex_encode(data: &[u8]) -> Vec<u8> {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut encoded = Vec::with_capacity(data.len() * 2);
@@ -184,5 +196,28 @@ fn recovery_events_keep_final_data_and_warning_after_prior_write_error() {
                 == "unsupported PDF feature: character out of range during base Hex decode: G"
             && warning.message == "input stream is complete but output may still be valid"
             && warning.code == -5
+    ));
+}
+
+#[test]
+fn recovery_events_keep_nonfinal_warning_between_data_and_cleanup() {
+    let dictionary = flate_then_asciihex_dictionary();
+    let mut flate_dictionary = Dictionary::new();
+    flate_dictionary.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let compressed = encode_stream_data(&flate_dictionary, b"414").unwrap();
+
+    let outcome =
+        decode_stream_data_recovering(&dictionary, &compressed[..compressed.len() - 4]).unwrap();
+
+    assert!(matches!(
+        &outcome.events[..],
+        [
+            StreamDecodeEvent::Data(data),
+            StreamDecodeEvent::Warning(warning),
+            StreamDecodeEvent::Data(cleanup),
+        ] if data == b"A"
+            && warning.message == "input stream is complete but output may still be valid"
+            && warning.code == -5
+            && cleanup == b"@"
     ));
 }

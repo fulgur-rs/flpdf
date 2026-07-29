@@ -124,15 +124,17 @@ impl Pipeline for OutputBuffer {
     }
 
     fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        if self.finish_phase.get() && self.cleanup_data_start.is_none() {
+            self.cleanup_data_start = Some(self.data.len());
+        }
         if let Some(limit) = self.max_output {
-            if data.len() > limit.saturating_sub(self.data.len()) {
+            let remaining = limit.saturating_sub(self.data.len());
+            if data.len() > remaining {
+                self.data.extend_from_slice(&data[..remaining]);
                 return Err(PipelineError::runtime(format!(
                     "{DECODE_OUTPUT_LIMIT_PREFIX} {limit} bytes"
                 )));
             }
-        }
-        if self.finish_phase.get() && self.cleanup_data_start.is_none() {
-            self.cleanup_data_start = Some(self.data.len());
         }
         self.data.extend_from_slice(data);
         Ok(())
@@ -424,6 +426,7 @@ impl StreamFilter for FlateLzwStreamFilter {
     ) -> Result<FilterDecodeOutcome> {
         let geometry = self.decode_predictor_geometry()?;
         let mut sink = OutputBuffer::new(max_output);
+        let finish_phase = sink.finish_phase();
         // SF_FlateLzwDecode::getDecodePipeline builds the chain from the sink
         // outward, so the predictor stage is constructed before the codec and
         // any construction failure precedes every codec write.
@@ -438,9 +441,9 @@ impl StreamFilter for FlateLzwStreamFilter {
                     bits_per_component,
                 )
                 .map_err(map_pipeline_error)?;
-                self.pipe_codec(&mut predictor, data, warn)?
+                self.pipe_codec(&mut predictor, data, warn, Some(&finish_phase))?
             }
-            None => self.pipe_codec(&mut sink, data, warn)?,
+            None => self.pipe_codec(&mut sink, data, warn, Some(&finish_phase))?,
         };
         Ok(FilterDecodeOutcome {
             cleanup_data_start: sink.cleanup_data_start(),
@@ -480,10 +483,11 @@ impl FlateLzwStreamFilter {
         next: &mut dyn Pipeline,
         data: &[u8],
         warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+        finish_phase: Option<&Cell<bool>>,
     ) -> Result<Option<FilterDecodeError>> {
         let error = if self.lzw {
             let mut stage = LzwDecoder::new("lzw decode", next, self.early_code_change);
-            write_and_finish(&mut stage, data, None)
+            write_and_finish(&mut stage, data, finish_phase)
         } else {
             let mut stage = Flate::new(
                 "stream inflate",
@@ -493,7 +497,7 @@ impl FlateLzwStreamFilter {
             )
             .map_err(map_pipeline_error)?;
             stage.set_warn_callback(|message, code| warn(message, code));
-            write_and_finish(&mut stage, data, None)
+            write_and_finish(&mut stage, data, finish_phase)
         };
         Ok(error.map(map_stage_error))
     }
@@ -741,6 +745,7 @@ mod tests {
         ignore_warning, normalize_filter_name, stream_filter_for, FlateLzwStreamFilter,
         OutputBuffer, Pipeline, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
     };
+    use crate::pipeline::lzw::pack_codes;
     use crate::{Dictionary, Error, Object};
     use std::cell::RefCell;
 
@@ -1291,6 +1296,59 @@ mod tests {
         assert!(
             error.to_string().contains(DECODE_OUTPUT_LIMIT_PREFIX),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn flate_and_lzw_predictor_finish_output_keeps_its_cleanup_boundary() {
+        let predictor = params(&[
+            ("Predictor", Object::Integer(12)),
+            ("Columns", Object::Integer(2)),
+        ]);
+
+        let mut flate = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
+        assert!(flate.set_decode_params(Some(&predictor)));
+        let mut flate_payload = encode_flate(&[0, b'A']).expect("encode predicted bytes");
+        flate_payload.truncate(flate_payload.len() - 4);
+        let mut warnings = Vec::new();
+        let flate_outcome = flate
+            .pipe_decode_recovering(&flate_payload, Some(1), &mut |message, code| {
+                warnings.push((message.to_string(), code));
+                Ok(())
+            })
+            .expect("constructed Flate pipeline");
+        assert_eq!(flate_outcome.data, b"A");
+        assert_eq!(flate_outcome.cleanup_data_start, 0);
+        assert!(
+            !flate_outcome
+                .error
+                .expect("finish output hits limit")
+                .during_write
+        );
+        assert_eq!(
+            warnings,
+            [(
+                "input stream is complete but output may still be valid".to_string(),
+                -5
+            )]
+        );
+
+        let mut lzw = stream_filter_for(b"LZWDecode").expect("registered LZW filter");
+        assert!(lzw.set_decode_params(Some(&predictor)));
+        let lzw_outcome = lzw
+            .pipe_decode_recovering(
+                &pack_codes(&[256, 0, u32::from(b'A'), 257], true),
+                Some(1),
+                &mut ignore_warning,
+            )
+            .expect("constructed LZW pipeline");
+        assert_eq!(lzw_outcome.data, b"A");
+        assert_eq!(lzw_outcome.cleanup_data_start, 0);
+        assert!(
+            !lzw_outcome
+                .error
+                .expect("finish output hits limit")
+                .during_write
         );
     }
 

@@ -367,6 +367,36 @@ where
                                 pending_events.extend(stage_warnings);
                                 pending_events.push(StreamDecodeEvent::Error(stage_error.error));
                             }
+                        } else if let Some(PendingDataBoundary(boundary, _)) =
+                            next_pending_data_boundary
+                        {
+                            let boundary = boundary.min(outcome.data.len());
+                            let cleanup_data_start = cleanup_data_start.min(outcome.data.len());
+                            let (before_pending, after_pending) = outcome.data.split_at(boundary);
+                            if !before_pending.is_empty() {
+                                events.push(StreamDecodeEvent::Data(before_pending.to_vec()));
+                            }
+                            events.append(&mut pending_events);
+                            if stage_error.during_write {
+                                let cleanup_after_pending =
+                                    cleanup_data_start.saturating_sub(boundary);
+                                let (before_cleanup, cleanup) =
+                                    after_pending.split_at(cleanup_after_pending);
+                                if !before_cleanup.is_empty() {
+                                    events.push(StreamDecodeEvent::Data(before_cleanup.to_vec()));
+                                }
+                                events.push(StreamDecodeEvent::Error(stage_error.error));
+                                if !cleanup.is_empty() {
+                                    events.push(StreamDecodeEvent::Data(cleanup.to_vec()));
+                                }
+                                events.extend(stage_warnings);
+                            } else {
+                                if !after_pending.is_empty() {
+                                    events.push(StreamDecodeEvent::Data(after_pending.to_vec()));
+                                }
+                                events.extend(stage_warnings);
+                                events.push(StreamDecodeEvent::Error(stage_error.error));
+                            }
                         } else if stage_error.during_write {
                             let (before_cleanup, cleanup) =
                                 outcome.data.split_at(cleanup_data_start);
@@ -387,8 +417,14 @@ where
                         }
                     }
                 } else {
+                    let defer_stage_warnings = !is_last_stage && !stage_warnings.is_empty();
+                    if defer_stage_warnings {
+                        pending_events.append(&mut stage_warnings);
+                        next_pending_data_boundary =
+                            Some(PendingDataBoundary(cleanup_data_start, false));
+                    }
                     if is_last_stage {
-                        if has_runtime_error {
+                        if has_runtime_error || next_pending_data_boundary.is_some() {
                             let boundary = next_pending_data_boundary
                                 .expect("pending recovery data has a codec output boundary")
                                 .0;
@@ -404,12 +440,14 @@ where
                             events.push(StreamDecodeEvent::Data(outcome.data.clone()));
                         }
                     }
-                    if is_last_stage && !has_runtime_error {
+                    if is_last_stage && !has_runtime_error && next_pending_data_boundary.is_none() {
                         events.append(&mut pending_events);
                     }
-                    events.extend(stage_warnings);
+                    if !defer_stage_warnings {
+                        events.extend(stage_warnings);
+                    }
                 }
-                if !is_last_stage && has_runtime_error {
+                if !is_last_stage && (has_runtime_error || next_pending_data_boundary.is_some()) {
                     pending_data_boundary = next_pending_data_boundary;
                 }
                 outcome.data
@@ -1027,6 +1065,101 @@ mod tests {
                 if error.to_string() == "unsupported PDF feature: unexpected z during base 85 decode"
                     && data == b"@"
         ));
+    }
+
+    #[test]
+    fn recovering_decode_preserves_chunked_prefix_before_a_later_output_limit() {
+        let mut state = 0x1234_5678u32;
+        let mut plain = Vec::with_capacity(102_500);
+        for _ in 0..2_500 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            plain.push((state >> 24) as u8);
+        }
+        plain.extend(std::iter::repeat_n(b'A', 100_000));
+        let inner_flate = encode_flate(&plain).unwrap();
+        assert!(
+            (2_500..4_000).contains(&inner_flate.len()),
+            "unexpected compressed length {}",
+            inner_flate.len()
+        );
+
+        // The first complete predictor row contains only the incompressible
+        // prefix. Flate warns before the predictor finishes the partial second
+        // row, whose remaining compressed bytes expand beyond the downstream
+        // limit.
+        let columns = inner_flate.len().div_ceil(2);
+        let mut predicted = Vec::with_capacity(inner_flate.len() + 2);
+        predicted.push(0);
+        predicted.extend_from_slice(&inner_flate[..columns]);
+        predicted.push(0);
+        predicted.extend_from_slice(&inner_flate[columns..inner_flate.len() - 1]);
+
+        let mut outer_flate = encode_flate(&predicted).unwrap();
+        outer_flate.truncate(outer_flate.len() - 4);
+
+        let mut predictor = Dictionary::new();
+        predictor.insert("Predictor", Object::Integer(12));
+        predictor.insert("Columns", Object::Integer(columns as i64));
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![Object::Dictionary(predictor), Object::Null]),
+        );
+
+        let outcome = decode_stream_data_recovering_with_limits(
+            &dict,
+            &outer_flate,
+            DecodeLimits {
+                max_output: Some(4_000),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data.len(), 4_000);
+        assert_eq!(outcome.data, plain[..4_000]);
+        assert!(matches!(
+            &outcome.events[..],
+            [
+                StreamDecodeEvent::Data(before_warning),
+                StreamDecodeEvent::Warning(warning),
+                StreamDecodeEvent::Data(after_warning),
+                StreamDecodeEvent::Error(error),
+                StreamDecodeEvent::Warning(inner_warning),
+            ] if !before_warning.is_empty()
+                && !after_warning.is_empty()
+                && before_warning.len() + after_warning.len() == outcome.data.len()
+                && before_warning
+                    .iter()
+                    .chain(after_warning)
+                    .copied()
+                    .eq(outcome.data.iter().copied())
+                && warning.message == "input stream is complete but output may still be valid"
+                && warning.code == -5
+                && error.to_string()
+                    == "unsupported PDF feature: decoded output exceeds configured limit of 4000 bytes"
+                && inner_warning.message
+                    == "input stream is complete but output may still be valid"
+                && inner_warning.code == -5
+        ));
+        assert_eq!(
+            decode_stream_data_with_limits(
+                &dict,
+                &outer_flate,
+                DecodeLimits {
+                    max_output: Some(4_000),
+                },
+            )
+            .unwrap_err()
+            .to_string(),
+            "unsupported PDF feature: stream inflate: input stream is complete but output may still be valid (zlib error -5)"
+        );
     }
 
     #[test]
