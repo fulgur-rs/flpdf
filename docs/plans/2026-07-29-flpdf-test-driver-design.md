@@ -284,6 +284,21 @@ unparseResolved: <…>
     を呼ぶだけで解決しない）に渡すため `None` になり、`filterable = false`。
     `/Filter` / `/DecodeParms` の解決は「値そのもの」だけでなく、値が
     dictionary なら**そのエントリ値も**チェーン解決してから渡す必要がある。
+  - **`/DecodeParms` の「コンテナ自体」も間接参照でありうる —
+    しかもこちらは unfilterable にすらならない、より悪い失敗モード。**
+    `/DecodeParms 8 0 R`（コンテナ全体が間接）や `/DecodeParms [9 0 R]`
+    （配列要素が間接な辞書）は、`decode_filter_specs` の decode_params
+    array 分岐（`stream_filter.rs:66-80`、各要素を Null チェックのみで
+    そのまま通す）を経て `set_decode_params` に渡ると、
+    `params.as_dict()` が `Object::Reference` に対して `None` を返すため
+    `let Some(params) = params.as_dict() else { return true; }` の
+    早期リターンに入る。これは「フィルタ不可」ではなく**「パラメータ無し
+    （デフォルト値）として黙って通す」**分岐 — qpdf が実際の Predictor/Columns
+    で decode する場面で、flpdf は既定値で decode してしまい**中身の異なる
+    バイト列を出力する**。単なる unfilterable 誤判定より悪い。
+    `/DecodeParms` は「値そのもの（top-level 間接）」「配列要素」「配列要素が
+    指す辞書のエントリ値」の 3 層すべてを §4 のチェーン解決に通してから
+    `set_decode_params` に渡す。
   
   qpdf は `QPDFObjectHandle::isName()` / `getIntValueAsInt()` の自動 dereference で
   top-level・配列要素・辞書エントリのいずれもチェーンの終端まで解決するので、
@@ -336,7 +351,21 @@ stderr の警告が改行なしで割り込む**形を要求するため、別�
 テストが偽陽性で通る）。n9t0.6 の golden テストは、子プロセスの stdout と stderr を
 同じファイル記述子へ向けて起動し（Unix なら stderr を stdout の fd に `dup2`
 する、または `std::process::Command` に生の `Stdio` をハンドオフする）、
-端末が見るのと同じバイト列で比較する。§7 の `driver_goldens.rs`（test_0_1 用）は
+端末が見るのと同じバイト列で比較する。
+
+**警告に載るファイル名は argv[2] の生文字列そのもの。** `test_driver.cc` の `runtest`
+は `n % 2 == 1`（test_3 が該当）で `processMemoryFile(filename1, …)` を呼び、
+`filename1 = argv[2]`。この文字列は qpdf 内部で「description」として保持され、
+警告の書式（`QPDFExc::createWhat`、`<filename> (offset N): <message>`）にそのまま
+載る。`good14.out` の `WARNING: good14.pdf (offset 628): …` が `good14.pdf` という
+**相対パスの basename** なのはこのため。golden テストが
+`CARGO_MANIFEST_DIR` 由来の絶対パスを argv に渡すと、警告の埋め込み文字列が
+コミット済み `.out` と一致しなくなりチェックアウト場所依存になる。
+n9t0.6 の golden テストは、子プロセスの working directory を fixture ディレクトリに
+設定し、argv には basename（`good14.pdf`）だけを渡す（または、他に安定した
+一意の相対文字列を argv[2] として固定する）。
+
+§7 の `driver_goldens.rs`（test_0_1 用）は
 この問題を持たない — test_0_1 のフィクスチャは全て整形式で `decode_stream_data` の
 デフォルト経路（`reject_decode_warning`、警告を stderr ではなく `Err` にする）を
 通るため、stderr 出力自体が発生しない。
@@ -375,6 +404,15 @@ tests/fixtures/test_driver/
   stream_indirect_decode_parms.{pdf,out}  /DecodeParms << /Predictor 8 0 R
                                           /Columns 9 0 R >> のように辞書の
                                           エントリ値が間接参照のストリーム（§5 参照）
+  stream_indirect_decode_parms_container.{pdf,out}  /DecodeParms [9 0 R]
+                                          のようにコンテナ自体・配列要素が
+                                          間接参照で、かつ Predictor が
+                                          効いている（デフォルト値と異なる）
+                                          ストリーム（§5 参照。unfilterable
+                                          にはならず、既定値で decode した
+                                          誤ったバイト列を返す方の失敗モード
+                                          — decoded 出力の byte 比較でしか
+                                          検出できない）
   stream_unfilterable.{pdf,out}  Stream data is not filterable.
 ```
 
@@ -404,6 +442,23 @@ exit 2 になることを確認する negative test と、§3 の「読込がル
 `driver_goldens.rs` に加える。n9t0.3 で shim を PATH に置いた瞬間、basic-parsing 以外の
 `.test` が呼ぶ ~97 個の test 番号すべてに fail-loud の契約が効くため、ここが黙って
 壊れると golden 全緑のまま互換性ベースラインだけが動く。
+
+**negative test は部分一致ではなく完全一致を要求する。** `.stderr(predicate::contains(...))`
+のような部分一致は、`invalid test <n>` を出しつつ `test <n> done` も stdout に
+漏らすバグや、malformed PDF ケースで parse エラーと `invalid test <n>` の**両方**が
+出るバグを見逃す（どちらも期待文字列を「含む」ので通ってしまう）。qpdf は最初の
+例外で止まり、qtest は捕捉したバイト列をそのまま突き合わせるので、余計な出力は
+観測可能な差分になる。negative test は stdout が空であること、stderr が
+期待する診断 1 行ちょうどであることを要求する（競合する診断が無いことも
+明示的にアサートする）。
+
+**§3 の argc 境界の両側を golden でカバーする。** `argc < 3 || argc > 4` の境界は
+「受理される 4 引数形（`arg2` あり）が誤って reject されない」ことと
+「2 引数・5 引数が Usage + exit 2 になる」ことの両方を確認しないと片手落ち。
+4 引数を誤って reject する実装は `test_0_1` の成功ケース（3 引数のみ使う。§3 参照）
+では検出できないが、qtest が `test_driver <n> <file> <password>` の形で未実装番号を
+呼ぶ場面（`test_2`, `test_35`, `test_36` 相当）では Usage を返すべきでないところで
+返してしまい、fail-loud の互換性ベースラインを変える。
 `scripts/qpdf-test-driver-diff.sh`（既存の `qpdf-{tokenizer,rc4,lzw-png,stream-codecs}-diff.sh`
 と同じ形）は別役割で、`scripts/fetch-qpdf-source.sh` で pinned source を取り本物の
 `test_driver` をビルドして fixture を再生成・オラクル照合するための開発者ツール。
