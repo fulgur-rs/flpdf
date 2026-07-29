@@ -1,6 +1,8 @@
 use std::env;
 use std::process::ExitCode;
 
+use flpdf_qtest_tools::common::program_name;
+
 // Shared helpers live in the library crate; the binary reaches them via
 // `use flpdf_qtest_tools::...`. Duplicating them with `mod output;` here would
 // compile them twice into the binary and add dead-code the compiler can
@@ -87,15 +89,6 @@ fn run(args: &[String]) -> ExitCode {
     } else {
         ExitCode::from(0)
     }
-}
-
-fn program_name(argv0: &str) -> &str {
-    // Windows argv[0] uses `\` (or a mix) and a `.exe` suffix; strip both so
-    // stderr / --version output prints just `flpdf-test-compare`, matching
-    // qpdf's `strrchr(argv[0], '/') + 1` semantics on Unix AND making the
-    // CI's `stderr.contains("flpdf-test-compare:")` assertions portable.
-    let stem = argv0.rsplit(['/', '\\']).next().unwrap_or(argv0);
-    stem.strip_suffix(".exe").unwrap_or(stem)
 }
 
 fn usage(whoami: &str) {

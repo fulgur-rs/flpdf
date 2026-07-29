@@ -11,6 +11,7 @@
 
 // Public modules the binaries re-use.
 pub mod clean;
+pub mod common;
 pub mod compare;
 pub mod orchestrator;
 pub mod output;
