@@ -49,7 +49,7 @@ pub fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u
     };
     let mut pdf = match Pdf::open_mem_with_options(&bytes, options) {
         Ok(pdf) => pdf,
-        Err(error) => return write_error(stdout, stderr, &open_pdf_error(n, filename, &error)),
+        Err(error) => return write_open_failure(n, filename, &error, stdout, stderr),
     };
 
     let mut diagnostics_written = 0;
@@ -76,8 +76,31 @@ fn open_pdf_error(n: i32, filename: &str, error: &Error) -> String {
         Error::Parse { message, .. } if n == 0 && message == "xref not found" => {
             format!("{filename}: can't find startxref")
         }
+        Error::Parse { message, .. } if n != 0 && message == "trailer dictionary not found" => {
+            format!("{filename}: unable to find trailer dictionary while recovering damaged file")
+        }
         _ => error.to_string(),
     }
+}
+
+fn write_open_failure(
+    n: i32,
+    filename: &str,
+    error: &Error,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let source = if let Some((source, diagnostics)) = error.open_failure() {
+        for diagnostic in diagnostics.entries() {
+            if write_warning(filename, diagnostic, stdout, stderr).is_err() {
+                return 2;
+            }
+        }
+        source
+    } else {
+        error
+    };
+    write_error(stdout, stderr, &open_pdf_error(n, filename, source))
 }
 
 fn open_error_bytes(filename: &str, crt_message: Option<&[u8]>, fallback: &io::Error) -> Vec<u8> {
@@ -388,6 +411,24 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct FirstWriteFailure {
+        attempted: Vec<u8>,
+        writes: usize,
+    }
+
+    impl Write for FirstWriteFailure {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.attempted.extend_from_slice(buf);
+            Err(io::Error::other("warning write failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
     struct FooterFailure {
         bytes: Vec<u8>,
     }
@@ -418,6 +459,26 @@ mod tests {
         assert_eq!(stdout.write(b"probe").expect("probe write"), 5);
         assert_eq!(run(&args, &mut stdout, &mut stderr), 2);
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn failed_open_warning_write_failure_skips_terminal_error() {
+        let args = vec![
+            "flpdf-test-driver".to_string(),
+            "1".to_string(),
+            fixture("open_repair_failure"),
+        ];
+        let mut stdout = Vec::new();
+        let mut stderr = FirstWriteFailure::default();
+
+        assert_eq!(run(&args, &mut stdout, &mut stderr), 2);
+        assert_eq!(stderr.writes, 1);
+        assert!(stderr.attempted.starts_with(b"WARNING:"));
+        assert!(!stderr
+            .attempted
+            .windows(b"unable to recover".len())
+            .any(|window| window == b"unable to recover"));
+        stderr.flush().expect("flush failure writer");
     }
 
     #[test]

@@ -16,6 +16,7 @@ cd "$script_dir"
 
 fixture_names=(
     repairable_input
+    open_repair_failure
     implicit_null
     direct_null
     dangling_ref
@@ -120,6 +121,7 @@ def write(name: str, data: bytes) -> None:
 
 
 write("repairable_input", build_pdf(b"true", {}, bad_startxref=True))
+write("open_repair_failure", b"%PDF-1.7\nstartxref\n0\n%%EOF\n")
 write("implicit_null", build_pdf(None, {}))
 write("direct_null", build_pdf(b"null", {}))
 write("dangling_ref", build_pdf(b"99 0 R", {}))
@@ -354,8 +356,15 @@ check_all() {
         qpdf --check "${name}.pdf" >/dev/null 2>&1
         status=$?
         set -e
-        if [[ "$status" -ne 0 && "$status" -ne 3 ]]; then
+        if [[ "$name" == open_repair_failure ]]; then
+            expected_status=2
+        else
+            expected_status='0 or 3'
+        fi
+        if [[ "$name" == open_repair_failure && "$status" -ne 2 ]] ||
+            [[ "$name" != open_repair_failure && "$status" -ne 0 && "$status" -ne 3 ]]; then
             printf 'qpdf rejected %s.pdf with exit %d\n' "$name" "$status" >&2
+            printf 'expected exit %s\n' "$expected_status" >&2
             exit 1
         fi
     done

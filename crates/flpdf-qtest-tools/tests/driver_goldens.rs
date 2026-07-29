@@ -23,27 +23,43 @@ fn fixture_names() -> Vec<String> {
     names
 }
 
+fn run_fixture(name: &str) -> (Option<i32>, Vec<u8>) {
+    let merged = tempfile::tempfile().expect("merged capture file");
+    let stdout = merged.try_clone().expect("clone merged capture");
+    let stderr = merged.try_clone().expect("clone merged capture");
+    let status = StdCommand::new(assert_cmd::cargo_bin!("flpdf-test-driver"))
+        .args(["1", &format!("{name}.pdf")])
+        .current_dir(fixture_dir())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .status()
+        .expect("run flpdf-test-driver");
+
+    let mut merged: File = merged;
+    merged.seek(SeekFrom::Start(0)).expect("rewind capture");
+    let mut actual = Vec::new();
+    merged.read_to_end(&mut actual).expect("read merged output");
+    (status.code(), actual)
+}
+
 #[test]
 fn test_0_1_fixtures_match_committed_qpdf_merged_output() {
     for name in fixture_names() {
         let expected =
             fs::read(fixture_dir().join(format!("{name}.out"))).expect("read qpdf oracle output");
-        let merged = tempfile::tempfile().expect("merged capture file");
-        let stdout = merged.try_clone().expect("clone merged capture");
-        let stderr = merged.try_clone().expect("clone merged capture");
-        let status = StdCommand::new(assert_cmd::cargo_bin!("flpdf-test-driver"))
-            .args(["1", &format!("{name}.pdf")])
-            .current_dir(fixture_dir())
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .status()
-            .expect("run flpdf-test-driver");
-        assert_eq!(status.code(), Some(0), "{name}: nonzero status");
-
-        let mut merged: File = merged;
-        merged.seek(SeekFrom::Start(0)).expect("rewind capture");
-        let mut actual = Vec::new();
-        merged.read_to_end(&mut actual).expect("read merged output");
+        let (status, actual) = run_fixture(&name);
+        let expected_status = if name == "open_repair_failure" { 2 } else { 0 };
+        assert_eq!(status, Some(expected_status), "{name}: unexpected status");
         assert_eq!(actual, expected, "{name}: merged output differs");
     }
+}
+
+#[test]
+fn open_repair_failure_matches_qpdf_output_and_exit_two() {
+    let expected =
+        fs::read(fixture_dir().join("open_repair_failure.out")).expect("read qpdf oracle output");
+    let (status, actual) = run_fixture("open_repair_failure");
+
+    assert_eq!(status, Some(2));
+    assert_eq!(actual, expected);
 }

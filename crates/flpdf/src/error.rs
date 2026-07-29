@@ -15,6 +15,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// carried by [`EncryptedError`].
 /// [`Error::Internal`] and [`Error::System`] mirror qpdf's public classification
 /// of `std::logic_error` and `std::runtime_error`, respectively.
+/// [`Error::OpenFailure`] preserves the terminal source error and accumulated
+/// repair diagnostics from a failed permissive open; callers can retrieve both
+/// through [`Error::open_failure`].
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("I/O error: {0}")]
@@ -37,6 +40,15 @@ pub enum Error {
 
     #[error("{0}")]
     System(String),
+
+    /// A terminal permissive-open failure with the qpdf-compatible repair
+    /// warnings accumulated before reconstruction failed.
+    #[error("{source}")]
+    OpenFailure {
+        #[source]
+        source: Box<Error>,
+        diagnostics: crate::Diagnostics,
+    },
 }
 
 impl Error {
@@ -62,6 +74,33 @@ impl Error {
                 message,
             },
             other => other,
+        }
+    }
+
+    /// Return the terminal source error and preceding repair diagnostics for a
+    /// failed permissive open.
+    pub fn open_failure(&self) -> Option<(&Error, &crate::Diagnostics)> {
+        match self {
+            Self::OpenFailure {
+                source,
+                diagnostics,
+            } => Some((source.as_ref(), diagnostics)),
+            _ => None,
+        }
+    }
+
+    /// Attach open-time repair diagnostics to a terminal failure.
+    ///
+    /// This wrapper is created only after qpdf-compatible repair warnings
+    /// exist. Empty diagnostics leave the original error unchanged.
+    pub(crate) fn with_open_diagnostics(source: Error, diagnostics: crate::Diagnostics) -> Error {
+        if diagnostics.entries().is_empty() {
+            source
+        } else {
+            Self::OpenFailure {
+                source: Box::new(source),
+                diagnostics,
+            }
         }
     }
 }
@@ -149,6 +188,8 @@ impl EncryptedError {
 mod tests {
     use super::*;
     use crate::security::primitives::PrimitiveError;
+    use crate::Diagnostic;
+    use std::error::Error as _;
 
     #[test]
     fn pipeline_logic_error_maps_to_qpdf_internal_category() {
@@ -172,6 +213,42 @@ mod tests {
             Error::System(ref message)
                 if message == "inflate: inflate: data: corrupt stream"
         ));
+    }
+
+    #[test]
+    fn open_failure_delegates_display_and_error_source() {
+        let source = Error::parse(7, "terminal repair failure");
+        let mut diagnostics = crate::Diagnostics::default();
+        diagnostics.push(Diagnostic::warning("repair warning", None));
+
+        let error = Error::with_open_diagnostics(source, diagnostics);
+
+        assert_eq!(
+            error.to_string(),
+            "parse error at byte 7: terminal repair failure"
+        );
+        assert_eq!(
+            std::error::Error::source(&error)
+                .expect("wrapped error source")
+                .to_string(),
+            "parse error at byte 7: terminal repair failure"
+        );
+        let (source, diagnostics) = error.open_failure().expect("open failure wrapper");
+        assert_eq!(
+            source.to_string(),
+            "parse error at byte 7: terminal repair failure"
+        );
+        assert_eq!(diagnostics.entries().len(), 1);
+    }
+
+    #[test]
+    fn empty_open_diagnostics_leave_the_original_error_unwrapped() {
+        let error =
+            Error::with_open_diagnostics(Error::parse(9, "plain failure"), Default::default());
+
+        assert!(matches!(error, Error::Parse { offset: 9, .. }));
+        assert!(error.open_failure().is_none());
+        assert!(error.source().is_none());
     }
 
     #[test]

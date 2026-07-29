@@ -65,10 +65,11 @@ pub fn load_xref_and_trailer<R: Read + Seek>(reader: &mut R) -> Result<LoadedXre
 ///   UTF-8 (this check runs before any repair fallback). When `allow_repair`
 ///   is `false`, also when `startxref`, a cross-reference table or stream, or a
 ///   `/Prev` chain is malformed (including offsets that do not fit `usize` and a
-///   circular `/Prev` chain). When `allow_repair` is `true`, such failures are
-///   recorded as diagnostics and recovered by a linear scan, which itself
-///   raises [`Error::Parse`] when no cross-reference entries can be recovered or
-///   no `trailer` dictionary is found.
+///   circular `/Prev` chain).
+/// - [`Error::OpenFailure`] when `allow_repair` is `true`, repair diagnostics
+///   were accumulated, and the linear scan still cannot recover a trailer or
+///   cross-reference entries. [`Error::open_failure`] exposes both the terminal
+///   source error and the preceding diagnostics.
 /// - [`Error::Missing`] when a required cross-reference stream entry (such as
 ///   `/Size` or `/W`) is absent and `allow_repair` is `false`.
 /// - [`Error::Unsupported`] when a cross-reference stream uses an unsupported
@@ -113,7 +114,13 @@ pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
             Err(error) if allow_repair => {
                 // Report the first recorded failure; this parse error is only the
                 // trigger when the startxref stage itself succeeded.
-                let trigger = parse_errors.into_iter().next().unwrap_or(error);
+                let trigger = parse_errors.into_iter().next().unwrap_or_else(|| {
+                    if startxref == 0 {
+                        Error::parse(0, "xref not found")
+                    } else {
+                        error
+                    }
+                });
                 return recover_xref_from_linear_scan(&bytes, version, startxref, trigger, None);
             }
             Err(error) => return Err(error),
@@ -252,15 +259,18 @@ fn recover_xref_from_linear_scan(
     trigger_error: Error,
     fallback_trailer: Option<&Dictionary>,
 ) -> Result<LoadedXrefState> {
-    let entries = recover_xref_entries(bytes)?;
+    let mut repair_diagnostics = Diagnostics::default();
+    push_repair_diagnostics(&mut repair_diagnostics, &trigger_error, startxref);
+
     let trailer = match (recover_trailer(bytes), fallback_trailer) {
         (Ok(trailer), _) => trailer,
         (Err(_), Some(trailer)) => trailer.clone(),
-        (Err(error), None) => return Err(error),
+        (Err(error), None) => {
+            return Err(Error::with_open_diagnostics(error, repair_diagnostics));
+        }
     };
-
-    let mut repair_diagnostics = Diagnostics::default();
-    push_repair_diagnostics(&mut repair_diagnostics, &trigger_error, startxref);
+    let entries = recover_xref_entries(bytes)
+        .map_err(|error| Error::with_open_diagnostics(error, repair_diagnostics.clone()))?;
     let trailer_references = collect_trailer_references(&trailer);
 
     Ok(LoadedXrefState {
@@ -310,8 +320,11 @@ fn merge_recovered_qpdf_state(
 ///
 /// - [`Error::Io`] when seeking or reading the input fails.
 /// - [`Error::Parse`] when the PDF header is missing or its version is not
-///   UTF-8, or when the linear-scan recovery cannot find any cross-reference
-///   entries or a `trailer` dictionary.
+///   UTF-8 before repair begins.
+/// - [`Error::OpenFailure`] when repair diagnostics were accumulated but the
+///   linear scan cannot recover a trailer or cross-reference entries.
+///   [`Error::open_failure`] exposes both the terminal source error and the
+///   preceding diagnostics.
 pub fn load_xref_and_trailer_best_effort<R: Read + Seek>(reader: &mut R) -> Result<LoadedXref> {
     load_xref_and_trailer_with_repair(reader, true)
 }
@@ -493,6 +506,9 @@ fn parse_non_negative_i64(value: i64, name: &str) -> Result<u64> {
 fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error, startxref: u64) {
     diagnostics.push(Diagnostic::warning("file is damaged", None));
     let (message, offset) = match trigger_error {
+        Error::Parse { offset: 0, message } if message == "xref not found" => {
+            ("can't find startxref".to_string(), None)
+        }
         Error::Parse { message, .. } if message == "loop detected following xref tables" => {
             (message.clone(), None)
         }
@@ -1045,4 +1061,50 @@ fn parse_xref_subsection_u32(token: &Token) -> Result<u32> {
         .parse::<u64>()
         .map_err(|_| Error::parse(token.start, "invalid unsigned integer"))?;
     u32::try_from(value).map_err(|_| Error::parse(token.start, "number does not fit u32"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_xref_and_trailer_with_repair;
+    use std::io::Cursor;
+
+    #[test]
+    fn failed_repair_retains_qpdf_warning_sequence() {
+        let mut input = Cursor::new(b"%PDF-1.7\nstartxref\n0\n%%EOF\n");
+        let error =
+            load_xref_and_trailer_with_repair(&mut input, true).expect_err("repair must fail");
+        let (source, diagnostics) = error
+            .open_failure()
+            .expect("repair failure carries diagnostics");
+
+        assert_eq!(
+            diagnostics
+                .entries()
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "file is damaged",
+                "can't find startxref",
+                "Attempting to reconstruct cross-reference table",
+            ]
+        );
+        assert!(source.to_string().contains("trailer dictionary not found"));
+    }
+
+    #[test]
+    fn failed_entry_repair_retains_qpdf_warning_sequence() {
+        let mut input =
+            Cursor::new(b"%PDF-1.7\ntrailer\n<< /Size 1 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n");
+        let error =
+            load_xref_and_trailer_with_repair(&mut input, true).expect_err("repair must fail");
+        let (source, diagnostics) = error
+            .open_failure()
+            .expect("repair failure carries diagnostics");
+
+        assert_eq!(diagnostics.entries().len(), 3);
+        assert!(source
+            .to_string()
+            .contains("unable to recover xref entries by linear scan"));
+    }
 }

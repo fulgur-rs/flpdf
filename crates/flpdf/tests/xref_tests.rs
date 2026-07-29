@@ -976,7 +976,11 @@ fn best_effort_errors_when_no_objects_to_recover() {
         message.contains("unable to recover xref entries"),
         "got {message}"
     );
-    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+    let (source, diagnostics) = err
+        .open_failure()
+        .expect("terminal repair failure carries warnings");
+    assert!(matches!(source, Error::Parse { .. }), "got {source:?}");
+    assert_eq!(diagnostics.entries().len(), 3);
 }
 
 /// Build a damaged document that strict parsing rejects (corrupt `xref` keyword)
@@ -1217,7 +1221,11 @@ fn best_effort_errors_when_trailer_missing() {
         message.contains("trailer dictionary not found"),
         "got {message}"
     );
-    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+    let (source, diagnostics) = err
+        .open_failure()
+        .expect("terminal repair failure carries warnings");
+    assert!(matches!(source, Error::Parse { .. }), "got {source:?}");
+    assert_eq!(diagnostics.entries().len(), 3);
 }
 
 /// When the `trailer` keyword is present but followed by a non-dictionary token,
@@ -1239,7 +1247,11 @@ fn best_effort_errors_when_trailer_not_dictionary() {
         message.contains("trailer dictionary is not a dictionary"),
         "got {message}"
     );
-    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+    let (source, diagnostics) = err
+        .open_failure()
+        .expect("terminal repair failure carries warnings");
+    assert!(matches!(source, Error::Parse { .. }), "got {source:?}");
+    assert_eq!(diagnostics.entries().len(), 3);
 }
 
 /// When `startxref` is absent, repair pushes a "can't find startxref" error

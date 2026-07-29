@@ -20,6 +20,7 @@ build_dir=
 
 fixture_names=(
     repairable_input
+    open_repair_failure
     implicit_null
     direct_null
     dangling_ref
@@ -190,10 +191,22 @@ for name in "${fixture_names[@]}"; do
     rust_status=$?
     set -e
 
-    if [[ "$oracle_status" -ne 0 || "$rust_status" -ne "$oracle_status" ]]; then
+    if [[ "$name" == open_repair_failure ]]; then
+        expected_status=2
+    else
+        expected_status=0
+    fi
+
+    expected="${fixture_dir}/${name}.out"
+    if [[ "$mode" == --regenerate ]]; then
+        cp -f -- "$oracle_actual" "$expected"
+    fi
+
+    if [[ "$oracle_status" -ne "$expected_status" ||
+        "$rust_status" -ne "$oracle_status" ]]; then
         printf \
-            'qpdf-test-driver-diff.sh: %s status mismatch (qpdf=%d flpdf=%d expected=0)\n' \
-            "$name" "$oracle_status" "$rust_status" >&2
+            'qpdf-test-driver-diff.sh: %s status mismatch (qpdf=%d flpdf=%d expected=%d)\n' \
+            "$name" "$oracle_status" "$rust_status" "$expected_status" >&2
         exit 1
     fi
 
@@ -202,13 +215,10 @@ for name in "${fixture_names[@]}"; do
         exit 1
     fi
 
-    expected="${fixture_dir}/${name}.out"
-    if [[ "$mode" == --regenerate ]]; then
-        cp -f -- "$oracle_actual" "$expected"
-    elif [[ ! -f "$expected" ]]; then
+    if [[ "$mode" != --regenerate && ! -f "$expected" ]]; then
         printf 'qpdf-test-driver-diff.sh: missing oracle output: %s\n' "$expected" >&2
         exit 1
-    elif ! cmp -s -- "$expected" "$oracle_actual"; then
+    elif [[ "$mode" != --regenerate ]] && ! cmp -s -- "$expected" "$oracle_actual"; then
         diff -u -- "$expected" "$oracle_actual" || true
         exit 1
     fi
