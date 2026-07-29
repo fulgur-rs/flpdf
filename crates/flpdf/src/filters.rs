@@ -1082,14 +1082,7 @@ mod tests {
         }
         plain.extend(std::iter::repeat_n(b'A', 100_000));
         let inner_flate = encode_flate(&plain).unwrap();
-        assert!(
-            (2_500..4_000).contains(&inner_flate.len()),
-            // cov:ignore: fixed deterministic fixture length is validated by
-            // the succeeding event-order assertions; only this failure format
-            // expression is otherwise unexecutable.
-            "unexpected compressed length {}",
-            inner_flate.len()
-        );
+        assert!((2_500..4_000).contains(&inner_flate.len()));
 
         // The first complete predictor row contains only the incompressible
         // prefix. Flate warns before the predictor finishes the partial second
