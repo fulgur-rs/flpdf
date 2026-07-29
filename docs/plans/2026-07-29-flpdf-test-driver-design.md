@@ -404,9 +404,25 @@ n9t0.6 の golden テストは、子プロセスの working directory を fixtur
 一意の相対文字列を argv[2] として固定する）。
 
 §7 の `driver_goldens.rs`（test_0_1 用）は
-この問題を持たない — test_0_1 のフィクスチャは全て整形式で `decode_stream_data` の
-デフォルト経路（`reject_decode_warning`、警告を stderr ではなく `Err` にする）を
-通るため、stderr 出力自体が発生しない。
+この問題を持たない — **`repairable_input` fixture を除き**、test_0_1 のフィクスチャは
+全て整形式で `decode_stream_data` のデフォルト経路（`reject_decode_warning`、警告を
+stderr ではなく `Err` にする）を通るため、stderr 出力自体が発生しない。
+
+**`repairable_input` fixture は stderr が空でない側の例外。** `QPDF::warn()`
+（`QPDF.cc:487-493`）は `suppress_warnings` でない限り `"WARNING: " + e.what() + "\n"`
+を stderr（既定 logger の `getWarn()`）に書く。id 1 は `setAttemptRecovery(false)` を
+呼ばない（§3）ので repair が発火すれば警告が出る。`reconstruct_xref`
+（`QPDF.cc:516-`）は最低 3 行の warn を出す:
+
+```
+WARNING: <filename>: file is damaged
+WARNING: <filename>: <実際に repair の引き金になった例外のメッセージ>
+WARNING: <filename>: Attempting to reconstruct cross-reference table
+```
+
+（`damagedPDF("", 0, …)` は object/offset が両方空なので `QPDFExc::createWhat` の
+括弧書き `(object, offset)` 部分は出ない — `<filename>: <message>` の形。）
+この fixture の golden は上記 3 行 + 正常な test_0_1 出力（exit 0）を要求する。
 
 ## 7. fixture とテスト
 
@@ -414,6 +430,11 @@ n9t0.6 の golden テストは、子プロセスの working directory を fixtur
 tests/fixtures/test_driver/
   README.md        flpdf-authored の license 注記（compare_for_test/README.md に倣う）
   generate.sh      PDF は python3 で生成、期待出力は本物の test_driver で生成
+  repairable_input.{pdf,out}     壊れた xref/trailer だが qpdf が repair で読める
+                                  入力（§5 参照。strict な Pdf::open_mem のままだと
+                                  この fixture だけ pre-dispatch で読込エラーになり
+                                  test_0_1 に到達しない。stderr が空でない唯一の
+                                  test_0_1 fixture — 3 行の WARNING を要求する）
   implicit_null.{pdf,out}        欠落キー
   direct_null.{pdf,out}          /QTest null
   dangling_ref.{pdf,out}         存在しないオブジェクトへの参照
@@ -468,7 +489,8 @@ tests/fixtures/test_driver/
 **通常の `cargo test` が実際にこの比較を行う経路**: `crates/flpdf-qtest-tools/tests/driver_goldens.rs`
 がコミット済みの `tests/fixtures/test_driver/*.{pdf,out}` を読み、`flpdf-test-driver` を
 `assert_cmd` 経由で起動して stdout を `.out` と突き合わせ、**かつ `.assert().success()`
-で exit code 0 も、stderr が空であることも**アサートする（qpdf ビルド不要）。
+で exit code 0 も、stderr が空であること（`repairable_input` を除く。上記の
+3 行の WARNING が期待値）も**アサートする（qpdf ビルド不要）。
 `assert_cmd::Command::output()` は非 0 終了でも stdout を返すため、stdout 比較だけでは
 「期待どおりのバイトを出力してから exit 2 する」回帰を見逃す — qtest 自身は
 `basic-parsing.test` の `EXIT_STATUS => 0` で終了コードを見ているので、golden テスト側
