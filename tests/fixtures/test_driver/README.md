@@ -11,6 +11,11 @@ payload `abc`. It captures qpdf's recoverable codec-error behavior: the stream
 is filterable, the decoder warning is emitted at the stream-data offset, and
 the filtered pipeline is still finished.
 
+`stream_filter_error_then_warning` decodes the literal payload `78G` through
+`[/ASCIIHexDecode /FlateDecode]`. ASCIIHex emits one byte before rejecting
+`G`; cleanup then finishes Flate. The golden fixes qpdf's diagnostic order:
+the write error precedes Flate's downstream finish warning.
+
 ## Regeneration
 
 ```sh

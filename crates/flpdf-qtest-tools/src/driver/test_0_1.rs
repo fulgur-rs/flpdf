@@ -1,10 +1,18 @@
 use std::io::{Read, Seek, Write};
 
+use flpdf::filters::StreamDecodeEvent;
 use flpdf::{Diagnostic, Error, Object, Pdf};
 
 use super::handle::{resolve_stream_dictionary, write_qpdf_object, Handle};
 use super::{emit_new_diagnostics, write_warning};
 use crate::output::write_bytes;
+
+fn stream_decode_error_detail(error: Error) -> String {
+    match error {
+        Error::Unsupported(message) | Error::Internal(message) | Error::System(message) => message,
+        error => error.to_string(),
+    }
+}
 
 pub(crate) fn run_test_0_1<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -114,38 +122,38 @@ fn write_object_details<R: Read + Seek>(
                         .flatten();
                     stdout.flush()?;
                     write_bytes(stdout, &decoded.data)?;
-                    for warning in decoded.warnings {
-                        write_warning(
-                            filename,
-                            &Diagnostic::warning(warning.message, offset),
-                            stdout,
-                            stderr,
-                        )?;
-                    }
-                    if let Some(error) = decoded.error {
-                        let object_ref = terminal_ref.ok_or_else(|| {
-                            Error::System(
-                                "decoded stream has no terminal indirect object".to_string(),
-                            )
-                        })?;
-                        let detail = match error {
-                            Error::Unsupported(message)
-                            | Error::Internal(message)
-                            | Error::System(message) => message,
-                            error => error.to_string(),
-                        };
-                        write_warning(
-                            filename,
-                            &Diagnostic::warning(
-                                format!(
-                                    "error decoding stream data for object {} {}: {detail}",
-                                    object_ref.number, object_ref.generation
-                                ),
-                                offset,
-                            ),
-                            stdout,
-                            stderr,
-                        )?;
+                    for event in decoded.events {
+                        match event {
+                            StreamDecodeEvent::Warning(warning) => {
+                                write_warning(
+                                    filename,
+                                    &Diagnostic::warning(warning.message, offset),
+                                    stdout,
+                                    stderr,
+                                )?;
+                            }
+                            StreamDecodeEvent::Error(error) => {
+                                let object_ref = terminal_ref.ok_or_else(|| {
+                                    Error::System(
+                                        "decoded stream has no terminal indirect object"
+                                            .to_string(),
+                                    )
+                                })?;
+                                let detail = stream_decode_error_detail(error);
+                                write_warning(
+                                    filename,
+                                    &Diagnostic::warning(
+                                        format!(
+                                            "error decoding stream data for object {} {}: {detail}",
+                                            object_ref.number, object_ref.generation
+                                        ),
+                                        offset,
+                                    ),
+                                    stdout,
+                                    stderr,
+                                )?;
+                            }
+                        }
                     }
                     writeln!(stdout)?;
                     writeln!(stdout, "End of stream data")?;
@@ -175,9 +183,24 @@ fn write_object_details<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_test_0_1, write_object_details};
+    use super::{run_test_0_1, stream_decode_error_detail, write_object_details};
     use crate::driver::handle::Handle;
-    use flpdf::{Object, ObjectRef, Pdf, PdfOpenOptions};
+    use flpdf::{Dictionary, Error, Object, ObjectRef, Pdf, PdfOpenOptions, Stream};
+    use std::io::{self, Write};
+
+    struct WriteFailure;
+
+    impl Write for WriteFailure {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("write failed"))
+        }
+
+        // cov:ignore-start: warning emission returns from the failed write before stderr can be flushed
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        // cov:ignore-end
+    }
 
     fn pdf_with_qtest(qtest: &[u8], extras: &[(u32, Vec<u8>)]) -> Vec<u8> {
         let max_object = extras.iter().map(|(number, _)| *number).max().unwrap_or(2);
@@ -453,6 +476,152 @@ mod tests {
             b"WARNING: fixture.pdf (offset 163): error decoding stream data for object 7 0: \
               stream inflate: inflate: data: incorrect header check\n"
         );
+    }
+
+    #[test]
+    fn chained_filter_emits_write_error_before_finish_warning() {
+        let (stdout, stderr) = output_channels(
+            b"7 0 R",
+            &[(
+                7,
+                b"<< /Filter [ /ASCIIHexDecode /FlateDecode ] /Length 3 >>\n\
+                  stream\n78G\nendstream"
+                    .to_vec(),
+            )],
+        );
+
+        assert!(stdout
+            .windows(b"\nUncompressed stream data:\n\nEnd of stream data\n".len())
+            .any(|line| line == b"\nUncompressed stream data:\n\nEnd of stream data\n"));
+        assert_eq!(
+            stderr,
+            b"WARNING: fixture.pdf (offset 183): error decoding stream data for object 7 0: \
+              character out of range during base Hex decode: G\n\
+              WARNING: fixture.pdf (offset 183): input stream is complete but output may still be valid\n"
+        );
+    }
+
+    #[test]
+    fn nonfatal_flate_warning_is_emitted_before_end_of_stream() {
+        let (stdout, stderr) = output_channels(
+            b"7 0 R",
+            &[(
+                7,
+                b"<< /Filter /FlateDecode /Length 1 >>\nstream\n\x78\nendstream".to_vec(),
+            )],
+        );
+
+        assert!(stdout
+            .windows(b"\nUncompressed stream data:\n\nEnd of stream data\n".len())
+            .any(|line| line == b"\nUncompressed stream data:\n\nEnd of stream data\n"));
+        assert_eq!(
+            stderr,
+            b"WARNING: fixture.pdf (offset 163): input stream is complete but output may still be valid\n"
+        );
+    }
+
+    #[test]
+    fn direct_stream_runtime_error_requires_a_terminal_object_reference() {
+        let bytes = pdf_with_qtest(b"null", &[]);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open direct stream fixture");
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let qtest = Handle::from_value(
+            &mut pdf,
+            Object::Stream(Stream::new(dictionary, b"abc".to_vec())),
+        )
+        .expect("construct direct stream handle");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        let error = write_object_details(
+            &mut pdf,
+            "fixture.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+            &qtest,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "decoded stream has no terminal indirect object"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn stream_decode_error_detail_formats_every_match_arm() {
+        let cases = [
+            (Error::Unsupported("unsupported".to_string()), "unsupported"),
+            (Error::Internal("internal".to_string()), "internal"),
+            (Error::System("system".to_string()), "system"),
+            (Error::parse(4, "parse"), "parse error at byte 4: parse"),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(stream_decode_error_detail(error), expected);
+        }
+    }
+
+    #[test]
+    fn nonfatal_warning_writer_error_is_propagated() {
+        let bytes = pdf_with_qtest(
+            b"7 0 R",
+            &[(
+                7,
+                b"<< /Filter /FlateDecode /Length 1 >>\nstream\n\x78\nendstream".to_vec(),
+            )],
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open warning fixture");
+        let trailer = pdf.trailer().clone();
+        let qtest = Handle::get_key(&mut pdf, &trailer, b"QTest").expect("get qtest");
+        let mut stdout = Vec::new();
+        let mut stderr = WriteFailure;
+        let mut diagnostics_written = 0;
+
+        let error = write_object_details(
+            &mut pdf,
+            "fixture.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+            &qtest,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "I/O error: write failed");
+    }
+
+    #[test]
+    fn runtime_error_warning_writer_error_is_propagated() {
+        let bytes = pdf_with_qtest(
+            b"7 0 R",
+            &[(
+                7,
+                b"<< /Filter /FlateDecode /Length 3 >>\nstream\nabc\nendstream".to_vec(),
+            )],
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open codec-error fixture");
+        let trailer = pdf.trailer().clone();
+        let qtest = Handle::get_key(&mut pdf, &trailer, b"QTest").expect("get qtest");
+        let mut stdout = Vec::new();
+        let mut stderr = WriteFailure;
+        let mut diagnostics_written = 0;
+
+        let error = write_object_details(
+            &mut pdf,
+            "fixture.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+            &qtest,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "I/O error: write failed");
     }
 
     #[test]

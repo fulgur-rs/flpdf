@@ -97,27 +97,31 @@ pub struct StreamDecodeWarning {
     pub code: i32,
 }
 
-/// Data and diagnostics produced by an opt-in recoverable stream decode.
+/// One ordered diagnostic emitted by an opt-in recoverable stream decode.
+///
+/// Events retain pipeline emission order. In particular, an error raised by
+/// an outer filter's `write` precedes warnings emitted while its downstream
+/// pipeline is subsequently finished.
+#[derive(Debug)]
+pub enum StreamDecodeEvent {
+    /// A non-fatal codec warning.
+    Warning(StreamDecodeWarning),
+    /// The first runtime codec failure after successful pipeline construction.
+    Error(Error),
+}
+
+/// Data and ordered diagnostics produced by an opt-in recoverable stream decode.
 ///
 /// An outer [`Result::Err`] from [`decode_stream_data_recovering`] means the
 /// filter chain could not be interpreted or constructed. Once construction
-/// succeeds, a codec failure is stored in [`error`](Self::error), and
+/// succeeds, a codec failure is stored as a [`StreamDecodeEvent::Error`], and
 /// [`data`](Self::data) retains bytes already emitted before that failure.
 #[derive(Debug)]
 pub struct StreamDecodeOutcome {
     /// Bytes emitted by the constructed decode pipeline.
     pub data: Vec<u8>,
-    /// Non-fatal codec warnings in emission order.
-    pub warnings: Vec<StreamDecodeWarning>,
-    /// The first runtime codec failure, if decoding did not complete cleanly.
-    pub error: Option<Error>,
-    events: Vec<StreamDecodeEvent>,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum StreamDecodeEvent {
-    Warning(usize),
-    Error,
+    /// Non-fatal warnings and the first runtime error in pipeline order.
+    pub events: Vec<StreamDecodeEvent>,
 }
 
 /// Decode a stream while preserving output emitted before a codec failure.
@@ -163,19 +167,13 @@ pub(crate) fn decode_stream_data_with_limits_and_warnings(
     warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
 ) -> Result<Vec<u8>> {
     let outcome = decode_stream_data_recovering_with_limits(dict, stream_data, limits)?;
-    let mut runtime_error = outcome.error;
     for event in outcome.events {
         match event {
-            StreamDecodeEvent::Warning(index) => {
-                let warning = &outcome.warnings[index];
+            StreamDecodeEvent::Warning(warning) => {
                 warn(&warning.message, warning.code)
                     .map_err(|error| Error::Unsupported(error.into_string_lossy()))?;
             }
-            StreamDecodeEvent::Error => {
-                return Err(runtime_error
-                    .take()
-                    .expect("runtime event must retain the first codec error"));
-            }
+            StreamDecodeEvent::Error(error) => return Err(error),
         }
     }
     Ok(outcome.data)
@@ -285,41 +283,41 @@ where
     validate_filter_chain_count(specs.len())?;
     let prepared = prepare_decode_filters(specs)?;
     let mut decoded = Cow::Borrowed(stream_data);
-    let mut warnings = Vec::new();
-    let mut first_error = None;
     let mut events = Vec::new();
+    let mut has_runtime_error = false;
     for mut stage in prepared {
         let next = match &mut stage.stage {
             PreparedStage::Crypt { decode_params } => {
                 decrypt_crypt(*decode_params, decoded.as_ref())?
             }
             PreparedStage::Codec { adapter } => {
-                let warning_start = warnings.len();
+                let mut stage_warnings = Vec::new();
                 let outcome = adapter.pipe_decode_recovering(
                     decoded.as_ref(),
                     limits.max_output,
                     &mut |message, code| {
-                        warnings.push(StreamDecodeWarning {
+                        stage_warnings.push(StreamDecodeEvent::Warning(StreamDecodeWarning {
                             message: message.to_string(),
                             code,
-                        });
+                        }));
                         Ok(())
                     },
-                )?; // cov:ignore: adapters are already preflighted and this recovery warning sink is infallible
-                let warning_end = warnings.len();
+                )?; // cov:ignore: fixed closed-registry adapters were preflighted with unchanged constructor inputs; warning sink is infallible
                 if let Some(stage_error) = outcome.error {
-                    if stage_error.during_write {
-                        events.push(StreamDecodeEvent::Error);
-                    }
-                    events.extend((warning_start..warning_end).map(StreamDecodeEvent::Warning));
-                    if !stage_error.during_write {
-                        events.push(StreamDecodeEvent::Error);
-                    }
-                    if first_error.is_none() {
-                        first_error = Some(stage_error.error);
+                    if has_runtime_error {
+                        events.extend(stage_warnings);
+                    } else {
+                        has_runtime_error = true;
+                        if stage_error.during_write {
+                            events.push(StreamDecodeEvent::Error(stage_error.error));
+                            events.extend(stage_warnings);
+                        } else {
+                            events.extend(stage_warnings);
+                            events.push(StreamDecodeEvent::Error(stage_error.error));
+                        }
                     }
                 } else {
-                    events.extend((warning_start..warning_end).map(StreamDecodeEvent::Warning));
+                    events.extend(stage_warnings);
                 }
                 outcome.data
             }
@@ -328,8 +326,6 @@ where
     }
     Ok(StreamDecodeOutcome {
         data: decoded.into_owned(),
-        warnings,
-        error: first_error,
         events,
     })
 }
@@ -576,17 +572,14 @@ mod tests {
         let outcome = decode_stream_data_recovering(&flate_dict(), &encoded).unwrap();
 
         assert_eq!(outcome.data, decoded_prefix[..65_536]);
-        assert!(outcome.warnings.is_empty());
-        assert!(
-            outcome
-                .error
-                .as_ref()
-                .unwrap()
-                .to_string()
-                .starts_with("unsupported PDF feature: stream inflate: inflate: data:"),
-            "{:?}",
-            outcome.error
-        );
+        assert_eq!(outcome.events.len(), 1);
+        assert!(matches!(
+            &outcome.events[0],
+            StreamDecodeEvent::Error(error)
+                if error
+                    .to_string()
+                    .starts_with("unsupported PDF feature: stream inflate: inflate: data:")
+        ));
     }
 
     #[test]
@@ -594,22 +587,42 @@ mod tests {
         let outcome = decode_stream_data_recovering(&flate_dict(), b"abc").unwrap();
 
         assert!(outcome.data.is_empty());
-        assert!(outcome.warnings.is_empty());
-        assert_eq!(
-            outcome.error.as_ref().unwrap().to_string(),
-            "unsupported PDF feature: stream inflate: inflate: data: incorrect header check"
-        );
+        assert_eq!(outcome.events.len(), 1);
+        assert!(matches!(
+            &outcome.events[0],
+            StreamDecodeEvent::Error(error)
+                if error.to_string()
+                    == "unsupported PDF feature: stream inflate: inflate: data: incorrect header check"
+        ));
     }
 
     #[test]
     fn strict_decode_keeps_the_recovering_codec_error_contract() {
         let (encoded, _) = valid_prefix_then_invalid_stored_block();
         let outcome = decode_stream_data_recovering(&flate_dict(), &encoded).unwrap();
-        let recovering_error = outcome.error.unwrap().to_string();
-
         let strict_error = decode_stream_data(&flate_dict(), &encoded).unwrap_err();
 
-        assert_eq!(strict_error.to_string(), recovering_error);
+        assert!(matches!(
+            &outcome.events[0],
+            StreamDecodeEvent::Error(recovering_error)
+                if strict_error.to_string() == recovering_error.to_string()
+        ));
+    }
+
+    #[test]
+    fn recovering_decode_retains_only_the_first_filter_runtime_error() {
+        let dict = array_filter_dict(&[b"ASCIIHexDecode", b"ASCIIHexDecode"]);
+
+        let outcome = decode_stream_data_recovering(&dict, b"4G").unwrap();
+
+        assert!(outcome.data.is_empty());
+        assert_eq!(outcome.events.len(), 1);
+        assert!(matches!(
+            &outcome.events[0],
+            StreamDecodeEvent::Error(error)
+                if error.to_string()
+                    == "unsupported PDF feature: character out of range during base Hex decode: G"
+        ));
     }
 
     #[test]
@@ -617,14 +630,13 @@ mod tests {
         let outcome = decode_stream_data_recovering(&flate_dict(), b"\x78").unwrap();
 
         assert!(outcome.data.is_empty());
-        assert!(outcome.error.is_none());
-        assert_eq!(
-            outcome.warnings,
-            [StreamDecodeWarning {
-                message: "input stream is complete but output may still be valid".to_string(),
-                code: -5,
-            }]
-        );
+        assert_eq!(outcome.events.len(), 1);
+        assert!(matches!(
+            &outcome.events[0],
+            StreamDecodeEvent::Warning(warning)
+                if warning.message == "input stream is complete but output may still be valid"
+                    && warning.code == -5
+        ));
     }
 
     #[test]
@@ -642,11 +654,13 @@ mod tests {
         .unwrap();
 
         assert!(outcome.data.is_empty());
-        assert!(outcome.warnings.is_empty());
-        assert_eq!(
-            outcome.error.unwrap().to_string(),
-            "unsupported PDF feature: decoded output exceeds configured limit of 0 bytes"
-        );
+        assert_eq!(outcome.events.len(), 1);
+        assert!(matches!(
+            &outcome.events[0],
+            StreamDecodeEvent::Error(error)
+                if error.to_string()
+                    == "unsupported PDF feature: decoded output exceeds configured limit of 0 bytes"
+        ));
     }
 
     #[test]

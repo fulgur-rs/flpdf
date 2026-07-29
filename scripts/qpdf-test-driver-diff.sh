@@ -45,6 +45,7 @@ fixture_names=(
     stream_offset_false_markers
     stream_unknown_decode_param
     stream_flate_error
+    stream_filter_error_then_warning
     stream_unfilterable
 )
 
