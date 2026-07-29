@@ -187,6 +187,12 @@ Create under `P0_ID`:
      state: applicable, excluded, represented, blocked, passing, or failing.
      Derive the applicable denominator as applicable + blocked + passing +
      failing, and derive the direct-pass count from passing.
+   - Define transitions: unmeasured runnable entries start as applicable and
+     move to blocked, passing, or failing after survey; blocked moves to passing
+     or failing when observation is unlocked; passing and failing may move
+     between each other as behavior changes; new scope evidence may reclassify
+     an entry as excluded or represented with its required rationale or
+     replacement reference.
    - Record rationale for every excluded entry and a concrete Rust-test
      reference for every represented entry. A true ABI-only exclusion requires
      rationale but no replacement test. An excluded direct qpdf-ctest entry

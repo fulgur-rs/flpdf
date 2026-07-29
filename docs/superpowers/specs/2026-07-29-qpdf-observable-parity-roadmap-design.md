@@ -152,6 +152,12 @@ Deliverables:
   The applicable denominator is the sum of `applicable`, `blocked`, `passing`,
   and `failing`; `passing` is the current direct-pass count, while `blocked`
   and `failing` distinguish observation infrastructure from reached behavior;
+- explicit composite-state transitions: an unmeasured runnable entry starts as
+  `applicable` and moves to `blocked`, `passing`, or `failing` after survey;
+  `blocked` moves to `passing` or `failing` when observation is unlocked;
+  `failing` and `passing` may transition between each other as behavior changes;
+  scope evidence may reclassify an entry as `excluded` or `represented`, with
+  the required rationale or replacement reference;
 - an explicit rationale for every excluded test, a concrete Rust-test reference
   for every represented test, and—by Phase 1 closure—a concrete Rust test or
   narrower follow-up Bead for every excluded entry that exercises portable PDF
