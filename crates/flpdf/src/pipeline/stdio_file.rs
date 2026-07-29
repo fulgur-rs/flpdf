@@ -32,36 +32,60 @@ impl<'a> StdioBuffer<'a> {
         STDIO_BUFFER_CAPACITY - self.buffer.len()
     }
 
-    fn flush_buffer(&mut self) -> io::Result<()> {
-        let mut written = 0;
-        while written < self.buffer.len() {
-            self.panicked = true;
-            let result = self.writer.write(&self.buffer[written..]);
-            self.panicked = false;
-            match result {
-                Ok(0) => {
-                    self.buffer.clear();
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "failed to write buffered data",
-                    ));
-                }
-                Ok(count) => written += count,
-                Err(error) => {
-                    self.buffer.clear();
-                    return Err(error);
-                }
+    fn write_buffer_once(&mut self) -> io::Result<usize> {
+        self.panicked = true;
+        let result = self.writer.write(&self.buffer);
+        self.panicked = false;
+        result
+    }
+
+    fn drain_full_buffer(&mut self) -> io::Result<()> {
+        debug_assert_eq!(self.buffer.len(), STDIO_BUFFER_CAPACITY);
+        match self.write_buffer_once() {
+            Ok(0) => {
+                self.buffer.clear();
+                Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write buffered data",
+                ))
+            }
+            Ok(count) => {
+                self.buffer.drain(..count);
+                Ok(())
+            }
+            Err(error) => {
+                self.buffer.clear();
+                Err(error)
             }
         }
+    }
+
+    fn flush_buffer(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        let buffered = self.buffer.len();
+        let result = self.write_buffer_once();
         self.buffer.clear();
-        Ok(())
+        match result {
+            Ok(count) if count == buffered => Ok(()),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write buffered data",
+            )),
+            Err(error) => Err(error),
+        }
     }
 }
 
 impl Write for StdioBuffer<'_> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        if data.len() > self.spare_capacity() {
-            self.flush_buffer()?;
+        if !self.buffer.is_empty() && data.len() >= self.spare_capacity() {
+            let count = self.spare_capacity();
+            self.buffer.extend_from_slice(&data[..count]);
+            self.drain_full_buffer()?;
+            return Ok(count);
         }
 
         if self.buffer.is_empty() && data.len() >= STDIO_BUFFER_CAPACITY {
@@ -408,6 +432,31 @@ mod tests {
     }
 
     #[test]
+    fn buffered_short_write_during_finish_is_not_retried() {
+        let payload = (0..4095)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut sink = ProbeSink::with_write_steps([
+            ProbeWriteStep::Accept(1024),
+            ProbeWriteStep::Accept(3071),
+        ]);
+        {
+            let mut buffered = StdioBuffer::new(&mut sink);
+            let mut stage = PlStdioFile::new("stdio", &mut buffered);
+            stage.write(&payload).unwrap();
+            stage.finish().unwrap();
+        }
+
+        assert_eq!(sink.bytes, payload[..1024]);
+        assert_eq!(sink.write_lengths, [4095]);
+        assert_eq!(sink.flush_calls, 0);
+        assert!(matches!(
+            sink.write_steps.front(),
+            Some(ProbeWriteStep::Accept(3071))
+        ));
+    }
+
+    #[test]
     fn buffered_4096_byte_enospc_is_a_write_runtime_error() {
         let mut sink = ProbeSink::with_write_steps([ProbeWriteStep::RawError(ENOSPC_ERRNO)]);
         let error = {
@@ -441,6 +490,46 @@ mod tests {
         assert_eq!(sink.bytes, payload);
         assert_eq!(sink.write_lengths, [4097]);
         assert_eq!(sink.flush_calls, 1);
+    }
+
+    #[test]
+    fn buffered_chunk_fills_existing_capacity_before_drain() {
+        let tail = (0..4096)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut sink = ProbeSink::default();
+        {
+            let mut buffered = StdioBuffer::new(&mut sink);
+            buffered.write_all(b"x").unwrap();
+            buffered.write_all(&tail).unwrap();
+            buffered.flush().unwrap();
+        }
+
+        let mut expected = vec![b'x'];
+        expected.extend_from_slice(&tail);
+        assert_eq!(sink.bytes, expected);
+        assert_eq!(sink.write_lengths, [4096, 1]);
+        assert_eq!(sink.flush_calls, 1);
+    }
+
+    #[test]
+    fn buffered_full_block_zero_progress_is_not_retried() {
+        let mut sink =
+            ProbeSink::with_write_steps([ProbeWriteStep::Zero, ProbeWriteStep::Accept(4096)]);
+        let error = {
+            let mut buffered = StdioBuffer::new(&mut sink);
+            buffered.write_all(b"x").unwrap();
+            buffered.write(&vec![b'y'; 4095]).unwrap_err()
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+        assert!(sink.bytes.is_empty());
+        assert_eq!(sink.write_lengths, [4096]);
+        assert_eq!(sink.flush_calls, 0);
+        assert!(matches!(
+            sink.write_steps.front(),
+            Some(ProbeWriteStep::Accept(4096))
+        ));
     }
 
     #[test]

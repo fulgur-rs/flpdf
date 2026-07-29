@@ -473,6 +473,36 @@ namespace
         }
 
         {
+            Cookie cookie;
+            cookie.steps.push_back({WriteStepKind::accept, 1024, 0});
+            cookie.steps.push_back({WriteStepKind::accept, 3071, 0});
+            std::array<char, 4096> buffer{};
+            auto* file = open_cookie(cookie, buffer);
+            Pl_StdioFile stage("stdio", file);
+            auto const payload = patterned_bytes(4095);
+            auto const case_status = status([&]() {
+                during(cookie, CookiePhase::write, [&]() {
+                    stage.write(payload.data(), payload.size());
+                });
+                during(cookie, CookiePhase::finish, [&]() { stage.finish(); });
+            });
+            close_cookie(file, cookie);
+            auto const expected =
+                std::vector<unsigned char>(payload.begin(), payload.begin() + 1024);
+            if ((case_status != "ok") || (cookie.bytes != expected)) {
+                throw std::runtime_error(
+                    "stdio-short-finish: unexpected qpdf result");
+            }
+            verify_cookie_lifecycle(
+                "stdio-short-finish",
+                cookie,
+                {},
+                {4095},
+                {},
+                {{WriteStepKind::accept, 3071, 0}});
+        }
+
+        {
             auto* file = open_buffered("/dev/full");
             Pl_StdioFile stage("stdio", file);
             size_t write_count = 0;
@@ -515,6 +545,30 @@ namespace
                 write_count,
                 finish_count);
             fclose(file);
+        }
+
+        {
+            Cookie cookie;
+            std::array<char, 4096> buffer{};
+            auto* file = open_cookie(cookie, buffer);
+            Pl_StdioFile stage("stdio", file);
+            auto const tail = patterned_bytes(4096);
+            auto const case_status = status([&]() {
+                during(cookie, CookiePhase::write, [&]() {
+                    stage.writeCStr("x");
+                    stage.write(tail.data(), tail.size());
+                });
+                during(cookie, CookiePhase::finish, [&]() { stage.finish(); });
+            });
+            close_cookie(file, cookie);
+            auto expected = std::vector<unsigned char>{'x'};
+            expected.insert(expected.end(), tail.begin(), tail.end());
+            if ((case_status != "ok") || (cookie.bytes != expected)) {
+                throw std::runtime_error(
+                    "stdio-fill-before-flush: unexpected qpdf result");
+            }
+            verify_cookie_lifecycle(
+                "stdio-fill-before-flush", cookie, {4096}, {1}, {}, {});
         }
 
         {

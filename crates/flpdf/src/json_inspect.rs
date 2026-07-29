@@ -3321,9 +3321,6 @@ mod tests {
                 return Err(std::io::Error::other("sink full"));
             }
             if let Some(remaining) = self.remaining.as_mut() {
-                if *remaining == 0 {
-                    return Err(std::io::Error::other("sink full"));
-                }
                 let written = (*remaining).min(buffer.len());
                 self.bytes.extend_from_slice(&buffer[..written]);
                 *remaining -= written;
@@ -3783,7 +3780,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_file_4095_bytes_are_flushed_on_buffered_drop() {
+    fn coordinator_file_buffered_drop_does_not_retry_short_write() {
         let empty_output = selected_string_output(0);
         let payload_length = 4095usize
             .checked_sub(empty_output.len())
@@ -3811,7 +3808,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.bytes, expected[..24]);
-        assert_eq!(output.write_lengths, [4095, 4071]);
+        assert_eq!(output.write_lengths, [4095]);
         assert_eq!(output.flushes, 0);
     }
 
