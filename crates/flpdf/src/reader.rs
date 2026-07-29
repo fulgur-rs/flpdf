@@ -887,21 +887,37 @@ impl<R: Read + Seek> Pdf<R> {
         else {
             return Ok(None);
         };
-        let read_limit = self
-            .next_object_offset(offset)
-            .unwrap_or(u64::MAX)
-            .saturating_sub(offset);
-        self.reader.seek(SeekFrom::Start(offset))?;
-        let mut bytes = Vec::new();
-        self.reader
-            .by_ref()
-            .take(read_limit)
-            .read_to_end(&mut bytes)?;
-        let pending = parse_file_object_syntax(&bytes)?;
+        let pending = self.parse_source_file_object_at(offset)?;
         let PendingBody::Stream { data_start, .. } = pending.body else {
             return Ok(None);
         };
         Ok(Some(offset.saturating_add(data_start as u64)))
+    }
+
+    fn parse_source_file_object_at(&mut self, offset: u64) -> Result<PendingFileObject> {
+        let next = self.next_object_offset(offset);
+        self.reader.seek(SeekFrom::Start(offset))?;
+        let mut bytes = Vec::new();
+        match next {
+            Some(next) => self
+                .reader
+                .by_ref()
+                .take(next.saturating_sub(offset))
+                .read_to_end(&mut bytes)?,
+            None => self.reader.read_to_end(&mut bytes)?,
+        };
+
+        match parse_file_object_syntax(&bytes) {
+            Ok(pending) => Ok(pending),
+            Err(window_error) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
+                self.resolution_fallbacks_remaining -= 1;
+                self.reader.seek(SeekFrom::Start(offset))?;
+                let mut full = Vec::new();
+                self.reader.read_to_end(&mut full)?;
+                parse_file_object_syntax(&full).or(Err(window_error))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn compressed_parent(&self, object_ref: ObjectRef) -> Option<(ObjectRef, u32)> {
@@ -3281,6 +3297,38 @@ mod tests {
     }
 
     #[test]
+    fn source_stream_data_offset_retries_after_false_next_object_offset() {
+        let bytes = stream_with_false_next_xref_offset();
+        let expected = bytes
+            .windows(b"\nstream\nabc".len())
+            .position(|window| window == b"\nstream\nabc")
+            .expect("stream marker")
+            + b"\nstream\n".len();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open false-next-offset PDF");
+
+        assert!(matches!(
+            pdf.resolve(ObjectRef::new(1, 0))
+                .expect("ordinary bounded fallback"),
+            Object::Stream(_)
+        ));
+        assert_eq!(
+            pdf.source_stream_data_offset(ObjectRef::new(1, 0))
+                .expect("offset lookup uses the same fallback"),
+            Some(expected as u64)
+        );
+    }
+
+    #[test]
+    fn source_stream_data_offset_preserves_bounded_retry_cap() {
+        let mut pdf = Pdf::open_mem_owned(stream_with_false_next_xref_offset())
+            .expect("open false-next-offset PDF");
+        pdf.resolution_fallbacks_remaining = 0;
+
+        assert!(pdf.source_stream_data_offset(ObjectRef::new(1, 0)).is_err());
+        assert_eq!(pdf.resolution_fallbacks_remaining, 0);
+    }
+
+    #[test]
     fn qpdf_object_read_uses_bounded_fallback_and_preserves_strict_errors() {
         let stream_body =
             b"1 0 obj\n<< /Length 2 0 R >>\nstream\n9 0 obj\nnull\nendobj\nendstream\nendobj\n";
@@ -3533,6 +3581,28 @@ mod tests {
             ],
             ObjectRef::new(1, 0),
         )
+    }
+
+    fn stream_with_false_next_xref_offset() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let stream_offset = bytes.len();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Filter [ /FlateDecode /FlateDecode ] /DecodeParms [ null ] /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
+        );
+        let false_next = stream_offset + b"1 0 obj\n<< /Filter".len();
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 3\n\
+                 0000000000 65535 f \n\
+                 {stream_offset:010} 00000 n \n\
+                 {false_next:010} 00000 n \n\
+                 trailer\n<< /Size 3 /Root 1 0 R /QTest 1 0 R >>\n\
+                 startxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
     }
 
     #[test]
