@@ -3,7 +3,10 @@ use std::{
     io::{self, Write},
 };
 
-use flpdf::{Diagnostic, Pdf, PdfOpenOptions};
+#[cfg(unix)]
+use std::ffi::CString;
+
+use flpdf::{Diagnostic, Error, Pdf, PdfOpenOptions};
 
 use crate::common::program_name;
 
@@ -31,15 +34,22 @@ pub fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u
     let filename = &args[2];
     let bytes = match std::fs::read(filename) {
         Ok(bytes) => bytes,
-        Err(error) => return write_error(stdout, stderr, &format_open_error(filename, &error)),
+        Err(error) => {
+            let crt_message = crt_open_error_message(filename);
+            return write_error_bytes(
+                stdout,
+                stderr,
+                &open_error_bytes(filename, crt_message.as_deref(), &error),
+            );
+        }
     };
     let options = PdfOpenOptions {
-        repair: true,
+        repair: n != 0,
         ..PdfOpenOptions::default()
     };
     let mut pdf = match Pdf::open_mem_with_options(&bytes, options) {
         Ok(pdf) => pdf,
-        Err(error) => return write_error(stdout, stderr, &error.to_string()),
+        Err(error) => return write_error(stdout, stderr, &open_pdf_error(n, filename, &error)),
     };
 
     let mut diagnostics_written = 0;
@@ -61,21 +71,75 @@ pub fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u
     0
 }
 
-fn format_open_error(filename: &str, error: &io::Error) -> String {
-    let message = error
-        .raw_os_error()
-        .and_then(system_error_message)
-        .unwrap_or_else(|| error.to_string());
-    format!("open {filename}: {message}")
+fn open_pdf_error(n: i32, filename: &str, error: &Error) -> String {
+    match error {
+        Error::Parse { message, .. } if n == 0 && message == "xref not found" => {
+            format!("{filename}: can't find startxref")
+        }
+        _ => error.to_string(),
+    }
 }
 
-fn system_error_message(error_code: i32) -> Option<String> {
+fn open_error_bytes(filename: &str, crt_message: Option<&[u8]>, fallback: &io::Error) -> Vec<u8> {
+    let message = crt_message
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| fallback.to_string().into_bytes());
+    let mut output = b"open ".to_vec();
+    output.extend_from_slice(filename.as_bytes());
+    output.extend_from_slice(b": ");
+    output.extend_from_slice(&message);
+    output
+}
+
+fn strerror_bytes(error_code: libc::c_int) -> Option<Vec<u8>> {
     let message = unsafe { libc::strerror(error_code) };
-    (!message.is_null()).then(|| {
-        unsafe { CStr::from_ptr(message) }
-            .to_string_lossy()
-            .into_owned()
-    })
+    (!message.is_null()).then(|| unsafe { CStr::from_ptr(message) }.to_bytes().to_vec())
+}
+
+#[cfg(unix)]
+fn crt_open_error_message(filename: &str) -> Option<Vec<u8>> {
+    let filename = CString::new(filename).ok()?;
+    let mode = CString::new("rb").expect("literal contains no NUL");
+    let file = unsafe { libc::fopen(filename.as_ptr(), mode.as_ptr()) };
+    if !file.is_null() {
+        // Rust's initial read failed but this second, diagnostic CRT open won a race.
+        // It provides no matching errno, so preserve the original Rust error as fallback.
+        let _ = unsafe { libc::fclose(file) };
+        return None;
+    }
+    let error_code = io::Error::last_os_error().raw_os_error()?;
+    strerror_bytes(error_code)
+}
+
+#[cfg(windows)]
+unsafe extern "C" {
+    fn _wfopen_s(
+        file: *mut *mut libc::FILE,
+        filename: *const libc::wchar_t,
+        mode: *const libc::wchar_t,
+    ) -> libc::c_int;
+}
+
+#[cfg(windows)]
+fn crt_open_error_message(filename: &str) -> Option<Vec<u8>> {
+    let filename: Vec<libc::wchar_t> = filename.encode_utf16().chain(std::iter::once(0)).collect();
+    let mode = [b'r' as libc::wchar_t, b'b' as libc::wchar_t, 0];
+    let mut file = std::ptr::null_mut();
+    let error_code = unsafe { _wfopen_s(&mut file, filename.as_ptr(), mode.as_ptr()) };
+    if error_code == 0 {
+        // Rust's initial read failed but this second, diagnostic CRT open won a race.
+        // It provides no matching errno, so preserve the original Rust error as fallback.
+        if !file.is_null() {
+            let _ = unsafe { libc::fclose(file) };
+        }
+        return None;
+    }
+    strerror_bytes(error_code)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn crt_open_error_message(_filename: &str) -> Option<Vec<u8>> {
+    None
 }
 
 fn parse_test_number(input: &str) -> Result<i32, String> {
@@ -181,7 +245,11 @@ fn write_warning(
 }
 
 fn write_error(stdout: &mut dyn Write, stderr: &mut dyn Write, message: &str) -> u8 {
-    let _ = write_stderr_line(stdout, stderr, message);
+    write_error_bytes(stdout, stderr, message.as_bytes())
+}
+
+fn write_error_bytes(stdout: &mut dyn Write, stderr: &mut dyn Write, message: &[u8]) -> u8 {
+    let _ = write_stderr_bytes(stdout, stderr, message);
     2
 }
 
@@ -190,13 +258,22 @@ fn write_stderr_line(
     stderr: &mut dyn Write,
     message: &str,
 ) -> io::Result<()> {
+    write_stderr_bytes(stdout, stderr, message.as_bytes())
+}
+
+fn write_stderr_bytes(
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    message: &[u8],
+) -> io::Result<()> {
     stdout.flush()?;
-    writeln!(stderr, "{message}")
+    stderr.write_all(message)?;
+    stderr.write_all(b"\n")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use super::{crt_open_error_message, open_error_bytes, run, write_error_bytes};
     use std::io::{self, Write};
 
     fn fixture(name: &str) -> String {
@@ -204,6 +281,61 @@ mod tests {
             "{}/../../tests/fixtures/test_driver/{name}.pdf",
             env!("CARGO_MANIFEST_DIR")
         )
+    }
+
+    #[test]
+    fn open_error_bytes_preserve_non_utf8_crt_message_bytes() {
+        let fallback = io::Error::other("fallback must not be used");
+        assert_eq!(
+            open_error_bytes("input.pdf", Some(&[0xff, b'!']), &fallback),
+            b"open input.pdf: \xff!"
+        );
+    }
+
+    #[test]
+    fn open_error_bytes_fall_back_only_without_a_crt_message() {
+        let fallback = io::Error::other("fallback message");
+        assert_eq!(
+            open_error_bytes("input.pdf", None, &fallback),
+            b"open input.pdf: fallback message"
+        );
+    }
+
+    #[test]
+    fn byte_error_writer_emits_raw_message_bytes_and_newline() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            write_error_bytes(&mut stdout, &mut stderr, &[0xff, b'!']),
+            2
+        );
+        assert_eq!(stderr, b"\xff!\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_crt_open_failure_supplies_raw_strerror_bytes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let missing = directory.path().join("missing.pdf");
+        let message = crt_open_error_message(missing.to_str().expect("utf-8 temp path"))
+            .expect("fopen failure must supply strerror bytes");
+        assert!(!message.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_crt_open_success_is_not_misreported_as_an_error() {
+        assert!(crt_open_error_message(&fixture("direct_null")).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_crt_open_failure_supplies_raw_strerror_bytes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let missing = directory.path().join("missing.pdf");
+        let message = crt_open_error_message(missing.to_str().expect("utf-8 temp path"))
+            .expect("_wfopen_s failure must supply strerror bytes");
+        assert!(!message.is_empty());
     }
 
     struct FlushFailure;

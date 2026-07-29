@@ -12,6 +12,13 @@ fn minimal_pdf() -> &'static str {
     )
 }
 
+fn repairable_pdf() -> &'static str {
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/test_driver/repairable_input.pdf"
+    )
+}
+
 const TEST_0_OUTPUT: &str = concat!(
     "/QTest is implicit\n",
     "/QTest is direct and has type null (2)\n",
@@ -27,6 +34,14 @@ const TEST_1_OUTPUT: &str = concat!(
     "/QTest is null\n",
     "unparse: null\n",
     "unparseResolved: null\n",
+    "test 1 done\n",
+);
+
+const REPAIRABLE_TEST_1_OUTPUT: &str = concat!(
+    "/QTest is direct and has type boolean (3)\n",
+    "/QTest is Boolean with value true\n",
+    "unparse: true\n",
+    "unparseResolved: true\n",
     "test 1 done\n",
 );
 
@@ -101,6 +116,38 @@ fn one_dispatches_the_test_zero_one_family() {
         .code(0)
         .stdout(TEST_1_OUTPUT)
         .stderr("");
+}
+
+#[test]
+fn zero_disables_repair_before_opening_the_input() {
+    let repairable = repairable_pdf();
+
+    driver()
+        .args(["0", repairable])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(format!("{repairable}: can't find startxref\n"));
+}
+
+#[test]
+fn one_keeps_repair_enabled_before_opening_the_input() {
+    let repairable = repairable_pdf();
+    let expected = format!(
+        concat!(
+            "WARNING: {}: file is damaged\n",
+            "WARNING: {}: can't find startxref\n",
+            "WARNING: {}: Attempting to reconstruct cross-reference table\n",
+        ),
+        repairable, repairable, repairable,
+    );
+
+    driver()
+        .args(["1", repairable])
+        .assert()
+        .code(0)
+        .stdout(REPAIRABLE_TEST_1_OUTPUT)
+        .stderr(expected);
 }
 
 #[test]

@@ -217,9 +217,10 @@ run_cli_probe i64_underflow -9223372036854775809 direct_null.pdf
 run_cli_probe i64_minimum -9223372036854775808 direct_null.pdf
 run_cli_probe unsupported_test 99 direct_null.pdf
 run_cli_probe missing_path 1 missing-cli-probe.pdf
+run_cli_probe no_repair_test_zero 0 repairable_input.pdf
 
 if [[ "$mode" == --regenerate ]]; then
-    printf 'regenerated and matched %d qpdf test_driver outputs and 9 CLI probes\n' "${#fixture_names[@]}"
+    printf 'regenerated and matched %d qpdf test_driver outputs and 10 CLI probes\n' "${#fixture_names[@]}"
 else
-    printf 'qpdf and flpdf test_driver outputs match %d fixtures and 9 CLI probes\n' "${#fixture_names[@]}"
+    printf 'qpdf and flpdf test_driver outputs match %d fixtures and 10 CLI probes\n' "${#fixture_names[@]}"
 fi
