@@ -368,7 +368,7 @@ where
                         }));
                         Ok(())
                     },
-                )?; // cov:ignore: fixed closed-registry adapters were preflighted with unchanged constructor inputs; warning sink is infallible
+                )?;
                 let cleanup_data_start = outcome.cleanup_data_start;
                 if let Some(stage_error) = outcome.error {
                     if has_runtime_error {
@@ -702,6 +702,16 @@ mod tests {
         dict.insert("Filter", Object::Name(b"TestBorrowedInput".to_vec()));
 
         assert_eq!(decode_stream_data(&dict, input).unwrap(), input);
+    }
+
+    #[test]
+    fn recovering_decode_propagates_a_post_preflight_adapter_error() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"TestPostPreflightFailure".to_vec()));
+
+        let error = decode_stream_data_recovering(&dict, b"encoded input").unwrap_err();
+
+        assert_eq!(error.to_string(), "test post-preflight decode failure");
     }
 
     #[test]

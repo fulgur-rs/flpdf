@@ -200,11 +200,20 @@ mod tests {
             Err(io::Error::other("write failed"))
         }
 
-        // cov:ignore-start: warning emission returns from the failed write before stderr can be flushed
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
-        // cov:ignore-end
+    }
+
+    #[test]
+    fn write_failure_fixture_fails_writes_but_allows_flush() {
+        let mut writer = WriteFailure;
+
+        assert_eq!(
+            writer.write(b"warning").unwrap_err().to_string(),
+            "write failed"
+        );
+        writer.flush().expect("flush remains independently usable");
     }
 
     fn pdf_with_qtest(qtest: &[u8], extras: &[(u32, Vec<u8>)]) -> Vec<u8> {
@@ -598,6 +607,9 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.to_string(), "I/O error: write failed");
+        assert!(!stdout
+            .windows(b"End of stream data\n".len())
+            .any(|line| line == b"End of stream data\n"));
     }
 
     #[test]
@@ -627,6 +639,9 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.to_string(), "I/O error: write failed");
+        assert!(!stdout
+            .windows(b"End of stream data\n".len())
+            .any(|line| line == b"End of stream data\n"));
     }
 
     #[test]

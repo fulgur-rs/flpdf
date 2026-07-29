@@ -579,6 +579,23 @@ impl StreamFilter for BorrowedInputProbe {
     }
 }
 
+#[cfg(test)]
+struct PostPreflightFailure;
+
+#[cfg(test)]
+impl StreamFilter for PostPreflightFailure {
+    fn pipe_decode_recovering(
+        &mut self,
+        _: &[u8],
+        _: Option<usize>,
+        _: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+    ) -> Result<FilterDecodeOutcome> {
+        Err(Error::Internal(
+            "test post-preflight decode failure".to_string(),
+        ))
+    }
+}
+
 pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilter>> {
     match filter_name {
         b"FlateDecode" => Some(Box::new(FlateLzwStreamFilter::new(false))),
@@ -590,6 +607,8 @@ pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilt
         b"TestRejectDecode" => Some(Box::new(TestStreamFilter)),
         #[cfg(test)]
         b"TestBorrowedInput" => Some(Box::new(BorrowedInputProbe)),
+        #[cfg(test)]
+        b"TestPostPreflightFailure" => Some(Box::new(PostPreflightFailure)),
         _ => None,
     }
 }
