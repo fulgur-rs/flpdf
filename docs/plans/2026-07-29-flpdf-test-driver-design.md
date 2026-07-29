@@ -161,6 +161,8 @@ qtest は両ストリームを 1 本に束ねて捕捉するため、flush 規�
 
 ## 4. `Handle` — QPDFObjectHandle 意味論
 
+> **[provisional — settled by TDD, not by this document]**
+
 ```rust
 struct Handle {
     resolved: Object,            // 解決済みの値
@@ -191,6 +193,8 @@ obj 7 の本体が `true`）だと `Object::Reference` のまま返る。qpdf �
 **`indirect` に残すのは最初の 1 hop の `ObjectRef` だけ**（qpdf の `unparse()` はハンドル
 自身の objgen を出す。`good3`/`good4` の `unparse: 7 0 R` は 1 hop の例なので多段でも
 振る舞いは変わらない）。`resolved` にはチェーンを辿り切った終端値を格納する。
+
+> **[/provisional]**
 
 **`has_key`** — `QPDF_Dictionary::hasKey`（`QPDF_Dictionary.cc:98-101`）は
 `items.count(key) > 0 && !items[key].isNull()`。`isNull()` が間接参照を解決するため、
@@ -257,6 +261,9 @@ unparseResolved: <…>
 - stream は raw（`Stream.data` をそのまま）と decoded（`decode_stream_data`）を両方 stdout へ。
   decode 失敗時は `Stream data is not filterable.`
 - `array` / `dictionary` は要素ごとに `  item N is {in,}direct` / `  /key is {in,}direct`
+
+> **[provisional — settled by TDD, not by this document]**
+
 - **decode の前に `/Filter` と `/DecodeParms` を § 4 の参照チェーン解決で解決する
   ——top-level・配列要素のどちらも、両方とも多段チェーンでありうる。**
   `decode_stream_data` は `dict.get("Filter")` / `dict.get("DecodeParms")` を直接
@@ -280,6 +287,8 @@ unparseResolved: <…>
   compare 精度（zlib 差異の許容漏れ、false-negative）にも影響する
   （flpdf-n9t0.8、follow-up）。test_driver の設計としては新規実装側だけを
   正しくすれば足りる
+
+> **[/provisional]**
 
 この 20 subtest は既存の flpdf 公開 API だけで完結する — `Pdf::open_mem` / `trailer()` /
 `resolve_borrowed()` / `Stream { pub dict, pub data }` / `decode_stream_data` /

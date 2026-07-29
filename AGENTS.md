@@ -57,7 +57,22 @@
 - Do not edit `AGENTS.md`/`CLAUDE.md`/`docs/superpowers/...` unless instruction updates are needed.
 - `.beads/issues.jsonl` is tracked by Beads tooling and `.gitignore`d; avoid manual edits unless explicitly requested by issue workflow.
 
-## 7) Session close
+## 7) Design-doc review scope (`docs/plans/*.md`)
+- A design doc mixes two kinds of content that need different review treatment:
+  - **Durable decisions** — crate/module layout, dependency ordering, scope boundaries, qpdf oracle facts verified against real source/output. Stable once checked; review these for correctness like any other claim.
+  - **Implementation-detail sketches** — exact algorithms, branch-by-branch pseudocode, edge-case enumeration for code that does not exist yet. These are provisional. Precision here is fragile: sketch-vs-sketch review rounds have produced as many new errors as they removed (see PR #585's history — a "fix" in one round introduced the bug the next round caught). The real check for this tier is TDD once the code exists, not another prose pass.
+- Content between these markers is in the second tier:
+  > **[provisional — settled by TDD, not by this document]**
+  >
+  > *(implementation-detail sketch)*
+  >
+  > **[/provisional]**
+- For marked content:
+  - **Do** flag a claim that misdescribes qpdf's actual behavior (a wrong oracle fact, a citation that doesn't match the cited source) — that's a factual error regardless of tier.
+  - **Do not** flag missing edge cases, unhandled branches, or "this needs more precision" — those are expected to stay open until the corresponding code and tests exist. Re-litigating them in prose is the failure mode this convention exists to avoid.
+- Unmarked content has no such exemption — review it normally.
+
+## 8) Session close
 - Before finishing, ensure quality gates ran for changed code, then push both Beads and git:
   - `bd dolt push`
   - `git pull --rebase` (optional if already synced)
