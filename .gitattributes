@@ -21,6 +21,9 @@ docs/qpdf-module-doc-index.md text eol=lf
 # these checked snapshots to CRLF.
 tests/oracle/*.tsv text eol=lf
 
+# test_driver qpdf merged-output goldens are compared byte-for-byte.
+tests/fixtures/test_driver/*.out text eol=lf
+
 # QDF fixtures are byte-exact golden artifacts (fix_qdf recomputes
 # xref offsets/lengths from raw bytes). Git autocrlf on Windows must NOT
 # rewrite their line endings or the byte-for-byte golden comparisons
