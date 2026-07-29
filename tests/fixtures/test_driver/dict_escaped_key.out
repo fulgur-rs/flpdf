@@ -1,0 +1,6 @@
+/QTest is indirect and has type dictionary (9)
+/QTest is a dictionary
+  /hex strings is direct
+unparse: 6 0 R
+unparseResolved: << /hex#20strings true >>
+test 1 done

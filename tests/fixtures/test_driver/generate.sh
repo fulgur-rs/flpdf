@@ -29,12 +29,15 @@ fixture_names=(
     name_escape
     array_indirect
     dict_keys
+    dict_dangling_value
+    dict_escaped_key
     stream_flate
     stream_indirect_filter
     stream_chained_filter
     stream_indirect_filter_array
     stream_indirect_decode_parms
     stream_indirect_decode_parms_container
+    stream_decode_parms_length_mismatch
     stream_unfilterable
 )
 
@@ -125,6 +128,14 @@ write(
     "dict_keys",
     build_pdf(b"6 0 R", {6: b"<< /b false /a 7 0 R >>", 7: b"true"}),
 )
+write(
+    "dict_dangling_value",
+    build_pdf(b"6 0 R", {6: b"<< /a (a) /gone 99 0 R >>"}),
+)
+write(
+    "dict_escaped_key",
+    build_pdf(b"6 0 R", {6: b"<< /hex#20strings true >>"}),
+)
 
 flate_abc = zlib.compress(b"abc")
 write(
@@ -182,6 +193,18 @@ write(
                 predictor_payload,
             ),
             7: b"<< /Predictor 12 /Columns 3 >>",
+        },
+    ),
+)
+write(
+    "stream_decode_parms_length_mismatch",
+    build_pdf(
+        b"6 0 R",
+        {
+            6: stream(
+                b"/Filter [ /FlateDecode /FlateDecode ] /DecodeParms [ null ]",
+                b"abc",
+            ),
         },
     ),
 )

@@ -2,7 +2,7 @@ use std::io::{Read, Seek, Write};
 
 use flpdf::{Diagnostic, Error, Object, ObjectRef, Pdf};
 
-use super::handle::{resolve_stream_dictionary, Handle};
+use super::handle::{resolve_stream_dictionary, write_qpdf_object, Handle};
 use super::{emit_new_diagnostics, write_warning};
 use crate::output::write_bytes;
 
@@ -40,10 +40,10 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     details?;
 
     write!(stdout, "unparse: ")?;
-    write_bytes(stdout, &qtest.unparse())?;
+    write_bytes(stdout, &qtest.unparse(pdf)?)?;
     writeln!(stdout)?;
     write!(stdout, "unparseResolved: ")?;
-    write_bytes(stdout, &qtest.unparse_resolved())?;
+    write_bytes(stdout, &qtest.unparse_resolved(pdf)?)?;
     writeln!(stdout)?;
     Ok(())
 }
@@ -71,7 +71,7 @@ fn write_object_details<R: Read + Seek>(
         }
         Object::Real(_) | Object::RealLiteral { .. } => {
             write!(stdout, "/QTest is a real number with value ")?;
-            write_bytes(stdout, &qtest.unparse_resolved())?;
+            write_bytes(stdout, &qtest.unparse_resolved(pdf)?)?;
             writeln!(stdout)?;
         }
         Object::Name(value) => {
@@ -94,10 +94,8 @@ fn write_object_details<R: Read + Seek>(
         Object::Dictionary(_) => {
             writeln!(stdout, "/QTest is a dictionary")?;
             for (key, value) in qtest.dictionary_items(pdf)? {
-                write!(stdout, "  ")?;
-                let mut name = Vec::new();
-                Object::Name(key).write_pdf(&mut name);
-                write_bytes(stdout, &name)?;
+                write!(stdout, "  /")?;
+                write_bytes(stdout, &key)?;
                 let direct_prefix = if value.is_indirect() { "in" } else { "" };
                 writeln!(stdout, " is {direct_prefix}direct")?;
             }
@@ -105,10 +103,9 @@ fn write_object_details<R: Read + Seek>(
         Object::Stream(stream) => {
             let stream = stream.clone();
             write!(stdout, "/QTest is a stream.  Dictionary: ")?;
+            let dictionary = write_qpdf_object(pdf, &Object::Dictionary(stream.dict.clone()))?;
             let decode_dictionary = resolve_stream_dictionary(pdf, &stream.dict)?;
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-            let mut dictionary = Vec::new();
-            Object::Dictionary(stream.dict.clone()).write_pdf(&mut dictionary);
             write_bytes(stdout, &dictionary)?;
             writeln!(stdout)?;
 
@@ -126,7 +123,8 @@ fn write_object_details<R: Read + Seek>(
                     writeln!(stdout, "End of stream data")?;
                 }
                 Err(Error::Unsupported(message))
-                    if message == "stream filter type is not name or array" =>
+                    if message == "stream filter type is not name or array"
+                        || message == "stream /DecodeParms length is inconsistent with filters" =>
                 {
                     let offset = stream_data_offset(source, qtest.indirect_ref());
                     let diagnostic = Diagnostic::warning(message, offset);
@@ -146,28 +144,51 @@ fn write_object_details<R: Read + Seek>(
 fn stream_data_offset(source: &[u8], object_ref: Option<ObjectRef>) -> Option<u64> {
     let object_ref = object_ref?;
     let header = format!("{} {} obj", object_ref.number, object_ref.generation);
-    let line_header = format!("\n{header}");
-    let object_start = if source.starts_with(header.as_bytes()) {
-        0
-    } else {
-        find_bytes(source, line_header.as_bytes())? + 1
-    };
-    let stream_marker = find_bytes(&source[object_start..], b"stream")? + object_start;
-    let after_marker = &source[stream_marker + b"stream".len()..];
-    let eol_length = if after_marker.starts_with(b"\r\n") {
-        2
-    } else if after_marker.starts_with(b"\n") {
-        1
-    } else {
-        return None;
-    };
-    u64::try_from(stream_marker + b"stream".len() + eol_length).ok()
+    let object_start = find_line_token(source, header.as_bytes(), 0)?;
+    let search_start = object_start + header.len();
+
+    for index in search_start..source.len() {
+        if !is_line_start(source, index) {
+            continue;
+        }
+        if source[index..].starts_with(b"endobj") {
+            return None;
+        }
+        if !source[index..].starts_with(b"stream") {
+            continue;
+        }
+        let after_marker = &source[index + b"stream".len()..];
+        let eol_length = if after_marker.starts_with(b"\r\n") {
+            2
+        } else if after_marker.starts_with(b"\n") || after_marker.starts_with(b"\r") {
+            1
+        } else {
+            continue;
+        };
+        return u64::try_from(index + b"stream".len() + eol_length).ok();
+    }
+    None
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+fn find_line_token(source: &[u8], token: &[u8], start: usize) -> Option<usize> {
+    source[start..]
+        .windows(token.len())
+        .enumerate()
+        .find_map(|(relative, window)| {
+            let index = start + relative;
+            let after = index + token.len();
+            let has_token_boundary = source
+                .get(after)
+                .is_some_and(|byte| matches!(byte, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' '));
+            (window == token && is_line_start(source, index) && has_token_boundary).then_some(index)
+        })
+}
+
+fn is_line_start(source: &[u8], index: usize) -> bool {
+    index == 0
+        || source
+            .get(index - 1)
+            .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
 }
 
 #[cfg(test)]
@@ -215,7 +236,7 @@ mod tests {
         bytes
     }
 
-    fn output(qtest: &[u8], extras: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    fn output_channels(qtest: &[u8], extras: &[(u32, Vec<u8>)]) -> (Vec<u8>, Vec<u8>) {
         let bytes = pdf_with_qtest(qtest, extras);
         let options = PdfOpenOptions {
             repair: true,
@@ -235,6 +256,11 @@ mod tests {
             &mut diagnostics_written,
         )
         .expect("run test_0_1");
+        (stdout, stderr)
+    }
+
+    fn output(qtest: &[u8], extras: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let (stdout, stderr) = output_channels(qtest, extras);
         assert!(stderr.is_empty());
         stdout
     }
@@ -322,16 +348,20 @@ mod tests {
     }
 
     #[test]
-    fn dictionary_reports_sorted_keys_and_value_indirectness() {
+    fn dictionary_omits_resolved_nulls_and_uses_decoded_display_names() {
         assert_eq!(
-            output(b"<< /b false /a 7 0 R >>", &[(7, b"true".to_vec())],),
+            output(
+                b"<< /b false /a 7 0 R /gone 99 0 R /hex#20strings true >>",
+                &[(7, b"true".to_vec())],
+            ),
             concat!(
                 "/QTest is direct and has type dictionary (9)\n",
                 "/QTest is a dictionary\n",
                 "  /a is indirect\n",
                 "  /b is direct\n",
-                "unparse: << /a 7 0 R /b false >>\n",
-                "unparseResolved: << /a 7 0 R /b false >>\n",
+                "  /hex strings is direct\n",
+                "unparse: << /a 7 0 R /b false /hex#20strings true >>\n",
+                "unparseResolved: << /a 7 0 R /b false /hex#20strings true >>\n",
             )
             .as_bytes()
         );
@@ -381,7 +411,35 @@ mod tests {
     }
 
     #[test]
-    fn stream_data_offsets_accept_lf_and_crlf_framing() {
+    fn decode_parms_length_mismatch_reports_qpdf_warning() {
+        let (stdout, stderr) = output_channels(
+            b"7 0 R",
+            &[(
+                7,
+                b"<< /Filter [ /FlateDecode /FlateDecode ] /DecodeParms [ null ] /Length 3 >>\n\
+                  stream\nabc\nendstream"
+                    .to_vec(),
+            )],
+        );
+        assert_eq!(
+            stdout,
+            b"/QTest is indirect and has type stream (10)\n\
+              /QTest is a stream.  Dictionary: << /DecodeParms [ null ] /Filter [ /FlateDecode /FlateDecode ] /Length 3 >>\n\
+              Raw stream data:\n\
+              abc\n\
+              Uncompressed stream data:\n\
+              Stream data is not filterable.\n\
+              unparse: 7 0 R\n\
+              unparseResolved: 7 0 R\n"
+        );
+        assert_eq!(
+            stderr,
+            b"WARNING: fixture.pdf: stream /DecodeParms length is inconsistent with filters\n"
+        );
+    }
+
+    #[test]
+    fn stream_data_offsets_accept_pdf_eols_and_skip_non_marker_text() {
         let object_ref = Some(flpdf::ObjectRef::new(6, 0));
         assert_eq!(
             stream_data_offset(b"6 0 obj\n<<>>\nstream\nabc", object_ref),
@@ -391,7 +449,22 @@ mod tests {
             stream_data_offset(b"6 0 obj\n<<>>\nstream\r\nabc", object_ref),
             Some(21)
         );
+        assert_eq!(
+            stream_data_offset(b"6 0 obj\r<<>>\rstream\rabc", object_ref),
+            Some(20)
+        );
+        assert_eq!(
+            stream_data_offset(b"6 0 obj\n<< /Note (stream) >>\nstream\rabc", object_ref),
+            Some(36)
+        );
         assert_eq!(stream_data_offset(b"6 0 obj\n<<>>", object_ref), None);
+        assert_eq!(
+            stream_data_offset(
+                b"6 0 obj\n<<>>\nendobj\n7 0 obj\n<<>>\nstream\nabc",
+                object_ref
+            ),
+            None
+        );
         assert_eq!(
             stream_data_offset(b"16 0 obj\nnull\n6 0 obj\n<<>>\nstream\nabc", object_ref),
             Some(34)

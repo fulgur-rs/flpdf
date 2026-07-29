@@ -33,12 +33,15 @@ fixture_names=(
     name_escape
     array_indirect
     dict_keys
+    dict_dangling_value
+    dict_escaped_key
     stream_flate
     stream_indirect_filter
     stream_chained_filter
     stream_indirect_filter_array
     stream_indirect_decode_parms
     stream_indirect_decode_parms_container
+    stream_decode_parms_length_mismatch
     stream_unfilterable
 )
 
@@ -83,7 +86,7 @@ cleanup() {
     exit "$status"
 }
 
-for command in cmake diff git mktemp stat; do
+for command in cargo cmake cmp diff git mktemp stat; do
     command -v "$command" >/dev/null || {
         printf 'qpdf-test-driver-diff.sh: %s is required\n' "$command" >&2
         exit 1
@@ -110,33 +113,64 @@ if [[ -L "$oracle" || ! -x "$oracle" ]]; then
     exit 1
 fi
 
-mkdir -m 700 "${build_dir}/oracle"
+cargo build \
+    --manifest-path "${repo_root}/Cargo.toml" \
+    -p flpdf-qtest-tools \
+    --bin flpdf-test-driver
+rust_driver="${repo_root}/target/debug/flpdf-test-driver"
+if [[ -L "$rust_driver" || ! -x "$rust_driver" ]]; then
+    printf 'qpdf-test-driver-diff.sh: missing flpdf-test-driver build artifact\n' >&2
+    exit 1
+fi
+
+mkdir -m 700 "${build_dir}/oracle" "${build_dir}/rust"
 for name in "${fixture_names[@]}"; do
     pdf="${fixture_dir}/${name}.pdf"
-    actual="${build_dir}/oracle/${name}.out"
+    oracle_actual="${build_dir}/oracle/${name}.out"
+    rust_actual="${build_dir}/rust/${name}.out"
     [[ -f "$pdf" ]] || {
         printf 'qpdf-test-driver-diff.sh: missing fixture: %s\n' "$pdf" >&2
         exit 1
     }
+    set +e
     (
         cd "$fixture_dir"
         "$oracle" 1 "${name}.pdf"
-    ) >"$actual" 2>&1
+    ) >"$oracle_actual" 2>&1
+    oracle_status=$?
+    (
+        cd "$fixture_dir"
+        "$rust_driver" 1 "${name}.pdf"
+    ) >"$rust_actual" 2>&1
+    rust_status=$?
+    set -e
+
+    if [[ "$oracle_status" -ne 0 || "$rust_status" -ne "$oracle_status" ]]; then
+        printf \
+            'qpdf-test-driver-diff.sh: %s status mismatch (qpdf=%d flpdf=%d expected=0)\n' \
+            "$name" "$oracle_status" "$rust_status" >&2
+        exit 1
+    fi
+
+    if ! cmp -s -- "$oracle_actual" "$rust_actual"; then
+        diff -u -- "$oracle_actual" "$rust_actual" || true
+        exit 1
+    fi
 
     expected="${fixture_dir}/${name}.out"
     if [[ "$mode" == --regenerate ]]; then
-        cp -f -- "$actual" "$expected"
+        cp -f -- "$oracle_actual" "$expected"
     elif [[ ! -f "$expected" ]]; then
         printf 'qpdf-test-driver-diff.sh: missing oracle output: %s\n' "$expected" >&2
         exit 1
-    elif ! cmp -s -- "$expected" "$actual"; then
-        diff -u -- "$expected" "$actual" || true
+    elif ! cmp -s -- "$expected" "$oracle_actual"; then
+        diff -u -- "$expected" "$oracle_actual" || true
         exit 1
     fi
 done
 
 if [[ "$mode" == --regenerate ]]; then
-    printf 'regenerated %d qpdf test_driver outputs\n' "${#fixture_names[@]}"
+    printf 'regenerated and matched %d qpdf test_driver outputs\n' "${#fixture_names[@]}"
 else
-    printf 'qpdf test_driver outputs match %d fixtures\n' "${#fixture_names[@]}"
+    printf 'qpdf and flpdf test_driver outputs match %d fixtures\n' "${#fixture_names[@]}"
 fi

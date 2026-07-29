@@ -77,10 +77,14 @@ impl Handle {
             .iter()
             .map(|(key, value)| (key.to_vec(), value.clone()))
             .collect();
-        values
-            .into_iter()
-            .map(|(key, value)| Ok((key, Self::from_value(pdf, value)?)))
-            .collect()
+        let mut items = Vec::new();
+        for (key, value) in values {
+            let value = Self::from_value(pdf, value)?;
+            if !value.is_null() {
+                items.push((key, value));
+            }
+        }
+        Ok(items)
     }
 
     pub(crate) fn type_code(&self) -> u8 {
@@ -108,18 +112,21 @@ impl Handle {
         }
     }
 
-    pub(crate) fn unparse(&self) -> Vec<u8> {
+    pub(crate) fn unparse<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> flpdf::Result<Vec<u8>> {
         match self.indirect {
-            Some(reference) => write_object(&Object::Reference(reference)),
-            None => write_object(&self.resolved),
+            Some(reference) => Ok(write_object(&Object::Reference(reference))),
+            None => write_qpdf_object(pdf, &self.resolved),
         }
     }
 
-    pub(crate) fn unparse_resolved(&self) -> Vec<u8> {
+    pub(crate) fn unparse_resolved<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+    ) -> flpdf::Result<Vec<u8>> {
         if matches!(self.resolved, Object::Stream(_)) {
-            self.unparse()
+            self.unparse(pdf)
         } else {
-            write_object(&self.resolved)
+            write_qpdf_object(pdf, &self.resolved)
         }
     }
 }
@@ -128,6 +135,52 @@ fn write_object(object: &Object) -> Vec<u8> {
     let mut bytes = Vec::new();
     object.write_pdf(&mut bytes);
     bytes
+}
+
+pub(crate) fn write_qpdf_object<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object: &Object,
+) -> flpdf::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    write_qpdf_object_into(pdf, object, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn write_qpdf_object_into<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object: &Object,
+    bytes: &mut Vec<u8>,
+) -> flpdf::Result<()> {
+    match object {
+        Object::Array(values) => {
+            bytes.extend_from_slice(b"[ ");
+            for value in values {
+                write_qpdf_object_into(pdf, value, bytes)?;
+                bytes.push(b' ');
+            }
+            bytes.push(b']');
+        }
+        Object::Dictionary(dictionary) => {
+            bytes.extend_from_slice(b"<< ");
+            for (key, value) in dictionary.iter() {
+                let value = Handle::from_value(pdf, value.clone())?;
+                if value.is_null() {
+                    continue;
+                }
+                Object::Name(key.to_vec()).write_pdf(bytes);
+                bytes.push(b' ');
+                if let Some(reference) = value.indirect_ref() {
+                    Object::Reference(reference).write_pdf(bytes);
+                } else {
+                    write_qpdf_object_into(pdf, value.resolved(), bytes)?;
+                }
+                bytes.push(b' ');
+            }
+            bytes.extend_from_slice(b">>");
+        }
+        _ => object.write_pdf(bytes),
+    }
+    Ok(())
 }
 
 fn resolve_chain<R: Read + Seek>(
@@ -286,8 +339,11 @@ mod tests {
         let handle = Handle::get_key(&mut pdf, &trailer, b"QTest").expect("get /QTest");
         assert!(handle.is_indirect());
         assert_eq!(handle.as_bool(), Some(true));
-        assert_eq!(handle.unparse(), b"6 0 R");
-        assert_eq!(handle.unparse_resolved(), b"true");
+        assert_eq!(handle.unparse(&mut pdf).expect("unparse"), b"6 0 R");
+        assert_eq!(
+            handle.unparse_resolved(&mut pdf).expect("unparse resolved"),
+            b"true"
+        );
     }
 
     #[test]
@@ -357,8 +413,11 @@ mod tests {
         let mut pdf = handle_pdf(b" /QTest 9 0 R");
         let trailer = pdf.trailer().clone();
         let handle = Handle::get_key(&mut pdf, &trailer, b"QTest").expect("stream handle");
-        assert_eq!(handle.unparse(), b"9 0 R");
-        assert_eq!(handle.unparse_resolved(), b"9 0 R");
+        assert_eq!(handle.unparse(&mut pdf).expect("unparse"), b"9 0 R");
+        assert_eq!(
+            handle.unparse_resolved(&mut pdf).expect("unparse resolved"),
+            b"9 0 R"
+        );
     }
 
     #[test]
