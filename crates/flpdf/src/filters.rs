@@ -391,16 +391,11 @@ where
                                 }
                                 events.extend(stage_warnings);
                             } else {
-                                // cov:ignore-start: no production filter can emit a
-                                // finish-time error after this pending diagnostic while
-                                // retaining a post-diagnostic data chunk; all current
-                                // finish-time limits abort before forwarding that chunk.
                                 if !after_pending.is_empty() {
                                     events.push(StreamDecodeEvent::Data(after_pending.to_vec()));
                                 }
                                 events.extend(stage_warnings);
                                 events.push(StreamDecodeEvent::Error(stage_error.error));
-                                // cov:ignore-end
                             }
                         } else if stage_error.during_write {
                             let (before_cleanup, cleanup) =
@@ -648,6 +643,7 @@ fn apply_single_filter_encode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::lzw::pack_codes;
 
     fn flate_dict() -> Dictionary {
         let mut dict = Dictionary::new();
@@ -1161,6 +1157,68 @@ mod tests {
             .to_string(),
             "unsupported PDF feature: stream inflate: input stream is complete but output may still be valid (zlib error -5)"
         );
+    }
+
+    #[test]
+    fn recovering_decode_replays_nonfinal_predictor_warning_before_final_lzw_finish_limit() {
+        let lzw = pack_codes(&[256, 0], true);
+        assert_eq!(lzw.len(), 3);
+
+        // The first complete row leaves LZW with only its Clear code. The
+        // predictor's finish-time tail supplies the last bit of the literal;
+        // LZW forwards that byte to its predictor, whose own finish pads a
+        // partial row and crosses the per-stage output limit.
+        let mut predicted = vec![0];
+        predicted.extend_from_slice(&lzw[..2]);
+        predicted.push(0);
+        predicted.push(lzw[2]);
+        let mut encoded = encode_flate(&predicted).unwrap();
+        encoded.truncate(encoded.len() - 4);
+
+        let mut first_predictor = Dictionary::new();
+        first_predictor.insert("Predictor", Object::Integer(12));
+        first_predictor.insert("Columns", Object::Integer(2));
+        let mut final_predictor = Dictionary::new();
+        final_predictor.insert("Predictor", Object::Integer(12));
+        final_predictor.insert("Columns", Object::Integer(5));
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"LZWDecode".to_vec()),
+            ]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![
+                Object::Dictionary(first_predictor),
+                Object::Dictionary(final_predictor),
+            ]),
+        );
+
+        let outcome = decode_stream_data_recovering_with_limits(
+            &dict,
+            &encoded,
+            DecodeLimits {
+                max_output: Some(4),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data, [0; 4]);
+        assert!(matches!(
+            &outcome.events[..],
+            [
+                StreamDecodeEvent::Warning(warning),
+                StreamDecodeEvent::Data(data),
+                StreamDecodeEvent::Error(error),
+            ] if warning.message == "input stream is complete but output may still be valid"
+                && warning.code == -5
+                && data == b"\0\0\0\0"
+                && error.to_string()
+                    == "unsupported PDF feature: decoded output exceeds configured limit of 4 bytes"
+        ));
     }
 
     #[test]
