@@ -696,6 +696,17 @@ mod tests {
         content_pdf("4 0 R", &[(4, corrupt_filtered_object(4, "Fl", b"\x78"))])
     }
 
+    fn ascii_hex_error_then_flate_warning_content_pdf() -> Vec<u8> {
+        let object = b"4 0 obj\n\
+                       << /Filter [/ASCIIHexDecode /FlateDecode] /Length 3 >>\n\
+                       stream\n\
+                       78G\n\
+                       endstream\n\
+                       endobj\n"
+            .to_vec();
+        content_pdf("4 0 R", &[(4, object)])
+    }
+
     fn malformed_header_abbreviated_flate_content_pdf() -> Vec<u8> {
         content_pdf(
             "4 0 R",
@@ -1089,6 +1100,34 @@ mod tests {
     fn truncated_flate_warning_survives_later_ascii85_error() {
         let report = check_reader_with_options(
             Cursor::new(truncated_flate_then_invalid_ascii85_content_pdf()),
+            PdfOpenOptions {
+                repair: false,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!report.valid);
+        assert!(report.diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic.message.contains("content stream object 4 0")
+                && diagnostic
+                    .message
+                    .contains("input stream is complete but output may still be valid")
+        }));
+        assert!(report.diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Error
+                && diagnostic.message.contains("content stream object 4 0")
+                && diagnostic
+                    .message
+                    .contains("errors while decoding content stream")
+        }));
+    }
+
+    #[test]
+    fn post_error_flate_warning_reaches_the_content_check() {
+        let report = check_reader_with_options(
+            Cursor::new(ascii_hex_error_then_flate_warning_content_pdf()),
             PdfOpenOptions {
                 repair: false,
                 ..PdfOpenOptions::default()

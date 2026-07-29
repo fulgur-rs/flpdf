@@ -167,16 +167,22 @@ pub(crate) fn decode_stream_data_with_limits_and_warnings(
     warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
 ) -> Result<Vec<u8>> {
     let outcome = decode_stream_data_recovering_with_limits(dict, stream_data, limits)?;
+    let mut first_error = None;
     for event in outcome.events {
-        match event {
-            StreamDecodeEvent::Warning(warning) => {
-                warn(&warning.message, warning.code)
-                    .map_err(|error| Error::Unsupported(error.into_string_lossy()))?;
-            }
-            StreamDecodeEvent::Error(error) => return Err(error),
+        let event_error = match event {
+            StreamDecodeEvent::Warning(warning) => warn(&warning.message, warning.code)
+                .err()
+                .map(|error| Error::Unsupported(error.into_string_lossy())),
+            StreamDecodeEvent::Error(error) => Some(error),
+        };
+        if first_error.is_none() {
+            first_error = event_error;
         }
     }
-    Ok(outcome.data)
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(outcome.data),
+    }
 }
 
 fn decode_stream_data_recovering_with_limits(
@@ -637,6 +643,75 @@ mod tests {
                 if warning.message == "input stream is complete but output may still be valid"
                     && warning.code == -5
         ));
+    }
+
+    #[test]
+    fn strict_replay_delivers_warning_after_error_and_keeps_the_runtime_error() {
+        let dict = array_filter_dict(&[b"ASCIIHexDecode", b"FlateDecode"]);
+        let mut warnings = Vec::new();
+
+        let error = decode_stream_data_with_limits_and_warnings(
+            &dict,
+            b"78G",
+            DecodeLimits::default(),
+            &mut |message, code| {
+                warnings.push((message.to_string(), code));
+                Err(PipelineError::runtime("later callback failure"))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: character out of range during base Hex decode: G"
+        );
+        assert_eq!(
+            warnings,
+            vec![(
+                "input stream is complete but output may still be valid".to_string(),
+                -5
+            )]
+        );
+    }
+
+    #[test]
+    fn strict_replay_keeps_a_callback_error_and_delivers_later_warnings() {
+        let mut encoded = encode_stream_data(&flate_dict(), b"78G").unwrap();
+        encoded.pop();
+        let dict = array_filter_dict(&[b"FlateDecode", b"ASCIIHexDecode", b"FlateDecode"]);
+        let mut warnings = Vec::new();
+
+        let error = decode_stream_data_with_limits_and_warnings(
+            &dict,
+            &encoded,
+            DecodeLimits::default(),
+            &mut |message, code| {
+                warnings.push((message.to_string(), code));
+                Err(PipelineError::runtime(format!(
+                    "callback failure {}",
+                    warnings.len()
+                )))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: callback failure 1"
+        );
+        assert_eq!(
+            warnings,
+            vec![
+                (
+                    "input stream is complete but output may still be valid".to_string(),
+                    -5
+                ),
+                (
+                    "input stream is complete but output may still be valid".to_string(),
+                    -5
+                ),
+            ]
+        );
     }
 
     #[test]
