@@ -1,0 +1,6 @@
+WARNING: chained_reference.pdf (object 6 0, offset 121): expected endobj
+/QTest is indirect and has type integer (4)
+/QTest is an integer with value 7
+unparse: 6 0 R
+unparseResolved: 7
+test 1 done

@@ -1,16 +1,22 @@
 use std::io::{Read, Seek, Write};
 
-use flpdf::{Object, Pdf};
+use flpdf::{Diagnostic, Error, Object, ObjectRef, Pdf};
 
 use super::handle::{resolve_stream_dictionary, Handle};
+use super::{emit_new_diagnostics, write_warning};
 use crate::output::write_bytes;
 
 pub(crate) fn run_test_0_1<R: Read + Seek>(
     pdf: &mut Pdf<R>,
+    source: &[u8],
+    filename: &str,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer().clone();
     let qtest = Handle::get_key(pdf, &trailer, b"QTest")?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     if !Handle::has_key(pdf, &trailer, b"QTest")? {
         writeln!(stdout, "/QTest is implicit")?;
@@ -44,9 +50,9 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
             write_bytes(stdout, &qtest.unparse_resolved())?;
             writeln!(stdout)?;
         }
-        Object::Name(_) => {
-            write!(stdout, "/QTest is a name with value ")?;
-            write_bytes(stdout, &qtest.unparse_resolved())?;
+        Object::Name(value) => {
+            write!(stdout, "/QTest is a name with value /")?;
+            write_bytes(stdout, value)?;
             writeln!(stdout)?;
         }
         Object::String(value) => {
@@ -81,6 +87,8 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
         Object::Stream(stream) => {
             let stream = stream.clone();
             write!(stdout, "/QTest is a stream.  Dictionary: ")?;
+            let decode_dictionary = resolve_stream_dictionary(pdf, &stream.dict)?;
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             let mut dictionary = Vec::new();
             Object::Dictionary(stream.dict.clone()).write_pdf(&mut dictionary);
             write_bytes(stdout, &dictionary)?;
@@ -92,13 +100,20 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
             writeln!(stdout)?;
             writeln!(stdout, "Uncompressed stream data:")?;
 
-            let decode_dictionary = resolve_stream_dictionary(pdf, &stream.dict)?;
             match flpdf::filters::decode_stream_data(&decode_dictionary, &stream.data) {
                 Ok(decoded) => {
                     stdout.flush()?;
                     write_bytes(stdout, &decoded)?;
                     writeln!(stdout)?;
                     writeln!(stdout, "End of stream data")?;
+                }
+                Err(Error::Unsupported(message))
+                    if message == "stream filter type is not name or array" =>
+                {
+                    let offset = stream_data_offset(source, qtest.indirect_ref());
+                    let diagnostic = Diagnostic::warning(message, offset);
+                    write_warning(filename, &diagnostic, stdout, stderr)?;
+                    writeln!(stdout, "Stream data is not filterable.")?;
                 }
                 Err(_) => writeln!(stdout, "Stream data is not filterable.")?,
             }
@@ -117,9 +132,31 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     Ok(())
 }
 
+fn stream_data_offset(source: &[u8], object_ref: Option<ObjectRef>) -> Option<u64> {
+    let object_ref = object_ref?;
+    let header = format!("{} {} obj", object_ref.number, object_ref.generation);
+    let object_start = find_bytes(source, header.as_bytes())?;
+    let stream_marker = find_bytes(&source[object_start..], b"stream")? + object_start;
+    let after_marker = &source[stream_marker + b"stream".len()..];
+    let eol_length = if after_marker.starts_with(b"\r\n") {
+        2
+    } else if after_marker.starts_with(b"\n") {
+        1
+    } else {
+        return None;
+    };
+    u64::try_from(stream_marker + b"stream".len() + eol_length).ok()
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::run_test_0_1;
+    use super::{run_test_0_1, stream_data_offset};
     use flpdf::{Pdf, PdfOpenOptions};
 
     fn pdf_with_qtest(qtest: &[u8], extras: &[(u32, Vec<u8>)]) -> Vec<u8> {
@@ -170,7 +207,18 @@ mod tests {
         let mut pdf =
             Pdf::open_mem_owned_with_options(bytes, options).expect("open test_0_1 fixture");
         let mut stdout = Vec::new();
-        run_test_0_1(&mut pdf, &mut stdout).expect("run test_0_1");
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
+        run_test_0_1(
+            &mut pdf,
+            &[],
+            "fixture.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test_0_1");
+        assert!(stderr.is_empty());
         stdout
     }
 
@@ -222,7 +270,7 @@ mod tests {
             (
                 b"/A#20B",
                 b"/QTest is direct and has type name (7)\n\
-                  /QTest is a name with value /A#20B\n\
+                  /QTest is a name with value /A B\n\
                   unparse: /A#20B\n\
                   unparseResolved: /A#20B\n",
             ),
@@ -313,5 +361,20 @@ mod tests {
               unparse: 7 0 R\n\
               unparseResolved: 7 0 R\n"
         );
+    }
+
+    #[test]
+    fn stream_data_offsets_accept_lf_and_crlf_framing() {
+        let object_ref = Some(flpdf::ObjectRef::new(6, 0));
+        assert_eq!(
+            stream_data_offset(b"6 0 obj\n<<>>\nstream\nabc", object_ref),
+            Some(20)
+        );
+        assert_eq!(
+            stream_data_offset(b"6 0 obj\n<<>>\nstream\r\nabc", object_ref),
+            Some(21)
+        );
+        assert_eq!(stream_data_offset(b"6 0 obj\n<<>>", object_ref), None);
+        assert_eq!(stream_data_offset(b"", None), None);
     }
 }

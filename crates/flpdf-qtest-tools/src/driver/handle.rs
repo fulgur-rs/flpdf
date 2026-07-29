@@ -38,6 +38,10 @@ impl Handle {
         self.indirect.is_some()
     }
 
+    pub(crate) fn indirect_ref(&self) -> Option<ObjectRef> {
+        self.indirect
+    }
+
     pub(crate) fn is_null(&self) -> bool {
         self.resolved.is_null()
     }

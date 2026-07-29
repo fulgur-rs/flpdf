@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 
-use flpdf::{Pdf, PdfOpenOptions};
+use flpdf::{Diagnostic, Pdf, PdfOpenOptions};
 
 use crate::common::program_name;
 
@@ -39,29 +39,65 @@ pub fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u
         Err(error) => return write_error(stdout, stderr, &error.to_string()),
     };
 
-    for diagnostic in pdf.repair_diagnostics().entries() {
-        let line = match diagnostic.offset {
-            Some(offset) => format!(
-                "WARNING: {filename} (offset {offset}): {}",
-                diagnostic.message
-            ),
-            None => format!("WARNING: {filename}: {}", diagnostic.message),
-        };
-        if write_stderr_line(stdout, stderr, &line).is_err() {
-            return 2;
-        }
+    let mut diagnostics_written = 0;
+    if emit_new_diagnostics(&pdf, &mut diagnostics_written, filename, stdout, stderr).is_err() {
+        return 2;
     }
 
     if n != 1 {
         return write_error(stdout, stderr, &format!("invalid test {n}"));
     }
-    if let Err(error) = test_0_1::run_test_0_1(&mut pdf, stdout) {
+    if let Err(error) = test_0_1::run_test_0_1(
+        &mut pdf,
+        &bytes,
+        filename,
+        stdout,
+        stderr,
+        &mut diagnostics_written,
+    ) {
         return write_error(stdout, stderr, &error.to_string());
     }
     if writeln!(stdout, "test {n} done").is_err() {
         return 2;
     }
     0
+}
+
+fn emit_new_diagnostics<R: io::Read + io::Seek>(
+    pdf: &Pdf<R>,
+    diagnostics_written: &mut usize,
+    filename: &str,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> io::Result<()> {
+    let entries = pdf.repair_diagnostics().entries();
+    for diagnostic in &entries[*diagnostics_written..] {
+        write_warning(filename, diagnostic, stdout, stderr)?;
+    }
+    *diagnostics_written = entries.len();
+    Ok(())
+}
+
+fn write_warning(
+    filename: &str,
+    diagnostic: &Diagnostic,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> io::Result<()> {
+    let (message, offset) =
+        if diagnostic.message == "xref not found" && diagnostic.offset == Some(0) {
+            ("can't find startxref", None)
+        } else {
+            (diagnostic.message.as_str(), diagnostic.offset)
+        };
+    let line = if message.starts_with('(') {
+        format!("WARNING: {filename} {message}")
+    } else if let Some(offset) = offset {
+        format!("WARNING: {filename} (offset {offset}): {message}")
+    } else {
+        format!("WARNING: {filename}: {message}")
+    };
+    write_stderr_line(stdout, stderr, &line)
 }
 
 fn write_error(stdout: &mut dyn Write, stderr: &mut dyn Write, message: &str) -> u8 {

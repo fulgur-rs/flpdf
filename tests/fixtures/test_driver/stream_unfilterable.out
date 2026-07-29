@@ -1,0 +1,9 @@
+/QTest is indirect and has type stream (10)
+/QTest is a stream.  Dictionary: << /Filter /BogusDecode /Length 3 >>
+Raw stream data:
+abc
+Uncompressed stream data:
+Stream data is not filterable.
+unparse: 6 0 R
+unparseResolved: 6 0 R
+test 1 done
