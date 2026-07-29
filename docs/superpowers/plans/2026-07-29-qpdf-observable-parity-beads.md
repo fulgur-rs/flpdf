@@ -245,7 +245,12 @@ Create under `P1_ID`:
 1. P1 task `test_driver: inventory remaining IDs by qpdf responsibility`
    - Cover IDs 0, 2, 3, 28, 33–36, 39, 52–71, 76–77, 80, 81, and 85.
    - Acceptance: each ID has source range, qtest invocations, consumer
-     contract, dependency order, and follow-up Bead IDs.
+     contract, dependency order, and follow-up Bead IDs. Every generated
+     implementation follow-up is a child of `P1_ID`, carries `pre-v1` and
+     `qpdf-parity`, uses this roadmap `--spec-id`, satisfies the full
+     implementation-issue acceptance template, and is added as a blocking
+     dependency of the inventory task; the inventory remains open until all
+     such follow-ups are closed.
 
 - [ ] **Step 4: Create the Phase 2 lazy/eager audit**
 
@@ -255,8 +260,12 @@ Create under `P2_ID`:
    - Classify each consumer operation as raw identity inspection, one-value
      resolution, chain resolution, or graph traversal.
    - Acceptance: every discovered mismatch has an oracle probe and a bounded
-     follow-up issue; no broad lazy-object rewrite is proposed without a real
-     consumer.
+     implementation follow-up; every generated follow-up is a child of
+     `P2_ID`, carries `pre-v1` and `qpdf-parity`, uses this roadmap
+     `--spec-id`, satisfies the full implementation-issue acceptance template,
+     and is added as a blocking dependency of the audit task; the audit remains
+     open until all such follow-ups are closed; no broad lazy-object rewrite is
+     proposed without a real consumer.
 
 - [ ] **Step 5: Create Phase 3 codec tasks**
 
@@ -287,8 +296,12 @@ Create under `P3_ID`:
 Create under `P5_ID`:
 
 1. P2 task `writer parity: encrypted-output semantic and byte gate`
-   - Pure Rust semantic comparison and `qpdf-zlib-compat` byte comparison.
-   - Include deterministic crypto inputs and supported encryption revisions.
+   - Pure Rust semantic and structural comparison and `qpdf-zlib-compat` byte
+     comparison.
+   - Include supported direct-encryption revisions and a distinct
+     `--copy-encryption-from` tuple with a fixed donor PDF, donor and output
+     passwords, permissions, IDs, and randomness inputs. Run both configured
+     comparisons for the donor-based tuple.
 2. P2 task `writer parity: incremental-output semantic and append-invariant gate`
    - Compare appended objects, `/Prev`, xref form, generations, trailer/ID,
      warning status, and final-document semantics and structure under
@@ -528,6 +541,15 @@ Expected:
   closes; every generated non-ABI follow-up is a labeled Phase 1 child,
   satisfies the implementation acceptance template, and blocks the mapping
   task until it closes;
+- every generated test-driver implementation follow-up is a labeled Phase 1
+  child that satisfies the implementation acceptance template and blocks its
+  inventory task until it closes;
+- every generated lazy-resolution implementation follow-up is a labeled
+  Phase 2 child that satisfies the implementation acceptance template and
+  blocks its audit task until it closes;
+- the encrypted writer gate contains a deterministic donor-based
+  `--copy-encryption-from` tuple with both the Pure Rust semantic/structural
+  and `qpdf-zlib-compat` byte comparisons;
 - required existing parity issues block their owning phase; only explicitly
   non-observable roadmap associations such as `flpdf-mfir` use `relates-to`;
 - each Phase 2–5 completion gate is blocked by the exact required non-epic

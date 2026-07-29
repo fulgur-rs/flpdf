@@ -182,7 +182,11 @@ Make applicable qtest behavior reach Rust code.
 Deliverables:
 
 - merge and wire the existing test-driver test 1 implementation;
-- port test-driver IDs in responsibility-based slices rather than one monolith;
+- port test-driver IDs in responsibility-based slices rather than one
+  monolith. Every implementation follow-up created by the inventory becomes a
+  Phase 1 child with the roadmap labels, this spec ID, and the full
+  implementation acceptance template; it blocks the inventory task and
+  therefore Phase 1 closure;
 - implement the 11 Linux-applicable non-C helpers remaining after removing
   `qpdf-ctest` and Windows-only `test_shell_glob` from `flpdf-egzr`;
 - map `qpdf-ctest` underlying behavior to Rust oracle tests and eliminate all
@@ -209,7 +213,10 @@ Deliverables:
 
 - inventory `QPDFObjectHandle` consumers and state whether each operation
   inspects raw identity, resolves one value, follows a chain, or traverses a
-  graph;
+  graph. Every implementation follow-up created for a discovered mismatch
+  becomes a Phase 2 child with the roadmap labels, this spec ID, and the full
+  implementation acceptance template; it blocks the audit task and therefore
+  Phase 2 closure;
 - replace broad eager resolution with consumer-specific access;
 - converge file-object parsing, xref/trailer recovery, page-tree recovery, and
   dangling-reference behavior;
@@ -258,12 +265,15 @@ The matrix covers:
 - QDF;
 - object-stream/xref-stream output;
 - linearized output;
-- encrypted and copy-encryption output; and
+- encrypted output plus a deterministic `--copy-encryption-from` tuple whose
+  donor PDF, passwords, permissions, IDs, and randomness inputs are fixed; and
 - incremental output.
 
-Each qpdf-produced tuple records semantic comparison for the Pure Rust build
-and byte comparison for `qpdf-zlib-compat`. The encrypted byte gate is new
-required work. The flpdf-specific incremental tuple records final-document
+Each qpdf-produced tuple records semantic and structural comparison for the
+Pure Rust build and byte comparison for `qpdf-zlib-compat`. This applies
+independently to direct encryption and the donor-based copy-encryption tuple.
+The encrypted byte gate is new required work. The flpdf-specific incremental
+tuple records final-document
 semantic and structural comparison plus appended-revision invariants; it is
 explicitly excluded from qpdf byte identity because qpdf produces only a full
 rewrite. Existing open route-specific issues remain authoritative and are
