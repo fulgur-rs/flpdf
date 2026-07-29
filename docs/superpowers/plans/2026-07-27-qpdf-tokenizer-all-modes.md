@@ -105,7 +105,7 @@ Build the current CLI and run only the related external groups:
 
 ```bash
 implementation_root="$(git rev-parse --show-toplevel)"
-cargo build --release -p flpdf-cli -p flpdf-test-compare
+cargo build --release -p flpdf-cli -p flpdf-qtest-tools
 cd /home/ubuntu/flpdf-qtest
 FLPDF_DIR="$implementation_root" \
 QTEST_TESTS="tokenizer token-filters basic-parsing inline-images" \
@@ -2102,7 +2102,7 @@ issue.
 
 ```bash
 implementation_root="$(git rev-parse --show-toplevel)"
-cargo build --release -p flpdf-cli -p flpdf-test-compare
+cargo build --release -p flpdf-cli -p flpdf-qtest-tools
 cd /home/ubuntu/flpdf-qtest
 FLPDF_DIR="$implementation_root" \
 QTEST_TESTS="tokenizer token-filters basic-parsing inline-images" \
