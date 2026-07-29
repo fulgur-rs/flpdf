@@ -179,6 +179,19 @@ qpdf の `QPDFObjectHandle` は未解決の参照を保持したまま型を聞�
 根拠は `QPDF_Dictionary::getKey` のコメント（"PDF spec says fetching a non-existent key
 from a dictionary returns the null object"）。これが subtest 1 "implicit null" の中身。
 
+**参照チェーンを終端まで辿る。** `Pdf::resolve_borrowed` は 1 回の解決で止まる —
+対象オブジェクトの本体自体が別の参照（`/QTest 6 0 R` で obj 6 の本体が `7 0 R`、
+obj 7 の本体が `true`）だと `Object::Reference` のまま返る。qpdf の
+`QPDFObjectHandle::dereference()` は終端まで辿るので、1 回だけの解決では
+`qtest.getTypeCode()` が中間の参照を分類してしまい qpdf と食い違う。flpdf 本体には
+`ref_chain.rs` にまさにこの用途の共有プリミティブ（`resolve_ref_chain` /
+`terminal_ref_of_chain`、深さ上限 `MAX_REF_CHAIN_DEPTH = 64`、20 モジュールが使用）が
+あるが **`pub(crate)`** — 別 crate の `Handle` からは呼べない。同じ形（`Object::Reference`
+である限り解決を繰り返す、64 hop で打ち切り）のループを `handle.rs` にローカルに実装する。
+**`indirect` に残すのは最初の 1 hop の `ObjectRef` だけ**（qpdf の `unparse()` はハンドル
+自身の objgen を出す。`good3`/`good4` の `unparse: 7 0 R` は 1 hop の例なので多段でも
+振る舞いは変わらない）。`resolved` にはチェーンを辿り切った終端値を格納する。
+
 **`has_key`** — `QPDF_Dictionary::hasKey`（`QPDF_Dictionary.cc:98-101`）は
 `items.count(key) > 0 && !items[key].isNull()`。`isNull()` が間接参照を解決するため、
 `good2`（直接 null）・`good3`（dangling ref）・`good4`（実在する null）が揃って `false` になり、
@@ -244,13 +257,21 @@ unparseResolved: <…>
 - stream は raw（`Stream.data` をそのまま）と decoded（`decode_stream_data`）を両方 stdout へ。
   decode 失敗時は `Stream data is not filterable.`
 - `array` / `dictionary` は要素ごとに `  item N is {in,}direct` / `  /key is {in,}direct`
-- **decode の前に `/Filter` と `/DecodeParms` を解決する。** `decode_stream_data` は
-  `dict.get("Filter")` / `dict.get("DecodeParms")` を直接 `decode_stream_data_with_filters`
-  へ渡すだけで間接参照を解決しない（`filters.rs`）。`Object::Reference` が来ると
-  `decode_filter_specs`（`stream_filter.rs:55-59`）が `Unsupported` を返し、qpdf が
-  正しくフィルタする場面でも `Stream data is not filterable.` になってしまう。既存の
-  `flpdf-qtest-tools`（旧 `flpdf-test-compare`）の `compare.rs` が全く同じ理由で
-  `resolve_stream_keys` を持っているので、同じ解決ステップをここでも呼ぶ
+- **decode の前に `/Filter` と `/DecodeParms` を要素ごと (element-wise) に解決する。**
+  `decode_stream_data` は `dict.get("Filter")` / `dict.get("DecodeParms")` を直接
+  `decode_stream_data_with_filters` へ渡すだけで間接参照を解決しない（`filters.rs`）。
+  `Object::Reference` が来ると `decode_filter_specs`（`stream_filter.rs:55-59`）が
+  `Unsupported` を返す。既存の `flpdf-qtest-tools`（旧 `flpdf-test-compare`）の
+  `compare.rs` の `resolve_stream_keys` は全く同じ理由で存在するが、**top-level の
+  1 hop しか見ていない** — `/Filter [8 0 R]`（配列要素が間接参照）は
+  `decode_filter_specs`（`stream_filter.rs:47-53`）が各要素へ直接 `as_name()` を
+  呼ぶだけなので、`resolve_stream_keys` を通しても依然として失敗する。qpdf は
+  `QPDFObjectHandle::isName()` の自動 dereference で配列要素も解決するため、
+  `/Filter` と `/DecodeParms` が **配列の場合は要素ごとに** `§4 の参照チェーン解決`
+  を適用してから `decode_stream_data` へ渡す（top-level が配列でない場合は従来どおり
+  1 回の解決で足りる）。`resolve_stream_keys` 自体のこの限界は `flpdf-qtest-tools`
+  側の compare 精度（zlib 差異の許容漏れ、false-negative）にも影響するが、
+  test_driver の設計としては新規実装側だけを正しくすれば足りる
 
 この 20 subtest は既存の flpdf 公開 API だけで完結する — `Pdf::open_mem` / `trailer()` /
 `resolve_borrowed()` / `Stream { pub dict, pub data }` / `decode_stream_data` /
@@ -282,6 +303,19 @@ WARNING: good14.pdf (offset 628): content normalization encountered bad tokens
 n9t0.2 は `test_0_1` に限定し `test_3` は flpdf-n9t0.6 に切り出した。** `invalid test 3`
 で fail-loud するのでベースラインは静かに動かない。
 
+**good14 の golden テストは merged-stream capture が要る。** `assert_cmd::Command::output()`
+は stdout/stderr を別バッファで捕捉する。`good14.out` は
+`<610062> (MOO)WARNING: good14.pdf (offset 628): …` のように **stdout の途中に
+stderr の警告が改行なしで割り込む**形を要求するため、別バッファ比較では
+この interleaving を検証できない（stdout 側と stderr 側を別々に正しく出しても
+テストが偽陽性で通る）。n9t0.6 の golden テストは、子プロセスの stdout と stderr を
+同じファイル記述子へ向けて起動し（Unix なら stderr を stdout の fd に `dup2`
+する、または `std::process::Command` に生の `Stdio` をハンドオフする）、
+端末が見るのと同じバイト列で比較する。§7 の `driver_goldens.rs`（test_0_1 用）は
+この問題を持たない — test_0_1 のフィクスチャは全て整形式で `decode_stream_data` の
+デフォルト経路（`reject_decode_warning`、警告を stderr ではなく `Err` にする）を
+通るため、stderr 出力自体が発生しない。
+
 ## 7. fixture とテスト
 
 ```
@@ -293,6 +327,8 @@ tests/fixtures/test_driver/
   dangling_ref.{pdf,out}         存在しないオブジェクトへの参照
   indirect_null.{pdf,out}        実在する null オブジェクト
   indirect_bool.{pdf,out}        hasKey が true になる対照
+  chained_reference.{pdf,out}    多段間接参照（§4 参照。/QTest 6 0 R -> 7 0 R -> true
+                                  のような 2 hop 以上のチェーン）
   integer.{pdf,out}              top-level integer（good7 相当）
   real.{pdf,out}                 top-level indirect real（good8 相当）
   string_hex_literal.{pdf,out}   n9t0.4 の境界（\n 入り・閾値ちょうど・8 進フォールバック）
@@ -303,7 +339,10 @@ tests/fixtures/test_driver/
                                   エスケープが要るキーは flpdf-n9t0.7 が着地するまで
                                   追加できない — §4 参照）
   stream_flate.{pdf,out}         raw / uncompressed / dict unparse
-  stream_indirect_filter.{pdf,out}  /Filter が間接参照のストリーム（§5 参照）
+  stream_indirect_filter.{pdf,out}       /Filter 自体が間接参照のストリーム（§5 参照）
+  stream_indirect_filter_array.{pdf,out} /Filter が [8 0 R] のように配列要素が
+                                          間接参照のストリーム（§5 参照。
+                                          top-level 1 hop の resolve では救えない）
   stream_unfilterable.{pdf,out}  Stream data is not filterable.
 ```
 
