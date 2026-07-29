@@ -311,23 +311,16 @@ where
                 data
             }
             PreparedStage::Codec { adapter } => {
-                let mut next_pending_data_boundary = pending_data_boundary
-                    .map(|boundary| {
-                        let prefix = decode_codec_prefix(
-                            stage.spec,
-                            &decoded[..boundary.input_end],
-                            limits,
-                        )?;
-                        Ok::<PendingDataBoundary, Error>(PendingDataBoundary {
-                            input_end: if boundary.finish_before_event {
-                                prefix.data.len()
-                            } else {
-                                prefix.cleanup_data_start
-                            },
-                            finish_before_event: boundary.finish_before_event,
-                        })
-                    })
-                    .transpose()?;
+                let mut next_pending_data_boundary = pending_data_boundary.map(|boundary| {
+                    let prefix_data = &decoded[..boundary.0];
+                    let prefix = decode_codec_prefix(stage.spec, prefix_data, limits);
+                    let input_end = if boundary.1 {
+                        prefix.data.len()
+                    } else {
+                        prefix.cleanup_data_start
+                    };
+                    PendingDataBoundary(input_end, boundary.1)
+                });
                 let mut stage_warnings = Vec::new();
                 let outcome = adapter.pipe_decode_recovering(
                     decoded.as_ref(),
@@ -346,7 +339,7 @@ where
                         if is_last_stage {
                             let boundary = next_pending_data_boundary
                                 .expect("pending recovery data has a codec output boundary")
-                                .input_end;
+                                .0;
                             let (before_pending, after_pending) = outcome.data.split_at(boundary);
                             if !before_pending.is_empty() {
                                 events.push(StreamDecodeEvent::Data(before_pending.to_vec()));
@@ -360,14 +353,13 @@ where
                     } else {
                         has_runtime_error = true;
                         if !is_last_stage {
-                            next_pending_data_boundary = Some(PendingDataBoundary {
-                                input_end: if stage_error.during_write {
-                                    cleanup_data_start
-                                } else {
-                                    outcome.data.len()
-                                },
-                                finish_before_event: !stage_error.during_write,
-                            });
+                            let input_end = if stage_error.during_write {
+                                cleanup_data_start
+                            } else {
+                                outcome.data.len()
+                            };
+                            next_pending_data_boundary =
+                                Some(PendingDataBoundary(input_end, !stage_error.during_write));
                             if stage_error.during_write {
                                 pending_events.push(StreamDecodeEvent::Error(stage_error.error));
                                 pending_events.extend(stage_warnings);
@@ -399,7 +391,7 @@ where
                         if has_runtime_error {
                             let boundary = next_pending_data_boundary
                                 .expect("pending recovery data has a codec output boundary")
-                                .input_end;
+                                .0;
                             let (before_pending, after_pending) = outcome.data.split_at(boundary);
                             if !before_pending.is_empty() {
                                 events.push(StreamDecodeEvent::Data(before_pending.to_vec()));
@@ -494,21 +486,20 @@ fn prepare_decode_filters<'a>(
 }
 
 #[derive(Clone, Copy)]
-struct PendingDataBoundary {
-    input_end: usize,
-    finish_before_event: bool,
-}
+struct PendingDataBoundary(usize, bool);
 
 fn decode_codec_prefix(
     spec: crate::stream_filter::FilterSpec<'_>,
     data: &[u8],
     limits: DecodeLimits,
-) -> Result<crate::stream_filter::FilterDecodeOutcome> {
+) -> crate::stream_filter::FilterDecodeOutcome {
     let filter_name = crate::stream_filter::normalize_filter_name(spec.name);
     let mut adapter =
         stream_filter_for(filter_name).expect("a prepared codec has a registered prefix decoder");
     debug_assert!(adapter.set_decode_params(spec.decode_params));
-    adapter.pipe_decode_recovering(data, limits.max_output, &mut |_, _| Ok(()))
+    adapter
+        .pipe_decode_recovering(data, limits.max_output, &mut |_, _| Ok(()))
+        .expect("preflighted codec prefix pipeline is infallible")
 }
 
 /// Report why a filter name has no decode route.
@@ -959,6 +950,76 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(outcome.data, b"@");
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Error(error), StreamDecodeEvent::Data(data)]
+                if error.to_string() == "unsupported PDF feature: unexpected z during base 85 decode"
+                    && data == b"@"
+        ));
+    }
+
+    #[test]
+    fn recovering_decode_preserves_prefix_probe_and_intermediate_error_paths() {
+        let mut decrypt = |_: Option<&Object>, data: &[u8]| Ok(data.to_vec());
+        let two_ascii_hex = Object::Array(vec![
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+        ]);
+
+        let outcome = decode_stream_data_with_filters_and_crypt(
+            Some(&two_ascii_hex),
+            None,
+            b"47G",
+            DecodeLimits::default(),
+            &mut decrypt,
+        )
+        .unwrap();
+        assert!(outcome.data.is_empty());
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Error(error)]
+                if error.to_string()
+                    == "unsupported PDF feature: character out of range during base Hex decode: G"
+        ));
+
+        let finish_outcome = decode_stream_data_with_filters_and_crypt(
+            Some(&two_ascii_hex),
+            None,
+            b"41F",
+            DecodeLimits {
+                max_output: Some(1),
+            },
+            &mut decrypt,
+        )
+        .unwrap();
+        assert!(matches!(
+            &finish_outcome.events[..],
+            [StreamDecodeEvent::Data(data), StreamDecodeEvent::Error(error)]
+                if data == b"\xa0"
+                    && error.to_string()
+                        == "unsupported PDF feature: decoded output exceeds configured limit of 1 bytes"
+        ));
+
+        let three_stages = Object::Array(vec![
+            Object::Name(b"ASCII85Decode".to_vec()),
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+            Object::Name(b"TestRejectDecode".to_vec()),
+        ]);
+        let mut encoded = ascii85::encode(b"4   ");
+        encoded.truncate(encoded.len() - 2);
+        let cleanup = ascii85::encode(b"G");
+        encoded.extend_from_slice(&cleanup[..2]);
+        encoded.push(b'z');
+
+        let outcome = decode_stream_data_with_filters_and_crypt(
+            Some(&three_stages),
+            None,
+            &encoded,
+            DecodeLimits::default(),
+            &mut decrypt,
+        )
+        .unwrap();
         assert_eq!(outcome.data, b"@");
         assert!(matches!(
             &outcome.events[..],
