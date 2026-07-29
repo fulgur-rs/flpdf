@@ -1,20 +1,45 @@
 use std::cell::{Cell, RefCell};
-use std::io;
 use std::rc::Rc;
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use flpdf::json::Json;
+use flpdf::pipeline::{Pipeline, PipelineError, PipelineResult, PlString};
 
-struct MaxWriteSink {
+#[derive(Default)]
+struct RecordingPipeline {
+    bytes: Vec<u8>,
+    finishes: usize,
+}
+
+impl Pipeline for RecordingPipeline {
+    fn identifier(&self) -> &str {
+        "recording"
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> PipelineResult<()> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        self.finishes += 1;
+        Ok(())
+    }
+}
+
+struct MaxWritePipeline {
     bytes: Vec<u8>,
     max_write: usize,
     write_sizes: Vec<usize>,
 }
 
-impl io::Write for MaxWriteSink {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+impl Pipeline for MaxWritePipeline {
+    fn identifier(&self) -> &str {
+        "max-write"
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> PipelineResult<()> {
         if bytes.len() > self.max_write {
-            return Err(io::Error::other(format!(
+            return Err(PipelineError::runtime(format!(
                 "write of {} bytes exceeds {} byte limit",
                 bytes.len(),
                 self.max_write
@@ -22,61 +47,112 @@ impl io::Write for MaxWriteSink {
         }
         self.write_sizes.push(bytes.len());
         self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
+        Ok(())
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn finish(&mut self) -> PipelineResult<()> {
         Ok(())
     }
 }
 
-struct CallbackSink<F> {
+struct CallbackPipeline<F> {
     bytes: Vec<u8>,
     callback: F,
 }
 
-impl<F: FnMut(&[u8])> io::Write for CallbackSink<F> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+impl<F: FnMut(&[u8])> Pipeline for CallbackPipeline<F> {
+    fn identifier(&self) -> &str {
+        "callback"
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> PipelineResult<()> {
         self.bytes.extend_from_slice(bytes);
         (self.callback)(&self.bytes);
-        Ok(bytes.len())
+        Ok(())
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn finish(&mut self) -> PipelineResult<()> {
         Ok(())
     }
 }
 
-struct FlushSink {
+#[derive(Default)]
+struct ChunkRecordingPipeline {
+    chunks: Vec<Vec<u8>>,
+}
+
+impl Pipeline for ChunkRecordingPipeline {
+    fn identifier(&self) -> &str {
+        "chunk-recording"
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> PipelineResult<()> {
+        self.chunks.push(bytes.to_vec());
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
+struct FailOnChunkPipeline {
     bytes: Vec<u8>,
-    flushes: Rc<Cell<usize>>,
+    fail_on: &'static [u8],
+    category: ErrorCategory,
 }
 
-impl io::Write for FlushSink {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
+#[derive(Clone, Copy)]
+enum ErrorCategory {
+    Logic,
+    Runtime,
+}
+
+impl Pipeline for FailOnChunkPipeline {
+    fn identifier(&self) -> &str {
+        "fail-on-chunk"
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        self.flushes.set(self.flushes.get() + 1);
+    fn write(&mut self, bytes: &[u8]) -> PipelineResult<()> {
+        if bytes == self.fail_on {
+            return Err(match self.category {
+                ErrorCategory::Logic => PipelineError::logic("pipeline logic failure"),
+                ErrorCategory::Runtime => PipelineError::runtime("pipeline runtime failure"),
+            });
+        }
+        self.bytes.extend_from_slice(bytes);
         Ok(())
     }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
+fn write_with_pl_string(
+    mut callback: impl FnMut(&mut dyn Pipeline) -> PipelineResult<()>,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut output = PlString::new("json test output", None, &mut bytes);
+        callback(&mut output).unwrap();
+    }
+    bytes
 }
 
 #[test]
 fn incremental_writer_matches_qpdf_nested_bytes() {
-    let mut out = Vec::new();
-    let mut top_first = true;
-    Json::write_dictionary_open(&mut out, &mut top_first, 0).unwrap();
-    Json::write_dictionary_item(&mut out, &mut top_first, b"version", &Json::make_int(2), 1)
-        .unwrap();
-    Json::write_dictionary_key(&mut out, &mut top_first, b"items", 1).unwrap();
-    let mut array_first = true;
-    Json::write_array_open(&mut out, &mut array_first, 1).unwrap();
-    Json::write_array_item(&mut out, &mut array_first, &Json::make_bool(true), 2).unwrap();
-    Json::write_array_close(&mut out, array_first, 1).unwrap();
-    Json::write_dictionary_close(&mut out, top_first, 0).unwrap();
+    let out = write_with_pl_string(|out| {
+        let mut top_first = true;
+        Json::write_dictionary_open(out, &mut top_first, 0)?;
+        Json::write_dictionary_item(out, &mut top_first, b"version", &Json::make_int(2), 1)?;
+        Json::write_dictionary_key(out, &mut top_first, b"items", 1)?;
+        let mut array_first = true;
+        Json::write_array_open(out, &mut array_first, 1)?;
+        Json::write_array_item(out, &mut array_first, &Json::make_bool(true), 2)?;
+        Json::write_array_close(out, array_first, 1)?;
+        Json::write_dictionary_close(out, top_first, 0)
+    });
     assert_eq!(
         out,
         b"{\n  \"version\": 2,\n  \"items\": [\n    true\n  ]\n}"
@@ -85,36 +161,79 @@ fn incremental_writer_matches_qpdf_nested_bytes() {
 
 #[test]
 fn incremental_writer_keeps_empty_containers_compact() {
-    let mut out = Vec::new();
     let mut first = false;
-    Json::write_dictionary_open(&mut out, &mut first, 3).unwrap();
-    assert!(first);
-    Json::write_dictionary_close(&mut out, first, 3).unwrap();
+    let out = write_with_pl_string(|out| {
+        Json::write_dictionary_open(out, &mut first, 3)?;
+        assert!(first);
+        Json::write_dictionary_close(out, first, 3)?;
 
-    Json::write_array_open(&mut out, &mut first, 8).unwrap();
-    assert!(first);
-    Json::write_array_close(&mut out, first, 8).unwrap();
+        Json::write_array_open(out, &mut first, 8)?;
+        assert!(first);
+        Json::write_array_close(out, first, 8)
+    });
 
     assert_eq!(out, b"{}[]");
 }
 
 #[test]
 fn incremental_writer_writes_dictionary_keys_that_are_already_encoded() {
-    let mut out = Vec::new();
-    let mut first = true;
-    Json::write_dictionary_open(&mut out, &mut first, 0).unwrap();
-    Json::write_dictionary_item(&mut out, &mut first, b"line\\n", &Json::make_int(1), 1).unwrap();
-    Json::write_dictionary_close(&mut out, first, 0).unwrap();
+    let out = write_with_pl_string(|out| {
+        let mut first = true;
+        Json::write_dictionary_open(out, &mut first, 0)?;
+        Json::write_dictionary_item(out, &mut first, b"line\\n", &Json::make_int(1), 1)?;
+        Json::write_dictionary_close(out, first, 0)
+    });
 
     assert_eq!(out, b"{\n  \"line\\n\": 1\n}");
 }
 
 #[test]
-fn make_blob_propagates_callback_io_errors() {
-    let blob = Json::make_blob(|_| Err(io::Error::other("blob callback failure")));
+fn quoted_string_is_one_qpdf_pipeline_write() {
+    let mut out = ChunkRecordingPipeline::default();
+
+    Json::make_string(b"line\n\\\"").write(&mut out, 0).unwrap();
+
+    assert_eq!(out.chunks, [b"\"line\\n\\\\\\\"\"".to_vec()]);
+}
+
+#[test]
+fn layout_newline_and_indentation_are_one_qpdf_pipeline_write() {
+    let mut out = ChunkRecordingPipeline::default();
+    let mut first = true;
+
+    Json::write_next(&mut out, &mut first, 2).unwrap();
+    Json::write_next(&mut out, &mut first, 2).unwrap();
+
+    assert!(!first);
+    assert_eq!(out.chunks, [b"\n    ".to_vec(), b",\n    ".to_vec()]);
+}
+
+#[test]
+fn non_empty_container_close_is_one_qpdf_pipeline_write() {
+    let mut out = ChunkRecordingPipeline::default();
+
+    Json::write_dictionary_close(&mut out, false, 1).unwrap();
+    Json::write_array_close(&mut out, false, 2).unwrap();
+
+    assert_eq!(out.chunks, [b"\n  }".to_vec(), b"\n    ]".to_vec()]);
+}
+
+#[test]
+fn dictionary_key_uses_qpdf_layout_and_key_pipeline_writes() {
+    let mut out = ChunkRecordingPipeline::default();
+    let mut first = true;
+
+    Json::write_dictionary_key(&mut out, &mut first, b"line\\n", 1).unwrap();
+
+    assert_eq!(out.chunks, [b"\n  ".to_vec(), b"\"line\\n\": ".to_vec()]);
+}
+
+#[test]
+fn make_blob_propagates_callback_pipeline_errors() {
+    let blob = Json::make_blob(|_| Err(PipelineError::runtime("blob callback failure")));
 
     let error = blob.unparse().unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert!(matches!(error, PipelineError::Runtime(_)));
     assert_eq!(error.to_string(), "blob callback failure");
 }
 
@@ -180,7 +299,7 @@ fn qpdf_string_escape_bytes_are_exact() {
 
 #[test]
 fn qpdf_blob_uses_standard_base64_without_newlines() {
-    let blob = Json::make_blob(|out| out.write_all(b"\x01\x02\x03\x04\x05\xff\xfe\xfd\xfc\xfb"));
+    let blob = Json::make_blob(|out| out.write(b"\x01\x02\x03\x04\x05\xff\xfe\xfd\xfc\xfb"));
     assert_eq!(blob.unparse().unwrap(), b"\"AQIDBAX//v38+w==\"");
 }
 
@@ -188,58 +307,84 @@ fn qpdf_blob_uses_standard_base64_without_newlines() {
 fn qpdf_blob_batches_base64_into_bounded_writes() {
     let bytes = vec![0x5a; 4096];
     let payload = bytes.clone();
-    let blob = Json::make_blob(move |out| out.write_all(&payload));
-    let mut out = MaxWriteSink {
+    let blob = Json::make_blob(move |out| out.write(&payload));
+    let mut out = MaxWritePipeline {
         bytes: Vec::new(),
-        max_write: 8192,
+        max_write: 4,
         write_sizes: Vec::new(),
     };
 
     blob.write(&mut out, 0).unwrap();
 
-    let expected = format!("\"{}\"", STANDARD.encode(bytes)).into_bytes();
+    let expected = format!("\"{}Wg==\"", "Wlpa".repeat(1365)).into_bytes();
     assert_eq!(out.bytes, expected);
-    assert!(
-        out.write_sizes.len() <= 4,
-        "bounded Base64 batching should need at most opening quote, complete groups, tail, and closing quote; got {:?}",
-        out.write_sizes
-    );
+    assert_eq!(out.write_sizes.first(), Some(&1));
+    assert_eq!(out.write_sizes.last(), Some(&1));
+    assert!(out.write_sizes[1..out.write_sizes.len() - 1]
+        .iter()
+        .all(|size| *size == 4));
 }
 
 #[test]
-fn blob_callback_flushes_its_underlying_sink() {
-    let flushes = Rc::new(Cell::new(0));
-    let blob = Json::make_blob(|out| out.flush());
-    let mut out = FlushSink {
-        bytes: Vec::new(),
-        flushes: flushes.clone(),
-    };
+fn blob_callback_receives_pipeline_and_outer_pipeline_is_not_finished() {
+    let blob = Json::make_blob(|out| {
+        out.write(b"\x01")?;
+        out.write(b"\x02\x03\x04")
+    });
+    let mut out = RecordingPipeline::default();
+
+    blob.write(&mut out, 0).unwrap();
+
+    assert_eq!(out.bytes, b"\"AQIDBA==\"");
+    assert_eq!(out.finishes, 0);
+}
+
+#[test]
+fn blob_callback_failure_keeps_prefix_without_tail_or_closing_quote() {
+    let blob = Json::make_blob(|out| {
+        out.write(b"\x01")?;
+        Err(PipelineError::runtime("blob callback failure"))
+    });
+    let mut out = RecordingPipeline::default();
+
+    let error = blob.write(&mut out, 0).unwrap_err();
+
+    assert!(matches!(error, PipelineError::Runtime(_)));
+    assert_eq!(error.message(), "blob callback failure");
+    assert_eq!(out.bytes, b"\"");
+    assert_eq!(out.finishes, 0);
+}
+
+#[test]
+fn blob_callback_finish_does_not_finish_outer_pipeline() {
+    let blob = Json::make_blob(|out| out.finish());
+    let mut out = RecordingPipeline::default();
 
     blob.write(&mut out, 0).unwrap();
 
     assert_eq!(out.bytes, b"\"\"");
-    assert_eq!(flushes.get(), 1);
+    assert_eq!(out.finishes, 0);
 }
 
 #[test]
 fn blob_base64_preserves_pending_bytes_across_split_writes() {
     let one_plus_one = Json::make_blob(|out| {
-        out.write_all(b"x")?;
-        out.write_all(b"y")
+        out.write(b"x")?;
+        out.write(b"y")
     });
     assert_eq!(one_plus_one.unparse().unwrap(), b"\"eHk=\"");
 
     let two_plus_empty = Json::make_blob(|out| {
-        out.write_all(b"xy")?;
-        assert_eq!(out.write(&[])?, 0);
+        out.write(b"xy")?;
+        out.write(&[])?;
         Ok(())
     });
     assert_eq!(two_plus_empty.unparse().unwrap(), b"\"eHk=\"");
 
     let one_plus_one_plus_one = Json::make_blob(|out| {
-        out.write_all(b"x")?;
-        out.write_all(b"y")?;
-        out.write_all(b"z")
+        out.write(b"x")?;
+        out.write(b"y")?;
+        out.write(b"z")
     });
     assert_eq!(one_plus_one_plus_one.unparse().unwrap(), b"\"eHl6\"");
 }
@@ -253,7 +398,7 @@ fn blob_callback_can_reenter_the_same_callback() {
         let nested = nested.clone();
         move |out| {
             if nested.replace(true) {
-                out.write_all(b"x")?;
+                out.write(b"x")?;
             } else {
                 let blob = weak_holder
                     .upgrade()
@@ -281,15 +426,69 @@ fn blob_error_does_not_finalize_a_partial_base64_group() {
     ] {
         let raw = raw.to_vec();
         let blob = Json::make_blob(move |out| {
-            out.write_all(&raw)?;
-            Err(io::Error::other("producer failed"))
+            out.write(&raw)?;
+            Err(PipelineError::runtime("producer failed"))
         });
-        let mut bytes = Vec::new();
+        let mut out = RecordingPipeline::default();
 
-        let error = blob.write(&mut bytes, 0).unwrap_err();
+        let error = blob.write(&mut out, 0).unwrap_err();
 
+        assert!(matches!(error, PipelineError::Runtime(_)));
         assert_eq!(error.to_string(), "producer failed");
-        assert_eq!(bytes, expected);
+        assert_eq!(out.bytes, expected);
+    }
+}
+
+#[test]
+fn blob_base64_finish_failure_keeps_open_quote_and_complete_groups() {
+    let blob = Json::make_blob(|out| out.write(b"abcd"));
+    let mut out = FailOnChunkPipeline {
+        bytes: Vec::new(),
+        fail_on: b"ZA==",
+        category: ErrorCategory::Runtime,
+    };
+
+    let error = blob.write(&mut out, 0).unwrap_err();
+
+    assert!(matches!(error, PipelineError::Runtime(_)));
+    assert_eq!(error.message(), "pipeline runtime failure");
+    assert_eq!(out.bytes, b"\"YWJj");
+}
+
+#[test]
+fn unparse_uses_pl_string_without_finishing() {
+    let value = Json::make_string("value");
+    let mut bytes = Vec::new();
+    let mut downstream = RecordingPipeline::default();
+    {
+        let mut output = PlString::new("unparse", Some(&mut downstream), &mut bytes);
+        value.write(&mut output, 0).unwrap();
+    }
+
+    assert_eq!(bytes, value.unparse().unwrap());
+    assert_eq!(downstream.bytes, bytes);
+    assert_eq!(downstream.finishes, 0);
+}
+
+#[test]
+fn json_write_propagates_pipeline_logic_and_runtime_categories() {
+    for (category, expected_message) in [
+        (ErrorCategory::Logic, "pipeline logic failure"),
+        (ErrorCategory::Runtime, "pipeline runtime failure"),
+    ] {
+        let mut out = FailOnChunkPipeline {
+            bytes: Vec::new(),
+            fail_on: b"42",
+            category,
+        };
+
+        let error = Json::make_int(42).write(&mut out, 0).unwrap_err();
+
+        assert_eq!(error.message(), expected_message);
+        match category {
+            ErrorCategory::Logic => assert!(matches!(error, PipelineError::Logic(_))),
+            ErrorCategory::Runtime => assert!(matches!(error, PipelineError::Runtime(_))),
+        }
     }
 }
 
@@ -301,7 +500,7 @@ fn dictionary_writer_rereads_value_after_key_output() {
         .unwrap();
     let alias = dictionary.clone();
     let replaced = Rc::new(Cell::new(false));
-    let mut sink = CallbackSink {
+    let mut sink = CallbackPipeline {
         bytes: Vec::new(),
         callback: {
             let replaced = replaced.clone();
@@ -330,7 +529,7 @@ fn dictionary_writer_starts_iteration_after_opening_brace() {
         .unwrap();
     let alias = dictionary.clone();
     let inserted = Rc::new(Cell::new(false));
-    let mut sink = CallbackSink {
+    let mut sink = CallbackPipeline {
         bytes: Vec::new(),
         callback: {
             let inserted = inserted.clone();
@@ -356,7 +555,7 @@ fn array_writer_snapshots_elements_after_opening_bracket() {
     array.add_array_element(Json::make_int(1)).unwrap();
     let alias = array.clone();
     let inserted = Rc::new(Cell::new(false));
-    let mut sink = CallbackSink {
+    let mut sink = CallbackPipeline {
         bytes: Vec::new(),
         callback: {
             let inserted = inserted.clone();
@@ -416,13 +615,13 @@ fn dictionary_writer_observes_live_mutations_from_blob_callback() {
 }
 
 #[test]
-fn dictionary_writer_stops_after_blob_io_error() {
+fn dictionary_writer_stops_after_blob_pipeline_error() {
     let later_visits = Rc::new(Cell::new(0));
     let dictionary = Json::make_dictionary();
     dictionary
         .add_dictionary_member(
             b"a",
-            Json::make_blob(|_| Err(io::Error::other("first blob failed"))),
+            Json::make_blob(|_| Err(PipelineError::runtime("first blob failed"))),
         )
         .unwrap();
     dictionary
@@ -437,12 +636,13 @@ fn dictionary_writer_stops_after_blob_io_error() {
             }),
         )
         .unwrap();
-    let mut out = Vec::new();
+    let mut out = RecordingPipeline::default();
 
     let error = dictionary.write(&mut out, 0).unwrap_err();
 
+    assert!(matches!(error, PipelineError::Runtime(_)));
     assert_eq!(error.to_string(), "first blob failed");
-    assert_eq!(out, b"{\n  \"a\": \"");
+    assert_eq!(out.bytes, b"{\n  \"a\": \"");
     assert_eq!(later_visits.get(), 0);
 }
 

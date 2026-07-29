@@ -1,184 +1,111 @@
 //! qpdf correspondence: JSON.cc incremental serialization and blob Base64 responsibilities.
+//!
+//! Writers leave the caller-supplied outer pipeline unfinished. Blob
+//! serialization finishes only its internally owned Base64 stage.
 
-use std::io::{self, Write};
-
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use crate::pipeline::{Base64Action, Pipeline, PipelineResult, PlBase64, PlConcatenate, PlString};
 
 use super::value::{ContainerOrBlobSnapshot, ValueSnapshot};
 use super::Json;
 
-const BASE64_INPUT_CHUNK_LEN: usize = 6 * 1024;
-const BASE64_OUTPUT_CHUNK_LEN: usize = BASE64_INPUT_CHUNK_LEN / 3 * 4;
-
-struct Base64Writer<'a, W: Write + ?Sized> {
-    out: &'a mut W,
-    pending: [u8; 3],
-    pending_len: usize,
-}
-
-impl<'a, W: Write + ?Sized> Base64Writer<'a, W> {
-    fn new(out: &'a mut W) -> Self {
-        Self {
-            out,
-            pending: [0; 3],
-            pending_len: 0,
-        }
-    }
-
-    fn write_complete_groups(&mut self, groups: &[u8]) -> io::Result<()> {
-        debug_assert!(!groups.is_empty());
-        debug_assert_eq!(groups.len() % 3, 0);
-        debug_assert!(groups.len() <= BASE64_INPUT_CHUNK_LEN);
-
-        let mut encoded = [0; BASE64_OUTPUT_CHUNK_LEN];
-        let encoded_len = STANDARD
-            .encode_slice(groups, &mut encoded)
-            .expect("complete Base64 groups fit in the bounded output chunk");
-        self.out.write_all(&encoded[..encoded_len])
-    }
-
-    fn finish(self) -> io::Result<()> {
-        if self.pending_len != 0 {
-            let encoded = STANDARD.encode(&self.pending[..self.pending_len]);
-            self.out.write_all(encoded.as_bytes())?;
-        }
-        Ok(())
-    }
-}
-
-impl<W: Write + ?Sized> Write for Base64Writer<'_, W> {
-    fn write(&mut self, mut input: &[u8]) -> io::Result<usize> {
-        let input_len = input.len();
-
-        if self.pending_len != 0 {
-            let needed = 3 - self.pending_len;
-            let copied = needed.min(input.len());
-            self.pending[self.pending_len..self.pending_len + copied]
-                .copy_from_slice(&input[..copied]);
-            self.pending_len += copied;
-            input = &input[copied..];
-            if self.pending_len == 3 {
-                let group = self.pending;
-                self.write_complete_groups(&group)?;
-                self.pending_len = 0;
-            }
-            if input.is_empty() {
-                return Ok(input_len);
-            }
-        }
-
-        while input.len() >= 3 {
-            let complete_len = input.len().min(BASE64_INPUT_CHUNK_LEN) / 3 * 3;
-            self.write_complete_groups(&input[..complete_len])?;
-            input = &input[complete_len..];
-        }
-
-        self.pending[..input.len()].copy_from_slice(input);
-        self.pending_len = input.len();
-        Ok(input_len)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.out.flush()
-    }
-}
-
 impl Json {
     pub fn write_dictionary_open(
-        out: &mut (impl Write + ?Sized),
+        out: &mut dyn Pipeline,
         first: &mut bool,
         _depth: usize,
-    ) -> io::Result<()> {
-        out.write_all(b"{")?;
+    ) -> PipelineResult<()> {
+        out.write(b"{")?;
         *first = true;
         Ok(())
     }
 
     pub fn write_array_open(
-        out: &mut (impl Write + ?Sized),
+        out: &mut dyn Pipeline,
         first: &mut bool,
         _depth: usize,
-    ) -> io::Result<()> {
-        out.write_all(b"[")?;
+    ) -> PipelineResult<()> {
+        out.write(b"[")?;
         *first = true;
         Ok(())
     }
 
     pub fn write_dictionary_close(
-        out: &mut (impl Write + ?Sized),
+        out: &mut dyn Pipeline,
         first: bool,
         depth: usize,
-    ) -> io::Result<()> {
+    ) -> PipelineResult<()> {
         write_close(out, first, depth, b"}")
     }
 
     pub fn write_array_close(
-        out: &mut (impl Write + ?Sized),
+        out: &mut dyn Pipeline,
         first: bool,
         depth: usize,
-    ) -> io::Result<()> {
+    ) -> PipelineResult<()> {
         write_close(out, first, depth, b"]")
     }
 
     pub fn write_dictionary_item(
-        out: &mut (impl Write + ?Sized),
+        out: &mut dyn Pipeline,
         first: &mut bool,
         key: &[u8],
         value: &Json,
         depth: usize,
-    ) -> io::Result<()> {
+    ) -> PipelineResult<()> {
         Self::write_dictionary_key(out, first, key, depth)?;
         value.write(out, depth)
     }
 
     pub fn write_dictionary_key(
-        out: &mut (impl Write + ?Sized),
+        out: &mut dyn Pipeline,
         first: &mut bool,
         encoded_key: &[u8],
         depth: usize,
-    ) -> io::Result<()> {
+    ) -> PipelineResult<()> {
         Self::write_next(out, first, depth)?;
-        out.write_all(b"\"")?;
-        out.write_all(encoded_key)?;
-        out.write_all(b"\": ")
+        let mut item = Vec::with_capacity(encoded_key.len() + 4);
+        item.push(b'"');
+        item.extend_from_slice(encoded_key);
+        item.extend_from_slice(b"\": ");
+        out.write(&item)
     }
 
     pub fn write_array_item(
-        out: &mut (impl Write + ?Sized),
+        out: &mut dyn Pipeline,
         first: &mut bool,
         value: &Json,
         depth: usize,
-    ) -> io::Result<()> {
+    ) -> PipelineResult<()> {
         Self::write_next(out, first, depth)?;
         value.write(out, depth)
     }
 
     pub fn write_next(
-        out: &mut (impl Write + ?Sized),
+        out: &mut dyn Pipeline,
         first: &mut bool,
         depth: usize,
-    ) -> io::Result<()> {
-        if *first {
+    ) -> PipelineResult<()> {
+        let prefix = if *first {
             *first = false;
-            out.write_all(b"\n")?;
+            b"\n".as_slice()
         } else {
-            out.write_all(b",\n")?;
-        }
-        write_indent(out, depth)
+            b",\n".as_slice()
+        };
+        write_indented(out, prefix, depth, b"")
     }
 
-    pub fn write(&self, out: &mut (impl Write + ?Sized), depth: usize) -> io::Result<()> {
+    pub fn write(&self, out: &mut dyn Pipeline, depth: usize) -> PipelineResult<()> {
         match self.value_snapshot() {
-            None => out.write_all(b"null"),
-            Some(ValueSnapshot::Number(value)) => out.write_all(&value),
-            Some(ValueSnapshot::Bool(value)) => {
-                out.write_all(if value { b"true" } else { b"false" })
-            }
-            Some(ValueSnapshot::Null) => out.write_all(b"null"),
+            None => out.write(b"null"),
+            Some(ValueSnapshot::Number(value)) => out.write(&value),
+            Some(ValueSnapshot::Bool(value)) => out.write(if value { b"true" } else { b"false" }),
+            Some(ValueSnapshot::Null) => out.write(b"null"),
             Some(ValueSnapshot::String(encoded)) => {
-                out.write_all(b"\"")?;
-                out.write_all(&encoded)?;
-                out.write_all(b"\"")
+                let mut quoted = Vec::with_capacity(encoded.len() + 2);
+                quoted.push(b'"');
+                quoted.extend_from_slice(&encoded);
+                quoted.push(b'"');
+                out.write(&quoted)
             }
             Some(other) => write_container_or_blob(
                 self,
@@ -191,32 +118,34 @@ impl Json {
         }
     }
 
-    pub fn unparse(&self) -> io::Result<Vec<u8>> {
-        let mut out = Vec::new();
-        self.write(&mut out, 0)?;
-        Ok(out)
+    pub fn unparse(&self) -> PipelineResult<Vec<u8>> {
+        let mut bytes = Vec::new();
+        {
+            let mut output = PlString::new("unparse", None, &mut bytes);
+            self.write(&mut output, 0)?;
+        }
+        Ok(bytes)
     }
 }
 
 fn write_close(
-    out: &mut (impl Write + ?Sized),
+    out: &mut dyn Pipeline,
     first: bool,
     depth: usize,
     delimiter: &[u8],
-) -> io::Result<()> {
+) -> PipelineResult<()> {
     if !first {
-        out.write_all(b"\n")?;
-        write_indent(out, depth)?;
+        return write_indented(out, b"\n", depth, delimiter);
     }
-    out.write_all(delimiter)
+    out.write(delimiter)
 }
 
 fn write_container_or_blob(
     owner: &Json,
     value: ContainerOrBlobSnapshot,
-    out: &mut (impl Write + ?Sized),
+    out: &mut dyn Pipeline,
     depth: usize,
-) -> io::Result<()> {
+) -> PipelineResult<()> {
     match value {
         ContainerOrBlobSnapshot::Dictionary => {
             let mut first = true;
@@ -244,18 +173,30 @@ fn write_container_or_blob(
             Json::write_array_close(out, first, depth)
         }
         ContainerOrBlobSnapshot::Blob(writer) => {
-            out.write_all(b"\"")?;
-            let mut encoder = Base64Writer::new(&mut *out);
-            writer(&mut encoder)?;
-            encoder.finish()?;
-            out.write_all(b"\"")
+            out.write(b"\"")?;
+            {
+                let mut concatenate = PlConcatenate::new("blob concatenate", out);
+                let mut base64 =
+                    PlBase64::new("blob base64", &mut concatenate, Base64Action::Encode);
+                writer(&mut base64)?;
+                base64.finish()?;
+            }
+            out.write(b"\"")
         }
     }
 }
 
-fn write_indent(out: &mut (impl Write + ?Sized), depth: usize) -> io::Result<()> {
+fn write_indented(
+    out: &mut dyn Pipeline,
+    prefix: &[u8],
+    depth: usize,
+    suffix: &[u8],
+) -> PipelineResult<()> {
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(prefix);
     for _ in 0..depth {
-        out.write_all(b"  ")?;
+        chunk.extend_from_slice(b"  ");
     }
-    Ok(())
+    chunk.extend_from_slice(suffix);
+    out.write(&chunk)
 }

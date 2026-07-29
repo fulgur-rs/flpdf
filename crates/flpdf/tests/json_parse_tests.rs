@@ -623,7 +623,7 @@ fn parser_retries_interrupted_reads_between_chunks_without_changing_reactions() 
 }
 
 #[test]
-fn parser_emits_reactor_events_before_a_later_reader_error() {
+fn parser_classifies_reader_errors_as_parse_after_emitting_reactor_events() {
     let mut reader = ChunkThenErrorReader {
         chunk: br#"{"first":1,"#,
         emitted: false,
@@ -632,7 +632,12 @@ fn parser_emits_reactor_events_before_a_later_reader_error() {
 
     let error = Json::parse_reader(&mut reader, Some(&mut reactor)).unwrap_err();
 
-    assert_eq!(error.to_string(), "reader failure after first member");
+    match error {
+        JsonError::Parse(message) => {
+            assert_eq!(message.as_bytes(), b"reader failure after first member");
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
     assert_eq!(
         reactor.events,
         ["dict-start", "dict-item:first:1"],
@@ -641,12 +646,14 @@ fn parser_emits_reactor_events_before_a_later_reader_error() {
 }
 
 #[test]
-fn parser_reads_scalars_from_readers_and_preserves_io_errors() {
+fn parser_classifies_reader_errors_as_parse() {
     let mut reader = Cursor::new(b"  42\n".as_slice());
     let value = Json::parse_reader(&mut reader, None).unwrap();
     assert_eq!(value.get_number().as_deref(), Some(b"42".as_slice()));
     assert_eq!((value.start(), value.end()), (2, 4));
 
-    let error = Json::parse_reader(&mut FailingReader, None).unwrap_err();
-    assert_eq!(error.to_string(), "reader failure");
+    match Json::parse_reader(&mut FailingReader, None).unwrap_err() {
+        JsonError::Parse(message) => assert_eq!(message.as_bytes(), b"reader failure"),
+        other => panic!("expected parse error, got {other:?}"),
+    }
 }

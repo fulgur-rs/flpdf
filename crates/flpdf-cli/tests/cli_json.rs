@@ -23,6 +23,132 @@ fn is_qpdf_available() -> bool {
         .unwrap_or(false)
 }
 
+const EXPECTED_QPDF_ORACLE_VERSION: &str = "11.9.0";
+const QPDF_ORACLE_SKIP_CHILD: &str = "FLPDF_QPDF_ORACLE_SKIP_CHILD";
+
+#[derive(Debug, PartialEq, Eq)]
+enum QpdfOracleAction {
+    Run,
+    Skip(String),
+    ConfigurationFailure(String),
+}
+
+fn qpdf_oracle_action(version_stdout: Result<&[u8], String>, on_ci: bool) -> QpdfOracleAction {
+    let expected = format!("qpdf version {EXPECTED_QPDF_ORACLE_VERSION}");
+    let reason = match version_stdout {
+        Ok(stdout) => {
+            let stdout = String::from_utf8_lossy(stdout);
+            match stdout.lines().next().map(str::trim) {
+                Some(found) if found == expected => return QpdfOracleAction::Run,
+                Some(found) => format!("expected {expected}, found {found}"),
+                None => format!("expected {expected}, found <no version output>"),
+            }
+        }
+        Err(reason) => reason,
+    };
+    if on_ci {
+        QpdfOracleAction::ConfigurationFailure(reason)
+    } else {
+        QpdfOracleAction::Skip(reason)
+    }
+}
+
+#[must_use]
+fn skip_unless_qpdf_11_9() -> bool {
+    let on_ci = std::env::var_os("CI").is_some();
+    let action = match ShellCommand::new("qpdf").arg("--version").output() {
+        Ok(output) if output.status.success() => qpdf_oracle_action(Ok(&output.stdout), on_ci),
+        Ok(output) => qpdf_oracle_action(
+            Err(format!("qpdf --version exited with {}", output.status)),
+            on_ci,
+        ),
+        Err(error) => {
+            qpdf_oracle_action(Err(format!("unable to run qpdf --version: {error}")), on_ci)
+        }
+    };
+    match action {
+        QpdfOracleAction::Run => false,
+        QpdfOracleAction::Skip(reason) => {
+            let mut stderr = std::io::stderr().lock();
+            writeln!(stderr, "skipping qpdf JSON /dev/full oracle: {reason}")
+                .expect("write qpdf JSON oracle skip reason");
+            true
+        }
+        QpdfOracleAction::ConfigurationFailure(reason) => {
+            panic!("qpdf JSON oracle configuration failure on CI: {reason}")
+        }
+    }
+}
+
+#[test]
+fn qpdf_oracle_guard_accepts_exact_11_9_first_line() {
+    assert_eq!(
+        qpdf_oracle_action(Ok(b"qpdf version 11.9.0\nRun qpdf --copyright\n"), false),
+        QpdfOracleAction::Run
+    );
+}
+
+#[test]
+fn qpdf_oracle_guard_reports_mismatch_locally_and_fails_ci() {
+    let found = b"qpdf version 12.0.0\n";
+
+    assert_eq!(
+        qpdf_oracle_action(Ok(found), false),
+        QpdfOracleAction::Skip(
+            "expected qpdf version 11.9.0, found qpdf version 12.0.0".to_string()
+        )
+    );
+    assert_eq!(
+        qpdf_oracle_action(Ok(found), true),
+        QpdfOracleAction::ConfigurationFailure(
+            "expected qpdf version 11.9.0, found qpdf version 12.0.0".to_string()
+        )
+    );
+}
+
+#[test]
+fn qpdf_oracle_guard_reports_missing_binary_locally_and_fails_ci() {
+    let missing = Err("unable to run qpdf --version: qpdf not found".to_string());
+
+    assert_eq!(
+        qpdf_oracle_action(missing.clone(), false),
+        QpdfOracleAction::Skip("unable to run qpdf --version: qpdf not found".to_string())
+    );
+    assert_eq!(
+        qpdf_oracle_action(missing, true),
+        QpdfOracleAction::ConfigurationFailure(
+            "unable to run qpdf --version: qpdf not found".to_string()
+        )
+    );
+}
+
+#[test]
+fn qpdf_oracle_guard_local_skip_child() {
+    if std::env::var_os(QPDF_ORACLE_SKIP_CHILD).is_none() {
+        return;
+    }
+    assert!(skip_unless_qpdf_11_9());
+}
+
+#[test]
+fn qpdf_oracle_guard_exposes_local_skip_reason_without_nocapture() {
+    let empty_path = tempfile::tempdir().unwrap();
+    let output = ShellCommand::new(std::env::current_exe().unwrap())
+        .args(["--exact", "qpdf_oracle_guard_local_skip_child"])
+        .env(QPDF_ORACLE_SKIP_CHILD, "1")
+        .env("PATH", empty_path.path())
+        .env_remove("CI")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("skipping qpdf JSON /dev/full oracle: unable to run qpdf --version:"),
+        "{output:?}"
+    );
+}
+
 /// One-page PDF with a single content stream so we have at least one stream
 /// object in the qpdf section.
 fn one_page_pdf_with_stream() -> Vec<u8> {
@@ -181,6 +307,58 @@ fn json_flag_outputs_json_to_stdout() {
         .stdout(predicate::str::contains("\"pages\""))
         // stderr is empty — no spurious warnings for a clean PDF
         .stderr(predicate::str::is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn json_stdout_to_dev_full_matches_qpdf_success() {
+    use std::fs::File;
+    use std::process::Stdio;
+
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--json=2"])
+        .arg(input.path())
+        .stdout(Stdio::from(File::create("/dev/full").unwrap()))
+        .output()
+        .unwrap();
+    let flpdf = ShellCommand::new(assert_cmd::cargo_bin!("flpdf"))
+        .args(["--json=2"])
+        .arg(input.path())
+        .stdout(Stdio::from(File::create("/dev/full").unwrap()))
+        .output()
+        .unwrap();
+    assert!(qpdf.status.success(), "{qpdf:?}");
+    assert!(flpdf.status.success(), "{flpdf:?}");
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn json_output_dev_full_matches_qpdf_success() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+    let input = write_temp_pdf(&one_page_pdf_with_stream());
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--json=2"])
+        .arg(input.path())
+        .arg("/dev/full")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--json-output=/dev/full"])
+        .arg(input.path())
+        .output()
+        .unwrap();
+    assert!(qpdf.status.success(), "{qpdf:?}");
+    assert!(flpdf.status.success(), "{flpdf:?}");
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
 #[test]
@@ -1089,6 +1267,7 @@ fn file_stream_to_dev_full_matches_qpdf_success_and_complete_json() {
         .output()
         .unwrap();
     assert!(qpdf.status.success(), "{qpdf:?}");
+    serde_json::from_slice::<serde_json::Value>(&qpdf.stdout).unwrap();
 
     let flpdf = Command::cargo_bin("flpdf")
         .unwrap()

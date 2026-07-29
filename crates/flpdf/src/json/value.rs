@@ -2,8 +2,9 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
 use std::rc::Rc;
+
+use crate::pipeline::{Pipeline, PipelineResult};
 
 use super::JsonMessage;
 
@@ -13,14 +14,12 @@ pub enum JsonError {
     Type(JsonMessage),
     #[error("{0}")]
     Parse(JsonMessage),
-    #[error(transparent)]
-    Io(#[from] io::Error),
 }
 
 #[derive(Clone, Default)]
 pub struct Json(Option<Rc<RefCell<Members>>>);
 
-type BlobWriter = Rc<dyn Fn(&mut dyn io::Write) -> io::Result<()>>;
+type BlobWriter = Rc<dyn Fn(&mut dyn Pipeline) -> PipelineResult<()>>;
 
 impl std::fmt::Debug for Json {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -175,7 +174,7 @@ impl Json {
         Self::with_value(Value::Null)
     }
 
-    pub fn make_blob(callback: impl Fn(&mut dyn io::Write) -> io::Result<()> + 'static) -> Self {
+    pub fn make_blob(callback: impl Fn(&mut dyn Pipeline) -> PipelineResult<()> + 'static) -> Self {
         Self::with_value(Value::Blob(Rc::new(callback)))
     }
 
@@ -395,7 +394,7 @@ fn format_qpdf_real(value: f64) -> String {
     encoded
 }
 
-fn encode_string(value: &[u8]) -> Vec<u8> {
+pub(super) fn encode_string(value: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(value.len());
     for &byte in value {
         match byte {
@@ -512,7 +511,7 @@ mod tests {
 
     #[test]
     fn blob_writer_base64_encodes_the_bytes_produced_by_its_callback() {
-        let blob = Json::with_value(Value::Blob(Rc::new(|out| out.write_all(b"\x00\xff"))));
+        let blob = Json::with_value(Value::Blob(Rc::new(|out| out.write(b"\x00\xff"))));
 
         assert_eq!(blob.unparse().unwrap(), b"\"AP8=\"");
     }
