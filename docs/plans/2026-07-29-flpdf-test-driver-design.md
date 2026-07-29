@@ -257,21 +257,29 @@ unparseResolved: <…>
 - stream は raw（`Stream.data` をそのまま）と decoded（`decode_stream_data`）を両方 stdout へ。
   decode 失敗時は `Stream data is not filterable.`
 - `array` / `dictionary` は要素ごとに `  item N is {in,}direct` / `  /key is {in,}direct`
-- **decode の前に `/Filter` と `/DecodeParms` を要素ごと (element-wise) に解決する。**
+- **decode の前に `/Filter` と `/DecodeParms` を § 4 の参照チェーン解決で解決する
+  ——top-level・配列要素のどちらも、両方とも多段チェーンでありうる。**
   `decode_stream_data` は `dict.get("Filter")` / `dict.get("DecodeParms")` を直接
   `decode_stream_data_with_filters` へ渡すだけで間接参照を解決しない（`filters.rs`）。
   `Object::Reference` が来ると `decode_filter_specs`（`stream_filter.rs:55-59`）が
-  `Unsupported` を返す。既存の `flpdf-qtest-tools`（旧 `flpdf-test-compare`）の
-  `compare.rs` の `resolve_stream_keys` は全く同じ理由で存在するが、**top-level の
-  1 hop しか見ていない** — `/Filter [8 0 R]`（配列要素が間接参照）は
-  `decode_filter_specs`（`stream_filter.rs:47-53`）が各要素へ直接 `as_name()` を
-  呼ぶだけなので、`resolve_stream_keys` を通しても依然として失敗する。qpdf は
-  `QPDFObjectHandle::isName()` の自動 dereference で配列要素も解決するため、
-  `/Filter` と `/DecodeParms` が **配列の場合は要素ごとに** `§4 の参照チェーン解決`
-  を適用してから `decode_stream_data` へ渡す（top-level が配列でない場合は従来どおり
-  1 回の解決で足りる）。`resolve_stream_keys` 自体のこの限界は `flpdf-qtest-tools`
-  側の compare 精度（zlib 差異の許容漏れ、false-negative）にも影響するが、
-  test_driver の設計としては新規実装側だけを正しくすれば足りる
+  `Unsupported` を返す。
+  - **top-level が多段チェーンでも 1 hop では足りない。** `/Filter 8 0 R` で obj 8 の
+    中身が `9 0 R`、obj 9 が `/FlateDecode` という 2 hop 以上の形は、1 回だけの
+    `resolve` では `Object::Reference` のまま残り `decode_filter_specs` の
+    `Some(_) => Err` に落ちる。§4 のチェーン解決子をここにも適用する。
+  - **配列要素も同様。** `/Filter [8 0 R]`（配列要素が間接参照）は
+    `decode_filter_specs`（`stream_filter.rs:47-53`）が各要素へ直接 `as_name()` を
+    呼ぶだけなので、要素ごとに §4 のチェーン解決を適用してから渡す必要がある。
+  
+  qpdf は `QPDFObjectHandle::isName()` の自動 dereference で top-level・配列要素
+  いずれもチェーンの終端まで解決するので、flpdf 側も**値の形（直接参照か配列か）で
+  分岐せず、resolve 対象を毎回 §4 の同じチェーン解決子に通す**のが正しい設計。
+  既存の `flpdf-qtest-tools`（旧 `flpdf-test-compare`）の `compare.rs` の
+  `resolve_stream_keys` は全く同じ理由で存在するが 1 hop しか見ておらず
+  （top-level・配列要素どちらも未対応）、この限界は `flpdf-qtest-tools` 側の
+  compare 精度（zlib 差異の許容漏れ、false-negative）にも影響する
+  （flpdf-n9t0.8、follow-up）。test_driver の設計としては新規実装側だけを
+  正しくすれば足りる
 
 この 20 subtest は既存の flpdf 公開 API だけで完結する — `Pdf::open_mem` / `trailer()` /
 `resolve_borrowed()` / `Stream { pub dict, pub data }` / `decode_stream_data` /
@@ -340,6 +348,10 @@ tests/fixtures/test_driver/
                                   追加できない — §4 参照）
   stream_flate.{pdf,out}         raw / uncompressed / dict unparse
   stream_indirect_filter.{pdf,out}       /Filter 自体が間接参照のストリーム（§5 参照）
+  stream_chained_filter.{pdf,out}        /Filter 8 0 R で obj 8 の中身が 9 0 R、
+                                          obj 9 が /FlateDecode という 2 hop 以上の
+                                          top-level チェーン（§5 参照。1 回だけの
+                                          resolve では Object::Reference が残り失敗する）
   stream_indirect_filter_array.{pdf,out} /Filter が [8 0 R] のように配列要素が
                                           間接参照のストリーム（§5 参照。
                                           top-level 1 hop の resolve では救えない）
@@ -355,7 +367,12 @@ tests/fixtures/test_driver/
 
 **通常の `cargo test` が実際にこの比較を行う経路**: `crates/flpdf-qtest-tools/tests/driver_goldens.rs`
 がコミット済みの `tests/fixtures/test_driver/*.{pdf,out}` を読み、`flpdf-test-driver` を
-`assert_cmd` 経由で起動して stdout を `.out` と突き合わせる（qpdf ビルド不要）。
+`assert_cmd` 経由で起動して stdout を `.out` と突き合わせ、**かつ `.assert().success()`
+で exit code 0 もアサートする**（qpdf ビルド不要）。`assert_cmd::Command::output()` は
+非 0 終了でも stdout を返すため、stdout 比較だけでは「期待どおりのバイトを出力してから
+exit 2 する」回帰を見逃す — qtest 自身は `basic-parsing.test` の
+`EXIT_STATUS => 0` で終了コードを見ているので、golden テスト側もこれを見ないと
+qtest が FAIL とみなすケースを golden が PASS させてしまう。
 `scripts/qpdf-test-driver-diff.sh`（既存の `qpdf-{tokenizer,rc4,lzw-png,stream-codecs}-diff.sh`
 と同じ形）は別役割で、`scripts/fetch-qpdf-source.sh` で pinned source を取り本物の
 `test_driver` をビルドして fixture を再生成・オラクル照合するための開発者ツール。
