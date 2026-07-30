@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDF_String.cc UTF-8 value, Unicode-string construction, and forced binary unparsing exposed only to qtest helper binaries.
 //! qpdf string operations exposed only to the qtest helper binaries.
 
 /// Return qpdf's UTF-8 view of one stored PDF string.
