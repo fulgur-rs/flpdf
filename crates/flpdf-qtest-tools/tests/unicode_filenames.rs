@@ -109,8 +109,7 @@ fn input_missing_errors_opening_files_and_exits_two() {
 #[test]
 fn output_is_directory_errors_opening_files_and_exits_two() {
     let dir = tempfile::tempdir().expect("create tempdir");
-    fs::write(dir.path().join("minimal.pdf"), minimal_pdf_bytes())
-        .expect("write minimal.pdf");
+    fs::write(dir.path().join("minimal.pdf"), minimal_pdf_bytes()).expect("write minimal.pdf");
     fs::create_dir(dir.path().join("auto-ü.pdf")).expect("create dir auto-ü.pdf");
 
     let output = Command::cargo_bin("flpdf-test-unicode-filenames")
@@ -150,8 +149,7 @@ fn read_write_error_exits_two() {
     // We still assert the binary is runnable (it exists and compiles) as a
     // smoke check — if the binary panics on startup we'd see a non-2 exit.
     let dir = tempfile::tempdir().expect("create tempdir");
-    fs::write(dir.path().join("minimal.pdf"), minimal_pdf_bytes())
-        .expect("write minimal.pdf");
+    fs::write(dir.path().join("minimal.pdf"), minimal_pdf_bytes()).expect("write minimal.pdf");
 
     let output = Command::cargo_bin("flpdf-test-unicode-filenames")
         .unwrap()

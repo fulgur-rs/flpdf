@@ -8,7 +8,7 @@ fn do_copy(input: &Path, output: &Path) {
     let mut f_in = match File::open(input) {
         Ok(f) => f,
         Err(_) => {
-            eprint!("errors opening files\n");
+            eprintln!("errors opening files");
             std::process::exit(2);
         }
     };
@@ -16,7 +16,7 @@ fn do_copy(input: &Path, output: &Path) {
     let mut f_out = match File::create(output) {
         Ok(f) => f,
         Err(_) => {
-            eprint!("errors opening files\n");
+            eprintln!("errors opening files");
             std::process::exit(2);
         }
     };
@@ -27,12 +27,12 @@ fn do_copy(input: &Path, output: &Path) {
             Ok(0) => return,
             Ok(n) => {
                 if f_out.write_all(&buf[..n]).is_err() {
-                    eprint!("errors reading or writing\n");
+                    eprintln!("errors reading or writing");
                     std::process::exit(2);
                 }
             }
             Err(_) => {
-                eprint!("errors reading or writing\n");
+                eprintln!("errors reading or writing");
                 std::process::exit(2);
             }
         }
@@ -47,5 +47,5 @@ fn main() {
     do_copy(src, dst1);
     do_copy(src, dst2);
 
-    print!("created Unicode filenames\n");
+    println!("created Unicode filenames");
 }
