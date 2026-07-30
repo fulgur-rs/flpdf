@@ -1467,12 +1467,16 @@ impl<R: Read + Seek> Pdf<R> {
         ))
     }
 
-    // Convert an already-resolved legacy `Object` into an `ObjectValue`.
-    //
-    // Handles scalars, arrays, and dictionaries. `Object::Stream`'s dict/data
-    // split is not implemented here (falls back to `ObjectValue::Null`), nor
-    // are the content-stream-only `Object::Operator`/`Object::InlineImage`
-    // variants, which never appear as the resolved value of a file object.
+    // Convert an already-resolved legacy `Object` into an `ObjectValue`. Since
+    // this task reroutes Uncompressed objects to a native parse instead
+    // (`native_parse_uncompressed_value`), the only remaining caller of this
+    // function resolves Compressed (ObjStm-member) objects, which can never
+    // themselves be `Object::Stream` — so its dict/data split is not
+    // implemented here (falls back to `ObjectValue::Null`, unreachable in
+    // practice; see the `Object::Stream` match arm below). The
+    // content-stream-only `Object::Operator`/`Object::InlineImage` variants
+    // are equally unreachable, as is `Object::Reference` (filtered out by
+    // `lift_to_handle` before it would ever reach here).
     //
     // `depth` bounds inline `Array`/`Dictionary` nesting against
     // `MAX_INLINE_DEPTH`, mirroring every other post-parse structural walker
@@ -1508,10 +1512,24 @@ impl<R: Read + Seek> Pdf<R> {
                     .map(|(k, v)| Ok((k.to_vec(), self.lift_to_handle(v, depth + 1)?)))
                     .collect::<Result<std::collections::BTreeMap<_, _>>>()?,
             ),
+            // Unreachable via `lift`'s only remaining callers now that this
+            // task reroutes Uncompressed objects away from it: `Object::Stream`
+            // can no longer reach here (a Compressed/ObjStm member, `lift`'s
+            // sole caller's remaining case, can never itself be a stream —
+            // that PDF spec constraint is why Task 6's stream test, the one
+            // case that used to exercise this arm via an Uncompressed
+            // fixture, now asserts a real materialized stream value instead,
+            // see `resolve_object_handle_survives_a_cyclic_indirect_stream_length`);
+            // `Object::Operator`/`Object::InlineImage` are content-stream-only
+            // and never a resolved file/ObjStm object value; `Object::Reference`
+            // never survives to a top-level resolved value (qpdf integerizes
+            // a bare top-level reference before caching it, and
+            // `lift_to_handle` filters `Object::Reference` out before ever
+            // calling `lift`).
             Object::Stream(_)
             | Object::Operator(_)
             | Object::InlineImage(_)
-            | Object::Reference(_) => ObjectValue::Null,
+            | Object::Reference(_) => ObjectValue::Null, // cov:ignore: unreachable per the invariants noted above
         };
         Ok(value)
     }
