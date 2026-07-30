@@ -1358,8 +1358,13 @@ impl<R: Read + Seek> Pdf<R> {
     /// rare case where the object's cross-reference layout is malformed or
     /// overlapping enough that the native parse's own read window is
     /// insufficient, this falls back to the no-offset sentinel rather than
-    /// failing — this method never fails to resolve an object that
-    /// [`Pdf::resolve_borrowed`] resolves successfully.
+    /// failing.
+    ///
+    /// This method never fails on a plain nesting/malformed-layout case
+    /// alone; the one narrow exception is a malformed/overlapping xref
+    /// layout combined with inline nesting beyond `MAX_INLINE_DEPTH`,
+    /// sharing the same bound already applied unconditionally to compressed
+    /// (ObjStm-member) references.
     ///
     /// # Errors
     ///

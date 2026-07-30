@@ -1685,6 +1685,29 @@ mod handle_path_parity_tests {
         );
     }
 
+    // Unlike this file's `content_mode_preserves_the_object_nesting_guard`
+    // sibling (which calls its `assert_*` helper directly on the default
+    // test-harness thread), this one must not: the native handle-producing
+    // path's measured per-frame stack cost in an unoptimized build (see the
+    // `native_handle_path_nesting_guard_fits_a_larger_regression_stack_budget`
+    // test's own comment) overflows the default test-thread stack on at
+    // least one CI target, aborting the whole test binary. Spawning a
+    // generously-sized dedicated thread here — cheap, and `std::thread`
+    // works on every platform, unlike the `#[cfg]`-gated test below, which
+    // pins the *precise* budget only on the one target it's gated for — is
+    // what gives this an unconditional call site (avoiding a `dead_code`
+    // warning on the CI legs that don't run the gated test) without
+    // reintroducing that crash.
+    #[test]
+    fn native_handle_path_preserves_the_object_nesting_guard() {
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(assert_native_handle_path_preserves_the_object_nesting_guard)
+            .expect("nesting-guard test thread must start")
+            .join()
+            .expect("nesting guard must return an error before exhausting the stack");
+    }
+
     // Pins the specific stack budget the native handle-producing path needs
     // at `MAX_PARSE_DEPTH`, mirroring
     // `content_mode_nesting_guard_fits_the_regression_stack_budget` above for
