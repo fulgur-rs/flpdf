@@ -69,6 +69,11 @@ pub struct Pdf<R: Read + Seek> {
     /// identity): repeated [`Pdf::get_object_handle`] calls for the same
     /// `ObjectRef` return the same shared handle. Populated lazily on first
     /// request; does not perform file I/O or force body parsing.
+    // `ObjectHandle`'s Rc<RefCell<..>> identity (see object_handle.rs) makes
+    // `Pdf<R>` lose the `Send`/`Sync` auto traits it previously had for any
+    // `R: Send`/`Sync`. This is an accepted, intentional consequence of that
+    // deviation, not a regression to fix — qpdf's own `QPDF` is likewise not
+    // thread-safe for concurrent access to one document.
     handle_registry: BTreeMap<ObjectRef, ObjectHandle>,
     compressed_member_parents: BTreeMap<ObjectRef, (ObjectRef, u32)>,
     /// Every uncompressed object offset, sorted ascending and deduplicated. Used
@@ -1315,9 +1320,10 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// Repeated calls with the same `object_ref` return the same shared
     /// handle rather than a new, independently-identified one, mirroring
-    /// qpdf's per-document object cache (`libqpdf/qpdf/QPDF.cc`): once an
-    /// indirect object has been requested, later requests for the same
-    /// object number/generation observe the same cached identity.
+    /// qpdf's per-document object cache (`QPDF::getObject`,
+    /// `libqpdf/QPDF.cc:1951-1959`): once an indirect object has been
+    /// requested, later requests for the same object number/generation
+    /// observe the same cached identity.
     ///
     /// This does not perform file I/O or force object-body parsing: the
     /// returned handle's value is not read or resolved by this call.
