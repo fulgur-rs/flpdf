@@ -137,16 +137,17 @@ backs them internally.
   decrypt, materialization round-trip).
 - Modify: `crates/flpdf/src/lib.rs` — register `mod object_handle;` and
   `pub use object_handle::ObjectHandle;`.
-- Modify: `crates/flpdf/src/reader.rs` — add the canonical handle registry to
-  `Pdf`; cut `resolve_to_cache` / `read_object_at` / `resolve_compressed_entry`
-  / `resolve_pending_stream_length` / `decrypt_resolved_object` onto it; make
-  `resolve` / `resolve_borrowed` / `set_object` / `delete_object` bridge
-  wrappers; add `get_object_handle`, `resolve_object_handle`,
-  `get_all_object_handles`, `trailer_handle`.
-- Modify: `crates/flpdf/src/cache.rs` — repurpose `ObjectCache`/`CacheEntry`
-  as the bridge's legacy-materialization memo (or replace with a plain
-  `BTreeMap<ObjectRef, Object>` memo — Task 9 decides, TDD-verified either
-  way).
+- Modify: `crates/flpdf/src/reader.rs` — add the canonical handle registry
+  and a *new*, additive `resolve_object_handle` that dual-writes alongside
+  the untouched legacy engine (Task 6); later make `resolve` /
+  `resolve_borrowed` / `set_object` / `delete_object` thin bridge wrappers
+  around it (Task 8); add `get_object_handle`, `get_all_object_handles`,
+  `trailer_handle`.
+- `crates/flpdf/src/cache.rs` (`ObjectCache`/`CacheEntry`) is **not**
+  modified. `resolve_to_cache` and its private callees keep depending on it
+  exactly as today, as the untouched legacy engine's own internal
+  bookkeeping — see Task 8's explicit note on why this is not shrunk or
+  repurposed.
 - Modify: `crates/flpdf/src/parser.rs` — add a file-object-body handle
   construction path with parsed-offset capture (Task 7), without touching
   `object()`/`dictionary()`/`array()`/`parse_content_object()`.
@@ -569,6 +570,16 @@ mod object_value_tests {
         assert!(ObjectHandle::null().is_null());
         assert!(!ObjectHandle::integer(0).is_null());
     }
+
+    #[test]
+    fn real_literal_handle_preserves_the_non_canonical_source_literal() {
+        // Object::RealLiteral exists so a non-canonical source spelling
+        // (e.g. ".4") survives unparse byte-identically. The handle payload
+        // must carry the same two fields, or byte-identical output breaks
+        // the moment a real-literal round-trips through this layer.
+        let handle = ObjectHandle::real_literal(0.4, b".4".to_vec());
+        assert_eq!(handle.as_real_literal(), Some((0.4, b".4".to_vec())));
+    }
 }
 ```
 
@@ -638,6 +649,18 @@ impl ObjectHandle {
             ObjectValue::Dictionary(entries.into_iter().collect()),
             NO_PARSED_OFFSET,
         )
+    }
+    /// Preserves a non-canonical source literal (e.g. `.4`) for byte-identical
+    /// unparse, mirroring `Object::RealLiteral`.
+    pub fn real_literal(value: f64, literal: Vec<u8>) -> Self {
+        Self::new_direct(ObjectValue::RealLiteral { value, literal }, NO_PARSED_OFFSET)
+    }
+
+    pub fn as_real_literal(&self) -> Option<(f64, Vec<u8>)> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::RealLiteral { value, literal }) => Some((*value, literal.clone())),
+            _ => None,
+        })
     }
 
     pub fn is_null(&self) -> bool {
@@ -792,17 +815,20 @@ git commit -m "feat(reader): canonical indirect ObjectHandle registry on Pdf"
 
 ---
 
-### Task 6: Lazy resolution engine cutover
+### Task 6: Lazy resolution engine — dual-write alongside the untouched legacy cache
 
 This is the core of "the production reader path cuts over in this layer"
-(AC2) and is the largest task in this plan. It replaces the *meaning* of
-`CacheEntry`'s `Unresolved`/`Compressed`/`Resolved`/`Missing`/`Reserved`/
-`Deleted` states (`crates/flpdf/src/cache.rs:6-13`) with equivalent states
-living on `IndirectSlot` (`object_handle.rs`), and rewrites
-`resolve_to_cache`, `read_object_at`/`read_object_at_with_policy`,
-`resolve_compressed_entry`, `resolve_pending_stream_length`, and
-`decrypt_resolved_object` (`reader.rs:1269-1510` and callers) to populate the
-handle graph instead of `self.cache`.
+(AC2) and is the largest task in this plan. **It is a strictly additive,
+dual-write step: the existing `resolve_to_cache` / `read_object_at` /
+`resolve_compressed_entry` / `resolve_pending_stream_length` /
+`decrypt_resolved_object` machinery (`reader.rs:1269-1510`) is not rewritten
+and not touched.** `Pdf::resolve` / `Pdf::resolve_borrowed` keep calling it
+exactly as today, so the entire existing test suite (~2841+ tests) stays
+green throughout this task — that is the whole point of doing it this way
+instead of rewriting the engine in place. This task only adds a *new*,
+independent, so-far-unused-by-production-consumers method,
+`Pdf::resolve_object_handle`, that piggy-backs on the untouched engine's
+output to populate the new handle graph.
 
 **Do not pre-decide every internal data-structure detail before starting.**
 The design explicitly defers this ("Exact Rust data structures and internal
@@ -810,42 +836,34 @@ synchronization remain implementation details to be settled by TDD as long
 as they preserve the approved public behavior and ownership"). What follows
 is the **contract this task must satisfy**, expressed as tests, plus the
 **existing behaviors it must reproduce exactly** (cited by file:line so they
-can be diffed against, not re-derived from scratch).
+can be diffed against, not re-derived from scratch) — reproduced "for free"
+here because this task calls the untouched engine rather than reimplementing
+it.
 
-**Behaviors that must be reproduced exactly (read these sites first):**
+**Behaviors this task relies on unchanged (read these sites first, do not edit them):**
 
-1. Cyclic `/Length` handling via a `Reserved` guard state
-   (`reader.rs:1338-1377`, `resolve_pending_stream_length`): resolving a
-   stream's indirect `/Length` while the stream itself is mid-resolution
-   must not recurse infinitely; a re-entrant resolve of the same ref reads
-   as `Null` instead. Add an `IndirectState::Reserved` variant and a
-   `set_reserved`/`set_unresolved` pair analogous to
-   `cache.rs:69-80`.
+1. Cyclic `/Length` handling via the existing `Reserved` cache-entry guard
+   (`reader.rs:1338-1377`, `resolve_pending_stream_length`;
+   `cache.rs:65-80`). Untouched.
 2. Compressed (ObjStm) member resolution
-   (`reader.rs:1480-1510+`, `resolve_compressed_entry`): resolving an
-   object stored in an object stream requires resolving the container
-   stream object first (itself going through the same engine), then
-   decoding and locating the member. Reuse the existing decode/locate logic;
-   only the storage the *result* lands in changes (`IndirectSlot::Resolved`
-   instead of `CacheEntry::Resolved`).
+   (`reader.rs:1480-1510+`, `resolve_compressed_entry`). Untouched.
 3. Bounded read-then-fallback-to-EOF policy
-   (`reader.rs:1256-1322`, `read_object_at`/`read_object_at_with_policy`,
-   `resolution_fallbacks_remaining`): do not change this — it is an
-   unrelated DoS mitigation (quadratic-read guard), not part of the
-   object-model cutover. Keep calling it exactly as today; only what it
-   feeds into changes.
-4. Decryption hook (`decrypt_resolved_object`, referenced at
-   `reader.rs:1435,1500`): must still run on every freshly-parsed object
-   before it is considered `Resolved`.
+   (`reader.rs:1256-1322`, `resolution_fallbacks_remaining`). Untouched.
+4. Decryption hook (`decrypt_resolved_object`, `reader.rs:1435,1500`).
+   Untouched.
 5. Missing/freed/broken-compressed references resolve to `Null`, not an
-   error (`reader.rs:1244-1245` doc comment, and the `Ok(&NULL_OBJECT)`
-   fallback at `reader.rs:1253`) — same must hold for
-   `ObjectHandle::as_integer()`/etc. against an unresolved-then-missing
-   indirect handle.
-6. `set_unresolved`/`set_missing`/`set_deleted` are used by call sites
-   outside the immediate resolve path too (repair, dirty-tracking) — grep
-   `self.cache.set_` across `reader.rs` for the full list before assuming
-   only the resolve path touches these states.
+   error (`reader.rs:1244-1245,1253`). Untouched.
+
+**Parsed offsets are intentionally not populated by this task.** The handle
+graph this task builds gets its `ObjectValue` by converting
+(`lift`-ing — see Task 8) the `Object` that the untouched legacy engine
+already produced, so every offset stays at the `-1` sentinel here. This is
+not the forbidden "reparse to reconstruct provenance" pattern (design,
+"Parser" section) — it is simply a feature (real parsed offsets) not yet
+built. Task 7 replaces *only* the source of the resolved `ObjectValue` for
+plain file objects (native construction with real offsets, during the one
+parse pass, per design lines 145-147) while leaving this task's dual-write
+wiring and every behavior above completely intact.
 
 **Step 1: Write the failing tests (contract, not implementation)**
 
@@ -925,65 +943,141 @@ adding.
 
 **Step 3: Implement**
 
-Add `IndirectState` variants mirroring `CacheEntry` (`cache.rs:6-13`):
+Add a minimal `IndirectState` — deliberately *not* a mirror of every
+`CacheEntry` variant, because this task never drives byte-level resolution
+itself; it only records what the untouched legacy engine already decided:
 
 ```rust
 // object_handle.rs
 pub(crate) enum IndirectState {
-    Unresolved { offset: u64 },
-    Compressed { stream: u32, index: u32 },
+    NotYetResolved,
     Resolved(ObjectValue),
-    Missing,
-    Reserved,
-    Deleted,
+    Missing, // ref absent from source_xref_entries — the dangling case
 }
 ```
 
-Add crate-internal accessors `ObjectHandle` needs for the engine to drive
-resolution (state inspection/mutation, `pub(crate)` only — not public API):
-a way to read the current `IndirectState` discriminant, and to replace it
-(`set_resolved`, `set_reserved`, `set_unresolved`, `set_missing`,
-`set_deleted`, mirroring `cache.rs:49-85` exactly but operating on the
-handle's own `RefCell` instead of a `BTreeMap` entry).
+Add crate-internal setters (`pub(crate)` only, not public API):
+`set_resolved(&self, value: ObjectValue)`, `set_missing(&self)`, and a
+`pub(crate) fn is_resolved(&self) -> bool` reader, operating on the handle's
+own `RefCell`.
 
-In `reader.rs`, add `Pdf::resolve_object_handle(&mut self, handle:
-&ObjectHandle) -> Result<()>`: if `handle` is direct, no-op `Ok(())`
-(already has a value). If indirect and its `IndirectState` is already
-`Resolved`, `Ok(())`. Otherwise dispatch through the *same* logic currently
-in `resolve_to_cache`/`read_object_at`/`resolve_compressed_entry`/
-`resolve_pending_stream_length`/`decrypt_resolved_object`, adapted to read
-the initial state from `handle`'s `IndirectState` (populated at
-registration time in `get_object_handle` from `source_xref_entries`, exactly
-as `ObjectCache::from_offsets` does today at `cache.rs:22-43`) and write the
-final state back onto `handle` via the new setters instead of
-`self.cache.set_resolved(..)`.
+In `reader.rs`, add:
 
-Concretely: `get_object_handle` (Task 5) currently always creates
-`IndirectState::Unresolved { offset: NO_PARSED_OFFSET as u64 }` — a
-placeholder. Fix it now to look up the real state from
-`self.source_xref_entries()` (`reader.rs:881`), mirroring
-`ObjectCache::from_offsets`'s `Free -> Deleted`, `Uncompressed{offset} ->
-Unresolved{offset}`, `Compressed{stream,index} -> Compressed{stream,index}`
-mapping (`cache.rs:26-35`), falling back to `Missing` for a ref absent from
-the xref table (the "dangling" case in the parity tests above).
+```rust
+/// Resolves `handle` in place if it is an unresolved indirect handle.
+/// Direct handles and already-resolved indirect handles are a no-op.
+///
+/// Temporary bridge implementation: delegates to the existing *private*
+/// `resolve_to_cache` engine (unchanged) and converts its result — this
+/// task does not reimplement decryption, ObjStm decoding, or the cyclic
+/// `/Length` guard, it reuses them as-is. Parsed offsets are not populated
+/// here; see Task 7.
+///
+/// Deliberately calls `resolve_to_cache` (private), **not** the public
+/// `resolve_borrowed` — Task 8 repoints `resolve_borrowed` to call *this*
+/// method, so routing through the public method here would recurse.
+pub fn resolve_object_handle(&mut self, handle: &ObjectHandle) -> Result<()> {
+    let Some(object_ref) = handle.object_ref() else {
+        return Ok(()); // direct handle, already has a value
+    };
+    if handle.is_resolved() {
+        return Ok(());
+    }
+    self.resolve_to_cache(object_ref)?; // untouched private engine
+    match self.cache.entry(object_ref) {
+        Some(CacheEntry::Resolved(object)) => {
+            let object = object.clone();
+            let value = self.lift(&object);
+            handle.set_resolved(value);
+        }
+        _ => handle.set_missing(), // Missing/Deleted/Reserved-still (should
+                                    // not happen post-resolve_to_cache)/None
+    }
+    Ok(())
+}
+```
+
+Matching on `self.cache.entry(object_ref)` after `resolve_to_cache` (rather
+than re-deriving presence from the xref table separately) naturally
+distinguishes a *genuinely* null resolved object (`CacheEntry::Resolved(Object::Null)`
+— present in the file, correctly lifted to `ObjectValue::Null`) from an
+actually missing/freed/dangling ref (`CacheEntry::Missing`/`Deleted`/`None`
+— correctly `set_missing()`). Write a test for this distinction explicitly
+(a fixture where some indirect object's real value is the literal PDF
+`null`, vs. a ref to an object number absent from the xref table) since both
+produce `ObjectHandle::is_null() == true` from the outside and are easy to
+conflate if the implementation is refactored later.
+
+Add a minimal `Pdf::lift(&mut self, object: &Object) -> ObjectValue` in
+`reader.rs`, scoped to what this task's own tests need (a full,
+production-grade version — including the `Object::Reference` →
+`get_object_handle` identity-preserving case and the `Stream`
+dict/data split — is Task 8's job, which extends this exact function
+rather than introducing a second one):
+
+```rust
+fn lift(&mut self, object: &Object) -> ObjectValue {
+    match object {
+        Object::Null => ObjectValue::Null,
+        Object::Boolean(b) => ObjectValue::Boolean(*b),
+        Object::Integer(n) => ObjectValue::Integer(*n),
+        Object::Real(r) => ObjectValue::Real(*r),
+        Object::RealLiteral { value, literal } => ObjectValue::RealLiteral {
+            value: *value,
+            literal: literal.clone(),
+        },
+        Object::Name(name) => ObjectValue::Name(name.clone()),
+        Object::String(s) => ObjectValue::String(s.clone()),
+        Object::Array(items) => {
+            ObjectValue::Array(items.iter().map(|item| self.lift_to_handle(item)).collect())
+        }
+        Object::Dictionary(dict) => ObjectValue::Dictionary(
+            dict.iter()
+                .map(|(k, v)| (k.to_vec(), self.lift_to_handle(v)))
+                .collect(),
+        ),
+        // Stream dict/data split and Object::Operator/InlineImage (content-
+        // stream-only, never reachable from a file-object resolve) are out
+        // of this task's own test scope; Task 8 completes them.
+        _ => ObjectValue::Null,
+    }
+}
+
+fn lift_to_handle(&mut self, object: &Object) -> ObjectHandle {
+    match object {
+        Object::Reference(object_ref) => self.get_object_handle(*object_ref),
+        direct => {
+            let value = self.lift(direct);
+            ObjectHandle::from_value(value) // new tiny constructor: Direct
+                                             // handle, offset -1 — add next
+                                             // to `new_direct` in object_handle.rs
+        }
+    }
+}
+```
 
 **Step 4: Run to verify it passes**
 
 Run: `cargo test -p flpdf --test object_handle_parity_tests`
-Expected: PASS.
+Expected: PASS for every test in this task's list (Step 1) — the `Stream`
+dict/data split noted as out of scope above is not exercised by any of
+them.
 
 **Step 5: Run the full existing suite as a regression check**
 
 Run: `cargo test --workspace`
-Expected: unchanged — this task does not yet touch `resolve`/`resolve_borrowed`
-themselves (that is Task 8's bridge rewrite), so every existing test must
-still pass exactly as before, exercising the *old* path untouched.
+Expected: **unchanged pass count, zero moved tests** — this task adds a new
+method and calls the untouched legacy engine from it; it does not modify
+`resolve`, `resolve_borrowed`, `set_object`, `delete_object`, `cache.rs`, or
+any of the resolution internals listed above. If anything outside
+`object_handle.rs`/the new test file changed behavior, something leaked
+beyond this task's intended additive scope — revert and redo.
 
 **Step 6: Commit**
 
 ```bash
 git add crates/flpdf/src/object_handle.rs crates/flpdf/src/reader.rs crates/flpdf/tests/object_handle_parity_tests.rs
-git commit -m "feat(reader): lazy resolution engine on the canonical handle graph"
+git commit -m "feat(reader): dual-write ObjectHandle resolution alongside the legacy engine"
 ```
 
 ---
@@ -1002,38 +1096,52 @@ counters, `MAX_PARSE_DEPTH`). **Do not fork or duplicate this logic.**
 Content-stream parsing must keep using exactly what exists today, untouched,
 forever (see Global Constraints).
 
-**Step 1: Decide the integration shape before writing code**
+**This task has one required shape, not a choice.** The design is explicit
+and forecloses the alternative: "The parser builds the handle graph directly
+and assigns parsed offsets during node construction. **It does not return a
+parallel metadata tree**, and `Pdf` does not reparse an object later solely
+to reconstruct provenance" (design, "Parser" section, lines 145-147).
+Parsing to `Object` first and then converting/annotating with offsets in a
+second pass — via a parallel offset table or a `Parser::position()`
+re-scan — **is** exactly the forbidden parallel-metadata-tree/reparse
+pattern. The only compliant shape is to generify the construction sites
+themselves so the *same* recursive walk emits an `ObjectHandle` with its
+offset already attached, at the same place it would have emitted `Object::*`.
 
-Two shapes are viable; pick one after reading `parser.rs:192-482` in full
-(further than the excerpt already reviewed this session) and running the
-existing `parser.rs` test module to see how deeply recovery/bad-token
-behavior is entangled with the leaf/container construction sites:
+Read `parser.rs:192-482` in full (further than the excerpt already reviewed
+this session) and run the existing `parser.rs` test module first, to see
+exactly how deeply recovery/bad-token behavior is entangled with the
+leaf/container construction sites before touching them.
 
-- **(A) Wrapper:** keep `object()`/`dictionary()`/`array()` returning `Object`
-  exactly as today, unchanged; add a *new*, separate top-level entry point
-  used only by the file-object read path
-  (`parse_file_object_syntax`/`finish_file_object`, referenced from
-  `reader.rs:1331`) that calls the existing `object()` to get an `Object`
-  tree, then converts it to `ObjectHandle`/`ObjectValue` — capturing offsets
-  from `token.start`/`self.position()` requires exposing them alongside the
-  parsed `Object`, e.g. changing `parse_file_object_syntax`'s return type to
-  include a parallel offset for each node, OR having the top-level
-  file-object entry point re-derive offsets in a second, offset-only pass
-  using `Parser::position()`. Lower risk (existing recovery logic
-  untouched), but needs an offset side-channel design.
-- **(B) Generify the construction sites:** parameterize `object_inner`'s leaf
-  and container construction (currently hard-coded to build `Object::*`
-  variants, `parser.rs:261-306`+) so it can emit either `Object` (content
-  mode) or `(ObjectHandle, i64 offset)` (file mode) from the *same* recursive
-  walk, with `top_level_no_reference`/recovery/depth-guard code paths shared
-  bit-for-bit. Zero duplication, offsets fall out naturally from
-  `token.start` at each construction site. Higher risk (touches the shared
-  recursive engine directly) but the design's clearly preferred end state.
+**Step 1: Generify `object_inner`'s construction, do not fork it**
 
-Write this decision (which shape, why) as a one-paragraph note at the top of
-the new code before proceeding — this is the "internal synchronization
-detail settled by TDD" the design allows, but it must be a **recorded**
-decision, not a silent one (CLAUDE.md category (B), condition 3: "明示的に記録すること").
+Parameterize `object_inner`'s leaf and container construction (currently
+hard-coded to build `Object::*` variants, `parser.rs:261-306`+) so the file
+side of the recursive walk emits `(ObjectHandle, i64 offset)` — with the
+offset read from `token.start`/`self.position()` at the exact same call
+site that constructs the value, never a second pass — while
+`top_level_no_reference`, bad-token recovery, and `MAX_PARSE_DEPTH` remain
+byte-for-byte the same shared code, executed once per node either way.
+Content-stream parsing (`ParserMode::Content`) keeps producing `Object`
+exactly as today; only the file-object-body path constructs handles.
+`Object::Reference(object_ref)` at `integer_or_ref` (`parser.rs:459-482`)
+becomes a call to the same canonical-handle lookup this plan already added
+(`Pdf::get_object_handle`), not a bare `ObjectRef` value.
+
+Task 6's `resolve_object_handle` currently resolves every indirect handle
+by delegating to the legacy engine and calling `Pdf::lift` (offset `-1`
+always). This task changes that delegation **only for the plain
+uncompressed-file-object case** (`IndirectState` sourced from
+`XrefEntry::Uncompressed`): instead of calling `resolve_borrowed` + `lift`,
+it calls this task's new native parse-to-handle entry point directly on the
+object's source bytes, so the resulting handle (and every direct child
+in its tree) carries a real parsed offset from construction. The
+`Compressed` (ObjStm-member) case is explicitly **not** required to gain
+real per-member offset coordinates in this task — full ObjStm-relative/
+recovered/hybrid-xref offset coordinate correctness is `flpdf-egzr.3.3`'s
+scope (see Non-goals); leaving ObjStm members on the Task 6 `lift`-based
+path (offset `-1`) here is a recorded, intentional scope boundary, not a
+silent gap.
 
 **Step 2: Write the failing tests**
 
@@ -1081,7 +1189,7 @@ fn indirect_reference_child_is_the_canonical_handle_not_a_fresh_value() {
 }
 ```
 
-**Step 3-4: Implement, run to green** — following the shape chosen in Step 1.
+**Step 3-4: Implement per Step 1, run to green.**
 
 **Step 5: Run the FULL existing parser test suite**
 
@@ -1112,8 +1220,8 @@ routes" as AC3 requires, replacing them with the named-and-bounded bridge.
 
 **Files:**
 - Modify: `crates/flpdf/src/reader.rs`
-- Modify: `crates/flpdf/src/cache.rs`
 - Modify: `crates/flpdf/src/object_handle.rs`
+- `crates/flpdf/src/cache.rs` is **not** modified in this task — see Step 3.
 
 **Step 1: Write the failing tests**
 
@@ -1160,6 +1268,65 @@ fn materialize_then_set_object_round_trips_structurally() {
 }
 ```
 
+Plus, covering the three round-trip hazards a byte-identical-suite failure
+would otherwise catch late and expensively:
+
+```rust
+#[test]
+fn real_literal_survives_resolve_set_object_round_trip() {
+    // Object::RealLiteral{value, literal} preserves a non-canonical source
+    // spelling (e.g. ".4") for byte-identical unparse. If materialize/lift
+    // ever drops `literal` and falls back to Object::Real, this must fail.
+    let mut pdf = open_fixture("real-literal.pdf"); // an object whose value
+                                                     // is literally `.4`
+    let object_ref = /* that object's ref */;
+    let resolved = pdf.resolve(object_ref).unwrap();
+    assert!(matches!(&resolved, Object::RealLiteral { literal, .. } if literal == b".4"));
+    pdf.set_object(object_ref, resolved.clone());
+    assert_eq!(pdf.resolve(object_ref).unwrap(), resolved);
+}
+
+#[test]
+fn stream_dictionary_parsed_offset_survives_resolve_set_object_round_trip() {
+    // Stream is `{ dict: Dictionary, data: Vec<u8> }` by value; the handle
+    // graph keeps the stream dictionary as a *separate handle* with its own
+    // `<<`-start parsed offset (design requirement). materialize() flattens
+    // that into a plain Dictionary; lift() must re-split it by *reusing the
+    // existing canonical dictionary handle* rather than minting a fresh one
+    // with a lost offset — this test is the tripwire for getting that wrong.
+    let mut pdf = open_fixture("minimal.pdf"); // any fixture with a stream
+    let stream_ref = /* that stream's object ref */;
+    let handle = pdf.get_object_handle(stream_ref);
+    pdf.resolve_object_handle(&handle).unwrap();
+    let dict_offset_before = /* the stream's dict-handle parsed offset,
+                                 via whatever accessor Task 7 exposed */;
+    let resolved = pdf.resolve(stream_ref).unwrap();
+    pdf.set_object(stream_ref, resolved);
+    let dict_offset_after = /* same accessor, same handle/ref */;
+    assert_eq!(dict_offset_before, dict_offset_after);
+}
+
+#[test]
+fn transformed_stream_refs_and_recovered_stream_eols_still_populate_on_the_handle_path() {
+    // reader.rs:1437-1446 sets these side-tables alongside CacheEntry::Resolved
+    // in the untouched legacy engine. resolve_object_handle must not bypass
+    // the code path that sets them for a stream that needs stream-payload
+    // transformation or has a recovered EOL.
+    let mut pdf = open_fixture("recovered-stream-eol.pdf"); // reuse whichever
+                                                             // existing fixture
+                                                             // reader.rs's own
+                                                             // recovery tests use
+    let stream_ref = /* that stream's ref */;
+    let handle = pdf.get_object_handle(stream_ref);
+    pdf.resolve_object_handle(&handle).unwrap();
+    assert!(pdf.recovered_stream_eols_contains(stream_ref)); // whatever the
+                                                              // existing
+                                                              // crate-internal
+                                                              // accessor for
+                                                              // this is
+}
+```
+
 Plus: re-run **every existing** `resolve_borrowed`/`resolve` test in the
 crate unchanged (350 call sites across 47 files, per this session's survey)
 — they are this task's real regression suite, since none of their source is
@@ -1168,7 +1335,7 @@ being edited.
 **Step 2: Run to verify the new tests fail, old ones still pass**
 
 Run: `cargo test --workspace`
-Expected: the 4 new tests FAIL (bridge not wired yet); all ~2841+ existing
+Expected: the 7 new tests FAIL (bridge not wired yet); all ~2841+ existing
 tests still PASS (nothing touched yet).
 
 **Step 3: Implement**
@@ -1177,47 +1344,75 @@ tests still PASS (nothing touched yet).
   (`object_handle.rs`): converts a *resolved* handle's `ObjectValue` into an
   `Object`, recursively, but for an `ObjectValue::Array`/`Dictionary` child
   that is itself an **indirect** `ObjectHandle`, emit `Object::Reference(child.object_ref().unwrap())`
-  — do not recurse into it. This is the exact semantic the parser already
-  had for `Object::Reference` before this plan (`parser.rs`'s
+  — do not recurse into it. `ObjectValue::Stream { dict, data }` flattens
+  `dict` (itself an `ObjectHandle`, resolved and materialized) into a plain
+  `Dictionary` for `Object::Stream { dict, data }`. `ObjectValue::RealLiteral`
+  round-trips its `literal` bytes unchanged. This is the exact semantic the
+  parser already had for `Object::Reference` before this plan (`parser.rs`'s
   `integer_or_ref`, `459-482`) and is what every consumer's direct
   `Object::Reference(..)` match already expects.
-- Add `pub(crate) fn lift(object: &Object, pdf: &mut Pdf<impl Read + Seek>) -> ObjectValue`
-  (or equivalent) — the inverse, used by `set_object`: converts an owned
-  `Object` into `ObjectValue`, converting `Object::Reference(r)` into
-  `pdf.get_object_handle(r)` (the canonical handle, not a fresh one) so
-  identity is preserved.
-- Repurpose `crates/flpdf/src/cache.rs`'s `ObjectCache`/`CacheEntry` as the
-  bridge's **materialized-`Object` memo only** — it no longer drives
-  resolution (Task 6 moved that to `IndirectState`); it exists solely so
-  `resolve_borrowed` can hand back `&Object` with a lifetime tied to
-  `&mut Pdf`, exactly as today. Simplify its shape if that is now cleaner
-  (e.g. down to `BTreeMap<ObjectRef, Object>`) — TDD-verify either way; the
-  public `Pdf` surface must not change regardless of which internal shape
-  is chosen.
-- Rewrite `Pdf::resolve_borrowed`:
+- Extend Task 6's `Pdf::lift` (do not add a second function) so it also
+  handles `Object::Stream { dict, data }` — converting `dict` via
+  `lift_to_handle` exactly like any other nested dictionary — and so
+  `lift_to_handle`'s `Object::Reference(r)` arm keeps calling
+  `self.get_object_handle(r)` (the canonical handle), preserving identity
+  for `set_object`'s round trip.
+- **Do not repurpose or shrink `cache.rs`'s `ObjectCache`/`CacheEntry`.**
+  Task 6 established that `resolve_to_cache` and its private callees
+  (`read_object_at`, `resolve_compressed_entry`, `resolve_pending_stream_length`,
+  `decrypt_resolved_object`) are untouched and still depend on the full
+  `CacheEntry` state machine (`Unresolved`/`Compressed`/`Reserved` included)
+  to do the actual byte-level work — deleting or shrinking it would break
+  the very engine `resolve_object_handle` calls. What AC3 requires removed
+  is `ObjectCache`'s *architectural role as the public-facing production
+  route* — that role now belongs to `ObjectHandle`/`get_object_handle`/
+  `resolve_object_handle`. `ObjectCache` remains, fully intact, as a
+  private implementation detail of the untouched legacy byte-parsing engine.
+  Record this explicitly (it is a deliberate, bounded scope decision, not
+  silent scope creep) rather than claiming a cache.rs simplification that
+  the untouched Task 6 engine cannot actually tolerate.
+- Add a new, separate field for the bridge's own materialized-`Object` memo
+  (it must be distinct from `self.cache`, since after Task 7, `self.cache`
+  is **not** guaranteed to be populated for a handle that was resolved via
+  Task 7's native-parsing path rather than via `resolve_to_cache`):
+  ```rust
+  legacy_materialized_memo: std::collections::BTreeMap<ObjectRef, Object>,
+  ```
+- Rewrite `Pdf::resolve_borrowed`, checking the memo **before** materializing
+  (memoize-if-absent, not unconditional insert — a fresh `materialize()` per
+  call on 350 call sites, several in loops of dozens of iterations
+  (`page_extract_tests` 38, `json_inspect` 31, `embedded_files` 27), would
+  reproduce the exact quadratic-resolution shape this repo has already fixed
+  once, see `reader.rs:1256-1268`'s doc comment on that history):
   ```rust
   pub fn resolve_borrowed(&mut self, object_ref: ObjectRef) -> Result<&Object> {
       let handle = self.get_object_handle(object_ref);
       self.resolve_object_handle(&handle)?;
-      let materialized = handle.materialize();
-      self.legacy_object_memo.insert(object_ref, materialized);
-      Ok(self.legacy_object_memo.get(&object_ref).unwrap_or(&NULL_OBJECT))
+      if !self.legacy_materialized_memo.contains_key(&object_ref) {
+          let materialized = handle.materialize();
+          self.legacy_materialized_memo.insert(object_ref, materialized);
+      }
+      Ok(self
+          .legacy_materialized_memo
+          .get(&object_ref)
+          .unwrap_or(&NULL_OBJECT))
   }
   ```
-  (Exact memo field name/type per whatever Task 6/this task settled on —
-  keep `resolve`'s existing one-line `self.resolve_borrowed(..)?.clone()`
+  (Keep `resolve`'s existing one-line `self.resolve_borrowed(..)?.clone()`
   body unchanged; it already composes correctly on top of the rewritten
   `resolve_borrowed`.)
-- Rewrite `Pdf::set_object`/`Pdf::delete_object`
-  (`reader.rs:1000,1020`) to write through `lift()` into the canonical
-  handle graph (updating the shared `IndirectSlot`, so every other
-  outstanding clone of that handle observes the new value too), and refresh
-  the legacy memo entry to match.
+- Rewrite `Pdf::set_object`/`Pdf::delete_object` (`reader.rs:1000,1020`) to
+  write through `lift()` into the canonical handle graph (updating the
+  shared `IndirectSlot`, so every other outstanding clone of that handle
+  observes the new value too), and **invalidate** (`remove`, not
+  re-`insert` with a stale value) the corresponding
+  `legacy_materialized_memo` entry so the next `resolve_borrowed` call
+  re-materializes from the updated handle instead of serving the old memo.
 
 **Step 4: Run to verify it passes**
 
 Run: `cargo test --workspace`
-Expected: **every** test passes — the 4 new ones and all ~2841+ pre-existing
+Expected: **every** test passes — the 7 new ones and all ~2841+ pre-existing
 ones. A pre-existing test failing here means the bridge is not behaviorally
 transparent; do not proceed to Task 9 until this is 100% green.
 
@@ -1229,7 +1424,7 @@ byte.
 **Step 6: Commit**
 
 ```bash
-git add crates/flpdf/src/reader.rs crates/flpdf/src/cache.rs crates/flpdf/src/object_handle.rs
+git add crates/flpdf/src/reader.rs crates/flpdf/src/object_handle.rs crates/flpdf/tests/object_handle_parity_tests.rs
 git commit -m "feat(reader): materialization bridge - resolve/resolve_borrowed cut onto ObjectHandle graph"
 ```
 
@@ -1300,28 +1495,36 @@ git commit -m "feat(reader): get_all_object_handles and trailer_handle"
 
 **This task is a gate, not new functionality. Do not skip it.**
 
-**Step 1: Diff against the base commit, restricted to the allowlist**
+**Step 1: Diff everything, then assert the changed set is a subset of the allowlist**
+
+Enumerating consumer files to exclude (as an earlier draft of this plan did)
+is fragile — the full-crate survey that grounded this plan already found
+public `Object`-returning signatures and direct enum matches in more files
+than fit in any hand-written list (`page_merge.rs`, `page_rotate.rs`,
+`acroform_field_prune.rs`, `outline_dest_remap.rs`,
+`writer/object_streams.rs`, `pages/repair.rs`, and others). Invert the
+check instead: list everything that changed, then assert every path is one
+this plan was actually allowed to touch.
 
 ```bash
-git diff --stat design/flpdf-egzr-3-object-handle...HEAD -- \
-  crates/flpdf/src/writer.rs crates/flpdf/src/pages.rs \
-  crates/flpdf/src/page_object_helper.rs crates/flpdf/src/json_inspect.rs \
-  crates/flpdf/src/resources.rs crates/flpdf/src/outline.rs \
-  crates/flpdf/src/outline_document_helper.rs \
-  crates/flpdf/src/linearization/ crates/flpdf/src/object_copy.rs \
-  crates/flpdf/src/nntree.rs crates/flpdf/src/encrypt_setup.rs \
-  crates/flpdf/src/xref.rs crates/flpdf/src/acroform_document_helper.rs \
-  crates/flpdf/src/annotation_helper.rs crates/flpdf/src/embedded_files.rs \
-  crates/flpdf/src/signatures.rs crates/flpdf/src/filespec_helper.rs \
-  crates/flpdf/src/appearance.rs crates/flpdf/src/overlay.rs \
-  crates/flpdf/src/overlay_annotations.rs crates/flpdf/src/struct_tree_pg.rs \
-  crates/flpdf/src/name_number_tree.rs crates/flpdf/src/ref_chain.rs \
-  crates/flpdf/src/rewrite_renumber.rs crates/flpdf/src/xref_entry.rs \
-  crates/flpdf-cli/ crates/flpdf-qtest-tools/
+git diff --name-only design/flpdf-egzr-3-object-handle...HEAD -- crates/ > /tmp/objecthandle_changed_files.txt
+comm -23 \
+  <(sort /tmp/objecthandle_changed_files.txt) \
+  <(printf '%s\n' \
+      crates/flpdf/src/object_handle.rs \
+      crates/flpdf/src/object.rs \
+      crates/flpdf/src/reader.rs \
+      crates/flpdf/src/parser.rs \
+      crates/flpdf/src/lib.rs \
+      crates/flpdf/tests/object_handle_parity_tests.rs \
+    | sort)
 ```
-Expected: **empty output.** If anything appears here, the bridge leaked into
-consumer code — stop, do not proceed to Task 11, and revisit whichever of
-Tasks 6-9 introduced the leak.
+Expected: **empty output** — every changed path under `crates/` is one of
+the six above. Any other line printed is a leak: stop, do not proceed to
+Task 11, and revisit whichever of Tasks 6-9 introduced it. (If a task
+legitimately needed a new test fixture file, add its exact path to the
+second `printf` list here and note why in the commit that added it — do not
+silently widen this check.)
 
 **Step 2: Full workspace build and test, no features**
 
@@ -1332,7 +1535,38 @@ Expected: clean build, all green.
 
 ---
 
-### Task 11: Full regression — clippy, fmt, byte-identical, doctest
+### Task 11: Full regression — clippy, fmt, byte-identical, doctest, deviation recording
+
+**Step 0: Record the `Rc<RefCell<..>>` deviation (CLAUDE.md category (B), condition 3)**
+
+This is a category-(B) internal-structure substitute (qpdf's
+`std::shared_ptr<QPDFValue>` → Rust `Rc<RefCell<..>>`), permitted because it
+does not affect output bytes (verified throughout this plan by the
+byte-identical suite) and preserves qpdf's algorithm/ordering. Condition 3
+requires recording it explicitly in two places:
+
+1. Add a one-line deviation note to `crates/flpdf/src/object_handle.rs`'s
+   module doc (`//!`), e.g.: `// Deviation: shared handle identity uses
+   Rc<RefCell<..>> in place of qpdf's std::shared_ptr<QPDFValue> — internal
+   structure only, does not affect output bytes (see
+   docs/qpdf-correspondence.md).` (as a `//` comment, not a `///`/`//!` doc
+   line, per `.claude/rules/pdf-rust-doc-review-patterns.md` — this is
+   implementation history, not user-facing API documentation).
+2. Update `docs/qpdf-correspondence.md`:
+   - Row for `QPDFObjectHandle.cc` (currently line 58: `🔀 アクセサが各所に
+     散在 (flpdf-mfir)`) — add `object_handle.rs` alongside `object.rs` as a
+     target module, since object identity/lazy-resolution now lives there.
+   - Row for `QPDFObject.cc` / `QPDFValue.cc` (currently line 60: `✅`) —
+     same addition; change the note to reflect that this layer is a
+     `flpdf-egzr.3.1`-owned in-progress cutover if the row's classification
+     needs to move off `✅` (check the current state at edit time; do not
+     silently leave it claiming full correspondence if the bridge changes
+     the module boundary).
+   - Add a new ⚪ row (or extend the existing one) documenting the
+     `Rc<RefCell<..>>` vs `std::shared_ptr<QPDFValue>` substitution
+     specifically, in the "逸脱候補（⚪）" section's format (module, line
+     count, flpdf replacement, ⚪), matching the existing style at e.g. line
+     73 (`InputSource` 系 → `Read + Seek`).
 
 **Step 1: Format check**
 
