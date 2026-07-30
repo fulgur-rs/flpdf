@@ -1374,7 +1374,7 @@ impl<R: Read + Seek> Pdf<R> {
         };
         match resolved {
             Some(object) => {
-                let value = self.lift(&object);
+                let value = self.lift(&object, 0)?;
                 handle.set_resolved(value);
             }
             None => handle.set_missing(),
@@ -1388,8 +1388,20 @@ impl<R: Read + Seek> Pdf<R> {
     // split is not implemented here (falls back to `ObjectValue::Null`), nor
     // are the content-stream-only `Object::Operator`/`Object::InlineImage`
     // variants, which never appear as the resolved value of a file object.
-    fn lift(&mut self, object: &Object) -> ObjectValue {
-        match object {
+    //
+    // `depth` bounds inline `Array`/`Dictionary` nesting against
+    // `MAX_INLINE_DEPTH`, mirroring every other post-parse structural walker
+    // over an `Object` tree in this crate (`subset_prune.rs`, `object_copy.rs`,
+    // `page_closure.rs`, `rewrite_renumber.rs`, and others) — this is a
+    // separate, tighter bound than the parser's own `MAX_PARSE_DEPTH`.
+    fn lift(&mut self, object: &Object, depth: usize) -> Result<ObjectValue> {
+        if depth > crate::object::MAX_INLINE_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "object handle lift: inline object nesting exceeds maximum of {}",
+                crate::object::MAX_INLINE_DEPTH
+            )));
+        }
+        let value = match object {
             Object::Null => ObjectValue::Null,
             Object::Boolean(b) => ObjectValue::Boolean(*b),
             Object::Integer(n) => ObjectValue::Integer(*n),
@@ -1400,19 +1412,23 @@ impl<R: Read + Seek> Pdf<R> {
             },
             Object::Name(name) => ObjectValue::Name(name.clone()),
             Object::String(s) => ObjectValue::String(s.clone()),
-            Object::Array(items) => {
-                ObjectValue::Array(items.iter().map(|item| self.lift_to_handle(item)).collect())
-            }
+            Object::Array(items) => ObjectValue::Array(
+                items
+                    .iter()
+                    .map(|item| self.lift_to_handle(item, depth + 1))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
             Object::Dictionary(dict) => ObjectValue::Dictionary(
                 dict.iter()
-                    .map(|(k, v)| (k.to_vec(), self.lift_to_handle(v)))
-                    .collect(),
+                    .map(|(k, v)| Ok((k.to_vec(), self.lift_to_handle(v, depth + 1)?)))
+                    .collect::<Result<std::collections::BTreeMap<_, _>>>()?,
             ),
             Object::Stream(_)
             | Object::Operator(_)
             | Object::InlineImage(_)
             | Object::Reference(_) => ObjectValue::Null,
-        }
+        };
+        Ok(value)
     }
 
     /// Lift a child `Object` (array element or dictionary value) to a handle.
@@ -1422,12 +1438,12 @@ impl<R: Read + Seek> Pdf<R> {
     /// any other handle already registered for the same object — it is left
     /// unresolved, not eagerly followed. Any other value is lifted directly
     /// and wrapped in a fresh direct handle.
-    fn lift_to_handle(&mut self, object: &Object) -> ObjectHandle {
+    fn lift_to_handle(&mut self, object: &Object, depth: usize) -> Result<ObjectHandle> {
         match object {
-            Object::Reference(object_ref) => self.get_object_handle(*object_ref),
+            Object::Reference(object_ref) => Ok(self.get_object_handle(*object_ref)),
             direct => {
-                let value = self.lift(direct);
-                ObjectHandle::from_value(value)
+                let value = self.lift(direct, depth)?;
+                Ok(ObjectHandle::from_value(value))
             }
         }
     }
@@ -4598,5 +4614,29 @@ mod tests {
             pdf.cache.entry(dangling_ref).is_none(),
             "a ref absent from the xref table must never gain a cache entry just from resolving its handle"
         );
+    }
+
+    #[test]
+    fn resolve_object_handle_rejects_inline_nesting_past_max_inline_depth() {
+        // Nesting between MAX_INLINE_DEPTH (256) and MAX_PARSE_DEPTH (500) is
+        // accepted by the parser but must still be rejected by `lift`'s own
+        // depth guard, mirroring every other post-parse structural walker
+        // over an `Object` tree in this crate (e.g. subset_prune.rs's
+        // `walk_refs`).
+        let depth = crate::object::MAX_INLINE_DEPTH + 5;
+        let mut body = b"1 0 obj\n".to_vec();
+        body.extend(std::iter::repeat_n(b'[', depth));
+        body.push(b'1');
+        body.extend(std::iter::repeat_n(b']', depth));
+        body.extend_from_slice(b"\nendobj\n");
+
+        let bytes = classic_pdf_with_bodies(&[&body], ObjectRef::new(1, 0));
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open deeply-nested fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+
+        let err = pdf
+            .resolve_object_handle(&handle)
+            .expect_err("nesting beyond MAX_INLINE_DEPTH must be rejected");
+        assert!(matches!(err, Error::Unsupported(_)));
     }
 }

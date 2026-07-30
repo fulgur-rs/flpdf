@@ -206,15 +206,15 @@ fn get_object_handle_repeated_calls_share_already_resolved_state() {
     );
 }
 
-/// A literal PDF `null` object (present in the xref table, genuinely
-/// parsed) must resolve to `ObjectValue::Null` — and this must not be the
-/// same internal route as the "dangling" (absent from xref) case in test 2,
-/// even though both currently present the same externally-observable
-/// `is_null() == true`. `object_handle.rs`'s `IndirectState` keeps
-/// `Missing` and `Resolved(ObjectValue::Null)` as distinct variants for
-/// exactly this reason (see its doc comment); this test fixes the
-/// black-box (public-API) half of that contract in place so a future change
-/// collapsing the two cannot pass unnoticed here.
+/// Both a literal PDF `null` object (present in the xref table, genuinely
+/// parsed) and a dangling reference (absent from the xref table) present as
+/// `is_null() == true` through the public API. This test only fixes that
+/// black-box observation in place; it does NOT prove the two take different
+/// internal routes (`IndirectState::Resolved(ObjectValue::Null)` vs.
+/// `IndirectState::Missing`) — the real tripwire for that internal
+/// distinction is `reader.rs`'s white-box
+/// `resolve_object_handle_literal_null_and_dangling_ref_take_different_cache_paths`,
+/// which asserts directly on `Pdf::cache`.
 #[test]
 fn resolve_object_handle_distinguishes_a_literal_null_from_a_dangling_reference() {
     let bytes = classic_pdf_with_bodies(&[b"1 0 obj\nnull\nendobj\n"], ObjectRef::new(1, 0));
