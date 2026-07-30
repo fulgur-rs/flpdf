@@ -2698,6 +2698,34 @@ mod tests {
     }
 
     #[test]
+    fn leading_crypt_stage_decrypts_before_the_following_codec() {
+        let filter = Object::Array(vec![
+            Object::Name(b"Crypt".to_vec()),
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+        ]);
+        let mut decrypt = |_: Option<&Object>, data: &[u8]| {
+            assert_eq!(data, b"encrypted");
+            Ok(b"41>".to_vec())
+        };
+
+        let outcome = decode_stream_data_with_filters_and_crypt(
+            Some(&filter),
+            None,
+            b"encrypted",
+            DecodeLimits::default(),
+            DataEventMode::Record,
+            &mut decrypt,
+        )
+        .expect("decode after the leading Crypt stage");
+
+        assert_eq!(outcome.data, b"A");
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Data(data)] if data == b"A"
+        ));
+    }
+
+    #[test]
     fn decode_accepts_max_length_filter_chain() {
         // Exactly MAX_FILTER_CHAIN_LEN (16) ASCIIHexDecode stages round-trips (each
         // stage is identity here: hex-encode applied 16 times, then this many decodes).
