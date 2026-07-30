@@ -49,7 +49,7 @@ impl PartialEq for Token {
 
 impl Token {
     #[allow(dead_code)] // Synthetic owned tokens remain part of the Task 1 contract.
-    pub fn new(token_type: TokenType, value: Vec<u8>) -> Self {
+    pub(crate) fn new(token_type: TokenType, value: Vec<u8>) -> Self {
         let raw = match token_type {
             TokenType::Name => canonical_name_raw(&value),
             TokenType::String => canonical_string_raw(&value),
@@ -58,7 +58,7 @@ impl Token {
         Self::from_parts(token_type, value, raw, None, 0..0)
     }
 
-    pub fn from_parts(
+    pub(crate) fn from_parts(
         token_type: TokenType,
         value: Vec<u8>,
         raw: Vec<u8>,
@@ -76,15 +76,15 @@ impl Token {
         }
     }
 
-    pub fn is_integer(&self) -> bool {
+    pub(crate) fn is_integer(&self) -> bool {
         self.token_type == TokenType::Integer
     }
 
-    pub fn is_word(&self) -> bool {
+    pub(crate) fn is_word(&self) -> bool {
         self.token_type == TokenType::Word
     }
 
-    pub fn is_word_value(&self, value: &[u8]) -> bool {
+    pub(crate) fn is_word_value(&self, value: &[u8]) -> bool {
         self.is_word() && self.value == value
     }
 }
@@ -159,9 +159,9 @@ pub enum TokenizerStateError {
 }
 
 #[allow(dead_code)] // The push result is consumed by Task 3's pull routing.
-pub struct PushedToken {
-    pub token: Token,
-    pub unread: Option<u8>,
+pub(crate) struct PushedToken {
+    pub(crate) token: Token,
+    pub(crate) unread: Option<u8>,
 }
 
 #[allow(dead_code)] // InlineImage is entered by Task 4.
@@ -216,7 +216,7 @@ pub struct Tokenizer<'a> {
 
 #[allow(dead_code)] // Push mode becomes a production caller in Task 3.
 impl Tokenizer<'static> {
-    pub fn push() -> Self {
+    pub(crate) fn push() -> Self {
         Self::new(b"")
     }
 }
@@ -257,7 +257,10 @@ impl<'a> Tokenizer<'a> {
         self.include_ignorable = true;
     }
 
-    pub fn present_character(&mut self, byte: u8) -> std::result::Result<(), TokenizerStateError> {
+    pub(crate) fn present_character(
+        &mut self,
+        byte: u8,
+    ) -> std::result::Result<(), TokenizerStateError> {
         if self.state == State::TokenReady {
             return Err(TokenizerStateError::TokenWaiting);
         }
@@ -268,7 +271,7 @@ impl<'a> Tokenizer<'a> {
         Ok(())
     }
 
-    pub fn present_eof(&mut self) -> std::result::Result<(), TokenizerStateError> {
+    pub(crate) fn present_eof(&mut self) -> std::result::Result<(), TokenizerStateError> {
         match self.state {
             State::Name
             | State::NameHex1
@@ -316,7 +319,7 @@ impl<'a> Tokenizer<'a> {
         Ok(())
     }
 
-    pub fn get_token(&mut self) -> Option<PushedToken> {
+    pub(crate) fn get_token(&mut self) -> Option<PushedToken> {
         if self.state != State::TokenReady {
             return None;
         }
@@ -330,7 +333,7 @@ impl<'a> Tokenizer<'a> {
         Some(PushedToken { token, unread })
     }
 
-    pub fn between_tokens(&self) -> bool {
+    pub(crate) fn between_tokens(&self) -> bool {
         self.before_token
     }
 
@@ -871,7 +874,7 @@ impl<'a> Tokenizer<'a> {
         Ok(())
     }
 
-    pub fn consume_one_byte_or(&mut self, default: u8) -> u8 {
+    pub(crate) fn consume_one_byte_or(&mut self, default: u8) -> u8 {
         let byte = self.input.get(self.pos).copied().unwrap_or(default);
         if self.pos < self.input.len() {
             self.pos += 1;
@@ -880,7 +883,7 @@ impl<'a> Tokenizer<'a> {
         byte
     }
 
-    pub fn skip_ignorable(&mut self) -> Result<()> {
+    pub(crate) fn skip_ignorable(&mut self) -> Result<()> {
         let saved_allow_eof = self.allow_eof;
         let saved_include_ignorable = self.include_ignorable;
         self.allow_eof = true;
@@ -896,7 +899,7 @@ impl<'a> Tokenizer<'a> {
         self.set_position(token.start)
     }
 
-    pub fn next_integer(&mut self) -> Result<i64> {
+    pub(crate) fn next_integer(&mut self) -> Result<i64> {
         let token = self.read_token(false, 0)?;
         if !token.is_integer() {
             return Err(Error::parse(token.start, "expected integer"));
@@ -907,7 +910,7 @@ impl<'a> Tokenizer<'a> {
             .ok_or_else(|| Error::parse(token.start, "integer is out of range"))
     }
 
-    pub fn expect_word(&mut self, expected: &[u8]) -> Result<()> {
+    pub(crate) fn expect_word(&mut self, expected: &[u8]) -> Result<()> {
         let token = self.read_token(false, 0)?;
         if token.is_word_value(expected) {
             Ok(())
@@ -995,14 +998,14 @@ fn invalid_hex_character_message(byte: u8) -> Vec<u8> {
     message
 }
 
-pub fn is_ws(byte: u8) -> bool {
+pub(crate) fn is_ws(byte: u8) -> bool {
     matches!(
         byte,
         b'\0' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r' | b' '
     )
 }
 
-pub fn is_delimiter(byte: u8) -> bool {
+pub(crate) fn is_delimiter(byte: u8) -> bool {
     matches!(
         byte,
         b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'

@@ -206,13 +206,9 @@ fn process(
 }
 
 fn resolve_objstm_type(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, dict: &flpdf::Dictionary) -> bool {
-    let type_val = match dict.get(b"Type") {
-        Some(val) => val.clone(),
-        None => return false,
-    };
-    match type_val {
-        Object::Name(ref n) => n == b"ObjStm",
-        Object::Reference(r) => match pdf.resolve(r) {
+    match dict.get(b"Type") {
+        Some(Object::Name(n)) => n == b"ObjStm",
+        Some(Object::Reference(r)) => match pdf.resolve(*r) {
             Ok(Object::Name(ref n)) => n == b"ObjStm",
             _ => false,
         },
@@ -243,7 +239,7 @@ fn dump_tokens(
     skip_inline_images: bool,
     stdout: &mut dyn io::Write,
 ) {
-    writeln!(stdout, "--- BEGIN {label} ---").unwrap();
+    let _ = writeln!(stdout, "--- BEGIN {label} ---");
 
     let mut tokenizer = Tokenizer::new(input);
     tokenizer.allow_eof();
@@ -289,27 +285,27 @@ fn dump_tokens(
         }
         inline_image_offset = None;
 
-        write!(stdout, "{offset}: {}", token_type_name(token.token_type)).unwrap();
+        let _ = write!(stdout, "{offset}: {}", token_type_name(token.token_type));
         if token.token_type != TokenType::Eof {
-            write!(stdout, ": {}", sanitize(&token.value)).unwrap();
+            let _ = write!(stdout, ": {}", sanitize(&token.value));
             if token.value != token.raw {
-                write!(stdout, " (raw: {})", sanitize(&token.raw)).unwrap();
+                let _ = write!(stdout, " (raw: {})", sanitize(&token.raw));
             }
         }
         if let Some(ref msg) = token.error_message {
-            write!(stdout, " ({})", sanitize(msg)).unwrap();
+            let _ = write!(stdout, " ({})", sanitize(msg));
         }
-        writeln!(stdout).unwrap();
+        let _ = writeln!(stdout);
 
         if skip_streams && token.token_type == TokenType::Word && token.value == b"stream" {
-            writeln!(stdout, "skipping to endstream").unwrap();
+            let _ = writeln!(stdout, "skipping to endstream");
             let saved = tokenizer.position();
-            if let Some(after_endstream) = find_endstream(input, saved) {
+            if let Some(endstream_start) = find_endstream(input, saved) {
                 tokenizer
-                    .set_position(after_endstream)
+                    .set_position(endstream_start)
                     .expect("position within input");
             } else {
-                writeln!(stdout, "endstream not found").unwrap();
+                let _ = writeln!(stdout, "endstream not found");
                 tokenizer
                     .set_position(saved)
                     .expect("position within input");
@@ -325,41 +321,29 @@ fn dump_tokens(
         }
     }
 
-    writeln!(stdout, "--- END {label} ---").unwrap();
+    let _ = writeln!(stdout, "--- END {label} ---");
 }
 
-fn is_delimiter(byte: u8) -> bool {
-    matches!(
-        byte,
-        b' ' | b'\n'
-            | b'\r'
-            | b'\t'
-            | b'\x0c'
-            | b'\x00'
-            | b'('
-            | b')'
-            | b'<'
-            | b'>'
-            | b'['
-            | b']'
-            | b'{'
-            | b'}'
-            | b'/'
-            | b'%'
-    )
-}
-
+// Mirrors qpdf's `InputSource::findFirst` + `Finder::check()` as used by
+// `qpdf/test_tokenizer.cc`'s `try_skipping`: for each literal occurrence of
+// "endstream", tokenize forward from that exact byte (a fresh, unconfigured
+// tokenizer, no relation to what precedes it) and accept only if the result
+// is the word token "endstream". Unlike a delimiter-boundary scan, this does
+// not require a delimiter before the match -- streams that lack a newline
+// before `endstream` still match starting mid-data. On success the return
+// value is the start of "endstream" itself, not the position after it,
+// since qpdf leaves the input positioned there for the next token read.
 fn find_endstream(input: &[u8], start: usize) -> Option<usize> {
     let search = &input[start..];
     let mut pos = 0;
     while pos < search.len() {
         let found = search[pos..].windows(9).position(|w| w == b"endstream")?;
         let abs = start + pos + found;
-        let is_start = abs == 0 || is_delimiter(input[abs - 1]);
-        let after = abs + 9;
-        let is_end = after >= input.len() || is_delimiter(input[after]);
-        if is_start && is_end {
-            return Some(after);
+        let mut probe = Tokenizer::new(&input[abs..]);
+        if let Ok(token) = probe.read_token(true, 0) {
+            if token.token_type == TokenType::Word && token.value == b"endstream" {
+                return Some(abs);
+            }
         }
         pos += found + 1;
     }
@@ -371,39 +355,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn find_endstream_finds_at_start() {
+    fn find_endstream_finds_word_at_start() {
         let data = b"endstream ";
-        assert_eq!(find_endstream(data, 0), Some(9));
+        assert_eq!(find_endstream(data, 0), Some(0));
     }
 
     #[test]
-    fn find_endstream_requires_delimiter_before() {
+    fn find_endstream_matches_without_preceding_delimiter() {
+        // qpdf's Finder tokenizes forward from the match; it never looks at
+        // the byte before "endstream", so data glued directly onto it (no
+        // newline before endstream) still matches.
         let data = b"xendstream ";
-        assert_eq!(find_endstream(data, 0), None);
+        assert_eq!(find_endstream(data, 0), Some(1));
     }
 
     #[test]
-    fn find_endstream_requires_delimiter_after() {
+    fn find_endstream_rejects_when_word_extends_past_match() {
         let data = b" endstreamx";
         assert_eq!(find_endstream(data, 0), None);
     }
 
     #[test]
-    fn find_endstream_at_delimiter_boundaries() {
+    fn find_endstream_at_crlf_boundary() {
         let data = b" stream\r\nendstream\r";
-        assert_eq!(find_endstream(data, 0), Some(18));
+        assert_eq!(find_endstream(data, 0), Some(9));
     }
 
     #[test]
-    fn find_endstream_with_nul_delimiter_before_and_after() {
+    fn find_endstream_with_nul_boundaries() {
         let data = b"\x00endstream\x00";
-        assert_eq!(find_endstream(data, 0), Some(10));
+        assert_eq!(find_endstream(data, 0), Some(1));
     }
 
     #[test]
-    fn find_endstream_with_nul_delimiter_after() {
-        let data = b" endstream\x00";
-        assert_eq!(find_endstream(data, 0), Some(10));
+    fn find_endstream_returns_none_when_absent() {
+        let data = b"no match here";
+        assert_eq!(find_endstream(data, 0), None);
     }
 
     #[test]
@@ -416,11 +403,5 @@ mod tests {
         assert_eq!(sanitize(&[0x00]), "\\x00");
         assert_eq!(sanitize(&[0x7f]), "\\x7f");
         assert_eq!(sanitize(&[0xff]), "\\xff");
-    }
-
-    #[test]
-    fn find_endstream_with_nul_delimiter() {
-        let data = b" endstream\x00";
-        assert_eq!(find_endstream(data, 0), Some(10));
     }
 }

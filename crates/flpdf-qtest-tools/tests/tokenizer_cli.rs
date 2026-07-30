@@ -69,6 +69,30 @@ fn tokenizer_no_ignorable_flag() {
 }
 
 #[test]
+fn tokenizer_finds_endstream_without_preceding_delimiter() {
+    // Regression test: qpdf's own endstream search (test_tokenizer.cc's
+    // try_skipping/Finder) tokenizes forward from each literal "endstream"
+    // match and never inspects the preceding byte, so stream data that
+    // abuts "endstream" with no separating newline still matches.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let pdf_bytes: &[u8] =
+        b"%PDF-1.4\n1 0 obj\n<< /Length 5 >>\nstream\nABCDEendstream\nendobj\n%%EOF\n";
+    fs::write(dir.path().join("glued.pdf"), pdf_bytes).expect("write glued.pdf into tempdir");
+
+    let output = run(&["glued.pdf"], dir.path());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("word: endstream"),
+        "expected a standalone endstream token, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("endstream not found"),
+        "endstream search should not fail when stream data abuts endstream: {stdout}"
+    );
+}
+
+#[test]
 fn tokenizer_maxlen_flag() {
     let dir = tempfile::tempdir().expect("create tempdir");
     fs::write(dir.path().join("minimal.pdf"), minimal_pdf_bytes())
