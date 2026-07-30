@@ -1354,7 +1354,12 @@ impl<R: Read + Seek> Pdf<R> {
     /// carries a real parsed offset from a native parse of the object's own
     /// source bytes, per qpdf's `getParsedOffset` contract. A compressed
     /// (object-stream member) reference keeps the no-offset sentinel: its
-    /// object-stream-relative parsed offset is not yet populated.
+    /// object-stream-relative parsed offset is not yet populated. In the
+    /// rare case where the object's cross-reference layout is malformed or
+    /// overlapping enough that the native parse's own read window is
+    /// insufficient, this falls back to the no-offset sentinel rather than
+    /// failing — this method never fails to resolve an object that
+    /// [`Pdf::resolve_borrowed`] resolves successfully.
     ///
     /// # Errors
     ///
@@ -1387,9 +1392,27 @@ impl<R: Read + Seek> Pdf<R> {
         // the source xref table, matching the design's Parsed-Offset
         // Contract table row-by-row: only `Uncompressed` file objects gain
         // real offsets in this layer.
+        //
+        // The native parse below reads only the fast bounded-to-the-next-
+        // object window (`read_bounded_object_window`), not
+        // `read_object_at_with_policy`'s rare full-file fallback for a
+        // malformed/overlapping source xref layout (e.g. a stray xref entry
+        // whose offset lands inside another object's body, truncating the
+        // window `next_object_offset` computes). `resolve_to_cache` above
+        // already resolved `object` successfully — via that same fallback,
+        // if the fast window needed it — so a native-parse failure here
+        // does not mean the object is unresolvable; it means only this
+        // reparse's narrower window was insufficient. Falling back to the
+        // already-correct `lift(&object, 0)` (offset sentinel, exactly the
+        // Compressed-branch expression below) guarantees
+        // `resolve_object_handle` never fails where `resolve_borrowed`/
+        // `resolve` already succeeded.
         let (value, parsed_offset) = match self.source_xref_entries().get(&object_ref).copied() {
             Some(XrefEntry::Uncompressed { offset }) => {
-                self.native_parse_uncompressed_value(offset, &object)?
+                match self.native_parse_uncompressed_value(offset, &object) {
+                    Ok(native) => native,
+                    Err(_) => (self.lift(&object, 0)?, NO_PARSED_OFFSET),
+                }
             }
             _ => (self.lift(&object, 0)?, NO_PARSED_OFFSET),
         };
@@ -1417,15 +1440,16 @@ impl<R: Read + Seek> Pdf<R> {
     // decrypted string content off a handle yet (that lands with a later
     // task's consumer cutover), so this is not yet output-visible.
     //
-    // Known, recorded gap: `read_bounded_object_window` reads only the fast
-    // "bounded to the next object's offset" window, not
-    // `read_object_at_with_policy`'s rare full-file fallback for a malformed
-    // or overlapping source xref layout. Since `resolve_to_cache` above
-    // always resolves via *some* window before this runs, the only way this
-    // native reparse can fail here is if resolving `object` needed that rare
-    // fallback — in which case this returns an error where `resolve_borrowed`
-    // would have succeeded. Not reproduced by this task's test fixtures (it
-    // requires a deliberately malformed/overlapping xref layout to trigger).
+    // `read_bounded_object_window` reads only the fast "bounded to the next
+    // object's offset" window, not `read_object_at_with_policy`'s rare
+    // full-file fallback for a malformed or overlapping source xref layout
+    // (e.g. `stream_with_false_next_xref_offset` in this module's own
+    // tests, whose bogus xref entry truncates the window mid-dictionary).
+    // An `Err` here therefore does not mean the object is unresolvable —
+    // `resolve_to_cache` already fully resolved `object` above, via that
+    // same fallback if the fast window needed it — so the caller
+    // (`resolve_object_handle`) treats this function's error as "fall back
+    // to `lift`", never as a hard failure.
     fn native_parse_uncompressed_value(
         &mut self,
         offset: u64,
@@ -1458,12 +1482,33 @@ impl<R: Read + Seek> Pdf<R> {
         let pending = parse_file_object_syntax(&bytes)?;
         let data_start = match pending.body {
             PendingBody::Stream { data_start, .. } => data_start,
-            // cov:ignore-start: unreachable in practice -- `object` (already
-            // resolved above from these same bytes) is `Object::Stream`, so
-            // parsing the identical bytes here always classifies it as
-            // `PendingBody::Stream` too.
-            PendingBody::Direct { next_offset, .. } => next_offset,
-            // cov:ignore-end
+            // Defensive, not reachable in practice: `object` is already
+            // confirmed `Object::Stream` (checked above), and `object` can
+            // only be `Object::Stream` if either (a) the bounded window
+            // above already contains the "stream" keyword — so this
+            // identical-bytes reparse would also classify it as
+            // `PendingBody::Stream`, matching case `Stream{..}` above — or
+            // (b) `resolve_to_cache` needed the full-file fallback, which
+            // only triggers on a hard parse failure, meaning this
+            // function's own dictionary parse (shared decision functions,
+            // identical window) would have already propagated that same
+            // failure via `?` a few lines up, never reaching this match at
+            // all. See `resolve_object_handle_tracks_legacys_dictionary_vs_stream_classification`,
+            // which empirically confirms the seemingly-plausible third case
+            // (bounded window sees the dictionary but not "stream", while
+            // `resolve_to_cache` still resolves a real stream) cannot occur:
+            // the legacy engine hits the identical ambiguity first and
+            // resolves `object` to a bare `Object::Dictionary` instead,
+            // which the `Object::Stream` check above would already have
+            // routed around. Erroring here rather than silently treating
+            // some other position as the stream's own parsed offset is a
+            // deliberate belt-and-suspenders choice: if this reasoning is
+            // ever wrong, the caller's fallback to `lift(&object, 0)` is
+            // strictly safer than fabricating a number.
+            // cov:ignore-start: unreachable per the invariants noted above
+            PendingBody::Direct { .. } => {
+                return Err(Error::parse(0, "native parse: expected stream framing"));
+            } // cov:ignore-end
         };
         let dict_handle = ObjectHandle::from_value(value);
         dict_handle.set_parsed_offset_if_unset(value_offset);
@@ -1479,14 +1524,18 @@ impl<R: Read + Seek> Pdf<R> {
 
     // Convert an already-resolved legacy `Object` into an `ObjectValue`. Since
     // this task reroutes Uncompressed objects to a native parse instead
-    // (`native_parse_uncompressed_value`), the only remaining caller of this
-    // function resolves Compressed (ObjStm-member) objects, which can never
-    // themselves be `Object::Stream` — so its dict/data split is not
-    // implemented here (falls back to `ObjectValue::Null`, unreachable in
-    // practice; see the `Object::Stream` match arm below). The
-    // content-stream-only `Object::Operator`/`Object::InlineImage` variants
-    // are equally unreachable, as is `Object::Reference` (filtered out by
-    // `lift_to_handle` before it would ever reach here).
+    // (`native_parse_uncompressed_value`), this function is now called only
+    // for Compressed (ObjStm-member) objects — which can never themselves be
+    // `Object::Stream` — and as `resolve_object_handle`'s fallback when that
+    // native parse's own (narrower) read window fails on a malformed or
+    // overlapping source xref layout even though the object resolved fine
+    // via `resolve_to_cache`'s own full-file fallback. `Object::Stream`'s
+    // dict/data split is not implemented here (falls back to
+    // `ObjectValue::Null`; see the `Object::Stream` match arm below for when
+    // that fallback path is actually reached). The content-stream-only
+    // `Object::Operator`/`Object::InlineImage` variants remain unreachable,
+    // as does `Object::Reference` (filtered out by `lift_to_handle` before
+    // it would ever reach here).
     //
     // `depth` bounds inline `Array`/`Dictionary` nesting against
     // `MAX_INLINE_DEPTH`, mirroring every other post-parse structural walker
@@ -1522,24 +1571,25 @@ impl<R: Read + Seek> Pdf<R> {
                     .map(|(k, v)| Ok((k.to_vec(), self.lift_to_handle(v, depth + 1)?)))
                     .collect::<Result<std::collections::BTreeMap<_, _>>>()?,
             ),
-            // Unreachable via `lift`'s only remaining callers now that this
-            // task reroutes Uncompressed objects away from it: `Object::Stream`
-            // can no longer reach here (a Compressed/ObjStm member, `lift`'s
-            // sole caller's remaining case, can never itself be a stream —
-            // that PDF spec constraint is why Task 6's stream test, the one
-            // case that used to exercise this arm via an Uncompressed
-            // fixture, now asserts a real materialized stream value instead,
-            // see `resolve_object_handle_survives_a_cyclic_indirect_stream_length`);
+            // `Object::Stream`'s dict/data split is not implemented here:
+            // reachable only through `resolve_object_handle`'s narrow
+            // native-parse-failure fallback (a Compressed/ObjStm member,
+            // `lift`'s other caller, can never itself be a stream — that PDF
+            // spec constraint is why Task 6's stream test, the one case that
+            // used to exercise this arm via an ordinary Uncompressed
+            // fixture, now asserts a real materialized stream value instead;
+            // see `resolve_object_handle_survives_a_cyclic_indirect_stream_length`
+            // and, for the fallback case, `resolve_object_handle_falls_back_to_lift_when_the_native_window_is_truncated`).
             // `Object::Operator`/`Object::InlineImage` are content-stream-only
             // and never a resolved file/ObjStm object value; `Object::Reference`
             // never survives to a top-level resolved value (qpdf integerizes
             // a bare top-level reference before caching it, and
             // `lift_to_handle` filters `Object::Reference` out before ever
-            // calling `lift`).
+            // calling `lift`) — both stay unreachable.
             Object::Stream(_)
             | Object::Operator(_)
             | Object::InlineImage(_)
-            | Object::Reference(_) => ObjectValue::Null, // cov:ignore: unreachable per the invariants noted above
+            | Object::Reference(_) => ObjectValue::Null,
         };
         Ok(value)
     }
@@ -4201,6 +4251,126 @@ mod tests {
             .as_bytes(),
         );
         bytes
+    }
+
+    /// Regression for a spec-review finding: a malformed/overlapping source
+    /// xref layout (this exact, pre-existing fixture — its object-2 entry
+    /// deliberately points into the middle of object 1's own body) truncates
+    /// `native_parse_uncompressed_value`'s bounded read window, but
+    /// `resolve_to_cache`/`resolve_borrowed` already recover the real value
+    /// via `read_object_at_with_policy`'s full-file fallback. Before the
+    /// fallback added to `resolve_object_handle`, this made
+    /// `resolve_object_handle` return `Err` where `resolve_borrowed`
+    /// succeeds — this test pins that it no longer does.
+    #[test]
+    fn resolve_object_handle_falls_back_to_lift_when_the_native_window_is_truncated() {
+        let object_ref = ObjectRef::new(1, 0);
+        let mut pdf = Pdf::open_mem_owned(stream_with_false_next_xref_offset())
+            .expect("open false-next-offset PDF");
+
+        let legacy = pdf
+            .resolve(object_ref)
+            .expect("resolve_borrowed already succeeds via the full-file fallback");
+        assert!(matches!(legacy, Object::Stream(_)));
+
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve_object_handle must not fail where resolve_borrowed succeeds");
+
+        // The fallback lands on the untouched Task 6 `lift` bridge, which
+        // does not implement `Object::Stream`'s dict/data split (a
+        // pre-existing, documented gap — see `lift`'s own comment) — so the
+        // *value* is `Null` here, not the real stream. What this test pins
+        // is that this no longer *errors*; a later task's cutover away from
+        // `lift` entirely would be the place to also make this fallback
+        // path stream-aware.
+        assert!(handle.is_null());
+        assert_eq!(handle.get_parsed_offset(), -1);
+    }
+
+    /// A malformed/overlapping xref layout whose bogus "next object" offset
+    /// lands between object 1's dictionary and its `stream` keyword: long
+    /// enough for the dictionary to parse successfully within the bounded
+    /// window, but too short to ever see `stream` itself. Investigated for
+    /// a spec-review follow-up concern about `native_parse_uncompressed_value`
+    /// silently misreporting a stream's parsed offset if its bounded window
+    /// disagreed with `resolve_to_cache`'s classification of the same
+    /// object — see `resolve_object_handle_tracks_legacys_dictionary_vs_stream_classification`
+    /// for why that turns out not to be reachable.
+    fn stream_with_false_next_xref_offset_between_dict_and_stream_keyword() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let stream_offset = bytes.len();
+        let body = b"1 0 obj\n<< /Length 5 >>\nstream\nHello\nendstream\nendobj\n";
+        bytes.extend_from_slice(body);
+        let dict_and_newline_len = b"1 0 obj\n<< /Length 5 >>\n".len();
+        let false_next = stream_offset + dict_and_newline_len;
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 3\n\
+                 0000000000 65535 f \n\
+                 {stream_offset:010} 00000 n \n\
+                 {false_next:010} 00000 n \n\
+                 trailer\n<< /Size 3 /Root 1 0 R >>\n\
+                 startxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    /// Empirically closes the spec-review follow-up concern: a bounded
+    /// window long enough for the dictionary to parse but too short to see
+    /// the `stream` keyword does *not* let `native_parse_uncompressed_value`
+    /// silently misclassify a genuine stream as a bare dictionary, because
+    /// the *legacy* engine's own bounded attempt hits the exact same
+    /// ambiguity first — and, since a missing `endobj`/`stream` is only ever
+    /// a soft warning (`check_endobj`), never a hard failure, `resolve_to_cache`
+    /// itself resolves `object` to a bare `Object::Dictionary` here (a
+    /// pre-existing flpdf quirk this task neither introduces nor fixes; it
+    /// affects `Pdf::resolve`/`resolve_borrowed` identically, with or
+    /// without this task's changes). Since `object`'s *actual* classification
+    /// is already `Dictionary`, not `Stream`, `native_parse_uncompressed_value`'s
+    /// `let Object::Stream(stream) = object else { return Ok(..) }` early
+    /// return takes over — the same code path exercised for any ordinary
+    /// dictionary — so the `PendingBody::Direct` arm inside the `Some(stream)`
+    /// branch is provably unreachable: `object` can only be `Object::Stream`
+    /// when the bounded window already saw `stream` (case: the legacy
+    /// bounded attempt's own classification would then agree), or when a
+    /// hard parse failure forced the full-file retry (case: this task's own
+    /// `resolve_object_handle_falls_back_to_lift_when_the_native_window_is_truncated`
+    /// regression, where the *dictionary* parse itself fails identically on
+    /// both paths, not just the stream-keyword visibility).
+    #[test]
+    fn resolve_object_handle_tracks_legacys_dictionary_vs_stream_classification() {
+        let object_ref = ObjectRef::new(1, 0);
+        let mut pdf = Pdf::open_mem_owned(
+            stream_with_false_next_xref_offset_between_dict_and_stream_keyword(),
+        )
+        .expect("open false-next-offset PDF");
+
+        let legacy = pdf
+            .resolve(object_ref)
+            .expect("legacy resolves, to the (pre-existing quirk's) wrong classification");
+        assert!(matches!(legacy, Object::Dictionary(_)));
+
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve_object_handle must not fail");
+
+        let dict = handle
+            .as_dictionary()
+            .expect("must track object's actual Dictionary classification, not guess Stream");
+        assert_eq!(
+            dict.get(b"Length".as_slice())
+                .and_then(ObjectHandle::as_integer),
+            Some(5)
+        );
+        assert_ne!(
+            handle.get_parsed_offset(),
+            -1,
+            "a plain dictionary still gets a real native-parsed offset"
+        );
     }
 
     #[test]
