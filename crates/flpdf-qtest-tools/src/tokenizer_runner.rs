@@ -9,6 +9,8 @@ use flpdf::pages::{page_content_bytes, page_refs};
 use flpdf::tokenizer::{TokenType, Tokenizer};
 use flpdf::{Object, Pdf, PdfOpenOptions};
 
+use crate::driver::{emit_new_diagnostics, os_str_diagnostic_bytes, write_warning};
+
 pub enum RunOutcome {
     Exit(u8),
 }
@@ -156,7 +158,29 @@ fn process(
         allow_weak_crypto: true,
         ..PdfOpenOptions::default()
     };
-    let mut pdf = Pdf::open_mem_owned_with_options(bytes, options).map_err(|e| e.to_string())?;
+    let filename_diagnostic = os_str_diagnostic_bytes(filename);
+    let mut pdf = match Pdf::open_mem_owned_with_options(bytes, options) {
+        Ok(pdf) => pdf,
+        Err(e) => {
+            // qpdf's processFile prints repair warnings as it emits them,
+            // even when reconstruction ultimately fails to produce an
+            // openable document.
+            if let Some((_, diagnostics)) = e.open_failure() {
+                for diagnostic in diagnostics.entries() {
+                    let _ = write_warning(&filename_diagnostic, diagnostic, stdout, stderr);
+                }
+            }
+            return Err(e.to_string());
+        }
+    };
+    let mut diagnostics_written = 0;
+    let _ = emit_new_diagnostics(
+        &pdf,
+        &mut diagnostics_written,
+        &filename_diagnostic,
+        stdout,
+        stderr,
+    );
 
     let page_refs = page_refs(&mut pdf).map_err(|e| e.to_string())?;
     for (pageno, page_ref) in page_refs.iter().enumerate() {
@@ -319,9 +343,12 @@ fn dump_tokens(
             }
         } else if skip_inline_images && token.token_type == TokenType::Word && token.value == b"ID"
         {
-            if let Err(_e) = tokenizer.consume_one_byte() {
-                continue;
-            }
+            // qpdf's is->read(&ch, 1) doesn't check how many bytes it got —
+            // it always proceeds to expectInlineImage and records the
+            // cursor. A content stream that ends right after `ID` (no
+            // separator byte) still enters inline-image recovery, which the
+            // next iteration's EOF handling reports as "EI not found".
+            let _ = tokenizer.consume_one_byte();
             inline_image_offset = Some(tokenizer.position());
         } else if token.token_type == TokenType::Eof {
             done = true;

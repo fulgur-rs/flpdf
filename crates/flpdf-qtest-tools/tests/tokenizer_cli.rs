@@ -93,6 +93,104 @@ fn tokenizer_finds_endstream_without_preceding_delimiter() {
 }
 
 #[test]
+fn tokenizer_emits_repair_warnings_to_stderr() {
+    // Regression test: repair diagnostics accumulated while reconstructing a
+    // damaged file's xref table were collected but never surfaced. qpdf's
+    // own processFile prints these warnings as it repairs the file.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let bytes = fs::read(
+        fixture_dir()
+            .join("test_driver")
+            .join("repairable_input.pdf"),
+    )
+    .expect("read repairable_input.pdf fixture");
+    fs::write(dir.path().join("repairable_input.pdf"), bytes)
+        .expect("write repairable_input.pdf into tempdir");
+
+    let output = run(&["repairable_input.pdf"], dir.path());
+
+    assert!(
+        output.status.success(),
+        "unexpected exit status: {:?}; stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("WARNING: repairable_input.pdf: file is damaged"));
+    assert!(stderr.contains("WARNING: repairable_input.pdf: can't find startxref"));
+    assert!(stderr.contains(
+        "WARNING: repairable_input.pdf: Attempting to reconstruct cross-reference table"
+    ));
+}
+
+fn build_pdf_with_page_content(content: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+    let mut offsets: Vec<u64> = vec![0];
+    let push_obj = |out: &mut Vec<u8>, offsets: &mut Vec<u64>, body: &[u8]| {
+        let n = offsets.len();
+        offsets.push(out.len() as u64);
+        out.extend_from_slice(format!("{n} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    };
+    push_obj(&mut out, &mut offsets, b"<< /Type /Catalog /Pages 2 0 R >>");
+    push_obj(
+        &mut out,
+        &mut offsets,
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    push_obj(
+        &mut out,
+        &mut offsets,
+        b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /MediaBox [0 0 1 1] >>",
+    );
+    let mut stream_obj = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+    stream_obj.extend_from_slice(content);
+    stream_obj.extend_from_slice(b"\nendstream");
+    push_obj(&mut out, &mut offsets, &stream_obj);
+
+    let xref_start = out.len() as u64;
+    let total = offsets.len();
+    out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+    for offset in &offsets[1..] {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn tokenizer_recovers_inline_image_missing_id_separator() {
+    // Regression test: when a page's content stream ends immediately after
+    // `ID` (no separator byte), qpdf's is->read(&ch, 1) still proceeds to
+    // expectInlineImage and records the cursor. flpdf must do the same
+    // rather than silently skipping the recovery attempt.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    fs::write(
+        dir.path().join("id_at_eof.pdf"),
+        build_pdf_with_page_content(b"ID"),
+    )
+    .expect("write id_at_eof.pdf into tempdir");
+
+    let output = run(&["id_at_eof.pdf"], dir.path());
+
+    assert!(
+        output.status.success(),
+        "unexpected exit status: {:?}; stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("EI not found; resuming normal scanning"),
+        "expected inline-image recovery output, got: {stdout}"
+    );
+}
+
+#[test]
 fn tokenizer_maxlen_flag() {
     let dir = tempfile::tempdir().expect("create tempdir");
     fs::write(dir.path().join("minimal.pdf"), minimal_pdf_bytes())
