@@ -5,7 +5,7 @@ use std::io;
 
 use flpdf::filters::{self, DecodeLimits};
 use flpdf::pages::{page_content_bytes, page_refs};
-use flpdf::qtest_tokenizer::{token_type_name, TokenType, Tokenizer};
+use flpdf::qtest_tokenizer::{TokenType, Tokenizer};
 use flpdf::{Object, Pdf, PdfOpenOptions};
 
 /// Outcome produced by the tokenizer runner.
@@ -107,6 +107,30 @@ fn sanitize(value: &[u8]) -> String {
         }
     }
     result
+}
+
+/// qpdf correspondence: `test_tokenizer.cc:50-94`
+fn token_type_name(token_type: TokenType) -> &'static str {
+    match token_type {
+        TokenType::Bad => "bad",
+        TokenType::ArrayClose => "array_close",
+        TokenType::ArrayOpen => "array_open",
+        TokenType::BraceClose => "brace_close",
+        TokenType::BraceOpen => "brace_open",
+        TokenType::DictClose => "dict_close",
+        TokenType::DictOpen => "dict_open",
+        TokenType::Integer => "integer",
+        TokenType::Name => "name",
+        TokenType::Real => "real",
+        TokenType::String => "string",
+        TokenType::Null => "null",
+        TokenType::Bool => "bool",
+        TokenType::Word => "word",
+        TokenType::Eof => "eof",
+        TokenType::Space => "space",
+        TokenType::Comment => "comment",
+        TokenType::InlineImage => "inline-image",
+    }
 }
 
 fn process(
