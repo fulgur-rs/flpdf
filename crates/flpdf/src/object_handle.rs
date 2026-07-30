@@ -127,7 +127,7 @@ impl ObjectHandle {
 
     // Record `offset` as the parsed offset, but only if none has been set
     // yet (matches qpdf: "set only while still negative",
-    // `libqpdf/qpdf/QPDFValue.hh:149-152`). The parser wires up real callers
+    // `libqpdf/qpdf/QPDFValue.hh:90-100`). The parser wires up real callers
     // in a later task; exposed here so this module's own tests can exercise
     // the set-once contract without a live parser.
     #[allow(dead_code)]
