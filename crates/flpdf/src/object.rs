@@ -835,7 +835,7 @@ impl Dictionary {
         out.extend_from_slice(b"<<");
         for (key, value) in self.iter() {
             out.extend_from_slice(b" /");
-            out.extend_from_slice(key);
+            write_name_escaped(out, key);
             out.push(b' ');
             value.write_pdf(out);
         }
@@ -867,7 +867,7 @@ impl Dictionary {
         let mut id_writer = id_writer;
         for (key, value) in self.iter() {
             out.extend_from_slice(b" /");
-            out.extend_from_slice(key);
+            write_name_escaped(out, key);
             out.push(b' ');
             match (key == b"ID", id_writer.as_mut()) {
                 (true, Some(write_id)) => write_id(out),
@@ -910,7 +910,7 @@ impl Dictionary {
                 continue;
             }
             out.extend_from_slice(b" /");
-            out.extend_from_slice(key);
+            write_name_escaped(out, key);
             out.push(b' ');
             value.write_pdf(out);
         }
@@ -956,7 +956,7 @@ impl Dictionary {
                 continue;
             }
             out.extend_from_slice(b" /");
-            out.extend_from_slice(key);
+            write_name_escaped(out, key);
             out.push(b' ');
             value.write_pdf(out);
         }
@@ -1077,6 +1077,52 @@ mod qdf_key_escape_tests {
         let mut out = Vec::new();
         d.write_pdf_qdf(&mut out, 0);
         assert_eq!(out, b"<<\n  /Type /Catalog\n>>");
+    }
+}
+
+#[cfg(test)]
+mod compact_key_escape_tests {
+    use super::*;
+
+    const RAW_KEY: &[u8] = b"A B#C/D\x80E";
+    const ESCAPED_KEY: &[u8] = b"A#20B#23C#2fD#80E";
+
+    fn dictionary() -> Dictionary {
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(RAW_KEY, Object::Integer(1));
+        dictionary
+    }
+
+    #[test]
+    fn plain_dictionary_key_is_name_escaped() {
+        let mut out = Vec::new();
+        dictionary().write_pdf(&mut out);
+        assert_eq!(out, [b"<< /", ESCAPED_KEY, b" 1 >>"].concat());
+    }
+
+    #[test]
+    fn id_writer_dictionary_key_is_name_escaped() {
+        let mut out = Vec::new();
+        dictionary().write_pdf_with_id_writer(&mut out, None);
+        assert_eq!(out, [b"<< /", ESCAPED_KEY, b" 1 >>"].concat());
+    }
+
+    #[test]
+    fn stream_dictionary_key_is_name_escaped() {
+        let mut dictionary = dictionary();
+        dictionary.insert(b"Length", Object::Integer(0));
+        let mut out = Vec::new();
+        dictionary.write_pdf_stream(&mut out, false);
+        assert_eq!(out, [b"<< /", ESCAPED_KEY, b" 1 /Length 0 >>"].concat());
+    }
+
+    #[test]
+    fn trailer_dictionary_key_is_name_escaped() {
+        let mut dictionary = dictionary();
+        dictionary.insert(b"Size", Object::Integer(5));
+        let mut out = Vec::new();
+        dictionary.write_pdf_trailer(&mut out, None);
+        assert_eq!(out, [b"<< /", ESCAPED_KEY, b" 1 /Size 5 >>"].concat());
     }
 }
 
