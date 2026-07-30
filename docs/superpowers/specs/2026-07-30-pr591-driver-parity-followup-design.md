@@ -17,7 +17,9 @@ Keep `/DCTDecode` in existing follow-up `flpdf-n9t0.9`. Track TIFF
 
 - qpdf 11.9.0 `qpdf/test_driver.cc:3572-3589` receives `char* argv[]`, derives
   `whoami` directly from `argv[0]`, and passes `argv[2]` unchanged to file
-  processing. On Unix, those argv and filesystem path bytes need not be UTF-8.
+  processing. Its `strrchr(argv[0], '/')` strips only a forward-slash prefix;
+  backslashes and suffixes such as `.exe` remain byte-exact. On Unix, those
+  argv and filesystem path bytes need not be UTF-8.
 - Test 1 requests `qpdf_dl_all` both for filterability and actual output
   (`qpdf/test_driver.cc:268-272`).
 - `QPDF_Stream::pipeStreamData` constructs every parsed filter in reverse order
@@ -46,9 +48,11 @@ Unicode and a documented lossy fallback only for unpaired wide values. This
 does not regress ordinary Windows paths and removes the Unix panic reported by
 the review.
 
-Program-name extraction operates on diagnostic bytes, stripping the final
-`/` or `\` component and `.exe` without converting the whole argument to
-`String`.
+Driver program-name extraction operates on diagnostic bytes and returns only
+the bytes after the final `/`, without converting the whole argument to
+`String`. It deliberately preserves `\` and `.exe`, matching qpdf's
+`strrchr(argv[0], '/')`. The existing compare-binary string helper retains its
+separate cross-platform basename behavior.
 
 Warning and error writers emit a fixed ASCII prefix/suffix around raw filename
 bytes. They must not rebuild the complete line with `format!`, which would
@@ -132,8 +136,9 @@ Acceptance must cover:
   filename contains invalid UTF-8 and verifies normal test output/status.
 - A Unix failure-path test verifies the raw invalid filename bytes appear in
   the open error and the process exits 2 without a panic.
-- A unit test supplies a non-UTF-8 argv0 and verifies byte-exact basename usage
-  in the usage line.
+- A unit test supplies an argv0 containing non-UTF-8, `\`, and `.exe`, and
+  verifies qpdf's slash-only, suffix-preserving usage line byte-for-byte.
+- A pinned oracle CLI probe controls argv0 and compares exact usage/status.
 - Existing Linux, macOS, and Windows CLI/golden tests remain unchanged in
   meaning and pass.
 
@@ -145,7 +150,9 @@ Acceptance must cover:
 - A deterministic flpdf-authored PDF with 17 `ASCIIHexDecode` stages is added
   to the generator and qpdf differential inventory.
 - Its `.out` is generated only from pinned qpdf 11.9.0.
-- The differential inventory increases from 37 to 38 fixtures.
+- The original filter-chain follow-up increases the inventory from 37 to 38
+  fixtures; the shared final-wave manifest contains 46 fixtures and 11 CLI
+  probes.
 - The Rust driver matches qpdf merged output and exit status exactly.
 
 ### Quality gates

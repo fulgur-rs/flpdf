@@ -14,6 +14,32 @@ fn stream_decode_error_detail(error: Error) -> String {
     }
 }
 
+fn write_decode_param_type_warning(
+    filename: &[u8],
+    object_ref: flpdf::ObjectRef,
+    offset: Option<u64>,
+    object_type: &str,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> flpdf::Result<()> {
+    stdout.flush()?;
+    write!(stderr, "WARNING: ")?;
+    write_bytes(stderr, filename)?;
+    write!(
+        stderr,
+        ", object {} {}",
+        object_ref.number, object_ref.generation
+    )?;
+    if let Some(offset) = offset {
+        write!(stderr, " at offset {offset}")?;
+    }
+    writeln!(
+        stderr,
+        ": operation for dictionary attempted on object of type {object_type}: treating as empty"
+    )?;
+    Ok(())
+}
+
 pub(crate) fn run_test_0_1<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filename: &[u8],
@@ -91,7 +117,9 @@ fn write_object_details<R: Read + Seek>(
         }
         Object::Dictionary(_) => {
             writeln!(stdout, "/QTest is a dictionary")?;
-            for (key, value) in qtest.dictionary_items(pdf)? {
+            let items = qtest.dictionary_items(pdf)?;
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            for (key, value) in items {
                 write!(stdout, "  /")?;
                 write_bytes(stdout, &key)?;
                 let direct_prefix = if value.is_indirect() { "in" } else { "" };
@@ -113,9 +141,53 @@ fn write_object_details<R: Read + Seek>(
             writeln!(stdout)?;
             writeln!(stdout, "Uncompressed stream data:")?;
 
+            let decode_param_warnings = if decode_dictionary.decode_param_type_warnings().is_empty()
+            {
+                Vec::new()
+            } else {
+                let object_ref = qtest.terminal_indirect_ref().ok_or_else(|| {
+                    Error::System(
+                        "stream DecodeParms warning has no terminal indirect object".to_string(),
+                    )
+                })?;
+                decode_dictionary
+                    .decode_param_type_warnings()
+                    .iter()
+                    .map(|warning| {
+                        pdf.qtest_decode_parms_source_offset(object_ref, warning.filter_index)
+                            .map(|offset| (warning.object_type, offset))
+                    })
+                    .collect::<flpdf::Result<Vec<_>>>()?
+            };
+            if let Some(object_ref) = qtest.terminal_indirect_ref() {
+                for (object_type, offset) in &decode_param_warnings {
+                    write_decode_param_type_warning(
+                        filename,
+                        object_ref,
+                        *offset,
+                        object_type,
+                        stdout,
+                        stderr,
+                    )?;
+                }
+            }
+
             if !decode_dictionary.is_filterable() {
                 writeln!(stdout, "Stream data is not filterable.")?;
                 return Ok(());
+            }
+
+            if let Some(object_ref) = qtest.terminal_indirect_ref() {
+                for (object_type, offset) in &decode_param_warnings {
+                    write_decode_param_type_warning(
+                        filename,
+                        object_ref,
+                        *offset,
+                        object_type,
+                        stdout,
+                        stderr,
+                    )?;
+                }
             }
 
             match flpdf::filters::decode_stream_data_recovering_with_limits(
@@ -428,6 +500,54 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_lazy_child_warning_is_drained_before_items_even_when_null() {
+        let bytes = pdf_with_qtest(
+            b"6 0 R",
+            &[
+                (6, b"<< /a 7 0 R >>".to_vec()),
+                (7, b"null\nnot-endobj".to_vec()),
+            ],
+        );
+        let warning_offset = bytes
+            .windows(b"not-endobj".len())
+            .position(|window| window == b"not-endobj")
+            .expect("malformed child token");
+        let options = PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        };
+        let mut pdf =
+            Pdf::open_mem_owned_with_options(bytes, options).expect("open lazy child fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
+
+        run_test_0_1(
+            &mut pdf,
+            b"fixture.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test_0_1");
+
+        assert_eq!(
+            stdout,
+            b"/QTest is indirect and has type dictionary (9)\n\
+              /QTest is a dictionary\n\
+              unparse: 6 0 R\n\
+              unparseResolved: << >>\n"
+        );
+        assert_eq!(
+            stderr,
+            format!(
+                "WARNING: fixture.pdf (object 7 0, offset {warning_offset}): expected endobj\n"
+            )
+            .into_bytes()
+        );
+    }
+
+    #[test]
     fn flate_stream_emits_raw_and_decoded_bytes_and_indirect_unparse() {
         let compressed = b"\x78\x9c\x4b\x4c\x4a\x06\x00\x02\x4d\x01\x27";
         let mut stream = b"<< /Filter /FlateDecode /Length 11 >>\nstream\n".to_vec();
@@ -450,6 +570,52 @@ mod tests {
     }
 
     #[test]
+    fn crypt_stream_is_driver_only_identity_after_qpdf_decryption_boundary() {
+        assert_eq!(
+            output(
+                b"7 0 R",
+                &[(
+                    7,
+                    b"<< /Filter /Crypt /Length 3 >>\nstream\nabc\nendstream".to_vec(),
+                )],
+            ),
+            b"/QTest is indirect and has type stream (10)\n\
+              /QTest is a stream.  Dictionary: << /Filter /Crypt /Length 3 >>\n\
+              Raw stream data:\n\
+              abc\n\
+              Uncompressed stream data:\n\
+              abc\n\
+              End of stream data\n\
+              unparse: 7 0 R\n\
+              unparseResolved: 7 0 R\n"
+        );
+    }
+
+    #[test]
+    fn crypt_decode_params_follow_qpdf_validation_without_weakening_core_decode() {
+        let compressed = b"\x78\x9c\x4b\x4c\x4a\x06\x00\x02\x4d\x01\x27";
+        let mut stream = b"<< /Filter [ /Crypt /FlateDecode ] \
+                           /DecodeParms [ << /Type /CryptFilterDecodeParms /Name 42 >> null ] \
+                           /Length 11 >>\nstream\n"
+            .to_vec();
+        stream.extend_from_slice(compressed);
+        stream.extend_from_slice(b"\nendstream");
+
+        let actual = output(b"7 0 R", &[(7, stream)]);
+
+        assert!(actual
+            .windows(b"\nUncompressed stream data:\nabc\nEnd of stream data\n".len())
+            .any(|line| line == b"\nUncompressed stream data:\nabc\nEnd of stream data\n"));
+
+        let mut core_dictionary = Dictionary::new();
+        core_dictionary.insert("Filter", Object::Name(b"Crypt".to_vec()));
+        assert!(
+            flpdf::filters::decode_stream_data_recovering(&core_dictionary, b"abc").is_err(),
+            "ordinary library decode must continue rejecting identity Crypt"
+        );
+    }
+
+    #[test]
     fn flate_ignores_deep_unknown_decode_parameter_values() {
         let metadata = (0..64).fold(b"1".to_vec(), |value, _| {
             let mut nested = b"[ ".to_vec();
@@ -468,6 +634,49 @@ mod tests {
         assert!(actual
             .windows(b"\nabc\nEnd of stream data\n".len())
             .any(|line| { line == b"\nabc\nEnd of stream data\n" }));
+    }
+
+    #[test]
+    fn nondictionary_flate_decode_params_warn_twice_at_the_value_token() {
+        let compressed = b"\x78\x9c\x4b\x4c\x4a\x06\x00\x02\x4d\x01\x27";
+        let mut stream =
+            b"<< /Filter /FlateDecode /DecodeParms 42 /Length 11 >>\nstream\n".to_vec();
+        stream.extend_from_slice(compressed);
+        stream.extend_from_slice(b"\nendstream");
+        let bytes = pdf_with_qtest(b"7 0 R", &[(7, stream)]);
+        let marker = b"/DecodeParms 42";
+        let marker_start = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("DecodeParms source token");
+        let value_offset = marker_start + b"/DecodeParms ".len();
+        let options = PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        };
+        let mut pdf =
+            Pdf::open_mem_owned_with_options(bytes, options).expect("open DecodeParms fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
+
+        run_test_0_1(
+            &mut pdf,
+            b"fixture.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test_0_1");
+
+        assert!(stdout
+            .windows(b"\nUncompressed stream data:\nabc\nEnd of stream data\n".len())
+            .any(|line| line == b"\nUncompressed stream data:\nabc\nEnd of stream data\n"));
+        let warning = format!(
+            "WARNING: fixture.pdf, object 7 0 at offset {value_offset}: \
+             operation for dictionary attempted on object of type integer: treating as empty\n"
+        );
+        assert_eq!(stderr, warning.repeat(2).into_bytes());
     }
 
     #[test]

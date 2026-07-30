@@ -14,53 +14,29 @@ esac
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 cd "$script_dir"
 
-fixture_names=(
-    repairable_input
-    open_repair_failure
-    empty_reconstructed_xref
-    implicit_null
-    direct_null
-    dangling_ref
-    indirect_null
-    indirect_bool_true
-    indirect_bool_false
-    chained_reference
-    integer
-    real
-    string_hex_literal
-    name_escape
-    array_indirect
-    dict_keys
-    dict_dangling_value
-    dict_escaped_key
-    stream_flate
-    stream_indirect_filter
-    stream_chained_filter
-    stream_indirect_filter_array
-    stream_indirect_decode_parms
-    stream_indirect_decode_parms_container
-    stream_decode_parms_direct_null
-    stream_decode_parms_indirect_null
-    stream_decode_parms_length_mismatch
-    stream_offset_false_markers
-    stream_unknown_decode_param
-    stream_deep_invalid_filter
-    stream_flate_error
-    stream_filter_error_then_warning
-    stream_asciihex_odd_nibble_recovery
-    stream_asciihex_data_before_error
-    stream_asciihex_downstream_cleanup_after_error
-    stream_filter_chain_17
-    stream_unfilterable
-    stream_unsupported_filter_skips_decode_parms
-)
+manifest="${script_dir}/fixture-names.txt"
+fixture_names=()
+while IFS= read -r name || [[ -n "$name" ]]; do
+    if [[ -z "$name" || ! "$name" =~ ^[a-z0-9_]+$ ]]; then
+        printf 'invalid fixture manifest entry: %s\n' "$name" >&2
+        exit 1
+    fi
+    for existing in "${fixture_names[@]}"; do
+        if [[ "$existing" == "$name" ]]; then
+            printf 'duplicate fixture manifest entry: %s\n' "$name" >&2
+            exit 1
+        fi
+    done
+    fixture_names+=("$name")
+done <"$manifest"
 
 generate_all() {
+    local out_dir=$1
     command -v python3 >/dev/null || {
         printf 'python3 is required to generate test_driver fixtures\n' >&2
         exit 1
     }
-    python3 - "$script_dir" <<'PYEOF'
+    python3 - "$out_dir" <<'PYEOF'
 import os
 import sys
 import zlib
@@ -72,6 +48,7 @@ def build_pdf(
     qtest: bytes | None,
     extras: dict[int, bytes],
     bad_startxref: bool = False,
+    omit_startxref: bool = False,
     object_leader: bytes = b"",
 ) -> bytes:
     objects: dict[int, bytes] = {
@@ -99,9 +76,12 @@ def build_pdf(
     data += f"trailer\n<< /Size {max_object + 1} /Root 1 0 R".encode("ascii")
     if qtest is not None:
         data += b" /QTest " + qtest
-    data += b" >>\nstartxref\n"
-    data += (b"0" if bad_startxref else str(xref_offset).encode("ascii"))
-    data += b"\n%%EOF\n"
+    data += b" >>\n"
+    if not omit_startxref:
+        data += b"startxref\n"
+        data += (b"0" if bad_startxref else str(xref_offset).encode("ascii"))
+        data += b"\n"
+    data += b"%%EOF\n"
     return bytes(data)
 
 
@@ -128,6 +108,11 @@ write(
     "empty_reconstructed_xref",
     b"%PDF-1.7\ntrailer\n<< /Size 1 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n",
 )
+write(
+    "missing_pdf_header",
+    build_pdf(b"true", {}).replace(b"%PDF-1.7\n", b"notpdf!!\n", 1),
+)
+write("missing_startxref", build_pdf(b"true", {}, omit_startxref=True))
 write("implicit_null", build_pdf(None, {}))
 write("direct_null", build_pdf(b"null", {}))
 write("dangling_ref", build_pdf(b"99 0 R", {}))
@@ -160,6 +145,16 @@ write(
 write(
     "dict_escaped_key",
     build_pdf(b"6 0 R", {6: b"<< /hex#20strings true >>"}),
+)
+write(
+    "dict_indirect_value_warning",
+    build_pdf(
+        b"6 0 R",
+        {
+            6: b"<< /a 7 0 R >>",
+            7: b"true\nnot-endobj",
+        },
+    ),
 )
 
 flate_abc = zlib.compress(b"abc")
@@ -259,6 +254,25 @@ write(
     ),
 )
 write(
+    "stream_flate_nondict_decode_parms",
+    build_pdf(
+        b"6 0 R",
+        {6: stream(b"/Filter /FlateDecode /DecodeParms 42", flate_abc)},
+    ),
+)
+write(
+    "stream_lzw_nondict_decode_parms_array",
+    build_pdf(
+        b"6 0 R",
+        {
+            6: stream(
+                b"/Filter [ /LZWDecode ] /DecodeParms [ 42 ]",
+                bytes.fromhex("80106020"),
+            ),
+        },
+    ),
+)
+write(
     "stream_offset_false_markers",
     build_pdf(
         b"6 0 R",
@@ -302,6 +316,18 @@ write(
     ),
 )
 write(
+    "stream_flate_png_finish_warning_order",
+    build_pdf(
+        b"6 0 R",
+        {
+            6: stream(
+                b"/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 2 >>",
+                zlib.compress(b"\x00A")[:-4],
+            ),
+        },
+    ),
+)
+write(
     "stream_asciihex_odd_nibble_recovery",
     build_pdf(b"6 0 R", {6: stream(b"/Filter /AHx", b"4G ")}),
 )
@@ -333,6 +359,23 @@ write(
         },
     ),
 )
+write(
+    "stream_crypt_identity",
+    build_pdf(b"6 0 R", {6: stream(b"/Filter /Crypt", b"abc")}),
+)
+write(
+    "stream_crypt_identity_decode_parms_array",
+    build_pdf(
+        b"6 0 R",
+        {
+            6: stream(
+                b"/Filter [ /Crypt /FlateDecode ] "
+                b"/DecodeParms [ << /Type /CryptFilterDecodeParms /Name 42 >> null ]",
+                flate_abc,
+            ),
+        },
+    ),
+)
 
 metadata = b"1"
 for _ in range(64):
@@ -360,6 +403,27 @@ write(
     build_pdf(b"6 0 R", {6: stream(b"/Filter " + deep_invalid_filter, b"abc")}),
 )
 PYEOF
+}
+
+check_inventory() {
+    local directory=$1
+    local extension=$2
+    local files=()
+    local name
+    shopt -s nullglob
+    files=("$directory"/*."$extension")
+    shopt -u nullglob
+    if [[ "${#files[@]}" -ne "${#fixture_names[@]}" ]]; then
+        printf '%s inventory count differs from manifest: expected %d, found %d\n' \
+            "$extension" "${#fixture_names[@]}" "${#files[@]}" >&2
+        exit 1
+    fi
+    for name in "${fixture_names[@]}"; do
+        test -f "${directory}/${name}.${extension}" || {
+            printf 'missing manifest fixture: %s.%s\n' "$name" "$extension" >&2
+            exit 1
+        }
+    done
 }
 
 check_all() {
@@ -395,6 +459,31 @@ check_all() {
 }
 
 if [[ "$mode" == --generate ]]; then
-    generate_all
+    generate_all "$script_dir"
+    check_inventory "$script_dir" pdf
+else
+    generated_dir=$(mktemp -d /tmp/flpdf-test-driver-fixtures.XXXXXXXX)
+    cleanup_generated() {
+        local status=$?
+        trap - EXIT
+        case "$generated_dir" in
+            /tmp/flpdf-test-driver-fixtures.*)
+                rm -rf -- "$generated_dir" || status=1
+                ;;
+            *)
+                printf 'refusing unsafe fixture cleanup: %s\n' "$generated_dir" >&2
+                status=1
+                ;;
+        esac
+        exit "$status"
+    }
+    trap cleanup_generated EXIT
+    generate_all "$generated_dir"
+    check_inventory "$generated_dir" pdf
+    check_inventory "$script_dir" pdf
+    check_inventory "$script_dir" out
+    for name in "${fixture_names[@]}"; do
+        cmp -- "${generated_dir}/${name}.pdf" "${script_dir}/${name}.pdf"
+    done
 fi
 check_all

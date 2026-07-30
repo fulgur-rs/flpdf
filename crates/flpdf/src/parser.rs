@@ -114,6 +114,49 @@ pub(crate) fn parse_strict_direct_object(input: &[u8]) -> Result<ParsedDirectObj
     })
 }
 
+#[cfg(feature = "qtest-driver")]
+pub(crate) fn dictionary_value_source_offset(
+    input: &[u8],
+    key: &[u8],
+    array_index: usize,
+) -> Result<Option<usize>> {
+    let mut tokenizer = Tokenizer::new(input);
+    let mut parser = Parser::with_tokenizer(&mut tokenizer);
+    let open = parser.next_token()?;
+    if open.token_type != TokenType::DictOpen {
+        return Ok(None);
+    }
+
+    loop {
+        let key_token = parser.next_token()?;
+        if key_token.token_type == TokenType::DictClose {
+            return Ok(None);
+        }
+        if key_token.token_type != TokenType::Name {
+            return Err(Error::parse(key_token.start, "expected dictionary key"));
+        }
+        if key_token.value.strip_prefix(b"/") == Some(key) {
+            let first = parser.peek_token()?;
+            if first.token_type != TokenType::ArrayOpen {
+                return Ok(Some(first.start));
+            }
+            let _ = parser.next_token()?;
+            for index in 0.. {
+                let item = parser.peek_token()?;
+                if item.token_type == TokenType::ArrayClose {
+                    return Ok(None);
+                }
+                let item_start = parser.position();
+                let _ = parser.object()?;
+                if index == array_index {
+                    return Ok(Some(item_start));
+                }
+            }
+        }
+        let _ = parser.object()?;
+    }
+}
+
 pub(crate) struct Parser<'tokenizer, 'input> {
     tokenizer: &'tokenizer mut Tokenizer<'input>,
     buffered: VecDeque<Token>,

@@ -283,7 +283,8 @@ git commit -m "feat(filters): make decode chain limit configurable"
 
 **Interfaces:**
 - Consumes: `std::env::args_os`, `std::fs::read<P: AsRef<Path>>`, existing raw stderr writer, native CRT open probes, and qpdf-style signed-decimal-prefix parsing.
-- Produces: `pub fn program_name_bytes(argv0: &[u8]) -> &[u8]`.
+- Produces: `pub fn test_driver_program_name_bytes(argv0: &[u8]) -> &[u8]`,
+  using qpdf's slash-only, suffix-preserving rule.
 - Produces: `pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8`.
 - Produces: internal `fn os_str_diagnostic_bytes(value: &OsStr) -> Cow<'_, [u8]>`.
 - Changes: driver-only filename diagnostic parameters in `run_test_0_1`, `emit_new_diagnostics`, and `write_warning` from `&str` to `&[u8]`.
@@ -352,14 +353,14 @@ Expected on Unix: both tests fail because `env::args()` panics before `driver::r
 - [ ] **Step 3: Add unit RED coverage for raw argv0 basename and parser input**
 
 In `crates/flpdf-qtest-tools/src/common.rs`, change the test import to
-`use super::{program_name, program_name_bytes};` and add:
+`use super::{program_name, test_driver_program_name_bytes};` and add:
 
 ```rust
 #[test]
-fn program_name_bytes_preserves_non_utf8_and_strips_path_and_exe() {
+fn test_driver_program_name_preserves_backslash_suffix_and_non_utf8() {
     assert_eq!(
-        program_name_bytes(b"/tmp/test-\xff-driver.exe"),
-        b"test-\xff-driver"
+        test_driver_program_name_bytes(b"/tmp/test-\xff\\driver.exe"),
+        b"test-\xff\\driver.exe"
     );
 }
 ```
@@ -369,32 +370,31 @@ In `crates/flpdf-qtest-tools/src/driver/mod.rs` tests, add:
 ```rust
 #[cfg(unix)]
 #[test]
-fn usage_preserves_non_utf8_argv0_basename() {
+fn usage_preserves_non_utf8_backslash_and_exe_suffix() {
     use std::os::unix::ffi::OsStringExt;
 
     let args = vec![std::ffi::OsString::from_vec(
-        b"/tmp/test-\xff-driver.exe".to_vec(),
+        b"/tmp/test-\xff\\driver.exe".to_vec(),
     )];
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
 
     assert_eq!(run(&args, &mut stdout, &mut stderr), 2);
     assert!(stdout.is_empty());
-    assert_eq!(stderr, b"Usage: test-\xff-driver n filename1 [arg2]\n");
+    assert_eq!(stderr, b"Usage: test-\xff\\driver.exe n filename1 [arg2]\n");
 }
 ```
 
 - [ ] **Step 4: Implement byte-oriented basename and OS diagnostic conversion**
 
-Keep `program_name` and add to `common.rs`:
+Keep the compare-only `program_name` unchanged and add to `common.rs`:
 
 ```rust
-pub fn program_name_bytes(argv0: &[u8]) -> &[u8] {
-    let stem = argv0
-        .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+pub fn test_driver_program_name_bytes(argv0: &[u8]) -> &[u8] {
+    argv0
+        .rsplit(|byte| *byte == b'/')
         .next()
-        .unwrap_or(argv0);
-    stem.strip_suffix(b".exe").unwrap_or(stem)
+        .unwrap_or(argv0)
 }
 ```
 
@@ -660,7 +660,7 @@ bash scripts/qpdf-test-driver-diff.sh --check
 Expected final differential line:
 
 ```text
-qpdf and flpdf test_driver outputs match 38 fixtures and 10 CLI probes
+qpdf and flpdf test_driver outputs match 46 fixtures and 11 CLI probes
 ```
 
 - [ ] **Step 7: Commit production wiring and oracle fixture**
@@ -699,7 +699,6 @@ Run:
 
 ```bash
 bd create \
-  --id flpdf-n9t0.10 \
   --parent flpdf-n9t0 \
   --deps flpdf-n9t0.2 \
   --type feature \
@@ -707,8 +706,11 @@ bd create \
   --external-ref "gh-591#discussion_r3678686116" \
   --title "flpdf: qpdf-compatible TIFF Predictor 2 for Flate and LZW" \
   --description "PR #591 review follow-up. Pinned qpdf 11.9.0 routes Predictor 2 through Pl_TIFFPredictor for both FlateDecode and LZWDecode. Implement that component faithfully rather than adding a test-driver exception." \
-  --acceptance "Cover 1/2/4/8/16 BitsPerComponent, multiple Colors, row reset, partial-row zero padding at finish, invalid Columns/Colors/BitsPerComponent geometry, Flate and LZW composition, pinned qpdf test-driver merged output/status, and 100% changed executable-line coverage."
+  --acceptance "Cover 1/2/4/8/16 BitsPerComponent, multiple Colors, row reset, partial-row zero padding at finish, invalid Columns/Colors/BitsPerComponent geometry, Flate and LZW composition, pinned qpdf test-driver merged output/status, and 100% changed executable-line coverage." \
+  --json
 ```
+
+Expected: the creation JSON returns the parent-derived ID `flpdf-n9t0.10`.
 
 - [ ] **Step 3: Read back hierarchy and dependency**
 
@@ -771,7 +773,7 @@ bash tests/fixtures/test_driver/generate.sh --check
 bash scripts/qpdf-test-driver-diff.sh --check
 ```
 
-Expected: all pass and the differential reports 38 fixtures plus 10 CLI probes.
+Expected: all pass and the differential reports 46 fixtures plus 11 CLI probes.
 
 - [ ] **Step 3: Run workspace lint and all-feature tests**
 
@@ -822,7 +824,7 @@ If a line is uncovered, add a behaviorally meaningful focused test, run its RED 
 Append a note to `flpdf-n9t0.2` naming:
 
 ```text
-the final commit, 38 fixtures + 10 probes, non-UTF-8 Unix valid/missing path tests,
+the final commit, 46 fixtures + 11 probes, non-UTF-8 Unix valid/missing path tests,
 workspace fmt/clippy/tests, strict rustdoc, module docs, exact fresh coverage
 numerators, and flpdf-n9t0.10 as the TIFF follow-up
 ```
@@ -908,7 +910,7 @@ Fixed with an explicit driver policy rather than removing library hardening:
 DecodeLimits now defaults to max_filter_chain=Some(16), while test_driver test
 0/1 alone passes None to the ordered recovering API. The new flpdf-authored
 17-stage ASCIIHex fixture matches pinned qpdf 11.9.0; the full differential is
-38 fixtures + 10 CLI probes, and the default public API still rejects 17.
+46 fixtures + 11 CLI probes, and the default public API still rejects 17.
 ```
 
 Do not resolve the thread.

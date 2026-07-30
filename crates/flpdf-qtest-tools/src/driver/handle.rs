@@ -7,11 +7,22 @@ const MAX_REF_CHAIN_DEPTH: usize = 64;
 pub(crate) struct ResolvedStreamDictionary {
     dictionary: Dictionary,
     filterable: bool,
+    decode_param_type_warnings: Vec<DecodeParamTypeWarning>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DecodeParamTypeWarning {
+    pub(crate) filter_index: usize,
+    pub(crate) object_type: &'static str,
 }
 
 impl ResolvedStreamDictionary {
     pub(crate) fn is_filterable(&self) -> bool {
         self.filterable
+    }
+
+    pub(crate) fn decode_param_type_warnings(&self) -> &[DecodeParamTypeWarning] {
+        &self.decode_param_type_warnings
     }
 }
 
@@ -248,7 +259,7 @@ pub(crate) fn resolve_stream_dictionary<R: Read + Seek>(
     // before it asks for /DecodeParms. In particular, an unknown later name
     // prevents a preceding known filter from traversing a diagnostic parameter
     // reference chain.
-    let filterable = filter_names
+    let mut filterable = filter_names
         .as_deref()
         .is_none_or(|names| names.iter().all(|name| qpdf_filter_factory_exists(name)));
 
@@ -267,10 +278,133 @@ pub(crate) fn resolve_stream_dictionary<R: Read + Seek>(
         };
         resolved.insert(key, value);
     }
+    let mut decode_param_type_warnings = Vec::new();
+    if filterable {
+        if let Some(names) = filter_names.as_deref() {
+            if let Some(params) = aligned_decode_params(names, resolved.get(b"DecodeParms")) {
+                for (filter_index, (filter, params)) in names.iter().zip(params).enumerate() {
+                    let normalized = normalized_filter_name(filter);
+                    if params.is_some_and(|params| {
+                        !matches!(params, Object::Null | Object::Dictionary(_))
+                    }) && matches!(normalized, b"Crypt" | b"FlateDecode" | b"LZWDecode")
+                    {
+                        decode_param_type_warnings.push(DecodeParamTypeWarning {
+                            filter_index,
+                            object_type: qpdf_object_type_name(
+                                params.expect("non-null DecodeParms"),
+                            ),
+                        });
+                    }
+                    if normalized == b"Crypt" && !crypt_decode_params_filterable(params) {
+                        filterable = false;
+                    }
+                }
+                remove_identity_crypt_stages(&mut resolved, names);
+            }
+        }
+    }
     Ok(ResolvedStreamDictionary {
         dictionary: resolved,
         filterable,
+        decode_param_type_warnings,
     })
+}
+
+fn aligned_decode_params<'a>(
+    filters: &[&[u8]],
+    decode_params: Option<&'a Object>,
+) -> Option<Vec<Option<&'a Object>>> {
+    match decode_params {
+        None | Some(Object::Null) => Some(vec![None; filters.len()]),
+        Some(Object::Array(values)) if values.is_empty() => Some(vec![None; filters.len()]),
+        Some(Object::Array(values)) if values.len() == filters.len() => Some(
+            values
+                .iter()
+                .map(|value| (!value.is_null()).then_some(value))
+                .collect(),
+        ),
+        Some(Object::Array(_)) => None,
+        Some(value) => Some(vec![Some(value); filters.len()]),
+    }
+}
+
+fn crypt_decode_params_filterable(decode_params: Option<&Object>) -> bool {
+    let Some(decode_params) = decode_params else {
+        return true;
+    };
+    if decode_params.is_null() {
+        return true;
+    }
+    let Some(dictionary) = decode_params.as_dict() else {
+        // QPDFObjectHandle::getKeys warns and returns an empty key set.
+        return true;
+    };
+    let visible: Vec<(&[u8], &Object)> = dictionary
+        .iter()
+        .filter(|(_, value)| !value.is_null())
+        .collect();
+    let type_is_valid = visible
+        .iter()
+        .find(|(key, _)| *key == b"Type")
+        .is_none_or(|(_, value)| value.as_name() == Some(b"CryptFilterDecodeParms".as_slice()));
+    type_is_valid
+        && visible
+            .iter()
+            .all(|(key, _)| matches!(*key, b"Type" | b"Name"))
+}
+
+fn qpdf_object_type_name(object: &Object) -> &'static str {
+    match object {
+        Object::Null => "null",
+        Object::Boolean(_) => "boolean",
+        Object::Integer(_) => "integer",
+        Object::Real(_) | Object::RealLiteral { .. } => "real",
+        Object::String(_) => "string",
+        Object::Name(_) => "name",
+        Object::Array(_) => "array",
+        Object::Dictionary(_) => "dictionary",
+        Object::Stream(_) => "stream",
+        Object::Operator(_) => "operator",
+        Object::InlineImage(_) => "inline-image",
+        Object::Reference(_) => "unresolved",
+    }
+}
+
+fn remove_identity_crypt_stages(dictionary: &mut Dictionary, filters: &[&[u8]]) {
+    let crypt_indices: Vec<usize> = filters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, filter)| (normalized_filter_name(filter) == b"Crypt").then_some(index))
+        .collect();
+    if crypt_indices.is_empty() {
+        return;
+    }
+
+    match dictionary.get(b"Filter").cloned() {
+        Some(Object::Name(name)) if normalized_filter_name(&name) == b"Crypt" => {
+            dictionary.insert(b"Filter", Object::Null);
+        }
+        Some(Object::Array(values)) => {
+            let values = values
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, value)| (!crypt_indices.contains(&index)).then_some(value))
+                .collect();
+            dictionary.insert(b"Filter", Object::Array(values));
+        }
+        _ => {}
+    }
+
+    if let Some(Object::Array(values)) = dictionary.get(b"DecodeParms").cloned() {
+        if values.len() == filters.len() {
+            let values = values
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, value)| (!crypt_indices.contains(&index)).then_some(value))
+                .collect();
+            dictionary.insert(b"DecodeParms", Object::Array(values));
+        }
+    }
 }
 
 fn resolved_filter_names(filter: &Object) -> Option<Vec<&[u8]>> {
@@ -318,6 +452,9 @@ fn filter_consumes_decode_key(filter: &[u8], key: &[u8]) -> bool {
             key,
             b"Predictor" | b"Columns" | b"Colors" | b"BitsPerComponent" | b"EarlyChange"
         ),
+        // SF_Crypt::setDecodeParms calls getKeys(), which resolves every value
+        // to omit null entries before validating /Type, /Name, and unknown keys.
+        b"Crypt" => true,
         _ => false,
     }
 }
@@ -974,5 +1111,135 @@ mod tests {
             .expect("resolved shared DecodeParms dictionary");
         assert_eq!(params.get(b"Predictor"), Some(&Object::Integer(15)));
         assert_eq!(params.get(b"EarlyChange"), Some(&Object::Integer(0)));
+    }
+
+    #[test]
+    fn crypt_decode_params_validate_only_qpdfs_visible_keys_and_type() {
+        let cases = [
+            (
+                vec![
+                    (
+                        b"Type".to_vec(),
+                        Object::Name(b"CryptFilterDecodeParms".to_vec()),
+                    ),
+                    (b"Name".to_vec(), Object::Integer(42)),
+                ],
+                true,
+            ),
+            (
+                vec![(b"Type".to_vec(), Object::Name(b"Wrong".to_vec()))],
+                false,
+            ),
+            (vec![(b"Extra".to_vec(), Object::Integer(1))], false),
+            (vec![(b"Extra".to_vec(), Object::Null)], true),
+        ];
+
+        for (entries, expected_filterable) in cases {
+            let mut pdf = handle_pdf(b"");
+            let mut params = Dictionary::new();
+            for (key, value) in entries {
+                params.insert(key, value);
+            }
+            let mut dictionary = Dictionary::new();
+            dictionary.insert(b"Filter", Object::Name(b"Crypt".to_vec()));
+            dictionary.insert(b"DecodeParms", Object::Dictionary(params));
+
+            let resolved = resolve_stream_dictionary(&mut pdf, &dictionary)
+                .expect("resolve Crypt DecodeParms");
+
+            assert_eq!(resolved.is_filterable(), expected_filterable);
+            assert_eq!(resolved.get(b"Filter"), Some(&Object::Null));
+        }
+    }
+
+    #[test]
+    fn crypt_removal_keeps_filter_and_decode_param_array_alignment() {
+        let mut pdf = handle_pdf(b"");
+        let mut crypt = Dictionary::new();
+        crypt.insert(b"Type", Object::Name(b"CryptFilterDecodeParms".to_vec()));
+        let mut flate = Dictionary::new();
+        flate.insert(b"Predictor", Object::Integer(1));
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(
+            b"Filter",
+            Object::Array(vec![
+                Object::Name(b"Crypt".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"Crypt".to_vec()),
+            ]),
+        );
+        dictionary.insert(
+            b"DecodeParms",
+            Object::Array(vec![
+                Object::Dictionary(crypt),
+                Object::Dictionary(flate.clone()),
+                Object::Null,
+            ]),
+        );
+
+        let resolved =
+            resolve_stream_dictionary(&mut pdf, &dictionary).expect("resolve Crypt chain");
+
+        assert!(resolved.is_filterable());
+        assert_eq!(
+            resolved.get(b"Filter"),
+            Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]))
+        );
+        assert_eq!(
+            resolved.get(b"DecodeParms"),
+            Some(&Object::Array(vec![Object::Dictionary(flate)]))
+        );
+    }
+
+    #[test]
+    fn crypt_removal_does_not_hide_a_decode_param_length_mismatch() {
+        let mut pdf = handle_pdf(b"");
+        let filters = Object::Array(vec![
+            Object::Name(b"Crypt".to_vec()),
+            Object::Name(b"FlateDecode".to_vec()),
+        ]);
+        let decode_params = Object::Array(vec![Object::Null]);
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(b"Filter", filters.clone());
+        dictionary.insert(b"DecodeParms", decode_params.clone());
+
+        let resolved =
+            resolve_stream_dictionary(&mut pdf, &dictionary).expect("resolve mismatched chain");
+
+        assert!(resolved.is_filterable());
+        assert_eq!(resolved.get(b"Filter"), Some(&filters));
+        assert_eq!(resolved.get(b"DecodeParms"), Some(&decode_params));
+    }
+
+    #[test]
+    fn nondictionary_decode_param_warnings_keep_filter_indices_and_types() {
+        let mut pdf = handle_pdf(b"");
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(
+            b"Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"ASCIIHexDecode".to_vec()),
+                Object::Name(b"LZWDecode".to_vec()),
+            ]),
+        );
+        dictionary.insert(b"DecodeParms", Object::Integer(42));
+
+        let resolved = resolve_stream_dictionary(&mut pdf, &dictionary)
+            .expect("resolve shared non-dictionary DecodeParms");
+
+        assert_eq!(
+            resolved.decode_param_type_warnings(),
+            [
+                super::DecodeParamTypeWarning {
+                    filter_index: 0,
+                    object_type: "integer",
+                },
+                super::DecodeParamTypeWarning {
+                    filter_index: 2,
+                    object_type: "integer",
+                },
+            ]
+        );
     }
 }

@@ -31,6 +31,9 @@ serde_json.workspace = true
 
 [features]
 default = []
+# Internal cross-crate hooks used only by the qpdf test-driver compatibility
+# binary. Normal library builds do not expose or compile this oracle plumbing.
+qtest-driver = []
 # Opt-in: link classic libz (zlib1g) via libz-sys so flate2's deflate output
 # matches qpdf's compress2() at level 6 byte-for-byte. Used by bytes-identical
 # tests only — production builds stay Pure Rust (miniz_oxide).

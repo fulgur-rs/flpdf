@@ -8,6 +8,12 @@ fn driver() -> Command {
     Command::cargo_bin("flpdf-test-driver").expect("flpdf-test-driver binary")
 }
 
+fn usage_for(command: &Command) -> String {
+    let program = command.get_program().to_string_lossy();
+    let whoami = program.rsplit('/').next().unwrap_or(&program);
+    format!("Usage: {whoami} n filename1 [arg2]\n")
+}
+
 fn minimal_pdf() -> &'static str {
     concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -50,21 +56,21 @@ const REPAIRABLE_TEST_1_OUTPUT: &str = concat!(
 
 #[test]
 fn too_few_arguments_print_exact_usage_and_exit_two() {
-    driver()
-        .assert()
-        .code(2)
-        .stdout("")
-        .stderr("Usage: flpdf-test-driver n filename1 [arg2]\n");
+    let mut command = driver();
+    let usage = usage_for(&command);
+    command.assert().code(2).stdout("").stderr(usage);
 }
 
 #[test]
 fn too_many_arguments_print_exact_usage_and_exit_two() {
-    driver()
+    let mut command = driver();
+    let usage = usage_for(&command);
+    command
         .args(["1", minimal_pdf(), "arg2", "extra"])
         .assert()
         .code(2)
         .stdout("")
-        .stderr("Usage: flpdf-test-driver n filename1 [arg2]\n");
+        .stderr(usage);
 }
 
 #[test]
@@ -82,13 +88,21 @@ fn malformed_pdf_error_precedes_unsupported_test_lookup() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let malformed = directory.path().join("malformed.pdf");
     fs::write(&malformed, b"not a PDF").expect("write malformed fixture");
+    let filename = malformed.to_str().expect("utf-8 temp path");
+    let expected = format!(
+        "WARNING: {filename}: can't find PDF header\n\
+         WARNING: {filename}: file is damaged\n\
+         WARNING: {filename}: can't find startxref\n\
+         WARNING: {filename}: Attempting to reconstruct cross-reference table\n\
+         {filename}: unable to find trailer dictionary while recovering damaged file\n"
+    );
 
     driver()
-        .args(["99", malformed.to_str().expect("utf-8 temp path")])
+        .args(["99", filename])
         .assert()
         .code(2)
         .stdout("")
-        .stderr("parse error at byte 0: missing PDF header\n");
+        .stderr(expected);
 }
 
 #[test]

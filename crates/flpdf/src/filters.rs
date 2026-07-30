@@ -7,7 +7,7 @@ use crate::pipeline::{PipelineError, PipelineResult};
 #[cfg(test)]
 use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
-    decode_filter_specs, encode_flate, encode_run_length, stream_filter_for,
+    decode_filter_specs, encode_flate, encode_run_length, stream_filter_for, FilterDecodePhase,
     DECODE_OUTPUT_LIMIT_PREFIX,
 };
 use crate::{Dictionary, Error, Object, Result};
@@ -368,10 +368,16 @@ where
             PreparedStage::Crypt { decode_params } => {
                 let data = decrypt_crypt(*decode_params, decoded.as_ref())?;
                 if is_last_stage {
-                    data_events.push(&mut events, &data);
-                }
-                if is_last_stage {
-                    events.append(&mut pending_events);
+                    let mut markers = Vec::new();
+                    if let Some(PendingDataBoundary(boundary, after_finish)) = pending_data_boundary
+                    {
+                        markers.extend(position_pending_events(
+                            boundary,
+                            after_finish,
+                            std::mem::take(&mut pending_events),
+                        ));
+                    }
+                    append_positioned_events(&mut events, &data, data_events, markers);
                 }
                 data
             }
@@ -390,106 +396,96 @@ where
                 let outcome = adapter.pipe_decode_recovering(
                     decoded.as_ref(),
                     limits.max_output,
-                    &mut |message, code| {
-                        stage_warnings.push(StreamDecodeEvent::Warning(StreamDecodeWarning {
-                            message: message.to_string(),
-                            code,
-                        }));
+                    &mut |message, code, output_offset, phase| {
+                        let ordinal = stage_warnings.len();
+                        stage_warnings.push(PositionedDecodeEvent::local(
+                            output_offset,
+                            phase,
+                            ordinal,
+                            StreamDecodeEvent::Warning(StreamDecodeWarning {
+                                message: message.to_string(),
+                                code,
+                            }),
+                        ));
                         Ok(())
                     },
                 )?;
-                let cleanup_data_start = outcome.cleanup_data_start;
                 if let Some(stage_error) = outcome.error {
                     if has_runtime_error {
                         if is_last_stage {
-                            let boundary = next_pending_data_boundary
-                                .expect("pending recovery data has a codec output boundary")
-                                .0;
-                            let (before_pending, after_pending) = outcome.data.split_at(boundary);
-                            data_events.push(&mut events, before_pending);
-                            events.append(&mut pending_events);
-                            data_events.push(&mut events, after_pending);
+                            let mut markers = stage_warnings;
+                            if let Some(PendingDataBoundary(boundary, after_finish)) =
+                                next_pending_data_boundary
+                            {
+                                markers.extend(position_pending_events(
+                                    boundary,
+                                    after_finish,
+                                    std::mem::take(&mut pending_events),
+                                ));
+                            }
+                            append_positioned_events(
+                                &mut events,
+                                &outcome.data,
+                                data_events,
+                                markers,
+                            );
+                        } else {
+                            append_plain_events(&mut events, stage_warnings);
                         }
-                        events.extend(stage_warnings);
                     } else {
                         has_runtime_error = true;
-                        if !is_last_stage {
-                            let input_end = if stage_error.during_write {
-                                cleanup_data_start
-                            } else {
-                                outcome.data.len()
-                            };
-                            next_pending_data_boundary =
-                                Some(PendingDataBoundary(input_end, !stage_error.during_write));
-                            if stage_error.during_write {
-                                pending_events.push(StreamDecodeEvent::Error(stage_error.error));
-                                pending_events.extend(stage_warnings);
-                            } else {
-                                pending_events.extend(stage_warnings);
-                                pending_events.push(StreamDecodeEvent::Error(stage_error.error));
-                            }
-                        } else if let Some(PendingDataBoundary(boundary, _)) =
-                            next_pending_data_boundary
-                        {
-                            let boundary = boundary.min(outcome.data.len());
-                            let cleanup_data_start = cleanup_data_start.min(outcome.data.len());
-                            let (before_pending, after_pending) = outcome.data.split_at(boundary);
-                            data_events.push(&mut events, before_pending);
-                            events.append(&mut pending_events);
-                            if stage_error.during_write {
-                                let cleanup_after_pending =
-                                    cleanup_data_start.saturating_sub(boundary);
-                                let (before_cleanup, cleanup) =
-                                    after_pending.split_at(cleanup_after_pending);
-                                data_events.push(&mut events, before_cleanup);
-                                events.push(StreamDecodeEvent::Error(stage_error.error));
-                                data_events.push(&mut events, cleanup);
-                                events.extend(stage_warnings);
-                            } else {
-                                data_events.push(&mut events, after_pending);
-                                events.extend(stage_warnings);
-                                events.push(StreamDecodeEvent::Error(stage_error.error));
-                            }
-                        } else if stage_error.during_write {
-                            let (before_cleanup, cleanup) =
-                                outcome.data.split_at(cleanup_data_start);
-                            data_events.push(&mut events, before_cleanup);
-                            events.push(StreamDecodeEvent::Error(stage_error.error));
-                            data_events.push(&mut events, cleanup);
-                            events.extend(stage_warnings);
+                        let error_phase = if stage_error.during_write {
+                            FilterDecodePhase::Write
                         } else {
-                            if is_last_stage {
-                                data_events.push(&mut events, &outcome.data);
+                            FilterDecodePhase::Finish
+                        };
+                        let error_offset = stage_error.output_offset;
+                        let error_ordinal = stage_warnings.len();
+                        stage_warnings.push(PositionedDecodeEvent::local(
+                            error_offset,
+                            error_phase,
+                            error_ordinal,
+                            StreamDecodeEvent::Error(stage_error.error),
+                        ));
+                        if !is_last_stage {
+                            next_pending_data_boundary =
+                                Some(PendingDataBoundary(error_offset, !stage_error.during_write));
+                            pending_events.extend(positioned_into_plain_events(stage_warnings));
+                        } else {
+                            if let Some(PendingDataBoundary(boundary, after_finish)) =
+                                next_pending_data_boundary
+                            {
+                                stage_warnings.extend(position_pending_events(
+                                    boundary,
+                                    after_finish,
+                                    std::mem::take(&mut pending_events),
+                                ));
                             }
-                            events.extend(stage_warnings);
-                            events.push(StreamDecodeEvent::Error(stage_error.error));
+                            append_positioned_events(
+                                &mut events,
+                                &outcome.data,
+                                data_events,
+                                stage_warnings,
+                            );
                         }
                     }
                 } else {
-                    let defer_stage_warnings = !is_last_stage && !stage_warnings.is_empty();
-                    if defer_stage_warnings {
-                        pending_events.append(&mut stage_warnings);
-                        next_pending_data_boundary =
-                            Some(PendingDataBoundary(cleanup_data_start, false));
-                    }
                     if is_last_stage {
-                        if has_runtime_error || next_pending_data_boundary.is_some() {
-                            let boundary = next_pending_data_boundary
-                                .expect("pending recovery data has a codec output boundary")
-                                .0;
-                            let (before_pending, after_pending) = outcome.data.split_at(boundary);
-                            data_events.push(&mut events, before_pending);
-                            events.append(&mut pending_events);
-                            data_events.push(&mut events, after_pending);
-                        } else {
-                            data_events.push(&mut events, &outcome.data);
+                        let mut markers = stage_warnings;
+                        if let Some(PendingDataBoundary(boundary, after_finish)) =
+                            next_pending_data_boundary
+                        {
+                            markers.extend(position_pending_events(
+                                boundary,
+                                after_finish,
+                                std::mem::take(&mut pending_events),
+                            ));
                         }
-                    }
-                    if is_last_stage && !has_runtime_error && next_pending_data_boundary.is_none() {
-                        events.append(&mut pending_events);
-                    }
-                    if !defer_stage_warnings {
-                        events.extend(stage_warnings);
+                        append_positioned_events(&mut events, &outcome.data, data_events, markers);
+                    } else if !stage_warnings.is_empty() {
+                        let boundary = stage_warnings[0].offset;
+                        pending_events.extend(positioned_into_plain_events(stage_warnings));
+                        next_pending_data_boundary = Some(PendingDataBoundary(boundary, false));
                     }
                 }
                 if !is_last_stage && (has_runtime_error || next_pending_data_boundary.is_some()) {
@@ -571,6 +567,86 @@ fn prepare_decode_filters<'a>(
 #[derive(Clone, Copy)]
 struct PendingDataBoundary(usize, bool);
 
+struct PositionedDecodeEvent {
+    offset: usize,
+    barrier: u8,
+    ordinal: usize,
+    event: StreamDecodeEvent,
+}
+
+impl PositionedDecodeEvent {
+    fn local(
+        offset: usize,
+        phase: FilterDecodePhase,
+        ordinal: usize,
+        event: StreamDecodeEvent,
+    ) -> Self {
+        let barrier = match phase {
+            FilterDecodePhase::Write => 1,
+            FilterDecodePhase::Finish => 2,
+        };
+        Self {
+            offset,
+            barrier,
+            ordinal,
+            event,
+        }
+    }
+}
+
+fn position_pending_events(
+    offset: usize,
+    after_finish: bool,
+    events: Vec<StreamDecodeEvent>,
+) -> impl Iterator<Item = PositionedDecodeEvent> {
+    // A pending upstream event at this boundary happens before the downstream
+    // stage consumes any cleanup bytes that follow it. Those bytes can produce
+    // a write-time event at the same output offset, so the pending event must
+    // win that tie. An event explicitly marked after finish remains last.
+    let barrier = if after_finish { 3 } else { 0 };
+    events
+        .into_iter()
+        .enumerate()
+        .map(move |(ordinal, event)| PositionedDecodeEvent {
+            offset,
+            barrier,
+            ordinal,
+            event,
+        })
+}
+
+fn sort_positioned_events(events: &mut [PositionedDecodeEvent]) {
+    events.sort_by_key(|event| (event.offset, event.barrier, event.ordinal));
+}
+
+fn positioned_into_plain_events(
+    mut events: Vec<PositionedDecodeEvent>,
+) -> impl Iterator<Item = StreamDecodeEvent> {
+    sort_positioned_events(&mut events);
+    events.into_iter().map(|event| event.event)
+}
+
+fn append_plain_events(output: &mut Vec<StreamDecodeEvent>, events: Vec<PositionedDecodeEvent>) {
+    output.extend(positioned_into_plain_events(events));
+}
+
+fn append_positioned_events(
+    output: &mut Vec<StreamDecodeEvent>,
+    data: &[u8],
+    data_events: DataEventMode,
+    mut events: Vec<PositionedDecodeEvent>,
+) {
+    sort_positioned_events(&mut events);
+    let mut data_start = 0;
+    for event in events {
+        let offset = event.offset.min(data.len()).max(data_start);
+        data_events.push(output, &data[data_start..offset]);
+        output.push(event.event);
+        data_start = offset;
+    }
+    data_events.push(output, &data[data_start..]);
+}
+
 fn decode_codec_prefix(
     spec: crate::stream_filter::FilterSpec<'_>,
     data: &[u8],
@@ -581,7 +657,7 @@ fn decode_codec_prefix(
         stream_filter_for(filter_name).expect("a prepared codec has a registered prefix decoder");
     debug_assert!(adapter.set_decode_params(spec.decode_params));
     adapter
-        .pipe_decode_recovering(data, limits.max_output, &mut |_, _| Ok(()))
+        .pipe_decode_recovering(data, limits.max_output, &mut |_, _, _, _| Ok(()))
         .expect("preflighted codec prefix pipeline is infallible")
 }
 
@@ -913,6 +989,99 @@ mod tests {
             StreamDecodeEvent::Warning(warning)
                 if warning.message == "input stream is complete but output may still be valid"
                     && warning.code == -5
+        ));
+    }
+
+    #[test]
+    fn recovering_final_flate_warning_precedes_predictor_finish_data() {
+        let mut encoded = encode_flate(b"\0A").unwrap();
+        encoded.truncate(encoded.len() - 4);
+
+        let mut decode_params = Dictionary::new();
+        decode_params.insert("Predictor", Object::Integer(12));
+        decode_params.insert("Columns", Object::Integer(2));
+        let mut dictionary = flate_dict();
+        dictionary.insert("DecodeParms", Object::Dictionary(decode_params));
+
+        let outcome = decode_stream_data_recovering(&dictionary, &encoded).unwrap();
+
+        assert_eq!(outcome.data, b"A\0");
+        assert!(matches!(
+            &outcome.events[..],
+            [
+                StreamDecodeEvent::Warning(warning),
+                StreamDecodeEvent::Data(data),
+            ] if warning.message == "input stream is complete but output may still be valid"
+                && warning.code == -5
+                && data == b"A\0"
+        ));
+    }
+
+    #[test]
+    fn recovering_final_flate_warning_precedes_predictor_finish_limit() {
+        let mut encoded = encode_flate(b"\0A").unwrap();
+        encoded.truncate(encoded.len() - 4);
+
+        let mut decode_params = Dictionary::new();
+        decode_params.insert("Predictor", Object::Integer(12));
+        decode_params.insert("Columns", Object::Integer(2));
+        let mut dictionary = flate_dict();
+        dictionary.insert("DecodeParms", Object::Dictionary(decode_params));
+
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
+            &dictionary,
+            &encoded,
+            DecodeLimits {
+                max_output: Some(1),
+                ..DecodeLimits::default()
+            },
+            DataEventMode::Record,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data, b"A");
+        assert!(matches!(
+            &outcome.events[..],
+            [
+                StreamDecodeEvent::Warning(warning),
+                StreamDecodeEvent::Data(data),
+                StreamDecodeEvent::Error(error),
+            ] if warning.message == "input stream is complete but output may still be valid"
+                && warning.code == -5
+                && data == b"A"
+                && error.to_string()
+                    == "unsupported PDF feature: decoded output exceeds configured limit of 1 bytes"
+        ));
+    }
+
+    #[test]
+    fn recovering_pending_error_precedes_equal_offset_final_finish_warning() {
+        let filter = Object::Array(vec![
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+            Object::Name(b"FlateDecode".to_vec()),
+        ]);
+        let mut predictor = Dictionary::new();
+        predictor.insert("Predictor", Object::Integer(12));
+        predictor.insert("Columns", Object::Integer(2));
+        let decode_params = Object::Array(vec![Object::Null, Object::Dictionary(predictor)]);
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("Filter", filter);
+        dictionary.insert("DecodeParms", decode_params);
+
+        let outcome = decode_stream_data_recovering(&dictionary, b"789C63700400G").unwrap();
+
+        assert_eq!(outcome.data, b"A\0");
+        assert!(matches!(
+            &outcome.events[..],
+            [
+                StreamDecodeEvent::Error(error),
+                StreamDecodeEvent::Warning(warning),
+                StreamDecodeEvent::Data(data),
+            ] if error.to_string()
+                    == "unsupported PDF feature: character out of range during base Hex decode: G"
+                && warning.message == "input stream is complete but output may still be valid"
+                && warning.code == -5
+                && data == b"A\0"
         ));
     }
 

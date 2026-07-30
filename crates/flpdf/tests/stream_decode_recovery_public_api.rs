@@ -65,6 +65,34 @@ fn recovering_limits_keep_default_chain_cap_but_allow_explicit_unlimited_chain()
     ));
 }
 
+#[test]
+fn recovering_final_flate_warning_precedes_predictor_finish_data() {
+    let mut flate = Dictionary::new();
+    flate.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let mut encoded = encode_stream_data(&flate, b"\0A").unwrap();
+    encoded.truncate(encoded.len() - 4);
+
+    let mut decode_params = Dictionary::new();
+    decode_params.insert("Predictor", Object::Integer(12));
+    decode_params.insert("Columns", Object::Integer(2));
+    let mut dictionary = Dictionary::new();
+    dictionary.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    dictionary.insert("DecodeParms", Object::Dictionary(decode_params));
+
+    let outcome = decode_stream_data_recovering(&dictionary, &encoded).unwrap();
+
+    assert_eq!(outcome.data, b"A\0");
+    assert!(matches!(
+        &outcome.events[..],
+        [
+            StreamDecodeEvent::Warning(warning),
+            StreamDecodeEvent::Data(data),
+        ] if warning.message == "input stream is complete but output may still be valid"
+            && warning.code == -5
+            && data == b"A\0"
+    ));
+}
+
 fn downstream_data_before_upstream_error_dictionary() -> Dictionary {
     let mut dictionary = Dictionary::new();
     dictionary.insert(

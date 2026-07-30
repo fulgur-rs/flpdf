@@ -18,46 +18,42 @@ qpdf_source=$(CDPATH= cd -- "$qpdf_source" && pwd -P)
 qpdf_commit=3b97c9bd266b7c32ea36d3536e22dab77412886d
 build_dir=
 
-fixture_names=(
-    repairable_input
-    open_repair_failure
-    empty_reconstructed_xref
-    implicit_null
-    direct_null
-    dangling_ref
-    indirect_null
-    indirect_bool_true
-    indirect_bool_false
-    chained_reference
-    integer
-    real
-    string_hex_literal
-    name_escape
-    array_indirect
-    dict_keys
-    dict_dangling_value
-    dict_escaped_key
-    stream_flate
-    stream_indirect_filter
-    stream_chained_filter
-    stream_indirect_filter_array
-    stream_indirect_decode_parms
-    stream_indirect_decode_parms_container
-    stream_decode_parms_direct_null
-    stream_decode_parms_indirect_null
-    stream_decode_parms_length_mismatch
-    stream_offset_false_markers
-    stream_unknown_decode_param
-    stream_deep_invalid_filter
-    stream_flate_error
-    stream_filter_error_then_warning
-    stream_asciihex_odd_nibble_recovery
-    stream_asciihex_data_before_error
-    stream_asciihex_downstream_cleanup_after_error
-    stream_filter_chain_17
-    stream_unfilterable
-    stream_unsupported_filter_skips_decode_parms
-)
+manifest="${fixture_dir}/fixture-names.txt"
+fixture_names=()
+while IFS= read -r name || [[ -n "$name" ]]; do
+    if [[ -z "$name" || ! "$name" =~ ^[a-z0-9_]+$ ]]; then
+        printf 'qpdf-test-driver-diff.sh: invalid manifest entry: %s\n' "$name" >&2
+        exit 1
+    fi
+    for existing in "${fixture_names[@]}"; do
+        if [[ "$existing" == "$name" ]]; then
+            printf 'qpdf-test-driver-diff.sh: duplicate manifest entry: %s\n' "$name" >&2
+            exit 1
+        fi
+    done
+    fixture_names+=("$name")
+done <"$manifest"
+
+check_fixture_inventory() {
+    local extension=$1
+    local files=()
+    local name
+    shopt -s nullglob
+    files=("${fixture_dir}"/*."$extension")
+    shopt -u nullglob
+    if [[ "${#files[@]}" -ne "${#fixture_names[@]}" ]]; then
+        printf \
+            'qpdf-test-driver-diff.sh: %s inventory differs from manifest (expected %d, found %d)\n' \
+            "$extension" "${#fixture_names[@]}" "${#files[@]}" >&2
+        exit 1
+    fi
+    for name in "${fixture_names[@]}"; do
+        [[ -f "${fixture_dir}/${name}.${extension}" ]] || {
+            printf 'qpdf-test-driver-diff.sh: missing %s.%s\n' "$name" "$extension" >&2
+            exit 1
+        }
+    done
+}
 
 check_source() {
     local actual_commit status
@@ -108,6 +104,7 @@ for command in cargo cmake cmp diff git mktemp stat; do
 done
 
 check_source
+check_fixture_inventory pdf
 trap cleanup EXIT
 build_dir=$(mktemp -d /tmp/flpdf-qpdf-test-driver.XXXXXXXX)
 if [[ -L "$build_dir" || ! -d "$build_dir" ||
@@ -164,6 +161,36 @@ run_cli_probe() {
         printf \
             'qpdf-test-driver-diff.sh: CLI %s status mismatch (qpdf=%d flpdf=%d)\n' \
             "$name" "$oracle_status" "$rust_status" >&2
+        exit 1
+    fi
+    if ! cmp -s -- "$oracle_actual" "$rust_actual"; then
+        diff -u -- "$oracle_actual" "$rust_actual" || true
+        exit 1
+    fi
+}
+
+run_argv0_probe() {
+    local oracle_actual="${build_dir}/oracle/cli-argv0_slash_only.out"
+    local rust_actual="${build_dir}/rust/cli-argv0_slash_only.out"
+    local oracle_status rust_status
+
+    set +e
+    (
+        cd "$fixture_dir"
+        exec -a 'probe/path\oracle.exe' "$oracle"
+    ) >"$oracle_actual" 2>&1
+    oracle_status=$?
+    (
+        cd "$fixture_dir"
+        exec -a 'probe/path\oracle.exe' "$rust_driver"
+    ) >"$rust_actual" 2>&1
+    rust_status=$?
+    set -e
+
+    if [[ "$rust_status" -ne "$oracle_status" ]]; then
+        printf \
+            'qpdf-test-driver-diff.sh: CLI argv0_slash_only status mismatch (qpdf=%d flpdf=%d)\n' \
+            "$oracle_status" "$rust_status" >&2
         exit 1
     fi
     if ! cmp -s -- "$oracle_actual" "$rust_actual"; then
@@ -236,9 +263,13 @@ run_cli_probe i64_minimum -9223372036854775808 direct_null.pdf
 run_cli_probe unsupported_test 99 direct_null.pdf
 run_cli_probe missing_path 1 missing-cli-probe.pdf
 run_cli_probe no_repair_test_zero 0 repairable_input.pdf
+run_argv0_probe
+
+check_fixture_inventory out
+bash "${fixture_dir}/generate.sh" --check
 
 if [[ "$mode" == --regenerate ]]; then
-    printf 'regenerated and matched %d qpdf test_driver outputs and 10 CLI probes\n' "${#fixture_names[@]}"
+    printf 'regenerated and matched %d qpdf test_driver outputs and 11 CLI probes\n' "${#fixture_names[@]}"
 else
-    printf 'qpdf and flpdf test_driver outputs match %d fixtures and 10 CLI probes\n' "${#fixture_names[@]}"
+    printf 'qpdf and flpdf test_driver outputs match %d fixtures and 11 CLI probes\n' "${#fixture_names[@]}"
 fi

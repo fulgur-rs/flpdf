@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
@@ -8,19 +9,24 @@ fn fixture_dir() -> std::path::PathBuf {
 }
 
 fn fixture_names() -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(fixture_dir())
+    include_str!("../../../tests/fixtures/test_driver/fixture-names.txt")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn fixture_stems(extension: &str) -> BTreeSet<String> {
+    fs::read_dir(fixture_dir())
         .expect("read test_driver fixtures")
         .map(|entry| entry.expect("fixture entry").path())
-        .filter(|path| path.extension() == Some(OsStr::new("pdf")))
+        .filter(|path| path.extension() == Some(OsStr::new(extension)))
         .map(|path| {
             path.file_stem()
                 .expect("fixture stem")
                 .to_string_lossy()
                 .into_owned()
         })
-        .collect();
-    names.sort();
-    names
+        .collect()
 }
 
 fn run_fixture(name: &str) -> (Option<i32>, Vec<u8>) {
@@ -52,6 +58,22 @@ fn test_0_1_fixtures_match_committed_qpdf_merged_output() {
         assert_eq!(status, Some(expected_status), "{name}: unexpected status");
         assert_eq!(actual, expected, "{name}: merged output differs");
     }
+}
+
+#[test]
+fn fixture_inventories_match_manifest_exactly() {
+    let names = fixture_names();
+    assert_eq!(names.len(), 46, "unexpected manifest fixture count");
+    assert!(names.iter().all(|name| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    }));
+    let manifest: BTreeSet<String> = names.iter().cloned().collect();
+    assert_eq!(manifest.len(), names.len(), "duplicate manifest fixture");
+    assert_eq!(fixture_stems("pdf"), manifest, "PDF inventory differs");
+    assert_eq!(fixture_stems("out"), manifest, "oracle inventory differs");
 }
 
 #[test]

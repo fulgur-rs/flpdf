@@ -1,5 +1,11 @@
 # flpdf `test_driver test_0_1` Implementation Plan
 
+> **Supersession note:** The id-0 exclusion and `invalid test 0` expectation
+> below describe the historical initial plan and were superseded by
+> qpdf-parity commit `b166632c`. IDs 0 and 1 both dispatch `test_0_1`; id 0
+> opens without repair and id 1 opens with repair. `test_3` and the qtest shim
+> remain out of scope.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a Rust `flpdf-test-driver` binary that reproduces qpdf 11.9.0

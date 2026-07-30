@@ -25,6 +25,7 @@ tests/oracle/*.tsv text eol=lf
 # compressed bytes. Treat them as binary so line-ending conversion and text
 # diffing cannot mutate their oracle bytes.
 tests/fixtures/test_driver/*.out -text -diff
+tests/fixtures/test_driver/fixture-names.txt text eol=lf
 
 # QDF fixtures are byte-exact golden artifacts (fix_qdf recomputes
 # xref offsets/lengths from raw bytes). Git autocrlf on Windows must NOT

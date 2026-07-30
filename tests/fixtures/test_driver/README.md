@@ -6,6 +6,13 @@ compares the Rust binary with the committed `.out` files during ordinary
 `cargo test`; `scripts/qpdf-test-driver-diff.sh` regenerates or checks those
 outputs against the pinned qpdf source.
 
+`fixture-names.txt` is the single inventory consumed by the generator, Rust
+golden test, and pinned differential script. `generate.sh --check` regenerates
+every PDF in a temporary directory, compares it byte-for-byte with the
+committed authored input, and requires both the `.pdf` and `.out` inventories
+to match the manifest exactly. Only `qpdf-test-driver-diff.sh --regenerate`
+may create or update `.out` files.
+
 `stream_flate_error` deliberately declares `/FlateDecode` for the literal
 payload `abc`. It captures qpdf's recoverable codec-error behavior: the stream
 is filterable, the decoder warning is emitted at the stream-data offset, and
@@ -15,6 +22,23 @@ the filtered pipeline is still finished.
 `[/ASCIIHexDecode /FlateDecode]`. ASCIIHex emits one byte before rejecting
 `G`; cleanup then finishes Flate. The golden fixes qpdf's diagnostic order:
 the write error precedes Flate's downstream finish warning.
+
+`stream_flate_png_finish_warning_order` truncates a Flate trailer around a
+partial PNG predictor row. It fixes qpdf's finish order: the Flate warning is
+emitted before the predictor pads and writes `A\0`.
+
+`stream_crypt_identity` and
+`stream_crypt_identity_decode_parms_array` cover qpdf's driver view after
+stream decryption: a valid explicit `/Crypt` filter is an identity stage.
+Ordinary flpdf decode continues rejecting `/Crypt`.
+
+`stream_flate_nondict_decode_parms` and
+`stream_lzw_nondict_decode_parms_array` pin qpdf's two type warnings at the
+non-dictionary parameter token before decoded output.
+
+`missing_pdf_header`, `missing_startxref`, and
+`dict_indirect_value_warning` pin repair-warning lifecycle and the lazy
+dictionary-child diagnostic boundary.
 
 `stream_asciihex_odd_nibble_recovery` decodes `4G ` through `/AHx`. ASCIIHex
 reports the invalid `G` during `write`, then its cleanup flushes the pending
@@ -49,7 +73,12 @@ bash scripts/qpdf-test-driver-diff.sh --regenerate
 ```
 
 `generate.sh` uses Python 3's standard library to calculate xref offsets and
-zlib payloads. It never invokes flpdf to generate the input bytes.
+zlib payloads. It never invokes flpdf to generate the input bytes. Check
+provenance without rewriting committed files with:
+
+```sh
+bash tests/fixtures/test_driver/generate.sh --check
+```
 
 ## Licensing
 

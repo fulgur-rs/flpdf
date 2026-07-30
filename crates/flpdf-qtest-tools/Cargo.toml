@@ -26,7 +26,7 @@ default = []
 qpdf-zlib-compat = ["flpdf/qpdf-zlib-compat"]
 
 [dependencies]
-flpdf = { path = "../flpdf" }
+flpdf = { path = "../flpdf", features = ["qtest-driver"] }
 libc.workspace = true
 
 [dev-dependencies]

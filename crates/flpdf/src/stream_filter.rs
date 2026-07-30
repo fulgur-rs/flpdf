@@ -97,6 +97,7 @@ struct OutputBuffer {
     max_output: Option<usize>,
     cleanup_data_start: Option<usize>,
     finish_phase: Rc<Cell<bool>>,
+    output_position: Rc<Cell<usize>>,
 }
 
 impl OutputBuffer {
@@ -106,11 +107,16 @@ impl OutputBuffer {
             max_output,
             cleanup_data_start: None,
             finish_phase: Rc::new(Cell::new(false)),
+            output_position: Rc::new(Cell::new(0)),
         }
     }
 
     fn finish_phase(&self) -> Rc<Cell<bool>> {
         Rc::clone(&self.finish_phase)
+    }
+
+    fn output_position(&self) -> Rc<Cell<usize>> {
+        Rc::clone(&self.output_position)
     }
 
     fn cleanup_data_start(&self) -> usize {
@@ -131,12 +137,14 @@ impl Pipeline for OutputBuffer {
             let remaining = limit.saturating_sub(self.data.len());
             if data.len() > remaining {
                 self.data.extend_from_slice(&data[..remaining]);
+                self.output_position.set(self.data.len());
                 return Err(PipelineError::runtime(format!(
                     "{DECODE_OUTPUT_LIMIT_PREFIX} {limit} bytes"
                 )));
             }
         }
         self.data.extend_from_slice(data);
+        self.output_position.set(self.data.len());
         Ok(())
     }
 
@@ -158,6 +166,13 @@ pub(crate) struct FilterDecodeOutcome {
 pub(crate) struct FilterDecodeError {
     pub(crate) error: Error,
     pub(crate) during_write: bool,
+    pub(crate) output_offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FilterDecodePhase {
+    Write,
+    Finish,
 }
 
 impl FilterDecodeOutcome {
@@ -188,12 +203,14 @@ impl FilterDecodeOutcome {
 struct StagePipelineError {
     error: PipelineError,
     during_write: bool,
+    output_offset: usize,
 }
 
 fn write_and_finish(
     stage: &mut dyn Pipeline,
     data: &[u8],
     finish_phase: Option<&Cell<bool>>,
+    output_position: &Cell<usize>,
 ) -> Option<StagePipelineError> {
     if let Some(finish_phase) = finish_phase {
         finish_phase.set(false);
@@ -206,9 +223,11 @@ fn write_and_finish(
             stage.finish().err().map(|error| StagePipelineError {
                 error,
                 during_write: false,
+                output_offset: output_position.get(),
             })
         }
         Err(error) => {
+            let output_offset = output_position.get();
             if let Some(finish_phase) = finish_phase {
                 finish_phase.set(true);
             }
@@ -216,6 +235,7 @@ fn write_and_finish(
             Some(StagePipelineError {
                 error,
                 during_write: true,
+                output_offset,
             })
         }
     }
@@ -225,11 +245,22 @@ fn map_stage_error(error: StagePipelineError) -> FilterDecodeError {
     FilterDecodeError {
         error: map_pipeline_error(error.error),
         during_write: error.during_write,
+        output_offset: error.output_offset,
     }
 }
 
 #[cfg(test)]
-pub(crate) fn ignore_warning(_: &str, _: i32) -> PipelineResult<()> {
+pub(crate) fn ignore_warning(
+    _: &str,
+    _: i32,
+    _: usize,
+    _: FilterDecodePhase,
+) -> PipelineResult<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn ignore_codec_warning(_: &str, _: i32) -> PipelineResult<()> {
     Ok(())
 }
 
@@ -268,7 +299,7 @@ pub(crate) trait StreamFilter {
         &mut self,
         data: &[u8],
         max_output: Option<usize>,
-        warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+        warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
     ) -> Result<FilterDecodeOutcome>;
 
     #[cfg(test)]
@@ -276,7 +307,7 @@ pub(crate) trait StreamFilter {
         &mut self,
         data: &[u8],
         max_output: Option<usize>,
-        warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+        warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
     ) -> Result<Vec<u8>> {
         self.pipe_decode_recovering(data, max_output, warn)?
             .into_strict_result()
@@ -422,11 +453,12 @@ impl StreamFilter for FlateLzwStreamFilter {
         &mut self,
         data: &[u8],
         max_output: Option<usize>,
-        warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+        warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
     ) -> Result<FilterDecodeOutcome> {
         let geometry = self.decode_predictor_geometry()?;
         let mut sink = OutputBuffer::new(max_output);
         let finish_phase = sink.finish_phase();
+        let output_position = sink.output_position();
         // SF_FlateLzwDecode::getDecodePipeline builds the chain from the sink
         // outward, so the predictor stage is constructed before the codec and
         // any construction failure precedes every codec write.
@@ -441,9 +473,17 @@ impl StreamFilter for FlateLzwStreamFilter {
                     bits_per_component,
                 )
                 .map_err(map_pipeline_error)?;
-                self.pipe_codec(&mut predictor, data, warn, Some(&finish_phase))?
+                self.pipe_codec(
+                    &mut predictor,
+                    data,
+                    warn,
+                    Some(&finish_phase),
+                    &output_position,
+                )?
             }
-            None => self.pipe_codec(&mut sink, data, warn, Some(&finish_phase))?,
+            None => {
+                self.pipe_codec(&mut sink, data, warn, Some(&finish_phase), &output_position)?
+            }
         };
         Ok(FilterDecodeOutcome {
             cleanup_data_start: sink.cleanup_data_start(),
@@ -482,12 +522,13 @@ impl FlateLzwStreamFilter {
         &self,
         next: &mut dyn Pipeline,
         data: &[u8],
-        warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+        warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
         finish_phase: Option<&Cell<bool>>,
+        output_position: &Cell<usize>,
     ) -> Result<Option<FilterDecodeError>> {
         let error = if self.lzw {
             let mut stage = LzwDecoder::new("lzw decode", next, self.early_code_change);
-            write_and_finish(&mut stage, data, finish_phase)
+            write_and_finish(&mut stage, data, finish_phase, output_position)
         } else {
             let mut stage = Flate::new(
                 "stream inflate",
@@ -496,8 +537,15 @@ impl FlateLzwStreamFilter {
                 DEFAULT_OUT_BUFFER_SIZE,
             )
             .map_err(map_pipeline_error)?;
-            stage.set_warn_callback(|message, code| warn(message, code));
-            write_and_finish(&mut stage, data, finish_phase)
+            stage.set_warn_callback(|message, code| {
+                let phase = if finish_phase.is_some_and(Cell::get) {
+                    FilterDecodePhase::Finish
+                } else {
+                    FilterDecodePhase::Write
+                };
+                warn(message, code, output_position.get(), phase)
+            });
+            write_and_finish(&mut stage, data, finish_phase, output_position)
         };
         Ok(error.map(map_stage_error))
     }
@@ -510,7 +558,7 @@ impl StreamFilter for Ascii85StreamFilter {
         &mut self,
         data: &[u8],
         max_output: Option<usize>,
-        _warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+        _warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
     ) -> Result<FilterDecodeOutcome> {
         decode_ascii85(data, max_output)
     }
@@ -523,7 +571,7 @@ impl StreamFilter for AsciiHexStreamFilter {
         &mut self,
         data: &[u8],
         max_output: Option<usize>,
-        _warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+        _warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
     ) -> Result<FilterDecodeOutcome> {
         decode_ascii_hex(data, max_output)
     }
@@ -536,7 +584,7 @@ impl StreamFilter for RunLengthStreamFilter {
         &mut self,
         data: &[u8],
         max_output: Option<usize>,
-        _warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+        _warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
     ) -> Result<FilterDecodeOutcome> {
         decode_run_length(data, max_output)
     }
@@ -555,7 +603,7 @@ impl StreamFilter for TestStreamFilter {
         &mut self,
         data: &[u8],
         _: Option<usize>,
-        _: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+        _: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
     ) -> Result<FilterDecodeOutcome> {
         Ok(FilterDecodeOutcome::complete(data.to_vec()))
     }
@@ -570,7 +618,7 @@ impl StreamFilter for BorrowedInputProbe {
         &mut self,
         data: &[u8],
         _: Option<usize>,
-        _: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+        _: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
     ) -> Result<FilterDecodeOutcome> {
         EXPECTED_FIRST_INPUT.with(|expected| {
             assert_eq!(data.as_ptr() as usize, expected.get());
@@ -588,7 +636,7 @@ impl StreamFilter for PostPreflightFailure {
         &mut self,
         _: &[u8],
         _: Option<usize>,
-        _: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+        _: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
     ) -> Result<FilterDecodeOutcome> {
         Err(Error::Internal(
             "test post-preflight decode failure".to_string(),
@@ -616,9 +664,11 @@ pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilt
 fn decode_ascii85(data: &[u8], max_output: Option<usize>) -> Result<FilterDecodeOutcome> {
     let mut sink = OutputBuffer::new(max_output);
     let finish_phase = sink.finish_phase();
+    let output_position = sink.output_position();
     let error = {
         let mut stage = Ascii85Decoder::new("ascii85 decode", &mut sink);
-        write_and_finish(&mut stage, data, Some(&finish_phase)).map(map_stage_error)
+        write_and_finish(&mut stage, data, Some(&finish_phase), &output_position)
+            .map(map_stage_error)
     };
     Ok(FilterDecodeOutcome {
         cleanup_data_start: sink.cleanup_data_start(),
@@ -630,9 +680,11 @@ fn decode_ascii85(data: &[u8], max_output: Option<usize>) -> Result<FilterDecode
 fn decode_ascii_hex(data: &[u8], max_output: Option<usize>) -> Result<FilterDecodeOutcome> {
     let mut sink = OutputBuffer::new(max_output);
     let finish_phase = sink.finish_phase();
+    let output_position = sink.output_position();
     let error = {
         let mut stage = AsciiHexDecoder::new("asciiHex decode", &mut sink);
-        write_and_finish(&mut stage, data, Some(&finish_phase)).map(map_stage_error)
+        write_and_finish(&mut stage, data, Some(&finish_phase), &output_position)
+            .map(map_stage_error)
     };
     Ok(FilterDecodeOutcome {
         cleanup_data_start: sink.cleanup_data_start(),
@@ -644,9 +696,11 @@ fn decode_ascii_hex(data: &[u8], max_output: Option<usize>) -> Result<FilterDeco
 fn decode_run_length(data: &[u8], max_output: Option<usize>) -> Result<FilterDecodeOutcome> {
     let mut sink = OutputBuffer::new(max_output);
     let finish_phase = sink.finish_phase();
+    let output_position = sink.output_position();
     let error = {
         let mut stage = RunLength::new("runlength decode", &mut sink, RunLengthAction::Decode);
-        write_and_finish(&mut stage, data, Some(&finish_phase)).map(map_stage_error)
+        write_and_finish(&mut stage, data, Some(&finish_phase), &output_position)
+            .map(map_stage_error)
     };
     Ok(FilterDecodeOutcome {
         cleanup_data_start: sink.cleanup_data_start(),
@@ -681,7 +735,7 @@ fn decode_flate_chunks<'a>(
 
 #[cfg(test)]
 fn decode_flate(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>> {
-    decode_flate_chunks([data], max_output, &mut ignore_warning)
+    decode_flate_chunks([data], max_output, &mut ignore_codec_warning)
 }
 
 pub(crate) fn encode_flate(data: &[u8]) -> Result<Vec<u8>> {
@@ -761,8 +815,8 @@ pub(crate) fn encode_run_length(data: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::{
         decode_filter_specs, decode_flate, decode_flate_chunks, encode_flate, encode_run_length,
-        ignore_warning, normalize_filter_name, stream_filter_for, FlateLzwStreamFilter,
-        OutputBuffer, Pipeline, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
+        ignore_codec_warning, ignore_warning, normalize_filter_name, stream_filter_for,
+        FlateLzwStreamFilter, OutputBuffer, Pipeline, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
     };
     use crate::pipeline::lzw::pack_codes;
     use crate::{Dictionary, Error, Object};
@@ -941,7 +995,7 @@ mod tests {
             )]
         );
         assert!(
-            decode_flate_chunks([b"\x78".as_slice()], None, &mut ignore_warning)
+            decode_flate_chunks([b"\x78".as_slice()], None, &mut ignore_codec_warning)
                 .unwrap()
                 .is_empty()
         );
@@ -949,7 +1003,8 @@ mod tests {
 
     #[test]
     fn empty_inflate_skips_codec_and_warning_like_qpdf() {
-        let decoded = decode_flate_chunks(std::iter::empty(), None, &mut ignore_warning).unwrap();
+        let decoded =
+            decode_flate_chunks(std::iter::empty(), None, &mut ignore_codec_warning).unwrap();
 
         assert!(decoded.is_empty());
     }
@@ -959,7 +1014,7 @@ mod tests {
         let error = decode_flate_chunks(
             [b"\x78\x00".as_slice(), b"not reached".as_slice()],
             None,
-            &mut ignore_warning,
+            &mut ignore_codec_warning,
         )
         .unwrap_err();
 
@@ -985,7 +1040,7 @@ mod tests {
 
         let encoded = encode_flate(b"factory pipeline").unwrap();
         let decoded = filter
-            .pipe_decode(&encoded, None, &mut |_, _| Ok(()))
+            .pipe_decode(&encoded, None, &mut |_, _, _, _| Ok(()))
             .unwrap();
         assert_eq!(decoded, b"factory pipeline");
     }
@@ -1331,7 +1386,7 @@ mod tests {
         flate_payload.truncate(flate_payload.len() - 4);
         let mut warnings = Vec::new();
         let flate_outcome = flate
-            .pipe_decode_recovering(&flate_payload, Some(1), &mut |message, code| {
+            .pipe_decode_recovering(&flate_payload, Some(1), &mut |message, code, _, _| {
                 warnings.push((message.to_string(), code));
                 Ok(())
             })

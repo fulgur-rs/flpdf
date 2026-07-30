@@ -1,0 +1,7 @@
+/QTest is indirect and has type dictionary (9)
+/QTest is a dictionary
+WARNING: dict_indirect_value_warning.pdf (object 7 0, offset 154): expected endobj
+  /a is indirect
+unparse: 6 0 R
+unparseResolved: << /a 7 0 R >>
+test 1 done

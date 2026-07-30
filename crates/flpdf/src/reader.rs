@@ -894,6 +894,57 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(Some(offset.saturating_add(data_start as u64)))
     }
 
+    /// Return the source offset of the `/DecodeParms` value paired with one
+    /// filter in an indirect stream dictionary.
+    ///
+    /// This compatibility hook is compiled only for `flpdf-test-driver`. It
+    /// preserves qpdf's token-specific warning locations without adding source
+    /// spans to the ordinary object model.
+    #[doc(hidden)]
+    #[cfg(feature = "qtest-driver")]
+    pub fn qtest_decode_parms_source_offset(
+        &mut self,
+        object_ref: ObjectRef,
+        filter_index: usize,
+    ) -> Result<Option<u64>> {
+        let Some(XrefEntry::Uncompressed { offset }) =
+            self.source_xref_entries.get(&object_ref).copied()
+        else {
+            return Ok(None);
+        };
+        let next = self.next_object_offset(offset);
+        self.reader.seek(SeekFrom::Start(offset))?;
+        let mut bytes = Vec::new();
+        match next {
+            Some(next) => self
+                .reader
+                .by_ref()
+                .take(next.saturating_sub(offset))
+                .read_to_end(&mut bytes)?,
+            None => self.reader.read_to_end(&mut bytes)?,
+        };
+
+        let mut tokenizer = Tokenizer::new(&bytes);
+        let _ = tokenizer.next_integer()?;
+        let _ = tokenizer.next_integer()?;
+        tokenizer.expect_word(b"obj")?;
+        tokenizer.skip_ignorable()?;
+        let body_start = tokenizer.position();
+        let Some(value_offset) = crate::parser::dictionary_value_source_offset(
+            &bytes[body_start..],
+            b"DecodeParms",
+            filter_index,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            offset
+                .saturating_add(body_start as u64)
+                .saturating_add(value_offset as u64),
+        ))
+    }
+
     fn parse_source_file_object_at(&mut self, offset: u64) -> Result<PendingFileObject> {
         let next = self.next_object_offset(offset);
         self.reader.seek(SeekFrom::Start(offset))?;

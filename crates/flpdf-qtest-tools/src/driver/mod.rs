@@ -9,7 +9,7 @@ use std::ffi::CString;
 
 use flpdf::{Diagnostic, Error, Pdf, PdfOpenOptions};
 
-use crate::common::program_name_bytes;
+use crate::common::test_driver_program_name_bytes;
 
 pub(crate) mod handle;
 pub(crate) mod test_0_1;
@@ -20,7 +20,7 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
         .map(OsString::as_os_str)
         .map(os_str_diagnostic_bytes)
         .unwrap_or_else(|| Cow::Borrowed(b"flpdf-test-driver"));
-    let whoami = program_name_bytes(&whoami);
+    let whoami = test_driver_program_name_bytes(&whoami);
     if args.len() < 3 || args.len() > 4 {
         let mut usage = b"Usage: ".to_vec();
         usage.extend_from_slice(whoami);
@@ -376,16 +376,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn usage_preserves_non_utf8_argv0_basename() {
+    fn usage_preserves_non_utf8_backslash_and_exe_suffix() {
         use std::os::unix::ffi::OsStringExt;
 
-        let args = vec![OsString::from_vec(b"/tmp/test-\xff-driver.exe".to_vec())];
+        let args = vec![OsString::from_vec(b"/tmp/test-\xff\\driver.exe".to_vec())];
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
         assert_eq!(run(&args, &mut stdout, &mut stderr), 2);
         assert!(stdout.is_empty());
-        assert_eq!(stderr, b"Usage: test-\xff-driver n filename1 [arg2]\n");
+        assert_eq!(stderr, b"Usage: test-\xff\\driver.exe n filename1 [arg2]\n");
     }
 
     #[cfg(unix)]
