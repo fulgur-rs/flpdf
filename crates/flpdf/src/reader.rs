@@ -9,8 +9,8 @@ use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
 #[cfg(feature = "qtest-driver")]
-#[cfg(feature = "qtest-driver")]
 use crate::parser::array_item_source_offset;
+#[cfg(feature = "qtest-driver")]
 use crate::parser::dictionary_value_source_offset;
 use crate::parser::parse_qpdf_file_object;
 use crate::pipeline::rc4::PlRc4;
