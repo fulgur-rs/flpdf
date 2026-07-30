@@ -140,6 +140,12 @@ fn resolve_object_handle_resolves_a_dangling_reference_to_null() {
 /// untouched `Reserved`-state guard is what breaks the cycle; this proves it
 /// still works when reached via `resolve_object_handle` instead of
 /// `resolve`/`resolve_borrowed`.
+///
+/// Unlike Task 6 (where an indirect stream lifted to `ObjectValue::Null`,
+/// since `Pdf::lift` does not convert `Object::Stream`), this task's native
+/// parse for the plain uncompressed-file-object case builds a real
+/// `ObjectValue::Stream` — so the object under test here resolves to the
+/// actual (cycle-recovered) stream payload, not null.
 #[test]
 fn resolve_object_handle_survives_a_cyclic_indirect_stream_length() {
     let bytes = classic_pdf_with_bodies(
@@ -156,17 +162,24 @@ fn resolve_object_handle_survives_a_cyclic_indirect_stream_length() {
     pdf.resolve_object_handle(&handle)
         .expect("a cyclic indirect /Length must not error");
 
-    // `Pdf::lift` does not convert `Object::Stream` (dict/data split is out
-    // of this task's scope; see `lift` in reader.rs), so an indirect stream
-    // lifts to `ObjectValue::Null` for now — the scenario under test here is
-    // the cyclic-/Length guard surviving the new bridge, not the eventual
-    // stream materialization.
-    assert!(handle.is_null());
-
-    // The untouched legacy engine still recovers the real stream payload,
-    // proving the cycle guard's behavior is unchanged by this task.
+    // The untouched legacy engine's cycle-recovered payload ("abc") and the
+    // new bridge's own materialized stream data must match.
     let legacy = pdf.resolve(object_ref).expect("legacy resolve");
     assert_eq!(legacy.as_stream().expect("stream").data, b"abc");
+    assert_eq!(handle.as_stream_data(), Some(b"abc".to_vec()));
+
+    // The stream's own dictionary is a distinct, natively-parsed handle
+    // (not folded into the stream value itself), and its /Length entry
+    // still preserves the indirect reference's identity rather than being
+    // inlined as the recovered integer.
+    let dict = handle
+        .as_stream_dict()
+        .expect("stream value carries its own dictionary handle")
+        .as_dictionary()
+        .expect("stream dictionary handle resolves to a dictionary");
+    let length_handle = dict.get(b"Length".as_slice()).expect("Length entry");
+    assert!(length_handle.is_indirect());
+    assert_eq!(length_handle.object_ref(), Some(ObjectRef::new(2, 0)));
 }
 
 /// A compressed (ObjStm) member resolves correctly through
@@ -327,4 +340,318 @@ fn resolve_object_handle_lifts_every_scalar_object_value_variant() {
     assert!(dict.contains_key(b"R".as_slice()));
     assert!(dict.contains_key(b"N".as_slice()));
     assert!(dict.contains_key(b"S".as_slice()));
+}
+
+// ---------------------------------------------------------------------
+// Task 7: parsed offsets for the plain uncompressed-file-object case.
+//
+// `classic_pdf_with_bodies` always starts with the fixed 9-byte
+// `%PDF-1.7\n` header, so a single-body fixture's own bytes start at file
+// offset `PDF_HEADER_LEN`. Every expected offset below is computed from the
+// fixture's own bytes (via `find_after`), never hardcoded, so a fixture
+// edit cannot silently desynchronize the assertion from reality.
+// ---------------------------------------------------------------------
+
+const PDF_HEADER_LEN: usize = 9; // b"%PDF-1.7\n".len()
+
+/// The offset of the first occurrence of `pattern` at or after `after`
+/// within `haystack`.
+fn find_after(haystack: &[u8], pattern: &[u8], after: usize) -> usize {
+    haystack[after..]
+        .windows(pattern.len())
+        .position(|window| window == pattern)
+        .expect("pattern not found")
+        + after
+}
+
+/// The offset right after a body's own "`N G obj`" header line.
+fn after_object_header(body: &[u8]) -> usize {
+    body.iter().position(|&b| b == b'\n').expect("header line") + 1
+}
+
+#[test]
+fn scalar_parsed_offset_is_the_token_start_not_leading_whitespace() {
+    let body: &[u8] = b"1 0 obj\n   42\nendobj\n";
+    let scalar_local = find_after(body, b"42", after_object_header(body));
+    let expected_offset = (PDF_HEADER_LEN + scalar_local) as i64;
+
+    let bytes = classic_pdf_with_bodies(&[body], ObjectRef::new(1, 0));
+    let mut pdf = Pdf::open_mem_owned(bytes).expect("open scalar-offset fixture");
+    let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve_object_handle(&handle).expect("resolve scalar");
+
+    assert_eq!(handle.as_integer(), Some(42));
+    assert_eq!(handle.get_parsed_offset(), expected_offset);
+}
+
+#[test]
+fn array_parsed_offset_is_the_bracket_not_the_first_child() {
+    let body: &[u8] = b"1 0 obj\n[  1 2 3]\nendobj\n";
+    let after_header = after_object_header(body);
+    let bracket_local = find_after(body, b"[", after_header);
+    let first_child_local = find_after(body, b"1", bracket_local);
+    let expected_array_offset = (PDF_HEADER_LEN + bracket_local) as i64;
+    let expected_child_offset = (PDF_HEADER_LEN + first_child_local) as i64;
+    assert_ne!(
+        expected_array_offset, expected_child_offset,
+        "the fixture must actually separate the bracket from the first child"
+    );
+
+    let bytes = classic_pdf_with_bodies(&[body], ObjectRef::new(1, 0));
+    let mut pdf = Pdf::open_mem_owned(bytes).expect("open array-offset fixture");
+    let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve_object_handle(&handle).expect("resolve array");
+
+    assert_eq!(handle.get_parsed_offset(), expected_array_offset);
+    let children = handle.as_array().expect("array");
+    assert_eq!(children.len(), 3);
+    assert_eq!(children[0].as_integer(), Some(1));
+    assert_eq!(children[0].get_parsed_offset(), expected_child_offset);
+}
+
+#[test]
+fn dictionary_parsed_offset_is_the_double_angle_bracket() {
+    let body: &[u8] = b"1 0 obj\n<<  /A 1>>\nendobj\n";
+    let dict_open_local = find_after(body, b"<<", after_object_header(body));
+    let expected_dict_offset = (PDF_HEADER_LEN + dict_open_local) as i64;
+
+    let bytes = classic_pdf_with_bodies(&[body], ObjectRef::new(1, 0));
+    let mut pdf = Pdf::open_mem_owned(bytes).expect("open dictionary-offset fixture");
+    let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve_object_handle(&handle)
+        .expect("resolve dictionary");
+
+    assert_eq!(handle.get_parsed_offset(), expected_dict_offset);
+    let dict = handle.as_dictionary().expect("dictionary");
+    assert_eq!(
+        dict.get(b"A".as_slice()).and_then(ObjectHandle::as_integer),
+        Some(1)
+    );
+}
+
+/// "the parser constructs QPDF_Null without assigning a description or
+/// offset" (design, Fixed qpdf Facts) — even though `null` has a real token
+/// position (nonzero here, well past the fixture's own header), the
+/// handle's parsed offset must stay the sentinel.
+#[test]
+fn parsed_null_offset_is_always_the_sentinel() {
+    let bytes = classic_pdf_with_bodies(&[b"1 0 obj\nnull\nendobj\n"], ObjectRef::new(1, 0));
+    let mut pdf = Pdf::open_mem_owned(bytes).expect("open null-offset fixture");
+    let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve_object_handle(&handle).expect("resolve null");
+
+    assert!(handle.is_null());
+    assert_eq!(handle.get_parsed_offset(), -1);
+}
+
+#[test]
+fn stream_handle_and_its_dictionary_handle_have_distinct_offsets() {
+    let body: &[u8] = b"1 0 obj\n<< /Length 5 >>\nstream\nHello\nendstream\nendobj\n";
+    let after_header = after_object_header(body);
+    let dict_open_local = find_after(body, b"<<", after_header);
+    let data_start_local = find_after(body, b"Hello", dict_open_local);
+    let expected_dict_offset = (PDF_HEADER_LEN + dict_open_local) as i64;
+    let expected_stream_offset = (PDF_HEADER_LEN + data_start_local) as i64;
+    assert_ne!(expected_dict_offset, expected_stream_offset);
+
+    let bytes = classic_pdf_with_bodies(&[body], ObjectRef::new(1, 0));
+    let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream-offset fixture");
+    let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve_object_handle(&handle).expect("resolve stream");
+
+    assert_eq!(handle.as_stream_data(), Some(b"Hello".to_vec()));
+    assert_eq!(handle.get_parsed_offset(), expected_stream_offset);
+
+    let dict_handle = handle.as_stream_dict().expect("stream dictionary handle");
+    assert_eq!(dict_handle.get_parsed_offset(), expected_dict_offset);
+}
+
+/// A parsed `N G R` points at the canonical indirect handle for that
+/// `ObjectRef`, not a fresh value — `ObjectHandle::ptr_eq` is crate-internal
+/// and not visible from this integration test (the same limitation
+/// `get_object_handle_repeated_calls_share_already_resolved_state` above
+/// documents), so identity is proven the public-API-observable way instead:
+/// resolving *only* the dictionary's own child handle must also make a
+/// handle obtained *before* parsing (via a wholly separate
+/// `get_object_handle` call) observe the resolved value — a freshly
+/// constructed, independently-identified handle for the same reference
+/// would not.
+#[test]
+fn indirect_reference_child_is_the_canonical_handle_not_a_fresh_value() {
+    let bytes = classic_pdf_with_bodies(
+        &[
+            b"1 0 obj\n<< /Kid 5 0 R >>\nendobj\n".as_slice(),
+            b"2 0 obj\nnull\nendobj\n",
+            b"3 0 obj\nnull\nendobj\n",
+            b"4 0 obj\nnull\nendobj\n",
+            b"5 0 obj\n99\nendobj\n",
+        ],
+        ObjectRef::new(1, 0),
+    );
+    let mut pdf = Pdf::open_mem_owned(bytes).expect("open kid-ref fixture");
+
+    let canonical = pdf.get_object_handle(ObjectRef::new(5, 0));
+    assert!(canonical.as_integer().is_none(), "not yet resolved");
+
+    let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve_object_handle(&handle).expect("resolve parent");
+
+    let dict = handle.as_dictionary().expect("dictionary");
+    let kid_handle = dict.get(b"Kid".as_slice()).expect("Kid entry").clone();
+    assert_eq!(kid_handle.object_ref(), Some(ObjectRef::new(5, 0)));
+
+    pdf.resolve_object_handle(&kid_handle).expect("resolve kid");
+    assert_eq!(canonical.as_integer(), Some(99));
+}
+
+/// An ObjStm-member handle keeps the Task 6 `lift`-based route (offset `-1`
+/// always): full ObjStm-relative parsed-offset coordinate correctness is a
+/// later layer's scope, not this task's. Asserting the sentinel here (not
+/// merely "resolved without error") is the proof it took the `lift` route —
+/// the native route never leaves an `Integer` value at the sentinel offset,
+/// since every native-parsed scalar gets a real, non-negative offset from
+/// construction.
+#[test]
+fn compressed_object_stream_member_keeps_the_sentinel_offset_via_legacy_lift() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(compressed_entry_pdf())).unwrap();
+    let object_ref = ObjectRef::new(2, 0);
+
+    let handle = pdf.get_object_handle(object_ref);
+    pdf.resolve_object_handle(&handle)
+        .expect("resolve compressed member");
+
+    assert_eq!(handle.as_integer(), Some(42));
+    assert_eq!(
+        handle.get_parsed_offset(),
+        -1,
+        "an ObjStm member must keep the no-offset sentinel in this task"
+    );
+}
+
+/// A file-object body containing `.4`, resolved via the native handle path,
+/// must preserve the non-canonical source literal — exercising the shared
+/// `real_object`/`real_object_handle` literal-preservation decision through
+/// actual parsing (Task 4 only ever exercised this via a hand-built direct
+/// handle).
+#[test]
+fn real_literal_round_trips_through_native_parsing() {
+    let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n.4\nendobj\n"], ObjectRef::new(1, 0));
+    let mut pdf = Pdf::open_mem_owned(bytes).expect("open real-literal fixture");
+    let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve_object_handle(&handle)
+        .expect("resolve real literal");
+
+    assert_eq!(handle.as_real_literal(), Some((0.4, b".4".to_vec())));
+}
+
+// ---------------------------------------------------------------------
+// Task 7, Step 2b: cross-path parity — the drift tripwire.
+//
+// These compare `Pdf::resolve` (legacy) against `resolve_object_handle`
+// (native, for the Uncompressed case) at the public-API level, per the
+// plan's literal Step 2b list. Note that `resolve_object_handle` calls the
+// untouched `resolve_to_cache` engine *first* and propagates its error
+// via `?` before the native parse ever runs, so for malformed input these
+// two public entry points are *guaranteed* to agree here (both surface the
+// exact same underlying error) — that is still worth pinning as a
+// regression (a future edit could easily break the delegation), but the
+// real drift tripwire for the handle-producing container shells
+// themselves (`dictionary_handle`/`array_handle`/`object_handle`) is
+// `parser.rs`'s own `handle_path_parity_tests` module, which calls
+// `Parser::object` and `Parser::object_handle` directly and so actually
+// exercises the native path's own error arms.
+// ---------------------------------------------------------------------
+
+#[test]
+fn cross_path_parity_unterminated_dictionary_matches_legacy_error() {
+    let bytes = classic_pdf_with_bodies(
+        &[
+            b"1 0 obj\n<< /A 1\nendobj\n".as_slice(),
+            b"2 0 obj\nnull\nendobj\n",
+        ],
+        ObjectRef::new(1, 0),
+    );
+    let object_ref = ObjectRef::new(1, 0);
+    let mut pdf = Pdf::open_mem_owned(bytes).expect("open unterminated-dict fixture");
+
+    let legacy_error = pdf
+        .resolve(object_ref)
+        .expect_err("legacy must reject the unterminated dictionary")
+        .to_string();
+    assert!(
+        legacy_error.contains("expected byte 47"),
+        "unexpected legacy error: {legacy_error}"
+    );
+
+    let handle = pdf.get_object_handle(object_ref);
+    let native_error = pdf
+        .resolve_object_handle(&handle)
+        .expect_err("the native path must reject it identically")
+        .to_string();
+    assert_eq!(legacy_error, native_error);
+}
+
+#[test]
+fn cross_path_parity_unterminated_array_matches_legacy_error() {
+    let bytes = classic_pdf_with_bodies(
+        &[b"1 0 obj\n[1 2 3".as_slice(), b"2 0 obj\nnull\nendobj\n"],
+        ObjectRef::new(1, 0),
+    );
+    let object_ref = ObjectRef::new(1, 0);
+    let mut pdf = Pdf::open_mem_owned(bytes).expect("open unterminated-array fixture");
+
+    let legacy_error = pdf
+        .resolve(object_ref)
+        .expect_err("legacy must reject the unterminated array")
+        .to_string();
+    assert!(
+        legacy_error.contains("unexpected EOF in array"),
+        "unexpected legacy error: {legacy_error}"
+    );
+
+    let handle = pdf.get_object_handle(object_ref);
+    let native_error = pdf
+        .resolve_object_handle(&handle)
+        .expect_err("the native path must reject it identically")
+        .to_string();
+    assert_eq!(legacy_error, native_error);
+}
+
+#[test]
+fn cross_path_parity_nesting_past_max_parse_depth_matches_legacy_error() {
+    // Matches the stack-budget reasoning in `parser.rs`'s own
+    // `handle_path_parity_tests` module: constructing `ObjectHandle`s this
+    // deep needs more stack than an unoptimized test binary's default
+    // thread provides, so this runs on a dedicated, generously-sized one.
+    std::thread::Builder::new()
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            let depth = 501; // > MAX_PARSE_DEPTH (500), same bound either path
+            let mut body = b"1 0 obj\n".to_vec();
+            body.extend(std::iter::repeat_n(b'[', depth));
+            body.extend(std::iter::repeat_n(b']', depth));
+            body.extend_from_slice(b"\nendobj\n");
+            let bytes = classic_pdf_with_bodies(&[&body], ObjectRef::new(1, 0));
+            let object_ref = ObjectRef::new(1, 0);
+            let mut pdf = Pdf::open_mem_owned(bytes).expect("open deep-nesting fixture");
+
+            let legacy_error = pdf
+                .resolve(object_ref)
+                .expect_err("legacy must reject nesting past MAX_PARSE_DEPTH")
+                .to_string();
+            assert!(
+                legacy_error.contains("object nesting too deep"),
+                "unexpected legacy error: {legacy_error}"
+            );
+
+            let handle = pdf.get_object_handle(object_ref);
+            let native_error = pdf
+                .resolve_object_handle(&handle)
+                .expect_err("the native path must reject it identically")
+                .to_string();
+            assert_eq!(legacy_error, native_error);
+        })
+        .expect("comparison thread must start")
+        .join()
+        .expect("comparison must not overflow the stack");
 }

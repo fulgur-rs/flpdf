@@ -59,7 +59,11 @@ pub(crate) enum ObjectValue {
     String(Vec<u8>),
     Array(Vec<ObjectHandle>),
     Dictionary(std::collections::BTreeMap<Vec<u8>, ObjectHandle>),
-    #[allow(dead_code)] // constructed/consumed by a later materialization task
+    /// A stream's own value: its dictionary (a separately parsed handle
+    /// carrying its own `<<`-start parsed offset) and its raw encoded byte
+    /// payload. The stream value's own parsed offset (see
+    /// [`ObjectHandle::get_parsed_offset`]) is the encoded stream-data
+    /// start, distinct from the dictionary's.
     Stream {
         dict: ObjectHandle,
         data: Vec<u8>,
@@ -155,6 +159,29 @@ impl ObjectHandle {
     /// factories above.
     pub(crate) fn from_value(value: ObjectValue) -> Self {
         Self::new_direct(value, NO_PARSED_OFFSET)
+    }
+
+    /// Consume a directly-constructed, exclusively-owned handle and return
+    /// its value and parsed offset without cloning.
+    ///
+    /// Used by the parser's top-level file-object handle entry point
+    /// (`parser::parse_qpdf_direct_object_handle`), which builds the
+    /// top-level value as a handle purely to reuse the same
+    /// offset-assignment machinery as every nested child, then immediately
+    /// unwraps it into the pre-existing indirect slot the resolved object
+    /// actually belongs to.
+    ///
+    /// Returns `None` for an indirect handle, or for a direct handle whose
+    /// `Rc` is still shared elsewhere (refcount > 1) — the latter cannot
+    /// happen for a handle a caller alone constructed and never cloned.
+    pub(crate) fn into_direct_value(self) -> Option<(ObjectValue, i64)> {
+        match self.0 {
+            Repr::Direct(rc) => {
+                let slot = Rc::try_unwrap(rc).ok()?.into_inner();
+                Some((slot.value, slot.parsed_offset))
+            }
+            Repr::Indirect(_) => None,
+        }
     }
 
     /// Mark this indirect handle's value as resolved to `value`. A no-op for
@@ -323,6 +350,27 @@ impl ObjectHandle {
     pub fn as_dictionary(&self) -> Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> {
         self.with_value(|value| match value {
             Some(ObjectValue::Dictionary(entries)) => Some(entries.clone()),
+            _ => None,
+        })
+    }
+
+    /// The stream's own dictionary handle if this handle is a direct stream
+    /// value, or `None` otherwise — including for any indirect handle, whose
+    /// value is not read here. Cloning the returned handle is O(1): it
+    /// shares the dictionary's identity rather than copying its subtree.
+    pub fn as_stream_dict(&self) -> Option<ObjectHandle> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Stream { dict, .. }) => Some(dict.clone()),
+            _ => None,
+        })
+    }
+
+    /// The stream's raw encoded byte payload if this handle is a direct
+    /// stream value, or `None` otherwise — including for any indirect
+    /// handle, whose value is not read here.
+    pub fn as_stream_data(&self) -> Option<Vec<u8>> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Stream { data, .. }) => Some(data.clone()),
             _ => None,
         })
     }

@@ -1349,9 +1349,12 @@ impl<R: Read + Seek> Pdf<R> {
     /// handle rather than an error, matching [`Pdf::resolve`].
     ///
     /// This reuses the same decryption, object-stream, and stream-`/Length`
-    /// resolution behavior as [`Pdf::resolve`]. Parsed offsets are not
-    /// populated by this method: every handle resolved this way keeps
-    /// [`ObjectHandle::get_parsed_offset`] at the no-offset sentinel.
+    /// resolution behavior as [`Pdf::resolve`]. For a plain uncompressed file
+    /// object, the resolved handle (and every direct child in its tree)
+    /// carries a real parsed offset from a native parse of the object's own
+    /// source bytes, per qpdf's `getParsedOffset` contract. A compressed
+    /// (object-stream member) reference keeps the no-offset sentinel: its
+    /// object-stream-relative parsed offset is not yet populated.
     ///
     /// # Errors
     ///
@@ -1372,14 +1375,96 @@ impl<R: Read + Seek> Pdf<R> {
             Some(CacheEntry::Resolved(object)) => Some(object.clone()),
             _ => None,
         };
-        match resolved {
-            Some(object) => {
-                let value = self.lift(&object, 0)?;
-                handle.set_resolved(value);
+        let Some(object) = resolved else {
+            handle.set_missing();
+            return Ok(());
+        };
+
+        // Deciding native-parse vs. the legacy `lift` bridge requires the
+        // object's *xref-entry* classification, not its already-resolved
+        // `Object` shape (a `CacheEntry` alone can't distinguish "was always
+        // uncompressed" from other cache states after mutation) — consult
+        // the source xref table, matching the design's Parsed-Offset
+        // Contract table row-by-row: only `Uncompressed` file objects gain
+        // real offsets in this layer.
+        let (value, parsed_offset) = match self.source_xref_entries().get(&object_ref).copied() {
+            Some(XrefEntry::Uncompressed { offset }) => {
+                self.native_parse_uncompressed_value(offset, &object)?
             }
-            None => handle.set_missing(),
-        }
+            _ => (self.lift(&object, 0)?, NO_PARSED_OFFSET),
+        };
+        handle.set_resolved(value);
+        handle.set_parsed_offset_if_unset(parsed_offset);
         Ok(())
+    }
+
+    // Builds the resolved value for a plain uncompressed file object by
+    // parsing its own source bytes directly into `ObjectValue`/`ObjectHandle`
+    // in a single pass, so every node (including nested children) carries a
+    // real parsed offset from construction — never from a second pass over
+    // `object` (design, "Parser" section: no parallel metadata tree, no
+    // reparse-for-provenance). `object` is the value `resolve_to_cache`
+    // already fully resolved above (decryption, indirect `/Length`
+    // resolution, and stream-boundary recovery already applied); this reuses
+    // only its final stream *data* bytes below, which the native pass does
+    // not attempt to rederive (recovery/decryption stay entirely on the
+    // untouched legacy path).
+    //
+    // Known, recorded gap: a native-parsed `ObjectValue::String` carries the
+    // *raw* (possibly still-encrypted) source bytes, not `object`'s
+    // already-decrypted string value (`ObjectValue::Name` has no such gap:
+    // PDF names are never encrypted regardless of path). No accessor reads
+    // decrypted string content off a handle yet (that lands with a later
+    // task's consumer cutover), so this is not yet output-visible.
+    fn native_parse_uncompressed_value(
+        &mut self,
+        offset: u64,
+        object: &Object,
+    ) -> Result<(ObjectValue, i64)> {
+        let bytes = self.read_bounded_object_window(offset)?;
+        let mut tokenizer = Tokenizer::new(&bytes);
+        let _number = tokenizer.next_integer()?;
+        let _generation = tokenizer.next_integer()?;
+        tokenizer.expect_word(b"obj")?;
+        tokenizer.skip_ignorable()?;
+        let body_start = tokenizer.position();
+
+        let file_origin = i64::try_from(offset).unwrap_or(i64::MAX);
+        let base_offset = file_origin + body_start as i64;
+        let (value, value_offset) =
+            crate::parser::parse_qpdf_direct_object_handle(&bytes[body_start..], base_offset, self)
+                .map_err(|error| error.rebase_offset(body_start))?;
+
+        let Object::Stream(stream) = object else {
+            return Ok((value, value_offset));
+        };
+
+        // The dictionary and stream-data-start positions came from the
+        // exact same deterministic, recovery-independent scan
+        // (`parse_file_object_syntax`, unmodified) that the legacy pipeline
+        // above already used to classify this object as a stream in the
+        // first place — reused here only for that one numeric fact, not
+        // reparsed for its (discarded) `Object` value.
+        let pending = parse_file_object_syntax(&bytes)?;
+        let data_start = match pending.body {
+            PendingBody::Stream { data_start, .. } => data_start,
+            // cov:ignore-start: unreachable in practice -- `object` (already
+            // resolved above from these same bytes) is `Object::Stream`, so
+            // parsing the identical bytes here always classifies it as
+            // `PendingBody::Stream` too.
+            PendingBody::Direct { next_offset, .. } => next_offset,
+            // cov:ignore-end
+        };
+        let dict_handle = ObjectHandle::from_value(value);
+        dict_handle.set_parsed_offset_if_unset(value_offset);
+        let stream_offset = file_origin + data_start as i64;
+        Ok((
+            ObjectValue::Stream {
+                dict: dict_handle,
+                data: stream.data.clone(),
+            },
+            stream_offset,
+        ))
     }
 
     // Convert an already-resolved legacy `Object` into an `ObjectValue`.
@@ -1519,13 +1604,13 @@ impl<R: Read + Seek> Pdf<R> {
         )
     }
 
-    fn read_object_at_with_policy(
-        &mut self,
-        expected_ref: ObjectRef,
-        offset: u64,
-        window_policy: RecoveryPolicy,
-        full_policy: RecoveryPolicy,
-    ) -> Result<file_object::FileObjectRead> {
+    // Read the byte window starting at `offset`, bounded by the next known
+    // object's offset when one exists, or by EOF for the last object in the
+    // file. Shared by `read_object_at_with_policy`'s own (first-attempt)
+    // window read and by `native_parse_uncompressed_value`'s single read —
+    // extracted so the two never drift on how the fast-path window is
+    // computed.
+    fn read_bounded_object_window(&mut self, offset: u64) -> Result<Vec<u8>> {
         let next = self.next_object_offset(offset);
         let physical_offset = self.physical_source_offset(offset);
         self.reader.seek(SeekFrom::Start(physical_offset))?;
@@ -1541,6 +1626,19 @@ impl<R: Read + Seek> Pdf<R> {
                 self.reader.read_to_end(&mut bytes)?;
             }
         }
+        Ok(bytes)
+    }
+
+    fn read_object_at_with_policy(
+        &mut self,
+        expected_ref: ObjectRef,
+        offset: u64,
+        window_policy: RecoveryPolicy,
+        full_policy: RecoveryPolicy,
+    ) -> Result<file_object::FileObjectRead> {
+        let next = self.next_object_offset(offset);
+        let physical_offset = self.physical_source_offset(offset);
+        let bytes = self.read_bounded_object_window(offset)?;
 
         let initial_policy = if next.is_some() {
             window_policy
@@ -1926,6 +2024,17 @@ impl<R: Read + Seek> Pdf<R> {
 
         streams.push((stream_ref, stream_object.clone()));
         Ok(())
+    }
+}
+
+// Lets `parser::Parser::object_handle` reach `Pdf::get_object_handle` for a
+// nested `N G R` without `Parser` depending on `Pdf<R>`'s reader-generic
+// type. Named `indirect_handle` (not `get_object_handle`) so this trait
+// method and the inherent one it delegates to can never be confused for
+// each other at the call site below.
+impl<R: Read + Seek> crate::parser::HandleResolver for Pdf<R> {
+    fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
+        self.get_object_handle(object_ref)
     }
 }
 
@@ -4617,12 +4726,76 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_rejects_inline_nesting_past_max_inline_depth() {
+    fn resolve_object_handle_compressed_member_still_rejects_inline_nesting_past_max_inline_depth()
+    {
         // Nesting between MAX_INLINE_DEPTH (256) and MAX_PARSE_DEPTH (500) is
         // accepted by the parser but must still be rejected by `lift`'s own
         // depth guard, mirroring every other post-parse structural walker
         // over an `Object` tree in this crate (e.g. subset_prune.rs's
-        // `walk_refs`).
+        // `walk_refs`). This guard remains live exactly for the Compressed
+        // (ObjStm-member) case: this task deliberately leaves it on the
+        // `lift` bridge (see `resolve_object_handle_uncompressed_now_accepts_the_same_nesting_depth_via_native_parse`
+        // for why the Uncompressed case no longer hits this bound).
+        let depth = crate::object::MAX_INLINE_DEPTH + 5;
+        let mut member_value = Vec::new();
+        member_value.extend(std::iter::repeat_n(b'[', depth));
+        member_value.push(b'1');
+        member_value.extend(std::iter::repeat_n(b']', depth));
+
+        let header = b"7 0 ".to_vec();
+        let first = header.len();
+        let mut objstm_body = header;
+        objstm_body.extend_from_slice(&member_value);
+        let stream_object = format!(
+            "4 0 obj\n<< /Type /ObjStm /N 1 /First {first} /Length {} >>\nstream\n",
+            objstm_body.len()
+        )
+        .into_bytes();
+        let mut body = stream_object;
+        body.extend_from_slice(&objstm_body);
+        body.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n", &body],
+            ObjectRef::new(1, 0),
+        );
+        let objstm_offset = bytes
+            .windows(b"4 0 obj".len())
+            .position(|window| window == b"4 0 obj")
+            .unwrap() as u64;
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open deeply-nested ObjStm fixture");
+        pdf.cache
+            .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
+        pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
+        pdf.source_xref_entries.insert(
+            ObjectRef::new(7, 0),
+            XrefEntry::Compressed {
+                stream: 4,
+                index: 0,
+            },
+        );
+
+        let handle = pdf.get_object_handle(ObjectRef::new(7, 0));
+        let err = pdf
+            .resolve_object_handle(&handle)
+            .expect_err("a compressed member's nesting beyond MAX_INLINE_DEPTH must be rejected");
+        assert!(matches!(err, Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn resolve_object_handle_uncompressed_now_accepts_the_same_nesting_depth_via_native_parse() {
+        // Task 6's `resolve_object_handle` routed every indirect handle
+        // (Uncompressed and Compressed alike) through the same `lift`
+        // bridge, so this exact depth (between MAX_INLINE_DEPTH and
+        // MAX_PARSE_DEPTH) used to be rejected for BOTH. This task reroutes
+        // the Uncompressed case to a native parse bounded only by
+        // MAX_PARSE_DEPTH (matching `object`/`object_inner` exactly, see
+        // `Parser::object_handle`) — so it now succeeds, matching what
+        // `resolve_borrowed` (which was never subject to MAX_INLINE_DEPTH)
+        // already accepted at this depth. This is an intentional behavior
+        // change, not a weakened test: the assertion below pins parity with
+        // `resolve_borrowed`, not just "no longer errors".
         let depth = crate::object::MAX_INLINE_DEPTH + 5;
         let mut body = b"1 0 obj\n".to_vec();
         body.extend(std::iter::repeat_n(b'[', depth));
@@ -4632,11 +4805,16 @@ mod tests {
 
         let bytes = classic_pdf_with_bodies(&[&body], ObjectRef::new(1, 0));
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open deeply-nested fixture");
-        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        let object_ref = ObjectRef::new(1, 0);
 
-        let err = pdf
-            .resolve_object_handle(&handle)
-            .expect_err("nesting beyond MAX_INLINE_DEPTH must be rejected");
-        assert!(matches!(err, Error::Unsupported(_)));
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("nesting between MAX_INLINE_DEPTH and MAX_PARSE_DEPTH must now succeed");
+
+        let legacy = pdf
+            .resolve(object_ref)
+            .expect("resolve_borrowed must also accept it");
+        assert!(legacy.as_array().is_some());
+        assert!(handle.as_array().is_some());
     }
 }
