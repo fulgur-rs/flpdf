@@ -26,7 +26,6 @@ pub(crate) const NO_PARSED_OFFSET: i64 = -1;
 pub struct ObjectHandle(Repr);
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // constructed only by this module's own test-only factories for now
 enum Repr {
     Direct(Rc<RefCell<DirectSlot>>),
     Indirect(Rc<RefCell<IndirectSlot>>),
@@ -286,5 +285,17 @@ mod parsed_offset_tests {
         handle.set_parsed_offset_if_unset(100);
         handle.set_parsed_offset_if_unset(200);
         assert_eq!(handle.get_parsed_offset(), 100);
+    }
+
+    #[test]
+    fn zero_is_a_legitimate_parsed_offset_not_treated_as_unset() {
+        // The guard is a strict `< 0` check, so `0` (a real token-start
+        // offset) must count as "already set" and block later writes, the
+        // same as any other non-negative value.
+        let handle = ObjectHandle::integer(1);
+        handle.set_parsed_offset_if_unset(0);
+        assert_eq!(handle.get_parsed_offset(), 0);
+        handle.set_parsed_offset_if_unset(50);
+        assert_eq!(handle.get_parsed_offset(), 0);
     }
 }
