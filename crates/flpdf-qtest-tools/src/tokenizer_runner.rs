@@ -1,19 +1,18 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write;
 use std::fs;
 use std::io;
+use std::path::Path;
 
-use flpdf::filters::{self, DecodeLimits};
+use flpdf::filters::{self, DecodeLimits, StreamDecodeEvent};
 use flpdf::pages::{page_content_bytes, page_refs};
 use flpdf::tokenizer::{TokenType, Tokenizer};
 use flpdf::{Object, Pdf, PdfOpenOptions};
 
-/// Outcome produced by the tokenizer runner.
 pub enum RunOutcome {
     Exit(u8),
 }
 
-/// Run the qpdf `test_tokenizer` contract.
 pub fn run(
     args: &[OsString],
     stdout: &mut dyn io::Write,
@@ -21,13 +20,13 @@ pub fn run(
 ) -> RunOutcome {
     let mut max_len: usize = 0;
     let mut include_ignorable = true;
-    let mut filename: Option<String> = None;
+    let mut filename: Option<OsString> = None;
 
     let mut i = 1;
     while i < args.len() {
-        let arg = args[i].to_string_lossy().into_owned();
-        if arg.starts_with('-') {
-            if arg == "-maxlen" {
+        let arg_str = args[i].to_string_lossy();
+        if arg_str.starts_with('-') {
+            if arg_str == "-maxlen" {
                 i += 1;
                 if i >= args.len() {
                     usage(args, stderr);
@@ -40,7 +39,7 @@ pub fn run(
                         return RunOutcome::Exit(2);
                     }
                 };
-            } else if arg == "-no-ignorable" {
+            } else if arg_str == "-no-ignorable" {
                 include_ignorable = false;
             } else {
                 usage(args, stderr);
@@ -50,7 +49,7 @@ pub fn run(
             usage(args, stderr);
             return RunOutcome::Exit(2);
         } else {
-            filename = Some(arg);
+            filename = Some(args[i].clone());
         }
         i += 1;
     }
@@ -109,7 +108,6 @@ fn sanitize(value: &[u8]) -> String {
     result
 }
 
-/// qpdf correspondence: `test_tokenizer.cc:50-94`
 fn token_type_name(token_type: TokenType) -> &'static str {
     match token_type {
         TokenType::Bad => "bad",
@@ -134,12 +132,12 @@ fn token_type_name(token_type: TokenType) -> &'static str {
 }
 
 fn process(
-    filename: &str,
+    filename: &OsStr,
     include_ignorable: bool,
     max_len: usize,
     stdout: &mut dyn io::Write,
 ) -> Result<(), String> {
-    let file_bytes = fs::read(filename).map_err(|e| e.to_string())?;
+    let file_bytes = fs::read(Path::new(filename)).map_err(|e| e.to_string())?;
 
     dump_tokens(
         &file_bytes,
@@ -153,14 +151,18 @@ fn process(
 
     let bytes = file_bytes;
     let options = PdfOpenOptions {
-        repair: false,
+        repair: true,
+        allow_weak_crypto: true,
         ..PdfOpenOptions::default()
     };
     let mut pdf = Pdf::open_mem_owned_with_options(bytes, options).map_err(|e| e.to_string())?;
 
     let page_refs = page_refs(&mut pdf).map_err(|e| e.to_string())?;
     for (pageno, page_ref) in page_refs.iter().enumerate() {
-        let content = page_content_bytes(&mut pdf, *page_ref).map_err(|e| e.to_string())?;
+        let content = match page_content_bytes(&mut pdf, *page_ref) {
+            Ok(c) => c,
+            Err(_) => Vec::new(),
+        };
         let label = format!("PAGE {}", pageno + 1);
         dump_tokens(
             &content,
@@ -177,12 +179,7 @@ fn process(
     for obj_ref in object_refs {
         let obj = pdf.resolve(obj_ref).map_err(|e| e.to_string())?;
         if let Object::Stream(ref stream) = obj {
-            let is_objstm = stream
-                .dict
-                .get(b"Type")
-                .and_then(|v| v.as_name())
-                .map(|n| n == b"ObjStm")
-                .unwrap_or(false);
+            let is_objstm = resolve_objstm_type(&mut pdf, &stream.dict);
             if is_objstm {
                 let decoded = filters::decode_stream_data_recovering_with_limits(
                     &stream.dict,
@@ -193,6 +190,7 @@ fn process(
                     },
                 )
                 .map_err(|e| e.to_string())?;
+                report_stream_events(&decoded.events, stdout);
                 let label = format!("OBJECT STREAM {}", obj_ref.number);
                 dump_tokens(
                     &decoded.data,
@@ -208,6 +206,35 @@ fn process(
     }
 
     Ok(())
+}
+
+fn resolve_objstm_type(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, dict: &flpdf::Dictionary) -> bool {
+    let type_val = match dict.get(b"Type") {
+        Some(val) => val.clone(),
+        None => return false,
+    };
+    match type_val {
+        Object::Name(ref n) => n == b"ObjStm",
+        Object::Reference(r) => match pdf.resolve(r) {
+            Ok(Object::Name(ref n)) => n == b"ObjStm",
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn report_stream_events(events: &[StreamDecodeEvent], stdout: &mut dyn io::Write) {
+    for event in events {
+        match event {
+            StreamDecodeEvent::Warning(w) => {
+                let _ = writeln!(stdout, "WARNING: {} (code {})", w.message, w.code);
+            }
+            StreamDecodeEvent::Error(e) => {
+                let _ = writeln!(stdout, "ERROR: {e}");
+            }
+            StreamDecodeEvent::Data(_) => {}
+        }
+    }
 }
 
 fn dump_tokens(
@@ -232,8 +259,8 @@ fn dump_tokens(
 
     while !done {
         if inline_image_offset.is_some() {
-            if let Err(e) = tokenizer.expect_inline_image() {
-                let _ = writeln!(stdout, "EI not found; resuming normal scanning: {e:?}");
+            if let Err(_e) = tokenizer.expect_inline_image() {
+                let _ = writeln!(stdout, "EI not found; resuming normal scanning");
                 inline_image_offset = None;
                 continue;
             }
@@ -273,7 +300,7 @@ fn dump_tokens(
             }
         }
         if let Some(ref msg) = token.error_message {
-            write!(stdout, " ({})", String::from_utf8_lossy(msg)).unwrap();
+            write!(stdout, " ({})", sanitize(msg)).unwrap();
         }
         writeln!(stdout).unwrap();
 
@@ -292,7 +319,9 @@ fn dump_tokens(
             }
         } else if skip_inline_images && token.token_type == TokenType::Word && token.value == b"ID"
         {
-            tokenizer.consume_one_byte().expect("byte after ID");
+            if let Err(_e) = tokenizer.consume_one_byte() {
+                continue;
+            }
             inline_image_offset = Some(tokenizer.position());
         } else if token.token_type == TokenType::Eof {
             done = true;
@@ -309,6 +338,7 @@ fn is_delimiter(byte: u8) -> bool {
             | b'\r'
             | b'\t'
             | b'\x0c'
+            | b'\x00'
             | b'('
             | b')'
             | b'<'
@@ -368,6 +398,18 @@ mod tests {
     }
 
     #[test]
+    fn find_endstream_with_nul_delimiter_before_and_after() {
+        let data = b"\x00endstream\x00";
+        assert_eq!(find_endstream(data, 0), Some(10));
+    }
+
+    #[test]
+    fn find_endstream_with_nul_delimiter_after() {
+        let data = b" endstream\x00";
+        assert_eq!(find_endstream(data, 0), Some(10));
+    }
+
+    #[test]
     fn sanitize_printable_passes_through() {
         assert_eq!(sanitize(b"hello"), "hello");
     }
@@ -377,5 +419,11 @@ mod tests {
         assert_eq!(sanitize(&[0x00]), "\\x00");
         assert_eq!(sanitize(&[0x7f]), "\\x7f");
         assert_eq!(sanitize(&[0xff]), "\\xff");
+    }
+
+    #[test]
+    fn find_endstream_with_nul_delimiter() {
+        let data = b" endstream\x00";
+        assert_eq!(find_endstream(data, 0), Some(10));
     }
 }
