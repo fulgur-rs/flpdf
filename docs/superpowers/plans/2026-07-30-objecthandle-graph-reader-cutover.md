@@ -1297,15 +1297,92 @@ engine's decryption step — unlike the already-resolved legacy `Object` (via
 `resolve_to_cache`) it runs alongside, whose `String` values *are*
 decrypted. This was inert in Task 7 (no accessor read a handle's decrypted
 string content yet), but this task is exactly where that risk becomes live:
-if the materialization bridge (or any new accessor this task adds) surfaces
-a native-parsed `String`'s bytes for an encrypted PDF without decrypting
-them first, that is an output-visible correctness bug, not a deferred one.
-Before closing this task, explicitly confirm one of: (a) the
-materialization path re-derives/decrypts `String` values from the already-
-decrypted legacy `object` rather than trusting the native parse's raw
-bytes, or (b) the native parse itself is changed to decrypt strings,
-matching the legacy engine's behavior. Do not let this resurface as a
-silent gap a second time.
+once `resolve_borrowed`/`resolve` route through `materialize()`, ANY
+encrypted PDF whose `/Info` dictionary, or any other string-bearing
+dictionary, lives in an `XrefEntry::Uncompressed` object (very common —
+`/Info` in particular is frequently not object-stream-compressed even in
+otherwise-hybrid files) surfaces raw ciphertext bytes as plaintext through
+the public API. This is an output-visible correctness bug the moment it
+ships, not a deferred one.
+
+**Required Step 0, before writing any other code for this task:** resolve
+this concretely, don't re-derive the design from scratch — the reasoning
+below already traces the two facts that decide it:
+
+- `decrypt_resolved_object` (`reader.rs:1870`) — the legacy engine's own
+  decryption entry point — takes an *already-built* `Object` tree (`mut
+  object: Object`) and mutates it in place via `decrypt_object_strings`
+  (`reader.rs:2148`) → `decrypt_strings_in_object`, which walks the whole
+  tree recursively. It does not take individual string byte slices in
+  isolation anywhere in the existing call graph.
+- `resolve_to_cache` (`reader.rs:1746`) calls `decrypt_resolved_object`
+  **before** `self.cache.set_resolved(object_ref, object)` — so the
+  `object` available at `native_parse_uncompressed_value`'s call site in
+  `resolve_object_handle` (passed in from the `CacheEntry::Resolved(object)`
+  match) is *already fully decrypted*. It is the correct source of truth
+  for every `String` value in that object's tree today; nothing needs to
+  reach into `parser.rs` to fix this.
+- **Do not attempt a lockstep walk between the native `ObjectValue` tree
+  and the legacy `Object` tree** to copy over decrypted string bytes
+  position-by-position. The two trees can have different shapes for a
+  malformed object with a duplicate dictionary key (native's
+  `BTreeMap<Vec<u8>, ObjectHandle>` construction and the legacy engine's own
+  duplicate-key handling are not guaranteed to agree byte-for-byte on which
+  duplicate wins) — a silent mismatch here is exactly the kind of
+  correctness hazard this plan exists to prevent, so this approach is
+  rejected, not merely discouraged.
+- **First check whether this is even reachable today** before building
+  anything: does any existing fixture (or a quick one you construct) route
+  an *encrypted* PDF through an `XrefEntry::Uncompressed` object containing
+  a `String`? Search `crates/flpdf/tests/` (`encrypt_writer_smoke.rs`,
+  `reader_tests.rs`, `check_tests.rs`, and the `encrypted/` fixture
+  directories) for existing coverage; if none exists, construct a minimal
+  one (encrypted classic PDF, `/Info` dict as a plain uncompressed object
+  with a `/Title` string) and drive it through `resolve_borrowed` before
+  and after your Step 3 changes.
+- If reachable (expected — this is the likely outcome and you should plan
+  for it): fix it by having `native_parse_uncompressed_value`'s caller (or
+  `native_parse_uncompressed_value` itself) decrypt strings in the
+  *materialized* `Object` — not the native `ObjectValue` — using the
+  existing `decrypt_object_strings`/`decrypt_resolved_object` machinery
+  unchanged, keyed by the same `object_ref` `resolve_object_handle` already
+  has in scope. Concretely: this task already builds `materialize()`
+  (`ObjectHandle -> Object`, this task's own Step 3) — for a handle that
+  was populated via the native-parse route specifically (not every handle;
+  Compressed-branch handles built via `lift(&object, 0)` already carry
+  correctly-decrypted strings from `object` and must not be decrypted
+  twice), decrypt the *materialized* `Object` before caching it in
+  `legacy_materialized_memo`, mirroring exactly what `resolve_to_cache`
+  already does for the legacy engine, with the same "skip decryption for
+  the `/Encrypt` dictionary object itself" guard `decrypt_resolved_object`
+  already has. This reuses 100% of the existing crypto call graph (RC4/
+  AES-128/AES-256 dispatch, per-object key derivation, explicit crypt
+  filters) with zero duplication — the only new code is deciding *when* to
+  invoke it (native-parse-populated handles only) and threading whatever
+  marker distinguishes "this handle was populated via native parse" (the
+  parsed offset being non-sentinel is one candidate signal already
+  available on every handle; consider whether that's sufficient and
+  precise enough, or whether a small explicit flag is clearer — your call,
+  document whichever you pick).
+- If NOT reachable today (e.g. every fixture with encrypted strings happens
+  to route them through Compressed/ObjStm objects only): the honest move is
+  smaller — add a test that pins this specific claim (encrypted + `String`
+  + `Uncompressed` is not exercised by any current fixture/test), keep
+  `flpdf-jjxb` open against `flpdf-egzr.3.2` rather than closing it here,
+  and do not build the decryption machinery above speculatively. State
+  explicitly in your report which branch you took and why.
+
+**Separately, before writing Step 3's `resolve_borrowed` rewrite, check
+this borrow-lifetime question**: the sketch below has `set_object`/
+`delete_object` `remove` the corresponding `legacy_materialized_memo` entry.
+Grep the crate for any call site that holds a `resolve_borrowed(..)`-
+returned `&Object` borrow **across** a `set_object`/`delete_object` call on
+the same `Pdf`. If the borrow checker already forbids this today (likely,
+since `resolve_borrowed` takes `&mut self` and so does `set_object`), there
+is nothing to do; if some existing call site currently compiles by relying
+on `resolve_borrowed`'s current borrow shape in a way this rewrite would
+break across many of the 350 call sites, that is a compile-time discovery
+you want made now, not treated as a surprise mid-implementation.
 
 **Files:**
 - Modify: `crates/flpdf/src/reader.rs`
