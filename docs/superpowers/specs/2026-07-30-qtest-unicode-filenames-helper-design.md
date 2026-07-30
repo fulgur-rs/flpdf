@@ -49,7 +49,7 @@ The binary takes no arguments and ignores `argv`.
 | Condition | stderr | Exit |
 |---|---|---|
 | Input file cannot be opened, or *either* output file cannot be opened | `errors opening files\n` | 2 |
-| `fread` returns an error mid-loop (`len != 0` after the read returns 0 via EOF+error) | `errors reading or writing\n` | 2 |
+| Write failure mid-loop (`fwrite` writes fewer bytes than requested, leaving `len > 0` when the loop breaks) | `errors reading or writing\n` | 2 |
 
 ---
 
@@ -77,8 +77,9 @@ The Rust implementation replicates this exactly:
    `auto-öπ.pdf` — re-opening `minimal.pdf` each time. This matches qpdf's
    `copy(f1)` → `copy(f2)` sequence (`qpdf/test_unicode_filenames.cc:77–78`)
    where `copy()` calls `fopen("minimal.pdf", "rb")` internally.
-4. After each loop exits with `len == 0`, check whether the last `read` call was
-   a legitimate EOF versus a read error (error → `"errors reading or writing"`).
+4. Read errors are treated like EOF (qpdf does not check `ferror` after `fread` returns 0,
+   so a read error silently exits the loop the same way EOF does). The write error
+   branch (`fwrite` partial write → `len != 0`) mirrors qpdf's dead code path.
 
 > The buffer size **must** be 10240 — that is part of the observable behaviour
 > (it controls the chunk count that could affect error detection points in a
@@ -98,7 +99,7 @@ with `tempfile::TempDir` for per-test working directories.
 | # | Name | Setup | Assertions |
 |---|---|---|---|
 | 1 | Happy path — successful copy | Copy `tests/fixtures/minimal.pdf` into tempdir as `minimal.pdf` | `exit == 0`, `stdout == "created Unicode filenames\n"`, `stderr == ""`, `auto-ü.pdf` and `auto-öπ.pdf` exist and are byte-identical to `minimal.pdf` |
-| 2 | Input file missing | Empty tempdir (no `minimal.pdf`) | `exit == 2`, `stderr == "errors opening files\n"`, no output files created |
+| 2 | Input file missing | Empty tempdir (no `minimal.pdf`) | `exit == 2`, `stderr == "errors opening files\n"`, `auto-ü.pdf` created as empty file (qpdf calls `fopen("wb")` before checking the input handle), `auto-öπ.pdf` not created |
 | 3 | Output path is a directory | `minimal.pdf` present, `auto-ü.pdf` exists as a directory | `exit == 2`, `stderr == "errors opening files\n"`, `auto-öπ.pdf` not created |
 | 4 | Read/write error mid-copy | *Tested via code path but untestable with regular filesystem — covered by comment only or tested via artificial means (e.g. partial write on a special device).* | `exit == 2`, `stderr == "errors reading or writing\n"` |
 
