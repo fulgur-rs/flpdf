@@ -4817,4 +4817,81 @@ mod tests {
         assert!(legacy.as_array().is_some());
         assert!(handle.as_array().is_some());
     }
+
+    /// Now that this task reroutes the Uncompressed case away from `lift`,
+    /// `lift`/`lift_to_handle`'s own scalar/dictionary/reference branches are
+    /// reachable only through the Compressed (ObjStm-member) route this task
+    /// deliberately leaves unchanged — this is the coverage anchor for that
+    /// route, mirroring what `resolve_object_handle_lifts_every_scalar_object_value_variant`
+    /// (the tests-crate parity file) already covers for the Uncompressed
+    /// (native-parse) case.
+    #[test]
+    fn resolve_object_handle_compressed_member_lifts_every_scalar_dictionary_and_reference_variant()
+    {
+        let member_value: &[u8] =
+            b"<< /B true /R 1.5 /RL .5 /N /Foo /S (bar) /Nul null /Kid 5 0 R /Sub << /X 1 >> >>";
+        let header = b"7 0 ".to_vec();
+        let first = header.len();
+        let mut objstm_body = header;
+        objstm_body.extend_from_slice(member_value);
+        let stream_object = format!(
+            "4 0 obj\n<< /Type /ObjStm /N 1 /First {first} /Length {} >>\nstream\n",
+            objstm_body.len()
+        )
+        .into_bytes();
+        let mut body = stream_object;
+        body.extend_from_slice(&objstm_body);
+        body.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n", &body],
+            ObjectRef::new(1, 0),
+        );
+        let objstm_offset = bytes
+            .windows(b"4 0 obj".len())
+            .position(|window| window == b"4 0 obj")
+            .unwrap() as u64;
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open scalar-variant ObjStm fixture");
+        pdf.cache
+            .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
+        pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
+        pdf.source_xref_entries.insert(
+            ObjectRef::new(7, 0),
+            XrefEntry::Compressed {
+                stream: 4,
+                index: 0,
+            },
+        );
+
+        let handle = pdf.get_object_handle(ObjectRef::new(7, 0));
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve compressed scalar/dictionary/reference dict");
+
+        let dict = handle.as_dictionary().expect("dictionary");
+        assert!(dict.contains_key(b"B".as_slice()));
+        assert!(dict.contains_key(b"R".as_slice()));
+        assert_eq!(
+            dict.get(b"RL".as_slice())
+                .and_then(ObjectHandle::as_real_literal),
+            Some((0.5, b".5".to_vec()))
+        );
+        assert!(dict.contains_key(b"N".as_slice()));
+        assert!(dict.contains_key(b"S".as_slice()));
+        assert!(dict.get(b"Nul".as_slice()).expect("Nul entry").is_null());
+
+        let kid = dict.get(b"Kid".as_slice()).expect("Kid entry");
+        assert!(kid.is_indirect());
+        assert_eq!(kid.object_ref(), Some(ObjectRef::new(5, 0)));
+
+        let sub = dict
+            .get(b"Sub".as_slice())
+            .expect("Sub entry")
+            .as_dictionary()
+            .expect("nested dictionary");
+        assert_eq!(
+            sub.get(b"X".as_slice()).and_then(ObjectHandle::as_integer),
+            Some(1)
+        );
+    }
 }

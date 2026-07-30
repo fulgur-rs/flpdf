@@ -1580,6 +1580,69 @@ mod handle_path_parity_tests {
         assert_eq!(legacy, native_error(input));
     }
 
+    #[test]
+    fn bad_token_matches_between_legacy_and_native_paths() {
+        let input = b"<0g>";
+        let legacy = legacy_error(input);
+        assert!(
+            legacy.contains("invalid character"),
+            "unexpected legacy error: {legacy}"
+        );
+        assert_eq!(legacy, native_error(input));
+    }
+
+    #[test]
+    fn eof_at_top_level_matches_between_legacy_and_native_paths() {
+        let input = b"";
+        let legacy = legacy_error(input);
+        assert!(
+            legacy.contains("unexpected EOF"),
+            "unexpected legacy error: {legacy}"
+        );
+        assert_eq!(legacy, native_error(input));
+    }
+
+    #[test]
+    fn unsupported_token_matches_between_legacy_and_native_paths() {
+        let input = b"foo";
+        let legacy = legacy_error(input);
+        assert!(
+            legacy.contains("expected PDF object"),
+            "unexpected legacy error: {legacy}"
+        );
+        assert_eq!(legacy, native_error(input));
+    }
+
+    /// A nested `N G R` (not at the top-level bare-reference-recovery gate,
+    /// since a fresh `Parser::with_tokenizer` defaults `top_level_no_reference`
+    /// to `false`) resolves through the `HandleResolver` this task adds,
+    /// exercising `integer_or_ref_handle`'s reference arm directly.
+    #[test]
+    fn reference_resolves_through_the_shared_handle_resolver() {
+        let input = b"5 0 R";
+        let mut tokenizer = Tokenizer::new(input);
+        let mut parser = Parser::with_tokenizer(&mut tokenizer);
+        let mut resolver = NullResolver;
+        let handle = parser
+            .object_handle(0, &mut resolver)
+            .expect("reference must parse");
+        assert!(handle.is_indirect());
+        assert_eq!(handle.object_ref(), Some(ObjectRef::new(5, 0)));
+    }
+
+    /// Mirrors `qpdf_direct_object_reports_empty_body_without_consuming_endobj`
+    /// (the legacy free function's own empty-object recovery test) for the
+    /// handle-producing counterpart.
+    #[test]
+    fn parse_qpdf_direct_object_handle_recovers_empty_body_as_null() {
+        let input = b" \nendobj\n";
+        let mut resolver = NullResolver;
+        let (value, offset) = super::parse_qpdf_direct_object_handle(input, 100, &mut resolver)
+            .expect("empty body recovers as null");
+        assert!(matches!(value, crate::object_handle::ObjectValue::Null));
+        assert_eq!(offset, -1);
+    }
+
     // Constructing `ObjectHandle`/`ObjectValue` recursively measurably costs
     // more per-frame stack in unoptimized (debug/test) builds than the
     // legacy `Object`-producing recursion does — the same underlying reason

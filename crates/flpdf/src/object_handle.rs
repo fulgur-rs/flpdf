@@ -180,7 +180,11 @@ impl ObjectHandle {
                 let slot = Rc::try_unwrap(rc).ok()?.into_inner();
                 Some((slot.value, slot.parsed_offset))
             }
-            Repr::Indirect(_) => None,
+            // Unreachable via this module's sole caller
+            // (`parser::parse_qpdf_direct_object_handle`): `top_level_no_reference`
+            // forces every top-level parse to `Integer`, never a reference,
+            // so the handle it builds and consumes here is always direct.
+            Repr::Indirect(_) => None, // cov:ignore: unreachable per the invariant noted above
         }
     }
 
@@ -490,14 +494,17 @@ mod object_value_tests {
 
     #[test]
     fn accessors_return_none_for_a_mismatched_direct_value() {
-        // `as_integer`/`as_array`/`as_dictionary`/`as_real_literal` must
-        // reject a direct value of the wrong variant, not just a missing
-        // one — the same `_ => None` arm handles both cases.
+        // `as_integer`/`as_array`/`as_dictionary`/`as_real_literal`/
+        // `as_stream_dict`/`as_stream_data` must reject a direct value of
+        // the wrong variant, not just a missing one — the same `_ => None`
+        // arm handles both cases.
         let handle = ObjectHandle::string(b"not-an-integer".to_vec());
         assert_eq!(handle.as_integer(), None);
         assert!(handle.as_array().is_none());
         assert!(handle.as_dictionary().is_none());
         assert_eq!(handle.as_real_literal(), None);
+        assert!(handle.as_stream_dict().is_none());
+        assert!(handle.as_stream_data().is_none());
     }
 
     #[test]
@@ -513,6 +520,8 @@ mod object_value_tests {
         assert!(handle.as_array().is_none());
         assert!(handle.as_dictionary().is_none());
         assert_eq!(handle.as_real_literal(), None);
+        assert!(handle.as_stream_dict().is_none());
+        assert!(handle.as_stream_data().is_none());
     }
 }
 
