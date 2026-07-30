@@ -62,7 +62,7 @@ pub fn run(
         }
     };
 
-    match process(&filename, include_ignorable, max_len, stdout) {
+    match process(&filename, include_ignorable, max_len, stdout, stderr) {
         Ok(()) => RunOutcome::Exit(0),
         Err(e) => {
             let _ = write!(
@@ -136,6 +136,7 @@ fn process(
     include_ignorable: bool,
     max_len: usize,
     stdout: &mut dyn io::Write,
+    stderr: &mut dyn io::Write,
 ) -> Result<(), String> {
     let file_bytes = fs::read(Path::new(filename)).map_err(|e| e.to_string())?;
 
@@ -187,7 +188,7 @@ fn process(
                     },
                 )
                 .map_err(|e| e.to_string())?;
-                report_stream_events(&decoded.events, stdout);
+                report_stream_events(&decoded.events, stderr);
                 let label = format!("OBJECT STREAM {}", obj_ref.number);
                 dump_tokens(
                     &decoded.data,
@@ -216,14 +217,18 @@ fn resolve_objstm_type(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, dict: &flpdf::Di
     }
 }
 
-fn report_stream_events(events: &[StreamDecodeEvent], stdout: &mut dyn io::Write) {
+// qpdf's test_tokenizer.cc prints nothing of the kind; these diagnostics are
+// an flpdf-qtest-tools addition for visibility into a recovering decode. They
+// go to stderr, not stdout, so they never pollute the token dump that is
+// compared against qpdf's stdout.
+fn report_stream_events(events: &[StreamDecodeEvent], stderr: &mut dyn io::Write) {
     for event in events {
         match event {
             StreamDecodeEvent::Warning(w) => {
-                let _ = writeln!(stdout, "WARNING: {} (code {})", w.message, w.code);
+                let _ = writeln!(stderr, "WARNING: {} (code {})", w.message, w.code);
             }
             StreamDecodeEvent::Error(e) => {
-                let _ = writeln!(stdout, "ERROR: {e}");
+                let _ = writeln!(stderr, "ERROR: {e}");
             }
             StreamDecodeEvent::Data(_) => {}
         }
@@ -353,6 +358,8 @@ fn find_endstream(input: &[u8], start: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flpdf::filters::StreamDecodeWarning;
+    use flpdf::Error;
 
     #[test]
     fn find_endstream_finds_word_at_start() {
@@ -391,6 +398,23 @@ mod tests {
     fn find_endstream_returns_none_when_absent() {
         let data = b"no match here";
         assert_eq!(find_endstream(data, 0), None);
+    }
+
+    #[test]
+    fn report_stream_events_writes_warnings_and_errors_to_stderr() {
+        let events = vec![
+            StreamDecodeEvent::Warning(StreamDecodeWarning {
+                message: "truncated stream".into(),
+                code: -5,
+            }),
+            StreamDecodeEvent::Error(Error::parse(0, "boom")),
+            StreamDecodeEvent::Data(vec![1, 2, 3]),
+        ];
+        let mut stderr = Vec::new();
+        report_stream_events(&events, &mut stderr);
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("WARNING: truncated stream (code -5)"));
+        assert!(stderr.contains("boom"));
     }
 
     #[test]
