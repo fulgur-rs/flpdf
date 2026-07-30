@@ -3,10 +3,10 @@
 //!
 //! qpdf correspondence: `QPDFObjectHandle` (`include/qpdf/QPDFObjectHandle.hh`)
 //! and its backing `QPDFValue` (`libqpdf/qpdf/QPDFValue.hh`).
-//!
-//! `Rc<RefCell<..>>` stands in for qpdf's `std::shared_ptr<QPDFValue>`:
-//! internal-structure-only substitute (CLAUDE.md category (B)), no effect on
-//! output bytes.
+
+// Deviation: shared handle identity uses Rc<RefCell<..>> in place of qpdf's
+// std::shared_ptr<QPDFValue> — internal structure only, does not affect
+// output bytes (see docs/qpdf-correspondence.md).
 
 use crate::ObjectRef;
 use std::cell::RefCell;
