@@ -7,7 +7,7 @@
 // std::shared_ptr<QPDFValue> — internal structure only, does not affect
 // output bytes (see docs/qpdf-correspondence.md).
 
-use crate::ObjectRef;
+use crate::{Dictionary, Object, ObjectRef, Stream};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -68,6 +68,17 @@ pub(crate) enum ObjectValue {
         dict: ObjectHandle,
         data: Vec<u8>,
     },
+    // An indirect object whose own resolved value is *itself* a bare
+    // reference to another object (e.g. `4 0 obj\n5 0 R\nendobj`, or a
+    // reference redirected in place via `Pdf::set_object`) -- never seen
+    // from a file/ObjStm parse (`Pdf::resolve_object_handle`'s native path
+    // integerizes a top-level bare reference to `Integer` instead, matching
+    // qpdf), but a real value `Pdf::set_object` callers pass directly (used
+    // throughout this crate to redirect/collapse holder chains). A child
+    // array/dictionary entry that is a reference is represented as a
+    // separate indirect `ObjectHandle`, never this variant -- see
+    // `Pdf::lift_to_handle` and `materialize`'s own doc.
+    Reference(ObjectRef),
 }
 
 #[derive(Debug)]
@@ -395,6 +406,107 @@ impl ObjectHandle {
             },
         }
     }
+
+    /// Convert this handle's value into a legacy [`crate::Object`] tree
+    /// (`Pdf::resolve`/`Pdf::resolve_borrowed`'s materialization bridge).
+    ///
+    /// An indirect array/dictionary child is *not* recursively resolved: it
+    /// becomes `Object::Reference(child_ref)`, matching the parser's
+    /// pre-existing `Object::Reference` semantics so every consumer match on
+    /// that variant keeps working unchanged. A stream's own dictionary
+    /// handle (a separately parsed handle with its own `<<`-start parsed
+    /// offset) is flattened into a plain [`Dictionary`] for
+    /// `Object::Stream`.
+    ///
+    /// An indirect handle that has not yet been resolved (see
+    /// [`Self::is_resolved`]) materializes as `Object::Null` rather than
+    /// performing hidden resolution; callers that need the real value must
+    /// resolve first (e.g. via `Pdf::resolve_object_handle`).
+    pub(crate) fn materialize(&self) -> Object {
+        self.with_value(|value| match value {
+            Some(value) => materialize_value(value),
+            None => Object::Null,
+        })
+    }
+
+    /// Replace this handle's own value in place, preserving its identity
+    /// (every other outstanding clone observes the new value) and its
+    /// already-recorded parsed offset (`parsed_offset` is untouched here --
+    /// see [`Self::reset_parsed_offset`] to clear it). A no-op for an
+    /// indirect handle; see [`Self::set_resolved`] for that case.
+    ///
+    /// Used by `Pdf::set_object` to update a stream's own dictionary handle
+    /// in place when the replacement value is also a stream, so the
+    /// dictionary handle's already-recorded `<<`-start parsed offset
+    /// survives instead of being lost to a freshly minted handle.
+    pub(crate) fn replace_direct_value(&self, value: ObjectValue) {
+        if let Repr::Direct(slot) = &self.0 {
+            slot.borrow_mut().value = value;
+        }
+    }
+
+    /// Reset this handle's parsed offset back to the no-offset sentinel,
+    /// overriding the set-once contract [`Self::set_parsed_offset_if_unset`]
+    /// normally enforces.
+    ///
+    /// Used by `Pdf::set_object`: once it replaces an indirect handle's
+    /// value with a caller-supplied one, any previously recorded source
+    /// position no longer describes that value.
+    pub(crate) fn reset_parsed_offset(&self) {
+        match &self.0 {
+            Repr::Direct(slot) => slot.borrow_mut().parsed_offset = NO_PARSED_OFFSET,
+            Repr::Indirect(slot) => slot.borrow_mut().parsed_offset = NO_PARSED_OFFSET,
+        }
+    }
+}
+
+fn materialize_value(value: &ObjectValue) -> Object {
+    match value {
+        ObjectValue::Null => Object::Null,
+        ObjectValue::Boolean(b) => Object::Boolean(*b),
+        ObjectValue::Integer(n) => Object::Integer(*n),
+        ObjectValue::Real(r) => Object::Real(*r),
+        ObjectValue::RealLiteral { value, literal } => Object::RealLiteral {
+            value: *value,
+            literal: literal.clone(),
+        },
+        ObjectValue::Name(name) => Object::Name(name.clone()),
+        ObjectValue::String(s) => Object::String(s.clone()),
+        ObjectValue::Array(children) => {
+            Object::Array(children.iter().map(materialize_child).collect())
+        }
+        ObjectValue::Dictionary(entries) => {
+            let mut dict = Dictionary::new();
+            for (key, value) in entries {
+                dict.insert(key.as_slice(), materialize_child(value));
+            }
+            Object::Dictionary(dict)
+        }
+        ObjectValue::Stream { dict, data } => {
+            let dict = match dict.materialize() {
+                Object::Dictionary(dict) => dict,
+                // A stream's own dictionary handle is always constructed as
+                // a direct `ObjectValue::Dictionary` (see
+                // `Pdf::native_parse_uncompressed_value`, `Pdf::lift`, and
+                // `Pdf::lift_for_set_object`), never an indirect reference
+                // or any other variant.
+                _ => Dictionary::new(), // cov:ignore: unreachable per the invariant above
+            };
+            Object::Stream(Stream::new(dict, data.clone()))
+        }
+        ObjectValue::Reference(object_ref) => Object::Reference(*object_ref),
+    }
+}
+
+// An array/dictionary child handle materializes to `Object::Reference`
+// without recursing into it when indirect (identity-preserving, matching
+// the parser's pre-existing `Object::Reference` semantics); a direct child
+// is materialized in place.
+fn materialize_child(handle: &ObjectHandle) -> Object {
+    match handle.object_ref() {
+        Some(object_ref) => Object::Reference(object_ref),
+        None => handle.materialize(),
+    }
 }
 
 #[cfg(test)]
@@ -643,6 +755,136 @@ mod resolution_state_tests {
         let handle = ObjectHandle::from_value(ObjectValue::Integer(3));
         assert!(handle.is_direct());
         assert_eq!(handle.as_integer(), Some(3));
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+}
+
+#[cfg(test)]
+mod materialize_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_values_materialize_to_the_matching_object_variant() {
+        assert_eq!(ObjectHandle::null().materialize(), Object::Null);
+        assert_eq!(
+            ObjectHandle::boolean(true).materialize(),
+            Object::Boolean(true)
+        );
+        assert_eq!(ObjectHandle::integer(7).materialize(), Object::Integer(7));
+        assert_eq!(ObjectHandle::real(1.5).materialize(), Object::Real(1.5));
+        assert_eq!(
+            ObjectHandle::name(b"Foo".to_vec()).materialize(),
+            Object::Name(b"Foo".to_vec())
+        );
+        assert_eq!(
+            ObjectHandle::string(b"bar".to_vec()).materialize(),
+            Object::String(b"bar".to_vec())
+        );
+    }
+
+    #[test]
+    fn real_literal_materializes_with_its_source_literal_preserved() {
+        let handle = ObjectHandle::real_literal(0.4, b".4".to_vec());
+        assert_eq!(
+            handle.materialize(),
+            Object::RealLiteral {
+                value: 0.4,
+                literal: b".4".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_direct_array_materializes_recursively_but_an_indirect_child_becomes_a_reference() {
+        let indirect_child = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(1), indirect_child]);
+
+        let materialized = array.materialize();
+        assert_eq!(
+            materialized,
+            Object::Array(vec![
+                Object::Integer(1),
+                Object::Reference(ObjectRef::new(9, 0))
+            ])
+        );
+    }
+
+    #[test]
+    fn a_dictionary_materializes_its_entries_by_key() {
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
+        let Object::Dictionary(materialized) = dict.materialize() else {
+            panic!("expected a dictionary");
+        };
+        assert_eq!(materialized.get("A"), Some(&Object::Integer(1)));
+    }
+
+    #[test]
+    fn a_stream_value_flattens_its_dictionary_handle_into_a_plain_dictionary() {
+        let dict_handle =
+            ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(5))]);
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            dict: dict_handle,
+            data: b"Hello".to_vec(),
+        });
+
+        let Object::Stream(materialized) = stream.materialize() else {
+            panic!("expected a stream");
+        };
+        assert_eq!(materialized.data, b"Hello");
+        assert_eq!(materialized.dict.get("Length"), Some(&Object::Integer(5)));
+    }
+
+    #[test]
+    fn an_unresolved_indirect_handle_materializes_to_null_without_performing_resolution() {
+        // `Pdf::resolve_borrowed` always resolves before materializing, but
+        // `materialize` itself must not assume that precondition holds --
+        // a caller that skips resolution sees `Object::Null`, not a panic.
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
+        assert_eq!(handle.materialize(), Object::Null);
+    }
+
+    #[test]
+    fn replace_direct_value_updates_a_direct_handles_value_but_keeps_its_offset() {
+        let handle = ObjectHandle::integer(1);
+        handle.set_parsed_offset_if_unset(100);
+
+        handle.replace_direct_value(ObjectValue::Integer(2));
+
+        assert_eq!(handle.as_integer(), Some(2));
+        assert_eq!(handle.get_parsed_offset(), 100);
+    }
+
+    #[test]
+    fn replace_direct_value_is_a_no_op_on_an_indirect_handle() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Integer(1));
+
+        handle.replace_direct_value(ObjectValue::Integer(2));
+
+        assert_eq!(handle.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn reset_parsed_offset_clears_an_already_set_offset() {
+        let handle = ObjectHandle::integer(1);
+        handle.set_parsed_offset_if_unset(100);
+
+        handle.reset_parsed_offset();
+
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+        // The set-once guard is not permanently defeated: a later value can
+        // set a fresh offset after a reset.
+        handle.set_parsed_offset_if_unset(200);
+        assert_eq!(handle.get_parsed_offset(), 200);
+    }
+
+    #[test]
+    fn reset_parsed_offset_works_on_an_indirect_handle_too() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_parsed_offset_if_unset(100);
+
+        handle.reset_parsed_offset();
+
         assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
     }
 }

@@ -75,6 +75,19 @@ pub struct Pdf<R: Read + Seek> {
     // deviation, not a regression to fix — qpdf's own `QPDF` is likewise not
     // thread-safe for concurrent access to one document.
     handle_registry: BTreeMap<ObjectRef, ObjectHandle>,
+    /// Memoized [`Object`] materialization of an already-resolved
+    /// [`ObjectHandle`] (`ObjectHandle::materialize`), keyed by `ObjectRef`.
+    /// This is [`Pdf::resolve_borrowed`]'s own cache, distinct from
+    /// `self.cache`: after the native-parse cutover, `self.cache` is not
+    /// guaranteed to hold a value that agrees with what the handle graph
+    /// would materialize (e.g. [`Pdf::set_object`] on an excessively deep
+    /// value writes an authoritative override here without a corresponding
+    /// handle-graph update — see that method's own comment). Populated
+    /// lazily by [`Pdf::resolve_borrowed`]; invalidated (removed, never
+    /// re-inserted with a stale value) by [`Pdf::set_object`] and
+    /// [`Pdf::delete_object`] so the next resolve re-derives from the
+    /// updated handle.
+    legacy_materialized_memo: BTreeMap<ObjectRef, Object>,
     compressed_member_parents: BTreeMap<ObjectRef, (ObjectRef, u32)>,
     /// Every uncompressed object offset, sorted ascending and deduplicated. Used
     /// to bound a single object read to the start of the next object in the file
@@ -588,6 +601,7 @@ impl<R: Read + Seek> Pdf<R> {
             repair_diagnostics: loaded.repair_diagnostics,
             cache,
             handle_registry: BTreeMap::new(),
+            legacy_materialized_memo: BTreeMap::new(),
             compressed_member_parents: BTreeMap::new(),
             sorted_object_offsets,
             resolution_fallbacks_remaining: MAX_RESOLUTION_FALLBACKS,
@@ -1103,7 +1117,9 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// The original on-disk bytes are not touched; an incremental rewrite via
     /// [`crate::write_pdf`] will see the updated value when it walks the cache and emit
-    /// a new revision for the touched object.
+    /// a new revision for the touched object. Subsequent [`Pdf::resolve`]/
+    /// [`Pdf::resolve_borrowed`] calls for `object_ref` observe `object`
+    /// immediately.
     pub fn set_object(&mut self, object_ref: ObjectRef, object: Object) {
         self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
@@ -1120,10 +1136,79 @@ impl<R: Read + Seek> Pdf<R> {
             self.compressed_member_parents
                 .insert(object_ref, (parent_ref, parent_index));
         }
+
+        // Write through to the canonical handle graph too (not just
+        // `self.cache`): `Pdf::resolve_borrowed` now materializes from the
+        // handle, so leaving a stale already-resolved handle in place would
+        // make a later resolve of this same ref keep observing the value
+        // from *before* this call.
+        self.legacy_materialized_memo.remove(&object_ref);
+        let handle = self.get_object_handle(object_ref);
+        match self.lift_for_set_object(&object, &handle) {
+            Ok(value) => {
+                handle.set_resolved(value);
+                // The value is now caller-supplied, in-memory-constructed
+                // data, not something parsed from a source position; any
+                // previously recorded offset no longer describes it.
+                handle.reset_parsed_offset();
+            }
+            Err(_) => {
+                // `lift`'s bounded-depth guard (mirroring every other
+                // post-parse structural walker over an `Object` tree in
+                // this crate) cannot represent an excessively deep `object`
+                // as an `ObjectHandle` tree. `set_object` is infallible, so
+                // store `object` directly as the bridge's authoritative
+                // materialized value instead: `resolve`/`resolve_borrowed`
+                // must still hand back exactly what the caller set, so a
+                // later structural walker (e.g. `optimization.rs`'s own
+                // inline-depth guard) is what rejects the excess depth, not
+                // `set_object` itself. This is the one authoritative value
+                // the caller just supplied, not the "stale value" the
+                // invalidate-not-reinsert rule above guards against —
+                // `Pdf::resolve_borrowed`'s memo check always prefers it
+                // over whatever the (in this case untouched) handle graph
+                // holds.
+                self.legacy_materialized_memo
+                    .insert(object_ref, object.clone());
+            }
+        }
+
         self.cache.set_resolved(object_ref, object);
         self.dirty_object_refs.insert(object_ref);
     }
 
+    // Convert `object` for `Pdf::set_object`'s handle-graph write-through.
+    // Identical to `Pdf::lift` except when `object` is a stream and
+    // `existing_handle`'s current (pre-overwrite) value is also a stream:
+    // the new dictionary is written into the existing stream's own
+    // dictionary handle in place (`ObjectHandle::replace_direct_value`),
+    // preserving its already-recorded parsed offset and shared identity,
+    // rather than minting a fresh dictionary handle that would start at the
+    // no-offset sentinel (`stream_dictionary_parsed_offset_survives_resolve_set_object_round_trip`
+    // is the regression tripwire for getting this wrong).
+    fn lift_for_set_object(
+        &mut self,
+        object: &Object,
+        existing_handle: &ObjectHandle,
+    ) -> Result<ObjectValue> {
+        if let (Object::Stream(stream), Some(existing_dict)) =
+            (object, existing_handle.as_stream_dict())
+        {
+            let dict_value = ObjectValue::Dictionary(self.lift_dictionary(&stream.dict, 0)?);
+            existing_dict.replace_direct_value(dict_value);
+            return Ok(ObjectValue::Stream {
+                dict: existing_dict,
+                data: stream.data.clone(),
+            });
+        }
+        self.lift(object, 0)
+    }
+
+    /// Remove `object_ref`, marking it deleted.
+    ///
+    /// Subsequent [`Pdf::resolve`]/[`Pdf::resolve_borrowed`] calls for
+    /// `object_ref` observe [`Object::Null`], matching the behavior for any
+    /// other unknown or freed reference.
     pub fn delete_object(&mut self, object_ref: ObjectRef) {
         if object_ref.number != 0 {
             self.qpdf_removed_refs.insert(object_ref);
@@ -1142,6 +1227,8 @@ impl<R: Read + Seek> Pdf<R> {
         }
         self.cache.set_deleted(object_ref);
         self.dirty_object_refs.insert(object_ref);
+        self.legacy_materialized_memo.remove(&object_ref);
+        self.get_object_handle(object_ref).set_missing();
     }
 
     pub(crate) fn source_bytes(&mut self) -> Result<Vec<u8>> {
@@ -1381,13 +1468,24 @@ impl<R: Read + Seek> Pdf<R> {
         }
 
         self.resolve_to_cache(object_ref)?;
-        let resolved = match self.cache.entry(object_ref) {
-            Some(CacheEntry::Resolved(object)) => Some(object.clone()),
-            _ => None,
-        };
-        let Some(object) = resolved else {
-            handle.set_missing();
-            return Ok(());
+        let object = match self.cache.entry(object_ref) {
+            Some(CacheEntry::Resolved(object)) => object.clone(),
+            // A cyclic/self-referential resolution already in progress
+            // higher up the call stack (e.g. `resolve_pending_stream_length`
+            // resolving this same ref's indirect `/Length` holder, directly
+            // or transitively) leaves the cache entry `Reserved`, not
+            // genuinely missing — `resolve_to_cache` itself uses this state
+            // to break the cycle (see its own doc). Leave the handle
+            // unresolved rather than marking it permanently `Missing`: once
+            // the outer resolution completes, a later call must still
+            // resolve the real value, not keep observing a placeholder.
+            // `Pdf::resolve_borrowed` mirrors this same distinction so it
+            // never memoizes this transient observation.
+            Some(CacheEntry::Reserved) => return Ok(()),
+            _ => {
+                handle.set_missing();
+                return Ok(());
+            }
         };
 
         // Deciding native-parse vs. the legacy `lift` bridge requires the
@@ -1412,8 +1510,27 @@ impl<R: Read + Seek> Pdf<R> {
         // Compressed-branch expression below) guarantees
         // `resolve_object_handle` never fails where `resolve_borrowed`/
         // `resolve` already succeeded.
+        // A stream in `self.transformed_stream_refs` had its payload bytes
+        // *and*, for an explicit `/Crypt` filter, its own dictionary
+        // (`/Filter`/`/DecodeParms` with the consumed `Crypt` entries
+        // stripped) rewritten by `decrypt_resolved_object`/
+        // `apply_explicit_crypt_filters` — transformations the native parse
+        // below cannot see, since it reads the dictionary straight from raw
+        // source bytes rather than from `object`. Native-parsing it anyway
+        // would silently resurrect the pre-decryption `/Filter` (with a
+        // still-present `/Crypt` entry the caller can no longer decode) and
+        // reuse `object`'s already-transformed *data* against that stale
+        // dictionary. Route it through `lift(&object, 0)` instead, which
+        // copies both the transformed dictionary and the transformed data
+        // from `object` directly — correct, at the cost of losing native
+        // parsed offsets for this ref (conservative: this also applies to a
+        // stream that was merely decrypted without an explicit crypt filter,
+        // whose dictionary was not actually rewritten, since
+        // `transformed_stream_refs` does not distinguish the two cases).
         let (value, parsed_offset) = match self.source_xref_entries().get(&object_ref).copied() {
-            Some(XrefEntry::Uncompressed { offset }) => {
+            Some(XrefEntry::Uncompressed { offset })
+                if !self.transformed_stream_refs.contains(&object_ref) =>
+            {
                 match self.native_parse_uncompressed_value(offset, &object) {
                     Ok(native) => native,
                     Err(_) => (self.lift(&object, 0)?, NO_PARSED_OFFSET),
@@ -1527,26 +1644,29 @@ impl<R: Read + Seek> Pdf<R> {
         ))
     }
 
-    // Convert an already-resolved legacy `Object` into an `ObjectValue`. Since
-    // this task reroutes Uncompressed objects to a native parse instead
-    // (`native_parse_uncompressed_value`), this function is now called only
-    // for Compressed (ObjStm-member) objects — which can never themselves be
-    // `Object::Stream` — and as `resolve_object_handle`'s fallback when that
+    // Convert a legacy `Object` into an `ObjectValue`. Called for Compressed
+    // (ObjStm-member) objects (which can never themselves be
+    // `Object::Stream`), as `resolve_object_handle`'s fallback when the
     // native parse's own (narrower) read window fails on a malformed or
     // overlapping source xref layout even though the object resolved fine
-    // via `resolve_to_cache`'s own full-file fallback. `Object::Stream`'s
-    // dict/data split is not implemented here (falls back to
-    // `ObjectValue::Null`; see the `Object::Stream` match arm below for when
-    // that fallback path is actually reached). The content-stream-only
-    // `Object::Operator`/`Object::InlineImage` variants remain unreachable,
-    // as does `Object::Reference` (filtered out by `lift_to_handle` before
-    // it would ever reach here).
+    // via `resolve_to_cache`'s own full-file fallback, and by
+    // `Pdf::set_object`/`Pdf::lift_for_set_object` to write a caller-supplied
+    // `Object` through to the handle graph (the one caller for which
+    // `object` need not already be a legacy-engine-resolved value — it can
+    // be anything a consumer passes to `set_object`, including a bare
+    // `Object::Reference` used throughout this crate to redirect or
+    // collapse a holder chain in place — see `ObjectValue::Reference`'s own
+    // doc). The content-stream-only `Object::Operator`/`Object::InlineImage`
+    // variants fall back to `ObjectValue::Null`: neither is ever a resolved
+    // file/ObjStm object value nor a value any caller passes to
+    // `set_object`.
     //
-    // `depth` bounds inline `Array`/`Dictionary` nesting against
-    // `MAX_INLINE_DEPTH`, mirroring every other post-parse structural walker
-    // over an `Object` tree in this crate (`subset_prune.rs`, `object_copy.rs`,
-    // `page_closure.rs`, `rewrite_renumber.rs`, and others) — this is a
-    // separate, tighter bound than the parser's own `MAX_PARSE_DEPTH`.
+    // `depth` bounds inline `Array`/`Dictionary`/`Stream`-dictionary nesting
+    // against `MAX_INLINE_DEPTH`, mirroring every other post-parse structural
+    // walker over an `Object` tree in this crate (`subset_prune.rs`,
+    // `object_copy.rs`, `page_closure.rs`, `rewrite_renumber.rs`, and
+    // others) — this is a separate, tighter bound than the parser's own
+    // `MAX_PARSE_DEPTH`.
     fn lift(&mut self, object: &Object, depth: usize) -> Result<ObjectValue> {
         if depth > crate::object::MAX_INLINE_DEPTH {
             return Err(Error::Unsupported(format!(
@@ -1571,32 +1691,50 @@ impl<R: Read + Seek> Pdf<R> {
                     .map(|item| self.lift_to_handle(item, depth + 1))
                     .collect::<Result<Vec<_>>>()?,
             ),
-            Object::Dictionary(dict) => ObjectValue::Dictionary(
-                dict.iter()
-                    .map(|(k, v)| Ok((k.to_vec(), self.lift_to_handle(v, depth + 1)?)))
-                    .collect::<Result<std::collections::BTreeMap<_, _>>>()?,
-            ),
-            // `Object::Stream`'s dict/data split is not implemented here:
-            // reachable only through `resolve_object_handle`'s narrow
-            // native-parse-failure fallback (a Compressed/ObjStm member,
-            // `lift`'s other caller, can never itself be a stream — that PDF
-            // spec constraint is why Task 6's stream test, the one case that
-            // used to exercise this arm via an ordinary Uncompressed
-            // fixture, now asserts a real materialized stream value instead;
-            // see `resolve_object_handle_survives_a_cyclic_indirect_stream_length`
-            // and, for the fallback case, `resolve_object_handle_falls_back_to_lift_when_the_native_window_is_truncated`).
-            // `Object::Operator`/`Object::InlineImage` are content-stream-only
-            // and never a resolved file/ObjStm object value; `Object::Reference`
-            // never survives to a top-level resolved value (qpdf integerizes
-            // a bare top-level reference before caching it, and
-            // `lift_to_handle` filters `Object::Reference` out before ever
-            // calling `lift`) — both stay unreachable.
-            Object::Stream(_)
-            | Object::Operator(_)
-            | Object::InlineImage(_)
-            | Object::Reference(_) => ObjectValue::Null,
+            Object::Dictionary(dict) => ObjectValue::Dictionary(self.lift_dictionary(dict, depth)?),
+            // A stream's own dictionary is lifted the same way any other
+            // nested dictionary is (see `lift_dictionary`), then wrapped in
+            // its own fresh handle: this arm mints a new dictionary handle
+            // every time, at the no-offset sentinel. `Pdf::set_object`
+            // (the only caller that can reach this arm with a *replacement*
+            // for an already-resolved stream) special-cases reusing the
+            // pre-existing dictionary handle instead, via
+            // `Pdf::lift_for_set_object`, so an established parsed offset
+            // is not lost on a plain round trip.
+            Object::Stream(stream) => ObjectValue::Stream {
+                dict: ObjectHandle::from_value(ObjectValue::Dictionary(
+                    self.lift_dictionary(&stream.dict, depth)?,
+                )),
+                data: stream.data.clone(),
+            },
+            // A bare top-level reference never comes from a file/ObjStm
+            // parse (`top_level_no_reference` integerizes it there,
+            // matching qpdf), but `Pdf::set_object` callers pass one
+            // directly throughout this crate to redirect or collapse a
+            // holder chain in place (`ObjectRef` -> `ObjectRef`, no
+            // recursive follow) -- `ObjectValue::Reference` is the handle
+            // graph's representation for exactly that case; see its own
+            // doc.
+            Object::Reference(object_ref) => ObjectValue::Reference(*object_ref),
+            // Content-stream-only tokens; never a resolved file/ObjStm
+            // object value, and not a value any caller passes to
+            // `Pdf::set_object` in practice.
+            Object::Operator(_) | Object::InlineImage(_) => ObjectValue::Null,
         };
         Ok(value)
+    }
+
+    // Shared by `lift`'s `Object::Dictionary`/`Object::Stream` arms and by
+    // `Pdf::lift_for_set_object`: lift every entry of `dict` one level
+    // deeper than `depth`, matching `lift`'s own depth bound.
+    fn lift_dictionary(
+        &mut self,
+        dict: &Dictionary,
+        depth: usize,
+    ) -> Result<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> {
+        dict.iter()
+            .map(|(k, v)| Ok((k.to_vec(), self.lift_to_handle(v, depth + 1)?)))
+            .collect()
     }
 
     /// Lift a child `Object` (array element or dictionary value) to a handle.
@@ -1652,13 +1790,115 @@ impl<R: Read + Seek> Pdf<R> {
     /// An unknown, freed, or compressed-but-broken reference is **not** an error;
     /// it resolves to [`Object::Null`].
     pub fn resolve_borrowed(&mut self, object_ref: ObjectRef) -> Result<&Object> {
-        if self.resolve_to_cache(object_ref)? {
-            if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
-                return Ok(object);
+        // Check the memo *before* resolving/materializing: `Pdf::set_object`
+        // can write an authoritative override directly into
+        // `legacy_materialized_memo` for a value `lift` cannot represent as
+        // an `ObjectHandle` tree (see its own comment) without updating the
+        // handle graph at all. If we resolved the handle unconditionally
+        // first, `resolve_object_handle`'s own attempt to lift that same
+        // value for a *different*, offset-less path (e.g. a freshly
+        // allocated ref with no source xref entry) could propagate an `Err`
+        // via `?` before this method ever reached the memo that already has
+        // the right answer. Once the memo has an entry for `object_ref`, it
+        // is authoritative and the handle is not consulted at all.
+        if !self.legacy_materialized_memo.contains_key(&object_ref) {
+            let handle = self.get_object_handle(object_ref);
+            self.resolve_object_handle(&handle)?;
+
+            if !handle.is_resolved() {
+                // A cyclic/self-referential resolution already in progress
+                // higher up the call stack (`resolve_pending_stream_length`
+                // calls `resolve_borrowed` directly to look up an indirect
+                // `/Length` holder, which can transitively re-enter this
+                // same ref while it is still being resolved) left this
+                // ref's cache entry `Reserved` — `resolve_object_handle`
+                // deliberately leaves the handle unresolved for exactly
+                // this case rather than marking it permanently `Missing`.
+                // Return the same transient `Object::Null` the untouched
+                // legacy engine's own cache-reading `resolve_borrowed`
+                // always returned here, but do NOT memoize it: once the
+                // outer resolution completes, a later call must still
+                // resolve the real value instead of being stuck serving
+                // this placeholder forever.
+                return Ok(&NULL_OBJECT);
             }
+
+            // A stream handle at the no-offset sentinel was populated by
+            // `lift` (`Pdf::set_object`'s write-through, or
+            // `resolve_object_handle`'s narrow native-parse-failure
+            // fallback) directly from the `Object` already sitting in
+            // `self.cache` for this same ref — `lift`'s `Object::Stream` arm
+            // builds the handle's value from exactly that cached `Object`.
+            // Serve the cache's own reference here instead of materializing
+            // a second copy: `materialize()` would clone the stream's
+            // (potentially huge) payload bytes yet again, on top of the
+            // clone `lift` already made getting the value into the handle
+            // graph in the first place — three copies of the same buffer
+            // alive at once for a single `set_object` + `resolve_borrowed`
+            // round trip. `borrowed_qpdf_resolution_preserves_historical_stream_fallback_without_clone`
+            // is the regression test for this.
+            if handle.get_parsed_offset() < 0 {
+                if let Some(CacheEntry::Resolved(cached @ Object::Stream(_))) =
+                    self.cache.entry(object_ref)
+                {
+                    return Ok(cached);
+                }
+            }
+
+            let mut materialized = handle.materialize();
+            // A non-sentinel parsed offset means this handle's top-level
+            // value came from `native_parse_uncompressed_value`, which reads
+            // raw (possibly still-encrypted) source bytes directly into
+            // `ObjectValue::String` rather than through the legacy engine's
+            // own already-decrypted `Object` tree. Every other route to a
+            // resolved handle (the Compressed/ObjStm branch, the
+            // native-parse-failure fallback, and `Pdf::set_object`, all of
+            // which go through `lift`/`Pdf::lift_for_set_object`) already
+            // carries correctly-decrypted strings and must not be decrypted
+            // again here; `Pdf::set_object` resets the offset back to the
+            // sentinel for exactly this reason whenever it replaces a
+            // handle's value.
+            if handle.get_parsed_offset() >= 0 {
+                self.decrypt_materialized_strings(object_ref, &mut materialized)?;
+            }
+            self.legacy_materialized_memo
+                .insert(object_ref, materialized);
         }
 
-        Ok(&NULL_OBJECT)
+        Ok(self
+            .legacy_materialized_memo
+            .get(&object_ref)
+            .unwrap_or(&NULL_OBJECT))
+    }
+
+    // Applies exactly the string-decryption step `decrypt_resolved_object`
+    // already performs for the legacy engine's own `Object` tree
+    // (`decrypt_object_strings`, unchanged, including its own guard against
+    // decrypting the `/Encrypt` dictionary object itself), to a materialized
+    // `Object` built from a native-parse-populated `ObjectHandle`. Stream
+    // *data* bytes are never touched here — they were already correctly
+    // decrypted before this object's handle was populated, since
+    // `native_parse_uncompressed_value` reuses the legacy engine's own
+    // already-decrypted stream payload rather than re-deriving it — so
+    // calling `decrypt_resolved_object` itself here (which also transforms
+    // stream data) would double-decrypt it; only `decrypt_object_strings`,
+    // which touches `Object::String` values alone, is safe to call from
+    // this bridge.
+    fn decrypt_materialized_strings(
+        &self,
+        object_ref: ObjectRef,
+        object: &mut Object,
+    ) -> Result<()> {
+        let Some(encryption) = &self.encryption else {
+            return Ok(());
+        };
+        decrypt_object_strings(
+            object_ref,
+            object,
+            encryption.string_mode,
+            &encryption.file_key,
+            encryption.encrypt_ref,
+        )
     }
 
     /// Read and parse the indirect object stored at `offset`, returning the read
@@ -4282,14 +4522,12 @@ mod tests {
         pdf.resolve_object_handle(&handle)
             .expect("resolve_object_handle must not fail where resolve_borrowed succeeds");
 
-        // The fallback lands on the untouched Task 6 `lift` bridge, which
-        // does not implement `Object::Stream`'s dict/data split (a
-        // pre-existing, documented gap — see `lift`'s own comment) — so the
-        // *value* is `Null` here, not the real stream. What this test pins
-        // is that this no longer *errors*; a later task's cutover away from
-        // `lift` entirely would be the place to also make this fallback
-        // path stream-aware.
-        assert!(handle.is_null());
+        // The fallback lands on the `lift` bridge, which (as of this task)
+        // properly splits a stream's dict/data instead of falling back to
+        // `ObjectValue::Null` — so the fallback path now carries the real
+        // stream value, matching `resolve_borrowed`, at the no-offset
+        // sentinel (this fallback never records a real parsed offset).
+        assert_eq!(handle.as_stream_data(), Some(b"abc".to_vec()));
         assert_eq!(handle.get_parsed_offset(), -1);
     }
 
@@ -5095,6 +5333,64 @@ mod tests {
         assert_eq!(
             sub.get(b"X".as_slice()).and_then(ObjectHandle::as_integer),
             Some(1)
+        );
+    }
+
+    /// `resolve_to_cache` records a stream's recovered `endstream`-scan EOL
+    /// alongside `CacheEntry::Resolved` (see `Self::recovered_stream_eol`).
+    /// `resolve_object_handle` calls `resolve_to_cache` as its very first
+    /// step for every indirect handle — this pins that it does not bypass
+    /// that side table.
+    ///
+    /// This test needs the crate-private `recovered_stream_eol` accessor, so
+    /// it lives here rather than in the `tests/` integration suite (which
+    /// only sees the public API).
+    #[test]
+    fn resolve_object_handle_still_populates_recovered_stream_eol() {
+        let bytes = recovered_stream_fixture(b"", b"\n", None);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open recovered-stream fixture");
+        let object_ref = ObjectRef::new(1, 0);
+
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve recovered stream");
+
+        assert_eq!(handle.as_stream_data(), Some(b"abc".to_vec()));
+        assert_eq!(pdf.recovered_stream_eol(object_ref), Some(&b"\n"[..]));
+    }
+
+    /// Companion to the above for the other side table
+    /// (`transformed_stream_refs`): when a stream's payload is actually
+    /// transformed (here, decrypted), `resolve_to_cache` marks that ref so
+    /// `recovered_stream_eol` stops surfacing a recovered EOL that belongs to
+    /// ciphertext framing, not the plaintext `resolve` returns. The
+    /// `EncryptionState` is injected directly (matching
+    /// `explicit_rc4_encryption_state`'s existing pattern) rather than
+    /// authenticating a real encrypted fixture, since only the
+    /// side-table bookkeeping is under test here, not decryption
+    /// correctness (already covered elsewhere).
+    #[test]
+    fn resolve_object_handle_still_marks_transformed_stream_refs_for_a_decrypted_stream() {
+        let bytes = recovered_stream_fixture(b"", b"\n", None);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open recovered-stream fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        pdf.encryption = Some(EncryptionState {
+            stream_mode: EncryptionMode::Rc4,
+            ..explicit_rc4_encryption_state()
+        });
+
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve recovered, (fake-)encrypted stream");
+
+        assert!(
+            pdf.transformed_stream_refs.contains(&object_ref),
+            "a decrypted stream's payload transformation must still be tracked via the handle path"
+        );
+        assert_eq!(
+            pdf.recovered_stream_eol(object_ref),
+            None,
+            "a transformed stream's recovered EOL belongs to ciphertext framing and must stay masked"
         );
     }
 }

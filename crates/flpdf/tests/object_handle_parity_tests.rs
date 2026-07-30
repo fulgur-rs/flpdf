@@ -1,12 +1,15 @@
 //! Public-API parity tests for `Pdf::resolve_object_handle` (the dual-write
-//! `ObjectHandle` resolution bridge): proves it reaches the same observable
-//! outcomes as the untouched legacy `resolve`/`resolve_borrowed` engine it
-//! delegates to — missing/dangling references resolve to null, compressed
-//! (ObjStm) members and cyclic indirect `/Length` streams resolve without
-//! erroring or hanging, and repeated `get_object_handle` calls observe the
-//! same canonical, already-resolved state.
+//! `ObjectHandle` resolution bridge) and, from the materialization bridge
+//! task onward, for `Pdf::resolve`/`Pdf::resolve_borrowed`/`Pdf::set_object`/
+//! `Pdf::delete_object` themselves once they are thin views over the same
+//! `ObjectHandle` graph: proves the public API reaches the same observable
+//! outcomes it always has — missing/dangling references resolve to null,
+//! compressed (ObjStm) members and cyclic indirect `/Length` streams resolve
+//! without erroring or hanging, repeated `get_object_handle` calls observe
+//! the same canonical, already-resolved state, and `resolve`/`set_object`
+//! round trip structurally.
 
-use flpdf::{ObjectHandle, ObjectRef, Pdf};
+use flpdf::{Object, ObjectHandle, ObjectRef, Pdf};
 use std::fs::File;
 use std::io::BufReader;
 
@@ -654,4 +657,154 @@ fn cross_path_parity_nesting_past_max_parse_depth_matches_legacy_error() {
         .expect("comparison thread must start")
         .join()
         .expect("comparison must not overflow the stack");
+}
+
+// ---------------------------------------------------------------------
+// Materialization bridge: `resolve`/`resolve_borrowed`/`set_object`/
+// `delete_object` cut onto the `ObjectHandle` graph.
+// ---------------------------------------------------------------------
+
+/// The bridge must materialize an indirect array/dict *child* back to
+/// `Object::Reference(ObjectRef)` — not recursively resolve it — so every
+/// existing consumer match on `Object::Reference(..)` keeps working exactly
+/// as today.
+#[test]
+fn legacy_resolve_borrowed_still_returns_object_reference_for_indirect_children() {
+    let bytes = classic_pdf_with_bodies(
+        &[
+            b"1 0 obj\n<< /Kid 2 0 R >>\nendobj\n".as_slice(),
+            b"2 0 obj\n<< /Type /Page >>\nendobj\n",
+        ],
+        ObjectRef::new(1, 0),
+    );
+    let mut pdf = Pdf::open_mem_owned(bytes).expect("open nested-indirect fixture");
+    let object_ref = ObjectRef::new(1, 0);
+
+    let resolved = pdf.resolve_borrowed(object_ref).unwrap();
+    let dict = resolved.as_dict().expect("dict");
+    let kid = dict.get("Kid").expect("Kid key");
+    assert!(matches!(kid, Object::Reference(_)));
+    assert_eq!(kid.as_ref_id(), Some(ObjectRef::new(2, 0)));
+}
+
+#[test]
+fn legacy_resolve_matches_legacy_resolve_borrowed_cloned() {
+    let file = File::open(minimal_fixture_path()).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    let object_ref = pdf.root_ref().expect("root");
+
+    let owned = pdf.resolve(object_ref).unwrap();
+    let borrowed = pdf.resolve_borrowed(object_ref).unwrap();
+    assert_eq!(&owned, borrowed);
+}
+
+#[test]
+fn legacy_resolve_borrowed_on_dangling_ref_is_null_object() {
+    let file = File::open(minimal_fixture_path()).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    let dangling = ObjectRef::new(999_999, 0);
+
+    assert_eq!(pdf.resolve_borrowed(dangling).unwrap(), &Object::Null);
+}
+
+#[test]
+fn materialize_then_set_object_round_trips_structurally() {
+    let file = File::open(minimal_fixture_path()).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    let object_ref = pdf.root_ref().expect("root");
+
+    let resolved = pdf.resolve(object_ref).unwrap();
+    pdf.set_object(object_ref, resolved.clone());
+    assert_eq!(pdf.resolve(object_ref).unwrap(), resolved);
+}
+
+/// `Object::RealLiteral { value, literal }` preserves a non-canonical source
+/// spelling (e.g. `.4`) for byte-identical unparse. If `materialize`/`lift`
+/// ever dropped `literal` and fell back to `Object::Real`, this would fail.
+#[test]
+fn real_literal_survives_resolve_set_object_round_trip() {
+    let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n.4\nendobj\n"], ObjectRef::new(1, 0));
+    let mut pdf = Pdf::open_mem_owned(bytes).expect("open real-literal fixture");
+    let object_ref = ObjectRef::new(1, 0);
+
+    let resolved = pdf.resolve(object_ref).unwrap();
+    assert!(matches!(&resolved, Object::RealLiteral { literal, .. } if literal == b".4"));
+
+    pdf.set_object(object_ref, resolved.clone());
+    assert_eq!(pdf.resolve(object_ref).unwrap(), resolved);
+}
+
+/// `Stream` is `{ dict: Dictionary, data: Vec<u8> }` by value; the handle
+/// graph keeps the stream dictionary as a *separate handle* with its own
+/// `<<`-start parsed offset (design requirement). `materialize` flattens
+/// that into a plain `Dictionary`; `set_object`'s write-through must re-split
+/// it by *reusing the existing canonical dictionary handle* rather than
+/// minting a fresh one with a lost offset — this test is the tripwire for
+/// getting that wrong.
+#[test]
+fn stream_dictionary_parsed_offset_survives_resolve_set_object_round_trip() {
+    let body: &[u8] = b"1 0 obj\n<< /Length 5 >>\nstream\nHello\nendstream\nendobj\n";
+    let bytes = classic_pdf_with_bodies(&[body], ObjectRef::new(1, 0));
+    let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
+    let stream_ref = ObjectRef::new(1, 0);
+
+    let handle = pdf.get_object_handle(stream_ref);
+    pdf.resolve_object_handle(&handle).expect("resolve stream");
+    let dict_offset_before = handle
+        .as_stream_dict()
+        .expect("stream carries its own dictionary handle")
+        .get_parsed_offset();
+    assert!(
+        dict_offset_before >= 0,
+        "native parse must record a real dictionary offset"
+    );
+
+    let resolved = pdf.resolve(stream_ref).unwrap();
+    assert!(matches!(&resolved, Object::Stream(_)));
+    pdf.set_object(stream_ref, resolved);
+
+    let dict_offset_after = handle
+        .as_stream_dict()
+        .expect("stream still carries its own dictionary handle after set_object")
+        .get_parsed_offset();
+    assert_eq!(dict_offset_before, dict_offset_after);
+}
+
+/// Regression for `Pdf::delete_object`'s own handle-graph write-through:
+/// resolving an already-resolved, then-deleted ref must observe
+/// `Object::Null` afterward, not the stale pre-delete value the handle graph
+/// would otherwise still carry.
+#[test]
+fn resolve_borrowed_returns_null_after_delete_object() {
+    let file = File::open(minimal_fixture_path()).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    let root_ref = pdf.root_ref().expect("root");
+    pdf.resolve(root_ref).unwrap();
+
+    pdf.delete_object(root_ref);
+
+    assert_eq!(pdf.resolve_borrowed(root_ref).unwrap(), &Object::Null);
+}
+
+/// `Pdf::lift`'s bounded-depth guard (private to the crate; mirrors every
+/// other post-parse structural walker over an `Object` tree here) cannot
+/// represent an excessively deep object as an `ObjectHandle` tree.
+/// `Pdf::set_object` is infallible, so it must still make
+/// `resolve`/`resolve_borrowed` hand back exactly the value the caller set —
+/// it is a later structural walker's job (e.g. `optimization.rs`'s own
+/// inline-depth guard, exercised end-to-end by its own test suite) to reject
+/// the excess depth, not `set_object`'s.
+#[test]
+fn set_object_with_excessive_depth_still_round_trips_via_the_memo_override() {
+    let file = File::open(minimal_fixture_path()).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    let object_ref = pdf.root_ref().expect("root");
+
+    let mut deep = Object::Integer(0);
+    for _ in 0..300 {
+        deep = Object::Array(vec![deep]);
+    }
+
+    pdf.set_object(object_ref, deep.clone());
+    assert_eq!(pdf.resolve(object_ref).unwrap(), deep);
 }
