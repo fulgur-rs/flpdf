@@ -17,5 +17,6 @@ pub mod compare;
 pub mod driver;
 pub mod orchestrator;
 pub mod output;
+pub mod tokenizer_runner;
 
 pub use orchestrator::compare_files;

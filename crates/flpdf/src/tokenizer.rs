@@ -6,7 +6,7 @@ use crate::{object::write_name_escaped, Error, Result};
 
 #[allow(dead_code)] // Space, Comment, and InlineImage are produced by Task 2's state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TokenType {
+pub enum TokenType {
     Bad,
     ArrayClose,
     ArrayOpen,
@@ -28,15 +28,15 @@ pub(crate) enum TokenType {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Token {
-    pub(crate) token_type: TokenType,
-    pub(crate) value: Vec<u8>,
-    pub(crate) raw: Vec<u8>,
-    pub(crate) error_message: Option<Vec<u8>>,
-    pub(crate) error_offset: usize,
-    pub(crate) start: usize,
+pub struct Token {
+    pub token_type: TokenType,
+    pub value: Vec<u8>,
+    pub raw: Vec<u8>,
+    pub error_message: Option<Vec<u8>>,
+    pub error_offset: usize,
+    pub start: usize,
     #[allow(dead_code)] // Retained as part of qpdf's token range contract.
-    pub(crate) end: usize,
+    pub end: usize,
 }
 
 impl PartialEq for Token {
@@ -49,7 +49,7 @@ impl PartialEq for Token {
 
 impl Token {
     #[allow(dead_code)] // Synthetic owned tokens remain part of the Task 1 contract.
-    pub(crate) fn new(token_type: TokenType, value: Vec<u8>) -> Self {
+    pub fn new(token_type: TokenType, value: Vec<u8>) -> Self {
         let raw = match token_type {
             TokenType::Name => canonical_name_raw(&value),
             TokenType::String => canonical_string_raw(&value),
@@ -58,7 +58,7 @@ impl Token {
         Self::from_parts(token_type, value, raw, None, 0..0)
     }
 
-    pub(crate) fn from_parts(
+    pub fn from_parts(
         token_type: TokenType,
         value: Vec<u8>,
         raw: Vec<u8>,
@@ -76,15 +76,15 @@ impl Token {
         }
     }
 
-    pub(crate) fn is_integer(&self) -> bool {
+    pub fn is_integer(&self) -> bool {
         self.token_type == TokenType::Integer
     }
 
-    pub(crate) fn is_word(&self) -> bool {
+    pub fn is_word(&self) -> bool {
         self.token_type == TokenType::Word
     }
 
-    pub(crate) fn is_word_value(&self, value: &[u8]) -> bool {
+    pub fn is_word_value(&self, value: &[u8]) -> bool {
         self.is_word() && self.value == value
     }
 }
@@ -153,15 +153,15 @@ fn canonical_string_raw(value: &[u8]) -> Vec<u8> {
 
 #[allow(dead_code)] // ImproperInlineImageState is produced by Task 4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TokenizerStateError {
+pub enum TokenizerStateError {
     TokenWaiting,
     ImproperInlineImageState,
 }
 
 #[allow(dead_code)] // The push result is consumed by Task 3's pull routing.
-pub(crate) struct PushedToken {
-    pub(crate) token: Token,
-    pub(crate) unread: Option<u8>,
+pub struct PushedToken {
+    pub token: Token,
+    pub unread: Option<u8>,
 }
 
 #[allow(dead_code)] // InlineImage is entered by Task 4.
@@ -192,7 +192,7 @@ enum State {
 }
 
 #[allow(dead_code)] // State fields are consumed by push mode before Task 3 routes production callers.
-pub(crate) struct Tokenizer<'a> {
+pub struct Tokenizer<'a> {
     input: &'a [u8],
     pos: usize,
     state: State,
@@ -216,13 +216,13 @@ pub(crate) struct Tokenizer<'a> {
 
 #[allow(dead_code)] // Push mode becomes a production caller in Task 3.
 impl Tokenizer<'static> {
-    pub(crate) fn push() -> Self {
+    pub fn push() -> Self {
         Self::new(b"")
     }
 }
 
 impl<'a> Tokenizer<'a> {
-    pub(crate) fn new(input: &'a [u8]) -> Self {
+    pub fn new(input: &'a [u8]) -> Self {
         Self {
             input,
             pos: 0,
@@ -249,18 +249,15 @@ impl<'a> Tokenizer<'a> {
 
 #[allow(dead_code)] // Push APIs and handlers become production-used in Task 3.
 impl<'a> Tokenizer<'a> {
-    pub(crate) fn allow_eof(&mut self) {
+    pub fn allow_eof(&mut self) {
         self.allow_eof = true;
     }
 
-    pub(crate) fn include_ignorable(&mut self) {
+    pub fn include_ignorable(&mut self) {
         self.include_ignorable = true;
     }
 
-    pub(crate) fn present_character(
-        &mut self,
-        byte: u8,
-    ) -> std::result::Result<(), TokenizerStateError> {
+    pub fn present_character(&mut self, byte: u8) -> std::result::Result<(), TokenizerStateError> {
         if self.state == State::TokenReady {
             return Err(TokenizerStateError::TokenWaiting);
         }
@@ -271,7 +268,7 @@ impl<'a> Tokenizer<'a> {
         Ok(())
     }
 
-    pub(crate) fn present_eof(&mut self) -> std::result::Result<(), TokenizerStateError> {
+    pub fn present_eof(&mut self) -> std::result::Result<(), TokenizerStateError> {
         match self.state {
             State::Name
             | State::NameHex1
@@ -319,7 +316,7 @@ impl<'a> Tokenizer<'a> {
         Ok(())
     }
 
-    pub(crate) fn get_token(&mut self) -> Option<PushedToken> {
+    pub fn get_token(&mut self) -> Option<PushedToken> {
         if self.state != State::TokenReady {
             return None;
         }
@@ -333,7 +330,7 @@ impl<'a> Tokenizer<'a> {
         Some(PushedToken { token, unread })
     }
 
-    pub(crate) fn between_tokens(&self) -> bool {
+    pub fn between_tokens(&self) -> bool {
         self.before_token
     }
 
@@ -723,12 +720,12 @@ impl<'a> Tokenizer<'a> {
 }
 
 impl<'a> Tokenizer<'a> {
-    pub(crate) fn position(&self) -> usize {
+    pub fn position(&self) -> usize {
         self.pos
     }
 
     #[allow(dead_code)] // Task 6 routes content-stream inline images through this tokenizer API.
-    pub(crate) fn expect_inline_image(&mut self) -> std::result::Result<(), TokenizerStateError> {
+    pub fn expect_inline_image(&mut self) -> std::result::Result<(), TokenizerStateError> {
         if self.state == State::TokenReady {
             self.reset();
         } else if self.state != State::BeforeToken {
@@ -779,7 +776,7 @@ impl<'a> Tokenizer<'a> {
 
     /// Pull adapter matching qpdf 11.9.0 `QPDFTokenizer::readToken` and
     /// `nextToken` (`libqpdf/QPDFTokenizer.cc:887-965`).
-    pub(crate) fn read_token(&mut self, allow_bad: bool, max_len: usize) -> Result<Token> {
+    pub fn read_token(&mut self, allow_bad: bool, max_len: usize) -> Result<Token> {
         if self.state != State::InlineImage {
             self.reset();
         }
@@ -849,7 +846,7 @@ impl<'a> Tokenizer<'a> {
         Ok(token)
     }
 
-    pub(crate) fn set_position(&mut self, position: usize) -> Result<()> {
+    pub fn set_position(&mut self, position: usize) -> Result<()> {
         if position > self.input.len() {
             return Err(Error::parse(
                 position,
@@ -865,7 +862,7 @@ impl<'a> Tokenizer<'a> {
     ///
     /// qpdf uses this after the `ID` operator to discard the byte that
     /// terminated the token (`libqpdf/QPDFObjectHandle.cc:1820-1825`).
-    pub(crate) fn consume_one_byte(&mut self) -> Result<()> {
+    pub fn consume_one_byte(&mut self) -> Result<()> {
         if self.pos >= self.input.len() {
             return Err(Error::parse(self.pos, "missing separator after ID"));
         }
@@ -874,7 +871,7 @@ impl<'a> Tokenizer<'a> {
         Ok(())
     }
 
-    pub(crate) fn consume_one_byte_or(&mut self, default: u8) -> u8 {
+    pub fn consume_one_byte_or(&mut self, default: u8) -> u8 {
         let byte = self.input.get(self.pos).copied().unwrap_or(default);
         if self.pos < self.input.len() {
             self.pos += 1;
@@ -883,7 +880,7 @@ impl<'a> Tokenizer<'a> {
         byte
     }
 
-    pub(crate) fn skip_ignorable(&mut self) -> Result<()> {
+    pub fn skip_ignorable(&mut self) -> Result<()> {
         let saved_allow_eof = self.allow_eof;
         let saved_include_ignorable = self.include_ignorable;
         self.allow_eof = true;
@@ -899,7 +896,7 @@ impl<'a> Tokenizer<'a> {
         self.set_position(token.start)
     }
 
-    pub(crate) fn next_integer(&mut self) -> Result<i64> {
+    pub fn next_integer(&mut self) -> Result<i64> {
         let token = self.read_token(false, 0)?;
         if !token.is_integer() {
             return Err(Error::parse(token.start, "expected integer"));
@@ -910,7 +907,7 @@ impl<'a> Tokenizer<'a> {
             .ok_or_else(|| Error::parse(token.start, "integer is out of range"))
     }
 
-    pub(crate) fn expect_word(&mut self, expected: &[u8]) -> Result<()> {
+    pub fn expect_word(&mut self, expected: &[u8]) -> Result<()> {
         let token = self.read_token(false, 0)?;
         if token.is_word_value(expected) {
             Ok(())
@@ -998,14 +995,14 @@ fn invalid_hex_character_message(byte: u8) -> Vec<u8> {
     message
 }
 
-pub(crate) fn is_ws(byte: u8) -> bool {
+pub fn is_ws(byte: u8) -> bool {
     matches!(
         byte,
         b'\0' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r' | b' '
     )
 }
 
-pub(crate) fn is_delimiter(byte: u8) -> bool {
+pub fn is_delimiter(byte: u8) -> bool {
     matches!(
         byte,
         b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
