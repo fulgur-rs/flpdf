@@ -256,7 +256,9 @@ fn missing_input_prefixes_the_native_open_error() {
         .stderr(expected);
 }
 
-#[cfg(unix)]
+// macOS rejects invalid UTF-8 filenames before the driver can open them.
+// The missing-path diagnostic below still exercises raw argv bytes there.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn non_utf8_pdf_path_opens_without_panicking() {
     let directory = tempfile::tempdir().expect("temporary directory");
