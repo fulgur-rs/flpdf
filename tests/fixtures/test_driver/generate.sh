@@ -274,6 +274,77 @@ write(
     ),
 )
 write(
+    "stream_decode_parms_indirect_nondict",
+    build_pdf(
+        b"6 0 R",
+        {
+            6: stream(b"/Filter /FlateDecode /DecodeParms 7 0 R", flate_abc),
+            7: b"42",
+        },
+    ),
+)
+write(
+    "stream_decode_parms_indirect_nondict_array",
+    build_pdf(
+        b"6 0 R",
+        {
+            6: stream(b"/Filter [ /FlateDecode ] /DecodeParms [ 7 0 R ]", flate_abc),
+            7: b"42",
+        },
+    ),
+)
+write(
+    "stream_decode_parms_indirect_container_nondict",
+    build_pdf(
+        b"6 0 R",
+        {
+            6: stream(
+                b"/Filter [ /FlateDecode /FlateDecode ] /DecodeParms 7 0 R",
+                zlib.compress(flate_abc),
+            ),
+            7: b"[ 9 9 ]",
+        },
+    ),
+)
+
+
+def build_false_next_offset_pdf() -> bytes:
+    data = bytearray(b"%PDF-1.7\n")
+    offsets: dict[int, int] = {}
+    offsets[1] = len(data)
+    data += b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+    offsets[2] = len(data)
+    data += b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [ ] >>\nendobj\n"
+    offsets[6] = len(data)
+    data += (
+        b"6 0 obj\n<< /Filter [ /FlateDecode /FlateDecode ] "
+        b"/DecodeParms [ null 42 ] /Length 3 >>\nstream\nabc\nendstream\nendobj\n"
+    )
+    # A dangling in-use xref entry for object 7 whose recorded offset lands
+    # inside object 6's own dictionary, before /DecodeParms. Nothing ever
+    # resolves object 7; it exists only so flpdf's bounded-read heuristic
+    # (which trusts the next recorded offset to bound how far it reads for
+    # object 6) sees a false, too-early boundary and must retry unbounded
+    # instead of truncating before /DecodeParms.
+    false_next = offsets[6] + len(b"6 0 obj\n<< /Filter")
+    xref_offset = len(data)
+    data += b"xref\n0 8\n"
+    data += b"0000000000 65535 f \n"
+    data += f"{offsets[1]:010d} 00000 n \n".encode("ascii")
+    data += f"{offsets[2]:010d} 00000 n \n".encode("ascii")
+    data += b"0000000000 00000 f \n"
+    data += b"0000000000 00000 f \n"
+    data += b"0000000000 00000 f \n"
+    data += f"{offsets[6]:010d} 00000 n \n".encode("ascii")
+    data += f"{false_next:010d} 00000 n \n".encode("ascii")
+    data += b"trailer\n<< /Size 8 /Root 1 0 R /QTest 6 0 R >>\n"
+    data += f"startxref\n{xref_offset}\n".encode("ascii")
+    data += b"%%EOF\n"
+    return bytes(data)
+
+
+write("stream_decode_parms_false_next_offset", build_false_next_offset_pdf())
+write(
     "stream_offset_false_markers",
     build_pdf(
         b"6 0 R",

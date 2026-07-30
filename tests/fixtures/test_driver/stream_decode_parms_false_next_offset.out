@@ -1,0 +1,13 @@
+/QTest is indirect and has type stream (10)
+/QTest is a stream.  Dictionary: << /DecodeParms [ null 42 ] /Filter [ /FlateDecode /FlateDecode ] /Length 3 >>
+Raw stream data:
+abc
+Uncompressed stream data:
+WARNING: stream_decode_parms_false_next_offset.pdf, object 6 0 at offset 180: operation for dictionary attempted on object of type integer: treating as empty
+WARNING: stream_decode_parms_false_next_offset.pdf, object 6 0 at offset 180: operation for dictionary attempted on object of type integer: treating as empty
+WARNING: stream_decode_parms_false_next_offset.pdf (offset 205): error decoding stream data for object 6 0: stream inflate: inflate: data: incorrect header check
+
+End of stream data
+unparse: 6 0 R
+unparseResolved: 6 0 R
+test 1 done

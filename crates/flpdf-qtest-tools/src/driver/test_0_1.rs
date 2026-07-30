@@ -3,7 +3,9 @@ use std::io::{Read, Seek, Write};
 use flpdf::filters::{DecodeLimits, StreamDecodeEvent};
 use flpdf::{Diagnostic, Error, Object, Pdf};
 
-use super::handle::{resolve_stream_dictionary, write_qpdf_object, Handle};
+use super::handle::{
+    resolve_stream_dictionary, write_qpdf_object, DecodeParmsWarningSource, Handle,
+};
 use super::{emit_new_diagnostics, write_warning};
 use crate::output::write_bytes;
 
@@ -139,35 +141,46 @@ fn write_object_details<R: Read + Seek>(
             writeln!(stdout)?;
             writeln!(stdout, "Uncompressed stream data:")?;
 
-            let decode_param_warnings = if decode_dictionary.decode_param_type_warnings().is_empty()
-            {
-                Vec::new()
-            } else {
-                let object_ref = qtest.terminal_indirect_ref().ok_or_else(|| {
-                    Error::System(
-                        "stream DecodeParms warning has no terminal indirect object".to_string(),
-                    )
-                })?;
-                decode_dictionary
-                    .decode_param_type_warnings()
-                    .iter()
-                    .map(|warning| {
-                        pdf.qtest_decode_parms_source_offset(object_ref, warning.filter_index)
-                            .map(|offset| (warning.object_type, offset))
-                    })
-                    .collect::<flpdf::Result<Vec<_>>>()?
-            };
-            if let Some(object_ref) = qtest.terminal_indirect_ref() {
-                for (object_type, offset) in &decode_param_warnings {
-                    write_decode_param_type_warning(
-                        filename,
-                        object_ref,
-                        *offset,
-                        object_type,
-                        stdout,
-                        stderr,
-                    )?;
-                }
+            let stream_ref = qtest.terminal_indirect_ref();
+            let decode_param_warnings = decode_dictionary
+                .decode_param_type_warnings()
+                .iter()
+                .map(|warning| {
+                    let (object_ref, offset) = match warning.source {
+                        DecodeParmsWarningSource::StreamDictionary => {
+                            let object_ref = stream_ref.ok_or_else(|| {
+                                Error::System(
+                                    "stream DecodeParms warning has no terminal indirect object"
+                                        .to_string(),
+                                )
+                            })?;
+                            let offset = pdf.qtest_decode_parms_source_offset(
+                                object_ref,
+                                warning.filter_index,
+                            )?;
+                            (object_ref, offset)
+                        }
+                        DecodeParmsWarningSource::ObjectBody(object_ref) => {
+                            let offset = pdf.qtest_object_value_source_offset(object_ref)?;
+                            (object_ref, offset)
+                        }
+                        DecodeParmsWarningSource::ArrayItem(object_ref, index) => {
+                            let offset = pdf.qtest_array_item_source_offset(object_ref, index)?;
+                            (object_ref, offset)
+                        }
+                    };
+                    Ok((object_ref, warning.object_type, offset))
+                })
+                .collect::<flpdf::Result<Vec<_>>>()?;
+            for (object_ref, object_type, offset) in &decode_param_warnings {
+                write_decode_param_type_warning(
+                    filename,
+                    *object_ref,
+                    *offset,
+                    object_type,
+                    stdout,
+                    stderr,
+                )?;
             }
 
             if !decode_dictionary.is_filterable() {
@@ -175,17 +188,15 @@ fn write_object_details<R: Read + Seek>(
                 return Ok(());
             }
 
-            if let Some(object_ref) = qtest.terminal_indirect_ref() {
-                for (object_type, offset) in &decode_param_warnings {
-                    write_decode_param_type_warning(
-                        filename,
-                        object_ref,
-                        *offset,
-                        object_type,
-                        stdout,
-                        stderr,
-                    )?;
-                }
+            for (object_ref, object_type, offset) in &decode_param_warnings {
+                write_decode_param_type_warning(
+                    filename,
+                    *object_ref,
+                    *offset,
+                    object_type,
+                    stdout,
+                    stderr,
+                )?;
             }
 
             match flpdf::filters::decode_stream_data_recovering_with_limits(

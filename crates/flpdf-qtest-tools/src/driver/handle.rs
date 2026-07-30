@@ -14,6 +14,29 @@ pub(crate) struct ResolvedStreamDictionary {
 pub(crate) struct DecodeParamTypeWarning {
     pub(crate) filter_index: usize,
     pub(crate) object_type: &'static str,
+    pub(crate) source: DecodeParmsWarningSource,
+}
+
+/// Where a `/DecodeParms` type-warning's object/offset attribution comes
+/// from, mirroring qpdf's `QPDFObjectHandle::typeWarning` description:
+/// whichever object's own bytes physically hold the offending value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DecodeParmsWarningSource {
+    /// The value sits directly in the stream dictionary itself (no
+    /// reference was followed at or above this filter position):
+    /// attribute to the stream's own indirect object via the existing
+    /// `/DecodeParms` dictionary/array locator.
+    StreamDictionary,
+    /// The value is the *entire* body of this indirect object (a
+    /// reference chain — at this value or its enclosing array — that
+    /// terminated on a non-array, or on an array consumed as one unit).
+    ObjectBody(ObjectRef),
+    /// The value is a direct item at this array index inside this
+    /// indirect object's own body: the enclosing `/DecodeParms` array was
+    /// itself reached through a reference, but the item at this position
+    /// is not itself a reference, so qpdf keeps the array's own
+    /// description and its item's own precise parsed position.
+    ArrayItem(ObjectRef, usize),
 }
 
 impl ResolvedStreamDictionary {
@@ -263,13 +286,18 @@ pub(crate) fn resolve_stream_dictionary<R: Read + Seek>(
         .as_deref()
         .is_none_or(|names| names.iter().all(|name| qpdf_filter_factory_exists(name)));
 
+    let mut decode_parms_sources: Vec<DecodeParmsWarningSource> = Vec::new();
     let mut resolved = Dictionary::new();
     for (key, value) in source.iter() {
         let value = if key == b"Filter" {
             filter.clone().unwrap_or_else(|| value.clone())
         } else if key == b"DecodeParms" {
             match filter_names.as_deref() {
-                Some(names) if filterable => resolve_decode_params(pdf, names, value.clone())?,
+                Some(names) if filterable => {
+                    let (value, sources) = resolve_decode_params(pdf, names, value.clone())?;
+                    decode_parms_sources = sources;
+                    value
+                }
                 None => value.clone(),
                 Some(_) => value.clone(),
             }
@@ -293,6 +321,10 @@ pub(crate) fn resolve_stream_dictionary<R: Read + Seek>(
                             object_type: qpdf_object_type_name(
                                 params.expect("non-null DecodeParms"),
                             ),
+                            source: decode_parms_sources
+                                .get(filter_index)
+                                .copied()
+                                .unwrap_or(DecodeParmsWarningSource::StreamDictionary),
                         });
                     }
                     if normalized == b"Crypt" && !crypt_decode_params_filterable(params) {
@@ -488,35 +520,69 @@ fn resolve_decode_param_dict<R: Read + Seek>(
     Ok(Object::Dictionary(resolved))
 }
 
+/// Resolve one `/DecodeParms` value (a scalar, or one aligned array item)
+/// against `filters`, returning the resolved value plus the indirect object
+/// (if any) whose own bytes directly hold it — i.e. the terminal reference
+/// of *this* value's own chain, not any enclosing container's.
 fn resolve_decode_param_for_filters<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filters: &[&[u8]],
     value: Object,
-) -> flpdf::Result<Object> {
-    let value = resolve_chain(pdf, value)?.0;
-    match value {
-        Object::Dictionary(dictionary) => resolve_decode_param_dict(pdf, filters, dictionary),
-        other => Ok(other),
-    }
+) -> flpdf::Result<(Object, Option<ObjectRef>)> {
+    let (value, _, terminal_ref) = resolve_chain(pdf, value)?;
+    let value = match value {
+        Object::Dictionary(dictionary) => resolve_decode_param_dict(pdf, filters, dictionary)?,
+        other => other,
+    };
+    Ok((value, terminal_ref))
 }
 
+/// Resolve `/DecodeParms` and, for each filter position, where a type
+/// warning at that position should be attributed.
+///
+/// qpdf attributes a non-dictionary `/DecodeParms` value to the innermost
+/// indirect object whose own bytes physically hold the offending token: an
+/// array item that is itself a reference wins over its enclosing array
+/// (attributed to that item's own object, as its whole body), but a direct
+/// item inherits the enclosing array's own indirect object — as one item
+/// inside that array — when the array itself was reached through a
+/// reference, rather than reporting no indirection at all.
 fn resolve_decode_params<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filters: &[&[u8]],
     value: Object,
-) -> flpdf::Result<Object> {
-    let value = resolve_chain(pdf, value)?.0;
+) -> flpdf::Result<(Object, Vec<DecodeParmsWarningSource>)> {
+    let (value, _, container_ref) = resolve_chain(pdf, value)?;
     match value {
         Object::Array(values) if values.len() == filters.len() => {
-            let values = values
-                .into_iter()
-                .zip(filters.iter().copied())
-                .map(|(value, filter)| resolve_decode_param_for_filters(pdf, &[filter], value))
-                .collect::<flpdf::Result<Vec<_>>>()?;
-            Ok(Object::Array(values))
+            let mut resolved_values = Vec::with_capacity(values.len());
+            let mut sources = Vec::with_capacity(values.len());
+            for (index, (value, filter)) in
+                values.into_iter().zip(filters.iter().copied()).enumerate()
+            {
+                let (value, item_ref) = resolve_decode_param_for_filters(pdf, &[filter], value)?;
+                resolved_values.push(value);
+                sources.push(match (item_ref, container_ref) {
+                    (Some(item_ref), _) => DecodeParmsWarningSource::ObjectBody(item_ref),
+                    (None, Some(container_ref)) => {
+                        DecodeParmsWarningSource::ArrayItem(container_ref, index)
+                    }
+                    (None, None) => DecodeParmsWarningSource::StreamDictionary,
+                });
+            }
+            Ok((Object::Array(resolved_values), sources))
         }
-        Object::Array(values) => Ok(Object::Array(values)),
-        other => resolve_decode_param_for_filters(pdf, filters, other),
+        Object::Array(values) => {
+            let sources = vec![DecodeParmsWarningSource::StreamDictionary; values.len()];
+            Ok((Object::Array(values), sources))
+        }
+        other => {
+            let (value, _) = resolve_decode_param_for_filters(pdf, filters, other)?;
+            let source = container_ref
+                .map(DecodeParmsWarningSource::ObjectBody)
+                .unwrap_or(DecodeParmsWarningSource::StreamDictionary);
+            Ok((value, vec![source; filters.len()]))
+        }
     }
 }
 
@@ -1287,10 +1353,108 @@ mod tests {
                 super::DecodeParamTypeWarning {
                     filter_index: 0,
                     object_type: "integer",
+                    source: super::DecodeParmsWarningSource::StreamDictionary,
                 },
                 super::DecodeParamTypeWarning {
                     filter_index: 2,
                     object_type: "integer",
+                    source: super::DecodeParmsWarningSource::StreamDictionary,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_param_warning_attributes_indirect_scalar_to_its_own_object() {
+        let mut pdf = handle_pdf(b"");
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(b"Filter", Object::Name(b"FlateDecode".to_vec()));
+        dictionary.insert(b"DecodeParms", Object::Reference(ObjectRef::new(13, 0)));
+
+        let resolved = resolve_stream_dictionary(&mut pdf, &dictionary)
+            .expect("resolve indirect non-dictionary DecodeParms");
+
+        assert_eq!(
+            resolved.decode_param_type_warnings(),
+            [super::DecodeParamTypeWarning {
+                filter_index: 0,
+                object_type: "integer",
+                source: super::DecodeParmsWarningSource::ObjectBody(ObjectRef::new(13, 0)),
+            }]
+        );
+    }
+
+    #[test]
+    fn decode_param_warning_array_items_attribute_indirect_items_to_themselves() {
+        let mut pdf = handle_pdf(b"");
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(
+            b"Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"LZWDecode".to_vec()),
+            ]),
+        );
+        dictionary.insert(
+            b"DecodeParms",
+            Object::Array(vec![
+                Object::Reference(ObjectRef::new(13, 0)),
+                Object::Integer(7),
+            ]),
+        );
+
+        let resolved = resolve_stream_dictionary(&mut pdf, &dictionary)
+            .expect("resolve array DecodeParms with an indirect item");
+
+        assert_eq!(
+            resolved.decode_param_type_warnings(),
+            [
+                super::DecodeParamTypeWarning {
+                    filter_index: 0,
+                    object_type: "integer",
+                    source: super::DecodeParmsWarningSource::ObjectBody(ObjectRef::new(13, 0)),
+                },
+                super::DecodeParamTypeWarning {
+                    filter_index: 1,
+                    object_type: "integer",
+                    source: super::DecodeParmsWarningSource::StreamDictionary,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_param_warning_direct_array_item_attributes_to_the_containers_own_array_index() {
+        // qpdf attributes the warning to the array's own indirect object,
+        // at this item's own array index, when an item embedded directly
+        // in it (not itself a reference) is the offending value.
+        let bytes = pdf_with_objects(&[(1, b"<< /Type /Catalog >>"), (5, b"[ 9 9 ]")], b"");
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open indirect-array fixture");
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(
+            b"Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"LZWDecode".to_vec()),
+            ]),
+        );
+        dictionary.insert(b"DecodeParms", Object::Reference(ObjectRef::new(5, 0)));
+
+        let resolved = resolve_stream_dictionary(&mut pdf, &dictionary)
+            .expect("resolve indirect array with direct items");
+
+        assert_eq!(
+            resolved.decode_param_type_warnings(),
+            [
+                super::DecodeParamTypeWarning {
+                    filter_index: 0,
+                    object_type: "integer",
+                    source: super::DecodeParmsWarningSource::ArrayItem(ObjectRef::new(5, 0), 0),
+                },
+                super::DecodeParamTypeWarning {
+                    filter_index: 1,
+                    object_type: "integer",
+                    source: super::DecodeParmsWarningSource::ArrayItem(ObjectRef::new(5, 0), 1),
                 },
             ]
         );

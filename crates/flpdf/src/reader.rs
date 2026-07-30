@@ -9,6 +9,8 @@ use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
 #[cfg(feature = "qtest-driver")]
+#[cfg(feature = "qtest-driver")]
+use crate::parser::array_item_source_offset;
 use crate::parser::dictionary_value_source_offset;
 use crate::parser::parse_qpdf_file_object;
 use crate::pipeline::rc4::PlRc4;
@@ -930,6 +932,79 @@ impl<R: Read + Seek> Pdf<R> {
         else {
             return Ok(None);
         };
+        let value_offset = self.qtest_read_source_object_with_retry(offset, |bytes| {
+            Self::decode_parms_value_offset_within(bytes, filter_index)
+        })?;
+        Ok(value_offset.map(|value_offset| offset.saturating_add(value_offset as u64)))
+    }
+
+    /// Return the source offset of an indirect object's own direct value.
+    ///
+    /// This compatibility hook is compiled only for `flpdf-test-driver`. It
+    /// locates the position immediately after `N G obj`, matching qpdf's
+    /// warning offset when a `/DecodeParms` reference chain terminates on a
+    /// non-dictionary object: qpdf records this position once, before
+    /// parsing the object's value, rather than the value token's own
+    /// (whitespace/comment-skipped) start.
+    #[doc(hidden)]
+    #[cfg(feature = "qtest-driver")]
+    pub fn qtest_object_value_source_offset(
+        &mut self,
+        object_ref: ObjectRef,
+    ) -> Result<Option<u64>> {
+        let Some(XrefEntry::Uncompressed { offset }) =
+            self.source_xref_entries.get(&object_ref).copied()
+        else {
+            return Ok(None);
+        };
+        let body_start =
+            self.qtest_read_source_object_with_retry(offset, Self::object_body_start_within)?;
+        Ok(Some(offset.saturating_add(body_start as u64)))
+    }
+
+    /// Return the source offset of the item at `array_index` in an indirect
+    /// object whose own direct value is an array.
+    ///
+    /// This compatibility hook is compiled only for `flpdf-test-driver`. It
+    /// covers a `/DecodeParms` array reached through a reference whose item
+    /// at this position is not itself a reference: qpdf attributes the
+    /// warning to the array's own indirect object, at that item's precise
+    /// (whitespace/comment-skipped) token position — unlike
+    /// [`Self::qtest_object_value_source_offset`], which reports the
+    /// coarser "right after `obj`" position for a value that is the
+    /// object's entire body.
+    #[doc(hidden)]
+    #[cfg(feature = "qtest-driver")]
+    pub fn qtest_array_item_source_offset(
+        &mut self,
+        object_ref: ObjectRef,
+        array_index: usize,
+    ) -> Result<Option<u64>> {
+        let Some(XrefEntry::Uncompressed { offset }) =
+            self.source_xref_entries.get(&object_ref).copied()
+        else {
+            return Ok(None);
+        };
+        let value_offset = self.qtest_read_source_object_with_retry(offset, |bytes| {
+            let body_start = Self::object_body_start_within(bytes)?;
+            let body = &bytes[body_start..];
+            let value_offset = array_item_source_offset(body, array_index)?;
+            Ok(value_offset.map(|value_offset| body_start + value_offset))
+        })?;
+        Ok(value_offset.map(|value_offset| offset.saturating_add(value_offset as u64)))
+    }
+
+    /// Read an indirect object's bytes bounded by the next recorded object
+    /// offset, retrying with an unbounded read (subject to
+    /// [`Self::resolution_fallbacks_remaining`]) when `parse` fails on the
+    /// bounded window — matching [`Self::parse_source_file_object_at`]'s
+    /// guarded full-object retry for a corrupt or false next-xref offset.
+    #[cfg(feature = "qtest-driver")]
+    fn qtest_read_source_object_with_retry<T>(
+        &mut self,
+        offset: u64,
+        parse: impl Fn(&[u8]) -> Result<T>,
+    ) -> Result<T> {
         let next = self.next_object_offset(offset);
         let physical_offset = self.physical_source_offset(offset);
         self.reader.seek(SeekFrom::Start(physical_offset))?;
@@ -943,22 +1018,41 @@ impl<R: Read + Seek> Pdf<R> {
             None => self.reader.read_to_end(&mut bytes)?,
         };
 
-        let mut tokenizer = Tokenizer::new(&bytes);
+        match parse(&bytes) {
+            Ok(value) => Ok(value),
+            Err(window_error) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
+                self.resolution_fallbacks_remaining -= 1;
+                self.reader.seek(SeekFrom::Start(physical_offset))?;
+                let mut full = Vec::new();
+                self.reader.read_to_end(&mut full)?;
+                parse(&full).or(Err(window_error))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Position immediately after `N G obj`, without skipping the
+    /// whitespace/comments that follow. qpdf records an indirect object's
+    /// own "parsed offset" once, at this point, before parsing its value —
+    /// not at the value token's own (later) start.
+    #[cfg(feature = "qtest-driver")]
+    fn object_body_start_within(bytes: &[u8]) -> Result<usize> {
+        let mut tokenizer = Tokenizer::new(bytes);
         let _ = tokenizer.next_integer()?;
         let _ = tokenizer.next_integer()?;
         tokenizer.expect_word(b"obj")?;
-        tokenizer.skip_ignorable()?;
-        let body_start = tokenizer.position();
+        Ok(tokenizer.position())
+    }
+
+    #[cfg(feature = "qtest-driver")]
+    fn decode_parms_value_offset_within(
+        bytes: &[u8],
+        filter_index: usize,
+    ) -> Result<Option<usize>> {
+        let body_start = Self::object_body_start_within(bytes)?;
         let body = &bytes[body_start..];
-        let value_offset = dictionary_value_source_offset(body, b"DecodeParms", filter_index);
-        let Some(value_offset) = value_offset? else {
-            return Ok(None);
-        };
-        Ok(Some(
-            offset
-                .saturating_add(body_start as u64)
-                .saturating_add(value_offset as u64),
-        ))
+        let value_offset = dictionary_value_source_offset(body, b"DecodeParms", filter_index)?;
+        Ok(value_offset.map(|value_offset| body_start + value_offset))
     }
 
     fn parse_source_file_object_at(&mut self, offset: u64) -> Result<PendingFileObject> {
@@ -3398,6 +3492,120 @@ mod tests {
         );
         assert_eq!(
             pdf.qtest_decode_parms_source_offset(ObjectRef::new(99, 0), 0)
+                .expect("unknown object"),
+            None
+        );
+    }
+
+    #[cfg(feature = "qtest-driver")]
+    #[test]
+    fn qtest_decode_parms_offsets_retry_after_false_next_object_offset() {
+        let bytes = stream_with_false_next_xref_offset();
+        let expected = bytes
+            .windows(b"[ null ]".len())
+            .position(|window| window == b"[ null ]")
+            .expect("DecodeParms array")
+            + b"[ ".len();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open false-next-offset PDF");
+
+        assert_eq!(
+            pdf.qtest_decode_parms_source_offset(ObjectRef::new(1, 0), 0)
+                .expect("offset lookup uses the same bounded fallback"),
+            Some(expected as u64)
+        );
+    }
+
+    #[cfg(feature = "qtest-driver")]
+    #[test]
+    fn qtest_decode_parms_offsets_preserve_bounded_retry_cap() {
+        let mut pdf = Pdf::open_mem_owned(stream_with_false_next_xref_offset())
+            .expect("open false-next-offset PDF");
+        pdf.resolution_fallbacks_remaining = 0;
+
+        assert!(pdf
+            .qtest_decode_parms_source_offset(ObjectRef::new(1, 0), 0)
+            .is_err());
+        assert_eq!(pdf.resolution_fallbacks_remaining, 0);
+    }
+
+    #[cfg(feature = "qtest-driver")]
+    #[test]
+    fn qtest_object_value_source_offset_locates_the_position_right_after_obj() {
+        // qpdf records an indirect object's own "parsed offset" once, right
+        // after `N G obj`, before parsing its value — not at the value
+        // token's own start. Extra whitespace/comments between `obj` and
+        // the value must not shift the reported offset.
+        let stream_body = b"1 0 obj\n\
+                            << /Filter /FlateDecode /DecodeParms 3 0 R /Length 0 >>\n\
+                            stream\n\nendstream\nendobj\n";
+        let catalog_body = b"2 0 obj\n<< /Type /Catalog >>\nendobj\n";
+        let scalar_body = b"3 0 obj\n  % a comment\n  42\nendobj\n";
+        let bytes = classic_pdf_with_bodies(
+            &[stream_body, catalog_body, scalar_body],
+            ObjectRef::new(2, 0),
+        );
+        let expected = bytes
+            .windows(b"3 0 obj".len())
+            .rposition(|window| window == b"3 0 obj")
+            .expect("scalar object")
+            + b"3 0 obj".len();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open indirect-scalar fixture");
+
+        assert_eq!(
+            pdf.qtest_object_value_source_offset(ObjectRef::new(3, 0))
+                .expect("position right after obj"),
+            Some(expected as u64)
+        );
+        assert_eq!(
+            pdf.qtest_object_value_source_offset(ObjectRef::new(99, 0))
+                .expect("unknown object has no source offset"),
+            None
+        );
+    }
+
+    #[cfg(feature = "qtest-driver")]
+    #[test]
+    fn qtest_array_item_source_offset_locates_precise_item_positions() {
+        let stream_body = b"1 0 obj\n\
+                            << /Filter [ /LZWDecode /FlateDecode ] /DecodeParms 3 0 R \
+                               /Length 0 >>\n\
+                            stream\n\nendstream\nendobj\n";
+        let catalog_body = b"2 0 obj\n<< /Type /Catalog >>\nendobj\n";
+        let array_body = b"3 0 obj\n[ 9 9 ]\nendobj\n";
+        let bytes = classic_pdf_with_bodies(
+            &[stream_body, catalog_body, array_body],
+            ObjectRef::new(2, 0),
+        );
+        let first = bytes
+            .windows(b"[ 9 9 ]".len())
+            .position(|window| window == b"[ 9 9 ]")
+            .expect("array object")
+            + b"[ ".len();
+        let second = first + b"9 ".len();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open indirect-array fixture");
+
+        assert_eq!(
+            pdf.qtest_array_item_source_offset(ObjectRef::new(3, 0), 0)
+                .expect("first item offset"),
+            Some(first as u64)
+        );
+        assert_eq!(
+            pdf.qtest_array_item_source_offset(ObjectRef::new(3, 0), 1)
+                .expect("second item offset"),
+            Some(second as u64)
+        );
+        assert_eq!(
+            pdf.qtest_array_item_source_offset(ObjectRef::new(3, 0), 2)
+                .expect("missing item index"),
+            None
+        );
+        assert_eq!(
+            pdf.qtest_array_item_source_offset(ObjectRef::new(1, 0), 0)
+                .expect("non-array body"),
+            None
+        );
+        assert_eq!(
+            pdf.qtest_array_item_source_offset(ObjectRef::new(99, 0), 0)
                 .expect("unknown object"),
             None
         );
