@@ -31,10 +31,44 @@ enum Repr {
     Indirect(Rc<RefCell<IndirectSlot>>),
 }
 
+/// The value payload of a direct `ObjectHandle`, mirroring qpdf's
+/// `QPDFValue` type family (`libqpdf/qpdf/QPDFValue.hh`) and this crate's
+/// existing [`crate::Object`] enum.
+///
+/// Array and dictionary children are [`ObjectHandle`]s rather than raw
+/// nested `ObjectValue`s, so cloning a container clones only `Rc` handles
+/// (O(1) per child), not the subtree.
+#[derive(Debug)]
+pub(crate) enum ObjectValue {
+    Null,
+    #[allow(dead_code)] // as_boolean accessor lands in a later task
+    Boolean(bool),
+    Integer(i64),
+    #[allow(dead_code)] // as_real accessor lands in a later task
+    Real(f64),
+    /// Preserves a non-canonical source spelling (e.g. `.4`) alongside its
+    /// parsed value, mirroring [`crate::Object::RealLiteral`], so that a
+    /// real number written in the source PDF unparses byte-identically.
+    RealLiteral {
+        value: f64,
+        literal: Vec<u8>,
+    },
+    #[allow(dead_code)] // as_name accessor lands in a later task
+    Name(Vec<u8>),
+    #[allow(dead_code)] // as_string accessor lands in a later task
+    String(Vec<u8>),
+    Array(Vec<ObjectHandle>),
+    Dictionary(std::collections::BTreeMap<Vec<u8>, ObjectHandle>),
+    #[allow(dead_code)] // constructed/consumed by a later materialization task
+    Stream {
+        dict: ObjectHandle,
+        data: Vec<u8>,
+    },
+}
+
 #[derive(Debug)]
 struct DirectSlot {
-    #[allow(dead_code)] // populated in a later task
-    value: Option<()>, // placeholder until ObjectValue lands in a later task
+    value: ObjectValue,
     parsed_offset: i64,
 }
 
@@ -99,19 +133,16 @@ impl ObjectHandle {
         }))))
     }
 
-    fn new_direct(parsed_offset: i64) -> Self {
+    fn new_direct(value: ObjectValue, parsed_offset: i64) -> Self {
         Self(Repr::Direct(Rc::new(RefCell::new(DirectSlot {
-            value: None,
+            value,
             parsed_offset,
         }))))
     }
 
-    // Minimal factory to satisfy this task's tests; the full factory set
-    // (null/boolean/real/name/string/array/dictionary/stream) lands in a
-    // later task.
-    #[allow(dead_code)]
-    pub(crate) fn integer(_value: i64) -> Self {
-        Self::new_direct(NO_PARSED_OFFSET)
+    /// Construct a direct integer value.
+    pub fn integer(value: i64) -> Self {
+        Self::new_direct(ObjectValue::Integer(value), NO_PARSED_OFFSET)
     }
 
     /// The qpdf-compatible signed parsed offset. `-1` means the value was
@@ -142,44 +173,116 @@ impl ObjectHandle {
         }
     }
 
-    // Payload is still discarded (a placeholder) — the real `ObjectValue`
-    // payload (Null/Boolean/Integer/Array/Dictionary/Stream) lands in a
-    // later task. These factories exist now only so the parsed-offset
-    // contract can be tested independently of value representation.
-
     /// Construct a direct null value.
     pub fn null() -> Self {
-        Self::new_direct(NO_PARSED_OFFSET)
+        Self::new_direct(ObjectValue::Null, NO_PARSED_OFFSET)
     }
 
     /// Construct a direct boolean value.
-    pub fn boolean(_value: bool) -> Self {
-        Self::new_direct(NO_PARSED_OFFSET)
+    pub fn boolean(value: bool) -> Self {
+        Self::new_direct(ObjectValue::Boolean(value), NO_PARSED_OFFSET)
     }
 
     /// Construct a direct real (floating-point) value.
-    pub fn real(_value: f64) -> Self {
-        Self::new_direct(NO_PARSED_OFFSET)
+    pub fn real(value: f64) -> Self {
+        Self::new_direct(ObjectValue::Real(value), NO_PARSED_OFFSET)
     }
 
     /// Construct a direct name value.
-    pub fn name(_value: Vec<u8>) -> Self {
-        Self::new_direct(NO_PARSED_OFFSET)
+    pub fn name(value: Vec<u8>) -> Self {
+        Self::new_direct(ObjectValue::Name(value), NO_PARSED_OFFSET)
     }
 
     /// Construct a direct string value.
-    pub fn string(_value: Vec<u8>) -> Self {
-        Self::new_direct(NO_PARSED_OFFSET)
+    pub fn string(value: Vec<u8>) -> Self {
+        Self::new_direct(ObjectValue::String(value), NO_PARSED_OFFSET)
     }
 
-    /// Construct a direct array value.
-    pub fn array(_children: Vec<ObjectHandle>) -> Self {
-        Self::new_direct(NO_PARSED_OFFSET)
+    /// Construct a direct array value. Child values are handles, so cloning
+    /// or re-reading this array's children never deep-copies their subtrees.
+    pub fn array(children: Vec<ObjectHandle>) -> Self {
+        Self::new_direct(ObjectValue::Array(children), NO_PARSED_OFFSET)
     }
 
-    /// Construct a direct dictionary value.
-    pub fn dictionary(_entries: Vec<(Vec<u8>, ObjectHandle)>) -> Self {
-        Self::new_direct(NO_PARSED_OFFSET)
+    /// Construct a direct dictionary value from `entries`, in insertion
+    /// order. Values are handles, so cloning or re-reading this
+    /// dictionary's entries never deep-copies their subtrees.
+    pub fn dictionary(entries: Vec<(Vec<u8>, ObjectHandle)>) -> Self {
+        Self::new_direct(
+            ObjectValue::Dictionary(entries.into_iter().collect()),
+            NO_PARSED_OFFSET,
+        )
+    }
+
+    /// Construct a direct real value that preserves a non-canonical source
+    /// literal (e.g. `.4`) alongside its parsed value, mirroring
+    /// [`crate::Object::RealLiteral`], so that a real number written in the
+    /// source PDF unparses byte-identically.
+    pub fn real_literal(value: f64, literal: Vec<u8>) -> Self {
+        Self::new_direct(
+            ObjectValue::RealLiteral { value, literal },
+            NO_PARSED_OFFSET,
+        )
+    }
+
+    /// The value as an `f64`/literal-bytes pair if this handle is a direct
+    /// real value with a preserved source literal, or `None` otherwise —
+    /// including for any indirect handle, whose value is not read here.
+    pub fn as_real_literal(&self) -> Option<(f64, Vec<u8>)> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::RealLiteral { value, literal }) => Some((*value, literal.clone())),
+            _ => None,
+        })
+    }
+
+    /// True if this handle is a direct null value, or if it is an indirect
+    /// handle whose value is not currently known without resolving it — an
+    /// unread indirect handle is treated as null until it is actually
+    /// looked up.
+    pub fn is_null(&self) -> bool {
+        self.with_value(|value| matches!(value, Some(ObjectValue::Null) | None))
+    }
+
+    /// The value as `i64` if this handle is a direct integer value, or
+    /// `None` otherwise — including for any indirect handle, whose value
+    /// is not read here.
+    pub fn as_integer(&self) -> Option<i64> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Integer(n)) => Some(*n),
+            _ => None,
+        })
+    }
+
+    /// The child handles if this handle is a direct array value, or `None`
+    /// otherwise — including for any indirect handle, whose value is not
+    /// read here. Cloning the returned `Vec` clones only the child `Rc`
+    /// handles, not their subtrees.
+    pub fn as_array(&self) -> Option<Vec<ObjectHandle>> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Array(children)) => Some(children.clone()),
+            _ => None,
+        })
+    }
+
+    /// The entries if this handle is a direct dictionary value, or `None`
+    /// otherwise — including for any indirect handle, whose value is not
+    /// read here. Cloning the returned map clones only the child `Rc`
+    /// handles, not their subtrees.
+    pub fn as_dictionary(&self) -> Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Dictionary(entries)) => Some(entries.clone()),
+            _ => None,
+        })
+    }
+
+    // `None` for an unresolved indirect handle — value access on an
+    // unresolved handle must not perform hidden I/O (design, `Pdf` section).
+    // Real `Some(..)` for a resolved indirect handle lands in a later task.
+    fn with_value<T>(&self, f: impl FnOnce(Option<&ObjectValue>) -> T) -> T {
+        match &self.0 {
+            Repr::Direct(slot) => f(Some(&slot.borrow().value)),
+            Repr::Indirect(_) => f(None),
+        }
     }
 }
 
@@ -232,6 +335,76 @@ mod identity_tests {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(5, 0), 0);
         assert!(!direct.ptr_eq(&indirect));
         assert!(!indirect.ptr_eq(&direct));
+    }
+}
+
+#[cfg(test)]
+mod object_value_tests {
+    use super::*;
+
+    #[test]
+    fn integer_handle_round_trips_its_value() {
+        let handle = ObjectHandle::integer(42);
+        assert_eq!(handle.as_integer(), Some(42));
+    }
+
+    #[test]
+    fn array_handle_holds_child_handles_not_raw_values() {
+        let child = ObjectHandle::integer(7);
+        let array = ObjectHandle::array(vec![child.clone()]);
+        let children = array.as_array().expect("array");
+        assert_eq!(children.len(), 1);
+        assert!(children[0].ptr_eq(&child));
+    }
+
+    #[test]
+    fn dictionary_handle_preserves_insertion_of_child_handles() {
+        let value = ObjectHandle::name(b"Type".to_vec());
+        let dict = ObjectHandle::dictionary(vec![(b"Key".to_vec(), value.clone())]);
+        let entries = dict.as_dictionary().expect("dictionary");
+        assert!(entries.get(b"Key".as_slice()).unwrap().ptr_eq(&value));
+    }
+
+    #[test]
+    fn null_handle_is_null() {
+        assert!(ObjectHandle::null().is_null());
+        assert!(!ObjectHandle::integer(0).is_null());
+    }
+
+    #[test]
+    fn real_literal_handle_preserves_the_non_canonical_source_literal() {
+        // Object::RealLiteral exists so a non-canonical source spelling
+        // (e.g. ".4") survives unparse byte-identically. The handle payload
+        // must carry the same two fields, or byte-identical output breaks
+        // the moment a real-literal round-trips through this layer.
+        let handle = ObjectHandle::real_literal(0.4, b".4".to_vec());
+        assert_eq!(handle.as_real_literal(), Some((0.4, b".4".to_vec())));
+    }
+
+    #[test]
+    fn accessors_return_none_for_a_mismatched_direct_value() {
+        // `as_integer`/`as_array`/`as_dictionary`/`as_real_literal` must
+        // reject a direct value of the wrong variant, not just a missing
+        // one — the same `_ => None` arm handles both cases.
+        let handle = ObjectHandle::string(b"not-an-integer".to_vec());
+        assert_eq!(handle.as_integer(), None);
+        assert!(handle.as_array().is_none());
+        assert!(handle.as_dictionary().is_none());
+        assert_eq!(handle.as_real_literal(), None);
+    }
+
+    #[test]
+    fn accessors_return_none_or_null_for_an_indirect_handle_before_resolution() {
+        // `with_value` never performs hidden I/O to resolve an indirect
+        // handle (design, `Pdf` section), so today every indirect handle
+        // reads as "value not known" — surfaced as `None` from the typed
+        // accessors, and folded into `true` by `is_null` (see its doc).
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
+        assert!(handle.is_null());
+        assert_eq!(handle.as_integer(), None);
+        assert!(handle.as_array().is_none());
+        assert!(handle.as_dictionary().is_none());
+        assert_eq!(handle.as_real_literal(), None);
     }
 }
 
