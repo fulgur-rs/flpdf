@@ -1096,37 +1096,93 @@ counters, `MAX_PARSE_DEPTH`). **Do not fork or duplicate this logic.**
 Content-stream parsing must keep using exactly what exists today, untouched,
 forever (see Global Constraints).
 
-**This task has one required shape, not a choice.** The design is explicit
-and forecloses the alternative: "The parser builds the handle graph directly
-and assigns parsed offsets during node construction. **It does not return a
-parallel metadata tree**, and `Pdf` does not reparse an object later solely
-to reconstruct provenance" (design, "Parser" section, lines 145-147).
-Parsing to `Object` first and then converting/annotating with offsets in a
-second pass — via a parallel offset table or a `Parser::position()`
-re-scan — **is** exactly the forbidden parallel-metadata-tree/reparse
-pattern. The only compliant shape is to generify the construction sites
-themselves so the *same* recursive walk emits an `ObjectHandle` with its
-offset already attached, at the same place it would have emitted `Object::*`.
+**This task has one required shape, not a choice — but "the same recursive
+walk" does not mean "one literal function."** The design's real constraint
+is about *provenance*, not Rust code-sharing mechanics: "The parser builds
+the handle graph directly and assigns parsed offsets during node
+construction. **It does not return a parallel metadata tree**, and `Pdf`
+does not reparse an object later solely to reconstruct provenance" (design,
+"Parser" section, lines 145-147). Parsing to `Object` first and then
+converting/annotating with offsets in a second pass — via a parallel offset
+table or a `Parser::position()` re-scan — **is** exactly the forbidden
+parallel-metadata-tree/reparse pattern, and remains forbidden. What is
+**not** forbidden: `content_dictionary()`/`finish_content_dictionary()`
+already exist as container-construction functions entirely separate from
+`dictionary()`, used only for `ParserMode::Content` — the split between
+content-mode and object-mode container construction predates this task.
+Given that, a new object-mode-only container-construction path (e.g.
+`dictionary_handle()`/`array_handle()`/`object_inner_handle()`) that
+assigns offsets during its own single parse pass is compliant, **provided**
+every byte-identical-load-bearing leaf decision is factored into one
+shared function called by both the legacy `Object`-producing path and the
+new handle-producing path — never reimplemented a second time with
+similar-looking code. Concretely, these three decisions must each live in
+exactly one function, called from both paths:
 
-Read `parser.rs:192-482` in full (further than the excerpt already reviewed
+- `real_object`'s literal-preservation branch (`value.to_string().as_bytes()
+  == token.raw` → `Real` vs `RealLiteral`, `parser.rs:495`).
+- `integer_or_ref`'s three-token backtracking / `unread_token` ordering
+  (`parser.rs:479-480`).
+- `top_level_no_reference && depth == 1` gating.
+
+Duplicating the *container shells* (the loop that walks tokens and builds
+either an `Object::Array`/`Object::Dictionary` or an `ObjectHandle` array/
+dictionary) is acceptable — those shells differ inherently by output type
+anyway. Duplicating any *token-level decision* is not: if the handle path
+recomputes the real-literal comparison or the backtracking order itself
+instead of calling the same extracted helper, a future edit to one and not
+the other silently moves output bytes, which is exactly the failure mode
+this plan exists to prevent. `top_level_no_reference`, bad-token recovery,
+and `MAX_PARSE_DEPTH` remain byte-for-byte the same shared code either way.
+Content-stream parsing (`ParserMode::Content`) keeps using
+`content_dictionary()`/`parse_content_object()` exactly as today, completely
+untouched; only the file-object-body path gains a handle-producing route.
+`Object::Reference(object_ref)` at `integer_or_ref` (`parser.rs:459-482`)
+becomes, on the handle path only, a call to the same canonical-handle
+lookup this plan already added (`Pdf::get_object_handle`), not a bare
+`ObjectRef` value — the legacy `Object`-producing path keeps returning a
+bare `Object::Reference` exactly as today (Task 8 is where legacy callers
+change, not this task).
+
+Read `parser.rs:192-509` in full (further than the excerpt already reviewed
 this session) and run the existing `parser.rs` test module first, to see
 exactly how deeply recovery/bad-token behavior is entangled with the
 leaf/container construction sites before touching them.
 
-**Step 1: Generify `object_inner`'s construction, do not fork it**
+**Step 1: Extract the shared leaf decisions, then add a parallel
+object-mode-only handle-construction path**
 
-Parameterize `object_inner`'s leaf and container construction (currently
-hard-coded to build `Object::*` variants, `parser.rs:261-306`+) so the file
-side of the recursive walk emits `(ObjectHandle, i64 offset)` — with the
-offset read from `token.start`/`self.position()` at the exact same call
-site that constructs the value, never a second pass — while
-`top_level_no_reference`, bad-token recovery, and `MAX_PARSE_DEPTH` remain
-byte-for-byte the same shared code, executed once per node either way.
-Content-stream parsing (`ParserMode::Content`) keeps producing `Object`
-exactly as today; only the file-object-body path constructs handles.
-`Object::Reference(object_ref)` at `integer_or_ref` (`parser.rs:459-482`)
-becomes a call to the same canonical-handle lookup this plan already added
-(`Pdf::get_object_handle`), not a bare `ObjectRef` value.
+First extract the three decisions listed above into standalone functions
+(or methods taking only the token/value they need, no `Object`- or
+`ObjectHandle`-shaped state) if they are not already isolated enough to
+call from two call sites without duplication. Then add the new
+handle-producing container/leaf construction (parallel to `object_inner`/
+`dictionary`/`array`/`integer_or_ref`, object-mode only — never invoked from
+`ParserMode::Content`) that builds `ObjectHandle`s via the extracted
+helpers, with the offset read from `token.start`/`self.position()` at the
+exact same call site that constructs the value, never a second pass.
+
+Task 6's `resolve_object_handle` currently resolves every indirect handle
+by delegating to the legacy engine and calling `Pdf::lift` (offset `-1`
+always). This task changes that delegation **only for the plain
+uncompressed-file-object case** (`IndirectState` sourced from
+`XrefEntry::Uncompressed`): instead of calling `resolve_borrowed` + `lift`,
+it calls this task's new native parse-to-handle entry point directly on the
+object's source bytes, so the resulting handle (and every direct child
+in its tree) carries a real parsed offset from construction. The
+`Compressed` (ObjStm-member) case is explicitly **not** required to gain
+real per-member offset coordinates in this task — full ObjStm-relative/
+recovered/hybrid-xref offset coordinate correctness is `flpdf-egzr.3.3`'s
+scope (see Non-goals); leaving ObjStm members on the Task 6 `lift`-based
+path (offset `-1`) here is a recorded, intentional scope boundary, not a
+silent gap. Since `IndirectState`/the handle itself carries no xref-class
+tag, deciding which route to take requires consulting the xref table
+(`source_xref_entries()` or equivalent) for the object's `XrefEntry` variant
+*before* choosing native-parse vs. legacy-`lift`; get this branch right and
+add a test that a compressed (ObjStm) member handle still resolves via the
+Task 6 `lift` path with offset `-1`, not through native parsing against a
+file-relative offset that would be wrong for it (see Step 2's coverage of
+this exact scenario, mirroring the design's Parsed-Offset Contract table).
 
 Task 6's `resolve_object_handle` currently resolves every indirect handle
 by delegating to the legacy engine and calling `Pdf::lift` (offset `-1`
@@ -1187,7 +1243,37 @@ fn indirect_reference_child_is_the_canonical_handle_not_a_fresh_value() {
     // has object 5 registered (or registers it during parse); the
     // dictionary's "Kid" entry handle must `ptr_eq` `pdf.get_object_handle(ObjectRef::new(5, 0))`.
 }
+
+#[test]
+fn compressed_object_stream_member_keeps_the_sentinel_offset_via_legacy_lift() {
+    // an ObjStm-member indirect object (XrefEntry::Compressed) must still
+    // resolve through Task 6's lift path (offset -1), not be native-parsed
+    // against a file-relative offset that would be meaningless for it.
+}
+
+#[test]
+fn real_literal_round_trips_through_native_parsing() {
+    // a file-object body containing ".4" resolved via the native handle
+    // path: `as_real_literal()` must return `(0.4, b".4")`, exercising the
+    // shared real_object literal-preservation decision through the new
+    // path specifically (Task 4 only ever exercised this via a hand-built
+    // direct handle, never through actual parsing).
+}
 ```
+
+**Step 2b: Cross-path parity tests — the drift tripwire**
+
+The existing `parser::` test suite only exercises the legacy `Object`-
+producing path; it will stay green even if the new handle-producing path
+silently diverges from it on malformed input, since nothing there calls the
+new path. Add tests that feed the same malformed/edge-case object-mode
+bodies through *both* `Pdf::resolve` (legacy path) and
+`resolve_object_handle` (new native path) and assert identical error
+messages/offsets for at least: an unterminated dictionary (`"expected byte
+47"`-class error from `dictionary()`), an unterminated array (`"unexpected
+EOF in array"`-class error), and nesting past `MAX_PARSE_DEPTH` (`"object
+nesting too deep"`-class error). If any pair diverges, that is a bug in
+this task's implementation, not a pre-existing difference to document away.
 
 **Step 3-4: Implement per Step 1, run to green.**
 
