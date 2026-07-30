@@ -1006,6 +1006,7 @@ mod tests {
             },
             crate::filters::DecodeLimits {
                 max_output: Some(1024),
+                ..crate::filters::DecodeLimits::default()
             },
         )
         .unwrap();
@@ -1188,6 +1189,7 @@ mod tests {
             },
             crate::filters::DecodeLimits {
                 max_output: Some(1024),
+                ..crate::filters::DecodeLimits::default()
             },
         )
         .unwrap();
@@ -1212,6 +1214,7 @@ mod tests {
             },
             crate::filters::DecodeLimits {
                 max_output: Some(1024),
+                ..crate::filters::DecodeLimits::default()
             },
         )
         .unwrap();

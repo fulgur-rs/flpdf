@@ -21,13 +21,13 @@ use crate::{Dictionary, Error, Object, Result};
 const MAX_FILTER_CHAIN_LEN: usize = 16;
 
 pub(crate) fn validate_filter_chain_len(filters: &[Object]) -> Result<()> {
-    validate_filter_chain_count(filters.len())
+    validate_filter_chain_count(filters.len(), Some(MAX_FILTER_CHAIN_LEN))
 }
 
-fn validate_filter_chain_count(count: usize) -> Result<()> {
-    if count > MAX_FILTER_CHAIN_LEN {
+fn validate_filter_chain_count(count: usize, maximum: Option<usize>) -> Result<()> {
+    if let Some(maximum) = maximum.filter(|maximum| count > *maximum) {
         return Err(Error::Unsupported(format!(
-            "filter chain length {count} exceeds maximum of {MAX_FILTER_CHAIN_LEN}"
+            "filter chain length {count} exceeds maximum of {maximum}"
         )));
     }
     Ok(())
@@ -146,33 +146,62 @@ pub struct StreamDecodeOutcome {
 /// interpretation/construction from runtime codec failure. Unsupported filter
 /// shapes, names, and decode parameters return an outer [`Error`]. A runtime
 /// error after successful construction returns [`StreamDecodeOutcome`] with
-/// its partial bytes and error populated.
+/// its partial bytes and error populated. This applies
+/// [`DecodeLimits::default()`], including the default 16-stage `/Filter` cap.
 pub fn decode_stream_data_recovering(
     dict: &Dictionary,
     stream_data: &[u8],
 ) -> Result<StreamDecodeOutcome> {
+    decode_stream_data_recovering_with_limits(dict, stream_data, DecodeLimits::default())
+}
+
+/// Decode a stream with explicit limits while retaining ordered recovery events.
+///
+/// # Errors
+///
+/// Returns an outer [`Error`] when the filter chain cannot be interpreted or
+/// constructed, including when it exceeds [`DecodeLimits::max_filter_chain`].
+/// Runtime codec failures instead remain ordered [`StreamDecodeEvent::Error`]
+/// events alongside any recovered output, as for [`decode_stream_data_recovering`].
+pub fn decode_stream_data_recovering_with_limits(
+    dict: &Dictionary,
+    stream_data: &[u8],
+    limits: DecodeLimits,
+) -> Result<StreamDecodeOutcome> {
     decode_stream_data_recovering_with_limits_and_mode(
         dict,
         stream_data,
-        DecodeLimits::default(),
+        limits,
         DataEventMode::Record,
     )
 }
 
 /// Opt-in limits applied while decoding a stream's filter chain.
 ///
-/// Default is unlimited, matching [`decode_stream_data`]. Embedders processing
-/// untrusted input can set [`max_output`](Self::max_output) to bound the
-/// decoded size of each `FlateDecode`, `LZWDecode`, `ASCII85Decode`,
-/// `ASCIIHexDecode`, or `RunLengthDecode` stage, trading completeness for a
-/// per-stage bound. It is not a ceiling on the total work or cumulative output
-/// across a filter chain.
-#[derive(Clone, Copy, Debug, Default)]
+/// By default, output is unlimited, matching [`decode_stream_data`], while the
+/// `/Filter` chain is capped at 16 stages. Embedders processing untrusted input
+/// can set [`max_output`](Self::max_output) to bound the decoded size of each
+/// `FlateDecode`, `LZWDecode`, `ASCII85Decode`, `ASCIIHexDecode`, or
+/// `RunLengthDecode` stage, trading completeness for a per-stage bound. It is
+/// not a ceiling on the total work or cumulative output across a filter chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodeLimits {
     /// Maximum decoded byte count permitted out of any single supported filter
     /// stage, counted after that stage's predictor if it has one. `None`
     /// (default) is unlimited.
     pub max_output: Option<usize>,
+    /// Maximum `/Filter` stages accepted before individual filter items are
+    /// validated. `None` disables this count limit.
+    pub max_filter_chain: Option<usize>,
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_output: None,
+            max_filter_chain: Some(MAX_FILTER_CHAIN_LEN),
+        }
+    }
 }
 
 fn reject_decode_warning(message: &str, code: i32) -> PipelineResult<()> {
@@ -255,8 +284,8 @@ pub(crate) fn is_decode_output_limit_error(error: &Error) -> bool {
 ///
 /// Returns [`Error::Unsupported`] for the same reasons as [`decode_stream_data`],
 /// plus when a supported filter stage's decoded output exceeds
-/// [`DecodeLimits::max_output`], or when the `/Filter` chain exceeds the fixed
-/// stage cap.
+/// [`DecodeLimits::max_output`], or when the `/Filter` chain exceeds
+/// [`DecodeLimits::max_filter_chain`].
 pub fn decode_stream_data_with_limits(
     dict: &Dictionary,
     stream_data: &[u8],
@@ -322,10 +351,10 @@ where
     F: FnMut(Option<&Object>, &[u8]) -> Result<Vec<u8>>,
 {
     if let Some(Object::Array(filters)) = filter {
-        validate_filter_chain_len(filters)?;
+        validate_filter_chain_count(filters.len(), limits.max_filter_chain)?;
     }
     let specs = decode_filter_specs(filter, decode_params)?;
-    validate_filter_chain_count(specs.len())?;
+    validate_filter_chain_count(specs.len(), limits.max_filter_chain)?;
     let prepared = prepare_decode_filters(specs)?;
     let stage_count = prepared.len();
     let mut decoded = Cow::Borrowed(stream_data);
@@ -661,6 +690,40 @@ mod tests {
     use super::*;
     use crate::pipeline::lzw::pack_codes;
 
+    #[test]
+    fn decode_limits_default_to_unbounded_output_and_sixteen_filters() {
+        assert_eq!(
+            DecodeLimits::default(),
+            DecodeLimits {
+                max_output: None,
+                max_filter_chain: Some(16),
+            }
+        );
+    }
+
+    #[test]
+    fn unlimited_chain_policy_reaches_filter_item_validation() {
+        let mut filters = vec![Object::Name(b"ASCIIHexDecode".to_vec()); 16];
+        filters.push(Object::Integer(1));
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("Filter", Object::Array(filters));
+
+        let error = decode_stream_data_recovering_with_limits(
+            &dictionary,
+            b">",
+            DecodeLimits {
+                max_output: None,
+                max_filter_chain: None,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream filter type is not name or array"
+        );
+    }
+
     fn flate_dict() -> Dictionary {
         let mut dict = Dictionary::new();
         dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
@@ -942,6 +1005,7 @@ mod tests {
             b"F",
             DecodeLimits {
                 max_output: Some(0),
+                ..DecodeLimits::default()
             },
             DataEventMode::Record,
         )
@@ -967,6 +1031,7 @@ mod tests {
             b"41F",
             DecodeLimits {
                 max_output: Some(1),
+                ..DecodeLimits::default()
             },
             DataEventMode::Record,
         )
@@ -991,6 +1056,7 @@ mod tests {
             b"41F",
             DecodeLimits {
                 max_output: Some(1),
+                ..DecodeLimits::default()
             },
             DataEventMode::Record,
         )
@@ -1101,6 +1167,7 @@ mod tests {
             b"41F",
             DecodeLimits {
                 max_output: Some(1),
+                ..DecodeLimits::default()
             },
             DataEventMode::Record,
             &mut decrypt,
@@ -1190,6 +1257,7 @@ mod tests {
             &outer_flate,
             DecodeLimits {
                 max_output: Some(4_000),
+                ..DecodeLimits::default()
             },
             DataEventMode::Record,
         )
@@ -1227,6 +1295,7 @@ mod tests {
                 &outer_flate,
                 DecodeLimits {
                     max_output: Some(4_000),
+                    ..DecodeLimits::default()
                 },
             )
             .unwrap_err()
@@ -1278,6 +1347,7 @@ mod tests {
             &encoded,
             DecodeLimits {
                 max_output: Some(4),
+                ..DecodeLimits::default()
             },
             DataEventMode::Record,
         )
@@ -1397,6 +1467,7 @@ mod tests {
             &[0xf9, b'A'],
             DecodeLimits {
                 max_output: Some(0),
+                ..DecodeLimits::default()
             },
         )
         .unwrap_err();
@@ -1928,6 +1999,7 @@ mod tests {
             b"9jqo^9jqo^~>",
             DecodeLimits {
                 max_output: Some(1),
+                ..DecodeLimits::default()
             },
         )
         .unwrap_err();
@@ -2478,6 +2550,7 @@ mod tests {
             &encoded,
             DecodeLimits {
                 max_output: Some(1999),
+                ..DecodeLimits::default()
             },
         );
         assert!(
@@ -2490,6 +2563,7 @@ mod tests {
             &encoded,
             DecodeLimits {
                 max_output: Some(2000),
+                ..DecodeLimits::default()
             },
         )
         .unwrap();
@@ -2513,6 +2587,7 @@ mod tests {
             &lzw_bytes,
             DecodeLimits {
                 max_output: Some(100),
+                ..DecodeLimits::default()
             },
         );
         assert!(

@@ -1617,6 +1617,7 @@ fn main() {
             &args.password,
             filters::DecodeLimits {
                 max_output: args.decode_memory_limit,
+                ..filters::DecodeLimits::default()
             },
         )
     } else if args.list_attachments {
@@ -2050,6 +2051,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             &cmd.password,
             filters::DecodeLimits {
                 max_output: cmd.decode_memory_limit,
+                ..filters::DecodeLimits::default()
             },
         ),
         Commands::CheckLinearization(cmd) => match check_linearization_path(&cmd.input) {

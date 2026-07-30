@@ -1,7 +1,17 @@
 use flpdf::filters::{
-    decode_stream_data, decode_stream_data_recovering, encode_stream_data, StreamDecodeEvent,
+    decode_stream_data, decode_stream_data_recovering, decode_stream_data_recovering_with_limits,
+    encode_stream_data, DecodeLimits, StreamDecodeEvent,
 };
 use flpdf::{Dictionary, Object};
+
+fn asciihex_dictionary(stages: usize) -> Dictionary {
+    let mut dictionary = Dictionary::new();
+    dictionary.insert(
+        "Filter",
+        Object::Array(vec![Object::Name(b"ASCIIHexDecode".to_vec()); stages]),
+    );
+    dictionary
+}
 
 fn error_then_finish_warning_dictionary() -> Dictionary {
     let mut dictionary = Dictionary::new();
@@ -19,6 +29,40 @@ fn odd_nibble_error_dictionary() -> Dictionary {
     let mut dictionary = Dictionary::new();
     dictionary.insert("Filter", Object::Name(b"AHx".to_vec()));
     dictionary
+}
+
+#[test]
+fn recovering_limits_keep_default_chain_cap_but_allow_explicit_unlimited_chain() {
+    let one_stage = asciihex_dictionary(1);
+    let dictionary = asciihex_dictionary(17);
+    let original = b"A";
+    let mut encoded = original.to_vec();
+    for _ in 0..17 {
+        encoded = encode_stream_data(&one_stage, &encoded).unwrap();
+    }
+
+    assert_eq!(
+        decode_stream_data_recovering(&dictionary, &encoded)
+            .unwrap_err()
+            .to_string(),
+        "unsupported PDF feature: filter chain length 17 exceeds maximum of 16"
+    );
+
+    let outcome = decode_stream_data_recovering_with_limits(
+        &dictionary,
+        &encoded,
+        DecodeLimits {
+            max_output: None,
+            max_filter_chain: None,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(outcome.data, original);
+    assert!(matches!(
+        &outcome.events[..],
+        [StreamDecodeEvent::Data(data)] if data == original
+    ));
 }
 
 fn downstream_data_before_upstream_error_dictionary() -> Dictionary {
