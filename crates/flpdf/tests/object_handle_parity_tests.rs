@@ -770,6 +770,24 @@ fn stream_dictionary_parsed_offset_survives_resolve_set_object_round_trip() {
     assert_eq!(dict_offset_before, dict_offset_after);
 }
 
+/// `Object::Operator`/`Object::InlineImage` are content-stream-only tokens
+/// that no caller sets a resolved object to in practice, but `set_object`'s
+/// signature does not forbid it (it accepts any `Object`). `Pdf::lift`
+/// falls back to `ObjectValue::Null` for both, matching how an unknown
+/// reference resolves.
+#[test]
+fn set_object_with_a_content_stream_only_token_materializes_to_null() {
+    let file = File::open(minimal_fixture_path()).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    let object_ref = pdf.root_ref().expect("root");
+
+    pdf.set_object(object_ref, Object::Operator(b"q".to_vec()));
+    assert_eq!(pdf.resolve(object_ref).unwrap(), Object::Null);
+
+    pdf.set_object(object_ref, Object::InlineImage(b"data".to_vec()));
+    assert_eq!(pdf.resolve(object_ref).unwrap(), Object::Null);
+}
+
 /// Regression for `Pdf::delete_object`'s own handle-graph write-through:
 /// resolving an already-resolved, then-deleted ref must observe
 /// `Object::Null` afterward, not the stale pre-delete value the handle graph

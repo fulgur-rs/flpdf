@@ -813,7 +813,7 @@ mod materialize_tests {
     fn a_dictionary_materializes_its_entries_by_key() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         let Object::Dictionary(materialized) = dict.materialize() else {
-            panic!("expected a dictionary");
+            panic!("expected a dictionary"); // cov:ignore: unreachable in a passing run
         };
         assert_eq!(materialized.get("A"), Some(&Object::Integer(1)));
     }
@@ -828,7 +828,7 @@ mod materialize_tests {
         });
 
         let Object::Stream(materialized) = stream.materialize() else {
-            panic!("expected a stream");
+            panic!("expected a stream"); // cov:ignore: unreachable in a passing run
         };
         assert_eq!(materialized.data, b"Hello");
         assert_eq!(materialized.dict.get("Length"), Some(&Object::Integer(5)));
