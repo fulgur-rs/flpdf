@@ -127,33 +127,76 @@ pub(crate) fn dictionary_value_source_offset(
         return Ok(None);
     }
 
+    // qpdf's dictionary parser keeps the last occurrence of a repeated key
+    // (plain map insertion), so this locator must scan the whole dictionary
+    // rather than returning at the first match.
+    let mut value_offset = None;
     loop {
         let key_token = parser.next_token()?;
         if key_token.token_type == TokenType::DictClose {
-            return Ok(None);
+            return Ok(value_offset);
         }
         if key_token.token_type != TokenType::Name {
             return Err(Error::parse(key_token.start, "expected dictionary key"));
         }
-        if key_token.value.strip_prefix(b"/") == Some(key) {
-            let first = parser.peek_token()?;
-            if first.token_type != TokenType::ArrayOpen {
-                return Ok(Some(first.start));
-            }
-            let _ = parser.next_token()?;
-            for index in 0.. {
-                let item = parser.peek_token()?;
-                if item.token_type == TokenType::ArrayClose {
-                    return Ok(None);
-                }
-                let item_start = parser.position();
-                let _ = parser.object()?;
-                if index == array_index {
-                    return Ok(Some(item_start));
-                }
-            }
+        if key_token.value.strip_prefix(b"/") != Some(key) {
+            let _ = parser.object()?;
+            continue;
         }
+
+        let first = parser.peek_token()?;
+        if first.token_type != TokenType::ArrayOpen {
+            value_offset = Some(first.start);
+            let _ = parser.object()?;
+            continue;
+        }
+
+        let _ = parser.next_token()?;
+        let mut item_offset = None;
+        let mut index = 0usize;
+        loop {
+            let item = parser.peek_token()?;
+            if item.token_type == TokenType::ArrayClose {
+                let _ = parser.next_token()?;
+                break;
+            }
+            let item_start = parser.position();
+            let _ = parser.object()?;
+            if index == array_index {
+                item_offset = Some(item_start);
+            }
+            index += 1;
+        }
+        value_offset = item_offset;
+    }
+}
+
+/// Return the source offset of the item at `array_index` in a top-level
+/// array body (e.g. an indirect object whose direct value is an array).
+///
+/// `Ok(None)` covers both "not an array" and "array too short" — qpdf's
+/// warning is simply omitted in both cases, so no error is raised.
+#[cfg(feature = "qtest-driver")]
+pub(crate) fn array_item_source_offset(input: &[u8], array_index: usize) -> Result<Option<usize>> {
+    let mut tokenizer = Tokenizer::new(input);
+    let mut parser = Parser::with_tokenizer(&mut tokenizer);
+    let open = parser.next_token()?;
+    if open.token_type != TokenType::ArrayOpen {
+        return Ok(None);
+    }
+
+    let mut index = 0usize;
+    loop {
+        let item = parser.peek_token()?;
+        if item.token_type == TokenType::ArrayClose {
+            return Ok(None);
+        }
+        let item_start = parser.position();
         let _ = parser.object()?;
+        if index == array_index {
+            return Ok(Some(item_start));
+        }
+        index += 1;
     }
 }
 
@@ -875,6 +918,33 @@ mod stream_length_tests {
             .windows(b"42".len())
             .position(|window| window == b"42")
             .expect("array item");
+        assert_eq!(
+            dictionary_value_source_offset(input, b"DecodeParms", 1).unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[cfg(feature = "qtest-driver")]
+    #[test]
+    fn dictionary_value_offset_keeps_last_duplicate_key_scalar_and_array() {
+        // qpdf's dictionary parser is plain map insertion, so a repeated key
+        // keeps only the last occurrence; the DecodeParms locator must match
+        // that instead of stopping at the first match.
+        let input = b"<< /DecodeParms << >> /DecodeParms 42 >>";
+        let expected = input
+            .windows(b"42".len())
+            .position(|window| window == b"42")
+            .expect("scalar override");
+        assert_eq!(
+            dictionary_value_source_offset(input, b"DecodeParms", 0).unwrap(),
+            Some(expected)
+        );
+
+        let input = b"<< /DecodeParms [ 1 ] /DecodeParms [ null 42 ] >>";
+        let expected = input
+            .windows(b"42".len())
+            .rposition(|window| window == b"42")
+            .expect("array override");
         assert_eq!(
             dictionary_value_source_offset(input, b"DecodeParms", 1).unwrap(),
             Some(expected)
