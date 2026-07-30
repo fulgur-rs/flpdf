@@ -147,9 +147,6 @@ pub(crate) mod qpdf_null;
 #[cfg(feature = "qtest-driver")]
 #[doc(hidden)]
 pub mod qtest_string;
-#[cfg(feature = "qtest-driver")]
-#[doc(hidden)]
-pub mod qtest_tokenizer;
 pub mod reader;
 pub(crate) mod ref_chain;
 mod resource_finder;
@@ -164,7 +161,11 @@ pub mod struct_tree_pg;
 pub mod subset_prune;
 pub mod thread_bead_p;
 pub(crate) mod token_filter;
+#[cfg(not(feature = "qtest-driver"))]
 pub(crate) mod tokenizer;
+#[cfg(feature = "qtest-driver")]
+#[doc(hidden)]
+pub mod tokenizer;
 pub mod writer;
 pub mod xref;
 pub mod xref_entry;

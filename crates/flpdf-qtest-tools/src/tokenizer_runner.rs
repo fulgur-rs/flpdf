@@ -5,7 +5,7 @@ use std::io;
 
 use flpdf::filters::{self, DecodeLimits};
 use flpdf::pages::{page_content_bytes, page_refs};
-use flpdf::qtest_tokenizer::{TokenType, Tokenizer};
+use flpdf::tokenizer::{TokenType, Tokenizer};
 use flpdf::{Object, Pdf, PdfOpenOptions};
 
 /// Outcome produced by the tokenizer runner.
