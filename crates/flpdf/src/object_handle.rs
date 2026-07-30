@@ -235,12 +235,12 @@ impl ObjectHandle {
         })
     }
 
-    /// True if this handle is a direct null value, or if it is an indirect
-    /// handle whose value is not currently known without resolving it — an
-    /// unread indirect handle is treated as null until it is actually
-    /// looked up.
+    /// True if this handle is a direct null value. An indirect handle whose
+    /// value is not yet known returns `false` here, matching qpdf's
+    /// `isDirectNull` (`libqpdf/QPDFObjectHandle.cc`) rather than assuming
+    /// null for anything unresolved.
     pub fn is_null(&self) -> bool {
-        self.with_value(|value| matches!(value, Some(ObjectValue::Null) | None))
+        self.with_value(|value| matches!(value, Some(ObjectValue::Null)))
     }
 
     /// The value as `i64` if this handle is a direct integer value, or
@@ -394,13 +394,14 @@ mod object_value_tests {
     }
 
     #[test]
-    fn accessors_return_none_or_null_for_an_indirect_handle_before_resolution() {
+    fn accessors_return_none_for_an_indirect_handle_before_resolution() {
         // `with_value` never performs hidden I/O to resolve an indirect
         // handle (design, `Pdf` section), so today every indirect handle
         // reads as "value not known" — surfaced as `None` from the typed
-        // accessors, and folded into `true` by `is_null` (see its doc).
+        // accessors. `is_null` is not an exception: an unresolved indirect
+        // handle is not assumed to be null (matches qpdf's `isDirectNull`).
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
-        assert!(handle.is_null());
+        assert!(!handle.is_null());
         assert_eq!(handle.as_integer(), None);
         assert!(handle.as_array().is_none());
         assert!(handle.as_dictionary().is_none());
