@@ -1217,18 +1217,31 @@ impl<R: Read + Seek> Pdf<R> {
         self.qpdf_dangling_refs.remove(&object_ref);
         self.recovered_stream_eols.remove(&object_ref);
         self.transformed_stream_refs.remove(&object_ref);
-        if object_ref.number == 0
-            || matches!(
-                self.cache.entry(object_ref),
-                Some(CacheEntry::Deleted | CacheEntry::Missing)
-            )
-        {
+        if object_ref.number == 0 {
+            return;
+        }
+
+        // Invalidate the handle-graph bridge state unconditionally, before
+        // the cache-state early return below: `Pdf::prepare_qpdf_json_objects`
+        // can mark a ref's cache entry `Missing` (discovered as a dangling
+        // reference from a live object's own content) before any handle for
+        // it has ever been created via `Pdf::get_object_handle`. If the two
+        // lines below ran only past the early return, that combination
+        // (cache already `Missing`, handle still `NotYetResolved`) would
+        // skip them entirely, leaving a stale-but-unresolved handle whose
+        // correctness would then depend on `Pdf::resolve_object_handle`'s
+        // fallback arm staying a wildcard forever.
+        self.legacy_materialized_memo.remove(&object_ref);
+        self.get_object_handle(object_ref).set_missing();
+
+        if matches!(
+            self.cache.entry(object_ref),
+            Some(CacheEntry::Deleted | CacheEntry::Missing)
+        ) {
             return;
         }
         self.cache.set_deleted(object_ref);
         self.dirty_object_refs.insert(object_ref);
-        self.legacy_materialized_memo.remove(&object_ref);
-        self.get_object_handle(object_ref).set_missing();
     }
 
     pub(crate) fn source_bytes(&mut self) -> Result<Vec<u8>> {
@@ -1555,12 +1568,19 @@ impl<R: Read + Seek> Pdf<R> {
     // not attempt to rederive (recovery/decryption stay entirely on the
     // untouched legacy path).
     //
-    // Known, recorded gap: a native-parsed `ObjectValue::String` carries the
-    // *raw* (possibly still-encrypted) source bytes, not `object`'s
-    // already-decrypted string value (`ObjectValue::Name` has no such gap:
-    // PDF names are never encrypted regardless of path). No accessor reads
-    // decrypted string content off a handle yet (that lands with a later
-    // task's consumer cutover), so this is not yet output-visible.
+    // A native-parsed `ObjectValue::String` carries the *raw* (possibly
+    // still-encrypted) source bytes, not `object`'s already-decrypted string
+    // value (`ObjectValue::Name` has no such gap: PDF names are never
+    // encrypted regardless of path). This is real, output-visible ciphertext
+    // unless corrected: `Pdf::resolve_borrowed`'s `decrypt_materialized_strings`
+    // is the accessor that corrects it, applying `decrypt_object_strings` to
+    // the materialized `Object` for exactly a handle populated via this
+    // function (gated on the handle's own non-sentinel parsed offset, which
+    // only this function's success path sets). Do not remove or weaken that
+    // gate without re-deriving this fix: doing so silently reintroduces
+    // ciphertext leaking through the public `resolve`/`resolve_borrowed` API
+    // for any encrypted document whose `/Info` (or any other string-bearing
+    // dictionary) is not object-stream-compressed.
     //
     // `read_bounded_object_window` reads only the fast "bounded to the next
     // object's offset" window, not `read_object_at_with_policy`'s rare
@@ -1837,6 +1857,20 @@ impl<R: Read + Seek> Pdf<R> {
             // alive at once for a single `set_object` + `resolve_borrowed`
             // round trip. `borrowed_qpdf_resolution_preserves_historical_stream_fallback_without_clone`
             // is the regression test for this.
+            //
+            // Correctness here rests on an invariant spanning three
+            // functions that mutate `self.cache` and `self.handle_registry`
+            // independently: whenever a sentinel-offset handle resolves to
+            // `ObjectValue::Stream`, `self.cache`'s entry for the same ref
+            // must already be the value-equal `Object::Stream` that handle
+            // was lifted from (true for `set_object`'s write-through and for
+            // `resolve_object_handle`'s native-parse-failure fallback, both
+            // of which lift directly from the same `object` that is — or
+            // was just — written into `self.cache`). A future edit to
+            // `Pdf::lift`, `Pdf::set_object`, or `Pdf::resolve_object_handle`
+            // that breaks this pairing would only be caught by the
+            // no-extra-clone regression test above if it also happened to
+            // change the pointer; a value-only divergence would not be.
             if handle.get_parsed_offset() < 0 {
                 if let Some(CacheEntry::Resolved(cached @ Object::Stream(_))) =
                     self.cache.entry(object_ref)
@@ -5392,5 +5426,82 @@ mod tests {
             None,
             "a transformed stream's recovered EOL belongs to ciphertext framing and must stay masked"
         );
+    }
+
+    /// `Pdf::prepare_qpdf_json_objects` can mark a ref's cache entry
+    /// `Missing` (discovered as a dangling reference from a live object's
+    /// own content) before `Pdf::get_object_handle` has ever been called for
+    /// it. `Pdf::delete_object` must still invalidate the handle-graph
+    /// bridge state (the memo entry and the handle itself) in that case, not
+    /// only when the cache entry was already `Deleted`/`Missing` via a prior
+    /// `delete_object` call — pinned here so a later narrowing of
+    /// `resolve_object_handle`'s fallback wildcard arm (the one thing this
+    /// self-healed silently through before this test existed) gets caught
+    /// instead of silently regressing.
+    #[test]
+    fn delete_object_invalidates_bridge_state_for_a_dangling_ref_seeded_only_via_cache() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog /Dangling 99 0 R >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open dangling-ref fixture");
+        let dangling_ref = ObjectRef::new(99, 0);
+
+        pdf.prepare_qpdf_json_objects()
+            .expect("discover the dangling reference");
+        assert!(
+            matches!(pdf.cache.entry(dangling_ref), Some(CacheEntry::Missing)),
+            "prepare_qpdf_json_objects must have seeded the cache as Missing"
+        );
+        assert!(
+            !pdf.handle_registry.contains_key(&dangling_ref),
+            "no handle must exist yet for this ref"
+        );
+
+        pdf.delete_object(dangling_ref);
+
+        assert_eq!(pdf.resolve_borrowed(dangling_ref).unwrap(), &Object::Null);
+    }
+
+    /// `Pdf::resolve_borrowed` now returns the *native*-parsed dictionary
+    /// value for a plain Uncompressed object (via `Pdf::materialize`) rather
+    /// than the legacy-resolved one, for the first time. The native
+    /// `dictionary_handle` parser (`parser.rs`) and the legacy
+    /// `Parser::dictionary` are two independently maintained left-to-right
+    /// `BTreeMap::insert` passes over the same token stream; this pins that
+    /// they still agree on a duplicate dictionary key (last write wins),
+    /// rather than relying on that being merely "true today, unverified".
+    #[test]
+    fn native_and_legacy_dictionary_parsers_agree_on_a_duplicate_key() {
+        let body: &[u8] = b"1 0 obj\n<< /A 1 /A 2 /B 3 >>\nendobj\n";
+        let object_ref = ObjectRef::new(1, 0);
+
+        // Legacy-only path: `resolve_qpdf_json_object` reads straight from
+        // `self.cache` (`resolve_to_cache`'s own output), entirely
+        // independent of the `ObjectHandle` bridge this task adds.
+        let mut legacy_pdf =
+            Pdf::open_mem_owned(classic_pdf_with_bodies(&[body], object_ref)).expect("open");
+        let legacy = legacy_pdf
+            .resolve_qpdf_json_object(object_ref)
+            .expect("legacy resolve");
+
+        // Bridge path: `resolve` materializes from a *native* parse of the
+        // same source bytes (`native_parse_uncompressed_value`), a separate
+        // `BTreeMap`-building pass over the identical duplicate-key
+        // dictionary token stream.
+        let mut native_pdf =
+            Pdf::open_mem_owned(classic_pdf_with_bodies(&[body], object_ref)).expect("open");
+        let native = native_pdf.resolve(object_ref).expect("bridge resolve");
+
+        assert_eq!(legacy, native);
+        let Object::Dictionary(dict) = &legacy else {
+            panic!("fixture body is always a dictionary"); // cov:ignore: unreachable
+        };
+        assert_eq!(
+            dict.get("A"),
+            Some(&Object::Integer(2)),
+            "last write wins for a duplicate key"
+        );
+        assert_eq!(dict.get("B"), Some(&Object::Integer(3)));
     }
 }
