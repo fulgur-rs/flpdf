@@ -660,7 +660,7 @@ bash scripts/qpdf-test-driver-diff.sh --check
 Expected final differential line:
 
 ```text
-qpdf and flpdf test_driver outputs match 46 fixtures and 11 CLI probes
+qpdf and flpdf test_driver outputs match 47 fixtures and 11 CLI probes
 ```
 
 - [ ] **Step 7: Commit production wiring and oracle fixture**
@@ -773,7 +773,7 @@ bash tests/fixtures/test_driver/generate.sh --check
 bash scripts/qpdf-test-driver-diff.sh --check
 ```
 
-Expected: all pass and the differential reports 46 fixtures plus 11 CLI probes.
+Expected: all pass and the differential reports 47 fixtures plus 11 CLI probes.
 
 - [ ] **Step 3: Run workspace lint and all-feature tests**
 
@@ -824,7 +824,7 @@ If a line is uncovered, add a behaviorally meaningful focused test, run its RED 
 Append a note to `flpdf-n9t0.2` naming:
 
 ```text
-the final commit, 46 fixtures + 11 probes, non-UTF-8 Unix valid/missing path tests,
+the final commit, 47 fixtures + 11 probes, non-UTF-8 Unix valid/missing path tests,
 workspace fmt/clippy/tests, strict rustdoc, module docs, exact fresh coverage
 numerators, and flpdf-n9t0.10 as the TIFF follow-up
 ```
@@ -910,7 +910,7 @@ Fixed with an explicit driver policy rather than removing library hardening:
 DecodeLimits now defaults to max_filter_chain=Some(16), while test_driver test
 0/1 alone passes None to the ordered recovering API. The new flpdf-authored
 17-stage ASCIIHex fixture matches pinned qpdf 11.9.0; the full differential is
-46 fixtures + 11 CLI probes, and the default public API still rejects 17.
+47 fixtures + 11 CLI probes, and the default public API still rejects 17.
 ```
 
 Do not resolve the thread.

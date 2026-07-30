@@ -151,7 +151,7 @@ Acceptance must cover:
   to the generator and qpdf differential inventory.
 - Its `.out` is generated only from pinned qpdf 11.9.0.
 - The original filter-chain follow-up increases the inventory from 37 to 38
-  fixtures; the shared final-wave manifest contains 46 fixtures and 11 CLI
+  fixtures; the shared final-wave manifest contains 47 fixtures and 11 CLI
   probes.
 - The Rust driver matches qpdf merged output and exit status exactly.
 

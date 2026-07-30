@@ -2,6 +2,7 @@ repairable_input
 open_repair_failure
 empty_reconstructed_xref
 missing_pdf_header
+leading_material_pdf_header
 missing_startxref
 implicit_null
 direct_null

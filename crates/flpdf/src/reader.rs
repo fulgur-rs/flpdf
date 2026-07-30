@@ -51,6 +51,10 @@ static NULL_OBJECT: Object = Object::Null;
 /// ```
 pub struct Pdf<R: Read + Seek> {
     reader: R,
+    /// Physical byte position corresponding to qpdf's logical input offset 0.
+    /// This is nonzero only when repair found a valid header after leading
+    /// material in the first 1024 bytes.
+    header_offset: usize,
     version: String,
     trailer: Dictionary,
     startxref: u64,
@@ -562,6 +566,7 @@ impl<R: Read + Seek> Pdf<R> {
         let cache = ObjectCache::from_offsets(&loaded.entries);
         let mut pdf = Self {
             reader,
+            header_offset: loaded_state.header_offset,
             version: loaded.version,
             trailer: loaded.trailer,
             startxref: loaded.startxref,
@@ -877,8 +882,15 @@ impl<R: Read + Seek> Pdf<R> {
         self.source_xref_entries.clone()
     }
 
-    /// Return the absolute byte offset of an indirect stream's encoded data in
-    /// the original input.
+    pub(crate) fn source_header_offset(&self) -> usize {
+        self.header_offset
+    }
+
+    /// Return the qpdf-logical byte offset of an indirect stream's encoded data.
+    ///
+    /// This is normally the absolute offset in the original input. When repair
+    /// finds a valid PDF header after leading material, qpdf treats that header
+    /// as logical offset zero, and this method follows that origin.
     ///
     /// This uses the source xref entry and the same indirect-object parser as
     /// normal resolution, so `stream` text inside strings, names, comments, or
@@ -894,6 +906,10 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(None);
         };
         Ok(Some(offset.saturating_add(data_start as u64)))
+    }
+
+    fn physical_source_offset(&self, logical_offset: u64) -> u64 {
+        (self.header_offset as u64).saturating_add(logical_offset)
     }
 
     /// Return the source offset of the `/DecodeParms` value paired with one
@@ -915,7 +931,8 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(None);
         };
         let next = self.next_object_offset(offset);
-        self.reader.seek(SeekFrom::Start(offset))?;
+        let physical_offset = self.physical_source_offset(offset);
+        self.reader.seek(SeekFrom::Start(physical_offset))?;
         let mut bytes = Vec::new();
         match next {
             Some(next) => self
@@ -946,7 +963,8 @@ impl<R: Read + Seek> Pdf<R> {
 
     fn parse_source_file_object_at(&mut self, offset: u64) -> Result<PendingFileObject> {
         let next = self.next_object_offset(offset);
-        self.reader.seek(SeekFrom::Start(offset))?;
+        let physical_offset = self.physical_source_offset(offset);
+        self.reader.seek(SeekFrom::Start(physical_offset))?;
         let mut bytes = Vec::new();
         match next {
             Some(next) => self
@@ -961,7 +979,7 @@ impl<R: Read + Seek> Pdf<R> {
             Ok(pending) => Ok(pending),
             Err(window_error) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
                 self.resolution_fallbacks_remaining -= 1;
-                self.reader.seek(SeekFrom::Start(offset))?;
+                self.reader.seek(SeekFrom::Start(physical_offset))?;
                 let mut full = Vec::new();
                 self.reader.read_to_end(&mut full)?;
                 parse_file_object_syntax(&full).or(Err(window_error))
@@ -1269,7 +1287,8 @@ impl<R: Read + Seek> Pdf<R> {
         full_policy: RecoveryPolicy,
     ) -> Result<file_object::FileObjectRead> {
         let next = self.next_object_offset(offset);
-        self.reader.seek(SeekFrom::Start(offset))?;
+        let physical_offset = self.physical_source_offset(offset);
+        self.reader.seek(SeekFrom::Start(physical_offset))?;
         let mut bytes = Vec::new();
         match next {
             Some(next) => {
@@ -1292,7 +1311,7 @@ impl<R: Read + Seek> Pdf<R> {
             Ok(parsed) => Ok(parsed),
             Err(window_err) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
                 self.resolution_fallbacks_remaining -= 1;
-                self.reader.seek(SeekFrom::Start(offset))?;
+                self.reader.seek(SeekFrom::Start(physical_offset))?;
                 let mut full = Vec::new();
                 self.reader.read_to_end(&mut full)?;
                 self.parse_and_finish_file_object(expected_ref, &full, offset, full_policy)

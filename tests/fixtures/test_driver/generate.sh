@@ -112,6 +112,7 @@ write(
     "missing_pdf_header",
     build_pdf(b"true", {}).replace(b"%PDF-1.7\n", b"notpdf!!\n", 1),
 )
+write("leading_material_pdf_header", b"leading material\n" + build_pdf(b"true", {}))
 write("missing_startxref", build_pdf(b"true", {}, omit_startxref=True))
 write("implicit_null", build_pdf(None, {}))
 write("direct_null", build_pdf(b"null", {}))

@@ -1,6 +1,7 @@
 use flpdf::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
-    Diagnostics, Dictionary, Error, LoadedXref, ObjectRef, XrefEntry, XrefForm,
+    write_pdf, Diagnostics, Dictionary, Error, LoadedXref, Object, ObjectRef, Pdf, PdfOpenOptions,
+    XrefEntry, XrefForm,
 };
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -1333,6 +1334,87 @@ fn repair_missing_header_uses_version_1_2_and_preserves_strict_rejection() {
     assert_eq!(
         strict.to_string(),
         "parse error at byte 0: missing PDF header"
+    );
+}
+
+#[test]
+fn repair_finds_a_valid_header_in_the_first_1024_bytes_and_uses_it_as_origin() {
+    let mut logical_pdf = b"%PDF-1.7\n".to_vec();
+    logical_pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref_offset = logical_pdf.len();
+    logical_pdf.extend_from_slice(
+        b"xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n\
+          trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n",
+    );
+    logical_pdf.extend_from_slice(format!("{xref_offset}\n%%EOF\n").as_bytes());
+
+    // qpdf accepts a pattern whose first byte is still inside [0, 1024).
+    let mut bytes = vec![b'x'; 1023];
+    bytes.extend_from_slice(&logical_pdf);
+
+    let loaded =
+        load_xref_and_trailer_best_effort(&mut Cursor::new(bytes.clone())).expect("repair header");
+    assert_eq!(loaded.version, "1.7");
+    assert!(loaded.repair_diagnostics.entries().is_empty());
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefEntry::Uncompressed { offset: 9 })
+    );
+
+    let mut pdf = Pdf::open_mem_owned_with_options(
+        bytes.clone(),
+        PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("open with qpdf header origin");
+    let root = pdf.root_ref().expect("root reference");
+    assert!(pdf.resolve(root).expect("resolve root").as_dict().is_some());
+
+    pdf.set_object(root, Object::Boolean(false));
+    let mut rewritten = Vec::new();
+    write_pdf(&mut pdf, &mut rewritten).expect("incremental write");
+    assert!(
+        rewritten.starts_with(&bytes),
+        "incremental output preserves the physical source prefix"
+    );
+    let mut reopened = Pdf::open_mem_owned_with_options(
+        rewritten,
+        PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("reopen incremental output");
+    assert!(
+        reopened.repair_diagnostics().entries().is_empty(),
+        "header-relative incremental xref must not require repair"
+    );
+    assert_eq!(
+        reopened
+            .resolve(root)
+            .expect("resolve rewritten root")
+            .as_bool(),
+        Some(false)
+    );
+
+    let strict = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect_err("strict loading keeps the ordinary start-at-zero boundary");
+    assert_eq!(
+        strict.to_string(),
+        "parse error at byte 0: missing PDF header"
+    );
+
+    // A pattern beginning exactly at byte 1024 is outside qpdf's search range.
+    let mut outside_search_range = vec![b'x'; 1024];
+    outside_search_range.extend_from_slice(&logical_pdf);
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(outside_search_range))
+        .expect("repair without an in-range header");
+    assert_eq!(loaded.version, "1.2");
+    assert_eq!(
+        loaded.repair_diagnostics.entries().first(),
+        Some(&flpdf::Diagnostic::warning("can't find PDF header", None))
     );
 }
 

@@ -36,9 +36,11 @@ Ordinary flpdf decode continues rejecting `/Crypt`.
 `stream_lzw_nondict_decode_parms_array` pin qpdf's two type warnings at the
 non-dictionary parameter token before decoded output.
 
-`missing_pdf_header`, `missing_startxref`, and
+`missing_pdf_header`, `leading_material_pdf_header`, `missing_startxref`, and
 `dict_indirect_value_warning` pin repair-warning lifecycle and the lazy
-dictionary-child diagnostic boundary.
+dictionary-child diagnostic boundary. The leading-material fixture keeps xref
+offsets relative to the valid header and pins qpdf's first-1024-byte search plus
+logical input origin.
 
 `stream_asciihex_odd_nibble_recovery` decodes `4G ` through `/AHx`. ASCIIHex
 reports the invalid `G` during `write`, then its cleanup flushes the pending
