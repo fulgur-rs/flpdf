@@ -159,10 +159,7 @@ fn process(
 
     let page_refs = page_refs(&mut pdf).map_err(|e| e.to_string())?;
     for (pageno, page_ref) in page_refs.iter().enumerate() {
-        let content = match page_content_bytes(&mut pdf, *page_ref) {
-            Ok(c) => c,
-            Err(_) => Vec::new(),
-        };
+        let content = page_content_bytes(&mut pdf, *page_ref).unwrap_or_default();
         let label = format!("PAGE {}", pageno + 1);
         dump_tokens(
             &content,
