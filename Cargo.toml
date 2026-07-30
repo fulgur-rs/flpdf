@@ -30,10 +30,10 @@ assert_cmd = "2"
 predicates = "3"
 regex = "1"
 tempfile = "3"
-aes = "0.8"
-cbc = { version = "0.1", features = ["block-padding"] }
-md-5 = "0.10"
-sha2 = "0.10"
+aes = "0.9"
+cbc = { version = "0.2", features = ["block-padding"] }
+md-5 = "0.11"
+sha2 = "0.11"
 stringprep = "0.1"
 hex = "0.4"
 libc = "0.2"
@@ -45,4 +45,4 @@ same-file = "1"
 # (Linux getrandom(2), macOS SecRandomCopyBytes, Windows BCryptGenRandom).
 # Already present as a transitive dep via tempfile/etc — direct declaration
 # is free build-closure-wise.
-getrandom = "0.2"
+getrandom = "0.4"
