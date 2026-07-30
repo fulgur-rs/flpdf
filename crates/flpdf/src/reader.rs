@@ -1416,6 +1416,16 @@ impl<R: Read + Seek> Pdf<R> {
     // PDF names are never encrypted regardless of path). No accessor reads
     // decrypted string content off a handle yet (that lands with a later
     // task's consumer cutover), so this is not yet output-visible.
+    //
+    // Known, recorded gap: `read_bounded_object_window` reads only the fast
+    // "bounded to the next object's offset" window, not
+    // `read_object_at_with_policy`'s rare full-file fallback for a malformed
+    // or overlapping source xref layout. Since `resolve_to_cache` above
+    // always resolves via *some* window before this runs, the only way this
+    // native reparse can fail here is if resolving `object` needed that rare
+    // fallback — in which case this returns an error where `resolve_borrowed`
+    // would have succeeded. Not reproduced by this task's test fixtures (it
+    // requires a deliberately malformed/overlapping xref layout to trigger).
     fn native_parse_uncompressed_value(
         &mut self,
         offset: u64,
