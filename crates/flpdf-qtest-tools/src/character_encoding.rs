@@ -176,10 +176,10 @@ mod tests {
         fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
             Err(io::Error::other("authored write failure"))
         }
-
+        // cov:ignore-start: the runner only calls write_all; flush exists solely to satisfy Write
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
-        }
+        } // cov:ignore-end
     }
 
     fn args(program: &str, input: &Path) -> Vec<OsString> {
@@ -217,7 +217,7 @@ mod tests {
         );
 
         let RunOutcome::Abort(message) = outcome else {
-            panic!("missing input must request abort");
+            panic!("missing input must request abort"); // cov:ignore: assertion failure guard
         };
         assert!(message.starts_with(
             b"terminate called after throwing an instance of 'QPDFSystemError'\n  what():  open "
