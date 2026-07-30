@@ -148,7 +148,11 @@ pub(crate) mod qpdf_null;
 #[doc(hidden)]
 pub mod qtest_string;
 pub mod reader;
+#[cfg(not(feature = "qtest-driver"))]
 pub(crate) mod ref_chain;
+#[cfg(feature = "qtest-driver")]
+#[doc(hidden)]
+pub mod ref_chain;
 mod resource_finder;
 mod resource_replacer;
 pub mod resources;

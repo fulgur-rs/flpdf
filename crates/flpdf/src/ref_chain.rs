@@ -23,7 +23,7 @@ pub(crate) const MAX_REF_CHAIN_DEPTH: usize = 64;
 /// against, an indirect target). A cyclic / over-deep chain terminates at the
 /// bound and yields the last resolved value, so a hostile target cannot loop
 /// forever.
-pub(crate) fn resolve_ref_chain<R: Read + Seek>(
+pub fn resolve_ref_chain<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: &Object,
 ) -> Result<(Object, Option<ObjectRef>)> {

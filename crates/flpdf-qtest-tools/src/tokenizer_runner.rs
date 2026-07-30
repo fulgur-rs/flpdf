@@ -207,12 +207,14 @@ fn process(
 }
 
 fn resolve_objstm_type(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, dict: &flpdf::Dictionary) -> bool {
-    match dict.get(b"Type") {
-        Some(Object::Name(n)) => n == b"ObjStm",
-        Some(Object::Reference(r)) => match pdf.resolve(*r) {
-            Ok(Object::Name(ref n)) => n == b"ObjStm",
-            _ => false,
-        },
+    let Some(type_val) = dict.get(b"Type") else {
+        return false;
+    };
+    // /Type may be reached through a holder chain of two or more indirect
+    // references, not just one hop; resolve_ref_chain follows it to the
+    // terminal value the same way every other flpdf consumer does.
+    match flpdf::ref_chain::resolve_ref_chain(pdf, type_val) {
+        Ok((Object::Name(n), _)) => n == b"ObjStm",
         _ => false,
     }
 }
@@ -359,7 +361,58 @@ fn find_endstream(input: &[u8], start: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use flpdf::filters::StreamDecodeWarning;
-    use flpdf::Error;
+    use flpdf::{Dictionary, Error, ObjectRef};
+
+    fn open_minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let bytes: &[u8] = b"%PDF-1.4\n\
+            1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+            2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n\
+            xref\n0 3\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n\
+            trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n110\n%%EOF\n";
+        Pdf::open(std::io::Cursor::new(bytes.to_vec())).expect("parse minimal PDF")
+    }
+
+    #[test]
+    fn resolve_objstm_type_true_for_direct_name() {
+        let mut pdf = open_minimal_pdf();
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
+        assert!(resolve_objstm_type(&mut pdf, &dict));
+    }
+
+    #[test]
+    fn resolve_objstm_type_true_for_single_hop_reference() {
+        let mut pdf = open_minimal_pdf();
+        pdf.set_object(ObjectRef::new(100, 0), Object::Name(b"ObjStm".to_vec()));
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Reference(ObjectRef::new(100, 0)));
+        assert!(resolve_objstm_type(&mut pdf, &dict));
+    }
+
+    #[test]
+    fn resolve_objstm_type_true_for_two_hop_reference_chain() {
+        // Regression test: /Type may be reached through a holder chain of
+        // more than one indirect reference (100 -> 101 -> /ObjStm), which a
+        // single pdf.resolve() call does not follow.
+        let mut pdf = open_minimal_pdf();
+        pdf.set_object(
+            ObjectRef::new(100, 0),
+            Object::Reference(ObjectRef::new(101, 0)),
+        );
+        pdf.set_object(ObjectRef::new(101, 0), Object::Name(b"ObjStm".to_vec()));
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Reference(ObjectRef::new(100, 0)));
+        assert!(resolve_objstm_type(&mut pdf, &dict));
+    }
+
+    #[test]
+    fn resolve_objstm_type_false_for_other_name_or_missing_type() {
+        let mut pdf = open_minimal_pdf();
+        let mut other = Dictionary::new();
+        other.insert("Type", Object::Name(b"XRef".to_vec()));
+        assert!(!resolve_objstm_type(&mut pdf, &other));
+        assert!(!resolve_objstm_type(&mut pdf, &Dictionary::new()));
+    }
 
     #[test]
     fn find_endstream_finds_word_at_start() {
