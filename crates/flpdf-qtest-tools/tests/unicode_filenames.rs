@@ -74,11 +74,14 @@ fn happy_path_creates_unicode_filenames() {
     }
 }
 
-/// qpdf `qpdf/test_unicode_filenames.cc:12–18`: input file missing.
+/// qpdf `qpdf/test_unicode_filenames.cc:63–69`: input file missing.
 ///
-/// When `minimal.pdf` does not exist in cwd, `fopen("minimal.pdf", "rb")`
-/// returns `nullptr` → `do_copy` prints `errors opening files` to stderr,
-/// exits 2.
+/// When `minimal.pdf` does not exist in cwd, qpdf calls `fopen("minimal.pdf", "rb")`
+/// (returns `nullptr`) and ALWAYS also calls `fopen(outname, "wb")` (which creates
+/// or truncates the output file) before checking either handle inside `do_copy`.
+/// The output file is therefore created as an empty file before the error is
+/// reported. Under oracle parity, `auto-ü.pdf` must exist as an empty file while
+/// `auto-öπ.pdf` must not (process exits before the second `copy()` call).
 #[test]
 fn input_missing_errors_opening_files_and_exits_two() {
     let dir = tempfile::tempdir().expect("create tempdir");
@@ -96,7 +99,8 @@ fn input_missing_errors_opening_files_and_exits_two() {
         "errors opening files\n",
     );
     assert!(output.stdout.is_empty());
-    assert!(!dir.path().join("auto-ü.pdf").exists());
+    // qpdf creates the first output file before checking the input handle
+    assert!(dir.path().join("auto-ü.pdf").exists());
     assert!(!dir.path().join("auto-öπ.pdf").exists());
 }
 
