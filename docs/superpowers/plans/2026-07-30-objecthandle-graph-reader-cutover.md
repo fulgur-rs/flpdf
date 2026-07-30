@@ -1184,21 +1184,6 @@ Task 6 `lift` path with offset `-1`, not through native parsing against a
 file-relative offset that would be wrong for it (see Step 2's coverage of
 this exact scenario, mirroring the design's Parsed-Offset Contract table).
 
-Task 6's `resolve_object_handle` currently resolves every indirect handle
-by delegating to the legacy engine and calling `Pdf::lift` (offset `-1`
-always). This task changes that delegation **only for the plain
-uncompressed-file-object case** (`IndirectState` sourced from
-`XrefEntry::Uncompressed`): instead of calling `resolve_borrowed` + `lift`,
-it calls this task's new native parse-to-handle entry point directly on the
-object's source bytes, so the resulting handle (and every direct child
-in its tree) carries a real parsed offset from construction. The
-`Compressed` (ObjStm-member) case is explicitly **not** required to gain
-real per-member offset coordinates in this task — full ObjStm-relative/
-recovered/hybrid-xref offset coordinate correctness is `flpdf-egzr.3.3`'s
-scope (see Non-goals); leaving ObjStm members on the Task 6 `lift`-based
-path (offset `-1`) here is a recorded, intentional scope boundary, not a
-silent gap.
-
 **Step 2: Write the failing tests**
 
 Cover the design's full Parsed-Offset Contract table with one asymmetric
