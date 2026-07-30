@@ -75,6 +75,11 @@ pub struct Pdf<R: Read + Seek> {
     // deviation, not a regression to fix — qpdf's own `QPDF` is likewise not
     // thread-safe for concurrent access to one document.
     handle_registry: BTreeMap<ObjectRef, ObjectHandle>,
+    /// Canonical trailer handle (`QPDF::getTrailer`-equivalent identity):
+    /// repeated [`Pdf::trailer_handle`] calls return the same shared handle
+    /// rather than re-deriving a fresh one from `self.trailer` each time.
+    /// Populated lazily on first request.
+    trailer_handle_memo: Option<ObjectHandle>,
     /// Memoized [`Object`] materialization of an already-resolved
     /// [`ObjectHandle`] (`ObjectHandle::materialize`), keyed by `ObjectRef`.
     /// This is [`Pdf::resolve_borrowed`]'s own cache, distinct from
@@ -601,6 +606,7 @@ impl<R: Read + Seek> Pdf<R> {
             repair_diagnostics: loaded.repair_diagnostics,
             cache,
             handle_registry: BTreeMap::new(),
+            trailer_handle_memo: None,
             legacy_materialized_memo: BTreeMap::new(),
             compressed_member_parents: BTreeMap::new(),
             sorted_object_offsets,
@@ -899,16 +905,29 @@ impl<R: Read + Seek> Pdf<R> {
     // reachable here even though it never occurs for a realistic document.
     // Mirrors how `resolve`/`resolve_borrowed` already present a
     // structurally-unusable reference as `Object::Null` rather than erroring.
+    //
+    // Memoized in `self.trailer_handle_memo`, the same way `handle_registry`
+    // memoizes indirect handles: `self.trailer` is set once at construction
+    // and never reassigned afterward, so a lazily-cached handle here has no
+    // invalidation to worry about, and repeated calls return the same shared
+    // identity (`QPDF::getTrailer`) instead of a fresh `Rc` (and fresh direct
+    // children, e.g. `/ID`) on every call.
     /// The trailer dictionary as an [`ObjectHandle`].
     ///
     /// The trailer is always a direct, in-memory dictionary — it is never
     /// itself an indirect object per the PDF spec — so the returned handle is
     /// always direct. A trailer whose literal (non-indirect) nesting exceeds
     /// the crate's inline-object-nesting bound yields a null handle instead.
+    /// Repeated calls return the same shared handle.
     pub fn trailer_handle(&mut self) -> ObjectHandle {
+        if let Some(handle) = &self.trailer_handle_memo {
+            return handle.clone();
+        }
         let trailer = Object::Dictionary(self.trailer.clone());
         let value = self.lift(&trailer, 0).unwrap_or(ObjectValue::Null);
-        ObjectHandle::from_value(value)
+        let handle = ObjectHandle::from_value(value);
+        self.trailer_handle_memo = Some(handle.clone());
+        handle
     }
 
     pub(crate) fn startxref(&self) -> u64 {
@@ -1481,9 +1500,8 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// # Errors
     ///
-    /// This method does not currently produce an error: every candidate
-    /// reference is registered via [`Pdf::get_object_handle`], which never
-    /// fails.
+    /// This method never returns an error: every candidate reference is
+    /// registered via [`Pdf::get_object_handle`], which cannot fail.
     pub fn get_all_object_handles(&mut self) -> Result<Vec<ObjectHandle>> {
         let refs_to_register: Vec<ObjectRef> = self
             .source_xref_entries
@@ -5264,7 +5282,7 @@ mod tests {
     }
 
     #[test]
-    fn trailer_handle_is_indirect_or_direct_matching_trailer_dictionary_contents() {
+    fn trailer_handle_is_direct_with_a_canonical_indirect_root_child() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let handle = pdf.trailer_handle();
         assert!(handle.is_direct());
@@ -5276,6 +5294,32 @@ mod tests {
         let root_handle = dict.get(b"Root".as_slice()).expect("trailer has /Root");
         assert!(root_handle.is_indirect());
         assert_eq!(root_handle.object_ref(), pdf.root_ref());
+    }
+
+    #[test]
+    fn trailer_handle_is_the_same_canonical_handle_for_repeated_calls() {
+        // A trailer with only an indirect `/Root` couldn't catch a
+        // non-canonical `trailer_handle`: indirect children already route
+        // through the memoized `handle_registry` regardless of how the
+        // trailer handle itself is produced. A direct nested value (`/ID`,
+        // as a real trailer carries) has no such registry to fall back on,
+        // so it actually exercises the trailer handle's own identity.
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        pdf.trailer.insert(
+            "ID",
+            Object::Array(vec![
+                Object::String(b"0123456789abcdef".to_vec()),
+                Object::String(b"0123456789abcdef".to_vec()),
+            ]),
+        );
+
+        let first = pdf.trailer_handle();
+        let second = pdf.trailer_handle();
+
+        assert!(
+            first.ptr_eq(&second),
+            "repeated trailer_handle calls must return the same canonical handle"
+        );
     }
 
     #[test]
