@@ -8,7 +8,7 @@ use self::file_object::{
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
-use crate::object_handle::NO_PARSED_OFFSET;
+use crate::object_handle::{ObjectValue, NO_PARSED_OFFSET};
 #[cfg(feature = "qtest-driver")]
 use crate::parser::array_item_source_offset;
 #[cfg(feature = "qtest-driver")]
@@ -1332,6 +1332,104 @@ impl<R: Read + Seek> Pdf<R> {
             .entry(object_ref)
             .or_insert_with(|| ObjectHandle::new_indirect_unresolved(object_ref, NO_PARSED_OFFSET))
             .clone()
+    }
+
+    // Bridge implementation: delegates to the existing *private*
+    // `resolve_to_cache` engine (unchanged) rather than reimplementing
+    // decryption, ObjStm decoding, or the cyclic `/Length` guard it already
+    // performs. Deliberately calls `resolve_to_cache` (private), NOT the
+    // public `resolve_borrowed` — a later task repoints `resolve_borrowed` to
+    // call *this* method, so routing through the public method here would
+    // recurse.
+    /// Resolve `handle` in place if it is an unresolved indirect handle.
+    ///
+    /// A direct handle, or an indirect handle that has already been
+    /// resolved, is a no-op. An indirect handle whose reference is absent
+    /// from — or broken in — the cross-reference table resolves to a null
+    /// handle rather than an error, matching [`Pdf::resolve`].
+    ///
+    /// This reuses the same decryption, object-stream, and stream-`/Length`
+    /// resolution behavior as [`Pdf::resolve`]. Parsed offsets are not
+    /// populated by this method: every handle resolved this way keeps
+    /// [`ObjectHandle::get_parsed_offset`] at the no-offset sentinel.
+    ///
+    /// # Errors
+    ///
+    /// Has the same error behavior as [`Pdf::resolve_borrowed`]: I/O, parse,
+    /// or decryption failures from resolution propagate. An unknown, freed,
+    /// or compressed-but-broken reference is **not** an error; it resolves to
+    /// a null handle.
+    pub fn resolve_object_handle(&mut self, handle: &ObjectHandle) -> Result<()> {
+        let Some(object_ref) = handle.object_ref() else {
+            return Ok(()); // direct handle: already has a value
+        };
+        if handle.is_resolved() {
+            return Ok(());
+        }
+
+        self.resolve_to_cache(object_ref)?;
+        let resolved = match self.cache.entry(object_ref) {
+            Some(CacheEntry::Resolved(object)) => Some(object.clone()),
+            _ => None,
+        };
+        match resolved {
+            Some(object) => {
+                let value = self.lift(&object);
+                handle.set_resolved(value);
+            }
+            None => handle.set_missing(),
+        }
+        Ok(())
+    }
+
+    // Convert an already-resolved legacy `Object` into an `ObjectValue`.
+    //
+    // Handles scalars, arrays, and dictionaries. `Object::Stream`'s dict/data
+    // split is not implemented here (falls back to `ObjectValue::Null`), nor
+    // are the content-stream-only `Object::Operator`/`Object::InlineImage`
+    // variants, which never appear as the resolved value of a file object.
+    fn lift(&mut self, object: &Object) -> ObjectValue {
+        match object {
+            Object::Null => ObjectValue::Null,
+            Object::Boolean(b) => ObjectValue::Boolean(*b),
+            Object::Integer(n) => ObjectValue::Integer(*n),
+            Object::Real(r) => ObjectValue::Real(*r),
+            Object::RealLiteral { value, literal } => ObjectValue::RealLiteral {
+                value: *value,
+                literal: literal.clone(),
+            },
+            Object::Name(name) => ObjectValue::Name(name.clone()),
+            Object::String(s) => ObjectValue::String(s.clone()),
+            Object::Array(items) => {
+                ObjectValue::Array(items.iter().map(|item| self.lift_to_handle(item)).collect())
+            }
+            Object::Dictionary(dict) => ObjectValue::Dictionary(
+                dict.iter()
+                    .map(|(k, v)| (k.to_vec(), self.lift_to_handle(v)))
+                    .collect(),
+            ),
+            Object::Stream(_)
+            | Object::Operator(_)
+            | Object::InlineImage(_)
+            | Object::Reference(_) => ObjectValue::Null,
+        }
+    }
+
+    /// Lift a child `Object` (array element or dictionary value) to a handle.
+    ///
+    /// An `Object::Reference` becomes the canonical indirect handle for that
+    /// reference (via [`Pdf::get_object_handle`]), preserving identity with
+    /// any other handle already registered for the same object — it is left
+    /// unresolved, not eagerly followed. Any other value is lifted directly
+    /// and wrapped in a fresh direct handle.
+    fn lift_to_handle(&mut self, object: &Object) -> ObjectHandle {
+        match object {
+            Object::Reference(object_ref) => self.get_object_handle(*object_ref),
+            direct => {
+                let value = self.lift(direct);
+                ObjectHandle::from_value(value)
+            }
+        }
     }
 
     /// Resolve `object_ref` to its concrete value, parsing on demand.
@@ -4436,5 +4534,69 @@ mod tests {
         let handle = pdf.get_object_handle(object_ref);
         assert!(handle.is_indirect());
         assert_eq!(handle.object_ref(), Some(object_ref));
+    }
+
+    #[test]
+    fn resolve_object_handle_is_a_no_op_for_a_direct_handle() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let direct = ObjectHandle::integer(7);
+        pdf.resolve_object_handle(&direct)
+            .expect("a direct handle is a no-op");
+        assert_eq!(direct.as_integer(), Some(7));
+    }
+
+    #[test]
+    fn resolve_object_handle_matches_resolve_borrowed_for_a_live_object() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle).expect("resolve handle");
+
+        let legacy = pdf.resolve_borrowed(object_ref).expect("resolve legacy");
+        let legacy_dict = legacy.as_dict().expect("legacy resolves to a dictionary");
+        let dict = handle
+            .as_dictionary()
+            .expect("handle resolves to a dictionary");
+        assert_eq!(dict.len(), legacy_dict.iter().count());
+        assert_eq!(
+            dict.get(b"Pages".as_slice())
+                .and_then(ObjectHandle::object_ref),
+            legacy_dict.get_ref("Pages")
+        );
+    }
+
+    /// White-box companion to the public-API
+    /// `resolve_object_handle_distinguishes_a_literal_null_from_a_dangling_reference`
+    /// integration test: proves the two null-observing cases actually take
+    /// different internal routes through `self.cache`, not merely that both
+    /// happen to read as `is_null() == true` from the outside. A literal
+    /// `null` object present in the xref table resolves to a real
+    /// `CacheEntry::Resolved(Object::Null)`; a reference entirely absent from
+    /// the xref table never gains a cache entry at all.
+    #[test]
+    fn resolve_object_handle_literal_null_and_dangling_ref_take_different_cache_paths() {
+        let bytes = classic_pdf_with_bodies(&[b"1 0 obj\nnull\nendobj\n"], ObjectRef::new(1, 0));
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open literal-null fixture");
+
+        let literal_null_ref = ObjectRef::new(1, 0);
+        let literal_null_handle = pdf.get_object_handle(literal_null_ref);
+        pdf.resolve_object_handle(&literal_null_handle)
+            .expect("resolve literal null");
+        assert!(literal_null_handle.is_null());
+        assert!(matches!(
+            pdf.cache.entry(literal_null_ref),
+            Some(CacheEntry::Resolved(Object::Null))
+        ));
+
+        let dangling_ref = ObjectRef::new(999, 0);
+        let dangling_handle = pdf.get_object_handle(dangling_ref);
+        pdf.resolve_object_handle(&dangling_handle)
+            .expect("resolve dangling ref");
+        assert!(dangling_handle.is_null());
+        assert!(
+            pdf.cache.entry(dangling_ref).is_none(),
+            "a ref absent from the xref table must never gain a cache entry just from resolving its handle"
+        );
     }
 }

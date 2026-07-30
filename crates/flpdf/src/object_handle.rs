@@ -72,18 +72,26 @@ struct DirectSlot {
     parsed_offset: i64,
 }
 
+/// The resolution state of an indirect handle's backing slot.
+///
+/// `Missing` and `Resolved(ObjectValue::Null)` are kept as distinct variants
+/// even though both currently present the same externally-observable value
+/// (`is_null() == true`): the former is a reference absent from — or broken
+/// in — the source cross-reference table (`Pdf::resolve_object_handle`'s
+/// fallback arm), the latter is a genuinely parsed literal `null` object.
+/// Collapsing them into one variant would lose that distinction the moment a
+/// later task needs it (e.g. to tell a dangling reference apart from a real
+/// null value for diagnostics).
 #[derive(Debug)]
-#[allow(dead_code)] // constructed only by this module's own test-only factories for now
 pub(crate) enum IndirectState {
-    Unresolved,
-    // Resolved/Missing/etc. variants land in a later task alongside the
-    // real resolution engine cutover.
+    NotYetResolved,
+    Resolved(ObjectValue),
+    Missing,
 }
 
 #[derive(Debug)]
 struct IndirectSlot {
     object_ref: ObjectRef,
-    #[allow(dead_code)] // read once the resolution engine lands in a later task
     state: IndirectState,
     parsed_offset: i64,
 }
@@ -128,7 +136,7 @@ impl ObjectHandle {
         let _ = offset; // real Unresolved{offset} state lands in a later task
         Self(Repr::Indirect(Rc::new(RefCell::new(IndirectSlot {
             object_ref,
-            state: IndirectState::Unresolved,
+            state: IndirectState::NotYetResolved,
             parsed_offset: NO_PARSED_OFFSET,
         }))))
     }
@@ -138,6 +146,44 @@ impl ObjectHandle {
             value,
             parsed_offset,
         }))))
+    }
+
+    /// Construct a direct handle wrapping an already-built [`ObjectValue`], at
+    /// the no-offset sentinel. Used by the resolution bridge
+    /// (`Pdf::lift`/`Pdf::lift_to_handle`) to wrap a value lifted from a
+    /// legacy [`crate::Object`] without going through one of the typed public
+    /// factories above.
+    pub(crate) fn from_value(value: ObjectValue) -> Self {
+        Self::new_direct(value, NO_PARSED_OFFSET)
+    }
+
+    /// Mark this indirect handle's value as resolved to `value`. A no-op for
+    /// a direct handle, which has no resolution state to update.
+    pub(crate) fn set_resolved(&self, value: ObjectValue) {
+        if let Repr::Indirect(slot) = &self.0 {
+            slot.borrow_mut().state = IndirectState::Resolved(value);
+        }
+    }
+
+    /// Mark this indirect handle as resolved-to-null because its reference is
+    /// absent from — or broken in — the source cross-reference table (see
+    /// [`IndirectState`]). A no-op for a direct handle, which has no
+    /// resolution state to update.
+    pub(crate) fn set_missing(&self) {
+        if let Repr::Indirect(slot) = &self.0 {
+            slot.borrow_mut().state = IndirectState::Missing;
+        }
+    }
+
+    /// True if this handle's value is known without performing resolution: a
+    /// direct handle always is; an indirect handle is once its state has left
+    /// [`IndirectState::NotYetResolved`], whether that landed on a real value
+    /// or on [`IndirectState::Missing`].
+    pub(crate) fn is_resolved(&self) -> bool {
+        match &self.0 {
+            Repr::Direct(_) => true,
+            Repr::Indirect(slot) => !matches!(slot.borrow().state, IndirectState::NotYetResolved),
+        }
     }
 
     /// Construct a direct integer value.
@@ -241,9 +287,10 @@ impl ObjectHandle {
 
     /// True if this handle's value is known to be null. An indirect handle
     /// whose value has not yet been resolved returns `false` — this method
-    /// never performs resolution itself, so "unresolved" and "resolved to
-    /// null" are distinct until a later task's resolution engine can make
-    /// the latter observable through this same method.
+    /// never performs resolution itself, so an unresolved handle is not
+    /// assumed to be null. Once resolved, this reflects the real value:
+    /// `true` both for a genuinely parsed `null` object and for a reference
+    /// that turned out to be missing from the source.
     pub fn is_null(&self) -> bool {
         self.with_value(|value| matches!(value, Some(ObjectValue::Null)))
     }
@@ -280,13 +327,20 @@ impl ObjectHandle {
         })
     }
 
-    // `None` for an unresolved indirect handle — value access on an
-    // unresolved handle must not perform hidden I/O (design, `Pdf` section).
-    // Real `Some(..)` for a resolved indirect handle lands in a later task.
+    // `None` for an indirect handle that has not yet been resolved — value
+    // access on an unresolved handle must not perform hidden I/O (design,
+    // `Pdf` section). A resolved indirect handle exposes its real value;
+    // `Missing` (see [`IndirectState`]) presents as `ObjectValue::Null`,
+    // matching the externally-observable behavior of a resolved literal
+    // `null` object.
     fn with_value<T>(&self, f: impl FnOnce(Option<&ObjectValue>) -> T) -> T {
         match &self.0 {
             Repr::Direct(slot) => f(Some(&slot.borrow().value)),
-            Repr::Indirect(_) => f(None),
+            Repr::Indirect(slot) => match &slot.borrow().state {
+                IndirectState::NotYetResolved => f(None),
+                IndirectState::Resolved(value) => f(Some(value)),
+                IndirectState::Missing => f(Some(&ObjectValue::Null)),
+            },
         }
     }
 }
@@ -476,5 +530,62 @@ mod parsed_offset_tests {
         assert_eq!(handle.get_parsed_offset(), 0);
         handle.set_parsed_offset_if_unset(50);
         assert_eq!(handle.get_parsed_offset(), 0);
+    }
+}
+
+#[cfg(test)]
+mod resolution_state_tests {
+    use super::*;
+
+    #[test]
+    fn direct_handle_is_always_resolved() {
+        // A direct handle has no resolution state to wait on — its value was
+        // known at construction time.
+        assert!(ObjectHandle::integer(1).is_resolved());
+    }
+
+    #[test]
+    fn fresh_indirect_handle_is_not_resolved() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        assert!(!handle.is_resolved());
+    }
+
+    #[test]
+    fn set_resolved_marks_the_handle_resolved_and_exposes_its_value() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Integer(7));
+        assert!(handle.is_resolved());
+        assert_eq!(handle.as_integer(), Some(7));
+    }
+
+    #[test]
+    fn set_missing_marks_the_handle_resolved_to_null() {
+        // `Missing` (dangling/broken reference) must present the same
+        // observable value as a genuinely parsed `null` object — but see
+        // `set_resolved_with_a_null_value_is_indistinguishable_from_the_outside`
+        // for proof the two routes are not literally the same variant.
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_missing();
+        assert!(handle.is_resolved());
+        assert!(handle.is_null());
+        assert_eq!(handle.as_integer(), None);
+    }
+
+    #[test]
+    fn set_resolved_and_set_missing_are_a_no_op_on_a_direct_handle() {
+        // Direct handles have no resolution state; calling either setter must
+        // not panic and must leave the original value untouched.
+        let handle = ObjectHandle::integer(42);
+        handle.set_resolved(ObjectValue::Integer(99));
+        handle.set_missing();
+        assert_eq!(handle.as_integer(), Some(42));
+    }
+
+    #[test]
+    fn from_value_constructs_a_direct_handle_at_the_offset_sentinel() {
+        let handle = ObjectHandle::from_value(ObjectValue::Integer(3));
+        assert!(handle.is_direct());
+        assert_eq!(handle.as_integer(), Some(3));
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
     }
 }
