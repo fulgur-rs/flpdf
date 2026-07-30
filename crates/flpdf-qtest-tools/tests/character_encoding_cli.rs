@@ -73,6 +73,7 @@ fn empty_blank_and_terminal_lf_inputs_remain_distinct() {
         ("empty.in", b"".as_slice(), b"".as_slice()),
         ("blank.in", b"\n".as_slice(), b"\n".as_slice()),
         ("terminal.in", b"x\n".as_slice(), b"x\n".as_slice()),
+        ("bare-cr.in", b"x\r".as_slice(), b"x\r\n".as_slice()),
     ] {
         let input = write_input(directory.path(), name, input);
         helper(PDFDOC_BIN)

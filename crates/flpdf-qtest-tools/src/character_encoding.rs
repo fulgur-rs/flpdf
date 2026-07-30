@@ -115,8 +115,11 @@ fn run(
 
 fn qpdf_lines(input: &[u8]) -> impl Iterator<Item = &[u8]> {
     input.split_inclusive(|byte| *byte == b'\n').map(|line| {
-        let line = line.strip_suffix(b"\n").unwrap_or(line);
-        line.strip_suffix(b"\r").unwrap_or(line)
+        if let Some(line) = line.strip_suffix(b"\n") {
+            line.strip_suffix(b"\r").unwrap_or(line)
+        } else {
+            line
+        }
     })
 }
 
