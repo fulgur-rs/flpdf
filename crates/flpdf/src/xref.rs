@@ -99,10 +99,7 @@ pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
             }
         }
     } else {
-        match parse_header(&bytes) {
-            Ok(version) => version,
-            Err(error) => return Err(error),
-        }
+        parse_header(&bytes)?
     };
     let mut parse_errors = Vec::new();
     let startxref = match parse_startxref(&bytes) {
