@@ -539,7 +539,10 @@ fn resolve_filter_structure<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_stream_dictionary, Handle};
+    use super::{
+        crypt_decode_params_filterable, qpdf_object_type_name, remove_identity_crypt_stages,
+        resolve_stream_dictionary, Handle,
+    };
     use flpdf::{Dictionary, Object, ObjectRef, Pdf, Stream};
     use std::io::Cursor;
 
@@ -659,6 +662,56 @@ mod tests {
         };
         assert_eq!(unresolved.type_code(), 13);
         assert_eq!(unresolved.type_name(), "unresolved");
+    }
+
+    #[test]
+    fn decode_param_type_names_cover_every_qpdf_object_kind() {
+        let cases = [
+            (Object::Null, "null"),
+            (Object::Boolean(false), "boolean"),
+            (Object::Integer(1), "integer"),
+            (Object::Real(1.5), "real"),
+            (
+                Object::RealLiteral {
+                    value: 0.4,
+                    literal: b".4".to_vec(),
+                },
+                "real",
+            ),
+            (Object::String(b"s".to_vec()), "string"),
+            (Object::Name(b"N".to_vec()), "name"),
+            (Object::Array(Vec::new()), "array"),
+            (Object::Dictionary(Dictionary::new()), "dictionary"),
+            (
+                Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
+                "stream",
+            ),
+            (Object::Operator(b"q".to_vec()), "operator"),
+            (Object::InlineImage(b"abc".to_vec()), "inline-image"),
+            (Object::Reference(ObjectRef::new(99, 0)), "unresolved"),
+        ];
+
+        for (object, expected) in cases {
+            assert_eq!(qpdf_object_type_name(&object), expected);
+        }
+    }
+
+    #[test]
+    fn crypt_helpers_accept_nullish_params_and_leave_defensive_mismatches_unchanged() {
+        assert!(crypt_decode_params_filterable(Some(&Object::Null)));
+        assert!(crypt_decode_params_filterable(Some(&Object::Integer(42))));
+
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(b"Filter", Object::Integer(1));
+        dictionary.insert(
+            b"DecodeParms",
+            Object::Array(vec![Object::Null, Object::Null]),
+        );
+        let original = dictionary.clone();
+
+        remove_identity_crypt_stages(&mut dictionary, &[b"Crypt".as_slice()]);
+
+        assert_eq!(dictionary, original);
     }
 
     #[test]

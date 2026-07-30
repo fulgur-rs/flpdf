@@ -3347,6 +3347,44 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "qtest-driver")]
+    #[test]
+    fn qtest_decode_parms_offsets_follow_filter_array_items() {
+        let stream_body = b"1 0 obj\n\
+                            << /Filter [ /FlateDecode /LZWDecode ] \
+                               /DecodeParms [ null 42 ] /Length 0 >>\n\
+                            stream\n\nendstream\nendobj\n";
+        let catalog_body = b"2 0 obj\n<< /Type /Catalog >>\nendobj\n";
+        let bytes = classic_pdf_with_bodies(&[stream_body, catalog_body], ObjectRef::new(2, 0));
+        let expected = bytes
+            .windows(b"/DecodeParms [ null 42 ]".len())
+            .position(|window| window == b"/DecodeParms [ null 42 ]")
+            .expect("DecodeParms array")
+            + b"/DecodeParms [ null ".len();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open DecodeParms-offset fixture");
+
+        assert_eq!(
+            pdf.qtest_decode_parms_source_offset(ObjectRef::new(1, 0), 1)
+                .expect("second array item offset"),
+            Some(expected as u64)
+        );
+        assert_eq!(
+            pdf.qtest_decode_parms_source_offset(ObjectRef::new(1, 0), 2)
+                .expect("missing array item"),
+            None
+        );
+        assert_eq!(
+            pdf.qtest_decode_parms_source_offset(ObjectRef::new(2, 0), 0)
+                .expect("last direct object"),
+            None
+        );
+        assert_eq!(
+            pdf.qtest_decode_parms_source_offset(ObjectRef::new(99, 0), 0)
+                .expect("unknown object"),
+            None
+        );
+    }
+
     #[test]
     fn source_stream_data_offset_retries_after_false_next_object_offset() {
         let bytes = stream_with_false_next_xref_offset();

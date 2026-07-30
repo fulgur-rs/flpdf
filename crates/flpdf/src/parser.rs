@@ -815,6 +815,8 @@ pub(crate) fn keyword_token_end(input: &[u8], pos: usize, keyword: &[u8]) -> Opt
 
 #[cfg(test)]
 mod stream_length_tests {
+    #[cfg(feature = "qtest-driver")]
+    use super::dictionary_value_source_offset;
     use super::{
         keyword_token_end, parse_indirect_object, parse_object, parse_qpdf_direct_object,
         RecoveredStreamEol,
@@ -838,6 +840,44 @@ mod stream_length_tests {
         assert_eq!(
             object.as_stream().expect("expected stream").data,
             b"strict payload"
+        );
+    }
+
+    #[cfg(feature = "qtest-driver")]
+    #[test]
+    fn dictionary_value_offsets_cover_absent_malformed_and_array_values() {
+        assert_eq!(
+            dictionary_value_source_offset(b"42", b"DecodeParms", 0).unwrap(),
+            None
+        );
+        assert_eq!(
+            dictionary_value_source_offset(b"<< >>", b"DecodeParms", 0).unwrap(),
+            None
+        );
+        assert!(
+            dictionary_value_source_offset(b"<< 42 true >>", b"DecodeParms", 0)
+                .unwrap_err()
+                .to_string()
+                .contains("expected dictionary key")
+        );
+        assert_eq!(
+            dictionary_value_source_offset(
+                b"<< /Other 0 /DecodeParms [ null ] >>",
+                b"DecodeParms",
+                1,
+            )
+            .unwrap(),
+            None
+        );
+
+        let input = b"<< /Other 0 /DecodeParms [ null 42 ] >>";
+        let expected = input
+            .windows(b"42".len())
+            .position(|window| window == b"42")
+            .expect("array item");
+        assert_eq!(
+            dictionary_value_source_offset(input, b"DecodeParms", 1).unwrap(),
+            Some(expected)
         );
     }
 

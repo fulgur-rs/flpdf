@@ -1123,8 +1123,28 @@ fn parse_xref_subsection_u32(token: &Token) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::load_xref_and_trailer_with_repair;
+    use super::{load_xref_and_trailer_with_repair, prepend_repair_diagnostics};
+    use crate::{Diagnostic, Diagnostics};
     use std::io::Cursor;
+
+    #[test]
+    fn initial_repair_diagnostics_precede_recovered_diagnostics() {
+        let mut recovered = Diagnostics::default();
+        recovered.push(Diagnostic::warning("recovered", Some(12)));
+        let mut initial = Diagnostics::default();
+        initial.push(Diagnostic::warning("initial", None));
+
+        prepend_repair_diagnostics(&mut recovered, initial);
+
+        assert_eq!(
+            recovered
+                .entries()
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["initial", "recovered"]
+        );
+    }
 
     #[test]
     fn failed_repair_retains_qpdf_warning_sequence() {

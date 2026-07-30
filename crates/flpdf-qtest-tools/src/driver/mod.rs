@@ -367,7 +367,8 @@ fn write_stderr_bytes(
 #[cfg(test)]
 mod tests {
     use super::{
-        crt_open_error_message, has_interior_nul, open_error_bytes, run, write_error_bytes,
+        crt_open_error_message, has_interior_nul, open_error_bytes, open_pdf_error_bytes, run,
+        write_error_bytes,
     };
     use std::{
         ffi::{OsStr, OsString},
@@ -434,6 +435,16 @@ mod tests {
         assert_eq!(
             open_error_bytes(b"input.pdf", None, &fallback),
             b"open input.pdf: fallback message"
+        );
+    }
+
+    #[test]
+    fn ordinary_pdf_open_error_uses_the_error_display() {
+        let error = flpdf::Error::System("ordinary open failure".to_string());
+
+        assert_eq!(
+            open_pdf_error_bytes(1, b"input.pdf", &error),
+            b"ordinary open failure"
         );
     }
 

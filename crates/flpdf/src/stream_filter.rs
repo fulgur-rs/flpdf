@@ -473,13 +473,8 @@ impl StreamFilter for FlateLzwStreamFilter {
                     bits_per_component,
                 )
                 .map_err(map_pipeline_error)?;
-                self.pipe_codec(
-                    &mut predictor,
-                    data,
-                    warn,
-                    Some(&finish_phase),
-                    &output_position,
-                )?
+                let phase = Some(finish_phase.as_ref());
+                self.pipe_codec(&mut predictor, data, warn, phase, &output_position)?
             }
             None => {
                 self.pipe_codec(&mut sink, data, warn, Some(&finish_phase), &output_position)?
@@ -538,16 +533,20 @@ impl FlateLzwStreamFilter {
             )
             .map_err(map_pipeline_error)?;
             stage.set_warn_callback(|message, code| {
-                let phase = if finish_phase.is_some_and(Cell::get) {
-                    FilterDecodePhase::Finish
-                } else {
-                    FilterDecodePhase::Write
-                };
+                let phase = filter_decode_phase(finish_phase);
                 warn(message, code, output_position.get(), phase)
             });
             write_and_finish(&mut stage, data, finish_phase, output_position)
         };
         Ok(error.map(map_stage_error))
+    }
+}
+
+fn filter_decode_phase(finish_phase: Option<&Cell<bool>>) -> FilterDecodePhase {
+    if finish_phase.is_some_and(Cell::get) {
+        FilterDecodePhase::Finish
+    } else {
+        FilterDecodePhase::Write
     }
 }
 
@@ -820,7 +819,7 @@ mod tests {
     };
     use crate::pipeline::lzw::pack_codes;
     use crate::{Dictionary, Error, Object};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     #[test]
     fn run_length_encoder_uses_qpdf_two_byte_run() {
@@ -1423,6 +1422,24 @@ mod tests {
                 .error
                 .expect("finish output hits limit")
                 .during_write
+        );
+    }
+
+    #[test]
+    fn codec_warning_phase_distinguishes_write_from_finish() {
+        let phase = Cell::new(false);
+        assert_eq!(
+            super::filter_decode_phase(None),
+            super::FilterDecodePhase::Write
+        );
+        assert_eq!(
+            super::filter_decode_phase(Some(&phase)),
+            super::FilterDecodePhase::Write
+        );
+        phase.set(true);
+        assert_eq!(
+            super::filter_decode_phase(Some(&phase)),
+            super::FilterDecodePhase::Finish
         );
     }
 

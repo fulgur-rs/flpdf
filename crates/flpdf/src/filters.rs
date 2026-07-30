@@ -2652,6 +2652,34 @@ mod tests {
     }
 
     #[test]
+    fn final_crypt_stage_preserves_pending_codec_events_and_cleanup_data() {
+        let filter = Object::Array(vec![
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+            Object::Name(b"Crypt".to_vec()),
+        ]);
+        let mut decrypt = |_: Option<&Object>, data: &[u8]| Ok(data.to_vec());
+
+        let outcome = decode_stream_data_with_filters_and_crypt(
+            Some(&filter),
+            None,
+            b"4G ",
+            DecodeLimits::default(),
+            DataEventMode::Record,
+            &mut decrypt,
+        )
+        .expect("recover through the identity Crypt stage");
+
+        assert_eq!(outcome.data, b"@");
+        assert!(matches!(
+            &outcome.events[..],
+            [
+                StreamDecodeEvent::Error(Error::Unsupported(message)),
+                StreamDecodeEvent::Data(data),
+            ] if message == "character out of range during base Hex decode: G" && data == b"@"
+        ));
+    }
+
+    #[test]
     fn decode_accepts_max_length_filter_chain() {
         // Exactly MAX_FILTER_CHAIN_LEN (16) ASCIIHexDecode stages round-trips (each
         // stage is identity here: hex-encode applied 16 times, then this many decodes).

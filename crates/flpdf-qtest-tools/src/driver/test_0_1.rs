@@ -267,7 +267,10 @@ fn write_object_details<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_test_0_1, stream_decode_error_detail, write_object_details};
+    use super::{
+        run_test_0_1, stream_decode_error_detail, write_decode_param_type_warning,
+        write_object_details,
+    };
     use crate::driver::handle::Handle;
     use flpdf::{Dictionary, Error, Object, ObjectRef, Pdf, PdfOpenOptions, Stream};
     use std::io::{self, Write};
@@ -277,6 +280,30 @@ mod tests {
     impl Write for WriteFailure {
         fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
             Err(io::Error::other("write failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailOnWarning {
+        fail_on: usize,
+        warnings: usize,
+    }
+
+    impl Write for FailOnWarning {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf
+                .windows(b"WARNING: ".len())
+                .any(|window| window == b"WARNING: ")
+            {
+                self.warnings += 1;
+                if self.warnings == self.fail_on {
+                    return Err(io::Error::other("injected DecodeParms warning failure"));
+                }
+            }
+            Ok(buf.len())
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -780,6 +807,113 @@ mod tests {
             "decoded stream has no terminal indirect object"
         );
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn direct_stream_decode_param_warning_requires_a_terminal_object_reference() {
+        let bytes = pdf_with_qtest(b"null", &[]);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open direct stream fixture");
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        dictionary.insert("DecodeParms", Object::Integer(42));
+        let qtest = Handle::from_value(
+            &mut pdf,
+            Object::Stream(Stream::new(dictionary, Vec::new())),
+        )
+        .expect("construct direct stream handle");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        let error = write_object_details(
+            &mut pdf,
+            b"fixture.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+            &qtest,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "stream DecodeParms warning has no terminal indirect object"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn decode_param_warning_formats_offsets_and_unknown_offsets() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_decode_param_type_warning(
+            b"fixture.pdf",
+            ObjectRef::new(7, 0),
+            Some(42),
+            "integer",
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("warning with offset");
+        write_decode_param_type_warning(
+            b"fixture.pdf",
+            ObjectRef::new(8, 1),
+            None,
+            "array",
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("warning without offset");
+
+        assert!(stdout.is_empty());
+        assert_eq!(
+            stderr,
+            b"WARNING: fixture.pdf, object 7 0 at offset 42: operation for dictionary attempted \
+              on object of type integer: treating as empty\n\
+              WARNING: fixture.pdf, object 8 1: operation for dictionary attempted on object of \
+              type array: treating as empty\n"
+        );
+    }
+
+    #[test]
+    fn decode_param_warning_write_failures_propagate_from_both_emissions() {
+        for fail_on in [1, 2] {
+            let bytes = pdf_with_qtest(
+                b"7 0 R",
+                &[(
+                    7,
+                    b"<< /Filter /FlateDecode /DecodeParms 42 /Length 0 >>\n\
+                      stream\n\nendstream"
+                        .to_vec(),
+                )],
+            );
+            let mut pdf = Pdf::open_mem_owned(bytes).expect("open DecodeParms warning fixture");
+            let trailer = pdf.trailer().clone();
+            let qtest = Handle::get_key(&mut pdf, &trailer, b"QTest").expect("get qtest");
+            let mut stdout = Vec::new();
+            let mut stderr = FailOnWarning {
+                fail_on,
+                warnings: 0,
+            };
+            let mut diagnostics_written = 0;
+
+            let error = write_object_details(
+                &mut pdf,
+                b"fixture.pdf",
+                &mut stdout,
+                &mut stderr,
+                &mut diagnostics_written,
+                &qtest,
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                "I/O error: injected DecodeParms warning failure"
+            );
+            assert_eq!(stderr.warnings, fail_on);
+        }
     }
 
     #[test]
