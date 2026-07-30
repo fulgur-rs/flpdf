@@ -44,11 +44,12 @@ pub fn run_pdf_unicode(
 pub fn finish(outcome: RunOutcome, stderr: &mut dyn Write) -> ExitCode {
     match outcome {
         RunOutcome::Exit(status) => ExitCode::from(status),
+        // cov:ignore-start: subprocess integration verifies exact stderr and SIGABRT; abort cannot flush an in-process coverage profile
         RunOutcome::Abort(message) => {
             let _ = stderr.write_all(&message);
             let _ = stderr.flush();
             std::process::abort()
-        }
+        } // cov:ignore-end
     }
 }
 
@@ -146,7 +147,7 @@ fn native_error_message(error: &io::Error) -> Vec<u8> {
     };
     let message = unsafe { libc::strerror(error_code) };
     if message.is_null() {
-        error.to_string().into_bytes()
+        error.to_string().into_bytes() // cov:ignore: glibc returns an "Unknown error" string even for unrecognized error numbers
     } else {
         unsafe { CStr::from_ptr(message) }.to_bytes().to_vec()
     }
@@ -162,4 +163,111 @@ fn os_str_bytes(value: &OsStr) -> Cow<'_, [u8]> {
 #[cfg(not(unix))]
 fn os_str_bytes(value: &OsStr) -> Cow<'_, [u8]> {
     Cow::Owned(value.to_string_lossy().into_owned().into_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    struct FailedWriter;
+
+    impl Write for FailedWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("authored write failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn args(program: &str, input: &Path) -> Vec<OsString> {
+        vec![OsString::from(program), input.as_os_str().to_owned()]
+    }
+
+    #[test]
+    fn missing_argv_uses_each_helpers_default_program_name() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            run_pdf_doc_encoding(&[], &mut stdout, &mut stderr),
+            RunOutcome::Exit(2)
+        );
+        assert_eq!(stderr, b"Usage: flpdf-test-pdf-doc-encoding infile\n");
+
+        stderr.clear();
+        assert_eq!(
+            run_pdf_unicode(&[], &mut stdout, &mut stderr),
+            RunOutcome::Exit(2)
+        );
+        assert_eq!(stderr, b"Usage: flpdf-test-pdf-unicode infile\n");
+    }
+
+    #[test]
+    fn missing_input_returns_the_qpdf_system_exception_bytes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let missing = directory.path().join("missing.in");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let outcome = run_pdf_doc_encoding(
+            &args("test_pdf_doc_encoding", &missing),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        let RunOutcome::Abort(message) = outcome else {
+            panic!("missing input must request abort");
+        };
+        assert!(message.starts_with(
+            b"terminate called after throwing an instance of 'QPDFSystemError'\n  what():  open "
+        ));
+        assert!(message.ends_with(b": No such file or directory\n"));
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_input_returns_the_qpdf_runtime_exception_bytes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            run_pdf_unicode(
+                &args("test_pdf_unicode", directory.path()),
+                &mut stdout,
+                &mut stderr,
+            ),
+            RunOutcome::Abort(
+                b"terminate called after throwing an instance of 'std::runtime_error'\n  \
+                  what():  failure reading character from file\n"
+                    .to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn output_failure_returns_status_two() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let input = directory.path().join("input");
+        std::fs::write(&input, b"line\n").expect("write input");
+        let mut stdout = FailedWriter;
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            run_pdf_doc_encoding(
+                &args("test_pdf_doc_encoding", &input),
+                &mut stdout,
+                &mut stderr,
+            ),
+            RunOutcome::Exit(2)
+        );
+    }
+
+    #[test]
+    fn native_error_without_errno_uses_display_text() {
+        let error = io::Error::other("authored native error");
+        assert_eq!(native_error_message(&error), b"authored native error");
+    }
 }
