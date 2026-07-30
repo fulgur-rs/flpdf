@@ -367,18 +367,14 @@ where
         let next = match &mut stage.stage {
             PreparedStage::Crypt { decode_params } => {
                 let data = decrypt_crypt(*decode_params, decoded.as_ref())?;
-                if is_last_stage {
-                    let mut markers = Vec::new();
-                    if let Some(PendingDataBoundary(boundary, after_finish)) = pending_data_boundary
-                    {
-                        markers.extend(position_pending_events(
-                            boundary,
-                            after_finish,
-                            std::mem::take(&mut pending_events),
-                        ));
-                    }
-                    append_positioned_events(&mut events, &data, data_events, markers);
-                }
+                append_final_crypt_events(
+                    is_last_stage,
+                    &mut events,
+                    &data,
+                    data_events,
+                    pending_data_boundary,
+                    &mut pending_events,
+                );
                 data
             }
             PreparedStage::Codec { adapter } => {
@@ -572,6 +568,28 @@ struct PositionedDecodeEvent {
     barrier: u8,
     ordinal: usize,
     event: StreamDecodeEvent,
+}
+
+fn append_final_crypt_events(
+    is_last_stage: bool,
+    events: &mut Vec<StreamDecodeEvent>,
+    data: &[u8],
+    data_events: DataEventMode,
+    pending_data_boundary: Option<PendingDataBoundary>,
+    pending_events: &mut Vec<StreamDecodeEvent>,
+) {
+    if !is_last_stage {
+        return;
+    }
+    let mut markers = Vec::new();
+    if let Some(PendingDataBoundary(boundary, after_finish)) = pending_data_boundary {
+        markers.extend(position_pending_events(
+            boundary,
+            after_finish,
+            std::mem::take(pending_events),
+        ));
+    }
+    append_positioned_events(events, data, data_events, markers);
 }
 
 impl PositionedDecodeEvent {

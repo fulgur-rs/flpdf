@@ -22,21 +22,19 @@ fn write_decode_param_type_warning(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> flpdf::Result<()> {
-    stdout.flush()?;
-    write!(stderr, "WARNING: ")?;
-    write_bytes(stderr, filename)?;
-    write!(
-        stderr,
-        ", object {} {}",
-        object_ref.number, object_ref.generation
-    )?;
+    let mut warning = b"WARNING: ".to_vec();
+    warning.extend_from_slice(filename);
+    warning.extend_from_slice(
+        format!(", object {} {}", object_ref.number, object_ref.generation).as_bytes(),
+    );
     if let Some(offset) = offset {
-        write!(stderr, " at offset {offset}")?;
+        warning.extend_from_slice(format!(" at offset {offset}").as_bytes());
     }
-    writeln!(
-        stderr,
-        ": operation for dictionary attempted on object of type {object_type}: treating as empty"
-    )?;
+    warning.extend_from_slice(b": operation for dictionary attempted on object of type ");
+    warning.extend_from_slice(object_type.as_bytes());
+    warning.extend_from_slice(b": treating as empty\n");
+    stdout.flush()?;
+    stderr.write_all(&warning)?;
     Ok(())
 }
 
@@ -280,30 +278,6 @@ mod tests {
     impl Write for WriteFailure {
         fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
             Err(io::Error::other("write failed"))
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    struct FailOnWarning {
-        fail_on: usize,
-        warnings: usize,
-    }
-
-    impl Write for FailOnWarning {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            if buf
-                .windows(b"WARNING: ".len())
-                .any(|window| window == b"WARNING: ")
-            {
-                self.warnings += 1;
-                if self.warnings == self.fail_on {
-                    return Err(io::Error::other("injected DecodeParms warning failure"));
-                }
-            }
-            Ok(buf.len())
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -888,14 +862,24 @@ mod tests {
                         .to_vec(),
                 )],
             );
+            let marker = b"/DecodeParms 42";
+            let marker_start = bytes
+                .windows(marker.len())
+                .position(|window| window == marker)
+                .expect("DecodeParms source token");
+            let value_offset = marker_start + b"/DecodeParms ".len();
+            let first_warning_len = format!(
+                "WARNING: fixture.pdf, object 7 0 at offset {value_offset}: \
+                 operation for dictionary attempted on object of type integer: treating as empty\n"
+            )
+            .len();
             let mut pdf = Pdf::open_mem_owned(bytes).expect("open DecodeParms warning fixture");
             let trailer = pdf.trailer().clone();
             let qtest = Handle::get_key(&mut pdf, &trailer, b"QTest").expect("get qtest");
             let mut stdout = Vec::new();
-            let mut stderr = FailOnWarning {
-                fail_on,
-                warnings: 0,
-            };
+            let capacity = if fail_on == 1 { 0 } else { first_warning_len };
+            let mut storage = vec![0; capacity];
+            let mut stderr = io::Cursor::new(storage.as_mut_slice());
             let mut diagnostics_written = 0;
 
             let error = write_object_details(
@@ -908,11 +892,8 @@ mod tests {
             )
             .unwrap_err();
 
-            assert_eq!(
-                error.to_string(),
-                "I/O error: injected DecodeParms warning failure"
-            );
-            assert_eq!(stderr.warnings, fail_on);
+            assert_eq!(error.to_string(), "I/O error: failed to write whole buffer");
+            assert_eq!(stderr.position(), capacity as u64);
         }
     }
 

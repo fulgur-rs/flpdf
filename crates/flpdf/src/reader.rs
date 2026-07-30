@@ -8,6 +8,8 @@ use self::file_object::{
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
+#[cfg(feature = "qtest-driver")]
+use crate::parser::dictionary_value_source_offset;
 use crate::parser::parse_qpdf_file_object;
 use crate::pipeline::rc4::PlRc4;
 use crate::security::password::{normalize_password, PasswordMode};
@@ -930,12 +932,9 @@ impl<R: Read + Seek> Pdf<R> {
         tokenizer.expect_word(b"obj")?;
         tokenizer.skip_ignorable()?;
         let body_start = tokenizer.position();
-        let Some(value_offset) = crate::parser::dictionary_value_source_offset(
-            &bytes[body_start..],
-            b"DecodeParms",
-            filter_index,
-        )?
-        else {
+        let body = &bytes[body_start..];
+        let value_offset = dictionary_value_source_offset(body, b"DecodeParms", filter_index);
+        let Some(value_offset) = value_offset? else {
             return Ok(None);
         };
         Ok(Some(
