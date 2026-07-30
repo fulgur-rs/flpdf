@@ -66,7 +66,7 @@ pub fn run(
     match process(&filename, include_ignorable, max_len, stdout) {
         Ok(()) => RunOutcome::Exit(0),
         Err(e) => {
-            let _ = writeln!(
+            let _ = write!(
                 stderr,
                 "{}: exception: {}",
                 String::from_utf8_lossy(&program_name(args)),
@@ -257,6 +257,9 @@ fn dump_tokens(
 
         if inline_image_offset.is_some() && token.token_type == TokenType::Bad {
             let _ = writeln!(stdout, "EI not found; resuming normal scanning");
+            tokenizer
+                .set_position(inline_image_offset.unwrap())
+                .expect("position after ID separator");
             inline_image_offset = None;
             continue;
         }
@@ -275,10 +278,16 @@ fn dump_tokens(
         writeln!(stdout).unwrap();
 
         if skip_streams && token.token_type == TokenType::Word && token.value == b"stream" {
-            let after_stream = tokenizer.position();
-            if let Some(after_endstream) = find_endstream(input, after_stream) {
+            writeln!(stdout, "skipping to endstream").unwrap();
+            let saved = tokenizer.position();
+            if let Some(after_endstream) = find_endstream(input, saved) {
                 tokenizer
                     .set_position(after_endstream)
+                    .expect("position within input");
+            } else {
+                writeln!(stdout, "endstream not found").unwrap();
+                tokenizer
+                    .set_position(saved)
                     .expect("position within input");
             }
         } else if skip_inline_images && token.token_type == TokenType::Word && token.value == b"ID"
