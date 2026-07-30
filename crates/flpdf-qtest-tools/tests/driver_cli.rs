@@ -206,6 +206,16 @@ fn i64_overflow_reports_qpdf_decimal_conversion_error() {
 }
 
 #[test]
+fn u64_overflow_reports_qpdf_decimal_conversion_error() {
+    driver()
+        .args(["18446744073709551616", minimal_pdf()])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr("overflow/underflow converting 18446744073709551616 to 64-bit integer\n");
+}
+
+#[test]
 fn i64_underflow_reports_qpdf_decimal_conversion_error() {
     driver()
         .args(["-9223372036854775809", minimal_pdf()])
