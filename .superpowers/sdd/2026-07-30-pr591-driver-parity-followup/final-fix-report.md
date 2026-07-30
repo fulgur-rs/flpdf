@@ -1,0 +1,116 @@
+# PR #591 final fix report
+
+## Status
+
+PASS. All six Important findings, fixture-provenance Minor 1, and documentation
+Minors 2-3 are fixed and committed on
+`feat/flpdf-n9t0-2-test-driver`.
+
+- Review base: `57e814234051247d40c7f03097331b27290963cb`
+- Final code/fixture commit: `390e6203`
+- Pinned oracle: qpdf 11.9.0 at
+  `3b97c9bd266b7c32ea36d3536e22dab77412886d`
+- Differential inventory: 47 fixtures and 11 CLI probes
+- Residual in-scope findings: none
+
+## Commits
+
+1. `b7bbe625` `fix(qtest): close final driver parity gaps`
+2. `483c050e` `fix(xref): scope qpdf header validation to repair`
+3. `ee99cc35` `style(xref): simplify strict header parse`
+4. `8827fab5` `test(qtest): cover final parity boundaries`
+5. `2da6282c` `test(qtest): eliminate final patch coverage gaps`
+6. `a0609fc5` `test(filters): cover leading identity Crypt stage`
+7. `390e6203` `fix(xref): honor leading PDF header origin`
+
+## Finding disposition
+
+| Finding | Root cause and smallest fix | Evidence |
+| --- | --- | --- |
+| Important 1: final Flate+PNG order | Aggregated final data had lost the byte position and write/finish phase at which callbacks occurred. Output now records cursor/phase markers and composes data, warning, error, and cleanup events in call order, including equal-offset barriers. | Public/internal REDs covered truncated Flate + partial PNG row, output limit, pending error vs finish warning, and downstream cleanup. Pinned fixture emits warning before `A\0`. |
+| Important 2: identity Crypt | Driver filterability recognized `/Crypt`, but the ordinary core decoder correctly rejected it. The qtest-only route now validates qpdf-visible Crypt DecodeParms and removes only aligned identity stages after the decryption boundary. | Direct and array differential fixtures pass. Mutation-sensitive tests retain length mismatch and invalid `/Type`/key failures. Ordinary core APIs still reject `/Crypt`. |
+| Important 3: repair lifecycle | Header parsing ran before repair; missing `startxref` leaked an EOF offset; the first implementation also matched only byte zero. Repair now searches candidate starts in `[0, 1024)`, validates the candidate-local 1024-byte line, applies qpdf's logical header origin to parsing/lazy seeks, and preserves that origin through incremental xref emission. Strict/default header behavior remains unchanged. | REDs observed version `1.2` instead of `1.7` for a leading header and repair warnings after incremental rewrite. GREEN covers starts at bytes 1023/1024, lazy resolve, prefix-preserving incremental rewrite, warning order/offsets, and strict rejection. Packaged qpdf 11.9.0 reports no syntax or stream errors on the rewritten leading-material file. |
+| Important 4: lazy dictionary diagnostics | Diagnostics created while resolving `dictionary_items()` were not drained at the qpdf boundary. The driver now drains them before item output. | Authored indirect-child fixture and unit test pin the warning-before-item order, including a null child. |
+| Important 5: non-dictionary DecodeParms | Core intentionally treated non-dictionaries as empty, while the driver lacked qpdf's two observable `getKeys()` warnings and token offsets. A qtest-only source-offset hook and driver boundary replay reproduce both warnings without changing core decode policy. | Direct Flate and array LZW fixtures match exact warning count, offset, order, decoded data, and status. Writer-failure tests cover both emissions. |
+| Important 6: argv0 | The driver reused the compare helper, which split backslashes and stripped `.exe`. A driver-only byte helper now splits only `/` and preserves suffix/non-UTF-8 bytes. | Unit/CLI tests plus the controlled `exec -a` oracle probe match qpdf usage bytes and status. Compare helper behavior is unchanged. |
+| Minor 1: fixture provenance | Inventories were duplicated and `--check` did not regenerate. A single manifest now drives generator, Cargo goldens, and differential checks; check mode regenerates in a temporary directory and byte-compares exact PDF/out inventories. | Manifest, committed PDFs, and qpdf-only `.out` files all contain exactly 47 stems. |
+| Minors 2-3: docs | The unsupported Beads `--id` + `--parent` form and historical test-id-0 claim were stale. | Plan uses parent-derived JSON creation/readback, and the historical plan carries an explicit supersession note. |
+
+## Oracle and provenance evidence
+
+The implementation was checked against the pinned sources that govern the
+affected boundaries:
+
+- `Pl_Flate.cc`, `Pl_PNGFilter.cc`, `QPDF_Stream.cc`, and `QPDF.cc` for live
+  pipeline warning/data/finish order.
+- `QPDF_Stream.cc`, `QPDF_encryption.cc`, and
+  `SF_FlateLzwDecode.cc` for Crypt and DecodeParms behavior.
+- `QPDF.cc:365-437`, `InputSource.cc:44-164`, and
+  `OffsetInputSource.cc:7-74` for header search, validation, and logical origin.
+- `qpdf/test_driver.cc` for lazy diagnostic boundaries and slash-only argv0.
+
+Every PDF is generated by `tests/fixtures/test_driver/generate.sh`. Expected
+`.out` files were generated only by:
+
+```text
+bash scripts/qpdf-test-driver-diff.sh --regenerate
+```
+
+Final live oracle result:
+
+```text
+qpdf and flpdf test_driver outputs match 47 fixtures and 11 CLI probes
+```
+
+## RED, GREEN, and mutation evidence
+
+- Each Important finding first failed a focused behavioral assertion or exact
+  differential comparison on the pre-fix code.
+- The leading-header follow-up first failed with `1.2 != 1.7`; after header
+  search passed, a separate incremental mutation test failed because reopen
+  required repair. Both are GREEN after `390e6203`.
+- Existing mixed warning/error/cleanup fixtures and the ASCIIHex odd-nibble
+  regression prevented fixes based on global event sorting.
+- Crypt alignment, DecodeParms warning multiplicity, strict header rejection,
+  byte-1023/1024 search bounds, and driver-only policy tests prevent the main
+  over-broad mutations.
+
+## Final verification
+
+All commands below passed from clean committed `390e6203`:
+
+```text
+cargo fmt --all -- --check
+cargo test -p flpdf --test stream_decode_recovery_public_api        # 9/9
+cargo test -p flpdf filters::tests                                 # 99/99
+cargo test -p flpdf --test check_tests                              # 7/7
+cargo test -p flpdf-qtest-tools --test driver_cli                   # 20/20
+cargo test -p flpdf-qtest-tools --test driver_goldens               # 4/4
+cargo test -p flpdf-qtest-tools                                     # PASS
+bash tests/fixtures/test_driver/generate.sh --check                 # PASS
+bash scripts/qpdf-test-driver-diff.sh --check                       # 47 + 11
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+python3 scripts/qpdf-module-docs.py --check
+RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links -D rustdoc::invalid_html_tags" cargo doc --workspace --no-deps --document-private-items
+git diff --check origin/main...HEAD
+```
+
+The exclusion audit found no added `cov:ignore`, `coverage off`, or
+`coverage:ignore` marker. Fresh coverage:
+
+```text
+flpdf     : changed 1613, uncovered 0 -> PASS (100%)
+report    : changed 2206, uncovered 0 -> PASS (100%)
+```
+
+## Boundaries and operational notes
+
+- The ordinary library filter-chain cap, `/Crypt` rejection, strict header
+  handling, encryption boundary, and raw path behavior remain unchanged.
+- Leading material is retained byte-for-byte during incremental output, while
+  all PDF offsets are calculated relative to the accepted header, matching
+  qpdf's `OffsetInputSource`.
+- No Git push, GitHub write, review-thread resolution, or explicit `bd` command
+  was performed. The repository commit hook printed its automatic Beads export
+  message during commits; the Git worktree remained clean.

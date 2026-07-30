@@ -1,6 +1,7 @@
 use flpdf::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
-    Diagnostics, Dictionary, Error, LoadedXref, ObjectRef, XrefEntry, XrefForm,
+    write_pdf, Diagnostics, Dictionary, Error, LoadedXref, Object, ObjectRef, Pdf, PdfOpenOptions,
+    XrefEntry, XrefForm,
 };
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -956,11 +957,10 @@ fn best_effort_objstm_non_integer_offset_yields_no_compressed_entry() {
     assert_no_compressed_entry(bytes, objstm);
 }
 
-/// When the linear scan finds no indirect objects at all, recovery must fail
-/// with the "unable to recover xref entries" error (`recover_xref_entries`
-/// empty-map branch).
+/// qpdf accepts a recovered trailer even when the linear scan finds no
+/// indirect objects.
 #[test]
-fn best_effort_errors_when_no_objects_to_recover() {
+fn best_effort_accepts_recovered_trailer_without_objects() {
     // Header + corrupt xref + trailer, but zero indirect objects to scan.
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let start_xref = bytes.len();
@@ -969,14 +969,23 @@ fn best_effort_errors_when_no_objects_to_recover() {
         format!("trailer\n<< /Size 1 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
     );
 
-    let err = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
-        .expect_err("no recoverable objects should fail");
-    let message = format!("{err}");
-    assert!(
-        message.contains("unable to recover xref entries"),
-        "got {message}"
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("recovered trailer is sufficient");
+    assert!(loaded.entries.is_empty());
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+    assert_eq!(
+        loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "file is damaged",
+            "expected integer",
+            "Attempting to reconstruct cross-reference table",
+        ]
     );
-    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 }
 
 /// Build a damaged document that strict parsing rejects (corrupt `xref` keyword)
@@ -1217,7 +1226,11 @@ fn best_effort_errors_when_trailer_missing() {
         message.contains("trailer dictionary not found"),
         "got {message}"
     );
-    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+    let (source, diagnostics) = err
+        .open_failure()
+        .expect("terminal repair failure carries warnings");
+    assert!(matches!(source, Error::Parse { .. }), "got {source:?}");
+    assert_eq!(diagnostics.entries().len(), 3);
 }
 
 /// When the `trailer` keyword is present but followed by a non-dictionary token,
@@ -1239,7 +1252,11 @@ fn best_effort_errors_when_trailer_not_dictionary() {
         message.contains("trailer dictionary is not a dictionary"),
         "got {message}"
     );
-    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+    let (source, diagnostics) = err
+        .open_failure()
+        .expect("terminal repair failure carries warnings");
+    assert!(matches!(source, Error::Parse { .. }), "got {source:?}");
+    assert_eq!(diagnostics.entries().len(), 3);
 }
 
 /// When `startxref` is absent, repair pushes a "can't find startxref" error
@@ -1254,8 +1271,6 @@ fn repair_diagnostics_report_only_the_triggering_error() {
     bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
     // Note: NO `startxref` keyword at all.
     bytes.extend_from_slice(b"trailer\n<< /Size 2 /Root 1 0 R >>\n%%EOF\n");
-    let file_len = bytes.len() as u64;
-
     let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
 
     let messages: Vec<&str> = loaded
@@ -1274,15 +1289,12 @@ fn repair_diagnostics_report_only_the_triggering_error() {
         "expected the qpdf warning sequence with only the first error"
     );
 
-    // The triggering error's warning carries the parse error's own offset
-    // (end of file for a missing startxref), not the startxref fallback of 0.
     assert_eq!(
         loaded.repair_diagnostics.entries()[1].offset,
-        Some(file_len),
-        "expected the trigger warning to carry the parse error offset"
+        None,
+        "qpdf suppresses the synthetic EOF offset for missing startxref"
     );
-    // qpdf prints no offset for the surrounding warnings (#1 and #3); only
-    // the trigger warning carries one.
+    // qpdf prints no offset for any of this missing-startxref sequence.
     assert_eq!(loaded.repair_diagnostics.entries()[0].offset, None);
     assert_eq!(loaded.repair_diagnostics.entries()[2].offset, None);
 
@@ -1292,6 +1304,214 @@ fn repair_diagnostics_report_only_the_triggering_error() {
         Some(&XrefEntry::Uncompressed { offset: 9 })
     );
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+}
+
+#[test]
+fn repair_missing_header_uses_version_1_2_and_preserves_strict_rejection() {
+    let mut bytes = b"notpdf!!\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        b"xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n\
+          trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n",
+    );
+    bytes.extend_from_slice(format!("{xref_offset}\n%%EOF\n").as_bytes());
+
+    let loaded =
+        load_xref_and_trailer_best_effort(&mut Cursor::new(bytes.clone())).expect("repair header");
+
+    assert_eq!(loaded.version, "1.2");
+    assert_eq!(
+        loaded.repair_diagnostics.entries(),
+        [flpdf::Diagnostic::warning("can't find PDF header", None)]
+    );
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefEntry::Uncompressed { offset: 9 })
+    );
+
+    let strict = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect_err("strict loading must still reject a missing header");
+    assert_eq!(
+        strict.to_string(),
+        "parse error at byte 0: missing PDF header"
+    );
+}
+
+#[test]
+fn repair_finds_a_valid_header_in_the_first_1024_bytes_and_uses_it_as_origin() {
+    let mut logical_pdf = b"%PDF-1.7\n".to_vec();
+    logical_pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref_offset = logical_pdf.len();
+    logical_pdf.extend_from_slice(
+        b"xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n\
+          trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n",
+    );
+    logical_pdf.extend_from_slice(format!("{xref_offset}\n%%EOF\n").as_bytes());
+
+    // qpdf accepts a pattern whose first byte is still inside [0, 1024).
+    let mut bytes = vec![b'x'; 1023];
+    bytes.extend_from_slice(&logical_pdf);
+
+    let loaded =
+        load_xref_and_trailer_best_effort(&mut Cursor::new(bytes.clone())).expect("repair header");
+    assert_eq!(loaded.version, "1.7");
+    assert!(loaded.repair_diagnostics.entries().is_empty());
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefEntry::Uncompressed { offset: 9 })
+    );
+
+    let mut pdf = Pdf::open_mem_owned_with_options(
+        bytes.clone(),
+        PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("open with qpdf header origin");
+    let root = pdf.root_ref().expect("root reference");
+    assert!(pdf.resolve(root).expect("resolve root").as_dict().is_some());
+
+    pdf.set_object(root, Object::Boolean(false));
+    let mut rewritten = Vec::new();
+    write_pdf(&mut pdf, &mut rewritten).expect("incremental write");
+    assert!(
+        rewritten.starts_with(&bytes),
+        "incremental output preserves the physical source prefix"
+    );
+    let mut reopened = Pdf::open_mem_owned_with_options(
+        rewritten,
+        PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("reopen incremental output");
+    assert!(
+        reopened.repair_diagnostics().entries().is_empty(),
+        "header-relative incremental xref must not require repair"
+    );
+    assert_eq!(
+        reopened
+            .resolve(root)
+            .expect("resolve rewritten root")
+            .as_bool(),
+        Some(false)
+    );
+
+    let strict = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect_err("strict loading keeps the ordinary start-at-zero boundary");
+    assert_eq!(
+        strict.to_string(),
+        "parse error at byte 0: missing PDF header"
+    );
+
+    // A pattern beginning exactly at byte 1024 is outside qpdf's search range.
+    let mut outside_search_range = vec![b'x'; 1024];
+    outside_search_range.extend_from_slice(&logical_pdf);
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(outside_search_range))
+        .expect("repair without an in-range header");
+    assert_eq!(loaded.version, "1.2");
+    assert_eq!(
+        loaded.repair_diagnostics.entries().first(),
+        Some(&flpdf::Diagnostic::warning("can't find PDF header", None))
+    );
+}
+
+#[test]
+fn repair_invalid_header_version_uses_version_1_2_and_preserves_strict_version() {
+    let mut bytes = b"%PDF-x.y\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        b"xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n\
+          trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n",
+    );
+    bytes.extend_from_slice(format!("{xref_offset}\n%%EOF\n").as_bytes());
+
+    let loaded =
+        load_xref_and_trailer_best_effort(&mut Cursor::new(bytes.clone())).expect("repair header");
+
+    assert_eq!(loaded.version, "1.2");
+    assert_eq!(
+        loaded.repair_diagnostics.entries(),
+        [flpdf::Diagnostic::warning("can't find PDF header", None)]
+    );
+
+    let strict =
+        load_xref_and_trailer(&mut Cursor::new(bytes)).expect("strict keeps its raw version");
+    assert_eq!(strict.version, "x.y");
+    assert!(strict.repair_diagnostics.entries().is_empty());
+}
+
+#[test]
+fn repair_non_utf8_header_version_uses_version_1_2_and_preserves_strict_error() {
+    let mut bytes = b"%PDF-\xff\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        b"xref\n0 2\n0000000000 65535 f \n0000000007 00000 n \n\
+          trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n",
+    );
+    bytes.extend_from_slice(format!("{xref_offset}\n%%EOF\n").as_bytes());
+
+    let loaded =
+        load_xref_and_trailer_best_effort(&mut Cursor::new(bytes.clone())).expect("repair header");
+
+    assert_eq!(loaded.version, "1.2");
+    assert_eq!(
+        loaded.repair_diagnostics.entries(),
+        [flpdf::Diagnostic::warning("can't find PDF header", None)]
+    );
+
+    let strict = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect_err("strict loading must reject a non-UTF-8 header version");
+    assert_eq!(
+        strict.to_string(),
+        "parse error at byte 5: PDF version is not utf-8"
+    );
+}
+
+#[test]
+fn header_version_uses_qpdfs_valid_numeric_prefix() {
+    let mut bytes = b"%PDF-1.7suffix\n".to_vec();
+    let object_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \n\
+             trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let repaired = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes.clone()))
+        .expect("repair uses qpdf's numeric version prefix");
+    assert_eq!(repaired.version, "1.7");
+    assert!(repaired.repair_diagnostics.entries().is_empty());
+
+    let strict =
+        load_xref_and_trailer(&mut Cursor::new(bytes)).expect("strict keeps its raw version");
+    assert_eq!(strict.version, "1.7suffix");
+    assert!(strict.repair_diagnostics.entries().is_empty());
+}
+
+#[test]
+fn missing_header_and_startxref_terminal_failure_preserves_warning_order() {
+    let error = load_xref_and_trailer_best_effort(&mut Cursor::new(b"not a PDF".to_vec()))
+        .expect_err("unrecoverable malformed input");
+    let (_, diagnostics) = error
+        .open_failure()
+        .expect("repair diagnostics survive terminal failure");
+
+    assert_eq!(
+        diagnostics.entries(),
+        [
+            flpdf::Diagnostic::warning("can't find PDF header", None),
+            flpdf::Diagnostic::warning("file is damaged", None),
+            flpdf::Diagnostic::warning("can't find startxref", None),
+            flpdf::Diagnostic::warning("Attempting to reconstruct cross-reference table", None,),
+        ]
+    );
 }
 
 /// When the triggering error is not `Error::Parse` (here: `Error::Missing`
@@ -1400,10 +1620,9 @@ fn with_repair_appends_diagnostic_when_stream_parse_succeeds() {
         !messages.iter().any(|m| m.contains("linear object scan")),
         "must not claim a linear scan ran: {messages:?}"
     );
-    // qpdf prints no offset for the surrounding warnings (#1 and #3); only
-    // the trigger warning carries one.
+    // qpdf prints no offset for the missing-startxref trigger either.
     assert_eq!(loaded.repair_diagnostics.entries()[0].offset, None);
-    assert!(loaded.repair_diagnostics.entries()[1].offset.is_some());
+    assert_eq!(loaded.repair_diagnostics.entries()[1].offset, None);
     assert_eq!(loaded.repair_diagnostics.entries()[2].offset, None);
 
     // The stream's own entries are present (e.g. object 1 at its offset).
@@ -1519,7 +1738,7 @@ fn circular_prev_xref_stream_recovers_without_classic_trailer() {
 }
 
 #[test]
-fn circular_prev_repair_propagates_linear_scan_failure() {
+fn circular_prev_repair_accepts_empty_linear_scan() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let xref_offset = bytes.len();
     bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
@@ -1530,13 +1749,22 @@ fn circular_prev_repair_propagates_linear_scan_failure() {
         .as_bytes(),
     );
 
-    let error = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
-        .expect_err("repair cannot reconstruct a file without indirect objects");
-    assert!(
-        error
-            .to_string()
-            .contains("unable to recover xref entries by linear scan"),
-        "{error}"
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("recovered trailer is sufficient despite an empty object scan");
+    assert!(loaded.entries.is_empty());
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+    assert_eq!(
+        loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "file is damaged",
+            "loop detected following xref tables",
+            "Attempting to reconstruct cross-reference table",
+        ]
     );
 }
 

@@ -972,17 +972,20 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
     let mut bytes = pdf.source_bytes()?;
     // flpdf-9hc.22.4: the incremental path only ever *appends* to the source
     // bytes, so the original prefix — and therefore any signed `/ByteRange`
-    // region within it — stays bit-identical. In debug builds capture the
-    // source length and an MD5 digest of it (O(1) memory, instead of an O(N)
-    // clone of a possibly hundreds-of-MB PDF) so the invariant can be asserted
-    // before we hand off the buffer.
+    // region within it — stays bit-identical. In debug builds capture an MD5
+    // digest of it (O(1) memory, instead of an O(N) clone of a possibly
+    // hundreds-of-MB PDF) so the invariant can be asserted before we hand off
+    // the buffer.
     #[cfg(debug_assertions)]
-    let (source_len, source_digest) = {
+    let source_digest = {
         use md5::Digest as _;
         let mut hasher = md5::Md5::new();
         hasher.update(&bytes);
-        (bytes.len(), hasher.finalize())
+        hasher.finalize()
     };
+    let leading_bytes: Vec<u8> = bytes.drain(..pdf.source_header_offset()).collect();
+    #[cfg(debug_assertions)]
+    let logical_source_len = bytes.len();
     if !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
     }
@@ -1094,15 +1097,17 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
 
     // flpdf-9hc.22.4: guard the byte-preservation invariant. The source prefix
     // (and any signed `/ByteRange` covered by it) must survive verbatim — the
-    // appended trailing `\n` lands *after* it, so we re-hash exactly the first
-    // `source_len` bytes (not the whole buffer) and compare against the digest
-    // captured up front. `.get(..source_len)` keeps a pathological shrink from
-    // panicking the index, surfacing it as a clean assertion failure instead.
+    // appended trailing `\n` lands *after* it, so we re-hash the leading
+    // material plus exactly the logical source prefix (not the whole buffer)
+    // and compare against the digest captured up front. `.get(...)` keeps a
+    // pathological shrink from panicking the index, surfacing it as a clean
+    // assertion failure instead.
     #[cfg(debug_assertions)]
     {
         use md5::Digest as _;
         let mut hasher = md5::Md5::new();
-        hasher.update(bytes.get(..source_len).unwrap_or(&bytes));
+        hasher.update(&leading_bytes);
+        hasher.update(bytes.get(..logical_source_len).unwrap_or(&bytes));
         debug_assert_eq!(
             hasher.finalize(),
             source_digest,
@@ -1110,6 +1115,7 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
         );
     }
 
+    out.write_all(&leading_bytes)?;
     out.write_all(&bytes)?;
     Ok(())
 }

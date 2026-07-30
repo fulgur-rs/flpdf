@@ -7,7 +7,7 @@ use crate::pipeline::{PipelineError, PipelineResult};
 #[cfg(test)]
 use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
-    decode_filter_specs, encode_flate, encode_run_length, stream_filter_for,
+    decode_filter_specs, encode_flate, encode_run_length, stream_filter_for, FilterDecodePhase,
     DECODE_OUTPUT_LIMIT_PREFIX,
 };
 use crate::{Dictionary, Error, Object, Result};
@@ -21,13 +21,13 @@ use crate::{Dictionary, Error, Object, Result};
 const MAX_FILTER_CHAIN_LEN: usize = 16;
 
 pub(crate) fn validate_filter_chain_len(filters: &[Object]) -> Result<()> {
-    validate_filter_chain_count(filters.len())
+    validate_filter_chain_count(filters.len(), Some(MAX_FILTER_CHAIN_LEN))
 }
 
-fn validate_filter_chain_count(count: usize) -> Result<()> {
-    if count > MAX_FILTER_CHAIN_LEN {
+fn validate_filter_chain_count(count: usize, maximum: Option<usize>) -> Result<()> {
+    if let Some(maximum) = maximum.filter(|maximum| count > *maximum) {
         return Err(Error::Unsupported(format!(
-            "filter chain length {count} exceeds maximum of {MAX_FILTER_CHAIN_LEN}"
+            "filter chain length {count} exceeds maximum of {maximum}"
         )));
     }
     Ok(())
@@ -84,20 +84,124 @@ pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u
     )
 }
 
+/// A non-fatal warning emitted while decoding a stream codec.
+///
+/// The message and numeric code correspond to qpdf's `Pl_Flate` warning
+/// callback. In particular, truncated Flate input reports zlib code `-5`
+/// without turning a successfully built filter chain into an outer error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamDecodeWarning {
+    /// qpdf-compatible warning text without document/object location context.
+    pub message: String,
+    /// Codec-specific numeric error code (a zlib code for Flate warnings).
+    pub code: i32,
+}
+
+/// One ordered output or diagnostic emitted by an opt-in recoverable stream decode.
+///
+/// Events retain pipeline emission order. In particular, an error raised by
+/// an outer filter's `write` precedes warnings emitted while its downstream
+/// pipeline is subsequently finished.
+#[derive(Debug)]
+pub enum StreamDecodeEvent {
+    /// A recovered decoded output chunk.
+    Data(Vec<u8>),
+    /// A non-fatal codec warning.
+    Warning(StreamDecodeWarning),
+    /// The first runtime codec failure after successful pipeline construction.
+    Error(Error),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DataEventMode {
+    Record,
+    Suppress,
+}
+
+impl DataEventMode {
+    fn push(self, events: &mut Vec<StreamDecodeEvent>, data: &[u8]) {
+        if self == Self::Record && !data.is_empty() {
+            events.push(StreamDecodeEvent::Data(data.to_vec()));
+        }
+    }
+}
+
+/// Data and ordered diagnostics produced by an opt-in recoverable stream decode.
+///
+/// An outer [`Result::Err`] from [`decode_stream_data_recovering`] means the
+/// filter chain could not be interpreted or constructed. Once construction
+/// succeeds, a codec failure is stored as a [`StreamDecodeEvent::Error`], and
+/// [`data`](Self::data) retains bytes already emitted before that failure.
+#[derive(Debug)]
+pub struct StreamDecodeOutcome {
+    /// Bytes emitted by the constructed decode pipeline.
+    pub data: Vec<u8>,
+    /// Recovered output and diagnostics in pipeline emission order.
+    pub events: Vec<StreamDecodeEvent>,
+}
+
+/// Decode a stream while preserving output emitted before a codec failure.
+///
+/// Unlike [`decode_stream_data`], this opt-in boundary separates filter-chain
+/// interpretation/construction from runtime codec failure. Unsupported filter
+/// shapes, names, and decode parameters return an outer [`Error`]. A runtime
+/// error after successful construction returns [`StreamDecodeOutcome`] with
+/// its partial bytes and error populated. This applies
+/// [`DecodeLimits::default()`], including the default 16-stage `/Filter` cap.
+pub fn decode_stream_data_recovering(
+    dict: &Dictionary,
+    stream_data: &[u8],
+) -> Result<StreamDecodeOutcome> {
+    decode_stream_data_recovering_with_limits(dict, stream_data, DecodeLimits::default())
+}
+
+/// Decode a stream with explicit limits while retaining ordered recovery events.
+///
+/// # Errors
+///
+/// Returns an outer [`Error`] when the filter chain cannot be interpreted or
+/// constructed, including when it exceeds [`DecodeLimits::max_filter_chain`].
+/// Runtime codec failures instead remain ordered [`StreamDecodeEvent::Error`]
+/// events alongside any recovered output, as for [`decode_stream_data_recovering`].
+pub fn decode_stream_data_recovering_with_limits(
+    dict: &Dictionary,
+    stream_data: &[u8],
+    limits: DecodeLimits,
+) -> Result<StreamDecodeOutcome> {
+    decode_stream_data_recovering_with_limits_and_mode(
+        dict,
+        stream_data,
+        limits,
+        DataEventMode::Record,
+    )
+}
+
 /// Opt-in limits applied while decoding a stream's filter chain.
 ///
-/// Default is unlimited, matching [`decode_stream_data`]. Embedders processing
-/// untrusted input can set [`max_output`](Self::max_output) to bound the
-/// decoded size of each `FlateDecode`, `LZWDecode`, `ASCII85Decode`,
-/// `ASCIIHexDecode`, or `RunLengthDecode` stage, trading completeness for a
-/// per-stage bound. It is not a ceiling on the total work or cumulative output
-/// across a filter chain.
-#[derive(Clone, Copy, Debug, Default)]
+/// By default, output is unlimited, matching [`decode_stream_data`], while the
+/// `/Filter` chain is capped at 16 stages. Embedders processing untrusted input
+/// can set [`max_output`](Self::max_output) to bound the decoded size of each
+/// `FlateDecode`, `LZWDecode`, `ASCII85Decode`, `ASCIIHexDecode`, or
+/// `RunLengthDecode` stage, trading completeness for a per-stage bound. It is
+/// not a ceiling on the total work or cumulative output across a filter chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodeLimits {
     /// Maximum decoded byte count permitted out of any single supported filter
     /// stage, counted after that stage's predictor if it has one. `None`
     /// (default) is unlimited.
     pub max_output: Option<usize>,
+    /// Maximum `/Filter` stages accepted before individual filter items are
+    /// validated. `None` disables this count limit.
+    pub max_filter_chain: Option<usize>,
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_output: None,
+            max_filter_chain: Some(MAX_FILTER_CHAIN_LEN),
+        }
+    }
 }
 
 fn reject_decode_warning(message: &str, code: i32) -> PipelineResult<()> {
@@ -112,12 +216,50 @@ pub(crate) fn decode_stream_data_with_limits_and_warnings(
     limits: DecodeLimits,
     warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
 ) -> Result<Vec<u8>> {
+    let outcome = decode_stream_data_recovering_with_limits_and_mode(
+        dict,
+        stream_data,
+        limits,
+        DataEventMode::Suppress,
+    )?;
+    let mut first_error = None;
+    for event in outcome.events {
+        let event_error = replay_strict_decode_event(event, warn);
+        if first_error.is_none() {
+            first_error = event_error;
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(outcome.data),
+    }
+}
+
+fn replay_strict_decode_event(
+    event: StreamDecodeEvent,
+    warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+) -> Option<Error> {
+    match event {
+        StreamDecodeEvent::Data(_) => None,
+        StreamDecodeEvent::Warning(warning) => warn(&warning.message, warning.code)
+            .err()
+            .map(|error| Error::Unsupported(error.into_string_lossy())),
+        StreamDecodeEvent::Error(error) => Some(error),
+    }
+}
+
+fn decode_stream_data_recovering_with_limits_and_mode(
+    dict: &Dictionary,
+    stream_data: &[u8],
+    limits: DecodeLimits,
+    data_events: DataEventMode,
+) -> Result<StreamDecodeOutcome> {
     decode_stream_data_with_filters(
         dict.get("Filter"),
         dict.get("DecodeParms"),
         stream_data,
         limits,
-        warn,
+        data_events,
     )
 }
 
@@ -142,8 +284,8 @@ pub(crate) fn is_decode_output_limit_error(error: &Error) -> bool {
 ///
 /// Returns [`Error::Unsupported`] for the same reasons as [`decode_stream_data`],
 /// plus when a supported filter stage's decoded output exceeds
-/// [`DecodeLimits::max_output`], or when the `/Filter` chain exceeds the fixed
-/// stage cap.
+/// [`DecodeLimits::max_output`], or when the `/Filter` chain exceeds
+/// [`DecodeLimits::max_filter_chain`].
 pub fn decode_stream_data_with_limits(
     dict: &Dictionary,
     stream_data: &[u8],
@@ -181,19 +323,19 @@ fn decode_stream_data_with_filters(
     decode_params: Option<&Object>,
     stream_data: &[u8],
     limits: DecodeLimits,
-    warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
-) -> Result<Vec<u8>> {
+    data_events: DataEventMode,
+) -> Result<StreamDecodeOutcome> {
     decode_stream_data_with_filters_and_crypt(
         filter,
         decode_params,
         stream_data,
         limits,
+        data_events,
         &mut |_, _| {
             Err(Error::Unsupported(
                 "unsupported stream filter: Crypt".to_string(),
             ))
         },
-        warn,
     )
 }
 
@@ -202,31 +344,159 @@ fn decode_stream_data_with_filters_and_crypt<F>(
     decode_params: Option<&Object>,
     stream_data: &[u8],
     limits: DecodeLimits,
+    data_events: DataEventMode,
     decrypt_crypt: &mut F,
-    warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
-) -> Result<Vec<u8>>
+) -> Result<StreamDecodeOutcome>
 where
     F: FnMut(Option<&Object>, &[u8]) -> Result<Vec<u8>>,
 {
     if let Some(Object::Array(filters)) = filter {
-        validate_filter_chain_len(filters)?;
+        validate_filter_chain_count(filters.len(), limits.max_filter_chain)?;
     }
     let specs = decode_filter_specs(filter, decode_params)?;
-    validate_filter_chain_count(specs.len())?;
+    validate_filter_chain_count(specs.len(), limits.max_filter_chain)?;
     let prepared = prepare_decode_filters(specs)?;
+    let stage_count = prepared.len();
     let mut decoded = Cow::Borrowed(stream_data);
-    for mut stage in prepared {
+    let mut events = Vec::new();
+    let mut pending_events = Vec::new();
+    let mut pending_data_boundary: Option<PendingDataBoundary> = None;
+    let mut has_runtime_error = false;
+    for (stage_index, mut stage) in prepared.into_iter().enumerate() {
+        let is_last_stage = stage_index + 1 == stage_count;
         let next = match &mut stage.stage {
             PreparedStage::Crypt { decode_params } => {
-                decrypt_crypt(*decode_params, decoded.as_ref())?
+                let data = decrypt_crypt(*decode_params, decoded.as_ref())?;
+                append_final_crypt_events(
+                    is_last_stage,
+                    &mut events,
+                    &data,
+                    data_events,
+                    pending_data_boundary,
+                    &mut pending_events,
+                );
+                data
             }
             PreparedStage::Codec { adapter } => {
-                adapter.pipe_decode(decoded.as_ref(), limits.max_output, warn)?
+                let mut next_pending_data_boundary = pending_data_boundary.map(|boundary| {
+                    let prefix_data = &decoded[..boundary.0];
+                    let prefix = decode_codec_prefix(stage.spec, prefix_data, limits);
+                    let input_end = if boundary.1 {
+                        prefix.data.len()
+                    } else {
+                        prefix.cleanup_data_start
+                    };
+                    PendingDataBoundary(input_end, boundary.1)
+                });
+                let mut stage_warnings = Vec::new();
+                let outcome = adapter.pipe_decode_recovering(
+                    decoded.as_ref(),
+                    limits.max_output,
+                    &mut |message, code, output_offset, phase| {
+                        let ordinal = stage_warnings.len();
+                        stage_warnings.push(PositionedDecodeEvent::local(
+                            output_offset,
+                            phase,
+                            ordinal,
+                            StreamDecodeEvent::Warning(StreamDecodeWarning {
+                                message: message.to_string(),
+                                code,
+                            }),
+                        ));
+                        Ok(())
+                    },
+                )?;
+                if let Some(stage_error) = outcome.error {
+                    if has_runtime_error {
+                        if is_last_stage {
+                            let mut markers = stage_warnings;
+                            if let Some(PendingDataBoundary(boundary, after_finish)) =
+                                next_pending_data_boundary
+                            {
+                                markers.extend(position_pending_events(
+                                    boundary,
+                                    after_finish,
+                                    std::mem::take(&mut pending_events),
+                                ));
+                            }
+                            append_positioned_events(
+                                &mut events,
+                                &outcome.data,
+                                data_events,
+                                markers,
+                            );
+                        } else {
+                            append_plain_events(&mut events, stage_warnings);
+                        }
+                    } else {
+                        has_runtime_error = true;
+                        let error_phase = if stage_error.during_write {
+                            FilterDecodePhase::Write
+                        } else {
+                            FilterDecodePhase::Finish
+                        };
+                        let error_offset = stage_error.output_offset;
+                        let error_ordinal = stage_warnings.len();
+                        stage_warnings.push(PositionedDecodeEvent::local(
+                            error_offset,
+                            error_phase,
+                            error_ordinal,
+                            StreamDecodeEvent::Error(stage_error.error),
+                        ));
+                        if !is_last_stage {
+                            next_pending_data_boundary =
+                                Some(PendingDataBoundary(error_offset, !stage_error.during_write));
+                            pending_events.extend(positioned_into_plain_events(stage_warnings));
+                        } else {
+                            if let Some(PendingDataBoundary(boundary, after_finish)) =
+                                next_pending_data_boundary
+                            {
+                                stage_warnings.extend(position_pending_events(
+                                    boundary,
+                                    after_finish,
+                                    std::mem::take(&mut pending_events),
+                                ));
+                            }
+                            append_positioned_events(
+                                &mut events,
+                                &outcome.data,
+                                data_events,
+                                stage_warnings,
+                            );
+                        }
+                    }
+                } else {
+                    if is_last_stage {
+                        let mut markers = stage_warnings;
+                        if let Some(PendingDataBoundary(boundary, after_finish)) =
+                            next_pending_data_boundary
+                        {
+                            markers.extend(position_pending_events(
+                                boundary,
+                                after_finish,
+                                std::mem::take(&mut pending_events),
+                            ));
+                        }
+                        append_positioned_events(&mut events, &outcome.data, data_events, markers);
+                    } else if !stage_warnings.is_empty() {
+                        let boundary = stage_warnings[0].offset;
+                        pending_events.extend(positioned_into_plain_events(stage_warnings));
+                        next_pending_data_boundary = Some(PendingDataBoundary(boundary, false));
+                    }
+                }
+                if !is_last_stage && (has_runtime_error || next_pending_data_boundary.is_some()) {
+                    pending_data_boundary = next_pending_data_boundary;
+                }
+                outcome.data
             }
         };
         decoded = Cow::Owned(next);
     }
-    Ok(decoded.into_owned())
+    let data = decoded.into_owned();
+    if stage_count == 0 {
+        data_events.push(&mut events, &data);
+    }
+    Ok(StreamDecodeOutcome { data, events })
 }
 
 /// A filter-chain stage with its decode route already resolved.
@@ -243,6 +513,7 @@ enum PreparedStage<'a> {
 }
 
 struct PreparedDecodeFilter<'a> {
+    spec: crate::stream_filter::FilterSpec<'a>,
     stage: PreparedStage<'a>,
 }
 
@@ -254,6 +525,7 @@ fn prepare_decode_filters<'a>(
         let filter_name = crate::stream_filter::normalize_filter_name(spec.name);
         if filter_name == b"Crypt" {
             prepared.push(PreparedDecodeFilter {
+                spec,
                 stage: PreparedStage::Crypt {
                     decode_params: spec.decode_params,
                 },
@@ -272,6 +544,7 @@ fn prepare_decode_filters<'a>(
         }
 
         prepared.push(PreparedDecodeFilter {
+            spec,
             stage: PreparedStage::Codec { adapter },
         });
     }
@@ -285,6 +558,125 @@ fn prepare_decode_filters<'a>(
         }
     }
     Ok(prepared)
+}
+
+#[derive(Clone, Copy)]
+struct PendingDataBoundary(usize, bool);
+
+struct PositionedDecodeEvent {
+    offset: usize,
+    barrier: u8,
+    ordinal: usize,
+    event: StreamDecodeEvent,
+}
+
+fn append_final_crypt_events(
+    is_last_stage: bool,
+    events: &mut Vec<StreamDecodeEvent>,
+    data: &[u8],
+    data_events: DataEventMode,
+    pending_data_boundary: Option<PendingDataBoundary>,
+    pending_events: &mut Vec<StreamDecodeEvent>,
+) {
+    if !is_last_stage {
+        return;
+    }
+    let mut markers = Vec::new();
+    if let Some(PendingDataBoundary(boundary, after_finish)) = pending_data_boundary {
+        markers.extend(position_pending_events(
+            boundary,
+            after_finish,
+            std::mem::take(pending_events),
+        ));
+    }
+    append_positioned_events(events, data, data_events, markers);
+}
+
+impl PositionedDecodeEvent {
+    fn local(
+        offset: usize,
+        phase: FilterDecodePhase,
+        ordinal: usize,
+        event: StreamDecodeEvent,
+    ) -> Self {
+        let barrier = match phase {
+            FilterDecodePhase::Write => 1,
+            FilterDecodePhase::Finish => 2,
+        };
+        Self {
+            offset,
+            barrier,
+            ordinal,
+            event,
+        }
+    }
+}
+
+fn position_pending_events(
+    offset: usize,
+    after_finish: bool,
+    events: Vec<StreamDecodeEvent>,
+) -> impl Iterator<Item = PositionedDecodeEvent> {
+    // A pending upstream event at this boundary happens before the downstream
+    // stage consumes any cleanup bytes that follow it. Those bytes can produce
+    // a write-time event at the same output offset, so the pending event must
+    // win that tie. An event explicitly marked after finish remains last.
+    let barrier = if after_finish { 3 } else { 0 };
+    events
+        .into_iter()
+        .enumerate()
+        .map(move |(ordinal, event)| PositionedDecodeEvent {
+            offset,
+            barrier,
+            ordinal,
+            event,
+        })
+}
+
+fn sort_positioned_events(events: &mut [PositionedDecodeEvent]) {
+    events.sort_by_key(|event| (event.offset, event.barrier, event.ordinal));
+}
+
+fn positioned_into_plain_events(
+    mut events: Vec<PositionedDecodeEvent>,
+) -> impl Iterator<Item = StreamDecodeEvent> {
+    sort_positioned_events(&mut events);
+    events.into_iter().map(|event| event.event)
+}
+
+fn append_plain_events(output: &mut Vec<StreamDecodeEvent>, events: Vec<PositionedDecodeEvent>) {
+    output.extend(positioned_into_plain_events(events));
+}
+
+fn append_positioned_events(
+    output: &mut Vec<StreamDecodeEvent>,
+    data: &[u8],
+    data_events: DataEventMode,
+    mut events: Vec<PositionedDecodeEvent>,
+) {
+    sort_positioned_events(&mut events);
+    let mut data_start = 0;
+    for event in events {
+        let offset = event.offset.min(data.len()).max(data_start);
+        data_events.push(output, &data[data_start..offset]);
+        output.push(event.event);
+        data_start = offset;
+    }
+    data_events.push(output, &data[data_start..]);
+}
+
+fn decode_codec_prefix(
+    spec: crate::stream_filter::FilterSpec<'_>,
+    data: &[u8],
+    limits: DecodeLimits,
+) -> crate::stream_filter::FilterDecodeOutcome {
+    let filter_name = crate::stream_filter::normalize_filter_name(spec.name);
+    let mut adapter =
+        stream_filter_for(filter_name).expect("a prepared codec has a registered prefix decoder");
+    debug_assert!(adapter.set_decode_params(spec.decode_params));
+    adapter
+        .pipe_decode_recovering(data, limits.max_output, &mut |_, _, _, _| Ok(()))
+        .expect("preflighted codec prefix pipeline is infallible")
 }
 
 /// Report why a filter name has no decode route.
@@ -390,11 +782,62 @@ fn apply_single_filter_encode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::lzw::pack_codes;
+
+    #[test]
+    fn decode_limits_default_to_unbounded_output_and_sixteen_filters() {
+        assert_eq!(
+            DecodeLimits::default(),
+            DecodeLimits {
+                max_output: None,
+                max_filter_chain: Some(16),
+            }
+        );
+    }
+
+    #[test]
+    fn unlimited_chain_policy_reaches_filter_item_validation() {
+        let mut filters = vec![Object::Name(b"ASCIIHexDecode".to_vec()); 16];
+        filters.push(Object::Integer(1));
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("Filter", Object::Array(filters));
+
+        let error = decode_stream_data_recovering_with_limits(
+            &dictionary,
+            b">",
+            DecodeLimits {
+                max_output: None,
+                max_filter_chain: None,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream filter type is not name or array"
+        );
+    }
 
     fn flate_dict() -> Dictionary {
         let mut dict = Dictionary::new();
         dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
         dict
+    }
+
+    fn valid_prefix_then_invalid_stored_block() -> (Vec<u8>, Vec<u8>) {
+        let mut encoded = vec![
+            0x78, 0x01, // zlib header
+            0x00, 0xff, 0xff, 0x00, 0x00, // non-final stored block, 65,535 bytes
+        ];
+        encoded.extend(std::iter::repeat_n(b'A', 65_535));
+        encoded.extend_from_slice(&[
+            0x00, 0x02, 0x00, 0xfd, 0xff, b'B', b'C', // valid non-final two-byte block
+            0x01, 0x01, 0x00, 0x00, 0x00, // final block with invalid LEN/NLEN
+        ]);
+
+        let mut decoded = vec![b'A'; 65_535];
+        decoded.extend_from_slice(b"BC");
+        (encoded, decoded)
     }
 
     #[test]
@@ -416,6 +859,16 @@ mod tests {
         dict.insert("Filter", Object::Name(b"TestBorrowedInput".to_vec()));
 
         assert_eq!(decode_stream_data(&dict, input).unwrap(), input);
+    }
+
+    #[test]
+    fn recovering_decode_propagates_a_post_preflight_adapter_error() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"TestPostPreflightFailure".to_vec()));
+
+        let error = decode_stream_data_recovering(&dict, b"encoded input").unwrap_err();
+
+        assert_eq!(error.to_string(), "test post-preflight decode failure");
     }
 
     #[test]
@@ -447,6 +900,674 @@ mod tests {
             "unsupported PDF feature: stream inflate: inflate: data: incorrect header check"
         );
     }
+
+    #[test]
+    fn recovering_decode_retains_partial_bytes_after_codec_error() {
+        let (encoded, decoded_prefix) = valid_prefix_then_invalid_stored_block();
+
+        let outcome = decode_stream_data_recovering(&flate_dict(), &encoded).unwrap();
+
+        assert_eq!(outcome.data, decoded_prefix[..65_536]);
+        assert_eq!(outcome.events.len(), 2);
+        assert!(matches!(
+            &outcome.events[0],
+            StreamDecodeEvent::Data(data) if data == &decoded_prefix[..65_536]
+        ));
+        assert!(matches!(
+            &outcome.events[1],
+            StreamDecodeEvent::Error(error)
+                if error
+                    .to_string()
+                    .starts_with("unsupported PDF feature: stream inflate: inflate: data:")
+        ));
+    }
+
+    #[test]
+    fn recovering_decode_reports_blank_partial_for_malformed_header() {
+        let outcome = decode_stream_data_recovering(&flate_dict(), b"abc").unwrap();
+
+        assert!(outcome.data.is_empty());
+        assert_eq!(outcome.events.len(), 1);
+        assert!(matches!(
+            &outcome.events[0],
+            StreamDecodeEvent::Error(error)
+                if error.to_string()
+                    == "unsupported PDF feature: stream inflate: inflate: data: incorrect header check"
+        ));
+    }
+
+    #[test]
+    fn strict_decode_keeps_the_recovering_codec_error_contract() {
+        let (encoded, _) = valid_prefix_then_invalid_stored_block();
+        let outcome = decode_stream_data_recovering(&flate_dict(), &encoded).unwrap();
+        let strict_error = decode_stream_data(&flate_dict(), &encoded).unwrap_err();
+
+        assert!(outcome.events.iter().any(|event| {
+            matches!(event, StreamDecodeEvent::Error(recovering_error)
+                if strict_error.to_string() == recovering_error.to_string())
+        }));
+    }
+
+    #[test]
+    fn strict_decode_retains_data_without_recording_a_duplicate_data_event() {
+        let encoded = encode_stream_data(&flate_dict(), b"strict payload").unwrap();
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
+            &flate_dict(),
+            &encoded,
+            DecodeLimits::default(),
+            DataEventMode::Suppress,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data, b"strict payload");
+        assert!(!outcome
+            .events
+            .iter()
+            .any(|event| matches!(event, StreamDecodeEvent::Data(_))));
+    }
+
+    #[test]
+    fn strict_decode_without_filters_suppresses_the_passthrough_data_event() {
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
+            &Dictionary::new(),
+            b"unfiltered payload",
+            DecodeLimits::default(),
+            DataEventMode::Suppress,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data, b"unfiltered payload");
+        assert!(outcome.events.is_empty());
+    }
+
+    #[test]
+    fn recovering_decode_retains_only_the_first_filter_runtime_error() {
+        let dict = array_filter_dict(&[b"ASCIIHexDecode", b"ASCIIHexDecode"]);
+
+        let outcome = decode_stream_data_recovering(&dict, b"4G").unwrap();
+
+        assert!(outcome.data.is_empty());
+        assert_eq!(outcome.events.len(), 1);
+        assert!(matches!(
+            &outcome.events[0],
+            StreamDecodeEvent::Error(error)
+                if error.to_string()
+                    == "unsupported PDF feature: character out of range during base Hex decode: G"
+        ));
+    }
+
+    #[test]
+    fn recovering_decode_collects_nonfatal_flate_warnings() {
+        let outcome = decode_stream_data_recovering(&flate_dict(), b"\x78").unwrap();
+
+        assert!(outcome.data.is_empty());
+        assert_eq!(outcome.events.len(), 1);
+        assert!(matches!(
+            &outcome.events[0],
+            StreamDecodeEvent::Warning(warning)
+                if warning.message == "input stream is complete but output may still be valid"
+                    && warning.code == -5
+        ));
+    }
+
+    #[test]
+    fn recovering_final_flate_warning_precedes_predictor_finish_data() {
+        let mut encoded = encode_flate(b"\0A").unwrap();
+        encoded.truncate(encoded.len() - 4);
+
+        let mut decode_params = Dictionary::new();
+        decode_params.insert("Predictor", Object::Integer(12));
+        decode_params.insert("Columns", Object::Integer(2));
+        let mut dictionary = flate_dict();
+        dictionary.insert("DecodeParms", Object::Dictionary(decode_params));
+
+        let outcome = decode_stream_data_recovering(&dictionary, &encoded).unwrap();
+
+        assert_eq!(outcome.data, b"A\0");
+        assert!(matches!(
+            &outcome.events[..],
+            [
+                StreamDecodeEvent::Warning(warning),
+                StreamDecodeEvent::Data(data),
+            ] if warning.message == "input stream is complete but output may still be valid"
+                && warning.code == -5
+                && data == b"A\0"
+        ));
+    }
+
+    #[test]
+    fn recovering_final_flate_warning_precedes_predictor_finish_limit() {
+        let mut encoded = encode_flate(b"\0A").unwrap();
+        encoded.truncate(encoded.len() - 4);
+
+        let mut decode_params = Dictionary::new();
+        decode_params.insert("Predictor", Object::Integer(12));
+        decode_params.insert("Columns", Object::Integer(2));
+        let mut dictionary = flate_dict();
+        dictionary.insert("DecodeParms", Object::Dictionary(decode_params));
+
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
+            &dictionary,
+            &encoded,
+            DecodeLimits {
+                max_output: Some(1),
+                ..DecodeLimits::default()
+            },
+            DataEventMode::Record,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data, b"A");
+        assert!(matches!(
+            &outcome.events[..],
+            [
+                StreamDecodeEvent::Warning(warning),
+                StreamDecodeEvent::Data(data),
+                StreamDecodeEvent::Error(error),
+            ] if warning.message == "input stream is complete but output may still be valid"
+                && warning.code == -5
+                && data == b"A"
+                && error.to_string()
+                    == "unsupported PDF feature: decoded output exceeds configured limit of 1 bytes"
+        ));
+    }
+
+    #[test]
+    fn recovering_pending_error_precedes_equal_offset_final_finish_warning() {
+        let filter = Object::Array(vec![
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+            Object::Name(b"FlateDecode".to_vec()),
+        ]);
+        let mut predictor = Dictionary::new();
+        predictor.insert("Predictor", Object::Integer(12));
+        predictor.insert("Columns", Object::Integer(2));
+        let decode_params = Object::Array(vec![Object::Null, Object::Dictionary(predictor)]);
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("Filter", filter);
+        dictionary.insert("DecodeParms", decode_params);
+
+        let outcome = decode_stream_data_recovering(&dictionary, b"789C63700400G").unwrap();
+
+        assert_eq!(outcome.data, b"A\0");
+        assert!(matches!(
+            &outcome.events[..],
+            [
+                StreamDecodeEvent::Error(error),
+                StreamDecodeEvent::Warning(warning),
+                StreamDecodeEvent::Data(data),
+            ] if error.to_string()
+                    == "unsupported PDF feature: character out of range during base Hex decode: G"
+                && warning.message == "input stream is complete but output may still be valid"
+                && warning.code == -5
+                && data == b"A\0"
+        ));
+    }
+
+    #[test]
+    fn strict_replay_ignores_a_defensive_data_event() {
+        let error = replay_strict_decode_event(
+            StreamDecodeEvent::Data(b"synthetic recovered data".to_vec()),
+            &mut reject_decode_warning,
+        );
+
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn strict_replay_delivers_warning_after_error_and_keeps_the_runtime_error() {
+        let dict = array_filter_dict(&[b"ASCIIHexDecode", b"FlateDecode"]);
+        let mut warnings = Vec::new();
+
+        let error = decode_stream_data_with_limits_and_warnings(
+            &dict,
+            b"78G",
+            DecodeLimits::default(),
+            &mut |message, code| {
+                warnings.push((message.to_string(), code));
+                Err(PipelineError::runtime("later callback failure"))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: character out of range during base Hex decode: G"
+        );
+        assert_eq!(
+            warnings,
+            vec![(
+                "input stream is complete but output may still be valid".to_string(),
+                -5
+            )]
+        );
+    }
+
+    #[test]
+    fn strict_replay_keeps_a_callback_error_and_delivers_later_warnings() {
+        let mut encoded = encode_stream_data(&flate_dict(), b"78G").unwrap();
+        encoded.pop();
+        let dict = array_filter_dict(&[b"FlateDecode", b"ASCIIHexDecode", b"FlateDecode"]);
+        let mut warnings = Vec::new();
+
+        let error = decode_stream_data_with_limits_and_warnings(
+            &dict,
+            &encoded,
+            DecodeLimits::default(),
+            &mut |message, code| {
+                warnings.push((message.to_string(), code));
+                Err(PipelineError::runtime(format!(
+                    "callback failure {}",
+                    warnings.len()
+                )))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: callback failure 1"
+        );
+        assert_eq!(
+            warnings,
+            vec![
+                (
+                    "input stream is complete but output may still be valid".to_string(),
+                    -5
+                ),
+                (
+                    "input stream is complete but output may still be valid".to_string(),
+                    -5
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovering_decode_records_finish_time_output_limit_after_partial_input() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"ASCIIHexDecode".to_vec()));
+
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
+            &dict,
+            b"F",
+            DecodeLimits {
+                max_output: Some(0),
+                ..DecodeLimits::default()
+            },
+            DataEventMode::Record,
+        )
+        .unwrap();
+
+        assert!(outcome.data.is_empty());
+        assert_eq!(outcome.events.len(), 1);
+        assert!(matches!(
+            &outcome.events[0],
+            StreamDecodeEvent::Error(error)
+                if error.to_string()
+                    == "unsupported PDF feature: decoded output exceeds configured limit of 0 bytes"
+        ));
+    }
+
+    #[test]
+    fn recovering_decode_emits_data_before_a_finish_time_error() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"ASCIIHexDecode".to_vec()));
+
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
+            &dict,
+            b"41F",
+            DecodeLimits {
+                max_output: Some(1),
+                ..DecodeLimits::default()
+            },
+            DataEventMode::Record,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data, b"A");
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Data(data), StreamDecodeEvent::Error(error)]
+                if data == b"A"
+                    && error.to_string()
+                        == "unsupported PDF feature: decoded output exceeds configured limit of 1 bytes"
+        ));
+    }
+
+    #[test]
+    fn recovering_decode_defers_a_nonfinal_finish_time_error_until_after_data() {
+        let dict = array_filter_dict(&[b"ASCIIHexDecode", b"ASCIIHexDecode"]);
+
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
+            &dict,
+            b"41F",
+            DecodeLimits {
+                max_output: Some(1),
+                ..DecodeLimits::default()
+            },
+            DataEventMode::Record,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Data(data), StreamDecodeEvent::Error(error)]
+                if data == b"\xa0"
+                    && error.to_string()
+                        == "unsupported PDF feature: decoded output exceeds configured limit of 1 bytes"
+        ));
+    }
+
+    #[test]
+    fn recovering_decode_keeps_final_data_after_a_prior_runtime_error() {
+        let dict = array_filter_dict(&[b"FlateDecode", b"ASCIIHexDecode"]);
+        let (mut compressed, _) = valid_prefix_then_invalid_stored_block();
+        compressed[7..10].copy_from_slice(b"41G");
+
+        let outcome = decode_stream_data_recovering(&dict, &compressed).unwrap();
+
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Data(data), StreamDecodeEvent::Error(error)]
+                if data == b"A"
+                    && error.to_string()
+                        .starts_with("unsupported PDF feature: stream inflate: inflate: data:")
+        ));
+    }
+
+    #[test]
+    fn recovering_decode_keeps_downstream_cleanup_after_upstream_write_error() {
+        let dict = array_filter_dict(&[b"ASCIIHexDecode", b"ASCIIHexDecode"]);
+
+        let outcome = decode_stream_data_recovering(&dict, b"343G").unwrap();
+
+        assert_eq!(outcome.data, b"@");
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Error(error), StreamDecodeEvent::Data(data)]
+                if error.to_string()
+                    == "unsupported PDF feature: character out of range during base Hex decode: G"
+                    && data == b"@"
+        ));
+    }
+
+    #[test]
+    fn recovering_decode_replays_final_cleanup_after_two_write_errors() {
+        let filter = Object::Array(vec![
+            Object::Name(b"ASCII85Decode".to_vec()),
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+        ]);
+        let mut encoded = ascii85::encode(b"4   ");
+        encoded.truncate(encoded.len() - 2);
+        let cleanup = ascii85::encode(b"G");
+        encoded.extend_from_slice(&cleanup[..2]);
+        encoded.push(b'z');
+        let mut decrypt = |_: Option<&Object>, data: &[u8]| Ok(data.to_vec());
+
+        let outcome = decode_stream_data_with_filters_and_crypt(
+            Some(&filter),
+            None,
+            &encoded,
+            DecodeLimits::default(),
+            DataEventMode::Record,
+            &mut decrypt,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data, b"@");
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Error(error), StreamDecodeEvent::Data(data)]
+                if error.to_string() == "unsupported PDF feature: unexpected z during base 85 decode"
+                    && data == b"@"
+        ));
+    }
+
+    #[test]
+    fn recovering_decode_preserves_prefix_probe_and_intermediate_error_paths() {
+        let mut decrypt = |_: Option<&Object>, data: &[u8]| Ok(data.to_vec());
+        let two_ascii_hex = Object::Array(vec![
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+        ]);
+
+        let outcome = decode_stream_data_with_filters_and_crypt(
+            Some(&two_ascii_hex),
+            None,
+            b"47G",
+            DecodeLimits::default(),
+            DataEventMode::Record,
+            &mut decrypt,
+        )
+        .unwrap();
+        assert!(outcome.data.is_empty());
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Error(error)]
+                if error.to_string()
+                    == "unsupported PDF feature: character out of range during base Hex decode: G"
+        ));
+
+        let finish_outcome = decode_stream_data_with_filters_and_crypt(
+            Some(&two_ascii_hex),
+            None,
+            b"41F",
+            DecodeLimits {
+                max_output: Some(1),
+                ..DecodeLimits::default()
+            },
+            DataEventMode::Record,
+            &mut decrypt,
+        )
+        .unwrap();
+        assert!(matches!(
+            &finish_outcome.events[..],
+            [StreamDecodeEvent::Data(data), StreamDecodeEvent::Error(error)]
+                if data == b"\xa0"
+                    && error.to_string()
+                        == "unsupported PDF feature: decoded output exceeds configured limit of 1 bytes"
+        ));
+
+        let three_stages = Object::Array(vec![
+            Object::Name(b"ASCII85Decode".to_vec()),
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+            Object::Name(b"TestRejectDecode".to_vec()),
+        ]);
+        let mut encoded = ascii85::encode(b"4   ");
+        encoded.truncate(encoded.len() - 2);
+        let cleanup = ascii85::encode(b"G");
+        encoded.extend_from_slice(&cleanup[..2]);
+        encoded.push(b'z');
+
+        let outcome = decode_stream_data_with_filters_and_crypt(
+            Some(&three_stages),
+            None,
+            &encoded,
+            DecodeLimits::default(),
+            DataEventMode::Record,
+            &mut decrypt,
+        )
+        .unwrap();
+        assert_eq!(outcome.data, b"@");
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Error(error), StreamDecodeEvent::Data(data)]
+                if error.to_string() == "unsupported PDF feature: unexpected z during base 85 decode"
+                    && data == b"@"
+        ));
+    }
+
+    #[test]
+    fn recovering_decode_preserves_chunked_prefix_before_a_later_output_limit() {
+        let mut state = 0x1234_5678u32;
+        let mut plain = Vec::with_capacity(102_500);
+        for _ in 0..2_500 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            plain.push((state >> 24) as u8);
+        }
+        plain.extend(std::iter::repeat_n(b'A', 100_000));
+        let inner_flate = encode_flate(&plain).unwrap();
+        assert!((2_500..4_000).contains(&inner_flate.len()));
+
+        // The first complete predictor row contains only the incompressible
+        // prefix. Flate warns before the predictor finishes the partial second
+        // row, whose remaining compressed bytes expand beyond the downstream
+        // limit.
+        let columns = inner_flate.len().div_ceil(2);
+        let mut predicted = Vec::with_capacity(inner_flate.len() + 2);
+        predicted.push(0);
+        predicted.extend_from_slice(&inner_flate[..columns]);
+        predicted.push(0);
+        predicted.extend_from_slice(&inner_flate[columns..inner_flate.len() - 1]);
+
+        let mut outer_flate = encode_flate(&predicted).unwrap();
+        outer_flate.truncate(outer_flate.len() - 4);
+
+        let mut predictor = Dictionary::new();
+        predictor.insert("Predictor", Object::Integer(12));
+        predictor.insert("Columns", Object::Integer(columns as i64));
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![Object::Dictionary(predictor), Object::Null]),
+        );
+
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
+            &dict,
+            &outer_flate,
+            DecodeLimits {
+                max_output: Some(4_000),
+                ..DecodeLimits::default()
+            },
+            DataEventMode::Record,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data.len(), 4_000);
+        assert_eq!(outcome.data, plain[..4_000]);
+        assert!(matches!(
+            &outcome.events[..],
+            [
+                StreamDecodeEvent::Data(before_warning),
+                StreamDecodeEvent::Warning(warning),
+                StreamDecodeEvent::Data(after_warning),
+                StreamDecodeEvent::Error(error),
+                StreamDecodeEvent::Warning(inner_warning),
+            ] if !before_warning.is_empty()
+                && !after_warning.is_empty()
+                && before_warning.len() + after_warning.len() == outcome.data.len()
+                && before_warning
+                    .iter()
+                    .chain(after_warning)
+                    .copied()
+                    .eq(outcome.data.iter().copied())
+                && warning.message == "input stream is complete but output may still be valid"
+                && warning.code == -5
+                && error.to_string()
+                    == "unsupported PDF feature: decoded output exceeds configured limit of 4000 bytes"
+                && inner_warning.message
+                    == "input stream is complete but output may still be valid"
+                && inner_warning.code == -5
+        ));
+        assert_eq!(
+            decode_stream_data_with_limits(
+                &dict,
+                &outer_flate,
+                DecodeLimits {
+                    max_output: Some(4_000),
+                    ..DecodeLimits::default()
+                },
+            )
+            .unwrap_err()
+            .to_string(),
+            "unsupported PDF feature: stream inflate: input stream is complete but output may still be valid (zlib error -5)"
+        );
+    }
+
+    #[test]
+    fn recovering_decode_replays_nonfinal_predictor_warning_before_final_lzw_finish_limit() {
+        let lzw = pack_codes(&[256, 0], true);
+        assert_eq!(lzw.len(), 3);
+
+        // The first complete row leaves LZW with only its Clear code. The
+        // predictor's finish-time tail supplies the last bit of the literal;
+        // LZW forwards that byte to its predictor, whose own finish pads a
+        // partial row and crosses the per-stage output limit.
+        let mut predicted = vec![0];
+        predicted.extend_from_slice(&lzw[..2]);
+        predicted.push(0);
+        predicted.push(lzw[2]);
+        let mut encoded = encode_flate(&predicted).unwrap();
+        encoded.truncate(encoded.len() - 4);
+
+        let mut first_predictor = Dictionary::new();
+        first_predictor.insert("Predictor", Object::Integer(12));
+        first_predictor.insert("Columns", Object::Integer(2));
+        let mut final_predictor = Dictionary::new();
+        final_predictor.insert("Predictor", Object::Integer(12));
+        final_predictor.insert("Columns", Object::Integer(5));
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"LZWDecode".to_vec()),
+            ]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![
+                Object::Dictionary(first_predictor),
+                Object::Dictionary(final_predictor),
+            ]),
+        );
+
+        let outcome = decode_stream_data_recovering_with_limits_and_mode(
+            &dict,
+            &encoded,
+            DecodeLimits {
+                max_output: Some(4),
+                ..DecodeLimits::default()
+            },
+            DataEventMode::Record,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data, [0; 4]);
+        assert!(matches!(
+            &outcome.events[..],
+            [
+                StreamDecodeEvent::Warning(warning),
+                StreamDecodeEvent::Data(data),
+                StreamDecodeEvent::Error(error),
+            ] if warning.message == "input stream is complete but output may still be valid"
+                && warning.code == -5
+                && data == b"\0\0\0\0"
+                && error.to_string()
+                    == "unsupported PDF feature: decoded output exceeds configured limit of 4 bytes"
+        ));
+    }
+
+    #[test]
+    fn recovering_decode_keeps_filterability_failures_in_outer_result() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"BogusDecode".to_vec()));
+
+        let error = decode_stream_data_recovering(&dict, b"abc").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: unsupported stream filter: BogusDecode"
+        );
+    }
+
     #[test]
     fn decode_stream_data_rejects_truncated_flate_warning() {
         let error = decode_stream_data(&flate_dict(), b"\x78").unwrap_err();
@@ -533,6 +1654,7 @@ mod tests {
             &[0xf9, b'A'],
             DecodeLimits {
                 max_output: Some(0),
+                ..DecodeLimits::default()
             },
         )
         .unwrap_err();
@@ -1064,6 +2186,7 @@ mod tests {
             b"9jqo^9jqo^~>",
             DecodeLimits {
                 max_output: Some(1),
+                ..DecodeLimits::default()
             },
         )
         .unwrap_err();
@@ -1525,6 +2648,84 @@ mod tests {
     }
 
     #[test]
+    fn recovering_crypt_stage_emits_final_data_event() {
+        let filter = Object::Name(b"Crypt".to_vec());
+        let mut decrypt = |_: Option<&Object>, data: &[u8]| Ok(data.to_vec());
+
+        let outcome = decode_stream_data_with_filters_and_crypt(
+            Some(&filter),
+            None,
+            b"decrypted",
+            DecodeLimits::default(),
+            DataEventMode::Record,
+            &mut decrypt,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.data, b"decrypted");
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Data(data)] if data == b"decrypted"
+        ));
+    }
+
+    #[test]
+    fn final_crypt_stage_preserves_pending_codec_events_and_cleanup_data() {
+        let filter = Object::Array(vec![
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+            Object::Name(b"Crypt".to_vec()),
+        ]);
+        let mut decrypt = |_: Option<&Object>, data: &[u8]| Ok(data.to_vec());
+
+        let outcome = decode_stream_data_with_filters_and_crypt(
+            Some(&filter),
+            None,
+            b"4G ",
+            DecodeLimits::default(),
+            DataEventMode::Record,
+            &mut decrypt,
+        )
+        .expect("recover through the identity Crypt stage");
+
+        assert_eq!(outcome.data, b"@");
+        assert!(matches!(
+            &outcome.events[..],
+            [
+                StreamDecodeEvent::Error(Error::Unsupported(message)),
+                StreamDecodeEvent::Data(data),
+            ] if message == "character out of range during base Hex decode: G" && data == b"@"
+        ));
+    }
+
+    #[test]
+    fn leading_crypt_stage_decrypts_before_the_following_codec() {
+        let filter = Object::Array(vec![
+            Object::Name(b"Crypt".to_vec()),
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+        ]);
+        let mut decrypt = |_: Option<&Object>, data: &[u8]| {
+            assert_eq!(data, b"encrypted");
+            Ok(b"41>".to_vec())
+        };
+
+        let outcome = decode_stream_data_with_filters_and_crypt(
+            Some(&filter),
+            None,
+            b"encrypted",
+            DecodeLimits::default(),
+            DataEventMode::Record,
+            &mut decrypt,
+        )
+        .expect("decode after the leading Crypt stage");
+
+        assert_eq!(outcome.data, b"A");
+        assert!(matches!(
+            &outcome.events[..],
+            [StreamDecodeEvent::Data(data)] if data == b"A"
+        ));
+    }
+
+    #[test]
     fn decode_accepts_max_length_filter_chain() {
         // Exactly MAX_FILTER_CHAIN_LEN (16) ASCIIHexDecode stages round-trips (each
         // stage is identity here: hex-encode applied 16 times, then this many decodes).
@@ -1592,6 +2793,7 @@ mod tests {
             &encoded,
             DecodeLimits {
                 max_output: Some(1999),
+                ..DecodeLimits::default()
             },
         );
         assert!(
@@ -1604,6 +2806,7 @@ mod tests {
             &encoded,
             DecodeLimits {
                 max_output: Some(2000),
+                ..DecodeLimits::default()
             },
         )
         .unwrap();
@@ -1627,6 +2830,7 @@ mod tests {
             &lzw_bytes,
             DecodeLimits {
                 max_output: Some(100),
+                ..DecodeLimits::default()
             },
         );
         assert!(

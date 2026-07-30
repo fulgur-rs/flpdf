@@ -114,6 +114,49 @@ pub(crate) fn parse_strict_direct_object(input: &[u8]) -> Result<ParsedDirectObj
     })
 }
 
+#[cfg(feature = "qtest-driver")]
+pub(crate) fn dictionary_value_source_offset(
+    input: &[u8],
+    key: &[u8],
+    array_index: usize,
+) -> Result<Option<usize>> {
+    let mut tokenizer = Tokenizer::new(input);
+    let mut parser = Parser::with_tokenizer(&mut tokenizer);
+    let open = parser.next_token()?;
+    if open.token_type != TokenType::DictOpen {
+        return Ok(None);
+    }
+
+    loop {
+        let key_token = parser.next_token()?;
+        if key_token.token_type == TokenType::DictClose {
+            return Ok(None);
+        }
+        if key_token.token_type != TokenType::Name {
+            return Err(Error::parse(key_token.start, "expected dictionary key"));
+        }
+        if key_token.value.strip_prefix(b"/") == Some(key) {
+            let first = parser.peek_token()?;
+            if first.token_type != TokenType::ArrayOpen {
+                return Ok(Some(first.start));
+            }
+            let _ = parser.next_token()?;
+            for index in 0.. {
+                let item = parser.peek_token()?;
+                if item.token_type == TokenType::ArrayClose {
+                    return Ok(None);
+                }
+                let item_start = parser.position();
+                let _ = parser.object()?;
+                if index == array_index {
+                    return Ok(Some(item_start));
+                }
+            }
+        }
+        let _ = parser.object()?;
+    }
+}
+
 pub(crate) struct Parser<'tokenizer, 'input> {
     tokenizer: &'tokenizer mut Tokenizer<'input>,
     buffered: VecDeque<Token>,
@@ -772,6 +815,8 @@ pub(crate) fn keyword_token_end(input: &[u8], pos: usize, keyword: &[u8]) -> Opt
 
 #[cfg(test)]
 mod stream_length_tests {
+    #[cfg(feature = "qtest-driver")]
+    use super::dictionary_value_source_offset;
     use super::{
         keyword_token_end, parse_indirect_object, parse_object, parse_qpdf_direct_object,
         RecoveredStreamEol,
@@ -795,6 +840,44 @@ mod stream_length_tests {
         assert_eq!(
             object.as_stream().expect("expected stream").data,
             b"strict payload"
+        );
+    }
+
+    #[cfg(feature = "qtest-driver")]
+    #[test]
+    fn dictionary_value_offsets_cover_absent_malformed_and_array_values() {
+        assert_eq!(
+            dictionary_value_source_offset(b"42", b"DecodeParms", 0).unwrap(),
+            None
+        );
+        assert_eq!(
+            dictionary_value_source_offset(b"<< >>", b"DecodeParms", 0).unwrap(),
+            None
+        );
+        assert!(
+            dictionary_value_source_offset(b"<< 42 true >>", b"DecodeParms", 0)
+                .unwrap_err()
+                .to_string()
+                .contains("expected dictionary key")
+        );
+        assert_eq!(
+            dictionary_value_source_offset(
+                b"<< /Other 0 /DecodeParms [ null ] >>",
+                b"DecodeParms",
+                1,
+            )
+            .unwrap(),
+            None
+        );
+
+        let input = b"<< /Other 0 /DecodeParms [ null 42 ] >>";
+        let expected = input
+            .windows(b"42".len())
+            .position(|window| window == b"42")
+            .expect("array item");
+        assert_eq!(
+            dictionary_value_source_offset(input, b"DecodeParms", 1).unwrap(),
+            Some(expected)
         );
     }
 

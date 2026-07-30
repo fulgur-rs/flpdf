@@ -13,6 +13,10 @@ description = "Rust ports of qpdf's test-harness helper binaries, for the flpdf-
 name = "flpdf-test-compare"
 path = "src/main.rs"
 
+[[bin]]
+name = "flpdf-test-driver"
+path = "src/bin/driver.rs"
+
 [lib]
 name = "flpdf_qtest_tools"
 path = "src/lib.rs"
@@ -22,7 +26,8 @@ default = []
 qpdf-zlib-compat = ["flpdf/qpdf-zlib-compat"]
 
 [dependencies]
-flpdf = { path = "../flpdf" }
+flpdf = { path = "../flpdf", features = ["qtest-driver"] }
+libc.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

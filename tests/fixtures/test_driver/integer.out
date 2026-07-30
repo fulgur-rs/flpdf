@@ -1,0 +1,5 @@
+/QTest is indirect and has type integer (4)
+/QTest is an integer with value 42
+unparse: 6 0 R
+unparseResolved: 42
+test 1 done

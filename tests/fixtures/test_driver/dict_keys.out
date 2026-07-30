@@ -1,0 +1,7 @@
+/QTest is indirect and has type dictionary (9)
+/QTest is a dictionary
+  /a is indirect
+  /b is direct
+unparse: 6 0 R
+unparseResolved: << /a 7 0 R /b false >>
+test 1 done

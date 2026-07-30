@@ -26,6 +26,7 @@ pub(crate) struct LoadedXrefState {
     pub(crate) loaded: LoadedXref,
     pub(crate) trailer_references: BTreeSet<ObjectRef>,
     pub(crate) parsed_xref_streams: BTreeMap<ObjectRef, Object>,
+    pub(crate) header_offset: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,14 +62,14 @@ pub fn load_xref_and_trailer<R: Read + Seek>(reader: &mut R) -> Result<LoadedXre
 /// # Errors
 ///
 /// - [`Error::Io`] when seeking or reading the input fails.
-/// - [`Error::Parse`] when the PDF header is missing or its version is not
-///   UTF-8 (this check runs before any repair fallback). When `allow_repair`
-///   is `false`, also when `startxref`, a cross-reference table or stream, or a
-///   `/Prev` chain is malformed (including offsets that do not fit `usize` and a
-///   circular `/Prev` chain). When `allow_repair` is `true`, such failures are
-///   recorded as diagnostics and recovered by a linear scan, which itself
-///   raises [`Error::Parse`] when no cross-reference entries can be recovered or
-///   no `trailer` dictionary is found.
+/// - [`Error::Parse`] when `allow_repair` is `false` and the PDF header is
+///   missing or its version is not UTF-8, or when `startxref`, a
+///   cross-reference table or stream, or a `/Prev` chain is malformed
+///   (including offsets that do not fit `usize` and a circular `/Prev` chain).
+/// - [`Error::OpenFailure`] when `allow_repair` is `true`, repair diagnostics
+///   were accumulated, and the linear scan still cannot recover a trailer.
+///   [`Error::open_failure`] exposes both the terminal source error and the
+///   preceding diagnostics.
 /// - [`Error::Missing`] when a required cross-reference stream entry (such as
 ///   `/Size` or `/W`) is absent and `allow_repair` is `false`.
 /// - [`Error::Unsupported`] when a cross-reference stream uses an unsupported
@@ -84,13 +85,25 @@ pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
     reader: &mut R,
     allow_repair: bool,
 ) -> Result<LoadedXrefState> {
-    let mut bytes = Vec::new();
+    let mut source_bytes = Vec::new();
     reader.seek(SeekFrom::Start(0))?;
-    reader.read_to_end(&mut bytes)?;
+    reader.read_to_end(&mut source_bytes)?;
 
-    let version = parse_header(&bytes)?;
+    let mut initial_diagnostics = Diagnostics::default();
+    let (version, header_offset) = if allow_repair {
+        match find_qpdf_header(&source_bytes) {
+            Some((offset, version)) => (version, offset),
+            None => {
+                initial_diagnostics.push(Diagnostic::warning("can't find PDF header", None));
+                ("1.2".to_string(), 0)
+            }
+        }
+    } else {
+        (parse_header(&source_bytes)?, 0)
+    };
+    let bytes = &source_bytes[header_offset..];
     let mut parse_errors = Vec::new();
-    let startxref = match parse_startxref(&bytes) {
+    let startxref = match parse_startxref(bytes) {
         Ok(offset) => offset,
         Err(error) if allow_repair => {
             parse_errors.push(error);
@@ -107,29 +120,48 @@ pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
         Err(_) => return Err(Error::parse(0, "startxref does not fit usize")),
     };
 
-    let mut loaded =
-        match parse_xref_from_start(&bytes, xref_pos, startxref, &version, allow_repair) {
-            Ok(loaded) => loaded,
-            Err(error) if allow_repair => {
-                // Report the first recorded failure; this parse error is only the
-                // trigger when the startxref stage itself succeeded.
-                let trigger = parse_errors.into_iter().next().unwrap_or(error);
-                return recover_xref_from_linear_scan(&bytes, version, startxref, trigger, None);
-            }
-            Err(error) => return Err(error),
-        };
+    let mut loaded = match parse_xref_from_start(bytes, xref_pos, startxref, &version, allow_repair)
+    {
+        Ok(loaded) => loaded,
+        Err(error) if allow_repair => {
+            // Report the first recorded failure; this parse error is only the
+            // trigger when the startxref stage itself succeeded.
+            let trigger = parse_errors.into_iter().next().unwrap_or_else(|| {
+                if startxref == 0 {
+                    Error::parse(0, "xref not found")
+                } else {
+                    error
+                }
+            });
+            let mut recovered = recover_xref_from_linear_scan(
+                bytes,
+                version,
+                startxref,
+                trigger,
+                None,
+                initial_diagnostics,
+            )?;
+            recovered.header_offset = header_offset;
+            return Ok(recovered);
+        }
+        Err(error) => return Err(error),
+    };
+    prepend_repair_diagnostics(&mut loaded.loaded.repair_diagnostics, initial_diagnostics);
 
-    if let Err(error) = merge_previous_xref_sections(&bytes, &version, &mut loaded, allow_repair) {
+    if let Err(error) = merge_previous_xref_sections(bytes, &version, &mut loaded, allow_repair) {
         if allow_repair {
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
             let recovered = recover_xref_from_linear_scan(
-                &bytes,
+                bytes,
                 version,
                 startxref,
                 trigger,
                 Some(&loaded.loaded.trailer),
+                Diagnostics::default(),
             )?;
-            return Ok(merge_recovered_qpdf_state(recovered, loaded));
+            let mut recovered = merge_recovered_qpdf_state(recovered, loaded);
+            recovered.header_offset = header_offset;
+            return Ok(recovered);
         }
         return Err(error);
     }
@@ -138,6 +170,7 @@ pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
         push_repair_diagnostics(&mut loaded.loaded.repair_diagnostics, &error, startxref);
     }
 
+    loaded.header_offset = header_offset;
     Ok(loaded)
 }
 
@@ -166,6 +199,7 @@ fn parse_xref_from_start(
             },
             trailer_references,
             parsed_xref_streams: BTreeMap::new(),
+            header_offset: 0,
         });
     }
 
@@ -251,16 +285,19 @@ fn recover_xref_from_linear_scan(
     startxref: u64,
     trigger_error: Error,
     fallback_trailer: Option<&Dictionary>,
+    mut repair_diagnostics: Diagnostics,
 ) -> Result<LoadedXrefState> {
-    let entries = recover_xref_entries(bytes)?;
+    push_repair_diagnostics(&mut repair_diagnostics, &trigger_error, startxref);
+
     let trailer = match (recover_trailer(bytes), fallback_trailer) {
         (Ok(trailer), _) => trailer,
         (Err(_), Some(trailer)) => trailer.clone(),
-        (Err(error), None) => return Err(error),
+        (Err(error), None) => {
+            return Err(Error::with_open_diagnostics(error, repair_diagnostics));
+        }
     };
-
-    let mut repair_diagnostics = Diagnostics::default();
-    push_repair_diagnostics(&mut repair_diagnostics, &trigger_error, startxref);
+    let entries = recover_xref_entries(bytes)
+        .map_err(|error| Error::with_open_diagnostics(error, repair_diagnostics.clone()))?;
     let trailer_references = collect_trailer_references(&trailer);
 
     Ok(LoadedXrefState {
@@ -274,7 +311,19 @@ fn recover_xref_from_linear_scan(
         },
         trailer_references,
         parsed_xref_streams: BTreeMap::new(),
+        header_offset: 0,
     })
+}
+
+fn prepend_repair_diagnostics(target: &mut Diagnostics, initial: Diagnostics) {
+    if initial.entries().is_empty() {
+        return;
+    }
+    let existing = std::mem::take(target);
+    *target = initial;
+    for diagnostic in existing.entries() {
+        target.push(diagnostic.clone());
+    }
 }
 
 fn merge_recovered_qpdf_state(
@@ -305,13 +354,15 @@ fn merge_recovered_qpdf_state(
 /// # Errors
 ///
 /// Calls [`load_xref_and_trailer_with_repair`] with repair enabled, so
-/// malformed cross-reference data is recovered rather than reported. It still
-/// fails with:
+/// malformed cross-reference data is recovered rather than reported. A missing
+/// header or invalid header version records qpdf's warning and uses version
+/// 1.2. It still fails with:
 ///
 /// - [`Error::Io`] when seeking or reading the input fails.
-/// - [`Error::Parse`] when the PDF header is missing or its version is not
-///   UTF-8, or when the linear-scan recovery cannot find any cross-reference
-///   entries or a `trailer` dictionary.
+/// - [`Error::OpenFailure`] when repair diagnostics were accumulated but the
+///   linear scan cannot recover a trailer.
+///   [`Error::open_failure`] exposes both the terminal source error and the
+///   preceding diagnostics.
 pub fn load_xref_and_trailer_best_effort<R: Read + Seek>(reader: &mut R) -> Result<LoadedXref> {
     load_xref_and_trailer_with_repair(reader, true)
 }
@@ -344,13 +395,6 @@ fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefEntry>> 
     // `/Type /ObjStm` so they remain resolvable without a usable xref; this extra
     // pass is bounded per object to keep recovery linear (see below).
     recover_objstm_compressed_entries(bytes, &mut entries);
-
-    if entries.is_empty() {
-        return Err(Error::parse(
-            0,
-            "unable to recover xref entries by linear scan",
-        ));
-    }
 
     Ok(entries)
 }
@@ -479,7 +523,7 @@ fn parse_non_negative_i64(value: i64, name: &str) -> Result<u64> {
 
 /// Push the qpdf-compatible repair warning sequence onto `diagnostics`.
 ///
-/// qpdf (`reconstruct_xref` in `QPDF_objects.cc`, observed with qpdf 11.9.0)
+/// qpdf (`reconstruct_xref` in `QPDF.cc`, observed with qpdf 11.9.0)
 /// emits the same three warnings regardless of how the damaged
 /// cross-reference data is ultimately recovered: `file is damaged`, the error
 /// that triggered recovery, and `Attempting to reconstruct cross-reference
@@ -493,6 +537,12 @@ fn parse_non_negative_i64(value: i64, name: &str) -> Result<u64> {
 fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error, startxref: u64) {
     diagnostics.push(Diagnostic::warning("file is damaged", None));
     let (message, offset) = match trigger_error {
+        Error::Parse { offset: 0, message } if message == "xref not found" => {
+            ("can't find startxref".to_string(), None)
+        }
+        Error::Parse { message, .. } if message == "can't find startxref" => {
+            (message.clone(), None)
+        }
         Error::Parse { message, .. } if message == "loop detected following xref tables" => {
             (message.clone(), None)
         }
@@ -739,6 +789,7 @@ fn parse_xref_stream(
         },
         trailer_references,
         parsed_xref_streams,
+        header_offset: 0,
     })
 }
 
@@ -923,6 +974,49 @@ fn parse_header(bytes: &[u8]) -> Result<String> {
     Ok(header.to_string())
 }
 
+fn find_qpdf_header(bytes: &[u8]) -> Option<(usize, String)> {
+    let search_end = bytes.len().min(1024);
+    (0..search_end).find_map(|offset| {
+        if !bytes[offset..].starts_with(b"%PDF-") {
+            return None;
+        }
+        parse_qpdf_header_version(&bytes[offset..]).map(|version| (offset, version))
+    })
+}
+
+fn parse_qpdf_header_version(bytes: &[u8]) -> Option<String> {
+    // `QPDF::findHeader` calls `readLine(1024)`, so a dot/version component
+    // beyond that candidate-local window must not make an otherwise invalid
+    // candidate valid.
+    let line = &bytes[..bytes.len().min(1024)];
+    let line_end = line
+        .iter()
+        .position(|byte| *byte == b'\n' || *byte == b'\r')
+        .unwrap_or(line.len());
+    let version = line.get(5..line_end)?;
+    let major_end = version
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(version.len());
+    let minor_start = major_end.checked_add(1)?;
+    if major_end == 0
+        || version.get(major_end) != Some(&b'.')
+        || !version.get(minor_start).is_some_and(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let minor_len = version[minor_start..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    let version_end = minor_start + minor_len;
+    Some(
+        std::str::from_utf8(&version[..version_end])
+            .expect("validated PDF version contains only ASCII digits and a dot")
+            .to_string(),
+    )
+}
+
 fn parse_startxref(bytes: &[u8]) -> Result<u64> {
     let marker = b"startxref";
     let Some(pos) = bytes
@@ -1045,4 +1139,82 @@ fn parse_xref_subsection_u32(token: &Token) -> Result<u32> {
         .parse::<u64>()
         .map_err(|_| Error::parse(token.start, "invalid unsigned integer"))?;
     u32::try_from(value).map_err(|_| Error::parse(token.start, "number does not fit u32"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_xref_and_trailer_with_repair, prepend_repair_diagnostics};
+    use crate::{Diagnostic, Diagnostics};
+    use std::io::Cursor;
+
+    #[test]
+    fn initial_repair_diagnostics_precede_recovered_diagnostics() {
+        let mut recovered = Diagnostics::default();
+        recovered.push(Diagnostic::warning("recovered", Some(12)));
+        let mut initial = Diagnostics::default();
+        initial.push(Diagnostic::warning("initial", None));
+
+        prepend_repair_diagnostics(&mut recovered, initial);
+
+        assert_eq!(
+            recovered
+                .entries()
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["initial", "recovered"]
+        );
+    }
+
+    #[test]
+    fn failed_repair_retains_qpdf_warning_sequence() {
+        let mut input = Cursor::new(b"%PDF-1.7\nstartxref\n0\n%%EOF\n");
+        let error =
+            load_xref_and_trailer_with_repair(&mut input, true).expect_err("repair must fail");
+        let (source, diagnostics) = error
+            .open_failure()
+            .expect("repair failure carries diagnostics");
+        let entries = diagnostics.entries();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "file is damaged",
+                "can't find startxref",
+                "Attempting to reconstruct cross-reference table",
+            ]
+        );
+        assert_eq!(entries[1].offset, None);
+        assert!(source.to_string().contains("trailer dictionary not found"));
+    }
+
+    #[test]
+    fn empty_entry_repair_retains_qpdf_warning_sequence() {
+        let mut input =
+            Cursor::new(b"%PDF-1.7\ntrailer\n<< /Size 1 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n");
+        let loaded = load_xref_and_trailer_with_repair(&mut input, true)
+            .expect("qpdf accepts a recovered trailer with no xref entries");
+
+        assert!(loaded.entries.is_empty());
+        assert_eq!(
+            loaded.trailer.get_ref("Root"),
+            Some(crate::ObjectRef::new(1, 0))
+        );
+        assert_eq!(
+            loaded
+                .repair_diagnostics
+                .entries()
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "file is damaged",
+                "can't find startxref",
+                "Attempting to reconstruct cross-reference table",
+            ]
+        );
+    }
 }

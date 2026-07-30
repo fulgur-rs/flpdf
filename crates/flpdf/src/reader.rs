@@ -2,12 +2,14 @@
 pub(crate) mod file_object;
 
 use self::file_object::{
-    finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, PendingFileObject,
-    RecoveryPolicy, ResolvedStreamLength,
+    finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, PendingBody,
+    PendingFileObject, RecoveryPolicy, ResolvedStreamLength,
 };
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
+#[cfg(feature = "qtest-driver")]
+use crate::parser::dictionary_value_source_offset;
 use crate::parser::parse_qpdf_file_object;
 use crate::pipeline::rc4::PlRc4;
 use crate::security::password::{normalize_password, PasswordMode};
@@ -49,6 +51,10 @@ static NULL_OBJECT: Object = Object::Null;
 /// ```
 pub struct Pdf<R: Read + Seek> {
     reader: R,
+    /// Physical byte position corresponding to qpdf's logical input offset 0.
+    /// This is nonzero only when repair found a valid header after leading
+    /// material in the first 1024 bytes.
+    header_offset: usize,
     version: String,
     trailer: Dictionary,
     startxref: u64,
@@ -560,6 +566,7 @@ impl<R: Read + Seek> Pdf<R> {
         let cache = ObjectCache::from_offsets(&loaded.entries);
         let mut pdf = Self {
             reader,
+            header_offset: loaded_state.header_offset,
             version: loaded.version,
             trailer: loaded.trailer,
             startxref: loaded.startxref,
@@ -875,6 +882,112 @@ impl<R: Read + Seek> Pdf<R> {
         self.source_xref_entries.clone()
     }
 
+    pub(crate) fn source_header_offset(&self) -> usize {
+        self.header_offset
+    }
+
+    /// Return the qpdf-logical byte offset of an indirect stream's encoded data.
+    ///
+    /// This is normally the absolute offset in the original input. When repair
+    /// finds a valid PDF header after leading material, qpdf treats that header
+    /// as logical offset zero, and this method follows that origin.
+    ///
+    /// This uses the source xref entry and the same indirect-object parser as
+    /// normal resolution, so `stream` text inside strings, names, comments, or
+    /// earlier stream payloads cannot be mistaken for the stream marker.
+    pub fn source_stream_data_offset(&mut self, object_ref: ObjectRef) -> Result<Option<u64>> {
+        let Some(XrefEntry::Uncompressed { offset }) =
+            self.source_xref_entries.get(&object_ref).copied()
+        else {
+            return Ok(None);
+        };
+        let pending = self.parse_source_file_object_at(offset)?;
+        let PendingBody::Stream { data_start, .. } = pending.body else {
+            return Ok(None);
+        };
+        Ok(Some(offset.saturating_add(data_start as u64)))
+    }
+
+    fn physical_source_offset(&self, logical_offset: u64) -> u64 {
+        (self.header_offset as u64).saturating_add(logical_offset)
+    }
+
+    /// Return the source offset of the `/DecodeParms` value paired with one
+    /// filter in an indirect stream dictionary.
+    ///
+    /// This compatibility hook is compiled only for `flpdf-test-driver`. It
+    /// preserves qpdf's token-specific warning locations without adding source
+    /// spans to the ordinary object model.
+    #[doc(hidden)]
+    #[cfg(feature = "qtest-driver")]
+    pub fn qtest_decode_parms_source_offset(
+        &mut self,
+        object_ref: ObjectRef,
+        filter_index: usize,
+    ) -> Result<Option<u64>> {
+        let Some(XrefEntry::Uncompressed { offset }) =
+            self.source_xref_entries.get(&object_ref).copied()
+        else {
+            return Ok(None);
+        };
+        let next = self.next_object_offset(offset);
+        let physical_offset = self.physical_source_offset(offset);
+        self.reader.seek(SeekFrom::Start(physical_offset))?;
+        let mut bytes = Vec::new();
+        match next {
+            Some(next) => self
+                .reader
+                .by_ref()
+                .take(next.saturating_sub(offset))
+                .read_to_end(&mut bytes)?,
+            None => self.reader.read_to_end(&mut bytes)?,
+        };
+
+        let mut tokenizer = Tokenizer::new(&bytes);
+        let _ = tokenizer.next_integer()?;
+        let _ = tokenizer.next_integer()?;
+        tokenizer.expect_word(b"obj")?;
+        tokenizer.skip_ignorable()?;
+        let body_start = tokenizer.position();
+        let body = &bytes[body_start..];
+        let value_offset = dictionary_value_source_offset(body, b"DecodeParms", filter_index);
+        let Some(value_offset) = value_offset? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            offset
+                .saturating_add(body_start as u64)
+                .saturating_add(value_offset as u64),
+        ))
+    }
+
+    fn parse_source_file_object_at(&mut self, offset: u64) -> Result<PendingFileObject> {
+        let next = self.next_object_offset(offset);
+        let physical_offset = self.physical_source_offset(offset);
+        self.reader.seek(SeekFrom::Start(physical_offset))?;
+        let mut bytes = Vec::new();
+        match next {
+            Some(next) => self
+                .reader
+                .by_ref()
+                .take(next.saturating_sub(offset))
+                .read_to_end(&mut bytes)?,
+            None => self.reader.read_to_end(&mut bytes)?,
+        };
+
+        match parse_file_object_syntax(&bytes) {
+            Ok(pending) => Ok(pending),
+            Err(window_error) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
+                self.resolution_fallbacks_remaining -= 1;
+                self.reader.seek(SeekFrom::Start(physical_offset))?;
+                let mut full = Vec::new();
+                self.reader.read_to_end(&mut full)?;
+                parse_file_object_syntax(&full).or(Err(window_error))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn compressed_parent(&self, object_ref: ObjectRef) -> Option<(ObjectRef, u32)> {
         self.compressed_member_parents.get(&object_ref).copied()
     }
@@ -1174,7 +1287,8 @@ impl<R: Read + Seek> Pdf<R> {
         full_policy: RecoveryPolicy,
     ) -> Result<file_object::FileObjectRead> {
         let next = self.next_object_offset(offset);
-        self.reader.seek(SeekFrom::Start(offset))?;
+        let physical_offset = self.physical_source_offset(offset);
+        self.reader.seek(SeekFrom::Start(physical_offset))?;
         let mut bytes = Vec::new();
         match next {
             Some(next) => {
@@ -1197,7 +1311,7 @@ impl<R: Read + Seek> Pdf<R> {
             Ok(parsed) => Ok(parsed),
             Err(window_err) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
                 self.resolution_fallbacks_remaining -= 1;
-                self.reader.seek(SeekFrom::Start(offset))?;
+                self.reader.seek(SeekFrom::Start(physical_offset))?;
                 let mut full = Vec::new();
                 self.reader.read_to_end(&mut full)?;
                 self.parse_and_finish_file_object(expected_ref, &full, offset, full_policy)
@@ -3221,6 +3335,107 @@ mod tests {
     }
 
     #[test]
+    fn source_stream_data_offset_comes_from_parsed_object_framing() {
+        let stream_body = b"1 0 obj\n\
+                            << /Note (first\nstream\nsecond) /Length 3 >>\n\
+                            stream\nabc\nendstream\nendobj\n";
+        let direct_body = b"2 0 obj\ntrue\nendobj\n";
+        let bytes = classic_pdf_with_bodies(&[stream_body, direct_body], ObjectRef::new(1, 0));
+        let expected = bytes
+            .windows(b"\nstream\nabc".len())
+            .rposition(|window| window == b"\nstream\nabc")
+            .expect("real stream marker")
+            + b"\nstream\n".len();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream-offset fixture");
+
+        assert_eq!(
+            pdf.source_stream_data_offset(ObjectRef::new(1, 0))
+                .expect("read parsed stream offset"),
+            Some(expected as u64)
+        );
+        assert_eq!(
+            pdf.source_stream_data_offset(ObjectRef::new(2, 0))
+                .expect("direct object has no source stream offset"),
+            None
+        );
+        assert_eq!(
+            pdf.source_stream_data_offset(ObjectRef::new(99, 0))
+                .expect("unknown object has no source stream offset"),
+            None
+        );
+    }
+
+    #[cfg(feature = "qtest-driver")]
+    #[test]
+    fn qtest_decode_parms_offsets_follow_filter_array_items() {
+        let stream_body = b"1 0 obj\n\
+                            << /Filter [ /FlateDecode /LZWDecode ] \
+                               /DecodeParms [ null 42 ] /Length 0 >>\n\
+                            stream\n\nendstream\nendobj\n";
+        let catalog_body = b"2 0 obj\n<< /Type /Catalog >>\nendobj\n";
+        let bytes = classic_pdf_with_bodies(&[stream_body, catalog_body], ObjectRef::new(2, 0));
+        let expected = bytes
+            .windows(b"/DecodeParms [ null 42 ]".len())
+            .position(|window| window == b"/DecodeParms [ null 42 ]")
+            .expect("DecodeParms array")
+            + b"/DecodeParms [ null ".len();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open DecodeParms-offset fixture");
+
+        assert_eq!(
+            pdf.qtest_decode_parms_source_offset(ObjectRef::new(1, 0), 1)
+                .expect("second array item offset"),
+            Some(expected as u64)
+        );
+        assert_eq!(
+            pdf.qtest_decode_parms_source_offset(ObjectRef::new(1, 0), 2)
+                .expect("missing array item"),
+            None
+        );
+        assert_eq!(
+            pdf.qtest_decode_parms_source_offset(ObjectRef::new(2, 0), 0)
+                .expect("last direct object"),
+            None
+        );
+        assert_eq!(
+            pdf.qtest_decode_parms_source_offset(ObjectRef::new(99, 0), 0)
+                .expect("unknown object"),
+            None
+        );
+    }
+
+    #[test]
+    fn source_stream_data_offset_retries_after_false_next_object_offset() {
+        let bytes = stream_with_false_next_xref_offset();
+        let expected = bytes
+            .windows(b"\nstream\nabc".len())
+            .position(|window| window == b"\nstream\nabc")
+            .expect("stream marker")
+            + b"\nstream\n".len();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open false-next-offset PDF");
+
+        assert!(matches!(
+            pdf.resolve(ObjectRef::new(1, 0))
+                .expect("ordinary bounded fallback"),
+            Object::Stream(_)
+        ));
+        assert_eq!(
+            pdf.source_stream_data_offset(ObjectRef::new(1, 0))
+                .expect("offset lookup uses the same fallback"),
+            Some(expected as u64)
+        );
+    }
+
+    #[test]
+    fn source_stream_data_offset_preserves_bounded_retry_cap() {
+        let mut pdf = Pdf::open_mem_owned(stream_with_false_next_xref_offset())
+            .expect("open false-next-offset PDF");
+        pdf.resolution_fallbacks_remaining = 0;
+
+        assert!(pdf.source_stream_data_offset(ObjectRef::new(1, 0)).is_err());
+        assert_eq!(pdf.resolution_fallbacks_remaining, 0);
+    }
+
+    #[test]
     fn qpdf_object_read_uses_bounded_fallback_and_preserves_strict_errors() {
         let stream_body =
             b"1 0 obj\n<< /Length 2 0 R >>\nstream\n9 0 obj\nnull\nendobj\nendstream\nendobj\n";
@@ -3473,6 +3688,28 @@ mod tests {
             ],
             ObjectRef::new(1, 0),
         )
+    }
+
+    fn stream_with_false_next_xref_offset() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let stream_offset = bytes.len();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Filter [ /FlateDecode /FlateDecode ] /DecodeParms [ null ] /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
+        );
+        let false_next = stream_offset + b"1 0 obj\n<< /Filter".len();
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 3\n\
+                 0000000000 65535 f \n\
+                 {stream_offset:010} 00000 n \n\
+                 {false_next:010} 00000 n \n\
+                 trailer\n<< /Size 3 /Root 1 0 R /QTest 1 0 R >>\n\
+                 startxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
     }
 
     #[test]

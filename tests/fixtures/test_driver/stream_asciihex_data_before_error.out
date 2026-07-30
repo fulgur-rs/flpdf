@@ -1,0 +1,11 @@
+/QTest is indirect and has type stream (10)
+/QTest is a stream.  Dictionary: << /Filter [ /AHx /AHx ] /Length 5 >>
+Raw stream data:
+3431G
+Uncompressed stream data:
+AWARNING: stream_asciihex_data_before_error.pdf (offset 164): error decoding stream data for object 6 0: character out of range during base Hex decode: G
+
+End of stream data
+unparse: 6 0 R
+unparseResolved: 6 0 R
+test 1 done

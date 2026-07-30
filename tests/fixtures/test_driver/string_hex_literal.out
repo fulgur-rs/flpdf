@@ -1,0 +1,6 @@
+/QTest is indirect and has type string (6)
+/QTest is a string with value a
+b
+unparse: 6 0 R
+unparseResolved: (a\nb)
+test 1 done
