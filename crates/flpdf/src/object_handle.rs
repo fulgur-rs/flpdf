@@ -1,8 +1,7 @@
 //! The core object-handle graph: shared, cloneable identity for direct and
 //! indirect PDF objects, with qpdf-compatible parsed-offset tracking.
 //!
-//! qpdf correspondence: `QPDFObjectHandle` (`include/qpdf/QPDFObjectHandle.hh`)
-//! and its backing `QPDFValue` (`libqpdf/qpdf/QPDFValue.hh`).
+//! qpdf correspondence: `QPDFObjectHandle` (`include/qpdf/QPDFObjectHandle.hh`) and its backing `QPDFValue` (`libqpdf/qpdf/QPDFValue.hh`).
 
 // Deviation: shared handle identity uses Rc<RefCell<..>> in place of qpdf's
 // std::shared_ptr<QPDFValue> — internal structure only, does not affect
@@ -24,16 +23,17 @@ pub(crate) const NO_PARSED_OFFSET: i64 = -1;
 /// Cloning a handle is O(1) and does not deep-copy the underlying value;
 /// every clone of an indirect handle shares the same canonical identity and
 /// resolution state.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ObjectHandle(Repr);
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 #[allow(dead_code)] // constructed only by this module's own test-only factories for now
 enum Repr {
     Direct(Rc<RefCell<DirectSlot>>),
     Indirect(Rc<RefCell<IndirectSlot>>),
 }
 
+#[derive(Debug)]
 struct DirectSlot {
     #[allow(dead_code)] // populated in a later task
     value: Option<()>, // placeholder until ObjectValue lands in a later task
@@ -41,6 +41,7 @@ struct DirectSlot {
     parsed_offset: i64,
 }
 
+#[derive(Debug)]
 #[allow(dead_code)] // constructed only by this module's own test-only factories for now
 pub(crate) enum IndirectState {
     Unresolved,
@@ -48,6 +49,7 @@ pub(crate) enum IndirectState {
     // real resolution engine cutover.
 }
 
+#[derive(Debug)]
 struct IndirectSlot {
     object_ref: ObjectRef,
     #[allow(dead_code)]
