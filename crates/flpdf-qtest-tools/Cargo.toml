@@ -17,6 +17,14 @@ path = "src/main.rs"
 name = "flpdf-test-driver"
 path = "src/bin/driver.rs"
 
+[[bin]]
+name = "flpdf-test-pdf-doc-encoding"
+path = "src/bin/pdf_doc_encoding.rs"
+
+[[bin]]
+name = "flpdf-test-pdf-unicode"
+path = "src/bin/pdf_unicode.rs"
+
 [lib]
 name = "flpdf_qtest_tools"
 path = "src/lib.rs"

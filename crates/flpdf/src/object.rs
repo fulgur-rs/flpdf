@@ -756,7 +756,7 @@ pub(crate) fn write_string_value(out: &mut Vec<u8>, value: &[u8]) {
     }
 }
 
-fn write_hex_string(out: &mut Vec<u8>, value: &[u8]) {
+pub(crate) fn write_hex_string(out: &mut Vec<u8>, value: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     out.push(b'<');
     for byte in value {

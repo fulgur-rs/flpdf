@@ -10,6 +10,7 @@
 //! harness depends on, so they stay fixed even when this package is renamed.
 
 // Public modules the binaries re-use.
+pub mod character_encoding;
 pub mod clean;
 pub mod common;
 pub mod compare;

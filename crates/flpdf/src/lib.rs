@@ -144,6 +144,9 @@ pub mod permissions;
 pub mod pipeline;
 pub mod qdf_fix;
 pub(crate) mod qpdf_null;
+#[cfg(feature = "qtest-driver")]
+#[doc(hidden)]
+pub mod qtest_string;
 pub mod reader;
 pub(crate) mod ref_chain;
 mod resource_finder;

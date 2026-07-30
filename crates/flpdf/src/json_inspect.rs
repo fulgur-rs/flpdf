@@ -239,8 +239,13 @@ pub(crate) fn qpdf_utf8_value(bytes: &[u8]) -> Vec<u8> {
 /// sequences according to `QUtil::get_next_utf8_codepoint`, then writes U+FFFD
 /// for every decode error, surrogate, or code point above U+10FFFF.
 pub(crate) fn qpdf_new_unicode_utf8_value(utf8: &[u8]) -> Vec<u8> {
+    qpdf_normalize_utf8(utf8).0
+}
+
+fn qpdf_normalize_utf8(utf8: &[u8]) -> (Vec<u8>, bool) {
     let mut result = Vec::with_capacity(utf8.len());
     let mut position = 0;
+    let mut had_error = false;
     while position < utf8.len() {
         let original_position = position;
         let mut byte = utf8[position];
@@ -285,6 +290,7 @@ pub(crate) fn qpdf_new_unicode_utf8_value(utf8: &[u8]) -> Vec<u8> {
             }
         }
 
+        had_error |= error;
         let scalar = if error {
             '\u{fffd}'
         } else {
@@ -293,27 +299,35 @@ pub(crate) fn qpdf_new_unicode_utf8_value(utf8: &[u8]) -> Vec<u8> {
         let mut encoded = [0; 4];
         result.extend_from_slice(scalar.encode_utf8(&mut encoded).as_bytes());
     }
-    result
+    (result, had_error)
 }
 
 /// Encode normalized UTF-8 as qpdf `newUnicodeString`: PDFDocEncoding when
 /// every scalar is representable, otherwise UTF-16BE with a BOM.
 pub(crate) fn qpdf_unicode_string_bytes(utf8: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(utf8);
+    let (normalized, had_error) = qpdf_normalize_utf8(utf8);
+    let text = std::str::from_utf8(&normalized)
+        .expect("qpdf UTF-8 normalization always emits valid Unicode");
     let mut pdfdoc = Vec::with_capacity(text.len());
-    for character in text.chars() {
-        let mut encoded_character = [0; 4];
-        let encoded_character = character.encode_utf8(&mut encoded_character).as_bytes();
-        let encoded = (0_u16..=u16::from(u8::MAX))
-            .map(|byte| byte as u8)
-            .filter(|byte| !matches!(byte, 0x7f | 0x9f | 0xad))
-            .find(|&byte| qpdf_utf8_value(&[byte]) == encoded_character);
-        let Some(encoded) = encoded else {
-            return crate::filespec_helper::encode_utf16be(&text);
-        };
-        pdfdoc.push(encoded);
+    let resembles_unicode_bom = utf8.starts_with("þÿ".as_bytes())
+        || utf8.starts_with("ÿþ".as_bytes())
+        || utf8.starts_with("ï»¿".as_bytes());
+    if !had_error && !resembles_unicode_bom {
+        for character in text.chars() {
+            let mut encoded_character = [0; 4];
+            let encoded_character = character.encode_utf8(&mut encoded_character).as_bytes();
+            let encoded = (0_u16..=u16::from(u8::MAX))
+                .map(|byte| byte as u8)
+                .filter(|byte| !matches!(byte, 0x7f | 0x9f | 0xad))
+                .find(|&byte| qpdf_utf8_value(&[byte]) == encoded_character);
+            let Some(encoded) = encoded else {
+                return crate::filespec_helper::encode_utf16be(text);
+            };
+            pdfdoc.push(encoded);
+        }
+        return pdfdoc;
     }
-    pdfdoc
+    crate::filespec_helper::encode_utf16be(text)
 }
 
 /// Decode a PDF text string (ISO 32000-1 §7.9.2) into a Rust `String`.
