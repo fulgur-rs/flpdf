@@ -1337,7 +1337,7 @@ fn repair_missing_header_uses_version_1_2_and_preserves_strict_rejection() {
 }
 
 #[test]
-fn repair_invalid_header_version_uses_version_1_2_and_preserves_strict_rejection() {
+fn repair_invalid_header_version_uses_version_1_2_and_preserves_strict_version() {
     let mut bytes = b"%PDF-x.y\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
     let xref_offset = bytes.len();
     bytes.extend_from_slice(
@@ -1355,12 +1355,10 @@ fn repair_invalid_header_version_uses_version_1_2_and_preserves_strict_rejection
         [flpdf::Diagnostic::warning("can't find PDF header", None)]
     );
 
-    let strict = load_xref_and_trailer(&mut Cursor::new(bytes))
-        .expect_err("strict loading must reject an invalid header version");
-    assert_eq!(
-        strict.to_string(),
-        "parse error at byte 5: invalid PDF version"
-    );
+    let strict =
+        load_xref_and_trailer(&mut Cursor::new(bytes)).expect("strict keeps its raw version");
+    assert_eq!(strict.version, "x.y");
+    assert!(strict.repair_diagnostics.entries().is_empty());
 }
 
 #[test]
@@ -1404,11 +1402,15 @@ fn header_version_uses_qpdfs_valid_numeric_prefix() {
         .as_bytes(),
     );
 
-    let loaded =
-        load_xref_and_trailer(&mut Cursor::new(bytes)).expect("accept numeric version prefix");
+    let repaired = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes.clone()))
+        .expect("repair uses qpdf's numeric version prefix");
+    assert_eq!(repaired.version, "1.7");
+    assert!(repaired.repair_diagnostics.entries().is_empty());
 
-    assert_eq!(loaded.version, "1.7");
-    assert!(loaded.repair_diagnostics.entries().is_empty());
+    let strict =
+        load_xref_and_trailer(&mut Cursor::new(bytes)).expect("strict keeps its raw version");
+    assert_eq!(strict.version, "1.7suffix");
+    assert!(strict.repair_diagnostics.entries().is_empty());
 }
 
 #[test]

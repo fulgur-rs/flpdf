@@ -90,13 +90,19 @@ pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
     reader.read_to_end(&mut bytes)?;
 
     let mut initial_diagnostics = Diagnostics::default();
-    let version = match parse_header(&bytes) {
-        Ok(version) => version,
-        Err(_error) if allow_repair => {
-            initial_diagnostics.push(Diagnostic::warning("can't find PDF header", None));
-            "1.2".to_string()
+    let version = if allow_repair {
+        match parse_qpdf_header_version(&bytes) {
+            Some(version) => version,
+            None => {
+                initial_diagnostics.push(Diagnostic::warning("can't find PDF header", None));
+                "1.2".to_string()
+            }
         }
-        Err(error) => return Err(error),
+    } else {
+        match parse_header(&bytes) {
+            Ok(version) => version,
+            Err(error) => return Err(error),
+        }
     };
     let mut parse_errors = Vec::new();
     let startxref = match parse_startxref(&bytes) {
@@ -957,27 +963,41 @@ fn parse_header(bytes: &[u8]) -> Result<String> {
         .iter()
         .position(|byte| *byte == b'\n' || *byte == b'\r')
         .unwrap_or(bytes.len());
-    let version = &bytes[5..end];
+    let header = std::str::from_utf8(&bytes[5..end])
+        .map_err(|_| Error::parse(5, "PDF version is not utf-8"))?;
+    Ok(header.to_string())
+}
+
+fn parse_qpdf_header_version(bytes: &[u8]) -> Option<String> {
+    if !bytes.starts_with(b"%PDF-") {
+        return None;
+    }
+    let line_end = bytes
+        .iter()
+        .position(|byte| *byte == b'\n' || *byte == b'\r')
+        .unwrap_or(bytes.len());
+    let version = bytes.get(5..line_end)?;
     let major_end = version
         .iter()
         .position(|byte| !byte.is_ascii_digit())
         .unwrap_or(version.len());
-    let minor_start = major_end + 1;
+    let minor_start = major_end.checked_add(1)?;
     if major_end == 0
         || version.get(major_end) != Some(&b'.')
         || !version.get(minor_start).is_some_and(u8::is_ascii_digit)
     {
-        std::str::from_utf8(version).map_err(|_| Error::parse(5, "PDF version is not utf-8"))?;
-        return Err(Error::parse(5, "invalid PDF version"));
+        return None;
     }
     let minor_len = version[minor_start..]
         .iter()
         .take_while(|byte| byte.is_ascii_digit())
         .count();
     let version_end = minor_start + minor_len;
-    Ok(std::str::from_utf8(&version[..version_end])
-        .expect("validated PDF version contains only ASCII digits and a dot")
-        .to_string())
+    Some(
+        std::str::from_utf8(&version[..version_end])
+            .expect("validated PDF version contains only ASCII digits and a dot")
+            .to_string(),
+    )
 }
 
 fn parse_startxref(bytes: &[u8]) -> Result<u64> {
