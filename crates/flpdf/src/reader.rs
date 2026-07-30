@@ -5428,6 +5428,28 @@ mod tests {
         );
     }
 
+    /// Object 0 (the qpdf-style xref free-list head) is exempt from every
+    /// tracking side effect `delete_object` otherwise performs, including
+    /// the handle-graph invalidation the previous test pins for every other
+    /// ref: it must return before touching `qpdf_removed_refs`,
+    /// `legacy_materialized_memo`, or `handle_registry` at all.
+    #[test]
+    fn delete_object_is_a_no_op_for_object_number_zero() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let free_list_head = ObjectRef::new(0, 65535);
+
+        pdf.delete_object(free_list_head);
+
+        assert!(
+            !pdf.qpdf_removed_refs.contains(&free_list_head),
+            "object 0 must never be tracked as an explicitly removed reference"
+        );
+        assert!(
+            !pdf.handle_registry.contains_key(&free_list_head),
+            "object 0 must not gain a handle just from delete_object"
+        );
+    }
+
     /// `Pdf::prepare_qpdf_json_objects` can mark a ref's cache entry
     /// `Missing` (discovered as a dangling reference from a live object's
     /// own content) before `Pdf::get_object_handle` has ever been called for
