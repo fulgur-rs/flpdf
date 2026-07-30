@@ -24,6 +24,10 @@ odd nibble as `@`; the golden fixes the warning-before-cleanup-byte order.
 The downstream ASCIIHex decoder emits `A` before the upstream decoder reports
 its `G` write error; the golden fixes that data-before-warning relationship.
 
+`stream_filter_chain_17` declares 17 supported `ASCIIHexDecode` stages. It
+pins qpdf test 1's uncapped `qpdf_dl_all` filter construction while the ordinary
+flpdf decode API remains capped at 16 by default.
+
 `stream_deep_invalid_filter` has 64 direct nested Filter arrays. qpdf treats
 the first nested array as an invalid immediate filter item; it warns and
 continues instead of traversing the nested structure.

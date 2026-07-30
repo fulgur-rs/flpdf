@@ -54,6 +54,7 @@ fixture_names=(
     stream_asciihex_odd_nibble_recovery
     stream_asciihex_data_before_error
     stream_asciihex_downstream_cleanup_after_error
+    stream_filter_chain_17
     stream_unfilterable
     stream_unsupported_filter_skips_decode_parms
 )

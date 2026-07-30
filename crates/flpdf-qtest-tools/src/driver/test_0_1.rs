@@ -1,6 +1,6 @@
 use std::io::{Read, Seek, Write};
 
-use flpdf::filters::StreamDecodeEvent;
+use flpdf::filters::{DecodeLimits, StreamDecodeEvent};
 use flpdf::{Diagnostic, Error, Object, Pdf};
 
 use super::handle::{resolve_stream_dictionary, write_qpdf_object, Handle};
@@ -118,7 +118,14 @@ fn write_object_details<R: Read + Seek>(
                 return Ok(());
             }
 
-            match flpdf::filters::decode_stream_data_recovering(&decode_dictionary, &stream.data) {
+            match flpdf::filters::decode_stream_data_recovering_with_limits(
+                &decode_dictionary,
+                &stream.data,
+                DecodeLimits {
+                    max_output: None,
+                    max_filter_chain: None,
+                },
+            ) {
                 Ok(decoded) => {
                     let terminal_ref = qtest.terminal_indirect_ref();
                     let offset = terminal_ref
