@@ -83,7 +83,7 @@ pub(crate) enum IndirectState {
 #[derive(Debug)]
 struct IndirectSlot {
     object_ref: ObjectRef,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // read once the resolution engine lands in a later task
     state: IndirectState,
     parsed_offset: i64,
 }
@@ -204,9 +204,11 @@ impl ObjectHandle {
         Self::new_direct(ObjectValue::Array(children), NO_PARSED_OFFSET)
     }
 
-    /// Construct a direct dictionary value from `entries`, in insertion
-    /// order. Values are handles, so cloning or re-reading this
-    /// dictionary's entries never deep-copies their subtrees.
+    /// Construct a direct dictionary value from `entries`. Iteration order
+    /// is the lexicographic order of the keys, not insertion order (matching
+    /// [`crate::Dictionary`]); a repeated key keeps its last value. Values
+    /// are handles, so cloning or re-reading this dictionary's entries never
+    /// deep-copies their subtrees.
     pub fn dictionary(entries: Vec<(Vec<u8>, ObjectHandle)>) -> Self {
         Self::new_direct(
             ObjectValue::Dictionary(entries.into_iter().collect()),
@@ -217,7 +219,9 @@ impl ObjectHandle {
     /// Construct a direct real value that preserves a non-canonical source
     /// literal (e.g. `.4`) alongside its parsed value, mirroring
     /// [`crate::Object::RealLiteral`], so that a real number written in the
-    /// source PDF unparses byte-identically.
+    /// source PDF unparses byte-identically. `literal` is expected to parse
+    /// back to `value` and to differ from `value`'s canonical string form —
+    /// see [`crate::Object::RealLiteral`]'s own documented invariant.
     pub fn real_literal(value: f64, literal: Vec<u8>) -> Self {
         Self::new_direct(
             ObjectValue::RealLiteral { value, literal },
@@ -235,10 +239,11 @@ impl ObjectHandle {
         })
     }
 
-    /// True if this handle is a direct null value. An indirect handle whose
-    /// value is not yet known returns `false` here, matching qpdf's
-    /// `isDirectNull` (`libqpdf/QPDFObjectHandle.cc`) rather than assuming
-    /// null for anything unresolved.
+    /// True if this handle's value is known to be null. An indirect handle
+    /// whose value has not yet been resolved returns `false` — this method
+    /// never performs resolution itself, so "unresolved" and "resolved to
+    /// null" are distinct until a later task's resolution engine can make
+    /// the latter observable through this same method.
     pub fn is_null(&self) -> bool {
         self.with_value(|value| matches!(value, Some(ObjectValue::Null)))
     }
