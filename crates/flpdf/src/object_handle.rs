@@ -15,7 +15,6 @@ use std::rc::Rc;
 /// source position (`QPDFValue`'s parsed offset starts at `-1` and is set
 /// only while still negative; see
 /// `libqpdf/qpdf/QPDFValue.hh:90-100,149-152`).
-#[allow(dead_code)] // wired into production construction paths in a later task
 pub(crate) const NO_PARSED_OFFSET: i64 = -1;
 
 /// A shared, cloneable handle to a PDF object.
@@ -37,7 +36,6 @@ enum Repr {
 struct DirectSlot {
     #[allow(dead_code)] // populated in a later task
     value: Option<()>, // placeholder until ObjectValue lands in a later task
-    #[allow(dead_code)] // populated/read once parsed-offset tracking lands
     parsed_offset: i64,
 }
 
@@ -54,7 +52,6 @@ struct IndirectSlot {
     object_ref: ObjectRef,
     #[allow(dead_code)]
     state: IndirectState,
-    #[allow(dead_code)] // populated/read once parsed-offset tracking lands
     parsed_offset: i64,
 }
 
@@ -103,7 +100,6 @@ impl ObjectHandle {
         }))))
     }
 
-    #[allow(dead_code)] // used by `integer`, the sole factory wired up so far
     fn new_direct(parsed_offset: i64) -> Self {
         Self(Repr::Direct(Rc::new(RefCell::new(DirectSlot {
             value: None,
@@ -116,6 +112,74 @@ impl ObjectHandle {
     // later task.
     #[allow(dead_code)]
     pub(crate) fn integer(_value: i64) -> Self {
+        Self::new_direct(NO_PARSED_OFFSET)
+    }
+
+    /// The qpdf-compatible signed parsed offset. `-1` means the value was
+    /// not parsed from a source position (`QPDFObjectHandle::getParsedOffset`,
+    /// `include/qpdf/QPDFObjectHandle.hh:415-419`).
+    pub fn get_parsed_offset(&self) -> i64 {
+        match &self.0 {
+            Repr::Direct(slot) => slot.borrow().parsed_offset,
+            Repr::Indirect(slot) => slot.borrow().parsed_offset,
+        }
+    }
+
+    // Record `offset` as the parsed offset, but only if none has been set
+    // yet (matches qpdf: "set only while still negative",
+    // `libqpdf/qpdf/QPDFValue.hh:149-152`). The parser wires up real callers
+    // in a later task; exposed here so this module's own tests can exercise
+    // the set-once contract without a live parser.
+    #[allow(dead_code)]
+    pub(crate) fn set_parsed_offset_if_unset(&self, offset: i64) {
+        let set = |current: &mut i64| {
+            if *current < 0 {
+                *current = offset;
+            }
+        };
+        match &self.0 {
+            Repr::Direct(slot) => set(&mut slot.borrow_mut().parsed_offset),
+            Repr::Indirect(slot) => set(&mut slot.borrow_mut().parsed_offset),
+        }
+    }
+
+    // Payload is still discarded (a placeholder) — the real `ObjectValue`
+    // payload (Null/Boolean/Integer/Array/Dictionary/Stream) lands in a
+    // later task. These factories exist now only so the parsed-offset
+    // contract can be tested independently of value representation.
+
+    /// Construct a direct null value.
+    pub fn null() -> Self {
+        Self::new_direct(NO_PARSED_OFFSET)
+    }
+
+    /// Construct a direct boolean value.
+    pub fn boolean(_value: bool) -> Self {
+        Self::new_direct(NO_PARSED_OFFSET)
+    }
+
+    /// Construct a direct real (floating-point) value.
+    pub fn real(_value: f64) -> Self {
+        Self::new_direct(NO_PARSED_OFFSET)
+    }
+
+    /// Construct a direct name value.
+    pub fn name(_value: Vec<u8>) -> Self {
+        Self::new_direct(NO_PARSED_OFFSET)
+    }
+
+    /// Construct a direct string value.
+    pub fn string(_value: Vec<u8>) -> Self {
+        Self::new_direct(NO_PARSED_OFFSET)
+    }
+
+    /// Construct a direct array value.
+    pub fn array(_children: Vec<ObjectHandle>) -> Self {
+        Self::new_direct(NO_PARSED_OFFSET)
+    }
+
+    /// Construct a direct dictionary value.
+    pub fn dictionary(_entries: Vec<(Vec<u8>, ObjectHandle)>) -> Self {
         Self::new_direct(NO_PARSED_OFFSET)
     }
 }
@@ -169,5 +233,58 @@ mod identity_tests {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(5, 0), 0);
         assert!(!direct.ptr_eq(&indirect));
         assert!(!indirect.ptr_eq(&direct));
+    }
+}
+
+#[cfg(test)]
+mod parsed_offset_tests {
+    use super::*;
+
+    #[test]
+    fn public_factory_direct_handles_default_to_no_offset_sentinel() {
+        for handle in [
+            ObjectHandle::null(),
+            ObjectHandle::boolean(true),
+            ObjectHandle::integer(1),
+            ObjectHandle::real(1.5),
+            ObjectHandle::name(b"Foo".to_vec()),
+            ObjectHandle::string(b"bar".to_vec()),
+            ObjectHandle::array(Vec::new()),
+            ObjectHandle::dictionary(Vec::new()),
+        ] {
+            assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+        }
+    }
+
+    #[test]
+    fn new_indirect_unresolved_starts_at_no_offset_sentinel() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
+    fn set_parsed_offset_is_retained_once_set() {
+        let handle = ObjectHandle::integer(1);
+        handle.set_parsed_offset_if_unset(100);
+        assert_eq!(handle.get_parsed_offset(), 100);
+    }
+
+    #[test]
+    fn first_nonnegative_offset_is_retained_a_second_set_is_ignored() {
+        // "The first nonnegative offset assigned to a value is retained.
+        // Resolution, cache access, unparse, and writer planning do not
+        // recompute or replace it." (design, Parsed-Offset Contract)
+        let handle = ObjectHandle::integer(1);
+        handle.set_parsed_offset_if_unset(100);
+        handle.set_parsed_offset_if_unset(200);
+        assert_eq!(handle.get_parsed_offset(), 100);
+    }
+
+    #[test]
+    fn indirect_handle_honors_the_same_set_once_contract() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_parsed_offset_if_unset(100);
+        handle.set_parsed_offset_if_unset(200);
+        assert_eq!(handle.get_parsed_offset(), 100);
     }
 }
