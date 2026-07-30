@@ -6,9 +6,10 @@ use std::path::Path;
 
 use flpdf::filters::{self, DecodeLimits, StreamDecodeEvent};
 use flpdf::pages::{page_content_bytes, page_refs};
-use flpdf::tokenizer::{TokenType, Tokenizer};
+use flpdf::tokenizer::{token_type_name, TokenType, Tokenizer};
 use flpdf::{Object, Pdf, PdfOpenOptions};
 
+use crate::common::test_driver_program_name_bytes;
 use crate::driver::{emit_new_diagnostics, os_str_diagnostic_bytes, write_warning};
 
 pub enum RunOutcome {
@@ -31,25 +32,19 @@ pub fn run(
             if arg_str == "-maxlen" {
                 i += 1;
                 if i >= args.len() {
-                    usage(args, stderr);
-                    return RunOutcome::Exit(2);
+                    return usage_error(args, stderr);
                 }
                 max_len = match args[i].to_string_lossy().parse::<usize>() {
                     Ok(n) => n,
-                    Err(_) => {
-                        usage(args, stderr);
-                        return RunOutcome::Exit(2);
-                    }
+                    Err(_) => return usage_error(args, stderr),
                 };
             } else if arg_str == "-no-ignorable" {
                 include_ignorable = false;
             } else {
-                usage(args, stderr);
-                return RunOutcome::Exit(2);
+                return usage_error(args, stderr);
             }
         } else if filename.is_some() {
-            usage(args, stderr);
-            return RunOutcome::Exit(2);
+            return usage_error(args, stderr);
         } else {
             filename = Some(args[i].clone());
         }
@@ -58,10 +53,7 @@ pub fn run(
 
     let filename = match filename {
         Some(f) => f,
-        None => {
-            usage(args, stderr);
-            return RunOutcome::Exit(2);
-        }
+        None => return usage_error(args, stderr),
     };
 
     match process(&filename, include_ignorable, max_len, stdout, stderr) {
@@ -78,6 +70,11 @@ pub fn run(
     }
 }
 
+fn usage_error(args: &[OsString], stderr: &mut dyn io::Write) -> RunOutcome {
+    usage(args, stderr);
+    RunOutcome::Exit(2)
+}
+
 fn usage(args: &[OsString], stderr: &mut dyn io::Write) {
     let name = program_name(args);
     let _ = writeln!(
@@ -88,14 +85,10 @@ fn usage(args: &[OsString], stderr: &mut dyn io::Write) {
 }
 
 fn program_name(args: &[OsString]) -> Vec<u8> {
-    args.first()
-        .and_then(|a| a.to_str())
-        .map(|s| {
-            s.rfind('/')
-                .map(|i| s.as_bytes()[i + 1..].to_vec())
-                .unwrap_or_else(|| s.as_bytes().to_vec())
-        })
-        .unwrap_or_else(|| b"test_tokenizer".to_vec())
+    match args.first() {
+        Some(argv0) => test_driver_program_name_bytes(&os_str_diagnostic_bytes(argv0)).to_vec(),
+        None => b"test_tokenizer".to_vec(),
+    }
 }
 
 fn sanitize(value: &[u8]) -> String {
@@ -108,29 +101,6 @@ fn sanitize(value: &[u8]) -> String {
         }
     }
     result
-}
-
-fn token_type_name(token_type: TokenType) -> &'static str {
-    match token_type {
-        TokenType::Bad => "bad",
-        TokenType::ArrayClose => "array_close",
-        TokenType::ArrayOpen => "array_open",
-        TokenType::BraceClose => "brace_close",
-        TokenType::BraceOpen => "brace_open",
-        TokenType::DictClose => "dict_close",
-        TokenType::DictOpen => "dict_open",
-        TokenType::Integer => "integer",
-        TokenType::Name => "name",
-        TokenType::Real => "real",
-        TokenType::String => "string",
-        TokenType::Null => "null",
-        TokenType::Bool => "bool",
-        TokenType::Word => "word",
-        TokenType::Eof => "eof",
-        TokenType::Space => "space",
-        TokenType::Comment => "comment",
-        TokenType::InlineImage => "inline-image",
-    }
 }
 
 fn process(
@@ -152,14 +122,13 @@ fn process(
         stdout,
     );
 
-    let bytes = file_bytes;
     let options = PdfOpenOptions {
         repair: true,
         allow_weak_crypto: true,
         ..PdfOpenOptions::default()
     };
     let filename_diagnostic = os_str_diagnostic_bytes(filename);
-    let mut pdf = match Pdf::open_mem_owned_with_options(bytes, options) {
+    let mut pdf = match Pdf::open_mem_owned_with_options(file_bytes, options) {
         Ok(pdf) => pdf,
         Err(e) => {
             // qpdf's processFile prints repair warnings as it emits them,
@@ -199,32 +168,41 @@ fn process(
 
     let object_refs = pdf.object_refs();
     for obj_ref in object_refs {
-        let obj = pdf.resolve(obj_ref).map_err(|e| e.to_string())?;
-        if let Object::Stream(ref stream) = obj {
-            let is_objstm = resolve_objstm_type(&mut pdf, &stream.dict);
-            if is_objstm {
-                let decoded = filters::decode_stream_data_recovering_with_limits(
-                    &stream.dict,
-                    &stream.data,
-                    DecodeLimits {
-                        max_output: None,
-                        max_filter_chain: None,
-                    },
-                )
-                .map_err(|e| e.to_string())?;
-                report_stream_events(&decoded.events, stderr);
-                let label = format!("OBJECT STREAM {}", obj_ref.number);
-                dump_tokens(
-                    &decoded.data,
-                    &label,
-                    max_len,
-                    include_ignorable,
-                    false,
-                    false,
-                    stdout,
-                );
-            }
+        // Clone only the (small) stream dictionary to classify it, rather
+        // than pdf.resolve()'s owned Object — which would deep-clone every
+        // stream's raw data just to read /Type, for every stream in the
+        // file (fonts and images included, not just the rare ObjStm).
+        let dict = match pdf.resolve_borrowed(obj_ref).map_err(|e| e.to_string())? {
+            Object::Stream(stream) => stream.dict.clone(),
+            _ => continue,
+        };
+        if !resolve_objstm_type(&mut pdf, &dict) {
+            continue;
         }
+        let Object::Stream(stream) = pdf.resolve_borrowed(obj_ref).map_err(|e| e.to_string())?
+        else {
+            continue;
+        };
+        let decoded = filters::decode_stream_data_recovering_with_limits(
+            &stream.dict,
+            &stream.data,
+            DecodeLimits {
+                max_output: None,
+                max_filter_chain: None,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        report_stream_events(&decoded.events, stderr);
+        let label = format!("OBJECT STREAM {}", obj_ref.number);
+        dump_tokens(
+            &decoded.data,
+            &label,
+            max_len,
+            include_ignorable,
+            false,
+            false,
+            stdout,
+        );
     }
 
     Ok(())
@@ -294,17 +272,14 @@ fn dump_tokens(
         } else {
             max_len
         };
-        let token = tokenizer.read_token(true, effective_max_len);
-        let (token, offset) = match token {
-            Ok(t) => {
-                let offset = t.start;
-                (t, offset)
-            }
+        let token = match tokenizer.read_token(true, effective_max_len) {
+            Ok(t) => t,
             Err(e) => {
                 let _ = writeln!(stdout, "tokenizer error: {e}");
                 break;
             }
         };
+        let offset = token.start;
 
         if inline_image_offset.is_some() && token.token_type == TokenType::Bad {
             let _ = writeln!(stdout, "EI not found; resuming normal scanning");
@@ -418,9 +393,12 @@ mod tests {
 
     #[test]
     fn resolve_objstm_type_true_for_two_hop_reference_chain() {
-        // Regression test: /Type may be reached through a holder chain of
-        // more than one indirect reference (100 -> 101 -> /ObjStm), which a
-        // single pdf.resolve() call does not follow.
+        // A bare top-level object body of "N G R" parses as an Integer, not
+        // a Reference (qpdf does the same), so this exact holder chain
+        // (100 -> 101 -> /ObjStm) cannot arise from parsing raw PDF bytes.
+        // pdf.set_object constructs it directly to exercise the full
+        // resolve_ref_chain contract defensively, matching how every other
+        // flpdf consumer of that shared primitive is expected to behave.
         let mut pdf = open_minimal_pdf();
         pdf.set_object(
             ObjectRef::new(100, 0),
