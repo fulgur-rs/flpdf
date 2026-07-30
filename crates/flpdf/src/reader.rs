@@ -1314,10 +1314,10 @@ impl<R: Read + Seek> Pdf<R> {
     /// registering an unresolved one on first request.
     ///
     /// Repeated calls with the same `object_ref` return the same shared
-    /// handle rather than a new, independently-identified one — indirect
-    /// object identity is stable across calls, matching a PDF's own model of
-    /// indirect references (an object number/generation pair always denotes
-    /// the same object).
+    /// handle rather than a new, independently-identified one, mirroring
+    /// qpdf's per-document object cache (`libqpdf/qpdf/QPDF.cc`): once an
+    /// indirect object has been requested, later requests for the same
+    /// object number/generation observe the same cached identity.
     ///
     /// This does not perform file I/O or force object-body parsing: the
     /// returned handle's value is not read or resolved by this call.
