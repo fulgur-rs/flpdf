@@ -1289,6 +1289,24 @@ signature changes**. This is the task that actually removes "the old raw
 Reference, cloned-value reader resolution, and cache-value production
 routes" as AC3 requires, replacing them with the named-and-bounded bridge.
 
+**Hard precondition carried over from Task 7 (bd issue flpdf-jjxb, blocks
+flpdf-egzr.3.2): verify string decryption before this task ships.** Task
+7's native-parse path (the plain-uncompressed-object case) builds
+`ObjectValue::String` directly from raw source bytes, bypassing the legacy
+engine's decryption step — unlike the already-resolved legacy `Object` (via
+`resolve_to_cache`) it runs alongside, whose `String` values *are*
+decrypted. This was inert in Task 7 (no accessor read a handle's decrypted
+string content yet), but this task is exactly where that risk becomes live:
+if the materialization bridge (or any new accessor this task adds) surfaces
+a native-parsed `String`'s bytes for an encrypted PDF without decrypting
+them first, that is an output-visible correctness bug, not a deferred one.
+Before closing this task, explicitly confirm one of: (a) the
+materialization path re-derives/decrypts `String` values from the already-
+decrypted legacy `object` rather than trusting the native parse's raw
+bytes, or (b) the native parse itself is changed to decrypt strings,
+matching the legacy engine's behavior. Do not let this resurface as a
+silent gap a second time.
+
 **Files:**
 - Modify: `crates/flpdf/src/reader.rs`
 - Modify: `crates/flpdf/src/object_handle.rs`
