@@ -891,6 +891,26 @@ impl<R: Read + Seek> Pdf<R> {
         &self.trailer
     }
 
+    // Degrade to a null handle rather than propagating `lift`'s depth error
+    // or panicking: a trailer is always fully parsed already (by the legacy
+    // engine, whose own recursion bound — `parser::MAX_PARSE_DEPTH`, 500 — is
+    // *higher* than `lift`'s `MAX_INLINE_DEPTH`, 256), so a crafted-but
+    // -parseable trailer with literal nesting between those two bounds is
+    // reachable here even though it never occurs for a realistic document.
+    // Mirrors how `resolve`/`resolve_borrowed` already present a
+    // structurally-unusable reference as `Object::Null` rather than erroring.
+    /// The trailer dictionary as an [`ObjectHandle`].
+    ///
+    /// The trailer is always a direct, in-memory dictionary — it is never
+    /// itself an indirect object per the PDF spec — so the returned handle is
+    /// always direct. A trailer whose literal (non-indirect) nesting exceeds
+    /// the crate's inline-object-nesting bound yields a null handle instead.
+    pub fn trailer_handle(&mut self) -> ObjectHandle {
+        let trailer = Object::Dictionary(self.trailer.clone());
+        let value = self.lift(&trailer, 0).unwrap_or(ObjectValue::Null);
+        ObjectHandle::from_value(value)
+    }
+
     pub(crate) fn startxref(&self) -> u64 {
         self.startxref
     }
@@ -1432,6 +1452,49 @@ impl<R: Read + Seek> Pdf<R> {
             .entry(object_ref)
             .or_insert_with(|| ObjectHandle::new_indirect_unresolved(object_ref, NO_PARSED_OFFSET))
             .clone()
+    }
+
+    // This implements the ordering/registration contract of qpdf's
+    // `getAllObjects()` (`libqpdf/QPDF.cc:1285-1294`) only. qpdf's own
+    // dangling-reference preparation additionally walks every live object's
+    // content to discover and register references that are syntactically
+    // valid but have no live xref/cache target — that step ties into
+    // xref/recovery semantics this layer does not own, and is out of scope
+    // here; full dangling-reference-preparation parity is flpdf-egzr.3.3's
+    // deliverable.
+    //
+    // qpdf's `m->xref_table` never contains free ("f"/type-0) entries in the
+    // first place (`insertFreeXrefEntry` records them in a separate
+    // `deleted_objects` set, never in `xref_table`), so `getAllObjects` never
+    // sees them. This crate's `source_xref_entries` is a more literal
+    // transcription of the on-disk table and *does* retain `XrefEntry::Free`
+    // rows (including the object-0 free-list head), so they are filtered out
+    // here to match what qpdf's object cache actually ends up holding.
+    /// Every indirect object known to this document.
+    ///
+    /// The result is the union of every reference already registered in the
+    /// canonical handle cache (see [`Pdf::get_object_handle`]) and every live
+    /// (non-free) reference recorded in the source cross-reference table,
+    /// registering any of the latter that is not yet cached. Returned in
+    /// `ObjectRef` order (ascending object number, then generation); every
+    /// handle in the result is indirect ([`ObjectHandle::is_indirect`]).
+    ///
+    /// # Errors
+    ///
+    /// This method does not currently produce an error: every candidate
+    /// reference is registered via [`Pdf::get_object_handle`], which never
+    /// fails.
+    pub fn get_all_object_handles(&mut self) -> Result<Vec<ObjectHandle>> {
+        let refs_to_register: Vec<ObjectRef> = self
+            .source_xref_entries
+            .iter()
+            .filter(|(_, entry)| !matches!(entry, XrefEntry::Free { .. }))
+            .map(|(object_ref, _)| *object_ref)
+            .collect();
+        for object_ref in refs_to_register {
+            self.get_object_handle(object_ref);
+        }
+        Ok(self.handle_registry.values().cloned().collect())
     }
 
     // Bridge implementation: delegates to the existing *private*
@@ -5134,6 +5197,100 @@ mod tests {
         let handle = pdf.get_object_handle(object_ref);
         assert!(handle.is_indirect());
         assert_eq!(handle.object_ref(), Some(object_ref));
+    }
+
+    #[test]
+    fn get_all_object_handles_returns_indirect_handles_in_object_ref_order() {
+        // `minimal_pdf_bytes` has three live objects (1 0, 2 0, 3 0) and one
+        // free entry: the `0 65535 f` free-list head that every classic xref
+        // table carries. The exact expected list below therefore also pins
+        // that the free-list head is excluded, matching qpdf's
+        // `getAllObjects()` (whose backing `xref_table` never contains free
+        // entries in the first place).
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let handles = pdf
+            .get_all_object_handles()
+            .expect("get all object handles");
+        assert!(handles.iter().all(ObjectHandle::is_indirect));
+        let refs: Vec<_> = handles.iter().map(|h| h.object_ref().unwrap()).collect();
+        let mut sorted = refs.clone();
+        sorted.sort();
+        assert_eq!(refs, sorted);
+        assert_eq!(
+            refs,
+            vec![
+                ObjectRef::new(1, 0),
+                ObjectRef::new(2, 0),
+                ObjectRef::new(3, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn get_all_object_handles_reuses_the_canonical_handle_for_an_already_registered_ref() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(2, 0);
+        let pre_registered = pdf.get_object_handle(object_ref);
+
+        let handles = pdf
+            .get_all_object_handles()
+            .expect("get all object handles");
+
+        let found = handles
+            .iter()
+            .find(|handle| handle.object_ref() == Some(object_ref))
+            .expect("ref 2 0 is present in the result");
+        assert!(
+            found.ptr_eq(&pre_registered),
+            "a ref already registered via get_object_handle must not be re-minted"
+        );
+    }
+
+    #[test]
+    fn get_all_object_handles_includes_a_ref_registered_only_via_handle_registry() {
+        // Register a ref that never appears in the source xref table at all
+        // (the dangling case): the union must not drop registry-only refs.
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let dangling_ref = ObjectRef::new(99, 0);
+        pdf.get_object_handle(dangling_ref);
+
+        let handles = pdf
+            .get_all_object_handles()
+            .expect("get all object handles");
+
+        assert!(handles
+            .iter()
+            .any(|handle| handle.object_ref() == Some(dangling_ref)));
+    }
+
+    #[test]
+    fn trailer_handle_is_indirect_or_direct_matching_trailer_dictionary_contents() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let handle = pdf.trailer_handle();
+        assert!(handle.is_direct());
+        let dict = handle
+            .as_dictionary()
+            .expect("trailer is a dictionary handle");
+        assert!(dict.contains_key(b"Root".as_slice()) || dict.contains_key(b"Size".as_slice()));
+
+        let root_handle = dict.get(b"Root".as_slice()).expect("trailer has /Root");
+        assert!(root_handle.is_indirect());
+        assert_eq!(root_handle.object_ref(), pdf.root_ref());
+    }
+
+    #[test]
+    fn trailer_handle_degrades_to_null_when_nesting_exceeds_the_inline_depth_bound() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let depth = crate::object::MAX_INLINE_DEPTH + 5;
+        let mut nested = Object::Integer(1);
+        for _ in 0..depth {
+            nested = Object::Array(vec![nested]);
+        }
+        pdf.trailer.insert("DeeplyNested", nested);
+
+        let handle = pdf.trailer_handle();
+
+        assert!(handle.is_null());
     }
 
     #[test]
