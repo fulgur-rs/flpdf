@@ -8,6 +8,7 @@ use self::file_object::{
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
+use crate::object_handle::NO_PARSED_OFFSET;
 #[cfg(feature = "qtest-driver")]
 use crate::parser::array_item_source_offset;
 #[cfg(feature = "qtest-driver")]
@@ -24,7 +25,8 @@ use crate::security::standard::{
 use crate::tokenizer::Tokenizer;
 use crate::xref::load_xref_state_with_repair;
 use crate::{
-    Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, Result, XrefEntry, XrefForm,
+    Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, XrefEntry,
+    XrefForm,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -63,6 +65,11 @@ pub struct Pdf<R: Read + Seek> {
     last_xref_form: XrefForm,
     repair_diagnostics: Diagnostics,
     cache: ObjectCache,
+    /// Canonical indirect-object handle registry (`QPDF::getObject`-equivalent
+    /// identity): repeated [`Pdf::get_object_handle`] calls for the same
+    /// `ObjectRef` return the same shared handle. Populated lazily on first
+    /// request; does not perform file I/O or force body parsing.
+    handle_registry: BTreeMap<ObjectRef, ObjectHandle>,
     compressed_member_parents: BTreeMap<ObjectRef, (ObjectRef, u32)>,
     /// Every uncompressed object offset, sorted ascending and deduplicated. Used
     /// to bound a single object read to the start of the next object in the file
@@ -575,6 +582,7 @@ impl<R: Read + Seek> Pdf<R> {
             last_xref_form: loaded.last_xref_form,
             repair_diagnostics: loaded.repair_diagnostics,
             cache,
+            handle_registry: BTreeMap::new(),
             compressed_member_parents: BTreeMap::new(),
             sorted_object_offsets,
             resolution_fallbacks_remaining: MAX_RESOLUTION_FALLBACKS,
@@ -1300,6 +1308,24 @@ impl<R: Read + Seek> Pdf<R> {
             Object::Boolean(value) if *value => Some(candidate),
             _ => None,
         })
+    }
+
+    /// Returns the canonical [`ObjectHandle`] for `object_ref`, creating and
+    /// registering an unresolved one on first request.
+    ///
+    /// Repeated calls with the same `object_ref` return the same shared
+    /// handle rather than a new, independently-identified one — indirect
+    /// object identity is stable across calls, matching a PDF's own model of
+    /// indirect references (an object number/generation pair always denotes
+    /// the same object).
+    ///
+    /// This does not perform file I/O or force object-body parsing: the
+    /// returned handle's value is not read or resolved by this call.
+    pub fn get_object_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
+        self.handle_registry
+            .entry(object_ref)
+            .or_insert_with(|| ObjectHandle::new_indirect_unresolved(object_ref, NO_PARSED_OFFSET))
+            .clone()
     }
 
     /// Resolve `object_ref` to its concrete value, parsing on demand.
@@ -4386,5 +4412,23 @@ mod tests {
     fn adobe_extension_level_absent_when_catalog_has_no_extensions() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         assert_eq!(pdf.adobe_extension_level(), None);
+    }
+
+    #[test]
+    fn get_object_handle_returns_the_same_canonical_handle_for_repeated_calls() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        let first = pdf.get_object_handle(object_ref);
+        let second = pdf.get_object_handle(object_ref);
+        assert!(first.ptr_eq(&second));
+    }
+
+    #[test]
+    fn get_object_handle_is_indirect_with_the_requested_ref() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        assert!(handle.is_indirect());
+        assert_eq!(handle.object_ref(), Some(object_ref));
     }
 }
