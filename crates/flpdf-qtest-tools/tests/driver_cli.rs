@@ -1,6 +1,9 @@
 use assert_cmd::Command;
 use std::{ffi::CStr, fs};
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+
 fn driver() -> Command {
     Command::cargo_bin("flpdf-test-driver").expect("flpdf-test-driver binary")
 }
@@ -241,4 +244,47 @@ fn missing_input_prefixes_the_native_open_error() {
         .code(2)
         .stdout("")
         .stderr(expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_pdf_path_opens_without_panicking() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let mut filename = b"valid-".to_vec();
+    filename.push(0xff);
+    filename.extend_from_slice(b".pdf");
+    let path = directory
+        .path()
+        .join(std::ffi::OsString::from_vec(filename));
+    fs::copy(minimal_pdf(), &path).expect("copy minimal PDF");
+
+    driver()
+        .arg("1")
+        .arg(&path)
+        .assert()
+        .code(0)
+        .stdout(TEST_1_OUTPUT)
+        .stderr("");
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_non_utf8_pdf_path_reports_raw_bytes_and_exit_two() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let mut filename = b"missing-".to_vec();
+    filename.push(0xff);
+    filename.extend_from_slice(b".pdf");
+    let path = directory
+        .path()
+        .join(std::ffi::OsString::from_vec(filename.clone()));
+
+    let assertion = driver().arg("1").arg(&path).assert().code(2).stdout("");
+    let stderr = assertion.get_output().stderr.as_slice();
+    assert!(stderr.starts_with(b"open "));
+    assert!(stderr
+        .windows(filename.len())
+        .any(|window| window == filename));
+    assert!(!stderr
+        .windows(b"panicked at".len())
+        .any(|window| window == b"panicked at"));
 }

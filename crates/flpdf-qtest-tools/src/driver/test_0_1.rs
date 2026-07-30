@@ -16,7 +16,7 @@ fn stream_decode_error_detail(error: Error) -> String {
 
 pub(crate) fn run_test_0_1<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    filename: &str,
+    filename: &[u8],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
@@ -49,7 +49,7 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
 
 fn write_object_details<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    filename: &str,
+    filename: &[u8],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
@@ -268,7 +268,7 @@ mod tests {
         let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
         run_test_0_1(
             &mut pdf,
-            "fixture.pdf",
+            b"fixture.pdf",
             &mut stdout,
             &mut stderr,
             &mut diagnostics_written,
@@ -388,7 +388,7 @@ mod tests {
         let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
         run_test_0_1(
             &mut pdf,
-            "fixture.pdf",
+            b"fixture.pdf",
             &mut stdout,
             &mut stderr,
             &mut diagnostics_written,
@@ -551,7 +551,7 @@ mod tests {
 
         let error = write_object_details(
             &mut pdf,
-            "fixture.pdf",
+            b"fixture.pdf",
             &mut stdout,
             &mut stderr,
             &mut diagnostics_written,
@@ -598,7 +598,7 @@ mod tests {
 
         let error = write_object_details(
             &mut pdf,
-            "fixture.pdf",
+            b"fixture.pdf",
             &mut stdout,
             &mut stderr,
             &mut diagnostics_written,
@@ -630,7 +630,7 @@ mod tests {
 
         let error = write_object_details(
             &mut pdf,
-            "fixture.pdf",
+            b"fixture.pdf",
             &mut stdout,
             &mut stderr,
             &mut diagnostics_written,
@@ -743,7 +743,7 @@ mod tests {
 
         run_test_0_1(
             &mut pdf,
-            "fixture.pdf",
+            b"fixture.pdf",
             &mut stdout,
             &mut stderr,
             &mut diagnostics_written,
@@ -771,7 +771,7 @@ mod tests {
         let mut diagnostics_written = 0;
         write_object_details(
             &mut pdf,
-            "fixture.pdf",
+            b"fixture.pdf",
             &mut stdout,
             &mut stderr,
             &mut diagnostics_written,

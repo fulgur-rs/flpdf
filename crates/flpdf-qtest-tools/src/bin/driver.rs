@@ -1,9 +1,10 @@
 use std::env;
+use std::ffi::OsString;
 use std::io;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
+    let args: Vec<OsString> = env::args_os().collect();
     let stdout = io::stdout();
     let stderr = io::stderr();
     let mut out = stdout.lock();

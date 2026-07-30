@@ -1,5 +1,6 @@
 use std::{
-    ffi::CStr,
+    borrow::Cow,
+    ffi::{CStr, OsStr, OsString},
     io::{self, Write},
 };
 
@@ -8,30 +9,32 @@ use std::ffi::CString;
 
 use flpdf::{Diagnostic, Error, Pdf, PdfOpenOptions};
 
-use crate::common::program_name;
+use crate::common::program_name_bytes;
 
 pub(crate) mod handle;
 pub(crate) mod test_0_1;
 
-pub fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
-    let whoami = program_name(
-        args.first()
-            .map(String::as_str)
-            .unwrap_or("flpdf-test-driver"),
-    );
+pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
+    let whoami = args
+        .first()
+        .map(OsString::as_os_str)
+        .map(os_str_diagnostic_bytes)
+        .unwrap_or_else(|| Cow::Borrowed(b"flpdf-test-driver"));
+    let whoami = program_name_bytes(&whoami);
     if args.len() < 3 || args.len() > 4 {
-        return write_error(
-            stdout,
-            stderr,
-            &format!("Usage: {whoami} n filename1 [arg2]"),
-        );
+        let mut usage = b"Usage: ".to_vec();
+        usage.extend_from_slice(whoami);
+        usage.extend_from_slice(b" n filename1 [arg2]");
+        return write_error_bytes(stdout, stderr, &usage);
     }
 
-    let n = match parse_test_number(&args[1]) {
+    let test_number = os_str_diagnostic_bytes(args[1].as_os_str());
+    let n = match parse_test_number(&test_number) {
         Ok(n) => n,
-        Err(error) => return write_error(stdout, stderr, &error),
+        Err(error) => return write_error_bytes(stdout, stderr, &error),
     };
-    let filename = &args[2];
+    let filename = args[2].as_os_str();
+    let filename_diagnostic = os_str_diagnostic_bytes(filename);
     let bytes = match std::fs::read(filename) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -39,7 +42,7 @@ pub fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u
             return write_error_bytes(
                 stdout,
                 stderr,
-                &open_error_bytes(filename, crt_message.as_deref(), &error),
+                &open_error_bytes(&filename_diagnostic, crt_message.as_deref(), &error),
             );
         }
     };
@@ -49,20 +52,34 @@ pub fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u
     };
     let mut pdf = match Pdf::open_mem_with_options(&bytes, options) {
         Ok(pdf) => pdf,
-        Err(error) => return write_open_failure(n, filename, &error, stdout, stderr),
+        Err(error) => {
+            return write_open_failure(n, &filename_diagnostic, &error, stdout, stderr);
+        }
     };
 
     let mut diagnostics_written = 0;
-    if emit_new_diagnostics(&pdf, &mut diagnostics_written, filename, stdout, stderr).is_err() {
+    if emit_new_diagnostics(
+        &pdf,
+        &mut diagnostics_written,
+        &filename_diagnostic,
+        stdout,
+        stderr,
+    )
+    .is_err()
+    {
         return 2;
     }
 
     if n != 0 && n != 1 {
         return write_error(stdout, stderr, &format!("invalid test {n}"));
     }
-    if let Err(error) =
-        test_0_1::run_test_0_1(&mut pdf, filename, stdout, stderr, &mut diagnostics_written)
-    {
+    if let Err(error) = test_0_1::run_test_0_1(
+        &mut pdf,
+        &filename_diagnostic,
+        stdout,
+        stderr,
+        &mut diagnostics_written,
+    ) {
         return write_error(stdout, stderr, &error.to_string());
     }
     if writeln!(stdout, "test {n} done").is_err() {
@@ -71,21 +88,28 @@ pub fn run(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u
     0
 }
 
-fn open_pdf_error(n: i32, filename: &str, error: &Error) -> String {
-    match error {
+fn open_pdf_error_bytes(n: i32, filename: &[u8], error: &Error) -> Vec<u8> {
+    let suffix = match error {
         Error::Parse { message, .. } if n == 0 && message == "xref not found" => {
-            format!("{filename}: can't find startxref")
+            Some(b": can't find startxref".as_slice())
         }
         Error::Parse { message, .. } if n != 0 && message == "trailer dictionary not found" => {
-            format!("{filename}: unable to find trailer dictionary while recovering damaged file")
+            Some(b": unable to find trailer dictionary while recovering damaged file".as_slice())
         }
-        _ => error.to_string(),
+        _ => None,
+    };
+    if let Some(suffix) = suffix {
+        let mut output = filename.to_vec();
+        output.extend_from_slice(suffix);
+        output
+    } else {
+        error.to_string().into_bytes()
     }
 }
 
 fn write_open_failure(
     n: i32,
-    filename: &str,
+    filename: &[u8],
     error: &Error,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -100,15 +124,15 @@ fn write_open_failure(
     } else {
         error
     };
-    write_error(stdout, stderr, &open_pdf_error(n, filename, source))
+    write_error_bytes(stdout, stderr, &open_pdf_error_bytes(n, filename, source))
 }
 
-fn open_error_bytes(filename: &str, crt_message: Option<&[u8]>, fallback: &io::Error) -> Vec<u8> {
+fn open_error_bytes(filename: &[u8], crt_message: Option<&[u8]>, fallback: &io::Error) -> Vec<u8> {
     let message = crt_message
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| fallback.to_string().into_bytes());
     let mut output = b"open ".to_vec();
-    output.extend_from_slice(filename.as_bytes());
+    output.extend_from_slice(filename);
     output.extend_from_slice(b": ");
     output.extend_from_slice(&message);
     output
@@ -120,8 +144,10 @@ fn strerror_bytes(error_code: libc::c_int) -> Option<Vec<u8>> {
 }
 
 #[cfg(unix)]
-fn crt_open_error_message(filename: &str) -> Option<Vec<u8>> {
-    let filename = CString::new(filename).ok()?;
+fn crt_open_error_message(filename: &OsStr) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let filename = CString::new(filename.as_bytes()).ok()?;
     let mode = CString::new("rb").expect("literal contains no NUL");
     let file = unsafe { libc::fopen(filename.as_ptr(), mode.as_ptr()) };
     if !file.is_null() {
@@ -143,19 +169,30 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
-#[cfg(any(test, windows))]
-fn has_interior_nul(filename: &str) -> bool {
-    filename.contains('\0')
+#[cfg(all(unix, test))]
+fn has_interior_nul(filename: &OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    filename.as_bytes().contains(&0)
 }
 
 #[cfg(windows)]
-fn crt_open_error_message(filename: &str) -> Option<Vec<u8>> {
+fn has_interior_nul(filename: &OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    filename.encode_wide().any(|unit| unit == 0)
+}
+
+#[cfg(windows)]
+fn crt_open_error_message(filename: &OsStr) -> Option<Vec<u8>> {
+    use std::os::windows::ffi::OsStrExt;
+
     if has_interior_nul(filename) {
         // `_wfopen_s` would stop at the NUL and probe a different path. With no
         // CRT evidence for Rust's failed path, preserve the original fallback.
         return None;
     }
-    let filename: Vec<libc::wchar_t> = filename.encode_utf16().chain(std::iter::once(0)).collect();
+    let filename: Vec<libc::wchar_t> = filename.encode_wide().chain(std::iter::once(0)).collect();
     let mode = [b'r' as libc::wchar_t, b'b' as libc::wchar_t, 0];
     let mut file = std::ptr::null_mut();
     let error_code = unsafe { _wfopen_s(&mut file, filename.as_ptr(), mode.as_ptr()) };
@@ -171,12 +208,33 @@ fn crt_open_error_message(filename: &str) -> Option<Vec<u8>> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn crt_open_error_message(_filename: &str) -> Option<Vec<u8>> {
+fn crt_open_error_message(_filename: &OsStr) -> Option<Vec<u8>> {
     None
 }
 
-fn parse_test_number(input: &str) -> Result<i32, String> {
-    let bytes = input.as_bytes();
+#[cfg(unix)]
+fn os_str_diagnostic_bytes(value: &OsStr) -> Cow<'_, [u8]> {
+    use std::os::unix::ffi::OsStrExt;
+
+    Cow::Borrowed(value.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn os_str_diagnostic_bytes(value: &OsStr) -> Cow<'_, [u8]> {
+    // This fallback is lossy only for unpaired wide values. Valid-Unicode Windows
+    // diagnostics remain byte-identical to their prior UTF-8 output.
+    Cow::Owned(value.to_string_lossy().into_owned().into_bytes())
+}
+
+fn decimal_error(prefix: &[u8], input: &[u8], suffix: &[u8]) -> Vec<u8> {
+    let mut message = prefix.to_vec();
+    message.extend_from_slice(input);
+    message.extend_from_slice(suffix);
+    message
+}
+
+fn parse_test_number(input: &[u8]) -> Result<i32, Vec<u8>> {
+    let bytes = input;
     let mut index = 0;
     while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
         index += 1;
@@ -204,7 +262,13 @@ fn parse_test_number(input: &str) -> Result<i32, String> {
         value = value
             .checked_mul(10)
             .and_then(|value| value.checked_add(u64::from(digit)))
-            .ok_or_else(|| format!("overflow/underflow converting {input} to 64-bit integer"))?;
+            .ok_or_else(|| {
+                decimal_error(
+                    b"overflow/underflow converting ",
+                    input,
+                    b" to 64-bit integer",
+                )
+            })?;
         index += 1;
     }
 
@@ -215,8 +279,10 @@ fn parse_test_number(input: &str) -> Result<i32, String> {
     let i64_value = if negative {
         const I64_MIN_MAGNITUDE: u64 = 9_223_372_036_854_775_808;
         if value > I64_MIN_MAGNITUDE {
-            return Err(format!(
-                "overflow/underflow converting {input} to 64-bit integer"
+            return Err(decimal_error(
+                b"overflow/underflow converting ",
+                input,
+                b" to 64-bit integer",
             ));
         }
         if value == I64_MIN_MAGNITUDE {
@@ -226,8 +292,10 @@ fn parse_test_number(input: &str) -> Result<i32, String> {
         }
     } else {
         if value > i64::MAX as u64 {
-            return Err(format!(
-                "overflow/underflow converting {input} to 64-bit integer"
+            return Err(decimal_error(
+                b"overflow/underflow converting ",
+                input,
+                b" to 64-bit integer",
             ));
         }
         value as i64
@@ -237,13 +305,14 @@ fn parse_test_number(input: &str) -> Result<i32, String> {
         format!(
             "integer out of range converting {i64_value} from a 8-byte signed type to a 4-byte signed type"
         )
+        .into_bytes()
     })
 }
 
 fn emit_new_diagnostics<R: io::Read + io::Seek>(
     pdf: &Pdf<R>,
     diagnostics_written: &mut usize,
-    filename: &str,
+    filename: &[u8],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
@@ -256,21 +325,24 @@ fn emit_new_diagnostics<R: io::Read + io::Seek>(
 }
 
 fn write_warning(
-    filename: &str,
+    filename: &[u8],
     diagnostic: &Diagnostic,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
     let message = diagnostic.message.as_str();
     let offset = diagnostic.offset;
-    let line = if message.starts_with('(') {
-        format!("WARNING: {filename} {message}")
+    let mut line = b"WARNING: ".to_vec();
+    line.extend_from_slice(filename);
+    if message.starts_with('(') {
+        line.push(b' ');
     } else if let Some(offset) = offset {
-        format!("WARNING: {filename} (offset {offset}): {message}")
+        line.extend_from_slice(format!(" (offset {offset}): ").as_bytes());
     } else {
-        format!("WARNING: {filename}: {message}")
-    };
-    write_stderr_line(stdout, stderr, &line)
+        line.extend_from_slice(b": ");
+    }
+    line.extend_from_slice(message.as_bytes());
+    write_stderr_bytes(stdout, stderr, &line)
 }
 
 fn write_error(stdout: &mut dyn Write, stderr: &mut dyn Write, message: &str) -> u8 {
@@ -280,14 +352,6 @@ fn write_error(stdout: &mut dyn Write, stderr: &mut dyn Write, message: &str) ->
 fn write_error_bytes(stdout: &mut dyn Write, stderr: &mut dyn Write, message: &[u8]) -> u8 {
     let _ = write_stderr_bytes(stdout, stderr, message);
     2
-}
-
-fn write_stderr_line(
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-    message: &str,
-) -> io::Result<()> {
-    write_stderr_bytes(stdout, stderr, message.as_bytes())
 }
 
 fn write_stderr_bytes(
@@ -305,7 +369,42 @@ mod tests {
     use super::{
         crt_open_error_message, has_interior_nul, open_error_bytes, run, write_error_bytes,
     };
-    use std::io::{self, Write};
+    use std::{
+        ffi::{OsStr, OsString},
+        io::{self, Write},
+    };
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_preserves_non_utf8_argv0_basename() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let args = vec![OsString::from_vec(b"/tmp/test-\xff-driver.exe".to_vec())];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        assert_eq!(run(&args, &mut stdout, &mut stderr), 2);
+        assert!(stdout.is_empty());
+        assert_eq!(stderr, b"Usage: test-\xff-driver n filename1 [arg2]\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_test_number_without_decimal_prefix_dispatches_zero() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let args = vec![
+            OsString::from("flpdf-test-driver"),
+            OsString::from_vec(vec![0xff]),
+            OsString::from(fixture("direct_null")),
+        ];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        assert_eq!(run(&args, &mut stdout, &mut stderr), 0);
+        assert!(stdout.ends_with(b"test 0 done\n"));
+        assert!(stderr.is_empty());
+    }
 
     fn fixture(name: &str) -> String {
         format!(
@@ -318,22 +417,22 @@ mod tests {
     fn open_error_bytes_preserve_non_utf8_crt_message_bytes() {
         let fallback = io::Error::other("fallback must not be used");
         assert_eq!(
-            open_error_bytes("input.pdf", Some(&[0xff, b'!']), &fallback),
+            open_error_bytes(b"input.pdf", Some(&[0xff, b'!']), &fallback),
             b"open input.pdf: \xff!"
         );
     }
 
     #[test]
     fn interior_nul_guard_rejects_a_path_that_would_be_truncated_by_the_crt() {
-        assert!(has_interior_nul("before\0after"));
-        assert!(!has_interior_nul("ordinary.pdf"));
+        assert!(has_interior_nul(OsStr::new("before\0after")));
+        assert!(!has_interior_nul(OsStr::new("ordinary.pdf")));
     }
 
     #[test]
     fn open_error_bytes_fall_back_only_without_a_crt_message() {
         let fallback = io::Error::other("fallback message");
         assert_eq!(
-            open_error_bytes("input.pdf", None, &fallback),
+            open_error_bytes(b"input.pdf", None, &fallback),
             b"open input.pdf: fallback message"
         );
     }
@@ -354,7 +453,7 @@ mod tests {
     fn unix_crt_open_failure_supplies_raw_strerror_bytes() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let missing = directory.path().join("missing.pdf");
-        let message = crt_open_error_message(missing.to_str().expect("utf-8 temp path"))
+        let message = crt_open_error_message(missing.as_os_str())
             .expect("fopen failure must supply strerror bytes");
         assert!(!message.is_empty());
     }
@@ -362,7 +461,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_crt_open_success_is_not_misreported_as_an_error() {
-        assert!(crt_open_error_message(&fixture("direct_null")).is_none());
+        assert!(crt_open_error_message(OsStr::new(&fixture("direct_null"))).is_none());
     }
 
     #[cfg(windows)]
@@ -370,7 +469,7 @@ mod tests {
     fn windows_crt_open_failure_supplies_raw_strerror_bytes() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let missing = directory.path().join("missing.pdf");
-        let message = crt_open_error_message(missing.to_str().expect("utf-8 temp path"))
+        let message = crt_open_error_message(missing.as_os_str())
             .expect("_wfopen_s failure must supply strerror bytes");
         assert!(!message.is_empty());
     }
@@ -378,8 +477,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_crt_probe_skips_an_interior_nul_path() {
-        assert!(has_interior_nul("before\0after"));
-        assert!(crt_open_error_message("before\0after").is_none());
+        assert!(has_interior_nul(OsStr::new("before\0after")));
+        assert!(crt_open_error_message(OsStr::new("before\0after")).is_none());
     }
 
     struct FlushFailure;
@@ -446,9 +545,9 @@ mod tests {
     #[test]
     fn repair_warning_flush_failure_exits_two() {
         let args = vec![
-            "flpdf-test-driver".to_string(),
-            "1".to_string(),
-            fixture("repairable_input"),
+            OsString::from("flpdf-test-driver"),
+            OsString::from("1"),
+            OsString::from(fixture("repairable_input")),
         ];
         let mut stdout = FlushFailure;
         let mut stderr = Vec::new();
@@ -460,9 +559,9 @@ mod tests {
     #[test]
     fn failed_open_warning_write_failure_skips_terminal_error() {
         let args = vec![
-            "flpdf-test-driver".to_string(),
-            "1".to_string(),
-            fixture("open_repair_failure"),
+            OsString::from("flpdf-test-driver"),
+            OsString::from("1"),
+            OsString::from(fixture("open_repair_failure")),
         ];
         let mut stdout = Vec::new();
         let mut stderr = FirstWriteFailure::default();
@@ -480,9 +579,9 @@ mod tests {
     #[test]
     fn test_body_write_failure_is_reported_and_exits_two() {
         let args = vec![
-            "flpdf-test-driver".to_string(),
-            "1".to_string(),
-            fixture("direct_null"),
+            OsString::from("flpdf-test-driver"),
+            OsString::from("1"),
+            OsString::from(fixture("direct_null")),
         ];
         let mut stdout = WriteFailure;
         let mut stderr = Vec::new();
@@ -493,9 +592,9 @@ mod tests {
     #[test]
     fn footer_write_failure_exits_two() {
         let args = vec![
-            "flpdf-test-driver".to_string(),
-            "1".to_string(),
-            fixture("direct_null"),
+            OsString::from("flpdf-test-driver"),
+            OsString::from("1"),
+            OsString::from(fixture("direct_null")),
         ];
         let mut stdout = FooterFailure::default();
         let mut stderr = Vec::new();
