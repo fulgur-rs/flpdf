@@ -820,6 +820,16 @@ mod resolution_state_tests {
     }
 
     #[test]
+    fn strong_count_reports_a_direct_handles_rc_count_too() {
+        let handle = ObjectHandle::integer(1);
+        assert_eq!(handle.strong_count(), 1);
+        let clone = handle.clone();
+        assert_eq!(handle.strong_count(), 2);
+        drop(clone);
+        assert_eq!(handle.strong_count(), 1);
+    }
+
+    #[test]
     fn disconnect_drops_the_strong_rc_a_resolved_value_holds_to_a_cyclic_child() {
         // Two objects that reference each other (e.g. a /Pages node and a
         // page's /Parent) form a strong Rc cycle once both are resolved:
