@@ -736,6 +736,59 @@ impl ObjectHandle {
         })
     }
 
+    /// This handle's qpdf-syntax unparse form
+    /// (`include/qpdf/QPDFObjectHandle.hh:1159`,
+    /// `libqpdf/QPDFObjectHandle.cc:1574-1584`): an indirect handle always
+    /// unparses to its own `"N G R"`, regardless of resolution state; a
+    /// direct handle delegates to [`Self::unparse_resolved`].
+    pub fn unparse(&self) -> Vec<u8> {
+        match self.object_ref() {
+            Some(object_ref) => {
+                let mut out = Vec::new();
+                Object::Reference(object_ref).write_pdf(&mut out);
+                out
+            }
+            None => self.unparse_resolved(),
+        }
+    }
+
+    /// This handle's resolved value in qpdf syntax
+    /// (`libqpdf/QPDFObjectHandle.cc:1586-1593`), except a stream always
+    /// reports its own reference form (`libqpdf/QPDF_Stream.cc:173-178`) —
+    /// a stream is only ever a top-level indirect object in valid qpdf
+    /// usage, so this never inlines a stream's dictionary and data.
+    ///
+    /// This port diverges from qpdf's own `unparseResolved()` in two
+    /// internal resolution states that qpdf itself does not reach the same
+    /// way:
+    /// - **Not yet resolved**: qpdf silently dereferences (resolves) an
+    ///   unresolved indirect handle before unparsing it; this method does
+    ///   not perform that hidden I/O, matching every other accessor in this
+    ///   file (see e.g. [`Self::as_integer`]'s own doc) — no accessor here
+    ///   resolves on the caller's behalf. Reports the same `null` fallback
+    ///   the value would show before resolution.
+    /// - **Destroyed** (the owning document has been dropped and this
+    ///   handle's value severed): qpdf's `QPDF_Destroyed::unparse()`
+    ///   (`libqpdf/QPDF_Destroyed.cc:24-28`) throws `std::logic_error`; this
+    ///   method has no exception channel to mirror that with (`Vec<u8>`
+    ///   return, no `Result`) and instead presents the same `null` fallback
+    ///   every other accessor in this file already gives a destroyed
+    ///   handle, rather than panicking.
+    pub fn unparse_resolved(&self) -> Vec<u8> {
+        // Bridges through the existing direct-value materialization path
+        // and `Object::write_pdf`'s own already-byte-identical-tested
+        // formatter rather than duplicating array/dict/string-escaping
+        // logic against `ObjectValue` directly.
+        let is_stream = self.object_ref().is_some()
+            && self.with_value(|value| matches!(value, Some(ObjectValue::Stream { .. })));
+        if is_stream {
+            return self.unparse();
+        }
+        let mut out = Vec::new();
+        self.materialize().write_pdf(&mut out);
+        out
+    }
+
     /// Replace this handle's own value in place, preserving its identity
     /// (every other outstanding clone observes the new value) and its
     /// already-recorded parsed offset (`parsed_offset` is untouched here --
@@ -1563,5 +1616,133 @@ mod type_code_tests {
         // code reports the same ordinal as a handle whose value is not
         // known at all.
         assert!(handle.is_resolved());
+    }
+}
+
+#[cfg(test)]
+mod unparse_tests {
+    use super::*;
+
+    #[test]
+    fn direct_scalar_unparses_like_object_write_pdf() {
+        assert_eq!(ObjectHandle::integer(7).unparse(), b"7");
+        assert_eq!(ObjectHandle::boolean(true).unparse(), b"true");
+        assert_eq!(ObjectHandle::name(b"Type".to_vec()).unparse(), b"/Type");
+    }
+
+    #[test]
+    fn indirect_handle_unparse_is_always_the_reference_form_even_before_resolution() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 2), 0);
+        assert_eq!(handle.unparse(), b"7 2 R");
+    }
+
+    #[test]
+    fn indirect_handle_unparse_resolved_falls_back_to_null_before_resolution() {
+        // No hidden I/O: an unresolved indirect handle's value is not
+        // known, so unparse_resolved reports the same as materialize()'s
+        // own documented null fallback rather than triggering resolution.
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 2), 0);
+        assert_eq!(handle.unparse_resolved(), b"null");
+    }
+
+    #[test]
+    fn resolved_indirect_handle_unparse_resolved_shows_the_real_value() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 2), 0);
+        handle.set_resolved(ObjectValue::Integer(42));
+        assert_eq!(handle.unparse(), b"7 2 R");
+        assert_eq!(handle.unparse_resolved(), b"42");
+    }
+
+    #[test]
+    fn stream_value_unparse_resolved_still_reports_the_reference_form() {
+        // QPDF_Stream::unparse() (libqpdf/QPDF_Stream.cc:173-178) always
+        // returns its own "N G R" — mirrored here rather than inlining the
+        // stream's dictionary/data.
+        let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(0))]);
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
+        handle.set_resolved(ObjectValue::Stream {
+            dict,
+            data: Vec::new(),
+        });
+        assert_eq!(handle.unparse(), b"9 0 R");
+        assert_eq!(handle.unparse_resolved(), b"9 0 R");
+    }
+
+    #[test]
+    fn direct_array_unparse_writes_indirect_children_as_references_not_recursed() {
+        let child = ObjectHandle::new_indirect_unresolved(ObjectRef::new(5, 0), 0);
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(1), child]);
+        assert_eq!(array.unparse(), b"[ 1 5 0 R ]");
+    }
+
+    #[test]
+    fn a_direct_stream_value_unparse_resolved_inlines_rather_than_referencing() {
+        // A *direct* Stream `ObjectValue` cannot arise through any public
+        // API in this crate (there is no `ObjectHandle::stream(..)`
+        // factory; every real stream value is installed via `set_resolved`
+        // on an indirect handle -- see `reader.rs`'s stream-construction
+        // sites, all of which route through `set_resolved`, never
+        // `from_value`). Real qpdf has the same invariant: a stream is only
+        // ever a *newly allocated indirect* `QPDFObjectHandle`
+        // (`QPDFObjectHandle::newStream`), never a value that can appear
+        // "direct" in the first place, so `QPDF_Stream::unparse()`'s
+        // reference-form guarantee has nothing to say about this case
+        // either. This test exists only to pin down that the fallback path
+        // (materialize + `Object::write_pdf`) is total and does not panic
+        // for this unreachable-in-production shape: it inlines the
+        // dictionary and data the same way `Object::write_pdf` already does
+        // for `Object::Stream`, rather than fabricating a meaningless
+        // reference for a value that was never assigned an object
+        // number/generation.
+        let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
+        let handle = ObjectHandle::from_value(ObjectValue::Stream {
+            dict,
+            data: b"ab".to_vec(),
+        });
+        assert_eq!(
+            handle.unparse_resolved(),
+            b"<< /Length 2 >>\nstream\nab\nendstream"
+        );
+    }
+
+    #[test]
+    fn destroyed_indirect_handle_unparse_is_unaffected_but_unparse_resolved_falls_back_to_null() {
+        // qpdf's own `unparse()` never dereferences an indirect handle at
+        // all (`libqpdf/QPDFObjectHandle.cc:1574-1584`: the isIndirect()
+        // branch returns "N G R" directly without calling
+        // `unparseResolved()`), so a destroyed handle's `unparse()` does
+        // not throw either -- no divergence there. `unparseResolved()`
+        // does dereference, though, and qpdf's `QPDF_Destroyed::unparse()`
+        // (`libqpdf/QPDF_Destroyed.cc:24-28`) throws `std::logic_error`
+        // once it gets there. This method has no exception channel to
+        // mirror that with, so -- as documented on `unparse_resolved`
+        // itself -- it presents the same `null` fallback every other
+        // accessor in this file gives a destroyed handle, rather than
+        // panicking.
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Integer(7));
+        handle.disconnect();
+
+        assert_eq!(handle.unparse(), b"1 0 R");
+        assert_eq!(handle.unparse_resolved(), b"null");
+    }
+
+    #[test]
+    fn resolved_to_a_reference_indirect_handle_unparse_and_unparse_resolved_diverge() {
+        // Mirrors `type_code_tests::resolved_to_a_reference_indirect_handle_reports_unresolved`'s
+        // own state: a handle `Pdf::set_object` redirected in place to
+        // another object (see `ObjectValue::Reference`'s own doc).
+        // `unparse()` never dereferences an indirect handle (see this
+        // module's `destroyed_...` test above), so it reports the
+        // redirecting handle's own "N G R" -- not the target's.
+        // `unparse_resolved()` does read the resolved value, which is
+        // itself a bare reference, so it reports the *target's* "N G R"
+        // instead -- the same outcome qpdf's own silently-chasing
+        // `unparseResolved()` would reach for an equivalent redirect.
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Reference(ObjectRef::new(9, 0)));
+
+        assert_eq!(handle.unparse(), b"1 0 R");
+        assert_eq!(handle.unparse_resolved(), b"9 0 R");
     }
 }
