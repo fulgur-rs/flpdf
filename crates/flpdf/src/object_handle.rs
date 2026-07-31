@@ -601,6 +601,38 @@ impl ObjectHandle {
         });
     }
 
+    /// A fresh, direct handle with a value copied from `self` — mirrors
+    /// `QPDFObjectHandle::shallowCopy` (`libqpdf/QPDFObjectHandle.cc:2073-2079`,
+    /// which defers to each type's own `copy(shallow=false)` default —
+    /// `libqpdf/QPDF_Dictionary.cc`/`libqpdf/QPDF_Array.cc`). Despite the
+    /// name, this recursively copies through every *direct* array/dictionary
+    /// descendant (each direct child is itself shallow-copied), stopping
+    /// only at an *indirect* child, which keeps its existing shared
+    /// identity rather than being copied — "shallow" describes not
+    /// resolving/duplicating through indirection, not a single-level-only
+    /// copy. A scalar value is cloned outright. Always returns a direct
+    /// handle regardless of whether `self` is indirect. Never performs
+    /// resolution itself: shallow-copying an unresolved/missing/destroyed
+    /// indirect handle produces a direct null handle, matching every other
+    /// accessor's "no hidden I/O" rule.
+    ///
+    /// A stream value reached this way (only possible for a *directly*
+    /// nested stream, a shape qpdf itself forbids and this crate does not
+    /// construct through its own public factories) is left shared rather
+    /// than copied: qpdf's own `QPDF_Stream::copy` throws ("stream objects
+    /// cannot be cloned", `libqpdf/QPDF_Stream.cc`), and this crate has no
+    /// exception channel to mirror that with — the same precedent
+    /// [`Self::unparse_resolved`]'s own doc comment already establishes for
+    /// a different qpdf-throws case.
+    pub fn shallow_copy(&self) -> ObjectHandle {
+        stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+            self.with_value(|value| match value {
+                Some(v) => ObjectHandle::from_value(shallow_copy_value(v)),
+                None => ObjectHandle::null(),
+            })
+        })
+    }
+
     /// The stream's own dictionary handle if this handle's value — its own
     /// if direct, or its already-resolved value if indirect — is a stream,
     /// or `None` otherwise. This never performs resolution itself: an
@@ -1017,6 +1049,36 @@ fn unparse_materialize_child(handle: &ObjectHandle) -> Object {
     match handle.object_ref() {
         Some(object_ref) => Object::Reference(object_ref),
         None => unparse_materialize(handle),
+    }
+}
+
+// `ObjectHandle::shallow_copy`'s per-variant dispatch: an Array/Dictionary
+// child is recursively shallow-copied through `shallow_copy_child` (which
+// re-enters `ObjectHandle::shallow_copy`, the recursion hub carrying its
+// own `stacker::maybe_grow` wrap — the same hub-per-call shape as
+// `unparse_materialize`/`unparse_materialize_child` above). Every other
+// variant, including `Stream` (see `shallow_copy`'s own doc comment for
+// why), is cloned as-is with no further recursion.
+fn shallow_copy_value(value: &ObjectValue) -> ObjectValue {
+    match value {
+        ObjectValue::Array(items) => {
+            ObjectValue::Array(items.iter().map(shallow_copy_child).collect())
+        }
+        ObjectValue::Dictionary(entries) => ObjectValue::Dictionary(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), shallow_copy_child(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn shallow_copy_child(child: &ObjectHandle) -> ObjectHandle {
+    if child.is_indirect() {
+        child.clone()
+    } else {
+        child.shallow_copy()
     }
 }
 
@@ -2148,5 +2210,60 @@ mod mutation_tests {
         let scalar = ObjectHandle::integer(1);
         scalar.remove_key(b"A");
         assert_eq!(scalar.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn shallow_copy_is_always_direct_even_from_an_indirect_source() {
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
+        indirect.set_resolved(ObjectValue::Dictionary(Default::default()));
+        let copy = indirect.shallow_copy();
+        assert!(copy.is_direct());
+    }
+
+    #[test]
+    fn shallow_copy_mutation_does_not_affect_the_source() {
+        let original = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
+        let copy = original.shallow_copy();
+        copy.replace_key(b"A", ObjectHandle::integer(2));
+        assert_eq!(original.get_key(b"A").as_integer(), Some(1));
+        assert_eq!(copy.get_key(b"A").as_integer(), Some(2));
+    }
+
+    // Despite the name, qpdf's shallowCopy() recursively copies through
+    // every *direct* array/dictionary descendant, stopping only at an
+    // *indirect* child (kept shared) -- see shallow_copy's own doc comment
+    // for the qpdf citations. These two tests pin that distinction.
+
+    #[test]
+    fn shallow_copy_of_a_direct_dictionary_child_produces_an_independent_copy() {
+        let original = ObjectHandle::dictionary(vec![(
+            b"A".to_vec(),
+            ObjectHandle::dictionary(vec![(b"Inner".to_vec(), ObjectHandle::integer(1))]),
+        )]);
+        let copy = original.shallow_copy();
+        copy.get_key(b"A")
+            .replace_key(b"Inner", ObjectHandle::integer(2));
+        assert_eq!(
+            original.get_key(b"A").get_key(b"Inner").as_integer(),
+            Some(1)
+        );
+        assert_eq!(copy.get_key(b"A").get_key(b"Inner").as_integer(), Some(2));
+    }
+
+    #[test]
+    fn shallow_copy_of_an_indirect_dictionary_child_keeps_shared_identity() {
+        let child = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
+        child.set_resolved(ObjectValue::Integer(1));
+        let original = ObjectHandle::dictionary(vec![(b"A".to_vec(), child.clone())]);
+        let copy = original.shallow_copy();
+        assert!(copy.get_key(b"A").ptr_eq(&child));
+    }
+
+    #[test]
+    fn shallow_copy_of_a_non_container_clones_the_scalar_value() {
+        let original = ObjectHandle::integer(5);
+        let copy = original.shallow_copy();
+        assert!(!copy.ptr_eq(&original));
+        assert_eq!(copy.as_integer(), Some(5));
     }
 }
