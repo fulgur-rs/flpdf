@@ -257,6 +257,20 @@ impl ObjectHandle {
         }
     }
 
+    /// This handle's value, cloned, if it is direct — `None` for an
+    /// indirect handle. Unlike [`Self::into_direct_value`], this works
+    /// regardless of how many other clones of this handle are outstanding
+    /// (it clones the value rather than requiring exclusive `Rc`
+    /// ownership). Used by `Pdf::make_indirect_object_handle`, which
+    /// cannot assume its caller holds the only reference to the direct
+    /// handle it passes in.
+    pub(crate) fn direct_value_clone(&self) -> Option<ObjectValue> {
+        match &self.0 {
+            Repr::Direct(slot) => Some(slot.borrow().value.clone()),
+            Repr::Indirect(_) => None,
+        }
+    }
+
     /// Mark this indirect handle's value as resolved to `value`. A no-op for
     /// a direct handle, which has no resolution state to update.
     pub(crate) fn set_resolved(&self, value: ObjectValue) {

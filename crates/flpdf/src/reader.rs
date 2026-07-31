@@ -1495,6 +1495,56 @@ impl<R: Read + Seek> Pdf<R> {
             .clone()
     }
 
+    /// Allocate a fresh object number and register `handle`'s value as its
+    /// indirect object, mirroring `QPDF::makeIndirectObject`
+    /// (`libqpdf/QPDF.cc:1891-1896`, allocating via `nextObjGen()` and
+    /// `obj_cache[next] = ObjCache(obj, -1, -1)`,
+    /// `libqpdf/QPDF.cc:1885-1888`).
+    ///
+    /// The returned handle is a new, distinct object identity: unlike
+    /// qpdf's uniform `shared_ptr<QPDFObject>` (where the caller's original
+    /// handle and the new indirect one end up viewing the exact same
+    /// underlying value, so mutating either mutates both), this crate's
+    /// `Direct`/`Indirect` representations are different storage shapes
+    /// (`object_handle.rs`'s own `Repr` enum) — an internal structural
+    /// deviation only, not an output-byte difference. `handle`'s value is
+    /// cloned into the new indirect slot; further mutation of `handle`
+    /// itself (if the caller kept another clone of it) does not affect the
+    /// returned handle, or vice versa.
+    ///
+    /// Allocation scans [`Pdf::object_refs`] for the highest existing
+    /// object number (`max + 1`, generation `0`) rather than maintaining a
+    /// running counter, matching this crate's existing
+    /// `overlay_appearance_stream.rs::allocate_next_ref` convention.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] if `handle` is indirect, mirroring
+    /// qpdf's own rejection of an already-indirect input
+    /// (`libqpdf/QPDF.cc:1891-1894`, `std::logic_error("attempted to make
+    /// an uninitialized QPDFObjectHandle indirect")` — this crate has no
+    /// "uninitialized handle" state to reject separately, since every
+    /// `ObjectHandle` is always validly constructed).
+    pub fn make_indirect_object_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
+        let Some(value) = handle.direct_value_clone() else {
+            return Err(Error::Unsupported(
+                "cannot make an already-indirect ObjectHandle indirect".to_string(),
+            ));
+        };
+        let next_number = self
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+        let new_ref = ObjectRef::new(next_number, 0);
+        let indirect = self.get_object_handle(new_ref);
+        indirect.set_resolved(value);
+        Ok(indirect)
+    }
+
     // This implements the ordering/registration contract of qpdf's
     // `getAllObjects()` (`libqpdf/QPDF.cc:1285-1294`) only. qpdf's own
     // dangling-reference preparation additionally walks every live object's
@@ -4428,6 +4478,57 @@ mod tests {
         // itself drops, so only this test's own local handles remain live.
         assert_eq!(pages.strong_count(), 1);
         assert_eq!(page.strong_count(), 1);
+    }
+
+    #[test]
+    fn make_indirect_object_handle_allocates_a_fresh_ref_and_preserves_the_value() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let direct = ObjectHandle::integer(42);
+        let indirect = pdf
+            .make_indirect_object_handle(direct)
+            .expect("make indirect");
+        assert!(indirect.is_indirect());
+        assert_eq!(indirect.as_integer(), Some(42));
+    }
+
+    #[test]
+    fn make_indirect_object_handle_rejects_an_already_indirect_handle() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let already_indirect = pdf.get_object_handle(ObjectRef::new(1, 0));
+        assert!(pdf.make_indirect_object_handle(already_indirect).is_err());
+    }
+
+    #[test]
+    fn make_indirect_object_handle_allocates_past_the_highest_existing_number() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let max_before = pdf
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let indirect = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(1))
+            .expect("make indirect");
+        assert!(indirect.object_ref().unwrap().number > max_before);
+    }
+
+    #[test]
+    fn make_indirect_object_handle_works_for_a_handle_with_other_outstanding_clones() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let direct = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
+        let clone_kept_by_caller = direct.clone();
+        let indirect = pdf
+            .make_indirect_object_handle(direct)
+            .expect("make indirect even though a clone is still outstanding");
+        assert_eq!(indirect.get_key(b"A").as_integer(), Some(1));
+        // The new indirect handle is its own object; mutating the original
+        // direct clone the caller kept does not affect it (Rust's Direct
+        // and Indirect slots are distinct storage, unlike qpdf's uniform
+        // shared_ptr<QPDFObject> -- see make_indirect_object_handle's own
+        // doc comment).
+        clone_kept_by_caller.replace_key(b"A", ObjectHandle::integer(99));
+        assert_eq!(indirect.get_key(b"A").as_integer(), Some(1));
     }
 
     fn classic_pdf_with_bodies(bodies: &[&[u8]], root: ObjectRef) -> Vec<u8> {
