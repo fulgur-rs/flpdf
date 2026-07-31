@@ -1029,31 +1029,6 @@ fn token_description(token: &Token) -> String {
     }
 }
 
-/// The snake_case name qpdf's `test_tokenizer.cc` prints for each token type.
-#[allow(dead_code)] // Used by this module's own tests and, under qtest-driver, by flpdf-qtest-tools.
-pub fn token_type_name(token_type: TokenType) -> &'static str {
-    match token_type {
-        TokenType::Bad => "bad",
-        TokenType::ArrayClose => "array_close",
-        TokenType::ArrayOpen => "array_open",
-        TokenType::BraceClose => "brace_close",
-        TokenType::BraceOpen => "brace_open",
-        TokenType::DictClose => "dict_close",
-        TokenType::DictOpen => "dict_open",
-        TokenType::Integer => "integer",
-        TokenType::Name => "name",
-        TokenType::Real => "real",
-        TokenType::String => "string",
-        TokenType::Null => "null",
-        TokenType::Bool => "bool",
-        TokenType::Word => "word",
-        TokenType::Eof => "eof",
-        TokenType::Space => "space",
-        TokenType::Comment => "comment",
-        TokenType::InlineImage => "inline-image",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -1061,7 +1036,30 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
 
-    use super::{token_type_name, PushedToken, Token, TokenType, Tokenizer, TokenizerStateError};
+    use super::{PushedToken, Token, TokenType, Tokenizer, TokenizerStateError};
+
+    fn token_type_name(token_type: TokenType) -> &'static str {
+        match token_type {
+            TokenType::Bad => "bad",
+            TokenType::ArrayClose => "array_close",
+            TokenType::ArrayOpen => "array_open",
+            TokenType::BraceClose => "brace_close",
+            TokenType::BraceOpen => "brace_open",
+            TokenType::DictClose => "dict_close",
+            TokenType::DictOpen => "dict_open",
+            TokenType::Integer => "integer",
+            TokenType::Name => "name",
+            TokenType::Real => "real",
+            TokenType::String => "string",
+            TokenType::Null => "null",
+            TokenType::Bool => "bool",
+            TokenType::Word => "word",
+            TokenType::Eof => "eof",
+            TokenType::Space => "space",
+            TokenType::Comment => "comment",
+            TokenType::InlineImage => "inline-image",
+        }
+    }
 
     type ValueCase<'a> = (&'a [u8], TokenType, &'a [u8], Option<&'a [u8]>);
     type RawValueCase<'a> = (&'a [u8], TokenType, &'a [u8], &'a [u8], Option<&'a [u8]>);

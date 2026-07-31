@@ -6,7 +6,7 @@ use std::path::Path;
 
 use flpdf::filters::{self, DecodeLimits, StreamDecodeEvent};
 use flpdf::pages::{page_content_bytes, page_refs};
-use flpdf::tokenizer::{token_type_name, TokenType, Tokenizer};
+use flpdf::tokenizer::{TokenType, Tokenizer};
 use flpdf::{Object, Pdf, PdfOpenOptions};
 
 use crate::common::test_driver_program_name_bytes;
@@ -101,6 +101,32 @@ fn sanitize(value: &[u8]) -> String {
         }
     }
     result
+}
+
+// qpdf keeps this mapping in qpdf/test_tokenizer.cc itself, not in
+// libqpdf's QPDFTokenizer -- it is display formatting for this test
+// binary, not tokenizer behavior, so it lives here rather than in flpdf.
+fn token_type_name(token_type: TokenType) -> &'static str {
+    match token_type {
+        TokenType::Bad => "bad",
+        TokenType::ArrayClose => "array_close",
+        TokenType::ArrayOpen => "array_open",
+        TokenType::BraceClose => "brace_close",
+        TokenType::BraceOpen => "brace_open",
+        TokenType::DictClose => "dict_close",
+        TokenType::DictOpen => "dict_open",
+        TokenType::Integer => "integer",
+        TokenType::Name => "name",
+        TokenType::Real => "real",
+        TokenType::String => "string",
+        TokenType::Null => "null",
+        TokenType::Bool => "bool",
+        TokenType::Word => "word",
+        TokenType::Eof => "eof",
+        TokenType::Space => "space",
+        TokenType::Comment => "comment",
+        TokenType::InlineImage => "inline-image",
+    }
 }
 
 fn process(
