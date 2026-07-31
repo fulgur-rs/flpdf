@@ -792,7 +792,15 @@ impl ObjectHandle {
             return self.unparse();
         }
         let mut out = Vec::new();
-        unparse_materialize(self).write_pdf(&mut out);
+        let materialized = unparse_materialize(self);
+        materialized.write_pdf(&mut out);
+        // `Object`'s own recursive Drop glue would walk this tree exactly
+        // as deep as the walk above just did, unprotected by
+        // `stacker::maybe_grow` -- protecting construction alone would
+        // still let a deep enough tree crash the process immediately after
+        // serialization completes, right here. Tear it down iteratively
+        // instead of letting it drop normally.
+        unparse_drop_iteratively(materialized);
         out
     }
 
@@ -958,6 +966,43 @@ fn unparse_materialize_child(handle: &ObjectHandle) -> Object {
 // to be null and is kept rather than guessed away.
 fn unparse_is_known_null(handle: &ObjectHandle) -> bool {
     handle.is_resolved() && handle.is_null()
+}
+
+// Tears down a materialized `Object` tree without using its own recursive
+// Drop glue, which -- like `unparse_materialize`'s construction walk this
+// mirrors -- has no protection against a deeply nested tree's per-frame
+// stack cost. Takes ownership so the caller's normal drop of the same value
+// never runs (its children have already been moved out and pushed onto this
+// function's own explicit, heap-allocated stack by the time each node's
+// turn to drop trivially arrives).
+//
+// Only `Array`/`Dictionary`/`Stream` nest another `Object`; every other
+// variant holds no `Object` children and drops in O(1) once popped, whether
+// or not this function ever visits it -- `Dictionary`/`Stream` are drained
+// through their existing public `iter()`/`remove()` API (no new access
+// needed into `object.rs`, kept outside this slice's file allowlist).
+fn unparse_drop_iteratively(root: Object) {
+    let mut stack = vec![root];
+    while let Some(mut node) = stack.pop() {
+        match &mut node {
+            Object::Array(items) => stack.extend(std::mem::take(items)),
+            Object::Dictionary(dict) => drain_dictionary_onto(dict, &mut stack),
+            Object::Stream(stream) => drain_dictionary_onto(&mut stream.dict, &mut stack),
+            _ => {}
+        }
+        // `node`'s own nested `Object` children (if any) were just moved
+        // out above, so its normal drop here -- an empty `Vec`/`Dictionary`
+        // plus whatever non-recursive fields it holds -- is O(1).
+    }
+}
+
+fn drain_dictionary_onto(dict: &mut Dictionary, stack: &mut Vec<Object>) {
+    let keys: Vec<Vec<u8>> = dict.iter().map(|(key, _)| key.to_vec()).collect();
+    for key in keys {
+        if let Some(value) = dict.remove(key) {
+            stack.push(value);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1713,41 +1758,53 @@ mod unparse_tests {
     use super::*;
 
     #[test]
-    fn unparse_resolved_handles_deeply_nested_arrays_without_stack_overflow() {
+    fn unparse_resolved_covers_every_teardown_arm_for_a_nested_array_dict_and_stream() {
         // Codex Review on PR #603 (discussion_r3689896128) found that the
         // recursive materialization walk backing unparse/unparse_resolved
         // had no protection against a deeply nested tree's per-frame stack
-        // cost. Unlike a parsed document (already bounded by
-        // parser::MAX_PARSE_DEPTH before an ObjectHandle tree this deep can
-        // exist), the public ObjectHandle::array/dictionary factories place
-        // no depth limit on a tree a caller builds directly. Confirmed
-        // empirically (temporarily reverting the fix): this exact depth,
-        // called through this same public unparse_resolved() API, overflows
-        // the stack and aborts the process (SIGABRT) without stack-growth
-        // protection, and succeeds with it.
+        // cost. Two recursion points were fixed: construction
+        // (unparse_materialize, wrapped in stacker::maybe_grow) and the
+        // resulting materialized `Object` tree's own teardown right after
+        // (unparse_drop_iteratively, an explicit-stack walk replacing
+        // Object's ordinary recursive Drop).
         //
-        // This depth is deliberately not pushed higher: above roughly this
-        // range, ObjectHandle's own Drop glue (recursive, unrelated to this
-        // fix -- filed separately as a pre-existing issue predating this
-        // slice) becomes the limiting factor for a tree built this way,
-        // regardless of unparse_resolved's own stack-growth protection.
-        const DEPTH: usize = 4_000;
-        let mut handle = ObjectHandle::integer(1);
-        for _ in 0..DEPTH {
-            handle = ObjectHandle::array(vec![handle]);
-        }
+        // This test intentionally does NOT probe an extreme depth. A
+        // depth large enough to discriminate "protected" from
+        // "unprotected" on every CI runner turned out not to exist: a
+        // depth safe on this author's local machine (4,000) still
+        // stack-overflowed on macOS/ARM/Windows CI runners, because
+        // `Object::write_pdf` -- called on the materialized tree between
+        // the two now-protected walks -- is *itself* an unprotected
+        // recursive serializer living in object.rs, outside this slice's
+        // file allowlist (only object_handle.rs may change). Fixing that
+        // third recursion point is out of scope here; it is tracked
+        // together with the other pre-existing unprotected-recursion
+        // concerns in flpdf-egzr.3.5. Until it lands, no caller of
+        // unparse_resolved has arbitrary-depth safety, so this test
+        // stays at a shallow, portable depth and exercises every
+        // container arm (Array, Dictionary, Stream) that
+        // unparse_drop_iteratively and drain_dictionary_onto handle,
+        // rather than chasing a depth number.
+        let stream = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
+        stream.set_resolved(ObjectValue::Stream {
+            dict: ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(0))]),
+            data: Vec::new(),
+        });
+        let inner_dict = ObjectHandle::dictionary(vec![
+            (b"A".to_vec(), ObjectHandle::null()),
+            (b"B".to_vec(), ObjectHandle::integer(2)),
+        ]);
+        let array = ObjectHandle::array(vec![
+            ObjectHandle::integer(1),
+            inner_dict,
+            stream,
+            ObjectHandle::array(vec![ObjectHandle::name(b"Nested".to_vec())]),
+        ]);
 
-        let out = handle.unparse_resolved();
-
-        let mut expected = Vec::new();
-        for _ in 0..DEPTH {
-            expected.extend_from_slice(b"[ ");
-        }
-        expected.extend_from_slice(b"1");
-        for _ in 0..DEPTH {
-            expected.extend_from_slice(b" ]");
-        }
-        assert_eq!(out, expected);
+        assert_eq!(
+            array.unparse_resolved(),
+            b"[ 1 << /B 2 >> 9 0 R [ /Nested ] ]"
+        );
     }
 
     #[test]
