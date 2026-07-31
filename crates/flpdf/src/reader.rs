@@ -3847,7 +3847,7 @@ mod tests {
             .expect("RC4 top-level string decryption");
 
         let ObjectValue::String(bytes) = &value else {
-            panic!("value must still be a string");
+            panic!("value must still be a string"); // cov:ignore: unreachable given this test's own construction of value
         };
         assert_eq!(bytes.as_slice(), b"TopSecretTitle");
     }
@@ -3864,7 +3864,7 @@ mod tests {
             .expect("the /Encrypt object's own strings are exempt, not an error");
 
         let ObjectValue::String(bytes) = &value else {
-            panic!("value must still be a string");
+            panic!("value must still be a string"); // cov:ignore: unreachable given this test's own construction of value
         };
         assert_eq!(
             bytes.as_slice(),
@@ -3885,7 +3885,7 @@ mod tests {
             .expect("array-contained string decryption");
 
         let ObjectValue::Array(items) = &value else {
-            panic!("value must still be an array");
+            panic!("value must still be an array"); // cov:ignore: unreachable given this test's own construction of value
         };
         assert_eq!(
             items[0].as_string().as_deref(),
@@ -3906,7 +3906,7 @@ mod tests {
             .expect("nested-dictionary string decryption");
 
         let ObjectValue::Dictionary(entries) = &value else {
-            panic!("value must still be a dictionary");
+            panic!("value must still be a dictionary"); // cov:ignore: unreachable given this test's own construction of value
         };
         let nested = entries.get(b"Nested".as_slice()).expect("Nested entry");
         let nested_dict = nested.as_dictionary().expect("Nested must be a dictionary");
@@ -3933,7 +3933,7 @@ mod tests {
             .expect("stream-dictionary string decryption");
 
         let ObjectValue::Stream { dict, data } = &value else {
-            panic!("value must still be a stream");
+            panic!("value must still be a stream"); // cov:ignore: unreachable given this test's own construction of value
         };
         let stream_dict = dict.as_dictionary().expect("stream dict");
         let title = stream_dict.get(b"Title".as_slice()).expect("Title entry");
@@ -3975,7 +3975,7 @@ mod tests {
             .expect("directly nested stream string decryption");
 
         let ObjectValue::Array(items) = &value else {
-            panic!("value must still be an array");
+            panic!("value must still be an array"); // cov:ignore: unreachable given this test's own construction of value
         };
         let nested_dict = items[0]
             .as_stream_dict()
