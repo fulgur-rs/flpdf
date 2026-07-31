@@ -1349,7 +1349,7 @@ fn build_og_to_name(dict: &ObjectHandle) -> std::collections::HashMap<ObjectRef,
                 map.insert(object_ref, key);
             }
         }
-    }
+    } // cov:ignore: control-flow marker — llvm-cov instrumentation artifact; the body above is exercised by merge_resources_reuses_an_existing_key_for_the_same_indirect_object
     map
 }
 
@@ -1367,7 +1367,7 @@ fn get_resource_names(dict: &ObjectHandle) -> std::collections::BTreeSet<Vec<u8>
                 result.extend(sub_entries.into_keys());
             }
         }
-    }
+    } // cov:ignore: control-flow marker — llvm-cov instrumentation artifact; the body above is exercised by merge_resources_mints_a_second_unique_name_when_the_first_candidate_is_taken
     result
 }
 
