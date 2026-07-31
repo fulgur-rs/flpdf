@@ -97,6 +97,15 @@ pub(crate) enum ObjectValue {
     Name(Vec<u8>),
     #[allow(dead_code)] // as_string accessor lands in a later task
     String(Vec<u8>),
+    /// A content-stream operator token (e.g. `q`, `Do`), mirroring
+    /// [`crate::Object::Operator`]. Only meaningful inside a content stream
+    /// (`include/qpdf/QPDFObjectHandle.hh:318-319`: "Operator and
+    /// InlineImage are only allowed in content streams").
+    Operator(Vec<u8>),
+    /// Raw inline-image (`BI`...`ID`...`EI`) bytes, mirroring
+    /// [`crate::Object::InlineImage`]. Same content-stream-only constraint
+    /// as `Operator` above.
+    InlineImage(Vec<u8>),
     Array(Vec<ObjectHandle>),
     Dictionary(std::collections::BTreeMap<Vec<u8>, ObjectHandle>),
     /// A stream's own value: its dictionary (a separately parsed handle
@@ -386,6 +395,16 @@ impl ObjectHandle {
         Self::new_direct(ObjectValue::String(value), NO_PARSED_OFFSET)
     }
 
+    /// Construct a direct content-stream operator token value.
+    pub fn operator(value: Vec<u8>) -> Self {
+        Self::new_direct(ObjectValue::Operator(value), NO_PARSED_OFFSET)
+    }
+
+    /// Construct a direct raw inline-image byte payload value.
+    pub fn inline_image(value: Vec<u8>) -> Self {
+        Self::new_direct(ObjectValue::InlineImage(value), NO_PARSED_OFFSET)
+    }
+
     /// Construct a direct array value. Child values are handles, so cloning
     /// or re-reading this array's children never deep-copies their subtrees.
     pub fn array(children: Vec<ObjectHandle>) -> Self {
@@ -504,6 +523,28 @@ impl ObjectHandle {
         })
     }
 
+    /// The value as raw operator bytes if this handle's value — its own if
+    /// direct, or its already-resolved value if indirect — is a
+    /// content-stream operator token, or `None` otherwise. Never performs
+    /// resolution itself.
+    pub fn as_operator(&self) -> Option<Vec<u8>> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Operator(bytes)) => Some(bytes.clone()),
+            _ => None,
+        })
+    }
+
+    /// The value as raw inline-image bytes if this handle's value — its own
+    /// if direct, or its already-resolved value if indirect — is an
+    /// inline-image payload, or `None` otherwise. Never performs resolution
+    /// itself.
+    pub fn as_inline_image(&self) -> Option<Vec<u8>> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::InlineImage(bytes)) => Some(bytes.clone()),
+            _ => None,
+        })
+    }
+
     // `None` for an indirect handle that has not yet been resolved — value
     // access on an unresolved handle must not perform hidden I/O (design,
     // `Pdf` section). A resolved indirect handle exposes its real value;
@@ -586,6 +627,8 @@ fn materialize_value(value: &ObjectValue) -> Object {
         },
         ObjectValue::Name(name) => Object::Name(name.clone()),
         ObjectValue::String(s) => Object::String(s.clone()),
+        ObjectValue::Operator(bytes) => Object::Operator(bytes.clone()),
+        ObjectValue::InlineImage(bytes) => Object::InlineImage(bytes.clone()),
         ObjectValue::Array(children) => {
             Object::Array(children.iter().map(materialize_child).collect())
         }
@@ -1143,5 +1186,36 @@ mod materialize_tests {
         handle.reset_parsed_offset();
 
         assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+}
+
+#[cfg(test)]
+mod token_value_tests {
+    use super::*;
+
+    #[test]
+    fn operator_handle_round_trips_its_bytes() {
+        let handle = ObjectHandle::operator(b"q".to_vec());
+        assert_eq!(handle.as_operator(), Some(b"q".to_vec()));
+        assert!(handle.as_inline_image().is_none());
+    }
+
+    #[test]
+    fn inline_image_handle_round_trips_its_bytes() {
+        let handle = ObjectHandle::inline_image(b"\x00\x01raw".to_vec());
+        assert_eq!(handle.as_inline_image(), Some(b"\x00\x01raw".to_vec()));
+        assert!(handle.as_operator().is_none());
+    }
+
+    #[test]
+    fn operator_and_inline_image_materialize_to_the_matching_object_variant() {
+        assert_eq!(
+            ObjectHandle::operator(b"Do".to_vec()).materialize(),
+            Object::Operator(b"Do".to_vec())
+        );
+        assert_eq!(
+            ObjectHandle::inline_image(b"data".to_vec()).materialize(),
+            Object::InlineImage(b"data".to_vec())
+        );
     }
 }
