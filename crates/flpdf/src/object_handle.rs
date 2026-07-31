@@ -932,6 +932,21 @@ mod resolution_state_tests {
         let handle = ObjectHandle::integer(7);
         assert!(format!("{handle:?}").contains("ObjectHandle::Direct"));
     }
+
+    #[test]
+    fn debug_format_summarizes_every_indirect_resolution_state() {
+        let not_yet_resolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        assert!(format!("{not_yet_resolved:?}").contains("NotYetResolved"));
+
+        let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(2, 0), 0);
+        missing.set_missing();
+        assert!(format!("{missing:?}").contains("Missing"));
+
+        let destroyed = ObjectHandle::new_indirect_unresolved(ObjectRef::new(3, 0), 0);
+        destroyed.set_resolved(ObjectValue::Integer(1));
+        destroyed.disconnect();
+        assert!(format!("{destroyed:?}").contains("Destroyed"));
+    }
 }
 
 #[cfg(test)]
