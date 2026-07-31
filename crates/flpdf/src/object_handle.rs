@@ -410,9 +410,12 @@ impl ObjectHandle {
         )
     }
 
-    /// The value as an `f64`/literal-bytes pair if this handle is a direct
-    /// real value with a preserved source literal, or `None` otherwise —
-    /// including for any indirect handle, whose value is not read here.
+    /// The value as an `f64`/literal-bytes pair if this handle's value — its
+    /// own if direct, or its already-resolved value if indirect — is a real
+    /// value with a preserved source literal, or `None` otherwise. This
+    /// never performs resolution itself: an indirect handle that has not
+    /// yet been resolved returns `None` too, the same as a resolved value
+    /// of a different type.
     pub fn as_real_literal(&self) -> Option<(f64, Vec<u8>)> {
         self.with_value(|value| match value {
             Some(ObjectValue::RealLiteral { value, literal }) => Some((*value, literal.clone())),
@@ -430,9 +433,11 @@ impl ObjectHandle {
         self.with_value(|value| matches!(value, Some(ObjectValue::Null)))
     }
 
-    /// The value as `i64` if this handle is a direct integer value, or
-    /// `None` otherwise — including for any indirect handle, whose value
-    /// is not read here.
+    /// The value as `i64` if this handle's value — its own if direct, or its
+    /// already-resolved value if indirect — is an integer, or `None`
+    /// otherwise. This never performs resolution itself: an indirect handle
+    /// that has not yet been resolved returns `None` too, the same as a
+    /// resolved value of a different type.
     pub fn as_integer(&self) -> Option<i64> {
         self.with_value(|value| match value {
             Some(ObjectValue::Integer(n)) => Some(*n),
@@ -440,10 +445,12 @@ impl ObjectHandle {
         })
     }
 
-    /// The child handles if this handle is a direct array value, or `None`
-    /// otherwise — including for any indirect handle, whose value is not
-    /// read here. Cloning the returned `Vec` clones only the child `Rc`
-    /// handles, not their subtrees.
+    /// The child handles if this handle's value — its own if direct, or its
+    /// already-resolved value if indirect — is an array, or `None`
+    /// otherwise. This never performs resolution itself: an indirect handle
+    /// that has not yet been resolved returns `None` too, the same as a
+    /// resolved value of a different type. Cloning the returned `Vec` clones
+    /// only the child `Rc` handles, not their subtrees.
     pub fn as_array(&self) -> Option<Vec<ObjectHandle>> {
         self.with_value(|value| match value {
             Some(ObjectValue::Array(children)) => Some(children.clone()),
@@ -451,10 +458,12 @@ impl ObjectHandle {
         })
     }
 
-    /// The entries if this handle is a direct dictionary value, or `None`
-    /// otherwise — including for any indirect handle, whose value is not
-    /// read here. Cloning the returned map clones only the child `Rc`
-    /// handles, not their subtrees.
+    /// The entries if this handle's value — its own if direct, or its
+    /// already-resolved value if indirect — is a dictionary, or `None`
+    /// otherwise. This never performs resolution itself: an indirect handle
+    /// that has not yet been resolved returns `None` too, the same as a
+    /// resolved value of a different type. Cloning the returned map clones
+    /// only the child `Rc` handles, not their subtrees.
     pub fn as_dictionary(&self) -> Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> {
         self.with_value(|value| match value {
             Some(ObjectValue::Dictionary(entries)) => Some(entries.clone()),
@@ -462,10 +471,13 @@ impl ObjectHandle {
         })
     }
 
-    /// The stream's own dictionary handle if this handle is a direct stream
-    /// value, or `None` otherwise — including for any indirect handle, whose
-    /// value is not read here. Cloning the returned handle is O(1): it
-    /// shares the dictionary's identity rather than copying its subtree.
+    /// The stream's own dictionary handle if this handle's value — its own
+    /// if direct, or its already-resolved value if indirect — is a stream,
+    /// or `None` otherwise. This never performs resolution itself: an
+    /// indirect handle that has not yet been resolved returns `None` too,
+    /// the same as a resolved value of a different type. Cloning the
+    /// returned handle is O(1): it shares the dictionary's identity rather
+    /// than copying its subtree.
     pub fn as_stream_dict(&self) -> Option<ObjectHandle> {
         self.with_value(|value| match value {
             Some(ObjectValue::Stream { dict, .. }) => Some(dict.clone()),
@@ -473,9 +485,11 @@ impl ObjectHandle {
         })
     }
 
-    /// The stream's raw encoded byte payload if this handle is a direct
-    /// stream value, or `None` otherwise — including for any indirect
-    /// handle, whose value is not read here.
+    /// The stream's raw encoded byte payload if this handle's value — its
+    /// own if direct, or its already-resolved value if indirect — is a
+    /// stream, or `None` otherwise. This never performs resolution itself:
+    /// an indirect handle that has not yet been resolved returns `None`
+    /// too, the same as a resolved value of a different type.
     pub fn as_stream_data(&self) -> Option<Vec<u8>> {
         self.with_value(|value| match value {
             Some(ObjectValue::Stream { data, .. }) => Some(data.clone()),
