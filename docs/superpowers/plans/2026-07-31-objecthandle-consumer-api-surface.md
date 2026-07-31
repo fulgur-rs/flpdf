@@ -25,6 +25,20 @@ rather than duplicating it — which is an internal implementation detail, not
 a new public dependency on `Object` (see Task 6's note on why this is safe to
 replace later without an API break).
 
+**Post-implementation update (2026-08-01):** the plan below was executed as
+Tasks 1-6 (`object_handle.rs` only), but two Codex Review findings during PR
+#603 required `crates/flpdf/src/reader.rs` changes too: a native-parsed
+string was never decrypted before a new accessor could read it (violating a
+hard precondition `flpdf-jjxb` had already recorded), and a stream
+dictionary's own inline-nesting depth was double-counted. Neither touches an
+existing *consumer's* call site — both are population/decrypt-correctness
+fixes underneath the new accessors — and flpdf-egzr.3.2.1's actual AC7 always
+permitted this ("no file outside `crates/flpdf/src/object_handle.rs` and
+`crates/flpdf/src/reader.rs` changes behavior"); this doc's narrower
+"`object_handle.rs` only" framing below was a self-imposed tightening that
+didn't anticipate either finding. See the two `fix(reader):` commits on this
+branch and flpdf-egzr.3.2.1's notes for the full detail.
+
 **Tech Stack:** Rust 2021 workspace; pinned qpdf 11.9.0 source
 (`include/qpdf/QPDFObjectHandle.hh`, `include/qpdf/Constants.h`,
 `libqpdf/QPDFObjectHandle.cc`, `libqpdf/QPDF_Stream.cc`) as the behavioral
@@ -105,11 +119,16 @@ existing `cargo test`, Clippy, `cargo llvm-cov`, `scripts/patch-coverage.sh`.
 ## Global Constraints
 
 - **Zero edits outside this allowlist:** `crates/flpdf/src/object_handle.rs`
-  only, for all production code. If a task appears to require touching any
-  other file (including `crates/flpdf/src/lib.rs` — `ObjectValue` stays
-  `pub(crate)` and is not re-exported; only `ObjectHandle` itself is, and
-  that re-export already exists), stop and reconsider — this plan's whole
-  point is a zero-consumer-diff slice. New test code lives in the same
+  for Tasks 1-6, for all production code. If a task appears to require
+  touching any other file (including `crates/flpdf/src/lib.rs` —
+  `ObjectValue` stays `pub(crate)` and is not re-exported; only
+  `ObjectHandle` itself is, and that re-export already exists), stop and
+  reconsider — this plan's whole point is a zero-consumer-diff slice.
+  `crates/flpdf/src/reader.rs` is also in scope, but only for a
+  population/decrypt-correctness fix underneath a new accessor added by
+  this plan, never for touching an existing consumer's call site — see the
+  "Post-implementation update" note above and flpdf-egzr.3.2.1's actual
+  AC7, which names both files explicitly. New test code lives in the same
   file's existing `#[cfg(test)]` module tree (new `mod` blocks alongside
   `identity_tests`/`object_value_tests`/`parsed_offset_tests`/
   `resolution_state_tests`/`materialize_tests`), not a new top-level test
@@ -880,14 +899,18 @@ git commit -m "feat(object_handle): add qpdf-compatible unparse/unparse_resolved
 
 **This task is a gate, not new functionality. Do not skip it.**
 
-**Step 1: Confirm the changed set is exactly one file**
+**Step 1: Confirm the changed set matches the allowlist**
 
 ```bash
 git diff --name-only main...HEAD -- crates/
 ```
-Expected: exactly `crates/flpdf/src/object_handle.rs`. Any other line is a
-leak — stop, do not proceed to Task 8, and revisit whichever of Tasks 2-6
-introduced it.
+Expected: `crates/flpdf/src/object_handle.rs`, and — only if a review
+finding surfaced a population/decrypt-correctness gap underneath a new
+accessor (see the "Post-implementation update" note near the top of this
+plan) — `crates/flpdf/src/reader.rs`. flpdf-egzr.3.2.1's actual AC7 permits
+exactly these two files and no others; any other line is a leak — stop, do
+not proceed to Task 8, and revisit whichever of Tasks 2-6 (or the
+`reader.rs` finding) introduced it.
 
 **Step 2: Full workspace build and test, no features**
 
@@ -1022,7 +1045,11 @@ gh pr create --base main \
   as_reference), a public is_resolved, and qpdf-shaped type_code/type_name/
   unparse/unparse_resolved.
 - Zero consumer files touched — verified by Task 7's `git diff --name-only`
-  gate; this is the first of 8 stacked sub-issues under flpdf-egzr.3.2.
+  gate, which also permits `crates/flpdf/src/reader.rs` for a
+  population/decrypt-correctness fix underneath the new accessors (two
+  review findings; see the "Post-implementation update" note near the top
+  of the plan); this is the first of 8 stacked sub-issues under
+  flpdf-egzr.3.2.
 - Design: docs/superpowers/specs/2026-07-30-xref-parsed-offset-object-handle-design.md
 - Plan: docs/superpowers/plans/2026-07-31-objecthandle-consumer-api-surface.md
 
@@ -1032,7 +1059,8 @@ gh pr create --base main \
 - [ ] cargo clippy --workspace --all-features -- -D warnings
 - [ ] cargo fmt --check
 - [ ] scripts/patch-coverage.sh --base main - 100%
-- [ ] git diff --name-only against main - exactly crates/flpdf/src/object_handle.rs
+- [ ] git diff --name-only against main - crates/flpdf/src/object_handle.rs
+      and crates/flpdf/src/reader.rs only (AC7)
 EOF
 )"
 ```
@@ -1047,8 +1075,10 @@ Follow CLAUDE.md's Session Completion protocol in full (`git pull --rebase`,
 ## Summary
 
 This plan adds exactly the `ObjectHandle` surface the next 7 stack layers
-need, confined to one file, with zero behavior change to any existing
-consumer. It closes a real representational gap (`Operator`/`InlineImage`),
+need, confined to `object_handle.rs` (plus the narrow `reader.rs`
+population/decrypt-correctness fix described in the "Post-implementation
+update" note near the top — AC7 permits both), with zero behavior change to
+any existing consumer. It closes a real representational gap (`Operator`/`InlineImage`),
 rounds out the existing typed-accessor family to match `Object`'s own
 accessor set, and ports the three qpdf-shaped operations
 (`type_code`/`type_name`/`unparse`/`unparse_resolved`) the design doc names
