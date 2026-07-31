@@ -753,10 +753,14 @@ impl ObjectHandle {
     }
 
     /// This handle's resolved value in qpdf syntax
-    /// (`libqpdf/QPDFObjectHandle.cc:1586-1593`), except a stream always
-    /// reports its own reference form (`libqpdf/QPDF_Stream.cc:173-178`) —
-    /// a stream is only ever a top-level indirect object in valid qpdf
-    /// usage, so this never inlines a stream's dictionary and data.
+    /// (`libqpdf/QPDFObjectHandle.cc:1586-1593`), except that an *indirect*
+    /// handle whose resolved value is a stream always reports its own
+    /// reference form instead (`libqpdf/QPDF_Stream.cc:173-178`) — a stream
+    /// is only ever a top-level indirect object in valid qpdf usage. A
+    /// direct handle wrapping a stream value (a shape this crate's own
+    /// types do not forbid, though qpdf's do) falls through to the same
+    /// inlining fallback as any other direct container value; see
+    /// `unparse_tests`' own direct-stream test for that case.
     ///
     /// This port diverges from qpdf's own `unparseResolved()` in two
     /// internal resolution states that qpdf itself does not reach the same
@@ -1677,23 +1681,23 @@ mod unparse_tests {
 
     #[test]
     fn a_direct_stream_value_unparse_resolved_inlines_rather_than_referencing() {
-        // A *direct* Stream `ObjectValue` cannot arise through any public
-        // API in this crate (there is no `ObjectHandle::stream(..)`
-        // factory; every real stream value is installed via `set_resolved`
-        // on an indirect handle -- see `reader.rs`'s stream-construction
-        // sites, all of which route through `set_resolved`, never
-        // `from_value`). Real qpdf has the same invariant: a stream is only
-        // ever a *newly allocated indirect* `QPDFObjectHandle`
-        // (`QPDFObjectHandle::newStream`), never a value that can appear
-        // "direct" in the first place, so `QPDF_Stream::unparse()`'s
-        // reference-form guarantee has nothing to say about this case
-        // either. This test exists only to pin down that the fallback path
-        // (materialize + `Object::write_pdf`) is total and does not panic
-        // for this unreachable-in-production shape: it inlines the
-        // dictionary and data the same way `Object::write_pdf` already does
-        // for `Object::Stream`, rather than fabricating a meaningless
-        // reference for a value that was never assigned an object
-        // number/generation.
+        // A *direct* Stream `ObjectValue` is not the common case (no public
+        // `ObjectHandle::stream(..)` factory exists; production reader code
+        // installs real stream values via `set_resolved` on an indirect
+        // handle), but it IS reachable through the public API: a nested
+        // `Object::Stream` passed to `Pdf::set_object` (e.g. inside an
+        // `Object::Array`) is lifted via `reader.rs`'s `lift_bounded`'s
+        // direct-value arm into `ObjectHandle::from_value`, producing
+        // exactly this shape. Real qpdf has no equivalent state -- a stream
+        // is only ever a *newly allocated indirect* `QPDFObjectHandle`
+        // (`QPDFObjectHandle::newStream`) -- so `QPDF_Stream::unparse()`'s
+        // reference-form guarantee has nothing to say about this case, and
+        // there is no qpdf byte-parity oracle to match here. This test
+        // pins down that the fallback path (materialize + `Object::write_pdf`)
+        // handles this shape by inlining the dictionary and data the same
+        // way `Object::write_pdf` already does for `Object::Stream`, rather
+        // than fabricating a meaningless reference for a value that was
+        // never assigned an object number/generation.
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let handle = ObjectHandle::from_value(ObjectValue::Stream {
             dict,
