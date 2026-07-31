@@ -623,15 +623,11 @@ impl ObjectHandle {
     /// contradiction with [`Self::is_resolved`] returning `true` for the
     /// same handle, but it is not: the *value* is known (it is a reference),
     /// while the *referenced object's own type* is not known without
-    /// following the chain further, which this method never does. qpdf's
-    /// own object model has no ordinal for this case at all — `resolve()`
-    /// always fully chases a reference chain before returning a concrete
-    /// value, so qpdf itself never observes a "resolved but still a
-    /// redirect" object — so `ot_unresolved` is the closest real qpdf
-    /// meaning: the terminal type is not yet established. This mirrors
-    /// `flpdf-qtest-tools::driver::Handle::type_info`'s own
-    /// `Object::Reference(_) => (13, "unresolved")` mapping for the same
-    /// reason.
+    /// following the chain further, which this method never does — this
+    /// case is not chased to its terminal type the way it would be
+    /// elsewhere in this crate's own object-inspection code, and `13`
+    /// (`ot_unresolved`) is reported as a placeholder rather than the
+    /// terminal object's real ordinal.
     pub fn type_code(&self) -> u8 {
         if let Repr::Indirect(slot) = &self.0 {
             // Bind the borrow to a local first and match on it, mirroring
@@ -1920,14 +1916,20 @@ mod unparse_tests {
         // redirecting handle's own "N G R" -- not the target's.
         // `unparse_resolved()` does read the resolved value, which is
         // itself a bare reference, so it reports the *target's* "N G R"
-        // instead. This is not a qpdf-matching case to begin with: as
-        // `type_code`'s own doc explains, qpdf's `resolve()` always fully
-        // chases a reference chain before returning a concrete value, so
-        // qpdf itself never observes a "resolved but still a redirect"
-        // object at all -- it would print the target's *concrete value*
-        // (e.g. `42`), not the target's own reference form. This method
-        // reports the redirect value it actually holds instead, without
-        // chasing further.
+        // instead of chasing to the target's own concrete value (e.g.
+        // `42`). This is a real gap, not a documented design choice: this
+        // crate's own `flpdf-qtest-tools::driver::Handle` already has an
+        // established, tested contract for exactly this redirect scenario
+        // (`reference_chain_resolves_but_unparse_retains_the_first_reference`,
+        // `driver/handle.rs:678-696`) where the equivalent accessor *does*
+        // chase to the target's terminal value while `unparse()` keeps
+        // reporting the first reference's own identity -- this method does
+        // not yet replicate that. Chasing needs `Pdf` (`ObjectValue::Reference`
+        // stores only a bare `ObjectRef`, not a handle link), so it cannot be
+        // implemented from this file alone; tracked as flpdf-l3kz, and wired
+        // as a hard dependency of flpdf-egzr.3.2.3 (the slice that migrates
+        // `driver::Handle` itself onto this API and must not regress that
+        // test).
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_resolved(ObjectValue::Reference(ObjectRef::new(9, 0)));
 
