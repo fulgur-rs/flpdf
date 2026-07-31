@@ -32,10 +32,17 @@ pub fn unparse_binary(stored: &[u8]) -> Vec<u8>;
 Keep the normalized-value helper needed by name-tree code crate-visible inside
 `pdf_string`; do not expose a qtest-specific module or feature-gated API.
 
-- [ ] **Step 1: Add the failing core-domain tests first**
+- [ ] **Step 1: Register the module and add the failing core-domain tests first**
 
-Create `pdf_string.rs` with the test module and the public function signatures
-absent. Move the existing semantic tests from
+First declare the module in `lib.rs`:
+
+```rust
+pub mod pdf_string;
+```
+
+Then create `pdf_string.rs` with the test module and the public function
+signatures absent. This makes the focused test target compile and discover the
+tests before the implementation exists. Move the existing semantic tests from
 `crates/flpdf/src/qtest_string.rs` and `json_inspect` into this test module.
 The minimum assertions are:
 
@@ -64,9 +71,9 @@ Run:
 cargo test -p flpdf pdf_string
 ```
 
-Expected: compilation fails because `pdf_string` has tests referring to the
-three not-yet-defined functions. Do not copy implementation code before this
-failure is observed.
+Expected: compilation fails because the discovered `pdf_string` tests refer to
+the three not-yet-defined functions. Do not copy implementation code before
+this failure is observed.
 
 - [ ] **Step 3: Move the canonical implementation without changing semantics**
 
@@ -84,11 +91,8 @@ Move the implementation currently in `json_inspect.rs` as one unit:
    `crate::object::write_hex_string` into a `Vec<u8>`; do not duplicate hex
    digit logic in qtest-tools.
 
-Declare the module in `lib.rs` with ordinary visibility:
-
-```rust
-pub mod pdf_string;
-```
+Keep the module declaration from Step 1 with ordinary visibility; do not add a
+feature gate or a second declaration.
 
 Remove the `qtest-driver`-gated `qtest_string` declaration. Delete the old
 `crates/flpdf/src/qtest_string.rs` only after its tests and implementation
@@ -143,7 +147,6 @@ git commit -m "refactor(flpdf): own PDF string semantics in domain module"
 
 **Files:**
 - Modify: `crates/flpdf-qtest-tools/src/character_encoding.rs`
-- Modify: `crates/flpdf-qtest-tools/src/lib.rs`
 - Test: `crates/flpdf-qtest-tools/tests/character_encoding_cli.rs`
 
 Call `flpdf::pdf_string::{utf8_value,new_unicode_string,unparse_binary}`
@@ -152,10 +155,13 @@ transformation, so a private delegation module would only obscure the actual
 ownership boundary. Keep line splitting, argv, stderr, exit-code, and SIGABRT
 behavior unchanged.
 
-- [ ] **Step 1: Remove the delegation-only module**
+- [ ] **Step 1: Route the character-encoding calls through the domain API**
 
-Delete `crates/flpdf-qtest-tools/src/qtest_string.rs`, remove its crate-root
-declaration, and replace its call sites with direct `flpdf::pdf_string` calls.
+Replace any remaining `flpdf::qtest_string` call sites with direct
+`flpdf::pdf_string` calls. The delegation-only module is not part of this
+boundary: Task 1 removes the core `qtest_string` module, and this task must not
+add a `flpdf-qtest-tools/src/qtest_string.rs` file or a crate-root declaration
+for one.
 
 - [ ] **Step 2: Run qtest-tools focused tests and verify GREEN**
 
@@ -172,8 +178,8 @@ finds no production reference.
 - [ ] **Step 3: Commit the direct boundary**
 
 ```bash
-git add crates/flpdf-qtest-tools/src/lib.rs \
-  crates/flpdf-qtest-tools/src/character_encoding.rs
+git add crates/flpdf-qtest-tools/src/character_encoding.rs \
+  crates/flpdf-qtest-tools/tests/character_encoding_cli.rs
 git commit -m "refactor(qtest-tools): call PDF string domain directly"
 ```
 
@@ -278,6 +284,9 @@ QTEST_FULL=1 \
 FLPDF_CLI_BIN=/home/ubuntu/flpdf/.worktrees/flpdf-egzr-9-pdf-string-boundary/target/release/flpdf \
 FLPDF_TEST_COMPARE_BIN=/home/ubuntu/flpdf/.worktrees/flpdf-egzr-9-pdf-string-boundary/target/release/flpdf-test-compare \
 FLPDF_TEST_DRIVER_BIN=/home/ubuntu/flpdf/.worktrees/flpdf-egzr-9-pdf-string-boundary/target/release/flpdf-test-driver \
+FLPDF_TEST_PDF_DOC_ENCODING_BIN=/home/ubuntu/flpdf/.worktrees/flpdf-egzr-9-pdf-string-boundary/target/release/flpdf-test-pdf-doc-encoding \
+FLPDF_TEST_PDF_UNICODE_BIN=/home/ubuntu/flpdf/.worktrees/flpdf-egzr-9-pdf-string-boundary/target/release/flpdf-test-pdf-unicode \
+FLPDF_TEST_UNICODE_FILENAMES_BIN=/home/ubuntu/flpdf/.worktrees/flpdf-egzr-9-pdf-string-boundary/target/release/flpdf-test-unicode-filenames \
 ./scripts/run.sh
 ```
 
