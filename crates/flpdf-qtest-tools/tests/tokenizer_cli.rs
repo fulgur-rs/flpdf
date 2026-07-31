@@ -274,6 +274,21 @@ fn tokenizer_maxlen_flag() {
 }
 
 #[test]
+fn tokenizer_maxlen_negative_value_shows_usage() {
+    // QUtil::string_to_uint rejects a leading '-' outright (an uncaught
+    // exception in real qpdf); this helper falls back to usage() instead of
+    // silently accepting a negative -maxlen value.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    fs::write(dir.path().join("minimal.pdf"), minimal_pdf_bytes())
+        .expect("write minimal.pdf into tempdir");
+
+    let output = run(&["-maxlen", "-5", "minimal.pdf"], dir.path());
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_stderr_contains_usage(&output);
+}
+
+#[test]
 fn tokenizer_maxlen_consumes_decimal_prefix() {
     // qpdf's -maxlen parsing goes through QUtil::string_to_uint, which runs the
     // argument through strtoull: a decimal prefix is consumed and anything
