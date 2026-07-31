@@ -551,6 +551,24 @@ impl ObjectHandle {
         })
     }
 
+    /// The value at `key` if this handle's value is a dictionary and `key`
+    /// is present, or a direct null handle otherwise (a missing key, or
+    /// this handle not being a dictionary at all) — mirrors
+    /// `QPDFObjectHandle::getKey`'s own "returns null for a missing key or
+    /// a non-dictionary handle" contract (`libqpdf/QPDFObjectHandle.cc:979-988`).
+    /// Unlike
+    /// [`Self::as_dictionary`], this never snapshots the whole dictionary —
+    /// it returns the one live child handle directly, so a caller that only
+    /// needs one key does not pay for every sibling. Never performs
+    /// resolution itself.
+    pub fn get_key(&self, key: &[u8]) -> ObjectHandle {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
+            _ => None,
+        })
+        .unwrap_or_else(ObjectHandle::null)
+    }
+
     /// The stream's own dictionary handle if this handle's value — its own
     /// if direct, or its already-resolved value if indirect — is a stream,
     /// or `None` otherwise. This never performs resolution itself: an
@@ -2036,5 +2054,25 @@ mod mutation_tests {
             panic!("expected dictionary");
         };
         assert!(entries.get(b"K".as_slice()).unwrap().ptr_eq(&child));
+    }
+
+    #[test]
+    fn get_key_returns_a_live_child_handle_without_snapshotting_the_dictionary() {
+        let child = ObjectHandle::integer(1);
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), child.clone())]);
+        let fetched = dict.get_key(b"A");
+        assert!(fetched.ptr_eq(&child));
+    }
+
+    #[test]
+    fn get_key_on_a_missing_key_returns_a_direct_null_handle() {
+        let dict = ObjectHandle::dictionary(vec![]);
+        assert!(dict.get_key(b"Missing").is_null());
+    }
+
+    #[test]
+    fn get_key_on_a_non_dictionary_handle_returns_a_direct_null_handle() {
+        let scalar = ObjectHandle::integer(5);
+        assert!(scalar.get_key(b"A").is_null());
     }
 }
