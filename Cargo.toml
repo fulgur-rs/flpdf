@@ -46,3 +46,10 @@ same-file = "1"
 # Already present as a transitive dep via tempfile/etc — direct declaration
 # is free build-closure-wise.
 getrandom = "0.2"
+# Transparently grows the call stack for the parser's bounded recursive
+# descent (MAX_PARSE_DEPTH levels) when the current stack segment is nearly
+# exhausted, so recursion to that depth cannot abort the process on a
+# caller-provided thread with a smaller-than-expected stack (e.g. the
+# default ~2 MiB a spawned thread gets, which some builds/paths measurably
+# do not have enough per-frame headroom to survive at the full depth).
+stacker = "0.1.24"

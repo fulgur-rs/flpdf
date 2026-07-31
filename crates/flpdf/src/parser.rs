@@ -289,6 +289,21 @@ enum ParserMode {
 // deep, so only adversarial input is rejected.
 pub(crate) const MAX_PARSE_DEPTH: usize = 500;
 
+// `MAX_PARSE_DEPTH` bounds recursion *count* to match qpdf's own limit, not
+// the stack *bytes* 500 levels of `object`/`object_handle` recursion actually
+// cost — that varies by target, build profile, and per-frame size, and is not
+// guaranteed to fit an arbitrary caller's thread stack (measured to exceed
+// the platform-default ~2 MiB spawned-thread stack for the handle-producing
+// path in an unoptimized build). `stacker::maybe_grow` is called at every
+// recursion level in both paths so recursion transparently continues on a
+// freshly allocated segment before the current one is exhausted, rather than
+// requiring every caller (including production `Pdf::resolve`, not just
+// tests) to pre-size its own thread. `STACK_RED_ZONE` mirrors the crate's own
+// documented example; `STACK_GROWTH_SIZE` is comfortably larger than the
+// worst per-frame cost measured across both recursive paths at this depth.
+const STACK_RED_ZONE: usize = 32 * 1024;
+const STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
 impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
     pub(crate) fn with_tokenizer(tokenizer: &'tokenizer mut Tokenizer<'input>) -> Self {
         Self::with_mode(tokenizer, ParserMode::Object)
@@ -348,7 +363,15 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
             self.depth -= 1;
             return Err(Error::parse(self.position(), "object nesting too deep"));
         }
-        let result = self.object_inner();
+        // `MAX_PARSE_DEPTH` bounds recursion *count*, not the stack bytes each
+        // level costs — those vary with target, optimization level, and this
+        // function's own frame size, so a fixed depth limit alone cannot
+        // guarantee no overflow on every caller's thread (see
+        // `STACK_RED_ZONE`/`STACK_GROWTH_SIZE`'s own comment). `maybe_grow`
+        // transparently moves the remaining recursion onto a fresh, larger
+        // stack segment only when the current one is nearly exhausted, so a
+        // caller never needs to pre-size its own thread for this bound.
+        let result = stacker::maybe_grow(STACK_RED_ZONE, STACK_GROWTH_SIZE, || self.object_inner());
         self.depth -= 1;
         result
     }
@@ -694,7 +717,14 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
             self.depth -= 1;
             return Err(Error::parse(self.position(), "object nesting too deep"));
         }
-        let result = self.object_inner_handle(base_offset, resolver);
+        // Same rationale as `object`'s own `maybe_grow` call: this
+        // ObjectHandle-producing recursion costs measurably more stack per
+        // frame than `object`'s (extra `Rc`/`RefCell` allocation bookkeeping
+        // per node), so it needs its own guard against the same default
+        // ~2 MiB caller thread stack, not just `object`'s.
+        let result = stacker::maybe_grow(STACK_RED_ZONE, STACK_GROWTH_SIZE, || {
+            self.object_inner_handle(base_offset, resolver)
+        });
         self.depth -= 1;
         result
     }
@@ -1685,19 +1715,13 @@ mod handle_path_parity_tests {
         );
     }
 
-    // Unlike this file's `content_mode_preserves_the_object_nesting_guard`
-    // sibling (which calls its `assert_*` helper directly on the default
-    // test-harness thread), this one must not: the native handle-producing
-    // path's measured per-frame stack cost in an unoptimized build (see the
-    // `native_handle_path_nesting_guard_fits_a_larger_regression_stack_budget`
-    // test's own comment) overflows the default test-thread stack on at
-    // least one CI target, aborting the whole test binary. Spawning a
-    // generously-sized dedicated thread here — cheap, and `std::thread`
-    // works on every platform, unlike the `#[cfg]`-gated test below, which
-    // pins the *precise* budget only on the one target it's gated for — is
-    // what gives this an unconditional call site (avoiding a `dead_code`
-    // warning on the CI legs that don't run the gated test) without
-    // reintroducing that crash.
+    // Spawns a dedicated thread rather than calling the `assert_*` helper
+    // directly on the default test-harness thread (unlike this file's
+    // `content_mode_preserves_the_object_nesting_guard` sibling), purely so
+    // this and the smaller-stack regression test below share one assertion
+    // helper — not because this path still needs an oversized stack: see
+    // `native_handle_path_fits_the_default_spawned_thread_stack_budget`
+    // below, which pins the actual production-realistic budget.
     #[test]
     fn native_handle_path_preserves_the_object_nesting_guard() {
         std::thread::Builder::new()
@@ -1708,20 +1732,23 @@ mod handle_path_parity_tests {
             .expect("nesting guard must return an error before exhausting the stack");
     }
 
-    // Pins the specific stack budget the native handle-producing path needs
-    // at `MAX_PARSE_DEPTH`, mirroring
-    // `content_mode_nesting_guard_fits_the_regression_stack_budget` above for
-    // the legacy path — measured empirically to require more than that
-    // test's 1920 KiB (the native path overflows there) but well under the
-    // 3072 KiB used here.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    // Regression test for the stack-overflow-abort hazard `object_handle`'s
+    // own `stacker::maybe_grow` call fixes: before that fix, this exact
+    // scenario aborted the whole process (not a recoverable `Err`) on a
+    // default-sized (2 MiB) spawned thread — the stack budget every
+    // production caller actually has, including `Pdf::resolve` on a thread
+    // this crate does not control the size of. `maybe_grow` transparently
+    // switches to a larger heap-backed stack segment once within
+    // `STACK_RED_ZONE` of the end of this one, so recursion to
+    // `MAX_PARSE_DEPTH` completes and returns the normal, controlled
+    // "nesting too deep" `Err` instead of aborting.
     #[test]
-    fn native_handle_path_nesting_guard_fits_a_larger_regression_stack_budget() {
+    fn native_handle_path_fits_the_default_spawned_thread_stack_budget() {
         std::thread::Builder::new()
-            .stack_size(3_072 * 1_024)
+            .stack_size(2 * 1024 * 1024)
             .spawn(assert_native_handle_path_preserves_the_object_nesting_guard)
             .expect("nesting-guard test thread must start")
             .join()
-            .expect("nesting guard must return an error before exhausting the stack");
+            .expect("nesting guard must return an error before exhausting the default-sized stack");
     }
 }
