@@ -769,11 +769,11 @@ impl ObjectHandle {
     ///   the value would show before resolution.
     /// - **Destroyed** (the owning document has been dropped and this
     ///   handle's value severed): qpdf's `QPDF_Destroyed::unparse()`
-    ///   (`libqpdf/QPDF_Destroyed.cc:24-28`) throws `std::logic_error`; this
+    ///   (`libqpdf/QPDF_Destroyed.cc:24-29`) throws `std::logic_error`; this
     ///   method has no exception channel to mirror that with (`Vec<u8>`
     ///   return, no `Result`) and instead presents the same `null` fallback
-    ///   every other accessor in this file already gives a destroyed
-    ///   handle, rather than panicking.
+    ///   this file's other value accessors (e.g. [`Self::is_null`]) already
+    ///   give a destroyed handle, rather than panicking.
     pub fn unparse_resolved(&self) -> Vec<u8> {
         // Bridges through the existing direct-value materialization path
         // and `Object::write_pdf`'s own already-byte-identical-tested
@@ -1713,12 +1713,11 @@ mod unparse_tests {
         // `unparseResolved()`), so a destroyed handle's `unparse()` does
         // not throw either -- no divergence there. `unparseResolved()`
         // does dereference, though, and qpdf's `QPDF_Destroyed::unparse()`
-        // (`libqpdf/QPDF_Destroyed.cc:24-28`) throws `std::logic_error`
+        // (`libqpdf/QPDF_Destroyed.cc:24-29`) throws `std::logic_error`
         // once it gets there. This method has no exception channel to
         // mirror that with, so -- as documented on `unparse_resolved`
-        // itself -- it presents the same `null` fallback every other
-        // accessor in this file gives a destroyed handle, rather than
-        // panicking.
+        // itself -- it presents the same `null` fallback this file's other
+        // value accessors give a destroyed handle, rather than panicking.
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_resolved(ObjectValue::Integer(7));
         handle.disconnect();
@@ -1737,8 +1736,14 @@ mod unparse_tests {
         // redirecting handle's own "N G R" -- not the target's.
         // `unparse_resolved()` does read the resolved value, which is
         // itself a bare reference, so it reports the *target's* "N G R"
-        // instead -- the same outcome qpdf's own silently-chasing
-        // `unparseResolved()` would reach for an equivalent redirect.
+        // instead. This is not a qpdf-matching case to begin with: as
+        // `type_code`'s own doc explains, qpdf's `resolve()` always fully
+        // chases a reference chain before returning a concrete value, so
+        // qpdf itself never observes a "resolved but still a redirect"
+        // object at all -- it would print the target's *concrete value*
+        // (e.g. `42`), not the target's own reference form. This method
+        // reports the redirect value it actually holds instead, without
+        // chasing further.
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_resolved(ObjectValue::Reference(ObjectRef::new(9, 0)));
 
