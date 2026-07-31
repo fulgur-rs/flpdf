@@ -97,9 +97,18 @@ The current public `Object` enum is replaced by a crate-private object-value
 representation owned by a handle.
 
 Arrays and dictionaries contain child `ObjectHandle` values rather than raw
-recursive values. A parsed `N G R` therefore points at the canonical indirect
-handle for that `ObjectRef`; it is not represented as a separate raw
-`Reference` value.
+recursive values. A parsed `N G R` in a nested position (an array element, a
+dictionary value, or a stream dictionary value) therefore points at the
+canonical indirect handle for that `ObjectRef`; it is not represented as a
+separate raw `Reference` value.
+
+This canonicalization rule does not apply to a bare `N G R` that is the
+entire body of an indirect object or an object-stream member: qpdf parses
+only the first integer there and emits an `expected endobj` diagnostic for
+the file-object case, never producing a reference value at that position
+(`top_level_no_reference`, pinned by `parser.rs:52-62`, `parser.rs:1067-1087`,
+and the reader tests at `reader.rs:3715-3740`). That existing behavior is
+unchanged by this design.
 
 Streams retain distinct handles for:
 
@@ -137,8 +146,13 @@ shared handle instead of returning a cloned value. Value access on an
 unresolved handle fails explicitly; it does not perform hidden file I/O.
 
 `get_all_objects` performs the qpdf-equivalent dangling-reference preparation,
-ensures all source-xref objects are represented by the cache, resolves the
-required objects, and returns indirect handles in `ObjectRef` order.
+ensures every non-free source-xref object is represented by the cache,
+resolves the required objects, and returns indirect handles in `ObjectRef`
+order. Free entries (including the object-0 free-list head) are excluded:
+qpdf's own object cache never contains them (`insertFreeXrefEntry` records a
+free object in a separate `deleted_objects` set, never in `xref_table`), so
+`getAllObjects()` never returns one, and the `test_parsedoffset` helper
+contract below treats an enumerated free entry as fatal.
 
 ### Parser
 
