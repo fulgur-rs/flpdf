@@ -732,6 +732,46 @@ impl ObjectHandle {
         }
     }
 
+    /// Replace this handle's stream data, and — when given — its `/Filter`
+    /// and `/DecodeParms` dictionary keys, mirroring
+    /// `QPDFObjectHandle::replaceStreamData`'s buffer overload
+    /// (`libqpdf/QPDFObjectHandle.cc:1345-1350`, delegating to
+    /// `QPDF_Stream::replaceStreamData`/`replaceFilterData`,
+    /// `libqpdf/QPDF_Stream.cc:637-649,669-685`). `filter`/`decode_parms`
+    /// are `Some` exactly where qpdf's own overload checks
+    /// `QPDFObjectHandle::isInitialized()`: `Some` installs the key via
+    /// [`Self::replace_key`], `None` leaves it untouched rather than
+    /// removing it. `/Length` is always set to `data`'s byte length —
+    /// qpdf's "unknown length, remove `/Length`" branch only applies to its
+    /// deferred-`StreamDataProvider` overloads, which this method does not
+    /// port (no caller in this crate needs deferred stream production). A
+    /// no-op if this handle's value is not a stream.
+    pub fn replace_stream_data(
+        &self,
+        data: Vec<u8>,
+        filter: Option<ObjectHandle>,
+        decode_parms: Option<ObjectHandle>,
+    ) {
+        let Some(dict) = self.as_stream_dict() else {
+            return;
+        };
+        if let Some(filter) = filter {
+            dict.replace_key(b"Filter", filter);
+        }
+        if let Some(decode_parms) = decode_parms {
+            dict.replace_key(b"DecodeParms", decode_parms);
+        }
+        dict.replace_key(
+            b"Length",
+            ObjectHandle::integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
+        );
+        self.with_value_mut(|v| {
+            if let Some(ObjectValue::Stream { data: existing, .. }) = v {
+                *existing = data;
+            }
+        });
+    }
+
     /// The stream's own dictionary handle if this handle's value — its own
     /// if direct, or its already-resolved value if indirect — is a stream,
     /// or `None` otherwise. This never performs resolution itself: an
@@ -2706,5 +2746,56 @@ mod mutation_tests {
         )]);
         dest.merge_resources(&other, None);
         assert_eq!(dest.get_key(b"Font").as_integer(), Some(1));
+    }
+
+    #[test]
+    fn replace_stream_data_updates_data_and_length() {
+        let dict = ObjectHandle::dictionary(vec![]);
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            dict: dict.clone(),
+            data: b"old".to_vec(),
+        });
+        stream.replace_stream_data(b"new data".to_vec(), None, None);
+        assert_eq!(stream.as_stream_data(), Some(b"new data".to_vec()));
+        assert_eq!(dict.get_key(b"Length").as_integer(), Some(8));
+    }
+
+    #[test]
+    fn replace_stream_data_sets_filter_and_decode_parms_when_given() {
+        let dict = ObjectHandle::dictionary(vec![]);
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            dict: dict.clone(),
+            data: b"old".to_vec(),
+        });
+        let filter = ObjectHandle::name(b"FlateDecode".to_vec());
+        let parms =
+            ObjectHandle::dictionary(vec![(b"Predictor".to_vec(), ObjectHandle::integer(12))]);
+        stream.replace_stream_data(b"x".to_vec(), Some(filter.clone()), Some(parms.clone()));
+        assert!(dict.get_key(b"Filter").ptr_eq(&filter));
+        assert!(dict.get_key(b"DecodeParms").ptr_eq(&parms));
+    }
+
+    #[test]
+    fn replace_stream_data_leaves_filter_untouched_when_not_given() {
+        let dict = ObjectHandle::dictionary(vec![(
+            b"Filter".to_vec(),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        )]);
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            dict: dict.clone(),
+            data: b"old".to_vec(),
+        });
+        stream.replace_stream_data(b"new".to_vec(), None, None);
+        assert_eq!(
+            dict.get_key(b"Filter").as_name(),
+            Some(b"FlateDecode".to_vec())
+        );
+    }
+
+    #[test]
+    fn replace_stream_data_on_a_non_stream_handle_is_a_no_op() {
+        let scalar = ObjectHandle::integer(1);
+        scalar.replace_stream_data(b"x".to_vec(), None, None);
+        assert_eq!(scalar.as_integer(), Some(1));
     }
 }
