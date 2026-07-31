@@ -99,7 +99,7 @@ pub(crate) enum ObjectValue {
     String(Vec<u8>),
     /// A content-stream operator token (e.g. `q`, `Do`), mirroring
     /// [`crate::Object::Operator`]. Only meaningful inside a content stream
-    /// (`include/qpdf/QPDFObjectHandle.hh:317-318`: "Operator and
+    /// (`include/qpdf/QPDFObjectHandle.hh:318-319`: "Operator and
     /// InlineImage are only allowed in content streams").
     Operator(Vec<u8>),
     /// Raw inline-image (`BI`...`ID`...`EI`) bytes, mirroring
