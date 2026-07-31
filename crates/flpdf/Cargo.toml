@@ -23,6 +23,14 @@ sha2.workspace = true
 stringprep.workspace = true
 hex.workspace = true
 getrandom.workspace = true
+stacker.workspace = true
+# Not used directly: `ar_archive_writer` is `stacker`'s transitive
+# build-dependency (via `psm`). Declaring it here is what makes the
+# `=0.5.1` MSRV pin in the workspace `[workspace.dependencies]` an active
+# resolver constraint — a `[workspace.dependencies]` entry alone is inert
+# unless some member's manifest actually inherits it (verified: `cargo
+# update -p ar_archive_writer --precise 0.5.2` succeeds without this line).
+ar_archive_writer.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

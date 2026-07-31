@@ -46,3 +46,17 @@ same-file = "1"
 # Already present as a transitive dep via tempfile/etc — direct declaration
 # is free build-closure-wise.
 getrandom = "0.2"
+# `ar_archive_writer` is a transitive build-dependency of `stacker` (via
+# `psm`), not used directly by this crate. Pinned to `=0.5.1`: 0.5.2 declares
+# `rust-version = "1.88.0"` (let-chain syntax), above this workspace's
+# declared MSRV of 1.87 (`rust-version` above), so an unpinned `cargo
+# update` would silently break the MSRV build. 0.5.1 declares no
+# `rust-version` and contains no let-chains.
+ar_archive_writer = "=0.5.1"
+# Transparently grows the call stack for the parser's bounded recursive
+# descent (MAX_PARSE_DEPTH levels) when the current stack segment is nearly
+# exhausted, so recursion to that depth cannot abort the process on a
+# caller-provided thread with a smaller-than-expected stack (e.g. the
+# default ~2 MiB a spawned thread gets, which some builds/paths measurably
+# do not have enough per-frame headroom to survive at the full depth).
+stacker = "0.1.24"
