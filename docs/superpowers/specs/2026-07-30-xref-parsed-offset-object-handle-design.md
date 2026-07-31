@@ -106,10 +106,12 @@ This canonicalization rule does not apply to a bare `N G R` that is the
 entire body of an indirect object or an object-stream member: qpdf parses
 only the first integer there and emits an `expected endobj` diagnostic for
 the file-object case, never producing a reference value at that position
-(`top_level_no_reference`, implemented at `parser.rs:52-62`, pinned by the
-regression tests at `reader.rs:4192-4207`, the file-object case, and
-`reader.rs:4978-4999`, the object-stream-member case). That existing
-behavior is unchanged by this design.
+(`top_level_no_reference`, implemented at `parser.rs:52-62`, pinned by
+`parser.rs:1137-1178` — asserting a top-level bare reference integerizes
+while the same reference nested in an array/dictionary/stream dictionary
+does not — and by the regression tests at `reader.rs:3380-3395`, the
+file-object case, and `reader.rs:4049-4070`, the object-stream-member
+case). That existing behavior is unchanged by this design.
 
 Streams retain distinct handles for:
 
