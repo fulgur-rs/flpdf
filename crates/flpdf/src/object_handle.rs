@@ -78,7 +78,7 @@ enum Repr {
 /// Array and dictionary children are [`ObjectHandle`]s rather than raw
 /// nested `ObjectValue`s, so cloning a container clones only `Rc` handles
 /// (O(1) per child), not the subtree.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum ObjectValue {
     Null,
     Boolean(bool),
@@ -707,6 +707,25 @@ impl ObjectHandle {
                 IndirectState::NotYetResolved => f(None),
                 IndirectState::Resolved(value) => f(Some(value)),
                 IndirectState::Missing | IndirectState::Destroyed => f(Some(&ObjectValue::Null)),
+            },
+        }
+    }
+
+    // Mutable twin of `with_value` above: `None` for an indirect handle not
+    // yet resolved (mutation on an unresolved handle must not perform
+    // hidden I/O, same rule as every read accessor), and for
+    // `Missing`/`Destroyed` (there is no live `ObjectValue::Null` slot to
+    // hand out a `&mut` into — those states only *present* as null, they do
+    // not store one).
+    #[allow(dead_code)] // wired up by replace_key/remove_key, added by a later task in the same stack
+    fn with_value_mut<T>(&self, f: impl FnOnce(Option<&mut ObjectValue>) -> T) -> T {
+        match &self.0 {
+            Repr::Direct(slot) => f(Some(&mut slot.borrow_mut().value)),
+            Repr::Indirect(slot) => match &mut slot.borrow_mut().state {
+                IndirectState::Resolved(value) => f(Some(value)),
+                IndirectState::NotYetResolved
+                | IndirectState::Missing
+                | IndirectState::Destroyed => f(None),
             },
         }
     }
@@ -1992,5 +2011,30 @@ mod unparse_tests {
         // literal "null" token rather than skipping them).
         let array = ObjectHandle::array(vec![ObjectHandle::integer(1), ObjectHandle::null()]);
         assert_eq!(array.unparse_resolved(), b"[ 1 null ]");
+    }
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+
+    #[test]
+    fn object_value_clone_preserves_scalar_content() {
+        let value = ObjectValue::Integer(42);
+        let cloned = value.clone();
+        assert!(matches!(cloned, ObjectValue::Integer(42)));
+    }
+
+    #[test]
+    fn object_value_clone_of_a_dictionary_shares_child_identity() {
+        let child = ObjectHandle::integer(7);
+        let dict = ObjectValue::Dictionary(
+            [(b"K".to_vec(), child.clone())].into_iter().collect(),
+        );
+        let cloned = dict.clone();
+        let ObjectValue::Dictionary(entries) = cloned else {
+            panic!("expected dictionary");
+        };
+        assert!(entries.get(b"K".as_slice()).unwrap().ptr_eq(&child));
     }
 }
