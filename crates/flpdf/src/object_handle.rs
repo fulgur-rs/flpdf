@@ -257,9 +257,20 @@ impl ObjectHandle {
     /// absent from — or broken in — the source cross-reference table (see
     /// [`IndirectState`]). A no-op for a direct handle, which has no
     /// resolution state to update.
+    ///
+    /// Also resets the parsed offset to the no-offset sentinel: "An absent,
+    /// freed, dangling, cyclic, or otherwise unresolvable indirect object
+    /// retains its indirect identity but resolves to null with parsed offset
+    /// `-1`" (design, Parsed-Offset Contract). Without this, a handle that
+    /// was previously resolved (e.g. natively parsed with a real offset)
+    /// and later marked missing — [`crate::Pdf::delete_object`] on an
+    /// already-resolved handle — would keep reporting its former body's
+    /// source position even though the value now reads as null.
     pub(crate) fn set_missing(&self) {
         if let Repr::Indirect(slot) = &self.0 {
-            slot.borrow_mut().state = IndirectState::Missing;
+            let mut slot = slot.borrow_mut();
+            slot.state = IndirectState::Missing;
+            slot.parsed_offset = NO_PARSED_OFFSET;
         }
     }
 
@@ -820,6 +831,25 @@ mod resolution_state_tests {
         assert!(handle.is_resolved());
         assert!(handle.is_null());
         assert_eq!(handle.as_integer(), None);
+    }
+
+    #[test]
+    fn set_missing_resets_a_previously_recorded_parsed_offset() {
+        // Design's Parsed-Offset Contract: "An absent, freed, dangling,
+        // cyclic, or otherwise unresolvable indirect object ... resolves to
+        // null with parsed offset -1." A handle that was already resolved
+        // with a real (non-negative) offset -- e.g. natively parsed, then
+        // later deleted -- must not keep reporting its former body's source
+        // position once it reads as null.
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Integer(7));
+        handle.set_parsed_offset_if_unset(100);
+        assert_eq!(handle.get_parsed_offset(), 100);
+
+        handle.set_missing();
+
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+        assert!(handle.is_null());
     }
 
     #[test]

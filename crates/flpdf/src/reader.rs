@@ -5734,6 +5734,35 @@ mod tests {
         assert_eq!(pdf.resolve_borrowed(dangling_ref).unwrap(), &Object::Null);
     }
 
+    /// Design's Parsed-Offset Contract: "An absent, freed, dangling, cyclic,
+    /// or otherwise unresolvable indirect object ... resolves to null with
+    /// parsed offset -1." Deleting an object whose handle was already
+    /// resolved (here, natively parsed with a real source offset) must
+    /// reset that offset -- an outstanding clone of the handle must not go
+    /// on reporting the deleted object's former body position once it reads
+    /// as null.
+    #[test]
+    fn delete_object_resets_the_parsed_offset_of_an_already_resolved_handle() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog /Count 1 >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+        let object_ref = ObjectRef::new(1, 0);
+
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle).expect("resolve");
+        assert!(
+            handle.get_parsed_offset() >= 0,
+            "native parse must record a real offset before deletion"
+        );
+
+        pdf.delete_object(object_ref);
+
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+        assert!(handle.is_null());
+    }
+
     /// `Pdf::resolve_borrowed` now returns the *native*-parsed dictionary
     /// value for a plain Uncompressed object (via `Pdf::materialize`) rather
     /// than the legacy-resolved one, for the first time. The native
