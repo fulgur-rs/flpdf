@@ -34,7 +34,8 @@ pub struct PreparedPages {
 /// # Errors
 ///
 /// Propagates any [`Error`] from resolving an object while walking the tree, and
-/// returns [`Error::Unsupported`] if the tree exceeds [`MAX_DEPTH`].
+/// returns [`Error::Unsupported`] if the tree exceeds
+/// [`DEFAULT_MAX_PAGE_TREE_DEPTH`](crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH).
 pub fn prepare_for_optimization<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<PreparedPages>> {
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(None);
