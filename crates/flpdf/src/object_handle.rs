@@ -599,6 +599,105 @@ impl ObjectHandle {
         })
     }
 
+    /// The qpdf-compatible numeric type code of this handle's current known
+    /// value: `include/qpdf/Constants.h:108-127`'s `qpdf_object_type_e`
+    /// ordinals. qpdf's own `getTypeCode()`/`getTypeName()`
+    /// (`include/qpdf/QPDFObjectHandle.hh:311-316`,
+    /// `libqpdf/QPDFObjectHandle.cc:240-250`) call `dereference()`, which
+    /// unconditionally resolves the handle first
+    /// (`libqpdf/QPDFObjectHandle.cc:2376-2382`); this method never performs
+    /// that hidden resolution (design, `Pdf` section: no hidden I/O), so an
+    /// indirect handle's *reachable* resolution states surface as their own
+    /// qpdf ordinals instead: not-yet-resolved reports `13`
+    /// (`ot_unresolved`) and a destroyed (owning document dropped) handle
+    /// reports `14` (`ot_destroyed`) — both real `qpdf_object_type_e`
+    /// entries, not invented here. `ot_uninitialized`/`ot_reserved` (qpdf's
+    /// two remaining entries) are construction-time-only states this port's
+    /// `ObjectHandle` never occupies, since every handle is fully
+    /// constructed at birth.
+    ///
+    /// A resolved indirect handle whose own value is itself a bare
+    /// reference (mirroring [`crate::Object::Reference`]; see
+    /// [`Self::as_reference`]'s own doc), a `Pdf::set_object`-driven
+    /// redirect, also reports `13`. This looks like a
+    /// contradiction with [`Self::is_resolved`] returning `true` for the
+    /// same handle, but it is not: the *value* is known (it is a reference),
+    /// while the *referenced object's own type* is not known without
+    /// following the chain further, which this method never does. qpdf's
+    /// own object model has no ordinal for this case at all — `resolve()`
+    /// always fully chases a reference chain before returning a concrete
+    /// value, so qpdf itself never observes a "resolved but still a
+    /// redirect" object — so `ot_unresolved` is the closest real qpdf
+    /// meaning: the terminal type is not yet established. This mirrors
+    /// `flpdf-qtest-tools::driver::Handle::type_info`'s own
+    /// `Object::Reference(_) => (13, "unresolved")` mapping for the same
+    /// reason.
+    pub fn type_code(&self) -> u8 {
+        if let Repr::Indirect(slot) = &self.0 {
+            // Bind the borrow to a local first and match on it, mirroring
+            // this file's own `Debug` impl (see above) rather than matching
+            // directly against a temporary. The borrow ends at this block's
+            // closing brace, strictly before `with_value` below takes its
+            // own borrow of the same slot — never nested.
+            let slot_ref = slot.borrow();
+            match &slot_ref.state {
+                IndirectState::NotYetResolved => return 13,
+                IndirectState::Destroyed => return 14,
+                IndirectState::Missing | IndirectState::Resolved(_) => {}
+            }
+        }
+        self.with_value(|value| {
+            match value.expect(
+                "every state reaching here (direct, indirect Missing, indirect Resolved) carries a value",
+            ) {
+                ObjectValue::Null => 2,
+                ObjectValue::Boolean(_) => 3,
+                ObjectValue::Integer(_) => 4,
+                ObjectValue::Real(_) | ObjectValue::RealLiteral { .. } => 5,
+                ObjectValue::String(_) => 6,
+                ObjectValue::Name(_) => 7,
+                ObjectValue::Array(_) => 8,
+                ObjectValue::Dictionary(_) => 9,
+                ObjectValue::Stream { .. } => 10,
+                ObjectValue::Operator(_) => 11,
+                ObjectValue::InlineImage(_) => 12,
+                // See this method's own doc for why this maps to
+                // `ot_unresolved`: a real, reachable state (via
+                // `Pdf::set_object`), not speculative dead code — see
+                // `resolved_to_a_reference_indirect_handle_reports_unresolved`
+                // for a test that exercises it via the same `set_resolved`
+                // call `Pdf::set_object` itself makes.
+                ObjectValue::Reference(_) => 13,
+            }
+        })
+    }
+
+    /// The qpdf-compatible type name string for [`Self::type_code`]'s
+    /// ordinal (`libqpdf/QPDFObjectHandle.cc:240-250`'s `getTypeName`, via
+    /// each `QPDFValue` subclass's own registered name, e.g.
+    /// `libqpdf/QPDF_InlineImage.cc:6`). See [`Self::type_code`]'s own doc
+    /// for the states this port surfaces instead of qpdf's silent resolve.
+    pub fn type_name(&self) -> &'static str {
+        match self.type_code() {
+            2 => "null",
+            3 => "boolean",
+            4 => "integer",
+            5 => "real",
+            6 => "string",
+            7 => "name",
+            8 => "array",
+            9 => "dictionary",
+            10 => "stream",
+            11 => "operator",
+            12 => "inline-image",
+            14 => "destroyed",
+            // `type_code` only ever returns 13 for any other value it can
+            // produce, so this is exhaustive in practice, not a silent
+            // catch-all for an unhandled ordinal.
+            _ => "unresolved",
+        }
+    }
+
     // `None` for an indirect handle that has not yet been resolved — value
     // access on an unresolved handle must not perform hidden I/O (design,
     // `Pdf` section). A resolved indirect handle exposes its real value;
@@ -1349,5 +1448,121 @@ mod is_resolved_visibility_tests {
         // itself, so a positive compile check here is the useful signal).
         let handle = ObjectHandle::integer(1);
         let _: bool = ObjectHandle::is_resolved(&handle);
+    }
+}
+
+#[cfg(test)]
+mod type_code_tests {
+    use super::*;
+
+    #[test]
+    fn direct_scalar_and_container_type_codes_match_qpdf_ordinals() {
+        // Ordinals and strings verified directly against the pinned qpdf
+        // 11.9.0 source: `include/qpdf/Constants.h:108-127`
+        // (`qpdf_object_type_e`) for the numbers, and each type's own
+        // `libqpdf/QPDF_*.cc` `QPDFValue(::ot_*, "...")` constructor for the
+        // name string (e.g. `libqpdf/QPDF_InlineImage.cc:6` for the
+        // hyphenated `"inline-image"`).
+        let cases: &[(ObjectHandle, u8, &str)] = &[
+            (ObjectHandle::null(), 2, "null"),
+            (ObjectHandle::boolean(true), 3, "boolean"),
+            (ObjectHandle::integer(1), 4, "integer"),
+            (ObjectHandle::real(1.5), 5, "real"),
+            (ObjectHandle::real_literal(0.4, b".4".to_vec()), 5, "real"),
+            (ObjectHandle::string(b"s".to_vec()), 6, "string"),
+            (ObjectHandle::name(b"N".to_vec()), 7, "name"),
+            (ObjectHandle::array(vec![]), 8, "array"),
+            (ObjectHandle::dictionary(vec![]), 9, "dictionary"),
+            (ObjectHandle::operator(b"q".to_vec()), 11, "operator"),
+            (
+                ObjectHandle::inline_image(b"d".to_vec()),
+                12,
+                "inline-image",
+            ),
+        ];
+        for (handle, code, name) in cases {
+            assert_eq!(handle.type_code(), *code, "{name}");
+            assert_eq!(handle.type_name(), *name);
+        }
+    }
+
+    #[test]
+    fn stream_handle_type_code_is_stream() {
+        let dict = ObjectHandle::dictionary(vec![]);
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            dict,
+            data: Vec::new(),
+        });
+        assert_eq!(stream.type_code(), 10);
+        assert_eq!(stream.type_name(), "stream");
+    }
+
+    #[test]
+    fn not_yet_resolved_indirect_handle_reports_unresolved_without_resolving() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        assert_eq!(handle.type_code(), 13, "ot_unresolved");
+        assert_eq!(handle.type_name(), "unresolved");
+    }
+
+    #[test]
+    fn destroyed_indirect_handle_reports_destroyed() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Integer(1));
+        handle.disconnect();
+        assert_eq!(handle.type_code(), 14, "ot_destroyed");
+        assert_eq!(handle.type_name(), "destroyed");
+    }
+
+    #[test]
+    fn missing_indirect_handle_reports_null_not_a_distinct_missing_code() {
+        // qpdf has no separate "missing" ot_* code — a dangling/broken
+        // reference presents as ot_null, matching set_missing's own
+        // documented is_null()==true contract.
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_missing();
+        assert_eq!(handle.type_code(), 2, "ot_null");
+        assert_eq!(handle.type_name(), "null");
+    }
+
+    #[test]
+    fn resolved_indirect_handle_reports_its_real_value_type() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Integer(7));
+        assert_eq!(handle.type_code(), 4, "ot_integer");
+        assert_eq!(handle.type_name(), "integer");
+    }
+
+    #[test]
+    fn resolved_to_a_reference_indirect_handle_reports_unresolved() {
+        // `ObjectValue::Reference` is a real, reachable resolution state,
+        // not a speculative one: `Pdf::set_object` (`reader.rs:1184-1239`)
+        // is public, `Object::Reference` is a public variant, and
+        // `set_object` writes exactly this state via
+        // `handle.set_resolved(value)` (`reader.rs:1207-1210`) whenever the
+        // lifted value is itself a bare reference
+        // (`reader.rs:1877`'s `Object::Reference(object_ref) =>
+        // ObjectValue::Reference(*object_ref)` arm) — e.g.
+        // `pdf.set_object(holder, Object::Reference(target))` to redirect a
+        // holder chain in place, exactly as `ref_chain.rs`'s own test
+        // fixture does. `resolve_object_handle` itself can never produce
+        // this state (a top-level bare reference never comes from a
+        // file/ObjStm parse — `parser.rs`'s `top_level_no_reference`
+        // integerizes it instead, matching qpdf — and `set_object` always
+        // resolves the same canonical handle it writes into the legacy
+        // cache, so `resolve_object_handle`'s own `is_resolved` early-return
+        // guards against ever re-deriving this value itself), but the state
+        // is still reachable from any public accessor call on the handle
+        // `Pdf::set_object` resolved directly. This test calls the same
+        // `set_resolved` method `set_object` itself calls, to exercise the
+        // state without pulling `Pdf` into this single-file slice.
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Reference(ObjectRef::new(9, 0)));
+        assert_eq!(handle.type_code(), 13, "ot_unresolved");
+        assert_eq!(handle.type_name(), "unresolved");
+        // The contradiction this method's own doc calls out: the value
+        // itself is known (is_resolved() is true) even though its type
+        // code reports the same ordinal as a handle whose value is not
+        // known at all.
+        assert!(handle.is_resolved());
     }
 }
