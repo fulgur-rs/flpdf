@@ -325,6 +325,28 @@ const MAX_OBJECT_STREAM_CHAIN_DEPTH: usize = 100;
 // defeating a flood of objects whose bodies run to EOF.
 const MAX_RESOLUTION_FALLBACKS: u32 = 64;
 
+impl<R: Read + Seek> Drop for Pdf<R> {
+    // A resolved indirect handle's value can embed other indirect handles
+    // sharing `handle_registry`'s own canonical `Rc` identity (array/dict/
+    // stream-dict children). Two objects that reference each other (e.g. a
+    // `/Pages` node and a page's `/Parent`, common in real PDFs) therefore
+    // form a strong reference cycle once both are resolved, which plain
+    // `Rc` drop never collects on its own.
+    //
+    // Mirrors qpdf's own teardown: `QPDF::~QPDF()` walks its object cache
+    // and disconnects every resolved object, replacing it with
+    // `QPDF_Destroyed()`, specifically to break cycles like this one
+    // (`libqpdf/QPDF.cc`, `QPDF::~QPDF`). Disconnecting every registry
+    // entry here — the sole owner of the canonical `Rc`s — before the
+    // registry itself drops ensures no lingering cycle keeps a document's
+    // object graph (and any reachable stream buffers) alive past `self`.
+    fn drop(&mut self) {
+        for handle in self.handle_registry.values() {
+            handle.disconnect();
+        }
+    }
+}
+
 impl<R: Read + Seek> Pdf<R> {
     /// Open a document strictly: parse the cross-reference and trailer, but do not run
     /// the recovery heuristics. Returns an [`Error`] if the document is malformed.
@@ -3822,6 +3844,32 @@ mod tests {
             format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
         pdf.extend_from_slice(trailer.as_bytes());
         pdf
+    }
+
+    #[test]
+    fn dropping_pdf_breaks_the_pages_parent_reference_cycle() {
+        // `minimal_pdf_bytes`'s Pages node (2 0 obj) and Page (3 0 obj)
+        // reference each other (`/Kids [3 0 R]` / `/Parent 2 0 R`); once both
+        // are resolved, each slot's value embeds the other's canonical
+        // handle, mirroring the CI fuzz LeakSanitizer failure reproduced
+        // from a self-referential `/Catalog`.
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve_object_handle(&pages).expect("resolve pages");
+        pdf.resolve_object_handle(&page).expect("resolve page");
+
+        // Each handle is held by: this test's own local variable, the
+        // registry, and the other object's resolved value (the cycle).
+        assert_eq!(pages.strong_count(), 3);
+        assert_eq!(page.strong_count(), 3);
+
+        drop(pdf);
+
+        // `Pdf::drop` disconnects every registry entry before the registry
+        // itself drops, so only this test's own local handles remain live.
+        assert_eq!(pages.strong_count(), 1);
+        assert_eq!(page.strong_count(), 1);
     }
 
     fn classic_pdf_with_bodies(bodies: &[&[u8]], root: ObjectRef) -> Vec<u8> {

@@ -102,6 +102,12 @@ pub(crate) enum IndirectState {
     NotYetResolved,
     Resolved(ObjectValue),
     Missing,
+    /// The owning document has been dropped and this slot's value has been
+    /// severed (see [`ObjectHandle::disconnect`]). Distinct from `Missing`
+    /// (a reference absent from the source) so a future diagnostic can still
+    /// tell the two apart; presents the same externally-observable `Null`
+    /// value as both other terminal states.
+    Destroyed,
 }
 
 #[derive(Debug)]
@@ -214,6 +220,42 @@ impl ObjectHandle {
     pub(crate) fn set_missing(&self) {
         if let Repr::Indirect(slot) = &self.0 {
             slot.borrow_mut().state = IndirectState::Missing;
+        }
+    }
+
+    /// Sever this indirect handle's resolved value, dropping any `ObjectHandle`
+    /// children it holds. A no-op for a direct handle.
+    ///
+    /// A resolved indirect value can hold direct-owning [`ObjectHandle`]
+    /// children (array/dictionary/stream-dict entries) that are themselves
+    /// indirect handles sharing the same canonical `Rc` identity as this
+    /// document's registry entries. Two objects that reference each other
+    /// (e.g. a `/Pages` node and a page's `/Parent`, both common in real
+    /// PDFs) therefore form a strong reference cycle once both are resolved,
+    /// which `Rc` alone never collects.
+    ///
+    /// Mirrors qpdf's own teardown: `QPDF::~QPDF()` walks its object cache
+    /// and disconnects every resolved object, replacing it with
+    /// `QPDF_Destroyed()`, specifically to break cycles like this one
+    /// (`libqpdf/QPDF.cc`, `QPDF::~QPDF`). The reader's `Pdf::drop` calls
+    /// this for every entry in its handle registry — the sole owner of the
+    /// canonical `Rc`s — before the registry itself is dropped, so no
+    /// lingering cycle keeps a document's object graph (and any reachable
+    /// stream buffers) alive past the `Pdf` that produced it.
+    pub(crate) fn disconnect(&self) {
+        if let Repr::Indirect(slot) = &self.0 {
+            slot.borrow_mut().state = IndirectState::Destroyed;
+        }
+    }
+
+    /// The `Rc` strong count backing this handle's identity. Test-only:
+    /// lets a regression test prove a cycle-breaking fix actually frees the
+    /// `Rc`s involved, without exposing reference counting as production API.
+    #[cfg(test)]
+    pub(crate) fn strong_count(&self) -> usize {
+        match &self.0 {
+            Repr::Direct(rc) => Rc::strong_count(rc),
+            Repr::Indirect(rc) => Rc::strong_count(rc),
         }
     }
 
@@ -402,7 +444,7 @@ impl ObjectHandle {
             Repr::Indirect(slot) => match &slot.borrow().state {
                 IndirectState::NotYetResolved => f(None),
                 IndirectState::Resolved(value) => f(Some(value)),
-                IndirectState::Missing => f(Some(&ObjectValue::Null)),
+                IndirectState::Missing | IndirectState::Destroyed => f(Some(&ObjectValue::Null)),
             },
         }
     }
@@ -756,6 +798,50 @@ mod resolution_state_tests {
         assert!(handle.is_direct());
         assert_eq!(handle.as_integer(), Some(3));
         assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
+    fn disconnect_replaces_a_resolved_value_and_presents_as_null() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Integer(7));
+
+        handle.disconnect();
+
+        assert!(handle.is_resolved());
+        assert!(handle.is_null());
+        assert_eq!(handle.as_integer(), None);
+    }
+
+    #[test]
+    fn disconnect_is_a_no_op_on_a_direct_handle() {
+        let handle = ObjectHandle::integer(42);
+        handle.disconnect();
+        assert_eq!(handle.as_integer(), Some(42));
+    }
+
+    #[test]
+    fn disconnect_drops_the_strong_rc_a_resolved_value_holds_to_a_cyclic_child() {
+        // Two objects that reference each other (e.g. a /Pages node and a
+        // page's /Parent) form a strong Rc cycle once both are resolved:
+        // each slot's value embeds the other's canonical handle. `disconnect`
+        // (called by `Pdf::drop` for every registry entry) must sever that
+        // cycle so both slots free once external references are gone.
+        let a = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        let b = ObjectHandle::new_indirect_unresolved(ObjectRef::new(2, 0), 0);
+        a.set_resolved(ObjectValue::Dictionary(
+            [(b"Kid".to_vec(), b.clone())].into_iter().collect(),
+        ));
+        b.set_resolved(ObjectValue::Dictionary(
+            [(b"Parent".to_vec(), a.clone())].into_iter().collect(),
+        ));
+        assert_eq!(a.strong_count(), 2, "held by this test and by b's value");
+        assert_eq!(b.strong_count(), 2, "held by this test and by a's value");
+
+        a.disconnect();
+        b.disconnect();
+
+        assert_eq!(a.strong_count(), 1, "only this test's own handle remains");
+        assert_eq!(b.strong_count(), 1, "only this test's own handle remains");
     }
 }
 
