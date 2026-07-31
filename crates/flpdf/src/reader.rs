@@ -1654,12 +1654,16 @@ impl<R: Read + Seek> Pdf<R> {
         // (ObjStm-member) object — or, more rarely, an Uncompressed one whose
         // fast native-parse window failed for an unrelated reason — with
         // literal nesting between the two bounds.
-        let (value, parsed_offset) = match self.source_xref_entries.get(&object_ref).copied() {
+        let mut native_parsed = false;
+        let (mut value, parsed_offset) = match self.source_xref_entries.get(&object_ref).copied() {
             Some(XrefEntry::Uncompressed { offset })
                 if !self.transformed_stream_refs.contains(&object_ref) =>
             {
                 match self.native_parse_uncompressed_value(offset, &object) {
-                    Ok(native) => native,
+                    Ok(native) => {
+                        native_parsed = true;
+                        native
+                    }
                     Err(_) => (
                         self.lift_bounded(&object, 0, crate::parser::MAX_PARSE_DEPTH)?,
                         NO_PARSED_OFFSET,
@@ -1671,6 +1675,28 @@ impl<R: Read + Seek> Pdf<R> {
                 NO_PARSED_OFFSET,
             ),
         };
+        // Only the native-parse success path above reads raw (possibly
+        // still-encrypted) source bytes directly into `ObjectValue::String`;
+        // every other route here lifts from `object`, which
+        // `resolve_to_cache` already decrypted through the legacy engine's
+        // own pipeline -- decrypting it again would corrupt it. See
+        // `native_parse_uncompressed_value`'s own doc for why this handle
+        // graph population, not `Pdf::resolve_borrowed`'s later
+        // materialization, is where this must happen: nested children here
+        // are already-populated `ObjectHandle`s carrying their own recorded
+        // parsed offsets, and round-tripping through `materialize`/`lift` to
+        // reach a legacy-engine decryption path would silently reset them.
+        if native_parsed {
+            if let Some(encryption) = &self.encryption {
+                decrypt_object_value_strings(
+                    object_ref,
+                    &mut value,
+                    encryption.string_mode,
+                    &encryption.file_key,
+                    encryption.encrypt_ref,
+                )?;
+            }
+        }
         handle.set_resolved(value);
         handle.set_parsed_offset_if_unset(parsed_offset);
         Ok(())
@@ -2052,22 +2078,14 @@ impl<R: Read + Seek> Pdf<R> {
                 }
             }
 
-            let mut materialized = handle.materialize();
-            // A non-sentinel parsed offset means this handle's top-level
-            // value came from `native_parse_uncompressed_value`, which reads
-            // raw (possibly still-encrypted) source bytes directly into
-            // `ObjectValue::String` rather than through the legacy engine's
-            // own already-decrypted `Object` tree. Every other route to a
-            // resolved handle (the Compressed/ObjStm branch, the
-            // native-parse-failure fallback, and `Pdf::set_object`, all of
-            // which go through `lift`/`Pdf::lift_for_set_object`) already
-            // carries correctly-decrypted strings and must not be decrypted
-            // again here; `Pdf::set_object` resets the offset back to the
-            // sentinel for exactly this reason whenever it replaces a
-            // handle's value.
-            if handle.get_parsed_offset() >= 0 {
-                self.decrypt_materialized_strings(object_ref, &mut materialized)?;
-            }
+            // `handle`'s own resolved value is already correctly decrypted
+            // regardless of route: `resolve_object_handle`'s native-parse
+            // branch decrypts strings at population time (see its own
+            // comment), and every other route lifts from `object`, which
+            // `resolve_to_cache` already decrypted through the legacy
+            // engine's own pipeline. `materialize()` below is a plain
+            // structural copy, nothing left to decrypt here.
+            let materialized = handle.materialize();
             self.legacy_materialized_memo
                 .insert(object_ref, materialized);
         }
@@ -2076,36 +2094,6 @@ impl<R: Read + Seek> Pdf<R> {
             .legacy_materialized_memo
             .get(&object_ref)
             .unwrap_or(&NULL_OBJECT))
-    }
-
-    // Applies exactly the string-decryption step `decrypt_resolved_object`
-    // already performs for the legacy engine's own `Object` tree
-    // (`decrypt_object_strings`, unchanged, including its own guard against
-    // decrypting the `/Encrypt` dictionary object itself), to a materialized
-    // `Object` built from a native-parse-populated `ObjectHandle`. Stream
-    // *data* bytes are never touched here — they were already correctly
-    // decrypted before this object's handle was populated, since
-    // `native_parse_uncompressed_value` reuses the legacy engine's own
-    // already-decrypted stream payload rather than re-deriving it — so
-    // calling `decrypt_resolved_object` itself here (which also transforms
-    // stream data) would double-decrypt it; only `decrypt_object_strings`,
-    // which touches `Object::String` values alone, is safe to call from
-    // this bridge.
-    fn decrypt_materialized_strings(
-        &self,
-        object_ref: ObjectRef,
-        object: &mut Object,
-    ) -> Result<()> {
-        let Some(encryption) = &self.encryption else {
-            return Ok(());
-        };
-        decrypt_object_strings(
-            object_ref,
-            object,
-            encryption.string_mode,
-            &encryption.file_key,
-            encryption.encrypt_ref,
-        )
     }
 
     /// Read and parse the indirect object stored at `offset`, returning the read
@@ -2734,6 +2722,147 @@ fn decrypt_object_strings(
             )
         }
     }
+}
+
+// Mirrors `decrypt_object_strings`'s mode dispatch exactly (same key
+// derivation, same `decrypt_cipher_bytes` leaf primitive), but walks an
+// `ObjectValue`/`ObjectHandle` tree in place rather than a legacy `Object`
+// tree. Needed for `Pdf::resolve_object_handle`'s native-parse branch:
+// `native_parse_uncompressed_value` builds `ObjectValue`/`ObjectHandle`
+// directly from raw source bytes, never through an intermediate `Object`, so
+// `decrypt_object_strings` (which only accepts `&mut Object`) cannot be
+// called on it without materializing and re-lifting -- which would silently
+// reset every nested child's already-recorded parsed offset, the exact
+// invariant `native_parse_uncompressed_value`'s own doc protects.
+fn decrypt_object_value_strings(
+    object_ref: ObjectRef,
+    value: &mut ObjectValue,
+    mode: EncryptionMode,
+    file_key: &[u8],
+    encrypt_ref: Option<ObjectRef>,
+) -> Result<()> {
+    if Some(object_ref) == encrypt_ref {
+        return Ok(());
+    }
+    match mode {
+        EncryptionMode::Rc4 => {
+            let key = per_object_key(
+                file_key,
+                object_ref.number,
+                u32::from(object_ref.generation),
+                ObjectKeyAlg::Rc4,
+            );
+            decrypt_strings_in_object_value(value, StringCipher::Rc4 { key: &key }, 0)
+        }
+        EncryptionMode::Aes128 => {
+            let key = per_object_key(
+                file_key,
+                object_ref.number,
+                u32::from(object_ref.generation),
+                ObjectKeyAlg::Aes,
+            );
+            let key = aes128_object_key(&key)?;
+            decrypt_strings_in_object_value(value, StringCipher::Aes128 { key: &key }, 0)
+        }
+        EncryptionMode::Identity => Ok(()),
+        EncryptionMode::Aes256 => {
+            let key = aes256_file_key(file_key)?;
+            decrypt_strings_in_object_value(value, StringCipher::Aes256 { key: &key }, 0)
+        }
+    }
+}
+
+// The top-level value itself: a bare `ObjectValue::String` is mutated
+// directly (it is a plain owned local, not yet wrapped in a handle); a
+// container recurses into its already-populated `ObjectHandle` children via
+// `decrypt_handle_strings_in_place`. Depth-bounded against
+// `MAX_INLINE_DEPTH`, mirroring `decrypt_strings_in_value`'s own guard for
+// the legacy `Object` walk.
+fn decrypt_strings_in_object_value(
+    value: &mut ObjectValue,
+    cipher: StringCipher<'_>,
+    depth: usize,
+) -> Result<()> {
+    if depth > crate::object::MAX_INLINE_DEPTH {
+        return Err(Error::Unsupported(format!(
+            "decrypt: inline object nesting exceeds maximum of {}",
+            crate::object::MAX_INLINE_DEPTH
+        )));
+    }
+    match value {
+        ObjectValue::String(bytes) => decrypt_cipher_bytes(bytes, cipher),
+        ObjectValue::Array(items) => {
+            for item in items.iter() {
+                decrypt_handle_strings_in_place(item, cipher, depth + 1)?;
+            }
+            Ok(())
+        }
+        ObjectValue::Dictionary(entries) => {
+            for item in entries.values() {
+                decrypt_handle_strings_in_place(item, cipher, depth + 1)?;
+            }
+            Ok(())
+        }
+        ObjectValue::Stream { dict, .. } => {
+            decrypt_handle_strings_in_place(dict, cipher, depth + 1)
+        }
+        ObjectValue::Null
+        | ObjectValue::Boolean(_)
+        | ObjectValue::Integer(_)
+        | ObjectValue::Real(_)
+        | ObjectValue::RealLiteral { .. }
+        | ObjectValue::Name(_)
+        | ObjectValue::Reference(_)
+        | ObjectValue::Operator(_)
+        | ObjectValue::InlineImage(_) => Ok(()),
+    }
+}
+
+// A child reached through direct containment: an indirect handle is a
+// terminal leaf here (its own eventual resolution decrypts it separately,
+// keyed by its own object ref, exactly like a legacy `Object::Reference`
+// stops `decrypt_strings_in_value`'s walk) -- `handle.is_indirect()` is
+// checked before touching the handle's value at all, rather than relying on
+// `replace_direct_value`'s no-op-on-indirect behavior alone, so a resolved
+// indirect child's own contents are never even read here, let alone
+// decrypted with the wrong (parent's) key. A direct string is decrypted and
+// written back in place via `replace_direct_value`, which preserves the
+// handle's identity and already-recorded parsed offset.
+fn decrypt_handle_strings_in_place(
+    handle: &ObjectHandle,
+    cipher: StringCipher<'_>,
+    depth: usize,
+) -> Result<()> {
+    if handle.is_indirect() {
+        return Ok(());
+    }
+    if depth > crate::object::MAX_INLINE_DEPTH {
+        return Err(Error::Unsupported(format!(
+            "decrypt: inline object nesting exceeds maximum of {}",
+            crate::object::MAX_INLINE_DEPTH
+        )));
+    }
+    if let Some(mut bytes) = handle.as_string() {
+        decrypt_cipher_bytes(&mut bytes, cipher)?;
+        handle.replace_direct_value(ObjectValue::String(bytes));
+        return Ok(());
+    }
+    if let Some(items) = handle.as_array() {
+        for item in &items {
+            decrypt_handle_strings_in_place(item, cipher, depth + 1)?;
+        }
+        return Ok(());
+    }
+    if let Some(entries) = handle.as_dictionary() {
+        for item in entries.values() {
+            decrypt_handle_strings_in_place(item, cipher, depth + 1)?;
+        }
+        return Ok(());
+    }
+    if let Some(dict) = handle.as_stream_dict() {
+        return decrypt_handle_strings_in_place(&dict, cipher, depth + 1);
+    }
+    Ok(())
 }
 
 fn decrypt_stream_bytes(
@@ -3581,6 +3710,84 @@ mod tests {
 
         assert_eq!(object, sentinel);
         assert!(!stream_payload_decrypted);
+    }
+
+    #[test]
+    fn object_handle_as_string_decrypts_native_parsed_encrypted_strings() {
+        use crate::encrypt_setup::EncryptParams;
+        use crate::writer::{write_pdf_with_options, CompressStreams, WriteOptions};
+        use std::io::Cursor;
+
+        // A minimal Catalog/Pages/Info fixture: /Info (trailer-reachable,
+        // survives the writer's Catalog-first reachability walk) holds a
+        // direct, uncompressed, plain-xref-table string -- exactly the shape
+        // `native_parse_uncompressed_value` builds directly from raw source
+        // bytes, the vulnerable path this test targets.
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut entries: Vec<(u16, usize)> = Vec::new();
+        entries.push((0, bytes.len()));
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        entries.push((0, bytes.len()));
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        entries.push((0, bytes.len()));
+        bytes.extend_from_slice(b"3 0 obj\n<< /Title (TopSecretTitle) >>\nendobj\n");
+        let startxref = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n", entries.len() + 1).as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for (generation, offset) in &entries {
+            bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R /Info 3 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+                entries.len() + 1
+            )
+            .as_bytes(),
+        );
+
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open plaintext fixture");
+        let mut out = Vec::new();
+        let options = WriteOptions {
+            full_rewrite: true,
+            compress_streams: CompressStreams::No,
+            encrypt: Some(EncryptParams::v4_aes128(
+                b"user-pw".to_vec(),
+                b"owner-pw".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        write_pdf_with_options(&mut pdf, &mut out, &options).expect("V=4 AES128 encrypted write");
+
+        let mut rt = Pdf::open_with_options(
+            Cursor::new(out),
+            PdfOpenOptions {
+                password: b"user-pw".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("re-open of V=4 output with user-pw");
+
+        let info_ref = match rt.trailer().get("Info") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("trailer /Info must be a reference, got {other:?}"),
+        };
+        let info_handle = rt.get_object_handle(info_ref);
+        rt.resolve_object_handle(&info_handle)
+            .expect("resolve /Info handle");
+        let dict = info_handle
+            .as_dictionary()
+            .expect("/Info must be a dictionary");
+        let title_handle = dict.get(b"Title".as_slice()).expect("/Title entry");
+        let title = title_handle.as_string().expect("/Title must be a string");
+
+        assert_eq!(
+            title.as_slice(),
+            b"TopSecretTitle",
+            "ObjectHandle::as_string() must decrypt a native-parsed string from an \
+             encrypted document, not return raw ciphertext -- native_parse_uncompressed_value \
+             builds ObjectValue::String directly from raw (possibly still-encrypted) source \
+             bytes, and this accessor reads that stored value directly"
+        );
     }
 
     fn explicit_rc4_encryption_state() -> EncryptionState {
