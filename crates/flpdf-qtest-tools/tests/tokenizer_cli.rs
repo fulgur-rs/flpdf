@@ -162,6 +162,76 @@ fn build_pdf_with_page_content(content: &[u8]) -> Vec<u8> {
     out
 }
 
+fn build_pdf_with_duplicate_page_leaf() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+    let mut offsets: Vec<u64> = vec![0];
+    let push_obj = |out: &mut Vec<u8>, offsets: &mut Vec<u64>, body: &[u8]| {
+        let n = offsets.len();
+        offsets.push(out.len() as u64);
+        out.extend_from_slice(format!("{n} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    };
+    push_obj(&mut out, &mut offsets, b"<< /Type /Catalog /Pages 2 0 R >>");
+    // The same leaf, 3 0 R, appears twice in /Kids -- qpdf's getAllPages()
+    // clones the second occurrence rather than deduplicating it.
+    push_obj(
+        &mut out,
+        &mut offsets,
+        b"<< /Type /Pages /Kids [3 0 R 3 0 R] /Count 2 >>",
+    );
+    push_obj(
+        &mut out,
+        &mut offsets,
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>",
+    );
+
+    let xref_start = out.len() as u64;
+    let total = offsets.len();
+    out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+    for offset in &offsets[1..] {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn tokenizer_repairs_page_tree_and_clones_duplicate_leaf() {
+    // Regression test: qpdf's test_tokenizer.cc enumerates pages via
+    // QPDFPageDocumentHelper(qpdf).getAllPages(), which is QPDF::getAllPages()'s
+    // tree-repairing walk. A /Kids array that lists the same leaf twice must
+    // therefore still produce two PAGE sections (the second is a clone), not
+    // be silently deduplicated down to one.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    fs::write(
+        dir.path().join("duplicate_leaf.pdf"),
+        build_pdf_with_duplicate_page_leaf(),
+    )
+    .expect("write duplicate_leaf.pdf into tempdir");
+
+    let output = run(&["duplicate_leaf.pdf"], dir.path());
+
+    assert!(
+        output.status.success(),
+        "unexpected exit status: {:?}; stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--- BEGIN PAGE 1 ---"),
+        "expected PAGE 1, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("--- BEGIN PAGE 2 ---"),
+        "expected PAGE 2 for the cloned duplicate leaf, got: {stdout}"
+    );
+}
+
 #[test]
 fn tokenizer_recovers_inline_image_missing_id_separator() {
     // Regression test: when a page's content stream ends immediately after
@@ -204,6 +274,28 @@ fn tokenizer_maxlen_flag() {
 }
 
 #[test]
+fn tokenizer_maxlen_consumes_decimal_prefix() {
+    // qpdf's -maxlen parsing goes through QUtil::string_to_uint, which runs the
+    // argument through strtoull: a decimal prefix is consumed and anything
+    // trailing the last digit is ignored, rather than str::parse's
+    // all-or-nothing conversion rejecting the whole argument.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    fs::write(dir.path().join("minimal.pdf"), minimal_pdf_bytes())
+        .expect("write minimal.pdf into tempdir");
+
+    let output = run(&["-maxlen", "5trailing", "minimal.pdf"], dir.path());
+
+    assert!(
+        output.status.success(),
+        "unexpected exit status: {:?}; stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("exceeded allowable length"));
+}
+
+#[test]
 fn tokenizer_missing_file_exits_two() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let output = run(&["nonexistent.pdf"], dir.path());
@@ -211,6 +303,12 @@ fn tokenizer_missing_file_exits_two() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("exception:"));
+    // qpdf's FileInputSource open failure reports "open <filename>: <error>";
+    // the message must name the file, not just the bare OS error text.
+    assert!(
+        stderr.contains("open nonexistent.pdf:"),
+        "expected the filename in the open error, got: {stderr}"
+    );
 }
 
 #[test]

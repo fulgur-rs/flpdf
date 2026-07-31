@@ -16,10 +16,17 @@ use crate::{Error, Pdf, Result};
 /// in this crate ([`crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH`]).
 const MAX_DEPTH: usize = crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 
+/// The effective `/Pages` root and leaf order after qpdf-compatible repair.
+///
+/// Returned by [`prepare_for_optimization`]; see that function for what "repair" covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PreparedPages {
-    pub(crate) root: ObjectRef,
-    pub(crate) pages: Vec<ObjectRef>,
+pub struct PreparedPages {
+    /// The effective `/Pages` root, after correcting a catalog whose `/Pages` points
+    /// into the tree instead of at the true root.
+    pub root: ObjectRef,
+    /// Every `Page` leaf in document order, with qpdf's `getAllPagesInternal` repairs
+    /// applied (see [`prepare_for_optimization`]).
+    pub pages: Vec<ObjectRef>,
 }
 
 /// Repair the `/Pages` tree and return its effective root and leaf order.
@@ -28,9 +35,7 @@ pub(crate) struct PreparedPages {
 ///
 /// Propagates any [`Error`] from resolving an object while walking the tree, and
 /// returns [`Error::Unsupported`] if the tree exceeds [`MAX_DEPTH`].
-pub(crate) fn prepare_for_optimization<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-) -> Result<Option<PreparedPages>> {
+pub fn prepare_for_optimization<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<PreparedPages>> {
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(None);
     };

@@ -5,7 +5,8 @@ use std::io;
 use std::path::Path;
 
 use flpdf::filters::{self, DecodeLimits, StreamDecodeEvent};
-use flpdf::pages::{page_content_bytes, page_refs};
+use flpdf::pages::page_content_bytes;
+use flpdf::pages::repair::prepare_for_optimization;
 use flpdf::tokenizer::{TokenType, Tokenizer};
 use flpdf::{Object, Pdf, PdfOpenOptions};
 
@@ -34,9 +35,9 @@ pub fn run(
                 if i >= args.len() {
                     return usage_error(args, stderr);
                 }
-                max_len = match args[i].to_string_lossy().parse::<usize>() {
-                    Ok(n) => n,
-                    Err(_) => return usage_error(args, stderr),
+                max_len = match parse_maxlen(&os_str_diagnostic_bytes(&args[i])) {
+                    Some(n) => n,
+                    None => return usage_error(args, stderr),
                 };
             } else if arg_str == "-no-ignorable" {
                 include_ignorable = false;
@@ -59,12 +60,10 @@ pub fn run(
     match process(&filename, include_ignorable, max_len, stdout, stderr) {
         Ok(()) => RunOutcome::Exit(0),
         Err(e) => {
-            let _ = write!(
-                stderr,
-                "{}: exception: {}",
-                String::from_utf8_lossy(&program_name(args)),
-                e
-            );
+            // argv[0] may contain non-UTF-8 bytes on Unix; write it verbatim
+            // rather than losing them through a lossy String conversion.
+            let _ = stderr.write_all(&program_name(args));
+            let _ = write!(stderr, ": exception: {e}");
             RunOutcome::Exit(2)
         }
     }
@@ -76,12 +75,39 @@ fn usage_error(args: &[OsString], stderr: &mut dyn io::Write) -> RunOutcome {
 }
 
 fn usage(args: &[OsString], stderr: &mut dyn io::Write) {
-    let name = program_name(args);
-    let _ = writeln!(
-        stderr,
-        "Usage: {} [-maxlen len | -no-ignorable] filename",
-        String::from_utf8_lossy(&name)
-    );
+    let _ = write!(stderr, "Usage: ");
+    let _ = stderr.write_all(&program_name(args));
+    let _ = writeln!(stderr, " [-maxlen len | -no-ignorable] filename");
+}
+
+// qpdf's test_tokenizer.cc parses -maxlen via `QUtil::string_to_uint`, which skips
+// leading whitespace, rejects a leading '-' (throws, uncaught -- unlike this
+// helper, which falls back to usage() rather than aborting), then runs the
+// argument through `strtoull`: a decimal prefix is consumed and anything after
+// the last digit is ignored, and a value with no digits at all converts to 0
+// rather than erroring. This mirrors that prefix/range behavior instead of
+// `str::parse`'s all-or-nothing conversion.
+fn parse_maxlen(input: &[u8]) -> Option<usize> {
+    let mut idx = 0;
+    while input.get(idx).is_some_and(u8::is_ascii_whitespace) {
+        idx += 1;
+    }
+    if input.get(idx) == Some(&b'-') {
+        return None;
+    }
+    if input.get(idx) == Some(&b'+') {
+        idx += 1;
+    }
+    let mut value: u64 = 0;
+    while let Some(digit) = input
+        .get(idx)
+        .and_then(|byte| byte.checked_sub(b'0'))
+        .filter(|digit| *digit <= 9)
+    {
+        value = value.saturating_mul(10).saturating_add(u64::from(digit));
+        idx += 1;
+    }
+    Some(usize::try_from(value).unwrap_or(usize::MAX))
 }
 
 fn program_name(args: &[OsString]) -> Vec<u8> {
@@ -136,7 +162,16 @@ fn process(
     stdout: &mut dyn io::Write,
     stderr: &mut dyn io::Write,
 ) -> Result<(), String> {
-    let file_bytes = fs::read(Path::new(filename)).map_err(|e| e.to_string())?;
+    let filename_diagnostic = os_str_diagnostic_bytes(filename);
+    let file_bytes = match fs::read(Path::new(filename)) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let crt_message = crate::driver::crt_open_error_message(filename);
+            let message =
+                crate::driver::open_error_bytes(&filename_diagnostic, crt_message.as_deref(), &e);
+            return Err(String::from_utf8_lossy(&message).into_owned());
+        }
+    };
 
     dump_tokens(
         &file_bytes,
@@ -153,7 +188,6 @@ fn process(
         allow_weak_crypto: true,
         ..PdfOpenOptions::default()
     };
-    let filename_diagnostic = os_str_diagnostic_bytes(filename);
     let mut pdf = match Pdf::open_mem_owned_with_options(file_bytes, options) {
         Ok(pdf) => pdf,
         Err(e) => {
@@ -177,7 +211,17 @@ fn process(
         stderr,
     );
 
-    let page_refs = page_refs(&mut pdf).map_err(|e| e.to_string())?;
+    // qpdf's test_tokenizer.cc enumerates pages via
+    // `QPDFPageDocumentHelper(qpdf).getAllPages()`, which is `QPDF::getAllPages()`
+    // (QPDF_pages.cc) directly -- the tree-repairing walk that clones duplicate
+    // leaves, mints direct leaves to indirect objects, and corrects mistyped
+    // nodes. `page_refs` performs no such repair and would silently drop or
+    // dedup the pages qpdf reports; `prepare_for_optimization` is flpdf's port
+    // of that same repair+enumerate walk.
+    let page_refs = prepare_for_optimization(&mut pdf)
+        .map_err(|e| e.to_string())?
+        .map(|prepared| prepared.pages)
+        .unwrap_or_default();
     for (pageno, page_ref) in page_refs.iter().enumerate() {
         let content = page_content_bytes(&mut pdf, *page_ref).unwrap_or_default();
         let label = format!("PAGE {}", pageno + 1);
@@ -191,6 +235,13 @@ fn process(
             stdout,
         );
     }
+    let _ = emit_new_diagnostics(
+        &pdf,
+        &mut diagnostics_written,
+        &filename_diagnostic,
+        stdout,
+        stderr,
+    );
 
     let object_refs = pdf.object_refs();
     for obj_ref in object_refs {
@@ -230,6 +281,13 @@ fn process(
             stdout,
         );
     }
+    let _ = emit_new_diagnostics(
+        &pdf,
+        &mut diagnostics_written,
+        &filename_diagnostic,
+        stdout,
+        stderr,
+    );
 
     Ok(())
 }
@@ -511,5 +569,47 @@ mod tests {
         assert_eq!(sanitize(&[0x00]), "\\x00");
         assert_eq!(sanitize(&[0x7f]), "\\x7f");
         assert_eq!(sanitize(&[0xff]), "\\xff");
+    }
+
+    #[test]
+    fn parse_maxlen_plain_decimal() {
+        assert_eq!(parse_maxlen(b"5"), Some(5));
+    }
+
+    #[test]
+    fn parse_maxlen_consumes_decimal_prefix_and_ignores_trailing_garbage() {
+        assert_eq!(parse_maxlen(b"5trailing"), Some(5));
+    }
+
+    #[test]
+    fn parse_maxlen_skips_leading_whitespace() {
+        assert_eq!(parse_maxlen(b"  5"), Some(5));
+    }
+
+    #[test]
+    fn parse_maxlen_with_no_digits_at_all_is_zero() {
+        assert_eq!(parse_maxlen(b"abc"), Some(0));
+        assert_eq!(parse_maxlen(b""), Some(0));
+    }
+
+    #[test]
+    fn parse_maxlen_rejects_leading_minus() {
+        // QUtil::string_to_uint throws on a leading '-' rather than wrapping;
+        // this helper reports the rejection as None so the caller can fall
+        // back to usage() instead of matching qpdf's uncaught-exception abort.
+        assert_eq!(parse_maxlen(b"-5"), None);
+    }
+
+    #[test]
+    fn parse_maxlen_accepts_leading_plus() {
+        assert_eq!(parse_maxlen(b"+5"), Some(5));
+    }
+
+    #[test]
+    fn parse_maxlen_saturates_on_overflow() {
+        assert_eq!(
+            parse_maxlen(b"99999999999999999999999999"),
+            Some(usize::MAX)
+        );
     }
 }
