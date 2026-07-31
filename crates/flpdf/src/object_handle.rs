@@ -569,6 +569,19 @@ impl ObjectHandle {
         .unwrap_or_else(ObjectHandle::null)
     }
 
+    /// True if this handle's value is a dictionary that has `key`, distinct
+    /// from [`Self::get_key`] returning a null handle for `key` (which
+    /// cannot tell a missing key apart from one whose value is genuinely
+    /// null) — mirrors `QPDFObjectHandle::hasKey`
+    /// (`libqpdf/QPDFObjectHandle.cc:966-976`). `false` for a non-dictionary
+    /// handle. Never performs resolution itself.
+    pub fn has_key(&self, key: &[u8]) -> bool {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Dictionary(entries)) => entries.contains_key(key),
+            _ => false,
+        })
+    }
+
     /// Insert or overwrite `key` in this handle's dictionary with `value`,
     /// mutating the live value every other clone of this handle also
     /// observes — mirrors `QPDFObjectHandle::replaceKey`
@@ -2265,5 +2278,18 @@ mod mutation_tests {
         let copy = original.shallow_copy();
         assert!(!copy.ptr_eq(&original));
         assert_eq!(copy.as_integer(), Some(5));
+    }
+
+    #[test]
+    fn has_key_distinguishes_a_present_null_value_from_a_missing_key() {
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::null())]);
+        assert!(dict.has_key(b"A"));
+        assert!(!dict.has_key(b"Missing"));
+    }
+
+    #[test]
+    fn has_key_on_a_non_dictionary_handle_is_false() {
+        let scalar = ObjectHandle::integer(1);
+        assert!(!scalar.has_key(b"A"));
     }
 }
