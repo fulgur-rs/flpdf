@@ -106,9 +106,10 @@ This canonicalization rule does not apply to a bare `N G R` that is the
 entire body of an indirect object or an object-stream member: qpdf parses
 only the first integer there and emits an `expected endobj` diagnostic for
 the file-object case, never producing a reference value at that position
-(`top_level_no_reference`, pinned by `parser.rs:52-62`, `parser.rs:1067-1087`,
-and the reader tests at `reader.rs:3715-3740`). That existing behavior is
-unchanged by this design.
+(`top_level_no_reference`, implemented at `parser.rs:52-62`, pinned by the
+regression tests at `reader.rs:4192-4207`, the file-object case, and
+`reader.rs:4978-4999`, the object-stream-member case). That existing
+behavior is unchanged by this design.
 
 Streams retain distinct handles for:
 
@@ -200,7 +201,13 @@ subject to qpdf-compatible reader diagnostics.
 
 The table:
 
-- preserves `Free`, `Uncompressed`, and `Compressed` classifications;
+- preserves `Uncompressed` and `Compressed` classifications;
+- excludes free entries, including the object-0 free-list head: matching
+  qpdf's own `xref_table` (`insertFreeXrefEntry` records a free object only
+  in a separate `deleted_objects` set, never in `xref_table`, and
+  `getXRefTable()` returns `xref_table` directly — the same fact already
+  noted for `get_all_objects` above), so `test_xref`'s "free entry" output
+  arm is unreachable for any object this table itself enumerates;
 - preserves uncompressed byte offsets and object-stream number/index;
 - reflects incremental-update precedence across classic xref tables and xref
   streams;
@@ -345,7 +352,12 @@ the parser's source position.
 
 ### Helper differentials
 
-The exact qpdf 11.9.0 merged output and exit status are compared for:
+The exact qpdf 11.9.0 exit status is compared for every case below, along
+with output bytes: a merged-output comparison where cross-stream ordering
+matters, plus an independent stdout/stderr comparison for every case —
+`test_xref.cc`/`test_parsedoffset.cc` write usage errors and diagnostics
+specifically to `stderr`, a distinction a merged-only comparison cannot
+catch a port getting backwards. Cases:
 
 - upstream `minimal.pdf`;
 - upstream `digitally-signed.pdf`;
