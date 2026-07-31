@@ -2789,7 +2789,7 @@ fn decrypt_strings_in_object_value(
             }
             Ok(())
         }
-        ObjectValue::Stream { dict, .. } => decrypt_handle_strings_in_place(dict, cipher, 1),
+        ObjectValue::Stream { dict, .. } => decrypt_stream_dict_strings_in_place(dict, cipher, 1),
         ObjectValue::Null
         | ObjectValue::Boolean(_)
         | ObjectValue::Integer(_)
@@ -2844,7 +2844,35 @@ fn decrypt_handle_strings_in_place(
         return Ok(());
     }
     if let Some(dict) = handle.as_stream_dict() {
-        return decrypt_handle_strings_in_place(&dict, cipher, depth + 1);
+        return decrypt_stream_dict_strings_in_place(&dict, cipher, depth + 1);
+    }
+    Ok(())
+}
+
+// Walks a stream's own dictionary entries directly, at exactly the depth its
+// caller specifies, without charging its own extra inline level for the
+// dictionary handle itself first. Matches `decrypt_strings_in_value`'s
+// `Object::Stream(stream) => stream.dict.values_mut()` arm, which visits a
+// stream's dictionary entries at the *same* depth+1 the stream itself was
+// reached at -- the legacy walk never treats the stream's own dictionary
+// container as a nesting level in its own right, only its entries count.
+// Getting this wrong is real, not cosmetic: a document with native parsing
+// enabled but `/StmF /Identity` (so the legacy decryptor still runs, but
+// native-parsed handles need this same-depth accounting to match it) can
+// have a stream dictionary value nested exactly up to `MAX_INLINE_DEPTH`
+// levels that the legacy path accepts and decrypts -- charging one extra
+// level here would reject it, diverging `resolve_object_handle` from
+// `resolve_to_cache` on input the legacy engine already handles correctly.
+fn decrypt_stream_dict_strings_in_place(
+    dict: &ObjectHandle,
+    cipher: StringCipher<'_>,
+    depth: usize,
+) -> Result<()> {
+    let entries = dict
+        .as_dictionary()
+        .expect("a stream's own dictionary handle is always a direct Dictionary value");
+    for item in entries.values() {
+        decrypt_handle_strings_in_place(item, cipher, depth)?;
     }
     Ok(())
 }
@@ -4036,6 +4064,59 @@ mod tests {
 
         let err = decrypt_object_value_strings(object_ref, &mut value, &encryption)
             .expect_err("excess direct nesting must error, not overflow the stack");
+        assert!(
+            matches!(err, Error::Unsupported(ref m) if m.contains("inline object nesting exceeds maximum")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decrypt_object_value_strings_does_not_charge_the_stream_dictionary_container_its_own_inline_level(
+    ) {
+        // Codex Review on PR #603 (discussion_r3690827731): a stream's own
+        // dictionary handle must not be charged its own inline-nesting level
+        // before its entries are visited -- decrypt_strings_in_value's
+        // legacy Object::Stream arm visits stream.dict.values_mut() at the
+        // *same* depth+1 the stream itself was reached at, so a document the
+        // legacy path (resolve_to_cache) accepts must not be rejected here
+        // just because native parsing routes it through this walk instead.
+        // Pin the exact boundary both paths must agree on: a stream
+        // dictionary entry nested MAX_INLINE_DEPTH levels deep (accepted --
+        // matches decrypt_strings_in_value's own depth+1-at-entries
+        // accounting) versus MAX_INLINE_DEPTH+1 (rejected, one level over).
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
+
+        let nest = |extra_levels: usize| {
+            let mut handle = ObjectHandle::string(ciphertext.clone());
+            for _ in 0..extra_levels {
+                handle = ObjectHandle::array(vec![handle]);
+            }
+            handle
+        };
+
+        let mut accepted = ObjectValue::Stream {
+            dict: ObjectHandle::dictionary(vec![(
+                b"Deep".to_vec(),
+                nest(crate::object::MAX_INLINE_DEPTH - 1),
+            )]),
+            data: Vec::new(),
+        };
+        decrypt_object_value_strings(object_ref, &mut accepted, &encryption).expect(
+            "a stream dictionary entry nested exactly MAX_INLINE_DEPTH levels deep, matching \
+             the legacy decryptor's own boundary, must be accepted",
+        );
+
+        let mut rejected = ObjectValue::Stream {
+            dict: ObjectHandle::dictionary(vec![(
+                b"TooDeep".to_vec(),
+                nest(crate::object::MAX_INLINE_DEPTH),
+            )]),
+            data: Vec::new(),
+        };
+        let err = decrypt_object_value_strings(object_ref, &mut rejected, &encryption)
+            .expect_err("one level past the legacy decryptor's own boundary must still error");
         assert!(
             matches!(err, Error::Unsupported(ref m) if m.contains("inline object nesting exceeds maximum")),
             "got {err:?}"
