@@ -569,6 +569,38 @@ impl ObjectHandle {
         .unwrap_or_else(ObjectHandle::null)
     }
 
+    /// Insert or overwrite `key` in this handle's dictionary with `value`,
+    /// mutating the live value every other clone of this handle also
+    /// observes — mirrors `QPDFObjectHandle::replaceKey`
+    /// (`libqpdf/QPDFObjectHandle.cc:1199-1209`). A no-op on a
+    /// non-dictionary handle or an unresolved/missing/destroyed indirect
+    /// handle, matching qpdf's own `typeWarning`-and-ignore contract rather
+    /// than panicking. Unlike qpdf's `replaceKey`, this does not check that
+    /// `value` belongs to the same document (`checkOwnership`) — no caller
+    /// in this crate crosses document boundaries this way today. Never
+    /// performs resolution itself.
+    pub fn replace_key(&self, key: &[u8], value: ObjectHandle) {
+        self.with_value_mut(|v| {
+            if let Some(ObjectValue::Dictionary(entries)) = v {
+                entries.insert(key.to_vec(), value);
+            }
+        });
+    }
+
+    /// Remove `key` from this handle's dictionary if present, mutating the
+    /// live value every other clone of this handle also observes — mirrors
+    /// `QPDFObjectHandle::removeKey` (`libqpdf/QPDFObjectHandle.cc:1226-1234`).
+    /// A no-op if `key` is absent, this handle is not a dictionary, or the
+    /// indirect handle is unresolved/missing/destroyed. Never performs
+    /// resolution itself.
+    pub fn remove_key(&self, key: &[u8]) {
+        self.with_value_mut(|v| {
+            if let Some(ObjectValue::Dictionary(entries)) = v {
+                entries.remove(key);
+            }
+        });
+    }
+
     /// The stream's own dictionary handle if this handle's value — its own
     /// if direct, or its already-resolved value if indirect — is a stream,
     /// or `None` otherwise. This never performs resolution itself: an
@@ -735,7 +767,6 @@ impl ObjectHandle {
     // `Missing`/`Destroyed` (there is no live `ObjectValue::Null` slot to
     // hand out a `&mut` into — those states only *present* as null, they do
     // not store one).
-    #[allow(dead_code)] // wired up by replace_key/remove_key, added by a later task in the same stack
     fn with_value_mut<T>(&self, f: impl FnOnce(Option<&mut ObjectValue>) -> T) -> T {
         match &self.0 {
             Repr::Direct(slot) => f(Some(&mut slot.borrow_mut().value)),
@@ -2074,5 +2105,48 @@ mod mutation_tests {
     fn get_key_on_a_non_dictionary_handle_returns_a_direct_null_handle() {
         let scalar = ObjectHandle::integer(5);
         assert!(scalar.get_key(b"A").is_null());
+    }
+
+    #[test]
+    fn replace_key_mutates_the_live_dictionary_in_place() {
+        let dict = ObjectHandle::dictionary(vec![]);
+        let clone = dict.clone();
+        dict.replace_key(b"A", ObjectHandle::integer(9));
+        assert_eq!(clone.get_key(b"A").as_integer(), Some(9));
+    }
+
+    #[test]
+    fn replace_key_overwrites_an_existing_key() {
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
+        dict.replace_key(b"A", ObjectHandle::integer(2));
+        assert_eq!(dict.get_key(b"A").as_integer(), Some(2));
+    }
+
+    #[test]
+    fn replace_key_on_a_non_dictionary_handle_is_a_no_op() {
+        let scalar = ObjectHandle::integer(1);
+        scalar.replace_key(b"A", ObjectHandle::integer(2));
+        assert_eq!(scalar.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn remove_key_deletes_a_present_key() {
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
+        dict.remove_key(b"A");
+        assert!(dict.get_key(b"A").is_null());
+    }
+
+    #[test]
+    fn remove_key_on_a_missing_key_is_a_no_op() {
+        let dict = ObjectHandle::dictionary(vec![]);
+        dict.remove_key(b"Missing");
+        assert!(dict.get_key(b"Missing").is_null());
+    }
+
+    #[test]
+    fn remove_key_on_a_non_dictionary_handle_is_a_no_op() {
+        let scalar = ObjectHandle::integer(1);
+        scalar.remove_key(b"A");
+        assert_eq!(scalar.as_integer(), Some(1));
     }
 }
