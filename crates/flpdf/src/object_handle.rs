@@ -915,10 +915,29 @@ fn unparse_materialize_value(value: &ObjectValue) -> Object {
     }
 }
 
+// Stack-safety constants for `unparse_materialize`'s recursive walk,
+// mirroring `parser.rs`'s own `STACK_RED_ZONE`/`STACK_GROWTH_SIZE` values
+// (kept as separate local constants rather than imported cross-module,
+// since this slice's own scope is limited to this file). A tree built
+// directly through the public `ObjectHandle::array`/`dictionary` factories
+// carries no depth bound the way parsed input does (`parser::MAX_PARSE_DEPTH`
+// rejects a document too deep to parse before an `ObjectHandle` tree that
+// deep can even exist for it), so this walk needs the same stack-growth
+// protection the parser already relies on for its own recursion.
+const UNPARSE_STACK_RED_ZONE: usize = 32 * 1024;
+const UNPARSE_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
+// The sole recursion hub for `unparse_materialize_value`'s `Array`/
+// `Dictionary`/`Stream` arms (every nested descent goes through
+// `unparse_materialize_child`, which calls back into this function) --
+// wrapping recursion here, in one place, bounds every nesting path the same
+// way `parser::Parser::object`'s own single hub does for parsing.
 fn unparse_materialize(handle: &ObjectHandle) -> Object {
-    handle.with_value(|value| match value {
-        Some(value) => unparse_materialize_value(value),
-        None => Object::Null,
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        handle.with_value(|value| match value {
+            Some(value) => unparse_materialize_value(value),
+            None => Object::Null,
+        })
     })
 }
 
@@ -1692,6 +1711,44 @@ mod type_code_tests {
 #[cfg(test)]
 mod unparse_tests {
     use super::*;
+
+    #[test]
+    fn unparse_resolved_handles_deeply_nested_arrays_without_stack_overflow() {
+        // Codex Review on PR #603 (discussion_r3689896128) found that the
+        // recursive materialization walk backing unparse/unparse_resolved
+        // had no protection against a deeply nested tree's per-frame stack
+        // cost. Unlike a parsed document (already bounded by
+        // parser::MAX_PARSE_DEPTH before an ObjectHandle tree this deep can
+        // exist), the public ObjectHandle::array/dictionary factories place
+        // no depth limit on a tree a caller builds directly. Confirmed
+        // empirically (temporarily reverting the fix): this exact depth,
+        // called through this same public unparse_resolved() API, overflows
+        // the stack and aborts the process (SIGABRT) without stack-growth
+        // protection, and succeeds with it.
+        //
+        // This depth is deliberately not pushed higher: above roughly this
+        // range, ObjectHandle's own Drop glue (recursive, unrelated to this
+        // fix -- filed separately as a pre-existing issue predating this
+        // slice) becomes the limiting factor for a tree built this way,
+        // regardless of unparse_resolved's own stack-growth protection.
+        const DEPTH: usize = 4_000;
+        let mut handle = ObjectHandle::integer(1);
+        for _ in 0..DEPTH {
+            handle = ObjectHandle::array(vec![handle]);
+        }
+
+        let out = handle.unparse_resolved();
+
+        let mut expected = Vec::new();
+        for _ in 0..DEPTH {
+            expected.extend_from_slice(b"[ ");
+        }
+        expected.extend_from_slice(b"1");
+        for _ in 0..DEPTH {
+            expected.extend_from_slice(b" ]");
+        }
+        assert_eq!(out, expected);
+    }
 
     #[test]
     fn direct_scalar_unparses_like_object_write_pdf() {
