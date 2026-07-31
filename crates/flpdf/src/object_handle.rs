@@ -17,6 +17,13 @@ use std::rc::Rc;
 /// `libqpdf/qpdf/QPDFValue.hh:90-100,149-152`).
 pub(crate) const NO_PARSED_OFFSET: i64 = -1;
 
+/// The conflicts-tracking map [`ObjectHandle::merge_resources`] populates:
+/// `rtype -> old_key -> new_key`, mirroring
+/// `QPDFObjectHandle::mergeResources`'s own
+/// `std::map<std::string, std::map<std::string, std::string>>` parameter.
+pub type ResourceConflicts =
+    std::collections::BTreeMap<Vec<u8>, std::collections::BTreeMap<Vec<u8>, Vec<u8>>>;
+
 /// A shared, cloneable handle to a PDF object.
 ///
 /// Cloning a handle is O(1) and does not deep-copy the underlying value;
@@ -646,6 +653,85 @@ impl ObjectHandle {
         })
     }
 
+    /// Merge `other`'s top-level entries into this handle's dictionary,
+    /// mirroring `QPDFObjectHandle::mergeResources`
+    /// (`libqpdf/QPDFObjectHandle.cc:1063-1153`; intended for merging two
+    /// `/Resources`- or `/DR`-shaped dictionaries, per its own header doc,
+    /// `include/qpdf/QPDFObjectHandle.hh:820-829`). `conflicts`, if given,
+    /// records `rtype -> old_key -> new_key` for some (not all — see below)
+    /// inner keys `other` had that collided with an existing key under the
+    /// same top-level `rtype`.
+    ///
+    /// A no-op unless both `self` and `other` are dictionaries. For each of
+    /// `other`'s top-level entries `(rtype, other_val)`:
+    /// - if `self` has no `rtype` key yet, `other_val` is privatized via
+    ///   [`Self::shallow_copy`] and installed via [`Self::replace_key`].
+    /// - if `self`'s existing `rtype` value and `other_val` are both
+    ///   dictionaries: `self`'s value is privatized first if it is
+    ///   indirect (`shallow_copy` + `replace_key`, mirroring
+    ///   `replaceKeyAndGetNew`'s combined mutate-and-rebind). Then each of
+    ///   `other_val`'s own entries is merged in: a key the (now-private)
+    ///   sub-dictionary does not have yet is installed directly
+    ///   (privatized first unless already indirect); a key it already has
+    ///   is left untouched unless `conflicts` is given, in which case an
+    ///   incoming *indirect* value whose object identity already exists
+    ///   somewhere in the sub-dictionary (as of the first such conflict
+    ///   this call encounters — a snapshot taken once per `rtype`, not
+    ///   re-taken per key) is reused under its existing name (`conflicts`
+    ///   records this rename only when that existing name differs from the
+    ///   incoming key — no rename is recorded, and nothing is installed,
+    ///   when they already match); anything else is installed verbatim
+    ///   under a freshly minted unique name (`conflicts` always records
+    ///   this one).
+    /// - if `self`'s existing `rtype` value and `other_val` are both
+    ///   arrays: every scalar item in `other_val` whose
+    ///   [`Self::unparse`] text does not already match a scalar item
+    ///   already in `self`'s array is appended to it — a set union by
+    ///   unparsed text, not object identity.
+    /// - any other existing-`rtype` shape combination (mismatched types,
+    ///   or neither dictionary nor array) leaves that entry untouched.
+    ///
+    /// The uniqueness pool for a freshly minted name is
+    /// `this_val.getResourceNames()`'s own "second-level keys" definition
+    /// (`libqpdf/QPDFObjectHandle.cc:1156-1170`) applied to the *inner*
+    /// sub-dictionary itself, not to `self` as a whole — i.e. the keys of
+    /// whichever of the sub-dictionary's *own* values are themselves
+    /// dictionaries, not the sub-dictionary's own key set. This looks like
+    /// it checks the wrong level (it does not, in general, collect the
+    /// F1/F2-style names actually in scope), but it is qpdf's real,
+    /// verified behavior, not a paraphrase — port it exactly rather than
+    /// the more "sensible"-looking alternative of the sub-dictionary's own
+    /// keys.
+    pub fn merge_resources(
+        &self,
+        other: &ObjectHandle,
+        mut conflicts: Option<&mut ResourceConflicts>,
+    ) {
+        let (Some(_), Some(other_entries)) = (self.as_dictionary(), other.as_dictionary()) else {
+            return;
+        };
+        for (rtype, other_val) in other_entries {
+            if !self.has_key(&rtype) {
+                self.replace_key(&rtype, other_val.shallow_copy());
+                continue;
+            }
+            let mut this_val = self.get_key(&rtype);
+            if this_val.as_dictionary().is_some() && other_val.as_dictionary().is_some() {
+                if this_val.is_indirect() {
+                    let privatized = this_val.shallow_copy();
+                    self.replace_key(&rtype, privatized.clone());
+                    this_val = privatized;
+                }
+                merge_resource_subdict(&this_val, &other_val, &rtype, conflicts.as_deref_mut());
+            } else if this_val.as_array().is_some() && other_val.as_array().is_some() {
+                merge_resource_array(&this_val, &other_val);
+            }
+            // Any other shape combination for an existing rtype: untouched,
+            // matching qpdf's own fallthrough (neither the dictionary nor
+            // the array arm matches, and there is no further branch).
+        }
+    }
+
     /// The stream's own dictionary handle if this handle's value — its own
     /// if direct, or its already-resolved value if indirect — is a stream,
     /// or `None` otherwise. This never performs resolution itself: an
@@ -1093,6 +1179,173 @@ fn shallow_copy_child(child: &ObjectHandle) -> ObjectHandle {
     } else {
         child.shallow_copy()
     }
+}
+
+// `ObjectHandle::merge_resources`'s per-rtype dictionary merge (the
+// `this_val.isDictionary() && other_val.isDictionary()` arm of
+// `QPDFObjectHandle::mergeResources`, `libqpdf/QPDFObjectHandle.cc:1095-1129`).
+// `this_val` is already the privatized (non-indirect) sub-dictionary by the
+// time this is called.
+fn merge_resource_subdict(
+    this_val: &ObjectHandle,
+    other_val: &ObjectHandle,
+    rtype: &[u8],
+    mut conflicts: Option<&mut ResourceConflicts>,
+) {
+    let mut og_to_name: Option<std::collections::HashMap<ObjectRef, Vec<u8>>> = None;
+    let mut rnames: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    let mut min_suffix: usize = 1;
+    let Some(other_sub_entries) = other_val.as_dictionary() else {
+        return; // cov:ignore: caller already confirmed other_val.as_dictionary().is_some()
+    };
+    for (key, rval) in other_sub_entries {
+        if !this_val.has_key(&key) {
+            let installed = if rval.is_indirect() {
+                rval
+            } else {
+                rval.shallow_copy()
+            };
+            this_val.replace_key(&key, installed);
+            continue;
+        }
+        let Some(conflicts_map) = conflicts.as_deref_mut() else {
+            continue;
+        };
+        if og_to_name.is_none() {
+            og_to_name = Some(build_og_to_name(this_val));
+            rnames = get_resource_names(this_val);
+        }
+        let reused = rval
+            .object_ref()
+            .and_then(|r| og_to_name.as_ref().and_then(|m| m.get(&r).cloned()));
+        if let Some(existing_key) = reused {
+            if existing_key != key {
+                conflicts_map
+                    .entry(rtype.to_vec())
+                    .or_default()
+                    .insert(key, existing_key);
+            }
+        } else {
+            let new_key = unique_resource_name(&key, &mut min_suffix, &rnames);
+            conflicts_map
+                .entry(rtype.to_vec())
+                .or_default()
+                .insert(key, new_key.clone());
+            this_val.replace_key(&new_key, rval);
+        }
+    }
+}
+
+// `ObjectHandle::merge_resources`'s per-rtype array merge (the
+// `this_val.isArray() && other_val.isArray()` arm,
+// `libqpdf/QPDFObjectHandle.cc:1130-1146`): union `other_val`'s scalar
+// items into `this_val` by unparsed text, appending only what is not
+// already present.
+fn merge_resource_array(this_val: &ObjectHandle, other_val: &ObjectHandle) {
+    let Some(other_items) = other_val.as_array() else {
+        return; // cov:ignore: caller already confirmed other_val.as_array().is_some()
+    };
+    let mut scalars: std::collections::BTreeSet<Vec<u8>> = this_val
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(is_scalar)
+        .map(|item| item.unparse())
+        .collect();
+    for item in other_items {
+        if !is_scalar(&item) {
+            continue;
+        }
+        let text = item.unparse();
+        if scalars.insert(text) {
+            append_array_item(this_val, item);
+        }
+    }
+}
+
+fn append_array_item(handle: &ObjectHandle, item: ObjectHandle) {
+    handle.with_value_mut(|v| {
+        if let Some(ObjectValue::Array(items)) = v {
+            items.push(item);
+        }
+    });
+}
+
+// Mirrors `isScalar()` (`libqpdf/QPDFObjectHandle.cc:450-453`): bool,
+// integer, name, null, real, or string. Checks only already-resolved/
+// direct state, matching every other accessor in this file's "no hidden
+// I/O" rule.
+fn is_scalar(handle: &ObjectHandle) -> bool {
+    handle.as_boolean().is_some()
+        || handle.as_integer().is_some()
+        || handle.as_name().is_some()
+        || handle.is_null()
+        || handle.as_real().is_some()
+        || handle.as_string().is_some()
+}
+
+// Mirrors `mergeResources`'s local `make_og_to_name` lambda
+// (`libqpdf/QPDFObjectHandle.cc:1071-1078`): every currently-indirect
+// entry in `dict`, keyed by object identity.
+fn build_og_to_name(dict: &ObjectHandle) -> std::collections::HashMap<ObjectRef, Vec<u8>> {
+    let mut map = std::collections::HashMap::new();
+    if let Some(entries) = dict.as_dictionary() {
+        for (key, value) in entries {
+            if let Some(object_ref) = value.object_ref() {
+                map.insert(object_ref, key);
+            }
+        }
+    }
+    map
+}
+
+// Mirrors `getResourceNames` (`libqpdf/QPDFObjectHandle.cc:1156-1170`,
+// `include/qpdf/QPDFObjectHandle.hh:831-835`): the union of every key
+// belonging to a dictionary-valued entry of `dict` -- i.e. `dict`'s own
+// *grandchildren's* keys, not `dict`'s own keys. See `merge_resources`'s
+// own doc comment for why this is the correct level to port here despite
+// looking mismatched against its call site.
+fn get_resource_names(dict: &ObjectHandle) -> std::collections::BTreeSet<Vec<u8>> {
+    let mut result = std::collections::BTreeSet::new();
+    if let Some(entries) = dict.as_dictionary() {
+        for (_, value) in entries {
+            if let Some(sub_entries) = value.as_dictionary() {
+                result.extend(sub_entries.into_keys());
+            }
+        }
+    }
+    result
+}
+
+// Mirrors `getUniqueResourceName` (`libqpdf/QPDFObjectHandle.cc:1175-1192`):
+// append a decimal suffix (starting at `*min_suffix`) to `key` + `"_"`
+// until the result is absent from `names`, leaving `*min_suffix` at the
+// value just used (not incremented past it -- a caller minting several
+// names in the same sub-dictionary reuses the search position, matching
+// qpdf's own "used, not next" contract).
+fn unique_resource_name(
+    key: &[u8],
+    min_suffix: &mut usize,
+    names: &std::collections::BTreeSet<Vec<u8>>,
+) -> Vec<u8> {
+    let mut prefix = key.to_vec();
+    prefix.push(b'_');
+    let max_suffix = *min_suffix + names.len();
+    while *min_suffix <= max_suffix {
+        let mut candidate = prefix.clone();
+        candidate.extend(min_suffix.to_string().into_bytes());
+        if !names.contains(&candidate) {
+            return candidate;
+        }
+        *min_suffix += 1;
+    }
+    // Unreachable per qpdf's own invariant: this loop tests strictly more
+    // candidates (names.len() + 1) than there are names to conflict with,
+    // so by pigeonhole one must be free. qpdf itself treats reaching this
+    // point as a coding error (throws std::logic_error); this crate has no
+    // exception channel to mirror that with, so panic the same way an
+    // internal invariant violation elsewhere in this crate would.
+    unreachable!("no unconflicting resource name found") // cov:ignore: unreachable, see comment above
 }
 
 // True if `handle`'s value is already known (no resolution performed here)
@@ -2152,9 +2405,7 @@ mod mutation_tests {
     #[test]
     fn object_value_clone_of_a_dictionary_shares_child_identity() {
         let child = ObjectHandle::integer(7);
-        let dict = ObjectValue::Dictionary(
-            [(b"K".to_vec(), child.clone())].into_iter().collect(),
-        );
+        let dict = ObjectValue::Dictionary([(b"K".to_vec(), child.clone())].into_iter().collect());
         let cloned = dict.clone();
         let ObjectValue::Dictionary(entries) = cloned else {
             panic!("expected dictionary");
@@ -2291,5 +2542,169 @@ mod mutation_tests {
     fn has_key_on_a_non_dictionary_handle_is_false() {
         let scalar = ObjectHandle::integer(1);
         assert!(!scalar.has_key(b"A"));
+    }
+
+    #[test]
+    fn merge_resources_is_a_no_op_unless_both_sides_are_dictionaries() {
+        let scalar = ObjectHandle::integer(1);
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
+        scalar.merge_resources(&dict, None);
+        dict.merge_resources(&scalar, None);
+        assert_eq!(dict.get_key(b"A").as_integer(), Some(1));
+        assert!(dict.get_key(b"B").is_null());
+    }
+
+    #[test]
+    fn merge_resources_installs_a_private_copy_of_a_top_level_key_self_lacks() {
+        let source_sub = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(1))]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), source_sub.clone())]);
+        let dest = ObjectHandle::dictionary(vec![]);
+        dest.merge_resources(&other, None);
+        let installed = dest.get_key(b"Font");
+        assert_eq!(installed.get_key(b"F1").as_integer(), Some(1));
+        assert!(!installed.ptr_eq(&source_sub)); // privatized, not shared
+    }
+
+    #[test]
+    fn merge_resources_adds_a_new_inner_key_without_a_conflicts_map() {
+        let this_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(1))]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        let other_font = ObjectHandle::dictionary(vec![(b"F2".to_vec(), ObjectHandle::integer(2))]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        dest.merge_resources(&other, None);
+        let font = dest.get_key(b"Font");
+        assert_eq!(font.get_key(b"F1").as_integer(), Some(1));
+        assert_eq!(font.get_key(b"F2").as_integer(), Some(2));
+    }
+
+    #[test]
+    fn merge_resources_leaves_a_colliding_inner_key_untouched_without_a_conflicts_map() {
+        let this_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(1))]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        let other_font =
+            ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(99))]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        dest.merge_resources(&other, None);
+        assert_eq!(dest.get_key(b"Font").get_key(b"F1").as_integer(), Some(1));
+    }
+
+    #[test]
+    fn merge_resources_reuses_an_existing_key_for_the_same_indirect_object() {
+        let shared = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1);
+        shared.set_resolved(ObjectValue::Name(b"Shared".to_vec()));
+        let this_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        // dest already has F1 -> shared. other also wants F1, but pointing at
+        // the same shared object identity -- reuse F1 verbatim, no conflict
+        // entry (existing_key == key), no new key minted.
+        let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        let mut conflicts = std::collections::BTreeMap::new();
+        dest.merge_resources(&other, Some(&mut conflicts));
+        assert!(conflicts.is_empty());
+        assert!(dest.get_key(b"Font").get_key(b"F1").ptr_eq(&shared));
+    }
+
+    #[test]
+    fn merge_resources_reuse_records_a_conflict_when_the_reused_name_differs() {
+        let shared = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1);
+        shared.set_resolved(ObjectValue::Name(b"Shared".to_vec()));
+        // dest already has this same shared object, but under a DIFFERENT
+        // key (F2) than what other asks for (F1) -- reuse F2, and DO record
+        // the rename since the reused name differs from the requested one.
+        let this_font = ObjectHandle::dictionary(vec![
+            (b"F2".to_vec(), shared.clone()),
+            (b"F1".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        let mut conflicts = std::collections::BTreeMap::new();
+        dest.merge_resources(&other, Some(&mut conflicts));
+        assert_eq!(
+            conflicts
+                .get(b"Font".as_slice())
+                .unwrap()
+                .get(b"F1".as_slice()),
+            Some(&b"F2".to_vec())
+        );
+        // F1 keeps its own original (unrelated) value; nothing overwrote it.
+        assert_eq!(dest.get_key(b"Font").get_key(b"F1").as_integer(), Some(1));
+    }
+
+    #[test]
+    fn merge_resources_mints_a_fresh_name_for_a_genuine_conflict() {
+        let this_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(1))]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        let mut conflicts = std::collections::BTreeMap::new();
+        dest.merge_resources(&other, Some(&mut conflicts));
+        let new_name = conflicts
+            .get(b"Font".as_slice())
+            .and_then(|m| m.get(b"F1".as_slice()))
+            .expect("F1 conflict recorded");
+        assert_eq!(new_name, b"F1_1");
+        assert_eq!(dest.get_key(b"Font").get_key(b"F1").as_integer(), Some(1));
+        assert_eq!(
+            dest.get_key(b"Font").get_key(new_name).as_integer(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn merge_resources_privatizes_an_indirect_existing_sub_dictionary() {
+        let indirect_font = ObjectHandle::new_indirect_unresolved(ObjectRef::new(3, 0), -1);
+        indirect_font.set_resolved(ObjectValue::Dictionary(
+            [(b"F1".to_vec(), ObjectHandle::integer(1))]
+                .into_iter()
+                .collect(),
+        ));
+        let shared_dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), indirect_font.clone())]);
+        let another_holder =
+            ObjectHandle::dictionary(vec![(b"Font".to_vec(), indirect_font.clone())]);
+        let other_font = ObjectHandle::dictionary(vec![(b"F2".to_vec(), ObjectHandle::integer(2))]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        shared_dest.merge_resources(&other, None);
+        // shared_dest's own /Font is now a private direct copy...
+        assert!(shared_dest.get_key(b"Font").is_direct());
+        assert_eq!(
+            shared_dest.get_key(b"Font").get_key(b"F2").as_integer(),
+            Some(2)
+        );
+        // ...and the other holder's /Font (and the original indirect object)
+        // is untouched.
+        assert!(another_holder.get_key(b"Font").ptr_eq(&indirect_font));
+        assert!(indirect_font.get_key(b"F2").is_null());
+    }
+
+    #[test]
+    fn merge_resources_unions_scalar_array_items_by_unparsed_text() {
+        let dest = ObjectHandle::dictionary(vec![(
+            b"ProcSet".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
+        )]);
+        let other = ObjectHandle::dictionary(vec![(
+            b"ProcSet".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"PDF".to_vec()),
+                ObjectHandle::name(b"Text".to_vec()),
+            ]),
+        )]);
+        dest.merge_resources(&other, None);
+        let items = dest.get_key(b"ProcSet").as_array().unwrap();
+        let names: Vec<_> = items.iter().map(|i| i.as_name().unwrap()).collect();
+        assert_eq!(names, vec![b"PDF".to_vec(), b"Text".to_vec()]);
+    }
+
+    #[test]
+    fn merge_resources_leaves_mismatched_or_non_container_rtype_shapes_untouched() {
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), ObjectHandle::integer(1))]);
+        let other = ObjectHandle::dictionary(vec![(
+            b"Font".to_vec(),
+            ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]),
+        )]);
+        dest.merge_resources(&other, None);
+        assert_eq!(dest.get_key(b"Font").as_integer(), Some(1));
     }
 }
