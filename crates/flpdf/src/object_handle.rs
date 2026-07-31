@@ -323,9 +323,10 @@ impl ObjectHandle {
     }
 
     /// True if this handle's value is known without performing resolution: a
-    /// direct handle always is; an indirect handle is once it has been
-    /// resolved, whether that landed on a real value or on a reference that
-    /// turned out to be missing from the source.
+    /// direct handle always is; an indirect handle is once it has left its
+    /// initial state, whether that landed on a real value, on a reference
+    /// that turned out to be missing from the source, or on a value severed
+    /// because its owning document was dropped.
     pub fn is_resolved(&self) -> bool {
         match &self.0 {
             Repr::Direct(_) => true,
