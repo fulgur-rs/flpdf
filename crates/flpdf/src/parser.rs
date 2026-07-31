@@ -287,7 +287,7 @@ enum ParserMode {
 // the qpdf CVE-2018-9918 class of denial of service. 500 matches the region of
 // qpdf's `parser_max_nesting` (default 499); real documents never nest this
 // deep, so only adversarial input is rejected.
-const MAX_PARSE_DEPTH: usize = 500;
+pub(crate) const MAX_PARSE_DEPTH: usize = 500;
 
 impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
     pub(crate) fn with_tokenizer(tokenizer: &'tokenizer mut Tokenizer<'input>) -> Self {

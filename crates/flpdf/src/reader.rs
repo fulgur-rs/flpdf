@@ -1564,10 +1564,10 @@ impl<R: Read + Seek> Pdf<R> {
     /// failing.
     ///
     /// This method never fails on a plain nesting/malformed-layout case
-    /// alone; the one narrow exception is a malformed/overlapping xref
-    /// layout combined with inline nesting beyond `MAX_INLINE_DEPTH`,
-    /// sharing the same bound already applied unconditionally to compressed
-    /// (ObjStm-member) references.
+    /// alone: it lifts the already-resolved cached value against the
+    /// parser's own nesting bound, not the tighter bound other structural
+    /// walkers in this crate use, so it never rejects a value
+    /// [`Pdf::resolve`]/[`Pdf::resolve_borrowed`] would have accepted.
     ///
     /// # Errors
     ///
@@ -1643,16 +1643,33 @@ impl<R: Read + Seek> Pdf<R> {
         // stream that was merely decrypted without an explicit crypt filter,
         // whose dictionary was not actually rewritten, since
         // `transformed_stream_refs` does not distinguish the two cases).
+        //
+        // Both arms below lift against `parser::MAX_PARSE_DEPTH`, not
+        // `lift`'s default `MAX_INLINE_DEPTH`: `object` already parsed
+        // successfully at that looser bound (via `resolve_to_cache` above),
+        // so re-lifting it through the tighter structural-walker bound would
+        // reject a value `resolve_borrowed`/`resolve` always accepted,
+        // breaking this function's own "never fails where `resolve_borrowed`/
+        // `resolve` already succeeded" guarantee for any Compressed
+        // (ObjStm-member) object — or, more rarely, an Uncompressed one whose
+        // fast native-parse window failed for an unrelated reason — with
+        // literal nesting between the two bounds.
         let (value, parsed_offset) = match self.source_xref_entries.get(&object_ref).copied() {
             Some(XrefEntry::Uncompressed { offset })
                 if !self.transformed_stream_refs.contains(&object_ref) =>
             {
                 match self.native_parse_uncompressed_value(offset, &object) {
                     Ok(native) => native,
-                    Err(_) => (self.lift(&object, 0)?, NO_PARSED_OFFSET),
+                    Err(_) => (
+                        self.lift_bounded(&object, 0, crate::parser::MAX_PARSE_DEPTH)?,
+                        NO_PARSED_OFFSET,
+                    ),
                 }
             }
-            _ => (self.lift(&object, 0)?, NO_PARSED_OFFSET),
+            _ => (
+                self.lift_bounded(&object, 0, crate::parser::MAX_PARSE_DEPTH)?,
+                NO_PARSED_OFFSET,
+            ),
         };
         handle.set_resolved(value);
         handle.set_parsed_offset_if_unset(parsed_offset);
@@ -1791,10 +1808,27 @@ impl<R: Read + Seek> Pdf<R> {
     // others) — this is a separate, tighter bound than the parser's own
     // `MAX_PARSE_DEPTH`.
     fn lift(&mut self, object: &Object, depth: usize) -> Result<ObjectValue> {
-        if depth > crate::object::MAX_INLINE_DEPTH {
+        self.lift_bounded(object, depth, crate::object::MAX_INLINE_DEPTH)
+    }
+
+    // Same as `lift`, but against a caller-chosen `max_depth` instead of the
+    // fixed `MAX_INLINE_DEPTH`. `resolve_object_handle`'s Compressed-member
+    // (ObjStm) fallback is the only caller that needs this: `object` there
+    // already parsed successfully up to the parser's own `MAX_PARSE_DEPTH`
+    // (via `resolve_to_cache`), so re-lifting it through the tighter
+    // structural-walker bound would reject a value `resolve_borrowed` always
+    // accepted, breaking the "never fails where `resolve_borrowed`/`resolve`
+    // already succeeded" invariant documented at that call site. Every other
+    // caller keeps going through `lift` (i.e. `MAX_INLINE_DEPTH`) unchanged.
+    fn lift_bounded(
+        &mut self,
+        object: &Object,
+        depth: usize,
+        max_depth: usize,
+    ) -> Result<ObjectValue> {
+        if depth > max_depth {
             return Err(Error::Unsupported(format!(
-                "object handle lift: inline object nesting exceeds maximum of {}",
-                crate::object::MAX_INLINE_DEPTH
+                "object handle lift: inline object nesting exceeds maximum of {max_depth}"
             )));
         }
         let value = match object {
@@ -1811,10 +1845,12 @@ impl<R: Read + Seek> Pdf<R> {
             Object::Array(items) => ObjectValue::Array(
                 items
                     .iter()
-                    .map(|item| self.lift_to_handle(item, depth + 1))
+                    .map(|item| self.lift_to_handle_bounded(item, depth + 1, max_depth))
                     .collect::<Result<Vec<_>>>()?,
             ),
-            Object::Dictionary(dict) => ObjectValue::Dictionary(self.lift_dictionary(dict, depth)?),
+            Object::Dictionary(dict) => {
+                ObjectValue::Dictionary(self.lift_dictionary_bounded(dict, depth, max_depth)?)
+            }
             // A stream's own dictionary is lifted the same way any other
             // nested dictionary is (see `lift_dictionary`), then wrapped in
             // its own fresh handle: this arm mints a new dictionary handle
@@ -1826,7 +1862,7 @@ impl<R: Read + Seek> Pdf<R> {
             // is not lost on a plain round trip.
             Object::Stream(stream) => ObjectValue::Stream {
                 dict: ObjectHandle::from_value(ObjectValue::Dictionary(
-                    self.lift_dictionary(&stream.dict, depth)?,
+                    self.lift_dictionary_bounded(&stream.dict, depth, max_depth)?,
                 )),
                 data: stream.data.clone(),
             },
@@ -1855,23 +1891,45 @@ impl<R: Read + Seek> Pdf<R> {
         dict: &Dictionary,
         depth: usize,
     ) -> Result<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> {
+        self.lift_dictionary_bounded(dict, depth, crate::object::MAX_INLINE_DEPTH)
+    }
+
+    // Same as `lift_dictionary`, but threading a caller-chosen `max_depth`
+    // through to every entry — see `lift_bounded`.
+    fn lift_dictionary_bounded(
+        &mut self,
+        dict: &Dictionary,
+        depth: usize,
+        max_depth: usize,
+    ) -> Result<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> {
         dict.iter()
-            .map(|(k, v)| Ok((k.to_vec(), self.lift_to_handle(v, depth + 1)?)))
+            .map(|(k, v)| {
+                Ok((
+                    k.to_vec(),
+                    self.lift_to_handle_bounded(v, depth + 1, max_depth)?,
+                ))
+            })
             .collect()
     }
 
-    /// Lift a child `Object` (array element or dictionary value) to a handle.
-    ///
-    /// An `Object::Reference` becomes the canonical indirect handle for that
-    /// reference (via [`Pdf::get_object_handle`]), preserving identity with
-    /// any other handle already registered for the same object — it is left
-    /// unresolved, not eagerly followed. Any other value is lifted directly
-    /// and wrapped in a fresh direct handle.
-    fn lift_to_handle(&mut self, object: &Object, depth: usize) -> Result<ObjectHandle> {
+    // Lift a child `Object` (array element or dictionary value) to a handle.
+    //
+    // An `Object::Reference` becomes the canonical indirect handle for that
+    // reference (via `Pdf::get_object_handle`), preserving identity with any
+    // other handle already registered for the same object — it is left
+    // unresolved, not eagerly followed. Any other value is lifted directly
+    // and wrapped in a fresh direct handle. `max_depth` bounds inline nesting
+    // the same way `lift_bounded` does — see its own comment.
+    fn lift_to_handle_bounded(
+        &mut self,
+        object: &Object,
+        depth: usize,
+        max_depth: usize,
+    ) -> Result<ObjectHandle> {
         match object {
             Object::Reference(object_ref) => Ok(self.get_object_handle(*object_ref)),
             direct => {
-                let value = self.lift(direct, depth)?;
+                let value = self.lift_bounded(direct, depth, max_depth)?;
                 Ok(ObjectHandle::from_value(value))
             }
         }
@@ -5450,16 +5508,16 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_compressed_member_still_rejects_inline_nesting_past_max_inline_depth()
-    {
+    fn resolve_object_handle_compressed_member_accepts_inline_nesting_past_max_inline_depth() {
         // Nesting between MAX_INLINE_DEPTH (256) and MAX_PARSE_DEPTH (500) is
-        // accepted by the parser but must still be rejected by `lift`'s own
-        // depth guard, mirroring every other post-parse structural walker
-        // over an `Object` tree in this crate (e.g. subset_prune.rs's
-        // `walk_refs`). This guard remains live exactly for the Compressed
-        // (ObjStm-member) case: this task deliberately leaves it on the
-        // `lift` bridge (see `resolve_object_handle_uncompressed_now_accepts_the_same_nesting_depth_via_native_parse`
-        // for why the Uncompressed case no longer hits this bound).
+        // accepted by the parser that already produced this compressed
+        // member's cached `Object` (via `resolve_to_cache`/
+        // `parse_object_stream_chain_entry`). `resolve_object_handle` must
+        // lift it at that same looser bound rather than `lift`'s default
+        // `MAX_INLINE_DEPTH`, or a value `resolve_borrowed` always accepted
+        // at this depth would spuriously fail here — see the comment on
+        // `resolve_object_handle`'s call to `lift_bounded` for the
+        // regression this pins.
         let depth = crate::object::MAX_INLINE_DEPTH + 5;
         let mut member_value = Vec::new();
         member_value.extend(std::iter::repeat_n(b'[', depth));
@@ -5501,10 +5559,70 @@ mod tests {
         );
 
         let handle = pdf.get_object_handle(ObjectRef::new(7, 0));
+        pdf.resolve_object_handle(&handle)
+            .expect("nesting between MAX_INLINE_DEPTH and MAX_PARSE_DEPTH must now succeed");
+
+        let legacy = pdf
+            .resolve(ObjectRef::new(7, 0))
+            .expect("resolve_borrowed must also accept it");
+        assert!(legacy.as_array().is_some());
+        assert!(handle.as_array().is_some());
+    }
+
+    #[test]
+    fn resolve_object_handle_compressed_member_still_rejects_nesting_past_max_parse_depth() {
+        // Unlike the MAX_INLINE_DEPTH/MAX_PARSE_DEPTH gap above, nesting past
+        // MAX_PARSE_DEPTH itself is genuinely unparseable — the underlying
+        // `parse_object_stream_chain_entry` call inside `resolve_to_cache`
+        // already rejects it before `resolve_object_handle` ever reaches the
+        // `lift_bounded` call, so `MAX_PARSE_DEPTH` remains a real ceiling
+        // for the Compressed (ObjStm-member) case too, not just for
+        // Uncompressed objects.
+        let depth = crate::parser::MAX_PARSE_DEPTH + 5;
+        let mut member_value = Vec::new();
+        member_value.extend(std::iter::repeat_n(b'[', depth));
+        member_value.push(b'1');
+        member_value.extend(std::iter::repeat_n(b']', depth));
+
+        let header = b"7 0 ".to_vec();
+        let first = header.len();
+        let mut objstm_body = header;
+        objstm_body.extend_from_slice(&member_value);
+        let stream_object = format!(
+            "4 0 obj\n<< /Type /ObjStm /N 1 /First {first} /Length {} >>\nstream\n",
+            objstm_body.len()
+        )
+        .into_bytes();
+        let mut body = stream_object;
+        body.extend_from_slice(&objstm_body);
+        body.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n", &body],
+            ObjectRef::new(1, 0),
+        );
+        let objstm_offset = bytes
+            .windows(b"4 0 obj".len())
+            .position(|window| window == b"4 0 obj")
+            .unwrap() as u64;
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open over-deeply-nested ObjStm fixture");
+        pdf.cache
+            .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
+        pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
+        pdf.source_xref_entries.insert(
+            ObjectRef::new(7, 0),
+            XrefEntry::Compressed {
+                stream: 4,
+                index: 0,
+            },
+        );
+
+        let handle = pdf.get_object_handle(ObjectRef::new(7, 0));
         let err = pdf
             .resolve_object_handle(&handle)
-            .expect_err("a compressed member's nesting beyond MAX_INLINE_DEPTH must be rejected");
-        assert!(matches!(err, Error::Unsupported(_)));
+            .expect_err("a compressed member's nesting beyond MAX_PARSE_DEPTH must be rejected");
+        assert!(matches!(err, Error::Parse { .. }));
     }
 
     #[test]
@@ -5517,9 +5635,13 @@ mod tests {
         // MAX_PARSE_DEPTH (matching `object`/`object_inner` exactly, see
         // `Parser::object_handle`) — so it now succeeds, matching what
         // `resolve_borrowed` (which was never subject to MAX_INLINE_DEPTH)
-        // already accepted at this depth. This is an intentional behavior
-        // change, not a weakened test: the assertion below pins parity with
-        // `resolve_borrowed`, not just "no longer errors".
+        // already accepted at this depth. The Compressed case now also
+        // accepts this depth (see
+        // `resolve_object_handle_compressed_member_accepts_inline_nesting_past_max_inline_depth`),
+        // via `lift_bounded` rather than native parse. This is an
+        // intentional behavior change, not a weakened test: the assertion
+        // below pins parity with `resolve_borrowed`, not just "no longer
+        // errors".
         let depth = crate::object::MAX_INLINE_DEPTH + 5;
         let mut body = b"1 0 obj\n".to_vec();
         body.extend(std::iter::repeat_n(b'[', depth));
