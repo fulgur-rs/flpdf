@@ -6,6 +6,7 @@
 /// PDFDocEncoding lookup table per ISO 32000-1 Annex D.3.
 const PDFDOC_ENCODING: [Option<char>; 256] = build_pdfdoc_table();
 
+// cov:ignore-start: const evaluation builds the lookup table before runtime; its assignments cannot execute under llvm-cov
 const fn build_pdfdoc_table() -> [Option<char>; 256] {
     let mut table: [Option<char>; 256] = [None; 256];
     table[0x08] = Some('\u{0008}');
@@ -69,6 +70,7 @@ const fn build_pdfdoc_table() -> [Option<char>; 256] {
     }
     table
 }
+// cov:ignore-end
 
 /// Return qpdf's UTF-8 view of one stored PDF string.
 pub fn utf8_value(bytes: &[u8]) -> Vec<u8> {
@@ -257,7 +259,10 @@ pub(crate) fn lossy_utf16_to_utf8(bytes: &[u8], is_le: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{new_unicode_string, normalized_utf8_value, unparse_binary, utf8_value};
+    use super::{
+        decode_pdf_text_string, new_unicode_string, normalized_utf8_value, unparse_binary,
+        utf8_value,
+    };
 
     #[test]
     fn utf8_value_decodes_pdf_string_encodings() {
@@ -337,5 +342,20 @@ mod tests {
     #[test]
     fn unparse_binary_uses_lowercase_hex() {
         assert_eq!(unparse_binary(b"A\n\x80"), b"<410a80>");
+    }
+
+    #[test]
+    fn decode_pdf_text_string_handles_utf16_endianness_and_malformed_lengths() {
+        assert_eq!(
+            decode_pdf_text_string(&[0xfe, 0xff, 0x00, b'A']),
+            Some("A".into())
+        );
+        assert_eq!(
+            decode_pdf_text_string(&[0xff, 0xfe, b'A', 0x00]),
+            Some("A".into())
+        );
+        assert_eq!(decode_pdf_text_string(&[0xfe, 0xff, 0x00]), None);
+        assert_eq!(decode_pdf_text_string(&[0xff, 0xfe, 0x00]), None);
+        assert_eq!(decode_pdf_text_string(&[0xfe, 0xff, 0xd8, 0x00]), None);
     }
 }
