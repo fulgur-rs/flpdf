@@ -4,7 +4,7 @@
 
 **Goal:** Port qpdf 11.9.0 `test_pdf_doc_encoding` and `test_pdf_unicode` to Rust, wire their historical command names into flpdf-qtest, and make all three owned `character-encoding.test` invocations execute the Rust production path.
 
-**Architecture:** The `flpdf` crate keeps one canonical implementation of qpdf PDF-string decoding, Unicode-string construction, and forced-binary unparsing. A feature-gated `qtest_string` adapter exposes only those operations to two dedicated `flpdf-qtest-tools` binaries. A pinned-qpdf differential script proves the helper boundary, while a separate flpdf-qtest branch owns PATH shims, release-build resolution, ledger transitions, and the before/after full survey.
+**Architecture:** The `flpdf` crate keeps one canonical `pdf_string` implementation of qpdf PDF-string decoding, Unicode-string construction, and forced-binary unparsing. A private `qtest_string` adapter in `flpdf-qtest-tools` exposes only those operations to two dedicated binaries. A pinned-qpdf differential script proves the helper boundary, while a separate flpdf-qtest branch owns PATH shims, release-build resolution, ledger transitions, and the before/after full survey.
 
 **Tech Stack:** Rust 2021, `flpdf`, `flpdf-qtest-tools`, Bash, Python 3 `unittest`, Cargo, CMake, pinned qpdf 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d`.
 
@@ -13,7 +13,7 @@
 - qpdf 11.9.0 source and observed output are authoritative.
 - Own exactly the three helper invocations in `character-encoding.test`; the fourth `qpdf --list-attachments` invocation is out of scope.
 - Do not copy qpdf-qtest inputs or goldens into the flpdf repository.
-- Use the existing `qtest-driver` feature for cross-crate oracle plumbing; ordinary flpdf builds must not expose the adapter.
+- Keep PDF string semantics in the ordinary `flpdf::pdf_string` domain API; keep the qtest adapter private to `flpdf-qtest-tools`.
 - Preserve qpdf line reading: split at LF, strip one immediately preceding CR, keep a final unterminated line, and do not synthesize a line after a terminal LF.
 - Preserve qpdf `newUnicodeString`: PDFDocEncoding only for a lossless non-BOM-looking input; otherwise UTF-16BE with BOM and qpdf-compatible malformed-UTF-8 replacement/consumption.
 - Preserve qpdf usage output and Linux failure behavior, including SIGABRT after an uncaught input-open/read exception.
@@ -23,23 +23,23 @@
 
 ---
 
-### Task 1: Canonical qpdf string adapter
+### Task 1: Canonical PDF string domain
 
 **Files:**
-- Create: `crates/flpdf/src/qtest_string.rs`
+- Create: `crates/flpdf/src/pdf_string.rs`
 - Modify: `crates/flpdf/src/lib.rs`
 - Modify: `crates/flpdf/src/json_inspect.rs`
 - Modify: `crates/flpdf/src/object.rs`
 
 **Interfaces:**
-- Produces: `qtest_string::utf8_value(stored: &[u8]) -> Vec<u8>`
-- Produces: `qtest_string::new_unicode_string(utf8: &[u8]) -> Vec<u8>`
-- Produces: `qtest_string::unparse_binary(stored: &[u8]) -> Vec<u8>`
-- Consumes: the existing canonical `json_inspect` qpdf string functions and `object` hex writer.
+- Produces: `pdf_string::utf8_value(stored: &[u8]) -> Vec<u8>`
+- Produces: `pdf_string::new_unicode_string(utf8: &[u8]) -> Vec<u8>`
+- Produces: `pdf_string::unparse_binary(stored: &[u8]) -> Vec<u8>`
+- Consumes: the existing `object` hex writer; all PDF string conversion remains in this module.
 
 - [ ] **Step 1: Write failing adapter tests**
 
-Create `qtest_string.rs` with tests first. Use hand-derived literals for:
+Create `pdf_string.rs` with tests first. Use hand-derived literals for:
 
 ```rust
 assert_eq!(utf8_value(&[0x80]), "•".as_bytes());
@@ -66,28 +66,26 @@ The `þÿ` case catches the existing false PDFDocEncoding choice that would crea
 Run:
 
 ```bash
-cargo test -p flpdf --features qtest-driver qtest_string
+cargo test -p flpdf pdf_string
 ```
 
-Expected: compilation fails because `qtest_string` and its functions do not exist. After adding only wrappers, the `þÿ` assertion must still fail against the current encoder.
+Expected: compilation fails because `pdf_string` and its functions do not exist. After adding only wrappers, the `þÿ` assertion must still fail against the current encoder.
 
-- [ ] **Step 3: Implement the minimal feature-gated adapter**
+- [ ] **Step 3: Implement the minimal domain module**
 
 In `lib.rs` add:
 
 ```rust
-#[cfg(feature = "qtest-driver")]
-#[doc(hidden)]
-pub mod qtest_string;
+pub mod pdf_string;
 ```
 
-The adapter delegates to `json_inspect::qpdf_utf8_value`,
-`json_inspect::qpdf_unicode_string_bytes`, and a crate-visible
-`object::write_hex_string`. It must contain no second encoding table.
+The domain module owns the PDFDocEncoding table, qpdf UTF-8 traversal,
+Unicode-string construction, and forced binary serialization. It must contain
+the only implementation of those operations.
 
 - [ ] **Step 4: Correct canonical Unicode construction**
 
-Refactor qpdf UTF-8 traversal to return both normalized UTF-8 and whether any decoder error occurred. `qpdf_unicode_string_bytes` must:
+Refactor qpdf UTF-8 traversal to return both normalized UTF-8 and whether any decoder error occurred. `new_unicode_string` must:
 
 1. normalize with the qpdf traversal;
 2. reject PDFDocEncoding when traversal reported an error;
@@ -103,8 +101,8 @@ Do not change JSON behavior except where the same canonical construction functio
 Run:
 
 ```bash
-cargo test -p flpdf --features qtest-driver qtest_string
-cargo test -p flpdf json_inspect::tests::qpdf_utf8_value
+cargo test -p flpdf pdf_string
+cargo test -p flpdf nntree::tests::name_codec_matches_qpdf_utf8_value_and_new_unicode_string
 ```
 
 Expected: all adapter and existing JSON string tests pass.
@@ -112,8 +110,8 @@ Expected: all adapter and existing JSON string tests pass.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/flpdf/src/lib.rs crates/flpdf/src/qtest_string.rs crates/flpdf/src/json_inspect.rs crates/flpdf/src/object.rs
-git commit -m "feat(qtest): expose canonical qpdf string operations"
+git add crates/flpdf/src/lib.rs crates/flpdf/src/pdf_string.rs crates/flpdf/src/json_inspect.rs crates/flpdf/src/nntree.rs crates/flpdf/src/outline_document_helper.rs
+git commit -m "refactor(flpdf): own PDF string semantics in domain module"
 ```
 
 ### Task 2: Dedicated Rust helper binaries
@@ -132,7 +130,7 @@ git commit -m "feat(qtest): expose canonical qpdf string operations"
 - Produces:
   `character_encoding::run_pdf_unicode(args, stdout, stderr) -> RunOutcome`
 - Produces binaries `flpdf-test-pdf-doc-encoding` and `flpdf-test-pdf-unicode`.
-- Consumes Task 1 `flpdf::qtest_string`.
+- Consumes Task 1 `flpdf::pdf_string` through the private qtest-tools adapter.
 
 - [ ] **Step 1: Write failing binary-boundary tests**
 
