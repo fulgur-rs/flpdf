@@ -81,10 +81,8 @@ enum Repr {
 #[derive(Debug)]
 pub(crate) enum ObjectValue {
     Null,
-    #[allow(dead_code)] // as_boolean accessor lands in a later task
     Boolean(bool),
     Integer(i64),
-    #[allow(dead_code)] // as_real accessor lands in a later task
     Real(f64),
     /// Preserves a non-canonical source spelling (e.g. `.4`) alongside its
     /// parsed value, mirroring [`crate::Object::RealLiteral`], so that a
@@ -93,9 +91,7 @@ pub(crate) enum ObjectValue {
         value: f64,
         literal: Vec<u8>,
     },
-    #[allow(dead_code)] // as_name accessor lands in a later task
     Name(Vec<u8>),
-    #[allow(dead_code)] // as_string accessor lands in a later task
     String(Vec<u8>),
     /// A content-stream operator token (e.g. `q`, `Do`), mirroring
     /// [`crate::Object::Operator`]. Only meaningful inside a content stream
@@ -445,6 +441,63 @@ impl ObjectHandle {
     pub fn as_real_literal(&self) -> Option<(f64, Vec<u8>)> {
         self.with_value(|value| match value {
             Some(ObjectValue::RealLiteral { value, literal }) => Some((*value, literal.clone())),
+            _ => None,
+        })
+    }
+
+    /// The value as `bool` if this handle's value — its own if direct, or
+    /// its already-resolved value if indirect — is a boolean, or `None`
+    /// otherwise. Never performs resolution itself.
+    pub fn as_boolean(&self) -> Option<bool> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Boolean(b)) => Some(*b),
+            _ => None,
+        })
+    }
+
+    /// The value as `f64` if this handle's value — its own if direct, or
+    /// its already-resolved value if indirect — is a real number (including
+    /// one with a preserved non-canonical source literal), or `None`
+    /// otherwise. Mirrors [`crate::Object::as_real`]'s own real-or-real-literal
+    /// arm. Never performs resolution itself.
+    pub fn as_real(&self) -> Option<f64> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Real(v) | ObjectValue::RealLiteral { value: v, .. }) => Some(*v),
+            _ => None,
+        })
+    }
+
+    /// The value as decoded PDF name bytes if this handle's value — its own
+    /// if direct, or its already-resolved value if indirect — is a name, or
+    /// `None` otherwise. Never performs resolution itself.
+    pub fn as_name(&self) -> Option<Vec<u8>> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Name(bytes)) => Some(bytes.clone()),
+            _ => None,
+        })
+    }
+
+    /// The value as string bytes if this handle's value — its own if
+    /// direct, or its already-resolved value if indirect — is a string, or
+    /// `None` otherwise. Never performs resolution itself.
+    pub fn as_string(&self) -> Option<Vec<u8>> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::String(bytes)) => Some(bytes.clone()),
+            _ => None,
+        })
+    }
+
+    /// The target as an indirect-object reference if this handle's value —
+    /// its own if direct, or its already-resolved value if indirect — is
+    /// itself a bare reference (e.g. one redirected in place to another
+    /// object via `Pdf::set_object`), mirroring [`crate::Object::Reference`],
+    /// or `None` otherwise. This is distinct from an indirect *child*
+    /// handle, which is exposed via [`Self::is_indirect`]/[`Self::object_ref`]
+    /// on the child handle itself rather than through this accessor. Never
+    /// performs resolution itself.
+    pub fn as_reference(&self) -> Option<ObjectRef> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Reference(object_ref)) => Some(*object_ref),
             _ => None,
         })
     }
@@ -1186,6 +1239,66 @@ mod materialize_tests {
         handle.reset_parsed_offset();
 
         assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+}
+
+#[cfg(test)]
+mod rounded_accessor_tests {
+    use super::*;
+
+    #[test]
+    fn boolean_handle_round_trips_its_value() {
+        assert_eq!(ObjectHandle::boolean(true).as_boolean(), Some(true));
+        assert_eq!(ObjectHandle::boolean(false).as_boolean(), Some(false));
+        assert_eq!(ObjectHandle::integer(1).as_boolean(), None);
+    }
+
+    #[test]
+    fn as_real_accepts_both_real_and_real_literal_like_object_does() {
+        // Mirrors Object::as_real's own `Real(v) | RealLiteral { value: v, .. }`
+        // arm (object.rs:348-353) — a real-literal value is still "a real"
+        // for callers that don't care about the source spelling.
+        assert_eq!(ObjectHandle::real(1.5).as_real(), Some(1.5));
+        assert_eq!(
+            ObjectHandle::real_literal(0.4, b".4".to_vec()).as_real(),
+            Some(0.4)
+        );
+        assert_eq!(ObjectHandle::integer(1).as_real(), None);
+    }
+
+    #[test]
+    fn name_and_string_handles_round_trip_their_bytes() {
+        assert_eq!(
+            ObjectHandle::name(b"Type".to_vec()).as_name(),
+            Some(b"Type".to_vec())
+        );
+        assert_eq!(
+            ObjectHandle::string(b"hi".to_vec()).as_string(),
+            Some(b"hi".to_vec())
+        );
+        assert!(ObjectHandle::name(b"Type".to_vec()).as_string().is_none());
+        assert!(ObjectHandle::string(b"hi".to_vec()).as_name().is_none());
+    }
+
+    #[test]
+    fn as_reference_reads_a_resolved_indirect_redirect_but_not_a_plain_value() {
+        // ObjectValue::Reference is what an indirect handle resolves to when
+        // its own body is itself a bare reference (Pdf::set_object-driven
+        // redirect/collapse chains — see ObjectValue::Reference's own doc).
+        let redirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        redirect.set_resolved(ObjectValue::Reference(ObjectRef::new(9, 0)));
+        assert_eq!(redirect.as_reference(), Some(ObjectRef::new(9, 0)));
+        assert_eq!(ObjectHandle::integer(1).as_reference(), None);
+    }
+
+    #[test]
+    fn rounded_accessors_return_none_for_an_indirect_handle_before_resolution() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
+        assert_eq!(handle.as_boolean(), None);
+        assert_eq!(handle.as_real(), None);
+        assert!(handle.as_name().is_none());
+        assert!(handle.as_string().is_none());
+        assert_eq!(handle.as_reference(), None);
     }
 }
 
