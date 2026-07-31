@@ -9,6 +9,8 @@
 //! factored out rather than copied. The binary names are the interface the
 //! harness depends on, so they stay fixed even when this package is renamed.
 
+mod qtest_string;
+
 // Public modules the binaries re-use.
 pub mod character_encoding;
 pub mod clean;

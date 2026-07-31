@@ -7,6 +7,7 @@ use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
 use crate::common::test_driver_program_name_bytes;
+use crate::qtest_string;
 
 /// Terminal action requested by one helper runner.
 #[derive(Debug, PartialEq, Eq)]
@@ -94,13 +95,13 @@ fn run(
     for line in qpdf_lines(&input) {
         let write_result = match mode {
             Mode::PdfDoc => {
-                let value = flpdf::qtest_string::utf8_value(line);
+                let value = qtest_string::utf8_value(line);
                 stdout.write_all(&value)
             }
             Mode::Unicode => {
-                let stored = flpdf::qtest_string::new_unicode_string(line);
-                let value = flpdf::qtest_string::utf8_value(&stored);
-                let binary = flpdf::qtest_string::unparse_binary(&stored);
+                let stored = qtest_string::new_unicode_string(line);
+                let value = qtest_string::utf8_value(&stored);
+                let binary = qtest_string::unparse_binary(&stored);
                 stdout
                     .write_all(&value)
                     .and_then(|()| stdout.write_all(b" // "))
