@@ -1654,12 +1654,16 @@ impl<R: Read + Seek> Pdf<R> {
         // (ObjStm-member) object — or, more rarely, an Uncompressed one whose
         // fast native-parse window failed for an unrelated reason — with
         // literal nesting between the two bounds.
-        let (value, parsed_offset) = match self.source_xref_entries.get(&object_ref).copied() {
+        let mut native_parsed = false;
+        let (mut value, parsed_offset) = match self.source_xref_entries.get(&object_ref).copied() {
             Some(XrefEntry::Uncompressed { offset })
                 if !self.transformed_stream_refs.contains(&object_ref) =>
             {
                 match self.native_parse_uncompressed_value(offset, &object) {
-                    Ok(native) => native,
+                    Ok(native) => {
+                        native_parsed = true;
+                        native
+                    }
                     Err(_) => (
                         self.lift_bounded(&object, 0, crate::parser::MAX_PARSE_DEPTH)?,
                         NO_PARSED_OFFSET,
@@ -1671,6 +1675,22 @@ impl<R: Read + Seek> Pdf<R> {
                 NO_PARSED_OFFSET,
             ),
         };
+        // Only the native-parse success path above reads raw (possibly
+        // still-encrypted) source bytes directly into `ObjectValue::String`;
+        // every other route here lifts from `object`, which
+        // `resolve_to_cache` already decrypted through the legacy engine's
+        // own pipeline -- decrypting it again would corrupt it. See
+        // `native_parse_uncompressed_value`'s own doc for why this handle
+        // graph population, not `Pdf::resolve_borrowed`'s later
+        // materialization, is where this must happen: nested children here
+        // are already-populated `ObjectHandle`s carrying their own recorded
+        // parsed offsets, and round-tripping through `materialize`/`lift` to
+        // reach a legacy-engine decryption path would silently reset them.
+        if native_parsed {
+            if let Some(encryption) = &self.encryption {
+                decrypt_object_value_strings(object_ref, &mut value, encryption)?;
+            }
+        }
         handle.set_resolved(value);
         handle.set_parsed_offset_if_unset(parsed_offset);
         Ok(())
@@ -2052,22 +2072,14 @@ impl<R: Read + Seek> Pdf<R> {
                 }
             }
 
-            let mut materialized = handle.materialize();
-            // A non-sentinel parsed offset means this handle's top-level
-            // value came from `native_parse_uncompressed_value`, which reads
-            // raw (possibly still-encrypted) source bytes directly into
-            // `ObjectValue::String` rather than through the legacy engine's
-            // own already-decrypted `Object` tree. Every other route to a
-            // resolved handle (the Compressed/ObjStm branch, the
-            // native-parse-failure fallback, and `Pdf::set_object`, all of
-            // which go through `lift`/`Pdf::lift_for_set_object`) already
-            // carries correctly-decrypted strings and must not be decrypted
-            // again here; `Pdf::set_object` resets the offset back to the
-            // sentinel for exactly this reason whenever it replaces a
-            // handle's value.
-            if handle.get_parsed_offset() >= 0 {
-                self.decrypt_materialized_strings(object_ref, &mut materialized)?;
-            }
+            // `handle`'s own resolved value is already correctly decrypted
+            // regardless of route: `resolve_object_handle`'s native-parse
+            // branch decrypts strings at population time (see its own
+            // comment), and every other route lifts from `object`, which
+            // `resolve_to_cache` already decrypted through the legacy
+            // engine's own pipeline. `materialize()` below is a plain
+            // structural copy, nothing left to decrypt here.
+            let materialized = handle.materialize();
             self.legacy_materialized_memo
                 .insert(object_ref, materialized);
         }
@@ -2076,36 +2088,6 @@ impl<R: Read + Seek> Pdf<R> {
             .legacy_materialized_memo
             .get(&object_ref)
             .unwrap_or(&NULL_OBJECT))
-    }
-
-    // Applies exactly the string-decryption step `decrypt_resolved_object`
-    // already performs for the legacy engine's own `Object` tree
-    // (`decrypt_object_strings`, unchanged, including its own guard against
-    // decrypting the `/Encrypt` dictionary object itself), to a materialized
-    // `Object` built from a native-parse-populated `ObjectHandle`. Stream
-    // *data* bytes are never touched here — they were already correctly
-    // decrypted before this object's handle was populated, since
-    // `native_parse_uncompressed_value` reuses the legacy engine's own
-    // already-decrypted stream payload rather than re-deriving it — so
-    // calling `decrypt_resolved_object` itself here (which also transforms
-    // stream data) would double-decrypt it; only `decrypt_object_strings`,
-    // which touches `Object::String` values alone, is safe to call from
-    // this bridge.
-    fn decrypt_materialized_strings(
-        &self,
-        object_ref: ObjectRef,
-        object: &mut Object,
-    ) -> Result<()> {
-        let Some(encryption) = &self.encryption else {
-            return Ok(());
-        };
-        decrypt_object_strings(
-            object_ref,
-            object,
-            encryption.string_mode,
-            &encryption.file_key,
-            encryption.encrypt_ref,
-        )
     }
 
     /// Read and parse the indirect object stored at `offset`, returning the read
@@ -2734,6 +2716,165 @@ fn decrypt_object_strings(
             )
         }
     }
+}
+
+// Mirrors `decrypt_object_strings`'s mode dispatch exactly (same key
+// derivation, same `decrypt_cipher_bytes` leaf primitive), but walks an
+// `ObjectValue`/`ObjectHandle` tree in place rather than a legacy `Object`
+// tree. Needed for `Pdf::resolve_object_handle`'s native-parse branch:
+// `native_parse_uncompressed_value` builds `ObjectValue`/`ObjectHandle`
+// directly from raw source bytes, never through an intermediate `Object`, so
+// `decrypt_object_strings` (which only accepts `&mut Object`) cannot be
+// called on it without materializing and re-lifting -- which would silently
+// reset every nested child's already-recorded parsed offset, the exact
+// invariant `native_parse_uncompressed_value`'s own doc protects.
+fn decrypt_object_value_strings(
+    object_ref: ObjectRef,
+    value: &mut ObjectValue,
+    encryption: &EncryptionState,
+) -> Result<()> {
+    if Some(object_ref) == encryption.encrypt_ref {
+        return Ok(());
+    }
+    let file_key = &encryption.file_key;
+    match encryption.string_mode {
+        EncryptionMode::Rc4 => {
+            let key = per_object_key(
+                file_key,
+                object_ref.number,
+                u32::from(object_ref.generation),
+                ObjectKeyAlg::Rc4,
+            );
+            decrypt_strings_in_object_value(value, StringCipher::Rc4 { key: &key })
+        }
+        EncryptionMode::Aes128 => {
+            let key = per_object_key(
+                file_key,
+                object_ref.number,
+                u32::from(object_ref.generation),
+                ObjectKeyAlg::Aes,
+            );
+            let key = aes128_object_key(&key)?;
+            decrypt_strings_in_object_value(value, StringCipher::Aes128 { key: &key })
+        }
+        EncryptionMode::Identity => Ok(()),
+        EncryptionMode::Aes256 => {
+            let key = aes256_file_key(file_key)?;
+            decrypt_strings_in_object_value(value, StringCipher::Aes256 { key: &key })
+        }
+    }
+}
+
+// The top-level value itself: a bare `ObjectValue::String` is mutated
+// directly (it is a plain owned local, not yet wrapped in a handle); a
+// container recurses into its already-populated `ObjectHandle` children via
+// `decrypt_handle_strings_in_place`, which tracks depth itself (this
+// function is the sole, always-depth-0 entry point -- it never recurses
+// into itself, so it carries no depth parameter of its own).
+fn decrypt_strings_in_object_value(
+    value: &mut ObjectValue,
+    cipher: StringCipher<'_>,
+) -> Result<()> {
+    match value {
+        ObjectValue::String(bytes) => decrypt_cipher_bytes(bytes, cipher),
+        ObjectValue::Array(items) => {
+            for item in items.iter() {
+                decrypt_handle_strings_in_place(item, cipher, 1)?;
+            }
+            Ok(())
+        }
+        ObjectValue::Dictionary(entries) => {
+            for item in entries.values() {
+                decrypt_handle_strings_in_place(item, cipher, 1)?;
+            }
+            Ok(())
+        }
+        ObjectValue::Stream { dict, .. } => decrypt_stream_dict_strings_in_place(dict, cipher, 1),
+        ObjectValue::Null
+        | ObjectValue::Boolean(_)
+        | ObjectValue::Integer(_)
+        | ObjectValue::Real(_)
+        | ObjectValue::RealLiteral { .. }
+        | ObjectValue::Name(_)
+        | ObjectValue::Reference(_)
+        | ObjectValue::Operator(_)
+        | ObjectValue::InlineImage(_) => Ok(()),
+    }
+}
+
+// A child reached through direct containment: an indirect handle is a
+// terminal leaf here (its own eventual resolution decrypts it separately,
+// keyed by its own object ref, exactly like a legacy `Object::Reference`
+// stops `decrypt_strings_in_value`'s walk) -- `handle.is_indirect()` is
+// checked before touching the handle's value at all, rather than relying on
+// `replace_direct_value`'s no-op-on-indirect behavior alone, so a resolved
+// indirect child's own contents are never even read here, let alone
+// decrypted with the wrong (parent's) key. A direct string is decrypted and
+// written back in place via `replace_direct_value`, which preserves the
+// handle's identity and already-recorded parsed offset.
+fn decrypt_handle_strings_in_place(
+    handle: &ObjectHandle,
+    cipher: StringCipher<'_>,
+    depth: usize,
+) -> Result<()> {
+    if handle.is_indirect() {
+        return Ok(());
+    }
+    if depth > crate::object::MAX_INLINE_DEPTH {
+        return Err(Error::Unsupported(format!(
+            "decrypt: inline object nesting exceeds maximum of {}",
+            crate::object::MAX_INLINE_DEPTH
+        )));
+    }
+    if let Some(mut bytes) = handle.as_string() {
+        decrypt_cipher_bytes(&mut bytes, cipher)?;
+        handle.replace_direct_value(ObjectValue::String(bytes));
+        return Ok(());
+    }
+    if let Some(items) = handle.as_array() {
+        for item in &items {
+            decrypt_handle_strings_in_place(item, cipher, depth + 1)?;
+        }
+        return Ok(());
+    }
+    if let Some(entries) = handle.as_dictionary() {
+        for item in entries.values() {
+            decrypt_handle_strings_in_place(item, cipher, depth + 1)?;
+        }
+        return Ok(());
+    }
+    if let Some(dict) = handle.as_stream_dict() {
+        return decrypt_stream_dict_strings_in_place(&dict, cipher, depth + 1);
+    }
+    Ok(())
+}
+
+// Walks a stream's own dictionary entries directly, at exactly the depth its
+// caller specifies, without charging its own extra inline level for the
+// dictionary handle itself first. Matches `decrypt_strings_in_value`'s
+// `Object::Stream(stream) => stream.dict.values_mut()` arm, which visits a
+// stream's dictionary entries at the *same* depth+1 the stream itself was
+// reached at -- the legacy walk never treats the stream's own dictionary
+// container as a nesting level in its own right, only its entries count.
+// Getting this wrong is real, not cosmetic: a document with native parsing
+// enabled but `/StmF /Identity` (so the legacy decryptor still runs, but
+// native-parsed handles need this same-depth accounting to match it) can
+// have a stream dictionary value nested exactly up to `MAX_INLINE_DEPTH`
+// levels that the legacy path accepts and decrypts -- charging one extra
+// level here would reject it, diverging `resolve_object_handle` from
+// `resolve_to_cache` on input the legacy engine already handles correctly.
+fn decrypt_stream_dict_strings_in_place(
+    dict: &ObjectHandle,
+    cipher: StringCipher<'_>,
+    depth: usize,
+) -> Result<()> {
+    let entries = dict
+        .as_dictionary()
+        .expect("a stream's own dictionary handle is always a direct Dictionary value");
+    for item in entries.values() {
+        decrypt_handle_strings_in_place(item, cipher, depth)?;
+    }
+    Ok(())
 }
 
 fn decrypt_stream_bytes(
@@ -3583,6 +3724,87 @@ mod tests {
         assert!(!stream_payload_decrypted);
     }
 
+    #[test]
+    fn object_handle_as_string_decrypts_native_parsed_encrypted_strings() {
+        use crate::encrypt_setup::EncryptParams;
+        use crate::writer::{write_pdf_with_options, CompressStreams, WriteOptions};
+        use std::io::Cursor;
+
+        // A minimal Catalog/Pages/Info fixture: /Info (trailer-reachable,
+        // survives the writer's Catalog-first reachability walk) holds a
+        // direct, uncompressed, plain-xref-table string -- exactly the shape
+        // `native_parse_uncompressed_value` builds directly from raw source
+        // bytes, the vulnerable path this test targets.
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut entries: Vec<(u16, usize)> = Vec::new();
+        entries.push((0, bytes.len()));
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        entries.push((0, bytes.len()));
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        entries.push((0, bytes.len()));
+        bytes.extend_from_slice(b"3 0 obj\n<< /Title (TopSecretTitle) >>\nendobj\n");
+        let startxref = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n", entries.len() + 1).as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for (generation, offset) in &entries {
+            bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R /Info 3 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+                entries.len() + 1
+            )
+            .as_bytes(),
+        );
+
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open plaintext fixture");
+        let mut out = Vec::new();
+        let options = WriteOptions {
+            full_rewrite: true,
+            compress_streams: CompressStreams::No,
+            encrypt: Some(EncryptParams::v4_aes128(
+                b"user-pw".to_vec(),
+                b"owner-pw".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        write_pdf_with_options(&mut pdf, &mut out, &options).expect("V=4 AES128 encrypted write");
+
+        let mut rt = Pdf::open_with_options(
+            Cursor::new(out),
+            PdfOpenOptions {
+                password: b"user-pw".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("re-open of V=4 output with user-pw");
+
+        let info_ref = match rt.trailer().get("Info") {
+            Some(Object::Reference(r)) => *r,
+            // Defensive-only: this test's own fixture always writes /Info
+            // as a reference (the writer's Catalog-first renumber keeps it
+            // that way), so this arm cannot run.
+            other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: unreachable given this test's own fixture
+        };
+        let info_handle = rt.get_object_handle(info_ref);
+        rt.resolve_object_handle(&info_handle)
+            .expect("resolve /Info handle");
+        let dict = info_handle
+            .as_dictionary()
+            .expect("/Info must be a dictionary");
+        let title_handle = dict.get(b"Title".as_slice()).expect("/Title entry");
+        let title = title_handle.as_string().expect("/Title must be a string");
+
+        assert_eq!(
+            title.as_slice(),
+            b"TopSecretTitle",
+            "ObjectHandle::as_string() must decrypt a native-parsed string from an \
+             encrypted document, not return raw ciphertext -- native_parse_uncompressed_value \
+             builds ObjectValue::String directly from raw (possibly still-encrypted) source \
+             bytes, and this accessor reads that stored value directly"
+        );
+    }
+
     fn explicit_rc4_encryption_state() -> EncryptionState {
         EncryptionState {
             file_key: vec![0x11, 0x22, 0x33, 0x44, 0x55],
@@ -3633,6 +3855,272 @@ mod tests {
             .expect("RC4 inverse transform");
         assert_eq!(bytes.as_ptr(), original_ptr);
         assert_eq!(bytes, plaintext);
+    }
+
+    fn explicit_rc4_string_encryption_state() -> EncryptionState {
+        EncryptionState {
+            string_mode: EncryptionMode::Rc4,
+            ..explicit_rc4_encryption_state()
+        }
+    }
+
+    #[test]
+    fn decrypt_object_value_strings_rc4_top_level_string() {
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let mut value =
+            ObjectValue::String(rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption));
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("RC4 top-level string decryption");
+
+        let ObjectValue::String(bytes) = &value else {
+            panic!("value must still be a string"); // cov:ignore: unreachable given this test's own construction of value
+        };
+        assert_eq!(bytes.as_slice(), b"TopSecretTitle");
+    }
+
+    #[test]
+    fn decrypt_object_value_strings_skips_the_encrypt_dictionary_object() {
+        let object_ref = ObjectRef::new(9, 0);
+        let mut encryption = explicit_rc4_string_encryption_state();
+        encryption.encrypt_ref = Some(object_ref);
+        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
+        let mut value = ObjectValue::String(ciphertext.clone());
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("the /Encrypt object's own strings are exempt, not an error");
+
+        let ObjectValue::String(bytes) = &value else {
+            panic!("value must still be a string"); // cov:ignore: unreachable given this test's own construction of value
+        };
+        assert_eq!(
+            bytes.as_slice(),
+            ciphertext.as_slice(),
+            "the /Encrypt dictionary's own strings must never be decrypted, \
+             mirroring decrypt_object_strings's identical encrypt_ref guard"
+        );
+    }
+
+    #[test]
+    fn decrypt_object_value_strings_decrypts_a_string_inside_a_direct_array() {
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
+        let mut value = ObjectValue::Array(vec![ObjectHandle::string(ciphertext)]);
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("array-contained string decryption");
+
+        let ObjectValue::Array(items) = &value else {
+            panic!("value must still be an array"); // cov:ignore: unreachable given this test's own construction of value
+        };
+        assert_eq!(
+            items[0].as_string().as_deref(),
+            Some(b"TopSecretTitle".as_slice())
+        );
+    }
+
+    #[test]
+    fn decrypt_object_value_strings_decrypts_a_string_inside_a_nested_dictionary() {
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
+        let inner =
+            ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
+        let mut value = ObjectValue::Dictionary(BTreeMap::from([(b"Nested".to_vec(), inner)]));
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("nested-dictionary string decryption");
+
+        let ObjectValue::Dictionary(entries) = &value else {
+            panic!("value must still be a dictionary"); // cov:ignore: unreachable given this test's own construction of value
+        };
+        let nested = entries.get(b"Nested".as_slice()).expect("Nested entry");
+        let nested_dict = nested.as_dictionary().expect("Nested must be a dictionary");
+        let title = nested_dict.get(b"Title".as_slice()).expect("Title entry");
+        assert_eq!(
+            title.as_string().as_deref(),
+            Some(b"TopSecretTitle".as_slice())
+        );
+    }
+
+    #[test]
+    fn decrypt_object_value_strings_decrypts_a_string_inside_a_stream_dictionary() {
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
+        let dict =
+            ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
+        let mut value = ObjectValue::Stream {
+            dict,
+            data: b"stream payload, untouched by string decryption".to_vec(),
+        };
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("stream-dictionary string decryption");
+
+        let ObjectValue::Stream { dict, data } = &value else {
+            panic!("value must still be a stream"); // cov:ignore: unreachable given this test's own construction of value
+        };
+        let stream_dict = dict.as_dictionary().expect("stream dict");
+        let title = stream_dict.get(b"Title".as_slice()).expect("Title entry");
+        assert_eq!(
+            title.as_string().as_deref(),
+            Some(b"TopSecretTitle".as_slice())
+        );
+        assert_eq!(
+            data.as_slice(),
+            b"stream payload, untouched by string decryption",
+            "stream payload bytes are never touched by string decryption"
+        );
+    }
+
+    #[test]
+    fn decrypt_handle_strings_in_place_decrypts_a_string_inside_a_directly_nested_stream() {
+        // Distinct from the top-level-stream test above: here the stream is
+        // a *child* reached through `decrypt_handle_strings_in_place`'s own
+        // `as_stream_dict()` arm, not `decrypt_strings_in_object_value`'s
+        // top-level `Stream` arm. A direct (non-indirect) `ObjectHandle`
+        // wrapping a stream value is not the common case -- qpdf's own
+        // streams are always indirect -- but it is reachable through the
+        // public API the same way `object_handle.rs`'s own
+        // `a_direct_stream_value_unparse_resolved_inlines_rather_than_referencing`
+        // test documents: a nested `Object::Stream` passed to
+        // `Pdf::set_object` inside an array or dictionary.
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
+        let stream_dict =
+            ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
+        let stream_child = ObjectHandle::from_value(ObjectValue::Stream {
+            dict: stream_dict,
+            data: b"payload".to_vec(),
+        });
+        let mut value = ObjectValue::Array(vec![stream_child]);
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("directly nested stream string decryption");
+
+        let ObjectValue::Array(items) = &value else {
+            panic!("value must still be an array"); // cov:ignore: unreachable given this test's own construction of value
+        };
+        let nested_dict = items[0]
+            .as_stream_dict()
+            .expect("array item must still be a stream")
+            .as_dictionary()
+            .expect("stream dict");
+        let title = nested_dict.get(b"Title".as_slice()).expect("Title entry");
+        assert_eq!(
+            title.as_string().as_deref(),
+            Some(b"TopSecretTitle".as_slice())
+        );
+    }
+
+    #[test]
+    fn decrypt_object_value_strings_leaves_a_top_level_scalar_untouched() {
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let mut value = ObjectValue::Integer(42);
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("a bare scalar object has no string to decrypt");
+
+        assert!(matches!(value, ObjectValue::Integer(42)));
+    }
+
+    #[test]
+    fn decrypt_handle_strings_in_place_never_touches_an_indirect_childs_own_value() {
+        // An indirect child is a terminal leaf: its own eventual resolution
+        // decrypts it separately, keyed by its own object ref. Using the
+        // *parent's* key here would corrupt it -- confirmed by resolving the
+        // child to a string that would decrypt to something else entirely
+        // under the parent's key, then asserting it is untouched.
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let child = ObjectHandle::new_indirect_unresolved(ObjectRef::new(4, 0), 0);
+        child.set_resolved(ObjectValue::String(b"unrelated ciphertext".to_vec()));
+        let mut value = ObjectValue::Dictionary(BTreeMap::from([(b"Ref".to_vec(), child.clone())]));
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("indirect children are skipped, not an error");
+
+        assert_eq!(
+            child.as_string().as_deref(),
+            Some(b"unrelated ciphertext".as_slice()),
+            "an indirect child's own resolved value must be left exactly as-is"
+        );
+    }
+
+    #[test]
+    fn decrypt_handle_strings_in_place_rejects_excess_direct_nesting() {
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let mut handle = ObjectHandle::string(b"leaf".to_vec());
+        for _ in 0..=crate::object::MAX_INLINE_DEPTH {
+            handle = ObjectHandle::array(vec![handle]);
+        }
+        let mut value = ObjectValue::Array(vec![handle]);
+
+        let err = decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect_err("excess direct nesting must error, not overflow the stack");
+        assert!(
+            matches!(err, Error::Unsupported(ref m) if m.contains("inline object nesting exceeds maximum")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decrypt_object_value_strings_does_not_charge_the_stream_dictionary_container_its_own_inline_level(
+    ) {
+        // Codex Review on PR #603 (discussion_r3690827731): a stream's own
+        // dictionary handle must not be charged its own inline-nesting level
+        // before its entries are visited -- decrypt_strings_in_value's
+        // legacy Object::Stream arm visits stream.dict.values_mut() at the
+        // *same* depth+1 the stream itself was reached at, so a document the
+        // legacy path (resolve_to_cache) accepts must not be rejected here
+        // just because native parsing routes it through this walk instead.
+        // Pin the exact boundary both paths must agree on: a stream
+        // dictionary entry nested MAX_INLINE_DEPTH levels deep (accepted --
+        // matches decrypt_strings_in_value's own depth+1-at-entries
+        // accounting) versus MAX_INLINE_DEPTH+1 (rejected, one level over).
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
+
+        let nest = |extra_levels: usize| {
+            let mut handle = ObjectHandle::string(ciphertext.clone());
+            for _ in 0..extra_levels {
+                handle = ObjectHandle::array(vec![handle]);
+            }
+            handle
+        };
+
+        let mut accepted = ObjectValue::Stream {
+            dict: ObjectHandle::dictionary(vec![(
+                b"Deep".to_vec(),
+                nest(crate::object::MAX_INLINE_DEPTH - 1),
+            )]),
+            data: Vec::new(),
+        };
+        decrypt_object_value_strings(object_ref, &mut accepted, &encryption).expect(
+            "a stream dictionary entry nested exactly MAX_INLINE_DEPTH levels deep, matching \
+             the legacy decryptor's own boundary, must be accepted",
+        );
+
+        let mut rejected = ObjectValue::Stream {
+            dict: ObjectHandle::dictionary(vec![(
+                b"TooDeep".to_vec(),
+                nest(crate::object::MAX_INLINE_DEPTH),
+            )]),
+            data: Vec::new(),
+        };
+        let err = decrypt_object_value_strings(object_ref, &mut rejected, &encryption)
+            .expect_err("one level past the legacy decryptor's own boundary must still error");
+        assert!(
+            matches!(err, Error::Unsupported(ref m) if m.contains("inline object nesting exceeds maximum")),
+            "got {err:?}"
+        );
     }
 
     fn flate_encoded(plaintext: &[u8]) -> Vec<u8> {
