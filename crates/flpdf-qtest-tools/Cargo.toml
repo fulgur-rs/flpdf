@@ -29,6 +29,10 @@ path = "src/bin/pdf_unicode.rs"
 name = "flpdf-test-unicode-filenames"
 path = "src/bin/unicode_filenames.rs"
 
+[[bin]]
+name = "flpdf-test-tokenizer"
+path = "src/bin/tokenizer.rs"
+
 [lib]
 name = "flpdf_qtest_tools"
 path = "src/lib.rs"

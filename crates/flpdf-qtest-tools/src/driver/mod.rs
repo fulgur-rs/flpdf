@@ -127,7 +127,11 @@ fn write_open_failure(
     write_error_bytes(stdout, stderr, &open_pdf_error_bytes(n, filename, source))
 }
 
-fn open_error_bytes(filename: &[u8], crt_message: Option<&[u8]>, fallback: &io::Error) -> Vec<u8> {
+pub(crate) fn open_error_bytes(
+    filename: &[u8],
+    crt_message: Option<&[u8]>,
+    fallback: &io::Error,
+) -> Vec<u8> {
     let message = crt_message
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| fallback.to_string().into_bytes());
@@ -144,7 +148,7 @@ fn strerror_bytes(error_code: libc::c_int) -> Option<Vec<u8>> {
 }
 
 #[cfg(unix)]
-fn crt_open_error_message(filename: &OsStr) -> Option<Vec<u8>> {
+pub(crate) fn crt_open_error_message(filename: &OsStr) -> Option<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
 
     let filename = CString::new(filename.as_bytes()).ok()?;
@@ -184,7 +188,7 @@ fn has_interior_nul(filename: &OsStr) -> bool {
 }
 
 #[cfg(windows)]
-fn crt_open_error_message(filename: &OsStr) -> Option<Vec<u8>> {
+pub(crate) fn crt_open_error_message(filename: &OsStr) -> Option<Vec<u8>> {
     use std::os::windows::ffi::OsStrExt;
 
     if has_interior_nul(filename) {
@@ -208,19 +212,19 @@ fn crt_open_error_message(filename: &OsStr) -> Option<Vec<u8>> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn crt_open_error_message(_filename: &OsStr) -> Option<Vec<u8>> {
+pub(crate) fn crt_open_error_message(_filename: &OsStr) -> Option<Vec<u8>> {
     None
 }
 
 #[cfg(unix)]
-fn os_str_diagnostic_bytes(value: &OsStr) -> Cow<'_, [u8]> {
+pub(crate) fn os_str_diagnostic_bytes(value: &OsStr) -> Cow<'_, [u8]> {
     use std::os::unix::ffi::OsStrExt;
 
     Cow::Borrowed(value.as_bytes())
 }
 
 #[cfg(not(unix))]
-fn os_str_diagnostic_bytes(value: &OsStr) -> Cow<'_, [u8]> {
+pub(crate) fn os_str_diagnostic_bytes(value: &OsStr) -> Cow<'_, [u8]> {
     // This fallback is lossy only for unpaired wide values. Valid-Unicode Windows
     // diagnostics remain byte-identical to their prior UTF-8 output.
     Cow::Owned(value.to_string_lossy().into_owned().into_bytes())
@@ -309,7 +313,7 @@ fn parse_test_number(input: &[u8]) -> Result<i32, Vec<u8>> {
     })
 }
 
-fn emit_new_diagnostics<R: io::Read + io::Seek>(
+pub(crate) fn emit_new_diagnostics<R: io::Read + io::Seek>(
     pdf: &Pdf<R>,
     diagnostics_written: &mut usize,
     filename: &[u8],
@@ -324,7 +328,7 @@ fn emit_new_diagnostics<R: io::Read + io::Seek>(
     Ok(())
 }
 
-fn write_warning(
+pub(crate) fn write_warning(
     filename: &[u8],
     diagnostic: &Diagnostic,
     stdout: &mut dyn Write,

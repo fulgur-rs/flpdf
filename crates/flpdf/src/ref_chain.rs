@@ -17,13 +17,13 @@ use std::io::{Read, Seek};
 /// looping forever, preserving the no-panic core guarantee on hostile input.
 pub(crate) const MAX_REF_CHAIN_DEPTH: usize = 64;
 
-/// Follow a chain of [`Object::Reference`] indirections up to
-/// [`MAX_REF_CHAIN_DEPTH`], returning the terminal non-reference object and the
+/// Follow a chain of [`Object::Reference`] indirections up to a bounded depth
+/// (`MAX_REF_CHAIN_DEPTH`), returning the terminal non-reference object and the
 /// last [`ObjectRef`] traversed (for in-place rewrite of, or copy-map matching
 /// against, an indirect target). A cyclic / over-deep chain terminates at the
 /// bound and yields the last resolved value, so a hostile target cannot loop
 /// forever.
-pub(crate) fn resolve_ref_chain<R: Read + Seek>(
+pub fn resolve_ref_chain<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: &Object,
 ) -> Result<(Object, Option<ObjectRef>)> {

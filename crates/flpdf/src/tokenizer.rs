@@ -6,7 +6,7 @@ use crate::{object::write_name_escaped, Error, Result};
 
 #[allow(dead_code)] // Space, Comment, and InlineImage are produced by Task 2's state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TokenType {
+pub enum TokenType {
     Bad,
     ArrayClose,
     ArrayOpen,
@@ -28,13 +28,13 @@ pub(crate) enum TokenType {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Token {
-    pub(crate) token_type: TokenType,
-    pub(crate) value: Vec<u8>,
-    pub(crate) raw: Vec<u8>,
-    pub(crate) error_message: Option<Vec<u8>>,
+pub struct Token {
+    pub token_type: TokenType,
+    pub value: Vec<u8>,
+    pub raw: Vec<u8>,
+    pub error_message: Option<Vec<u8>>,
     pub(crate) error_offset: usize,
-    pub(crate) start: usize,
+    pub start: usize,
     #[allow(dead_code)] // Retained as part of qpdf's token range contract.
     pub(crate) end: usize,
 }
@@ -153,7 +153,7 @@ fn canonical_string_raw(value: &[u8]) -> Vec<u8> {
 
 #[allow(dead_code)] // ImproperInlineImageState is produced by Task 4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TokenizerStateError {
+pub enum TokenizerStateError {
     TokenWaiting,
     ImproperInlineImageState,
 }
@@ -192,7 +192,7 @@ enum State {
 }
 
 #[allow(dead_code)] // State fields are consumed by push mode before Task 3 routes production callers.
-pub(crate) struct Tokenizer<'a> {
+pub struct Tokenizer<'a> {
     input: &'a [u8],
     pos: usize,
     state: State,
@@ -222,7 +222,7 @@ impl Tokenizer<'static> {
 }
 
 impl<'a> Tokenizer<'a> {
-    pub(crate) fn new(input: &'a [u8]) -> Self {
+    pub fn new(input: &'a [u8]) -> Self {
         Self {
             input,
             pos: 0,
@@ -249,11 +249,11 @@ impl<'a> Tokenizer<'a> {
 
 #[allow(dead_code)] // Push APIs and handlers become production-used in Task 3.
 impl<'a> Tokenizer<'a> {
-    pub(crate) fn allow_eof(&mut self) {
+    pub fn allow_eof(&mut self) {
         self.allow_eof = true;
     }
 
-    pub(crate) fn include_ignorable(&mut self) {
+    pub fn include_ignorable(&mut self) {
         self.include_ignorable = true;
     }
 
@@ -723,12 +723,12 @@ impl<'a> Tokenizer<'a> {
 }
 
 impl<'a> Tokenizer<'a> {
-    pub(crate) fn position(&self) -> usize {
+    pub fn position(&self) -> usize {
         self.pos
     }
 
     #[allow(dead_code)] // Task 6 routes content-stream inline images through this tokenizer API.
-    pub(crate) fn expect_inline_image(&mut self) -> std::result::Result<(), TokenizerStateError> {
+    pub fn expect_inline_image(&mut self) -> std::result::Result<(), TokenizerStateError> {
         if self.state == State::TokenReady {
             self.reset();
         } else if self.state != State::BeforeToken {
@@ -779,7 +779,7 @@ impl<'a> Tokenizer<'a> {
 
     /// Pull adapter matching qpdf 11.9.0 `QPDFTokenizer::readToken` and
     /// `nextToken` (`libqpdf/QPDFTokenizer.cc:887-965`).
-    pub(crate) fn read_token(&mut self, allow_bad: bool, max_len: usize) -> Result<Token> {
+    pub fn read_token(&mut self, allow_bad: bool, max_len: usize) -> Result<Token> {
         if self.state != State::InlineImage {
             self.reset();
         }
@@ -849,7 +849,7 @@ impl<'a> Tokenizer<'a> {
         Ok(token)
     }
 
-    pub(crate) fn set_position(&mut self, position: usize) -> Result<()> {
+    pub fn set_position(&mut self, position: usize) -> Result<()> {
         if position > self.input.len() {
             return Err(Error::parse(
                 position,
@@ -865,7 +865,7 @@ impl<'a> Tokenizer<'a> {
     ///
     /// qpdf uses this after the `ID` operator to discard the byte that
     /// terminated the token (`libqpdf/QPDFObjectHandle.cc:1820-1825`).
-    pub(crate) fn consume_one_byte(&mut self) -> Result<()> {
+    pub fn consume_one_byte(&mut self) -> Result<()> {
         if self.pos >= self.input.len() {
             return Err(Error::parse(self.pos, "missing separator after ID"));
         }
@@ -1037,6 +1037,29 @@ mod tests {
     use std::process::Command;
 
     use super::{PushedToken, Token, TokenType, Tokenizer, TokenizerStateError};
+
+    fn token_type_name(token_type: TokenType) -> &'static str {
+        match token_type {
+            TokenType::Bad => "bad",
+            TokenType::ArrayClose => "array_close",
+            TokenType::ArrayOpen => "array_open",
+            TokenType::BraceClose => "brace_close",
+            TokenType::BraceOpen => "brace_open",
+            TokenType::DictClose => "dict_close",
+            TokenType::DictOpen => "dict_open",
+            TokenType::Integer => "integer",
+            TokenType::Name => "name",
+            TokenType::Real => "real",
+            TokenType::String => "string",
+            TokenType::Null => "null",
+            TokenType::Bool => "bool",
+            TokenType::Word => "word",
+            TokenType::Eof => "eof",
+            TokenType::Space => "space",
+            TokenType::Comment => "comment",
+            TokenType::InlineImage => "inline-image",
+        }
+    }
 
     type ValueCase<'a> = (&'a [u8], TokenType, &'a [u8], Option<&'a [u8]>);
     type RawValueCase<'a> = (&'a [u8], TokenType, &'a [u8], &'a [u8], Option<&'a [u8]>);
@@ -1253,29 +1276,6 @@ mod tests {
             write!(encoded, "{byte:02x}").unwrap();
         }
         encoded
-    }
-
-    fn token_type_name(token_type: TokenType) -> &'static str {
-        match token_type {
-            TokenType::Bad => "bad",
-            TokenType::ArrayClose => "array_close",
-            TokenType::ArrayOpen => "array_open",
-            TokenType::BraceClose => "brace_close",
-            TokenType::BraceOpen => "brace_open",
-            TokenType::DictClose => "dict_close",
-            TokenType::DictOpen => "dict_open",
-            TokenType::Integer => "integer",
-            TokenType::Name => "name",
-            TokenType::Real => "real",
-            TokenType::String => "string",
-            TokenType::Null => "null",
-            TokenType::Bool => "bool",
-            TokenType::Word => "word",
-            TokenType::Eof => "eof",
-            TokenType::Space => "space",
-            TokenType::Comment => "comment",
-            TokenType::InlineImage => "inline-image",
-        }
     }
 
     fn append_token_record(
