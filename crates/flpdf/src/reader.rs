@@ -1688,13 +1688,7 @@ impl<R: Read + Seek> Pdf<R> {
         // reach a legacy-engine decryption path would silently reset them.
         if native_parsed {
             if let Some(encryption) = &self.encryption {
-                decrypt_object_value_strings(
-                    object_ref,
-                    &mut value,
-                    encryption.string_mode,
-                    &encryption.file_key,
-                    encryption.encrypt_ref,
-                )?;
+                decrypt_object_value_strings(object_ref, &mut value, encryption)?;
             }
         }
         handle.set_resolved(value);
@@ -2737,14 +2731,13 @@ fn decrypt_object_strings(
 fn decrypt_object_value_strings(
     object_ref: ObjectRef,
     value: &mut ObjectValue,
-    mode: EncryptionMode,
-    file_key: &[u8],
-    encrypt_ref: Option<ObjectRef>,
+    encryption: &EncryptionState,
 ) -> Result<()> {
-    if Some(object_ref) == encrypt_ref {
+    if Some(object_ref) == encryption.encrypt_ref {
         return Ok(());
     }
-    match mode {
+    let file_key = &encryption.file_key;
+    match encryption.string_mode {
         EncryptionMode::Rc4 => {
             let key = per_object_key(
                 file_key,
@@ -2752,7 +2745,7 @@ fn decrypt_object_value_strings(
                 u32::from(object_ref.generation),
                 ObjectKeyAlg::Rc4,
             );
-            decrypt_strings_in_object_value(value, StringCipher::Rc4 { key: &key }, 0)
+            decrypt_strings_in_object_value(value, StringCipher::Rc4 { key: &key })
         }
         EncryptionMode::Aes128 => {
             let key = per_object_key(
@@ -2762,12 +2755,12 @@ fn decrypt_object_value_strings(
                 ObjectKeyAlg::Aes,
             );
             let key = aes128_object_key(&key)?;
-            decrypt_strings_in_object_value(value, StringCipher::Aes128 { key: &key }, 0)
+            decrypt_strings_in_object_value(value, StringCipher::Aes128 { key: &key })
         }
         EncryptionMode::Identity => Ok(()),
         EncryptionMode::Aes256 => {
             let key = aes256_file_key(file_key)?;
-            decrypt_strings_in_object_value(value, StringCipher::Aes256 { key: &key }, 0)
+            decrypt_strings_in_object_value(value, StringCipher::Aes256 { key: &key })
         }
     }
 }
@@ -2775,37 +2768,28 @@ fn decrypt_object_value_strings(
 // The top-level value itself: a bare `ObjectValue::String` is mutated
 // directly (it is a plain owned local, not yet wrapped in a handle); a
 // container recurses into its already-populated `ObjectHandle` children via
-// `decrypt_handle_strings_in_place`. Depth-bounded against
-// `MAX_INLINE_DEPTH`, mirroring `decrypt_strings_in_value`'s own guard for
-// the legacy `Object` walk.
+// `decrypt_handle_strings_in_place`, which tracks depth itself (this
+// function is the sole, always-depth-0 entry point -- it never recurses
+// into itself, so it carries no depth parameter of its own).
 fn decrypt_strings_in_object_value(
     value: &mut ObjectValue,
     cipher: StringCipher<'_>,
-    depth: usize,
 ) -> Result<()> {
-    if depth > crate::object::MAX_INLINE_DEPTH {
-        return Err(Error::Unsupported(format!(
-            "decrypt: inline object nesting exceeds maximum of {}",
-            crate::object::MAX_INLINE_DEPTH
-        )));
-    }
     match value {
         ObjectValue::String(bytes) => decrypt_cipher_bytes(bytes, cipher),
         ObjectValue::Array(items) => {
             for item in items.iter() {
-                decrypt_handle_strings_in_place(item, cipher, depth + 1)?;
+                decrypt_handle_strings_in_place(item, cipher, 1)?;
             }
             Ok(())
         }
         ObjectValue::Dictionary(entries) => {
             for item in entries.values() {
-                decrypt_handle_strings_in_place(item, cipher, depth + 1)?;
+                decrypt_handle_strings_in_place(item, cipher, 1)?;
             }
             Ok(())
         }
-        ObjectValue::Stream { dict, .. } => {
-            decrypt_handle_strings_in_place(dict, cipher, depth + 1)
-        }
+        ObjectValue::Stream { dict, .. } => decrypt_handle_strings_in_place(dict, cipher, 1),
         ObjectValue::Null
         | ObjectValue::Boolean(_)
         | ObjectValue::Integer(_)
@@ -3769,7 +3753,10 @@ mod tests {
 
         let info_ref = match rt.trailer().get("Info") {
             Some(Object::Reference(r)) => *r,
-            other => panic!("trailer /Info must be a reference, got {other:?}"),
+            // Defensive-only: this test's own fixture always writes /Info
+            // as a reference (the writer's Catalog-first renumber keeps it
+            // that way), so this arm cannot run.
+            other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: unreachable given this test's own fixture
         };
         let info_handle = rt.get_object_handle(info_ref);
         rt.resolve_object_handle(&info_handle)
@@ -3840,6 +3827,219 @@ mod tests {
             .expect("RC4 inverse transform");
         assert_eq!(bytes.as_ptr(), original_ptr);
         assert_eq!(bytes, plaintext);
+    }
+
+    fn explicit_rc4_string_encryption_state() -> EncryptionState {
+        EncryptionState {
+            string_mode: EncryptionMode::Rc4,
+            ..explicit_rc4_encryption_state()
+        }
+    }
+
+    #[test]
+    fn decrypt_object_value_strings_rc4_top_level_string() {
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let mut value =
+            ObjectValue::String(rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption));
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("RC4 top-level string decryption");
+
+        let ObjectValue::String(bytes) = &value else {
+            panic!("value must still be a string");
+        };
+        assert_eq!(bytes.as_slice(), b"TopSecretTitle");
+    }
+
+    #[test]
+    fn decrypt_object_value_strings_skips_the_encrypt_dictionary_object() {
+        let object_ref = ObjectRef::new(9, 0);
+        let mut encryption = explicit_rc4_string_encryption_state();
+        encryption.encrypt_ref = Some(object_ref);
+        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
+        let mut value = ObjectValue::String(ciphertext.clone());
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("the /Encrypt object's own strings are exempt, not an error");
+
+        let ObjectValue::String(bytes) = &value else {
+            panic!("value must still be a string");
+        };
+        assert_eq!(
+            bytes.as_slice(),
+            ciphertext.as_slice(),
+            "the /Encrypt dictionary's own strings must never be decrypted, \
+             mirroring decrypt_object_strings's identical encrypt_ref guard"
+        );
+    }
+
+    #[test]
+    fn decrypt_object_value_strings_decrypts_a_string_inside_a_direct_array() {
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
+        let mut value = ObjectValue::Array(vec![ObjectHandle::string(ciphertext)]);
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("array-contained string decryption");
+
+        let ObjectValue::Array(items) = &value else {
+            panic!("value must still be an array");
+        };
+        assert_eq!(
+            items[0].as_string().as_deref(),
+            Some(b"TopSecretTitle".as_slice())
+        );
+    }
+
+    #[test]
+    fn decrypt_object_value_strings_decrypts_a_string_inside_a_nested_dictionary() {
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
+        let inner =
+            ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
+        let mut value = ObjectValue::Dictionary(BTreeMap::from([(b"Nested".to_vec(), inner)]));
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("nested-dictionary string decryption");
+
+        let ObjectValue::Dictionary(entries) = &value else {
+            panic!("value must still be a dictionary");
+        };
+        let nested = entries.get(b"Nested".as_slice()).expect("Nested entry");
+        let nested_dict = nested.as_dictionary().expect("Nested must be a dictionary");
+        let title = nested_dict.get(b"Title".as_slice()).expect("Title entry");
+        assert_eq!(
+            title.as_string().as_deref(),
+            Some(b"TopSecretTitle".as_slice())
+        );
+    }
+
+    #[test]
+    fn decrypt_object_value_strings_decrypts_a_string_inside_a_stream_dictionary() {
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
+        let dict =
+            ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
+        let mut value = ObjectValue::Stream {
+            dict,
+            data: b"stream payload, untouched by string decryption".to_vec(),
+        };
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("stream-dictionary string decryption");
+
+        let ObjectValue::Stream { dict, data } = &value else {
+            panic!("value must still be a stream");
+        };
+        let stream_dict = dict.as_dictionary().expect("stream dict");
+        let title = stream_dict.get(b"Title".as_slice()).expect("Title entry");
+        assert_eq!(
+            title.as_string().as_deref(),
+            Some(b"TopSecretTitle".as_slice())
+        );
+        assert_eq!(
+            data.as_slice(),
+            b"stream payload, untouched by string decryption",
+            "stream payload bytes are never touched by string decryption"
+        );
+    }
+
+    #[test]
+    fn decrypt_handle_strings_in_place_decrypts_a_string_inside_a_directly_nested_stream() {
+        // Distinct from the top-level-stream test above: here the stream is
+        // a *child* reached through `decrypt_handle_strings_in_place`'s own
+        // `as_stream_dict()` arm, not `decrypt_strings_in_object_value`'s
+        // top-level `Stream` arm. A direct (non-indirect) `ObjectHandle`
+        // wrapping a stream value is not the common case -- qpdf's own
+        // streams are always indirect -- but it is reachable through the
+        // public API the same way `object_handle.rs`'s own
+        // `a_direct_stream_value_unparse_resolved_inlines_rather_than_referencing`
+        // test documents: a nested `Object::Stream` passed to
+        // `Pdf::set_object` inside an array or dictionary.
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
+        let stream_dict =
+            ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
+        let stream_child = ObjectHandle::from_value(ObjectValue::Stream {
+            dict: stream_dict,
+            data: b"payload".to_vec(),
+        });
+        let mut value = ObjectValue::Array(vec![stream_child]);
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("directly nested stream string decryption");
+
+        let ObjectValue::Array(items) = &value else {
+            panic!("value must still be an array");
+        };
+        let nested_dict = items[0]
+            .as_stream_dict()
+            .expect("array item must still be a stream")
+            .as_dictionary()
+            .expect("stream dict");
+        let title = nested_dict.get(b"Title".as_slice()).expect("Title entry");
+        assert_eq!(
+            title.as_string().as_deref(),
+            Some(b"TopSecretTitle".as_slice())
+        );
+    }
+
+    #[test]
+    fn decrypt_object_value_strings_leaves_a_top_level_scalar_untouched() {
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let mut value = ObjectValue::Integer(42);
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("a bare scalar object has no string to decrypt");
+
+        assert!(matches!(value, ObjectValue::Integer(42)));
+    }
+
+    #[test]
+    fn decrypt_handle_strings_in_place_never_touches_an_indirect_childs_own_value() {
+        // An indirect child is a terminal leaf: its own eventual resolution
+        // decrypts it separately, keyed by its own object ref. Using the
+        // *parent's* key here would corrupt it -- confirmed by resolving the
+        // child to a string that would decrypt to something else entirely
+        // under the parent's key, then asserting it is untouched.
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let child = ObjectHandle::new_indirect_unresolved(ObjectRef::new(4, 0), 0);
+        child.set_resolved(ObjectValue::String(b"unrelated ciphertext".to_vec()));
+        let mut value = ObjectValue::Dictionary(BTreeMap::from([(b"Ref".to_vec(), child.clone())]));
+
+        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect("indirect children are skipped, not an error");
+
+        assert_eq!(
+            child.as_string().as_deref(),
+            Some(b"unrelated ciphertext".as_slice()),
+            "an indirect child's own resolved value must be left exactly as-is"
+        );
+    }
+
+    #[test]
+    fn decrypt_handle_strings_in_place_rejects_excess_direct_nesting() {
+        let object_ref = ObjectRef::new(3, 0);
+        let encryption = explicit_rc4_string_encryption_state();
+        let mut handle = ObjectHandle::string(b"leaf".to_vec());
+        for _ in 0..=crate::object::MAX_INLINE_DEPTH {
+            handle = ObjectHandle::array(vec![handle]);
+        }
+        let mut value = ObjectValue::Array(vec![handle]);
+
+        let err = decrypt_object_value_strings(object_ref, &mut value, &encryption)
+            .expect_err("excess direct nesting must error, not overflow the stack");
+        assert!(
+            matches!(err, Error::Unsupported(ref m) if m.contains("inline object nesting exceeds maximum")),
+            "got {err:?}"
+        );
     }
 
     fn flate_encoded(plaintext: &[u8]) -> Vec<u8> {
