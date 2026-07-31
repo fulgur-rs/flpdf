@@ -2462,7 +2462,7 @@ mod mutation_tests {
         let dict = ObjectValue::Dictionary([(b"K".to_vec(), child.clone())].into_iter().collect());
         let cloned = dict.clone();
         let ObjectValue::Dictionary(entries) = cloned else {
-            panic!("expected dictionary");
+            panic!("expected dictionary"); // cov:ignore: unreachable in a passing run
         };
         assert!(entries.get(b"K".as_slice()).unwrap().ptr_eq(&child));
     }
@@ -2811,5 +2811,112 @@ mod mutation_tests {
         let scalar = ObjectHandle::integer(1);
         scalar.replace_stream_data(b"x".to_vec(), None, None);
         assert_eq!(scalar.as_integer(), Some(1));
+    }
+
+    // --- Coverage closers: paths the tests above never happened to reach ---
+
+    #[test]
+    fn replace_key_and_remove_key_mutate_a_resolved_indirect_handle() {
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
+        indirect.set_resolved(ObjectValue::Dictionary(Default::default()));
+        indirect.replace_key(b"A", ObjectHandle::integer(1));
+        assert_eq!(indirect.get_key(b"A").as_integer(), Some(1));
+        indirect.remove_key(b"A");
+        assert!(indirect.get_key(b"A").is_null());
+    }
+
+    #[test]
+    fn replace_key_and_remove_key_are_no_ops_on_an_unresolved_indirect_handle() {
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
+        indirect.replace_key(b"A", ObjectHandle::integer(1)); // must not panic
+        indirect.remove_key(b"A"); // must not panic
+        assert!(indirect.get_key(b"A").is_null());
+    }
+
+    #[test]
+    fn shallow_copy_of_an_unresolved_indirect_handle_is_a_direct_null() {
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
+        let copy = indirect.shallow_copy();
+        assert!(copy.is_direct());
+        assert!(copy.is_null());
+    }
+
+    #[test]
+    fn shallow_copy_of_an_array_recurses_through_direct_elements() {
+        let inner = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+        let original = ObjectHandle::array(vec![inner]);
+        let copy = original.shallow_copy();
+        let copy_inner = copy.as_array().unwrap()[0].clone();
+        assert!(!copy_inner.ptr_eq(&original.as_array().unwrap()[0]));
+        assert_eq!(
+            copy.as_array().unwrap()[0].as_array().unwrap()[0].as_integer(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn merge_resources_installs_an_already_indirect_new_key_without_shallow_copying() {
+        let shared = ObjectHandle::new_indirect_unresolved(ObjectRef::new(5, 0), -1);
+        shared.set_resolved(ObjectValue::Integer(1));
+        let this_font = ObjectHandle::dictionary(vec![]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        dest.merge_resources(&other, None);
+        assert!(dest.get_key(b"Font").get_key(b"F1").ptr_eq(&shared));
+    }
+
+    #[test]
+    fn merge_resources_array_union_skips_a_non_scalar_item() {
+        let dest =
+            ObjectHandle::dictionary(vec![(b"ProcSet".to_vec(), ObjectHandle::array(vec![]))]);
+        let other = ObjectHandle::dictionary(vec![(
+            b"ProcSet".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::dictionary(vec![])]),
+        )]);
+        dest.merge_resources(&other, None);
+        assert!(dest.get_key(b"ProcSet").as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn is_scalar_covers_every_disjunct() {
+        assert!(is_scalar(&ObjectHandle::boolean(true)));
+        assert!(is_scalar(&ObjectHandle::integer(1)));
+        assert!(is_scalar(&ObjectHandle::name(b"N".to_vec())));
+        assert!(is_scalar(&ObjectHandle::null()));
+        assert!(is_scalar(&ObjectHandle::real(1.0)));
+        assert!(is_scalar(&ObjectHandle::string(b"S".to_vec())));
+        assert!(!is_scalar(&ObjectHandle::array(vec![])));
+    }
+
+    #[test]
+    fn merge_resources_mints_a_second_unique_name_when_the_first_candidate_is_taken() {
+        // this_val (the Font sub-dict itself) has a nested dictionary-valued
+        // entry ("Widths") whose own key happens to be "F1_1" --
+        // get_resource_names is called ON this_val (see merge_resources's
+        // own doc comment on why it is this level, not dest's), so its
+        // "grandchildren" pool picks this up, forcing unique_resource_name
+        // past its first candidate.
+        let this_font = ObjectHandle::dictionary(vec![
+            (b"F1".to_vec(), ObjectHandle::integer(1)),
+            (
+                b"Widths".to_vec(),
+                ObjectHandle::dictionary(vec![(b"F1_1".to_vec(), ObjectHandle::integer(0))]),
+            ),
+        ]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        let mut conflicts = std::collections::BTreeMap::new();
+        dest.merge_resources(&other, Some(&mut conflicts));
+        let new_name = conflicts
+            .get(b"Font".as_slice())
+            .and_then(|m| m.get(b"F1".as_slice()))
+            .expect("F1 conflict recorded");
+        assert_eq!(new_name, b"F1_2");
+        assert_eq!(
+            dest.get_key(b"Font").get_key(new_name).as_integer(),
+            Some(2)
+        );
     }
 }
