@@ -772,20 +772,29 @@ fn stream_dictionary_parsed_offset_survives_resolve_set_object_round_trip() {
 
 /// `Object::Operator`/`Object::InlineImage` are content-stream-only tokens
 /// that no caller sets a resolved object to in practice, but `set_object`'s
-/// signature does not forbid it (it accepts any `Object`). `Pdf::lift`
-/// falls back to `ObjectValue::Null` for both, matching how an unknown
-/// reference resolves.
+/// signature does not forbid it (it accepts any `Object`). `ObjectValue` has
+/// no variant to represent either, so `Pdf::lift` returns `Err` for both,
+/// routing `set_object` to its own "cannot be represented in the handle
+/// graph" fallback — the same route an excessively deep object already
+/// takes — which preserves the caller-supplied value as the authoritative
+/// materialized result instead of silently losing it to `Null`.
 #[test]
-fn set_object_with_a_content_stream_only_token_materializes_to_null() {
+fn set_object_with_a_content_stream_only_token_preserves_the_original_value() {
     let file = File::open(minimal_fixture_path()).unwrap();
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
     let object_ref = pdf.root_ref().expect("root");
 
     pdf.set_object(object_ref, Object::Operator(b"q".to_vec()));
-    assert_eq!(pdf.resolve(object_ref).unwrap(), Object::Null);
+    assert_eq!(
+        pdf.resolve(object_ref).unwrap(),
+        Object::Operator(b"q".to_vec())
+    );
 
     pdf.set_object(object_ref, Object::InlineImage(b"data".to_vec()));
-    assert_eq!(pdf.resolve(object_ref).unwrap(), Object::Null);
+    assert_eq!(
+        pdf.resolve(object_ref).unwrap(),
+        Object::InlineImage(b"data".to_vec())
+    );
 }
 
 /// Regression for `Pdf::delete_object`'s own handle-graph write-through:

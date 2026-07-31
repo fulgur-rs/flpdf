@@ -1797,9 +1797,9 @@ impl<R: Read + Seek> Pdf<R> {
     // `Object::Reference` used throughout this crate to redirect or
     // collapse a holder chain in place — see `ObjectValue::Reference`'s own
     // doc). The content-stream-only `Object::Operator`/`Object::InlineImage`
-    // variants fall back to `ObjectValue::Null`: neither is ever a resolved
-    // file/ObjStm object value nor a value any caller passes to
-    // `set_object`.
+    // variants return `Err`, routing `Pdf::set_object`'s caller to its own
+    // "cannot be represented in the handle graph" fallback (see that
+    // function's comment) instead of losing the value to a silent `Null`.
     //
     // `depth` bounds inline `Array`/`Dictionary`/`Stream`-dictionary nesting
     // against `MAX_INLINE_DEPTH`, mirroring every other post-parse structural
@@ -1877,8 +1877,20 @@ impl<R: Read + Seek> Pdf<R> {
             Object::Reference(object_ref) => ObjectValue::Reference(*object_ref),
             // Content-stream-only tokens; never a resolved file/ObjStm
             // object value, and not a value any caller passes to
-            // `Pdf::set_object` in practice.
-            Object::Operator(_) | Object::InlineImage(_) => ObjectValue::Null,
+            // `Pdf::set_object` in practice. `ObjectValue` has no variant to
+            // represent either losslessly, so this returns `Err` rather than
+            // silently discarding the caller-supplied value as `Null`:
+            // `Pdf::set_object` already treats a `lift` failure as "cannot be
+            // represented in the handle graph" and falls back to storing
+            // `object` directly as the authoritative
+            // `legacy_materialized_memo` value instead (see its own comment),
+            // exactly the same route the excess-depth case already takes.
+            Object::Operator(_) | Object::InlineImage(_) => {
+                return Err(Error::Unsupported(
+                    "object handle lift: content-stream-only token has no ObjectValue representation"
+                        .to_string(),
+                ));
+            }
         };
         Ok(value)
     }
