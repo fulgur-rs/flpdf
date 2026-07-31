@@ -3,7 +3,7 @@
 //! This module provides the shared engine plus public wrappers corresponding
 //! to `QPDFNameTreeObjectHelper` and `QPDFNumberTreeObjectHelper`.
 
-use crate::json_inspect::{qpdf_new_unicode_utf8_value, qpdf_unicode_string_bytes};
+use crate::pdf_string::{new_unicode_string, normalized_utf8_value, utf8_value};
 use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::cmp::Ordering;
@@ -35,14 +35,14 @@ impl TreeKey for NameKey {
 
     fn from_object(object: &Object) -> Option<Self::Key> {
         match object {
-            Object::String(value) => Some(crate::json_inspect::qpdf_utf8_value(value)),
+            Object::String(value) => Some(utf8_value(value)),
             _ => None,
         }
     }
 
     fn to_object(key: &Self::Key) -> Object {
-        let normalized = qpdf_new_unicode_utf8_value(key);
-        Object::String(qpdf_unicode_string_bytes(&normalized))
+        let normalized = normalized_utf8_value(key);
+        Object::String(new_unicode_string(&normalized))
     }
 }
 
@@ -2698,12 +2698,12 @@ mod tests {
             NameKey::to_object(&b"a\0z".to_vec()),
             Object::String(b"a\0z".to_vec())
         );
-        assert_eq!(qpdf_new_unicode_utf8_value(&[0xc2, b'A']), "�A".as_bytes());
-        assert_eq!(qpdf_new_unicode_utf8_value(&[0xc0, 0x80]), "�".as_bytes());
-        assert_eq!(qpdf_new_unicode_utf8_value(&[0xc2]), "�".as_bytes());
-        assert_eq!(qpdf_new_unicode_utf8_value(&[0x80]), "�".as_bytes());
+        assert_eq!(normalized_utf8_value(&[0xc2, b'A']), "�A".as_bytes());
+        assert_eq!(normalized_utf8_value(&[0xc0, 0x80]), "�".as_bytes());
+        assert_eq!(normalized_utf8_value(&[0xc2]), "�".as_bytes());
+        assert_eq!(normalized_utf8_value(&[0x80]), "�".as_bytes());
         assert_eq!(
-            qpdf_new_unicode_utf8_value(&[0xf8, 0x88, 0x80, 0x80, 0x80]),
+            normalized_utf8_value(&[0xf8, 0x88, 0x80, 0x80, 0x80]),
             "�".as_bytes()
         );
     }

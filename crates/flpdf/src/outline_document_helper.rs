@@ -360,9 +360,8 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     }
 
     fn resolve_name_tree_node_dest(&mut self, bytes: &[u8]) -> Result<Object> {
-        let lookup = crate::json_inspect::qpdf_new_unicode_utf8_value(
-            &crate::json_inspect::qpdf_utf8_value(bytes),
-        );
+        let lookup =
+            crate::pdf_string::normalized_utf8_value(&crate::pdf_string::utf8_value(bytes));
         let Some(Object::Dictionary(mut names)) = self.catalog_value_terminal("Names")? else {
             return Ok(Object::Null);
         };
@@ -489,7 +488,7 @@ fn resolve_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Res
 fn qpdf_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> String {
     match value {
         Object::String(bytes) => {
-            String::from_utf8_lossy(&crate::json_inspect::qpdf_utf8_value(&bytes)).into_owned()
+            String::from_utf8_lossy(&crate::pdf_string::utf8_value(&bytes)).into_owned()
         }
         other => {
             pdf.push_warning(format!(

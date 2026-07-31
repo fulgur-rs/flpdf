@@ -140,14 +140,12 @@ pub mod page_split;
 pub mod page_tree_rebuild;
 pub mod pages;
 pub mod parser;
+pub mod pdf_string;
 pub mod pdf_version;
 pub mod permissions;
 pub mod pipeline;
 pub mod qdf_fix;
 pub(crate) mod qpdf_null;
-#[cfg(feature = "qtest-driver")]
-#[doc(hidden)]
-pub mod qtest_string;
 pub mod reader;
 #[cfg(not(feature = "qtest-driver"))]
 pub(crate) mod ref_chain;
