@@ -623,15 +623,11 @@ impl ObjectHandle {
     /// contradiction with [`Self::is_resolved`] returning `true` for the
     /// same handle, but it is not: the *value* is known (it is a reference),
     /// while the *referenced object's own type* is not known without
-    /// following the chain further, which this method never does. qpdf's
-    /// own object model has no ordinal for this case at all — `resolve()`
-    /// always fully chases a reference chain before returning a concrete
-    /// value, so qpdf itself never observes a "resolved but still a
-    /// redirect" object — so `ot_unresolved` is the closest real qpdf
-    /// meaning: the terminal type is not yet established. This mirrors
-    /// `flpdf-qtest-tools::driver::Handle::type_info`'s own
-    /// `Object::Reference(_) => (13, "unresolved")` mapping for the same
-    /// reason.
+    /// following the chain further, which this method never does — this
+    /// case is not chased to its terminal type the way it would be
+    /// elsewhere in this crate's own object-inspection code, and `13`
+    /// (`ot_unresolved`) is reported as a placeholder rather than the
+    /// terminal object's real ordinal.
     pub fn type_code(&self) -> u8 {
         if let Repr::Indirect(slot) = &self.0 {
             // Bind the borrow to a local first and match on it, mirroring
@@ -737,6 +733,73 @@ impl ObjectHandle {
         })
     }
 
+    /// This handle's qpdf-syntax unparse form
+    /// (`include/qpdf/QPDFObjectHandle.hh:1159`,
+    /// `libqpdf/QPDFObjectHandle.cc:1574-1584`): an indirect handle always
+    /// unparses to its own `"N G R"`, regardless of resolution state; a
+    /// direct handle delegates to [`Self::unparse_resolved`].
+    pub fn unparse(&self) -> Vec<u8> {
+        match self.object_ref() {
+            Some(object_ref) => {
+                let mut out = Vec::new();
+                Object::Reference(object_ref).write_pdf(&mut out);
+                out
+            }
+            None => self.unparse_resolved(),
+        }
+    }
+
+    /// This handle's resolved value in qpdf syntax
+    /// (`libqpdf/QPDFObjectHandle.cc:1586-1593`), except that an *indirect*
+    /// handle whose resolved value is a stream always reports its own
+    /// reference form instead (`libqpdf/QPDF_Stream.cc:173-178`) — a stream
+    /// is only ever a top-level indirect object in valid qpdf usage. A
+    /// direct handle wrapping a stream value (a shape this crate's own
+    /// types do not forbid, though qpdf's do) falls through to the same
+    /// inlining fallback as any other direct container value; see
+    /// `unparse_tests`' own direct-stream test for that case.
+    ///
+    /// This port diverges from qpdf's own `unparseResolved()` in two
+    /// internal resolution states that qpdf itself does not reach the same
+    /// way:
+    /// - **Not yet resolved**: qpdf silently dereferences (resolves) an
+    ///   unresolved indirect handle before unparsing it; this method does
+    ///   not perform that hidden I/O, matching every other accessor in this
+    ///   file (see e.g. [`Self::as_integer`]'s own doc) — no accessor here
+    ///   resolves on the caller's behalf. Reports the same `null` fallback
+    ///   the value would show before resolution.
+    /// - **Destroyed** (the owning document has been dropped and this
+    ///   handle's value severed): qpdf's `QPDF_Destroyed::unparse()`
+    ///   (`libqpdf/QPDF_Destroyed.cc:24-29`) throws `std::logic_error`; this
+    ///   method has no exception channel to mirror that with (`Vec<u8>`
+    ///   return, no `Result`) and instead presents the same `null` fallback
+    ///   this file's other value accessors (e.g. [`Self::is_null`]) already
+    ///   give a destroyed handle, rather than panicking.
+    pub fn unparse_resolved(&self) -> Vec<u8> {
+        // Bridges through a null-omission-aware materialization walk
+        // (`unparse_materialize`, distinct from the general `materialize`/
+        // `Pdf::resolve_borrowed` bridge -- see that function's own doc)
+        // and `Object::write_pdf`'s own already-byte-identical-tested
+        // formatter rather than duplicating array/dict/string-escaping
+        // logic against `ObjectValue` directly.
+        let is_stream = self.object_ref().is_some()
+            && self.with_value(|value| matches!(value, Some(ObjectValue::Stream { .. })));
+        if is_stream {
+            return self.unparse();
+        }
+        let mut out = Vec::new();
+        let materialized = unparse_materialize(self);
+        materialized.write_pdf(&mut out);
+        // `Object`'s own recursive Drop glue would walk this tree exactly
+        // as deep as the walk above just did, unprotected by
+        // `stacker::maybe_grow` -- protecting construction alone would
+        // still let a deep enough tree crash the process immediately after
+        // serialization completes, right here. Tear it down iteratively
+        // instead of letting it drop normally.
+        unparse_drop_iteratively(materialized);
+        out
+    }
+
     /// Replace this handle's own value in place, preserving its identity
     /// (every other outstanding clone observes the new value) and its
     /// already-recorded parsed offset (`parsed_offset` is untouched here --
@@ -816,6 +879,125 @@ fn materialize_child(handle: &ObjectHandle) -> Object {
     match handle.object_ref() {
         Some(object_ref) => Object::Reference(object_ref),
         None => handle.materialize(),
+    }
+}
+
+// A separate materialization walk used only by `ObjectHandle::unparse_resolved`,
+// not by the general `materialize`/`Pdf::resolve_borrowed` bridge above (whose
+// existing behavior other callers depend on unchanged). Applies qpdf's
+// dictionary-entry null-omission rule (`QPDF_Dictionary::unparse()`,
+// `libqpdf/QPDF_Dictionary.cc:59-69`: `if (!iter.second.isNull()) { ... }`) —
+// an explicit null value is equivalent to a missing key. `QPDF_Array::unparse()`
+// (`libqpdf/QPDF_Array.cc:123-140`) has no such rule; array elements keep
+// their null values verbatim, so only the `Dictionary` arm differs from
+// `materialize_value` above.
+fn unparse_materialize_value(value: &ObjectValue) -> Object {
+    match value {
+        ObjectValue::Array(children) => {
+            Object::Array(children.iter().map(unparse_materialize_child).collect())
+        }
+        ObjectValue::Dictionary(entries) => {
+            let mut dict = Dictionary::new();
+            for (key, value) in entries {
+                if unparse_is_known_null(value) {
+                    continue;
+                }
+                dict.insert(key.as_slice(), unparse_materialize_child(value));
+            }
+            Object::Dictionary(dict)
+        }
+        ObjectValue::Stream { dict, data } => {
+            let dict = match unparse_materialize(dict) {
+                Object::Dictionary(dict) => dict,
+                _ => Dictionary::new(), // cov:ignore: same invariant as materialize_value's own Stream arm
+            };
+            Object::Stream(Stream::new(dict, data.clone()))
+        }
+        // No other variant nests a dictionary, so the omission rule cannot
+        // apply anywhere beneath it; delegate to the ordinary materializer.
+        other => materialize_value(other),
+    }
+}
+
+// Stack-safety constants for `unparse_materialize`'s recursive walk,
+// mirroring `parser.rs`'s own `STACK_RED_ZONE`/`STACK_GROWTH_SIZE` values
+// (kept as separate local constants rather than imported cross-module,
+// since this slice's own scope is limited to this file). A tree built
+// directly through the public `ObjectHandle::array`/`dictionary` factories
+// carries no depth bound the way parsed input does (`parser::MAX_PARSE_DEPTH`
+// rejects a document too deep to parse before an `ObjectHandle` tree that
+// deep can even exist for it), so this walk needs the same stack-growth
+// protection the parser already relies on for its own recursion.
+const UNPARSE_STACK_RED_ZONE: usize = 32 * 1024;
+const UNPARSE_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
+// The sole recursion hub for `unparse_materialize_value`'s `Array`/
+// `Dictionary`/`Stream` arms (every nested descent goes through
+// `unparse_materialize_child`, which calls back into this function) --
+// wrapping recursion here, in one place, bounds every nesting path the same
+// way `parser::Parser::object`'s own single hub does for parsing.
+fn unparse_materialize(handle: &ObjectHandle) -> Object {
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        handle.with_value(|value| match value {
+            Some(value) => unparse_materialize_value(value),
+            None => Object::Null,
+        })
+    })
+}
+
+fn unparse_materialize_child(handle: &ObjectHandle) -> Object {
+    match handle.object_ref() {
+        Some(object_ref) => Object::Reference(object_ref),
+        None => unparse_materialize(handle),
+    }
+}
+
+// True if `handle`'s value is already known (no resolution performed here)
+// to be null: a direct null, or an indirect handle that is already resolved
+// (`ObjectHandle::is_resolved`) and reads as null. qpdf's own check
+// (`QPDFObjectHandle::isNull()`, `libqpdf/QPDFObjectHandle.cc:353-356`)
+// dereferences an indirect child to decide this; this port never performs
+// that hidden resolution (matching every other accessor in this file), so a
+// not-yet-resolved indirect entry is conservatively treated as *not* known
+// to be null and is kept rather than guessed away.
+fn unparse_is_known_null(handle: &ObjectHandle) -> bool {
+    handle.is_resolved() && handle.is_null()
+}
+
+// Tears down a materialized `Object` tree without using its own recursive
+// Drop glue, which -- like `unparse_materialize`'s construction walk this
+// mirrors -- has no protection against a deeply nested tree's per-frame
+// stack cost. Takes ownership so the caller's normal drop of the same value
+// never runs (its children have already been moved out and pushed onto this
+// function's own explicit, heap-allocated stack by the time each node's
+// turn to drop trivially arrives).
+//
+// Only `Array`/`Dictionary`/`Stream` nest another `Object`; every other
+// variant holds no `Object` children and drops in O(1) once popped, whether
+// or not this function ever visits it -- `Dictionary`/`Stream` are drained
+// through their existing public `iter()`/`remove()` API (no new access
+// needed into `object.rs`, kept outside this slice's file allowlist).
+fn unparse_drop_iteratively(root: Object) {
+    let mut stack = vec![root];
+    while let Some(mut node) = stack.pop() {
+        match &mut node {
+            Object::Array(items) => stack.extend(std::mem::take(items)),
+            Object::Dictionary(dict) => drain_dictionary_onto(dict, &mut stack),
+            Object::Stream(stream) => drain_dictionary_onto(&mut stream.dict, &mut stack),
+            _ => {}
+        }
+        // `node`'s own nested `Object` children (if any) were just moved
+        // out above, so its normal drop here -- an empty `Vec`/`Dictionary`
+        // plus whatever non-recursive fields it holds -- is O(1).
+    }
+}
+
+fn drain_dictionary_onto(dict: &mut Dictionary, stack: &mut Vec<Object>) {
+    let keys: Vec<Vec<u8>> = dict.iter().map(|(key, _)| key.to_vec()).collect();
+    for key in keys {
+        if let Some(value) = dict.remove(key) {
+            stack.push(value);
+        }
     }
 }
 
@@ -1564,5 +1746,251 @@ mod type_code_tests {
         // code reports the same ordinal as a handle whose value is not
         // known at all.
         assert!(handle.is_resolved());
+    }
+}
+
+#[cfg(test)]
+mod unparse_tests {
+    use super::*;
+
+    #[test]
+    fn unparse_resolved_covers_every_teardown_arm_for_a_nested_array_dict_and_stream() {
+        // Codex Review on PR #603 (discussion_r3689896128) found that the
+        // recursive materialization walk backing unparse/unparse_resolved
+        // had no protection against a deeply nested tree's per-frame stack
+        // cost. Two recursion points were fixed: construction
+        // (unparse_materialize, wrapped in stacker::maybe_grow) and the
+        // resulting materialized `Object` tree's own teardown right after
+        // (unparse_drop_iteratively, an explicit-stack walk replacing
+        // Object's ordinary recursive Drop).
+        //
+        // This test intentionally does NOT probe an extreme depth. A
+        // depth large enough to discriminate "protected" from
+        // "unprotected" on every CI runner turned out not to exist: a
+        // depth safe on this author's local machine (4,000) still
+        // stack-overflowed on macOS/ARM/Windows CI runners, because
+        // `Object::write_pdf` -- called on the materialized tree between
+        // the two now-protected walks -- is *itself* an unprotected
+        // recursive serializer living in object.rs, outside this slice's
+        // file allowlist (only object_handle.rs may change). Fixing that
+        // third recursion point is out of scope here; it is tracked
+        // together with the other pre-existing unprotected-recursion
+        // concerns in flpdf-egzr.3.5. Until it lands, no caller of
+        // unparse_resolved has arbitrary-depth safety, so this test
+        // stays at a shallow, portable depth and exercises every
+        // container arm (Array, Dictionary, Stream) that
+        // unparse_drop_iteratively and drain_dictionary_onto handle,
+        // rather than chasing a depth number.
+        let stream = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
+        stream.set_resolved(ObjectValue::Stream {
+            dict: ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(0))]),
+            data: Vec::new(),
+        });
+        let inner_dict = ObjectHandle::dictionary(vec![
+            (b"A".to_vec(), ObjectHandle::null()),
+            (b"B".to_vec(), ObjectHandle::integer(2)),
+        ]);
+        let array = ObjectHandle::array(vec![
+            ObjectHandle::integer(1),
+            inner_dict,
+            stream,
+            ObjectHandle::array(vec![ObjectHandle::name(b"Nested".to_vec())]),
+        ]);
+
+        assert_eq!(
+            array.unparse_resolved(),
+            b"[ 1 << /B 2 >> 9 0 R [ /Nested ] ]"
+        );
+    }
+
+    #[test]
+    fn direct_scalar_unparses_like_object_write_pdf() {
+        assert_eq!(ObjectHandle::integer(7).unparse(), b"7");
+        assert_eq!(ObjectHandle::boolean(true).unparse(), b"true");
+        assert_eq!(ObjectHandle::name(b"Type".to_vec()).unparse(), b"/Type");
+    }
+
+    #[test]
+    fn indirect_handle_unparse_is_always_the_reference_form_even_before_resolution() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 2), 0);
+        assert_eq!(handle.unparse(), b"7 2 R");
+    }
+
+    #[test]
+    fn indirect_handle_unparse_resolved_falls_back_to_null_before_resolution() {
+        // No hidden I/O: an unresolved indirect handle's value is not
+        // known, so unparse_resolved reports the same as materialize()'s
+        // own documented null fallback rather than triggering resolution.
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 2), 0);
+        assert_eq!(handle.unparse_resolved(), b"null");
+    }
+
+    #[test]
+    fn resolved_indirect_handle_unparse_resolved_shows_the_real_value() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 2), 0);
+        handle.set_resolved(ObjectValue::Integer(42));
+        assert_eq!(handle.unparse(), b"7 2 R");
+        assert_eq!(handle.unparse_resolved(), b"42");
+    }
+
+    #[test]
+    fn stream_value_unparse_resolved_still_reports_the_reference_form() {
+        // QPDF_Stream::unparse() (libqpdf/QPDF_Stream.cc:173-178) always
+        // returns its own "N G R" — mirrored here rather than inlining the
+        // stream's dictionary/data.
+        let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(0))]);
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
+        handle.set_resolved(ObjectValue::Stream {
+            dict,
+            data: Vec::new(),
+        });
+        assert_eq!(handle.unparse(), b"9 0 R");
+        assert_eq!(handle.unparse_resolved(), b"9 0 R");
+    }
+
+    #[test]
+    fn direct_array_unparse_writes_indirect_children_as_references_not_recursed() {
+        let child = ObjectHandle::new_indirect_unresolved(ObjectRef::new(5, 0), 0);
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(1), child]);
+        assert_eq!(array.unparse(), b"[ 1 5 0 R ]");
+    }
+
+    #[test]
+    fn a_direct_stream_value_unparse_resolved_inlines_rather_than_referencing() {
+        // A *direct* Stream `ObjectValue` is not the common case (no public
+        // `ObjectHandle::stream(..)` factory exists; production reader code
+        // installs real stream values via `set_resolved` on an indirect
+        // handle), but it IS reachable through the public API: a nested
+        // `Object::Stream` passed to `Pdf::set_object` (e.g. inside an
+        // `Object::Array`) is lifted via `reader.rs`'s `lift_bounded`'s
+        // direct-value arm into `ObjectHandle::from_value`, producing
+        // exactly this shape. Real qpdf has no equivalent state -- a stream
+        // is only ever a *newly allocated indirect* `QPDFObjectHandle`
+        // (`QPDFObjectHandle::newStream`) -- so `QPDF_Stream::unparse()`'s
+        // reference-form guarantee has nothing to say about this case, and
+        // there is no qpdf byte-parity oracle to match here. This test
+        // pins down that the fallback path (materialize + `Object::write_pdf`)
+        // handles this shape by inlining the dictionary and data the same
+        // way `Object::write_pdf` already does for `Object::Stream`, rather
+        // than fabricating a meaningless reference for a value that was
+        // never assigned an object number/generation.
+        let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
+        let handle = ObjectHandle::from_value(ObjectValue::Stream {
+            dict,
+            data: b"ab".to_vec(),
+        });
+        assert_eq!(
+            handle.unparse_resolved(),
+            b"<< /Length 2 >>\nstream\nab\nendstream"
+        );
+    }
+
+    #[test]
+    fn destroyed_indirect_handle_unparse_is_unaffected_but_unparse_resolved_falls_back_to_null() {
+        // qpdf's own `unparse()` never dereferences an indirect handle at
+        // all (`libqpdf/QPDFObjectHandle.cc:1574-1584`: the isIndirect()
+        // branch returns "N G R" directly without calling
+        // `unparseResolved()`), so a destroyed handle's `unparse()` does
+        // not throw either -- no divergence there. `unparseResolved()`
+        // does dereference, though, and qpdf's `QPDF_Destroyed::unparse()`
+        // (`libqpdf/QPDF_Destroyed.cc:24-29`) throws `std::logic_error`
+        // once it gets there. This method has no exception channel to
+        // mirror that with, so -- as documented on `unparse_resolved`
+        // itself -- it presents the same `null` fallback this file's other
+        // value accessors give a destroyed handle, rather than panicking.
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Integer(7));
+        handle.disconnect();
+
+        assert_eq!(handle.unparse(), b"1 0 R");
+        assert_eq!(handle.unparse_resolved(), b"null");
+    }
+
+    #[test]
+    fn resolved_to_a_reference_indirect_handle_unparse_and_unparse_resolved_diverge() {
+        // Mirrors `type_code_tests::resolved_to_a_reference_indirect_handle_reports_unresolved`'s
+        // own state: a handle `Pdf::set_object` redirected in place to
+        // another object (see `ObjectValue::Reference`'s own doc).
+        // `unparse()` never dereferences an indirect handle (see this
+        // module's `destroyed_...` test above), so it reports the
+        // redirecting handle's own "N G R" -- not the target's.
+        // `unparse_resolved()` does read the resolved value, which is
+        // itself a bare reference, so it reports the *target's* "N G R"
+        // instead of chasing to the target's own concrete value (e.g.
+        // `42`). This is a real gap, not a documented design choice: this
+        // crate's own `flpdf-qtest-tools::driver::Handle` already has an
+        // established, tested contract for exactly this redirect scenario
+        // (`reference_chain_resolves_but_unparse_retains_the_first_reference`,
+        // `driver/handle.rs:678-696`) where the equivalent accessor *does*
+        // chase to the target's terminal value while `unparse()` keeps
+        // reporting the first reference's own identity -- this method does
+        // not yet replicate that. Chasing needs `Pdf` (`ObjectValue::Reference`
+        // stores only a bare `ObjectRef`, not a handle link), so it cannot be
+        // implemented from this file alone; tracked as flpdf-l3kz, and wired
+        // as a hard dependency of flpdf-egzr.3.2.3 (the slice that migrates
+        // `driver::Handle` itself onto this API and must not regress that
+        // test).
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Reference(ObjectRef::new(9, 0)));
+
+        assert_eq!(handle.unparse(), b"1 0 R");
+        assert_eq!(handle.unparse_resolved(), b"9 0 R");
+    }
+
+    #[test]
+    fn unparse_resolved_omits_a_direct_null_dictionary_entry() {
+        // qpdf's QPDF_Dictionary::unparse() (libqpdf/QPDF_Dictionary.cc:59-69)
+        // skips any entry whose value isNull(), matching the PDF-spec
+        // equivalence between an explicit null value and a missing key.
+        let dict = ObjectHandle::dictionary(vec![
+            (b"A".to_vec(), ObjectHandle::null()),
+            (b"B".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        assert_eq!(dict.unparse_resolved(), b"<< /B 1 >>");
+    }
+
+    #[test]
+    fn unparse_resolved_omits_an_already_resolved_null_indirect_dictionary_entry() {
+        // The same qpdf rule applies to an indirect child, since qpdf's
+        // isNull() dereferences before checking -- but only when this
+        // child's value is already known (is_resolved()), never by forcing
+        // new resolution (see the "keeps a not-yet-resolved" test below).
+        let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
+        missing.set_missing();
+        let dict = ObjectHandle::dictionary(vec![
+            (b"A".to_vec(), missing),
+            (b"B".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        assert_eq!(dict.unparse_resolved(), b"<< /B 1 >>");
+    }
+
+    #[test]
+    fn unparse_resolved_keeps_a_not_yet_resolved_indirect_dictionary_entry() {
+        // Divergence from qpdf, which would resolve the child to check its
+        // nullness (QPDFObjectHandle::isNull() dereferences,
+        // libqpdf/QPDFObjectHandle.cc:353-356); this port never performs
+        // hidden resolution (see unparse_resolved's own doc), so an entry
+        // whose nullness is not yet known is conservatively kept rather
+        // than guessed away.
+        let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), unresolved)]);
+        assert_eq!(dict.unparse_resolved(), b"<< /A 9 0 R >>");
+    }
+
+    #[test]
+    fn unparse_resolved_omits_nulls_in_a_nested_dictionary_inside_an_array() {
+        let inner = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::null())]);
+        let array = ObjectHandle::array(vec![inner]);
+        assert_eq!(array.unparse_resolved(), b"[ << >> ]");
+    }
+
+    #[test]
+    fn unparse_resolved_does_not_omit_null_array_elements() {
+        // Only dictionary keys are omitted for a null value; array elements
+        // keep their position (QPDF_Array::unparse(),
+        // libqpdf/QPDF_Array.cc:123-140, explicitly fills gaps with the
+        // literal "null" token rather than skipping them).
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(1), ObjectHandle::null()]);
+        assert_eq!(array.unparse_resolved(), b"[ 1 null ]");
     }
 }
