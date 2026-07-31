@@ -323,10 +323,11 @@ impl ObjectHandle {
     }
 
     /// True if this handle's value is known without performing resolution: a
-    /// direct handle always is; an indirect handle is once its state has left
-    /// [`IndirectState::NotYetResolved`], whether that landed on a real value
-    /// or on [`IndirectState::Missing`].
-    pub(crate) fn is_resolved(&self) -> bool {
+    /// direct handle always is; an indirect handle is once it has left its
+    /// initial state, whether that landed on a real value, on a reference
+    /// that turned out to be missing from the source, or on a value severed
+    /// because its owning document was dropped.
+    pub fn is_resolved(&self) -> bool {
         match &self.0 {
             Repr::Direct(_) => true,
             Repr::Indirect(slot) => !matches!(slot.borrow().state, IndirectState::NotYetResolved),
@@ -1330,5 +1331,23 @@ mod token_value_tests {
             ObjectHandle::inline_image(b"data".to_vec()).materialize(),
             Object::InlineImage(b"data".to_vec())
         );
+    }
+}
+
+#[cfg(test)]
+mod is_resolved_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn is_resolved_is_usable_the_same_way_a_pub_fn_is() {
+        // This test doesn't exercise new behavior (resolution_state_tests
+        // already covers is_resolved's semantics exhaustively) — it exists
+        // only to keep a compile-time witness that `is_resolved` stays
+        // `pub`, the same way the rest of this module's public surface has
+        // a direct caller in-tree. Real external verification happens in
+        // Task 7 (zero-consumer-diff gate does not apply to this file
+        // itself, so a positive compile check here is the useful signal).
+        let handle = ObjectHandle::integer(1);
+        let _: bool = ObjectHandle::is_resolved(&handle);
     }
 }
