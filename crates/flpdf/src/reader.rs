@@ -1643,7 +1643,7 @@ impl<R: Read + Seek> Pdf<R> {
         // stream that was merely decrypted without an explicit crypt filter,
         // whose dictionary was not actually rewritten, since
         // `transformed_stream_refs` does not distinguish the two cases).
-        let (value, parsed_offset) = match self.source_xref_entries().get(&object_ref).copied() {
+        let (value, parsed_offset) = match self.source_xref_entries.get(&object_ref).copied() {
             Some(XrefEntry::Uncompressed { offset })
                 if !self.transformed_stream_refs.contains(&object_ref) =>
             {

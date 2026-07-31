@@ -22,10 +22,50 @@ pub(crate) const NO_PARSED_OFFSET: i64 = -1;
 /// Cloning a handle is O(1) and does not deep-copy the underlying value;
 /// every clone of an indirect handle shares the same canonical identity and
 /// resolution state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ObjectHandle(Repr);
 
-#[derive(Clone, Debug)]
+// Hand-written rather than derived: a resolved indirect value can hold
+// other indirect `ObjectHandle`s sharing this same canonical `Rc` identity
+// (array/dict/stream-dict children — see `Pdf::drop`'s own comment on the
+// same cycle). A self- or reciprocal reference (e.g. a one-object
+// `/Self 1 0 R` dictionary, or a `/Pages`/`/Parent` pair) would make a
+// derived, recursively-expanding `Debug` walk back into the same slot
+// forever, overflowing the stack. Stop at every indirect boundary instead
+// of expanding its resolved value: since only an indirect handle can carry
+// the document's shared identity, no cycle can exist that does not pass
+// through one, so this bound is sufficient to make formatting total.
+impl std::fmt::Debug for ObjectHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Repr::Direct(slot) => {
+                let slot = slot.borrow();
+                f.debug_struct("ObjectHandle::Direct")
+                    .field("value", &slot.value)
+                    .field("parsed_offset", &slot.parsed_offset)
+                    .finish()
+            }
+            Repr::Indirect(slot) => {
+                let slot = slot.borrow();
+                let state: &str = match &slot.state {
+                    IndirectState::NotYetResolved => "NotYetResolved",
+                    IndirectState::Resolved(_) => "Resolved(..)",
+                    IndirectState::Missing => "Missing",
+                    IndirectState::Destroyed => "Destroyed",
+                };
+                f.debug_struct("ObjectHandle::Indirect")
+                    .field("object_ref", &slot.object_ref)
+                    .field("state", &state)
+                    .field("parsed_offset", &slot.parsed_offset)
+                    .finish()
+            }
+        }
+    }
+}
+
+// Deliberately not `Debug`: see `ObjectHandle`'s own hand-written `Debug`
+// impl above for why a derived one is unsafe here (indirect-handle cycles).
+#[derive(Clone)]
 enum Repr {
     Direct(Rc<RefCell<DirectSlot>>),
     Indirect(Rc<RefCell<IndirectSlot>>),
@@ -852,6 +892,45 @@ mod resolution_state_tests {
 
         assert_eq!(a.strong_count(), 1, "only this test's own handle remains");
         assert_eq!(b.strong_count(), 1, "only this test's own handle remains");
+    }
+
+    #[test]
+    fn debug_format_does_not_recurse_through_a_self_referential_handle() {
+        // A one-object `/Self 1 0 R` dictionary: the handle's own resolved
+        // value embeds itself. A derived `Debug` would recurse into the
+        // same slot forever and overflow the stack; formatting must stop at
+        // the indirect boundary instead.
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Dictionary(
+            [(b"Self".to_vec(), handle.clone())].into_iter().collect(),
+        ));
+
+        let formatted = format!("{handle:?}");
+
+        assert!(formatted.contains("ObjectHandle::Indirect"));
+        assert!(formatted.contains("Resolved(..)"));
+    }
+
+    #[test]
+    fn debug_format_does_not_recurse_through_a_reciprocal_cycle() {
+        let a = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        let b = ObjectHandle::new_indirect_unresolved(ObjectRef::new(2, 0), 0);
+        a.set_resolved(ObjectValue::Dictionary(
+            [(b"Kid".to_vec(), b.clone())].into_iter().collect(),
+        ));
+        b.set_resolved(ObjectValue::Dictionary(
+            [(b"Parent".to_vec(), a.clone())].into_iter().collect(),
+        ));
+
+        let formatted = format!("{a:?}");
+
+        assert!(formatted.contains("ObjectHandle::Indirect"));
+    }
+
+    #[test]
+    fn debug_format_of_a_direct_handle_shows_its_value() {
+        let handle = ObjectHandle::integer(7);
+        assert!(format!("{handle:?}").contains("ObjectHandle::Direct"));
     }
 }
 
