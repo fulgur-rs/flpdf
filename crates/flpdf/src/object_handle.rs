@@ -780,7 +780,9 @@ impl ObjectHandle {
     ///   this file's other value accessors (e.g. [`Self::is_null`]) already
     ///   give a destroyed handle, rather than panicking.
     pub fn unparse_resolved(&self) -> Vec<u8> {
-        // Bridges through the existing direct-value materialization path
+        // Bridges through a null-omission-aware materialization walk
+        // (`unparse_materialize`, distinct from the general `materialize`/
+        // `Pdf::resolve_borrowed` bridge -- see that function's own doc)
         // and `Object::write_pdf`'s own already-byte-identical-tested
         // formatter rather than duplicating array/dict/string-escaping
         // logic against `ObjectValue` directly.
@@ -790,7 +792,7 @@ impl ObjectHandle {
             return self.unparse();
         }
         let mut out = Vec::new();
-        self.materialize().write_pdf(&mut out);
+        unparse_materialize(self).write_pdf(&mut out);
         out
     }
 
@@ -874,6 +876,69 @@ fn materialize_child(handle: &ObjectHandle) -> Object {
         Some(object_ref) => Object::Reference(object_ref),
         None => handle.materialize(),
     }
+}
+
+// A separate materialization walk used only by `ObjectHandle::unparse_resolved`,
+// not by the general `materialize`/`Pdf::resolve_borrowed` bridge above (whose
+// existing behavior other callers depend on unchanged). Applies qpdf's
+// dictionary-entry null-omission rule (`QPDF_Dictionary::unparse()`,
+// `libqpdf/QPDF_Dictionary.cc:59-69`: `if (!iter.second.isNull()) { ... }`) —
+// an explicit null value is equivalent to a missing key. `QPDF_Array::unparse()`
+// (`libqpdf/QPDF_Array.cc:123-140`) has no such rule; array elements keep
+// their null values verbatim, so only the `Dictionary` arm differs from
+// `materialize_value` above.
+fn unparse_materialize_value(value: &ObjectValue) -> Object {
+    match value {
+        ObjectValue::Array(children) => {
+            Object::Array(children.iter().map(unparse_materialize_child).collect())
+        }
+        ObjectValue::Dictionary(entries) => {
+            let mut dict = Dictionary::new();
+            for (key, value) in entries {
+                if unparse_is_known_null(value) {
+                    continue;
+                }
+                dict.insert(key.as_slice(), unparse_materialize_child(value));
+            }
+            Object::Dictionary(dict)
+        }
+        ObjectValue::Stream { dict, data } => {
+            let dict = match unparse_materialize(dict) {
+                Object::Dictionary(dict) => dict,
+                _ => Dictionary::new(), // cov:ignore: same invariant as materialize_value's own Stream arm
+            };
+            Object::Stream(Stream::new(dict, data.clone()))
+        }
+        // No other variant nests a dictionary, so the omission rule cannot
+        // apply anywhere beneath it; delegate to the ordinary materializer.
+        other => materialize_value(other),
+    }
+}
+
+fn unparse_materialize(handle: &ObjectHandle) -> Object {
+    handle.with_value(|value| match value {
+        Some(value) => unparse_materialize_value(value),
+        None => Object::Null,
+    })
+}
+
+fn unparse_materialize_child(handle: &ObjectHandle) -> Object {
+    match handle.object_ref() {
+        Some(object_ref) => Object::Reference(object_ref),
+        None => unparse_materialize(handle),
+    }
+}
+
+// True if `handle`'s value is already known (no resolution performed here)
+// to be null: a direct null, or an indirect handle that is already resolved
+// (`ObjectHandle::is_resolved`) and reads as null. qpdf's own check
+// (`QPDFObjectHandle::isNull()`, `libqpdf/QPDFObjectHandle.cc:353-356`)
+// dereferences an indirect child to decide this; this port never performs
+// that hidden resolution (matching every other accessor in this file), so a
+// not-yet-resolved indirect entry is conservatively treated as *not* known
+// to be null and is kept rather than guessed away.
+fn unparse_is_known_null(handle: &ObjectHandle) -> bool {
+    handle.is_resolved() && handle.is_null()
 }
 
 #[cfg(test)]
@@ -1754,5 +1819,62 @@ mod unparse_tests {
 
         assert_eq!(handle.unparse(), b"1 0 R");
         assert_eq!(handle.unparse_resolved(), b"9 0 R");
+    }
+
+    #[test]
+    fn unparse_resolved_omits_a_direct_null_dictionary_entry() {
+        // qpdf's QPDF_Dictionary::unparse() (libqpdf/QPDF_Dictionary.cc:59-69)
+        // skips any entry whose value isNull(), matching the PDF-spec
+        // equivalence between an explicit null value and a missing key.
+        let dict = ObjectHandle::dictionary(vec![
+            (b"A".to_vec(), ObjectHandle::null()),
+            (b"B".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        assert_eq!(dict.unparse_resolved(), b"<< /B 1 >>");
+    }
+
+    #[test]
+    fn unparse_resolved_omits_an_already_resolved_null_indirect_dictionary_entry() {
+        // The same qpdf rule applies to an indirect child, since qpdf's
+        // isNull() dereferences before checking -- but only when this
+        // child's value is already known (is_resolved()), never by forcing
+        // new resolution (see the "keeps a not-yet-resolved" test below).
+        let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
+        missing.set_missing();
+        let dict = ObjectHandle::dictionary(vec![
+            (b"A".to_vec(), missing),
+            (b"B".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        assert_eq!(dict.unparse_resolved(), b"<< /B 1 >>");
+    }
+
+    #[test]
+    fn unparse_resolved_keeps_a_not_yet_resolved_indirect_dictionary_entry() {
+        // Divergence from qpdf, which would resolve the child to check its
+        // nullness (QPDFObjectHandle::isNull() dereferences,
+        // libqpdf/QPDFObjectHandle.cc:353-356); this port never performs
+        // hidden resolution (see unparse_resolved's own doc), so an entry
+        // whose nullness is not yet known is conservatively kept rather
+        // than guessed away.
+        let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), unresolved)]);
+        assert_eq!(dict.unparse_resolved(), b"<< /A 9 0 R >>");
+    }
+
+    #[test]
+    fn unparse_resolved_omits_nulls_in_a_nested_dictionary_inside_an_array() {
+        let inner = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::null())]);
+        let array = ObjectHandle::array(vec![inner]);
+        assert_eq!(array.unparse_resolved(), b"[ << >> ]");
+    }
+
+    #[test]
+    fn unparse_resolved_does_not_omit_null_array_elements() {
+        // Only dictionary keys are omitted for a null value; array elements
+        // keep their position (QPDF_Array::unparse(),
+        // libqpdf/QPDF_Array.cc:123-140, explicitly fills gaps with the
+        // literal "null" token rather than skipping them).
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(1), ObjectHandle::null()]);
+        assert_eq!(array.unparse_resolved(), b"[ 1 null ]");
     }
 }
