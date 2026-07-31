@@ -293,9 +293,16 @@ impl ObjectHandle {
     /// canonical `Rc`s — before the registry itself is dropped, so no
     /// lingering cycle keeps a document's object graph (and any reachable
     /// stream buffers) alive past the `Pdf` that produced it.
+    ///
+    /// Also resets the parsed offset to the no-offset sentinel, mirroring
+    /// [`Self::set_missing`]'s own reset and the same Parsed-Offset Contract
+    /// clause it cites: a surviving handle that now presents as null must
+    /// not keep reporting the destroyed value's former source position.
     pub(crate) fn disconnect(&self) {
         if let Repr::Indirect(slot) = &self.0 {
-            slot.borrow_mut().state = IndirectState::Destroyed;
+            let mut slot = slot.borrow_mut();
+            slot.state = IndirectState::Destroyed;
+            slot.parsed_offset = NO_PARSED_OFFSET;
         }
     }
 
@@ -894,6 +901,22 @@ mod resolution_state_tests {
         assert!(handle.is_resolved());
         assert!(handle.is_null());
         assert_eq!(handle.as_integer(), None);
+    }
+
+    #[test]
+    fn disconnect_resets_a_previously_recorded_parsed_offset() {
+        // Mirrors `set_missing_resets_a_previously_recorded_parsed_offset`
+        // for the same Parsed-Offset Contract clause: a handle a caller
+        // keeps alive past its owning `Pdf`'s drop must not keep reporting
+        // its former body's source position once it reads as null.
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Integer(7));
+        handle.set_parsed_offset_if_unset(100);
+        assert_eq!(handle.get_parsed_offset(), 100);
+
+        handle.disconnect();
+
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
     }
 
     #[test]
