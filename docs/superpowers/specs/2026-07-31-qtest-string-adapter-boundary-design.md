@@ -2,10 +2,11 @@
 
 ## Context
 
-`flpdf` currently exposes `qtest_string` behind the `qtest-driver` feature,
-while `flpdf-qtest-tools::character_encoding` calls that module to implement
-the qpdf `test_pdf_doc_encoding` and `test_pdf_unicode` helper binaries. This
-mixes two qpdf responsibility layers:
+`flpdf-qtest-tools::character_encoding` implements the qpdf
+`test_pdf_doc_encoding` and `test_pdf_unicode` helper binaries. The PDF string
+operations it needs are domain operations in `flpdf`; a second qtest-tools
+module that only delegates those calls would add an unnecessary layer. The
+qpdf responsibility split is:
 
 - qpdf's `libqpdf/QPDF_String.cc` owns PDF string semantics: PDFDocEncoding
   decoding, UTF-8/UTF-16 conversion, and string unparsing.
@@ -14,14 +15,15 @@ mixes two qpdf responsibility layers:
   formatting, and process results.
 
 The Rust boundary must follow that split. The PDF string semantics belong to
-`flpdf`; the qtest adapter belongs to `flpdf-qtest-tools`.
+`flpdf`; the qtest binary input/output contract belongs to
+`flpdf-qtest-tools::character_encoding`.
 
 ## Goals
 
 1. Keep one canonical implementation of PDFDocEncoding decoding, qpdf UTF-8
    normalization, Unicode-string construction, and forced binary serialization.
-2. Move the qtest-specific adapter into a private
-   `crates/flpdf-qtest-tools/src/qtest_string.rs` module.
+2. Keep qtest-specific input/output handling in `character_encoding.rs`
+   without introducing a delegation-only adapter module.
 3. Keep `flpdf`'s normal build independent of qtest-specific names and feature
    gates while exposing only a minimal domain-oriented PDF string interface to
    the helper crate.
@@ -64,14 +66,13 @@ construction, and lowercase hexadecimal serialization remain in this module.
 allows `json_inspect`, `nntree`, outline handling, and qtest-tools to consume
 the same implementation without making the core crate expose `qtest_string`.
 
-### qtest adapter module
+### qtest helper boundary
 
-Create `crates/flpdf-qtest-tools/src/qtest_string.rs` as a private module and
-declare it with `mod qtest_string;` in the qtest-tools crate root. It contains
-only adapter calls to `flpdf::pdf_string` and no conversion table or algorithm.
-The existing `character_encoding.rs` calls this private adapter, preserving the
-qpdf helper-oriented names at the helper boundary while keeping them out of
-the core crate.
+`character_encoding.rs` calls the ordinary `flpdf::pdf_string` domain API
+directly. It owns only qpdf helper behavior: byte-oriented input lines, argv
+validation, output formatting, and process results. No qtest-tools string
+adapter module is needed because there is no qtest-specific transformation
+between the helper and the domain API.
 
 Remove `crates/flpdf/src/qtest_string.rs` and its `lib.rs` module declaration.
 
@@ -85,9 +86,9 @@ change must not introduce a second implementation.
 
 Update the generated qpdf module index and the character-encoding design/plan
 so that `pdf_string.rs` is documented as the `libqpdf/QPDF_String.cc`
-correspondence and `flpdf-qtest-tools/src/qtest_string.rs` is documented as
-the qpdf test-binary adapter. No document should claim that qtest_string is a
-module owned by `flpdf`.
+correspondence and `character_encoding.rs` is documented as the qpdf
+test-binary boundary. No document should claim that a separate qtest string
+adapter module is required.
 
 ## Verification
 

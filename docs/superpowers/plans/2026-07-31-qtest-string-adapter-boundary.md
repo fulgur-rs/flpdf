@@ -4,7 +4,7 @@
 
 **Goal:** Move the qtest string adapter out of `flpdf` while keeping qpdf 11.9.0 PDF-string semantics in one normal `flpdf::pdf_string` domain module.
 
-**Architecture:** Extract the existing canonical PDFDocEncoding, UTF-8 normalization, Unicode-string construction, and forced-binary serialization into `crates/flpdf/src/pdf_string.rs`. Keep `crates/flpdf-qtest-tools/src/qtest_string.rs` private and limited to calls into that domain API; `character_encoding` owns the qpdf test-binary input/output contract. Update all core consumers and correspondence documentation to reflect the qpdf `libqpdf` versus `qpdf` split.
+**Architecture:** Extract the existing canonical PDFDocEncoding, UTF-8 normalization, Unicode-string construction, and forced-binary serialization into `crates/flpdf/src/pdf_string.rs`. `character_encoding` calls that ordinary domain API directly and owns the qpdf test-binary input/output contract; do not add a delegation-only qtest string module. Update all core consumers and correspondence documentation to reflect the qpdf `libqpdf` versus `qpdf` split.
 
 **Tech Stack:** Rust 2021 workspace, `flpdf`, `flpdf-qtest-tools`, qpdf 11.9.0 pinned source and helper binaries, Cargo tests, Clippy, `scripts/qpdf-character-encoding-diff.sh`, `scripts/qpdf-module-docs.py`, `cargo llvm-cov`, and `scripts/patch-coverage.sh`.
 
@@ -139,84 +139,42 @@ git add crates/flpdf/src/lib.rs crates/flpdf/src/pdf_string.rs \
 git commit -m "refactor(flpdf): own PDF string semantics in domain module"
 ```
 
-### Task 2: Move the qtest adapter into `flpdf-qtest-tools`
+### Task 2: Route the qtest helper directly through the domain API
 
 **Files:**
-- Create: `crates/flpdf-qtest-tools/src/qtest_string.rs`
-- Modify: `crates/flpdf-qtest-tools/src/lib.rs`
 - Modify: `crates/flpdf-qtest-tools/src/character_encoding.rs`
-- Test: `crates/flpdf-qtest-tools/src/qtest_string.rs`
+- Modify: `crates/flpdf-qtest-tools/src/lib.rs`
+- Test: `crates/flpdf-qtest-tools/tests/character_encoding_cli.rs`
 
-The adapter mirrors qpdf's `qpdf/test_pdf_doc_encoding.cc` and
-`qpdf/test_pdf_unicode.cc` boundary. It is private to the helper crate and
-contains only delegation:
+Call `flpdf::pdf_string::{utf8_value,new_unicode_string,unparse_binary}`
+directly from `character_encoding.rs`. There is no qtest-specific string
+transformation, so a private delegation module would only obscure the actual
+ownership boundary. Keep line splitting, argv, stderr, exit-code, and SIGABRT
+behavior unchanged.
 
-```rust
-pub(crate) fn utf8_value(stored: &[u8]) -> Vec<u8> {
-    flpdf::pdf_string::utf8_value(stored)
-}
+- [ ] **Step 1: Remove the delegation-only module**
 
-pub(crate) fn new_unicode_string(utf8: &[u8]) -> Vec<u8> {
-    flpdf::pdf_string::new_unicode_string(utf8)
-}
+Delete `crates/flpdf-qtest-tools/src/qtest_string.rs`, remove its crate-root
+declaration, and replace its call sites with direct `flpdf::pdf_string` calls.
 
-pub(crate) fn unparse_binary(stored: &[u8]) -> Vec<u8> {
-    flpdf::pdf_string::unparse_binary(stored)
-}
-```
-
-- [ ] **Step 1: Add adapter delegation tests first**
-
-Add a private module test that calls the three adapter functions with
-`[0x80]`, `b"ASCII"`, `"🥔"`, and `b"A\n\x80"`, asserting the same bytes as
-the core tests. This proves the adapter is wired to the core API rather than
-reimplementing conversion.
-
-- [ ] **Step 2: Run the adapter test and verify RED**
+- [ ] **Step 2: Run qtest-tools focused tests and verify GREEN**
 
 Run:
 
 ```bash
-cargo test -p flpdf-qtest-tools qtest_string
-```
-
-Expected: compilation fails because the private adapter module and its
-functions are not yet declared.
-
-- [ ] **Step 3: Implement and register the private adapter**
-
-Create `src/qtest_string.rs` with the delegation functions above and add this
-private declaration to `crates/flpdf-qtest-tools/src/lib.rs`:
-
-```rust
-mod qtest_string;
-```
-
-In `character_encoding.rs`, import the sibling module and replace the three
-`flpdf::qtest_string` calls with calls to the matching
-`qtest_string` functions. Keep the existing
-line splitting, argv, stderr, exit-code, and SIGABRT implementation unchanged.
-
-- [ ] **Step 4: Run qtest-tools focused tests and verify GREEN**
-
-Run:
-
-```bash
-cargo test -p flpdf-qtest-tools qtest_string
 cargo test -p flpdf-qtest-tools --test character_encoding_cli
 cargo test -p flpdf-qtest-tools character_encoding::
 ```
 
-Expected: all tests pass and `rg -n "flpdf::qtest_string|crates/flpdf/src/qtest_string"`
+Expected: all tests pass and `rg -n "qtest_string|crates/flpdf/src/qtest_string"`
 finds no production reference.
 
-- [ ] **Step 5: Commit the adapter move**
+- [ ] **Step 3: Commit the direct boundary**
 
 ```bash
 git add crates/flpdf-qtest-tools/src/lib.rs \
-  crates/flpdf-qtest-tools/src/qtest_string.rs \
   crates/flpdf-qtest-tools/src/character_encoding.rs
-git commit -m "refactor(qtest-tools): own character encoding adapter"
+git commit -m "refactor(qtest-tools): call PDF string domain directly"
 ```
 
 ### Task 3: Synchronize correspondence and historical plan documentation
@@ -229,19 +187,20 @@ git commit -m "refactor(qtest-tools): own character encoding adapter"
 - [ ] **Step 1: Update module correspondence annotations**
 
 Document `pdf_string.rs` with a `libqpdf/QPDF_String.cc` correspondence line.
-Do not add the qtest-tools adapter to the flpdf module index; it belongs to the
-helper crate and is private there.
+Do not add a qtest-tools string adapter to the flpdf module index; the helper
+crate calls the domain API directly.
 
 - [ ] **Step 2: Update the existing character-encoding plan**
 
 Replace its feature-gated `flpdf::qtest_string` architecture with:
 
 - ordinary `flpdf::pdf_string` for core semantics;
-- private `flpdf-qtest-tools::qtest_string` for test-binary adaptation;
+- direct `flpdf::pdf_string` calls from `character_encoding` for the
+  test-binary's string operations;
 - no `qtest-driver` feature gate for this boundary.
 
 Update the Task 1 file list and interfaces to point at `pdf_string.rs`, and
-update Task 2 to consume `flpdf::pdf_string` through the private adapter.
+update Task 2 to consume `flpdf::pdf_string` directly.
 Preserve the plan's qpdf output, signal, differential, and coverage criteria.
 
 - [ ] **Step 3: Regenerate and inspect the module index**
@@ -257,7 +216,7 @@ rg -n "qtest_string|pdf_string" docs/qpdf-module-doc-index.md \
 
 Expected: the generated index contains `crates/flpdf/src/pdf_string.rs` and
 does not contain `crates/flpdf/src/qtest_string.rs`; the historical plan names
-the private adapter only under `crates/flpdf-qtest-tools`.
+the direct `character_encoding` boundary without a delegation-only adapter.
 
 - [ ] **Step 4: Commit documentation synchronization**
 

@@ -4,7 +4,7 @@
 
 **Goal:** Port qpdf 11.9.0 `test_pdf_doc_encoding` and `test_pdf_unicode` to Rust, wire their historical command names into flpdf-qtest, and make all three owned `character-encoding.test` invocations execute the Rust production path.
 
-**Architecture:** The `flpdf` crate keeps one canonical `pdf_string` implementation of qpdf PDF-string decoding, Unicode-string construction, and forced-binary unparsing. A private `qtest_string` adapter in `flpdf-qtest-tools` exposes only those operations to two dedicated binaries. A pinned-qpdf differential script proves the helper boundary, while a separate flpdf-qtest branch owns PATH shims, release-build resolution, ledger transitions, and the before/after full survey.
+**Architecture:** The `flpdf` crate keeps one canonical `pdf_string` implementation of qpdf PDF-string decoding, Unicode-string construction, and forced-binary unparsing. The two dedicated binaries call that domain API directly; `character_encoding` owns the qtest input/output contract without a delegation-only string adapter. A pinned-qpdf differential script proves the helper boundary, while a separate flpdf-qtest branch owns PATH shims, release-build resolution, ledger transitions, and the before/after full survey.
 
 **Tech Stack:** Rust 2021, `flpdf`, `flpdf-qtest-tools`, Bash, Python 3 `unittest`, Cargo, CMake, pinned qpdf 11.9.0 commit `3b97c9bd266b7c32ea36d3536e22dab77412886d`.
 
@@ -13,7 +13,7 @@
 - qpdf 11.9.0 source and observed output are authoritative.
 - Own exactly the three helper invocations in `character-encoding.test`; the fourth `qpdf --list-attachments` invocation is out of scope.
 - Do not copy qpdf-qtest inputs or goldens into the flpdf repository.
-- Keep PDF string semantics in the ordinary `flpdf::pdf_string` domain API; keep the qtest adapter private to `flpdf-qtest-tools`.
+- Keep PDF string semantics in the ordinary `flpdf::pdf_string` domain API; do not add a delegation-only qtest string adapter.
 - Preserve qpdf line reading: split at LF, strip one immediately preceding CR, keep a final unterminated line, and do not synthesize a line after a terminal LF.
 - Preserve qpdf `newUnicodeString`: PDFDocEncoding only for a lossless non-BOM-looking input; otherwise UTF-16BE with BOM and qpdf-compatible malformed-UTF-8 replacement/consumption.
 - Preserve qpdf usage output and Linux failure behavior, including SIGABRT after an uncaught input-open/read exception.
@@ -130,7 +130,7 @@ git commit -m "refactor(flpdf): own PDF string semantics in domain module"
 - Produces:
   `character_encoding::run_pdf_unicode(args, stdout, stderr) -> RunOutcome`
 - Produces binaries `flpdf-test-pdf-doc-encoding` and `flpdf-test-pdf-unicode`.
-- Consumes Task 1 `flpdf::pdf_string` through the private qtest-tools adapter.
+- Consumes Task 1 `flpdf::pdf_string` directly; `character_encoding` owns only the helper process contract.
 
 - [ ] **Step 1: Write failing binary-boundary tests**
 
