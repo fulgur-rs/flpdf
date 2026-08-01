@@ -205,6 +205,24 @@ fn rotate_all_pages_adds_rotate_key() {
 }
 
 #[test]
+fn rotate_uses_repair_aware_page_list() {
+    let mut pdf = open(pdf_with_catalog_pages_pointing_to_leaf());
+    let range = PageRange::parse("").unwrap();
+
+    PageDocumentHelper::new(&mut pdf)
+        .rotate(&range, 90, RotateMode::Add)
+        .unwrap();
+
+    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must remain a dictionary");
+    };
+    assert_eq!(
+        catalog.get("Pages"),
+        Some(&Object::Reference(ObjectRef::new(2, 0)))
+    );
+}
+
+#[test]
 fn rotate_partial_range_only_affects_selected_pages() {
     let mut pdf = open(build_n_page_pdf(3));
     let range = PageRange::parse("1").unwrap(); // page 1 only
@@ -267,6 +285,25 @@ fn rotate_round_trip_persists_after_write_reopen() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn remove_page_allows_an_empty_document() {
+    let mut pdf = open(build_n_page_pdf(1));
+
+    PageDocumentHelper::new(&mut pdf)
+        .remove_page(ObjectRef::new(3, 0))
+        .unwrap();
+
+    assert!(PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .unwrap()
+        .is_empty());
+    let Object::Dictionary(root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+        panic!("pages root must be a dictionary");
+    };
+    assert_eq!(root.get("Kids"), Some(&Object::Array(Vec::new())));
+    assert_eq!(root.get("Count"), Some(&Object::Integer(0)));
+}
+
+#[test]
 fn remove_decreases_page_count() {
     let mut pdf = open(build_n_page_pdf(3));
     {
@@ -304,18 +341,6 @@ fn remove_out_of_bounds_is_error() {
     );
 }
 
-#[test]
-fn remove_only_page_is_error() {
-    let mut pdf = open(build_n_page_pdf(1));
-    let mut helper = PageDocumentHelper::new(&mut pdf);
-    let err = helper.remove(0).unwrap_err();
-    // We return Missing for the empty-document case.
-    assert!(
-        matches!(err, flpdf::Error::Missing(_)),
-        "expected Missing, got {err:?}"
-    );
-}
-
 /// Round-trip: remove a page then write→reopen, verify page count decreased.
 #[test]
 fn remove_round_trip_page_count_decreases() {
@@ -338,6 +363,58 @@ fn remove_round_trip_page_count_decreases() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn add_page_first_prepends_page() {
+    let mut pdf = open(build_n_page_pdf(3));
+
+    PageDocumentHelper::new(&mut pdf)
+        .add_page(ObjectRef::new(5, 0), true)
+        .unwrap();
+
+    let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
+    assert_eq!(pages.len(), 4);
+    assert_eq!(pages[0], ObjectRef::new(5, 0));
+}
+
+#[test]
+fn add_page_last_appends_page() {
+    let mut pdf = open(build_n_page_pdf(3));
+
+    PageDocumentHelper::new(&mut pdf)
+        .add_page(ObjectRef::new(3, 0), false)
+        .unwrap();
+
+    let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
+    assert_eq!(pages.len(), 4);
+    assert_eq!(pages[3], ObjectRef::new(6, 0));
+}
+
+#[test]
+fn add_page_at_after_reference_inserts_after_that_page() {
+    let mut pdf = open(build_n_page_pdf(3));
+
+    PageDocumentHelper::new(&mut pdf)
+        .add_page_at(ObjectRef::new(5, 0), false, ObjectRef::new(3, 0))
+        .unwrap();
+
+    let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
+    assert_eq!(pages.len(), 4);
+    assert_eq!(pages[0], ObjectRef::new(3, 0));
+    assert_eq!(pages[1], ObjectRef::new(5, 0));
+}
+
+#[test]
+fn add_page_at_rejects_reference_outside_document() {
+    let mut pdf = open(build_n_page_pdf(3));
+
+    let error = PageDocumentHelper::new(&mut pdf)
+        .add_page_at(ObjectRef::new(3, 0), true, ObjectRef::new(99, 0))
+        .unwrap_err();
+
+    assert!(matches!(error, flpdf::Error::Missing(_)), "got {error:?}");
+    assert_eq!(PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap().len(), 3);
+}
+
+#[test]
 fn insert_increases_page_count() {
     let mut pdf = open(build_n_page_pdf(2));
     let existing_ref = {
@@ -351,6 +428,24 @@ fn insert_increases_page_count() {
     }
     let mut helper = PageDocumentHelper::new(&mut pdf);
     assert_eq!(helper.pages().unwrap().len(), 3);
+}
+
+#[test]
+fn insert_uses_repair_aware_page_list() {
+    let mut pdf = open(pdf_with_catalog_pages_pointing_to_leaf());
+
+    PageDocumentHelper::new(&mut pdf)
+        .insert(1, ObjectRef::new(3, 0))
+        .unwrap();
+
+    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must remain a dictionary");
+    };
+    assert_eq!(
+        catalog.get("Pages"),
+        Some(&Object::Reference(ObjectRef::new(2, 0)))
+    );
+    assert_eq!(PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap().len(), 2);
 }
 
 #[test]
