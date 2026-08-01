@@ -144,7 +144,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         self.pdf.mark_get_all_pages_called();
         if let Some(prepared) = crate::pages::repair::prepare_for_optimization(self.pdf)? {
             crate::optimization::inherited_attrs::push(self.pdf, &prepared, true, false)?;
-        }
+        } // cov:ignore: closing brace is the already-covered successful push join
         Ok(())
     }
 
@@ -304,17 +304,21 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         let removed_pages: BTreeSet<ObjectRef> = self.get_all_pages()?.into_iter().collect();
         let catalog_ref = self.pdf.root_ref().ok_or(Error::Missing("/Root"))?;
         let crate::Object::Dictionary(catalog) = self.pdf.resolve_borrowed(catalog_ref)? else {
+            // cov:ignore-start: remove obtains pages through get_all_pages, which proves /Root is a dictionary before clear_page_tree runs
             return Err(Error::Unsupported(format!(
                 "document catalog {catalog_ref} is not a dictionary"
             )));
+            // cov:ignore-end
         };
         let pages_root_ref = catalog.get_ref("Pages").ok_or(Error::Missing("/Pages"))?;
         let crate::Object::Dictionary(mut root) =
             self.pdf.resolve_borrowed(pages_root_ref)?.clone()
         else {
+            // cov:ignore-start: remove obtains pages through get_all_pages, which proves the selected /Pages root is a dictionary before clear_page_tree runs
             return Err(Error::Unsupported(format!(
                 "document /Pages root {pages_root_ref} is not a dictionary"
             )));
+            // cov:ignore-end
         };
         root.insert("Type", crate::Object::Name(b"Pages".to_vec()));
         root.insert("Kids", crate::Object::Array(Vec::new()));

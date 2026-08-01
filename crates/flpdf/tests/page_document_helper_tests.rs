@@ -314,6 +314,30 @@ fn get_all_pages_rejects_an_overdeep_direct_pages_tree() {
 }
 
 #[test]
+fn get_all_pages_ignores_a_direct_pages_node_with_non_array_kids() {
+    let mut pdf = open(build_n_page_pdf(1));
+    let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+        panic!("pages root must be a dictionary");
+    };
+    let mut direct_interior = Dictionary::new();
+    direct_interior.insert("Type", Object::Name(b"Pages".to_vec()));
+    direct_interior.insert("Kids", Object::Integer(42));
+    root.insert(
+        "Kids",
+        Object::Array(vec![Object::Dictionary(direct_interior)]),
+    );
+    pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+
+    assert!(
+        PageDocumentHelper::new(&mut pdf)
+            .get_all_pages()
+            .unwrap()
+            .is_empty(),
+        "qpdf's getArrayNItems treats a non-array direct /Kids value as empty"
+    );
+}
+
+#[test]
 fn pages_forwards_to_repair_aware_enumeration() {
     let mut pdf = open(pdf_with_catalog_pages_pointing_to_leaf());
 
