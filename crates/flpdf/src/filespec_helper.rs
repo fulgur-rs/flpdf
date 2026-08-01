@@ -283,33 +283,33 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     }
 
     /// Return `/Params /CreationDate` through qpdf's UTF-8 string view.
-    pub fn get_creation_date(&self) -> Result<Option<String>> {
-        Ok(self.creation_date()?.map(|value| {
-            String::from_utf8(utf8_value(&value)).expect("qpdf UTF-8 view is valid UTF-8")
-        }))
+    ///
+    /// The byte vector mirrors qpdf's `std::string`: an explicit UTF-8 BOM
+    /// may be followed by invalid UTF-8, which Rust's [`String`] cannot hold.
+    pub fn get_creation_date(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.creation_date()?.map(|value| utf8_value(&value)))
     }
 
     /// Return `/Params /ModDate` through qpdf's UTF-8 string view.
-    pub fn get_modification_date(&self) -> Result<Option<String>> {
-        Ok(self.modification_date()?.map(|value| {
-            String::from_utf8(utf8_value(&value)).expect("qpdf UTF-8 view is valid UTF-8")
-        }))
+    pub fn get_modification_date(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.modification_date()?.map(|value| utf8_value(&value)))
     }
 
     /// Return `/Params /Size`, or qpdf's `0` default when it is absent,
     /// negative, or not representable as `usize`.
     pub fn get_size(&self) -> Result<usize> {
-        Ok(self
-            .size()?
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(0))
+        let Some(value) = self.size()? else {
+            return Ok(0);
+        };
+        if value < 0 {
+            return Ok(0);
+        }
+        Ok(u32::try_from(value).unwrap_or(u32::MAX) as usize)
     }
 
     /// Return `/Subtype` as a MIME-type string, without a leading slash.
-    pub fn get_subtype(&self) -> Result<Option<String>> {
-        Ok(self.mimetype()?.and_then(|value| {
-            (!value.is_empty()).then(|| String::from_utf8_lossy(&value).into_owned())
-        }))
+    pub fn get_subtype(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.mimetype()?.filter(|value| !value.is_empty()))
     }
 
     /// Return `/Params /CheckSum` as qpdf's binary string value.
@@ -397,10 +397,10 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// reference the same embedded-file stream.
     pub fn create(
         pdf: &mut Pdf<R>,
-        filename: &str,
+        filename: impl AsRef<[u8]>,
         embedded_file_ref: ObjectRef,
     ) -> Result<ObjectRef> {
-        let name = new_unicode_string(filename.as_bytes());
+        let name = new_unicode_string(filename.as_ref());
         let mut ef = Dictionary::new();
         ef.insert("F", Object::Reference(embedded_file_ref));
         ef.insert("UF", Object::Reference(embedded_file_ref));
@@ -419,7 +419,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// Create a Filespec and embedded-file stream from a filesystem path.
     pub fn create_from_path<P: AsRef<Path>>(
         pdf: &mut Pdf<R>,
-        filename: &str,
+        filename: impl AsRef<[u8]>,
         path: P,
     ) -> Result<ObjectRef> {
         let embedded_file_ref = EmbeddedFileStream::create_from_path(pdf, path)?;
@@ -452,33 +452,35 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     }
 
     /// Set `/Desc` with qpdf's `newUnicodeString` storage semantics.
-    pub fn set_description(&mut self, description: impl AsRef<str>) -> Result<()> {
+    pub fn set_description(&mut self, description: impl AsRef<[u8]>) -> Result<()> {
         let mut dict = self.resolve_dict()?;
         dict.insert(
             "Desc",
-            Object::String(new_unicode_string(description.as_ref().as_bytes())),
+            Object::String(new_unicode_string(description.as_ref())),
         );
         self.replace_dict(dict);
         Ok(())
     }
 
     /// Set `/UF` and `/F` with qpdf's compatibility-filename behavior.
+    ///
+    /// `unicode_name` and a non-empty `compatibility_name` are byte sequences,
+    /// matching qpdf's `std::string` parameters. The Unicode value is stored
+    /// with `newUnicodeString`; the compatibility value is stored verbatim.
     pub fn set_filename(
         &mut self,
-        unicode_name: impl AsRef<str>,
-        compatibility_name: Option<&str>,
+        unicode_name: impl AsRef<[u8]>,
+        compatibility_name: Option<impl AsRef<[u8]>>,
     ) -> Result<()> {
         let mut dict = self.resolve_dict()?;
-        let unicode_name = new_unicode_string(unicode_name.as_ref().as_bytes());
+        let unicode_name = new_unicode_string(unicode_name.as_ref());
         dict.insert("UF", Object::String(unicode_name.clone()));
-        let compatibility_name = compatibility_name.filter(|name| !name.is_empty());
+        let compatibility_name = compatibility_name
+            .map(|name| name.as_ref().to_vec())
+            .filter(|name| !name.is_empty());
         dict.insert(
             "F",
-            Object::String(
-                compatibility_name
-                    .map(|name| name.as_bytes().to_vec())
-                    .unwrap_or(unicode_name),
-            ),
+            Object::String(compatibility_name.unwrap_or(unicode_name)),
         );
         self.replace_dict(dict);
         Ok(())
@@ -544,38 +546,33 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     }
 
     /// Return `/Desc` through qpdf's UTF-8 string view.
-    pub fn get_description(&mut self) -> Result<Option<String>> {
-        Ok(self.description()?.map(|value| {
-            String::from_utf8(utf8_value(&value)).expect("qpdf UTF-8 view is valid UTF-8")
-        }))
+    ///
+    /// The byte vector mirrors qpdf's `std::string`: an explicit UTF-8 BOM
+    /// may be followed by invalid UTF-8, which Rust's [`String`] cannot hold.
+    pub fn get_description(&mut self) -> Result<Option<Vec<u8>>> {
+        Ok(self.description()?.map(|value| utf8_value(&value)))
     }
 
     /// Return the preferred file name using qpdf's `/UF`, `/F`, `/Unix`,
-    /// `/DOS`, `/Mac` priority order and UTF-8 string conversion.
-    pub fn get_filename(&mut self) -> Result<Option<String>> {
+    /// `/DOS`, `/Mac` priority order and UTF-8 value conversion.
+    pub fn get_filename(&mut self) -> Result<Option<Vec<u8>>> {
         let dict = self.resolve_dict()?;
-        Ok(NAME_KEYS.iter().find_map(|key| {
-            dict.get(*key).and_then(Object::as_string).map(|value| {
-                String::from_utf8(utf8_value(value)).expect("qpdf UTF-8 view is valid UTF-8")
-            })
-        }))
+        Ok(NAME_KEYS
+            .iter()
+            .find_map(|key| dict.get(*key).and_then(Object::as_string).map(utf8_value)))
     }
 
     /// Return every recognized Filespec name key whose value is a string.
     ///
     /// Keys retain qpdf's leading slash, e.g. `"/UF"`.
-    pub fn get_filenames(&mut self) -> Result<BTreeMap<String, String>> {
+    pub fn get_filenames(&mut self) -> Result<BTreeMap<String, Vec<u8>>> {
         let dict = self.resolve_dict()?;
         Ok(NAME_KEYS
             .iter()
             .filter_map(|key| {
-                dict.get(*key).and_then(Object::as_string).map(|value| {
-                    (
-                        format!("/{key}"),
-                        String::from_utf8(utf8_value(value))
-                            .expect("qpdf UTF-8 view is valid UTF-8"),
-                    )
-                })
+                dict.get(*key)
+                    .and_then(Object::as_string)
+                    .map(|value| (format!("/{key}"), utf8_value(value)))
             })
             .collect())
     }
@@ -594,6 +591,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         };
 
         if !key.is_empty() {
+            let key = key.strip_prefix('/').unwrap_or(key);
             return Ok(ef.get(key).cloned().unwrap_or(Object::Null));
         }
 
@@ -886,77 +884,6 @@ impl FileSpecBuilder {
     /// Returns an error only if object-number allocation fails (in practice
     /// this cannot happen with a well-formed document).
     pub fn build<R: Read + Seek>(self, pdf: &mut Pdf<R>) -> Result<ObjectRef> {
-        // Allocate two new object numbers.
-        let next = pdf
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0);
-        let stream_ref = ObjectRef::new(next + 1, 0);
-        let filespec_ref = ObjectRef::new(next + 2, 0);
-
-        // ── Build /Params sub-dictionary ─────────────────────────────────────
-        let checksum = md5_checksum(&self.payload);
-        let size = self.payload.len() as i64;
-
-        let mut params = Dictionary::new();
-        params.insert("Size", Object::Integer(size));
-        params.insert("CheckSum", Object::String(checksum));
-        if let Some((y, mo, d, h, mi, s)) = self.dates.creation {
-            params.insert(
-                "CreationDate",
-                Object::String(format_pdf_date(y, mo, d, h, mi, s)),
-            );
-        }
-        if let Some((y, mo, d, h, mi, s)) = self.dates.modification {
-            params.insert(
-                "ModDate",
-                Object::String(format_pdf_date(y, mo, d, h, mi, s)),
-            );
-        }
-
-        // ── Build /EmbeddedFile stream ────────────────────────────────────────
-        let mut ef_dict = Dictionary::new();
-        ef_dict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
-        if let Some(ref mime) = self.mimetype {
-            // `Object::Name` holds raw (logical) bytes. The serializer escapes
-            // delimiters as `#XX` on write and the parser decodes them on read,
-            // so a MIME type like `application/pdf` round-trips correctly
-            // through both in-memory access and write_pdf → reopen. Do NOT
-            // pre-escape here — that would double-escape on serialization.
-            ef_dict.insert("Subtype", Object::Name(mime.clone()));
-        }
-
-        // Compress if requested. /Params /Size and /Params /CheckSum are
-        // always based on the raw (uncompressed) bytes — determined above —
-        // regardless of compression.
-        let (stream_payload, stored_length) = if self.compress {
-            let mut enc_dict = Dictionary::new();
-            enc_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-            let encoded = encode_stream_data(&enc_dict, &self.payload)?;
-            // Add /Filter to the EmbeddedFile stream dictionary so the decoder
-            // knows how to decompress the payload.
-            ef_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-            let encoded_len = encoded.len() as i64;
-            (encoded, encoded_len)
-        } else {
-            (self.payload, size)
-        };
-
-        ef_dict.insert("Length", Object::Integer(stored_length));
-        ef_dict.insert("Params", Object::Dictionary(params));
-
-        let ef_stream = Stream::new(ef_dict, stream_payload);
-        pdf.set_object(stream_ref, Object::Stream(ef_stream));
-
-        // ── Build /EF sub-dictionary ──────────────────────────────────────────
-        // Both /F and /UF point to the same stream ref (qpdf convention).
-        let mut ef_sub = Dictionary::new();
-        ef_sub.insert("F", Object::Reference(stream_ref));
-        ef_sub.insert("UF", Object::Reference(stream_ref));
-
-        // ── Build /Filespec dictionary ────────────────────────────────────────
         let uf_filename = match self.uf_filename {
             Some(filename) => filename,
             None => std::str::from_utf8(&self.filename)
@@ -968,21 +895,56 @@ impl FileSpecBuilder {
                 })?
                 .to_string(),
         };
-        let uf_bytes = new_unicode_string(uf_filename.as_bytes());
 
-        let mut fs_dict = Dictionary::new();
-        fs_dict.insert("Type", Object::Name(b"Filespec".to_vec()));
-        fs_dict.insert("F", Object::String(self.filename));
-        fs_dict.insert("UF", Object::String(uf_bytes));
-        fs_dict.insert("EF", Object::Dictionary(ef_sub));
-        if let Some(desc) = self.description {
-            fs_dict.insert("Desc", Object::String(desc));
-        }
-        if let Some(rel) = self.af_relationship {
-            fs_dict.insert("AFRelationship", Object::Name(rel));
+        // The two qpdf-shaped factories own all base dictionary construction:
+        // `/Type`, `/Params /Size`, `/Params /CheckSum`, `/F`, `/UF`, and the
+        // paired `/EF` references. The builder adds only its opt-in features.
+        let stream_ref = EmbeddedFileStream::create(pdf, &self.payload)?;
+        if self.compress {
+            let Object::Stream(mut stream) = pdf.resolve(stream_ref)? else {
+                unreachable!("EmbeddedFileStream::create must create a stream");
+            };
+            let mut encode_dict = Dictionary::new();
+            encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+            stream.data = encode_stream_data(&encode_dict, &self.payload)?;
+            stream
+                .dict
+                .insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+            stream
+                .dict
+                .insert("Length", Object::Integer(stream.data.len() as i64));
+            pdf.set_object(stream_ref, Object::Stream(stream));
         }
 
-        pdf.set_object(filespec_ref, Object::Dictionary(fs_dict));
+        let filespec_ref = FileSpec::create(pdf, &uf_filename, stream_ref)?;
+        {
+            let mut filespec = FileSpec::new(filespec_ref, pdf);
+            filespec.set_filename(&uf_filename, Some(self.filename.as_slice()))?;
+            if let Some(description) = self.description {
+                filespec.set_description(description)?;
+            }
+
+            let mut embedded_file = filespec
+                .embedded_file()?
+                .expect("FileSpec::create must create an /EmbeddedFile stream");
+            if let Some(mimetype) = self.mimetype {
+                embedded_file.set_subtype(mimetype)?;
+            }
+            if let Some((y, mo, d, h, mi, s)) = self.dates.creation {
+                embedded_file.set_creation_date(format_pdf_date(y, mo, d, h, mi, s))?;
+            }
+            if let Some((y, mo, d, h, mi, s)) = self.dates.modification {
+                embedded_file.set_modification_date(format_pdf_date(y, mo, d, h, mi, s))?;
+            }
+        }
+
+        if let Some(relationship) = self.af_relationship {
+            let Object::Dictionary(mut filespec) = pdf.resolve(filespec_ref)? else {
+                unreachable!("FileSpec::create must create a dictionary");
+            };
+            filespec.insert("AFRelationship", Object::Name(relationship));
+            pdf.set_object(filespec_ref, Object::Dictionary(filespec));
+        }
 
         Ok(filespec_ref)
     }

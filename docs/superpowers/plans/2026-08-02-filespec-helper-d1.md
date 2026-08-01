@@ -33,8 +33,8 @@ pub fn preferred_filename(&mut self) -> Result<Option<Vec<u8>>>;
 pub fn filenames(&mut self) -> Result<BTreeMap<Vec<u8>, Vec<u8>>>;
 pub fn embedded_file_for_key(&mut self, key: &str) -> Result<Option<Object>>;
 pub fn embedded_file_entries(&mut self) -> Result<Option<Dictionary>>;
-pub fn get_filename(&mut self) -> Result<Option<String>>;
-pub fn get_filenames(&mut self) -> Result<BTreeMap<String, String>>;
+pub fn get_filename(&mut self) -> Result<Option<Vec<u8>>>;
+pub fn get_filenames(&mut self) -> Result<BTreeMap<String, Vec<u8>>>;
 ```
 
 - [ ] **Step 1: Write failing tests**
@@ -77,10 +77,10 @@ Expected: all existing and new Filespec helper tests pass.
 pub fn set_creation_date(&mut self, value: impl AsRef<[u8]>) -> Result<()>;
 pub fn set_modification_date(&mut self, value: impl AsRef<[u8]>) -> Result<()>;
 pub fn set_subtype(&mut self, value: impl AsRef<[u8]>) -> Result<()>;
-pub fn get_creation_date(&self) -> Result<Option<String>>;
-pub fn get_modification_date(&self) -> Result<Option<String>>;
+pub fn get_creation_date(&self) -> Result<Option<Vec<u8>>>;
+pub fn get_modification_date(&self) -> Result<Option<Vec<u8>>>;
 pub fn get_size(&self) -> Result<usize>;
-pub fn get_subtype(&self) -> Result<Option<String>>;
+pub fn get_subtype(&self) -> Result<Option<Vec<u8>>>;
 pub fn get_checksum(&self) -> Result<Option<Vec<u8>>>;
 ```
 
@@ -124,8 +124,8 @@ Expected: all Filespec helper tests pass.
 ```rust
 pub fn create<R: Read + Seek>(pdf: &mut Pdf<R>, data: impl AsRef<[u8]>) -> Result<ObjectRef>;
 pub fn create_from_path<R: Read + Seek, P: AsRef<Path>>(pdf: &mut Pdf<R>, path: P) -> Result<ObjectRef>;
-pub fn create<R: Read + Seek>(pdf: &mut Pdf<R>, filename: &str, ef_ref: ObjectRef) -> Result<ObjectRef>;
-pub fn create_from_path<R: Read + Seek, P: AsRef<Path>>(pdf: &mut Pdf<R>, filename: &str, path: P) -> Result<ObjectRef>;
+pub fn create<R: Read + Seek>(pdf: &mut Pdf<R>, filename: impl AsRef<[u8]>, ef_ref: ObjectRef) -> Result<ObjectRef>;
+pub fn create_from_path<R: Read + Seek, P: AsRef<Path>>(pdf: &mut Pdf<R>, filename: impl AsRef<[u8]>, path: P) -> Result<ObjectRef>;
 ```
 
 - [ ] **Step 1: Write failing tests**

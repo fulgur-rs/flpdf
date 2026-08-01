@@ -133,7 +133,10 @@ fn get_filename_prefers_uf_and_decodes_pdf_text() {
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(filespec));
 
     let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
-    assert_eq!(fs.get_filename().unwrap(), Some("東京.txt".to_string()));
+    assert_eq!(
+        fs.get_filename().unwrap(),
+        Some("東京.txt".as_bytes().to_vec())
+    );
 }
 
 #[test]
@@ -153,8 +156,8 @@ fn get_filenames_returns_only_string_name_keys_as_utf8() {
     assert_eq!(
         fs.get_filenames().unwrap(),
         BTreeMap::from([
-            ("/F".to_string(), "fallback.txt".to_string()),
-            ("/UF".to_string(), "日本語.txt".to_string()),
+            ("/F".to_string(), b"fallback.txt".to_vec()),
+            ("/UF".to_string(), "日本語.txt".as_bytes().to_vec()),
         ])
     );
 }
@@ -175,6 +178,34 @@ fn get_embedded_file_stream_returns_requested_entry_and_ef_dictionary() {
     };
     assert_eq!(entries.get_ref("F"), Some(ObjectRef::new(6, 0)));
     assert_eq!(entries.get_ref("UF"), Some(ObjectRef::new(6, 0)));
+}
+
+#[test]
+fn get_embedded_file_stream_accepts_qpdf_filename_keys() {
+    // qpdf's getFilenames() returns slash-prefixed keys, and each must be
+    // directly usable as getEmbeddedFileStream(key).
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+
+    assert_eq!(
+        fs.get_embedded_file_stream("/F").unwrap(),
+        Object::Reference(ObjectRef::new(6, 0))
+    );
+}
+
+#[test]
+fn qpdf_string_getters_preserve_invalid_utf8_bytes_without_panicking() {
+    // QPDFObjectHandle::getUTF8Value() returns std::string, whose bytes need
+    // not be valid UTF-8 when a stored string uses an explicit UTF-8 BOM.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let Object::Dictionary(mut filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected filespec dictionary");
+    };
+    filespec.insert("Desc", Object::String(vec![0xef, 0xbb, 0xbf, 0xff]));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(filespec));
+
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    assert_eq!(fs.get_description().unwrap(), Some(vec![0xff]));
 }
 
 // ── FileSpec::uf ──────────────────────────────────────────────────────────────
@@ -319,6 +350,24 @@ fn size_returns_integer() {
     assert_eq!(sz, Some(95));
 }
 
+#[test]
+fn qpdf_size_clamps_to_unsigned_int_range() {
+    let bytes = build_pdf_with_params("/Size 4294967296", b"data");
+    let mut pdf = open(bytes);
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
+    assert_eq!(ef.get_size().unwrap(), u32::MAX as usize);
+}
+
+#[test]
+fn qpdf_size_returns_zero_for_negative_integer() {
+    let bytes = build_pdf_with_params("/Size -1", b"data");
+    let mut pdf = open(bytes);
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
+    assert_eq!(ef.get_size().unwrap(), 0);
+}
+
 // ── qpdf-shaped EmbeddedFileStream metadata and mutation ────────────────────
 
 #[test]
@@ -335,16 +384,13 @@ fn embedded_file_setters_update_the_live_stream_and_qpdf_getters() {
 
         assert_eq!(
             ef.get_creation_date().unwrap(),
-            Some("D:20260101000000Z".to_string())
+            Some(b"D:20260101000000Z".to_vec())
         );
         assert_eq!(
             ef.get_modification_date().unwrap(),
-            Some("D:20260202000000Z".to_string())
+            Some(b"D:20260202000000Z".to_vec())
         );
-        assert_eq!(
-            ef.get_subtype().unwrap(),
-            Some("application/pdf".to_string())
-        );
+        assert_eq!(ef.get_subtype().unwrap(), Some(b"application/pdf".to_vec()));
         assert_eq!(ef.get_size().unwrap(), 0);
     }
 
@@ -422,7 +468,8 @@ fn filespec_setters_use_qpdf_unicode_and_compatibility_rules() {
     {
         let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
         fs.set_description("概要").unwrap();
-        fs.set_filename("東京.txt", Some("fallback.txt")).unwrap();
+        fs.set_filename("東京.txt", Some(b"fallback.txt".as_slice()))
+            .unwrap();
     }
 
     let Object::Dictionary(filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
@@ -439,6 +486,56 @@ fn filespec_setters_use_qpdf_unicode_and_compatibility_rules() {
     assert_eq!(
         filespec.get("F"),
         Some(&Object::String(b"fallback.txt".to_vec()))
+    );
+}
+
+#[test]
+fn filespec_set_filename_preserves_non_utf8_compatibility_bytes() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    {
+        let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+        fs.set_filename("東京.txt", Some(&[0x80, 0xff][..]))
+            .unwrap();
+    }
+
+    let Object::Dictionary(filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected Filespec dictionary");
+    };
+    assert_eq!(filespec.get("F"), Some(&Object::String(vec![0x80, 0xff])));
+}
+
+#[test]
+fn filespec_set_filename_normalizes_non_utf8_unicode_bytes_like_qpdf() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    {
+        let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+        fs.set_filename([0xff], None::<&[u8]>).unwrap();
+    }
+
+    let Object::Dictionary(filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected Filespec dictionary");
+    };
+    assert_eq!(
+        filespec.get("UF"),
+        Some(&Object::String(encode_utf16be("�")))
+    );
+    assert_eq!(filespec.get("F"), filespec.get("UF"));
+}
+
+#[test]
+fn builder_composes_helpers_for_qpdf_unicode_description() {
+    let mut pdf = open(build_attachment_pdf("", "", b"seed"));
+    let filespec_ref = FileSpecBuilder::new("report.txt", b"payload".as_slice())
+        .description("概要")
+        .build(&mut pdf)
+        .unwrap();
+
+    let Object::Dictionary(filespec) = pdf.resolve(filespec_ref).unwrap() else {
+        panic!("expected Filespec dictionary");
+    };
+    assert_eq!(
+        filespec.get("Desc"),
+        Some(&Object::String(encode_utf16be("概要")))
     );
 }
 
