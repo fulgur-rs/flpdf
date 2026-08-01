@@ -33,11 +33,13 @@ pub fn preferred_filename(&mut self) -> Result<Option<Vec<u8>>>;
 pub fn filenames(&mut self) -> Result<BTreeMap<Vec<u8>, Vec<u8>>>;
 pub fn embedded_file_for_key(&mut self, key: &str) -> Result<Option<Object>>;
 pub fn embedded_file_entries(&mut self) -> Result<Option<Dictionary>>;
+pub fn get_filename(&mut self) -> Result<Option<String>>;
+pub fn get_filenames(&mut self) -> Result<BTreeMap<String, String>>;
 ```
 
 - [ ] **Step 1: Write failing tests**
 
-Add tests that build `/UF`, `/F`, `/Unix`, `/DOS`, and `/Mac` values and assert `UF` wins, only string-valued entries appear in the filename map, a named `/EF` lookup returns its exact reference, and `UF` non-stream falls through to a lower-priority stream.
+Add tests that build `/UF`, `/F`, `/Unix`, `/DOS`, and `/Mac` values and assert `UF` wins, only string-valued entries appear in the filename map, a named `/EF` lookup returns its exact reference, and `UF` non-stream falls through to a lower-priority stream. Include a PDFDocEncoding byte and UTF-16BE filename to prove qpdf-shaped getters return the `pdf_string::utf8_value` text view.
 
 - [ ] **Step 2: Verify RED**
 
@@ -47,7 +49,7 @@ Expected: compilation failure because the new `FileSpec` operation is absent.
 
 - [ ] **Step 3: Implement minimal read helpers**
 
-Centralize `const NAME_KEYS: [&str; 5] = ["UF", "F", "Unix", "DOS", "Mac"]`. Resolve each candidate through the existing reference-chain helper. For the empty preferred EF request, return only a terminal `Object::Stream`; for a named request, return that `/EF` entry without treating it as a stream requirement.
+Centralize `const NAME_KEYS: [&str; 5] = ["UF", "F", "Unix", "DOS", "Mac"]`. Resolve each candidate through the existing reference-chain helper. For the empty preferred EF request, return only a terminal `Object::Stream`; for a named request, return that `/EF` entry without treating it as a stream requirement. qpdf-shaped string methods call the raw single implementation then `pdf_string::utf8_value`; they must not duplicate key ordering.
 
 - [ ] **Step 4: Verify GREEN**
 
@@ -75,11 +77,16 @@ Expected: all existing and new Filespec helper tests pass.
 pub fn set_creation_date(&mut self, value: impl AsRef<[u8]>) -> Result<()>;
 pub fn set_modification_date(&mut self, value: impl AsRef<[u8]>) -> Result<()>;
 pub fn set_subtype(&mut self, value: impl AsRef<[u8]>) -> Result<()>;
+pub fn get_creation_date(&self) -> Result<Option<String>>;
+pub fn get_modification_date(&self) -> Result<Option<String>>;
+pub fn get_size(&self) -> Result<usize>;
+pub fn get_subtype(&self) -> Result<Option<String>>;
+pub fn get_checksum(&self) -> Result<Option<Vec<u8>>>;
 ```
 
 - [ ] **Step 1: Write failing tests**
 
-Add tests that create a Filespec-backed EF stream, set both dates and subtype, then resolve the stream to assert `/Params /CreationDate`, `/Params /ModDate`, and `/Subtype` contain the expected raw PDF values. Add a missing metadata test that observes `None`.
+Add tests that create a Filespec-backed EF stream, set both dates and subtype, then resolve the stream to assert `/Params /CreationDate`, `/Params /ModDate`, and `/Subtype` contain the expected raw PDF values. Assert a PDFDocEncoding date is returned as qpdf UTF-8 text and a missing size is `0`.
 
 - [ ] **Step 2: Verify RED**
 
@@ -89,7 +96,7 @@ Expected: compilation failure because the new mutation methods are absent.
 
 - [ ] **Step 3: Implement minimal metadata operations**
 
-Resolve the indirect EF stream, create `/Params` only when a setter needs it, write date values as `Object::String`, and write subtype as logical `Object::Name` bytes. Preserve existing raw-byte getters and add qpdf-role names only as thin aliases.
+Resolve the indirect EF stream, create `/Params` only when a setter needs it, write date values as `Object::String`, and write subtype as logical `Object::Name` bytes. qpdf-shaped date and subtype getters use `pdf_string::utf8_value`; checksum stays binary. Preserve existing raw-byte getters as thin views over the same resolved data.
 
 - [ ] **Step 4: Verify GREEN**
 
@@ -123,7 +130,7 @@ pub fn create_from_path<R: Read + Seek, P: AsRef<Path>>(pdf: &mut Pdf<R>, filena
 
 - [ ] **Step 1: Write failing tests**
 
-Add a test that creates an EF stream from `b"payload"`, creates a Filespec from `"report.txt"` and that stream reference, then asserts `/Type`, `/Params /Size`, binary `/CheckSum`, `/F`, `/UF`, and equal `/EF /F` plus `/EF /UF` references. Add a temporary-file test for both path factories and a test for a distinct Unicode filename and compatibility filename.
+Add a test that creates an EF stream from `b"payload"`, creates a Filespec from `"report.txt"` and that stream reference, then asserts `/Type`, `/Params /Size`, binary `/CheckSum`, `/F`, `/UF`, and equal `/EF /F` plus `/EF /UF` references. Assert an ASCII Unicode filename is stored with `pdf_string::new_unicode_string` rather than forced UTF-16BE, while an unrepresentable Unicode filename is UTF-16BE. Add a temporary-file test for both path factories and a test for a distinct Unicode filename and compatibility filename.
 
 - [ ] **Step 2: Verify RED**
 
@@ -133,7 +140,7 @@ Expected: compilation failure because the factory operations are absent.
 
 - [ ] **Step 3: Implement factories and builder delegation**
 
-Allocate the next two object references deterministically. EF creation writes `/Type /EmbeddedFile` and `/Params` size/checksum from decoded data. Filespec creation writes `/Type /Filespec`, applies filename setup, then assigns the supplied stream reference under `/EF /F` and `/EF /UF`. Change `FileSpecBuilder::build` to call those helpers for its uncompressed path and retain only its feature-specific compression handling before helper construction.
+Allocate the next two object references deterministically. EF creation writes `/Type /EmbeddedFile` and `/Params` size/checksum from decoded data. Filespec creation writes `/Type /Filespec`, applies filename setup with `pdf_string::new_unicode_string`, then assigns the supplied stream reference under `/EF /F` and `/EF /UF`. Change `FileSpecBuilder::build` to call those helpers for its uncompressed path and retain only its feature-specific compression handling before helper construction.
 
 - [ ] **Step 4: Verify GREEN**
 

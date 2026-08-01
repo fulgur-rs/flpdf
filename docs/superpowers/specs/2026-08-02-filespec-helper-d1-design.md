@@ -18,10 +18,11 @@ Make `filespec_helper.rs` a complete Rust counterpart of the two qpdf helpers' p
 
 - The ordered name keys are exactly `UF`, `F`, `Unix`, `DOS`, `Mac` in every preferred lookup.
 - `getEmbeddedFileStream("")` skips a non-stream candidate and continues. A non-empty requested key returns that `/EF` value without preference scanning.
-- A missing or incorrectly typed qpdf scalar accessor has qpdf's empty/zero result. Rust represents this as `None`; raw PDF string/name bytes remain the helper's public value model.
+- qpdf's `getDescription`, `getFilename`, `getFilenames`, date getters, and subtype getter expose its UTF-8 value view. The qpdf-shaped Rust methods return UTF-8 `String` values using `pdf_string::utf8_value`; existing raw-byte accessors remain lower-level views only and do not reimplement lookup logic.
+- A missing or incorrectly typed qpdf scalar accessor has qpdf's empty/zero result. qpdf-shaped Rust methods represent missing string data as `None` and missing size as `0`.
 - `getSubtype()` returns the logical PDF name bytes without a leading slash.
 - EF creation writes `/Type /EmbeddedFile`, and computes `/Params /Size` plus binary MD5 `/CheckSum` over decoded payload bytes.
-- Filespec creation writes indirect `/Type /Filespec`, calls filename setup, and points both `/EF /F` and `/EF /UF` at the supplied EF stream.
+- Filespec creation writes indirect `/Type /Filespec`, calls filename setup, and points both `/EF /F` and `/EF /UF` at the supplied EF stream. Description and Unicode filename setters store `pdf_string::new_unicode_string` output, matching qpdf `newUnicodeString` rather than always forcing UTF-16BE.
 
 ## Public API shape
 
