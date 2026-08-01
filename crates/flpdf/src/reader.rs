@@ -1512,10 +1512,26 @@ impl<R: Read + Seek> Pdf<R> {
     /// itself (if the caller kept another clone of it) does not affect the
     /// returned handle, or vice versa.
     ///
-    /// Allocation scans [`Pdf::object_refs`] for the highest existing
-    /// object number (`max + 1`, generation `0`) rather than maintaining a
-    /// running counter, matching this crate's existing
+    /// Allocation scans both [`Pdf::object_refs`] (the legacy object cache)
+    /// and the handle registry for the highest existing object number
+    /// (`max + 1`, generation `0`) rather than maintaining a running
+    /// counter, matching this crate's existing
     /// `overlay_appearance_stream.rs::allocate_next_ref` convention.
+    /// `object_refs()` alone is not enough: a ref allocated by a prior call
+    /// to this same method is registered in [`Pdf::get_object_handle`]'s
+    /// handle registry but never written through to the legacy cache, so
+    /// scanning only `object_refs()` would let two back-to-back calls
+    /// compute the same "next" number and the second silently clobber the
+    /// first allocation's value.
+    ///
+    /// This does not validate that any indirect child handle reachable
+    /// from `handle`'s direct value belongs to this same [`Pdf`] — no
+    /// caller in this crate builds a direct value out of another
+    /// document's indirect handles today. Doing so would embed a foreign
+    /// document's live handle into this document's registry, which would
+    /// observe that foreign document's own lifecycle (e.g. going to the
+    /// destroyed state when the foreign `Pdf` is dropped) rather than this
+    /// one's.
     ///
     /// # Errors
     ///
@@ -1535,6 +1551,7 @@ impl<R: Read + Seek> Pdf<R> {
             .object_refs()
             .iter()
             .map(|r| r.number)
+            .chain(self.handle_registry.keys().map(|r| r.number))
             .max()
             .unwrap_or(0)
             .checked_add(1)
@@ -4529,6 +4546,29 @@ mod tests {
         // doc comment).
         clone_kept_by_caller.replace_key(b"A", ObjectHandle::integer(99));
         assert_eq!(indirect.get_key(b"A").as_integer(), Some(1));
+    }
+
+    #[test]
+    fn make_indirect_object_handle_allocates_distinct_refs_across_repeated_calls() {
+        // Regression test: a ref allocated by this method is registered in
+        // `handle_registry` but never written through to the legacy
+        // `object_refs()` cache, so scanning only `object_refs()` for the
+        // "next" number would let a second call compute the same number as
+        // the first and silently clobber its value via `set_resolved`.
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let first = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(1))
+            .expect("make first indirect");
+        let second = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(2))
+            .expect("make second indirect");
+        assert_ne!(
+            first.object_ref().unwrap(),
+            second.object_ref().unwrap(),
+            "repeated calls must allocate distinct object numbers"
+        );
+        assert_eq!(first.as_integer(), Some(1));
+        assert_eq!(second.as_integer(), Some(2));
     }
 
     fn classic_pdf_with_bodies(bodies: &[&[u8]], root: ObjectRef) -> Vec<u8> {

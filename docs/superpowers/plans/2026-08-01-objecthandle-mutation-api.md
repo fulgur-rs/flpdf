@@ -407,14 +407,6 @@ fn shallow_copy_mutation_does_not_affect_the_source() {
 }
 
 #[test]
-fn shallow_copy_children_keep_shared_identity_with_the_source() {
-    let child = ObjectHandle::integer(1);
-    let original = ObjectHandle::dictionary(vec![(b"A".to_vec(), child.clone())]);
-    let copy = original.shallow_copy();
-    assert!(copy.get_key(b"A").ptr_eq(&child));
-}
-
-#[test]
 fn shallow_copy_of_a_non_container_clones_the_scalar_value() {
     let original = ObjectHandle::integer(5);
     let copy = original.shallow_copy();
@@ -423,13 +415,26 @@ fn shallow_copy_of_a_non_container_clones_the_scalar_value() {
 }
 ```
 
-Note the third test's expectation is deliberate, not a bug to fix: a
-shallow copy shares child identity by design (qpdf's own `shallowCopy()`
-copies one level of dictionary/array entries; nested values keep their
-existing shared identity — this is exactly why `mergeResources` calls
-`shallowCopy()` before mutating, per the doc comment already on
-`adjust_appearance_stream` in `overlay_appearance_stream.rs`, not despite
-it).
+**Correction (2026-08-01, post-implementation):** the fourth test
+originally planned here —
+`shallow_copy_children_keep_shared_identity_with_the_source`, asserting
+`copy.get_key(b"A").ptr_eq(&child)` for a *direct* child — assumed
+`shallowCopy()` is a single-level-only copy that shares every child's
+identity. Reading `libqpdf/QPDF_Dictionary.cc`/`libqpdf/QPDF_Array.cc`'s
+`copy(shallow=false)` default (the method `QPDFObjectHandle::shallowCopy`
+actually defers to) before implementing this task showed that is wrong:
+qpdf recursively copies through every *direct* descendant, and shares
+identity only across an *indirect* boundary. The test above was never
+committed; the implemented and committed test suite instead covers this
+correctly (`shallow_copy_of_a_direct_dictionary_child_produces_an_independent_copy`,
+`shallow_copy_of_an_indirect_dictionary_child_keeps_shared_identity`, and
+`shallow_copy_of_an_array_recurses_through_direct_elements` in
+`crates/flpdf/src/object_handle.rs`'s `mutation_tests` module — a direct
+child is *not* `ptr_eq` after the copy, while an indirect child *is*). The
+implementation and its doc comment (`ObjectHandle::shallow_copy`) reflect
+this corrected semantics; only this plan step's original draft did not
+get updated to match. See the implementation's own doc comment for the
+precise contract.
 
 **Step 2: Run to verify it fails**
 
@@ -437,7 +442,13 @@ Run: `cargo test -p flpdf --lib mutation_tests -- --nocapture`
 
 **Step 3: Implement**
 
-Add after `remove_key`:
+Add after `remove_key`. **Note:** the sketch below is the pre-correction
+draft (same single-level-only assumption as the removed test above) and
+was superseded before landing — see the implemented
+`ObjectHandle::shallow_copy` (delegating to `shallow_copy_value`/
+`shallow_copy_child`) and its doc comment in
+`crates/flpdf/src/object_handle.rs` for the actual recursive
+implementation.
 
 ```rust
 /// A fresh, direct handle with a one-level-deep copy of this handle's

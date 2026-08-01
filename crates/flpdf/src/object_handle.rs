@@ -609,16 +609,47 @@ impl ObjectHandle {
     /// (`libqpdf/QPDFObjectHandle.cc:1199-1209`). A no-op on a
     /// non-dictionary handle or an unresolved/missing/destroyed indirect
     /// handle, matching qpdf's own `typeWarning`-and-ignore contract rather
-    /// than panicking. Unlike qpdf's `replaceKey`, this does not check that
-    /// `value` belongs to the same document (`checkOwnership`) — no caller
-    /// in this crate crosses document boundaries this way today. Never
-    /// performs resolution itself.
+    /// than panicking. Also a no-op if `value` is the same direct handle as
+    /// `self` — inserting a dictionary into itself would otherwise create a
+    /// direct cycle that none of this crate's recursive walkers
+    /// (`shallow_copy`, `materialize`, `Debug`) guard against, since they
+    /// only stop recursion at an indirect-handle boundary. This does not
+    /// detect a multi-hop reciprocal cycle built from two or more
+    /// `replace_key` calls across distinct direct dictionaries. Unlike
+    /// qpdf's `replaceKey`, this does not check that `value` belongs to the
+    /// same document (`checkOwnership`) — no caller in this crate crosses
+    /// document boundaries this way today. Never performs resolution
+    /// itself.
+    ///
+    /// This mutates the live handle graph directly. If `self`'s ref has
+    /// already been read through [`crate::Pdf::resolve`] or
+    /// [`crate::Pdf::resolve_borrowed`], those methods cache the
+    /// materialized value the first time a ref is resolved and do not
+    /// re-derive it — a later call to either will keep returning the
+    /// pre-mutation value for that ref rather than observing this change.
+    /// Callers that need `resolve`/`resolve_borrowed` to reflect a
+    /// mutation made through this API must not have resolved the same ref
+    /// through them first.
     pub fn replace_key(&self, key: &[u8], value: ObjectHandle) {
+        if self.is_same_direct_handle(&value) {
+            return;
+        }
         self.with_value_mut(|v| {
             if let Some(ObjectValue::Dictionary(entries)) = v {
                 entries.insert(key.to_vec(), value);
             }
         });
+    }
+
+    /// True if `self` and `other` are both direct handles sharing the same
+    /// underlying storage — i.e. `other` is `self` itself (or a clone of
+    /// it), not merely a distinct direct handle with an equal value. Unlike
+    /// [`Self::ptr_eq`], an indirect/indirect match returns `false` here:
+    /// an indirect handle referencing itself is not a direct cycle and is
+    /// already handled correctly by every recursive walker's
+    /// indirect-boundary stop.
+    fn is_same_direct_handle(&self, other: &Self) -> bool {
+        matches!((&self.0, &other.0), (Repr::Direct(a), Repr::Direct(b)) if Rc::ptr_eq(a, b))
     }
 
     /// Remove `key` from this handle's dictionary if present, mutating the
@@ -627,6 +658,9 @@ impl ObjectHandle {
     /// A no-op if `key` is absent, this handle is not a dictionary, or the
     /// indirect handle is unresolved/missing/destroyed. Never performs
     /// resolution itself.
+    ///
+    /// See [`Self::replace_key`]'s doc comment for the same
+    /// `resolve`/`resolve_borrowed` staleness caveat — it applies here too.
     pub fn remove_key(&self, key: &[u8]) {
         self.with_value_mut(|v| {
             if let Some(ObjectValue::Dictionary(entries)) = v {
@@ -716,6 +750,10 @@ impl ObjectHandle {
     /// verified behavior, not a paraphrase — port it exactly rather than
     /// the more "sensible"-looking alternative of the sub-dictionary's own
     /// keys.
+    ///
+    /// See [`Self::replace_key`]'s doc comment for the same
+    /// `resolve`/`resolve_borrowed` staleness caveat — it applies here too,
+    /// since this method installs and rebinds entries via `replace_key`.
     pub fn merge_resources(
         &self,
         other: &ObjectHandle,
@@ -760,6 +798,11 @@ impl ObjectHandle {
     /// deferred-`StreamDataProvider` overloads, which this method does not
     /// port (no caller in this crate needs deferred stream production). A
     /// no-op if this handle's value is not a stream.
+    ///
+    /// See [`Self::replace_key`]'s doc comment for the same
+    /// `resolve`/`resolve_borrowed` staleness caveat — it applies here too,
+    /// since this method installs `/Filter`/`/DecodeParms`/`/Length` via
+    /// `replace_key` and mutates the stream data in place.
     pub fn replace_stream_data(
         &self,
         data: Vec<u8>,
@@ -2507,6 +2550,28 @@ mod mutation_tests {
         let scalar = ObjectHandle::integer(1);
         scalar.replace_key(b"A", ObjectHandle::integer(2));
         assert_eq!(scalar.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn replace_key_rejects_inserting_a_direct_dictionary_into_itself() {
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
+        let self_clone = dict.clone();
+        dict.replace_key(b"Self", self_clone);
+        assert!(dict.get_key(b"Self").is_null());
+        // The rest of the dictionary is untouched by the rejected insert.
+        assert_eq!(dict.get_key(b"A").as_integer(), Some(1));
+    }
+
+    #[test]
+    fn replace_key_allows_an_indirect_handle_to_reference_itself() {
+        // Unlike a direct self-insertion, an indirect handle referencing
+        // itself is not a direct cycle -- every recursive walker already
+        // stops at the indirect boundary, so this must remain a normal
+        // insert rather than being rejected as a no-op.
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 0), -1);
+        indirect.set_resolved(ObjectValue::Dictionary(Default::default()));
+        indirect.replace_key(b"Self", indirect.clone());
+        assert!(indirect.get_key(b"Self").is_indirect());
     }
 
     #[test]
