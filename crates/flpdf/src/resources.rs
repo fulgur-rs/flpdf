@@ -71,9 +71,11 @@ pub(crate) fn remove_unreferenced_resources_on_page<R: Read + Seek>(
     }
 
     let Object::Dictionary(mut page) = pdf.resolve(page_ref)? else {
+        // cov:ignore-start: page_ref comes from repaired get_all_pages and remains unmodified until this final write
         return Err(Error::Unsupported(format!(
             "page {page_ref} is not a dictionary"
         )));
+        // cov:ignore-end
     };
     page.insert("Resources", Object::Dictionary(resources));
     pdf.set_object(page_ref, Object::Dictionary(page));
@@ -100,10 +102,10 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
             continue;
         }
         let Object::Stream(mut form) = pdf.resolve(form_ref)? else {
-            continue;
+            continue; // cov:ignore: form_xobjects_in_resources queues only terminal Stream objects
         };
         if !is_form_xobject(&form.dict) {
-            continue;
+            continue; // cov:ignore: form_xobjects_in_resources queues only /Subtype /Form streams
         }
         let resources = match form.dict.get("Resources") {
             Some(Object::Dictionary(resources)) => Some(resources.clone()),
@@ -188,7 +190,7 @@ fn collect_used_names_for_form<R: Read + Seek>(
                 owner: form_ref,
             },
             0,
-        )?
+        )? // cov:ignore: continuation of the covered collect_from_stream expression has no independent execution path
     };
     Ok(complete.then_some(used))
 }

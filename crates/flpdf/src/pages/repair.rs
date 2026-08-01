@@ -381,9 +381,11 @@ fn repair_direct_page_tree<R: Read + Seek>(
             }
             let new_ref = state.next_clone;
             state.next_clone = ObjectRef::new(
+                // cov:ignore-start: next_object_ref rejects u32::MAX before direct-leaf allocation can begin
                 new_ref.number.checked_add(1).ok_or_else(|| {
                     Error::Unsupported("object-number space exhausted".to_string())
                 })?,
+                // cov:ignore-end
                 0,
             );
             let owned = std::mem::replace(kid, Object::Reference(new_ref));
@@ -422,9 +424,11 @@ fn repair_direct_page_tree<R: Read + Seek>(
             let clone = pdf.resolve(kid_ref)?;
             let new_ref = state.next_clone;
             state.next_clone = ObjectRef::new(
+                // cov:ignore-start: next_object_ref rejects u32::MAX before duplicate-leaf allocation can begin
                 new_ref.number.checked_add(1).ok_or_else(|| {
                     Error::Unsupported("object-number space exhausted".to_string())
                 })?,
+                // cov:ignore-end
                 0,
             );
             pdf.set_object(new_ref, clone);
