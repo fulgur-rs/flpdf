@@ -7,8 +7,8 @@
 //! production-generated document.
 
 use flpdf::{
-    encode_utf16be, format_pdf_date, md5_checksum, FileParamDates, FileSpec, FileSpecBuilder,
-    Object, ObjectRef, Pdf,
+    encode_utf16be, format_pdf_date, md5_checksum, EmbeddedFileStream, FileParamDates, FileSpec,
+    FileSpecBuilder, Object, ObjectRef, Pdf,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -365,6 +365,100 @@ fn embedded_file_setters_update_the_live_stream_and_qpdf_getters() {
     assert_eq!(
         stream.dict.get("Subtype"),
         Some(&Object::Name(b"application/pdf".to_vec()))
+    );
+}
+
+#[test]
+fn qpdf_factories_create_filespec_and_embedded_file_objects() {
+    // This fails if either factory omits qpdf's /Type, computed EF parameters,
+    // shared /EF references, or newUnicodeString filename storage.
+    let mut pdf = open(build_attachment_pdf("", "", b"seed"));
+    let ef_ref = EmbeddedFileStream::create(&mut pdf, b"payload").unwrap();
+    let filespec_ref = FileSpec::create(&mut pdf, "report.txt", ef_ref).unwrap();
+
+    let Object::Stream(ef) = pdf.resolve(ef_ref).unwrap() else {
+        panic!("expected EmbeddedFile stream");
+    };
+    assert_eq!(
+        ef.dict.get("Type"),
+        Some(&Object::Name(b"EmbeddedFile".to_vec()))
+    );
+    let Object::Dictionary(params) = ef.dict.get("Params").unwrap() else {
+        panic!("expected /Params");
+    };
+    assert_eq!(params.get("Size"), Some(&Object::Integer(7)));
+    assert_eq!(
+        params.get("CheckSum"),
+        Some(&Object::String(md5_checksum(b"payload")))
+    );
+
+    let Object::Dictionary(filespec) = pdf.resolve(filespec_ref).unwrap() else {
+        panic!("expected Filespec dictionary");
+    };
+    assert_eq!(
+        filespec.get("Type"),
+        Some(&Object::Name(b"Filespec".to_vec()))
+    );
+    assert_eq!(
+        filespec.get("F"),
+        Some(&Object::String(b"report.txt".to_vec()))
+    );
+    assert_eq!(
+        filespec.get("UF"),
+        Some(&Object::String(b"report.txt".to_vec()))
+    );
+    let Object::Dictionary(ef_entries) = filespec.get("EF").unwrap() else {
+        panic!("expected /EF");
+    };
+    assert_eq!(ef_entries.get("F"), Some(&Object::Reference(ef_ref)));
+    assert_eq!(ef_entries.get("UF"), Some(&Object::Reference(ef_ref)));
+}
+
+#[test]
+fn filespec_setters_use_qpdf_unicode_and_compatibility_rules() {
+    // This fails if description/filename writes bypass newUnicodeString, or
+    // if a non-empty compatibility name does not replace /F alone.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    fs.set_description("概要").unwrap();
+    fs.set_filename("東京.txt", Some("fallback.txt")).unwrap();
+    drop(fs);
+
+    let Object::Dictionary(filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected Filespec dictionary");
+    };
+    assert_eq!(
+        filespec.get("Desc"),
+        Some(&Object::String(encode_utf16be("概要")))
+    );
+    assert_eq!(
+        filespec.get("UF"),
+        Some(&Object::String(encode_utf16be("東京.txt")))
+    );
+    assert_eq!(
+        filespec.get("F"),
+        Some(&Object::String(b"fallback.txt".to_vec()))
+    );
+}
+
+#[test]
+fn qpdf_path_factories_read_payload_and_make_filespec() {
+    // This fails if the Rust path equivalents of qpdf's file-provider
+    // overloads fail to preserve the file's decoded bytes.
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), b"from-path").unwrap();
+    let mut pdf = open(build_attachment_pdf("", "", b"seed"));
+
+    let ef_ref = EmbeddedFileStream::create_from_path(&mut pdf, file.path()).unwrap();
+    let fs_ref = FileSpec::create_from_path(&mut pdf, "path.txt", file.path()).unwrap();
+    assert_eq!(
+        pdf.resolve(ef_ref).unwrap().as_stream().unwrap().data,
+        b"from-path"
+    );
+    let mut fs = FileSpec::new(fs_ref, &mut pdf);
+    assert_eq!(
+        fs.embedded_file().unwrap().unwrap().payload().unwrap(),
+        b"from-path"
     );
 }
 

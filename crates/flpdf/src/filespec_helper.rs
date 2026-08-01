@@ -85,7 +85,7 @@
 
 use crate::filters::{decode_stream_data, encode_stream_data};
 use crate::object::{Dictionary, Object, Stream};
-use crate::pdf_string::utf8_value;
+use crate::pdf_string::{new_unicode_string, utf8_value};
 use crate::ref_chain::resolve_ref_chain;
 use crate::{Error, ObjectRef, Pdf, Result};
 use md5::{Digest, Md5};
@@ -94,6 +94,17 @@ use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 const NAME_KEYS: [&str; 5] = ["UF", "F", "Unix", "DOS", "Mac"];
+
+fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> ObjectRef {
+    let next = pdf
+        .object_refs()
+        .iter()
+        .map(|object_ref| object_ref.number)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    ObjectRef::new(next, 0)
+}
 
 // ── EmbeddedFileStream ────────────────────────────────────────────────────────
 
@@ -121,6 +132,30 @@ pub struct EmbeddedFileStream<'a, R: Read + Seek> {
 }
 
 impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
+    /// Create an indirect `/EmbeddedFile` stream from decoded data, including
+    /// qpdf's computed `/Params /Size` and binary MD5 `/CheckSum` values.
+    pub fn create(pdf: &mut Pdf<R>, data: impl AsRef<[u8]>) -> Result<ObjectRef> {
+        let data = data.as_ref();
+        let mut params = Dictionary::new();
+        params.insert("Size", Object::Integer(data.len() as i64));
+        params.insert("CheckSum", Object::String(md5_checksum(data)));
+
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
+        dict.insert("Length", Object::Integer(data.len() as i64));
+        dict.insert("Params", Object::Dictionary(params));
+
+        let object_ref = next_object_ref(pdf);
+        pdf.set_object(object_ref, Object::Stream(Stream::new(dict, data.to_vec())));
+        Ok(object_ref)
+    }
+
+    /// Create an embedded-file stream from filesystem bytes. This is the Rust
+    /// equivalent of qpdf's provider-based `createEFStream` overload.
+    pub fn create_from_path<P: AsRef<Path>>(pdf: &mut Pdf<R>, path: P) -> Result<ObjectRef> {
+        Self::create(pdf, std::fs::read(path)?)
+    }
+
     fn new(stream_ref: ObjectRef, stream: Stream, pdf: &'a mut Pdf<R>) -> Result<Self> {
         let params = match stream.dict.get("Params") {
             Some(Object::Dictionary(d)) => Some(d.clone()),
@@ -360,6 +395,39 @@ pub struct FileSpec<'a, R: Read + Seek> {
 }
 
 impl<'a, R: Read + Seek> FileSpec<'a, R> {
+    /// Create an indirect `/Filespec` whose `/EF /F` and `/EF /UF` entries
+    /// reference the same embedded-file stream.
+    pub fn create(
+        pdf: &mut Pdf<R>,
+        filename: &str,
+        embedded_file_ref: ObjectRef,
+    ) -> Result<ObjectRef> {
+        let name = new_unicode_string(filename.as_bytes());
+        let mut ef = Dictionary::new();
+        ef.insert("F", Object::Reference(embedded_file_ref));
+        ef.insert("UF", Object::Reference(embedded_file_ref));
+
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Name(b"Filespec".to_vec()));
+        dict.insert("UF", Object::String(name.clone()));
+        dict.insert("F", Object::String(name));
+        dict.insert("EF", Object::Dictionary(ef));
+
+        let object_ref = next_object_ref(pdf);
+        pdf.set_object(object_ref, Object::Dictionary(dict));
+        Ok(object_ref)
+    }
+
+    /// Create a Filespec and embedded-file stream from a filesystem path.
+    pub fn create_from_path<P: AsRef<Path>>(
+        pdf: &mut Pdf<R>,
+        filename: &str,
+        path: P,
+    ) -> Result<ObjectRef> {
+        let embedded_file_ref = EmbeddedFileStream::create_from_path(pdf, path)?;
+        Self::create(pdf, filename, embedded_file_ref)
+    }
+
     /// Construct a new wrapper for the `/Filespec` dictionary at `filespec_ref`.
     ///
     /// The constructor does **not** resolve the reference — call individual
@@ -378,6 +446,44 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
                 self.filespec_ref
             ))),
         }
+    }
+
+    fn replace_dict(&mut self, dict: Dictionary) {
+        self.pdf
+            .set_object(self.filespec_ref, Object::Dictionary(dict));
+    }
+
+    /// Set `/Desc` with qpdf's `newUnicodeString` storage semantics.
+    pub fn set_description(&mut self, description: impl AsRef<str>) -> Result<()> {
+        let mut dict = self.resolve_dict()?;
+        dict.insert(
+            "Desc",
+            Object::String(new_unicode_string(description.as_ref().as_bytes())),
+        );
+        self.replace_dict(dict);
+        Ok(())
+    }
+
+    /// Set `/UF` and `/F` with qpdf's compatibility-filename behavior.
+    pub fn set_filename(
+        &mut self,
+        unicode_name: impl AsRef<str>,
+        compatibility_name: Option<&str>,
+    ) -> Result<()> {
+        let mut dict = self.resolve_dict()?;
+        let unicode_name = new_unicode_string(unicode_name.as_ref().as_bytes());
+        dict.insert("UF", Object::String(unicode_name.clone()));
+        let compatibility_name = compatibility_name.filter(|name| !name.is_empty());
+        dict.insert(
+            "F",
+            Object::String(
+                compatibility_name
+                    .map(|name| name.as_bytes().to_vec())
+                    .unwrap_or(unicode_name),
+            ),
+        );
+        self.replace_dict(dict);
+        Ok(())
     }
 
     /// Return `/F` — the file name as raw PDF string bytes.
