@@ -456,6 +456,18 @@ impl ObjectHandle {
         )
     }
 
+    /// Construct a direct stream value from `dict` (a dictionary handle —
+    /// typically built via [`Self::dictionary`]) and `data` (the stream's
+    /// raw, undecoded bytes). qpdf's own model never allows a stream to be a
+    /// direct value (only ever a top-level indirect object,
+    /// `libqpdf/QPDF_Stream.cc:173-178`); this crate's own types do not
+    /// forbid it, matching [`Self::unparse_resolved`]'s own doc for that
+    /// case. Mainly useful for building a handle that is deliberately never
+    /// attached to a [`crate::Pdf`]'s object graph, e.g. in tests.
+    pub fn stream(dict: ObjectHandle, data: Vec<u8>) -> Self {
+        Self::new_direct(ObjectValue::Stream { dict, data }, NO_PARSED_OFFSET)
+    }
+
     /// Construct a direct real value that preserves a non-canonical source
     /// literal (e.g. `.4`) alongside its parsed value, mirroring
     /// [`crate::Object::RealLiteral`], so that a real number written in the
@@ -1035,8 +1047,13 @@ impl ObjectHandle {
         }
     }
 
-    /// Convert this handle's value into a legacy [`crate::Object`] tree
-    /// (`Pdf::resolve`/`Pdf::resolve_borrowed`'s materialization bridge).
+    /// Convert this handle's value into a legacy [`crate::Object`] tree —
+    /// `Pdf::resolve`/`Pdf::resolve_borrowed`'s own materialization bridge,
+    /// also public for a caller outside this crate that still needs a
+    /// legacy `Object`/[`Dictionary`] for one value reached through an
+    /// otherwise `ObjectHandle`-native walk (e.g. `flpdf-qtest-tools`' qtest
+    /// driver, which ports a `&Dictionary`-shaped qpdf filter/`DecodeParms`
+    /// resolution routine).
     ///
     /// An indirect array/dictionary child is *not* recursively resolved: it
     /// becomes `Object::Reference(child_ref)`, matching the parser's
@@ -1050,11 +1067,32 @@ impl ObjectHandle {
     /// [`Self::is_resolved`]) materializes as `Object::Null` rather than
     /// performing hidden resolution; callers that need the real value must
     /// resolve first (e.g. via `Pdf::resolve_object_handle`).
-    pub(crate) fn materialize(&self) -> Object {
-        self.with_value(|value| match value {
-            Some(value) => materialize_value(value),
-            None => Object::Null,
-        })
+    ///
+    /// A tree built through the public [`Self::array`]/[`Self::dictionary`]
+    /// factories carries no depth bound the way parsed input does, so this
+    /// walk is wrapped with the same stack-growth protection
+    /// [`Self::unparse_resolved`]/[`Self::shallow_copy`] already rely on
+    /// during construction, *and* capped at `parser::MAX_PARSE_DEPTH`,
+    /// substituting `Object::Null` for anything nested past that — no
+    /// document this crate accepts could parse a value nested deeper, so
+    /// the cap only ever bites a tree built directly through those
+    /// factories. Growing the construction stack alone would not be
+    /// enough on its own: the *returned* `Object` tree's own ordinary
+    /// recursive `Drop` runs later, unprotected, once this method has
+    /// already returned and the grown stack is gone — the depth cap keeps
+    /// that later drop within a size every other `MAX_PARSE_DEPTH`-bounded
+    /// `Object` tree in this crate already handles routinely, rather than
+    /// trying to protect `Drop` itself (`Object`'s recursive `Drop` glue
+    /// lives in `object.rs`, outside this file's scope to change).
+    ///
+    /// This does not protect `self` — the handle passed in — the same way:
+    /// an `ObjectHandle` tree that deep, built through the same public
+    /// factories, is a separate, pre-existing gap in `ObjectHandle`'s own
+    /// `Drop`, reachable without ever calling `materialize` at all (it
+    /// existed as long as those factories have been public), not something
+    /// introduced or fixable here.
+    pub fn materialize(&self) -> Object {
+        materialize_bounded(self, 0)
     }
 
     /// This handle's qpdf-syntax unparse form
@@ -1155,7 +1193,28 @@ impl ObjectHandle {
     }
 }
 
-fn materialize_value(value: &ObjectValue) -> Object {
+// The sole recursion hub for `ObjectHandle::materialize` — every nested
+// descent (array items, dictionary values, a stream's own dictionary handle)
+// goes through this function via `materialize_child`, so the depth cap and
+// `stacker::maybe_grow` wrap apply uniformly regardless of which container
+// shape carries the nesting. `depth` past `parser::MAX_PARSE_DEPTH`
+// substitutes `Object::Null`: no document this crate accepts could parse a
+// value nested deeper than that, so only a tree built directly through the
+// public `ObjectHandle::array`/`dictionary` factories (which impose no depth
+// bound themselves) can reach the cap at all.
+fn materialize_bounded(handle: &ObjectHandle, depth: usize) -> Object {
+    if depth > crate::parser::MAX_PARSE_DEPTH {
+        return Object::Null;
+    }
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        handle.with_value(|value| match value {
+            Some(value) => materialize_value(value, depth),
+            None => Object::Null,
+        })
+    })
+}
+
+fn materialize_value(value: &ObjectValue, depth: usize) -> Object {
     match value {
         ObjectValue::Null => Object::Null,
         ObjectValue::Boolean(b) => Object::Boolean(*b),
@@ -1169,25 +1228,29 @@ fn materialize_value(value: &ObjectValue) -> Object {
         ObjectValue::String(s) => Object::String(s.clone()),
         ObjectValue::Operator(bytes) => Object::Operator(bytes.clone()),
         ObjectValue::InlineImage(bytes) => Object::InlineImage(bytes.clone()),
-        ObjectValue::Array(children) => {
-            Object::Array(children.iter().map(materialize_child).collect())
-        }
+        ObjectValue::Array(children) => Object::Array(
+            children
+                .iter()
+                .map(|child| materialize_child(child, depth + 1))
+                .collect(),
+        ),
         ObjectValue::Dictionary(entries) => {
             let mut dict = Dictionary::new();
             for (key, value) in entries {
-                dict.insert(key.as_slice(), materialize_child(value));
+                dict.insert(key.as_slice(), materialize_child(value, depth + 1));
             }
             Object::Dictionary(dict)
         }
         ObjectValue::Stream { dict, data } => {
-            let dict = match dict.materialize() {
+            let dict = match materialize_bounded(dict, depth + 1) {
                 Object::Dictionary(dict) => dict,
                 // A stream's own dictionary handle is always constructed as
                 // a direct `ObjectValue::Dictionary` (see
                 // `Pdf::native_parse_uncompressed_value`, `Pdf::lift`, and
                 // `Pdf::lift_for_set_object`), never an indirect reference
-                // or any other variant.
-                _ => Dictionary::new(), // cov:ignore: unreachable per the invariant above
+                // or any other variant, unless the depth cap above already
+                // substituted `Object::Null` for it.
+                _ => Dictionary::new(), // cov:ignore: unreachable outside the depth-cap fallback, itself covered separately
             };
             Object::Stream(Stream::new(dict, data.clone()))
         }
@@ -1199,10 +1262,10 @@ fn materialize_value(value: &ObjectValue) -> Object {
 // without recursing into it when indirect (identity-preserving, matching
 // the parser's pre-existing `Object::Reference` semantics); a direct child
 // is materialized in place.
-fn materialize_child(handle: &ObjectHandle) -> Object {
+fn materialize_child(handle: &ObjectHandle, depth: usize) -> Object {
     match handle.object_ref() {
         Some(object_ref) => Object::Reference(object_ref),
-        None => handle.materialize(),
+        None => materialize_bounded(handle, depth),
     }
 }
 
@@ -1239,7 +1302,9 @@ fn unparse_materialize_value(value: &ObjectValue) -> Object {
         }
         // No other variant nests a dictionary, so the omission rule cannot
         // apply anywhere beneath it; delegate to the ordinary materializer.
-        other => materialize_value(other),
+        // Every remaining variant is a scalar with no further recursion, so
+        // the depth this arm passes never actually matters.
+        other => materialize_value(other, 0),
     }
 }
 
@@ -1612,6 +1677,84 @@ mod object_value_tests {
     fn null_handle_is_null() {
         assert!(ObjectHandle::null().is_null());
         assert!(!ObjectHandle::integer(0).is_null());
+    }
+
+    #[test]
+    fn stream_handle_round_trips_its_dict_and_data() {
+        let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(3))]);
+        let stream = ObjectHandle::stream(dict.clone(), b"abc".to_vec());
+        assert!(stream.as_stream_dict().expect("stream dict").ptr_eq(&dict));
+        assert_eq!(stream.as_stream_data(), Some(b"abc".to_vec()));
+        assert_eq!(stream.type_code(), 10, "ot_stream");
+    }
+
+    #[test]
+    fn materialize_is_now_a_public_bridge_usable_outside_this_crate() {
+        // `materialize` was widened from `pub(crate)` to `pub` so
+        // `flpdf-qtest-tools`' qtest driver can bridge one `ObjectHandle`
+        // value (a stream's own dictionary handle) back to a legacy
+        // `Object`/`Dictionary` for its still-`&Dictionary`-shaped
+        // filter/`DecodeParms` resolution routine — see this method's own
+        // doc. `object_value_tests` above already exercises its per-variant
+        // behavior exhaustively; this only pins the visibility contract.
+        let handle = ObjectHandle::integer(1);
+        let _: Object = ObjectHandle::materialize(&handle);
+    }
+
+    #[test]
+    fn materialize_caps_a_direct_tree_deeper_than_any_parseable_document() {
+        // Codex Review on PR #610 reproduced a process-aborting stack
+        // overflow by building a 100,000-level-deep direct array through
+        // the public `ObjectHandle::array` factory (which imposes no depth
+        // bound the way parsed input does), calling the newly-public
+        // `materialize` on it, then letting both the input handle and the
+        // materialized result drop normally. `materialize` now caps its own
+        // recursion at `parser::MAX_PARSE_DEPTH`, substituting `Object::Null`
+        // past that point -- verified below to actually take effect, not
+        // merely fail to crash by luck.
+        //
+        // `std::mem::forget(handle)` isolates what this fix is actually
+        // responsible for: dropping the *input* `handle` here, built the
+        // same way, independently overflows the stack even with no call to
+        // `materialize` at all (confirmed while narrowing this down) --
+        // `ObjectHandle`'s own recursive `Drop` is unprotected the same way
+        // `Object`'s is, and was already reachable this way before this PR
+        // (`array`/`dictionary` were already public). That is a real,
+        // separate, pre-existing gap this fix does not and cannot close
+        // from inside `materialize` -- forgetting `handle` here keeps this
+        // test scoped to materialize's own contribution rather than
+        // silently also depending on a fix for the unrelated one.
+        let mut handle = ObjectHandle::integer(1);
+        for _ in 0..100_000 {
+            handle = ObjectHandle::array(vec![handle]);
+        }
+
+        let materialized = handle.materialize();
+        std::mem::forget(handle);
+
+        let mut cursor = &materialized;
+        let mut depth = 0;
+        loop {
+            match cursor {
+                Object::Array(items) if items.len() == 1 => {
+                    cursor = &items[0];
+                    depth += 1;
+                }
+                other => {
+                    assert_eq!(
+                        *other,
+                        Object::Null,
+                        "the cap must substitute null once nesting exceeds MAX_PARSE_DEPTH"
+                    );
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            depth,
+            crate::parser::MAX_PARSE_DEPTH + 1,
+            "materialize should recurse exactly through the depth cap before substituting null"
+        );
     }
 
     #[test]

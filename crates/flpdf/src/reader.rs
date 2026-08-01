@@ -325,6 +325,14 @@ const MAX_OBJECT_STREAM_CHAIN_DEPTH: usize = 100;
 // defeating a flood of objects whose bodies run to EOF.
 const MAX_RESOLUTION_FALLBACKS: u32 = 64;
 
+// Stack-growth protection for `lift_bounded`'s recursive hub, mirroring
+// `parser.rs`'s own `STACK_RED_ZONE`/`STACK_GROWTH_SIZE` values (kept as
+// separate local constants rather than imported cross-module, matching this
+// crate's existing per-module duplication of the same two numbers in
+// `object_handle.rs`).
+const READER_STACK_RED_ZONE: usize = 32 * 1024;
+const READER_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
 impl<R: Read + Seek> Drop for Pdf<R> {
     // A resolved indirect handle's value can embed other indirect handles
     // sharing `handle_registry`'s own canonical `Rc` identity (array/dict/
@@ -939,8 +947,11 @@ impl<R: Read + Seek> Pdf<R> {
     /// The trailer is always a direct, in-memory dictionary — it is never
     /// itself an indirect object per the PDF spec — so the returned handle is
     /// always direct. A trailer whose literal (non-indirect) nesting exceeds
-    /// the crate's inline-object-nesting bound yields a null handle instead.
-    /// Repeated calls return the same shared handle.
+    /// the crate's inline-object-nesting bound yields a null handle instead —
+    /// note this degrades the *entire* trailer, so a caller that only cares
+    /// about one key and cannot tolerate an unrelated sibling entry's nesting
+    /// erasing it should use [`Pdf::trailer_key_handle`] instead. Repeated
+    /// calls return the same shared handle.
     pub fn trailer_handle(&mut self) -> ObjectHandle {
         if let Some(handle) = &self.trailer_handle_memo {
             return handle.clone();
@@ -950,6 +961,37 @@ impl<R: Read + Seek> Pdf<R> {
         let handle = ObjectHandle::from_value(value);
         self.trailer_handle_memo = Some(handle.clone());
         handle
+    }
+
+    /// `key`'s value in the trailer dictionary, as an [`ObjectHandle`] —
+    /// unlike `Pdf::trailer_handle().get_key(key)`, this lifts only `key`'s
+    /// own value, so an unrelated sibling trailer entry whose literal nesting
+    /// exceeds the crate's inline-object-nesting bound cannot degrade this
+    /// result to null the way it degrades [`Pdf::trailer_handle`]'s whole-
+    /// trailer walk. A bare reference (`/Key 1 0 R`) becomes a genuine
+    /// indirect handle sharing the canonical `handle_registry` identity
+    /// (matching how a dictionary *child* reference lifts, not `lift`'s own
+    /// top-level `ObjectValue::Reference` shape — a trailer value is read,
+    /// never `Pdf::set_object`-redirected in place). Returns a direct null
+    /// handle for a missing key or a lift failure on `key`'s own value
+    /// (matching [`ObjectHandle::get_key`]'s own "missing key" contract).
+    /// Not memoized — unlike the whole trailer, a single key's handle is
+    /// cheap enough to relift on every call, and every caller today needs at
+    /// most one key per `Pdf`.
+    pub fn trailer_key_handle(&mut self, key: &[u8]) -> ObjectHandle {
+        let Some(value) = self.trailer.get(key).cloned() else {
+            return ObjectHandle::null();
+        };
+        // `parser::MAX_PARSE_DEPTH`, not `lift`'s default `MAX_INLINE_DEPTH`:
+        // the trailer was already parsed successfully at the looser
+        // `MAX_PARSE_DEPTH` bound, so a value nested between the two would
+        // otherwise degrade to null *here* while the legacy `resolve_chain`/
+        // `resolve_borrowed` path (`MAX_PARSE_DEPTH`-bounded) still returns
+        // it — the same divergence `resolve_object_handle`'s own call to
+        // `lift_bounded` documents and avoids for the analogous
+        // compressed-member case.
+        self.lift_to_handle_bounded(&value, 0, crate::parser::MAX_PARSE_DEPTH)
+            .unwrap_or_else(|_| ObjectHandle::null())
     }
 
     pub(crate) fn startxref(&self) -> u64 {
@@ -1853,9 +1895,36 @@ impl<R: Read + Seek> Pdf<R> {
         &mut self,
         handle: &ObjectHandle,
     ) -> Result<ObjectHandle> {
+        Ok(self.resolve_object_handle_to_terminal_ref(handle)?.0)
+    }
+
+    /// Same chase as [`Pdf::resolve_object_handle_to_terminal`], additionally
+    /// returning the object reference the terminal value was actually read
+    /// from. This is `None` exactly when the returned handle is direct with
+    /// no indirect identity of its own — either `handle` itself was direct,
+    /// or the chase hit the `ref_chain::MAX_REF_CHAIN_DEPTH` bound and fell
+    /// back to a null handle. Otherwise it is `handle.object_ref()` when no
+    /// [`Pdf::set_object`] redirect was chased (matching
+    /// [`Pdf::resolve_object_handle_to_terminal`]'s own "returns `handle`
+    /// unchanged" case), or the *last* hop's ref when one or more redirects
+    /// were followed — deliberately not the chain's first ref, which callers
+    /// needing offset/diagnostic attribution for the terminal object itself
+    /// (e.g. a stream's source offset) must not conflate with an intermediate
+    /// redirect's own ref.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Pdf::resolve_object_handle`].
+    pub fn resolve_object_handle_to_terminal_ref(
+        &mut self,
+        handle: &ObjectHandle,
+    ) -> Result<(ObjectHandle, Option<ObjectRef>)> {
         self.resolve_object_handle(handle)?;
         let Some(mut current_ref) = handle.as_reference() else {
-            return Ok(handle.clone()); // already terminal (the common case) — or unresolved/missing
+            // already terminal (the common case) — or unresolved/missing;
+            // `handle.object_ref()` is already the correct terminal ref,
+            // `None` for an originally-direct handle.
+            return Ok((handle.clone(), handle.object_ref()));
         };
         for _ in 0..crate::ref_chain::MAX_REF_CHAIN_DEPTH {
             let hop = self.get_object_handle(current_ref);
@@ -1878,7 +1947,7 @@ impl<R: Read + Seek> Pdf<R> {
                 // No canonical state is written either way, so a later call
                 // simply redoes the chase rather than being stuck observing
                 // a stale result.
-                None => return Ok(hop.shallow_copy()),
+                None => return Ok((hop.shallow_copy(), Some(current_ref))),
             }
         }
         self.push_warning(format!(
@@ -1888,7 +1957,10 @@ impl<R: Read + Seek> Pdf<R> {
             current_ref.generation,
             crate::ref_chain::MAX_REF_CHAIN_DEPTH
         ));
-        Ok(ObjectHandle::null())
+        // Ref and handle degrade together: a null value paired with a
+        // live-looking ref would let a caller compute an "offset of
+        // terminal" for an object it was just told is null.
+        Ok((ObjectHandle::null(), None))
     }
 
     // Builds the resolved value for a plain uncompressed file object by
@@ -2046,68 +2118,82 @@ impl<R: Read + Seek> Pdf<R> {
                 "object handle lift: inline object nesting exceeds maximum of {max_depth}"
             )));
         }
-        let value = match object {
-            Object::Null => ObjectValue::Null,
-            Object::Boolean(b) => ObjectValue::Boolean(*b),
-            Object::Integer(n) => ObjectValue::Integer(*n),
-            Object::Real(r) => ObjectValue::Real(*r),
-            Object::RealLiteral { value, literal } => ObjectValue::RealLiteral {
-                value: *value,
-                literal: literal.clone(),
-            },
-            Object::Name(name) => ObjectValue::Name(name.clone()),
-            Object::String(s) => ObjectValue::String(s.clone()),
-            Object::Array(items) => ObjectValue::Array(
-                items
-                    .iter()
-                    .map(|item| self.lift_to_handle_bounded(item, depth + 1, max_depth))
-                    .collect::<Result<Vec<_>>>()?,
-            ),
-            Object::Dictionary(dict) => {
-                ObjectValue::Dictionary(self.lift_dictionary_bounded(dict, depth, max_depth)?)
-            }
-            // A stream's own dictionary is lifted the same way any other
-            // nested dictionary is (see `lift_dictionary`), then wrapped in
-            // its own fresh handle: this arm mints a new dictionary handle
-            // every time, at the no-offset sentinel. `Pdf::set_object`
-            // (the only caller that can reach this arm with a *replacement*
-            // for an already-resolved stream) special-cases reusing the
-            // pre-existing dictionary handle instead, via
-            // `Pdf::lift_for_set_object`, so an established parsed offset
-            // is not lost on a plain round trip.
-            Object::Stream(stream) => ObjectValue::Stream {
-                dict: ObjectHandle::from_value(ObjectValue::Dictionary(
-                    self.lift_dictionary_bounded(&stream.dict, depth, max_depth)?,
-                )),
-                data: stream.data.clone(),
-            },
-            // A bare top-level reference never comes from a file/ObjStm
-            // parse (`top_level_no_reference` integerizes it there,
-            // matching qpdf), but `Pdf::set_object` callers pass one
-            // directly throughout this crate to redirect or collapse a
-            // holder chain in place (`ObjectRef` -> `ObjectRef`, no
-            // recursive follow) -- `ObjectValue::Reference` is the handle
-            // graph's representation for exactly that case; see its own
-            // doc.
-            Object::Reference(object_ref) => ObjectValue::Reference(*object_ref),
-            // Content-stream-only tokens; never a resolved file/ObjStm
-            // object value, and not a value any caller passes to
-            // `Pdf::set_object` in practice. `ObjectValue` has no variant to
-            // represent either losslessly, so this returns `Err` rather than
-            // silently discarding the caller-supplied value as `Null`:
-            // `Pdf::set_object` already treats a `lift` failure as "cannot be
-            // represented in the handle graph" and falls back to storing
-            // `object` directly as the authoritative
-            // `legacy_materialized_memo` value instead (see its own comment),
-            // exactly the same route the excess-depth case already takes.
-            Object::Operator(_) | Object::InlineImage(_) => {
-                return Err(Error::Unsupported(
-                    "object handle lift: content-stream-only token has no ObjectValue representation"
-                        .to_string(),
-                ));
-            }
-        };
-        Ok(value)
+        // Recursion hub for the mutually-recursive `lift_bounded` /
+        // `lift_to_handle_bounded` / `lift_dictionary_bounded` triangle:
+        // every nesting level returns back through here, so wrapping this
+        // one call site protects the whole walk the same way
+        // `object_handle.rs`'s own recursive hubs do. Needed for real, not
+        // just for a test with an oversized stack to pass: unlike the
+        // native parse path (`parser.rs`, itself `stacker`-protected), this
+        // lift path has no protection of its own, and `Pdf::trailer_key_handle`
+        // now reaches it at the looser `MAX_PARSE_DEPTH` bound (500) — a
+        // legitimately deep but successfully parsed value could otherwise
+        // abort a production caller running on a small-stack thread instead
+        // of returning a handle.
+        stacker::maybe_grow(READER_STACK_RED_ZONE, READER_STACK_GROWTH_SIZE, || {
+            let value = match object {
+                Object::Null => ObjectValue::Null,
+                Object::Boolean(b) => ObjectValue::Boolean(*b),
+                Object::Integer(n) => ObjectValue::Integer(*n),
+                Object::Real(r) => ObjectValue::Real(*r),
+                Object::RealLiteral { value, literal } => ObjectValue::RealLiteral {
+                    value: *value,
+                    literal: literal.clone(),
+                },
+                Object::Name(name) => ObjectValue::Name(name.clone()),
+                Object::String(s) => ObjectValue::String(s.clone()),
+                Object::Array(items) => ObjectValue::Array(
+                    items
+                        .iter()
+                        .map(|item| self.lift_to_handle_bounded(item, depth + 1, max_depth))
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+                Object::Dictionary(dict) => {
+                    ObjectValue::Dictionary(self.lift_dictionary_bounded(dict, depth, max_depth)?)
+                }
+                // A stream's own dictionary is lifted the same way any other
+                // nested dictionary is (see `lift_dictionary`), then wrapped in
+                // its own fresh handle: this arm mints a new dictionary handle
+                // every time, at the no-offset sentinel. `Pdf::set_object`
+                // (the only caller that can reach this arm with a *replacement*
+                // for an already-resolved stream) special-cases reusing the
+                // pre-existing dictionary handle instead, via
+                // `Pdf::lift_for_set_object`, so an established parsed offset
+                // is not lost on a plain round trip.
+                Object::Stream(stream) => ObjectValue::Stream {
+                    dict: ObjectHandle::from_value(ObjectValue::Dictionary(
+                        self.lift_dictionary_bounded(&stream.dict, depth, max_depth)?,
+                    )),
+                    data: stream.data.clone(),
+                },
+                // A bare top-level reference never comes from a file/ObjStm
+                // parse (`top_level_no_reference` integerizes it there,
+                // matching qpdf), but `Pdf::set_object` callers pass one
+                // directly throughout this crate to redirect or collapse a
+                // holder chain in place (`ObjectRef` -> `ObjectRef`, no
+                // recursive follow) -- `ObjectValue::Reference` is the handle
+                // graph's representation for exactly that case; see its own
+                // doc.
+                Object::Reference(object_ref) => ObjectValue::Reference(*object_ref),
+                // Content-stream-only tokens; never a resolved file/ObjStm
+                // object value, and not a value any caller passes to
+                // `Pdf::set_object` in practice. `ObjectValue` has no variant to
+                // represent either losslessly, so this returns `Err` rather than
+                // silently discarding the caller-supplied value as `Null`:
+                // `Pdf::set_object` already treats a `lift` failure as "cannot be
+                // represented in the handle graph" and falls back to storing
+                // `object` directly as the authoritative
+                // `legacy_materialized_memo` value instead (see its own comment),
+                // exactly the same route the excess-depth case already takes.
+                Object::Operator(_) | Object::InlineImage(_) => {
+                    return Err(Error::Unsupported(
+                        "object handle lift: content-stream-only token has no ObjectValue representation"
+                            .to_string(),
+                    ));
+                }
+            };
+            Ok(value)
+        })
     }
 
     // Shared by `lift`'s `Object::Dictionary`/`Object::Stream` arms and by
@@ -6319,6 +6405,102 @@ mod tests {
     }
 
     #[test]
+    fn trailer_key_handle_survives_an_unrelated_sibling_entrys_deep_nesting() {
+        // The whole-trailer walk `trailer_handle` performs degrades every
+        // key to null once *any* sibling entry exceeds `MAX_INLINE_DEPTH` —
+        // `trailer_key_handle` must not inherit that coupling: `/QTest`
+        // itself is shallow here, only its unrelated sibling `/Deep` is not.
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        pdf.trailer.insert("QTest", Object::Boolean(true));
+        let depth = crate::object::MAX_INLINE_DEPTH + 5;
+        let mut nested = Object::Integer(1);
+        for _ in 0..depth {
+            nested = Object::Array(vec![nested]);
+        }
+        pdf.trailer.insert("Deep", nested);
+
+        assert!(
+            pdf.trailer_handle().is_null(),
+            "sanity: the whole-trailer walk does degrade here"
+        );
+        let handle = pdf.trailer_key_handle(b"QTest");
+        assert_eq!(handle.as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn trailer_key_handle_is_null_for_a_missing_key() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let handle = pdf.trailer_key_handle(b"NoSuchKey");
+        assert!(handle.is_null());
+    }
+
+    #[test]
+    fn trailer_key_handle_accepts_the_keys_own_value_nested_past_max_inline_depth() {
+        // Codex Review on PR #610: a value nested between `MAX_INLINE_DEPTH`
+        // and `MAX_PARSE_DEPTH` parses successfully (a real document can
+        // legitimately contain it), so `resolve_borrowed`/the legacy
+        // `resolve_chain` bridge already accepts it — `trailer_key_handle`
+        // must too, or it would report `/QTest` as null while a caller
+        // still using the legacy path for the same key sees the real value,
+        // the same contradiction fixed for an unrelated sibling's nesting
+        // above.
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let depth = crate::object::MAX_INLINE_DEPTH + 5;
+        let mut nested = Object::Integer(1);
+        for _ in 0..depth {
+            nested = Object::Array(vec![nested]);
+        }
+        pdf.trailer.insert("QTest", nested);
+
+        let handle = pdf.trailer_key_handle(b"QTest");
+
+        assert!(!handle.is_null());
+        assert!(handle.as_array().is_some());
+    }
+
+    // `lift`/`lift_bounded` (unlike the native parse path) has no
+    // `stacker::maybe_grow` protection of its own — matching
+    // `parser.rs`'s own `nesting_past_max_parse_depth_matches_between_legacy_and_native_paths`/
+    // `native_handle_path_preserves_the_object_nesting_guard`, recursing it
+    // all the way to `MAX_PARSE_DEPTH` needs a dedicated, larger-than-default
+    // thread stack to avoid aborting the whole test process on a
+    // small-default-stack CI runner (observed: Windows). Building the
+    // `Pdf`/`Object` tree inside the spawned closure, not moving one in from
+    // outside, sidesteps needing either type to be `Send`.
+    #[test]
+    fn trailer_key_handle_is_null_when_the_keys_own_value_exceeds_the_parse_depth_bound() {
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+                let depth = crate::parser::MAX_PARSE_DEPTH + 5;
+                let mut nested = Object::Integer(1);
+                for _ in 0..depth {
+                    nested = Object::Array(vec![nested]);
+                }
+                pdf.trailer.insert("QTest", nested);
+
+                let handle = pdf.trailer_key_handle(b"QTest");
+
+                assert!(handle.is_null());
+            })
+            .expect("nesting-guard test thread must start")
+            .join()
+            .expect("nesting guard must return null before exhausting the stack");
+    }
+
+    #[test]
+    fn trailer_key_handle_lifts_an_indirect_value_to_a_canonical_handle() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let root_ref = pdf.root_ref().expect("root ref");
+        pdf.trailer.insert("QTest", Object::Reference(root_ref));
+
+        let handle = pdf.trailer_key_handle(b"QTest");
+
+        assert_eq!(handle.object_ref(), Some(root_ref));
+    }
+
+    #[test]
     fn resolve_object_handle_is_a_no_op_for_a_direct_handle() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let direct = ObjectHandle::integer(7);
@@ -6361,6 +6543,40 @@ mod tests {
         assert!(result.ptr_eq(&handle), "no chase needed: same handle back");
         assert!(result.as_dictionary().is_some());
         assert_eq!(result.as_reference(), None);
+    }
+
+    #[test]
+    fn resolve_object_handle_to_terminal_ref_reports_the_objects_own_ref_for_a_natural_single_hop()
+    {
+        // No `set_object` redirect is involved at all: `object_ref` resolves
+        // directly to its dictionary. The terminal ref must be the object's
+        // own ref, not `None` — this is the case
+        // `resolve_object_handle_to_terminal`'s "already terminal" fast path
+        // takes, and it must still report a ref for a caller that needs one
+        // (e.g. a diagnostic source-offset lookup keyed on that ref).
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+
+        let handle = pdf.get_object_handle(object_ref);
+        let (result, terminal_ref) = pdf
+            .resolve_object_handle_to_terminal_ref(&handle)
+            .expect("resolve a plain, never-redirected object, also reporting its ref");
+
+        assert!(result.as_dictionary().is_some());
+        assert_eq!(terminal_ref, Some(object_ref));
+    }
+
+    #[test]
+    fn resolve_object_handle_to_terminal_ref_reports_no_ref_for_a_direct_handle() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let direct = ObjectHandle::integer(7);
+
+        let (result, terminal_ref) = pdf
+            .resolve_object_handle_to_terminal_ref(&direct)
+            .expect("a direct handle has no ref to chase from");
+
+        assert_eq!(result.as_integer(), Some(7));
+        assert_eq!(terminal_ref, None);
     }
 
     #[test]
@@ -6434,6 +6650,15 @@ mod tests {
         assert_eq!(
             pdf.resolve(redirect_ref).expect("legacy resolve"),
             Object::Reference(target_ref)
+        );
+
+        let (_ref_result, terminal_ref) = pdf
+            .resolve_object_handle_to_terminal_ref(&handle)
+            .expect("resolve redirect handle, also reporting its terminal ref");
+        assert_eq!(
+            terminal_ref,
+            Some(target_ref),
+            "terminal ref is the redirect's target (100), not handle.object_ref() (200)"
         );
     }
 
@@ -6511,6 +6736,15 @@ mod tests {
             "result is a direct, unregistered handle"
         );
 
+        let (_ref_result, observed_terminal_ref) = pdf
+            .resolve_object_handle_to_terminal_ref(&handle)
+            .expect("resolve multi-hop redirect handle, also reporting its terminal ref");
+        assert_eq!(
+            observed_terminal_ref,
+            Some(terminal_ref),
+            "terminal ref is the chain's *last* hop, not the first (outer_ref) or middle"
+        );
+
         // The chain's first-ref identity is on `handle` itself. Neither it
         // (outer) nor the intermediate hop's own canonical handle is
         // mutated: `ref_chain.rs`'s own chain-walk over either ref still
@@ -6581,6 +6815,11 @@ mod tests {
             .expect("a chain exactly at the depth limit must resolve, not be treated as cyclic");
 
         assert_eq!(result.as_integer(), Some(7));
+
+        let (_ref_result, observed_terminal_ref) = pdf
+            .resolve_object_handle_to_terminal_ref(&handle)
+            .expect("a chain exactly at the depth limit must resolve, also reporting its ref");
+        assert_eq!(observed_terminal_ref, Some(terminal_ref));
     }
 
     #[test]
@@ -6601,6 +6840,15 @@ mod tests {
             .expect("a too-long chain falls back rather than erroring");
 
         assert!(result.is_null());
+
+        let (ref_fallback, observed_terminal_ref) = pdf
+            .resolve_object_handle_to_terminal_ref(&handle)
+            .expect("a too-long chain falls back rather than erroring");
+        assert!(ref_fallback.is_null());
+        assert_eq!(
+            observed_terminal_ref, None,
+            "ref and handle degrade together on the depth-cap fallback"
+        );
     }
 
     /// White-box companion to the public-API

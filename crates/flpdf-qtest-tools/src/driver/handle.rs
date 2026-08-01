@@ -57,142 +57,7 @@ impl std::ops::Deref for ResolvedStreamDictionary {
     }
 }
 
-pub(crate) struct Handle {
-    resolved: Object,
-    indirect: Option<ObjectRef>,
-    terminal_indirect: Option<ObjectRef>,
-}
-
-impl Handle {
-    pub(crate) fn from_value<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        value: Object,
-    ) -> flpdf::Result<Self> {
-        let (resolved, indirect, terminal_indirect) = resolve_chain(pdf, value)?;
-        Ok(Self {
-            resolved,
-            indirect,
-            terminal_indirect,
-        })
-    }
-
-    pub(crate) fn get_key<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        dictionary: &Dictionary,
-        key: &[u8],
-    ) -> flpdf::Result<Self> {
-        Self::from_value(pdf, dictionary.get(key).cloned().unwrap_or(Object::Null))
-    }
-
-    pub(crate) fn has_key<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        dictionary: &Dictionary,
-        key: &[u8],
-    ) -> flpdf::Result<bool> {
-        Ok(!Self::get_key(pdf, dictionary, key)?.is_null())
-    }
-
-    pub(crate) fn is_indirect(&self) -> bool {
-        self.indirect.is_some()
-    }
-
-    pub(crate) fn indirect_ref(&self) -> Option<ObjectRef> {
-        self.indirect
-    }
-
-    pub(crate) fn terminal_indirect_ref(&self) -> Option<ObjectRef> {
-        self.terminal_indirect
-    }
-
-    pub(crate) fn is_null(&self) -> bool {
-        self.resolved.is_null()
-    }
-
-    pub(crate) fn as_bool(&self) -> Option<bool> {
-        self.resolved.as_bool()
-    }
-
-    pub(crate) fn resolved(&self) -> &Object {
-        &self.resolved
-    }
-
-    pub(crate) fn array_item_indirectness(&self) -> flpdf::Result<Vec<bool>> {
-        let values = self
-            .resolved
-            .as_array()
-            .ok_or_else(|| Error::System("array access on non-array object".to_string()))?;
-        Ok(values
-            .iter()
-            .map(|value| matches!(value, Object::Reference(_)))
-            .collect())
-    }
-
-    pub(crate) fn dictionary_items<R: Read + Seek>(
-        &self,
-        pdf: &mut Pdf<R>,
-    ) -> flpdf::Result<Vec<(Vec<u8>, Self)>> {
-        let values: Vec<(Vec<u8>, Object)> = self
-            .resolved
-            .as_dict()
-            .ok_or_else(|| Error::System("dictionary access on non-dictionary object".to_string()))?
-            .iter()
-            .map(|(key, value)| (key.to_vec(), value.clone()))
-            .collect();
-        let mut items = Vec::new();
-        for (key, value) in values {
-            let value = Self::from_value(pdf, value)?;
-            if !value.is_null() {
-                items.push((key, value));
-            }
-        }
-        Ok(items)
-    }
-
-    pub(crate) fn type_code(&self) -> u8 {
-        self.type_info().0
-    }
-
-    pub(crate) fn type_name(&self) -> &'static str {
-        self.type_info().1
-    }
-
-    fn type_info(&self) -> (u8, &'static str) {
-        match self.resolved {
-            Object::Null => (2, "null"),
-            Object::Boolean(_) => (3, "boolean"),
-            Object::Integer(_) => (4, "integer"),
-            Object::Real(_) | Object::RealLiteral { .. } => (5, "real"),
-            Object::String(_) => (6, "string"),
-            Object::Name(_) => (7, "name"),
-            Object::Array(_) => (8, "array"),
-            Object::Dictionary(_) => (9, "dictionary"),
-            Object::Stream(_) => (10, "stream"),
-            Object::Operator(_) => (11, "operator"),
-            Object::InlineImage(_) => (12, "inline-image"),
-            Object::Reference(_) => (13, "unresolved"),
-        }
-    }
-
-    pub(crate) fn unparse<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> flpdf::Result<Vec<u8>> {
-        match self.indirect {
-            Some(reference) => Ok(write_object(&Object::Reference(reference))),
-            None => write_qpdf_object(pdf, &self.resolved),
-        }
-    }
-
-    pub(crate) fn unparse_resolved<R: Read + Seek>(
-        &self,
-        pdf: &mut Pdf<R>,
-    ) -> flpdf::Result<Vec<u8>> {
-        if matches!(self.resolved, Object::Stream(_)) {
-            self.unparse(pdf)
-        } else {
-            write_qpdf_object(pdf, &self.resolved)
-        }
-    }
-}
-
-fn write_object(object: &Object) -> Vec<u8> {
+pub(crate) fn write_object(object: &Object) -> Vec<u8> {
     let mut bytes = Vec::new();
     object.write_pdf(&mut bytes);
     bytes
@@ -224,16 +89,16 @@ fn write_qpdf_object_into<R: Read + Seek>(
         Object::Dictionary(dictionary) => {
             bytes.extend_from_slice(b"<< ");
             for (key, value) in dictionary.iter() {
-                let value = Handle::from_value(pdf, value.clone())?;
-                if value.is_null() {
+                let (resolved, indirect, _terminal) = resolve_chain(pdf, value.clone())?;
+                if resolved.is_null() {
                     continue;
                 }
                 Object::Name(key.to_vec()).write_pdf(bytes);
                 bytes.push(b' ');
-                if let Some(reference) = value.indirect_ref() {
+                if let Some(reference) = indirect {
                     Object::Reference(reference).write_pdf(bytes);
                 } else {
-                    write_qpdf_object_into(pdf, value.resolved(), bytes)?;
+                    write_qpdf_object_into(pdf, &resolved, bytes)?;
                 }
                 bytes.push(b' ');
             }
@@ -244,7 +109,7 @@ fn write_qpdf_object_into<R: Read + Seek>(
     Ok(())
 }
 
-fn resolve_chain<R: Read + Seek>(
+pub(crate) fn resolve_chain<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mut value: Object,
 ) -> flpdf::Result<(Object, Option<ObjectRef>, Option<ObjectRef>)> {
@@ -607,7 +472,7 @@ fn resolve_filter_structure<R: Read + Seek>(
 mod tests {
     use super::{
         crypt_decode_params_filterable, qpdf_object_type_name, remove_identity_crypt_stages,
-        resolve_stream_dictionary, Handle,
+        resolve_chain, resolve_stream_dictionary,
     };
     use flpdf::{Dictionary, Object, ObjectRef, Pdf, Stream};
     use std::io::Cursor;
@@ -662,75 +527,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_direct_and_indirect_null_all_have_qpdf_null_semantics() {
-        for trailer_extra in [
-            b"".as_slice(),
-            b" /QTest null".as_slice(),
-            b" /QTest 99 0 R".as_slice(),
-            b" /QTest 8 0 R".as_slice(),
-        ] {
-            let mut pdf = handle_pdf(trailer_extra);
-            let trailer = pdf.trailer().clone();
-            let handle = Handle::get_key(&mut pdf, &trailer, b"QTest").expect("get /QTest handle");
-            assert!(!Handle::has_key(&mut pdf, &trailer, b"QTest").expect("has /QTest"));
-            assert_eq!(handle.type_code(), 2);
-            assert_eq!(handle.type_name(), "null");
-        }
-    }
-
-    #[test]
-    fn reference_chain_resolves_but_unparse_retains_the_first_reference() {
-        let mut pdf = handle_pdf(b" /QTest 6 0 R");
-        pdf.set_object(
-            ObjectRef::new(6, 0),
-            Object::Reference(ObjectRef::new(7, 0)),
-        );
-        let trailer = pdf.trailer().clone();
-        let handle = Handle::get_key(&mut pdf, &trailer, b"QTest").expect("get /QTest");
-        assert!(handle.is_indirect());
-        assert_eq!(handle.as_bool(), Some(true));
-        assert_eq!(handle.unparse(&mut pdf).expect("unparse"), b"6 0 R");
-        assert_eq!(
-            handle.unparse_resolved(&mut pdf).expect("unparse resolved"),
-            b"true"
-        );
-    }
-
-    #[test]
-    fn qpdf_type_codes_and_names_are_explicit() {
-        let mut pdf = handle_pdf(b"");
-        let cases = [
-            (Object::Null, 2, "null"),
-            (Object::Boolean(false), 3, "boolean"),
-            (Object::Integer(1), 4, "integer"),
-            (Object::Real(1.5), 5, "real"),
-            (Object::String(b"s".to_vec()), 6, "string"),
-            (Object::Name(b"N".to_vec()), 7, "name"),
-            (Object::Array(vec![]), 8, "array"),
-            (Object::Dictionary(Dictionary::new()), 9, "dictionary"),
-            (
-                Object::Stream(Stream::new(Dictionary::new(), vec![])),
-                10,
-                "stream",
-            ),
-            (Object::Operator(b"q".to_vec()), 11, "operator"),
-            (Object::InlineImage(b"abc".to_vec()), 12, "inline-image"),
-        ];
-        for (object, code, name) in cases {
-            let handle = Handle::from_value(&mut pdf, object).expect("build handle");
-            assert_eq!(handle.type_code(), code);
-            assert_eq!(handle.type_name(), name);
-        }
-        let unresolved = Handle {
-            resolved: Object::Reference(ObjectRef::new(99, 0)),
-            indirect: None,
-            terminal_indirect: None,
-        };
-        assert_eq!(unresolved.type_code(), 13);
-        assert_eq!(unresolved.type_name(), "unresolved");
-    }
-
-    #[test]
     fn decode_param_type_names_cover_every_qpdf_object_kind() {
         let cases = [
             (Object::Null, "null"),
@@ -781,50 +577,6 @@ mod tests {
     }
 
     #[test]
-    fn array_and_dictionary_items_preserve_child_indirectness() {
-        let mut pdf = handle_pdf(b"");
-        let array = Handle::from_value(
-            &mut pdf,
-            Object::Array(vec![
-                Object::Integer(1),
-                Object::Reference(ObjectRef::new(7, 0)),
-            ]),
-        )
-        .expect("array handle");
-        assert_eq!(
-            array
-                .array_item_indirectness()
-                .expect("array item metadata"),
-            vec![false, true]
-        );
-
-        let mut dictionary = Dictionary::new();
-        dictionary.insert(b"a", Object::Reference(ObjectRef::new(7, 0)));
-        dictionary.insert(b"b", Object::Boolean(false));
-        let dictionary =
-            Handle::from_value(&mut pdf, Object::Dictionary(dictionary)).expect("dict handle");
-        let items = dictionary
-            .dictionary_items(&mut pdf)
-            .expect("dictionary items");
-        assert_eq!(items[0].0, b"a");
-        assert!(items[0].1.is_indirect());
-        assert_eq!(items[1].0, b"b");
-        assert!(!items[1].1.is_indirect());
-    }
-
-    #[test]
-    fn stream_unparse_resolved_stays_an_indirect_reference() {
-        let mut pdf = handle_pdf(b" /QTest 9 0 R");
-        let trailer = pdf.trailer().clone();
-        let handle = Handle::get_key(&mut pdf, &trailer, b"QTest").expect("stream handle");
-        assert_eq!(handle.unparse(&mut pdf).expect("unparse"), b"9 0 R");
-        assert_eq!(
-            handle.unparse_resolved(&mut pdf).expect("unparse resolved"),
-            b"9 0 R"
-        );
-    }
-
-    #[test]
     fn stream_filter_and_decode_params_reference_chains_are_fully_resolved() {
         let mut pdf = handle_pdf(b"");
         pdf.set_object(
@@ -870,15 +622,18 @@ mod tests {
 
         let mut accepted = handle_pdf(b"");
         install_chain(&mut accepted, 64);
-        let handle = Handle::from_value(&mut accepted, Object::Reference(ObjectRef::new(100, 0)))
-            .expect("64-hop reference chain");
-        assert_eq!(handle.as_bool(), Some(true));
+        let (resolved, indirect, terminal_indirect) =
+            resolve_chain(&mut accepted, Object::Reference(ObjectRef::new(100, 0)))
+                .expect("64-hop reference chain");
+        assert_eq!(resolved.as_bool(), Some(true));
+        assert_eq!(indirect, Some(ObjectRef::new(100, 0)));
+        assert_eq!(terminal_indirect, Some(ObjectRef::new(163, 0)));
 
         let mut rejected = handle_pdf(b"");
         install_chain(&mut rejected, 65);
-        let result = Handle::from_value(&mut rejected, Object::Reference(ObjectRef::new(100, 0)));
+        let result = resolve_chain(&mut rejected, Object::Reference(ObjectRef::new(100, 0)));
         assert!(result.is_err(), "65-hop reference chain was accepted");
-        let error = result.err().expect("65-hop error");
+        let error = result.expect_err("65-hop error");
         assert!(error.to_string().contains("exceeds 64 hops"));
     }
 
