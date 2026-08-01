@@ -684,14 +684,16 @@ impl ObjectHandle {
     /// indirect handle produces a direct null handle, matching every other
     /// accessor's "no hidden I/O" rule.
     ///
-    /// A stream value reached this way (only possible for a *directly*
-    /// nested stream, a shape qpdf itself forbids and this crate does not
-    /// construct through its own public factories) is left shared rather
-    /// than copied: qpdf's own `QPDF_Stream::copy` throws ("stream objects
+    /// qpdf's own `QPDF_Stream::copy` throws outright ("stream objects
     /// cannot be cloned", `libqpdf/QPDF_Stream.cc`), and this crate has no
     /// exception channel to mirror that with — the same precedent
     /// [`Self::unparse_resolved`]'s own doc comment already establishes for
-    /// a different qpdf-throws case.
+    /// a different qpdf-throws case. Instead of leaving a stream's `dict`
+    /// Rc-shared with the source (which would let a later
+    /// [`Self::replace_stream_data`] on the copy silently corrupt the
+    /// source's `/Length`/`/Filter`/`/DecodeParms`), a stream's `dict` is
+    /// treated as a child exactly like an array/dictionary entry: copied
+    /// independently when direct, shared when indirect.
     pub fn shallow_copy(&self) -> ObjectHandle {
         stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
             self.with_value(|value| match value {
@@ -1252,9 +1254,12 @@ fn unparse_materialize_child(handle: &ObjectHandle) -> Object {
 // child is recursively shallow-copied through `shallow_copy_child` (which
 // re-enters `ObjectHandle::shallow_copy`, the recursion hub carrying its
 // own `stacker::maybe_grow` wrap — the same hub-per-call shape as
-// `unparse_materialize`/`unparse_materialize_child` above). Every other
-// variant, including `Stream` (see `shallow_copy`'s own doc comment for
-// why), is cloned as-is with no further recursion.
+// `unparse_materialize`/`unparse_materialize_child` above). A `Stream`'s
+// `dict` field is a child in exactly the same sense as an array/dictionary
+// entry and gets the same `shallow_copy_child` treatment, so the copy's
+// dictionary is independent of the source's rather than Rc-shared while
+// only `data` is deep-cloned (see `shallow_copy`'s own doc comment). Every
+// other variant is cloned as-is with no further recursion.
 fn shallow_copy_value(value: &ObjectValue) -> ObjectValue {
     match value {
         ObjectValue::Array(items) => {
@@ -1266,6 +1271,10 @@ fn shallow_copy_value(value: &ObjectValue) -> ObjectValue {
                 .map(|(k, v)| (k.clone(), shallow_copy_child(v)))
                 .collect(),
         ),
+        ObjectValue::Stream { dict, data } => ObjectValue::Stream {
+            dict: shallow_copy_child(dict),
+            data: data.clone(),
+        },
         other => other.clone(),
     }
 }
@@ -2917,6 +2926,35 @@ mod mutation_tests {
             copy.as_array().unwrap()[0].as_array().unwrap()[0].as_integer(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn shallow_copy_of_a_resolved_indirect_stream_gives_the_copy_its_own_dictionary() {
+        // Regression test: the copy's dict must not be Rc-shared with the
+        // source's, or mutating the copy via replace_stream_data would
+        // silently corrupt the source stream's /Length/Filter/DecodeParms.
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
+        indirect.set_resolved(ObjectValue::Stream {
+            dict: ObjectHandle::dictionary(vec![]),
+            data: b"old".to_vec(),
+        });
+        let copy = indirect.shallow_copy();
+        copy.replace_stream_data(b"new data".to_vec(), None, None);
+
+        assert_eq!(copy.as_stream_data(), Some(b"new data".to_vec()));
+        assert_eq!(
+            copy.as_stream_dict()
+                .unwrap()
+                .get_key(b"Length")
+                .as_integer(),
+            Some(8)
+        );
+        assert_eq!(indirect.as_stream_data(), Some(b"old".to_vec()));
+        assert!(indirect
+            .as_stream_dict()
+            .unwrap()
+            .get_key(b"Length")
+            .is_null());
     }
 
     #[test]

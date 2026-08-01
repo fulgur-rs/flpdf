@@ -1559,6 +1559,16 @@ impl<R: Read + Seek> Pdf<R> {
         let new_ref = ObjectRef::new(next_number, 0);
         let indirect = self.get_object_handle(new_ref);
         indirect.set_resolved(value);
+        // Mirrors `Pdf::set_object`'s own dirty-bookkeeping: the incremental
+        // writer's `collect_touched_object_refs` seeds emission exclusively
+        // from `dirty_object_refs()` (`writer.rs`), so a new object left out
+        // of that set would never get its own body or xref entry written,
+        // leaving any reference to it dangling. No `self.cache` write-through
+        // is needed alongside this: `write_incremental_objects` reads a
+        // touched ref's value via `Pdf::resolve_borrowed`, which for an
+        // already-`Resolved` handle (this one, via `set_resolved` above)
+        // short-circuits before ever consulting `self.cache`.
+        self.dirty_object_refs.insert(new_ref);
         Ok(indirect)
     }
 
@@ -4569,6 +4579,49 @@ mod tests {
         );
         assert_eq!(first.as_integer(), Some(1));
         assert_eq!(second.as_integer(), Some(2));
+    }
+
+    #[test]
+    fn make_indirect_object_handle_survives_a_default_incremental_write() {
+        // Regression test: the new object must be registered as dirty, or
+        // the incremental writer's `collect_touched_object_refs` (which
+        // seeds emission exclusively from `Pdf::dirty_object_refs`) never
+        // writes its body or xref entry, leaving the reference below
+        // dangling (resolving to `Object::Null` on reopen).
+        use crate::write_pdf;
+
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let new_object = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(777))
+            .expect("make indirect");
+        let new_ref = new_object.object_ref().unwrap();
+
+        let root_ref = ObjectRef::new(1, 0);
+        let mut root_dict = pdf
+            .resolve(root_ref)
+            .expect("resolve root")
+            .into_dict()
+            .unwrap();
+        root_dict.insert("Extra", Object::Reference(new_ref));
+        pdf.set_object(root_ref, Object::Dictionary(root_dict));
+
+        let mut out = Vec::new();
+        write_pdf(&mut pdf, &mut out).expect("incremental write");
+
+        let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
+        let resolved_root = reopened
+            .resolve(root_ref)
+            .expect("resolve root in reopened output");
+        let extra_ref = resolved_root
+            .into_dict()
+            .and_then(|d| d.get("Extra").cloned())
+            .expect("root has /Extra");
+        assert_eq!(extra_ref, Object::Reference(new_ref));
+        assert_eq!(
+            reopened.resolve(new_ref).expect("resolve new object"),
+            Object::Integer(777),
+            "new object must not be dangling after an incremental write"
+        );
     }
 
     fn classic_pdf_with_bodies(bodies: &[&[u8]], root: ObjectRef) -> Vec<u8> {
