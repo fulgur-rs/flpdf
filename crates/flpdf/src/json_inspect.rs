@@ -2388,11 +2388,14 @@ pub fn build_attachments_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Jso
 /// - `/R >= 5` → `"AESv3"`
 /// - `/R == 4` → `"AESv2"`
 /// - everything else (legacy) → `"RC4"`
-fn cf_method_string(encrypt: &Dictionary, selector: Option<&str>) -> &'static str {
-    fn revision_default(encrypt: &Dictionary) -> &'static str {
-        match encrypt.get("R") {
-            Some(Object::Integer(r)) if *r >= 5 => "AESv3",
-            Some(Object::Integer(4)) => "AESv2",
+fn cf_method_string(
+    encrypt: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
+    selector: Option<&str>,
+) -> &'static str {
+    fn revision_default(encrypt: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>) -> &'static str {
+        match encrypt.get(b"R".as_slice()).and_then(ObjectHandle::as_integer) {
+            Some(r) if r >= 5 => "AESv3",
+            Some(4) => "AESv2",
             _ => "RC4",
         }
     }
@@ -2404,30 +2407,41 @@ fn cf_method_string(encrypt: &Dictionary, selector: Option<&str>) -> &'static st
         return "none";
     }
     // Look up the CFM entry inside /CF/<selector>
-    let Some(Object::Dictionary(cf)) = encrypt.get("CF") else {
+    let Some(cf) = encrypt
+        .get(b"CF".as_slice())
+        .and_then(ObjectHandle::as_dictionary)
+    else {
         return revision_default(encrypt);
     };
-    let Some(Object::Dictionary(filter)) = cf.get(selector) else {
+    let Some(filter) = cf
+        .get(selector.as_bytes())
+        .and_then(ObjectHandle::as_dictionary)
+    else {
         return revision_default(encrypt);
     };
-    match filter.get("CFM") {
-        Some(Object::Name(cfm)) => match cfm.as_slice() {
+    match filter.get(b"CFM".as_slice()).and_then(ObjectHandle::as_name) {
+        Some(cfm) => match cfm.as_slice() {
             b"AESV2" => "AESv2",
             b"AESV3" => "AESv3",
             b"V2" => "RC4",
             b"None" => "none",
             _ => revision_default(encrypt),
         },
-        _ => revision_default(encrypt),
+        None => revision_default(encrypt),
     }
 }
 
-/// Read an optional name key from `dict` and return it as `Option<&str>`.
-fn dict_name_str<'a>(dict: &'a Dictionary, key: &str) -> Option<&'a str> {
-    match dict.get(key) {
-        Some(Object::Name(n)) => std::str::from_utf8(n).ok(),
-        _ => None,
-    }
+/// Read an optional name key from `dict` and return it decoded as UTF-8.
+///
+/// Returns `None` if the key is absent, the value is not a name, or the
+/// name's bytes are not valid UTF-8 (matching the strict, non-lossy
+/// decoding the original `Object`-based lookup used).
+fn dict_name_str(
+    dict: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
+    key: &str,
+) -> Option<String> {
+    let bytes = dict.get(key.as_bytes())?.as_name()?;
+    String::from_utf8(bytes).ok()
 }
 
 /// Decode /P integer into per-capability booleans.
@@ -2497,16 +2511,21 @@ fn all_true_capabilities() -> Result<Json, ConvertError> {
 /// Returns a [`ConvertError`] only when an indirect `/Encrypt` reference
 /// cannot be resolved (i.e. an underlying I/O or parse error).
 pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
-    // Resolve /Encrypt dictionary from the trailer.
-    let encrypt_dict: Option<Dictionary> = match pdf.trailer().get("Encrypt").cloned() {
-        None => None,
-        Some(Object::Dictionary(d)) => Some(d),
-        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
-            Object::Dictionary(d) => Some(d.clone()),
-            _ => None,
-        },
-        _ => None,
-    };
+    // Resolve /Encrypt dictionary from the trailer. `resolve_object_handle`
+    // is a no-op for a direct (inline) dictionary and resolves an indirect
+    // reference in place, so a single call covers both shapes; a present but
+    // non-dictionary value (any type, including an unresolved reference)
+    // falls out of `as_dictionary()` as `None`, matching the prior explicit
+    // `Object::Dictionary`/`Object::Reference`/catch-all arms.
+    let trailer_dict = pdf.trailer_handle().as_dictionary().unwrap_or_default();
+    let encrypt_dict: Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> =
+        match trailer_dict.get(b"Encrypt".as_slice()) {
+            None => None,
+            Some(handle) => {
+                pdf.resolve_object_handle(handle)?;
+                handle.as_dictionary()
+            }
+        };
 
     let is_encrypted = pdf.is_encrypted();
 
@@ -2535,25 +2554,29 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
             ])
         }
         Some(ref enc) => {
-            // Encrypted document: read V, R, P, /Length, CF methods.
-            let v = match enc.get("V") {
-                Some(Object::Integer(n)) => *n,
-                _ => 0,
-            };
-            let r = match enc.get("R") {
-                Some(Object::Integer(n)) => *n,
-                _ => 0,
-            };
-            let p_raw = match enc.get("P") {
-                Some(Object::Integer(n)) => *n as i32,
-                _ => 0,
-            };
-            let bits = match enc.get("Length") {
-                Some(Object::Integer(n)) => *n,
+            // Encrypted document: read V, R, P, /Length, CF methods. None of
+            // these nested lookups resolve indirect references — an
+            // unresolved handle's typed accessor returns `None` just like
+            // the prior code's `Object::Reference` arm fell through to the
+            // catch-all, so the non-resolving behavior carries over exactly.
+            let v = enc
+                .get(b"V".as_slice())
+                .and_then(ObjectHandle::as_integer)
+                .unwrap_or(0);
+            let r = enc
+                .get(b"R".as_slice())
+                .and_then(ObjectHandle::as_integer)
+                .unwrap_or(0);
+            let p_raw = enc
+                .get(b"P".as_slice())
+                .and_then(ObjectHandle::as_integer)
+                .map(|n| n as i32)
+                .unwrap_or(0);
+            let bits = match enc.get(b"Length".as_slice()) {
                 // Default key length when /Length is absent: 40 bits (V=1/2).
                 None => 40,
-                // Malformed /Length (not an integer): treat as 0.
-                _ => 0,
+                // Present: an integer value, or 0 for anything malformed.
+                Some(handle) => handle.as_integer().unwrap_or(0),
             };
 
             // Determine method strings from /StmF, /StrF, /EFF selectors.
@@ -2562,9 +2585,9 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
             let eff = dict_name_str(enc, "EFF");
 
             let (streammethod, stringmethod, filemethod) = if v >= 4 {
-                let sm = cf_method_string(enc, stmf);
-                let st = cf_method_string(enc, strf);
-                let fm = cf_method_string(enc, eff.or(stmf));
+                let sm = cf_method_string(enc, stmf.as_deref());
+                let st = cf_method_string(enc, strf.as_deref());
+                let fm = cf_method_string(enc, eff.as_deref().or(stmf.as_deref()));
                 (sm, st, fm)
             } else if v == 1 || v == 2 {
                 ("RC4", "RC4", "RC4")
@@ -10719,31 +10742,48 @@ mod tests {
     // /CFM, which silently disguised RC4/AESv2 documents as plaintext. It
     // now falls back to the same revision-based default the reader uses.
 
+    /// Build an [`ObjectHandle`] dictionary from `(name, value)` pairs, for
+    /// tests exercising the `&BTreeMap<Vec<u8>, ObjectHandle>` lookups
+    /// `cf_method_string`/`dict_name_str` perform on an already-resolved
+    /// dictionary.
+    fn oh_dict(entries: Vec<(&str, ObjectHandle)>) -> ObjectHandle {
+        ObjectHandle::dictionary(
+            entries
+                .into_iter()
+                .map(|(k, v)| (k.as_bytes().to_vec(), v))
+                .collect(),
+        )
+    }
+
     #[test]
     fn cf_method_string_defaults_to_aesv2_for_revision_4() {
-        let mut encrypt = Dictionary::new();
-        encrypt.insert("R", Object::Integer(4));
         // No /CF at all.
+        let encrypt = oh_dict(vec![("R", ObjectHandle::integer(4))])
+            .as_dictionary()
+            .unwrap();
         assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "AESv2");
+
         // /CF exists but the selector is missing.
-        let mut cf = Dictionary::new();
-        cf.insert("OtherCF", Object::Dictionary(Dictionary::new()));
-        encrypt.insert("CF", Object::Dictionary(cf));
+        let cf = oh_dict(vec![("OtherCF", oh_dict(vec![]))]);
+        let encrypt = oh_dict(vec![("R", ObjectHandle::integer(4)), ("CF", cf)])
+            .as_dictionary()
+            .unwrap();
         assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "AESv2");
+
         // Selector found but its /CFM is missing.
-        let mut encrypt2 = Dictionary::new();
-        encrypt2.insert("R", Object::Integer(4));
-        let mut cf2 = Dictionary::new();
-        cf2.insert("StdCF", Object::Dictionary(Dictionary::new()));
-        encrypt2.insert("CF", Object::Dictionary(cf2));
+        let cf2 = oh_dict(vec![("StdCF", oh_dict(vec![]))]);
+        let encrypt2 = oh_dict(vec![("R", ObjectHandle::integer(4)), ("CF", cf2)])
+            .as_dictionary()
+            .unwrap();
         assert_eq!(cf_method_string(&encrypt2, Some("StdCF")), "AESv2");
     }
 
     #[test]
     fn cf_method_string_defaults_to_aesv3_for_revision_5_and_6() {
         for r in [5i64, 6] {
-            let mut encrypt = Dictionary::new();
-            encrypt.insert("R", Object::Integer(r));
+            let encrypt = oh_dict(vec![("R", ObjectHandle::integer(r))])
+                .as_dictionary()
+                .unwrap();
             assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "AESv3");
             assert_eq!(cf_method_string(&encrypt, None), "AESv3");
         }
@@ -10751,11 +10791,12 @@ mod tests {
 
     #[test]
     fn cf_method_string_defaults_to_rc4_for_legacy_revisions() {
-        let mut encrypt = Dictionary::new();
-        encrypt.insert("R", Object::Integer(3));
+        let encrypt = oh_dict(vec![("R", ObjectHandle::integer(3))])
+            .as_dictionary()
+            .unwrap();
         assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "RC4");
         // No /R at all -> legacy default too.
-        let empty = Dictionary::new();
+        let empty = oh_dict(vec![]).as_dictionary().unwrap();
         assert_eq!(cf_method_string(&empty, Some("StdCF")), "RC4");
     }
 
@@ -10763,8 +10804,9 @@ mod tests {
     fn cf_method_string_identity_selector_still_returns_none() {
         // The "Identity" selector explicitly means no encryption for that
         // path and must keep its "none" behavior regardless of /R.
-        let mut encrypt = Dictionary::new();
-        encrypt.insert("R", Object::Integer(4));
+        let encrypt = oh_dict(vec![("R", ObjectHandle::integer(4))])
+            .as_dictionary()
+            .unwrap();
         assert_eq!(cf_method_string(&encrypt, Some("Identity")), "none");
     }
 
