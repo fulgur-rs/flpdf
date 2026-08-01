@@ -202,9 +202,9 @@ impl ObjectHandle {
         }
     }
 
-    // Used by this module's identity tests today; the reader wires up real
-    // callers (and the `Unresolved{offset}` state) in a later task.
-    #[allow(dead_code)]
+    // Used by this module's identity tests, and by `Pdf::get_object_handle`
+    // (reader.rs) to lazily create the canonical handle it registers into
+    // `handle_registry` the first time a given ref is requested.
     pub(crate) fn new_indirect_unresolved(object_ref: ObjectRef, offset: i64) -> Self {
         let _ = offset; // real Unresolved{offset} state lands in a later task
         Self(Repr::Indirect(Rc::new(RefCell::new(IndirectSlot {
