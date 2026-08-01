@@ -128,6 +128,21 @@ fn get_all_pages_marks_qpdf_json_observation() {
 }
 
 #[test]
+fn push_inherited_attributes_marks_qpdf_json_observation() {
+    let mut pdf = open(build_n_page_pdf(1));
+    assert!(!pdf.ever_called_get_all_pages());
+
+    PageDocumentHelper::new(&mut pdf)
+        .push_inherited_attributes_to_pages()
+        .unwrap();
+
+    assert!(
+        pdf.ever_called_get_all_pages(),
+        "qpdf pushInheritedAttributesToPage initializes pages through getAllPages"
+    );
+}
+
+#[test]
 fn get_all_pages_returns_empty_when_catalog_has_no_pages() {
     let mut pdf = open(build_n_page_pdf(1));
     let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
