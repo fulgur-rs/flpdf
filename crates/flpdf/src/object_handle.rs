@@ -275,27 +275,15 @@ impl ObjectHandle {
     /// `shallow_copy`'s own doc comment explains for that method.
     pub(crate) fn direct_value_clone(&self) -> Option<ObjectValue> {
         match &self.0 {
-            Repr::Direct(slot) => Some(clone_value_stream_safe(&slot.borrow().value)),
+            Repr::Direct(slot) => Some(match &slot.borrow().value {
+                ObjectValue::Stream { dict, data } => ObjectValue::Stream {
+                    dict: shallow_copy_child(dict),
+                    data: data.clone(),
+                },
+                other => other.clone(),
+            }),
             Repr::Indirect(_) => None,
         }
-    }
-
-    /// This handle's current value, cloned with the same Stream-safe
-    /// treatment as [`Self::direct_value_clone`] — but usable on *any*
-    /// handle whose value is already known, not only a direct one: a direct
-    /// handle's own value, or an already-resolved indirect handle's
-    /// resolved value (`Missing`/`Destroyed` presenting as
-    /// `ObjectValue::Null`, matching every other accessor in this file).
-    /// `None` only for an indirect handle that has not yet been resolved —
-    /// this never performs resolution itself, the same "no hidden I/O" rule
-    /// every other accessor here follows. Used by
-    /// `Pdf::resolve_object_handle_to_terminal` (reader.rs) to copy a
-    /// redirect target's already-resolved terminal value into a fresh,
-    /// direct handle it returns to its caller — neither the canonical
-    /// redirecting handle nor any intermediate hop's canonical handle is
-    /// ever mutated.
-    pub(crate) fn resolved_value_clone(&self) -> Option<ObjectValue> {
-        self.with_value(|value| value.map(clone_value_stream_safe))
     }
 
     /// Mark this indirect handle's value as resolved to `value`. A no-op for
@@ -1322,24 +1310,6 @@ fn shallow_copy_child(child: &ObjectHandle) -> ObjectHandle {
         child.clone()
     } else {
         child.shallow_copy()
-    }
-}
-
-// Single-level `ObjectValue` clone: every variant clones as-is (an
-// `Array`/`Dictionary`/`Stream`'s own `ObjectHandle` children stay
-// Rc-shared with the source, matching a plain `ObjectValue::clone()` and
-// unlike `shallow_copy_value`'s full recursive independent copy) except
-// `Stream`'s `dict`, which gets the same `shallow_copy_child` treatment
-// [`ObjectHandle::shallow_copy`] gives it instead of a bare `Rc::clone` —
-// see [`ObjectHandle::direct_value_clone`]'s own doc for the asymmetry
-// this avoids.
-fn clone_value_stream_safe(value: &ObjectValue) -> ObjectValue {
-    match value {
-        ObjectValue::Stream { dict, data } => ObjectValue::Stream {
-            dict: shallow_copy_child(dict),
-            data: data.clone(),
-        },
-        other => other.clone(),
     }
 }
 

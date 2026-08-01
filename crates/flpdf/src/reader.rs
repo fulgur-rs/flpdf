@@ -1795,18 +1795,11 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Resolve `handle` (via [`Pdf::resolve_object_handle`]), then chase
     /// through a [`Pdf::set_object`]-driven bare-reference redirect (if any)
-    /// to its terminal (non-reference) value, returning a **direct** handle
-    /// wrapping that terminal value. Every accessor (`type_code`,
+    /// to its terminal (non-reference) value. Every accessor (`type_code`,
     /// `as_integer`, `unparse_resolved`, …) called on the *returned* handle
     /// then observes the terminal value directly, with no awareness a
-    /// redirect ever happened. Because the returned handle is direct, it
-    /// carries no indirect identity of its own and no connection back to
-    /// this document: mutating it (`replace_key`, `insert_key`, …) has no
-    /// effect on anything the writer will ever observe, the same as
-    /// mutating any other freshly-constructed direct value — this is by
-    /// construction, not merely documented, so there is no way to mistake
-    /// the result for a live, registered handle. Callers that need `"N G R"`
-    /// for the chain's *first* ref (matching
+    /// redirect ever happened. Callers that need `"N G R"` for the chain's
+    /// *first* ref (matching
     /// `crates/flpdf-qtest-tools/src/driver/handle.rs`'s established
     /// `resolve_chain` contract — see
     /// `reference_chain_resolves_but_unparse_retains_the_first_reference`)
@@ -1814,11 +1807,21 @@ impl<R: Read + Seek> Pdf<R> {
     /// returned value.
     ///
     /// If `handle`'s value is not a redirect at all — the common case —
-    /// this returns `handle.clone()` unchanged (an `Rc` clone, not a copy;
-    /// still indirect, still the canonical handle). Otherwise `handle`
-    /// itself, and every intermediate hop's own canonical handle (as
-    /// [`Pdf::get_object_handle`] would return it), are never mutated. This
-    /// matters because those are the *same* canonical handles
+    /// this returns `handle.clone()` unchanged: an `Rc` clone of the same
+    /// live, canonical, still-indirect handle, so mutating it behaves
+    /// exactly as mutating `handle` itself always would. Otherwise the
+    /// returned handle is a **direct**, independent copy of the terminal
+    /// value ([`ObjectHandle::shallow_copy`]'s own recursive-through-direct-
+    /// descendants semantics: any nested indirect child stays canonically
+    /// shared, but every direct one — including the top level — is its own
+    /// copy), and `handle` itself, and every intermediate hop's own
+    /// canonical handle (as [`Pdf::get_object_handle`] would return it), are
+    /// never mutated. In this case mutating the returned handle (`replace_key`,
+    /// `insert_key`, …) has no effect on anything the writer will ever
+    /// observe: it carries no indirect identity of its own, so there is
+    /// nothing a caller could pass to `mark_object_dirty` to make the edit
+    /// visible even by mistake. This matters because `handle` and each
+    /// intermediate hop are the *same* canonical handles
     /// [`Pdf::resolve_borrowed`] resolves through — overwriting one in place
     /// would permanently change what a later `resolve_borrowed` call for
     /// that same ref returns, silently discarding the redirect
@@ -1859,15 +1862,23 @@ impl<R: Read + Seek> Pdf<R> {
             self.resolve_object_handle(&hop)?;
             match hop.as_reference() {
                 Some(next) => current_ref = next,
-                // `hop.resolved_value_clone()` is `None` only for the
+                // `hop.shallow_copy()` recursively copies every *direct*
+                // array/dictionary/stream-dict descendant independently,
+                // sharing `Rc` identity only with a genuinely *indirect*
+                // descendant (see its own doc) — required here, not just a
+                // nicety: a single-level clone would leave a direct nested
+                // child Rc-shared with `hop`'s own canonical value, so
+                // mutating it through the returned handle (e.g.
+                // `result.get_key(...).replace_key(...)`) would silently
+                // mutate the real document too. It also already handles the
                 // transient `CacheEntry::Reserved` cycle guard
                 // `resolve_object_handle`'s own doc describes (`hop` stays
-                // unresolved) — `terminal_value_handle` falls back to null
-                // for that case too, matching `resolve_borrowed`'s own
-                // transient-`Reserved` placeholder. No canonical state is
-                // written either way, so a later call simply redoes the
-                // chase rather than being stuck observing a stale result.
-                None => return Ok(Self::terminal_value_handle(hop.resolved_value_clone())),
+                // unresolved → `shallow_copy` gives a direct null handle,
+                // matching `resolve_borrowed`'s own transient placeholder).
+                // No canonical state is written either way, so a later call
+                // simply redoes the chase rather than being stuck observing
+                // a stale result.
+                None => return Ok(hop.shallow_copy()),
             }
         }
         self.push_warning(format!(
@@ -1877,18 +1888,7 @@ impl<R: Read + Seek> Pdf<R> {
             current_ref.generation,
             crate::ref_chain::MAX_REF_CHAIN_DEPTH
         ));
-        Ok(Self::terminal_value_handle(None))
-    }
-
-    // A fresh, direct handle wrapping `terminal` (`ObjectValue::Null` if
-    // `None`) — never indirect, never registered anywhere. See
-    // `resolve_object_handle_to_terminal`'s own doc for why: a caller that
-    // needs the chain's first-ref identity already has `handle` for that;
-    // this return value only needs to carry the resolved value itself, and
-    // staying direct is what makes mutating it provably inert rather than a
-    // silent-data-loss trap.
-    fn terminal_value_handle(terminal: Option<ObjectValue>) -> ObjectHandle {
-        ObjectHandle::from_value(terminal.unwrap_or(ObjectValue::Null))
+        Ok(ObjectHandle::null())
     }
 
     // Builds the resolved value for a plain uncompressed file object by
@@ -6434,6 +6434,58 @@ mod tests {
         assert_eq!(
             pdf.resolve(redirect_ref).expect("legacy resolve"),
             Object::Reference(target_ref)
+        );
+    }
+
+    #[test]
+    fn resolve_object_handle_to_terminal_deep_copies_direct_nested_children() {
+        // A single-level clone of the terminal `ObjectValue` would leave a
+        // *direct* nested child Rc-shared with the canonical target's own
+        // value (only an indirect child is meant to stay shared) — mutating
+        // it through the returned handle would then silently mutate the
+        // real document too. `ObjectHandle::shallow_copy` (used internally)
+        // must recurse through direct descendants independently.
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let target_ref = ObjectRef::new(100, 0);
+        let redirect_ref = ObjectRef::new(200, 0);
+
+        let mut nested = Dictionary::new();
+        nested.insert(b"Inner", Object::Integer(1));
+        let mut outer = Dictionary::new();
+        outer.insert(b"Nested", Object::Dictionary(nested));
+        pdf.set_object(target_ref, Object::Dictionary(outer));
+        pdf.set_object(redirect_ref, Object::Reference(target_ref));
+
+        let handle = pdf.get_object_handle(redirect_ref);
+        let result = pdf
+            .resolve_object_handle_to_terminal(&handle)
+            .expect("resolve redirect handle to its terminal dictionary");
+
+        let nested_handle = result
+            .as_dictionary()
+            .expect("terminal is a dictionary")
+            .get(b"Nested".as_slice())
+            .expect("Nested present")
+            .clone();
+        nested_handle.replace_key(b"Inner", ObjectHandle::integer(999));
+
+        let canonical_target = pdf.get_object_handle(target_ref);
+        pdf.resolve_object_handle(&canonical_target)
+            .expect("resolve canonical target");
+        let canonical_inner = canonical_target
+            .as_dictionary()
+            .expect("canonical target is a dictionary")
+            .get(b"Nested".as_slice())
+            .and_then(ObjectHandle::as_dictionary)
+            .and_then(|nested| {
+                nested
+                    .get(b"Inner".as_slice())
+                    .and_then(ObjectHandle::as_integer)
+            });
+        assert_eq!(
+            canonical_inner,
+            Some(1),
+            "mutating the detached terminal's nested child must not affect the canonical document"
         );
     }
 
