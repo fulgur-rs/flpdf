@@ -6515,6 +6515,31 @@ mod tests {
         assert_eq!(handle_b.as_reference(), Some(ref_a));
     }
 
+    #[test]
+    fn resolve_object_handle_to_terminal_shadow_stays_direct_for_a_direct_bare_reference() {
+        // `shadow_terminal_handle`'s `None` arm: `original` has no indirect
+        // identity to preserve (a direct handle whose own value happens to
+        // be a bare `ObjectValue::Reference` — only reachable by a caller
+        // constructing one directly, never from a file/ObjStm parse or from
+        // `Pdf::set_object`, which always writes into an *indirect* handle).
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let target_ref = ObjectRef::new(100, 0);
+        pdf.set_object(target_ref, Object::Boolean(true));
+
+        let handle = ObjectHandle::from_value(ObjectValue::Reference(target_ref));
+        let result = pdf
+            .resolve_object_handle_to_terminal(&handle)
+            .expect("resolve a direct handle wrapping a bare reference");
+
+        assert_eq!(result.as_boolean(), Some(true));
+        assert_eq!(
+            result.object_ref(),
+            None,
+            "shadow stays direct: no ref to report via unparse()"
+        );
+        assert_eq!(result.unparse(), b"true");
+    }
+
     /// White-box companion to the public-API
     /// `resolve_object_handle_distinguishes_a_literal_null_from_a_dangling_reference`
     /// integration test: proves the two null-observing cases actually take
