@@ -100,8 +100,8 @@
 
 use crate::page_rotate::{apply_rotate_to_pages, RotateMode, RotateOp};
 use crate::page_tree_rebuild::{rebuild_page_tree, RebuildResult};
-use crate::pages::page_refs;
 use crate::{Error, ObjectRef, PageRange, Pdf, Result};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 /// High-level page-document helper.
@@ -181,6 +181,35 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         Ok(self.pages()?.get(idx).copied())
     }
 
+    /// Add `page` at the beginning (`first == true`) or end of the document.
+    ///
+    /// Mirrors `QPDFPageDocumentHelper::addPage`. If `page` already occurs in
+    /// the page tree, rebuilding creates a shallow duplicate for its later
+    /// occurrence, retaining shared page sub-objects.
+    pub fn add_page(&mut self, page: ObjectRef, first: bool) -> Result<RebuildResult> {
+        let index = if first { 0 } else { self.get_all_pages()?.len() };
+        self.insert(index, page)
+    }
+
+    /// Add `page` immediately before or after `reference_page`.
+    ///
+    /// Mirrors `QPDFPageDocumentHelper::addPageAt`. The reference page must
+    /// be present in the repaired current page list; a non-member is rejected
+    /// before the page tree is mutated.
+    pub fn add_page_at(
+        &mut self,
+        page: ObjectRef,
+        before: bool,
+        reference_page: ObjectRef,
+    ) -> Result<RebuildResult> {
+        let pages = self.get_all_pages()?;
+        let index = pages
+            .iter()
+            .position(|&candidate| candidate == reference_page)
+            .ok_or(Error::Missing("reference page is not in the document"))?;
+        self.insert(index + usize::from(!before), page)
+    }
+
     /// Insert `page` at 0-based position `idx`, shifting existing pages to the
     /// right.
     ///
@@ -193,7 +222,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// - [`Error::Unsupported`] when `idx > page_count`.
     /// - Any error from [`rebuild_page_tree`] (e.g. `page` is not a `/Page` dict).
     pub fn insert(&mut self, idx: usize, page: ObjectRef) -> Result<RebuildResult> {
-        let mut refs = page_refs(self.pdf)?;
+        let mut refs = self.get_all_pages()?;
         if idx > refs.len() {
             return Err(Error::Unsupported(format!(
                 "insert index {idx} is out of bounds (page count {})",
@@ -209,10 +238,9 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// # Errors
     ///
     /// - [`Error::Unsupported`] when `idx >= page_count`.
-    /// - [`Error::Missing`] when removing the last remaining page (the result
-    ///   would be an empty document, which is not allowed by [`rebuild_page_tree`]).
+    /// - Any error from [`rebuild_page_tree`] when pages remain after removal.
     pub fn remove(&mut self, idx: usize) -> Result<RebuildResult> {
-        let mut refs = page_refs(self.pdf)?;
+        let mut refs = self.get_all_pages()?;
         if idx >= refs.len() {
             return Err(Error::Unsupported(format!(
                 "remove index {idx} is out of bounds (page count {})",
@@ -221,11 +249,53 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         }
         refs.remove(idx);
         if refs.is_empty() {
-            return Err(Error::Missing(
-                "cannot remove the only remaining page: result would be an empty document",
-            ));
+            return self.clear_page_tree();
         }
         rebuild_page_tree(self.pdf, &refs)
+    }
+
+    /// Remove the specified page from the document.
+    ///
+    /// Mirrors `QPDFPageDocumentHelper::removePage`. qpdf permits removal of
+    /// the final page, leaving an empty `/Pages` `/Kids` array and `/Count 0`.
+    pub fn remove_page(&mut self, page: ObjectRef) -> Result<RebuildResult> {
+        let index = self
+            .get_all_pages()?
+            .iter()
+            .position(|&candidate| candidate == page)
+            .ok_or(Error::Missing("page is not in the document"))?;
+        self.remove(index)
+    }
+
+    /// Clear the live document's root page tree after qpdf-style final-page
+    /// removal. `rebuild_page_tree` intentionally rejects an empty selection
+    /// because page-selection callers use that as invalid input, while qpdf's
+    /// `removePage` permits an empty document.
+    fn clear_page_tree(&mut self) -> Result<RebuildResult> {
+        let removed_pages: BTreeSet<ObjectRef> = self.get_all_pages()?.into_iter().collect();
+        let catalog_ref = self.pdf.root_ref().ok_or(Error::Missing("/Root"))?;
+        let crate::Object::Dictionary(catalog) = self.pdf.resolve_borrowed(catalog_ref)? else {
+            return Err(Error::Unsupported(format!(
+                "document catalog {catalog_ref} is not a dictionary"
+            )));
+        };
+        let pages_root_ref = catalog.get_ref("Pages").ok_or(Error::Missing("/Pages"))?;
+        let crate::Object::Dictionary(mut root) = self.pdf.resolve_borrowed(pages_root_ref)?.clone()
+        else {
+            return Err(Error::Unsupported(format!(
+                "document /Pages root {pages_root_ref} is not a dictionary"
+            )));
+        };
+        root.insert("Type", crate::Object::Name(b"Pages".to_vec()));
+        root.insert("Kids", crate::Object::Array(Vec::new()));
+        root.insert("Count", crate::Object::Integer(0));
+        root.remove("Parent");
+        self.pdf.set_object(pages_root_ref, crate::Object::Dictionary(root));
+        Ok(RebuildResult {
+            new_kids: Vec::new(),
+            ref_map: BTreeMap::new(),
+            removed_pages,
+        })
     }
 
     /// Apply a rotation to the pages selected by `range`.
@@ -245,7 +315,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     ///   page numbers beyond the document's page count.
     /// - Any error from [`apply_rotate_to_pages`].
     pub fn rotate(&mut self, range: &PageRange, degrees: i32, mode: RotateMode) -> Result<()> {
-        let all_refs = page_refs(self.pdf)?;
+        let all_refs = self.get_all_pages()?;
         let page_count = all_refs.len() as u32;
 
         // Resolve the range to 1-based page numbers, then convert to ObjectRefs.
