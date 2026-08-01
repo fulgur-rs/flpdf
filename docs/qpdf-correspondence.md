@@ -4,13 +4,76 @@
 （`scripts/fetch-qpdf-source.sh` で取得。パスは `--print-path` で解決する。
 本表のファイル名・行数はすべてこのツリーに対するもの。将来 v12 に追従する際は
 `git log v11.9.0..v12.0.0 -- libqpdf/` が移植差分になる）
-**調査日:** 2026-07-29
+**調査日:** 2026-07-29（初版）/ 2026-08-02（Phase 2 着手時の再測 — `flpdf-1e5g`）
 **関連:** `flpdf-qxba`（部品積み上げによる責務分割）/
 [設計書](superpowers/specs/2026-07-25-qpdf-component-bottom-up-refactor-design.md)
 
 pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の責務分割が qpdf と
 どこまで対応しているかのスナップショット。`flpdf-qxba` の work-list であり、Phase 1
 完了後に再測する。
+
+### 2026-08-02 の再測（`flpdf-1e5g` / Phase 2 着手時）
+
+分類と対応先モジュールは「維持する」対象であり、行数と違って追随義務がある。
+今回の再測では**両方向**の訂正が出た。
+
+**(a) 完成した部品が 🔀 のまま残っていた 3 行 → ✅**
+
+| 節 | qpdf | 訂正前 | 訂正後 | 由来 |
+|---|---|---|---|---|
+| §1 | `QPDFXRefEntry.cc` | 🔀 `xref.rs` に埋没 | ✅ `xref_entry.rs` | `qxba.9.2` |
+| §4 | `QPDF_optimization.cc` | 🔀 `plan.rs` に埋没 | ✅ `optimization.rs` | `qxba.9.3` / `.9.4` |
+| §10 | `BitStream.cc` / `BitWriter.cc` | 🔀 `hint_stream.rs` に埋没 | ✅ `bit_stream.rs` / `bit_writer.rs` | `qxba.9.1` |
+
+**(b) 未完成の部品が ✅ になっていた 3 行 → 🔀**
+
+いずれもモジュール doc 自身が未完成を申告しており、責務境界が一致しているとは
+言えない。D4 索引でも `correspondence` に分類されている。
+
+| 節 | qpdf | flpdf | doc の自己申告 |
+|---|---|---|---|
+| §7 | `QPDFFileSpecObjectHelper` / `QPDFEFStreamObjectHelper` | `filespec_helper.rs` | 「partial helper surface; 公開 API は未完成」 |
+| §7 | `QPDFEmbeddedFileDocumentHelper.cc` | `embedded_files.rs` | 「完全な公開ヘルパー境界を持たない」 |
+| §7 | `QPDFPageLabelDocumentHelper.cc` | `page_label_document_helper.rs` | 「公開 API 未完成 + single-implementation 監査未了」 |
+
+**(c) 責務の帰属誤り（§8 / §9）**
+
+`json_inspect.rs` が持つ `build_*_section` 群は `QPDF_json.cc` ではなく
+`QPDFJob.cc` の `doJSON*` 族に対応する（詳細は §9 の内訳表）。この誤りは
+PR #613/#614 で実害を出しており、地図が誤ったままだと後続スライスで同じ
+実装ミスを再生産する。あわせて:
+
+- `QPDF_json.cc` を入力側(1-833) / 出力側(834-946) の 2 行に分割した。1 行に 🔀 と ❌ を
+  混在させると集計できず、**未実装の JSON 入力が ❌ の work-list から消える**ため。
+  出力側の先頭は `QPDF::` 接頭辞を持たない free function `writeJSONStreamFile`(834-849)
+  であり、`QPDF::writeJSON` から呼ばれる side-file 書き出し（flpdf 側は
+  `json_inspect.rs::write_file_mode_side_file`）。接頭辞で検索すると取りこぼす
+- `doJSONObjects` は v1 分岐（自前で組み立て、flpdf に対応物なし）と v2 分岐
+  （`QPDF::writeJSON` へ委譲するだけ）を分けた。まとめると二重帰属になり
+  v1 の欠落が隠れる
+- `optimization/inherited_attrs.rs` のパス誤記（`linearization/` としていた）を
+  §2 / §4 の両方で訂正した
+
+**本表の ✅ と D4 の `Mirrors` は別の述語である（混同しないこと）**:
+
+- 本表の ✅ = 「**対応が明確で責務境界も一致**」（凡例）。実装の完成度は含意しない
+- D4 索引の `Mirrors` = `//! Mirrors qpdf 11.9.0 libqpdf/X.cc`。これは DoD の
+  D4 であり、`Mirrors` を名乗るには **D1〜D5 すべて**（全域移植 / 単一実装 /
+  アドホック分岐ゼロ / 対応行 / ゲート通過）を満たす必要がある
+
+したがって「本表で ✅ なら `Mirrors` にできる」は成り立たない。
+現状は **mirror 5 / correspondence 127**（`content_normalizer` / `matrix` /
+`pdf_version` / `security/rc4` / `tokenizer` のみが `Mirrors`）。
+本表で ✅ の `nntree.rs` / `json/` / `xref_entry.rs` / `bit_stream.rs` /
+`bit_writer.rs` / `optimization.rs` / `pipeline.rs` が `correspondence` のままである
+のは、責務境界が一致していても DoD 全体を検証していないためであり、
+必ずしも矛盾ではない。**昇格は各部品の担当スライスで D1〜D5 を検証したうえで
+行うこと**（D1 だけでは足りない）。
+
+逆に、モジュール doc 自身が「公開 API 未完成」等を申告している場合は
+責務境界が一致しているとも言えないため、本表でも ✅ にしてはならない。
+2026-08-02 の再測ではこの観点で §7 の 3 行を ✅ から 🔀 に訂正した
+（`filespec_helper.rs` / `embedded_files.rs` / `page_label_document_helper.rs`）。
 
 **機械可読なモジュール索引:** [`qpdf-module-doc-index.md`](qpdf-module-doc-index.md) は
 各 source module 先頭の対応行から生成する。この索引は注釈の欠落と drift を検査する
@@ -43,7 +106,7 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 
 | 記号 | 意味 |
 |---|---|
-| ✅ | **mirrors** — 対応が明確で責務境界も一致 |
+| ✅ | **境界一致** — 対応が明確で責務境界も一致。**実装の完成度は含意しない**（DoD D1〜D5 の充足は別途検証が必要。D4 索引の `Mirrors` とは別の述語 — 下記参照） |
 | 🔀 | **smeared** — 実装はあるが複数モジュールに散在、または別モジュールに埋没 |
 | ❌ | **missing** — flpdf に対応物が無い |
 | ⚪ | **逸脱候補** — Rust/エコシステムで代替済み。移植しない提案（要承認） |
@@ -59,7 +122,7 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 | `QPDF_Array/Dictionary/Stream/String/Name/Real/Integer/Bool/Null/InlineImage/Operator/Reserved/Unresolved/Destroyed.cc` | 1814 | `object.rs` の `Object` enum に統合 | 🔀 |
 | `QPDFObject.cc` / `QPDFValue.cc` | 79 | `object.rs` の `Object` + `object_handle.rs` の `ObjectHandle` / `ObjectValue`（共有 identity・qpdf 互換 parsed offset・`IndirectState` 遅延解決） | 🔀 `object.rs` の `Object` は静的な値表現のみ。`QPDFValue` 相当の共有 identity・parsed offset・遅延解決状態は `object_handle.rs` が新たに担う（layer cutover 進行中）。両モジュールに分割されているため `✅` から変更 |
 | `QPDFObjGen.cc` | 68 | `object.rs` の `ObjectRef` | ✅ |
-| `QPDFXRefEntry.cc` | 51 | `xref.rs`(1129) の一部 | 🔀 独立した型境界が無く `xref.rs` に埋没 |
+| `QPDFXRefEntry.cc` | 51 | `xref_entry.rs`（`XrefEntry` = free / uncompressed / compressed の 3 variant）。consumer は `xref.rs` / `reader.rs` / `cache.rs` / `writer.rs` / `writer/{object_streams,plain/plan}.rs` / `linearization/{writer,plan}.rs` | ✅ `flpdf-qxba.9.2` で完全 cutover（`XrefOffset` 削除）。`xref.rs` 側に型定義は残っていない |
 | `PDFVersion.cc` | 68 | `pdf_version.rs` の `PdfVersion` | ✅ |
 | `QPDFMatrix.cc` | 140 | `matrix.rs` の `Matrix` / `Rectangle` | ✅ |
 
@@ -71,7 +134,7 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 | `QPDFParser.cc` | 519 | `parser.rs` の `Parser`（Object / Content mode）。Content mode は EOF → `None`、word → `Object::Operator`、間接参照化の抑止を共有 object grammar 上で実装し、`content_stream.rs` が使用（`QPDFParser.cc:27-125,130-377`） | 🔀 content branch は対応済み。file-object parser 全体の API / recovery 差分は未精査 |
 | `QPDFTokenizer.cc` | 965 | `tokenizer.rs`（18 token types、owned value/raw/error bytes/offset、push/pull、pull-only `allowEOF`、`includeIgnorable`、space/comment、bad-token recovery、max length、`betweenTokens`、unread、inline-image `EI` discovery。`QPDFTokenizer.hh:34-193`; `QPDFTokenizer.cc:45-965`）+ `parser.rs` の content mode + `content_stream.rs` の `ParserCallbacks` orchestration + `object.rs` の `Operator` / `InlineImage`（`QPDFParser.cc:27-125,130-377`; `QPDFObjectHandle.cc:1770-1847`） | ✅ `QPDFTokenizer` の責務境界を移植済み。object/parser/content callback consumers は共有 tokenizer を使用し、旧 content lexer は削除 |
 | `InputSource` 系 5 ファイル | 625 | `Read + Seek` ジェネリクスで代替 | ⚪ |
-| `QPDF_pages.cc` | 319 | `pages.rs`(741) + `page_tree_rebuild.rs`(390) + `linearization/inherited_attrs.rs`(575: `QPDF_pages.cc:39-138` の `getAllPagesInternal` 修復を移植。`linearization/plan.rs:773` と `linearization/writer.rs:2582` から呼ばれる) | 🔀 |
+| `QPDF_pages.cc` | 319 | `pages.rs`(741) + `page_tree_rebuild.rs`(390) + `optimization/inherited_attrs.rs`(575: `QPDF_pages.cc:39-138` の `getAllPagesInternal` 修復を移植。`linearization/plan.rs:773` と `linearization/writer.rs:2582` から呼ばれる) | 🔀 |
 | `QPDFExc.cc` / `QPDFSystemError.cc` | 123 | `error.rs`(125) | ✅ |
 
 ## 3. 書き込み — 最大の smear
@@ -94,11 +157,11 @@ qpdf は 1 クラスで standard / linearized / encrypted / objstm を統一的�
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
 | `QPDF_linearization.cc` | 1796 | `linearization/`（`plan.rs` 3032, `hint_*` 1651, `check.rs` 726, `show.rs` 995, ほか）≒ 8,000 行 | 🔀 |
-| `QPDF_optimization.cc` | 381 | 独立モジュール無し — `linearization/plan.rs` に埋没 + `inherited_attrs.rs`(575) | 🔀 → Phase 2 |
+| `QPDF_optimization.cc` | 381 | `optimization.rs`（optimization orchestration、inherited-page preparation、object-user maps、compressed-object folding）+ `optimization/inherited_attrs.rs`(575) | ✅ `flpdf-qxba.9.3` / `.9.4` で完全 cutover。`linearization/plan.rs` 側に `ObjUser` / `update_object_maps` は残っていない |
 
 `ObjUser` 分類（`ou_page` / `ou_thumb` / `ou_trailer_key` / `ou_root_key`）と
-`updateObjectMaps`。定義は `plan.rs:2416-2950` に連続、呼び出しは `plan.rs:890-904`
-に集中しており抽出境界は clean。
+`updateObjectMaps` は `optimization.rs` に移設済み（`flpdf-qxba.9.3` / `.9.4`）。
+`linearization/plan.rs` は consumer として呼ぶだけになった。
 
 **objstm 経路の解錠は無い**: qpdf でも `optimize()` の呼び出し元は
 `QPDF_linearization.cc:495` と `QPDFWriter.cc:2553`（`writeLinearized()` 内）のみで
@@ -154,10 +217,10 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `QPDFPageDocumentHelper.cc` | 158 | `page_document_helper.rs`(236) + `page_extract.rs`(435: `emptyPDF()` + `addPage()` 経路。doc に明記) | 🔀 |
 | `QPDFAnnotationObjectHelper.cc` | 226 | `annotation_helper.rs` + `page_annotation_enum.rs`(249) | 🔀 |
 | `QPDFOutlineDocumentHelper` / `QPDFOutlineObjectHelper` | 198 | `outline_document_helper.rs`(1499) + `outline.rs`(145) | ✅ |
-| `QPDFPageLabelDocumentHelper.cc` | 134 | `page_label_document_helper.rs`(934) | ✅ |
+| `QPDFPageLabelDocumentHelper.cc` | 134 | `page_label_document_helper.rs`(934) | 🔀 モジュール doc 自身が「公開 API 未完成 + single-implementation 監査未了」と申告。D1 / D2 未達 |
 | `QPDFNameTreeObjectHelper` / `QPDFNumberTreeObjectHelper` / `NNTree.cc` | 1394 | `nntree.rs`（shared engine）+ `name_number_tree.rs`（compatibility wrapper）+ consumer adapters | ✅ |
-| `QPDFEmbeddedFileDocumentHelper.cc` | 122 | `embedded_files.rs`(678) | ✅ |
-| `QPDFFileSpecObjectHelper` / `QPDFEFStreamObjectHelper` | 280 | `filespec_helper.rs`(1324) | ✅ |
+| `QPDFEmbeddedFileDocumentHelper.cc` | 122 | `embedded_files.rs`(678) | 🔀 モジュール doc 自身が「完全な公開ヘルパー境界を持たない」と申告。D1 未達 |
+| `QPDFFileSpecObjectHelper` / `QPDFEFStreamObjectHelper` | 280 | `filespec_helper.rs`(1324) | 🔀 モジュール doc 自身が「partial helper surface; 公開 API は未完成」と申告。D1 未達。なお `json_inspect.rs` が同じ責務を再実装しているため D2 も未達（`flpdf-q2fo` で解消） |
 | `ResourceFinder.cc` | 56 | `resource_finder.rs`（operator/name tracking と resource type/offset 集約。flat `getNames()` oracle view は categorized map から test 内で導出）。production consumer は `resource_replacer.rs` と `resources.rs` の resource pruning | ✅ |
 | `QPDFAcroFormDocumentHelper.cc` anonymous `ResourceReplacer` | — | `resource_replacer.rs`（`ResourceFinder` の name offsets を exact-byte 置換）。production consumer は `overlay_annotations.rs` の `/DA` と `overlay_appearance_stream.rs` の AP streams | ✅ |
 | `QPDFDocumentHelper.cc` / `QPDFObjectHelper.cc` | 12 | 基底トレイトが無い | ⚪ |
@@ -168,15 +231,58 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 |---|---|---|---|
 | `JSON.cc` | 1401 | `json/`（全 write helper、blob callback、unparse が public `Pipeline` 境界を使用。serializer は caller-owned outer pipeline を finish しない） | ✅ |
 | `JSONHandler.cc` | 189 | `json/` | ✅ |
-| `QPDF_json.cc` | 946 | `json_inspect.rs`（JSON v2 key/object selection、raw incremental serialization、inline/file stream data。side file は `PlStdioFile` explicit finish） | 🔀 schema-content gap は別 Bead |
+| `QPDF_json.cc` 入力側（`QPDF_json.cc:1-833`: `JSONReactor` / `createFromJSON` / `updateFromJSON` / `importJSON` / `test_json_validators`） | 833 | 無し。flpdf に `--json-input` 相当は存在しない | ❌ |
+| `QPDF_json.cc` 出力側（`QPDF_json.cc:834-946`: free function `writeJSONStreamFile`(834-849) + `QPDF::writeJSON` ×2 overload(851-946)） | 113 | `json_inspect.rs` の raw incremental serialization（`qpdf_raw_stream_payload`、`"qpdf"` キーの raw 投影、inline stream data）+ `write_file_mode_side_file`(3101: `writeJSONStreamFile` 相当。side file は `PlStdioFile` explicit finish） | 🔀 分離は `flpdf-ridh`（Tier C） |
+| `QPDFObjectHandle::getJSON`（行数は §1 の `QPDFObjectHandle.cc` に計上済み。ここは所在の相互参照） | — | `json_inspect.rs` の `pdf_object_to_json` | 🔀 `dereference_indirect=false` のモードのみ。`pdf_object_to_json` は引数を持たず間接ハンドルを常に `"N G R"` として出力するため、`true`（間接参照を解決して出力）のモードは未実装 |
 
 ## 9. Job / CLI
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFJob.cc` | 3116 | `flpdf-cli/src/main.rs`(6491) + `overlay*.rs` + `page_merge.rs`(1117) + `check.rs`(360) + `attachment_list.rs`(306: `--list-attachments` の整形出力) + `acroform_field_prune.rs`(497: `QPDFJob.cc:2610-2632` の "Remove unreferenced form fields"。`prune_acroform_after_subset` が CLI から呼ばれる) + page 操作群 | 🔀 |
+| `QPDFJob.cc` | 3116 | `flpdf-cli/src/main.rs`(6491) + **`json_inspect.rs` の `doJSON*` 族相当**（下記）+ `overlay*.rs` + `page_merge.rs`(1117) + `check.rs`(360) + `attachment_list.rs`(306: `--list-attachments` の整形出力) + `acroform_field_prune.rs`(497: `QPDFJob.cc:2610-2632` の "Remove unreferenced form fields"。`prune_acroform_after_subset` が CLI から呼ばれる) + page 操作群 | 🔀 `QPDFJob` に相当する独立モジュールが**存在しない**。集約は `flpdf-q2fo`(D1) / `flpdf-ukux`(D2) / `flpdf-s5cw`(D3) |
 | `QPDFJob_config` / `_argv` / `_json` / `QPDFArgParser` / `QPDFUsage` | 3164 | clap で代替 | ⚪ |
 | `QPDFLogger.cc` | 255 | `diagnostics.rs`(80) | 🔀 |
+
+### `QPDFJob.cc` の `doJSON*` 族 — `json_inspect.rs` に埋没
+
+`QPDFJob.cc:958-1620` の JSON セクション生成が `json_inspect.rs` にある。
+**§8 の `QPDF_json.cc` 行と混同しないこと**（`QPDF_json.cc` は JSON 入力と
+`writeJSON` であって、セクション生成ではない）。
+
+| qpdf `QPDFJob.cc` | flpdf `json_inspect.rs` |
+|---|---|
+| `doJSONObjects`(958) の **v1 分岐**(960-981) / `doJSONObjectinfo`(1002) | **対応物なし**。どちらも JSON v1 専用（`doJSONObjectinfo` は `QPDFJob.cc:1620` の version guard 内、`objects` の schema も `json_schema:1357` で v1 限定）。flpdf CLI は `--json=2` のみを受け付け、`main.rs:1914` が `objects` / `objectinfo` を「v1 でのみ有効」と明示的に拒否する |
+| `doJSONObjects`(958) の **v2 分岐**(981-997) | 自前では何も組み立てず `QPDF::writeJSON` に委譲するだけ。実体は §8 の `QPDF_json.cc` 出力側の行を参照（ここに再掲すると二重帰属になる） |
+| `doJSONPages`(1030) | `build_pages_section` |
+| `doJSONPageLabels`(1095) | `build_pagelabels_section` |
+| `doJSONOutlines`(1143) | `build_outlines_section` |
+| `doJSONAcroform`(1159) | `build_acroform_section` |
+| `doJSONEncrypt`(1206) | `build_encrypt_section` |
+| `doJSONAttachments`(1281) | `build_attachments_section` |
+| `json_schema`(1332) / `json_out_schema`(1533) | `JsonKey` ほか |
+| `doJSON`(1545) | `write_qpdf_json_v2_selected_objects*` |
+
+**qpdf 側の `doJSON*` は辞書を直接歩かず、ヘルパーの薄い JSON 化層でしかない。**
+flpdf の現行実装はヘルパーを経由せず辞書を直接歩いており、PR #613/#614 で
+以下が同時に露出した: `preferredname` の Mac/DOS 優先順位バグが
+`json_inspect.rs` と `filespec_helper.rs` の**両方で独立に発生**、
+`modificationdate` が `QPDFEFStreamObjectHelper::getCreationDate()` を経由せず
+qpdf 側のコピペバグ（`QPDFJob.cc:1319-1322`）を再現できていなかった、
+`fieldtype` の先頭 `/` 欠落（`getFieldType()` 未経由）、
+`build_acroform_section` の走査モデルが qpdf と構造的に別物（`flpdf-d949`）。
+
+**同じ責務が 2 箇所に実装されている状態そのものが D2 違反**であり、
+ヘルパー側が D1 未達であることとは独立した問題である。Tier D1（`flpdf-q2fo`）は
+「ヘルパーへ載せ替える」だけでなく、載せ替え先のヘルパーが D1 を満たすことを
+前提とするため、下表の 🔀 を先に解消する必要がある。
+
+| doJSON* | 経由すべきヘルパー | §7 の状態 |
+|---|---|---|
+| `doJSONAcroform` | `QPDFAcroFormDocumentHelper` + `QPDFFormFieldObjectHelper` + `QPDFAnnotationObjectHelper` + `QPDFPageDocumentHelper` | 🔀 / 🔀 / 🔀 / 🔀 |
+| `doJSONAttachments` | `QPDFEmbeddedFileDocumentHelper` + `QPDFFileSpecObjectHelper` + `QPDFEFStreamObjectHelper` | 🔀 / 🔀（いずれもモジュール doc 自身が公開 API 未完成と申告。加えて `json_inspect.rs` の再実装により D2 も未達） |
+| `doJSONPages` | `QPDFPageDocumentHelper` + `QPDFPageObjectHelper` | 🔀 / 🔀 |
+| `doJSONOutlines` | `QPDFOutlineDocumentHelper` | ✅ |
+| `doJSONPageLabels` | `QPDFPageLabelDocumentHelper` | 🔀 |
 
 ## 10. インフラ
 
@@ -184,7 +290,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 |---|---|---|---|
 | `QUtil.cc` | 2003 | 各所に散在 | 🔀 |
 | `QTC.cc` | 50 | 無し | ❌ |
-| `BitStream.cc` / `BitWriter.cc` | 111 | `linearization/hint_stream.rs` に埋没 | 🔀 |
+| `BitStream.cc` / `BitWriter.cc` | 111 | `bit_stream.rs`（MSB-first bit 読み取り、Rust の error 値）/ `bit_writer.rs`（MSB-first bit 詰め、Pipeline stage）。production consumer は `linearization/hint_stream.rs`（hint stream の生成・読み取り）と `linearization/show.rs`（`read_h_page_offset` / `read_h_shared_object` / `read_h_generic` の hint decoder）、および `bit_writer.rs` 自身 | ✅ `flpdf-qxba.9.1` で cutover。`linearization/hint_stream.rs` 側に bit 実装は残っていない |
 | `Buffer.cc` / `MD5.cc` | 286 | `Vec<u8>` / 外部 crate | ⚪ |
 | `qpdf-c.cc` / `qpdfjob-c.cc` / `qpdflogger-c.cc` | 2237 | — | ➖ |
 
@@ -352,9 +458,9 @@ CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れてい
 
 | 状態 | qpdf 側の該当行数 | 内訳 |
 |---|---|---|
-| ✅ mirrors | 3,552 | 責務境界も一致。触らない |
-| 🔀 smeared | 28,493 | 再配置の主対象。qpdf 全体の 69% |
-| ❌ missing | 442 | `Pl_MD5`(66) / `Pl_DCT`(326) / `QTC`(50) |
+| ✅ 境界一致 | 3,559 | 責務境界は一致。**再配置は不要だが「完成」ではない** — DoD D1〜D5 の充足は各スライスで別途検証する |
+| 🔀 smeared | 27,653 | 再配置の主対象。qpdf 全体の 67% |
+| ❌ missing | 1,275 | `QPDF_json.cc` 入力側(833) / `Pl_DCT`(326) / `Pl_MD5`(66) / `QTC`(50) |
 | ⚪ 逸脱候補 | 6,735 | 要承認（下記の方針矛盾を参照） |
 | ➖ 対象外 | 2,237 | C API |
 | **合計** | **41,459** | qpdf `libqpdf/*.cc` の実測 41,459 行と一致 |
@@ -368,6 +474,6 @@ CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れてい
 どの qpdf ファイルもいずれかの行に属していることは確認済み。
 
 **❌ の数え方**: 以前は `Pipeline.cc` + `Pl_*.cc` 21 ファイル計 ~2,400 行を丸ごと
-missing として傘で数えていたが、個々の `Pl_*` は下の各行で mirrors / smeared /
+missing として傘で数えていたが、個々の `Pl_*` は下の各行で 境界一致 / smeared /
 逸脱候補として個別に分類されており**二重計上**だった。傘の行を `Pipeline.cc`
 本体（114 行）に限定し、真に未マップな qpdf 行だけを ❌ に数えるよう改めた。

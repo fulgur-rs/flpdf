@@ -32,7 +32,7 @@
 | `crates/flpdf/src/json/schema.rs` | correspondence | JSON.cc schema validation responsibilities |
 | `crates/flpdf/src/json/value.rs` | correspondence | JSON.cc shared value model and mutation and accessor responsibilities |
 | `crates/flpdf/src/json/writer.rs` | correspondence | JSON.cc incremental serialization and blob Base64 responsibilities |
-| `crates/flpdf/src/json_inspect.rs` | correspondence | QPDF_json.cc JSON v2 selection, serialization, and side-file lifecycle responsibilities |
+| `crates/flpdf/src/json_inspect.rs` | correspondence | QPDFJob.cc JSON v2 doJSON* section builders (doJSONPages, doJSONPageLabels, doJSONOutlines, doJSONAcroform, doJSONEncrypt, doJSONAttachments, doJSON; the v1-only doJSONObjects v1 branch and doJSONObjectinfo have no counterpart here), QPDF_json.cc writeJSON serialization and side-file lifecycle, and QPDFObjectHandle::getJSON object serialization responsibilities |
 | `crates/flpdf/src/lib.rs` | correspondence | crate root aggregating multiple qpdf library components and flpdf-only APIs |
 | `crates/flpdf/src/linearization/back_patch.rs` | correspondence | QPDFWriter.cc linearization back-patching split from the writer |
 | `crates/flpdf/src/linearization/check.rs` | correspondence | QPDF_linearization.cc structural validation represented as a standalone checker |
