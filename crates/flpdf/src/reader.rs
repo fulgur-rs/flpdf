@@ -974,7 +974,15 @@ impl<R: Read + Seek> Pdf<R> {
         let Some(value) = self.trailer.get(key).cloned() else {
             return ObjectHandle::null();
         };
-        self.lift_to_handle_bounded(&value, 0, crate::object::MAX_INLINE_DEPTH)
+        // `parser::MAX_PARSE_DEPTH`, not `lift`'s default `MAX_INLINE_DEPTH`:
+        // the trailer was already parsed successfully at the looser
+        // `MAX_PARSE_DEPTH` bound, so a value nested between the two would
+        // otherwise degrade to null *here* while the legacy `resolve_chain`/
+        // `resolve_borrowed` path (`MAX_PARSE_DEPTH`-bounded) still returns
+        // it — the same divergence `resolve_object_handle`'s own call to
+        // `lift_bounded` documents and avoids for the analogous
+        // compressed-member case.
+        self.lift_to_handle_bounded(&value, 0, crate::parser::MAX_PARSE_DEPTH)
             .unwrap_or_else(|_| ObjectHandle::null())
     }
 
@@ -6405,9 +6413,33 @@ mod tests {
     }
 
     #[test]
-    fn trailer_key_handle_is_null_when_the_keys_own_value_exceeds_the_inline_depth_bound() {
+    fn trailer_key_handle_accepts_the_keys_own_value_nested_past_max_inline_depth() {
+        // Codex Review on PR #610: a value nested between `MAX_INLINE_DEPTH`
+        // and `MAX_PARSE_DEPTH` parses successfully (a real document can
+        // legitimately contain it), so `resolve_borrowed`/the legacy
+        // `resolve_chain` bridge already accepts it — `trailer_key_handle`
+        // must too, or it would report `/QTest` as null while a caller
+        // still using the legacy path for the same key sees the real value,
+        // the same contradiction fixed for an unrelated sibling's nesting
+        // above.
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let depth = crate::object::MAX_INLINE_DEPTH + 5;
+        let mut nested = Object::Integer(1);
+        for _ in 0..depth {
+            nested = Object::Array(vec![nested]);
+        }
+        pdf.trailer.insert("QTest", nested);
+
+        let handle = pdf.trailer_key_handle(b"QTest");
+
+        assert!(!handle.is_null());
+        assert!(handle.as_array().is_some());
+    }
+
+    #[test]
+    fn trailer_key_handle_is_null_when_the_keys_own_value_exceeds_the_parse_depth_bound() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let depth = crate::parser::MAX_PARSE_DEPTH + 5;
         let mut nested = Object::Integer(1);
         for _ in 0..depth {
             nested = Object::Array(vec![nested]);

@@ -531,6 +531,36 @@ mod tests {
     }
 
     #[test]
+    fn a_directly_nested_qtest_value_past_max_inline_depth_is_not_erased() {
+        // Codex Review on PR #610, follow-up finding: it is not only an
+        // *unrelated* sibling's deep nesting that must not erase `/QTest` —
+        // `/QTest` itself, nested between the crate's inline-object-nesting
+        // limit (256) and the parser's own, higher, acceptance limit (500),
+        // parses successfully and must be reported as the array it is, not
+        // silently degraded to implicit/null by `trailer_key_handle`'s own
+        // lift bound being tighter than what `resolve_chain`/
+        // `resolve_borrowed` already accept for the same value.
+        let mut deep = b"1".to_vec();
+        for _ in 0..300 {
+            deep = [b"[ ".as_slice(), &deep, b" ]".as_slice()].concat();
+        }
+
+        let stdout = output(&deep, &[]);
+
+        assert!(
+            stdout.starts_with(b"/QTest is direct and has type array (8)\n"),
+            "stdout: {}",
+            String::from_utf8_lossy(&stdout)
+        );
+        assert!(
+            !stdout
+                .windows(b"/QTest is implicit\n".len())
+                .any(|window| window == b"/QTest is implicit\n"),
+            "a successfully parsed deep value must not be reported as implicit"
+        );
+    }
+
+    #[test]
     fn missing_qtest_has_exact_implicit_null_output() {
         assert_eq!(
             output(b"", &[]),
