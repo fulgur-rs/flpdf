@@ -901,8 +901,9 @@ impl FileSpecBuilder {
         let stream_ref = EmbeddedFileStream::create(pdf, &self.payload)?;
         if self.compress {
             let Object::Stream(mut stream) = pdf.resolve(stream_ref)? else {
+                // cov:ignore-start: factory return type makes this arm unreachable
                 unreachable!("EmbeddedFileStream::create must create a stream");
-                // cov:ignore: factory return type makes this arm unreachable
+                // cov:ignore-end
             };
             let mut encode_dict = Dictionary::new();
             encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
