@@ -9086,7 +9086,7 @@ mod tests {
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
         let top = object_pairs(&result);
         let serde_json::Value::Array(fields) = &top[0].1 else {
-            panic!("fields must be Array");
+            panic!("fields must be Array"); // cov:ignore: fixture-shape guard
         };
         assert!(fields.is_empty(), "non-dictionary field must be skipped");
     }
@@ -9110,7 +9110,7 @@ mod tests {
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
         let top = object_pairs(&result);
         let serde_json::Value::Array(fields) = &top[0].1 else {
-            panic!("fields must be Array");
+            panic!("fields must be Array"); // cov:ignore: fixture-shape guard
         };
         assert_eq!(
             fields.len(),
@@ -9132,7 +9132,7 @@ mod tests {
         let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
         let top = object_pairs(&result);
         let serde_json::Value::Array(fields) = &top[0].1 else {
-            panic!("fields must be Array");
+            panic!("fields must be Array"); // cov:ignore: fixture-shape guard
         };
         assert!(
             fields.is_empty(),
