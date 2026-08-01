@@ -1218,38 +1218,42 @@ fn stream_payload_with_decode_status(
 /// the wrapper array's ref number — that matches qpdf's `contents` output.
 fn collect_content_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    content_obj: &Object,
+    content_handle: &ObjectHandle,
 ) -> Result<Vec<String>, ConvertError> {
-    fn ref_string(r: &crate::ObjectRef) -> String {
+    fn ref_string(r: ObjectRef) -> String {
         format!("{} {} R", r.number, r.generation)
     }
 
-    match content_obj {
-        Object::Reference(r) => {
-            // Resolve to see whether the indirect object is a Stream (in
-            // which case this ref itself is the content) or an Array of
-            // Stream refs (in which case we recurse to flatten).
-            let resolved_array = match pdf.resolve_borrowed(*r).map_err(ConvertError::from)? {
-                Object::Stream(_) => return Ok(vec![ref_string(r)]),
-                Object::Array(arr) => Object::Array(arr.clone()),
-                // /Contents pointing at anything else (Null, missing) → empty.
-                _ => return Ok(vec![]),
-            };
-            // Recurse so a nested indirect array is also unwrapped.
-            collect_content_refs(pdf, &resolved_array)
+    // Direct array elements never get a further resolve pass here — only the
+    // top-level indirect case below unwraps one level of indirection, so a
+    // reference nested deeper inside an already-direct array is emitted as
+    // its own ref string rather than followed.
+    fn refs_in_direct_array(elems: &[ObjectHandle]) -> Vec<String> {
+        elems
+            .iter()
+            .filter_map(|e| e.object_ref().map(ref_string))
+            .collect()
+    }
+
+    if let Some(r) = content_handle.object_ref() {
+        // Resolve to see whether the indirect object is a Stream (in which
+        // case this ref itself is the content) or an Array of Stream refs
+        // (in which case its elements are the content).
+        pdf.resolve_object_handle(content_handle)?;
+        if content_handle.as_stream_dict().is_some() {
+            return Ok(vec![ref_string(r)]);
         }
-        Object::Array(elems) => {
-            let mut refs = Vec::with_capacity(elems.len());
-            for e in elems {
-                if let Object::Reference(r) = e {
-                    refs.push(ref_string(r));
-                }
-                // Direct inline streams have no ref string — skip them.
-            }
-            Ok(refs)
-        }
+        return match content_handle.as_array() {
+            Some(elems) => Ok(refs_in_direct_array(&elems)),
+            // /Contents pointing at anything else (Null, missing) → empty.
+            None => Ok(vec![]),
+        };
+    }
+
+    match content_handle.as_array() {
+        Some(elems) => Ok(refs_in_direct_array(&elems)),
         // Null, missing, or direct Stream — emit empty list.
-        _ => Ok(vec![]),
+        None => Ok(vec![]),
     }
 }
 
@@ -1269,35 +1273,38 @@ fn collect_image_refs<R: Read + Seek>(
         Ok(None) => return Ok(vec![]),
         Err(e) => return Err(ConvertError::PdfError(e.to_string())),
     };
+    // Bridge: `crate::pages` is not part of this migration slice and still
+    // returns a legacy `Dictionary`; lift it once here so the rest of this
+    // function can use the ObjectHandle idiom like the rest of json_inspect.
+    let resources_dict = pdf
+        .lift_object_to_handle(&Object::Dictionary(resources))?
+        .as_dictionary()
+        .unwrap_or_default();
 
     // Resolve the /XObject sub-dictionary (may itself be indirect).
-    let xobject_dict = match resources.get("XObject") {
-        Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => {
-            let resolved = pdf.resolve_borrowed(*r).map_err(ConvertError::from)?;
-            match resolved {
-                Object::Dictionary(d) => d.clone(),
-                _ => return Ok(vec![]),
-            }
-        }
-        _ => return Ok(vec![]),
+    let Some(xobject_handle) = resources_dict.get(b"XObject".as_slice()) else {
+        return Ok(vec![]);
+    };
+    pdf.resolve_object_handle(xobject_handle)?;
+    let Some(xobject_dict) = xobject_handle.as_dictionary() else {
+        return Ok(vec![]);
     };
 
     // Iterate in name (key) order — BTreeMap gives byte-lex order automatically.
     let mut image_refs: Vec<String> = Vec::new();
     for (_name, value) in xobject_dict.iter() {
         // Each XObject entry should be an indirect Reference.
-        let xobj_ref = match value {
-            Object::Reference(r) => *r,
+        let Some(xobj_ref) = value.object_ref() else {
             // Direct inline stream — no ref string available, skip.
-            _ => continue,
+            continue;
         };
-        let resolved = pdf.resolve_borrowed(xobj_ref).map_err(ConvertError::from)?;
-        if let Some(stream) = resolved.as_stream() {
-            if let Some(Object::Name(subtype)) = stream.dict.get("Subtype") {
-                if subtype.as_slice() == b"Image" {
-                    image_refs.push(format!("{} {} R", xobj_ref.number, xobj_ref.generation));
-                }
+        pdf.resolve_object_handle(value)?;
+        let Some(stream_dict) = value.as_stream_dict().and_then(|d| d.as_dictionary()) else {
+            continue;
+        };
+        if let Some(subtype) = stream_dict.get(b"Subtype".as_slice()).and_then(ObjectHandle::as_name) {
+            if subtype.as_slice() == b"Image" {
+                image_refs.push(format!("{} {} R", xobj_ref.number, xobj_ref.generation));
             }
         }
     }
@@ -1328,12 +1335,11 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, Con
         let object_str = format!("{} {} R", page_ref.number, page_ref.generation);
 
         // Resolve the page dict to extract /Contents.
-        let page_obj = pdf.resolve_borrowed(page_ref).map_err(ConvertError::from)?;
-        let contents_obj = match page_obj {
-            Object::Dictionary(d) => d.get("Contents").cloned(),
-            _ => None,
-        };
-        let contents: Vec<Json> = match &contents_obj {
+        let page_handle = pdf.get_object_handle(page_ref);
+        pdf.resolve_object_handle(&page_handle)?;
+        let page_dict = page_handle.as_dictionary().unwrap_or_default();
+        let contents_handle = page_dict.get(b"Contents".as_slice());
+        let contents: Vec<Json> = match contents_handle {
             Some(c) => collect_content_refs(pdf, c)?
                 .into_iter()
                 .map(Json::make_string)
@@ -6456,8 +6462,9 @@ mod tests {
         // one-page.pdf's /Contents is a single reference to a Stream
         // (object 7). The function must return that ref as-is.
         let mut pdf = load_one_page_pdf();
-        let obj = Object::Reference(crate::ObjectRef::new(7, 0));
-        let refs = collect_content_refs(&mut pdf, &obj).expect("collect_content_refs failed");
+        let handle = pdf.get_object_handle(crate::ObjectRef::new(7, 0));
+        let refs =
+            collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
         assert_eq!(refs, vec!["7 0 R".to_string()]);
     }
 
@@ -6466,11 +6473,12 @@ mod tests {
     #[test]
     fn collect_content_refs_array_of_refs() {
         let mut pdf = load_one_page_pdf();
-        let obj = Object::Array(vec![
-            Object::Reference(crate::ObjectRef::new(4, 0)),
-            Object::Reference(crate::ObjectRef::new(5, 0)),
+        let handle = ObjectHandle::array(vec![
+            pdf.get_object_handle(crate::ObjectRef::new(4, 0)),
+            pdf.get_object_handle(crate::ObjectRef::new(5, 0)),
         ]);
-        let refs = collect_content_refs(&mut pdf, &obj).expect("collect_content_refs failed");
+        let refs =
+            collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
         assert_eq!(refs, vec!["4 0 R".to_string(), "5 0 R".to_string()]);
     }
 
@@ -6479,8 +6487,9 @@ mod tests {
     #[test]
     fn collect_content_refs_null_returns_empty() {
         let mut pdf = load_one_page_pdf();
-        let obj = Object::Null;
-        let refs = collect_content_refs(&mut pdf, &obj).expect("collect_content_refs failed");
+        let handle = ObjectHandle::null();
+        let refs =
+            collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
         assert!(refs.is_empty());
     }
 
@@ -6489,12 +6498,13 @@ mod tests {
     #[test]
     fn collect_content_refs_array_skips_non_refs() {
         let mut pdf = load_one_page_pdf();
-        let obj = Object::Array(vec![
-            Object::Reference(crate::ObjectRef::new(3, 0)),
-            Object::Integer(99), // not a ref — must be skipped
-            Object::Reference(crate::ObjectRef::new(5, 0)),
+        let handle = ObjectHandle::array(vec![
+            pdf.get_object_handle(crate::ObjectRef::new(3, 0)),
+            ObjectHandle::integer(99), // not a ref — must be skipped
+            pdf.get_object_handle(crate::ObjectRef::new(5, 0)),
         ]);
-        let refs = collect_content_refs(&mut pdf, &obj).expect("collect_content_refs failed");
+        let refs =
+            collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
         assert_eq!(refs, vec!["3 0 R".to_string(), "5 0 R".to_string()]);
     }
 
@@ -6517,8 +6527,9 @@ mod tests {
             ]),
         );
 
-        let obj = Object::Reference(crate::ObjectRef::new(2, 0));
-        let refs = collect_content_refs(&mut pdf, &obj).expect("collect_content_refs failed");
+        let handle = pdf.get_object_handle(crate::ObjectRef::new(2, 0));
+        let refs =
+            collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
         assert_eq!(
             refs,
             vec!["4 0 R".to_string(), "5 0 R".to_string()],
