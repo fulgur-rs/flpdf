@@ -129,6 +129,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// current page list. The returned vector is an owned snapshot, so a later
     /// page insertion or removal requires a fresh call.
     pub fn get_all_pages(&mut self) -> Result<Vec<ObjectRef>> {
+        self.pdf.mark_get_all_pages_called();
         Ok(crate::pages::repair::prepare_for_optimization(self.pdf)?
             .map(|prepared| prepared.pages)
             .unwrap_or_default())
@@ -287,6 +288,10 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// Mirrors `QPDFPageDocumentHelper::flattenAnnotations` through flpdf's
     /// existing qpdf-oriented annotation-flattening primitive.
     pub fn flatten_annotations(&mut self, mode: crate::FlattenMode) -> Result<usize> {
+        // qpdf's document helper obtains `getAllPages()` before flattening.
+        // This repairs a catalog /Pages pointer that lands on a leaf, so the
+        // lower-level document primitive subsequently sees every page.
+        self.get_all_pages()?;
         crate::flatten_annotations(self.pdf, mode)
     }
 
