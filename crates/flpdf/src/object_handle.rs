@@ -630,6 +630,14 @@ impl ObjectHandle {
     /// Callers that need `resolve`/`resolve_borrowed` to reflect a
     /// mutation made through this API must not have resolved the same ref
     /// through them first.
+    ///
+    /// This also has no path to inform the owning [`crate::Pdf`] that
+    /// `self`'s ref changed. A default (incremental) call to
+    /// [`crate::write_pdf`] emits only refs marked dirty by
+    /// [`crate::Pdf::set_object`]/[`crate::Pdf::delete_object`] — after
+    /// mutating an already-registered indirect handle through this method,
+    /// call [`crate::Pdf::mark_object_dirty`] with the same ref or the
+    /// change is silently dropped from the written output.
     pub fn replace_key(&self, key: &[u8], value: ObjectHandle) {
         if self.is_same_direct_handle(&value) {
             return;
@@ -660,7 +668,8 @@ impl ObjectHandle {
     /// resolution itself.
     ///
     /// See [`Self::replace_key`]'s doc comment for the same
-    /// `resolve`/`resolve_borrowed` staleness caveat — it applies here too.
+    /// `resolve`/`resolve_borrowed` staleness caveat and the
+    /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too.
     pub fn remove_key(&self, key: &[u8]) {
         self.with_value_mut(|v| {
             if let Some(ObjectValue::Dictionary(entries)) = v {
@@ -754,7 +763,8 @@ impl ObjectHandle {
     /// keys.
     ///
     /// See [`Self::replace_key`]'s doc comment for the same
-    /// `resolve`/`resolve_borrowed` staleness caveat — it applies here too,
+    /// `resolve`/`resolve_borrowed` staleness caveat and the
+    /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too,
     /// since this method installs and rebinds entries via `replace_key`.
     pub fn merge_resources(
         &self,
@@ -802,7 +812,8 @@ impl ObjectHandle {
     /// no-op if this handle's value is not a stream.
     ///
     /// See [`Self::replace_key`]'s doc comment for the same
-    /// `resolve`/`resolve_borrowed` staleness caveat — it applies here too,
+    /// `resolve`/`resolve_borrowed` staleness caveat and the
+    /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too,
     /// since this method installs `/Filter`/`/DecodeParms`/`/Length` via
     /// `replace_key` and mutates the stream data in place.
     pub fn replace_stream_data(

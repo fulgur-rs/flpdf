@@ -1559,17 +1559,29 @@ impl<R: Read + Seek> Pdf<R> {
         let new_ref = ObjectRef::new(next_number, 0);
         let indirect = self.get_object_handle(new_ref);
         indirect.set_resolved(value);
-        // Mirrors `Pdf::set_object`'s own dirty-bookkeeping: the incremental
-        // writer's `collect_touched_object_refs` seeds emission exclusively
-        // from `dirty_object_refs()` (`writer.rs`), so a new object left out
-        // of that set would never get its own body or xref entry written,
-        // leaving any reference to it dangling. No `self.cache` write-through
-        // is needed alongside this: `write_incremental_objects` reads a
-        // touched ref's value via `Pdf::resolve_borrowed`, which for an
-        // already-`Resolved` handle (this one, via `set_resolved` above)
-        // short-circuits before ever consulting `self.cache`.
-        self.dirty_object_refs.insert(new_ref);
+        // A new object left out of the dirty set would never get its own
+        // body or xref entry written by a default incremental write,
+        // leaving any reference to it dangling — see `mark_object_dirty`'s
+        // own doc comment for the full explanation.
+        self.mark_object_dirty(new_ref);
         Ok(indirect)
+    }
+
+    /// Mark `object_ref` dirty, so the next default (incremental) call to
+    /// [`crate::write_pdf`] includes an updated body and xref entry for it.
+    ///
+    /// [`Self::set_object`] and [`Self::delete_object`] already do this
+    /// internally for the legacy `Object`-based mutation path. `ObjectHandle`'s
+    /// own in-place mutation methods (`replace_key`, `remove_key`,
+    /// `merge_resources`, `replace_stream_data`) mutate the live handle
+    /// graph directly and have no back-reference to this `Pdf` to mark
+    /// their own ref dirty — the incremental writer's
+    /// `collect_touched_object_refs` (`writer.rs`) seeds emission
+    /// exclusively from the dirty set, so a mutation made only through one
+    /// of those methods is silently dropped by a default incremental write
+    /// unless the caller also calls this method for the mutated ref.
+    pub fn mark_object_dirty(&mut self, object_ref: ObjectRef) {
+        self.dirty_object_refs.insert(object_ref);
     }
 
     // This implements the ordering/registration contract of qpdf's
@@ -4621,6 +4633,38 @@ mod tests {
             reopened.resolve(new_ref).expect("resolve new object"),
             Object::Integer(777),
             "new object must not be dangling after an incremental write"
+        );
+    }
+
+    #[test]
+    fn mark_object_dirty_makes_a_replace_key_mutation_survive_a_default_incremental_write() {
+        // Regression test: ObjectHandle::replace_key mutates the live
+        // handle graph directly and has no path back to Pdf's dirty
+        // bookkeeping. Without an explicit `mark_object_dirty` call, the
+        // incremental writer's `collect_touched_object_refs` never sees
+        // the mutated ref and silently drops the change from the output.
+        use crate::write_pdf;
+
+        let page_ref = ObjectRef::new(3, 0);
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve_object_handle(&page).expect("resolve page");
+        page.replace_key(b"Rotate", ObjectHandle::integer(90));
+        pdf.mark_object_dirty(page_ref);
+
+        let mut out = Vec::new();
+        write_pdf(&mut pdf, &mut out).expect("incremental write");
+
+        let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
+        let resolved_page = reopened
+            .resolve(page_ref)
+            .expect("resolve page in reopened output")
+            .into_dict()
+            .expect("page is a dictionary");
+        assert_eq!(
+            resolved_page.get("Rotate"),
+            Some(&Object::Integer(90)),
+            "replace_key mutation must survive a default incremental write once marked dirty"
         );
     }
 
