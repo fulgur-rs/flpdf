@@ -1814,60 +1814,64 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Resolve `handle` (via [`Pdf::resolve_object_handle`]), then chase
     /// through a [`Pdf::set_object`]-driven bare-reference redirect (if any)
-    /// to its terminal (non-reference) value, overwriting `handle`'s own
-    /// resolved value with a clone of that terminal value. Every other
-    /// accessor (`type_code`, `as_integer`, `unparse_resolved`, …) then
-    /// observes the terminal value directly, with no awareness a redirect
-    /// ever happened. [`ObjectHandle::unparse`] is unaffected either way: an
-    /// indirect handle's `unparse()` always reports its own `"N G R"` form
-    /// regardless of resolution state.
+    /// to its terminal (non-reference) value, returning a handle whose
+    /// resolved value *is* that terminal value. Every accessor
+    /// (`type_code`, `as_integer`, `unparse_resolved`, …) called on the
+    /// *returned* handle then observes the terminal value directly, with no
+    /// awareness a redirect ever happened — while [`ObjectHandle::unparse`]
+    /// still reports `handle`'s own `"N G R"` identity, matching
+    /// `crates/flpdf-qtest-tools/src/driver/handle.rs`'s established
+    /// `resolve_chain` contract (its own
+    /// `reference_chain_resolves_but_unparse_retains_the_first_reference`
+    /// test): the chain's *first* ref, not its terminal one.
     ///
-    /// Unlike [`Pdf::resolve_object_handle`] itself — whose single-hop-per-
-    /// call contract [`Pdf::resolve_borrowed`] and `ref_chain.rs`'s own
-    /// bounded chain-follow primitive both depend on (a caller of *that*
-    /// method is expected to loop across hops itself, tracking each
-    /// intermediate ref along the way) — this method is for callers that
-    /// only have a *handle* and want its own resolved value to already be
-    /// the chain's terminal, e.g. the qpdf-type-inspection accessors this
-    /// crate's `ObjectHandle` exposes, none of which can loop across hops
-    /// themselves (no `Pdf` access, no hidden I/O). Only `handle` itself is
-    /// ever mutated: each intermediate hop keeps exactly the resolved value
-    /// [`Pdf::resolve_object_handle`] alone would have left it with, so this
-    /// method never changes what `resolve_borrowed`/`ref_chain.rs` observe
-    /// for an intermediate ref.
+    /// If `handle`'s value is not a redirect at all — the common case —
+    /// this returns `handle.clone()` unchanged (an `Rc` clone, not a copy).
+    /// Otherwise it returns a *fresh*, unregistered handle carrying
+    /// `handle`'s own object number/generation, resolved directly to the
+    /// terminal value: `handle` itself, and every intermediate hop's own
+    /// canonical handle (as [`Pdf::get_object_handle`] would return it), are
+    /// never mutated. This matters because those are the *same* canonical
+    /// handles [`Pdf::resolve_borrowed`] resolves through — overwriting one
+    /// in place would permanently change what a later `resolve_borrowed`
+    /// call for that same ref returns, silently discarding the redirect
+    /// `Pdf::set_object` recorded.
     ///
     /// A self- or mutually-cyclic redirect chain is bounded (see
     /// `MAX_REFERENCE_REDIRECT_DEPTH`'s own doc for the qpdf precedent this
-    /// mirrors) and falls back to leaving `handle` resolved to null, with a
-    /// recorded [`Pdf::repair_diagnostics`] warning, rather than hanging or
-    /// overflowing the stack.
+    /// mirrors) and returns a null-resolved handle, with a recorded
+    /// [`Pdf::repair_diagnostics`] warning, rather than hanging or
+    /// overflowing the stack — again without mutating any canonical handle.
     ///
     /// # Errors
     ///
     /// Same as [`Pdf::resolve_object_handle`].
-    pub fn resolve_object_handle_to_terminal(&mut self, handle: &ObjectHandle) -> Result<()> {
+    pub fn resolve_object_handle_to_terminal(
+        &mut self,
+        handle: &ObjectHandle,
+    ) -> Result<ObjectHandle> {
         self.resolve_object_handle(handle)?;
         let Some(mut current_ref) = handle.as_reference() else {
-            return Ok(()); // already terminal (the common case) — or unresolved/missing
+            return Ok(handle.clone()); // already terminal (the common case) — or unresolved/missing
         };
         for _ in 0..MAX_REFERENCE_REDIRECT_DEPTH {
             let hop = self.get_object_handle(current_ref);
             self.resolve_object_handle(&hop)?;
             match hop.as_reference() {
                 Some(next) => current_ref = next,
+                // `hop.resolved_value_clone()` is `None` only for the
+                // transient `CacheEntry::Reserved` cycle guard
+                // `resolve_object_handle`'s own doc describes (`hop` stays
+                // unresolved) — `shadow_terminal_handle` falls back to null
+                // for that case too, matching `resolve_borrowed`'s own
+                // transient-`Reserved` placeholder. No canonical state is
+                // written either way, so a later call simply redoes the
+                // chase rather than being stuck observing a stale result.
                 None => {
-                    // `None` here also covers the transient
-                    // `CacheEntry::Reserved` cycle guard
-                    // `resolve_object_handle`'s own doc describes (`hop`
-                    // stays unresolved, so `resolved_value_clone()` is
-                    // `None` too): leave `handle` as its own `Reference`,
-                    // unchanged, so a later call retries the chase once the
-                    // outer resolution has completed, rather than
-                    // incorrectly caching a `Null` placeholder.
-                    if let Some(terminal) = hop.resolved_value_clone() {
-                        handle.set_resolved(terminal);
-                    }
-                    return Ok(());
+                    return Ok(Self::shadow_terminal_handle(
+                        handle,
+                        hop.resolved_value_clone(),
+                    ))
                 }
             }
         }
@@ -1876,8 +1880,33 @@ impl<R: Read + Seek> Pdf<R> {
              {MAX_REFERENCE_REDIRECT_DEPTH} hops, treating as cyclic",
             current_ref.number, current_ref.generation
         ));
-        handle.set_resolved(ObjectValue::Null);
-        Ok(())
+        Ok(Self::shadow_terminal_handle(handle, None))
+    }
+
+    // A fresh, unregistered indirect handle carrying `original`'s own
+    // object number/generation (so its `unparse()` still reports
+    // `original`'s `"N G R"` identity) but resolved directly to `terminal`
+    // (`ObjectValue::Null` if `None`). `original` itself is never touched —
+    // see `resolve_object_handle_to_terminal`'s own doc for why reusing the
+    // canonical handle here would be wrong. `original.object_ref()` is
+    // `None` only if `original` is a direct handle whose own value happens
+    // to be a bare `ObjectValue::Reference` (never produced by a file/ObjStm
+    // parse, only by a caller passing one straight to `ObjectHandle::from_value`);
+    // there is no indirect identity to preserve in that case, so the shadow
+    // is direct too.
+    fn shadow_terminal_handle(
+        original: &ObjectHandle,
+        terminal: Option<ObjectValue>,
+    ) -> ObjectHandle {
+        let terminal = terminal.unwrap_or(ObjectValue::Null);
+        match original.object_ref() {
+            Some(object_ref) => {
+                let shadow = ObjectHandle::new_indirect_unresolved(object_ref, NO_PARSED_OFFSET);
+                shadow.set_resolved(terminal);
+                shadow
+            }
+            None => ObjectHandle::from_value(terminal),
+        }
     }
 
     // Builds the resolved value for a plain uncompressed file object by
@@ -6343,11 +6372,13 @@ mod tests {
         let object_ref = ObjectRef::new(1, 0);
 
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle_to_terminal(&handle)
+        let result = pdf
+            .resolve_object_handle_to_terminal(&handle)
             .expect("resolve a plain, never-redirected object");
 
-        assert!(handle.as_dictionary().is_some());
-        assert_eq!(handle.as_reference(), None);
+        assert!(result.ptr_eq(&handle), "no chase needed: same handle back");
+        assert!(result.as_dictionary().is_some());
+        assert_eq!(result.as_reference(), None);
     }
 
     #[test]
@@ -6391,18 +6422,29 @@ mod tests {
         pdf.set_object(redirect_ref, Object::Reference(target_ref));
 
         let handle = pdf.get_object_handle(redirect_ref);
-        pdf.resolve_object_handle_to_terminal(&handle)
+        let result = pdf
+            .resolve_object_handle_to_terminal(&handle)
             .expect("resolve redirect handle to its terminal value");
 
-        assert_eq!(handle.as_boolean(), Some(true));
-        assert_eq!(handle.type_code(), 3, "ot_boolean, not 13/unresolved");
-        assert_eq!(handle.type_name(), "boolean");
+        assert_eq!(result.as_boolean(), Some(true));
+        assert_eq!(result.type_code(), 3, "ot_boolean, not 13/unresolved");
+        assert_eq!(result.type_name(), "boolean");
         assert_eq!(
-            handle.unparse(),
+            result.unparse(),
             b"200 0 R",
-            "unparse() ignores resolution entirely"
+            "unparse() still reports the chain's first ref, not the terminal's"
         );
-        assert_eq!(handle.unparse_resolved(), b"true");
+        assert_eq!(result.unparse_resolved(), b"true");
+
+        // The canonical handle for `redirect_ref` — the one
+        // `Pdf::resolve_borrowed` shares — must stay untouched, or a later
+        // `resolve`/`resolve_borrowed` call would silently start returning
+        // the chased value instead of the redirect `Pdf::set_object` set.
+        assert_eq!(handle.as_reference(), Some(target_ref));
+        assert_eq!(
+            pdf.resolve(redirect_ref).expect("legacy resolve"),
+            Object::Reference(target_ref)
+        );
     }
 
     #[test]
@@ -6416,19 +6458,23 @@ mod tests {
         pdf.set_object(outer_ref, Object::Reference(middle_ref));
 
         let handle = pdf.get_object_handle(outer_ref);
-        pdf.resolve_object_handle_to_terminal(&handle)
+        let result = pdf
+            .resolve_object_handle_to_terminal(&handle)
             .expect("resolve multi-hop redirect handle to its terminal value");
 
-        assert_eq!(handle.as_integer(), Some(42));
-        assert_eq!(handle.unparse(), b"300 0 R");
+        assert_eq!(result.as_integer(), Some(42));
+        assert_eq!(result.unparse(), b"300 0 R");
 
-        // Only `handle` (the outer, caller-passed handle) is mutated: the
-        // middle hop keeps exactly the resolved value `resolve_object_handle`
-        // alone would have left it with, so `ref_chain.rs`'s own chain-walk
-        // over `middle_ref` still sees its one real hop to `terminal_ref`,
-        // unaffected by this call.
+        // Neither `handle` (outer) nor the intermediate hop's own canonical
+        // handle is mutated: `ref_chain.rs`'s own chain-walk over either ref
+        // still sees exactly the one real hop `Pdf::set_object` recorded.
+        assert_eq!(handle.as_reference(), Some(middle_ref));
         let middle_handle = pdf.get_object_handle(middle_ref);
         assert_eq!(middle_handle.as_reference(), Some(terminal_ref));
+        assert_eq!(
+            pdf.resolve(outer_ref).expect("legacy resolve"),
+            Object::Reference(middle_ref)
+        );
     }
 
     #[test]
@@ -6438,10 +6484,13 @@ mod tests {
         pdf.set_object(self_ref, Object::Reference(self_ref));
 
         let handle = pdf.get_object_handle(self_ref);
-        pdf.resolve_object_handle_to_terminal(&handle)
+        let result = pdf
+            .resolve_object_handle_to_terminal(&handle)
             .expect("a self-referential redirect must not hang, overflow, or error");
 
-        assert!(handle.is_null());
+        assert!(result.is_null());
+        // The canonical handle is untouched by the cycle-bound fallback.
+        assert_eq!(handle.as_reference(), Some(self_ref));
     }
 
     #[test]
@@ -6453,13 +6502,15 @@ mod tests {
         pdf.set_object(ref_b, Object::Reference(ref_a));
 
         let handle_a = pdf.get_object_handle(ref_a);
-        pdf.resolve_object_handle_to_terminal(&handle_a)
+        let result = pdf
+            .resolve_object_handle_to_terminal(&handle_a)
             .expect("a mutual redirect cycle must not hang, overflow, or error");
 
-        assert!(handle_a.is_null());
+        assert!(result.is_null());
 
-        // Only `handle_a` is mutated by the cycle-bound fallback: `ref_b`'s
-        // own handle is left exactly as `Pdf::set_object` wrote it.
+        // Neither canonical handle is mutated by the cycle-bound fallback:
+        // both are left exactly as `Pdf::set_object` wrote them.
+        assert_eq!(handle_a.as_reference(), Some(ref_b));
         let handle_b = pdf.get_object_handle(ref_b);
         assert_eq!(handle_b.as_reference(), Some(ref_a));
     }
