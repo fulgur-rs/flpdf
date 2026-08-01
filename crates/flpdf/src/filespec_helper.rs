@@ -25,8 +25,9 @@
 //! # Design
 //!
 //! PDF key naming follows ISO 32000-1 §7.11.  The `/EF` lookup priority used
-//! here mirrors the qpdf JSON v2 `preferredcontents` order:
-//! `/UF` › `/F` › `/Unix` › `/Mac` › `/DOS`.
+//! here mirrors qpdf's `QPDFFileSpecObjectHelper::name_keys` order
+//! (`QPDFFileSpecObjectHelper.cc`), which is also what its `preferredcontents`
+//! JSON output uses: `/UF` › `/F` › `/Unix` › `/DOS` › `/Mac`.
 //!
 //! Date strings (e.g. `/Params /CreationDate`) are returned as raw PDF date
 //! byte sequences (`D:YYYYMMDDHHmmSSOHH'mm'`).  No date parsing is performed.
@@ -339,14 +340,14 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// Resolve and return the embedded file stream.
     ///
     /// The lookup priority for the `/EF` sub-dictionary key is
-    /// `/UF`, `/F`, `/Unix`, `/Mac`, `/DOS` — the same preference order
+    /// `/UF`, `/F`, `/Unix`, `/DOS`, `/Mac` — the same preference order
     /// qpdf applies (Unicode name first), consistent with ISO 32000-1
     /// §7.11.4.  The first key that resolves to an `/EmbeddedFile` stream
     /// reference is used.
     ///
     /// Returns `Ok(None)` when the `/Filespec` dictionary has no `/EF` entry
-    /// or when none of the standard keys (`/UF`, `/F`, `/Unix`, `/Mac`,
-    /// `/DOS`) resolve to an `/EmbeddedFile` stream.
+    /// or when none of the standard keys (`/UF`, `/F`, `/Unix`, `/DOS`,
+    /// `/Mac`) resolve to an `/EmbeddedFile` stream.
     ///
     /// A candidate key whose value is not an indirect reference, or that
     /// resolves to a non-stream object, is skipped and the search continues
@@ -394,7 +395,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         // Try each key in order and skip any that does not resolve to an
         // /EmbeddedFile stream, so a stray non-stream entry on a
         // higher-priority key does not mask a valid lower-priority one.
-        let candidates: Vec<ObjectRef> = ["UF", "F", "Unix", "Mac", "DOS"]
+        let candidates: Vec<ObjectRef> = ["UF", "F", "Unix", "DOS", "Mac"]
             .iter()
             .filter_map(|k| ef_dict.get(k).and_then(Object::as_ref_id))
             .collect();
@@ -1093,7 +1094,7 @@ fn sanitize_imported_object<R: Read + Seek>(
 /// 1. The `/Filespec` dictionary is resolved (handles both indirect-reference
 ///    and direct-dictionary tree values).
 /// 2. The `/EF` sub-dictionary is inspected with the qpdf key-priority order
-///    `[UF, F, Unix, Mac, DOS]`; the first key whose value is an indirect
+///    `[UF, F, Unix, DOS, Mac]`; the first key whose value is an indirect
 ///    reference that resolves to a `/EmbeddedFile` stream is selected.
 /// 3. The stream `data` bytes are copied verbatim (no decode/re-encode), and
 ///    the stream dictionary is **sanitized** (`sanitize_imported_object`):
@@ -1198,11 +1199,11 @@ pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
         };
 
         // ── Step 3 + 4: find the /EmbeddedFile stream in /EF and capture it ────
-        // Use qpdf priority order: UF, F, Unix, Mac, DOS.
+        // Use qpdf priority order: UF, F, Unix, DOS, Mac.
         // Capture the stream directly when found to avoid a second resolve call.
         let mut ef_stream: Stream = {
             let mut found = None;
-            for k in &["UF", "F", "Unix", "Mac", "DOS"] {
+            for k in &["UF", "F", "Unix", "DOS", "Mac"] {
                 if let Some(value @ Object::Reference(_)) = ef_dict.get(k) {
                     // A candidate stream may be reached through more than one
                     // indirect hop (ref -> ref -> stream); follow the chain to
