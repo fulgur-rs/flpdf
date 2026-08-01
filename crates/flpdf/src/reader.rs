@@ -6536,6 +6536,46 @@ mod tests {
         assert_eq!(result.unparse(), b"true");
     }
 
+    #[test]
+    fn resolve_object_handle_to_terminal_accepts_a_chain_exactly_at_the_depth_limit() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let terminal_ref = ObjectRef::new(1000, 0);
+        pdf.set_object(terminal_ref, Object::Integer(7));
+        let mut current_ref = terminal_ref;
+        for i in 0..crate::ref_chain::MAX_REF_CHAIN_DEPTH {
+            let next_ref = ObjectRef::new(1001 + i as u32, 0);
+            pdf.set_object(next_ref, Object::Reference(current_ref));
+            current_ref = next_ref;
+        }
+
+        let handle = pdf.get_object_handle(current_ref);
+        let result = pdf
+            .resolve_object_handle_to_terminal(&handle)
+            .expect("a chain exactly at the depth limit must resolve, not be treated as cyclic");
+
+        assert_eq!(result.as_integer(), Some(7));
+    }
+
+    #[test]
+    fn resolve_object_handle_to_terminal_treats_a_chain_one_hop_past_the_limit_as_cyclic() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let terminal_ref = ObjectRef::new(1000, 0);
+        pdf.set_object(terminal_ref, Object::Integer(7));
+        let mut current_ref = terminal_ref;
+        for i in 0..=crate::ref_chain::MAX_REF_CHAIN_DEPTH {
+            let next_ref = ObjectRef::new(2000 + i as u32, 0);
+            pdf.set_object(next_ref, Object::Reference(current_ref));
+            current_ref = next_ref;
+        }
+
+        let handle = pdf.get_object_handle(current_ref);
+        let result = pdf
+            .resolve_object_handle_to_terminal(&handle)
+            .expect("a too-long chain falls back rather than erroring");
+
+        assert!(result.is_null());
+    }
+
     /// White-box companion to the public-API
     /// `resolve_object_handle_distinguishes_a_literal_null_from_a_dangling_reference`
     /// integration test: proves the two null-observing cases actually take

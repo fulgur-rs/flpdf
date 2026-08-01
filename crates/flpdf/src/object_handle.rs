@@ -292,8 +292,9 @@ impl ObjectHandle {
     /// this never performs resolution itself, the same "no hidden I/O" rule
     /// every other accessor here follows. Used by
     /// `Pdf::resolve_object_handle_to_terminal` (reader.rs) to copy a
-    /// redirect target's already-resolved terminal value into the
-    /// redirecting handle's own resolved state.
+    /// redirect target's already-resolved terminal value into a fresh,
+    /// unregistered shadow handle — the canonical redirecting handle itself
+    /// is never mutated.
     pub(crate) fn resolved_value_clone(&self) -> Option<ObjectValue> {
         self.with_value(|value| value.map(clone_value_stream_safe))
     }
