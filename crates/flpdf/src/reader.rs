@@ -4571,6 +4571,37 @@ mod tests {
     }
 
     #[test]
+    fn make_indirect_object_handle_gives_a_stream_its_own_independent_dict() {
+        // Regression test: cloning a direct Stream value naively (the
+        // #[derive(Clone)] every other variant gets) would deep-clone
+        // `data` but Rc-share `dict` with the caller's original handle --
+        // the same asymmetry `shallow_copy` was fixed for. Mutating the
+        // *original* handle's stream data after making it indirect must
+        // not affect the new indirect object's dictionary.
+        let dict = ObjectHandle::dictionary(vec![]);
+        let direct_stream = ObjectHandle::from_value(ObjectValue::Stream {
+            dict: dict.clone(),
+            data: b"old".to_vec(),
+        });
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let indirect = pdf
+            .make_indirect_object_handle(direct_stream)
+            .expect("make indirect");
+
+        dict.replace_key(b"Length", ObjectHandle::integer(999));
+
+        assert!(
+            indirect
+                .as_stream_dict()
+                .unwrap()
+                .get_key(b"Length")
+                .is_null(),
+            "the new indirect object's dict must not observe a mutation \
+             made through the original handle's dict"
+        );
+    }
+
+    #[test]
     fn make_indirect_object_handle_allocates_distinct_refs_across_repeated_calls() {
         // Regression test: a ref allocated by this method is registered in
         // `handle_registry` but never written through to the legacy

@@ -264,9 +264,24 @@ impl ObjectHandle {
     /// ownership). Used by `Pdf::make_indirect_object_handle`, which
     /// cannot assume its caller holds the only reference to the direct
     /// handle it passes in.
+    ///
+    /// A `Stream` value's `dict` gets the same `shallow_copy_child`
+    /// treatment [`Self::shallow_copy`] gives it, rather than the plain
+    /// `ObjectValue::clone()` every other variant gets: `#[derive(Clone)]`
+    /// would leave `dict` Rc-shared with `self` while deep-cloning `data`,
+    /// so a later `replace_stream_data` on either handle would update the
+    /// other's `/Length`/`/Filter`/`/DecodeParms` without touching its
+    /// (independently cloned) data bytes — the exact asymmetry
+    /// `shallow_copy`'s own doc comment explains for that method.
     pub(crate) fn direct_value_clone(&self) -> Option<ObjectValue> {
         match &self.0 {
-            Repr::Direct(slot) => Some(slot.borrow().value.clone()),
+            Repr::Direct(slot) => Some(match &slot.borrow().value {
+                ObjectValue::Stream { dict, data } => ObjectValue::Stream {
+                    dict: shallow_copy_child(dict),
+                    data: data.clone(),
+                },
+                other => other.clone(),
+            }),
             Repr::Indirect(_) => None,
         }
     }
