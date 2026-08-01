@@ -815,10 +815,7 @@ fn pdf_object_to_json_bounded(handle: &ObjectHandle, depth: usize) -> Result<Jso
                 // indirect handle and every direct handle whose value is a bare
                 // reference, so no remaining direct value can produce
                 // `type_code()`'s `ot_unresolved`/`ot_destroyed` ordinals here.
-                other => {
-                    unreachable!("direct, non-reference ObjectHandle produced type_code()=={other}, expected 2..=12")
-                    // cov:ignore: unreachable per this match's own doc
-                }
+                other => unreachable!("unexpected direct type_code() {other}"), // cov:ignore: unreachable per this match's own doc
             }
         },
     )
@@ -4566,11 +4563,23 @@ mod tests {
                 dict.insert("Img", Object::InlineImage(b"\x00EI\xff".to_vec()));
                 dict
             }),
+            Object::Stream(Stream::new(
+                {
+                    let mut dict = Dictionary::new();
+                    dict.insert("Op", Object::Operator(b"cm".to_vec()));
+                    dict
+                },
+                vec![],
+            )),
         ]);
         let json = super::lift_and_convert_to_json(&mut pdf, &nested).unwrap();
         assert_eq!(
             project(json).unwrap(),
-            serde_json::json!([1, {"/Img": null, "/Op": null}])
+            serde_json::json!([
+                1,
+                {"/Img": null, "/Op": null},
+                {"stream": {"dict": {"/Op": null}}},
+            ])
         );
     }
 
@@ -5793,11 +5802,9 @@ mod tests {
         );
 
         let one_deeper = ObjectHandle::array(vec![inner]);
+        let result = super::pdf_object_to_json(&one_deeper);
         assert!(
-            matches!(
-                super::pdf_object_to_json(&one_deeper),
-                Err(ConvertError::PdfError(_))
-            ),
+            matches!(result, Err(ConvertError::PdfError(_))),
             "one level past MAX_PARSE_DEPTH must error, not silently succeed or overflow"
         );
     }
