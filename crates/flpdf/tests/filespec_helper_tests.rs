@@ -319,6 +319,55 @@ fn size_returns_integer() {
     assert_eq!(sz, Some(95));
 }
 
+// ── qpdf-shaped EmbeddedFileStream metadata and mutation ────────────────────
+
+#[test]
+fn embedded_file_setters_update_the_live_stream_and_qpdf_getters() {
+    // This fails if a setter only changes a retained stream copy, if /Params
+    // is not created, or if qpdf's UTF-8 string view is skipped on readback.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    {
+        let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+        let mut ef = fs.embedded_file().unwrap().expect("embedded file");
+        ef.set_creation_date(b"D:20260101000000Z").unwrap();
+        ef.set_modification_date(b"D:20260202000000Z").unwrap();
+        ef.set_subtype(b"application/pdf").unwrap();
+
+        assert_eq!(
+            ef.get_creation_date().unwrap(),
+            Some("D:20260101000000Z".to_string())
+        );
+        assert_eq!(
+            ef.get_modification_date().unwrap(),
+            Some("D:20260202000000Z".to_string())
+        );
+        assert_eq!(
+            ef.get_subtype().unwrap(),
+            Some("application/pdf".to_string())
+        );
+        assert_eq!(ef.get_size().unwrap(), 0);
+    }
+
+    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("expected embedded-file stream");
+    };
+    let Object::Dictionary(params) = stream.dict.get("Params").unwrap() else {
+        panic!("expected /Params dictionary");
+    };
+    assert_eq!(
+        params.get("CreationDate"),
+        Some(&Object::String(b"D:20260101000000Z".to_vec()))
+    );
+    assert_eq!(
+        params.get("ModDate"),
+        Some(&Object::String(b"D:20260202000000Z".to_vec()))
+    );
+    assert_eq!(
+        stream.dict.get("Subtype"),
+        Some(&Object::Name(b"application/pdf".to_vec()))
+    );
+}
+
 #[test]
 fn params_absent_returns_none_for_all_fields() {
     let bytes = build_attachment_pdf("", "", b"data");

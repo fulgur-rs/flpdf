@@ -104,6 +104,9 @@ const NAME_KEYS: [&str; 5] = ["UF", "F", "Unix", "DOS", "Mac"];
 /// All accessors are cheap: only [`payload`](EmbeddedFileStream::payload)
 /// performs I/O (decoding the filter chain).
 pub struct EmbeddedFileStream<'a, R: Read + Seek> {
+    /// The terminal indirect reference of the `/EmbeddedFile` stream. Setters
+    /// write the changed stream back through this object identity.
+    stream_ref: ObjectRef,
     /// The resolved `/EmbeddedFile` stream.  Stored by value because `Stream`
     /// owns its data, and we need the dict reference to survive across calls.
     stream: Stream,
@@ -118,7 +121,7 @@ pub struct EmbeddedFileStream<'a, R: Read + Seek> {
 }
 
 impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
-    fn new(stream: Stream, pdf: &'a mut Pdf<R>) -> Result<Self> {
+    fn new(stream_ref: ObjectRef, stream: Stream, pdf: &'a mut Pdf<R>) -> Result<Self> {
         let params = match stream.dict.get("Params") {
             Some(Object::Dictionary(d)) => Some(d.clone()),
             Some(Object::Reference(r)) => {
@@ -132,6 +135,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             _ => None,
         };
         Ok(Self {
+            stream_ref,
             stream,
             params,
             pdf,
@@ -243,6 +247,100 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             .params()
             .and_then(|p| p.get("Size"))
             .and_then(Object::as_integer))
+    }
+
+    /// Return `/Params /CreationDate` through qpdf's UTF-8 string view.
+    pub fn get_creation_date(&self) -> Result<Option<String>> {
+        Ok(self.creation_date()?.map(|value| {
+            String::from_utf8(utf8_value(&value)).expect("qpdf UTF-8 view is valid UTF-8")
+        }))
+    }
+
+    /// Return `/Params /ModDate` through qpdf's UTF-8 string view.
+    pub fn get_modification_date(&self) -> Result<Option<String>> {
+        Ok(self.modification_date()?.map(|value| {
+            String::from_utf8(utf8_value(&value)).expect("qpdf UTF-8 view is valid UTF-8")
+        }))
+    }
+
+    /// Return `/Params /Size`, or qpdf's `0` default when it is absent,
+    /// negative, or not representable as `usize`.
+    pub fn get_size(&self) -> Result<usize> {
+        Ok(self
+            .size()?
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0))
+    }
+
+    /// Return `/Subtype` as a MIME-type string, without a leading slash.
+    pub fn get_subtype(&self) -> Result<Option<String>> {
+        Ok(self.mimetype()?.and_then(|value| {
+            (!value.is_empty()).then(|| String::from_utf8_lossy(&value).into_owned())
+        }))
+    }
+
+    /// Return `/Params /CheckSum` as qpdf's binary string value.
+    pub fn get_checksum(&self) -> Result<Option<Vec<u8>>> {
+        self.checksum()
+    }
+
+    fn set_param(&mut self, key: &str, value: Object) -> Result<()> {
+        let params_value = self.stream.dict.get("Params").cloned();
+        let mut params = match params_value {
+            Some(Object::Dictionary(params)) => params,
+            Some(Object::Reference(reference)) => {
+                let (terminal, terminal_ref) =
+                    resolve_ref_chain(self.pdf, &Object::Reference(reference))?;
+                let Object::Dictionary(mut params) = terminal else {
+                    let mut params = Dictionary::new();
+                    params.insert(key, value.clone());
+                    self.stream
+                        .dict
+                        .insert("Params", Object::Dictionary(params.clone()));
+                    self.params = Some(params);
+                    self.pdf
+                        .set_object(self.stream_ref, Object::Stream(self.stream.clone()));
+                    return Ok(());
+                };
+                params.insert(key, value.clone());
+                if let Some(terminal_ref) = terminal_ref {
+                    self.pdf
+                        .set_object(terminal_ref, Object::Dictionary(params.clone()));
+                    self.params = Some(params);
+                    return Ok(());
+                }
+                params
+            }
+            _ => Dictionary::new(),
+        };
+        params.insert(key, value);
+        self.stream
+            .dict
+            .insert("Params", Object::Dictionary(params.clone()));
+        self.params = Some(params);
+        self.pdf
+            .set_object(self.stream_ref, Object::Stream(self.stream.clone()));
+        Ok(())
+    }
+
+    /// Set `/Params /CreationDate` to a raw PDF date string.
+    pub fn set_creation_date(&mut self, value: impl AsRef<[u8]>) -> Result<()> {
+        self.set_param("CreationDate", Object::String(value.as_ref().to_vec()))
+    }
+
+    /// Set `/Params /ModDate` to a raw PDF date string.
+    pub fn set_modification_date(&mut self, value: impl AsRef<[u8]>) -> Result<()> {
+        self.set_param("ModDate", Object::String(value.as_ref().to_vec()))
+    }
+
+    /// Set `/Subtype` to a MIME type represented as logical PDF Name bytes.
+    pub fn set_subtype(&mut self, value: impl AsRef<[u8]>) -> Result<()> {
+        self.stream
+            .dict
+            .insert("Subtype", Object::Name(value.as_ref().to_vec()));
+        self.pdf
+            .set_object(self.stream_ref, Object::Stream(self.stream.clone()));
+        Ok(())
     }
 }
 
@@ -456,9 +554,11 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// ```
     pub fn embedded_file(&mut self) -> Result<Option<EmbeddedFileStream<'_, R>>> {
         let candidate = self.get_embedded_file_stream("")?;
-        let (terminal, _) = resolve_ref_chain(self.pdf, &candidate)?;
-        match terminal {
-            Object::Stream(stream) => EmbeddedFileStream::new(stream, self.pdf).map(Some),
+        let (terminal, terminal_ref) = resolve_ref_chain(self.pdf, &candidate)?;
+        match (terminal, terminal_ref) {
+            (Object::Stream(stream), Some(stream_ref)) => {
+                EmbeddedFileStream::new(stream_ref, stream, self.pdf).map(Some)
+            }
             _ => Ok(None),
         }
     }
