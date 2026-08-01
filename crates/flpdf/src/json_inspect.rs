@@ -2045,7 +2045,7 @@ fn checksum_to_hex(bytes: &[u8]) -> String {
 /// `attachments` entry.
 enum FilespecSource {
     Indirect(crate::ObjectRef),
-    Direct(Dictionary),
+    Direct(std::collections::BTreeMap<Vec<u8>, ObjectHandle>),
 }
 
 /// Build a JSON entry for one filespec dictionary.
@@ -2058,22 +2058,18 @@ fn filespec_to_json<R: Read + Seek>(
 ) -> Result<Json, ConvertError> {
     let filespec_str = format!("{} {} R", filespec_ref.number, filespec_ref.generation);
 
-    let filespec_obj = pdf
-        .resolve_borrowed(filespec_ref)
-        .map_err(ConvertError::from)?;
-    let filespec_dict = match filespec_obj {
-        Object::Dictionary(d) => d.clone(),
-        _ => {
-            // Malformed filespec — return a minimal entry
-            return json_dictionary([
-                ("description".to_string(), Json::make_null()),
-                ("filespec".to_string(), Json::make_string(filespec_str)),
-                ("names".to_string(), Json::make_dictionary()),
-                ("preferredcontents".to_string(), Json::make_null()),
-                ("preferredname".to_string(), Json::make_null()),
-                ("streams".to_string(), Json::make_dictionary()),
-            ]);
-        }
+    let filespec_handle = pdf.get_object_handle(filespec_ref);
+    pdf.resolve_object_handle(&filespec_handle)?;
+    let Some(filespec_dict) = filespec_handle.as_dictionary() else {
+        // Malformed filespec — return a minimal entry
+        return json_dictionary([
+            ("description".to_string(), Json::make_null()),
+            ("filespec".to_string(), Json::make_string(filespec_str)),
+            ("names".to_string(), Json::make_dictionary()),
+            ("preferredcontents".to_string(), Json::make_null()),
+            ("preferredname".to_string(), Json::make_null()),
+            ("streams".to_string(), Json::make_dictionary()),
+        ]);
     };
 
     filespec_dict_to_json(pdf, &filespec_dict, Some(filespec_str))
@@ -2086,23 +2082,25 @@ fn filespec_to_json<R: Read + Seek>(
 /// no reference number exists.
 fn filespec_dict_to_json<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    filespec_dict: &Dictionary,
+    filespec_dict: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     filespec_str: Option<String>,
 ) -> Result<Json, ConvertError> {
-    let filespec_dict = filespec_dict.clone();
     let filespec_value = match filespec_str {
         Some(s) => Json::make_string(s),
         None => Json::make_null(),
     };
 
     // description: /Desc decoded as PDF text string, bare (no u:/b: prefix)
-    let description = match filespec_dict.get("Desc") {
-        Some(Object::String(bytes)) => {
-            let s = decode_pdf_text_string(bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+    let description = match filespec_dict
+        .get(b"Desc".as_slice())
+        .and_then(ObjectHandle::as_string)
+    {
+        Some(bytes) => {
+            let s = decode_pdf_text_string(&bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
             Json::make_string(s)
         }
-        _ => Json::make_null(),
+        None => Json::make_null(),
     };
 
     // names: collect /F, /UF, /DOS, /Mac, /Unix — each decoded as PDF text string
@@ -2110,9 +2108,12 @@ fn filespec_dict_to_json<R: Read + Seek>(
     let name_keys = ["DOS", "F", "Mac", "UF", "Unix"];
     let mut names_pairs: Vec<(String, Json)> = Vec::new();
     for key in &name_keys {
-        if let Some(Object::String(bytes)) = filespec_dict.get(*key) {
-            let s = decode_pdf_text_string(bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+        if let Some(bytes) = filespec_dict
+            .get(key.as_bytes())
+            .and_then(ObjectHandle::as_string)
+        {
+            let s = decode_pdf_text_string(&bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
             names_pairs.push((format!("/{key}"), Json::make_string(s)));
         }
     }
@@ -2122,25 +2123,26 @@ fn filespec_dict_to_json<R: Read + Seek>(
     let preferredname = preferred_name_key_order
         .iter()
         .find_map(|key| {
-            if let Some(Object::String(bytes)) = filespec_dict.get(*key) {
-                let s = decode_pdf_text_string(bytes)
-                    .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
-                Some(Json::make_string(s))
-            } else {
-                None
-            }
+            filespec_dict
+                .get(key.as_bytes())
+                .and_then(ObjectHandle::as_string)
+                .map(|bytes| {
+                    let s = decode_pdf_text_string(&bytes)
+                        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+                    Json::make_string(s)
+                })
         })
         .unwrap_or_else(Json::make_null);
 
     // /EF dictionary: embedded file stream refs, keyed by /F /UF /DOS /Mac /Unix
-    let ef_dict = match filespec_dict.get("EF") {
-        Some(Object::Dictionary(d)) => Some(d.clone()),
-        Some(Object::Reference(r)) => match pdf.resolve_borrowed(*r).map_err(ConvertError::from)? {
-            Object::Dictionary(d) => Some(d.clone()),
-            _ => None,
-        },
-        _ => None,
-    };
+    let ef_dict: Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> =
+        match filespec_dict.get(b"EF".as_slice()) {
+            Some(handle) => {
+                pdf.resolve_object_handle(handle)?;
+                handle.as_dictionary()
+            }
+            None => None,
+        };
 
     // preferredcontents: /EF/UF > /EF/F > /EF/Unix > /EF/Mac > /EF/DOS
     let preferred_ef_key_order = ["UF", "F", "Unix", "Mac", "DOS"];
@@ -2148,14 +2150,9 @@ fn filespec_dict_to_json<R: Read + Seek>(
         preferred_ef_key_order
             .iter()
             .find_map(|key| {
-                if let Some(Object::Reference(r)) = ef.get(*key) {
-                    Some(Json::make_string(format!(
-                        "{} {} R",
-                        r.number, r.generation
-                    )))
-                } else {
-                    None
-                }
+                ef.get(key.as_bytes())
+                    .and_then(ObjectHandle::object_ref)
+                    .map(|r| Json::make_string(format!("{} {} R", r.number, r.generation)))
             })
             .unwrap_or_else(Json::make_null)
     } else {
@@ -2169,75 +2166,64 @@ fn filespec_dict_to_json<R: Read + Seek>(
 
     if let Some(ref ef) = ef_dict {
         for key in &ef_key_order {
-            let stream_ref = match ef.get(*key) {
-                Some(Object::Reference(r)) => *r,
-                _ => continue,
+            let Some(stream_ref) = ef.get(key.as_bytes()).and_then(ObjectHandle::object_ref)
+            else {
+                continue;
             };
 
-            let stream_obj = pdf
-                .resolve_borrowed(stream_ref)
-                .map_err(ConvertError::from)?;
-            let stream_dict = match stream_obj {
-                Object::Stream(s) => s.dict.clone(),
-                _ => continue,
+            let stream_handle = pdf.get_object_handle(stream_ref);
+            pdf.resolve_object_handle(&stream_handle)?;
+            let Some(stream_dict) = stream_handle
+                .as_stream_dict()
+                .and_then(|d| d.as_dictionary())
+            else {
+                continue;
             };
 
             // mimetype: /Subtype name → bare string (no "/" prefix), or null
-            let mimetype = match stream_dict.get("Subtype") {
-                Some(Object::Name(bytes)) => {
-                    let s = String::from_utf8_lossy(bytes).into_owned();
-                    Json::make_string(s)
-                }
-                _ => Json::make_null(),
+            let mimetype = match stream_dict
+                .get(b"Subtype".as_slice())
+                .and_then(ObjectHandle::as_name)
+            {
+                Some(bytes) => Json::make_string(String::from_utf8_lossy(&bytes).into_owned()),
+                None => Json::make_null(),
             };
 
             // /Params sub-dict
-            let params_dict = match stream_dict.get("Params") {
-                Some(Object::Dictionary(d)) => Some(d.clone()),
-                Some(Object::Reference(r)) => {
-                    match pdf.resolve_borrowed(*r).map_err(ConvertError::from)? {
-                        Object::Dictionary(d) => Some(d.clone()),
-                        _ => None,
+            let params_dict: Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> =
+                match stream_dict.get(b"Params".as_slice()) {
+                    Some(handle) => {
+                        pdf.resolve_object_handle(handle)?;
+                        handle.as_dictionary()
                     }
-                }
-                _ => None,
-            };
+                    None => None,
+                };
 
             // checksum: /Params /CheckSum bytes → lowercase hex, or null
-            let checksum = if let Some(ref p) = params_dict {
-                match p.get("CheckSum") {
-                    Some(Object::String(bytes)) => Json::make_string(checksum_to_hex(bytes)),
-                    _ => Json::make_null(),
-                }
-            } else {
-                Json::make_null()
-            };
+            let checksum = params_dict
+                .as_ref()
+                .and_then(|p| p.get(b"CheckSum".as_slice()))
+                .and_then(ObjectHandle::as_string)
+                .map(|bytes| Json::make_string(checksum_to_hex(&bytes)))
+                .unwrap_or_else(Json::make_null);
 
             // creationdate: /Params /CreationDate → ISO 8601, or null
-            let creationdate = if let Some(ref p) = params_dict {
-                match p.get("CreationDate") {
-                    Some(Object::String(bytes)) => match parse_pdf_date(bytes) {
-                        Some(s) => Json::make_string(s),
-                        None => Json::make_null(),
-                    },
-                    _ => Json::make_null(),
-                }
-            } else {
-                Json::make_null()
-            };
+            let creationdate = params_dict
+                .as_ref()
+                .and_then(|p| p.get(b"CreationDate".as_slice()))
+                .and_then(ObjectHandle::as_string)
+                .and_then(|bytes| parse_pdf_date(&bytes))
+                .map(Json::make_string)
+                .unwrap_or_else(Json::make_null);
 
             // modificationdate: /Params /ModDate → ISO 8601, or null
-            let modificationdate = if let Some(ref p) = params_dict {
-                match p.get("ModDate") {
-                    Some(Object::String(bytes)) => match parse_pdf_date(bytes) {
-                        Some(s) => Json::make_string(s),
-                        None => Json::make_null(),
-                    },
-                    _ => Json::make_null(),
-                }
-            } else {
-                Json::make_null()
-            };
+            let modificationdate = params_dict
+                .as_ref()
+                .and_then(|p| p.get(b"ModDate".as_slice()))
+                .and_then(ObjectHandle::as_string)
+                .and_then(|bytes| parse_pdf_date(&bytes))
+                .map(Json::make_string)
+                .unwrap_or_else(Json::make_null);
 
             // Stream entry keys: checksum, creationdate, mimetype, modificationdate
             let stream_entry = json_dictionary([
@@ -2334,17 +2320,25 @@ pub fn build_attachments_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Jso
         }
     }
 
-    let mut raw_entries: Vec<(String, FilespecSource)> = entries
-        .into_iter()
-        .filter_map(|(key_bytes, value)| {
-            let source = match value {
-                Object::Reference(object_ref) => FilespecSource::Indirect(object_ref),
-                Object::Dictionary(dictionary) => FilespecSource::Direct(dictionary),
-                _ => return None,
-            };
-            Some((String::from_utf8_lossy(&key_bytes).into_owned(), source))
-        })
-        .collect();
+    let mut raw_entries: Vec<(String, FilespecSource)> = Vec::with_capacity(entries.len());
+    for (key_bytes, value) in entries {
+        let source = match value {
+            Object::Reference(object_ref) => FilespecSource::Indirect(object_ref),
+            Object::Dictionary(dictionary) => {
+                // Bridge: the NameTree walker (out of this migration's
+                // scope) still yields a legacy Object; lift a direct leaf
+                // dictionary once so filespec_dict_to_json can use the
+                // ObjectHandle idiom like the rest of json_inspect.
+                let dict = pdf
+                    .lift_object_to_handle(&Object::Dictionary(dictionary))?
+                    .as_dictionary()
+                    .unwrap_or_default();
+                FilespecSource::Direct(dict)
+            }
+            _ => continue,
+        };
+        raw_entries.push((String::from_utf8_lossy(&key_bytes).into_owned(), source));
+    }
 
     // Sort by name (alphabetical)
     raw_entries.sort_by(|a, b| a.0.cmp(&b.0));
