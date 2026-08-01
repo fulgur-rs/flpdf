@@ -115,6 +115,27 @@ fn get_all_pages_repairs_catalog_pages_pointer() {
 }
 
 #[test]
+fn get_all_pages_rejects_a_pages_tree_cycle() {
+    let mut pdf = open(build_n_page_pdf(1));
+    let Object::Dictionary(mut pages) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+        panic!("pages root must be a dictionary");
+    };
+    pages.insert(
+        "Kids",
+        Object::Array(vec![Object::Reference(ObjectRef::new(2, 0))]),
+    );
+    pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(pages));
+
+    let error = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("cycle"),
+        "qpdf rejects page-tree loops: {error}"
+    );
+}
+
+#[test]
 fn pages_forwards_to_repair_aware_enumeration() {
     let mut pdf = open(pdf_with_catalog_pages_pointing_to_leaf());
 
@@ -193,6 +214,59 @@ fn remove_unreferenced_resources_prunes_unused_font_on_page() {
     };
     assert!(fonts.get("F1").is_some());
     assert!(fonts.get("F2").is_none());
+}
+
+#[test]
+fn helper_prunes_unused_resources_inside_form_xobjects() {
+    let mut pdf = open(build_n_page_pdf(1));
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        Object::Stream(Stream::new(Dictionary::new(), b"/Fm0 Do".to_vec())),
+    );
+
+    let mut form_fonts = Dictionary::new();
+    form_fonts.insert("F1", Object::Dictionary(Dictionary::new()));
+    form_fonts.insert("F2", Object::Dictionary(Dictionary::new()));
+    let mut form_resources = Dictionary::new();
+    form_resources.insert("Font", Object::Dictionary(form_fonts));
+    let mut form_dict = Dictionary::new();
+    form_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
+    form_dict.insert("Resources", Object::Dictionary(form_resources));
+    pdf.set_object(
+        ObjectRef::new(6, 0),
+        Object::Stream(Stream::new(form_dict, b"BT /F1 12 Tf ET".to_vec())),
+    );
+
+    let mut xobjects = Dictionary::new();
+    xobjects.insert("Fm0", Object::Reference(ObjectRef::new(6, 0)));
+    let mut page_resources = Dictionary::new();
+    page_resources.insert("XObject", Object::Dictionary(xobjects));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(page_resources));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
+    page.insert("Resources", Object::Reference(ObjectRef::new(5, 0)));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .remove_unreferenced_resources()
+        .unwrap();
+
+    let Object::Stream(form) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("form must remain a stream");
+    };
+    let Some(Object::Dictionary(resources)) = form.dict.get("Resources") else {
+        panic!("form must retain a resource dictionary");
+    };
+    let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
+        panic!("form must retain a font dictionary");
+    };
+    assert!(fonts.get("F1").is_some());
+    assert!(
+        fonts.get("F2").is_none(),
+        "qpdf prunes unreferenced Form resources too"
+    );
 }
 
 #[test]

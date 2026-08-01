@@ -4,17 +4,28 @@
 
 **Goal:** Make `PageDocumentHelper` a qpdf 11.9.0-aligned live-document facade while preserving `page_extract.rs` as the fresh-document page-extraction path.
 
-**Architecture:** `PageDocumentHelper` will derive the current page list from qpdf-compatible repair before operating on it.  New qpdf-named facade methods delegate to the existing page-tree rebuild, inherited-attribute, resource-pruning, and annotation-flattening primitives; existing ergonomic methods remain as forwarding compatibility conveniences.  `page_extract.rs` remains separate because it creates a new PDF rather than altering a live document.
+**Architecture:** `PageDocumentHelper` derives the current page list from qpdf-compatible repair before operating on it and exposes only qpdf's seven public operations. `PageObjectHelper` carries either a direct page object or an indirect page plus its owning `Pdf`, so `add_page` can materialize direct pages, shallow-copy local duplicates, and copy foreign pages after attribute pushing. `page_extract.rs` remains separate because it creates a new PDF rather than altering a live document.
 
 **Tech Stack:** Rust workspace, `flpdf`, qpdf 11.9.0 source oracle, Cargo test/clippy/fmt.
 
 ## Global Constraints
 
 - qpdf 11.9.0 source and observed behavior are the oracle.
-- Do not create a second page-tree traversal, resource-pruning implementation, or annotation-flattening implementation.
+- Do not preserve non-qpdf `PageDocumentHelper` API compatibility.
+- Preserve no second page-tree traversal, resource-pruning implementation, or annotation-flattening implementation except where qpdf's Form-XObject or AcroForm behavior establishes a distinct responsibility.
 - `page_extract.rs` owns the `emptyPDF() + addPage()` fresh-document route; `pages.rs` owns traversal.
 - Keep a page list uncached: callers must enumerate again after mutations.
-- Preserve existing public convenience methods unless an exact qpdf behavior requires changing their semantics.
+- `flatten_annotations` must accept qpdf's `required_flags` and `forbidden_flags`; its defaults are `0` and Invisible|Hidden.
+
+### Review remediation (2026-08-02)
+
+The initial implementation failed qpdf parity in five verified ways. The remaining work supersedes Tasks 2-3's API details:
+
+1. Resource pruning must call the same per-object routine on every nested Form XObject, shallow-copying and pruning each Form's `/Font` and `/XObject` scopes.
+2. Document-level annotation flattening must run on repaired pages, use `required_flags`/`forbidden_flags`, honour `/NeedAppearances`, merge Widget field `/DR` into the selected appearance stream, and remove `/AcroForm` only when qpdf does.
+3. Page insertion must accept a page-object helper rather than an ownerless `ObjectRef`; direct pages become indirect, foreign pages are pushed then copied, and duplicate local leaves are shallow-copied.
+4. Page repair must fail on cycles and recurse through direct intermediate `/Pages` dictionaries in place.
+5. Remove the non-qpdf `pages`, `iter`, `get`, `insert`, `remove`, and `rotate` helper methods and their re-exports/tests. The qpdf-facing public set is `get_all_pages`, `push_inherited_attributes_to_pages`, `remove_unreferenced_resources`, `add_page`, `add_page_at`, `remove_page`, and `flatten_annotations`.
 
 ---
 

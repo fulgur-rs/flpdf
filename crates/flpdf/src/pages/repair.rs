@@ -183,9 +183,9 @@ fn repair_page_tree<R: Read + Seek>(
         )));
     }
     if !state.visited.insert(node_ref) {
-        // Cycle guard: qpdf throws here; flpdf tolerates (matching PageWalk) and
-        // stops descending. A well-formed tree never hits this.
-        return Ok(());
+        return Err(Error::Unsupported(format!(
+            "page tree cycle detected at {node_ref}"
+        )));
     }
     let Object::Dictionary(mut dict) = pdf.resolve(node_ref)? else {
         return Ok(()); // Non-dictionary node: nothing to walk.
@@ -220,17 +220,17 @@ fn repair_page_tree<R: Read + Seek>(
     for kid in kids.iter_mut() {
         let kid_ref = if let Object::Reference(r) = &*kid {
             *r
-        } else if let Object::Dictionary(d) = &*kid {
+        } else if let Object::Dictionary(d) = &mut *kid {
             // A DIRECT (inline) /Kids entry. qpdf 11.9.0's getAllPagesInternal
             // classifies interior-vs-leaf by `kid.hasKey("/Kids")` before any
             // direct→indirect conversion (QPDF_pages.cc:100-118), so branch the
             // same way here.
             if d.get("Kids").is_some() {
                 // (1i) Direct *interior* node (a direct dict WITH /Kids). qpdf
-                // recurses into it in place (:101-102); flpdf's reference-keyed
-                // walk has no non-reference recursion path, so this is out of
-                // scope — leave the entry direct and untouched. No golden exists
-                // for this exotic shape.
+                // recurses into it in place (:101-102) and keeps the node direct;
+                // only direct leaves are materialized.
+                repair_direct_page_tree(pdf, d, state, depth + 1, media_box)?;
+                changed = true;
                 continue;
             }
             // (1l) Direct *leaf* (no /Kids): mint it into a fresh indirect object
@@ -335,6 +335,123 @@ fn repair_page_tree<R: Read + Seek>(
 
 /// Allocate a fresh indirect-object reference (the new-object idiom used across
 /// the crate): one past the current highest object number.
+/// Recursively repair a direct interior `/Pages` dictionary in place.
+///
+/// qpdf treats direct intermediate nodes as ordinary handles during
+/// `getAllPagesInternal`: they stay direct, while any direct leaf beneath them
+/// is materialized. A direct dictionary has no object identity to insert into
+/// `RepairState::visited`, but a direct value cannot form a value-cycle by
+/// itself; indirect back-edges still re-enter [`repair_page_tree`] and are
+/// rejected there.
+fn repair_direct_page_tree<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dict: &mut Dictionary,
+    state: &mut RepairState,
+    depth: usize,
+    media_box: bool,
+) -> Result<()> {
+    if depth >= MAX_DEPTH {
+        return Err(Error::Unsupported(format!(
+            "page tree depth exceeds maximum of {MAX_DEPTH} in direct /Pages node"
+        )));
+    }
+
+    let mut changed = false;
+    if !type_name_is(dict, b"Pages") {
+        dict.insert("Type", Object::Name(b"Pages".to_vec()));
+        changed = true;
+    }
+    let media_box = media_box || is_rectangle(pdf, dict.get("MediaBox"))?;
+    let Some(mut kids) = dict
+        .get("Kids")
+        .and_then(Object::as_array)
+        .map(<[Object]>::to_vec)
+    else {
+        return Ok(());
+    };
+
+    for kid in kids.iter_mut() {
+        let kid_ref = if let Object::Reference(reference) = &*kid {
+            *reference
+        } else if let Object::Dictionary(child) = &mut *kid {
+            if child.get("Kids").is_some() {
+                repair_direct_page_tree(pdf, child, state, depth + 1, media_box)?;
+                changed = true;
+                continue;
+            }
+            let new_ref = state.next_clone;
+            state.next_clone = ObjectRef::new(
+                new_ref.number.checked_add(1).ok_or_else(|| {
+                    Error::Unsupported("object-number space exhausted".to_string())
+                })?,
+                0,
+            );
+            let owned = std::mem::replace(kid, Object::Reference(new_ref));
+            pdf.set_object(new_ref, owned);
+            changed = true;
+            new_ref
+        } else {
+            continue;
+        };
+
+        let (has_kids, leaf_media_box) = match pdf.resolve_borrowed(kid_ref)? {
+            Object::Dictionary(leaf) => (leaf.get("Kids").is_some(), leaf.get("MediaBox").cloned()),
+            _ => continue,
+        };
+        if has_kids {
+            repair_page_tree(pdf, kid_ref, state, depth + 1, media_box)?;
+            continue;
+        }
+        if !media_box && !is_rectangle(pdf, leaf_media_box.as_ref())? {
+            if let Object::Dictionary(mut leaf) = pdf.resolve(kid_ref)? {
+                leaf.insert(
+                    "MediaBox",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ]),
+                );
+                pdf.set_object(kid_ref, Object::Dictionary(leaf));
+            }
+        }
+        let leaf_ref = if state.seen.insert(kid_ref) {
+            kid_ref
+        } else {
+            let clone = pdf.resolve(kid_ref)?;
+            let new_ref = state.next_clone;
+            state.next_clone = ObjectRef::new(
+                new_ref.number.checked_add(1).ok_or_else(|| {
+                    Error::Unsupported("object-number space exhausted".to_string())
+                })?,
+                0,
+            );
+            pdf.set_object(new_ref, clone);
+            state.seen.insert(new_ref);
+            *kid = Object::Reference(new_ref);
+            changed = true;
+            new_ref
+        };
+        let wrong_type = matches!(
+            pdf.resolve_borrowed(leaf_ref)?,
+            Object::Dictionary(leaf) if !type_name_is(leaf, b"Page")
+        );
+        if wrong_type {
+            if let Object::Dictionary(mut leaf) = pdf.resolve(leaf_ref)? {
+                leaf.insert("Type", Object::Name(b"Page".to_vec()));
+                pdf.set_object(leaf_ref, Object::Dictionary(leaf));
+            }
+        }
+        state.pages.push(leaf_ref);
+    }
+
+    if changed {
+        dict.insert("Kids", Object::Array(kids));
+    }
+    Ok(())
+}
+
 fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
     let n = pdf
         .object_refs()
@@ -950,16 +1067,14 @@ mod tests {
     }
 
     #[test]
-    fn self_referential_pages_node_terminates() {
+    fn self_referential_pages_node_is_rejected() {
         let bytes = pdf_with_self_referential_pages_node();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
 
-        // Must return (Ok or Err), not hang. The test harness's own timeout
-        // is the real backstop; this assertion documents the expected outcome.
         let result = push_for_test(&mut pdf);
         assert!(
-            result.is_ok(),
-            "a self-referential /Kids entry must be skipped, not error"
+            matches!(result, Err(Error::Unsupported(ref message)) if message.contains("cycle")),
+            "qpdf rejects a self-referential /Kids entry: {result:?}"
         );
     }
 
@@ -3488,16 +3603,10 @@ mod tests {
         pdf
     }
 
-    /// A direct *interior* node (a direct dict WITH `/Kids`) is out of scope for
-    /// the direct → indirect repair: 11.9.0's `makeIndirectObject` conversion is
-    /// LEAF-ONLY (QPDF_pages.cc:113-118 is in the `else` branch, i.e. a kid with
-    /// no `/Kids`), while a direct interior node is recursed in place (:101-102).
-    /// flpdf's reference-keyed repair pass has no non-reference recursion path, so
-    /// it leaves such a node direct and untouched. This test pins the no-panic
-    /// behavior and that the direct entry stays direct — NOT byte parity (there is
-    /// no qpdf golden for this exotic shape).
+    /// qpdf recurses in place through a direct interior `/Pages` node. It does
+    /// not materialize that node: only direct leaves become indirect.
     #[test]
-    fn direct_interior_node_is_skipped() {
+    fn direct_interior_node_is_traversed_in_place() {
         let bytes = pdf_with_direct_interior_node();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         assert!(
@@ -3506,11 +3615,10 @@ mod tests {
             pdf.repair_diagnostics().entries(), // cov:ignore: message arg formatted only on assertion failure (fixture never reconstructs)
         );
 
-        let result = push_for_test(&mut pdf);
-        assert!(
-            result.is_ok(),
-            "a direct interior node must be skipped, not panic or error: {result:?}"
-        );
+        let prepared = prepare_for_optimization(&mut pdf)
+            .expect("direct interior node must be traversed")
+            .expect("fixture has a page tree");
+        assert_eq!(prepared.pages, vec![ObjectRef::new(3, 0)]);
 
         // The direct interior /Kids entry is left direct (not converted to a ref).
         let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
@@ -3522,7 +3630,7 @@ mod tests {
         };
         assert!(
             matches!(kids.first(), Some(Object::Dictionary(_))),
-            "the direct interior node must stay a direct dict (out-of-scope, not minted)"
+            "qpdf keeps a direct interior node direct while traversing it"
         );
     }
 

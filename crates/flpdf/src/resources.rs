@@ -43,6 +43,7 @@ pub(crate) fn remove_unreferenced_resources_on_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> Result<()> {
+    remove_unreferenced_resources_in_form_xobjects(pdf, page_ref)?;
     let Some(used) = collect_used_names_for_page(pdf, page_ref)? else {
         return Ok(());
     };
@@ -76,6 +77,135 @@ pub(crate) fn remove_unreferenced_resources_on_page<R: Read + Seek>(
     };
     page.insert("Resources", Object::Dictionary(resources));
     pdf.set_object(page_ref, Object::Dictionary(page));
+    Ok(())
+}
+
+/// Mirror qpdf's `forEachFormXObject(true, ...)` pre-pass for a page-resource
+/// scope. Each indirect Form XObject gets its own `/Font` and `/XObject`
+/// dictionaries shallow-copied and pruned before the containing page is
+/// processed. The traversal follows declared `/XObject` resources rather than
+/// only `Do` operators, exactly as qpdf's helper traversal does.
+fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<()> {
+    let Some(page_resources) = crate::pages::resolve_inherited_resources(pdf, page_ref)? else {
+        return Ok(());
+    };
+    let mut pending = form_xobjects_in_resources(pdf, &page_resources)?;
+    let mut visited = BTreeSet::new();
+
+    while let Some(form_ref) = pending.pop() {
+        if !visited.insert(form_ref) {
+            continue;
+        }
+        let Object::Stream(mut form) = pdf.resolve(form_ref)? else {
+            continue;
+        };
+        if !is_form_xobject(&form.dict) {
+            continue;
+        }
+        let resources = match form.dict.get("Resources") {
+            Some(Object::Dictionary(resources)) => Some(resources.clone()),
+            Some(reference @ Object::Reference(_)) => {
+                resolve_ref_chain(pdf, reference)?.0.into_dict()
+            }
+            _ => None,
+        };
+        let Some(mut resources) = resources else {
+            continue;
+        };
+
+        // qpdf discovers nested Forms from the current Form's resource
+        // dictionary independently of whether its content invokes them.
+        pending.extend(form_xobjects_in_resources(pdf, &resources)?);
+
+        let Ok(bytes) = decode_stream_data(&form.dict, &form.data) else {
+            continue;
+        };
+        let Some(used) = collect_direct_used_names(&bytes) else {
+            continue;
+        };
+        prune_font_and_xobject_dictionaries(pdf, &mut resources, &used)?;
+        form.dict.insert("Resources", Object::Dictionary(resources));
+        pdf.set_object(form_ref, Object::Stream(form));
+    }
+    Ok(())
+}
+
+/// Return direct indirect Form XObjects listed in a resource dictionary.
+fn form_xobjects_in_resources<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    resources: &Dictionary,
+) -> Result<Vec<ObjectRef>> {
+    let xobjects = match resources.get("XObject") {
+        Some(Object::Dictionary(dict)) => Some(dict.clone()),
+        Some(reference @ Object::Reference(_)) => resolve_ref_chain(pdf, reference)?.0.into_dict(),
+        _ => None,
+    };
+    let Some(xobjects) = xobjects else {
+        return Ok(Vec::new());
+    };
+    let mut forms = Vec::new();
+    for (_, value) in xobjects.iter() {
+        let Object::Reference(reference) = value else {
+            continue;
+        };
+        let Object::Stream(stream) = pdf.resolve(*reference)? else {
+            continue;
+        };
+        if is_form_xobject(&stream.dict) {
+            forms.push(*reference);
+        }
+    }
+    Ok(forms)
+}
+
+/// Tokenise one content stream without descending into its Form XObjects.
+/// qpdf's per-Form helper uses this direct parse while its outer traversal
+/// handles nested Forms independently.
+fn collect_direct_used_names(stream_bytes: &[u8]) -> Option<UsedNames> {
+    let mut callbacks = ResourceCallbacks {
+        finder: ResourceFinder::default(),
+        inline_header: None,
+        valid_xobjects: BTreeMap::new(),
+        complete: true,
+    };
+    let parsed = parse_content_stream_data(stream_bytes, &mut callbacks);
+    if parsed.is_err() || callbacks.finder.had_diagnostics() || !callbacks.complete {
+        return None;
+    }
+    let mut used = BTreeMap::new();
+    record_direct_names(&mut used, callbacks.finder.names_by_resource_type(), true);
+    Some(used)
+}
+
+/// Shallow-copy qpdf's mutable resource categories then remove names not used
+/// by the directly parsed content stream. Empty category dictionaries remain
+/// present, matching qpdf's `removeKey` loop on the category contents.
+fn prune_font_and_xobject_dictionaries<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    resources: &mut Dictionary,
+    used: &UsedNames,
+) -> Result<()> {
+    for category in [b"Font".as_slice(), b"XObject".as_slice()] {
+        let Some(value) = resources.get(category).cloned() else {
+            continue;
+        };
+        let Some(mut dictionary) = resolve_ref_chain(pdf, &value)?.0.into_dict() else {
+            continue;
+        };
+        let names = used.get(category).cloned().unwrap_or_default();
+        let remove = dictionary
+            .iter()
+            .filter(|(name, _)| !names.contains(*name))
+            .map(|(name, _)| name.to_vec())
+            .collect::<Vec<_>>();
+        for name in remove {
+            dictionary.remove(&name);
+        }
+        resources.insert(category, Object::Dictionary(dictionary));
+    }
     Ok(())
 }
 
