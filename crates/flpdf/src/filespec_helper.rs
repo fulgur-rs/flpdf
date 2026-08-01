@@ -470,13 +470,13 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     pub fn set_filename(
         &mut self,
         unicode_name: impl AsRef<[u8]>,
-        compatibility_name: Option<impl AsRef<[u8]>>,
+        compatibility_name: Option<&[u8]>,
     ) -> Result<()> {
         let mut dict = self.resolve_dict()?;
         let unicode_name = new_unicode_string(unicode_name.as_ref());
         dict.insert("UF", Object::String(unicode_name.clone()));
         let compatibility_name = compatibility_name
-            .map(|name| name.as_ref().to_vec())
+            .map(ToOwned::to_owned)
             .filter(|name| !name.is_empty());
         dict.insert(
             "F",

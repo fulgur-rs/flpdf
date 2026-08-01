@@ -509,7 +509,7 @@ fn filespec_set_filename_normalizes_non_utf8_unicode_bytes_like_qpdf() {
     let mut pdf = open(build_attachment_pdf("", "", b"data"));
     {
         let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
-        fs.set_filename([0xff], None::<&[u8]>).unwrap();
+        fs.set_filename([0xff], None).unwrap();
     }
 
     let Object::Dictionary(filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
