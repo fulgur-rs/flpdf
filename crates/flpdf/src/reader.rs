@@ -994,6 +994,34 @@ impl<R: Read + Seek> Pdf<R> {
             .unwrap_or_else(|_| ObjectHandle::null())
     }
 
+    /// Lift an already-materialized legacy [`Object`] value into a canonical
+    /// [`ObjectHandle`] — the reverse of [`ObjectHandle::materialize`], for a
+    /// caller that holds an `Object` with no live handle of its own (e.g. a
+    /// value copied out into a persisted, `Pdf`-detached structure) but does
+    /// have `&mut Pdf` back in scope. A reference position becomes the same
+    /// canonical registry-backed handle [`Pdf::get_object_handle`] would
+    /// return for that ref (see [`Self::lift_to_handle_bounded`]), so identity
+    /// is preserved with every other handle for the same object.
+    ///
+    /// Bounded at `parser::MAX_PARSE_DEPTH`, not `lift`'s default
+    /// `MAX_INLINE_DEPTH`: `object` already parsed successfully at the looser
+    /// bound (it came from [`Self::resolve_borrowed`] or an equivalent parse),
+    /// so re-lifting through the tighter structural-walk bound would reject a
+    /// value that parse already accepted — the same reasoning
+    /// [`Self::trailer_key_handle`] documents for the analogous trailer-entry
+    /// case.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] for [`Object::Operator`]/
+    /// [`Object::InlineImage`] (content-stream-only tokens with no
+    /// `ObjectValue` representation) or for nesting beyond the depth bound —
+    /// see [`Self::lift_bounded`]. Neither case arises for a value that
+    /// already came from ordinary indirect-object resolution.
+    pub(crate) fn lift_object_to_handle(&mut self, object: &Object) -> Result<ObjectHandle> {
+        self.lift_to_handle_bounded(object, 0, crate::parser::MAX_PARSE_DEPTH)
+    }
+
     pub(crate) fn startxref(&self) -> u64 {
         self.startxref
     }
