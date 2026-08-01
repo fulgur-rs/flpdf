@@ -1495,6 +1495,95 @@ impl<R: Read + Seek> Pdf<R> {
             .clone()
     }
 
+    /// Allocate a fresh object number and register `handle`'s value as its
+    /// indirect object, mirroring `QPDF::makeIndirectObject`
+    /// (`libqpdf/QPDF.cc:1891-1896`, allocating via `nextObjGen()` and
+    /// `obj_cache[next] = ObjCache(obj, -1, -1)`,
+    /// `libqpdf/QPDF.cc:1885-1888`).
+    ///
+    /// The returned handle is a new, distinct object identity: unlike
+    /// qpdf's uniform `shared_ptr<QPDFObject>` (where the caller's original
+    /// handle and the new indirect one end up viewing the exact same
+    /// underlying value, so mutating either mutates both), this crate's
+    /// `Direct`/`Indirect` representations are different storage shapes
+    /// (`object_handle.rs`'s own `Repr` enum) — an internal structural
+    /// deviation only, not an output-byte difference. `handle`'s value is
+    /// cloned into the new indirect slot; further mutation of `handle`
+    /// itself (if the caller kept another clone of it) does not affect the
+    /// returned handle, or vice versa.
+    ///
+    /// Allocation scans both [`Pdf::object_refs`] (the legacy object cache)
+    /// and the handle registry for the highest existing object number
+    /// (`max + 1`, generation `0`) rather than maintaining a running
+    /// counter, matching this crate's existing
+    /// `overlay_appearance_stream.rs::allocate_next_ref` convention.
+    /// `object_refs()` alone is not enough: a ref allocated by a prior call
+    /// to this same method is registered in [`Pdf::get_object_handle`]'s
+    /// handle registry but never written through to the legacy cache, so
+    /// scanning only `object_refs()` would let two back-to-back calls
+    /// compute the same "next" number and the second silently clobber the
+    /// first allocation's value.
+    ///
+    /// This does not validate that any indirect child handle reachable
+    /// from `handle`'s direct value belongs to this same [`Pdf`] — no
+    /// caller in this crate builds a direct value out of another
+    /// document's indirect handles today. Doing so would embed a foreign
+    /// document's live handle into this document's registry, which would
+    /// observe that foreign document's own lifecycle (e.g. going to the
+    /// destroyed state when the foreign `Pdf` is dropped) rather than this
+    /// one's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] if `handle` is indirect, mirroring
+    /// qpdf's own rejection of an already-indirect input
+    /// (`libqpdf/QPDF.cc:1891-1894`, `std::logic_error("attempted to make
+    /// an uninitialized QPDFObjectHandle indirect")` — this crate has no
+    /// "uninitialized handle" state to reject separately, since every
+    /// `ObjectHandle` is always validly constructed).
+    pub fn make_indirect_object_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
+        let Some(value) = handle.direct_value_clone() else {
+            return Err(Error::Unsupported(
+                "cannot make an already-indirect ObjectHandle indirect".to_string(),
+            ));
+        };
+        let next_number = self
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .chain(self.handle_registry.keys().map(|r| r.number))
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+        let new_ref = ObjectRef::new(next_number, 0);
+        let indirect = self.get_object_handle(new_ref);
+        indirect.set_resolved(value);
+        // A new object left out of the dirty set would never get its own
+        // body or xref entry written by a default incremental write,
+        // leaving any reference to it dangling — see `mark_object_dirty`'s
+        // own doc comment for the full explanation.
+        self.mark_object_dirty(new_ref);
+        Ok(indirect)
+    }
+
+    /// Mark `object_ref` dirty, so the next default (incremental) call to
+    /// [`crate::write_pdf`] includes an updated body and xref entry for it.
+    ///
+    /// [`Self::set_object`] and [`Self::delete_object`] already do this
+    /// internally for the legacy `Object`-based mutation path. `ObjectHandle`'s
+    /// own in-place mutation methods (`replace_key`, `remove_key`,
+    /// `merge_resources`, `replace_stream_data`) mutate the live handle
+    /// graph directly and have no back-reference to this `Pdf` to mark
+    /// their own ref dirty — the incremental writer's
+    /// `collect_touched_object_refs` (`writer.rs`) seeds emission
+    /// exclusively from the dirty set, so a mutation made only through one
+    /// of those methods is silently dropped by a default incremental write
+    /// unless the caller also calls this method for the mutated ref.
+    pub fn mark_object_dirty(&mut self, object_ref: ObjectRef) {
+        self.dirty_object_refs.insert(object_ref);
+    }
+
     // This implements the ordering/registration contract of qpdf's
     // `getAllObjects()` (`libqpdf/QPDF.cc:1285-1294`) only. qpdf's own
     // dangling-reference preparation additionally walks every live object's
@@ -4428,6 +4517,186 @@ mod tests {
         // itself drops, so only this test's own local handles remain live.
         assert_eq!(pages.strong_count(), 1);
         assert_eq!(page.strong_count(), 1);
+    }
+
+    #[test]
+    fn make_indirect_object_handle_allocates_a_fresh_ref_and_preserves_the_value() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let direct = ObjectHandle::integer(42);
+        let indirect = pdf
+            .make_indirect_object_handle(direct)
+            .expect("make indirect");
+        assert!(indirect.is_indirect());
+        assert_eq!(indirect.as_integer(), Some(42));
+    }
+
+    #[test]
+    fn make_indirect_object_handle_rejects_an_already_indirect_handle() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let already_indirect = pdf.get_object_handle(ObjectRef::new(1, 0));
+        assert!(pdf.make_indirect_object_handle(already_indirect).is_err());
+    }
+
+    #[test]
+    fn make_indirect_object_handle_allocates_past_the_highest_existing_number() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let max_before = pdf
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        let indirect = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(1))
+            .expect("make indirect");
+        assert!(indirect.object_ref().unwrap().number > max_before);
+    }
+
+    #[test]
+    fn make_indirect_object_handle_works_for_a_handle_with_other_outstanding_clones() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let direct = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
+        let clone_kept_by_caller = direct.clone();
+        let indirect = pdf
+            .make_indirect_object_handle(direct)
+            .expect("make indirect even though a clone is still outstanding");
+        assert_eq!(indirect.get_key(b"A").as_integer(), Some(1));
+        // The new indirect handle is its own object; mutating the original
+        // direct clone the caller kept does not affect it (Rust's Direct
+        // and Indirect slots are distinct storage, unlike qpdf's uniform
+        // shared_ptr<QPDFObject> -- see make_indirect_object_handle's own
+        // doc comment).
+        clone_kept_by_caller.replace_key(b"A", ObjectHandle::integer(99));
+        assert_eq!(indirect.get_key(b"A").as_integer(), Some(1));
+    }
+
+    #[test]
+    fn make_indirect_object_handle_gives_a_stream_its_own_independent_dict() {
+        // Regression test: cloning a direct Stream value naively (the
+        // #[derive(Clone)] every other variant gets) would deep-clone
+        // `data` but Rc-share `dict` with the caller's original handle --
+        // the same asymmetry `shallow_copy` was fixed for. Mutating the
+        // *original* handle's stream data after making it indirect must
+        // not affect the new indirect object's dictionary.
+        let dict = ObjectHandle::dictionary(vec![]);
+        let direct_stream = ObjectHandle::from_value(ObjectValue::Stream {
+            dict: dict.clone(),
+            data: b"old".to_vec(),
+        });
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let indirect = pdf
+            .make_indirect_object_handle(direct_stream)
+            .expect("make indirect");
+
+        dict.replace_key(b"Length", ObjectHandle::integer(999));
+
+        assert!(
+            indirect
+                .as_stream_dict()
+                .unwrap()
+                .get_key(b"Length")
+                .is_null(),
+            "the new indirect object's dict must not observe a mutation \
+             made through the original handle's dict"
+        );
+    }
+
+    #[test]
+    fn make_indirect_object_handle_allocates_distinct_refs_across_repeated_calls() {
+        // Regression test: a ref allocated by this method is registered in
+        // `handle_registry` but never written through to the legacy
+        // `object_refs()` cache, so scanning only `object_refs()` for the
+        // "next" number would let a second call compute the same number as
+        // the first and silently clobber its value via `set_resolved`.
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let first = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(1))
+            .expect("make first indirect");
+        let second = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(2))
+            .expect("make second indirect");
+        assert_ne!(
+            first.object_ref().unwrap(),
+            second.object_ref().unwrap(),
+            "repeated calls must allocate distinct object numbers"
+        );
+        assert_eq!(first.as_integer(), Some(1));
+        assert_eq!(second.as_integer(), Some(2));
+    }
+
+    #[test]
+    fn make_indirect_object_handle_survives_a_default_incremental_write() {
+        // Regression test: the new object must be registered as dirty, or
+        // the incremental writer's `collect_touched_object_refs` (which
+        // seeds emission exclusively from `Pdf::dirty_object_refs`) never
+        // writes its body or xref entry, leaving the reference below
+        // dangling (resolving to `Object::Null` on reopen).
+        use crate::write_pdf;
+
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let new_object = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(777))
+            .expect("make indirect");
+        let new_ref = new_object.object_ref().unwrap();
+
+        let root_ref = ObjectRef::new(1, 0);
+        let mut root_dict = pdf
+            .resolve(root_ref)
+            .expect("resolve root")
+            .into_dict()
+            .unwrap();
+        root_dict.insert("Extra", Object::Reference(new_ref));
+        pdf.set_object(root_ref, Object::Dictionary(root_dict));
+
+        let mut out = Vec::new();
+        write_pdf(&mut pdf, &mut out).expect("incremental write");
+
+        let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
+        let resolved_root = reopened
+            .resolve(root_ref)
+            .expect("resolve root in reopened output");
+        let extra_ref = resolved_root
+            .into_dict()
+            .and_then(|d| d.get("Extra").cloned())
+            .expect("root has /Extra");
+        assert_eq!(extra_ref, Object::Reference(new_ref));
+        assert_eq!(
+            reopened.resolve(new_ref).expect("resolve new object"),
+            Object::Integer(777),
+            "new object must not be dangling after an incremental write"
+        );
+    }
+
+    #[test]
+    fn mark_object_dirty_makes_a_replace_key_mutation_survive_a_default_incremental_write() {
+        // Regression test: ObjectHandle::replace_key mutates the live
+        // handle graph directly and has no path back to Pdf's dirty
+        // bookkeeping. Without an explicit `mark_object_dirty` call, the
+        // incremental writer's `collect_touched_object_refs` never sees
+        // the mutated ref and silently drops the change from the output.
+        use crate::write_pdf;
+
+        let page_ref = ObjectRef::new(3, 0);
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve_object_handle(&page).expect("resolve page");
+        page.replace_key(b"Rotate", ObjectHandle::integer(90));
+        pdf.mark_object_dirty(page_ref);
+
+        let mut out = Vec::new();
+        write_pdf(&mut pdf, &mut out).expect("incremental write");
+
+        let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
+        let resolved_page = reopened
+            .resolve(page_ref)
+            .expect("resolve page in reopened output")
+            .into_dict()
+            .expect("page is a dictionary");
+        assert_eq!(
+            resolved_page.get("Rotate"),
+            Some(&Object::Integer(90)),
+            "replace_key mutation must survive a default incremental write once marked dirty"
+        );
     }
 
     fn classic_pdf_with_bodies(bodies: &[&[u8]], root: ObjectRef) -> Vec<u8> {

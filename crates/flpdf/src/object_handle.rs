@@ -17,6 +17,13 @@ use std::rc::Rc;
 /// `libqpdf/qpdf/QPDFValue.hh:90-100,149-152`).
 pub(crate) const NO_PARSED_OFFSET: i64 = -1;
 
+/// The conflicts-tracking map [`ObjectHandle::merge_resources`] populates:
+/// `rtype -> old_key -> new_key`, mirroring
+/// `QPDFObjectHandle::mergeResources`'s own
+/// `std::map<std::string, std::map<std::string, std::string>>` parameter.
+pub type ResourceConflicts =
+    std::collections::BTreeMap<Vec<u8>, std::collections::BTreeMap<Vec<u8>, Vec<u8>>>;
+
 /// A shared, cloneable handle to a PDF object.
 ///
 /// Cloning a handle is O(1) and does not deep-copy the underlying value;
@@ -78,7 +85,7 @@ enum Repr {
 /// Array and dictionary children are [`ObjectHandle`]s rather than raw
 /// nested `ObjectValue`s, so cloning a container clones only `Rc` handles
 /// (O(1) per child), not the subtree.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum ObjectValue {
     Null,
     Boolean(bool),
@@ -247,6 +254,35 @@ impl ObjectHandle {
             // forces every top-level parse to `Integer`, never a reference,
             // so the handle it builds and consumes here is always direct.
             Repr::Indirect(_) => None, // cov:ignore: unreachable per the invariant noted above
+        }
+    }
+
+    /// This handle's value, cloned, if it is direct — `None` for an
+    /// indirect handle. Unlike [`Self::into_direct_value`], this works
+    /// regardless of how many other clones of this handle are outstanding
+    /// (it clones the value rather than requiring exclusive `Rc`
+    /// ownership). Used by `Pdf::make_indirect_object_handle`, which
+    /// cannot assume its caller holds the only reference to the direct
+    /// handle it passes in.
+    ///
+    /// A `Stream` value's `dict` gets the same `shallow_copy_child`
+    /// treatment [`Self::shallow_copy`] gives it, rather than the plain
+    /// `ObjectValue::clone()` every other variant gets: `#[derive(Clone)]`
+    /// would leave `dict` Rc-shared with `self` while deep-cloning `data`,
+    /// so a later `replace_stream_data` on either handle would update the
+    /// other's `/Length`/`/Filter`/`/DecodeParms` without touching its
+    /// (independently cloned) data bytes — the exact asymmetry
+    /// `shallow_copy`'s own doc comment explains for that method.
+    pub(crate) fn direct_value_clone(&self) -> Option<ObjectValue> {
+        match &self.0 {
+            Repr::Direct(slot) => Some(match &slot.borrow().value {
+                ObjectValue::Stream { dict, data } => ObjectValue::Stream {
+                    dict: shallow_copy_child(dict),
+                    data: data.clone(),
+                },
+                other => other.clone(),
+            }),
+            Repr::Indirect(_) => None,
         }
     }
 
@@ -551,6 +587,276 @@ impl ObjectHandle {
         })
     }
 
+    /// The value at `key` if this handle's value is a dictionary and `key`
+    /// is present, or a direct null handle otherwise (a missing key, or
+    /// this handle not being a dictionary at all) — mirrors
+    /// `QPDFObjectHandle::getKey`'s own "returns null for a missing key or
+    /// a non-dictionary handle" contract (`libqpdf/QPDFObjectHandle.cc:979-988`).
+    /// Unlike
+    /// [`Self::as_dictionary`], this never snapshots the whole dictionary —
+    /// it returns the one live child handle directly, so a caller that only
+    /// needs one key does not pay for every sibling. Never performs
+    /// resolution itself.
+    pub fn get_key(&self, key: &[u8]) -> ObjectHandle {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
+            _ => None,
+        })
+        .unwrap_or_else(ObjectHandle::null)
+    }
+
+    /// True if this handle's value is a dictionary that has `key`, distinct
+    /// from [`Self::get_key`] returning a null handle for `key` (which
+    /// cannot tell a missing key apart from one whose value is genuinely
+    /// null) — mirrors `QPDFObjectHandle::hasKey`
+    /// (`libqpdf/QPDFObjectHandle.cc:966-976`). `false` for a non-dictionary
+    /// handle. Never performs resolution itself.
+    pub fn has_key(&self, key: &[u8]) -> bool {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Dictionary(entries)) => entries.contains_key(key),
+            _ => false,
+        })
+    }
+
+    /// Insert or overwrite `key` in this handle's dictionary with `value`,
+    /// mutating the live value every other clone of this handle also
+    /// observes — mirrors `QPDFObjectHandle::replaceKey`
+    /// (`libqpdf/QPDFObjectHandle.cc:1199-1209`). A no-op on a
+    /// non-dictionary handle or an unresolved/missing/destroyed indirect
+    /// handle, matching qpdf's own `typeWarning`-and-ignore contract rather
+    /// than panicking. Also a no-op if `value` is the same direct handle as
+    /// `self` — inserting a dictionary into itself would otherwise create a
+    /// direct cycle that none of this crate's recursive walkers
+    /// (`shallow_copy`, `materialize`, `Debug`) guard against, since they
+    /// only stop recursion at an indirect-handle boundary. This does not
+    /// detect a multi-hop reciprocal cycle built from two or more
+    /// `replace_key` calls across distinct direct dictionaries. Unlike
+    /// qpdf's `replaceKey`, this does not check that `value` belongs to the
+    /// same document (`checkOwnership`) — no caller in this crate crosses
+    /// document boundaries this way today. Never performs resolution
+    /// itself.
+    ///
+    /// This mutates the live handle graph directly. If `self`'s ref has
+    /// already been read through [`crate::Pdf::resolve`] or
+    /// [`crate::Pdf::resolve_borrowed`], those methods cache the
+    /// materialized value the first time a ref is resolved and do not
+    /// re-derive it — a later call to either will keep returning the
+    /// pre-mutation value for that ref rather than observing this change.
+    /// Callers that need `resolve`/`resolve_borrowed` to reflect a
+    /// mutation made through this API must not have resolved the same ref
+    /// through them first.
+    ///
+    /// This also has no path to inform the owning [`crate::Pdf`] that
+    /// `self`'s ref changed. A default (incremental) call to
+    /// [`crate::write_pdf`] emits only refs marked dirty by
+    /// [`crate::Pdf::set_object`]/[`crate::Pdf::delete_object`] — after
+    /// mutating an already-registered indirect handle through this method,
+    /// call [`crate::Pdf::mark_object_dirty`] with the same ref or the
+    /// change is silently dropped from the written output.
+    pub fn replace_key(&self, key: &[u8], value: ObjectHandle) {
+        if self.is_same_direct_handle(&value) {
+            return;
+        }
+        self.with_value_mut(|v| {
+            if let Some(ObjectValue::Dictionary(entries)) = v {
+                entries.insert(key.to_vec(), value);
+            }
+        });
+    }
+
+    /// True if `self` and `other` are both direct handles sharing the same
+    /// underlying storage — i.e. `other` is `self` itself (or a clone of
+    /// it), not merely a distinct direct handle with an equal value. Unlike
+    /// [`Self::ptr_eq`], an indirect/indirect match returns `false` here:
+    /// an indirect handle referencing itself is not a direct cycle and is
+    /// already handled correctly by every recursive walker's
+    /// indirect-boundary stop.
+    fn is_same_direct_handle(&self, other: &Self) -> bool {
+        matches!((&self.0, &other.0), (Repr::Direct(a), Repr::Direct(b)) if Rc::ptr_eq(a, b))
+    }
+
+    /// Remove `key` from this handle's dictionary if present, mutating the
+    /// live value every other clone of this handle also observes — mirrors
+    /// `QPDFObjectHandle::removeKey` (`libqpdf/QPDFObjectHandle.cc:1226-1234`).
+    /// A no-op if `key` is absent, this handle is not a dictionary, or the
+    /// indirect handle is unresolved/missing/destroyed. Never performs
+    /// resolution itself.
+    ///
+    /// See [`Self::replace_key`]'s doc comment for the same
+    /// `resolve`/`resolve_borrowed` staleness caveat and the
+    /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too.
+    pub fn remove_key(&self, key: &[u8]) {
+        self.with_value_mut(|v| {
+            if let Some(ObjectValue::Dictionary(entries)) = v {
+                entries.remove(key);
+            }
+        });
+    }
+
+    /// A fresh, direct handle with a value copied from `self` — mirrors
+    /// `QPDFObjectHandle::shallowCopy` (`libqpdf/QPDFObjectHandle.cc:2073-2079`,
+    /// which defers to each type's own `copy(shallow=false)` default —
+    /// `libqpdf/QPDF_Dictionary.cc`/`libqpdf/QPDF_Array.cc`). Despite the
+    /// name, this recursively copies through every *direct* array/dictionary
+    /// descendant (each direct child is itself shallow-copied), stopping
+    /// only at an *indirect* child, which keeps its existing shared
+    /// identity rather than being copied — "shallow" describes not
+    /// resolving/duplicating through indirection, not a single-level-only
+    /// copy. A scalar value is cloned outright. Always returns a direct
+    /// handle regardless of whether `self` is indirect. Never performs
+    /// resolution itself: shallow-copying an unresolved/missing/destroyed
+    /// indirect handle produces a direct null handle, matching every other
+    /// accessor's "no hidden I/O" rule.
+    ///
+    /// qpdf's own `QPDF_Stream::copy` throws outright ("stream objects
+    /// cannot be cloned", `libqpdf/QPDF_Stream.cc`), and this crate has no
+    /// exception channel to mirror that with — the same precedent
+    /// [`Self::unparse_resolved`]'s own doc comment already establishes for
+    /// a different qpdf-throws case. Instead of leaving a stream's `dict`
+    /// Rc-shared with the source (which would let a later
+    /// [`Self::replace_stream_data`] on the copy silently corrupt the
+    /// source's `/Length`/`/Filter`/`/DecodeParms`), a stream's `dict` is
+    /// treated as a child exactly like an array/dictionary entry: copied
+    /// independently when direct, shared when indirect.
+    pub fn shallow_copy(&self) -> ObjectHandle {
+        stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+            self.with_value(|value| match value {
+                Some(v) => ObjectHandle::from_value(shallow_copy_value(v)),
+                None => ObjectHandle::null(),
+            })
+        })
+    }
+
+    /// Merge `other`'s top-level entries into this handle's dictionary,
+    /// mirroring `QPDFObjectHandle::mergeResources`
+    /// (`libqpdf/QPDFObjectHandle.cc:1063-1153`; intended for merging two
+    /// `/Resources`- or `/DR`-shaped dictionaries, per its own header doc,
+    /// `include/qpdf/QPDFObjectHandle.hh:820-829`). `conflicts`, if given,
+    /// records `rtype -> old_key -> new_key` for some (not all — see below)
+    /// inner keys `other` had that collided with an existing key under the
+    /// same top-level `rtype`.
+    ///
+    /// A no-op unless both `self` and `other` are dictionaries. For each of
+    /// `other`'s top-level entries `(rtype, other_val)`:
+    /// - if `self` has no `rtype` key yet, `other_val` is privatized via
+    ///   [`Self::shallow_copy`] and installed via [`Self::replace_key`].
+    /// - if `self`'s existing `rtype` value and `other_val` are both
+    ///   dictionaries: `self`'s value is privatized first if it is
+    ///   indirect (`shallow_copy` + `replace_key`, mirroring
+    ///   `replaceKeyAndGetNew`'s combined mutate-and-rebind). Then each of
+    ///   `other_val`'s own entries is merged in: a key the (now-private)
+    ///   sub-dictionary does not have yet is installed directly
+    ///   (privatized first unless already indirect); a key it already has
+    ///   is left untouched unless `conflicts` is given, in which case an
+    ///   incoming *indirect* value whose object identity already exists
+    ///   somewhere in the sub-dictionary (as of the first such conflict
+    ///   this call encounters — a snapshot taken once per `rtype`, not
+    ///   re-taken per key) is reused under its existing name (`conflicts`
+    ///   records this rename only when that existing name differs from the
+    ///   incoming key — no rename is recorded, and nothing is installed,
+    ///   when they already match); anything else is installed verbatim
+    ///   under a freshly minted unique name (`conflicts` always records
+    ///   this one).
+    /// - if `self`'s existing `rtype` value and `other_val` are both
+    ///   arrays: every scalar item in `other_val` whose
+    ///   [`Self::unparse`] text does not already match a scalar item
+    ///   already in `self`'s array is appended to it — a set union by
+    ///   unparsed text, not object identity.
+    /// - any other existing-`rtype` shape combination (mismatched types,
+    ///   or neither dictionary nor array) leaves that entry untouched.
+    ///
+    /// The uniqueness pool for a freshly minted name is
+    /// `this_val.getResourceNames()`'s own "second-level keys" definition
+    /// (`libqpdf/QPDFObjectHandle.cc:1156-1170`) applied to the *inner*
+    /// sub-dictionary itself, not to `self` as a whole — i.e. the keys of
+    /// whichever of the sub-dictionary's *own* values are themselves
+    /// dictionaries, not the sub-dictionary's own key set. This looks like
+    /// it checks the wrong level (it does not, in general, collect the
+    /// F1/F2-style names actually in scope), but it is qpdf's real,
+    /// verified behavior, not a paraphrase — port it exactly rather than
+    /// the more "sensible"-looking alternative of the sub-dictionary's own
+    /// keys.
+    ///
+    /// See [`Self::replace_key`]'s doc comment for the same
+    /// `resolve`/`resolve_borrowed` staleness caveat and the
+    /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too,
+    /// since this method installs and rebinds entries via `replace_key`.
+    pub fn merge_resources(
+        &self,
+        other: &ObjectHandle,
+        mut conflicts: Option<&mut ResourceConflicts>,
+    ) {
+        let (Some(_), Some(other_entries)) = (self.as_dictionary(), other.as_dictionary()) else {
+            return;
+        };
+        for (rtype, other_val) in other_entries {
+            if !self.has_key(&rtype) {
+                self.replace_key(&rtype, other_val.shallow_copy());
+                continue;
+            }
+            let mut this_val = self.get_key(&rtype);
+            if this_val.as_dictionary().is_some() && other_val.as_dictionary().is_some() {
+                if this_val.is_indirect() {
+                    let privatized = this_val.shallow_copy();
+                    self.replace_key(&rtype, privatized.clone());
+                    this_val = privatized;
+                }
+                merge_resource_subdict(&this_val, &other_val, &rtype, conflicts.as_deref_mut());
+            } else if this_val.as_array().is_some() && other_val.as_array().is_some() {
+                merge_resource_array(&this_val, &other_val);
+            }
+            // Any other shape combination for an existing rtype: untouched,
+            // matching qpdf's own fallthrough (neither the dictionary nor
+            // the array arm matches, and there is no further branch).
+        }
+    }
+
+    /// Replace this handle's stream data, and — when given — its `/Filter`
+    /// and `/DecodeParms` dictionary keys, mirroring
+    /// `QPDFObjectHandle::replaceStreamData`'s buffer overload
+    /// (`libqpdf/QPDFObjectHandle.cc:1345-1350`, delegating to
+    /// `QPDF_Stream::replaceStreamData`/`replaceFilterData`,
+    /// `libqpdf/QPDF_Stream.cc:637-649,669-685`). `filter`/`decode_parms`
+    /// are `Some` exactly where qpdf's own overload checks
+    /// `QPDFObjectHandle::isInitialized()`: `Some` installs the key via
+    /// [`Self::replace_key`], `None` leaves it untouched rather than
+    /// removing it. `/Length` is always set to `data`'s byte length —
+    /// qpdf's "unknown length, remove `/Length`" branch only applies to its
+    /// deferred-`StreamDataProvider` overloads, which this method does not
+    /// port (no caller in this crate needs deferred stream production). A
+    /// no-op if this handle's value is not a stream.
+    ///
+    /// See [`Self::replace_key`]'s doc comment for the same
+    /// `resolve`/`resolve_borrowed` staleness caveat and the
+    /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too,
+    /// since this method installs `/Filter`/`/DecodeParms`/`/Length` via
+    /// `replace_key` and mutates the stream data in place.
+    pub fn replace_stream_data(
+        &self,
+        data: Vec<u8>,
+        filter: Option<ObjectHandle>,
+        decode_parms: Option<ObjectHandle>,
+    ) {
+        let Some(dict) = self.as_stream_dict() else {
+            return;
+        };
+        if let Some(filter) = filter {
+            dict.replace_key(b"Filter", filter);
+        }
+        if let Some(decode_parms) = decode_parms {
+            dict.replace_key(b"DecodeParms", decode_parms);
+        }
+        dict.replace_key(
+            b"Length",
+            ObjectHandle::integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
+        );
+        self.with_value_mut(|v| {
+            if let Some(ObjectValue::Stream { data: existing, .. }) = v {
+                *existing = data;
+            }
+        });
+    }
+
     /// The stream's own dictionary handle if this handle's value — its own
     /// if direct, or its already-resolved value if indirect — is a stream,
     /// or `None` otherwise. This never performs resolution itself: an
@@ -707,6 +1013,24 @@ impl ObjectHandle {
                 IndirectState::NotYetResolved => f(None),
                 IndirectState::Resolved(value) => f(Some(value)),
                 IndirectState::Missing | IndirectState::Destroyed => f(Some(&ObjectValue::Null)),
+            },
+        }
+    }
+
+    // Mutable twin of `with_value` above: `None` for an indirect handle not
+    // yet resolved (mutation on an unresolved handle must not perform
+    // hidden I/O, same rule as every read accessor), and for
+    // `Missing`/`Destroyed` (there is no live `ObjectValue::Null` slot to
+    // hand out a `&mut` into — those states only *present* as null, they do
+    // not store one).
+    fn with_value_mut<T>(&self, f: impl FnOnce(Option<&mut ObjectValue>) -> T) -> T {
+        match &self.0 {
+            Repr::Direct(slot) => f(Some(&mut slot.borrow_mut().value)),
+            Repr::Indirect(slot) => match &mut slot.borrow_mut().state {
+                IndirectState::Resolved(value) => f(Some(value)),
+                IndirectState::NotYetResolved
+                | IndirectState::Missing
+                | IndirectState::Destroyed => f(None),
             },
         }
     }
@@ -950,6 +1274,210 @@ fn unparse_materialize_child(handle: &ObjectHandle) -> Object {
         Some(object_ref) => Object::Reference(object_ref),
         None => unparse_materialize(handle),
     }
+}
+
+// `ObjectHandle::shallow_copy`'s per-variant dispatch: an Array/Dictionary
+// child is recursively shallow-copied through `shallow_copy_child` (which
+// re-enters `ObjectHandle::shallow_copy`, the recursion hub carrying its
+// own `stacker::maybe_grow` wrap — the same hub-per-call shape as
+// `unparse_materialize`/`unparse_materialize_child` above). A `Stream`'s
+// `dict` field is a child in exactly the same sense as an array/dictionary
+// entry and gets the same `shallow_copy_child` treatment, so the copy's
+// dictionary is independent of the source's rather than Rc-shared while
+// only `data` is deep-cloned (see `shallow_copy`'s own doc comment). Every
+// other variant is cloned as-is with no further recursion.
+fn shallow_copy_value(value: &ObjectValue) -> ObjectValue {
+    match value {
+        ObjectValue::Array(items) => {
+            ObjectValue::Array(items.iter().map(shallow_copy_child).collect())
+        }
+        ObjectValue::Dictionary(entries) => ObjectValue::Dictionary(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), shallow_copy_child(v)))
+                .collect(),
+        ),
+        ObjectValue::Stream { dict, data } => ObjectValue::Stream {
+            dict: shallow_copy_child(dict),
+            data: data.clone(),
+        },
+        other => other.clone(),
+    }
+}
+
+fn shallow_copy_child(child: &ObjectHandle) -> ObjectHandle {
+    if child.is_indirect() {
+        child.clone()
+    } else {
+        child.shallow_copy()
+    }
+}
+
+// `ObjectHandle::merge_resources`'s per-rtype dictionary merge (the
+// `this_val.isDictionary() && other_val.isDictionary()` arm of
+// `QPDFObjectHandle::mergeResources`, `libqpdf/QPDFObjectHandle.cc:1095-1129`).
+// `this_val` is already the privatized (non-indirect) sub-dictionary by the
+// time this is called.
+fn merge_resource_subdict(
+    this_val: &ObjectHandle,
+    other_val: &ObjectHandle,
+    rtype: &[u8],
+    mut conflicts: Option<&mut ResourceConflicts>,
+) {
+    let mut og_to_name: Option<std::collections::HashMap<ObjectRef, Vec<u8>>> = None;
+    let mut rnames: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    let mut min_suffix: usize = 1;
+    let Some(other_sub_entries) = other_val.as_dictionary() else {
+        return; // cov:ignore: caller already confirmed other_val.as_dictionary().is_some()
+    };
+    for (key, rval) in other_sub_entries {
+        if !this_val.has_key(&key) {
+            let installed = if rval.is_indirect() {
+                rval
+            } else {
+                rval.shallow_copy()
+            };
+            this_val.replace_key(&key, installed);
+            continue;
+        }
+        let Some(conflicts_map) = conflicts.as_deref_mut() else {
+            continue;
+        };
+        if og_to_name.is_none() {
+            og_to_name = Some(build_og_to_name(this_val));
+            rnames = get_resource_names(this_val);
+        }
+        let reused = rval
+            .object_ref()
+            .and_then(|r| og_to_name.as_ref().and_then(|m| m.get(&r).cloned()));
+        if let Some(existing_key) = reused {
+            if existing_key != key {
+                conflicts_map
+                    .entry(rtype.to_vec())
+                    .or_default()
+                    .insert(key, existing_key);
+            }
+        } else {
+            let new_key = unique_resource_name(&key, &mut min_suffix, &rnames);
+            conflicts_map
+                .entry(rtype.to_vec())
+                .or_default()
+                .insert(key, new_key.clone());
+            this_val.replace_key(&new_key, rval);
+        }
+    }
+}
+
+// `ObjectHandle::merge_resources`'s per-rtype array merge (the
+// `this_val.isArray() && other_val.isArray()` arm,
+// `libqpdf/QPDFObjectHandle.cc:1130-1146`): union `other_val`'s scalar
+// items into `this_val` by unparsed text, appending only what is not
+// already present.
+fn merge_resource_array(this_val: &ObjectHandle, other_val: &ObjectHandle) {
+    let Some(other_items) = other_val.as_array() else {
+        return; // cov:ignore: caller already confirmed other_val.as_array().is_some()
+    };
+    let mut scalars: std::collections::BTreeSet<Vec<u8>> = this_val
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(is_scalar)
+        .map(|item| item.unparse())
+        .collect();
+    for item in other_items {
+        if !is_scalar(&item) {
+            continue;
+        }
+        let text = item.unparse();
+        if scalars.insert(text) {
+            append_array_item(this_val, item);
+        }
+    }
+}
+
+fn append_array_item(handle: &ObjectHandle, item: ObjectHandle) {
+    handle.with_value_mut(|v| {
+        if let Some(ObjectValue::Array(items)) = v {
+            items.push(item);
+        }
+    });
+}
+
+// Mirrors `isScalar()` (`libqpdf/QPDFObjectHandle.cc:450-453`): bool,
+// integer, name, null, real, or string. Checks only already-resolved/
+// direct state, matching every other accessor in this file's "no hidden
+// I/O" rule.
+fn is_scalar(handle: &ObjectHandle) -> bool {
+    handle.as_boolean().is_some()
+        || handle.as_integer().is_some()
+        || handle.as_name().is_some()
+        || handle.is_null()
+        || handle.as_real().is_some()
+        || handle.as_string().is_some()
+}
+
+// Mirrors `mergeResources`'s local `make_og_to_name` lambda
+// (`libqpdf/QPDFObjectHandle.cc:1071-1078`): every currently-indirect
+// entry in `dict`, keyed by object identity.
+fn build_og_to_name(dict: &ObjectHandle) -> std::collections::HashMap<ObjectRef, Vec<u8>> {
+    let mut map = std::collections::HashMap::new();
+    if let Some(entries) = dict.as_dictionary() {
+        for (key, value) in entries {
+            if let Some(object_ref) = value.object_ref() {
+                map.insert(object_ref, key);
+            }
+        }
+    } // cov:ignore: control-flow marker — llvm-cov instrumentation artifact; the body above is exercised by merge_resources_reuses_an_existing_key_for_the_same_indirect_object
+    map
+}
+
+// Mirrors `getResourceNames` (`libqpdf/QPDFObjectHandle.cc:1156-1170`,
+// `include/qpdf/QPDFObjectHandle.hh:831-835`): the union of every key
+// belonging to a dictionary-valued entry of `dict` -- i.e. `dict`'s own
+// *grandchildren's* keys, not `dict`'s own keys. See `merge_resources`'s
+// own doc comment for why this is the correct level to port here despite
+// looking mismatched against its call site.
+fn get_resource_names(dict: &ObjectHandle) -> std::collections::BTreeSet<Vec<u8>> {
+    let mut result = std::collections::BTreeSet::new();
+    if let Some(entries) = dict.as_dictionary() {
+        for (_, value) in entries {
+            if let Some(sub_entries) = value.as_dictionary() {
+                result.extend(sub_entries.into_keys());
+            }
+        }
+    } // cov:ignore: control-flow marker — llvm-cov instrumentation artifact; the body above is exercised by merge_resources_mints_a_second_unique_name_when_the_first_candidate_is_taken
+    result
+}
+
+// Mirrors `getUniqueResourceName` (`libqpdf/QPDFObjectHandle.cc:1175-1192`):
+// append a decimal suffix (starting at `*min_suffix`) to `key` + `"_"`
+// until the result is absent from `names`, leaving `*min_suffix` at the
+// value just used (not incremented past it -- a caller minting several
+// names in the same sub-dictionary reuses the search position, matching
+// qpdf's own "used, not next" contract).
+fn unique_resource_name(
+    key: &[u8],
+    min_suffix: &mut usize,
+    names: &std::collections::BTreeSet<Vec<u8>>,
+) -> Vec<u8> {
+    let mut prefix = key.to_vec();
+    prefix.push(b'_');
+    let max_suffix = *min_suffix + names.len();
+    while *min_suffix <= max_suffix {
+        let mut candidate = prefix.clone();
+        candidate.extend(min_suffix.to_string().into_bytes());
+        if !names.contains(&candidate) {
+            return candidate;
+        }
+        *min_suffix += 1;
+    }
+    // Unreachable per qpdf's own invariant: this loop tests strictly more
+    // candidates (names.len() + 1) than there are names to conflict with,
+    // so by pigeonhole one must be free. qpdf itself treats reaching this
+    // point as a coding error (throws std::logic_error); this crate has no
+    // exception channel to mirror that with, so panic the same way an
+    // internal invariant violation elsewhere in this crate would.
+    unreachable!("no unconflicting resource name found") // cov:ignore: unreachable, see comment above
 }
 
 // True if `handle`'s value is already known (no resolution performed here)
@@ -1992,5 +2520,532 @@ mod unparse_tests {
         // literal "null" token rather than skipping them).
         let array = ObjectHandle::array(vec![ObjectHandle::integer(1), ObjectHandle::null()]);
         assert_eq!(array.unparse_resolved(), b"[ 1 null ]");
+    }
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+
+    #[test]
+    fn object_value_clone_preserves_scalar_content() {
+        let value = ObjectValue::Integer(42);
+        let cloned = value.clone();
+        assert!(matches!(cloned, ObjectValue::Integer(42)));
+    }
+
+    #[test]
+    fn object_value_clone_of_a_dictionary_shares_child_identity() {
+        let child = ObjectHandle::integer(7);
+        let dict = ObjectValue::Dictionary([(b"K".to_vec(), child.clone())].into_iter().collect());
+        let cloned = dict.clone();
+        let ObjectValue::Dictionary(entries) = cloned else {
+            panic!("expected dictionary"); // cov:ignore: unreachable in a passing run
+        };
+        assert!(entries.get(b"K".as_slice()).unwrap().ptr_eq(&child));
+    }
+
+    #[test]
+    fn get_key_returns_a_live_child_handle_without_snapshotting_the_dictionary() {
+        let child = ObjectHandle::integer(1);
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), child.clone())]);
+        let fetched = dict.get_key(b"A");
+        assert!(fetched.ptr_eq(&child));
+    }
+
+    #[test]
+    fn get_key_on_a_missing_key_returns_a_direct_null_handle() {
+        let dict = ObjectHandle::dictionary(vec![]);
+        assert!(dict.get_key(b"Missing").is_null());
+    }
+
+    #[test]
+    fn get_key_on_a_non_dictionary_handle_returns_a_direct_null_handle() {
+        let scalar = ObjectHandle::integer(5);
+        assert!(scalar.get_key(b"A").is_null());
+    }
+
+    #[test]
+    fn replace_key_mutates_the_live_dictionary_in_place() {
+        let dict = ObjectHandle::dictionary(vec![]);
+        let clone = dict.clone();
+        dict.replace_key(b"A", ObjectHandle::integer(9));
+        assert_eq!(clone.get_key(b"A").as_integer(), Some(9));
+    }
+
+    #[test]
+    fn replace_key_overwrites_an_existing_key() {
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
+        dict.replace_key(b"A", ObjectHandle::integer(2));
+        assert_eq!(dict.get_key(b"A").as_integer(), Some(2));
+    }
+
+    #[test]
+    fn replace_key_on_a_non_dictionary_handle_is_a_no_op() {
+        let scalar = ObjectHandle::integer(1);
+        scalar.replace_key(b"A", ObjectHandle::integer(2));
+        assert_eq!(scalar.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn replace_key_rejects_inserting_a_direct_dictionary_into_itself() {
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
+        let self_clone = dict.clone();
+        dict.replace_key(b"Self", self_clone);
+        assert!(dict.get_key(b"Self").is_null());
+        // The rest of the dictionary is untouched by the rejected insert.
+        assert_eq!(dict.get_key(b"A").as_integer(), Some(1));
+    }
+
+    #[test]
+    fn replace_key_allows_an_indirect_handle_to_reference_itself() {
+        // Unlike a direct self-insertion, an indirect handle referencing
+        // itself is not a direct cycle -- every recursive walker already
+        // stops at the indirect boundary, so this must remain a normal
+        // insert rather than being rejected as a no-op.
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 0), -1);
+        indirect.set_resolved(ObjectValue::Dictionary(Default::default()));
+        indirect.replace_key(b"Self", indirect.clone());
+        assert!(indirect.get_key(b"Self").is_indirect());
+    }
+
+    #[test]
+    fn remove_key_deletes_a_present_key() {
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
+        dict.remove_key(b"A");
+        assert!(dict.get_key(b"A").is_null());
+    }
+
+    #[test]
+    fn remove_key_on_a_missing_key_is_a_no_op() {
+        let dict = ObjectHandle::dictionary(vec![]);
+        dict.remove_key(b"Missing");
+        assert!(dict.get_key(b"Missing").is_null());
+    }
+
+    #[test]
+    fn remove_key_on_a_non_dictionary_handle_is_a_no_op() {
+        let scalar = ObjectHandle::integer(1);
+        scalar.remove_key(b"A");
+        assert_eq!(scalar.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn shallow_copy_is_always_direct_even_from_an_indirect_source() {
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
+        indirect.set_resolved(ObjectValue::Dictionary(Default::default()));
+        let copy = indirect.shallow_copy();
+        assert!(copy.is_direct());
+    }
+
+    #[test]
+    fn shallow_copy_mutation_does_not_affect_the_source() {
+        let original = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
+        let copy = original.shallow_copy();
+        copy.replace_key(b"A", ObjectHandle::integer(2));
+        assert_eq!(original.get_key(b"A").as_integer(), Some(1));
+        assert_eq!(copy.get_key(b"A").as_integer(), Some(2));
+    }
+
+    // Despite the name, qpdf's shallowCopy() recursively copies through
+    // every *direct* array/dictionary descendant, stopping only at an
+    // *indirect* child (kept shared) -- see shallow_copy's own doc comment
+    // for the qpdf citations. These two tests pin that distinction.
+
+    #[test]
+    fn shallow_copy_of_a_direct_dictionary_child_produces_an_independent_copy() {
+        let original = ObjectHandle::dictionary(vec![(
+            b"A".to_vec(),
+            ObjectHandle::dictionary(vec![(b"Inner".to_vec(), ObjectHandle::integer(1))]),
+        )]);
+        let copy = original.shallow_copy();
+        copy.get_key(b"A")
+            .replace_key(b"Inner", ObjectHandle::integer(2));
+        assert_eq!(
+            original.get_key(b"A").get_key(b"Inner").as_integer(),
+            Some(1)
+        );
+        assert_eq!(copy.get_key(b"A").get_key(b"Inner").as_integer(), Some(2));
+    }
+
+    #[test]
+    fn shallow_copy_of_an_indirect_dictionary_child_keeps_shared_identity() {
+        let child = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
+        child.set_resolved(ObjectValue::Integer(1));
+        let original = ObjectHandle::dictionary(vec![(b"A".to_vec(), child.clone())]);
+        let copy = original.shallow_copy();
+        assert!(copy.get_key(b"A").ptr_eq(&child));
+    }
+
+    #[test]
+    fn shallow_copy_of_a_non_container_clones_the_scalar_value() {
+        let original = ObjectHandle::integer(5);
+        let copy = original.shallow_copy();
+        assert!(!copy.ptr_eq(&original));
+        assert_eq!(copy.as_integer(), Some(5));
+    }
+
+    #[test]
+    fn has_key_distinguishes_a_present_null_value_from_a_missing_key() {
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::null())]);
+        assert!(dict.has_key(b"A"));
+        assert!(!dict.has_key(b"Missing"));
+    }
+
+    #[test]
+    fn has_key_on_a_non_dictionary_handle_is_false() {
+        let scalar = ObjectHandle::integer(1);
+        assert!(!scalar.has_key(b"A"));
+    }
+
+    #[test]
+    fn merge_resources_is_a_no_op_unless_both_sides_are_dictionaries() {
+        let scalar = ObjectHandle::integer(1);
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
+        scalar.merge_resources(&dict, None);
+        dict.merge_resources(&scalar, None);
+        assert_eq!(dict.get_key(b"A").as_integer(), Some(1));
+        assert!(dict.get_key(b"B").is_null());
+    }
+
+    #[test]
+    fn merge_resources_installs_a_private_copy_of_a_top_level_key_self_lacks() {
+        let source_sub = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(1))]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), source_sub.clone())]);
+        let dest = ObjectHandle::dictionary(vec![]);
+        dest.merge_resources(&other, None);
+        let installed = dest.get_key(b"Font");
+        assert_eq!(installed.get_key(b"F1").as_integer(), Some(1));
+        assert!(!installed.ptr_eq(&source_sub)); // privatized, not shared
+    }
+
+    #[test]
+    fn merge_resources_adds_a_new_inner_key_without_a_conflicts_map() {
+        let this_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(1))]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        let other_font = ObjectHandle::dictionary(vec![(b"F2".to_vec(), ObjectHandle::integer(2))]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        dest.merge_resources(&other, None);
+        let font = dest.get_key(b"Font");
+        assert_eq!(font.get_key(b"F1").as_integer(), Some(1));
+        assert_eq!(font.get_key(b"F2").as_integer(), Some(2));
+    }
+
+    #[test]
+    fn merge_resources_leaves_a_colliding_inner_key_untouched_without_a_conflicts_map() {
+        let this_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(1))]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        let other_font =
+            ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(99))]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        dest.merge_resources(&other, None);
+        assert_eq!(dest.get_key(b"Font").get_key(b"F1").as_integer(), Some(1));
+    }
+
+    #[test]
+    fn merge_resources_reuses_an_existing_key_for_the_same_indirect_object() {
+        let shared = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1);
+        shared.set_resolved(ObjectValue::Name(b"Shared".to_vec()));
+        let this_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        // dest already has F1 -> shared. other also wants F1, but pointing at
+        // the same shared object identity -- reuse F1 verbatim, no conflict
+        // entry (existing_key == key), no new key minted.
+        let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        let mut conflicts = std::collections::BTreeMap::new();
+        dest.merge_resources(&other, Some(&mut conflicts));
+        assert!(conflicts.is_empty());
+        assert!(dest.get_key(b"Font").get_key(b"F1").ptr_eq(&shared));
+    }
+
+    #[test]
+    fn merge_resources_reuse_records_a_conflict_when_the_reused_name_differs() {
+        let shared = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1);
+        shared.set_resolved(ObjectValue::Name(b"Shared".to_vec()));
+        // dest already has this same shared object, but under a DIFFERENT
+        // key (F2) than what other asks for (F1) -- reuse F2, and DO record
+        // the rename since the reused name differs from the requested one.
+        let this_font = ObjectHandle::dictionary(vec![
+            (b"F2".to_vec(), shared.clone()),
+            (b"F1".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        let mut conflicts = std::collections::BTreeMap::new();
+        dest.merge_resources(&other, Some(&mut conflicts));
+        assert_eq!(
+            conflicts
+                .get(b"Font".as_slice())
+                .unwrap()
+                .get(b"F1".as_slice()),
+            Some(&b"F2".to_vec())
+        );
+        // F1 keeps its own original (unrelated) value; nothing overwrote it.
+        assert_eq!(dest.get_key(b"Font").get_key(b"F1").as_integer(), Some(1));
+    }
+
+    #[test]
+    fn merge_resources_mints_a_fresh_name_for_a_genuine_conflict() {
+        let this_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(1))]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        let mut conflicts = std::collections::BTreeMap::new();
+        dest.merge_resources(&other, Some(&mut conflicts));
+        let new_name = conflicts
+            .get(b"Font".as_slice())
+            .and_then(|m| m.get(b"F1".as_slice()))
+            .expect("F1 conflict recorded");
+        assert_eq!(new_name, b"F1_1");
+        assert_eq!(dest.get_key(b"Font").get_key(b"F1").as_integer(), Some(1));
+        assert_eq!(
+            dest.get_key(b"Font").get_key(new_name).as_integer(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn merge_resources_privatizes_an_indirect_existing_sub_dictionary() {
+        let indirect_font = ObjectHandle::new_indirect_unresolved(ObjectRef::new(3, 0), -1);
+        indirect_font.set_resolved(ObjectValue::Dictionary(
+            [(b"F1".to_vec(), ObjectHandle::integer(1))]
+                .into_iter()
+                .collect(),
+        ));
+        let shared_dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), indirect_font.clone())]);
+        let another_holder =
+            ObjectHandle::dictionary(vec![(b"Font".to_vec(), indirect_font.clone())]);
+        let other_font = ObjectHandle::dictionary(vec![(b"F2".to_vec(), ObjectHandle::integer(2))]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        shared_dest.merge_resources(&other, None);
+        // shared_dest's own /Font is now a private direct copy...
+        assert!(shared_dest.get_key(b"Font").is_direct());
+        assert_eq!(
+            shared_dest.get_key(b"Font").get_key(b"F2").as_integer(),
+            Some(2)
+        );
+        // ...and the other holder's /Font (and the original indirect object)
+        // is untouched.
+        assert!(another_holder.get_key(b"Font").ptr_eq(&indirect_font));
+        assert!(indirect_font.get_key(b"F2").is_null());
+    }
+
+    #[test]
+    fn merge_resources_unions_scalar_array_items_by_unparsed_text() {
+        let dest = ObjectHandle::dictionary(vec![(
+            b"ProcSet".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
+        )]);
+        let other = ObjectHandle::dictionary(vec![(
+            b"ProcSet".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"PDF".to_vec()),
+                ObjectHandle::name(b"Text".to_vec()),
+            ]),
+        )]);
+        dest.merge_resources(&other, None);
+        let items = dest.get_key(b"ProcSet").as_array().unwrap();
+        let names: Vec<_> = items.iter().map(|i| i.as_name().unwrap()).collect();
+        assert_eq!(names, vec![b"PDF".to_vec(), b"Text".to_vec()]);
+    }
+
+    #[test]
+    fn merge_resources_leaves_mismatched_or_non_container_rtype_shapes_untouched() {
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), ObjectHandle::integer(1))]);
+        let other = ObjectHandle::dictionary(vec![(
+            b"Font".to_vec(),
+            ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]),
+        )]);
+        dest.merge_resources(&other, None);
+        assert_eq!(dest.get_key(b"Font").as_integer(), Some(1));
+    }
+
+    #[test]
+    fn replace_stream_data_updates_data_and_length() {
+        let dict = ObjectHandle::dictionary(vec![]);
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            dict: dict.clone(),
+            data: b"old".to_vec(),
+        });
+        stream.replace_stream_data(b"new data".to_vec(), None, None);
+        assert_eq!(stream.as_stream_data(), Some(b"new data".to_vec()));
+        assert_eq!(dict.get_key(b"Length").as_integer(), Some(8));
+    }
+
+    #[test]
+    fn replace_stream_data_sets_filter_and_decode_parms_when_given() {
+        let dict = ObjectHandle::dictionary(vec![]);
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            dict: dict.clone(),
+            data: b"old".to_vec(),
+        });
+        let filter = ObjectHandle::name(b"FlateDecode".to_vec());
+        let parms =
+            ObjectHandle::dictionary(vec![(b"Predictor".to_vec(), ObjectHandle::integer(12))]);
+        stream.replace_stream_data(b"x".to_vec(), Some(filter.clone()), Some(parms.clone()));
+        assert!(dict.get_key(b"Filter").ptr_eq(&filter));
+        assert!(dict.get_key(b"DecodeParms").ptr_eq(&parms));
+    }
+
+    #[test]
+    fn replace_stream_data_leaves_filter_untouched_when_not_given() {
+        let dict = ObjectHandle::dictionary(vec![(
+            b"Filter".to_vec(),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        )]);
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            dict: dict.clone(),
+            data: b"old".to_vec(),
+        });
+        stream.replace_stream_data(b"new".to_vec(), None, None);
+        assert_eq!(
+            dict.get_key(b"Filter").as_name(),
+            Some(b"FlateDecode".to_vec())
+        );
+    }
+
+    #[test]
+    fn replace_stream_data_on_a_non_stream_handle_is_a_no_op() {
+        let scalar = ObjectHandle::integer(1);
+        scalar.replace_stream_data(b"x".to_vec(), None, None);
+        assert_eq!(scalar.as_integer(), Some(1));
+    }
+
+    // --- Coverage closers: paths the tests above never happened to reach ---
+
+    #[test]
+    fn replace_key_and_remove_key_mutate_a_resolved_indirect_handle() {
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
+        indirect.set_resolved(ObjectValue::Dictionary(Default::default()));
+        indirect.replace_key(b"A", ObjectHandle::integer(1));
+        assert_eq!(indirect.get_key(b"A").as_integer(), Some(1));
+        indirect.remove_key(b"A");
+        assert!(indirect.get_key(b"A").is_null());
+    }
+
+    #[test]
+    fn replace_key_and_remove_key_are_no_ops_on_an_unresolved_indirect_handle() {
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
+        indirect.replace_key(b"A", ObjectHandle::integer(1)); // must not panic
+        indirect.remove_key(b"A"); // must not panic
+        assert!(indirect.get_key(b"A").is_null());
+    }
+
+    #[test]
+    fn shallow_copy_of_an_unresolved_indirect_handle_is_a_direct_null() {
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
+        let copy = indirect.shallow_copy();
+        assert!(copy.is_direct());
+        assert!(copy.is_null());
+    }
+
+    #[test]
+    fn shallow_copy_of_an_array_recurses_through_direct_elements() {
+        let inner = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+        let original = ObjectHandle::array(vec![inner]);
+        let copy = original.shallow_copy();
+        let copy_inner = copy.as_array().unwrap()[0].clone();
+        assert!(!copy_inner.ptr_eq(&original.as_array().unwrap()[0]));
+        assert_eq!(
+            copy.as_array().unwrap()[0].as_array().unwrap()[0].as_integer(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn shallow_copy_of_a_resolved_indirect_stream_gives_the_copy_its_own_dictionary() {
+        // Regression test: the copy's dict must not be Rc-shared with the
+        // source's, or mutating the copy via replace_stream_data would
+        // silently corrupt the source stream's /Length/Filter/DecodeParms.
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
+        indirect.set_resolved(ObjectValue::Stream {
+            dict: ObjectHandle::dictionary(vec![]),
+            data: b"old".to_vec(),
+        });
+        let copy = indirect.shallow_copy();
+        copy.replace_stream_data(b"new data".to_vec(), None, None);
+
+        assert_eq!(copy.as_stream_data(), Some(b"new data".to_vec()));
+        assert_eq!(
+            copy.as_stream_dict()
+                .unwrap()
+                .get_key(b"Length")
+                .as_integer(),
+            Some(8)
+        );
+        assert_eq!(indirect.as_stream_data(), Some(b"old".to_vec()));
+        assert!(indirect
+            .as_stream_dict()
+            .unwrap()
+            .get_key(b"Length")
+            .is_null());
+    }
+
+    #[test]
+    fn merge_resources_installs_an_already_indirect_new_key_without_shallow_copying() {
+        let shared = ObjectHandle::new_indirect_unresolved(ObjectRef::new(5, 0), -1);
+        shared.set_resolved(ObjectValue::Integer(1));
+        let this_font = ObjectHandle::dictionary(vec![]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        dest.merge_resources(&other, None);
+        assert!(dest.get_key(b"Font").get_key(b"F1").ptr_eq(&shared));
+    }
+
+    #[test]
+    fn merge_resources_array_union_skips_a_non_scalar_item() {
+        let dest =
+            ObjectHandle::dictionary(vec![(b"ProcSet".to_vec(), ObjectHandle::array(vec![]))]);
+        let other = ObjectHandle::dictionary(vec![(
+            b"ProcSet".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::dictionary(vec![])]),
+        )]);
+        dest.merge_resources(&other, None);
+        assert!(dest.get_key(b"ProcSet").as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn is_scalar_covers_every_disjunct() {
+        assert!(is_scalar(&ObjectHandle::boolean(true)));
+        assert!(is_scalar(&ObjectHandle::integer(1)));
+        assert!(is_scalar(&ObjectHandle::name(b"N".to_vec())));
+        assert!(is_scalar(&ObjectHandle::null()));
+        assert!(is_scalar(&ObjectHandle::real(1.0)));
+        assert!(is_scalar(&ObjectHandle::string(b"S".to_vec())));
+        assert!(!is_scalar(&ObjectHandle::array(vec![])));
+    }
+
+    #[test]
+    fn merge_resources_mints_a_second_unique_name_when_the_first_candidate_is_taken() {
+        // this_val (the Font sub-dict itself) has a nested dictionary-valued
+        // entry ("Widths") whose own key happens to be "F1_1" --
+        // get_resource_names is called ON this_val (see merge_resources's
+        // own doc comment on why it is this level, not dest's), so its
+        // "grandchildren" pool picks this up, forcing unique_resource_name
+        // past its first candidate.
+        let this_font = ObjectHandle::dictionary(vec![
+            (b"F1".to_vec(), ObjectHandle::integer(1)),
+            (
+                b"Widths".to_vec(),
+                ObjectHandle::dictionary(vec![(b"F1_1".to_vec(), ObjectHandle::integer(0))]),
+            ),
+        ]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        let mut conflicts = std::collections::BTreeMap::new();
+        dest.merge_resources(&other, Some(&mut conflicts));
+        let new_name = conflicts
+            .get(b"Font".as_slice())
+            .and_then(|m| m.get(b"F1".as_slice()))
+            .expect("F1 conflict recorded");
+        assert_eq!(new_name, b"F1_2");
+        assert_eq!(
+            dest.get_key(b"Font").get_key(new_name).as_integer(),
+            Some(2)
+        );
     }
 }
