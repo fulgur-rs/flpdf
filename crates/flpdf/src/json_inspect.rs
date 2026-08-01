@@ -11386,8 +11386,7 @@ mod tests {
         let mut pdf = load_encrypted_r4_pdf();
         let encrypt_ref = match pdf.trailer().get("Encrypt") {
             Some(Object::Reference(r)) => *r,
-            // cov:ignore: fixture-shape guard
-            other => panic!("expected /Encrypt to be an indirect reference, got {other:?}"),
+            other => panic!("expected /Encrypt to be an indirect reference, got {other:?}"), // cov:ignore: fixture-shape guard
         };
         // Authentication already happened at open time; replacing the
         // referenced object post-open only affects build_encrypt_section's
