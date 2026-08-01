@@ -6436,19 +6436,35 @@ mod tests {
         assert!(handle.as_array().is_some());
     }
 
+    // `lift`/`lift_bounded` (unlike the native parse path) has no
+    // `stacker::maybe_grow` protection of its own — matching
+    // `parser.rs`'s own `nesting_past_max_parse_depth_matches_between_legacy_and_native_paths`/
+    // `native_handle_path_preserves_the_object_nesting_guard`, recursing it
+    // all the way to `MAX_PARSE_DEPTH` needs a dedicated, larger-than-default
+    // thread stack to avoid aborting the whole test process on a
+    // small-default-stack CI runner (observed: Windows). Building the
+    // `Pdf`/`Object` tree inside the spawned closure, not moving one in from
+    // outside, sidesteps needing either type to be `Send`.
     #[test]
     fn trailer_key_handle_is_null_when_the_keys_own_value_exceeds_the_parse_depth_bound() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
-        let depth = crate::parser::MAX_PARSE_DEPTH + 5;
-        let mut nested = Object::Integer(1);
-        for _ in 0..depth {
-            nested = Object::Array(vec![nested]);
-        }
-        pdf.trailer.insert("QTest", nested);
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+                let depth = crate::parser::MAX_PARSE_DEPTH + 5;
+                let mut nested = Object::Integer(1);
+                for _ in 0..depth {
+                    nested = Object::Array(vec![nested]);
+                }
+                pdf.trailer.insert("QTest", nested);
 
-        let handle = pdf.trailer_key_handle(b"QTest");
+                let handle = pdf.trailer_key_handle(b"QTest");
 
-        assert!(handle.is_null());
+                assert!(handle.is_null());
+            })
+            .expect("nesting-guard test thread must start")
+            .join()
+            .expect("nesting guard must return null before exhausting the stack");
     }
 
     #[test]
