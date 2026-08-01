@@ -1853,9 +1853,36 @@ impl<R: Read + Seek> Pdf<R> {
         &mut self,
         handle: &ObjectHandle,
     ) -> Result<ObjectHandle> {
+        Ok(self.resolve_object_handle_to_terminal_ref(handle)?.0)
+    }
+
+    /// Same chase as [`Pdf::resolve_object_handle_to_terminal`], additionally
+    /// returning the object reference the terminal value was actually read
+    /// from. This is `None` exactly when the returned handle is direct with
+    /// no indirect identity of its own — either `handle` itself was direct,
+    /// or the chase hit the `ref_chain::MAX_REF_CHAIN_DEPTH` bound and fell
+    /// back to a null handle. Otherwise it is `handle.object_ref()` when no
+    /// [`Pdf::set_object`] redirect was chased (matching
+    /// [`Pdf::resolve_object_handle_to_terminal`]'s own "returns `handle`
+    /// unchanged" case), or the *last* hop's ref when one or more redirects
+    /// were followed — deliberately not the chain's first ref, which callers
+    /// needing offset/diagnostic attribution for the terminal object itself
+    /// (e.g. a stream's source offset) must not conflate with an intermediate
+    /// redirect's own ref.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Pdf::resolve_object_handle`].
+    pub fn resolve_object_handle_to_terminal_ref(
+        &mut self,
+        handle: &ObjectHandle,
+    ) -> Result<(ObjectHandle, Option<ObjectRef>)> {
         self.resolve_object_handle(handle)?;
         let Some(mut current_ref) = handle.as_reference() else {
-            return Ok(handle.clone()); // already terminal (the common case) — or unresolved/missing
+            // already terminal (the common case) — or unresolved/missing;
+            // `handle.object_ref()` is already the correct terminal ref,
+            // `None` for an originally-direct handle.
+            return Ok((handle.clone(), handle.object_ref()));
         };
         for _ in 0..crate::ref_chain::MAX_REF_CHAIN_DEPTH {
             let hop = self.get_object_handle(current_ref);
@@ -1878,7 +1905,7 @@ impl<R: Read + Seek> Pdf<R> {
                 // No canonical state is written either way, so a later call
                 // simply redoes the chase rather than being stuck observing
                 // a stale result.
-                None => return Ok(hop.shallow_copy()),
+                None => return Ok((hop.shallow_copy(), Some(current_ref))),
             }
         }
         self.push_warning(format!(
@@ -1888,7 +1915,10 @@ impl<R: Read + Seek> Pdf<R> {
             current_ref.generation,
             crate::ref_chain::MAX_REF_CHAIN_DEPTH
         ));
-        Ok(ObjectHandle::null())
+        // Ref and handle degrade together: a null value paired with a
+        // live-looking ref would let a caller compute an "offset of
+        // terminal" for an object it was just told is null.
+        Ok((ObjectHandle::null(), None))
     }
 
     // Builds the resolved value for a plain uncompressed file object by
@@ -6364,6 +6394,40 @@ mod tests {
     }
 
     #[test]
+    fn resolve_object_handle_to_terminal_ref_reports_the_objects_own_ref_for_a_natural_single_hop()
+    {
+        // No `set_object` redirect is involved at all: `object_ref` resolves
+        // directly to its dictionary. The terminal ref must be the object's
+        // own ref, not `None` — this is the case
+        // `resolve_object_handle_to_terminal`'s "already terminal" fast path
+        // takes, and it must still report a ref for a caller that needs one
+        // (e.g. a diagnostic source-offset lookup keyed on that ref).
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+
+        let handle = pdf.get_object_handle(object_ref);
+        let (result, terminal_ref) = pdf
+            .resolve_object_handle_to_terminal_ref(&handle)
+            .expect("resolve a plain, never-redirected object, also reporting its ref");
+
+        assert!(result.as_dictionary().is_some());
+        assert_eq!(terminal_ref, Some(object_ref));
+    }
+
+    #[test]
+    fn resolve_object_handle_to_terminal_ref_reports_no_ref_for_a_direct_handle() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let direct = ObjectHandle::integer(7);
+
+        let (result, terminal_ref) = pdf
+            .resolve_object_handle_to_terminal_ref(&direct)
+            .expect("a direct handle has no ref to chase from");
+
+        assert_eq!(result.as_integer(), Some(7));
+        assert_eq!(terminal_ref, None);
+    }
+
+    #[test]
     fn resolve_object_handle_does_not_chase_a_set_object_reference_redirect() {
         // `resolve_object_handle` itself must keep its existing single-hop
         // contract: `Pdf::resolve_borrowed` (and `ref_chain.rs`'s own
@@ -6434,6 +6498,15 @@ mod tests {
         assert_eq!(
             pdf.resolve(redirect_ref).expect("legacy resolve"),
             Object::Reference(target_ref)
+        );
+
+        let (_ref_result, terminal_ref) = pdf
+            .resolve_object_handle_to_terminal_ref(&handle)
+            .expect("resolve redirect handle, also reporting its terminal ref");
+        assert_eq!(
+            terminal_ref,
+            Some(target_ref),
+            "terminal ref is the redirect's target (100), not handle.object_ref() (200)"
         );
     }
 
@@ -6511,6 +6584,15 @@ mod tests {
             "result is a direct, unregistered handle"
         );
 
+        let (_ref_result, observed_terminal_ref) = pdf
+            .resolve_object_handle_to_terminal_ref(&handle)
+            .expect("resolve multi-hop redirect handle, also reporting its terminal ref");
+        assert_eq!(
+            observed_terminal_ref,
+            Some(terminal_ref),
+            "terminal ref is the chain's *last* hop, not the first (outer_ref) or middle"
+        );
+
         // The chain's first-ref identity is on `handle` itself. Neither it
         // (outer) nor the intermediate hop's own canonical handle is
         // mutated: `ref_chain.rs`'s own chain-walk over either ref still
@@ -6581,6 +6663,11 @@ mod tests {
             .expect("a chain exactly at the depth limit must resolve, not be treated as cyclic");
 
         assert_eq!(result.as_integer(), Some(7));
+
+        let (_ref_result, observed_terminal_ref) = pdf
+            .resolve_object_handle_to_terminal_ref(&handle)
+            .expect("a chain exactly at the depth limit must resolve, also reporting its ref");
+        assert_eq!(observed_terminal_ref, Some(terminal_ref));
     }
 
     #[test]
@@ -6601,6 +6688,15 @@ mod tests {
             .expect("a too-long chain falls back rather than erroring");
 
         assert!(result.is_null());
+
+        let (ref_fallback, observed_terminal_ref) = pdf
+            .resolve_object_handle_to_terminal_ref(&handle)
+            .expect("a too-long chain falls back rather than erroring");
+        assert!(ref_fallback.is_null());
+        assert_eq!(
+            observed_terminal_ref, None,
+            "ref and handle degrade together on the depth-cap fallback"
+        );
     }
 
     /// White-box companion to the public-API

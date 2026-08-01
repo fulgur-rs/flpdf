@@ -1,10 +1,11 @@
 use std::io::{Read, Seek, Write};
 
 use flpdf::filters::{DecodeLimits, StreamDecodeEvent};
-use flpdf::{Diagnostic, Error, Object, Pdf};
+use flpdf::{Diagnostic, Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf};
 
 use super::handle::{
-    resolve_stream_dictionary, write_qpdf_object, DecodeParmsWarningSource, Handle,
+    resolve_chain, resolve_stream_dictionary, write_object, write_qpdf_object,
+    DecodeParmsWarningSource,
 };
 use super::{emit_new_diagnostics, write_warning};
 use crate::output::write_bytes;
@@ -47,101 +48,195 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let trailer = pdf.trailer().clone();
-    let qtest = Handle::get_key(pdf, &trailer, b"QTest")?;
+    let trailer_handle = pdf.trailer_handle();
+    let original = trailer_handle.get_key(b"QTest");
+    let (chased, terminal_ref) = pdf.resolve_object_handle_to_terminal_ref(&original)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
-    if !Handle::has_key(pdf, &trailer, b"QTest")? {
+    // qpdf's own `hasKey` treats a key resolving to null the same as a
+    // missing key (`libqpdf/QPDF_Dictionary.cc:98-100`) — an *explicit*
+    // `/QTest null` entry is "implicit" here too, not just a genuinely
+    // absent key, so this checks the chased terminal value rather than
+    // `ObjectHandle::has_key` (which only reports raw map presence; see its
+    // own doc distinguishing it from this exact case).
+    if chased.is_null() {
         writeln!(stdout, "/QTest is implicit")?;
     }
 
-    let direct_prefix = if qtest.is_indirect() { "in" } else { "" };
-    let type_name = qtest.type_name();
-    let type_code = qtest.type_code();
+    let direct_prefix = if original.object_ref().is_some() {
+        "in"
+    } else {
+        ""
+    };
+    let type_name = chased.type_name();
+    let type_code = chased.type_code();
     write!(stdout, "/QTest is {direct_prefix}direct and has type ")?;
     writeln!(stdout, "{type_name} ({type_code})")?;
 
-    let details = write_object_details(pdf, filename, stdout, stderr, diagnostics_written, &qtest);
+    let details = write_object_details(
+        pdf,
+        filename,
+        stdout,
+        stderr,
+        diagnostics_written,
+        &chased,
+        terminal_ref,
+    );
     details?;
 
+    // qpdf's `unparse()`/`unparseResolved()` for a dictionary omit any entry
+    // that resolves to null, eagerly re-resolving every entry (at every
+    // nesting depth) as they walk, regardless of what earlier steps above
+    // already resolved (`QPDF_Dictionary::unparse`,
+    // `libqpdf/QPDF_Dictionary.cc:59-69`). `write_qpdf_object` already
+    // implements exactly that eager, self-contained walk via `resolve_chain`
+    // — reused here via the legacy `Object` bridge rather than ported onto
+    // `ObjectHandle::unparse_resolved`, whose own null-omission depends on
+    // prior resolution state (`ObjectHandle::unparse_resolved`'s own doc)
+    // and would only coincidentally match for entries some earlier step
+    // happened to have already touched.
+    let raw_qtest_value = pdf.trailer().get(b"QTest").cloned().unwrap_or(Object::Null);
+    let (resolved, indirect, _terminal) = resolve_chain(pdf, raw_qtest_value)?;
+    let unparse_bytes = match indirect {
+        Some(reference) => write_object(&Object::Reference(reference)),
+        None => write_qpdf_object(pdf, &resolved)?,
+    };
+    let unparse_resolved_bytes = if matches!(resolved, Object::Stream(_)) {
+        unparse_bytes.clone()
+    } else {
+        write_qpdf_object(pdf, &resolved)?
+    };
+
     write!(stdout, "unparse: ")?;
-    write_bytes(stdout, &qtest.unparse(pdf)?)?;
+    write_bytes(stdout, &unparse_bytes)?;
     writeln!(stdout)?;
     write!(stdout, "unparseResolved: ")?;
-    write_bytes(stdout, &qtest.unparse_resolved(pdf)?)?;
+    write_bytes(stdout, &unparse_resolved_bytes)?;
     writeln!(stdout)?;
     Ok(())
 }
 
+// `dict`'s entries, chasing each value (including any `Pdf::set_object`
+// redirect, not just a natural PDF reference) to its terminal to decide
+// null-omission, mirroring qpdf's own `hasKey`/`getKeys`/`ditems()` rule
+// that a dictionary entry resolving to null is equivalent to a missing key
+// (`libqpdf/QPDF_Dictionary.cc:98-125`). Indirectness in the returned pairs
+// reflects the *original*, unresolved child handle — whether the entry's
+// own stored value was itself a reference — not the terminal value's.
+fn dictionary_items<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dict: &ObjectHandle,
+) -> flpdf::Result<Vec<(Vec<u8>, bool)>> {
+    let entries = dict
+        .as_dictionary()
+        .ok_or_else(|| Error::System("dictionary access on non-dictionary object".to_string()))?;
+    let mut items = Vec::new();
+    for (key, child) in entries {
+        let (terminal, _terminal_ref) = pdf.resolve_object_handle_to_terminal_ref(&child)?;
+        if !terminal.is_null() {
+            items.push((key, child.object_ref().is_some()));
+        }
+    }
+    Ok(items)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_object_details<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filename: &[u8],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
-    qtest: &Handle,
+    chased: &ObjectHandle,
+    terminal_ref: Option<ObjectRef>,
 ) -> flpdf::Result<()> {
-    match qtest.resolved() {
-        Object::Null => writeln!(stdout, "/QTest is null")?,
-        Object::Boolean(_) => {
-            let value = qtest
-                .as_bool()
-                .expect("boolean branch must retain a boolean value");
+    match chased.type_code() {
+        2 => writeln!(stdout, "/QTest is null")?,
+        3 => {
+            let value = chased
+                .as_boolean()
+                .expect("type_code confirmed a boolean value");
             let value = if value { "true" } else { "false" };
             writeln!(stdout, "/QTest is Boolean with value {value}")?;
         }
-        Object::Integer(value) => {
+        4 => {
+            let value = chased
+                .as_integer()
+                .expect("type_code confirmed an integer value");
             writeln!(stdout, "/QTest is an integer with value {value}")?;
         }
-        Object::Real(_) | Object::RealLiteral { .. } => {
+        5 => {
             write!(stdout, "/QTest is a real number with value ")?;
-            write_bytes(stdout, &qtest.unparse_resolved(pdf)?)?;
+            write_bytes(stdout, &chased.unparse_resolved())?;
             writeln!(stdout)?;
         }
-        Object::Name(value) => {
+        7 => {
+            let value = chased.as_name().expect("type_code confirmed a name value");
             write!(stdout, "/QTest is a name with value /")?;
-            write_bytes(stdout, value)?;
+            write_bytes(stdout, &value)?;
             writeln!(stdout)?;
         }
-        Object::String(value) => {
+        6 => {
+            let value = chased
+                .as_string()
+                .expect("type_code confirmed a string value");
             write!(stdout, "/QTest is a string with value ")?;
-            write_bytes(stdout, value)?;
+            write_bytes(stdout, &value)?;
             writeln!(stdout)?;
         }
-        Object::Array(values) => {
-            writeln!(stdout, "/QTest is an array with {} items", values.len())?;
-            for (index, is_indirect) in qtest.array_item_indirectness()?.into_iter().enumerate() {
-                let direct_prefix = if is_indirect { "in" } else { "" };
+        8 => {
+            let items = chased
+                .as_array()
+                .expect("type_code confirmed an array value");
+            writeln!(stdout, "/QTest is an array with {} items", items.len())?;
+            for (index, item) in items.iter().enumerate() {
+                let direct_prefix = if item.object_ref().is_some() {
+                    "in"
+                } else {
+                    ""
+                };
                 writeln!(stdout, "  item {index} is {direct_prefix}direct")?;
             }
         }
-        Object::Dictionary(_) => {
+        9 => {
             writeln!(stdout, "/QTest is a dictionary")?;
-            let items = qtest.dictionary_items(pdf)?;
+            let items = dictionary_items(pdf, chased)?;
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-            for (key, value) in items {
+            for (key, is_indirect) in items {
                 write!(stdout, "  /")?;
                 write_bytes(stdout, &key)?;
-                let direct_prefix = if value.is_indirect() { "in" } else { "" };
+                let direct_prefix = if is_indirect { "in" } else { "" };
                 writeln!(stdout, " is {direct_prefix}direct")?;
             }
         }
-        Object::Stream(stream) => {
-            let stream = stream.clone();
+        10 => {
+            let dict_handle = chased
+                .as_stream_dict()
+                .expect("type_code confirmed a stream value");
+            let dict = match dict_handle.materialize() {
+                Object::Dictionary(dict) => dict,
+                // A stream's own dictionary handle is always constructed as
+                // a direct dictionary value (`ObjectHandle::materialize`'s
+                // own doc).
+                _ => Dictionary::new(), // cov:ignore: unreachable per the invariant above
+            };
+            let data = chased
+                .as_stream_data()
+                .expect("type_code confirmed a stream value");
             write!(stdout, "/QTest is a stream.  Dictionary: ")?;
-            let dictionary = write_qpdf_object(pdf, &Object::Dictionary(stream.dict.clone()))?;
-            let decode_dictionary = resolve_stream_dictionary(pdf, &stream.dict)?;
+            let dictionary = write_qpdf_object(pdf, &Object::Dictionary(dict.clone()))?;
+            let decode_dictionary = resolve_stream_dictionary(pdf, &dict)?;
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             write_bytes(stdout, &dictionary)?;
             writeln!(stdout)?;
 
             writeln!(stdout, "Raw stream data:")?;
             stdout.flush()?;
-            write_bytes(stdout, &stream.data)?;
+            write_bytes(stdout, &data)?;
             writeln!(stdout)?;
             writeln!(stdout, "Uncompressed stream data:")?;
 
-            let stream_ref = qtest.terminal_indirect_ref();
+            let stream_ref = terminal_ref;
             let decode_param_warnings = decode_dictionary
                 .decode_param_type_warnings()
                 .iter()
@@ -201,14 +296,13 @@ fn write_object_details<R: Read + Seek>(
 
             match flpdf::filters::decode_stream_data_recovering_with_limits(
                 &decode_dictionary,
-                &stream.data,
+                &data,
                 DecodeLimits {
                     max_output: None,
                     max_filter_chain: None,
                 },
             ) {
                 Ok(decoded) => {
-                    let terminal_ref = qtest.terminal_indirect_ref();
                     let offset = terminal_ref
                         .map(|object_ref| pdf.source_stream_data_offset(object_ref))
                         .transpose()?
@@ -255,8 +349,7 @@ fn write_object_details<R: Read + Seek>(
                     if message == "stream filter type is not name or array"
                         || message == "stream /DecodeParms length is inconsistent with filters" =>
                 {
-                    let offset = qtest
-                        .terminal_indirect_ref()
+                    let offset = terminal_ref
                         .map(|object_ref| pdf.source_stream_data_offset(object_ref))
                         .transpose()?
                         .flatten();
@@ -267,7 +360,10 @@ fn write_object_details<R: Read + Seek>(
                 Err(_) => writeln!(stdout, "Stream data is not filterable.")?,
             }
         }
-        Object::Operator(_) | Object::InlineImage(_) | Object::Reference(_) => {
+        // 11 = operator, 12 = inline-image, 13 = unresolved (unreachable:
+        // `resolve_object_handle_to_terminal_ref`'s own contract guarantees
+        // `chased`'s value is never itself `ObjectValue::Reference`).
+        _ => {
             writeln!(stdout, "/QTest is an unknown object")?;
         }
     }
@@ -280,8 +376,7 @@ mod tests {
         run_test_0_1, stream_decode_error_detail, write_decode_param_type_warning,
         write_object_details,
     };
-    use crate::driver::handle::Handle;
-    use flpdf::{Dictionary, Error, Object, ObjectRef, Pdf, PdfOpenOptions, Stream};
+    use flpdf::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions};
     use std::io::{self, Write};
 
     struct WriteFailure;
@@ -766,13 +861,11 @@ mod tests {
     fn direct_stream_runtime_error_requires_a_terminal_object_reference() {
         let bytes = pdf_with_qtest(b"null", &[]);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open direct stream fixture");
-        let mut dictionary = Dictionary::new();
-        dictionary.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-        let qtest = Handle::from_value(
-            &mut pdf,
-            Object::Stream(Stream::new(dictionary, b"abc".to_vec())),
-        )
-        .expect("construct direct stream handle");
+        let dict = ObjectHandle::dictionary(vec![(
+            b"Filter".to_vec(),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        )]);
+        let qtest = ObjectHandle::stream(dict, b"abc".to_vec());
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut diagnostics_written = 0;
@@ -784,6 +877,7 @@ mod tests {
             &mut stderr,
             &mut diagnostics_written,
             &qtest,
+            None,
         )
         .unwrap_err();
 
@@ -798,14 +892,14 @@ mod tests {
     fn direct_stream_decode_param_warning_requires_a_terminal_object_reference() {
         let bytes = pdf_with_qtest(b"null", &[]);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open direct stream fixture");
-        let mut dictionary = Dictionary::new();
-        dictionary.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-        dictionary.insert("DecodeParms", Object::Integer(42));
-        let qtest = Handle::from_value(
-            &mut pdf,
-            Object::Stream(Stream::new(dictionary, Vec::new())),
-        )
-        .expect("construct direct stream handle");
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (b"DecodeParms".to_vec(), ObjectHandle::integer(42)),
+        ]);
+        let qtest = ObjectHandle::stream(dict, Vec::new());
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut diagnostics_written = 0;
@@ -817,6 +911,7 @@ mod tests {
             &mut stderr,
             &mut diagnostics_written,
             &qtest,
+            None,
         )
         .unwrap_err();
 
@@ -885,8 +980,10 @@ mod tests {
             )
             .len();
             let mut pdf = Pdf::open_mem_owned(bytes).expect("open DecodeParms warning fixture");
-            let trailer = pdf.trailer().clone();
-            let qtest = Handle::get_key(&mut pdf, &trailer, b"QTest").expect("get qtest");
+            let original = pdf.trailer_handle().get_key(b"QTest");
+            let (qtest, terminal_ref) = pdf
+                .resolve_object_handle_to_terminal_ref(&original)
+                .expect("resolve qtest");
             let mut stdout = Vec::new();
             let capacity = if fail_on == 1 { 0 } else { first_warning_len };
             let mut storage = vec![0; capacity];
@@ -900,6 +997,7 @@ mod tests {
                 &mut stderr,
                 &mut diagnostics_written,
                 &qtest,
+                terminal_ref,
             )
             .unwrap_err();
 
@@ -932,8 +1030,10 @@ mod tests {
             )],
         );
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open warning fixture");
-        let trailer = pdf.trailer().clone();
-        let qtest = Handle::get_key(&mut pdf, &trailer, b"QTest").expect("get qtest");
+        let original = pdf.trailer_handle().get_key(b"QTest");
+        let (qtest, terminal_ref) = pdf
+            .resolve_object_handle_to_terminal_ref(&original)
+            .expect("resolve qtest");
         let mut stdout = Vec::new();
         let mut stderr = WriteFailure;
         let mut diagnostics_written = 0;
@@ -945,6 +1045,7 @@ mod tests {
             &mut stderr,
             &mut diagnostics_written,
             &qtest,
+            terminal_ref,
         )
         .unwrap_err();
 
@@ -964,8 +1065,10 @@ mod tests {
             )],
         );
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open codec-error fixture");
-        let trailer = pdf.trailer().clone();
-        let qtest = Handle::get_key(&mut pdf, &trailer, b"QTest").expect("get qtest");
+        let original = pdf.trailer_handle().get_key(b"QTest");
+        let (qtest, terminal_ref) = pdf
+            .resolve_object_handle_to_terminal_ref(&original)
+            .expect("resolve qtest");
         let mut stdout = Vec::new();
         let mut stderr = WriteFailure;
         let mut diagnostics_written = 0;
@@ -977,6 +1080,7 @@ mod tests {
             &mut stderr,
             &mut diagnostics_written,
             &qtest,
+            terminal_ref,
         )
         .unwrap_err();
 
@@ -1106,8 +1210,7 @@ mod tests {
     fn content_only_object_uses_the_unknown_object_branch() {
         let bytes = pdf_with_qtest(b"null", &[]);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open operator test PDF");
-        let qtest =
-            Handle::from_value(&mut pdf, Object::Operator(b"q".to_vec())).expect("operator handle");
+        let qtest = ObjectHandle::operator(b"q".to_vec());
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut diagnostics_written = 0;
@@ -1118,6 +1221,7 @@ mod tests {
             &mut stderr,
             &mut diagnostics_written,
             &qtest,
+            None,
         )
         .expect("write operator details");
         assert_eq!(stdout, b"/QTest is an unknown object\n");

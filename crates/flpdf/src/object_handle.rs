@@ -456,6 +456,18 @@ impl ObjectHandle {
         )
     }
 
+    /// Construct a direct stream value from `dict` (a dictionary handle —
+    /// typically built via [`Self::dictionary`]) and `data` (the stream's
+    /// raw, undecoded bytes). qpdf's own model never allows a stream to be a
+    /// direct value (only ever a top-level indirect object,
+    /// `libqpdf/QPDF_Stream.cc:173-178`); this crate's own types do not
+    /// forbid it, matching [`Self::unparse_resolved`]'s own doc for that
+    /// case. Mainly useful for building a handle that is deliberately never
+    /// attached to a [`crate::Pdf`]'s object graph, e.g. in tests.
+    pub fn stream(dict: ObjectHandle, data: Vec<u8>) -> Self {
+        Self::new_direct(ObjectValue::Stream { dict, data }, NO_PARSED_OFFSET)
+    }
+
     /// Construct a direct real value that preserves a non-canonical source
     /// literal (e.g. `.4`) alongside its parsed value, mirroring
     /// [`crate::Object::RealLiteral`], so that a real number written in the
@@ -1035,8 +1047,13 @@ impl ObjectHandle {
         }
     }
 
-    /// Convert this handle's value into a legacy [`crate::Object`] tree
-    /// (`Pdf::resolve`/`Pdf::resolve_borrowed`'s materialization bridge).
+    /// Convert this handle's value into a legacy [`crate::Object`] tree —
+    /// `Pdf::resolve`/`Pdf::resolve_borrowed`'s own materialization bridge,
+    /// also public for a caller outside this crate that still needs a
+    /// legacy `Object`/[`Dictionary`] for one value reached through an
+    /// otherwise `ObjectHandle`-native walk (e.g. `flpdf-qtest-tools`' qtest
+    /// driver, which ports a `&Dictionary`-shaped qpdf filter/`DecodeParms`
+    /// resolution routine).
     ///
     /// An indirect array/dictionary child is *not* recursively resolved: it
     /// becomes `Object::Reference(child_ref)`, matching the parser's
@@ -1050,7 +1067,7 @@ impl ObjectHandle {
     /// [`Self::is_resolved`]) materializes as `Object::Null` rather than
     /// performing hidden resolution; callers that need the real value must
     /// resolve first (e.g. via `Pdf::resolve_object_handle`).
-    pub(crate) fn materialize(&self) -> Object {
+    pub fn materialize(&self) -> Object {
         self.with_value(|value| match value {
             Some(value) => materialize_value(value),
             None => Object::Null,
@@ -1612,6 +1629,28 @@ mod object_value_tests {
     fn null_handle_is_null() {
         assert!(ObjectHandle::null().is_null());
         assert!(!ObjectHandle::integer(0).is_null());
+    }
+
+    #[test]
+    fn stream_handle_round_trips_its_dict_and_data() {
+        let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(3))]);
+        let stream = ObjectHandle::stream(dict.clone(), b"abc".to_vec());
+        assert!(stream.as_stream_dict().expect("stream dict").ptr_eq(&dict));
+        assert_eq!(stream.as_stream_data(), Some(b"abc".to_vec()));
+        assert_eq!(stream.type_code(), 10, "ot_stream");
+    }
+
+    #[test]
+    fn materialize_is_now_a_public_bridge_usable_outside_this_crate() {
+        // `materialize` was widened from `pub(crate)` to `pub` so
+        // `flpdf-qtest-tools`' qtest driver can bridge one `ObjectHandle`
+        // value (a stream's own dictionary handle) back to a legacy
+        // `Object`/`Dictionary` for its still-`&Dictionary`-shaped
+        // filter/`DecodeParms` resolution routine — see this method's own
+        // doc. `object_value_tests` above already exercises its per-variant
+        // behavior exhaustively; this only pins the visibility contract.
+        let handle = ObjectHandle::integer(1);
+        let _: Object = ObjectHandle::materialize(&handle);
     }
 
     #[test]
