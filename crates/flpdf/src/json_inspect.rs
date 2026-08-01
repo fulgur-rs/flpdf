@@ -1292,7 +1292,7 @@ fn collect_image_refs<R: Read + Seek>(
 
     // Iterate in name (key) order — BTreeMap gives byte-lex order automatically.
     let mut image_refs: Vec<String> = Vec::new();
-    for (_name, value) in xobject_dict.iter() {
+    for value in xobject_dict.values() {
         // Each XObject entry should be an indirect Reference.
         let Some(xobj_ref) = value.object_ref() else {
             // Direct inline stream — no ref string available, skip.
@@ -1302,7 +1302,10 @@ fn collect_image_refs<R: Read + Seek>(
         let Some(stream_dict) = value.as_stream_dict().and_then(|d| d.as_dictionary()) else {
             continue;
         };
-        if let Some(subtype) = stream_dict.get(b"Subtype".as_slice()).and_then(ObjectHandle::as_name) {
+        if let Some(subtype) = stream_dict
+            .get(b"Subtype".as_slice())
+            .and_then(ObjectHandle::as_name)
+        {
             if subtype.as_slice() == b"Image" {
                 image_refs.push(format!("{} {} R", xobj_ref.number, xobj_ref.generation));
             }
@@ -1580,7 +1583,10 @@ fn walk_acroform_fields<R: Read + Seek>(
     };
 
     // Compute fullname: parent.T or just T at root.
-    let t_string = match field_dict.get(b"T".as_slice()).and_then(ObjectHandle::as_string) {
+    let t_string = match field_dict
+        .get(b"T".as_slice())
+        .and_then(ObjectHandle::as_string)
+    {
         Some(bytes) => decode_pdf_text_string(&bytes)
             .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
         None => String::new(),
@@ -1632,7 +1638,10 @@ fn walk_acroform_fields<R: Read + Seek>(
     };
 
     // /TU — alternate name.
-    let alternatename = match field_dict.get(b"TU".as_slice()).and_then(ObjectHandle::as_string) {
+    let alternatename = match field_dict
+        .get(b"TU".as_slice())
+        .and_then(ObjectHandle::as_string)
+    {
         Some(bytes) => {
             let s = decode_pdf_text_string(&bytes)
                 .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
@@ -1642,7 +1651,10 @@ fn walk_acroform_fields<R: Read + Seek>(
     };
 
     // /TM — mapping name.
-    let mappingname = match field_dict.get(b"TM".as_slice()).and_then(ObjectHandle::as_string) {
+    let mappingname = match field_dict
+        .get(b"TM".as_slice())
+        .and_then(ObjectHandle::as_string)
+    {
         Some(bytes) => {
             let s = decode_pdf_text_string(&bytes)
                 .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
@@ -1799,7 +1811,9 @@ fn inherited_field_value<R: Read + Seek>(
         if let Some(v) = pd.get(key.as_bytes()) {
             return Ok(Some(v.clone()));
         }
-        parent_ref = pd.get(b"Parent".as_slice()).and_then(ObjectHandle::object_ref);
+        parent_ref = pd
+            .get(b"Parent".as_slice())
+            .and_then(ObjectHandle::object_ref);
         depth += 1;
     }
     Ok(None)
@@ -2166,8 +2180,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
 
     if let Some(ref ef) = ef_dict {
         for key in &ef_key_order {
-            let Some(stream_ref) = ef.get(key.as_bytes()).and_then(ObjectHandle::object_ref)
-            else {
+            let Some(stream_ref) = ef.get(key.as_bytes()).and_then(ObjectHandle::object_ref) else {
                 continue;
             };
 
@@ -2374,8 +2387,13 @@ fn cf_method_string(
     encrypt: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     selector: Option<&str>,
 ) -> &'static str {
-    fn revision_default(encrypt: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>) -> &'static str {
-        match encrypt.get(b"R".as_slice()).and_then(ObjectHandle::as_integer) {
+    fn revision_default(
+        encrypt: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
+    ) -> &'static str {
+        match encrypt
+            .get(b"R".as_slice())
+            .and_then(ObjectHandle::as_integer)
+        {
             Some(r) if r >= 5 => "AESv3",
             Some(4) => "AESv2",
             _ => "RC4",
@@ -2401,7 +2419,10 @@ fn cf_method_string(
     else {
         return revision_default(encrypt);
     };
-    match filter.get(b"CFM".as_slice()).and_then(ObjectHandle::as_name) {
+    match filter
+        .get(b"CFM".as_slice())
+        .and_then(ObjectHandle::as_name)
+    {
         Some(cfm) => match cfm.as_slice() {
             b"AESV2" => "AESv2",
             b"AESV3" => "AESv3",
@@ -6442,8 +6463,7 @@ mod tests {
         // (object 7). The function must return that ref as-is.
         let mut pdf = load_one_page_pdf();
         let handle = pdf.get_object_handle(crate::ObjectRef::new(7, 0));
-        let refs =
-            collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
+        let refs = collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
         assert_eq!(refs, vec!["7 0 R".to_string()]);
     }
 
@@ -6456,8 +6476,7 @@ mod tests {
             pdf.get_object_handle(crate::ObjectRef::new(4, 0)),
             pdf.get_object_handle(crate::ObjectRef::new(5, 0)),
         ]);
-        let refs =
-            collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
+        let refs = collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
         assert_eq!(refs, vec!["4 0 R".to_string(), "5 0 R".to_string()]);
     }
 
@@ -6467,8 +6486,7 @@ mod tests {
     fn collect_content_refs_null_returns_empty() {
         let mut pdf = load_one_page_pdf();
         let handle = ObjectHandle::null();
-        let refs =
-            collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
+        let refs = collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
         assert!(refs.is_empty());
     }
 
@@ -6482,8 +6500,7 @@ mod tests {
             ObjectHandle::integer(99), // not a ref — must be skipped
             pdf.get_object_handle(crate::ObjectRef::new(5, 0)),
         ]);
-        let refs =
-            collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
+        let refs = collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
         assert_eq!(refs, vec!["3 0 R".to_string(), "5 0 R".to_string()]);
     }
 
@@ -6507,8 +6524,7 @@ mod tests {
         );
 
         let handle = pdf.get_object_handle(crate::ObjectRef::new(2, 0));
-        let refs =
-            collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
+        let refs = collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
         assert_eq!(
             refs,
             vec!["4 0 R".to_string(), "5 0 R".to_string()],
