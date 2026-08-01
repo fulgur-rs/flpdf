@@ -205,6 +205,115 @@ fn get_all_pages_rejects_a_pages_tree_cycle() {
 }
 
 #[test]
+fn get_all_pages_traverses_a_direct_intermediate_pages_node() {
+    let mut pdf = open(build_n_page_pdf(1));
+    let mut indirect_interior = Dictionary::new();
+    indirect_interior.insert("Type", Object::Name(b"Pages".to_vec()));
+    indirect_interior.insert(
+        "Kids",
+        Object::Array(vec![Object::Reference(ObjectRef::new(3, 0))]),
+    );
+    indirect_interior.insert("Count", Object::Integer(1));
+    pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(indirect_interior));
+    pdf.set_object(ObjectRef::new(12, 0), Object::Integer(12));
+
+    let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+        panic!("pages root must be a dictionary");
+    };
+    let mut direct_leaf = Dictionary::new();
+    direct_leaf.insert("Type", Object::Name(b"NotAPage".to_vec()));
+    let mut direct_interior = Dictionary::new();
+    direct_interior.insert("Type", Object::Name(b"NotPages".to_vec()));
+    direct_interior.insert(
+        "Kids",
+        Object::Array(vec![
+            Object::Dictionary(direct_leaf),
+            Object::Integer(42),
+            Object::Reference(ObjectRef::new(11, 0)),
+            Object::Reference(ObjectRef::new(12, 0)),
+            Object::Reference(ObjectRef::new(3, 0)),
+        ]),
+    );
+    direct_interior.insert("Count", Object::Integer(3));
+    let mut direct_outer = Dictionary::new();
+    direct_outer.insert("Type", Object::Name(b"NotPages".to_vec()));
+    direct_outer.insert(
+        "Kids",
+        Object::Array(vec![Object::Dictionary(direct_interior)]),
+    );
+    direct_outer.insert("Count", Object::Integer(3));
+    root.insert(
+        "Kids",
+        Object::Array(vec![Object::Dictionary(direct_outer)]),
+    );
+    pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+
+    assert_eq!(
+        PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap(),
+        vec![
+            ObjectRef::new(13, 0),
+            ObjectRef::new(3, 0),
+            ObjectRef::new(14, 0),
+        ],
+        "qpdf traverses direct nodes in place, mints direct leaves, and clones duplicate leaves"
+    );
+
+    let Object::Dictionary(minted_leaf) = pdf.resolve(ObjectRef::new(13, 0)).unwrap() else {
+        panic!("direct leaf must be made indirect");
+    };
+    assert_eq!(
+        minted_leaf.get("MediaBox"),
+        Some(&Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(612),
+            Object::Integer(792),
+        ])),
+        "qpdf supplies the default MediaBox before retaining the repaired leaf"
+    );
+    assert_eq!(
+        minted_leaf.get("Type"),
+        Some(&Object::Name(b"Page".to_vec()))
+    );
+
+    let Object::Dictionary(root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+        panic!("pages root must remain a dictionary");
+    };
+    let Some(Object::Array(kids)) = root.get("Kids") else {
+        panic!("pages root must retain /Kids");
+    };
+    assert!(
+        matches!(kids.first(), Some(Object::Dictionary(_))),
+        "qpdf leaves a direct intermediate /Pages dictionary direct"
+    );
+}
+
+#[test]
+fn get_all_pages_rejects_an_overdeep_direct_pages_tree() {
+    let mut pdf = open(build_n_page_pdf(1));
+    let mut child = Object::Reference(ObjectRef::new(3, 0));
+    for _ in 0..=flpdf::pages::DEFAULT_MAX_PAGE_TREE_DEPTH {
+        let mut direct_interior = Dictionary::new();
+        direct_interior.insert("Type", Object::Name(b"Pages".to_vec()));
+        direct_interior.insert("Kids", Object::Array(vec![child]));
+        child = Object::Dictionary(direct_interior);
+    }
+    let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+        panic!("pages root must be a dictionary");
+    };
+    root.insert("Kids", Object::Array(vec![child]));
+    pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+
+    let error = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("depth exceeds"),
+        "qpdf-compatible direct traversal must enforce the page-tree depth bound: {error}"
+    );
+}
+
+#[test]
 fn pages_forwards_to_repair_aware_enumeration() {
     let mut pdf = open(pdf_with_catalog_pages_pointing_to_leaf());
 
@@ -283,6 +392,190 @@ fn remove_unreferenced_resources_prunes_unused_font_on_page() {
     };
     assert!(fonts.get("F1").is_some());
     assert!(fonts.get("F2").is_none());
+}
+
+#[test]
+fn helper_resource_pruning_accepts_pages_without_content_or_resources() {
+    let mut no_content = open(build_n_page_pdf(1));
+    PageDocumentHelper::new(&mut no_content)
+        .remove_unreferenced_resources()
+        .unwrap();
+
+    let mut no_resources = open(build_n_page_pdf(1));
+    no_resources.set_object(
+        ObjectRef::new(4, 0),
+        Object::Stream(Stream::new(Dictionary::new(), b"q Q".to_vec())),
+    );
+    let Object::Dictionary(mut page) = no_resources.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
+    no_resources.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+    PageDocumentHelper::new(&mut no_resources)
+        .remove_unreferenced_resources()
+        .unwrap();
+}
+
+#[test]
+fn helper_resource_pruning_skips_non_dictionary_categories_and_malformed_forms() {
+    let mut pdf = open(build_n_page_pdf(1));
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        Object::Stream(Stream::new(Dictionary::new(), b"/Good Do".to_vec())),
+    );
+
+    // The pre-pass sees every declared XObject. None of these malformed entries
+    // is a usable Form; qpdf skips them without preventing page-level pruning.
+    pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(Dictionary::new()));
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Stream(Stream::new(Dictionary::new(), b"ignored".to_vec())),
+    );
+    let mut no_resources_dict = Dictionary::new();
+    no_resources_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
+    pdf.set_object(
+        ObjectRef::new(8, 0),
+        Object::Stream(Stream::new(no_resources_dict, b"ignored".to_vec())),
+    );
+    let mut malformed_resources = Dictionary::new();
+    malformed_resources.insert("Font", Object::Integer(42));
+    let mut undecodable_form = Dictionary::new();
+    undecodable_form.insert("Subtype", Object::Name(b"Form".to_vec()));
+    undecodable_form.insert("Resources", Object::Dictionary(malformed_resources));
+    undecodable_form.insert("Filter", Object::Name(b"UnknownFilter".to_vec()));
+    pdf.set_object(
+        ObjectRef::new(9, 0),
+        Object::Stream(Stream::new(undecodable_form, b"ignored".to_vec())),
+    );
+    let mut valid_form = Dictionary::new();
+    valid_form.insert("Subtype", Object::Name(b"Form".to_vec()));
+    valid_form.insert("Resources", Object::Dictionary(Dictionary::new()));
+    pdf.set_object(
+        ObjectRef::new(10, 0),
+        Object::Stream(Stream::new(valid_form, b"q Q".to_vec())),
+    );
+    let mut xobjects = Dictionary::new();
+    xobjects.insert("Direct", Object::Integer(0));
+    xobjects.insert("Dictionary", Object::Reference(ObjectRef::new(6, 0)));
+    xobjects.insert("NotForm", Object::Reference(ObjectRef::new(7, 0)));
+    xobjects.insert("NoResources", Object::Reference(ObjectRef::new(8, 0)));
+    xobjects.insert("Bad", Object::Reference(ObjectRef::new(9, 0)));
+    xobjects.insert("Good", Object::Reference(ObjectRef::new(10, 0)));
+    let mut resources = Dictionary::new();
+    resources.insert("Font", Object::Integer(99));
+    resources.insert("XObject", Object::Dictionary(xobjects));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(resources));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
+    page.insert("Resources", Object::Reference(ObjectRef::new(5, 0)));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .remove_unreferenced_resources()
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must remain a dictionary");
+    };
+    let Some(Object::Dictionary(resources)) = page.get("Resources") else {
+        panic!("page must retain a direct resource dictionary");
+    };
+    assert_eq!(resources.get("Font"), Some(&Object::Integer(99)));
+    let Some(Object::Dictionary(xobjects)) = resources.get("XObject") else {
+        panic!("page must retain an XObject category");
+    };
+    assert_eq!(
+        xobjects.iter().count(),
+        1,
+        "only the invoked XObject remains"
+    );
+    assert!(xobjects.get("Good").is_some());
+}
+
+#[test]
+fn helper_resource_pruning_handles_form_local_resource_variants() {
+    let mut pdf = open(build_n_page_pdf(1));
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        Object::Stream(Stream::new(
+            Dictionary::new(),
+            b"/Referenced Do /DirectOwner Do".to_vec(),
+        )),
+    );
+
+    let mut nested = Dictionary::new();
+    nested.insert("Subtype", Object::Name(b"Form".to_vec()));
+    pdf.set_object(
+        ObjectRef::new(10, 0),
+        Object::Stream(Stream::new(nested, b"q Q".to_vec())),
+    );
+    let mut nested_xobjects = Dictionary::new();
+    nested_xobjects.insert("First", Object::Reference(ObjectRef::new(10, 0)));
+    nested_xobjects.insert("Second", Object::Reference(ObjectRef::new(10, 0)));
+    pdf.set_object(ObjectRef::new(8, 0), Object::Dictionary(nested_xobjects));
+
+    let mut referenced_resources = Dictionary::new();
+    referenced_resources.insert("Font", Object::Integer(42));
+    referenced_resources.insert("XObject", Object::Reference(ObjectRef::new(8, 0)));
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Dictionary(referenced_resources),
+    );
+    let mut referenced_form = Dictionary::new();
+    referenced_form.insert("Subtype", Object::Name(b"Form".to_vec()));
+    referenced_form.insert("Resources", Object::Reference(ObjectRef::new(7, 0)));
+    pdf.set_object(
+        ObjectRef::new(6, 0),
+        Object::Stream(Stream::new(referenced_form, b"q Q".to_vec())),
+    );
+
+    let mut direct_child = Dictionary::new();
+    direct_child.insert("Subtype", Object::Name(b"Form".to_vec()));
+    let mut direct_child_xobjects = Dictionary::new();
+    direct_child_xobjects.insert(
+        "Child",
+        Object::Stream(Stream::new(direct_child, b"q Q".to_vec())),
+    );
+    let mut direct_owner_resources = Dictionary::new();
+    direct_owner_resources.insert("XObject", Object::Dictionary(direct_child_xobjects));
+    let mut direct_owner = Dictionary::new();
+    direct_owner.insert("Subtype", Object::Name(b"Form".to_vec()));
+    direct_owner.insert("Resources", Object::Dictionary(direct_owner_resources));
+    pdf.set_object(
+        ObjectRef::new(9, 0),
+        Object::Stream(Stream::new(direct_owner, b"/Child Do".to_vec())),
+    );
+
+    let mut page_xobjects = Dictionary::new();
+    page_xobjects.insert("Referenced", Object::Reference(ObjectRef::new(6, 0)));
+    page_xobjects.insert("DirectOwner", Object::Reference(ObjectRef::new(9, 0)));
+    let mut page_resources = Dictionary::new();
+    page_resources.insert("XObject", Object::Dictionary(page_xobjects));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(page_resources));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
+    page.insert("Resources", Object::Reference(ObjectRef::new(5, 0)));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .remove_unreferenced_resources()
+        .unwrap();
+
+    let Object::Stream(form) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("referenced Form must remain a stream");
+    };
+    let Some(Object::Dictionary(resources)) = form.dict.get("Resources") else {
+        panic!("Form resources must be materialized");
+    };
+    assert_eq!(resources.get("Font"), Some(&Object::Integer(42)));
+    let Some(Object::Dictionary(xobjects)) = resources.get("XObject") else {
+        panic!("qpdf retains the category dictionary after pruning its entries");
+    };
+    assert_eq!(xobjects.iter().count(), 0);
 }
 
 #[test]
