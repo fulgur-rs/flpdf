@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDFJob.cc doJSON* section builders plus QPDF_json.cc writeJSON serialization and side-file lifecycle responsibilities.
+//! qpdf correspondence: QPDFJob.cc doJSON* section builders, QPDF_json.cc writeJSON serialization and side-file lifecycle, and QPDFObjectHandle::getJSON object serialization responsibilities.
 //! qpdf JSON v2 inspection builders and command-boundary output coordinator.
 //!
 //! Provides the structural frame for qpdf `--json` output.  Each builder
