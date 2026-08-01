@@ -2603,8 +2603,10 @@ fn all_true_capabilities() -> Result<Json, ConvertError> {
 ///
 /// # Errors
 ///
-/// Returns a [`ConvertError`] only when an indirect `/Encrypt` reference
-/// cannot be resolved (i.e. an underlying I/O or parse error).
+/// Returns a [`ConvertError`] when the `/Encrypt` reference, or any of its
+/// nested entries (`/V`, `/R`, `/P`, `/Length`, `/StmF`, `/StrF`, `/EFF`,
+/// `/CF`, `/CFM`) that happen to be stored as indirect references, cannot be
+/// resolved (i.e. an underlying I/O or parse error).
 pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
     // Resolve /Encrypt via `trailer_key_handle`, not `trailer_handle`: the
     // latter lifts the *whole* trailer in one pass and degrades to a null
