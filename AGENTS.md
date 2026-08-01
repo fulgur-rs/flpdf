@@ -79,3 +79,14 @@
   - `git pull --rebase` (optional if already synced)
   - `git push`
 - Do not hand off before remote push succeeds.
+
+## Code Review Rules
+
+### Codex Cloud experiment
+
+For this pull request only, publish lifecycle visibility on this pull request's
+exact head commit. Before beginning review, create the commit-status context
+`codex/auto-review` with state `pending`. Immediately before submitting the
+review, update that same context to `success` when the review completed, or
+`failure` when it could not complete. Do not update any other commit, alter
+source files, expose credentials, or force-push.
