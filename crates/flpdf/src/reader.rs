@@ -6517,6 +6517,57 @@ mod tests {
             .expect("nesting guard must return null before exhausting the stack");
     }
 
+    // coderabbit (PR #610): the `+ 5` margin above and below
+    // `MAX_PARSE_DEPTH` in the two tests above cannot catch an off-by-one at
+    // the bound itself. These pin the exact boundary: a value nested to
+    // precisely `MAX_PARSE_DEPTH` is accepted, one hop deeper is null.
+    #[test]
+    fn trailer_key_handle_accepts_the_keys_own_value_at_exactly_the_parse_depth_bound() {
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+                let mut nested = Object::Integer(1);
+                for _ in 0..crate::parser::MAX_PARSE_DEPTH {
+                    nested = Object::Array(vec![nested]);
+                }
+                pdf.trailer.insert("QTest", nested);
+
+                let handle = pdf.trailer_key_handle(b"QTest");
+
+                assert!(!handle.is_null());
+                assert!(handle.as_array().is_some());
+            })
+            .expect("nesting-guard test thread must start")
+            .join()
+            .expect(
+                "nesting guard must accept exactly MAX_PARSE_DEPTH before exhausting the stack",
+            );
+    }
+
+    #[test]
+    fn trailer_key_handle_is_null_one_hop_past_the_parse_depth_bound() {
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+                let mut nested = Object::Integer(1);
+                for _ in 0..crate::parser::MAX_PARSE_DEPTH + 1 {
+                    nested = Object::Array(vec![nested]);
+                }
+                pdf.trailer.insert("QTest", nested);
+
+                let handle = pdf.trailer_key_handle(b"QTest");
+
+                assert!(handle.is_null());
+            })
+            .expect("nesting-guard test thread must start")
+            .join()
+            .expect(
+                "nesting guard must return null one hop past the bound before exhausting the stack",
+            );
+    }
+
     #[test]
     fn trailer_key_handle_lifts_an_indirect_value_to_a_canonical_handle() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
