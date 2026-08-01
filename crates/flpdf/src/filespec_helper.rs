@@ -336,13 +336,12 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                     return Ok(());
                 };
                 params.insert(key, value.clone());
-                if let Some(terminal_ref) = terminal_ref {
-                    self.pdf
-                        .set_object(terminal_ref, Object::Dictionary(params.clone()));
-                    self.params = Some(params);
-                    return Ok(());
-                }
-                params
+                let terminal_ref = terminal_ref
+                    .expect("a reference-chain lookup always retains its terminal reference");
+                self.pdf
+                    .set_object(terminal_ref, Object::Dictionary(params.clone()));
+                self.params = Some(params);
+                return Ok(());
             }
             _ => Dictionary::new(),
         };
@@ -903,6 +902,7 @@ impl FileSpecBuilder {
         if self.compress {
             let Object::Stream(mut stream) = pdf.resolve(stream_ref)? else {
                 unreachable!("EmbeddedFileStream::create must create a stream");
+                // cov:ignore: factory return type makes this arm unreachable
             };
             let mut encode_dict = Dictionary::new();
             encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
@@ -940,7 +940,7 @@ impl FileSpecBuilder {
 
         if let Some(relationship) = self.af_relationship {
             let Object::Dictionary(mut filespec) = pdf.resolve(filespec_ref)? else {
-                unreachable!("FileSpec::create must create a dictionary");
+                unreachable!("FileSpec::create must create a dictionary"); // cov:ignore: factory return type makes this arm unreachable
             };
             filespec.insert("AFRelationship", Object::Name(relationship));
             pdf.set_object(filespec_ref, Object::Dictionary(filespec));

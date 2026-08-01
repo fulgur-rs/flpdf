@@ -7,8 +7,8 @@
 //! production-generated document.
 
 use flpdf::{
-    encode_utf16be, format_pdf_date, md5_checksum, EmbeddedFileStream, FileParamDates, FileSpec,
-    FileSpecBuilder, Object, ObjectRef, Pdf,
+    encode_utf16be, format_pdf_date, md5_checksum, Dictionary, EmbeddedFileStream, FileParamDates,
+    FileSpec, FileSpecBuilder, Object, ObjectRef, Pdf,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -191,6 +191,21 @@ fn get_embedded_file_stream_accepts_qpdf_filename_keys() {
         fs.get_embedded_file_stream("/F").unwrap(),
         Object::Reference(ObjectRef::new(6, 0))
     );
+}
+
+#[test]
+fn get_embedded_file_stream_returns_null_when_no_candidate_is_a_stream() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let Object::Dictionary(mut filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected filespec dictionary");
+    };
+    let mut entries = Dictionary::new();
+    entries.insert("UF", Object::Integer(3));
+    filespec.insert("EF", Object::Dictionary(entries));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(filespec));
+
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    assert_eq!(fs.get_embedded_file_stream("").unwrap(), Object::Null);
 }
 
 #[test]
@@ -392,6 +407,7 @@ fn embedded_file_setters_update_the_live_stream_and_qpdf_getters() {
         );
         assert_eq!(ef.get_subtype().unwrap(), Some(b"application/pdf".to_vec()));
         assert_eq!(ef.get_size().unwrap(), 0);
+        assert_eq!(ef.get_checksum().unwrap(), None);
     }
 
     let Object::Stream(stream) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
@@ -411,6 +427,71 @@ fn embedded_file_setters_update_the_live_stream_and_qpdf_getters() {
     assert_eq!(
         stream.dict.get("Subtype"),
         Some(&Object::Name(b"application/pdf".to_vec()))
+    );
+}
+
+#[test]
+fn embedded_file_setter_updates_indirect_params_dictionary() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let mut params = Dictionary::new();
+    params.insert("Size", Object::Integer(4));
+    pdf.set_object(ObjectRef::new(7, 0), Object::Dictionary(params));
+    let Object::Stream(mut stream) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("expected embedded-file stream");
+    };
+    stream
+        .dict
+        .insert("Params", Object::Reference(ObjectRef::new(7, 0)));
+    pdf.set_object(ObjectRef::new(6, 0), Object::Stream(stream));
+
+    {
+        let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+        fs.embedded_file()
+            .unwrap()
+            .unwrap()
+            .set_creation_date(b"D:20260101000000Z")
+            .unwrap();
+    }
+
+    let Object::Dictionary(params) = pdf.resolve(ObjectRef::new(7, 0)).unwrap() else {
+        panic!("expected indirect /Params dictionary");
+    };
+    assert_eq!(
+        params.get("CreationDate"),
+        Some(&Object::String(b"D:20260101000000Z".to_vec()))
+    );
+}
+
+#[test]
+fn embedded_file_setter_replaces_non_dictionary_indirect_params() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    pdf.set_object(ObjectRef::new(7, 0), Object::Integer(4));
+    let Object::Stream(mut stream) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("expected embedded-file stream");
+    };
+    stream
+        .dict
+        .insert("Params", Object::Reference(ObjectRef::new(7, 0)));
+    pdf.set_object(ObjectRef::new(6, 0), Object::Stream(stream));
+
+    {
+        let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+        fs.embedded_file()
+            .unwrap()
+            .unwrap()
+            .set_modification_date(b"D:20260202000000Z")
+            .unwrap();
+    }
+
+    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("expected embedded-file stream");
+    };
+    let Object::Dictionary(params) = stream.dict.get("Params").unwrap() else {
+        panic!("expected replacement /Params dictionary");
+    };
+    assert_eq!(
+        params.get("ModDate"),
+        Some(&Object::String(b"D:20260202000000Z".to_vec()))
     );
 }
 
