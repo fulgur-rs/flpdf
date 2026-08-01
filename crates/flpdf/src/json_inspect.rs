@@ -10659,6 +10659,47 @@ mod tests {
     }
 
     #[test]
+    fn attachments_preferredname_skips_a_non_string_name_entry() {
+        let mut pdf = load_one_page_pdf();
+
+        let filespec_ref = crate::ObjectRef::new(934, 0);
+        let ef_root_ref = crate::ObjectRef::new(935, 0);
+        let names_ref = crate::ObjectRef::new(936, 0);
+
+        // /UF is present but not a string. qpdf's getFilename() requires
+        // isString(), so a wrong-type /UF must be skipped in favor of the
+        // next-priority key (/F) rather than accepted as the preferred name.
+        let mut filespec = Dictionary::new();
+        filespec.insert("Type", Object::Name(b"Filespec".to_vec()));
+        filespec.insert("UF", Object::Integer(42));
+        filespec.insert("F", Object::String(b"f-name.txt".to_vec()));
+
+        patch_embedded_files(
+            &mut pdf,
+            names_ref,
+            ef_root_ref,
+            filespec_ref,
+            filespec,
+            b"attachment.txt",
+        );
+
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        let pairs = object_pairs(&result);
+        let entry = object_pairs(&pairs[0].1);
+        let preferredname = entry
+            .iter()
+            .find(|(k, _)| k == "preferredname")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(
+            preferredname,
+            serde_json::Value::String("f-name.txt".to_string()),
+            "a non-string /UF entry must be skipped in favor of /F"
+        );
+    }
+
+    #[test]
     fn attachments_params_missing_and_invalid_values_become_null() {
         let mut pdf = load_one_page_pdf();
         let stream_f_ref = crate::ObjectRef::new(920, 0);
@@ -11335,6 +11376,36 @@ mod tests {
             serde_json::Value::String("AESv2".into())
         );
         assert_eq!(get("key"), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn encrypt_section_missing_v_r_p_default_to_zero() {
+        // A spec-invalid /Encrypt dictionary missing /V, /R, and /P: each
+        // must default to 0 rather than erroring, matching /Length's
+        // existing "absent -> default" behavior.
+        let mut pdf = load_encrypted_r4_pdf();
+        let encrypt_ref = match pdf.trailer().get("Encrypt") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("expected /Encrypt to be an indirect reference, got {other:?}"),
+        };
+        // Authentication already happened at open time; replacing the
+        // referenced object post-open only affects build_encrypt_section's
+        // fresh re-read of /V, /R, /P.
+        pdf.set_object(encrypt_ref, Object::Dictionary(Dictionary::new()));
+
+        let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
+        let pairs = object_pairs(enc);
+        let params = pairs
+            .iter()
+            .find(|(k, _)| k == "parameters")
+            .unwrap()
+            .1
+            .clone();
+        let p = object_pairs(params);
+        let get = |k: &str| p.iter().find(|(ky, _)| ky == k).unwrap().1.clone();
+        assert_eq!(get("V"), number(0), "/V absent must default to 0");
+        assert_eq!(get("R"), number(0), "/R absent must default to 0");
+        assert_eq!(get("P"), number(0), "/P absent must default to 0");
     }
 
     #[test]
