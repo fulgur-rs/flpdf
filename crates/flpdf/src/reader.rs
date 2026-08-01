@@ -325,25 +325,6 @@ const MAX_OBJECT_STREAM_CHAIN_DEPTH: usize = 100;
 // defeating a flood of objects whose bodies run to EOF.
 const MAX_RESOLUTION_FALLBACKS: u32 = 64;
 
-// Upper bound on hops `Pdf::resolve_object_handle_to_terminal`'s
-// `ObjectValue::Reference` chase follows before giving up.
-// `ObjectValue::Reference` is an flpdf-internal construct with no direct
-// qpdf analog — qpdf's own `QPDF::replaceObject` (`libqpdf/QPDF.cc:1980-1991`)
-// throws `std::logic_error` if given an indirect handle, so qpdf's object
-// graph can never itself hold a stored "this object's value is another
-// reference" redirect the way `Pdf::set_object` permits here. The closest
-// qpdf precedent is architectural rather than literal: `QPDF::resolve`'s own
-// cycle guard (`libqpdf/QPDF.cc:1699-1712`) tracks in-progress resolutions in
-// a `resolving` set and, on detecting a self/mutual loop, warns and falls
-// back to `QPDF_Null` rather than hanging or overflowing the stack — the
-// same "bounded, warn, fall back to null" shape this chase follows below,
-// via a hop counter instead of a visited set. The specific bound reuses
-// `crates/flpdf-qtest-tools/src/driver/handle.rs`'s own established
-// `MAX_REF_CHAIN_DEPTH` constant for exactly this scenario (that driver
-// layers the same chase on top of the legacy `Object`-based API; this
-// constant brings the same bound to the `ObjectHandle` API itself).
-const MAX_REFERENCE_REDIRECT_DEPTH: usize = 64;
-
 impl<R: Read + Seek> Drop for Pdf<R> {
     // A resolved indirect handle's value can embed other indirect handles
     // sharing `handle_registry`'s own canonical `Rc` identity (array/dict/
@@ -1837,11 +1818,24 @@ impl<R: Read + Seek> Pdf<R> {
     /// call for that same ref returns, silently discarding the redirect
     /// `Pdf::set_object` recorded.
     ///
-    /// A self- or mutually-cyclic redirect chain is bounded (see
-    /// `MAX_REFERENCE_REDIRECT_DEPTH`'s own doc for the qpdf precedent this
-    /// mirrors) and returns a null-resolved handle, with a recorded
-    /// [`Pdf::repair_diagnostics`] warning, rather than hanging or
-    /// overflowing the stack — again without mutating any canonical handle.
+    /// A self- or mutually-cyclic redirect chain is bounded by
+    /// `ref_chain::MAX_REF_CHAIN_DEPTH` — this crate's one shared hop-count
+    /// bound for exactly this kind of chase, also used by
+    /// `ref_chain::resolve_ref_chain`. `ObjectValue::Reference` has no
+    /// direct qpdf analog to bound against: qpdf's own
+    /// `QPDF::replaceObject` (`libqpdf/QPDF.cc:1980-1991`) throws
+    /// `std::logic_error` given an indirect handle, so qpdf's object graph
+    /// can never itself hold a stored "this object's value is another
+    /// reference" redirect the way [`Pdf::set_object`] permits here. The
+    /// closest qpdf precedent is architectural rather than literal:
+    /// `QPDF::resolve`'s own cycle guard (`libqpdf/QPDF.cc:1699-1712`)
+    /// tracks in-progress resolutions in a `resolving` set and, on detecting
+    /// a self/mutual loop, warns and falls back to `QPDF_Null` rather than
+    /// hanging or overflowing the stack — the same "bounded, warn, fall back
+    /// to null" shape this chase follows, via a hop counter instead of a
+    /// visited set. Reaching the bound returns a null-resolved handle, with
+    /// a recorded [`Pdf::repair_diagnostics`] warning, again without
+    /// mutating any canonical handle.
     ///
     /// # Errors
     ///
@@ -1854,7 +1848,7 @@ impl<R: Read + Seek> Pdf<R> {
         let Some(mut current_ref) = handle.as_reference() else {
             return Ok(handle.clone()); // already terminal (the common case) — or unresolved/missing
         };
-        for _ in 0..MAX_REFERENCE_REDIRECT_DEPTH {
+        for _ in 0..crate::ref_chain::MAX_REF_CHAIN_DEPTH {
             let hop = self.get_object_handle(current_ref);
             self.resolve_object_handle(&hop)?;
             match hop.as_reference() {
@@ -1877,8 +1871,10 @@ impl<R: Read + Seek> Pdf<R> {
         }
         self.push_warning(format!(
             "reference redirect chain reaching object {} {} exceeds \
-             {MAX_REFERENCE_REDIRECT_DEPTH} hops, treating as cyclic",
-            current_ref.number, current_ref.generation
+             {} hops, treating as cyclic",
+            current_ref.number,
+            current_ref.generation,
+            crate::ref_chain::MAX_REF_CHAIN_DEPTH
         ));
         Ok(Self::shadow_terminal_handle(handle, None))
     }
