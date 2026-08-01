@@ -1939,7 +1939,7 @@ mod tests {
     }
 
     #[test]
-    fn add_attachment_from_path_f_and_uf_are_basename() {
+    fn add_attachment_from_path_f_and_uf_follow_qpdf_unicode_string_rules() {
         let mut pdf = open_minimal();
         let dir = tempfile::tempdir().expect("tempdir");
         let file_path = dir.path().join("report.pdf");
@@ -1959,11 +1959,7 @@ mod tests {
             _ => panic!("missing /UF"),
         };
         assert_eq!(f, b"report.pdf", "/F must be basename");
-        assert_eq!(
-            uf,
-            encode_utf16be("report.pdf"),
-            "/UF must be UTF-16BE basename"
-        );
+        assert_eq!(uf, b"report.pdf", "/UF must use qpdf's PDFDocEncoding form");
     }
 
     #[test]
