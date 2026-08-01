@@ -882,20 +882,10 @@ fn builder_round_trip_all_fields() {
     let fname = fs.filename().expect("filename()");
     assert_eq!(fname, Some(b"report.txt".to_vec()), "/F mismatch");
 
-    // ── /UF (UTF-16BE with BOM) ───────────────────────────────────────────────
+    // ── /UF (qpdf newUnicodeString) ──────────────────────────────────────────
     let mut fs = FileSpec::new(filespec_ref, &mut pdf);
     let uf = fs.uf().expect("uf()").expect("/UF should be present");
-    assert!(
-        uf.starts_with(&[0xFE, 0xFF]),
-        "/UF must start with BOM FE FF"
-    );
-    // Decode UF back: skip BOM, read u16 pairs
-    let units: Vec<u16> = uf[2..]
-        .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
-        .collect();
-    let decoded = String::from_utf16(&units).expect("UTF-16BE decode");
-    assert_eq!(decoded, "report.txt", "/UF decoded filename mismatch");
+    assert_eq!(uf, b"report.txt", "ASCII /UF must be PDFDocEncoding");
 
     // ── /Desc ────────────────────────────────────────────────────────────────
     let mut fs = FileSpec::new(filespec_ref, &mut pdf);
@@ -986,7 +976,7 @@ fn builder_round_trip_minimal() {
 
     let mut fs = FileSpec::new(filespec_ref, &mut pdf);
     let uf = fs.uf().expect("uf()").expect("/UF present");
-    assert!(uf.starts_with(&[0xFE, 0xFF]), "/UF BOM missing");
+    assert_eq!(uf, b"tiny.bin", "ASCII /UF must be PDFDocEncoding");
 
     let mut fs = FileSpec::new(filespec_ref, &mut pdf);
     assert_eq!(fs.description().expect("description()"), None);
@@ -1007,9 +997,9 @@ fn builder_round_trip_minimal() {
     );
 }
 
-/// /UF is UTF-16BE encoded with BOM for a Unicode filename.
+/// /UF follows qpdf's newUnicodeString rule for an ASCII filename.
 #[test]
-fn builder_uf_is_utf16be_with_bom() {
+fn builder_uf_uses_pdfdocencoding_for_ascii() {
     let mut pdf = build_minimal_pdf();
     let payload = b"data";
     let filespec_ref = FileSpecBuilder::new("ascii.txt", payload.as_slice())
@@ -1019,15 +1009,7 @@ fn builder_uf_is_utf16be_with_bom() {
     let mut fs = FileSpec::new(filespec_ref, &mut pdf);
     let uf = fs.uf().expect("uf()").expect("/UF present");
 
-    // BOM must be first two bytes.
-    assert_eq!(&uf[..2], &[0xFE, 0xFF], "BOM missing");
-
-    // Decode and verify filename.
-    let units: Vec<u16> = uf[2..]
-        .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
-        .collect();
-    assert_eq!(String::from_utf16(&units).expect("utf16"), "ascii.txt");
+    assert_eq!(uf, b"ascii.txt");
 }
 
 /// /Params date format must follow D:YYYYMMDDHHmmSSZ.

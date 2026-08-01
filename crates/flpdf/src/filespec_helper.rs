@@ -968,7 +968,7 @@ impl FileSpecBuilder {
                 })?
                 .to_string(),
         };
-        let uf_bytes = encode_utf16be(&uf_filename);
+        let uf_bytes = new_unicode_string(uf_filename.as_bytes());
 
         let mut fs_dict = Dictionary::new();
         fs_dict.insert("Type", Object::Name(b"Filespec".to_vec()));
@@ -1758,7 +1758,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_compressed_f_and_uf_are_basename() {
+    fn builder_compressed_f_and_uf_follow_qpdf_unicode_string_rules() {
         let mut pdf = open_minimal();
         let raw = b"payload";
         let fs_ref = FileSpecBuilder::new("myfile.txt", raw.as_ref())
@@ -1782,8 +1782,7 @@ mod tests {
             _ => panic!("missing /UF"),
         };
         assert_eq!(f, b"myfile.txt", "/F must be the filename");
-        let expected_uf = encode_utf16be("myfile.txt");
-        assert_eq!(uf, expected_uf, "/UF must be UTF-16BE encoded filename");
+        assert_eq!(uf, b"myfile.txt", "/UF must use qpdf newUnicodeString");
     }
 
     #[test]

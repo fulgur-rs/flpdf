@@ -1,6 +1,6 @@
 # Filespec helper D1 design
 
-**Issue:** flpdf-d9sq  
+**Issue:** flpdf-d9sq
 **Oracle:** qpdf 11.9.0 `QPDFFileSpecObjectHelper` and `QPDFEFStreamObjectHelper`
 
 ## Goal
