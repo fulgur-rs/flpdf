@@ -419,10 +419,11 @@ fn filespec_setters_use_qpdf_unicode_and_compatibility_rules() {
     // This fails if description/filename writes bypass newUnicodeString, or
     // if a non-empty compatibility name does not replace /F alone.
     let mut pdf = open(build_attachment_pdf("", "", b"data"));
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
-    fs.set_description("概要").unwrap();
-    fs.set_filename("東京.txt", Some("fallback.txt")).unwrap();
-    drop(fs);
+    {
+        let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+        fs.set_description("概要").unwrap();
+        fs.set_filename("東京.txt", Some("fallback.txt")).unwrap();
+    }
 
     let Object::Dictionary(filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
         panic!("expected Filespec dictionary");

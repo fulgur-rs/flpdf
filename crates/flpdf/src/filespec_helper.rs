@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc partial helper surface; public APIs are incomplete.
+//! qpdf correspondence: QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc.
 //! Typed wrappers for `/Filespec` dictionaries and `/EmbeddedFile` streams,
 //! plus a builder for constructing them.
 //!
@@ -14,13 +14,11 @@
 //! the `/Names /EmbeddedFiles` name tree using
 //! [`crate::embedded_files::insert_embedded_file`].
 //!
-//! Both reader types are **read-only**. [`FileSpec`] is a thin borrowing wrapper that
-//! holds only the `/Filespec` `ObjectRef` and re-resolves the dictionary from
-//! the live document on each accessor call. [`EmbeddedFileStream`] is
-//! constructed once from an already-resolved `/EmbeddedFile` stream: it owns
-//! that [`Stream`] and the `/Params` sub-dictionary resolved at construction
-//! time (an indirect `/Params` is dereferenced once), so its metadata
-//! accessors read this retained state rather than re-resolving.
+//! [`FileSpec`] owns the `/Filespec` object reference and resolves its
+//! dictionary from the live document on each operation. [`EmbeddedFileStream`]
+//! owns the terminal `/EmbeddedFile` reference plus a retained stream snapshot;
+//! its setters write changes back through that reference, including an indirect
+//! `/Params` dictionary when one is present.
 //!
 //! # Design
 //!
