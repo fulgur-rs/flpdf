@@ -163,6 +163,20 @@ fn get_filenames_returns_only_string_name_keys_as_utf8() {
 }
 
 #[test]
+fn get_filename_returns_none_when_no_recognized_entry_is_a_string() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let Object::Dictionary(mut filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected filespec dictionary");
+    };
+    filespec.insert("UF", Object::Integer(7));
+    filespec.insert("F", Object::Name(b"not-a-string".to_vec()));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(filespec));
+
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    assert_eq!(fs.get_filename().unwrap(), None);
+}
+
+#[test]
 fn get_embedded_file_stream_returns_requested_entry_and_ef_dictionary() {
     // This fails if a named request applies the preferred-key stream filter,
     // or if the raw /EF dictionary is reconstructed instead of returned.
