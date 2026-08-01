@@ -1192,36 +1192,6 @@ fn stream_payload_with_decode_status(
     }
 }
 
-// ── resolved_value ────────────────────────────────────────────────────────────
-
-/// Resolve `handle` (a no-op if it is already a direct value) and read it
-/// through `accessor`.
-///
-/// qpdf's `QPDFObjectHandle` typed accessors (`isName`, `isString`,
-/// `isInteger`, `asDictionary`, …) each call `dereference()` internally, so
-/// every one of qpdf's own dictionary-key reads — `/T`, `/FT`, `/Ff`, `/TU`,
-/// `/TM`, `/Subtype`, `/Desc`, the filespec name keys, the encrypt
-/// dictionary's `/V`/`/R`/`/P`/`/Length`/`/CF`/`/CFM`, … — transparently
-/// follows an indirect reference. A bare `dict.get(key).and_then(accessor)`
-/// on an `ObjectHandle` does not: [`Pdf::get_object_handle`] returns the
-/// *same* shared, lazily-resolved handle for a given `ObjectRef` no matter
-/// who asks for it, so an unresolved handle reads as absent even when the
-/// referenced object holds a perfectly good value. Resolving here — rather
-/// than guarding against it — is what makes flpdf match qpdf's read-through
-/// behavior instead of diverging from it whenever a field happens to be
-/// stored as an indirect reference.
-fn resolved_value<R: Read + Seek, T>(
-    pdf: &mut Pdf<R>,
-    handle: Option<&ObjectHandle>,
-    accessor: fn(&ObjectHandle) -> Option<T>,
-) -> Result<Option<T>, ConvertError> {
-    let Some(handle) = handle else {
-        return Ok(None);
-    };
-    pdf.resolve_object_handle(handle)?;
-    Ok(accessor(handle))
-}
-
 // ── build_pages_section ───────────────────────────────────────────────────────
 
 /// Flatten a `/Contents` entry into a list of indirect-reference strings.
@@ -1332,10 +1302,12 @@ fn collect_image_refs<R: Read + Seek>(
         let Some(stream_dict) = value.as_stream_dict().and_then(|d| d.as_dictionary()) else {
             continue;
         };
-        let subtype_handle = stream_dict.get(b"Subtype".as_slice());
-        if let Some(subtype) = resolved_value(pdf, subtype_handle, ObjectHandle::as_name)? {
-            if subtype.as_slice() == b"Image" {
-                image_refs.push(format!("{} {} R", xobj_ref.number, xobj_ref.generation));
+        if let Some(subtype_handle) = stream_dict.get(b"Subtype".as_slice()) {
+            pdf.resolve_object_handle(subtype_handle)?;
+            if let Some(subtype) = subtype_handle.as_name() {
+                if subtype.as_slice() == b"Image" {
+                    image_refs.push(format!("{} {} R", xobj_ref.number, xobj_ref.generation));
+                }
             }
         }
     }
@@ -1611,10 +1583,15 @@ fn walk_acroform_fields<R: Read + Seek>(
     };
 
     // Compute fullname: parent.T or just T at root.
-    let t_handle = field_dict.get(b"T".as_slice());
-    let t_string = match resolved_value(pdf, t_handle, ObjectHandle::as_string)? {
-        Some(bytes) => decode_pdf_text_string(&bytes)
-            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
+    let t_string = match field_dict.get(b"T".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            match handle.as_string() {
+                Some(bytes) => decode_pdf_text_string(&bytes)
+                    .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
+                None => String::new(),
+            }
+        }
         None => String::new(),
     };
     let fullname = if parent_fullname.is_empty() {
@@ -1637,10 +1614,16 @@ fn walk_acroform_fields<R: Read + Seek>(
     // /FT, /V, /DV, /Ff are all inheritable down the /Parent chain
     // (ISO 32000-1 §12.7.3.1). Use the same lookup helper for each.
     let ft_obj = inherited_field_value(pdf, &field_dict, "FT")?;
-    let fieldtype = match resolved_value(pdf, ft_obj.as_ref(), ObjectHandle::as_name)? {
-        // qpdf's `getFieldType()` returns `QPDFObjectHandle::getName()`
-        // verbatim, which includes the leading "/" (QPDFFormFieldObjectHelper.cc).
-        Some(bytes) => Json::make_string(format!("/{}", String::from_utf8_lossy(&bytes))),
+    let fieldtype = match &ft_obj {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            match handle.as_name() {
+                // qpdf's `getFieldType()` returns `QPDFObjectHandle::getName()`
+                // verbatim, which includes the leading "/" (QPDFFormFieldObjectHelper.cc).
+                Some(bytes) => Json::make_string(format!("/{}", String::from_utf8_lossy(&bytes))),
+                None => Json::make_null(),
+            }
+        }
         None => Json::make_null(),
     };
 
@@ -1658,38 +1641,60 @@ fn walk_acroform_fields<R: Read + Seek>(
 
     // /Ff — field flags integer. Inherited from /Parent.
     let ff_obj = inherited_field_value(pdf, &field_dict, "Ff")?;
-    let fieldflags = match resolved_value(pdf, ff_obj.as_ref(), ObjectHandle::as_integer)? {
-        Some(n) => Json::make_int(n),
+    let fieldflags = match &ff_obj {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            match handle.as_integer() {
+                Some(n) => Json::make_int(n),
+                None => Json::make_null(),
+            }
+        }
         None => Json::make_null(),
     };
 
     // /TU — alternate name.
-    let tu_handle = field_dict.get(b"TU".as_slice());
-    let alternatename = match resolved_value(pdf, tu_handle, ObjectHandle::as_string)? {
-        Some(bytes) => {
-            let s = decode_pdf_text_string(&bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-            Json::make_string(s)
+    let alternatename = match field_dict.get(b"TU".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            match handle.as_string() {
+                Some(bytes) => {
+                    let s = decode_pdf_text_string(&bytes)
+                        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+                    Json::make_string(s)
+                }
+                None => Json::make_null(),
+            }
         }
         None => Json::make_null(),
     };
 
     // /TM — mapping name.
-    let tm_handle = field_dict.get(b"TM".as_slice());
-    let mappingname = match resolved_value(pdf, tm_handle, ObjectHandle::as_string)? {
-        Some(bytes) => {
-            let s = decode_pdf_text_string(&bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-            Json::make_string(s)
+    let mappingname = match field_dict.get(b"TM".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            match handle.as_string() {
+                Some(bytes) => {
+                    let s = decode_pdf_text_string(&bytes)
+                        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+                    Json::make_string(s)
+                }
+                None => Json::make_null(),
+            }
         }
         None => Json::make_null(),
     };
 
     // Determine if this field is itself a widget annotation.
-    let subtype_handle = field_dict.get(b"Subtype".as_slice());
-    let is_widget = resolved_value(pdf, subtype_handle, ObjectHandle::as_name)?
-        .map(|n| n.as_slice() == b"Widget")
-        .unwrap_or(false);
+    let is_widget = match field_dict.get(b"Subtype".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle
+                .as_name()
+                .map(|n| n.as_slice() == b"Widget")
+                .unwrap_or(false)
+        }
+        None => false,
+    };
 
     // /Kids — may be a direct Array or an indirect Reference to an Array.
     // Resolve the indirect form so we don't silently drop the entire kid
@@ -1722,10 +1727,16 @@ fn walk_acroform_fields<R: Read + Seek>(
         let Some(d) = kid.as_dictionary() else {
             continue;
         };
-        let is_widget_subtype =
-            resolved_value(pdf, d.get(b"Subtype".as_slice()), ObjectHandle::as_name)?
-                .map(|n| n.as_slice() == b"Widget")
-                .unwrap_or(false);
+        let is_widget_subtype = match d.get(b"Subtype".as_slice()) {
+            Some(handle) => {
+                pdf.resolve_object_handle(handle)?;
+                handle
+                    .as_name()
+                    .map(|n| n.as_slice() == b"Widget")
+                    .unwrap_or(false)
+            }
+            None => false,
+        };
         // Field-like markers that mean the kid acts as a (possibly unnamed)
         // field even when /Subtype is /Widget. Covers the merged widget+field
         // case where the widget dictionary carries field state (value, flags,
@@ -1889,9 +1900,13 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
     };
 
     // /NeedAppearances (default false).
-    let need_appearances_handle = acroform_dict.get(b"NeedAppearances".as_slice());
-    let need_appearances =
-        resolved_value(pdf, need_appearances_handle, ObjectHandle::as_boolean)?.unwrap_or(false);
+    let need_appearances = match acroform_dict.get(b"NeedAppearances".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle.as_boolean().unwrap_or(false)
+        }
+        None => false,
+    };
 
     // /Fields array (top-level field refs). Same as /Kids below: must
     // accept both the direct Array form and an indirect Reference to an
@@ -2124,12 +2139,17 @@ fn filespec_dict_to_json<R: Read + Seek>(
     };
 
     // description: /Desc decoded as PDF text string, bare (no u:/b: prefix)
-    let desc_handle = filespec_dict.get(b"Desc".as_slice());
-    let description = match resolved_value(pdf, desc_handle, ObjectHandle::as_string)? {
-        Some(bytes) => {
-            let s = decode_pdf_text_string(&bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-            Json::make_string(s)
+    let description = match filespec_dict.get(b"Desc".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            match handle.as_string() {
+                Some(bytes) => {
+                    let s = decode_pdf_text_string(&bytes)
+                        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+                    Json::make_string(s)
+                }
+                None => Json::make_null(),
+            }
         }
         None => Json::make_null(),
     };
@@ -2139,8 +2159,11 @@ fn filespec_dict_to_json<R: Read + Seek>(
     let name_keys = ["DOS", "F", "Mac", "UF", "Unix"];
     let mut names_pairs: Vec<(String, Json)> = Vec::new();
     for key in &name_keys {
-        let handle = filespec_dict.get(key.as_bytes());
-        if let Some(bytes) = resolved_value(pdf, handle, ObjectHandle::as_string)? {
+        let Some(handle) = filespec_dict.get(key.as_bytes()) else {
+            continue;
+        };
+        pdf.resolve_object_handle(handle)?;
+        if let Some(bytes) = handle.as_string() {
             let s = decode_pdf_text_string(&bytes)
                 .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
             names_pairs.push((format!("/{key}"), Json::make_string(s)));
@@ -2154,8 +2177,11 @@ fn filespec_dict_to_json<R: Read + Seek>(
     let preferred_name_key_order = ["UF", "F", "Unix", "DOS", "Mac"];
     let mut preferredname = Json::make_null();
     for key in &preferred_name_key_order {
-        let handle = filespec_dict.get(key.as_bytes());
-        if let Some(bytes) = resolved_value(pdf, handle, ObjectHandle::as_string)? {
+        let Some(handle) = filespec_dict.get(key.as_bytes()) else {
+            continue;
+        };
+        pdf.resolve_object_handle(handle)?;
+        if let Some(bytes) = handle.as_string() {
             let s = decode_pdf_text_string(&bytes)
                 .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
             preferredname = Json::make_string(s);
@@ -2216,9 +2242,16 @@ fn filespec_dict_to_json<R: Read + Seek>(
             };
 
             // mimetype: /Subtype name → bare string (no "/" prefix), or null
-            let subtype_handle = stream_dict.get(b"Subtype".as_slice());
-            let mimetype = match resolved_value(pdf, subtype_handle, ObjectHandle::as_name)? {
-                Some(bytes) => Json::make_string(String::from_utf8_lossy(&bytes).into_owned()),
+            let mimetype = match stream_dict.get(b"Subtype".as_slice()) {
+                Some(handle) => {
+                    pdf.resolve_object_handle(handle)?;
+                    match handle.as_name() {
+                        Some(bytes) => {
+                            Json::make_string(String::from_utf8_lossy(&bytes).into_owned())
+                        }
+                        None => Json::make_null(),
+                    }
+                }
                 None => Json::make_null(),
             };
 
@@ -2233,10 +2266,13 @@ fn filespec_dict_to_json<R: Read + Seek>(
                 };
 
             // checksum: /Params /CheckSum bytes → lowercase hex, or null
-            let checksum = match &params_dict {
-                Some(p) => {
-                    let handle = p.get(b"CheckSum".as_slice());
-                    match resolved_value(pdf, handle, ObjectHandle::as_string)? {
+            let checksum = match params_dict
+                .as_ref()
+                .and_then(|p| p.get(b"CheckSum".as_slice()))
+            {
+                Some(handle) => {
+                    pdf.resolve_object_handle(handle)?;
+                    match handle.as_string() {
                         Some(bytes) => Json::make_string(checksum_to_hex(&bytes)),
                         None => Json::make_null(),
                     }
@@ -2245,10 +2281,13 @@ fn filespec_dict_to_json<R: Read + Seek>(
             };
 
             // creationdate: /Params /CreationDate → ISO 8601, or null
-            let creationdate = match &params_dict {
-                Some(p) => {
-                    let handle = p.get(b"CreationDate".as_slice());
-                    match resolved_value(pdf, handle, ObjectHandle::as_string)? {
+            let creationdate = match params_dict
+                .as_ref()
+                .and_then(|p| p.get(b"CreationDate".as_slice()))
+            {
+                Some(handle) => {
+                    pdf.resolve_object_handle(handle)?;
+                    match handle.as_string() {
                         Some(bytes) => parse_pdf_date(&bytes)
                             .map(Json::make_string)
                             .unwrap_or_else(Json::make_null),
@@ -2420,13 +2459,18 @@ fn cf_method_string<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         encrypt: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     ) -> Result<&'static str, ConvertError> {
-        Ok(
-            match resolved_value(pdf, encrypt.get(b"R".as_slice()), ObjectHandle::as_integer)? {
-                Some(r) if r >= 5 => "AESv3",
-                Some(4) => "AESv2",
-                _ => "RC4",
-            },
-        )
+        let r = match encrypt.get(b"R".as_slice()) {
+            Some(handle) => {
+                pdf.resolve_object_handle(handle)?;
+                handle.as_integer()
+            }
+            None => None,
+        };
+        Ok(match r {
+            Some(r) if r >= 5 => "AESv3",
+            Some(4) => "AESv2",
+            _ => "RC4",
+        })
     }
 
     let Some(selector) = selector else {
@@ -2436,26 +2480,43 @@ fn cf_method_string<R: Read + Seek>(
         return Ok("none");
     }
     // Look up the CFM entry inside /CF/<selector>
-    let cf_handle = encrypt.get(b"CF".as_slice());
-    let Some(cf) = resolved_value(pdf, cf_handle, ObjectHandle::as_dictionary)? else {
+    let cf = match encrypt.get(b"CF".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle.as_dictionary()
+        }
+        None => None,
+    };
+    let Some(cf) = cf else {
         return revision_default(pdf, encrypt);
     };
-    let filter_handle = cf.get(selector.as_bytes());
-    let Some(filter) = resolved_value(pdf, filter_handle, ObjectHandle::as_dictionary)? else {
+    let filter = match cf.get(selector.as_bytes()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle.as_dictionary()
+        }
+        None => None,
+    };
+    let Some(filter) = filter else {
         return revision_default(pdf, encrypt);
     };
-    Ok(
-        match resolved_value(pdf, filter.get(b"CFM".as_slice()), ObjectHandle::as_name)? {
-            Some(cfm) => match cfm.as_slice() {
-                b"AESV2" => "AESv2",
-                b"AESV3" => "AESv3",
-                b"V2" => "RC4",
-                b"None" => "none",
-                _ => revision_default(pdf, encrypt)?,
-            },
-            None => revision_default(pdf, encrypt)?,
+    let cfm = match filter.get(b"CFM".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle.as_name()
+        }
+        None => None,
+    };
+    Ok(match cfm {
+        Some(cfm) => match cfm.as_slice() {
+            b"AESV2" => "AESv2",
+            b"AESV3" => "AESv3",
+            b"V2" => "RC4",
+            b"None" => "none",
+            _ => revision_default(pdf, encrypt)?,
         },
-    )
+        None => revision_default(pdf, encrypt)?,
+    })
 }
 
 /// Read an optional name key from `dict` and return it decoded as UTF-8.
@@ -2468,7 +2529,11 @@ fn dict_name_str<R: Read + Seek>(
     dict: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     key: &str,
 ) -> Result<Option<String>, ConvertError> {
-    let Some(bytes) = resolved_value(pdf, dict.get(key.as_bytes()), ObjectHandle::as_name)? else {
+    let Some(handle) = dict.get(key.as_bytes()) else {
+        return Ok(None);
+    };
+    pdf.resolve_object_handle(handle)?;
+    let Some(bytes) = handle.as_name() else {
         return Ok(None);
     };
     Ok(String::from_utf8(bytes).ok())
@@ -2588,19 +2653,34 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
             // own encryption-parameter reads (`QPDFObjectHandle::isInteger`
             // et al.) transparently follow indirect references, so these
             // lookups resolve too rather than guarding against it.
-            let v = resolved_value(pdf, enc.get(b"V".as_slice()), ObjectHandle::as_integer)?
-                .unwrap_or(0);
-            let r = resolved_value(pdf, enc.get(b"R".as_slice()), ObjectHandle::as_integer)?
-                .unwrap_or(0);
-            let p_raw = resolved_value(pdf, enc.get(b"P".as_slice()), ObjectHandle::as_integer)?
-                .map(|n| n as i32)
-                .unwrap_or(0);
+            let v = match enc.get(b"V".as_slice()) {
+                Some(handle) => {
+                    pdf.resolve_object_handle(handle)?;
+                    handle.as_integer().unwrap_or(0)
+                }
+                None => 0,
+            };
+            let r = match enc.get(b"R".as_slice()) {
+                Some(handle) => {
+                    pdf.resolve_object_handle(handle)?;
+                    handle.as_integer().unwrap_or(0)
+                }
+                None => 0,
+            };
+            let p_raw = match enc.get(b"P".as_slice()) {
+                Some(handle) => {
+                    pdf.resolve_object_handle(handle)?;
+                    handle.as_integer().map(|n| n as i32).unwrap_or(0)
+                }
+                None => 0,
+            };
             let bits = match enc.get(b"Length".as_slice()) {
                 // Default key length when /Length is absent: 40 bits (V=1/2).
                 None => 40,
                 // Present: an integer value, or 0 for anything malformed.
                 Some(handle) => {
-                    resolved_value(pdf, Some(handle), ObjectHandle::as_integer)?.unwrap_or(0)
+                    pdf.resolve_object_handle(handle)?;
+                    handle.as_integer().unwrap_or(0)
                 }
             };
 
