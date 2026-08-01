@@ -1586,11 +1586,13 @@ fn walk_acroform_fields<R: Read + Seek>(
     let t_string = match field_dict.get(b"T".as_slice()) {
         Some(handle) => {
             pdf.resolve_object_handle(handle)?;
-            match handle.as_string() {
-                Some(bytes) => decode_pdf_text_string(&bytes)
-                    .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
-                None => String::new(),
-            }
+            handle
+                .as_string()
+                .map(|bytes| {
+                    decode_pdf_text_string(&bytes)
+                        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned())
+                })
+                .unwrap_or_default()
         }
         None => String::new(),
     };
@@ -1617,12 +1619,12 @@ fn walk_acroform_fields<R: Read + Seek>(
     let fieldtype = match &ft_obj {
         Some(handle) => {
             pdf.resolve_object_handle(handle)?;
-            match handle.as_name() {
-                // qpdf's `getFieldType()` returns `QPDFObjectHandle::getName()`
-                // verbatim, which includes the leading "/" (QPDFFormFieldObjectHelper.cc).
-                Some(bytes) => Json::make_string(format!("/{}", String::from_utf8_lossy(&bytes))),
-                None => Json::make_null(),
-            }
+            // qpdf's `getFieldType()` returns `QPDFObjectHandle::getName()`
+            // verbatim, which includes the leading "/" (QPDFFormFieldObjectHelper.cc).
+            handle
+                .as_name()
+                .map(|bytes| Json::make_string(format!("/{}", String::from_utf8_lossy(&bytes))))
+                .unwrap_or_else(Json::make_null)
         }
         None => Json::make_null(),
     };
@@ -1644,10 +1646,10 @@ fn walk_acroform_fields<R: Read + Seek>(
     let fieldflags = match &ff_obj {
         Some(handle) => {
             pdf.resolve_object_handle(handle)?;
-            match handle.as_integer() {
-                Some(n) => Json::make_int(n),
-                None => Json::make_null(),
-            }
+            handle
+                .as_integer()
+                .map(Json::make_int)
+                .unwrap_or_else(Json::make_null)
         }
         None => Json::make_null(),
     };
@@ -1656,14 +1658,14 @@ fn walk_acroform_fields<R: Read + Seek>(
     let alternatename = match field_dict.get(b"TU".as_slice()) {
         Some(handle) => {
             pdf.resolve_object_handle(handle)?;
-            match handle.as_string() {
-                Some(bytes) => {
+            handle
+                .as_string()
+                .map(|bytes| {
                     let s = decode_pdf_text_string(&bytes)
                         .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
                     Json::make_string(s)
-                }
-                None => Json::make_null(),
-            }
+                })
+                .unwrap_or_else(Json::make_null)
         }
         None => Json::make_null(),
     };
@@ -1672,14 +1674,14 @@ fn walk_acroform_fields<R: Read + Seek>(
     let mappingname = match field_dict.get(b"TM".as_slice()) {
         Some(handle) => {
             pdf.resolve_object_handle(handle)?;
-            match handle.as_string() {
-                Some(bytes) => {
+            handle
+                .as_string()
+                .map(|bytes| {
                     let s = decode_pdf_text_string(&bytes)
                         .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
                     Json::make_string(s)
-                }
-                None => Json::make_null(),
-            }
+                })
+                .unwrap_or_else(Json::make_null)
         }
         None => Json::make_null(),
     };
@@ -2142,14 +2144,14 @@ fn filespec_dict_to_json<R: Read + Seek>(
     let description = match filespec_dict.get(b"Desc".as_slice()) {
         Some(handle) => {
             pdf.resolve_object_handle(handle)?;
-            match handle.as_string() {
-                Some(bytes) => {
+            handle
+                .as_string()
+                .map(|bytes| {
                     let s = decode_pdf_text_string(&bytes)
                         .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
                     Json::make_string(s)
-                }
-                None => Json::make_null(),
-            }
+                })
+                .unwrap_or_else(Json::make_null)
         }
         None => Json::make_null(),
     };
@@ -2245,12 +2247,12 @@ fn filespec_dict_to_json<R: Read + Seek>(
             let mimetype = match stream_dict.get(b"Subtype".as_slice()) {
                 Some(handle) => {
                     pdf.resolve_object_handle(handle)?;
-                    match handle.as_name() {
-                        Some(bytes) => {
+                    handle
+                        .as_name()
+                        .map(|bytes| {
                             Json::make_string(String::from_utf8_lossy(&bytes).into_owned())
-                        }
-                        None => Json::make_null(),
-                    }
+                        })
+                        .unwrap_or_else(Json::make_null)
                 }
                 None => Json::make_null(),
             };
@@ -2272,10 +2274,10 @@ fn filespec_dict_to_json<R: Read + Seek>(
             {
                 Some(handle) => {
                     pdf.resolve_object_handle(handle)?;
-                    match handle.as_string() {
-                        Some(bytes) => Json::make_string(checksum_to_hex(&bytes)),
-                        None => Json::make_null(),
-                    }
+                    handle
+                        .as_string()
+                        .map(|bytes| Json::make_string(checksum_to_hex(&bytes)))
+                        .unwrap_or_else(Json::make_null)
                 }
                 None => Json::make_null(),
             };
@@ -2287,12 +2289,11 @@ fn filespec_dict_to_json<R: Read + Seek>(
             {
                 Some(handle) => {
                     pdf.resolve_object_handle(handle)?;
-                    match handle.as_string() {
-                        Some(bytes) => parse_pdf_date(&bytes)
-                            .map(Json::make_string)
-                            .unwrap_or_else(Json::make_null),
-                        None => Json::make_null(),
-                    }
+                    handle
+                        .as_string()
+                        .and_then(|bytes| parse_pdf_date(&bytes))
+                        .map(Json::make_string)
+                        .unwrap_or_else(Json::make_null)
                 }
                 None => Json::make_null(),
             };
@@ -2533,10 +2534,9 @@ fn dict_name_str<R: Read + Seek>(
         return Ok(None);
     };
     pdf.resolve_object_handle(handle)?;
-    let Some(bytes) = handle.as_name() else {
-        return Ok(None);
-    };
-    Ok(String::from_utf8(bytes).ok())
+    Ok(handle
+        .as_name()
+        .and_then(|bytes| String::from_utf8(bytes).ok()))
 }
 
 /// Decode /P integer into per-capability booleans.
