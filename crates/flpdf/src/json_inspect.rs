@@ -1573,19 +1573,17 @@ fn walk_acroform_fields<R: Read + Seek>(
         return Ok(()); // cycle guard
     }
 
-    let field_obj = pdf
-        .resolve_borrowed(field_ref)
-        .map_err(ConvertError::from)?;
-    let field_dict = match field_obj {
-        Object::Dictionary(d) => d.clone(),
-        _ => return Ok(()), // non-dictionary field — skip
+    let field_handle = pdf.get_object_handle(field_ref);
+    pdf.resolve_object_handle(&field_handle)?;
+    let Some(field_dict) = field_handle.as_dictionary() else {
+        return Ok(()); // non-dictionary field — skip
     };
 
     // Compute fullname: parent.T or just T at root.
-    let t_string = match field_dict.get("T") {
-        Some(Object::String(bytes)) => decode_pdf_text_string(bytes)
-            .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
-        _ => String::new(),
+    let t_string = match field_dict.get(b"T".as_slice()).and_then(ObjectHandle::as_string) {
+        Some(bytes) => decode_pdf_text_string(&bytes)
+            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
+        None => String::new(),
     };
     let fullname = if parent_fullname.is_empty() {
         t_string.clone()
@@ -1607,68 +1605,68 @@ fn walk_acroform_fields<R: Read + Seek>(
     // /FT, /V, /DV, /Ff are all inheritable down the /Parent chain
     // (ISO 32000-1 §12.7.3.1). Use the same lookup helper for each.
     let ft_obj = inherited_field_value(pdf, &field_dict, "FT")?;
-    let fieldtype = match ft_obj {
-        Some(Object::Name(bytes)) => Json::make_string(String::from_utf8_lossy(&bytes).as_bytes()),
-        _ => Json::make_null(),
+    let fieldtype = match ft_obj.as_ref().and_then(ObjectHandle::as_name) {
+        Some(bytes) => Json::make_string(String::from_utf8_lossy(&bytes).as_bytes()),
+        None => Json::make_null(),
     };
 
     // /V — value, run through pdf_object_to_json. Inherited from /Parent.
-    // inherited_field_value still returns a legacy Object (flpdf-9ctq tracks
-    // migrating it and this whole section builder to ObjectHandle natively;
-    // this lift disappears once that lands), so bridge one-off here.
     let value = match inherited_field_value(pdf, &field_dict, "V")? {
-        Some(v) => lift_and_convert_to_json(pdf, &v)?,
+        Some(v) => pdf_object_to_json(&v)?,
         None => Json::make_null(),
     };
 
     // /DV — default value. Inherited from /Parent.
     let defaultvalue = match inherited_field_value(pdf, &field_dict, "DV")? {
-        Some(v) => lift_and_convert_to_json(pdf, &v)?,
+        Some(v) => pdf_object_to_json(&v)?,
         None => Json::make_null(),
     };
 
     // /Ff — field flags integer. Inherited from /Parent.
-    let fieldflags = match inherited_field_value(pdf, &field_dict, "Ff")? {
-        Some(Object::Integer(n)) => Json::make_int(n),
-        _ => Json::make_null(),
+    let fieldflags = match inherited_field_value(pdf, &field_dict, "Ff")?
+        .as_ref()
+        .and_then(ObjectHandle::as_integer)
+    {
+        Some(n) => Json::make_int(n),
+        None => Json::make_null(),
     };
 
     // /TU — alternate name.
-    let alternatename = match field_dict.get("TU") {
-        Some(Object::String(bytes)) => {
-            let s = decode_pdf_text_string(bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+    let alternatename = match field_dict.get(b"TU".as_slice()).and_then(ObjectHandle::as_string) {
+        Some(bytes) => {
+            let s = decode_pdf_text_string(&bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
             Json::make_string(s)
         }
-        _ => Json::make_null(),
+        None => Json::make_null(),
     };
 
     // /TM — mapping name.
-    let mappingname = match field_dict.get("TM") {
-        Some(Object::String(bytes)) => {
-            let s = decode_pdf_text_string(bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+    let mappingname = match field_dict.get(b"TM".as_slice()).and_then(ObjectHandle::as_string) {
+        Some(bytes) => {
+            let s = decode_pdf_text_string(&bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
             Json::make_string(s)
         }
-        _ => Json::make_null(),
+        None => Json::make_null(),
     };
 
     // Determine if this field is itself a widget annotation.
     let is_widget = field_dict
-        .get("Subtype")
-        .map(|v| matches!(v, Object::Name(n) if n.as_slice() == b"Widget"))
+        .get(b"Subtype".as_slice())
+        .and_then(ObjectHandle::as_name)
+        .map(|n| n.as_slice() == b"Widget")
         .unwrap_or(false);
 
     // /Kids — may be a direct Array or an indirect Reference to an Array.
     // Resolve the indirect form so we don't silently drop the entire kid
     // chain when it lives in its own object.
-    let kids = match field_dict.get("Kids").cloned() {
-        Some(Object::Array(arr)) => arr,
-        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
-            Object::Array(arr) => arr.clone(),
-            _ => vec![],
-        },
-        _ => vec![],
+    let kids: Vec<ObjectHandle> = match field_dict.get(b"Kids".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle.as_array().unwrap_or_default()
+        }
+        None => vec![],
     };
 
     let mut annotations: Vec<Json> = Vec::new();
@@ -1684,32 +1682,32 @@ fn walk_acroform_fields<R: Read + Seek>(
     // those branches and their descendants from the flat list.
     let mut subfield_refs: Vec<crate::ObjectRef> = Vec::new();
     for kid in &kids {
-        let kid_ref = match kid {
-            Object::Reference(r) => *r,
-            _ => continue,
-        };
-        let kid_obj = pdf.resolve_borrowed(kid_ref).map_err(ConvertError::from)?;
-        let Object::Dictionary(d) = kid_obj else {
+        let Some(kid_ref) = kid.object_ref() else {
             continue;
         };
-        let is_widget_subtype = matches!(
-            d.get("Subtype"),
-            Some(Object::Name(n)) if n.as_slice() == b"Widget"
-        );
+        pdf.resolve_object_handle(kid)?;
+        let Some(d) = kid.as_dictionary() else {
+            continue;
+        };
+        let is_widget_subtype = d
+            .get(b"Subtype".as_slice())
+            .and_then(ObjectHandle::as_name)
+            .map(|n| n.as_slice() == b"Widget")
+            .unwrap_or(false);
         // Field-like markers that mean the kid acts as a (possibly unnamed)
         // field even when /Subtype is /Widget. Covers the merged widget+field
         // case where the widget dictionary carries field state (value, flags,
         // alternate / mapping names, etc.) directly. /Parent is intentionally
         // NOT here: standalone widget annotations point back to their owning
         // field via /Parent, so its presence alone doesn't make a kid a field.
-        let has_field_entries = d.get("T").is_some()
-            || d.get("FT").is_some()
-            || d.get("Kids").is_some()
-            || d.get("V").is_some()
-            || d.get("DV").is_some()
-            || d.get("Ff").is_some()
-            || d.get("TU").is_some()
-            || d.get("TM").is_some();
+        let has_field_entries = d.contains_key(b"T".as_slice())
+            || d.contains_key(b"FT".as_slice())
+            || d.contains_key(b"Kids".as_slice())
+            || d.contains_key(b"V".as_slice())
+            || d.contains_key(b"DV".as_slice())
+            || d.contains_key(b"Ff".as_slice())
+            || d.contains_key(b"TU".as_slice())
+            || d.contains_key(b"TM".as_slice());
 
         if is_widget_subtype && !has_field_entries {
             // Pure widget annotation — collect ref string, do not recurse.
@@ -1772,17 +1770,19 @@ fn walk_acroform_fields<R: Read + Seek>(
 // Cycle-safe: never visits the same `/Parent` twice.
 fn inherited_field_value<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    field_dict: &Dictionary,
+    field_dict: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     key: &str,
-) -> Result<Option<Object>, ConvertError> {
+) -> Result<Option<ObjectHandle>, ConvertError> {
     use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
-    if let Some(local) = field_dict.get(key).cloned() {
-        return Ok(Some(local));
+    if let Some(local) = field_dict.get(key.as_bytes()) {
+        return Ok(Some(local.clone()));
     }
-    let mut parent = field_dict.get("Parent").cloned();
+    let mut parent_ref = field_dict
+        .get(b"Parent".as_slice())
+        .and_then(ObjectHandle::object_ref);
     let mut seen: std::collections::BTreeSet<crate::ObjectRef> = std::collections::BTreeSet::new();
     let mut depth: usize = 0;
-    while let Some(Object::Reference(pr)) = parent {
+    while let Some(pr) = parent_ref {
         if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
             return Err(ConvertError::PdfError(format!(
                 "AcroForm field-tree depth limit {DEFAULT_MAX_PAGE_TREE_DEPTH} exceeded"
@@ -1791,15 +1791,15 @@ fn inherited_field_value<R: Read + Seek>(
         if !seen.insert(pr) {
             break;
         }
-        match pdf.resolve_borrowed(pr).map_err(ConvertError::from)? {
-            Object::Dictionary(pd) => {
-                if let Some(v) = pd.get(key).cloned() {
-                    return Ok(Some(v));
-                }
-                parent = pd.get("Parent").cloned();
-            }
-            _ => break,
+        let parent_handle = pdf.get_object_handle(pr);
+        pdf.resolve_object_handle(&parent_handle)?;
+        let Some(pd) = parent_handle.as_dictionary() else {
+            break;
+        };
+        if let Some(v) = pd.get(key.as_bytes()) {
+            return Ok(Some(v.clone()));
         }
+        parent_ref = pd.get(b"Parent".as_slice()).and_then(ObjectHandle::object_ref);
         depth += 1;
     }
     Ok(None)
@@ -1829,73 +1829,55 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
     let catalog_ref = pdf
         .root_ref()
         .ok_or_else(|| ConvertError::PdfError("page tree has no catalog".to_string()))?;
-    let catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .map_err(ConvertError::from)?;
-    let catalog_dict = catalog
-        .as_dict()
+    let catalog_handle = pdf.get_object_handle(catalog_ref);
+    pdf.resolve_object_handle(&catalog_handle)?;
+    let catalog_dict = catalog_handle
+        .as_dictionary()
         .ok_or_else(|| ConvertError::PdfError("catalog is not a dictionary".to_string()))?;
 
     // Check for /AcroForm.
-    let acroform_val = match catalog_dict.get("AcroForm") {
-        Some(v) => v.clone(),
-        None => {
-            return json_dictionary([
-                ("fields".to_string(), Json::make_array()),
-                ("hasacroform".to_string(), Json::make_bool(false)),
-                ("needappearances".to_string(), Json::make_bool(false)),
-            ])
-        }
+    let Some(acroform_handle) = catalog_dict.get(b"AcroForm".as_slice()) else {
+        return json_dictionary([
+            ("fields".to_string(), Json::make_array()),
+            ("hasacroform".to_string(), Json::make_bool(false)),
+            ("needappearances".to_string(), Json::make_bool(false)),
+        ]);
     };
 
     // Resolve indirect reference if needed.
-    let acroform_dict = match acroform_val {
-        Object::Reference(r) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
-            Object::Dictionary(d) => d.clone(),
-            _ => {
-                return json_dictionary([
-                    ("fields".to_string(), Json::make_array()),
-                    ("hasacroform".to_string(), Json::make_bool(true)),
-                    ("needappearances".to_string(), Json::make_bool(false)),
-                ])
-            }
-        },
-        Object::Dictionary(d) => d,
-        _ => {
-            return json_dictionary([
-                ("fields".to_string(), Json::make_array()),
-                ("hasacroform".to_string(), Json::make_bool(true)),
-                ("needappearances".to_string(), Json::make_bool(false)),
-            ])
-        }
+    pdf.resolve_object_handle(acroform_handle)?;
+    let Some(acroform_dict) = acroform_handle.as_dictionary() else {
+        return json_dictionary([
+            ("fields".to_string(), Json::make_array()),
+            ("hasacroform".to_string(), Json::make_bool(true)),
+            ("needappearances".to_string(), Json::make_bool(false)),
+        ]);
     };
 
     // /NeedAppearances (default false).
-    let need_appearances = match acroform_dict.get("NeedAppearances") {
-        Some(Object::Boolean(b)) => *b,
-        _ => false,
-    };
+    let need_appearances = acroform_dict
+        .get(b"NeedAppearances".as_slice())
+        .and_then(ObjectHandle::as_boolean)
+        .unwrap_or(false);
 
     // /Fields array (top-level field refs). Same as /Kids below: must
     // accept both the direct Array form and an indirect Reference to an
     // Array, so AcroForm dictionaries that store /Fields as its own object
     // don't surface as an empty list.
-    let fields_array = match acroform_dict.get("Fields").cloned() {
-        Some(Object::Array(arr)) => arr,
-        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
-            Object::Array(arr) => arr.clone(),
-            _ => vec![],
-        },
-        _ => vec![],
+    let fields_array: Vec<ObjectHandle> = match acroform_dict.get(b"Fields".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle.as_array().unwrap_or_default()
+        }
+        None => vec![],
     };
 
     let mut output: Vec<Json> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
 
-    for field_obj in &fields_array {
-        let field_ref = match field_obj {
-            Object::Reference(r) => *r,
-            _ => continue,
+    for field_handle in &fields_array {
+        let Some(field_ref) = field_handle.object_ref() else {
+            continue;
         };
         walk_acroform_fields(
             pdf,
@@ -5460,7 +5442,7 @@ mod tests {
         start: u32,
         len: u32,
         key: &str,
-    ) -> Dictionary {
+    ) -> std::collections::BTreeMap<Vec<u8>, ObjectHandle> {
         for i in 0..len {
             let num = start + i;
             let mut d = Dictionary::new();
@@ -5475,8 +5457,11 @@ mod tests {
             }
             pdf.set_object(crate::ObjectRef::new(num, 0), Object::Dictionary(d));
         }
-        let mut start_dict = Dictionary::new();
-        start_dict.insert("Parent", Object::Reference(crate::ObjectRef::new(start, 0)));
+        let mut start_dict = std::collections::BTreeMap::new();
+        start_dict.insert(
+            b"Parent".to_vec(),
+            pdf.get_object_handle(crate::ObjectRef::new(start, 0)),
+        );
         start_dict
     }
 
@@ -5494,7 +5479,7 @@ mod tests {
         let mut pdf = empty_pdf();
         let start_dict = parent_chain(&mut pdf, 2, 4, "V");
         let got = inherited_field_value(&mut pdf, &start_dict, "V").unwrap();
-        assert_eq!(got, Some(Object::Integer(42)));
+        assert_eq!(got.and_then(|h| h.as_integer()), Some(42));
     }
 
     // ── 5. Default is Generalized ─────────────────────────────────────────────
