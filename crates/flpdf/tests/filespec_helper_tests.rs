@@ -7,8 +7,8 @@
 //! production-generated document.
 
 use flpdf::{
-    encode_utf16be, format_pdf_date, md5_checksum, Dictionary, EmbeddedFileStream, FileParamDates,
-    FileSpec, FileSpecBuilder, Object, ObjectRef, Pdf,
+    encode_utf16be, format_pdf_date, md5_checksum, Dictionary, EmbeddedFileStream, Error,
+    FileParamDates, FileSpec, FileSpecBuilder, Object, ObjectRef, Pdf,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -221,6 +221,63 @@ fn qpdf_string_getters_preserve_invalid_utf8_bytes_without_panicking() {
 
     let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
     assert_eq!(fs.get_description().unwrap(), Some(vec![0xff]));
+}
+
+#[test]
+fn qpdf_string_getters_resolve_indirect_strings_before_selecting_names() {
+    // QPDFObjectHandle::isString() dereferences its object handle, so a
+    // higher-priority indirect /UF must win over a direct /F. The same holds
+    // for getDescription() and every value returned by getFilenames().
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::String(encode_utf16be("東京.txt")),
+    );
+    pdf.set_object(
+        ObjectRef::new(8, 0),
+        Object::String(b"fallback.txt".to_vec()),
+    );
+    pdf.set_object(ObjectRef::new(9, 0), Object::String(encode_utf16be("概要")));
+    let Object::Dictionary(mut filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected filespec dictionary");
+    };
+    filespec.insert("UF", Object::Reference(ObjectRef::new(7, 0)));
+    filespec.insert("F", Object::Reference(ObjectRef::new(8, 0)));
+    filespec.insert("Desc", Object::Reference(ObjectRef::new(9, 0)));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(filespec));
+
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    assert_eq!(
+        fs.get_description().unwrap(),
+        Some("概要".as_bytes().to_vec())
+    );
+    assert_eq!(
+        fs.get_filename().unwrap(),
+        Some("東京.txt".as_bytes().to_vec())
+    );
+    assert_eq!(
+        fs.get_filenames().unwrap(),
+        BTreeMap::from([
+            ("/F".to_string(), b"fallback.txt".to_vec()),
+            ("/UF".to_string(), "東京.txt".as_bytes().to_vec()),
+        ])
+    );
+}
+
+#[test]
+fn filespec_factories_reject_exhausted_object_number_space() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    pdf.set_object(ObjectRef::new(u32::MAX, 0), Object::Null);
+
+    for result in [
+        EmbeddedFileStream::create(&mut pdf, b"payload").map(|_| ()),
+        FileSpec::create(&mut pdf, b"report.txt", ObjectRef::new(6, 0)).map(|_| ()),
+    ] {
+        assert!(
+            matches!(result, Err(Error::Unsupported(message)) if message == "object-number space exhausted"),
+            "factory must return an allocation error instead of wrapping object 0"
+        );
+    }
 }
 
 // ── FileSpec::uf ──────────────────────────────────────────────────────────────

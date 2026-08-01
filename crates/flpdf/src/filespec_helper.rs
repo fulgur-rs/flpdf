@@ -93,15 +93,16 @@ use std::path::Path;
 
 const NAME_KEYS: [&str; 5] = ["UF", "F", "Unix", "DOS", "Mac"];
 
-fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> ObjectRef {
+fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
     let next = pdf
         .object_refs()
         .iter()
         .map(|object_ref| object_ref.number)
         .max()
         .unwrap_or(0)
-        + 1;
-    ObjectRef::new(next, 0)
+        .checked_add(1)
+        .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+    Ok(ObjectRef::new(next, 0))
 }
 
 // ── EmbeddedFileStream ────────────────────────────────────────────────────────
@@ -143,7 +144,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         dict.insert("Length", Object::Integer(data.len() as i64));
         dict.insert("Params", Object::Dictionary(params));
 
-        let object_ref = next_object_ref(pdf);
+        let object_ref = next_object_ref(pdf)?;
         pdf.set_object(object_ref, Object::Stream(Stream::new(dict, data.to_vec())));
         Ok(object_ref)
     }
@@ -410,7 +411,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         dict.insert("F", Object::String(name));
         dict.insert("EF", Object::Dictionary(ef));
 
-        let object_ref = next_object_ref(pdf);
+        let object_ref = next_object_ref(pdf)?;
         pdf.set_object(object_ref, Object::Dictionary(dict));
         Ok(object_ref)
     }
@@ -448,6 +449,14 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     fn replace_dict(&mut self, dict: Dictionary) {
         self.pdf
             .set_object(self.filespec_ref, Object::Dictionary(dict));
+    }
+
+    fn resolved_string_value(&mut self, value: Option<&Object>) -> Result<Option<Vec<u8>>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let (value, _) = resolve_ref_chain(self.pdf, value)?;
+        Ok(value.as_string().map(ToOwned::to_owned))
     }
 
     /// Set `/Desc` with qpdf's `newUnicodeString` storage semantics.
@@ -549,16 +558,22 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// The byte vector mirrors qpdf's `std::string`: an explicit UTF-8 BOM
     /// may be followed by invalid UTF-8, which Rust's [`String`] cannot hold.
     pub fn get_description(&mut self) -> Result<Option<Vec<u8>>> {
-        Ok(self.description()?.map(|value| utf8_value(&value)))
+        let dict = self.resolve_dict()?;
+        Ok(self
+            .resolved_string_value(dict.get("Desc"))?
+            .map(|value| utf8_value(&value)))
     }
 
     /// Return the preferred file name using qpdf's `/UF`, `/F`, `/Unix`,
     /// `/DOS`, `/Mac` priority order and UTF-8 value conversion.
     pub fn get_filename(&mut self) -> Result<Option<Vec<u8>>> {
         let dict = self.resolve_dict()?;
-        Ok(NAME_KEYS
-            .iter()
-            .find_map(|key| dict.get(*key).and_then(Object::as_string).map(utf8_value)))
+        for key in NAME_KEYS {
+            if let Some(value) = self.resolved_string_value(dict.get(key))? {
+                return Ok(Some(utf8_value(&value)));
+            }
+        }
+        Ok(None)
     }
 
     /// Return every recognized Filespec name key whose value is a string.
@@ -566,14 +581,13 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// Keys retain qpdf's leading slash, e.g. `"/UF"`.
     pub fn get_filenames(&mut self) -> Result<BTreeMap<String, Vec<u8>>> {
         let dict = self.resolve_dict()?;
-        Ok(NAME_KEYS
-            .iter()
-            .filter_map(|key| {
-                dict.get(*key)
-                    .and_then(Object::as_string)
-                    .map(|value| (format!("/{key}"), utf8_value(value)))
-            })
-            .collect())
+        let mut filenames = BTreeMap::new();
+        for key in NAME_KEYS {
+            if let Some(value) = self.resolved_string_value(dict.get(key))? {
+                filenames.insert(format!("/{key}"), utf8_value(&value));
+            }
+        }
+        Ok(filenames)
     }
 
     /// Return the raw `/EF` entry for `key`, or qpdf's null-object equivalent
@@ -792,10 +806,11 @@ impl FileSpecBuilder {
     /// Create a new builder for a file with the given ASCII `filename` and
     /// raw `payload` bytes.
     ///
-    /// `filename` is used for both `/F` (PDFDocEncoding) and `/UF` (UTF-16BE).
-    /// For non-ASCII filenames, construct the builder with an ASCII fallback for
-    /// `/F` and call no extra setter (UTF-16BE `/UF` is derived from `filename`
-    /// via [`encode_utf16be`]).
+    /// `filename` is stored verbatim in `/F`. `/UF` is encoded with qpdf's
+    /// `newUnicodeString` behavior: it uses PDFDocEncoding when every
+    /// character is representable and otherwise uses UTF-16BE with a BOM.
+    /// For non-ASCII filenames, construct the builder with an ASCII fallback
+    /// for `/F` and call [`Self::uf_filename`] with the original Unicode name.
     ///
     /// `payload` must be the **decoded** (uncompressed) bytes.  By default the
     /// builder writes them verbatim to the stream (no `/Filter`).  Call
