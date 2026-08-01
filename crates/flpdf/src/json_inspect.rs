@@ -605,15 +605,7 @@ fn qpdf_pdf_object_to_json<R: Read + Seek>(
             "stream".to_string(),
             json_dictionary([("dict".to_string(), qpdf_dict_to_json(pdf, &stream.dict)?)])?,
         )]),
-        // Content-stream-only tokens have no `ObjectValue` representation
-        // (`Pdf::lift_object_to_handle` errors on them), but `pdf_object_to_json`
-        // maps both straight to `null` regardless — special-case locally
-        // rather than routing through the lift bridge.
-        Object::Operator(_) | Object::InlineImage(_) => Ok(Json::make_null()),
-        other => pdf_object_to_json(
-            &pdf.lift_object_to_handle(other)
-                .map_err(ConvertError::from)?,
-        ),
+        other => lift_and_convert_to_json(pdf, other),
     }
 }
 
@@ -662,9 +654,15 @@ fn stream_to_json(handle: &ObjectHandle) -> Result<Json, ConvertError> {
     let dict_handle = handle
         .as_stream_dict()
         .expect("caller only reaches stream_to_json for a handle with type_code()==10 (stream)");
-    let entries = dict_handle.as_dictionary().expect(
-        "a stream's own dict handle (as_stream_dict) always resolves to a dictionary value",
-    );
+    // Unlike the legacy `Object::Stream(Stream { dict: Dictionary, .. })`,
+    // whose `dict` field was structurally guaranteed to be a `Dictionary`,
+    // `ObjectHandle::stream`'s public constructor does not validate its
+    // `dict` argument — a caller can build a stream handle whose "dict" is
+    // any other value. Report that as a conversion error rather than
+    // panicking on publicly-constructible input.
+    let entries = dict_handle.as_dictionary().ok_or_else(|| {
+        ConvertError::PdfError("stream's dict handle is not a dictionary".to_string())
+    })?;
     let dict_json = dict_to_json(&entries)?;
     json_dictionary([(
         "stream".to_string(),
@@ -789,6 +787,16 @@ fn lift_and_convert_to_json<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     object: &Object,
 ) -> Result<Json, ConvertError> {
+    // Content-stream-only tokens have no `ObjectValue` representation
+    // (`Pdf::lift_object_to_handle` errors on them — `Pdf::set_object`
+    // itself falls back to its legacy materialized memo for the same
+    // reason), but `pdf_object_to_json` maps both straight to `null`
+    // regardless. Special-case locally so every caller of this bridge keeps
+    // that behavior instead of surfacing a conversion error for a value
+    // that used to convert cleanly.
+    if matches!(object, Object::Operator(_) | Object::InlineImage(_)) {
+        return Ok(Json::make_null());
+    }
     pdf_object_to_json(
         &pdf.lift_object_to_handle(object)
             .map_err(ConvertError::from)?,
@@ -4414,9 +4422,10 @@ mod tests {
     fn qpdf_projection_maps_content_only_tokens_to_null_without_lifting() {
         // Object::Operator/InlineImage have no ObjectValue representation
         // (Pdf::lift_object_to_handle errors on them), so
-        // qpdf_pdf_object_to_json's fallback arm special-cases both to null
-        // directly rather than routing through the lift bridge — pin that
-        // both variants still take this path and never reach the lift call.
+        // lift_and_convert_to_json (reached via qpdf_pdf_object_to_json's
+        // fallback arm) special-cases both to null directly rather than
+        // routing through the lift bridge — pin that both variants still
+        // convert cleanly instead of surfacing a conversion error.
         let mut pdf = empty_pdf();
         for object in [
             Object::Operator(b"cm".to_vec()),
@@ -4426,6 +4435,27 @@ mod tests {
                 qpdf_pdf_object_to_json(&mut pdf, &object).unwrap(),
                 serde_json::Value::Null
             );
+        }
+    }
+
+    #[test]
+    fn lift_and_convert_to_json_maps_content_only_tokens_to_null_instead_of_erroring() {
+        // Regression coverage for the bridge itself, not just its
+        // qpdf_pdf_object_to_json caller: outline_item_to_json and
+        // walk_acroform_fields both reach this helper directly with a
+        // caller-supplied Object (e.g. one injected via Pdf::set_object, the
+        // same fallback Pdf::set_object itself takes when a lift fails).
+        // Before this migration, pdf_object_to_json(&Object::Operator(..))
+        // returned null with no error; this pins that lift_and_convert_to_json
+        // still does, rather than surfacing Pdf::lift_object_to_handle's
+        // Unsupported error for a value that used to convert cleanly.
+        let mut pdf = empty_pdf();
+        for object in [
+            Object::Operator(b"cm".to_vec()),
+            Object::InlineImage(b"\x00EI\xff".to_vec()),
+        ] {
+            let json = super::lift_and_convert_to_json(&mut pdf, &object).unwrap();
+            assert!(project(json).unwrap().is_null());
         }
     }
 
@@ -5644,6 +5674,19 @@ mod tests {
         let pairs = object_pairs(&result);
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "stream");
+    }
+
+    #[test]
+    fn stream_with_non_dictionary_dict_handle_errors_instead_of_panicking() {
+        // Unlike the legacy Object::Stream(Stream { dict: Dictionary, .. }),
+        // ObjectHandle::stream's public constructor does not validate its
+        // dict argument's own type — a caller can build this directly.
+        let malformed = ObjectHandle::stream(ObjectHandle::integer(1), vec![]);
+        let result = super::pdf_object_to_json(&malformed);
+        assert!(
+            matches!(result, Err(ConvertError::PdfError(_))),
+            "expected a PdfError, got {result:?}"
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════════
