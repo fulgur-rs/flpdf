@@ -43,8 +43,11 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 PR #613/#614 で実害を出しており、地図が誤ったままだと後続スライスで同じ
 実装ミスを再生産する。あわせて:
 
-- `QPDF_json.cc` を入力側(851) / 出力側(95) の 2 行に分割した。1 行に 🔀 と ❌ を
-  混在させると集計できず、**未実装の JSON 入力が ❌ の work-list から消える**ため
+- `QPDF_json.cc` を入力側(1-833) / 出力側(834-946) の 2 行に分割した。1 行に 🔀 と ❌ を
+  混在させると集計できず、**未実装の JSON 入力が ❌ の work-list から消える**ため。
+  出力側の先頭は `QPDF::` 接頭辞を持たない free function `writeJSONStreamFile`(834-849)
+  であり、`QPDF::writeJSON` から呼ばれる side-file 書き出し（flpdf 側は
+  `json_inspect.rs::write_file_mode_side_file`）。接頭辞で検索すると取りこぼす
 - `doJSONObjects` は v1 分岐（自前で組み立て、flpdf に対応物なし）と v2 分岐
   （`QPDF::writeJSON` へ委譲するだけ）を分けた。まとめると二重帰属になり
   v1 の欠落が隠れる
@@ -103,7 +106,7 @@ PR #613/#614 で実害を出しており、地図が誤ったままだと後続�
 
 | 記号 | 意味 |
 |---|---|
-| ✅ | **mirrors** — 対応が明確で責務境界も一致 |
+| ✅ | **境界一致** — 対応が明確で責務境界も一致。**実装の完成度は含意しない**（DoD D1〜D5 の充足は別途検証が必要。D4 索引の `Mirrors` とは別の述語 — 下記参照） |
 | 🔀 | **smeared** — 実装はあるが複数モジュールに散在、または別モジュールに埋没 |
 | ❌ | **missing** — flpdf に対応物が無い |
 | ⚪ | **逸脱候補** — Rust/エコシステムで代替済み。移植しない提案（要承認） |
@@ -228,8 +231,8 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 |---|---|---|---|
 | `JSON.cc` | 1401 | `json/`（全 write helper、blob callback、unparse が public `Pipeline` 境界を使用。serializer は caller-owned outer pipeline を finish しない） | ✅ |
 | `JSONHandler.cc` | 189 | `json/` | ✅ |
-| `QPDF_json.cc` 入力側（`QPDF_json.cc:1-851`: `JSONReactor` / `createFromJSON` / `updateFromJSON` / `importJSON` / `test_json_validators`） | 851 | 無し。flpdf に `--json-input` 相当は存在しない | ❌ |
-| `QPDF_json.cc` 出力側（`QPDF_json.cc:852-946`: `QPDF::writeJSON` ×2 overload） | 95 | `json_inspect.rs` の raw incremental serialization（`qpdf_raw_stream_payload`、`"qpdf"` キーの raw 投影、inline/file stream data。side file は `PlStdioFile` explicit finish） | 🔀 分離は `flpdf-ridh`（Tier C） |
+| `QPDF_json.cc` 入力側（`QPDF_json.cc:1-833`: `JSONReactor` / `createFromJSON` / `updateFromJSON` / `importJSON` / `test_json_validators`） | 833 | 無し。flpdf に `--json-input` 相当は存在しない | ❌ |
+| `QPDF_json.cc` 出力側（`QPDF_json.cc:834-946`: free function `writeJSONStreamFile`(834-849) + `QPDF::writeJSON` ×2 overload(851-946)） | 113 | `json_inspect.rs` の raw incremental serialization（`qpdf_raw_stream_payload`、`"qpdf"` キーの raw 投影、inline stream data）+ `write_file_mode_side_file`(3101: `writeJSONStreamFile` 相当。side file は `PlStdioFile` explicit finish） | 🔀 分離は `flpdf-ridh`（Tier C） |
 | `QPDFObjectHandle::getJSON`（行数は §1 の `QPDFObjectHandle.cc` に計上済み。ここは所在の相互参照） | — | `json_inspect.rs` の `pdf_object_to_json` | 🔀 `dereference_indirect=false` のモードのみ。`pdf_object_to_json` は引数を持たず間接ハンドルを常に `"N G R"` として出力するため、`true`（間接参照を解決して出力）のモードは未実装 |
 
 ## 9. Job / CLI
@@ -287,7 +290,7 @@ qpdf 側のコピペバグ（`QPDFJob.cc:1319-1322`）を再現できていな�
 |---|---|---|---|
 | `QUtil.cc` | 2003 | 各所に散在 | 🔀 |
 | `QTC.cc` | 50 | 無し | ❌ |
-| `BitStream.cc` / `BitWriter.cc` | 111 | `bit_stream.rs`（MSB-first bit 読み取り、Rust の error 値）/ `bit_writer.rs`（MSB-first bit 詰め、Pipeline stage）。consumer は `linearization/hint_*` | ✅ `flpdf-qxba.9.1` で cutover。`linearization/hint_stream.rs` 側に bit 実装は残っていない |
+| `BitStream.cc` / `BitWriter.cc` | 111 | `bit_stream.rs`（MSB-first bit 読み取り、Rust の error 値）/ `bit_writer.rs`（MSB-first bit 詰め、Pipeline stage）。production consumer は `linearization/hint_stream.rs`（hint stream の生成・読み取り）と `linearization/show.rs`（`read_h_page_offset` / `read_h_shared_object` / `read_h_generic` の hint decoder）、および `bit_writer.rs` 自身 | ✅ `flpdf-qxba.9.1` で cutover。`linearization/hint_stream.rs` 側に bit 実装は残っていない |
 | `Buffer.cc` / `MD5.cc` | 286 | `Vec<u8>` / 外部 crate | ⚪ |
 | `qpdf-c.cc` / `qpdfjob-c.cc` / `qpdflogger-c.cc` | 2237 | — | ➖ |
 
@@ -455,9 +458,9 @@ CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れてい
 
 | 状態 | qpdf 側の該当行数 | 内訳 |
 |---|---|---|
-| ✅ mirrors | 3,559 | 責務境界も一致。触らない |
-| 🔀 smeared | 27,635 | 再配置の主対象。qpdf 全体の 67% |
-| ❌ missing | 1,293 | `QPDF_json.cc` 入力側(851) / `Pl_DCT`(326) / `Pl_MD5`(66) / `QTC`(50) |
+| ✅ 境界一致 | 3,559 | 責務境界は一致。**再配置は不要だが「完成」ではない** — DoD D1〜D5 の充足は各スライスで別途検証する |
+| 🔀 smeared | 27,653 | 再配置の主対象。qpdf 全体の 67% |
+| ❌ missing | 1,275 | `QPDF_json.cc` 入力側(833) / `Pl_DCT`(326) / `Pl_MD5`(66) / `QTC`(50) |
 | ⚪ 逸脱候補 | 6,735 | 要承認（下記の方針矛盾を参照） |
 | ➖ 対象外 | 2,237 | C API |
 | **合計** | **41,459** | qpdf `libqpdf/*.cc` の実測 41,459 行と一致 |
@@ -471,6 +474,6 @@ CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れてい
 どの qpdf ファイルもいずれかの行に属していることは確認済み。
 
 **❌ の数え方**: 以前は `Pipeline.cc` + `Pl_*.cc` 21 ファイル計 ~2,400 行を丸ごと
-missing として傘で数えていたが、個々の `Pl_*` は下の各行で mirrors / smeared /
+missing として傘で数えていたが、個々の `Pl_*` は下の各行で 境界一致 / smeared /
 逸脱候補として個別に分類されており**二重計上**だった。傘の行を `Pipeline.cc`
 本体（114 行）に限定し、真に未マップな qpdf 行だけを ❌ に数えるよう改めた。
