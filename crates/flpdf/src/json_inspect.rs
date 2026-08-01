@@ -1218,38 +1218,42 @@ fn stream_payload_with_decode_status(
 /// the wrapper array's ref number — that matches qpdf's `contents` output.
 fn collect_content_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    content_obj: &Object,
+    content_handle: &ObjectHandle,
 ) -> Result<Vec<String>, ConvertError> {
-    fn ref_string(r: &crate::ObjectRef) -> String {
+    fn ref_string(r: ObjectRef) -> String {
         format!("{} {} R", r.number, r.generation)
     }
 
-    match content_obj {
-        Object::Reference(r) => {
-            // Resolve to see whether the indirect object is a Stream (in
-            // which case this ref itself is the content) or an Array of
-            // Stream refs (in which case we recurse to flatten).
-            let resolved_array = match pdf.resolve_borrowed(*r).map_err(ConvertError::from)? {
-                Object::Stream(_) => return Ok(vec![ref_string(r)]),
-                Object::Array(arr) => Object::Array(arr.clone()),
-                // /Contents pointing at anything else (Null, missing) → empty.
-                _ => return Ok(vec![]),
-            };
-            // Recurse so a nested indirect array is also unwrapped.
-            collect_content_refs(pdf, &resolved_array)
+    // Direct array elements never get a further resolve pass here — only the
+    // top-level indirect case below unwraps one level of indirection, so a
+    // reference nested deeper inside an already-direct array is emitted as
+    // its own ref string rather than followed.
+    fn refs_in_direct_array(elems: &[ObjectHandle]) -> Vec<String> {
+        elems
+            .iter()
+            .filter_map(|e| e.object_ref().map(ref_string))
+            .collect()
+    }
+
+    if let Some(r) = content_handle.object_ref() {
+        // Resolve to see whether the indirect object is a Stream (in which
+        // case this ref itself is the content) or an Array of Stream refs
+        // (in which case its elements are the content).
+        pdf.resolve_object_handle(content_handle)?;
+        if content_handle.as_stream_dict().is_some() {
+            return Ok(vec![ref_string(r)]);
         }
-        Object::Array(elems) => {
-            let mut refs = Vec::with_capacity(elems.len());
-            for e in elems {
-                if let Object::Reference(r) = e {
-                    refs.push(ref_string(r));
-                }
-                // Direct inline streams have no ref string — skip them.
-            }
-            Ok(refs)
-        }
+        return match content_handle.as_array() {
+            Some(elems) => Ok(refs_in_direct_array(&elems)),
+            // /Contents pointing at anything else (Null, missing) → empty.
+            None => Ok(vec![]),
+        };
+    }
+
+    match content_handle.as_array() {
+        Some(elems) => Ok(refs_in_direct_array(&elems)),
         // Null, missing, or direct Stream — emit empty list.
-        _ => Ok(vec![]),
+        None => Ok(vec![]),
     }
 }
 
@@ -1269,35 +1273,41 @@ fn collect_image_refs<R: Read + Seek>(
         Ok(None) => return Ok(vec![]),
         Err(e) => return Err(ConvertError::PdfError(e.to_string())),
     };
+    // Bridge: `crate::pages` is not part of this migration slice and still
+    // returns a legacy `Dictionary`; lift it once here so the rest of this
+    // function can use the ObjectHandle idiom like the rest of json_inspect.
+    let resources_dict = pdf
+        .lift_object_to_handle(&Object::Dictionary(resources))?
+        .as_dictionary()
+        .unwrap_or_default();
 
     // Resolve the /XObject sub-dictionary (may itself be indirect).
-    let xobject_dict = match resources.get("XObject") {
-        Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => {
-            let resolved = pdf.resolve_borrowed(*r).map_err(ConvertError::from)?;
-            match resolved {
-                Object::Dictionary(d) => d.clone(),
-                _ => return Ok(vec![]),
-            }
-        }
-        _ => return Ok(vec![]),
+    let Some(xobject_handle) = resources_dict.get(b"XObject".as_slice()) else {
+        return Ok(vec![]);
+    };
+    pdf.resolve_object_handle(xobject_handle)?;
+    let Some(xobject_dict) = xobject_handle.as_dictionary() else {
+        return Ok(vec![]);
     };
 
     // Iterate in name (key) order — BTreeMap gives byte-lex order automatically.
     let mut image_refs: Vec<String> = Vec::new();
-    for (_name, value) in xobject_dict.iter() {
+    for value in xobject_dict.values() {
         // Each XObject entry should be an indirect Reference.
-        let xobj_ref = match value {
-            Object::Reference(r) => *r,
+        let Some(xobj_ref) = value.object_ref() else {
             // Direct inline stream — no ref string available, skip.
-            _ => continue,
+            continue;
         };
-        let resolved = pdf.resolve_borrowed(xobj_ref).map_err(ConvertError::from)?;
-        if let Some(stream) = resolved.as_stream() {
-            if let Some(Object::Name(subtype)) = stream.dict.get("Subtype") {
-                if subtype.as_slice() == b"Image" {
-                    image_refs.push(format!("{} {} R", xobj_ref.number, xobj_ref.generation));
-                }
+        pdf.resolve_object_handle(value)?;
+        let Some(stream_dict) = value.as_stream_dict().and_then(|d| d.as_dictionary()) else {
+            continue;
+        };
+        if let Some(subtype) = stream_dict
+            .get(b"Subtype".as_slice())
+            .and_then(ObjectHandle::as_name)
+        {
+            if subtype.as_slice() == b"Image" {
+                image_refs.push(format!("{} {} R", xobj_ref.number, xobj_ref.generation));
             }
         }
     }
@@ -1328,12 +1338,11 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, Con
         let object_str = format!("{} {} R", page_ref.number, page_ref.generation);
 
         // Resolve the page dict to extract /Contents.
-        let page_obj = pdf.resolve_borrowed(page_ref).map_err(ConvertError::from)?;
-        let contents_obj = match page_obj {
-            Object::Dictionary(d) => d.get("Contents").cloned(),
-            _ => None,
-        };
-        let contents: Vec<Json> = match &contents_obj {
+        let page_handle = pdf.get_object_handle(page_ref);
+        pdf.resolve_object_handle(&page_handle)?;
+        let page_dict = page_handle.as_dictionary().unwrap_or_default();
+        let contents_handle = page_dict.get(b"Contents".as_slice());
+        let contents: Vec<Json> = match contents_handle {
             Some(c) => collect_content_refs(pdf, c)?
                 .into_iter()
                 .map(Json::make_string)
@@ -1567,19 +1576,20 @@ fn walk_acroform_fields<R: Read + Seek>(
         return Ok(()); // cycle guard
     }
 
-    let field_obj = pdf
-        .resolve_borrowed(field_ref)
-        .map_err(ConvertError::from)?;
-    let field_dict = match field_obj {
-        Object::Dictionary(d) => d.clone(),
-        _ => return Ok(()), // non-dictionary field — skip
+    let field_handle = pdf.get_object_handle(field_ref);
+    pdf.resolve_object_handle(&field_handle)?;
+    let Some(field_dict) = field_handle.as_dictionary() else {
+        return Ok(()); // non-dictionary field — skip
     };
 
     // Compute fullname: parent.T or just T at root.
-    let t_string = match field_dict.get("T") {
-        Some(Object::String(bytes)) => decode_pdf_text_string(bytes)
-            .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
-        _ => String::new(),
+    let t_string = match field_dict
+        .get(b"T".as_slice())
+        .and_then(ObjectHandle::as_string)
+    {
+        Some(bytes) => decode_pdf_text_string(&bytes)
+            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
+        None => String::new(),
     };
     let fullname = if parent_fullname.is_empty() {
         t_string.clone()
@@ -1601,68 +1611,74 @@ fn walk_acroform_fields<R: Read + Seek>(
     // /FT, /V, /DV, /Ff are all inheritable down the /Parent chain
     // (ISO 32000-1 §12.7.3.1). Use the same lookup helper for each.
     let ft_obj = inherited_field_value(pdf, &field_dict, "FT")?;
-    let fieldtype = match ft_obj {
-        Some(Object::Name(bytes)) => Json::make_string(String::from_utf8_lossy(&bytes).as_bytes()),
-        _ => Json::make_null(),
+    let fieldtype = match ft_obj.as_ref().and_then(ObjectHandle::as_name) {
+        Some(bytes) => Json::make_string(String::from_utf8_lossy(&bytes).as_bytes()),
+        None => Json::make_null(),
     };
 
     // /V — value, run through pdf_object_to_json. Inherited from /Parent.
-    // inherited_field_value still returns a legacy Object (flpdf-9ctq tracks
-    // migrating it and this whole section builder to ObjectHandle natively;
-    // this lift disappears once that lands), so bridge one-off here.
     let value = match inherited_field_value(pdf, &field_dict, "V")? {
-        Some(v) => lift_and_convert_to_json(pdf, &v)?,
+        Some(v) => pdf_object_to_json(&v)?,
         None => Json::make_null(),
     };
 
     // /DV — default value. Inherited from /Parent.
     let defaultvalue = match inherited_field_value(pdf, &field_dict, "DV")? {
-        Some(v) => lift_and_convert_to_json(pdf, &v)?,
+        Some(v) => pdf_object_to_json(&v)?,
         None => Json::make_null(),
     };
 
     // /Ff — field flags integer. Inherited from /Parent.
-    let fieldflags = match inherited_field_value(pdf, &field_dict, "Ff")? {
-        Some(Object::Integer(n)) => Json::make_int(n),
-        _ => Json::make_null(),
+    let fieldflags = match inherited_field_value(pdf, &field_dict, "Ff")?
+        .as_ref()
+        .and_then(ObjectHandle::as_integer)
+    {
+        Some(n) => Json::make_int(n),
+        None => Json::make_null(),
     };
 
     // /TU — alternate name.
-    let alternatename = match field_dict.get("TU") {
-        Some(Object::String(bytes)) => {
-            let s = decode_pdf_text_string(bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+    let alternatename = match field_dict
+        .get(b"TU".as_slice())
+        .and_then(ObjectHandle::as_string)
+    {
+        Some(bytes) => {
+            let s = decode_pdf_text_string(&bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
             Json::make_string(s)
         }
-        _ => Json::make_null(),
+        None => Json::make_null(),
     };
 
     // /TM — mapping name.
-    let mappingname = match field_dict.get("TM") {
-        Some(Object::String(bytes)) => {
-            let s = decode_pdf_text_string(bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+    let mappingname = match field_dict
+        .get(b"TM".as_slice())
+        .and_then(ObjectHandle::as_string)
+    {
+        Some(bytes) => {
+            let s = decode_pdf_text_string(&bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
             Json::make_string(s)
         }
-        _ => Json::make_null(),
+        None => Json::make_null(),
     };
 
     // Determine if this field is itself a widget annotation.
     let is_widget = field_dict
-        .get("Subtype")
-        .map(|v| matches!(v, Object::Name(n) if n.as_slice() == b"Widget"))
+        .get(b"Subtype".as_slice())
+        .and_then(ObjectHandle::as_name)
+        .map(|n| n.as_slice() == b"Widget")
         .unwrap_or(false);
 
     // /Kids — may be a direct Array or an indirect Reference to an Array.
     // Resolve the indirect form so we don't silently drop the entire kid
     // chain when it lives in its own object.
-    let kids = match field_dict.get("Kids").cloned() {
-        Some(Object::Array(arr)) => arr,
-        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
-            Object::Array(arr) => arr.clone(),
-            _ => vec![],
-        },
-        _ => vec![],
+    let kids: Vec<ObjectHandle> = match field_dict.get(b"Kids".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle.as_array().unwrap_or_default()
+        }
+        None => vec![],
     };
 
     let mut annotations: Vec<Json> = Vec::new();
@@ -1678,32 +1694,32 @@ fn walk_acroform_fields<R: Read + Seek>(
     // those branches and their descendants from the flat list.
     let mut subfield_refs: Vec<crate::ObjectRef> = Vec::new();
     for kid in &kids {
-        let kid_ref = match kid {
-            Object::Reference(r) => *r,
-            _ => continue,
-        };
-        let kid_obj = pdf.resolve_borrowed(kid_ref).map_err(ConvertError::from)?;
-        let Object::Dictionary(d) = kid_obj else {
+        let Some(kid_ref) = kid.object_ref() else {
             continue;
         };
-        let is_widget_subtype = matches!(
-            d.get("Subtype"),
-            Some(Object::Name(n)) if n.as_slice() == b"Widget"
-        );
+        pdf.resolve_object_handle(kid)?;
+        let Some(d) = kid.as_dictionary() else {
+            continue;
+        };
+        let is_widget_subtype = d
+            .get(b"Subtype".as_slice())
+            .and_then(ObjectHandle::as_name)
+            .map(|n| n.as_slice() == b"Widget")
+            .unwrap_or(false);
         // Field-like markers that mean the kid acts as a (possibly unnamed)
         // field even when /Subtype is /Widget. Covers the merged widget+field
         // case where the widget dictionary carries field state (value, flags,
         // alternate / mapping names, etc.) directly. /Parent is intentionally
         // NOT here: standalone widget annotations point back to their owning
         // field via /Parent, so its presence alone doesn't make a kid a field.
-        let has_field_entries = d.get("T").is_some()
-            || d.get("FT").is_some()
-            || d.get("Kids").is_some()
-            || d.get("V").is_some()
-            || d.get("DV").is_some()
-            || d.get("Ff").is_some()
-            || d.get("TU").is_some()
-            || d.get("TM").is_some();
+        let has_field_entries = d.contains_key(b"T".as_slice())
+            || d.contains_key(b"FT".as_slice())
+            || d.contains_key(b"Kids".as_slice())
+            || d.contains_key(b"V".as_slice())
+            || d.contains_key(b"DV".as_slice())
+            || d.contains_key(b"Ff".as_slice())
+            || d.contains_key(b"TU".as_slice())
+            || d.contains_key(b"TM".as_slice());
 
         if is_widget_subtype && !has_field_entries {
             // Pure widget annotation — collect ref string, do not recurse.
@@ -1766,17 +1782,19 @@ fn walk_acroform_fields<R: Read + Seek>(
 // Cycle-safe: never visits the same `/Parent` twice.
 fn inherited_field_value<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    field_dict: &Dictionary,
+    field_dict: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     key: &str,
-) -> Result<Option<Object>, ConvertError> {
+) -> Result<Option<ObjectHandle>, ConvertError> {
     use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
-    if let Some(local) = field_dict.get(key).cloned() {
-        return Ok(Some(local));
+    if let Some(local) = field_dict.get(key.as_bytes()) {
+        return Ok(Some(local.clone()));
     }
-    let mut parent = field_dict.get("Parent").cloned();
+    let mut parent_ref = field_dict
+        .get(b"Parent".as_slice())
+        .and_then(ObjectHandle::object_ref);
     let mut seen: std::collections::BTreeSet<crate::ObjectRef> = std::collections::BTreeSet::new();
     let mut depth: usize = 0;
-    while let Some(Object::Reference(pr)) = parent {
+    while let Some(pr) = parent_ref {
         if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
             return Err(ConvertError::PdfError(format!(
                 "AcroForm field-tree depth limit {DEFAULT_MAX_PAGE_TREE_DEPTH} exceeded"
@@ -1785,15 +1803,17 @@ fn inherited_field_value<R: Read + Seek>(
         if !seen.insert(pr) {
             break;
         }
-        match pdf.resolve_borrowed(pr).map_err(ConvertError::from)? {
-            Object::Dictionary(pd) => {
-                if let Some(v) = pd.get(key).cloned() {
-                    return Ok(Some(v));
-                }
-                parent = pd.get("Parent").cloned();
-            }
-            _ => break,
+        let parent_handle = pdf.get_object_handle(pr);
+        pdf.resolve_object_handle(&parent_handle)?;
+        let Some(pd) = parent_handle.as_dictionary() else {
+            break;
+        };
+        if let Some(v) = pd.get(key.as_bytes()) {
+            return Ok(Some(v.clone()));
         }
+        parent_ref = pd
+            .get(b"Parent".as_slice())
+            .and_then(ObjectHandle::object_ref);
         depth += 1;
     }
     Ok(None)
@@ -1823,73 +1843,55 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
     let catalog_ref = pdf
         .root_ref()
         .ok_or_else(|| ConvertError::PdfError("page tree has no catalog".to_string()))?;
-    let catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .map_err(ConvertError::from)?;
-    let catalog_dict = catalog
-        .as_dict()
+    let catalog_handle = pdf.get_object_handle(catalog_ref);
+    pdf.resolve_object_handle(&catalog_handle)?;
+    let catalog_dict = catalog_handle
+        .as_dictionary()
         .ok_or_else(|| ConvertError::PdfError("catalog is not a dictionary".to_string()))?;
 
     // Check for /AcroForm.
-    let acroform_val = match catalog_dict.get("AcroForm") {
-        Some(v) => v.clone(),
-        None => {
-            return json_dictionary([
-                ("fields".to_string(), Json::make_array()),
-                ("hasacroform".to_string(), Json::make_bool(false)),
-                ("needappearances".to_string(), Json::make_bool(false)),
-            ])
-        }
+    let Some(acroform_handle) = catalog_dict.get(b"AcroForm".as_slice()) else {
+        return json_dictionary([
+            ("fields".to_string(), Json::make_array()),
+            ("hasacroform".to_string(), Json::make_bool(false)),
+            ("needappearances".to_string(), Json::make_bool(false)),
+        ]);
     };
 
     // Resolve indirect reference if needed.
-    let acroform_dict = match acroform_val {
-        Object::Reference(r) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
-            Object::Dictionary(d) => d.clone(),
-            _ => {
-                return json_dictionary([
-                    ("fields".to_string(), Json::make_array()),
-                    ("hasacroform".to_string(), Json::make_bool(true)),
-                    ("needappearances".to_string(), Json::make_bool(false)),
-                ])
-            }
-        },
-        Object::Dictionary(d) => d,
-        _ => {
-            return json_dictionary([
-                ("fields".to_string(), Json::make_array()),
-                ("hasacroform".to_string(), Json::make_bool(true)),
-                ("needappearances".to_string(), Json::make_bool(false)),
-            ])
-        }
+    pdf.resolve_object_handle(acroform_handle)?;
+    let Some(acroform_dict) = acroform_handle.as_dictionary() else {
+        return json_dictionary([
+            ("fields".to_string(), Json::make_array()),
+            ("hasacroform".to_string(), Json::make_bool(true)),
+            ("needappearances".to_string(), Json::make_bool(false)),
+        ]);
     };
 
     // /NeedAppearances (default false).
-    let need_appearances = match acroform_dict.get("NeedAppearances") {
-        Some(Object::Boolean(b)) => *b,
-        _ => false,
-    };
+    let need_appearances = acroform_dict
+        .get(b"NeedAppearances".as_slice())
+        .and_then(ObjectHandle::as_boolean)
+        .unwrap_or(false);
 
     // /Fields array (top-level field refs). Same as /Kids below: must
     // accept both the direct Array form and an indirect Reference to an
     // Array, so AcroForm dictionaries that store /Fields as its own object
     // don't surface as an empty list.
-    let fields_array = match acroform_dict.get("Fields").cloned() {
-        Some(Object::Array(arr)) => arr,
-        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
-            Object::Array(arr) => arr.clone(),
-            _ => vec![],
-        },
-        _ => vec![],
+    let fields_array: Vec<ObjectHandle> = match acroform_dict.get(b"Fields".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle.as_array().unwrap_or_default()
+        }
+        None => vec![],
     };
 
     let mut output: Vec<Json> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
 
-    for field_obj in &fields_array {
-        let field_ref = match field_obj {
-            Object::Reference(r) => *r,
-            _ => continue,
+    for field_handle in &fields_array {
+        let Some(field_ref) = field_handle.object_ref() else {
+            continue;
         };
         walk_acroform_fields(
             pdf,
@@ -2057,7 +2059,7 @@ fn checksum_to_hex(bytes: &[u8]) -> String {
 /// `attachments` entry.
 enum FilespecSource {
     Indirect(crate::ObjectRef),
-    Direct(Dictionary),
+    Direct(std::collections::BTreeMap<Vec<u8>, ObjectHandle>),
 }
 
 /// Build a JSON entry for one filespec dictionary.
@@ -2070,22 +2072,18 @@ fn filespec_to_json<R: Read + Seek>(
 ) -> Result<Json, ConvertError> {
     let filespec_str = format!("{} {} R", filespec_ref.number, filespec_ref.generation);
 
-    let filespec_obj = pdf
-        .resolve_borrowed(filespec_ref)
-        .map_err(ConvertError::from)?;
-    let filespec_dict = match filespec_obj {
-        Object::Dictionary(d) => d.clone(),
-        _ => {
-            // Malformed filespec — return a minimal entry
-            return json_dictionary([
-                ("description".to_string(), Json::make_null()),
-                ("filespec".to_string(), Json::make_string(filespec_str)),
-                ("names".to_string(), Json::make_dictionary()),
-                ("preferredcontents".to_string(), Json::make_null()),
-                ("preferredname".to_string(), Json::make_null()),
-                ("streams".to_string(), Json::make_dictionary()),
-            ]);
-        }
+    let filespec_handle = pdf.get_object_handle(filespec_ref);
+    pdf.resolve_object_handle(&filespec_handle)?;
+    let Some(filespec_dict) = filespec_handle.as_dictionary() else {
+        // Malformed filespec — return a minimal entry
+        return json_dictionary([
+            ("description".to_string(), Json::make_null()),
+            ("filespec".to_string(), Json::make_string(filespec_str)),
+            ("names".to_string(), Json::make_dictionary()),
+            ("preferredcontents".to_string(), Json::make_null()),
+            ("preferredname".to_string(), Json::make_null()),
+            ("streams".to_string(), Json::make_dictionary()),
+        ]);
     };
 
     filespec_dict_to_json(pdf, &filespec_dict, Some(filespec_str))
@@ -2098,23 +2096,25 @@ fn filespec_to_json<R: Read + Seek>(
 /// no reference number exists.
 fn filespec_dict_to_json<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    filespec_dict: &Dictionary,
+    filespec_dict: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     filespec_str: Option<String>,
 ) -> Result<Json, ConvertError> {
-    let filespec_dict = filespec_dict.clone();
     let filespec_value = match filespec_str {
         Some(s) => Json::make_string(s),
         None => Json::make_null(),
     };
 
     // description: /Desc decoded as PDF text string, bare (no u:/b: prefix)
-    let description = match filespec_dict.get("Desc") {
-        Some(Object::String(bytes)) => {
-            let s = decode_pdf_text_string(bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+    let description = match filespec_dict
+        .get(b"Desc".as_slice())
+        .and_then(ObjectHandle::as_string)
+    {
+        Some(bytes) => {
+            let s = decode_pdf_text_string(&bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
             Json::make_string(s)
         }
-        _ => Json::make_null(),
+        None => Json::make_null(),
     };
 
     // names: collect /F, /UF, /DOS, /Mac, /Unix — each decoded as PDF text string
@@ -2122,9 +2122,12 @@ fn filespec_dict_to_json<R: Read + Seek>(
     let name_keys = ["DOS", "F", "Mac", "UF", "Unix"];
     let mut names_pairs: Vec<(String, Json)> = Vec::new();
     for key in &name_keys {
-        if let Some(Object::String(bytes)) = filespec_dict.get(*key) {
-            let s = decode_pdf_text_string(bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
+        if let Some(bytes) = filespec_dict
+            .get(key.as_bytes())
+            .and_then(ObjectHandle::as_string)
+        {
+            let s = decode_pdf_text_string(&bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
             names_pairs.push((format!("/{key}"), Json::make_string(s)));
         }
     }
@@ -2134,25 +2137,26 @@ fn filespec_dict_to_json<R: Read + Seek>(
     let preferredname = preferred_name_key_order
         .iter()
         .find_map(|key| {
-            if let Some(Object::String(bytes)) = filespec_dict.get(*key) {
-                let s = decode_pdf_text_string(bytes)
-                    .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
-                Some(Json::make_string(s))
-            } else {
-                None
-            }
+            filespec_dict
+                .get(key.as_bytes())
+                .and_then(ObjectHandle::as_string)
+                .map(|bytes| {
+                    let s = decode_pdf_text_string(&bytes)
+                        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+                    Json::make_string(s)
+                })
         })
         .unwrap_or_else(Json::make_null);
 
     // /EF dictionary: embedded file stream refs, keyed by /F /UF /DOS /Mac /Unix
-    let ef_dict = match filespec_dict.get("EF") {
-        Some(Object::Dictionary(d)) => Some(d.clone()),
-        Some(Object::Reference(r)) => match pdf.resolve_borrowed(*r).map_err(ConvertError::from)? {
-            Object::Dictionary(d) => Some(d.clone()),
-            _ => None,
-        },
-        _ => None,
-    };
+    let ef_dict: Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> =
+        match filespec_dict.get(b"EF".as_slice()) {
+            Some(handle) => {
+                pdf.resolve_object_handle(handle)?;
+                handle.as_dictionary()
+            }
+            None => None,
+        };
 
     // preferredcontents: /EF/UF > /EF/F > /EF/Unix > /EF/Mac > /EF/DOS
     let preferred_ef_key_order = ["UF", "F", "Unix", "Mac", "DOS"];
@@ -2160,14 +2164,9 @@ fn filespec_dict_to_json<R: Read + Seek>(
         preferred_ef_key_order
             .iter()
             .find_map(|key| {
-                if let Some(Object::Reference(r)) = ef.get(*key) {
-                    Some(Json::make_string(format!(
-                        "{} {} R",
-                        r.number, r.generation
-                    )))
-                } else {
-                    None
-                }
+                ef.get(key.as_bytes())
+                    .and_then(ObjectHandle::object_ref)
+                    .map(|r| Json::make_string(format!("{} {} R", r.number, r.generation)))
             })
             .unwrap_or_else(Json::make_null)
     } else {
@@ -2181,75 +2180,63 @@ fn filespec_dict_to_json<R: Read + Seek>(
 
     if let Some(ref ef) = ef_dict {
         for key in &ef_key_order {
-            let stream_ref = match ef.get(*key) {
-                Some(Object::Reference(r)) => *r,
-                _ => continue,
+            let Some(stream_ref) = ef.get(key.as_bytes()).and_then(ObjectHandle::object_ref) else {
+                continue;
             };
 
-            let stream_obj = pdf
-                .resolve_borrowed(stream_ref)
-                .map_err(ConvertError::from)?;
-            let stream_dict = match stream_obj {
-                Object::Stream(s) => s.dict.clone(),
-                _ => continue,
+            let stream_handle = pdf.get_object_handle(stream_ref);
+            pdf.resolve_object_handle(&stream_handle)?;
+            let Some(stream_dict) = stream_handle
+                .as_stream_dict()
+                .and_then(|d| d.as_dictionary())
+            else {
+                continue;
             };
 
             // mimetype: /Subtype name → bare string (no "/" prefix), or null
-            let mimetype = match stream_dict.get("Subtype") {
-                Some(Object::Name(bytes)) => {
-                    let s = String::from_utf8_lossy(bytes).into_owned();
-                    Json::make_string(s)
-                }
-                _ => Json::make_null(),
+            let mimetype = match stream_dict
+                .get(b"Subtype".as_slice())
+                .and_then(ObjectHandle::as_name)
+            {
+                Some(bytes) => Json::make_string(String::from_utf8_lossy(&bytes).into_owned()),
+                None => Json::make_null(),
             };
 
             // /Params sub-dict
-            let params_dict = match stream_dict.get("Params") {
-                Some(Object::Dictionary(d)) => Some(d.clone()),
-                Some(Object::Reference(r)) => {
-                    match pdf.resolve_borrowed(*r).map_err(ConvertError::from)? {
-                        Object::Dictionary(d) => Some(d.clone()),
-                        _ => None,
+            let params_dict: Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> =
+                match stream_dict.get(b"Params".as_slice()) {
+                    Some(handle) => {
+                        pdf.resolve_object_handle(handle)?;
+                        handle.as_dictionary()
                     }
-                }
-                _ => None,
-            };
+                    None => None,
+                };
 
             // checksum: /Params /CheckSum bytes → lowercase hex, or null
-            let checksum = if let Some(ref p) = params_dict {
-                match p.get("CheckSum") {
-                    Some(Object::String(bytes)) => Json::make_string(checksum_to_hex(bytes)),
-                    _ => Json::make_null(),
-                }
-            } else {
-                Json::make_null()
-            };
+            let checksum = params_dict
+                .as_ref()
+                .and_then(|p| p.get(b"CheckSum".as_slice()))
+                .and_then(ObjectHandle::as_string)
+                .map(|bytes| Json::make_string(checksum_to_hex(&bytes)))
+                .unwrap_or_else(Json::make_null);
 
             // creationdate: /Params /CreationDate → ISO 8601, or null
-            let creationdate = if let Some(ref p) = params_dict {
-                match p.get("CreationDate") {
-                    Some(Object::String(bytes)) => match parse_pdf_date(bytes) {
-                        Some(s) => Json::make_string(s),
-                        None => Json::make_null(),
-                    },
-                    _ => Json::make_null(),
-                }
-            } else {
-                Json::make_null()
-            };
+            let creationdate = params_dict
+                .as_ref()
+                .and_then(|p| p.get(b"CreationDate".as_slice()))
+                .and_then(ObjectHandle::as_string)
+                .and_then(|bytes| parse_pdf_date(&bytes))
+                .map(Json::make_string)
+                .unwrap_or_else(Json::make_null);
 
             // modificationdate: /Params /ModDate → ISO 8601, or null
-            let modificationdate = if let Some(ref p) = params_dict {
-                match p.get("ModDate") {
-                    Some(Object::String(bytes)) => match parse_pdf_date(bytes) {
-                        Some(s) => Json::make_string(s),
-                        None => Json::make_null(),
-                    },
-                    _ => Json::make_null(),
-                }
-            } else {
-                Json::make_null()
-            };
+            let modificationdate = params_dict
+                .as_ref()
+                .and_then(|p| p.get(b"ModDate".as_slice()))
+                .and_then(ObjectHandle::as_string)
+                .and_then(|bytes| parse_pdf_date(&bytes))
+                .map(Json::make_string)
+                .unwrap_or_else(Json::make_null);
 
             // Stream entry keys: checksum, creationdate, mimetype, modificationdate
             let stream_entry = json_dictionary([
@@ -2346,17 +2333,25 @@ pub fn build_attachments_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Jso
         }
     }
 
-    let mut raw_entries: Vec<(String, FilespecSource)> = entries
-        .into_iter()
-        .filter_map(|(key_bytes, value)| {
-            let source = match value {
-                Object::Reference(object_ref) => FilespecSource::Indirect(object_ref),
-                Object::Dictionary(dictionary) => FilespecSource::Direct(dictionary),
-                _ => return None,
-            };
-            Some((String::from_utf8_lossy(&key_bytes).into_owned(), source))
-        })
-        .collect();
+    let mut raw_entries: Vec<(String, FilespecSource)> = Vec::with_capacity(entries.len());
+    for (key_bytes, value) in entries {
+        let source = match value {
+            Object::Reference(object_ref) => FilespecSource::Indirect(object_ref),
+            Object::Dictionary(dictionary) => {
+                // Bridge: the NameTree walker (out of this migration's
+                // scope) still yields a legacy Object; lift a direct leaf
+                // dictionary once so filespec_dict_to_json can use the
+                // ObjectHandle idiom like the rest of json_inspect.
+                let dict = pdf
+                    .lift_object_to_handle(&Object::Dictionary(dictionary))?
+                    .as_dictionary()
+                    .unwrap_or_default();
+                FilespecSource::Direct(dict)
+            }
+            _ => continue,
+        };
+        raw_entries.push((String::from_utf8_lossy(&key_bytes).into_owned(), source));
+    }
 
     // Sort by name (alphabetical)
     raw_entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2388,11 +2383,19 @@ pub fn build_attachments_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Jso
 /// - `/R >= 5` → `"AESv3"`
 /// - `/R == 4` → `"AESv2"`
 /// - everything else (legacy) → `"RC4"`
-fn cf_method_string(encrypt: &Dictionary, selector: Option<&str>) -> &'static str {
-    fn revision_default(encrypt: &Dictionary) -> &'static str {
-        match encrypt.get("R") {
-            Some(Object::Integer(r)) if *r >= 5 => "AESv3",
-            Some(Object::Integer(4)) => "AESv2",
+fn cf_method_string(
+    encrypt: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
+    selector: Option<&str>,
+) -> &'static str {
+    fn revision_default(
+        encrypt: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
+    ) -> &'static str {
+        match encrypt
+            .get(b"R".as_slice())
+            .and_then(ObjectHandle::as_integer)
+        {
+            Some(r) if r >= 5 => "AESv3",
+            Some(4) => "AESv2",
             _ => "RC4",
         }
     }
@@ -2404,30 +2407,44 @@ fn cf_method_string(encrypt: &Dictionary, selector: Option<&str>) -> &'static st
         return "none";
     }
     // Look up the CFM entry inside /CF/<selector>
-    let Some(Object::Dictionary(cf)) = encrypt.get("CF") else {
+    let Some(cf) = encrypt
+        .get(b"CF".as_slice())
+        .and_then(ObjectHandle::as_dictionary)
+    else {
         return revision_default(encrypt);
     };
-    let Some(Object::Dictionary(filter)) = cf.get(selector) else {
+    let Some(filter) = cf
+        .get(selector.as_bytes())
+        .and_then(ObjectHandle::as_dictionary)
+    else {
         return revision_default(encrypt);
     };
-    match filter.get("CFM") {
-        Some(Object::Name(cfm)) => match cfm.as_slice() {
+    match filter
+        .get(b"CFM".as_slice())
+        .and_then(ObjectHandle::as_name)
+    {
+        Some(cfm) => match cfm.as_slice() {
             b"AESV2" => "AESv2",
             b"AESV3" => "AESv3",
             b"V2" => "RC4",
             b"None" => "none",
             _ => revision_default(encrypt),
         },
-        _ => revision_default(encrypt),
+        None => revision_default(encrypt),
     }
 }
 
-/// Read an optional name key from `dict` and return it as `Option<&str>`.
-fn dict_name_str<'a>(dict: &'a Dictionary, key: &str) -> Option<&'a str> {
-    match dict.get(key) {
-        Some(Object::Name(n)) => std::str::from_utf8(n).ok(),
-        _ => None,
-    }
+/// Read an optional name key from `dict` and return it decoded as UTF-8.
+///
+/// Returns `None` if the key is absent, the value is not a name, or the
+/// name's bytes are not valid UTF-8 (matching the strict, non-lossy
+/// decoding the original `Object`-based lookup used).
+fn dict_name_str(
+    dict: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
+    key: &str,
+) -> Option<String> {
+    let bytes = dict.get(key.as_bytes())?.as_name()?;
+    String::from_utf8(bytes).ok()
 }
 
 /// Decode /P integer into per-capability booleans.
@@ -2497,16 +2514,21 @@ fn all_true_capabilities() -> Result<Json, ConvertError> {
 /// Returns a [`ConvertError`] only when an indirect `/Encrypt` reference
 /// cannot be resolved (i.e. an underlying I/O or parse error).
 pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
-    // Resolve /Encrypt dictionary from the trailer.
-    let encrypt_dict: Option<Dictionary> = match pdf.trailer().get("Encrypt").cloned() {
-        None => None,
-        Some(Object::Dictionary(d)) => Some(d),
-        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r).map_err(ConvertError::from)? {
-            Object::Dictionary(d) => Some(d.clone()),
-            _ => None,
-        },
-        _ => None,
-    };
+    // Resolve /Encrypt dictionary from the trailer. `resolve_object_handle`
+    // is a no-op for a direct (inline) dictionary and resolves an indirect
+    // reference in place, so a single call covers both shapes; a present but
+    // non-dictionary value (any type, including an unresolved reference)
+    // falls out of `as_dictionary()` as `None`, matching the prior explicit
+    // `Object::Dictionary`/`Object::Reference`/catch-all arms.
+    let trailer_dict = pdf.trailer_handle().as_dictionary().unwrap_or_default();
+    let encrypt_dict: Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> =
+        match trailer_dict.get(b"Encrypt".as_slice()) {
+            None => None,
+            Some(handle) => {
+                pdf.resolve_object_handle(handle)?;
+                handle.as_dictionary()
+            }
+        };
 
     let is_encrypted = pdf.is_encrypted();
 
@@ -2535,25 +2557,29 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
             ])
         }
         Some(ref enc) => {
-            // Encrypted document: read V, R, P, /Length, CF methods.
-            let v = match enc.get("V") {
-                Some(Object::Integer(n)) => *n,
-                _ => 0,
-            };
-            let r = match enc.get("R") {
-                Some(Object::Integer(n)) => *n,
-                _ => 0,
-            };
-            let p_raw = match enc.get("P") {
-                Some(Object::Integer(n)) => *n as i32,
-                _ => 0,
-            };
-            let bits = match enc.get("Length") {
-                Some(Object::Integer(n)) => *n,
+            // Encrypted document: read V, R, P, /Length, CF methods. None of
+            // these nested lookups resolve indirect references — an
+            // unresolved handle's typed accessor returns `None` just like
+            // the prior code's `Object::Reference` arm fell through to the
+            // catch-all, so the non-resolving behavior carries over exactly.
+            let v = enc
+                .get(b"V".as_slice())
+                .and_then(ObjectHandle::as_integer)
+                .unwrap_or(0);
+            let r = enc
+                .get(b"R".as_slice())
+                .and_then(ObjectHandle::as_integer)
+                .unwrap_or(0);
+            let p_raw = enc
+                .get(b"P".as_slice())
+                .and_then(ObjectHandle::as_integer)
+                .map(|n| n as i32)
+                .unwrap_or(0);
+            let bits = match enc.get(b"Length".as_slice()) {
                 // Default key length when /Length is absent: 40 bits (V=1/2).
                 None => 40,
-                // Malformed /Length (not an integer): treat as 0.
-                _ => 0,
+                // Present: an integer value, or 0 for anything malformed.
+                Some(handle) => handle.as_integer().unwrap_or(0),
             };
 
             // Determine method strings from /StmF, /StrF, /EFF selectors.
@@ -2562,9 +2588,9 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
             let eff = dict_name_str(enc, "EFF");
 
             let (streammethod, stringmethod, filemethod) = if v >= 4 {
-                let sm = cf_method_string(enc, stmf);
-                let st = cf_method_string(enc, strf);
-                let fm = cf_method_string(enc, eff.or(stmf));
+                let sm = cf_method_string(enc, stmf.as_deref());
+                let st = cf_method_string(enc, strf.as_deref());
+                let fm = cf_method_string(enc, eff.as_deref().or(stmf.as_deref()));
                 (sm, st, fm)
             } else if v == 1 || v == 2 {
                 ("RC4", "RC4", "RC4")
@@ -5431,7 +5457,7 @@ mod tests {
         start: u32,
         len: u32,
         key: &str,
-    ) -> Dictionary {
+    ) -> std::collections::BTreeMap<Vec<u8>, ObjectHandle> {
         for i in 0..len {
             let num = start + i;
             let mut d = Dictionary::new();
@@ -5446,8 +5472,11 @@ mod tests {
             }
             pdf.set_object(crate::ObjectRef::new(num, 0), Object::Dictionary(d));
         }
-        let mut start_dict = Dictionary::new();
-        start_dict.insert("Parent", Object::Reference(crate::ObjectRef::new(start, 0)));
+        let mut start_dict = std::collections::BTreeMap::new();
+        start_dict.insert(
+            b"Parent".to_vec(),
+            pdf.get_object_handle(crate::ObjectRef::new(start, 0)),
+        );
         start_dict
     }
 
@@ -5465,7 +5494,20 @@ mod tests {
         let mut pdf = empty_pdf();
         let start_dict = parent_chain(&mut pdf, 2, 4, "V");
         let got = inherited_field_value(&mut pdf, &start_dict, "V").unwrap();
-        assert_eq!(got, Some(Object::Integer(42)));
+        assert_eq!(got.and_then(|h| h.as_integer()), Some(42));
+    }
+
+    #[test]
+    fn inherited_field_value_parent_resolving_to_non_dictionary_stops_the_walk() {
+        let mut pdf = empty_pdf();
+        let parent_ref = crate::ObjectRef::new(5, 0);
+        pdf.set_object(parent_ref, Object::Integer(1));
+
+        let mut start_dict = std::collections::BTreeMap::new();
+        start_dict.insert(b"Parent".to_vec(), pdf.get_object_handle(parent_ref));
+
+        let got = inherited_field_value(&mut pdf, &start_dict, "V").unwrap();
+        assert!(got.is_none());
     }
 
     // ── 5. Default is Generalized ─────────────────────────────────────────────
@@ -6336,6 +6378,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn collect_image_refs_xobject_resolving_to_non_dictionary_returns_empty() {
+        let mut pdf = load_one_page_pdf();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let mut resources = Dictionary::new();
+        resources.insert("XObject", Object::Integer(7));
+
+        let Object::Dictionary(mut page) = pdf.resolve(page_ref).expect("resolve page") else {
+            panic!("page must be a dictionary"); // cov:ignore: fixture-shape guard
+        };
+        page.insert("Resources", Object::Dictionary(resources));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+
+        assert!(collect_image_refs(&mut pdf, page_ref)
+            .expect("collect images")
+            .is_empty());
+    }
+
+    #[test]
+    fn collect_image_refs_xobject_entry_resolving_to_non_stream_is_skipped() {
+        let mut pdf = load_one_page_pdf();
+        let page_ref = ObjectRef::new(3, 0);
+        let non_stream_ref = ObjectRef::new(99, 0);
+        pdf.set_object(non_stream_ref, Object::Integer(1));
+
+        let mut xobjects = Dictionary::new();
+        xobjects.insert("Im", Object::Reference(non_stream_ref));
+        let mut resources = Dictionary::new();
+        resources.insert("XObject", Object::Dictionary(xobjects));
+
+        let Object::Dictionary(mut page) = pdf.resolve(page_ref).expect("resolve page") else {
+            panic!("page must be a dictionary"); // cov:ignore: fixture-shape guard
+        };
+        page.insert("Resources", Object::Dictionary(resources));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+
+        assert!(collect_image_refs(&mut pdf, page_ref)
+            .expect("collect images")
+            .is_empty());
+    }
+
     // ── 29. three-page.pdf: length and pageposfrom1 sequence ─────────────────
 
     #[test]
@@ -6433,8 +6517,8 @@ mod tests {
         // one-page.pdf's /Contents is a single reference to a Stream
         // (object 7). The function must return that ref as-is.
         let mut pdf = load_one_page_pdf();
-        let obj = Object::Reference(crate::ObjectRef::new(7, 0));
-        let refs = collect_content_refs(&mut pdf, &obj).expect("collect_content_refs failed");
+        let handle = pdf.get_object_handle(crate::ObjectRef::new(7, 0));
+        let refs = collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
         assert_eq!(refs, vec!["7 0 R".to_string()]);
     }
 
@@ -6443,11 +6527,11 @@ mod tests {
     #[test]
     fn collect_content_refs_array_of_refs() {
         let mut pdf = load_one_page_pdf();
-        let obj = Object::Array(vec![
-            Object::Reference(crate::ObjectRef::new(4, 0)),
-            Object::Reference(crate::ObjectRef::new(5, 0)),
+        let handle = ObjectHandle::array(vec![
+            pdf.get_object_handle(crate::ObjectRef::new(4, 0)),
+            pdf.get_object_handle(crate::ObjectRef::new(5, 0)),
         ]);
-        let refs = collect_content_refs(&mut pdf, &obj).expect("collect_content_refs failed");
+        let refs = collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
         assert_eq!(refs, vec!["4 0 R".to_string(), "5 0 R".to_string()]);
     }
 
@@ -6456,8 +6540,8 @@ mod tests {
     #[test]
     fn collect_content_refs_null_returns_empty() {
         let mut pdf = load_one_page_pdf();
-        let obj = Object::Null;
-        let refs = collect_content_refs(&mut pdf, &obj).expect("collect_content_refs failed");
+        let handle = ObjectHandle::null();
+        let refs = collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
         assert!(refs.is_empty());
     }
 
@@ -6466,12 +6550,12 @@ mod tests {
     #[test]
     fn collect_content_refs_array_skips_non_refs() {
         let mut pdf = load_one_page_pdf();
-        let obj = Object::Array(vec![
-            Object::Reference(crate::ObjectRef::new(3, 0)),
-            Object::Integer(99), // not a ref — must be skipped
-            Object::Reference(crate::ObjectRef::new(5, 0)),
+        let handle = ObjectHandle::array(vec![
+            pdf.get_object_handle(crate::ObjectRef::new(3, 0)),
+            ObjectHandle::integer(99), // not a ref — must be skipped
+            pdf.get_object_handle(crate::ObjectRef::new(5, 0)),
         ]);
-        let refs = collect_content_refs(&mut pdf, &obj).expect("collect_content_refs failed");
+        let refs = collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
         assert_eq!(refs, vec!["3 0 R".to_string(), "5 0 R".to_string()]);
     }
 
@@ -6494,13 +6578,24 @@ mod tests {
             ]),
         );
 
-        let obj = Object::Reference(crate::ObjectRef::new(2, 0));
-        let refs = collect_content_refs(&mut pdf, &obj).expect("collect_content_refs failed");
+        let handle = pdf.get_object_handle(crate::ObjectRef::new(2, 0));
+        let refs = collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
         assert_eq!(
             refs,
             vec!["4 0 R".to_string(), "5 0 R".to_string()],
             "indirect Array of refs must be unwrapped, not emitted as the array's ref number"
         );
+    }
+
+    #[test]
+    fn collect_content_refs_indirect_resolving_to_non_stream_non_array_returns_empty() {
+        let mut pdf = load_one_page_pdf();
+        let non_stream_non_array_ref = crate::ObjectRef::new(50, 0);
+        pdf.set_object(non_stream_non_array_ref, Object::Integer(1));
+
+        let handle = pdf.get_object_handle(non_stream_non_array_ref);
+        let refs = collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
+        assert!(refs.is_empty());
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -8976,6 +9071,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn acroform_field_ref_resolving_to_non_dictionary_is_skipped() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let field_ref = crate::ObjectRef::new(201, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(vec![Object::Reference(field_ref)]));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+        pdf.set_object(field_ref, Object::Integer(1));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array"); // cov:ignore: fixture-shape guard
+        };
+        assert!(fields.is_empty(), "non-dictionary field must be skipped");
+    }
+
+    #[test]
+    fn acroform_field_kid_that_is_not_a_reference_is_skipped() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let field_ref = crate::ObjectRef::new(201, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(vec![Object::Reference(field_ref)]));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        let mut field = Dictionary::new();
+        field.insert("T", Object::String(b"parent".to_vec()));
+        field.insert("Kids", Object::Array(vec![Object::Integer(42)]));
+        pdf.set_object(field_ref, Object::Dictionary(field));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array"); // cov:ignore: fixture-shape guard
+        };
+        assert_eq!(
+            fields.len(),
+            1,
+            "only the parent field entry; the non-reference kid must be skipped"
+        );
+    }
+
+    #[test]
+    fn acroform_fields_array_element_that_is_not_a_reference_is_skipped() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(vec![Object::Integer(1)]));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array"); // cov:ignore: fixture-shape guard
+        };
+        assert!(
+            fields.is_empty(),
+            "non-reference /Fields element must be skipped"
+        );
+    }
+
     // ── acroform Test 4: parent + child, fullname = "parent.child" ───────────
 
     #[test]
@@ -10335,6 +10499,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn attachments_ef_entry_resolving_to_non_stream_is_skipped() {
+        let mut pdf = load_one_page_pdf();
+        let non_stream_ref = crate::ObjectRef::new(920, 0);
+        let filespec_ref = crate::ObjectRef::new(922, 0);
+        let ef_root_ref = crate::ObjectRef::new(923, 0);
+        let names_ref = crate::ObjectRef::new(924, 0);
+
+        pdf.set_object(non_stream_ref, Object::Integer(1));
+
+        let mut ef_dict = Dictionary::new();
+        ef_dict.insert("F", Object::Reference(non_stream_ref));
+        let mut filespec = Dictionary::new();
+        filespec.insert("EF", Object::Dictionary(ef_dict));
+        patch_embedded_files(
+            &mut pdf,
+            names_ref,
+            ef_root_ref,
+            filespec_ref,
+            filespec,
+            b"nonstream",
+        );
+
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        let entry = object_pairs(&object_pairs(&result)[0].1);
+        let streams = object_pairs(
+            entry
+                .iter()
+                .find(|(key, _)| key == "streams")
+                .expect("streams")
+                .1
+                .clone(),
+        );
+        assert!(streams.is_empty(), "non-stream /EF entry must be skipped");
+    }
+
     // ── attachments: direct (non-Reference) filespec value in the name tree ──
     //
     // Regression for CodeRabbit's flpdf-9hc.11.8 review: previously the name
@@ -10719,31 +10919,48 @@ mod tests {
     // /CFM, which silently disguised RC4/AESv2 documents as plaintext. It
     // now falls back to the same revision-based default the reader uses.
 
+    /// Build an [`ObjectHandle`] dictionary from `(name, value)` pairs, for
+    /// tests exercising the `&BTreeMap<Vec<u8>, ObjectHandle>` lookups
+    /// `cf_method_string`/`dict_name_str` perform on an already-resolved
+    /// dictionary.
+    fn oh_dict(entries: Vec<(&str, ObjectHandle)>) -> ObjectHandle {
+        ObjectHandle::dictionary(
+            entries
+                .into_iter()
+                .map(|(k, v)| (k.as_bytes().to_vec(), v))
+                .collect(),
+        )
+    }
+
     #[test]
     fn cf_method_string_defaults_to_aesv2_for_revision_4() {
-        let mut encrypt = Dictionary::new();
-        encrypt.insert("R", Object::Integer(4));
         // No /CF at all.
+        let encrypt = oh_dict(vec![("R", ObjectHandle::integer(4))])
+            .as_dictionary()
+            .unwrap();
         assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "AESv2");
+
         // /CF exists but the selector is missing.
-        let mut cf = Dictionary::new();
-        cf.insert("OtherCF", Object::Dictionary(Dictionary::new()));
-        encrypt.insert("CF", Object::Dictionary(cf));
+        let cf = oh_dict(vec![("OtherCF", oh_dict(vec![]))]);
+        let encrypt = oh_dict(vec![("R", ObjectHandle::integer(4)), ("CF", cf)])
+            .as_dictionary()
+            .unwrap();
         assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "AESv2");
+
         // Selector found but its /CFM is missing.
-        let mut encrypt2 = Dictionary::new();
-        encrypt2.insert("R", Object::Integer(4));
-        let mut cf2 = Dictionary::new();
-        cf2.insert("StdCF", Object::Dictionary(Dictionary::new()));
-        encrypt2.insert("CF", Object::Dictionary(cf2));
+        let cf2 = oh_dict(vec![("StdCF", oh_dict(vec![]))]);
+        let encrypt2 = oh_dict(vec![("R", ObjectHandle::integer(4)), ("CF", cf2)])
+            .as_dictionary()
+            .unwrap();
         assert_eq!(cf_method_string(&encrypt2, Some("StdCF")), "AESv2");
     }
 
     #[test]
     fn cf_method_string_defaults_to_aesv3_for_revision_5_and_6() {
         for r in [5i64, 6] {
-            let mut encrypt = Dictionary::new();
-            encrypt.insert("R", Object::Integer(r));
+            let encrypt = oh_dict(vec![("R", ObjectHandle::integer(r))])
+                .as_dictionary()
+                .unwrap();
             assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "AESv3");
             assert_eq!(cf_method_string(&encrypt, None), "AESv3");
         }
@@ -10751,11 +10968,12 @@ mod tests {
 
     #[test]
     fn cf_method_string_defaults_to_rc4_for_legacy_revisions() {
-        let mut encrypt = Dictionary::new();
-        encrypt.insert("R", Object::Integer(3));
+        let encrypt = oh_dict(vec![("R", ObjectHandle::integer(3))])
+            .as_dictionary()
+            .unwrap();
         assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "RC4");
         // No /R at all -> legacy default too.
-        let empty = Dictionary::new();
+        let empty = oh_dict(vec![]).as_dictionary().unwrap();
         assert_eq!(cf_method_string(&empty, Some("StdCF")), "RC4");
     }
 
@@ -10763,8 +10981,9 @@ mod tests {
     fn cf_method_string_identity_selector_still_returns_none() {
         // The "Identity" selector explicitly means no encryption for that
         // path and must keep its "none" behavior regardless of /R.
-        let mut encrypt = Dictionary::new();
-        encrypt.insert("R", Object::Integer(4));
+        let encrypt = oh_dict(vec![("R", ObjectHandle::integer(4))])
+            .as_dictionary()
+            .unwrap();
         assert_eq!(cf_method_string(&encrypt, Some("Identity")), "none");
     }
 
