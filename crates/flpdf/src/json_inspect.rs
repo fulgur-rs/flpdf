@@ -1302,12 +1302,12 @@ fn collect_image_refs<R: Read + Seek>(
         let Some(stream_dict) = value.as_stream_dict().and_then(|d| d.as_dictionary()) else {
             continue;
         };
-        if let Some(subtype) = stream_dict
-            .get(b"Subtype".as_slice())
-            .and_then(ObjectHandle::as_name)
-        {
-            if subtype.as_slice() == b"Image" {
-                image_refs.push(format!("{} {} R", xobj_ref.number, xobj_ref.generation));
+        if let Some(subtype_handle) = stream_dict.get(b"Subtype".as_slice()) {
+            pdf.resolve_object_handle(subtype_handle)?;
+            if let Some(subtype) = subtype_handle.as_name() {
+                if subtype.as_slice() == b"Image" {
+                    image_refs.push(format!("{} {} R", xobj_ref.number, xobj_ref.generation));
+                }
             }
         }
     }
@@ -1583,12 +1583,17 @@ fn walk_acroform_fields<R: Read + Seek>(
     };
 
     // Compute fullname: parent.T or just T at root.
-    let t_string = match field_dict
-        .get(b"T".as_slice())
-        .and_then(ObjectHandle::as_string)
-    {
-        Some(bytes) => decode_pdf_text_string(&bytes)
-            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
+    let t_string = match field_dict.get(b"T".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle
+                .as_string()
+                .map(|bytes| {
+                    decode_pdf_text_string(&bytes)
+                        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned())
+                })
+                .unwrap_or_default()
+        }
         None => String::new(),
     };
     let fullname = if parent_fullname.is_empty() {
@@ -1611,8 +1616,16 @@ fn walk_acroform_fields<R: Read + Seek>(
     // /FT, /V, /DV, /Ff are all inheritable down the /Parent chain
     // (ISO 32000-1 §12.7.3.1). Use the same lookup helper for each.
     let ft_obj = inherited_field_value(pdf, &field_dict, "FT")?;
-    let fieldtype = match ft_obj.as_ref().and_then(ObjectHandle::as_name) {
-        Some(bytes) => Json::make_string(String::from_utf8_lossy(&bytes).as_bytes()),
+    let fieldtype = match &ft_obj {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            // qpdf's `getFieldType()` returns `QPDFObjectHandle::getName()`
+            // verbatim, which includes the leading "/" (QPDFFormFieldObjectHelper.cc).
+            handle
+                .as_name()
+                .map(|bytes| Json::make_string(format!("/{}", String::from_utf8_lossy(&bytes))))
+                .unwrap_or_else(Json::make_null)
+        }
         None => Json::make_null(),
     };
 
@@ -1629,46 +1642,61 @@ fn walk_acroform_fields<R: Read + Seek>(
     };
 
     // /Ff — field flags integer. Inherited from /Parent.
-    let fieldflags = match inherited_field_value(pdf, &field_dict, "Ff")?
-        .as_ref()
-        .and_then(ObjectHandle::as_integer)
-    {
-        Some(n) => Json::make_int(n),
+    let ff_obj = inherited_field_value(pdf, &field_dict, "Ff")?;
+    let fieldflags = match &ff_obj {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle
+                .as_integer()
+                .map(Json::make_int)
+                .unwrap_or_else(Json::make_null)
+        }
         None => Json::make_null(),
     };
 
     // /TU — alternate name.
-    let alternatename = match field_dict
-        .get(b"TU".as_slice())
-        .and_then(ObjectHandle::as_string)
-    {
-        Some(bytes) => {
-            let s = decode_pdf_text_string(&bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-            Json::make_string(s)
+    let alternatename = match field_dict.get(b"TU".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle
+                .as_string()
+                .map(|bytes| {
+                    let s = decode_pdf_text_string(&bytes)
+                        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+                    Json::make_string(s)
+                })
+                .unwrap_or_else(Json::make_null)
         }
         None => Json::make_null(),
     };
 
     // /TM — mapping name.
-    let mappingname = match field_dict
-        .get(b"TM".as_slice())
-        .and_then(ObjectHandle::as_string)
-    {
-        Some(bytes) => {
-            let s = decode_pdf_text_string(&bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-            Json::make_string(s)
+    let mappingname = match field_dict.get(b"TM".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle
+                .as_string()
+                .map(|bytes| {
+                    let s = decode_pdf_text_string(&bytes)
+                        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+                    Json::make_string(s)
+                })
+                .unwrap_or_else(Json::make_null)
         }
         None => Json::make_null(),
     };
 
     // Determine if this field is itself a widget annotation.
-    let is_widget = field_dict
-        .get(b"Subtype".as_slice())
-        .and_then(ObjectHandle::as_name)
-        .map(|n| n.as_slice() == b"Widget")
-        .unwrap_or(false);
+    let is_widget = match field_dict.get(b"Subtype".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle
+                .as_name()
+                .map(|n| n.as_slice() == b"Widget")
+                .unwrap_or(false)
+        }
+        None => false,
+    };
 
     // /Kids — may be a direct Array or an indirect Reference to an Array.
     // Resolve the indirect form so we don't silently drop the entire kid
@@ -1701,11 +1729,16 @@ fn walk_acroform_fields<R: Read + Seek>(
         let Some(d) = kid.as_dictionary() else {
             continue;
         };
-        let is_widget_subtype = d
-            .get(b"Subtype".as_slice())
-            .and_then(ObjectHandle::as_name)
-            .map(|n| n.as_slice() == b"Widget")
-            .unwrap_or(false);
+        let is_widget_subtype = match d.get(b"Subtype".as_slice()) {
+            Some(handle) => {
+                pdf.resolve_object_handle(handle)?;
+                handle
+                    .as_name()
+                    .map(|n| n.as_slice() == b"Widget")
+                    .unwrap_or(false)
+            }
+            None => false,
+        };
         // Field-like markers that mean the kid acts as a (possibly unnamed)
         // field even when /Subtype is /Widget. Covers the merged widget+field
         // case where the widget dictionary carries field state (value, flags,
@@ -1869,10 +1902,13 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
     };
 
     // /NeedAppearances (default false).
-    let need_appearances = acroform_dict
-        .get(b"NeedAppearances".as_slice())
-        .and_then(ObjectHandle::as_boolean)
-        .unwrap_or(false);
+    let need_appearances = match acroform_dict.get(b"NeedAppearances".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle.as_boolean().unwrap_or(false)
+        }
+        None => false,
+    };
 
     // /Fields array (top-level field refs). Same as /Kids below: must
     // accept both the direct Array form and an indirect Reference to an
@@ -2105,14 +2141,17 @@ fn filespec_dict_to_json<R: Read + Seek>(
     };
 
     // description: /Desc decoded as PDF text string, bare (no u:/b: prefix)
-    let description = match filespec_dict
-        .get(b"Desc".as_slice())
-        .and_then(ObjectHandle::as_string)
-    {
-        Some(bytes) => {
-            let s = decode_pdf_text_string(&bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-            Json::make_string(s)
+    let description = match filespec_dict.get(b"Desc".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle
+                .as_string()
+                .map(|bytes| {
+                    let s = decode_pdf_text_string(&bytes)
+                        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+                    Json::make_string(s)
+                })
+                .unwrap_or_else(Json::make_null)
         }
         None => Json::make_null(),
     };
@@ -2122,31 +2161,35 @@ fn filespec_dict_to_json<R: Read + Seek>(
     let name_keys = ["DOS", "F", "Mac", "UF", "Unix"];
     let mut names_pairs: Vec<(String, Json)> = Vec::new();
     for key in &name_keys {
-        if let Some(bytes) = filespec_dict
-            .get(key.as_bytes())
-            .and_then(ObjectHandle::as_string)
-        {
+        let Some(handle) = filespec_dict.get(key.as_bytes()) else {
+            continue;
+        };
+        pdf.resolve_object_handle(handle)?;
+        if let Some(bytes) = handle.as_string() {
             let s = decode_pdf_text_string(&bytes)
                 .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
             names_pairs.push((format!("/{key}"), Json::make_string(s)));
         }
     }
 
-    // preferredname: /UF > /F > /Unix > /Mac > /DOS
-    let preferred_name_key_order = ["UF", "F", "Unix", "Mac", "DOS"];
-    let preferredname = preferred_name_key_order
-        .iter()
-        .find_map(|key| {
-            filespec_dict
-                .get(key.as_bytes())
-                .and_then(ObjectHandle::as_string)
-                .map(|bytes| {
-                    let s = decode_pdf_text_string(&bytes)
-                        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-                    Json::make_string(s)
-                })
-        })
-        .unwrap_or_else(Json::make_null);
+    // preferredname: /UF > /F > /Unix > /DOS > /Mac — matches qpdf's
+    // `QPDFFileSpecObjectHelper::name_keys` priority order
+    // (QPDFFileSpecObjectHelper.cc), which is *not* alphabetical (/DOS comes
+    // before /Mac).
+    let preferred_name_key_order = ["UF", "F", "Unix", "DOS", "Mac"];
+    let mut preferredname = Json::make_null();
+    for key in &preferred_name_key_order {
+        let Some(handle) = filespec_dict.get(key.as_bytes()) else {
+            continue;
+        };
+        pdf.resolve_object_handle(handle)?;
+        if let Some(bytes) = handle.as_string() {
+            let s = decode_pdf_text_string(&bytes)
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+            preferredname = Json::make_string(s);
+            break;
+        }
+    }
 
     // /EF dictionary: embedded file stream refs, keyed by /F /UF /DOS /Mac /Unix
     let ef_dict: Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> =
@@ -2158,20 +2201,27 @@ fn filespec_dict_to_json<R: Read + Seek>(
             None => None,
         };
 
-    // preferredcontents: /EF/UF > /EF/F > /EF/Unix > /EF/Mac > /EF/DOS
-    let preferred_ef_key_order = ["UF", "F", "Unix", "Mac", "DOS"];
-    let preferredcontents = if let Some(ref ef) = ef_dict {
-        preferred_ef_key_order
-            .iter()
-            .find_map(|key| {
-                ef.get(key.as_bytes())
-                    .and_then(ObjectHandle::object_ref)
-                    .map(|r| Json::make_string(format!("{} {} R", r.number, r.generation)))
-            })
-            .unwrap_or_else(Json::make_null)
-    } else {
-        Json::make_null()
-    };
+    // preferredcontents: /EF/UF > /EF/F > /EF/Unix > /EF/DOS > /EF/Mac, same
+    // priority order as preferredname, taking the first entry that resolves
+    // to an actual stream (qpdf's `getEmbeddedFileStream()` checks
+    // `isStream()`, not merely that the key is present).
+    let preferred_ef_key_order = ["UF", "F", "Unix", "DOS", "Mac"];
+    let mut preferredcontents = Json::make_null();
+    if let Some(ref ef) = ef_dict {
+        for key in &preferred_ef_key_order {
+            let Some(handle) = ef.get(key.as_bytes()) else {
+                continue;
+            };
+            let Some(r) = handle.object_ref() else {
+                continue;
+            };
+            pdf.resolve_object_handle(handle)?;
+            if handle.as_stream_dict().is_some() {
+                preferredcontents = Json::make_string(format!("{} {} R", r.number, r.generation));
+                break;
+            }
+        }
+    }
 
     // streams: for each key in /EF, build a stream-info object
     // Keys alphabetical: /DOS, /F, /Mac, /UF, /Unix
@@ -2194,11 +2244,16 @@ fn filespec_dict_to_json<R: Read + Seek>(
             };
 
             // mimetype: /Subtype name → bare string (no "/" prefix), or null
-            let mimetype = match stream_dict
-                .get(b"Subtype".as_slice())
-                .and_then(ObjectHandle::as_name)
-            {
-                Some(bytes) => Json::make_string(String::from_utf8_lossy(&bytes).into_owned()),
+            let mimetype = match stream_dict.get(b"Subtype".as_slice()) {
+                Some(handle) => {
+                    pdf.resolve_object_handle(handle)?;
+                    handle
+                        .as_name()
+                        .map(|bytes| {
+                            Json::make_string(String::from_utf8_lossy(&bytes).into_owned())
+                        })
+                        .unwrap_or_else(Json::make_null)
+                }
                 None => Json::make_null(),
             };
 
@@ -2213,30 +2268,43 @@ fn filespec_dict_to_json<R: Read + Seek>(
                 };
 
             // checksum: /Params /CheckSum bytes → lowercase hex, or null
-            let checksum = params_dict
+            let checksum = match params_dict
                 .as_ref()
                 .and_then(|p| p.get(b"CheckSum".as_slice()))
-                .and_then(ObjectHandle::as_string)
-                .map(|bytes| Json::make_string(checksum_to_hex(&bytes)))
-                .unwrap_or_else(Json::make_null);
+            {
+                Some(handle) => {
+                    pdf.resolve_object_handle(handle)?;
+                    handle
+                        .as_string()
+                        .map(|bytes| Json::make_string(checksum_to_hex(&bytes)))
+                        .unwrap_or_else(Json::make_null)
+                }
+                None => Json::make_null(),
+            };
 
             // creationdate: /Params /CreationDate → ISO 8601, or null
-            let creationdate = params_dict
+            let creationdate = match params_dict
                 .as_ref()
                 .and_then(|p| p.get(b"CreationDate".as_slice()))
-                .and_then(ObjectHandle::as_string)
-                .and_then(|bytes| parse_pdf_date(&bytes))
-                .map(Json::make_string)
-                .unwrap_or_else(Json::make_null);
+            {
+                Some(handle) => {
+                    pdf.resolve_object_handle(handle)?;
+                    handle
+                        .as_string()
+                        .and_then(|bytes| parse_pdf_date(&bytes))
+                        .map(Json::make_string)
+                        .unwrap_or_else(Json::make_null)
+                }
+                None => Json::make_null(),
+            };
 
-            // modificationdate: /Params /ModDate → ISO 8601, or null
-            let modificationdate = params_dict
-                .as_ref()
-                .and_then(|p| p.get(b"ModDate".as_slice()))
-                .and_then(ObjectHandle::as_string)
-                .and_then(|bytes| parse_pdf_date(&bytes))
-                .map(Json::make_string)
-                .unwrap_or_else(Json::make_null);
+            // modificationdate: qpdf's `QPDFJob::doJSONAttachments` reads
+            // `/Params /CreationDate` for *both* `creationdate` and
+            // `modificationdate` — a copy-paste bug (QPDFJob.cc:1319-1322 in
+            // qpdf 11.9.0, still present on qpdf `main`). Per the
+            // byte-identical mandate qpdf's behavior is replicated even where
+            // it is buggy, so `/ModDate` is deliberately never read here.
+            let modificationdate = creationdate.clone();
 
             // Stream entry keys: checksum, creationdate, mimetype, modificationdate
             let stream_entry = json_dictionary([
@@ -2383,55 +2451,73 @@ pub fn build_attachments_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Jso
 /// - `/R >= 5` → `"AESv3"`
 /// - `/R == 4` → `"AESv2"`
 /// - everything else (legacy) → `"RC4"`
-fn cf_method_string(
+fn cf_method_string<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
     encrypt: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     selector: Option<&str>,
-) -> &'static str {
-    fn revision_default(
+) -> Result<&'static str, ConvertError> {
+    fn revision_default<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
         encrypt: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
-    ) -> &'static str {
-        match encrypt
-            .get(b"R".as_slice())
-            .and_then(ObjectHandle::as_integer)
-        {
+    ) -> Result<&'static str, ConvertError> {
+        let r = match encrypt.get(b"R".as_slice()) {
+            Some(handle) => {
+                pdf.resolve_object_handle(handle)?;
+                handle.as_integer()
+            }
+            None => None,
+        };
+        Ok(match r {
             Some(r) if r >= 5 => "AESv3",
             Some(4) => "AESv2",
             _ => "RC4",
-        }
+        })
     }
 
     let Some(selector) = selector else {
-        return revision_default(encrypt);
+        return revision_default(pdf, encrypt);
     };
     if selector == "Identity" {
-        return "none";
+        return Ok("none");
     }
     // Look up the CFM entry inside /CF/<selector>
-    let Some(cf) = encrypt
-        .get(b"CF".as_slice())
-        .and_then(ObjectHandle::as_dictionary)
-    else {
-        return revision_default(encrypt);
+    let cf = match encrypt.get(b"CF".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle.as_dictionary()
+        }
+        None => None,
     };
-    let Some(filter) = cf
-        .get(selector.as_bytes())
-        .and_then(ObjectHandle::as_dictionary)
-    else {
-        return revision_default(encrypt);
+    let Some(cf) = cf else {
+        return revision_default(pdf, encrypt);
     };
-    match filter
-        .get(b"CFM".as_slice())
-        .and_then(ObjectHandle::as_name)
-    {
+    let filter = match cf.get(selector.as_bytes()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle.as_dictionary()
+        }
+        None => None,
+    };
+    let Some(filter) = filter else {
+        return revision_default(pdf, encrypt);
+    };
+    let cfm = match filter.get(b"CFM".as_slice()) {
+        Some(handle) => {
+            pdf.resolve_object_handle(handle)?;
+            handle.as_name()
+        }
+        None => None,
+    };
+    Ok(match cfm {
         Some(cfm) => match cfm.as_slice() {
             b"AESV2" => "AESv2",
             b"AESV3" => "AESv3",
             b"V2" => "RC4",
             b"None" => "none",
-            _ => revision_default(encrypt),
+            _ => revision_default(pdf, encrypt)?,
         },
-        None => revision_default(encrypt),
-    }
+        None => revision_default(pdf, encrypt)?,
+    })
 }
 
 /// Read an optional name key from `dict` and return it decoded as UTF-8.
@@ -2439,12 +2525,18 @@ fn cf_method_string(
 /// Returns `None` if the key is absent, the value is not a name, or the
 /// name's bytes are not valid UTF-8 (matching the strict, non-lossy
 /// decoding the original `Object`-based lookup used).
-fn dict_name_str(
+fn dict_name_str<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
     dict: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     key: &str,
-) -> Option<String> {
-    let bytes = dict.get(key.as_bytes())?.as_name()?;
-    String::from_utf8(bytes).ok()
+) -> Result<Option<String>, ConvertError> {
+    let Some(handle) = dict.get(key.as_bytes()) else {
+        return Ok(None);
+    };
+    pdf.resolve_object_handle(handle)?;
+    Ok(handle
+        .as_name()
+        .and_then(|bytes| String::from_utf8(bytes).ok()))
 }
 
 /// Decode /P integer into per-capability booleans.
@@ -2511,24 +2603,26 @@ fn all_true_capabilities() -> Result<Json, ConvertError> {
 ///
 /// # Errors
 ///
-/// Returns a [`ConvertError`] only when an indirect `/Encrypt` reference
-/// cannot be resolved (i.e. an underlying I/O or parse error).
+/// Returns a [`ConvertError`] when the `/Encrypt` reference, or any of its
+/// nested entries (`/V`, `/R`, `/P`, `/Length`, `/StmF`, `/StrF`, `/EFF`,
+/// `/CF`, `/CFM`) that happen to be stored as indirect references, cannot be
+/// resolved (i.e. an underlying I/O or parse error).
 pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
-    // Resolve /Encrypt dictionary from the trailer. `resolve_object_handle`
-    // is a no-op for a direct (inline) dictionary and resolves an indirect
-    // reference in place, so a single call covers both shapes; a present but
-    // non-dictionary value (any type, including an unresolved reference)
-    // falls out of `as_dictionary()` as `None`, matching the prior explicit
-    // `Object::Dictionary`/`Object::Reference`/catch-all arms.
-    let trailer_dict = pdf.trailer_handle().as_dictionary().unwrap_or_default();
-    let encrypt_dict: Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> =
-        match trailer_dict.get(b"Encrypt".as_slice()) {
-            None => None,
-            Some(handle) => {
-                pdf.resolve_object_handle(handle)?;
-                handle.as_dictionary()
-            }
-        };
+    // Resolve /Encrypt via `trailer_key_handle`, not `trailer_handle`: the
+    // latter lifts the *whole* trailer in one pass and degrades to a null
+    // handle if any unrelated sibling entry's literal nesting exceeds the
+    // inline-object bound, which would incorrectly report an otherwise-valid
+    // /Encrypt entry as absent (plaintext). `trailer_key_handle` lifts only
+    // this key's own value, so a deeply-nested sibling can't erase it.
+    // `resolve_object_handle` is a no-op for a direct (inline) dictionary and
+    // resolves an indirect reference in place, so a single call covers both
+    // shapes; a present but non-dictionary value (any type, including an
+    // unresolved reference) falls out of `as_dictionary()` as `None`,
+    // matching the prior explicit `Object::Dictionary`/`Object::Reference`/
+    // catch-all arms.
+    let encrypt_handle = pdf.trailer_key_handle(b"Encrypt");
+    pdf.resolve_object_handle(&encrypt_handle)?;
+    let encrypt_dict = encrypt_handle.as_dictionary();
 
     let is_encrypted = pdf.is_encrypted();
 
@@ -2557,40 +2651,50 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
             ])
         }
         Some(ref enc) => {
-            // Encrypted document: read V, R, P, /Length, CF methods. None of
-            // these nested lookups resolve indirect references — an
-            // unresolved handle's typed accessor returns `None` just like
-            // the prior code's `Object::Reference` arm fell through to the
-            // catch-all, so the non-resolving behavior carries over exactly.
-            let v = enc
-                .get(b"V".as_slice())
-                .and_then(ObjectHandle::as_integer)
-                .unwrap_or(0);
-            let r = enc
-                .get(b"R".as_slice())
-                .and_then(ObjectHandle::as_integer)
-                .unwrap_or(0);
-            let p_raw = enc
-                .get(b"P".as_slice())
-                .and_then(ObjectHandle::as_integer)
-                .map(|n| n as i32)
-                .unwrap_or(0);
+            // Encrypted document: read V, R, P, /Length, CF methods. qpdf's
+            // own encryption-parameter reads (`QPDFObjectHandle::isInteger`
+            // et al.) transparently follow indirect references, so these
+            // lookups resolve too rather than guarding against it.
+            let v = match enc.get(b"V".as_slice()) {
+                Some(handle) => {
+                    pdf.resolve_object_handle(handle)?;
+                    handle.as_integer().unwrap_or(0)
+                }
+                None => 0,
+            };
+            let r = match enc.get(b"R".as_slice()) {
+                Some(handle) => {
+                    pdf.resolve_object_handle(handle)?;
+                    handle.as_integer().unwrap_or(0)
+                }
+                None => 0,
+            };
+            let p_raw = match enc.get(b"P".as_slice()) {
+                Some(handle) => {
+                    pdf.resolve_object_handle(handle)?;
+                    handle.as_integer().map(|n| n as i32).unwrap_or(0)
+                }
+                None => 0,
+            };
             let bits = match enc.get(b"Length".as_slice()) {
                 // Default key length when /Length is absent: 40 bits (V=1/2).
                 None => 40,
                 // Present: an integer value, or 0 for anything malformed.
-                Some(handle) => handle.as_integer().unwrap_or(0),
+                Some(handle) => {
+                    pdf.resolve_object_handle(handle)?;
+                    handle.as_integer().unwrap_or(0)
+                }
             };
 
             // Determine method strings from /StmF, /StrF, /EFF selectors.
-            let stmf = dict_name_str(enc, "StmF");
-            let strf = dict_name_str(enc, "StrF");
-            let eff = dict_name_str(enc, "EFF");
+            let stmf = dict_name_str(pdf, enc, "StmF")?;
+            let strf = dict_name_str(pdf, enc, "StrF")?;
+            let eff = dict_name_str(pdf, enc, "EFF")?;
 
             let (streammethod, stringmethod, filemethod) = if v >= 4 {
-                let sm = cf_method_string(enc, stmf.as_deref());
-                let st = cf_method_string(enc, strf.as_deref());
-                let fm = cf_method_string(enc, eff.as_deref().or(stmf.as_deref()));
+                let sm = cf_method_string(pdf, enc, stmf.as_deref())?;
+                let st = cf_method_string(pdf, enc, strf.as_deref())?;
+                let fm = cf_method_string(pdf, enc, eff.as_deref().or(stmf.as_deref()))?;
                 (sm, st, fm)
             } else if v == 1 || v == 2 {
                 ("RC4", "RC4", "RC4")
@@ -8872,6 +8976,59 @@ mod tests {
         pdf.set_object(acroform_ref, Object::Dictionary(acroform));
     }
 
+    // Codex review finding on PR #613 (post-merge): an indirect /T's
+    // resolved value must not depend on whether some unrelated code path
+    // already resolved the same canonical handle first.
+    // `ObjectHandle::get_object_handle` returns the same shared,
+    // lazily-resolved handle for a given ObjectRef no matter who asks for
+    // it, so determinism must come from *always* resolving before reading
+    // -- matching qpdf's typed accessors, which transparently dereference
+    // -- not from refusing to resolve at all.
+    #[test]
+    fn acroform_indirect_t_resolves_regardless_of_unrelated_prior_resolution() {
+        let mut pdf = load_one_page_pdf();
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let field_ref = crate::ObjectRef::new(201, 0);
+        let t_ref = crate::ObjectRef::new(202, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(vec![Object::Reference(field_ref)]));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        let mut field = Dictionary::new();
+        field.insert("T", Object::Reference(t_ref));
+        pdf.set_object(field_ref, Object::Dictionary(field));
+        pdf.set_object(t_ref, Object::String(b"leaked".to_vec()));
+
+        // Simulate something ELSE (an earlier section builder, a prior
+        // walk) already having touched t_ref's canonical handle before
+        // build_acroform_section runs.
+        let pre_touch = pdf.get_object_handle(t_ref);
+        pdf.resolve_object_handle(&pre_touch).unwrap();
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array"); // cov:ignore: fixture-shape guard
+        };
+        let entry = object_pairs(&fields[0]);
+        let fullname = entry
+            .iter()
+            .find(|(k, _)| k == "fullname")
+            .unwrap()
+            .1
+            .clone();
+        // qpdf's typed accessors transparently follow indirect references,
+        // so an indirect /T resolves to its target's value just like a
+        // direct one -- regardless of what else has been resolved
+        // elsewhere in the same Pdf.
+        assert_eq!(
+            fullname,
+            serde_json::Value::String("leaked".to_string()),
+            "indirect /T must resolve deterministically regardless of unrelated prior resolution"
+        );
+    }
+
     // ── acroform Test 1: No /AcroForm → hasacroform: false, empty fields ──────
 
     #[test]
@@ -9041,8 +9198,8 @@ mod tests {
         assert_eq!(entry[3].1, number(0), "fieldflags must be 0");
         assert_eq!(
             entry[4].1,
-            serde_json::Value::String("Tx".to_string()),
-            "fieldtype must be Tx (bare, no /)"
+            serde_json::Value::String("/Tx".to_string()),
+            "fieldtype must be /Tx, matching qpdf's getFieldType() (getName() keeps the leading /)"
         );
         assert_eq!(
             entry[5].1,
@@ -9380,7 +9537,7 @@ mod tests {
 
         assert_eq!(
             get("fieldtype"),
-            serde_json::Value::String("Tx".to_string()),
+            serde_json::Value::String("/Tx".to_string()),
             "child must inherit /FT from parent"
         );
         assert_eq!(
@@ -9468,7 +9625,7 @@ mod tests {
             .find(|(k, _)| k == "fieldtype")
             .map(|(_, v)| v.clone())
             .unwrap();
-        assert_eq!(leaf_ft, serde_json::Value::String("Tx".to_string()));
+        assert_eq!(leaf_ft, serde_json::Value::String("/Tx".to_string()));
     }
 
     // ── acroform: widget kid with /Parent is still classified as annotation ─
@@ -10397,11 +10554,15 @@ mod tests {
             "creationdate mismatch"
         );
 
-        // modificationdate: D:20260202120000+09'00' → 2026-02-02T12:00:00+09:00
+        // modificationdate: qpdf's QPDFJob::doJSONAttachments reads
+        // /Params/CreationDate for *both* creationdate and modificationdate
+        // (a copy-paste bug in qpdf 11.9.0, QPDFJob.cc:1319-1322, still
+        // present on qpdf main) — /ModDate ("2026-02-02T12:00:00+09:00" if
+        // it were read) is never actually reached.
         assert_eq!(
             *f_get("modificationdate"),
-            serde_json::Value::String("2026-02-02T12:00:00+09:00".to_string()),
-            "modificationdate mismatch"
+            serde_json::Value::String("2026-01-01T00:00:00Z".to_string()),
+            "modificationdate must replicate qpdf's CreationDate/ModDate copy-paste bug"
         );
 
         // mimetype: bare "text/plain" (no "/" prefix, no "u:" prefix)
@@ -10439,6 +10600,104 @@ mod tests {
             *uf_get("modificationdate"),
             serde_json::Value::Null,
             "/UF modificationdate must be null"
+        );
+    }
+
+    #[test]
+    fn attachments_preferredcontents_skips_a_non_reference_ef_entry() {
+        let mut pdf = load_one_page_pdf();
+
+        let stream_f_ref = crate::ObjectRef::new(930, 0);
+        let filespec_ref = crate::ObjectRef::new(931, 0);
+        let ef_root_ref = crate::ObjectRef::new(932, 0);
+        let names_ref = crate::ObjectRef::new(933, 0);
+
+        let mut stream_f_dict = Dictionary::new();
+        stream_f_dict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
+        pdf.set_object(
+            stream_f_ref,
+            Object::Stream(crate::object::Stream::new(stream_f_dict, vec![])),
+        );
+
+        // /EF/UF is a direct (non-reference) value. qpdf's
+        // getEmbeddedFileStream() requires an indirect stream (isStream()),
+        // so a direct entry must be skipped in favor of the next-priority
+        // key rather than accepted as the preferred contents.
+        let mut ef_dict = Dictionary::new();
+        ef_dict.insert("UF", Object::Boolean(true));
+        ef_dict.insert("F", Object::Reference(stream_f_ref));
+
+        let mut filespec = Dictionary::new();
+        filespec.insert("Type", Object::Name(b"Filespec".to_vec()));
+        filespec.insert("F", Object::String(b"f-name.txt".to_vec()));
+        filespec.insert("EF", Object::Dictionary(ef_dict));
+
+        patch_embedded_files(
+            &mut pdf,
+            names_ref,
+            ef_root_ref,
+            filespec_ref,
+            filespec,
+            b"attachment.txt",
+        );
+
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        let pairs = object_pairs(&result);
+        let entry = object_pairs(&pairs[0].1);
+        let preferredcontents = entry
+            .iter()
+            .find(|(k, _)| k == "preferredcontents")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(
+            preferredcontents,
+            serde_json::Value::String(format!(
+                "{} {} R",
+                stream_f_ref.number, stream_f_ref.generation
+            )),
+            "a non-reference /EF/UF entry must be skipped in favor of /EF/F"
+        );
+    }
+
+    #[test]
+    fn attachments_preferredname_skips_a_non_string_name_entry() {
+        let mut pdf = load_one_page_pdf();
+
+        let filespec_ref = crate::ObjectRef::new(934, 0);
+        let ef_root_ref = crate::ObjectRef::new(935, 0);
+        let names_ref = crate::ObjectRef::new(936, 0);
+
+        // /UF is present but not a string. qpdf's getFilename() requires
+        // isString(), so a wrong-type /UF must be skipped in favor of the
+        // next-priority key (/F) rather than accepted as the preferred name.
+        let mut filespec = Dictionary::new();
+        filespec.insert("Type", Object::Name(b"Filespec".to_vec()));
+        filespec.insert("UF", Object::Integer(42));
+        filespec.insert("F", Object::String(b"f-name.txt".to_vec()));
+
+        patch_embedded_files(
+            &mut pdf,
+            names_ref,
+            ef_root_ref,
+            filespec_ref,
+            filespec,
+            b"attachment.txt",
+        );
+
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        let pairs = object_pairs(&result);
+        let entry = object_pairs(&pairs[0].1);
+        let preferredname = entry
+            .iter()
+            .find(|(k, _)| k == "preferredname")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(
+            preferredname,
+            serde_json::Value::String("f-name.txt".to_string()),
+            "a non-string /UF entry must be skipped in favor of /F"
         );
     }
 
@@ -10934,57 +11193,128 @@ mod tests {
 
     #[test]
     fn cf_method_string_defaults_to_aesv2_for_revision_4() {
+        let mut pdf = load_one_page_pdf();
+
         // No /CF at all.
         let encrypt = oh_dict(vec![("R", ObjectHandle::integer(4))])
             .as_dictionary()
             .unwrap();
-        assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "AESv2");
+        assert_eq!(
+            cf_method_string(&mut pdf, &encrypt, Some("StdCF")).unwrap(),
+            "AESv2"
+        );
 
         // /CF exists but the selector is missing.
         let cf = oh_dict(vec![("OtherCF", oh_dict(vec![]))]);
         let encrypt = oh_dict(vec![("R", ObjectHandle::integer(4)), ("CF", cf)])
             .as_dictionary()
             .unwrap();
-        assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "AESv2");
+        assert_eq!(
+            cf_method_string(&mut pdf, &encrypt, Some("StdCF")).unwrap(),
+            "AESv2"
+        );
 
         // Selector found but its /CFM is missing.
         let cf2 = oh_dict(vec![("StdCF", oh_dict(vec![]))]);
         let encrypt2 = oh_dict(vec![("R", ObjectHandle::integer(4)), ("CF", cf2)])
             .as_dictionary()
             .unwrap();
-        assert_eq!(cf_method_string(&encrypt2, Some("StdCF")), "AESv2");
+        assert_eq!(
+            cf_method_string(&mut pdf, &encrypt2, Some("StdCF")).unwrap(),
+            "AESv2"
+        );
     }
 
     #[test]
     fn cf_method_string_defaults_to_aesv3_for_revision_5_and_6() {
+        let mut pdf = load_one_page_pdf();
         for r in [5i64, 6] {
             let encrypt = oh_dict(vec![("R", ObjectHandle::integer(r))])
                 .as_dictionary()
                 .unwrap();
-            assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "AESv3");
-            assert_eq!(cf_method_string(&encrypt, None), "AESv3");
+            assert_eq!(
+                cf_method_string(&mut pdf, &encrypt, Some("StdCF")).unwrap(),
+                "AESv3"
+            );
+            assert_eq!(cf_method_string(&mut pdf, &encrypt, None).unwrap(), "AESv3");
         }
     }
 
     #[test]
     fn cf_method_string_defaults_to_rc4_for_legacy_revisions() {
+        let mut pdf = load_one_page_pdf();
         let encrypt = oh_dict(vec![("R", ObjectHandle::integer(3))])
             .as_dictionary()
             .unwrap();
-        assert_eq!(cf_method_string(&encrypt, Some("StdCF")), "RC4");
+        assert_eq!(
+            cf_method_string(&mut pdf, &encrypt, Some("StdCF")).unwrap(),
+            "RC4"
+        );
         // No /R at all -> legacy default too.
         let empty = oh_dict(vec![]).as_dictionary().unwrap();
-        assert_eq!(cf_method_string(&empty, Some("StdCF")), "RC4");
+        assert_eq!(
+            cf_method_string(&mut pdf, &empty, Some("StdCF")).unwrap(),
+            "RC4"
+        );
     }
 
     #[test]
     fn cf_method_string_identity_selector_still_returns_none() {
         // The "Identity" selector explicitly means no encryption for that
         // path and must keep its "none" behavior regardless of /R.
+        let mut pdf = load_one_page_pdf();
         let encrypt = oh_dict(vec![("R", ObjectHandle::integer(4))])
             .as_dictionary()
             .unwrap();
-        assert_eq!(cf_method_string(&encrypt, Some("Identity")), "none");
+        assert_eq!(
+            cf_method_string(&mut pdf, &encrypt, Some("Identity")).unwrap(),
+            "none"
+        );
+    }
+
+    #[test]
+    fn cf_method_string_maps_v2_and_none_cfm_values_and_falls_back_on_unrecognized() {
+        let mut pdf = load_one_page_pdf();
+
+        let cf_v2 = oh_dict(vec![(
+            "StdCF",
+            oh_dict(vec![("CFM", ObjectHandle::name(b"V2".to_vec()))]),
+        )]);
+        let encrypt_v2 = oh_dict(vec![("R", ObjectHandle::integer(4)), ("CF", cf_v2)])
+            .as_dictionary()
+            .unwrap();
+        assert_eq!(
+            cf_method_string(&mut pdf, &encrypt_v2, Some("StdCF")).unwrap(),
+            "RC4",
+            "/CFM /V2 must map to RC4"
+        );
+
+        let cf_none = oh_dict(vec![(
+            "StdCF",
+            oh_dict(vec![("CFM", ObjectHandle::name(b"None".to_vec()))]),
+        )]);
+        let encrypt_none = oh_dict(vec![("R", ObjectHandle::integer(4)), ("CF", cf_none)])
+            .as_dictionary()
+            .unwrap();
+        assert_eq!(
+            cf_method_string(&mut pdf, &encrypt_none, Some("StdCF")).unwrap(),
+            "none",
+            "/CFM /None must map to none"
+        );
+
+        // An unrecognized /CFM value falls back to the revision-based default.
+        let cf_unknown = oh_dict(vec![(
+            "StdCF",
+            oh_dict(vec![("CFM", ObjectHandle::name(b"Unknown".to_vec()))]),
+        )]);
+        let encrypt_unknown = oh_dict(vec![("R", ObjectHandle::integer(5)), ("CF", cf_unknown)])
+            .as_dictionary()
+            .unwrap();
+        assert_eq!(
+            cf_method_string(&mut pdf, &encrypt_unknown, Some("StdCF")).unwrap(),
+            "AESv3",
+            "unrecognized /CFM must fall back to the revision-based default"
+        );
     }
 
     #[test]
@@ -11048,6 +11378,36 @@ mod tests {
             serde_json::Value::String("AESv2".into())
         );
         assert_eq!(get("key"), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn encrypt_section_missing_v_r_p_default_to_zero() {
+        // A spec-invalid /Encrypt dictionary missing /V, /R, and /P: each
+        // must default to 0 rather than erroring, matching /Length's
+        // existing "absent -> default" behavior.
+        let mut pdf = load_encrypted_r4_pdf();
+        let encrypt_ref = match pdf.trailer().get("Encrypt") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("expected /Encrypt to be an indirect reference, got {other:?}"), // cov:ignore: fixture-shape guard
+        };
+        // Authentication already happened at open time; replacing the
+        // referenced object post-open only affects build_encrypt_section's
+        // fresh re-read of /V, /R, /P.
+        pdf.set_object(encrypt_ref, Object::Dictionary(Dictionary::new()));
+
+        let enc = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
+        let pairs = object_pairs(enc);
+        let params = pairs
+            .iter()
+            .find(|(k, _)| k == "parameters")
+            .unwrap()
+            .1
+            .clone();
+        let p = object_pairs(params);
+        let get = |k: &str| p.iter().find(|(ky, _)| ky == k).unwrap().1.clone();
+        assert_eq!(get("V"), number(0), "/V absent must default to 0");
+        assert_eq!(get("R"), number(0), "/R absent must default to 0");
+        assert_eq!(get("P"), number(0), "/P absent must default to 0");
     }
 
     #[test]
