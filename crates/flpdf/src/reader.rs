@@ -325,6 +325,14 @@ const MAX_OBJECT_STREAM_CHAIN_DEPTH: usize = 100;
 // defeating a flood of objects whose bodies run to EOF.
 const MAX_RESOLUTION_FALLBACKS: u32 = 64;
 
+// Stack-growth protection for `lift_bounded`'s recursive hub, mirroring
+// `parser.rs`'s own `STACK_RED_ZONE`/`STACK_GROWTH_SIZE` values (kept as
+// separate local constants rather than imported cross-module, matching this
+// crate's existing per-module duplication of the same two numbers in
+// `object_handle.rs`).
+const READER_STACK_RED_ZONE: usize = 32 * 1024;
+const READER_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
 impl<R: Read + Seek> Drop for Pdf<R> {
     // A resolved indirect handle's value can embed other indirect handles
     // sharing `handle_registry`'s own canonical `Rc` identity (array/dict/
@@ -2110,68 +2118,82 @@ impl<R: Read + Seek> Pdf<R> {
                 "object handle lift: inline object nesting exceeds maximum of {max_depth}"
             )));
         }
-        let value = match object {
-            Object::Null => ObjectValue::Null,
-            Object::Boolean(b) => ObjectValue::Boolean(*b),
-            Object::Integer(n) => ObjectValue::Integer(*n),
-            Object::Real(r) => ObjectValue::Real(*r),
-            Object::RealLiteral { value, literal } => ObjectValue::RealLiteral {
-                value: *value,
-                literal: literal.clone(),
-            },
-            Object::Name(name) => ObjectValue::Name(name.clone()),
-            Object::String(s) => ObjectValue::String(s.clone()),
-            Object::Array(items) => ObjectValue::Array(
-                items
-                    .iter()
-                    .map(|item| self.lift_to_handle_bounded(item, depth + 1, max_depth))
-                    .collect::<Result<Vec<_>>>()?,
-            ),
-            Object::Dictionary(dict) => {
-                ObjectValue::Dictionary(self.lift_dictionary_bounded(dict, depth, max_depth)?)
-            }
-            // A stream's own dictionary is lifted the same way any other
-            // nested dictionary is (see `lift_dictionary`), then wrapped in
-            // its own fresh handle: this arm mints a new dictionary handle
-            // every time, at the no-offset sentinel. `Pdf::set_object`
-            // (the only caller that can reach this arm with a *replacement*
-            // for an already-resolved stream) special-cases reusing the
-            // pre-existing dictionary handle instead, via
-            // `Pdf::lift_for_set_object`, so an established parsed offset
-            // is not lost on a plain round trip.
-            Object::Stream(stream) => ObjectValue::Stream {
-                dict: ObjectHandle::from_value(ObjectValue::Dictionary(
-                    self.lift_dictionary_bounded(&stream.dict, depth, max_depth)?,
-                )),
-                data: stream.data.clone(),
-            },
-            // A bare top-level reference never comes from a file/ObjStm
-            // parse (`top_level_no_reference` integerizes it there,
-            // matching qpdf), but `Pdf::set_object` callers pass one
-            // directly throughout this crate to redirect or collapse a
-            // holder chain in place (`ObjectRef` -> `ObjectRef`, no
-            // recursive follow) -- `ObjectValue::Reference` is the handle
-            // graph's representation for exactly that case; see its own
-            // doc.
-            Object::Reference(object_ref) => ObjectValue::Reference(*object_ref),
-            // Content-stream-only tokens; never a resolved file/ObjStm
-            // object value, and not a value any caller passes to
-            // `Pdf::set_object` in practice. `ObjectValue` has no variant to
-            // represent either losslessly, so this returns `Err` rather than
-            // silently discarding the caller-supplied value as `Null`:
-            // `Pdf::set_object` already treats a `lift` failure as "cannot be
-            // represented in the handle graph" and falls back to storing
-            // `object` directly as the authoritative
-            // `legacy_materialized_memo` value instead (see its own comment),
-            // exactly the same route the excess-depth case already takes.
-            Object::Operator(_) | Object::InlineImage(_) => {
-                return Err(Error::Unsupported(
-                    "object handle lift: content-stream-only token has no ObjectValue representation"
-                        .to_string(),
-                ));
-            }
-        };
-        Ok(value)
+        // Recursion hub for the mutually-recursive `lift_bounded` /
+        // `lift_to_handle_bounded` / `lift_dictionary_bounded` triangle:
+        // every nesting level returns back through here, so wrapping this
+        // one call site protects the whole walk the same way
+        // `object_handle.rs`'s own recursive hubs do. Needed for real, not
+        // just for a test with an oversized stack to pass: unlike the
+        // native parse path (`parser.rs`, itself `stacker`-protected), this
+        // lift path has no protection of its own, and `Pdf::trailer_key_handle`
+        // now reaches it at the looser `MAX_PARSE_DEPTH` bound (500) — a
+        // legitimately deep but successfully parsed value could otherwise
+        // abort a production caller running on a small-stack thread instead
+        // of returning a handle.
+        stacker::maybe_grow(READER_STACK_RED_ZONE, READER_STACK_GROWTH_SIZE, || {
+            let value = match object {
+                Object::Null => ObjectValue::Null,
+                Object::Boolean(b) => ObjectValue::Boolean(*b),
+                Object::Integer(n) => ObjectValue::Integer(*n),
+                Object::Real(r) => ObjectValue::Real(*r),
+                Object::RealLiteral { value, literal } => ObjectValue::RealLiteral {
+                    value: *value,
+                    literal: literal.clone(),
+                },
+                Object::Name(name) => ObjectValue::Name(name.clone()),
+                Object::String(s) => ObjectValue::String(s.clone()),
+                Object::Array(items) => ObjectValue::Array(
+                    items
+                        .iter()
+                        .map(|item| self.lift_to_handle_bounded(item, depth + 1, max_depth))
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+                Object::Dictionary(dict) => {
+                    ObjectValue::Dictionary(self.lift_dictionary_bounded(dict, depth, max_depth)?)
+                }
+                // A stream's own dictionary is lifted the same way any other
+                // nested dictionary is (see `lift_dictionary`), then wrapped in
+                // its own fresh handle: this arm mints a new dictionary handle
+                // every time, at the no-offset sentinel. `Pdf::set_object`
+                // (the only caller that can reach this arm with a *replacement*
+                // for an already-resolved stream) special-cases reusing the
+                // pre-existing dictionary handle instead, via
+                // `Pdf::lift_for_set_object`, so an established parsed offset
+                // is not lost on a plain round trip.
+                Object::Stream(stream) => ObjectValue::Stream {
+                    dict: ObjectHandle::from_value(ObjectValue::Dictionary(
+                        self.lift_dictionary_bounded(&stream.dict, depth, max_depth)?,
+                    )),
+                    data: stream.data.clone(),
+                },
+                // A bare top-level reference never comes from a file/ObjStm
+                // parse (`top_level_no_reference` integerizes it there,
+                // matching qpdf), but `Pdf::set_object` callers pass one
+                // directly throughout this crate to redirect or collapse a
+                // holder chain in place (`ObjectRef` -> `ObjectRef`, no
+                // recursive follow) -- `ObjectValue::Reference` is the handle
+                // graph's representation for exactly that case; see its own
+                // doc.
+                Object::Reference(object_ref) => ObjectValue::Reference(*object_ref),
+                // Content-stream-only tokens; never a resolved file/ObjStm
+                // object value, and not a value any caller passes to
+                // `Pdf::set_object` in practice. `ObjectValue` has no variant to
+                // represent either losslessly, so this returns `Err` rather than
+                // silently discarding the caller-supplied value as `Null`:
+                // `Pdf::set_object` already treats a `lift` failure as "cannot be
+                // represented in the handle graph" and falls back to storing
+                // `object` directly as the authoritative
+                // `legacy_materialized_memo` value instead (see its own comment),
+                // exactly the same route the excess-depth case already takes.
+                Object::Operator(_) | Object::InlineImage(_) => {
+                    return Err(Error::Unsupported(
+                        "object handle lift: content-stream-only token has no ObjectValue representation"
+                            .to_string(),
+                    ));
+                }
+            };
+            Ok(value)
+        })
     }
 
     // Shared by `lift`'s `Object::Dictionary`/`Object::Stream` arms and by

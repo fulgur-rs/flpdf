@@ -99,9 +99,28 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     // prior resolution state (`ObjectHandle::unparse_resolved`'s own doc)
     // and would only coincidentally match for entries some earlier step
     // happened to have already touched.
-    let raw_qtest_value = pdf.trailer().get(b"QTest").cloned().unwrap_or(Object::Null);
-    let (resolved, indirect, _terminal) = resolve_chain(pdf, raw_qtest_value)?;
-    let unparse_bytes = match indirect {
+    //
+    // `resolve_chain`'s own 64-hop count is spent starting from `original`'s
+    // *own* reference (its first loop iteration re-resolves it), while
+    // `resolve_object_handle_to_terminal_ref` above already resolved
+    // `original` once for free before counting any redirects — so a chain
+    // landing exactly at that chase's own limit is one hop short of
+    // `resolve_chain`'s budget here and errors instead of completing
+    // (Codex Review on PR #610). Starting `resolve_chain` from `original`'s
+    // *content* — the same value its own first resolution already
+    // established — instead of re-spending that hop keeps both walks
+    // counting the same redirects.
+    let resolved = match original.object_ref() {
+        Some(reference) => {
+            let first_content = pdf.resolve_borrowed(reference)?.clone();
+            resolve_chain(pdf, first_content)?.0
+        }
+        None => {
+            let raw_qtest_value = pdf.trailer().get(b"QTest").cloned().unwrap_or(Object::Null);
+            resolve_chain(pdf, raw_qtest_value)?.0
+        }
+    };
+    let unparse_bytes = match original.object_ref() {
         Some(reference) => write_object(&Object::Reference(reference)),
         None => write_qpdf_object(pdf, &resolved)?,
     };
@@ -1294,6 +1313,49 @@ mod tests {
                  stream /DecodeParms length is inconsistent with filters\n"
             )
             .into_bytes()
+        );
+    }
+
+    #[test]
+    fn a_redirect_chain_exactly_at_the_terminal_ref_chase_limit_still_unparses() {
+        // Codex Review on PR #610, follow-up: `resolve_object_handle_to_terminal_ref`
+        // (used for type inspection above) resolves `/QTest`'s own reference
+        // once for free before counting any further `Pdf::set_object`
+        // redirects, but the legacy `resolve_chain` walk feeding the final
+        // unparse lines used to re-spend that first hop -- a chain landing
+        // exactly at the ObjectHandle chase's own 64-redirect limit was one
+        // hop short of `resolve_chain`'s own budget, so `run_test_0_1`
+        // returned an error after printing the type-inspection lines but
+        // before either unparse line.
+        let bytes = pdf_with_qtest(b"1064 0 R", &[]);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open redirect-chain fixture");
+        pdf.set_object(flpdf::ObjectRef::new(1000, 0), Object::Boolean(true));
+        for number in 1001..=1064 {
+            pdf.set_object(
+                flpdf::ObjectRef::new(number, 0),
+                Object::Reference(flpdf::ObjectRef::new(number - 1, 0)),
+            );
+        }
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
+
+        run_test_0_1(
+            &mut pdf,
+            b"fixture.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("a chain exactly at the chase limit must not error");
+
+        assert!(stderr.is_empty());
+        assert_eq!(
+            stdout,
+            b"/QTest is indirect and has type boolean (3)\n\
+              /QTest is Boolean with value true\n\
+              unparse: 1064 0 R\n\
+              unparseResolved: true\n"
         );
     }
 
