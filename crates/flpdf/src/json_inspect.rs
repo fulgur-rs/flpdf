@@ -4584,6 +4584,30 @@ mod tests {
     }
 
     #[test]
+    fn lift_and_convert_to_json_detects_a_content_only_token_reachable_only_through_a_stream_dict()
+    {
+        // contains_content_only_token's Array/Dictionary arms use `.any()`,
+        // which short-circuits on the first hit — the combined test above
+        // never actually evaluates its Stream arm, because an earlier array
+        // element already satisfies `.any()`. Exercise it directly so a
+        // Stream dict is the *only* thing that could trigger detection.
+        let mut pdf = empty_pdf();
+        let stream_only = Object::Stream(Stream::new(
+            {
+                let mut dict = Dictionary::new();
+                dict.insert("Op", Object::Operator(b"cm".to_vec()));
+                dict
+            },
+            vec![],
+        ));
+        let json = super::lift_and_convert_to_json(&mut pdf, &stream_only).unwrap();
+        assert_eq!(
+            project(json).unwrap(),
+            serde_json::json!({"stream": {"dict": {"/Op": null}}})
+        );
+    }
+
+    #[test]
     fn side_file_success_writes_exact_payload_and_complete_json() {
         let mut pdf = empty_pdf();
         pdf.set_object(
