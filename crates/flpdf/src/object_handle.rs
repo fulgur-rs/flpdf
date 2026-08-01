@@ -202,11 +202,9 @@ impl ObjectHandle {
         }
     }
 
-    // Also used by `Pdf::resolve_object_handle_to_terminal` (reader.rs) to
-    // build a shadow handle carrying `object_ref`'s own "N G R" identity
-    // (for `unparse()`) without registering it in `handle_registry` — see
-    // that method's own doc for why it must not reuse the canonical handle
-    // `Pdf::get_object_handle` would return for the same ref.
+    // Used by this module's identity tests, and by `Pdf::get_object_handle`
+    // (reader.rs) to lazily create the canonical handle it registers into
+    // `handle_registry` the first time a given ref is requested.
     pub(crate) fn new_indirect_unresolved(object_ref: ObjectRef, offset: i64) -> Self {
         let _ = offset; // real Unresolved{offset} state lands in a later task
         Self(Repr::Indirect(Rc::new(RefCell::new(IndirectSlot {
@@ -293,8 +291,9 @@ impl ObjectHandle {
     /// every other accessor here follows. Used by
     /// `Pdf::resolve_object_handle_to_terminal` (reader.rs) to copy a
     /// redirect target's already-resolved terminal value into a fresh,
-    /// unregistered shadow handle — the canonical redirecting handle itself
-    /// is never mutated.
+    /// direct handle it returns to its caller — neither the canonical
+    /// redirecting handle nor any intermediate hop's canonical handle is
+    /// ever mutated.
     pub(crate) fn resolved_value_clone(&self) -> Option<ObjectValue> {
         self.with_value(|value| value.map(clone_value_stream_safe))
     }
