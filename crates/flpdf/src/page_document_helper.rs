@@ -187,7 +187,11 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// the page tree, rebuilding creates a shallow duplicate for its later
     /// occurrence, retaining shared page sub-objects.
     pub fn add_page(&mut self, page: ObjectRef, first: bool) -> Result<RebuildResult> {
-        let index = if first { 0 } else { self.get_all_pages()?.len() };
+        let index = if first {
+            0
+        } else {
+            self.get_all_pages()?.len()
+        };
         self.insert(index, page)
     }
 
@@ -267,6 +271,25 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         self.remove(index)
     }
 
+    /// Remove unused `/Font` and `/XObject` resources from each page.
+    ///
+    /// Mirrors `QPDFPageDocumentHelper::removeUnreferencedResources` by
+    /// invoking qpdf-style page-scoped pruning once for every current page.
+    pub fn remove_unreferenced_resources(&mut self) -> Result<()> {
+        for page in self.get_all_pages()? {
+            crate::resources::remove_unreferenced_resources_on_page(self.pdf, page)?;
+        }
+        Ok(())
+    }
+
+    /// Flatten annotations into their containing pages.
+    ///
+    /// Mirrors `QPDFPageDocumentHelper::flattenAnnotations` through flpdf's
+    /// existing qpdf-oriented annotation-flattening primitive.
+    pub fn flatten_annotations(&mut self, mode: crate::FlattenMode) -> Result<usize> {
+        crate::flatten_annotations(self.pdf, mode)
+    }
+
     /// Clear the live document's root page tree after qpdf-style final-page
     /// removal. `rebuild_page_tree` intentionally rejects an empty selection
     /// because page-selection callers use that as invalid input, while qpdf's
@@ -280,7 +303,8 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
             )));
         };
         let pages_root_ref = catalog.get_ref("Pages").ok_or(Error::Missing("/Pages"))?;
-        let crate::Object::Dictionary(mut root) = self.pdf.resolve_borrowed(pages_root_ref)?.clone()
+        let crate::Object::Dictionary(mut root) =
+            self.pdf.resolve_borrowed(pages_root_ref)?.clone()
         else {
             return Err(Error::Unsupported(format!(
                 "document /Pages root {pages_root_ref} is not a dictionary"
@@ -290,7 +314,8 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         root.insert("Kids", crate::Object::Array(Vec::new()));
         root.insert("Count", crate::Object::Integer(0));
         root.remove("Parent");
-        self.pdf.set_object(pages_root_ref, crate::Object::Dictionary(root));
+        self.pdf
+            .set_object(pages_root_ref, crate::Object::Dictionary(root));
         Ok(RebuildResult {
             new_kids: Vec::new(),
             ref_map: BTreeMap::new(),

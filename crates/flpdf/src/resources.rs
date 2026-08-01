@@ -33,6 +33,52 @@ use std::io::{Read, Seek};
 /// (`Font`, `XObject`, …) → set of referenced names.
 type UsedNames = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
 
+/// qpdf `QPDFPageObjectHelper::removeUnreferencedResources` for one page.
+///
+/// qpdf first copies an inherited or indirect `/Resources` dictionary onto the
+/// page, then shallow-copies the `/Font` and `/XObject` dictionaries it will
+/// mutate. This intentionally differs from the CLI-oriented document-wide
+/// policy below: each page gets its own mutable resource scope.
+pub(crate) fn remove_unreferenced_resources_on_page<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<()> {
+    let Some(used) = collect_used_names_for_page(pdf, page_ref)? else {
+        return Ok(());
+    };
+    let Some(mut resources) = crate::pages::resolve_inherited_resources(pdf, page_ref)? else {
+        return Ok(());
+    };
+
+    for category in [b"Font".as_slice(), b"XObject".as_slice()] {
+        let Some(value) = resources.get(category).cloned() else {
+            continue;
+        };
+        let Some(mut dictionary) = resolve_ref_chain(pdf, &value)?.0.into_dict() else {
+            continue;
+        };
+        let names = used.get(category).cloned().unwrap_or_default();
+        let remove = dictionary
+            .iter()
+            .filter(|(name, _)| !names.contains(*name))
+            .map(|(name, _)| name.to_vec())
+            .collect::<Vec<_>>();
+        for name in remove {
+            dictionary.remove(&name);
+        }
+        resources.insert(category, Object::Dictionary(dictionary));
+    }
+
+    let Object::Dictionary(mut page) = pdf.resolve(page_ref)? else {
+        return Err(Error::Unsupported(format!(
+            "page {page_ref} is not a dictionary"
+        )));
+    };
+    page.insert("Resources", Object::Dictionary(resources));
+    pdf.set_object(page_ref, Object::Dictionary(page));
+    Ok(())
+}
+
 /// Tracking information for indirect category sub-dictionary objects
 /// (e.g. `/Font 6 0 R`).  Built in a global pre-pass over all pages so that
 /// the sharing count includes pages Auto-mode would otherwise skip.

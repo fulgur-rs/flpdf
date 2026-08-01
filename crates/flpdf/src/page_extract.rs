@@ -5,8 +5,11 @@
 //! selected pages from `source` plus their transitive object closure, copied
 //! across documents; [`extract_page`] is the single-page convenience form.
 //! This mirrors qpdf's `emptyPDF()` + `QPDFPageDocumentHelper::addPage()`
-//! pattern: the document object is constructed and populated here, then
-//! written by a separate writer (`write_pdf` / `write_pdf_with_options`).
+//! extraction pattern: a **new** document object is constructed and populated
+//! here, then written by a separate writer (`write_pdf` /
+//! `write_pdf_with_options`). It is deliberately distinct from
+//! [`crate::PageDocumentHelper`], whose `add_page` mutates an already-open
+//! document, and from [`crate::pages`], which owns page-tree traversal.
 //!
 //! `source` is left unmodified. Inherited page attributes (`/Resources`,
 //! `/MediaBox`, `/CropBox`, `/Rotate`) are materialized onto each extracted
