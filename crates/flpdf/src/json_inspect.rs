@@ -5497,6 +5497,19 @@ mod tests {
         assert_eq!(got.and_then(|h| h.as_integer()), Some(42));
     }
 
+    #[test]
+    fn inherited_field_value_parent_resolving_to_non_dictionary_stops_the_walk() {
+        let mut pdf = empty_pdf();
+        let parent_ref = crate::ObjectRef::new(5, 0);
+        pdf.set_object(parent_ref, Object::Integer(1));
+
+        let mut start_dict = std::collections::BTreeMap::new();
+        start_dict.insert(b"Parent".to_vec(), pdf.get_object_handle(parent_ref));
+
+        let got = inherited_field_value(&mut pdf, &start_dict, "V").unwrap();
+        assert!(got.is_none());
+    }
+
     // ── 5. Default is Generalized ─────────────────────────────────────────────
 
     #[test]
@@ -6365,6 +6378,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn collect_image_refs_xobject_resolving_to_non_dictionary_returns_empty() {
+        let mut pdf = load_one_page_pdf();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let mut resources = Dictionary::new();
+        resources.insert("XObject", Object::Integer(7));
+
+        let Object::Dictionary(mut page) = pdf.resolve(page_ref).expect("resolve page") else {
+            panic!("page must be a dictionary"); // cov:ignore: fixture-shape guard
+        };
+        page.insert("Resources", Object::Dictionary(resources));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+
+        assert!(collect_image_refs(&mut pdf, page_ref)
+            .expect("collect images")
+            .is_empty());
+    }
+
+    #[test]
+    fn collect_image_refs_xobject_entry_resolving_to_non_stream_is_skipped() {
+        let mut pdf = load_one_page_pdf();
+        let page_ref = ObjectRef::new(3, 0);
+        let non_stream_ref = ObjectRef::new(99, 0);
+        pdf.set_object(non_stream_ref, Object::Integer(1));
+
+        let mut xobjects = Dictionary::new();
+        xobjects.insert("Im", Object::Reference(non_stream_ref));
+        let mut resources = Dictionary::new();
+        resources.insert("XObject", Object::Dictionary(xobjects));
+
+        let Object::Dictionary(mut page) = pdf.resolve(page_ref).expect("resolve page") else {
+            panic!("page must be a dictionary"); // cov:ignore: fixture-shape guard
+        };
+        page.insert("Resources", Object::Dictionary(resources));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+
+        assert!(collect_image_refs(&mut pdf, page_ref)
+            .expect("collect images")
+            .is_empty());
+    }
+
     // ── 29. three-page.pdf: length and pageposfrom1 sequence ─────────────────
 
     #[test]
@@ -6530,6 +6585,17 @@ mod tests {
             vec!["4 0 R".to_string(), "5 0 R".to_string()],
             "indirect Array of refs must be unwrapped, not emitted as the array's ref number"
         );
+    }
+
+    #[test]
+    fn collect_content_refs_indirect_resolving_to_non_stream_non_array_returns_empty() {
+        let mut pdf = load_one_page_pdf();
+        let non_stream_non_array_ref = crate::ObjectRef::new(50, 0);
+        pdf.set_object(non_stream_non_array_ref, Object::Integer(1));
+
+        let handle = pdf.get_object_handle(non_stream_non_array_ref);
+        let refs = collect_content_refs(&mut pdf, &handle).expect("collect_content_refs failed");
+        assert!(refs.is_empty());
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -9005,6 +9071,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn acroform_field_ref_resolving_to_non_dictionary_is_skipped() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let field_ref = crate::ObjectRef::new(201, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(vec![Object::Reference(field_ref)]));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+        pdf.set_object(field_ref, Object::Integer(1));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array");
+        };
+        assert!(fields.is_empty(), "non-dictionary field must be skipped");
+    }
+
+    #[test]
+    fn acroform_field_kid_that_is_not_a_reference_is_skipped() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let field_ref = crate::ObjectRef::new(201, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(vec![Object::Reference(field_ref)]));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        let mut field = Dictionary::new();
+        field.insert("T", Object::String(b"parent".to_vec()));
+        field.insert("Kids", Object::Array(vec![Object::Integer(42)]));
+        pdf.set_object(field_ref, Object::Dictionary(field));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array");
+        };
+        assert_eq!(
+            fields.len(),
+            1,
+            "only the parent field entry; the non-reference kid must be skipped"
+        );
+    }
+
+    #[test]
+    fn acroform_fields_array_element_that_is_not_a_reference_is_skipped() {
+        let mut pdf = load_one_page_pdf();
+
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(vec![Object::Integer(1)]));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array");
+        };
+        assert!(
+            fields.is_empty(),
+            "non-reference /Fields element must be skipped"
+        );
+    }
+
     // ── acroform Test 4: parent + child, fullname = "parent.child" ───────────
 
     #[test]
@@ -10362,6 +10497,42 @@ mod tests {
                 assert_eq!(value, serde_json::Value::Null);
             }
         }
+    }
+
+    #[test]
+    fn attachments_ef_entry_resolving_to_non_stream_is_skipped() {
+        let mut pdf = load_one_page_pdf();
+        let non_stream_ref = crate::ObjectRef::new(920, 0);
+        let filespec_ref = crate::ObjectRef::new(922, 0);
+        let ef_root_ref = crate::ObjectRef::new(923, 0);
+        let names_ref = crate::ObjectRef::new(924, 0);
+
+        pdf.set_object(non_stream_ref, Object::Integer(1));
+
+        let mut ef_dict = Dictionary::new();
+        ef_dict.insert("F", Object::Reference(non_stream_ref));
+        let mut filespec = Dictionary::new();
+        filespec.insert("EF", Object::Dictionary(ef_dict));
+        patch_embedded_files(
+            &mut pdf,
+            names_ref,
+            ef_root_ref,
+            filespec_ref,
+            filespec,
+            b"nonstream",
+        );
+
+        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
+        let entry = object_pairs(&object_pairs(&result)[0].1);
+        let streams = object_pairs(
+            entry
+                .iter()
+                .find(|(key, _)| key == "streams")
+                .expect("streams")
+                .1
+                .clone(),
+        );
+        assert!(streams.is_empty(), "non-stream /EF entry must be skipped");
     }
 
     // ── attachments: direct (non-Reference) filespec value in the name tree ──
