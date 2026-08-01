@@ -4,7 +4,10 @@
 //! `PageDocumentHelper` for all page-list access rather than calling
 //! `pages::page_refs` or touching raw [`Object`] values directly.
 
-use flpdf::{write_pdf, Object, ObjectRef, PageDocumentHelper, PageRange, Pdf, RotateMode};
+use flpdf::{
+    write_pdf, Dictionary, Object, ObjectRef, PageDocumentHelper, PageRange, Pdf, RotateMode,
+    Stream,
+};
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
@@ -75,10 +78,7 @@ fn pdf_with_catalog_pages_pointing_to_leaf() -> Vec<u8> {
     for (number, body) in [
         (1, "<< /Type /Catalog /Pages 3 0 R >>"),
         (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-        (
-            3,
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
-        ),
+        (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
     ] {
         offsets.insert(number, out.len() as u64);
         out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
@@ -156,6 +156,43 @@ fn pages_returns_correct_count() {
     let mut helper = PageDocumentHelper::new(&mut pdf);
     let pages = helper.pages().unwrap();
     assert_eq!(pages.len(), 3);
+}
+
+#[test]
+fn remove_unreferenced_resources_prunes_unused_font_on_page() {
+    let mut pdf = open(build_n_page_pdf(1));
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        Object::Stream(Stream::new(Dictionary::new(), b"BT /F1 12 Tf ET".to_vec())),
+    );
+    let mut fonts = Dictionary::new();
+    fonts.insert("F1", Object::Dictionary(Dictionary::new()));
+    fonts.insert("F2", Object::Dictionary(Dictionary::new()));
+    let mut resources = Dictionary::new();
+    resources.insert("Font", Object::Dictionary(fonts));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(resources));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
+    page.insert("Resources", Object::Reference(ObjectRef::new(5, 0)));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .remove_unreferenced_resources()
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    let Object::Dictionary(resources) = page.get("Resources").cloned().unwrap() else {
+        panic!("qpdf copies shared resources to the page");
+    };
+    let Object::Dictionary(fonts) = resources.get("Font").cloned().unwrap() else {
+        panic!("font dictionary must remain");
+    };
+    assert!(fonts.get("F1").is_some());
+    assert!(fonts.get("F2").is_none());
 }
 
 #[test]
@@ -411,7 +448,13 @@ fn add_page_at_rejects_reference_outside_document() {
         .unwrap_err();
 
     assert!(matches!(error, flpdf::Error::Missing(_)), "got {error:?}");
-    assert_eq!(PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap().len(), 3);
+    assert_eq!(
+        PageDocumentHelper::new(&mut pdf)
+            .get_all_pages()
+            .unwrap()
+            .len(),
+        3
+    );
 }
 
 #[test]
@@ -445,7 +488,13 @@ fn insert_uses_repair_aware_page_list() {
         catalog.get("Pages"),
         Some(&Object::Reference(ObjectRef::new(2, 0)))
     );
-    assert_eq!(PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap().len(), 2);
+    assert_eq!(
+        PageDocumentHelper::new(&mut pdf)
+            .get_all_pages()
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[test]
