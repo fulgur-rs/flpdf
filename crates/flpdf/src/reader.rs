@@ -939,8 +939,11 @@ impl<R: Read + Seek> Pdf<R> {
     /// The trailer is always a direct, in-memory dictionary — it is never
     /// itself an indirect object per the PDF spec — so the returned handle is
     /// always direct. A trailer whose literal (non-indirect) nesting exceeds
-    /// the crate's inline-object-nesting bound yields a null handle instead.
-    /// Repeated calls return the same shared handle.
+    /// the crate's inline-object-nesting bound yields a null handle instead —
+    /// note this degrades the *entire* trailer, so a caller that only cares
+    /// about one key and cannot tolerate an unrelated sibling entry's nesting
+    /// erasing it should use [`Pdf::trailer_key_handle`] instead. Repeated
+    /// calls return the same shared handle.
     pub fn trailer_handle(&mut self) -> ObjectHandle {
         if let Some(handle) = &self.trailer_handle_memo {
             return handle.clone();
@@ -950,6 +953,29 @@ impl<R: Read + Seek> Pdf<R> {
         let handle = ObjectHandle::from_value(value);
         self.trailer_handle_memo = Some(handle.clone());
         handle
+    }
+
+    /// `key`'s value in the trailer dictionary, as an [`ObjectHandle`] —
+    /// unlike `Pdf::trailer_handle().get_key(key)`, this lifts only `key`'s
+    /// own value, so an unrelated sibling trailer entry whose literal nesting
+    /// exceeds the crate's inline-object-nesting bound cannot degrade this
+    /// result to null the way it degrades [`Pdf::trailer_handle`]'s whole-
+    /// trailer walk. A bare reference (`/Key 1 0 R`) becomes a genuine
+    /// indirect handle sharing the canonical `handle_registry` identity
+    /// (matching how a dictionary *child* reference lifts, not `lift`'s own
+    /// top-level `ObjectValue::Reference` shape — a trailer value is read,
+    /// never `Pdf::set_object`-redirected in place). Returns a direct null
+    /// handle for a missing key or a lift failure on `key`'s own value
+    /// (matching [`ObjectHandle::get_key`]'s own "missing key" contract).
+    /// Not memoized — unlike the whole trailer, a single key's handle is
+    /// cheap enough to relift on every call, and every caller today needs at
+    /// most one key per `Pdf`.
+    pub fn trailer_key_handle(&mut self, key: &[u8]) -> ObjectHandle {
+        let Some(value) = self.trailer.get(key).cloned() else {
+            return ObjectHandle::null();
+        };
+        self.lift_to_handle_bounded(&value, 0, crate::object::MAX_INLINE_DEPTH)
+            .unwrap_or_else(|_| ObjectHandle::null())
     }
 
     pub(crate) fn startxref(&self) -> u64 {
@@ -6346,6 +6372,62 @@ mod tests {
         let handle = pdf.trailer_handle();
 
         assert!(handle.is_null());
+    }
+
+    #[test]
+    fn trailer_key_handle_survives_an_unrelated_sibling_entrys_deep_nesting() {
+        // The whole-trailer walk `trailer_handle` performs degrades every
+        // key to null once *any* sibling entry exceeds `MAX_INLINE_DEPTH` —
+        // `trailer_key_handle` must not inherit that coupling: `/QTest`
+        // itself is shallow here, only its unrelated sibling `/Deep` is not.
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        pdf.trailer.insert("QTest", Object::Boolean(true));
+        let depth = crate::object::MAX_INLINE_DEPTH + 5;
+        let mut nested = Object::Integer(1);
+        for _ in 0..depth {
+            nested = Object::Array(vec![nested]);
+        }
+        pdf.trailer.insert("Deep", nested);
+
+        assert!(
+            pdf.trailer_handle().is_null(),
+            "sanity: the whole-trailer walk does degrade here"
+        );
+        let handle = pdf.trailer_key_handle(b"QTest");
+        assert_eq!(handle.as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn trailer_key_handle_is_null_for_a_missing_key() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let handle = pdf.trailer_key_handle(b"NoSuchKey");
+        assert!(handle.is_null());
+    }
+
+    #[test]
+    fn trailer_key_handle_is_null_when_the_keys_own_value_exceeds_the_inline_depth_bound() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let depth = crate::object::MAX_INLINE_DEPTH + 5;
+        let mut nested = Object::Integer(1);
+        for _ in 0..depth {
+            nested = Object::Array(vec![nested]);
+        }
+        pdf.trailer.insert("QTest", nested);
+
+        let handle = pdf.trailer_key_handle(b"QTest");
+
+        assert!(handle.is_null());
+    }
+
+    #[test]
+    fn trailer_key_handle_lifts_an_indirect_value_to_a_canonical_handle() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let root_ref = pdf.root_ref().expect("root ref");
+        pdf.trailer.insert("QTest", Object::Reference(root_ref));
+
+        let handle = pdf.trailer_key_handle(b"QTest");
+
+        assert_eq!(handle.object_ref(), Some(root_ref));
     }
 
     #[test]

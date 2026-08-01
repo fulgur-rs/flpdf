@@ -1067,10 +1067,21 @@ impl ObjectHandle {
     /// [`Self::is_resolved`]) materializes as `Object::Null` rather than
     /// performing hidden resolution; callers that need the real value must
     /// resolve first (e.g. via `Pdf::resolve_object_handle`).
+    ///
+    /// A tree built through the public [`Self::array`]/[`Self::dictionary`]
+    /// factories carries no depth bound the way parsed input does
+    /// (`parser::MAX_PARSE_DEPTH` rejects a document too deep to parse
+    /// before an `ObjectHandle` tree that deep can even exist for it) — this
+    /// recursive walk is wrapped with the same stack-growth protection
+    /// [`Self::unparse_resolved`]/[`Self::shallow_copy`] already rely on for
+    /// exactly that reason, rather than risking a stack overflow on a
+    /// sufficiently deep direct tree.
     pub fn materialize(&self) -> Object {
-        self.with_value(|value| match value {
-            Some(value) => materialize_value(value),
-            None => Object::Null,
+        stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+            self.with_value(|value| match value {
+                Some(value) => materialize_value(value),
+                None => Object::Null,
+            })
         })
     }
 

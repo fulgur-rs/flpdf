@@ -48,8 +48,12 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let trailer_handle = pdf.trailer_handle();
-    let original = trailer_handle.get_key(b"QTest");
+    // `Pdf::trailer_key_handle`, not `Pdf::trailer_handle().get_key(...)`:
+    // the latter lifts the *entire* trailer in one structural walk bounded
+    // by the crate's inline-object-nesting limit, so an unrelated, deeply
+    // nested sibling trailer entry would degrade `/QTest` to null here too,
+    // even though `/QTest` itself is untouched.
+    let original = pdf.trailer_key_handle(b"QTest");
     let (chased, terminal_ref) = pdf.resolve_object_handle_to_terminal_ref(&original)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
@@ -467,6 +471,63 @@ mod tests {
         let (stdout, stderr) = output_channels(qtest, extras);
         assert!(stderr.is_empty());
         stdout
+    }
+
+    #[test]
+    fn an_unrelated_deeply_nested_sibling_trailer_entry_does_not_erase_qtest() {
+        // Regression: `run_test_0_1` must read `/QTest` via
+        // `Pdf::trailer_key_handle`, not `Pdf::trailer_handle().get_key(...)`
+        // — the latter lifts the *entire* trailer in one structural walk
+        // bounded by the crate's inline-object-nesting limit (256), so an
+        // unrelated sibling entry nested past that bound (but still within
+        // the parser's own, higher, acceptance limit) degraded the whole
+        // trailer handle to null, silently reporting `/QTest` as
+        // implicit/null while the (unaffected) legacy `unparse`/
+        // `unparseResolved` lines still printed its real value —
+        // internally contradictory output.
+        let mut bytes = pdf_with_qtest(b"true", &[]);
+        let marker = b" >>\nstartxref";
+        let marker_start = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("trailer close token");
+        let mut deep = b"1".to_vec();
+        for _ in 0..300 {
+            deep = [b"[ ".as_slice(), &deep, b" ]".as_slice()].concat();
+        }
+        let mut sibling = b" /Deep ".to_vec();
+        sibling.extend_from_slice(&deep);
+        bytes.splice(marker_start..marker_start, sibling);
+
+        let options = PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        };
+        let mut pdf =
+            Pdf::open_mem_owned_with_options(bytes, options).expect("open sibling-nesting fixture");
+        assert!(
+            pdf.trailer_handle().is_null(),
+            "sanity: the whole-trailer walk does degrade for this fixture"
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
+        run_test_0_1(
+            &mut pdf,
+            b"fixture.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test_0_1");
+
+        assert_eq!(
+            stdout,
+            b"/QTest is direct and has type boolean (3)\n\
+              /QTest is Boolean with value true\n\
+              unparse: true\n\
+              unparseResolved: true\n"
+        );
     }
 
     #[test]
