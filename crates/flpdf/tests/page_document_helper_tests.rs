@@ -5,8 +5,8 @@
 //! `pages::page_refs` or touching raw [`Object`] values directly.
 
 use flpdf::{
-    write_pdf, Dictionary, Object, ObjectRef, PageDocumentHelper, PageRange, Pdf, RotateMode,
-    Stream,
+    write_pdf, Dictionary, FlattenMode, Object, ObjectRef, PageDocumentHelper, PageRange, Pdf,
+    RotateMode, Stream,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -111,6 +111,60 @@ fn get_all_pages_repairs_catalog_pages_pointer() {
     assert_eq!(
         catalog.get("Pages"),
         Some(&Object::Reference(ObjectRef::new(2, 0)))
+    );
+}
+
+#[test]
+fn get_all_pages_marks_qpdf_json_observation() {
+    let mut pdf = open(build_n_page_pdf(1));
+    assert!(!pdf.ever_called_get_all_pages());
+
+    PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
+
+    assert!(
+        pdf.ever_called_get_all_pages(),
+        "qpdf marks everCalledGetAllPages whenever getAllPages initializes the page list"
+    );
+}
+
+#[test]
+fn get_all_pages_returns_empty_when_catalog_has_no_pages() {
+    let mut pdf = open(build_n_page_pdf(1));
+    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    catalog.remove("Pages");
+    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+    assert!(
+        PageDocumentHelper::new(&mut pdf)
+            .get_all_pages()
+            .unwrap()
+            .is_empty(),
+        "qpdf getAllPages returns an empty list when the catalog has no /Pages"
+    );
+}
+
+#[test]
+fn helper_flatten_annotations_repairs_page_tree_before_enumerating() {
+    let mut pdf = open(build_n_page_pdf(2));
+    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    catalog.insert("Pages", Object::Reference(ObjectRef::new(3, 0)));
+    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(FlattenMode::All)
+        .unwrap();
+
+    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must remain a dictionary");
+    };
+    assert_eq!(
+        catalog.get("Pages"),
+        Some(&Object::Reference(ObjectRef::new(2, 0))),
+        "qpdf flattenAnnotations obtains the repaired all-pages list before processing pages"
     );
 }
 
