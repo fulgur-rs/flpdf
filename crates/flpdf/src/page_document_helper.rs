@@ -122,6 +122,30 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         Self { pdf }
     }
 
+    /// Return qpdf's repaired leaf-page list in document order.
+    ///
+    /// This mirrors `QPDFPageDocumentHelper::getAllPages()`: qpdf repairs the
+    /// effective `/Pages` root and malformed leaf nodes before returning the
+    /// current page list. The returned vector is an owned snapshot, so a later
+    /// page insertion or removal requires a fresh call.
+    pub fn get_all_pages(&mut self) -> Result<Vec<ObjectRef>> {
+        Ok(crate::pages::repair::prepare_for_optimization(self.pdf)?
+            .map(|prepared| prepared.pages)
+            .unwrap_or_default())
+    }
+
+    /// Materialize inherited page attributes on each leaf page.
+    ///
+    /// Mirrors `QPDFPageDocumentHelper::pushInheritedAttributesToPage()` by
+    /// first applying qpdf-compatible page-tree repair, then pushing
+    /// `/CropBox`, `/MediaBox`, `/Resources`, and `/Rotate` onto leaf pages.
+    pub fn push_inherited_attributes_to_pages(&mut self) -> Result<()> {
+        if let Some(prepared) = crate::pages::repair::prepare_for_optimization(self.pdf)? {
+            crate::optimization::inherited_attrs::push(self.pdf, &prepared, true, false)?;
+        }
+        Ok(())
+    }
+
     /// Return all leaf page `ObjectRef`s in document order.
     ///
     /// This is the primary accessor. Every other method that needs the full
@@ -129,10 +153,10 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     ///
     /// # Errors
     ///
-    /// Propagates errors from [`crate::pages::page_refs`] (e.g. missing catalog,
-    /// page-tree depth exceeded).
+    /// Propagates errors from qpdf-compatible page-tree repair (e.g. page-tree
+    /// depth exceeded).
     pub fn pages(&mut self) -> Result<Vec<ObjectRef>> {
-        page_refs(self.pdf)
+        self.get_all_pages()
     }
 
     /// Return an iterator over all leaf page `ObjectRef`s in document order.
