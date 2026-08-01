@@ -6338,6 +6338,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_object_handle_to_terminal_is_a_no_op_for_an_already_terminal_value() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle_to_terminal(&handle)
+            .expect("resolve a plain, never-redirected object");
+
+        assert!(handle.as_dictionary().is_some());
+        assert_eq!(handle.as_reference(), None);
+    }
+
+    #[test]
     fn resolve_object_handle_does_not_chase_a_set_object_reference_redirect() {
         // `resolve_object_handle` itself must keep its existing single-hop
         // contract: `Pdf::resolve_borrowed` (and `ref_chain.rs`'s own
