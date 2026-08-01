@@ -324,6 +324,119 @@ fn helper_prunes_unused_resources_inside_form_xobjects() {
 }
 
 #[test]
+fn helper_prunes_unused_resources_inside_a_holder_chained_form_xobject() {
+    let mut pdf = open(build_n_page_pdf(1));
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        Object::Stream(Stream::new(Dictionary::new(), b"/Fm0 Do".to_vec())),
+    );
+
+    let mut fonts = Dictionary::new();
+    fonts.insert("F1", Object::Dictionary(Dictionary::new()));
+    fonts.insert("F2", Object::Dictionary(Dictionary::new()));
+    let mut form_resources = Dictionary::new();
+    form_resources.insert("Font", Object::Dictionary(fonts));
+    let mut form_dict = Dictionary::new();
+    form_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
+    form_dict.insert("Resources", Object::Dictionary(form_resources));
+    pdf.set_object(
+        ObjectRef::new(6, 0),
+        Object::Stream(Stream::new(form_dict, b"BT /F1 12 Tf ET".to_vec())),
+    );
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Reference(ObjectRef::new(6, 0)),
+    );
+
+    let mut xobjects = Dictionary::new();
+    xobjects.insert("Fm0", Object::Reference(ObjectRef::new(7, 0)));
+    let mut resources = Dictionary::new();
+    resources.insert("XObject", Object::Dictionary(xobjects));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(resources));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
+    page.insert("Resources", Object::Reference(ObjectRef::new(5, 0)));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .remove_unreferenced_resources()
+        .unwrap();
+
+    let Object::Stream(form) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("terminal Form must remain a stream");
+    };
+    let Some(Object::Dictionary(resources)) = form.dict.get("Resources") else {
+        panic!("Form must retain resources");
+    };
+    let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
+        panic!("Form must retain font resources");
+    };
+    assert!(fonts.get("F1").is_some());
+    assert!(fonts.get("F2").is_none());
+}
+
+#[test]
+fn helper_keeps_parent_form_resources_used_by_a_resource_less_nested_form() {
+    let mut pdf = open(build_n_page_pdf(1));
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        Object::Stream(Stream::new(Dictionary::new(), b"/Outer Do".to_vec())),
+    );
+    let mut child_dict = Dictionary::new();
+    child_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Stream(Stream::new(child_dict, b"BT /F1 12 Tf ET".to_vec())),
+    );
+
+    let mut parent_fonts = Dictionary::new();
+    parent_fonts.insert("F1", Object::Dictionary(Dictionary::new()));
+    parent_fonts.insert("F2", Object::Dictionary(Dictionary::new()));
+    let mut parent_xobjects = Dictionary::new();
+    parent_xobjects.insert("Child", Object::Reference(ObjectRef::new(7, 0)));
+    let mut parent_resources = Dictionary::new();
+    parent_resources.insert("Font", Object::Dictionary(parent_fonts));
+    parent_resources.insert("XObject", Object::Dictionary(parent_xobjects));
+    let mut parent_dict = Dictionary::new();
+    parent_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
+    parent_dict.insert("Resources", Object::Dictionary(parent_resources));
+    pdf.set_object(
+        ObjectRef::new(6, 0),
+        Object::Stream(Stream::new(parent_dict, b"/Child Do".to_vec())),
+    );
+
+    let mut page_xobjects = Dictionary::new();
+    page_xobjects.insert("Outer", Object::Reference(ObjectRef::new(6, 0)));
+    let mut page_resources = Dictionary::new();
+    page_resources.insert("XObject", Object::Dictionary(page_xobjects));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(page_resources));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
+    page.insert("Resources", Object::Reference(ObjectRef::new(5, 0)));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .remove_unreferenced_resources()
+        .unwrap();
+
+    let Object::Stream(parent) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("parent Form must remain a stream");
+    };
+    let Some(Object::Dictionary(resources)) = parent.dict.get("Resources") else {
+        panic!("parent Form must retain resources");
+    };
+    let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
+        panic!("parent Form must retain font resources");
+    };
+    assert!(fonts.get("F1").is_some());
+    assert!(fonts.get("F2").is_none());
+}
+
+#[test]
 fn iter_yields_all_pages_in_order() {
     let mut pdf = open(build_n_page_pdf(3));
     let mut helper = PageDocumentHelper::new(&mut pdf);
