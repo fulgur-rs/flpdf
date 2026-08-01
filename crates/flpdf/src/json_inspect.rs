@@ -703,10 +703,10 @@ const JSON_CONVERT_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 ///
 /// Returns [`ConvertError::NonFiniteFloat`] when a real value is non-finite
 /// (NaN or infinity), or a [`ConvertError::PdfError`] when `handle` nests
-/// deeper than [`crate::parser::MAX_PARSE_DEPTH`] — unlike the legacy
-/// `Object` tree, a caller can build a cyclic `ObjectHandle` graph directly
-/// (two direct dictionaries linked to each other via `replace_key`, with no
-/// indirect object involved at all), so this bounds recursion the same way
+/// past an internal depth bound — unlike the legacy `Object` tree, a caller
+/// can build a cyclic `ObjectHandle` graph directly (two direct dictionaries
+/// linked to each other via `replace_key`, with no indirect object involved
+/// at all), so this bounds recursion the same way
 /// [`ObjectHandle::materialize`] does rather than assuming acyclic input.
 pub fn pdf_object_to_json(handle: &ObjectHandle) -> Result<Json, ConvertError> {
     pdf_object_to_json_bounded(handle, 0)
