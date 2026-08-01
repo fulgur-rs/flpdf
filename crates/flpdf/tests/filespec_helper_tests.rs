@@ -114,6 +114,69 @@ fn filename_returns_f_bytes() {
     assert_eq!(name, Some(b"attachment.txt".to_vec()));
 }
 
+// ── qpdf-shaped FileSpec getters ────────────────────────────────────────────
+
+#[test]
+fn get_filename_prefers_uf_and_decodes_pdf_text() {
+    // This fails if lookup uses alphabetical order, if it chooses /F before
+    // /UF, or if it exposes the stored UTF-16BE bytes rather than qpdf's
+    // getUTF8Value() result.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let Object::Dictionary(mut filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected filespec dictionary");
+    };
+    filespec.insert("F", Object::String(b"fallback.txt".to_vec()));
+    filespec.insert("UF", Object::String(encode_utf16be("東京.txt")));
+    filespec.insert("Unix", Object::String(b"unix.txt".to_vec()));
+    filespec.insert("DOS", Object::String(b"dos.txt".to_vec()));
+    filespec.insert("Mac", Object::String(b"mac.txt".to_vec()));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(filespec));
+
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    assert_eq!(fs.get_filename().unwrap(), Some("東京.txt".to_string()));
+}
+
+#[test]
+fn get_filenames_returns_only_string_name_keys_as_utf8() {
+    // This fails if a non-string name key leaks into qpdf's getFilenames
+    // result, or if the qpdf UTF-8 text conversion is skipped.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let Object::Dictionary(mut filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected filespec dictionary");
+    };
+    filespec.insert("UF", Object::String(encode_utf16be("日本語.txt")));
+    filespec.insert("F", Object::String(b"fallback.txt".to_vec()));
+    filespec.insert("Unix", Object::Integer(7));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(filespec));
+
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    assert_eq!(
+        fs.get_filenames().unwrap(),
+        BTreeMap::from([
+            ("/F".to_string(), "fallback.txt".to_string()),
+            ("/UF".to_string(), "日本語.txt".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn get_embedded_file_stream_returns_requested_entry_and_ef_dictionary() {
+    // This fails if a named request applies the preferred-key stream filter,
+    // or if the raw /EF dictionary is reconstructed instead of returned.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+
+    assert_eq!(
+        fs.get_embedded_file_stream("F").unwrap(),
+        Object::Reference(ObjectRef::new(6, 0))
+    );
+    let Object::Dictionary(entries) = fs.get_embedded_file_streams().unwrap() else {
+        panic!("expected /EF dictionary");
+    };
+    assert_eq!(entries.get_ref("F"), Some(ObjectRef::new(6, 0)));
+    assert_eq!(entries.get_ref("UF"), Some(ObjectRef::new(6, 0)));
+}
+
 // ── FileSpec::uf ──────────────────────────────────────────────────────────────
 
 #[test]

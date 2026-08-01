@@ -85,11 +85,15 @@
 
 use crate::filters::{decode_stream_data, encode_stream_data};
 use crate::object::{Dictionary, Object, Stream};
+use crate::pdf_string::utf8_value;
 use crate::ref_chain::resolve_ref_chain;
 use crate::{Error, ObjectRef, Pdf, Result};
 use md5::{Digest, Md5};
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
 use std::path::Path;
+
+const NAME_KEYS: [&str; 5] = ["UF", "F", "Unix", "DOS", "Mac"];
 
 // ── EmbeddedFileStream ────────────────────────────────────────────────────────
 
@@ -337,6 +341,82 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
             .map(ToOwned::to_owned))
     }
 
+    /// Return `/Desc` through qpdf's UTF-8 string view.
+    pub fn get_description(&mut self) -> Result<Option<String>> {
+        Ok(self.description()?.map(|value| {
+            String::from_utf8(utf8_value(&value)).expect("qpdf UTF-8 view is valid UTF-8")
+        }))
+    }
+
+    /// Return the preferred file name using qpdf's `/UF`, `/F`, `/Unix`,
+    /// `/DOS`, `/Mac` priority order and UTF-8 string conversion.
+    pub fn get_filename(&mut self) -> Result<Option<String>> {
+        let dict = self.resolve_dict()?;
+        Ok(NAME_KEYS.iter().find_map(|key| {
+            dict.get(*key).and_then(Object::as_string).map(|value| {
+                String::from_utf8(utf8_value(value)).expect("qpdf UTF-8 view is valid UTF-8")
+            })
+        }))
+    }
+
+    /// Return every recognized Filespec name key whose value is a string.
+    ///
+    /// Keys retain qpdf's leading slash, e.g. `"/UF"`.
+    pub fn get_filenames(&mut self) -> Result<BTreeMap<String, String>> {
+        let dict = self.resolve_dict()?;
+        Ok(NAME_KEYS
+            .iter()
+            .filter_map(|key| {
+                dict.get(*key).and_then(Object::as_string).map(|value| {
+                    (
+                        format!("/{key}"),
+                        String::from_utf8(utf8_value(value))
+                            .expect("qpdf UTF-8 view is valid UTF-8"),
+                    )
+                })
+            })
+            .collect())
+    }
+
+    /// Return the raw `/EF` entry for `key`, or qpdf's null-object equivalent
+    /// when `/EF` or the requested key is absent.
+    ///
+    /// An empty `key` performs qpdf's preferred stream lookup: it skips
+    /// non-stream candidates and returns the first candidate that resolves to
+    /// a stream, preserving the original reference when it was indirect.
+    pub fn get_embedded_file_stream(&mut self, key: &str) -> Result<Object> {
+        let ef_value = self.get_embedded_file_streams()?;
+        let (ef, _) = resolve_ref_chain(self.pdf, &ef_value)?;
+        let Object::Dictionary(ef) = ef else {
+            return Ok(Object::Null);
+        };
+
+        if !key.is_empty() {
+            return Ok(ef.get(key).cloned().unwrap_or(Object::Null));
+        }
+
+        for key in NAME_KEYS {
+            let Some(candidate) = ef.get(key).cloned() else {
+                continue;
+            };
+            let (terminal, _) = resolve_ref_chain(self.pdf, &candidate)?;
+            if matches!(terminal, Object::Stream(_)) {
+                return Ok(candidate);
+            }
+        }
+        Ok(Object::Null)
+    }
+
+    /// Return the raw `/EF` dictionary, or qpdf's null-object equivalent when
+    /// the key is absent.
+    pub fn get_embedded_file_streams(&mut self) -> Result<Object> {
+        Ok(self
+            .resolve_dict()?
+            .get("EF")
+            .cloned()
+            .unwrap_or(Object::Null))
+    }
+
     /// Resolve and return the embedded file stream.
     ///
     /// The lookup priority for the `/EF` sub-dictionary key is
@@ -375,41 +455,12 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn embedded_file(&mut self) -> Result<Option<EmbeddedFileStream<'_, R>>> {
-        let dict = self.resolve_dict()?;
-
-        // Resolve /EF sub-dictionary.
-        let ef_dict: Dictionary = match dict.get("EF") {
-            Some(Object::Dictionary(d)) => d.clone(),
-            Some(Object::Reference(r)) => {
-                // /EF may be reached through more than one indirect hop
-                // (ref -> ref -> dict); follow the chain to its terminal.
-                match resolve_ref_chain(self.pdf, &Object::Reference(*r))?.0 {
-                    Object::Dictionary(d) => d,
-                    _ => return Ok(None),
-                }
-            }
-            _ => return Ok(None),
-        };
-
-        // qpdf preference order: Unicode name first, then platform-specific.
-        // Try each key in order and skip any that does not resolve to an
-        // /EmbeddedFile stream, so a stray non-stream entry on a
-        // higher-priority key does not mask a valid lower-priority one.
-        let candidates: Vec<ObjectRef> = ["UF", "F", "Unix", "DOS", "Mac"]
-            .iter()
-            .filter_map(|k| ef_dict.get(k).and_then(Object::as_ref_id))
-            .collect();
-
-        for ef_ref in candidates {
-            // A candidate stream may be reached through more than one indirect
-            // hop (ref -> ref -> stream); follow the chain to its terminal.
-            let (terminal, _) = resolve_ref_chain(self.pdf, &Object::Reference(ef_ref))?;
-            if let Object::Stream(stream) = terminal {
-                return EmbeddedFileStream::new(stream, self.pdf).map(Some);
-            }
+        let candidate = self.get_embedded_file_stream("")?;
+        let (terminal, _) = resolve_ref_chain(self.pdf, &candidate)?;
+        match terminal {
+            Object::Stream(stream) => EmbeddedFileStream::new(stream, self.pdf).map(Some),
+            _ => Ok(None),
         }
-
-        Ok(None)
     }
 }
 
