@@ -1192,6 +1192,40 @@ fn stream_payload_with_decode_status(
     }
 }
 
+// ── direct_value ──────────────────────────────────────────────────────────────
+
+/// Read `handle`'s value through `accessor`, but only when `handle` is a
+/// direct value — never when it is an indirect reference, resolved or not.
+///
+/// The legacy `Object`-based lookups this crate is migrating away from
+/// operated on owned snapshots: `match dict.get(key) { Some(Object::Name(n))
+/// => ..., _ => None }` never followed a `Object::Reference`, so its result
+/// depended only on what was literally stored at `key` — never on whatever
+/// else happened to be resolved elsewhere in the same document.
+///
+/// `ObjectHandle` breaks that independence: `Pdf::get_object_handle` returns
+/// the *same* shared, lazily-resolved handle for a given `ObjectRef` no
+/// matter who asks for it, so calling a typed accessor (`as_string`,
+/// `as_integer`, …) directly on a `dict.get(key)` result observes whatever
+/// resolution state that ref's canonical handle happens to be in — which can
+/// differ run to run, or even call to call within the same walk, depending on
+/// unrelated code that resolved the same ref first. Guarding on
+/// [`ObjectHandle::object_ref`] before calling `accessor` restores the
+/// original, deterministic "never follow a reference" behavior for the many
+/// section-builder fields (`/T`, `/TU`, `/NeedAppearances`, `/Desc`, the
+/// encrypt dictionary's `/V`/`/R`/`/P`/`/Length`, …) that qpdf itself never
+/// dereferences.
+fn direct_value<T>(
+    handle: Option<&ObjectHandle>,
+    accessor: fn(&ObjectHandle) -> Option<T>,
+) -> Option<T> {
+    let handle = handle?;
+    if handle.object_ref().is_some() {
+        return None;
+    }
+    accessor(handle)
+}
+
 // ── build_pages_section ───────────────────────────────────────────────────────
 
 /// Flatten a `/Contents` entry into a list of indirect-reference strings.
@@ -1302,10 +1336,10 @@ fn collect_image_refs<R: Read + Seek>(
         let Some(stream_dict) = value.as_stream_dict().and_then(|d| d.as_dictionary()) else {
             continue;
         };
-        if let Some(subtype) = stream_dict
-            .get(b"Subtype".as_slice())
-            .and_then(ObjectHandle::as_name)
-        {
+        if let Some(subtype) = direct_value(
+            stream_dict.get(b"Subtype".as_slice()),
+            ObjectHandle::as_name,
+        ) {
             if subtype.as_slice() == b"Image" {
                 image_refs.push(format!("{} {} R", xobj_ref.number, xobj_ref.generation));
             }
@@ -1583,10 +1617,7 @@ fn walk_acroform_fields<R: Read + Seek>(
     };
 
     // Compute fullname: parent.T or just T at root.
-    let t_string = match field_dict
-        .get(b"T".as_slice())
-        .and_then(ObjectHandle::as_string)
-    {
+    let t_string = match direct_value(field_dict.get(b"T".as_slice()), ObjectHandle::as_string) {
         Some(bytes) => decode_pdf_text_string(&bytes)
             .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
         None => String::new(),
@@ -1611,7 +1642,7 @@ fn walk_acroform_fields<R: Read + Seek>(
     // /FT, /V, /DV, /Ff are all inheritable down the /Parent chain
     // (ISO 32000-1 §12.7.3.1). Use the same lookup helper for each.
     let ft_obj = inherited_field_value(pdf, &field_dict, "FT")?;
-    let fieldtype = match ft_obj.as_ref().and_then(ObjectHandle::as_name) {
+    let fieldtype = match direct_value(ft_obj.as_ref(), ObjectHandle::as_name) {
         Some(bytes) => Json::make_string(String::from_utf8_lossy(&bytes).as_bytes()),
         None => Json::make_null(),
     };
@@ -1629,31 +1660,25 @@ fn walk_acroform_fields<R: Read + Seek>(
     };
 
     // /Ff — field flags integer. Inherited from /Parent.
-    let fieldflags = match inherited_field_value(pdf, &field_dict, "Ff")?
-        .as_ref()
-        .and_then(ObjectHandle::as_integer)
-    {
+    let ff_obj = inherited_field_value(pdf, &field_dict, "Ff")?;
+    let fieldflags = match direct_value(ff_obj.as_ref(), ObjectHandle::as_integer) {
         Some(n) => Json::make_int(n),
         None => Json::make_null(),
     };
 
     // /TU — alternate name.
-    let alternatename = match field_dict
-        .get(b"TU".as_slice())
-        .and_then(ObjectHandle::as_string)
-    {
-        Some(bytes) => {
-            let s = decode_pdf_text_string(&bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-            Json::make_string(s)
-        }
-        None => Json::make_null(),
-    };
+    let alternatename =
+        match direct_value(field_dict.get(b"TU".as_slice()), ObjectHandle::as_string) {
+            Some(bytes) => {
+                let s = decode_pdf_text_string(&bytes)
+                    .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+                Json::make_string(s)
+            }
+            None => Json::make_null(),
+        };
 
     // /TM — mapping name.
-    let mappingname = match field_dict
-        .get(b"TM".as_slice())
-        .and_then(ObjectHandle::as_string)
+    let mappingname = match direct_value(field_dict.get(b"TM".as_slice()), ObjectHandle::as_string)
     {
         Some(bytes) => {
             let s = decode_pdf_text_string(&bytes)
@@ -1664,9 +1689,7 @@ fn walk_acroform_fields<R: Read + Seek>(
     };
 
     // Determine if this field is itself a widget annotation.
-    let is_widget = field_dict
-        .get(b"Subtype".as_slice())
-        .and_then(ObjectHandle::as_name)
+    let is_widget = direct_value(field_dict.get(b"Subtype".as_slice()), ObjectHandle::as_name)
         .map(|n| n.as_slice() == b"Widget")
         .unwrap_or(false);
 
@@ -1701,9 +1724,7 @@ fn walk_acroform_fields<R: Read + Seek>(
         let Some(d) = kid.as_dictionary() else {
             continue;
         };
-        let is_widget_subtype = d
-            .get(b"Subtype".as_slice())
-            .and_then(ObjectHandle::as_name)
+        let is_widget_subtype = direct_value(d.get(b"Subtype".as_slice()), ObjectHandle::as_name)
             .map(|n| n.as_slice() == b"Widget")
             .unwrap_or(false);
         // Field-like markers that mean the kid acts as a (possibly unnamed)
@@ -1869,10 +1890,11 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
     };
 
     // /NeedAppearances (default false).
-    let need_appearances = acroform_dict
-        .get(b"NeedAppearances".as_slice())
-        .and_then(ObjectHandle::as_boolean)
-        .unwrap_or(false);
+    let need_appearances = direct_value(
+        acroform_dict.get(b"NeedAppearances".as_slice()),
+        ObjectHandle::as_boolean,
+    )
+    .unwrap_or(false);
 
     // /Fields array (top-level field refs). Same as /Kids below: must
     // accept both the direct Array form and an indirect Reference to an
@@ -2105,10 +2127,10 @@ fn filespec_dict_to_json<R: Read + Seek>(
     };
 
     // description: /Desc decoded as PDF text string, bare (no u:/b: prefix)
-    let description = match filespec_dict
-        .get(b"Desc".as_slice())
-        .and_then(ObjectHandle::as_string)
-    {
+    let description = match direct_value(
+        filespec_dict.get(b"Desc".as_slice()),
+        ObjectHandle::as_string,
+    ) {
         Some(bytes) => {
             let s = decode_pdf_text_string(&bytes)
                 .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
@@ -2122,9 +2144,8 @@ fn filespec_dict_to_json<R: Read + Seek>(
     let name_keys = ["DOS", "F", "Mac", "UF", "Unix"];
     let mut names_pairs: Vec<(String, Json)> = Vec::new();
     for key in &name_keys {
-        if let Some(bytes) = filespec_dict
-            .get(key.as_bytes())
-            .and_then(ObjectHandle::as_string)
+        if let Some(bytes) =
+            direct_value(filespec_dict.get(key.as_bytes()), ObjectHandle::as_string)
         {
             let s = decode_pdf_text_string(&bytes)
                 .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
@@ -2137,14 +2158,11 @@ fn filespec_dict_to_json<R: Read + Seek>(
     let preferredname = preferred_name_key_order
         .iter()
         .find_map(|key| {
-            filespec_dict
-                .get(key.as_bytes())
-                .and_then(ObjectHandle::as_string)
-                .map(|bytes| {
-                    let s = decode_pdf_text_string(&bytes)
-                        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-                    Json::make_string(s)
-                })
+            direct_value(filespec_dict.get(key.as_bytes()), ObjectHandle::as_string).map(|bytes| {
+                let s = decode_pdf_text_string(&bytes)
+                    .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+                Json::make_string(s)
+            })
         })
         .unwrap_or_else(Json::make_null);
 
@@ -2194,10 +2212,10 @@ fn filespec_dict_to_json<R: Read + Seek>(
             };
 
             // mimetype: /Subtype name → bare string (no "/" prefix), or null
-            let mimetype = match stream_dict
-                .get(b"Subtype".as_slice())
-                .and_then(ObjectHandle::as_name)
-            {
+            let mimetype = match direct_value(
+                stream_dict.get(b"Subtype".as_slice()),
+                ObjectHandle::as_name,
+            ) {
                 Some(bytes) => Json::make_string(String::from_utf8_lossy(&bytes).into_owned()),
                 None => Json::make_null(),
             };
@@ -2215,16 +2233,16 @@ fn filespec_dict_to_json<R: Read + Seek>(
             // checksum: /Params /CheckSum bytes → lowercase hex, or null
             let checksum = params_dict
                 .as_ref()
-                .and_then(|p| p.get(b"CheckSum".as_slice()))
-                .and_then(ObjectHandle::as_string)
+                .and_then(|p| direct_value(p.get(b"CheckSum".as_slice()), ObjectHandle::as_string))
                 .map(|bytes| Json::make_string(checksum_to_hex(&bytes)))
                 .unwrap_or_else(Json::make_null);
 
             // creationdate: /Params /CreationDate → ISO 8601, or null
             let creationdate = params_dict
                 .as_ref()
-                .and_then(|p| p.get(b"CreationDate".as_slice()))
-                .and_then(ObjectHandle::as_string)
+                .and_then(|p| {
+                    direct_value(p.get(b"CreationDate".as_slice()), ObjectHandle::as_string)
+                })
                 .and_then(|bytes| parse_pdf_date(&bytes))
                 .map(Json::make_string)
                 .unwrap_or_else(Json::make_null);
@@ -2232,8 +2250,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
             // modificationdate: /Params /ModDate → ISO 8601, or null
             let modificationdate = params_dict
                 .as_ref()
-                .and_then(|p| p.get(b"ModDate".as_slice()))
-                .and_then(ObjectHandle::as_string)
+                .and_then(|p| direct_value(p.get(b"ModDate".as_slice()), ObjectHandle::as_string))
                 .and_then(|bytes| parse_pdf_date(&bytes))
                 .map(Json::make_string)
                 .unwrap_or_else(Json::make_null);
@@ -2390,10 +2407,7 @@ fn cf_method_string(
     fn revision_default(
         encrypt: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     ) -> &'static str {
-        match encrypt
-            .get(b"R".as_slice())
-            .and_then(ObjectHandle::as_integer)
-        {
+        match direct_value(encrypt.get(b"R".as_slice()), ObjectHandle::as_integer) {
             Some(r) if r >= 5 => "AESv3",
             Some(4) => "AESv2",
             _ => "RC4",
@@ -2407,22 +2421,14 @@ fn cf_method_string(
         return "none";
     }
     // Look up the CFM entry inside /CF/<selector>
-    let Some(cf) = encrypt
-        .get(b"CF".as_slice())
-        .and_then(ObjectHandle::as_dictionary)
+    let Some(cf) = direct_value(encrypt.get(b"CF".as_slice()), ObjectHandle::as_dictionary) else {
+        return revision_default(encrypt);
+    };
+    let Some(filter) = direct_value(cf.get(selector.as_bytes()), ObjectHandle::as_dictionary)
     else {
         return revision_default(encrypt);
     };
-    let Some(filter) = cf
-        .get(selector.as_bytes())
-        .and_then(ObjectHandle::as_dictionary)
-    else {
-        return revision_default(encrypt);
-    };
-    match filter
-        .get(b"CFM".as_slice())
-        .and_then(ObjectHandle::as_name)
-    {
+    match direct_value(filter.get(b"CFM".as_slice()), ObjectHandle::as_name) {
         Some(cfm) => match cfm.as_slice() {
             b"AESV2" => "AESv2",
             b"AESV3" => "AESv3",
@@ -2443,7 +2449,7 @@ fn dict_name_str(
     dict: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     key: &str,
 ) -> Option<String> {
-    let bytes = dict.get(key.as_bytes())?.as_name()?;
+    let bytes = direct_value(dict.get(key.as_bytes()), ObjectHandle::as_name)?;
     String::from_utf8(bytes).ok()
 }
 
@@ -2514,21 +2520,21 @@ fn all_true_capabilities() -> Result<Json, ConvertError> {
 /// Returns a [`ConvertError`] only when an indirect `/Encrypt` reference
 /// cannot be resolved (i.e. an underlying I/O or parse error).
 pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
-    // Resolve /Encrypt dictionary from the trailer. `resolve_object_handle`
-    // is a no-op for a direct (inline) dictionary and resolves an indirect
-    // reference in place, so a single call covers both shapes; a present but
-    // non-dictionary value (any type, including an unresolved reference)
-    // falls out of `as_dictionary()` as `None`, matching the prior explicit
-    // `Object::Dictionary`/`Object::Reference`/catch-all arms.
-    let trailer_dict = pdf.trailer_handle().as_dictionary().unwrap_or_default();
-    let encrypt_dict: Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> =
-        match trailer_dict.get(b"Encrypt".as_slice()) {
-            None => None,
-            Some(handle) => {
-                pdf.resolve_object_handle(handle)?;
-                handle.as_dictionary()
-            }
-        };
+    // Resolve /Encrypt via `trailer_key_handle`, not `trailer_handle`: the
+    // latter lifts the *whole* trailer in one pass and degrades to a null
+    // handle if any unrelated sibling entry's literal nesting exceeds the
+    // inline-object bound, which would incorrectly report an otherwise-valid
+    // /Encrypt entry as absent (plaintext). `trailer_key_handle` lifts only
+    // this key's own value, so a deeply-nested sibling can't erase it.
+    // `resolve_object_handle` is a no-op for a direct (inline) dictionary and
+    // resolves an indirect reference in place, so a single call covers both
+    // shapes; a present but non-dictionary value (any type, including an
+    // unresolved reference) falls out of `as_dictionary()` as `None`,
+    // matching the prior explicit `Object::Dictionary`/`Object::Reference`/
+    // catch-all arms.
+    let encrypt_handle = pdf.trailer_key_handle(b"Encrypt");
+    pdf.resolve_object_handle(&encrypt_handle)?;
+    let encrypt_dict = encrypt_handle.as_dictionary();
 
     let is_encrypted = pdf.is_encrypted();
 
@@ -2558,28 +2564,22 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
         }
         Some(ref enc) => {
             // Encrypted document: read V, R, P, /Length, CF methods. None of
-            // these nested lookups resolve indirect references — an
-            // unresolved handle's typed accessor returns `None` just like
-            // the prior code's `Object::Reference` arm fell through to the
-            // catch-all, so the non-resolving behavior carries over exactly.
-            let v = enc
-                .get(b"V".as_slice())
-                .and_then(ObjectHandle::as_integer)
-                .unwrap_or(0);
-            let r = enc
-                .get(b"R".as_slice())
-                .and_then(ObjectHandle::as_integer)
-                .unwrap_or(0);
-            let p_raw = enc
-                .get(b"P".as_slice())
-                .and_then(ObjectHandle::as_integer)
+            // these nested lookups resolve indirect references — the prior
+            // `Object`-based code's `Object::Reference` arm always fell
+            // through to the catch-all, so `direct_value` (not a bare typed
+            // accessor — see its doc) is required to keep that non-resolving
+            // behavior deterministic regardless of what else in the document
+            // has already been resolved.
+            let v = direct_value(enc.get(b"V".as_slice()), ObjectHandle::as_integer).unwrap_or(0);
+            let r = direct_value(enc.get(b"R".as_slice()), ObjectHandle::as_integer).unwrap_or(0);
+            let p_raw = direct_value(enc.get(b"P".as_slice()), ObjectHandle::as_integer)
                 .map(|n| n as i32)
                 .unwrap_or(0);
             let bits = match enc.get(b"Length".as_slice()) {
                 // Default key length when /Length is absent: 40 bits (V=1/2).
                 None => 40,
                 // Present: an integer value, or 0 for anything malformed.
-                Some(handle) => handle.as_integer().unwrap_or(0),
+                Some(handle) => direct_value(Some(handle), ObjectHandle::as_integer).unwrap_or(0),
             };
 
             // Determine method strings from /StmF, /StrF, /EFF selectors.
@@ -8870,6 +8870,59 @@ mod tests {
         catalog.insert("AcroForm", Object::Reference(acroform_ref));
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
         pdf.set_object(acroform_ref, Object::Dictionary(acroform));
+    }
+
+    // Codex review finding on PR #613 (post-merge): an indirect /T must
+    // never be affected by unrelated resolution activity elsewhere in the
+    // same Pdf. `ObjectHandle::get_object_handle` returns the same shared,
+    // lazily-resolved handle for a given ObjectRef no matter who asks for
+    // it, so a bare typed accessor on a dict.get(key) result can observe
+    // whatever resolution state that ref's canonical handle happens to be
+    // in -- unlike the legacy Object-based lookup, which only ever saw an
+    // owned snapshot and so never followed Object::Reference for these
+    // fields. `direct_value` restores that determinism.
+    #[test]
+    fn acroform_indirect_t_does_not_leak_a_value_from_unrelated_prior_resolution() {
+        let mut pdf = load_one_page_pdf();
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let field_ref = crate::ObjectRef::new(201, 0);
+        let t_ref = crate::ObjectRef::new(202, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(vec![Object::Reference(field_ref)]));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        let mut field = Dictionary::new();
+        field.insert("T", Object::Reference(t_ref));
+        pdf.set_object(field_ref, Object::Dictionary(field));
+        pdf.set_object(t_ref, Object::String(b"leaked".to_vec()));
+
+        // Simulate something ELSE (an earlier section builder, a prior
+        // walk) already having touched t_ref's canonical handle before
+        // build_acroform_section runs.
+        let pre_touch = pdf.get_object_handle(t_ref);
+        pdf.resolve_object_handle(&pre_touch).unwrap();
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let top = object_pairs(&result);
+        let serde_json::Value::Array(fields) = &top[0].1 else {
+            panic!("fields must be Array"); // cov:ignore: fixture-shape guard
+        };
+        let entry = object_pairs(&fields[0]);
+        let fullname = entry
+            .iter()
+            .find(|(k, _)| k == "fullname")
+            .unwrap()
+            .1
+            .clone();
+        // qpdf / the original Object-based code always treats an indirect
+        // /T as absent (empty fullname), regardless of what else has been
+        // resolved elsewhere in the same Pdf.
+        assert_eq!(
+            fullname,
+            serde_json::Value::String(String::new()),
+            "indirect /T must never leak a value from unrelated prior resolution"
+        );
     }
 
     // ── acroform Test 1: No /AcroForm → hasacroform: false, empty fields ──────
