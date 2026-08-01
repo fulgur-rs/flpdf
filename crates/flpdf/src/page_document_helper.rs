@@ -141,6 +141,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// first applying qpdf-compatible page-tree repair, then pushing
     /// `/CropBox`, `/MediaBox`, `/Resources`, and `/Rotate` onto leaf pages.
     pub fn push_inherited_attributes_to_pages(&mut self) -> Result<()> {
+        self.pdf.mark_get_all_pages_called();
         if let Some(prepared) = crate::pages::repair::prepare_for_optimization(self.pdf)? {
             crate::optimization::inherited_attrs::push(self.pdf, &prepared, true, false)?;
         }
