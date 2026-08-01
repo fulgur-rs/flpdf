@@ -67,9 +67,88 @@ fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
 }
 
+/// A one-page PDF whose catalog incorrectly points `/Pages` at the leaf.
+/// qpdf walks `/Parent` to repair the catalog before `getAllPages()` returns.
+fn pdf_with_catalog_pages_pointing_to_leaf() -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = BTreeMap::new();
+    for (number, body) in [
+        (1, "<< /Type /Catalog /Pages 3 0 R >>"),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ),
+    ] {
+        offsets.insert(number, out.len() as u64);
+        out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let xref_start = out.len() as u64;
+    out.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for number in 1..=3 {
+        out.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
 // ---------------------------------------------------------------------------
 // pages() / iter() / get()
 // ---------------------------------------------------------------------------
+
+#[test]
+fn get_all_pages_repairs_catalog_pages_pointer() {
+    let mut pdf = open(pdf_with_catalog_pages_pointing_to_leaf());
+
+    let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
+
+    assert_eq!(pages, vec![ObjectRef::new(3, 0)]);
+    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must remain a dictionary");
+    };
+    assert_eq!(
+        catalog.get("Pages"),
+        Some(&Object::Reference(ObjectRef::new(2, 0)))
+    );
+}
+
+#[test]
+fn pages_forwards_to_repair_aware_enumeration() {
+    let mut pdf = open(pdf_with_catalog_pages_pointing_to_leaf());
+
+    assert_eq!(
+        PageDocumentHelper::new(&mut pdf).pages().unwrap(),
+        vec![ObjectRef::new(3, 0)]
+    );
+    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must remain a dictionary");
+    };
+    assert_eq!(
+        catalog.get("Pages"),
+        Some(&Object::Reference(ObjectRef::new(2, 0)))
+    );
+}
+
+#[test]
+fn push_inherited_attributes_materializes_rotate_on_leaf() {
+    let mut pdf = open(build_n_page_pdf(1));
+    let Object::Dictionary(mut pages) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+        panic!("pages root must be a dictionary");
+    };
+    pages.insert("Rotate", Object::Integer(90));
+    pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(pages));
+
+    PageDocumentHelper::new(&mut pdf)
+        .push_inherited_attributes_to_pages()
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    assert_eq!(page.get("Rotate"), Some(&Object::Integer(90)));
+}
 
 #[test]
 fn pages_returns_correct_count() {
