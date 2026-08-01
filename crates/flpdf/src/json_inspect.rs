@@ -773,8 +773,26 @@ pub fn pdf_object_to_json(handle: &ObjectHandle) -> Result<Json, ConvertError> {
         // produces one, and `lift_to_handle_bounded` routes `Object::Reference`
         // through the canonical indirect path instead — see its own doc), so
         // `type_code()` cannot reach 13/14 here.
-        other => unreachable!("direct ObjectHandle produced type_code()=={other}, expected 2..=12"),
+        // See this match's own doc above: every indirect handle is caught by
+        // the `object_ref()` check before this match runs, and a direct
+        // handle never holds `ObjectValue::Reference`.
+        other => unreachable!("direct ObjectHandle produced type_code()=={other}, expected 2..=12"), // cov:ignore: unreachable per this match's own doc
     }
+}
+
+/// Lift a legacy `Object` value one-off through [`Pdf::lift_object_to_handle`]
+/// and run it through [`pdf_object_to_json`] — shared by callers that still
+/// hold a plain `Object` with no live handle of their own (outline items,
+/// AcroForm inherited field values) rather than an already-migrated
+/// `ObjectHandle`.
+fn lift_and_convert_to_json<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object: &Object,
+) -> Result<Json, ConvertError> {
+    pdf_object_to_json(
+        &pdf.lift_object_to_handle(object)
+            .map_err(ConvertError::from)?,
+    )
 }
 
 #[cfg(test)]
@@ -1370,10 +1388,7 @@ fn outline_item_to_json<R: Read + Seek>(
     // handle of their own (flpdf-2mkd tracks moving `OutlineTree` itself to
     // `ObjectHandle`); lift each one-off via the canonical bridge so
     // `pdf_object_to_json` never needs a legacy-type entry point.
-    let dest = pdf_object_to_json(
-        &pdf.lift_object_to_handle(&item.dest)
-            .map_err(ConvertError::from)?,
-    )?;
+    let dest = lift_and_convert_to_json(pdf, &item.dest)?;
     let destpageposfrom1 = match item.dest_page() {
         Object::Reference(reference) => page_numbers
             .get(&reference)
@@ -1388,10 +1403,7 @@ fn outline_item_to_json<R: Read + Seek>(
     }
     let object = match item.source_ref {
         Some(reference) => Json::make_string(reference.to_string()),
-        None => pdf_object_to_json(
-            &pdf.lift_object_to_handle(&item.object)
-                .map_err(ConvertError::from)?,
-        )?,
+        None => lift_and_convert_to_json(pdf, &item.object)?,
     };
 
     json_dictionary([
@@ -1504,13 +1516,13 @@ fn walk_acroform_fields<R: Read + Seek>(
     // migrating it and this whole section builder to ObjectHandle natively;
     // this lift disappears once that lands), so bridge one-off here.
     let value = match inherited_field_value(pdf, &field_dict, "V")? {
-        Some(v) => pdf_object_to_json(&pdf.lift_object_to_handle(&v).map_err(ConvertError::from)?)?,
+        Some(v) => lift_and_convert_to_json(pdf, &v)?,
         None => Json::make_null(),
     };
 
     // /DV — default value. Inherited from /Parent.
     let defaultvalue = match inherited_field_value(pdf, &field_dict, "DV")? {
-        Some(v) => pdf_object_to_json(&pdf.lift_object_to_handle(&v).map_err(ConvertError::from)?)?,
+        Some(v) => lift_and_convert_to_json(pdf, &v)?,
         None => Json::make_null(),
     };
 
@@ -4396,6 +4408,25 @@ mod tests {
                 .unwrap(),
             serde_json::Value::Null
         );
+    }
+
+    #[test]
+    fn qpdf_projection_maps_content_only_tokens_to_null_without_lifting() {
+        // Object::Operator/InlineImage have no ObjectValue representation
+        // (Pdf::lift_object_to_handle errors on them), so
+        // qpdf_pdf_object_to_json's fallback arm special-cases both to null
+        // directly rather than routing through the lift bridge — pin that
+        // both variants still take this path and never reach the lift call.
+        let mut pdf = empty_pdf();
+        for object in [
+            Object::Operator(b"cm".to_vec()),
+            Object::InlineImage(b"\x00EI\xff".to_vec()),
+        ] {
+            assert_eq!(
+                qpdf_pdf_object_to_json(&mut pdf, &object).unwrap(),
+                serde_json::Value::Null
+            );
+        }
     }
 
     #[test]
