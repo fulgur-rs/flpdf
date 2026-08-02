@@ -1227,9 +1227,10 @@ mod tests {
 
     #[test]
     fn flate_lzw_filter_retains_only_the_qpdf_parameter_set() {
-        // The adapter keeps the five scalar parameters qpdf keeps; an
-        // arbitrarily large source object contributes none of them.
-        let params = Object::String(vec![b'x'; 64 * 1024]);
+        // A present non-dictionary reduces to no entries, so none of the five
+        // scalar parameters qpdf keeps is touched and every constructor
+        // default survives.
+        let params = Object::String(b"not a dictionary".to_vec());
         let mut filter = FlateLzwStreamFilter::new(false);
 
         assert!(filter.set_decode_params(&decode_params_from_object(Some(&params))));
