@@ -111,10 +111,7 @@ fn ensure_indirect_handle_belongs_to_pdf<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     kind: &str,
 ) -> Result<()> {
-    if handle.object_ref().is_none() {
-        return Ok(());
-    }
-    if pdf.is_canonical_object_handle(handle) {
+    if handle.belongs_to_pdf(pdf.unique_id()) {
         Ok(())
     } else {
         Err(Error::Unsupported(format!(
@@ -178,9 +175,9 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] for an indirect handle owned by another
-    /// [`Pdf`]. Rust makes qpdf's document ownership explicit here rather than
-    /// silently resolving the same object number in the supplied document.
+    /// Returns [`Error::Unsupported`] for a handle owned by another [`Pdf`].
+    /// Rust makes qpdf's document ownership explicit here rather than silently
+    /// resolving the same object number in the supplied document.
     pub fn new(stream: ObjectHandle, pdf: &'a mut Pdf<R>) -> Result<Self> {
         ensure_indirect_handle_belongs_to_pdf(&stream, pdf, "embedded-file")?;
         Ok(Self {
@@ -1739,6 +1736,30 @@ mod tests {
 
         assert!(FileSpec::new(foreign_filespec, &mut destination).is_err());
         assert!(EmbeddedFileStream::new(foreign_stream, &mut destination).is_err());
+    }
+
+    #[test]
+    fn filespec_constructor_rejects_a_direct_child_from_another_pdf() {
+        let mut source = open_minimal();
+        let owner_ref = ObjectRef::new(5, 0);
+        let mut filespec = Dictionary::new();
+        filespec.insert("F", Object::String(b"foreign.txt".to_vec()));
+        let mut owner_dict = Dictionary::new();
+        owner_dict.insert("FS", Object::Dictionary(filespec));
+        source.set_object(owner_ref, Object::Dictionary(owner_dict));
+        let owner = source.get_object_handle(owner_ref);
+        source.resolve_object_handle(&owner).unwrap();
+        let foreign_direct_filespec = owner.get_key(b"FS");
+        assert!(foreign_direct_filespec.is_direct());
+
+        let mut destination = open_minimal();
+        let error = FileSpec::new(foreign_direct_filespec, &mut destination)
+            .err()
+            .expect("a direct child owned by another Pdf must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: Filespec handle belongs to another Pdf"
+        );
     }
 
     #[test]
