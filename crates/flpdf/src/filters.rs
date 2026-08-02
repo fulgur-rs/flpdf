@@ -2731,8 +2731,10 @@ mod tests {
     /// rather than collapsing into the `ParamValue::Other` stand-in.
     ///
     /// It is also what pins the Crypt arm to its stage's own parameters:
-    /// substituting any constant for `stage.spec.decode_params` turns this
-    /// assertion red.
+    /// substituting `DecodeParams::Absent` or a present-but-empty set for
+    /// `stage.spec.decode_params` turns this assertion red. Those are the two
+    /// constants the mutation actually proved — a constant carrying this same
+    /// `/Name` would still pass, so this claim stops where the evidence does.
     #[test]
     fn crypt_stage_receives_the_name_parameter_a_provider_selects_on() {
         let filter = Object::Name(b"Crypt".to_vec());
