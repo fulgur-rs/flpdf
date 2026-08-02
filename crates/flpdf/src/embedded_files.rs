@@ -134,10 +134,10 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
     /// must explicitly restore that value into the catalog path.
     fn store_embedded_files_root(&mut self, root: Object) -> Result<()> {
         let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(());
+            return Ok(()); // cov:ignore: name_tree already resolved /Root
         };
         let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
-            return Ok(());
+            return Ok(()); // cov:ignore: name_tree already resolved a catalog dictionary
         };
         match catalog.get("Names").cloned() {
             Some(Object::Dictionary(mut names)) => {
@@ -149,7 +149,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
             Some(value @ Object::Reference(source_ref)) => {
                 let (terminal, terminal_ref) = resolve_ref_chain(self.pdf, &value)?;
                 let Some(mut names) = terminal.into_dict() else {
-                    return Ok(());
+                    return Ok(()); // cov:ignore: name_tree already resolved this names dictionary
                 };
                 names.insert("EmbeddedFiles", root);
                 self.pdf.set_object(
@@ -157,7 +157,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
                     Object::Dictionary(names),
                 );
             }
-            _ => {}
+            _ => {} // cov:ignore: name_tree established a direct or indirect /Names owner
         }
         Ok(())
     }
