@@ -377,9 +377,12 @@ fn helper_flatten_annotations_uses_qpdf_flag_contract_and_removes_acroform() {
             .arg(&output_path)
             .output()
             .unwrap();
+        // qpdf writes a usable output then returns 3 when it repaired this
+        // deliberately minimal probe fixture. Treat that warning exit as a
+        // successful oracle observation on every CI platform.
         assert!(
-            output.status.success(),
-            "qpdf failed: {}",
+            matches!(output.status.code(), Some(0 | 3)),
+            "qpdf did not produce an oracle output: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         let mut qpdf_output = Pdf::open(Cursor::new(fs::read(&output_path).unwrap())).unwrap();

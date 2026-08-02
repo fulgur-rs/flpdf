@@ -940,6 +940,16 @@ mod tests {
     use crate::{Object, ObjectRef, Pdf};
     use std::io::Cursor;
 
+    #[test]
+    fn qpdf_document_flatten_empty_page_exercises_public_contract() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
+        flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
+        let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+            panic!("fixture page must remain a dictionary");
+        };
+        assert!(matches!(page.get("Resources"), Some(Object::Dictionary(_))));
+    }
+
     // -----------------------------------------------------------------------
     // Minimal PDF builder
     // -----------------------------------------------------------------------
