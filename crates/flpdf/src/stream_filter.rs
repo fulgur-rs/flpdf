@@ -36,12 +36,21 @@ pub(crate) enum DecodeParams {
 
 /// A `/DecodeParms` value reduced to the bounded scalars any filter reads.
 ///
-/// `Int` carries `getIntValueAsInt`'s clamp, which saturates at *both* ends
-/// (`QPDFObjectHandle.cc:526-543`). `Name` exists for `Crypt`'s `/Name`, which
-/// selects the crypt filter — carrying it now keeps Phase 3's AES/Crypt cutover
-/// from having to widen this shared type. `Other` is every remaining shape,
-/// which every current filter rejects the same way `clamped_int_param`
-/// rejected a non-integer.
+/// **Invariant:** `Int` appears if and only if `QPDFObjectHandle::isInteger`
+/// would answer true — it is exactly `obj->getTypeCode() == ::ot_integer`
+/// (`QPDFObjectHandle.cc:358-362`) — and carries the value already put through
+/// `getIntValueAsInt`'s both-ends saturation (`:526-543`). `Name` and `Other`
+/// are qpdf's `else` branch: `SF_FlateLzwDecode::setDecodeParms` reaches
+/// `getIntValueAsInt` only behind an `isInteger()` guard
+/// (`SF_FlateLzwDecode.cc:33`, `:43`, `:56`) and sets `filterable = false`
+/// otherwise, so a filter matching on those two variants reproduces that
+/// branch without re-inspecting the value.
+///
+/// The split between them is flpdf's, not qpdf's: `Name` exists for `Crypt`'s
+/// `/Name`, which selects the crypt filter, so carrying it now keeps Phase 3's
+/// AES/Crypt cutover from having to widen this shared type. Every
+/// `StreamFilter` still treats the two identically; only the Crypt stage's
+/// provider closure is positioned to tell them apart.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ParamValue {
     Int(i32),
@@ -426,18 +435,31 @@ impl FlateLzwStreamFilter {
     }
 }
 
-/// Reduce a `/DecodeParms` value to an integer the way qpdf's
-/// `getIntValueAsInt` does.
+/// Apply `getIntValueAsInt`'s saturation (`QPDFObjectHandle.cc:531-538`), which
+/// pins a value below `INT_MIN` to `INT_MIN` and one above `INT_MAX` to
+/// `INT_MAX` rather than failing — so a `/Columns` far beyond `INT_MAX` behaves
+/// as `INT_MAX` does.
 ///
-/// Values outside the 32-bit range saturate rather than failing, so a
-/// `/Columns` far beyond `INT_MAX` behaves as `INT_MAX` does. The filters no
-/// longer call this: it runs once per value in `param_value_from_object`, so
-/// the clamp is applied while the `Object` shape is read and every filter sees
-/// only the already-clamped `ParamValue::Int`.
+/// qpdf also emits `warnIfPossible("requested value of integer is too small;
+/// returning INT_MIN")` (and the `INT_MAX` counterpart) on those two branches;
+/// flpdf does not reproduce those diagnostics, only the value.
+///
+/// This is the shape-independent half of the parity, kept separate from
+/// `clamped_int_param` so a second `/DecodeParms` shape reader clamps through
+/// this one copy instead of restating the bounds.
+fn clamp_to_i32(value: i64) -> i32 {
+    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// Read an `Object` the way qpdf reads a `/DecodeParms` value: `None` for every
+/// shape `QPDFObjectHandle::isInteger` (`QPDFObjectHandle.cc:358-362`) rejects,
+/// and otherwise the clamped integer.
+///
+/// The filters no longer call this. It runs once per value in
+/// `param_value_from_object`, so the clamp is applied while the `Object` shape
+/// is read and every filter sees only the already-clamped `ParamValue::Int`.
 fn clamped_int_param(value: &Object) -> Option<i32> {
-    value
-        .as_integer()
-        .map(|value| value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
+    value.as_integer().map(clamp_to_i32)
 }
 
 /// Mirror `QIntC::to_uint`, whose range failure is a `std::runtime_error`.
@@ -1168,30 +1190,27 @@ mod tests {
 
     /// Crosses the shape seam deliberately: a present non-dictionary is only
     /// visible as an `Object`, and the property under test is that reading it
-    /// leaves the filter filterable the way `getKeys`' empty key set does.
+    /// leaves the filter filterable the way `getKeys`' empty key set does
+    /// (`QPDFObjectHandle.cc:997-1009`), touching none of the five scalar
+    /// parameters `SF_FlateLzwDecode` keeps.
     #[test]
     fn flate_factory_treats_non_dictionary_decode_params_as_empty_like_qpdf() {
         let mut filter = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
-
         assert!(filter.set_decode_params(&decode_params_from_object(Some(&Object::Integer(1)))));
-    }
 
-    #[test]
-    fn flate_lzw_filter_retains_only_the_qpdf_parameter_set() {
-        // A present non-dictionary reduces to no entries, so none of the five
-        // scalar parameters qpdf keeps is touched and every constructor
-        // default survives.
+        // Assert on the concrete type as well, because the boxed
+        // `dyn StreamFilter` above can report only the `bool`, not which
+        // parameters survived.
         let params = Object::String(b"not a dictionary".to_vec());
-        let mut filter = FlateLzwStreamFilter::new(false);
-
-        assert!(filter.set_decode_params(&decode_params_from_object(Some(&params))));
+        let mut flate = FlateLzwStreamFilter::new(false);
+        assert!(flate.set_decode_params(&decode_params_from_object(Some(&params))));
         assert_eq!(
             (
-                filter.predictor,
-                filter.columns,
-                filter.colors,
-                filter.bits_per_component,
-                filter.early_code_change,
+                flate.predictor,
+                flate.columns,
+                flate.colors,
+                flate.bits_per_component,
+                flate.early_code_change,
             ),
             (1, 1, 1, 8, true),
             "a non-dictionary parameter object leaves every default in place"
@@ -1280,16 +1299,41 @@ mod tests {
         // `(predictor > 1) && (columns == 0)` check at `:68-70`. So this merge is a
         // CONVERGENCE toward qpdf, not a tolerated loss.
         //
-        // Both shapes still answer `true` because every caller applies params to a
-        // freshly constructed adapter (defaults `predictor = 1, columns = 1`),
-        // making that trailing check false either way. This assertion is what fails
-        // if an adapter is ever reused across specs.
+        // Both shapes still answer `true` because this test — like every
+        // production caller — applies params to a freshly constructed adapter
+        // (defaults `predictor = 1, columns = 1`), making that trailing check
+        // false either way. That freshness is an assumption of *this* test, not
+        // something it can detect the loss of;
+        // `a_dirtied_adapter_shows_why_absent_short_circuits_and_present_does_not`
+        // is what pins the behavior once an adapter carries prior geometry.
         assert!(
             FlateLzwStreamFilter::new(false).set_decode_params(&DecodeParams::Present(Vec::new()))
         );
         assert!(
             FlateLzwStreamFilter::new(true).set_decode_params(&DecodeParams::Present(Vec::new()))
         );
+    }
+
+    #[test]
+    fn a_dirtied_adapter_shows_why_absent_short_circuits_and_present_does_not() {
+        let mut filter = FlateLzwStreamFilter::new(false);
+        // `/Predictor` is stored before its own range check
+        // (`SF_FlateLzwDecode.cc:34` then `:35-38`) and `/Columns` is stored with
+        // no range validation at all (`:46`), so predictor = 12 and columns = 0
+        // both stick even though the trailing `(predictor > 1) && (columns == 0)`
+        // check at `:68-70` answers `filterable = false`.
+        assert!(!filter.set_decode_params(&neutral_params(&[
+            ("Predictor", ParamValue::Int(12)),
+            ("Columns", ParamValue::Int(0)),
+        ])));
+        assert_eq!((filter.predictor, filter.columns), (12, 0));
+        // `SF_FlateLzwDecode.cc:24-26` returns true for `isNull()` before reading
+        // any key, regardless of prior state. Removing flpdf's matching
+        // `is_absent()` early return fails only this line.
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        // Present-but-empty does not short-circuit: it reaches `:68-70` still
+        // carrying the geometry the first call left behind.
+        assert!(!filter.set_decode_params(&DecodeParams::Present(Vec::new())));
     }
 
     #[test]
