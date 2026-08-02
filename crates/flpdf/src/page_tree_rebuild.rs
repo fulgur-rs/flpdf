@@ -352,22 +352,28 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     let (mut root_dict, direct_catalog) = match page_root {
         PageTreeRoot::Indirect(root_ref) => {
             let Object::Dictionary(root_dict) = pdf.resolve_borrowed(root_ref)?.clone() else {
+                // cov:ignore-start: prepare_for_optimization just repaired this same indirect root as a dictionary
                 return Err(Error::Unsupported(format!(
                     "document /Pages root {root_ref} is not a dictionary"
                 )));
+                // cov:ignore-end
             };
             (root_dict, None)
         }
         PageTreeRoot::Direct { catalog } => {
             let Object::Dictionary(catalog_dict) = pdf.resolve_borrowed(catalog)?.clone() else {
+                // cov:ignore-start: prepare_for_optimization just resolved this catalog dictionary to obtain Direct
                 return Err(Error::Unsupported(format!(
                     "document catalog {catalog} is not a dictionary"
                 )));
+                // cov:ignore-end
             };
             let Some(Object::Dictionary(root_dict)) = catalog_dict.get("Pages").cloned() else {
+                // cov:ignore-start: prepare_for_optimization produced Direct only after retaining this direct Pages dictionary
                 return Err(Error::Unsupported(
                     "document catalog /Pages root is not a dictionary".into(),
                 ));
+                // cov:ignore-end
             };
             (root_dict, Some((catalog, catalog_dict)))
         }
@@ -390,7 +396,9 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
         }
         PageTreeRoot::Direct { .. } => {
             let Some((catalog, mut catalog_dict)) = direct_catalog else {
+                // cov:ignore-start: direct_catalog is populated by the matching Direct branch immediately above
                 unreachable!("direct root supplies its catalog owner");
+                // cov:ignore-end
             };
             catalog_dict.insert("Pages", Object::Dictionary(root_dict.clone()));
             pdf.set_object(catalog, Object::Dictionary(catalog_dict));
