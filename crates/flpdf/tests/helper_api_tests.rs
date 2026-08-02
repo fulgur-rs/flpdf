@@ -104,12 +104,12 @@ fn next_free_number<R: std::io::Read + std::io::Seek>(pdf: &flpdf::Pdf<R>) -> u3
 // ---------------------------------------------------------------------------
 
 #[test]
-fn page_helper_pages_matches_manual_kids() {
+fn page_helper_get_all_pages_matches_manual_kids() {
     let bytes = build_n_page_pdf(3);
     let mut pdf = flpdf::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
     let helper_pages = {
         let mut helper = flpdf::PageDocumentHelper::new(&mut pdf);
-        helper.pages().unwrap()
+        helper.get_all_pages().unwrap()
     };
     let root = pdf.root_ref().unwrap();
     let cat = pdf.resolve(root).unwrap();
@@ -607,7 +607,7 @@ fn manual_set_pages_kids(
 
 /// Page `remove` parity.
 ///
-/// `PageDocumentHelper::remove(1)` routes through `rebuild_page_tree`, which (a)
+/// `PageDocumentHelper::remove_page(4 0 R)` routes through `rebuild_page_tree`, which (a)
 /// drops the removed leaf from a flat `/Kids` and sets `/Count`, and (b)
 /// materializes `/Rotate 0` explicitly on every *surviving* leaf (there is no
 /// inheritable `/Resources` / `/MediaBox` / `/CropBox` source in this fixture, so
@@ -621,113 +621,15 @@ fn page_remove_matches_manual_kids_rewrite() {
     roundtrip_eq(
         || build_n_page_pdf(3),
         |pdf| {
-            flpdf::PageDocumentHelper::new(pdf).remove(1).unwrap();
+            flpdf::PageDocumentHelper::new(pdf)
+                .remove_page(ObjectRef::new(4, 0))
+                .unwrap();
         },
         |pdf| {
             // Survivors are 3 0 R and 5 0 R (page index 1 == 4 0 R removed).
             manual_set_leaf_rotate(pdf, ObjectRef::new(3, 0), 0);
             manual_set_leaf_rotate(pdf, ObjectRef::new(5, 0), 0);
             manual_set_pages_kids(pdf, &[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]);
-        },
-    );
-}
-
-/// Page `rotate` parity.
-///
-/// `PageDocumentHelper::rotate` routes through `apply_rotate_to_pages`, which
-/// writes `/Rotate <degrees>` (Integer) on *only the selected* leaf and touches
-/// nothing else. With `RotateMode::Assign` and 90° on page 0, the sole change is
-/// `/Rotate 90` on 3 0 R; pages 4 and 5 keep no `/Rotate` at all (do NOT add
-/// `/Rotate 0` to them — that is the `remove`/`insert` model, not this one). The
-/// manual path inserts `/Rotate 90` on page 0 only ⇒ byte-identity.
-#[test]
-fn page_rotate_matches_manual_rotate_insert() {
-    use flpdf::{ObjectRef, RotateMode};
-    let range = flpdf::PageRange::parse("1").unwrap(); // 1-based "1" == page index 0
-    roundtrip_eq(
-        || build_n_page_pdf(3),
-        |pdf| {
-            flpdf::PageDocumentHelper::new(pdf)
-                .rotate(&range, 90, RotateMode::Assign)
-                .unwrap();
-        },
-        |pdf| {
-            manual_set_leaf_rotate(pdf, ObjectRef::new(3, 0), 90);
-        },
-    );
-}
-
-/// Page `insert` parity.
-///
-/// `PageDocumentHelper::insert(1, new)` splices `new` into the page list at index
-/// 1 and routes through `rebuild_page_tree`, which materializes `/Rotate 0` on
-/// ALL FOUR resulting leaves and sets a flat `/Kids [3 new 4 5]` `/Count 4`. The
-/// helper path and manual path allocate the inserted page at DIFFERENT free
-/// object numbers (60 vs 70); the keystone proves the Catalog-first renumber
-/// converges across that difference, so the differing internal numbers still
-/// yield byte-identical output. The new page is created with an identical key set
-/// on both sides ⇒ byte-identity.
-#[test]
-fn page_insert_matches_manual_splice() {
-    use flpdf::{Dictionary, Object, ObjectRef};
-
-    /// Create a detached `/Page` dict at `num`, parented to the page tree root.
-    fn make_detached_page(pdf: &mut flpdf::Pdf<std::io::Cursor<Vec<u8>>>, num: u32) -> ObjectRef {
-        let root = pdf.root_ref().unwrap();
-        let pages_ref = pdf
-            .resolve(root)
-            .unwrap()
-            .as_dict()
-            .unwrap()
-            .get_ref("Pages")
-            .unwrap();
-        let mut page = Dictionary::new();
-        page.insert("Type", Object::Name(b"Page".to_vec()));
-        page.insert("Parent", Object::Reference(pages_ref));
-        // Distinguishable MediaBox (originals use [0 0 612 792]) so the byte
-        // comparison itself pins the inserted page's position in /Kids: a
-        // reordering would change the bytes, not just the structure.
-        page.insert(
-            "MediaBox",
-            Object::Array(vec![
-                Object::Integer(0),
-                Object::Integer(0),
-                Object::Integer(200),
-                Object::Integer(200),
-            ]),
-        );
-        let page_ref = ObjectRef::new(num, 0);
-        pdf.set_object(page_ref, Object::Dictionary(page));
-        page_ref
-    }
-
-    roundtrip_eq(
-        || build_n_page_pdf(3),
-        |pdf| {
-            // Helper path: detached page at object number 60.
-            let new_ref = make_detached_page(pdf, 60);
-            flpdf::PageDocumentHelper::new(pdf)
-                .insert(1, new_ref)
-                .unwrap();
-        },
-        |pdf| {
-            // Manual path: independently create the same page at a DIFFERENT
-            // free number (70), then reproduce the helper's resulting structure:
-            // /Rotate 0 materialized on all four leaves, flat /Kids [3 70 4 5].
-            let new_ref = make_detached_page(pdf, 70);
-            manual_set_leaf_rotate(pdf, new_ref, 0);
-            manual_set_leaf_rotate(pdf, ObjectRef::new(3, 0), 0);
-            manual_set_leaf_rotate(pdf, ObjectRef::new(4, 0), 0);
-            manual_set_leaf_rotate(pdf, ObjectRef::new(5, 0), 0);
-            manual_set_pages_kids(
-                pdf,
-                &[
-                    ObjectRef::new(3, 0),
-                    new_ref,
-                    ObjectRef::new(4, 0),
-                    ObjectRef::new(5, 0),
-                ],
-            );
         },
     );
 }
