@@ -1718,6 +1718,64 @@ fn helper_reads_repairs_direct_kid() {
 }
 
 #[test]
+fn helper_remove_missing_persists_direct_kid_repair() {
+    let mut pdf = open(build_no_names_pdf());
+    let filespec = make_filespec(&mut pdf, b"kid.txt");
+    let filespec_ref = filespec.object_ref().expect("indirect filespec");
+    let mut leaf = Dictionary::new();
+    leaf.insert(
+        "Names",
+        Object::Array(vec![
+            Object::String(b"kid".to_vec()),
+            Object::Reference(filespec_ref),
+        ]),
+    );
+    leaf.insert(
+        "Limits",
+        Object::Array(vec![
+            Object::String(b"kid".to_vec()),
+            Object::String(b"kid".to_vec()),
+        ]),
+    );
+    let mut root = Dictionary::new();
+    root.insert("Kids", Object::Array(vec![Object::Dictionary(leaf)]));
+    let mut names = Dictionary::new();
+    names.insert("EmbeddedFiles", Object::Dictionary(root));
+    let catalog_ref = pdf.root_ref().expect("root");
+    let mut catalog = pdf
+        .resolve_borrowed(catalog_ref)
+        .expect("catalog")
+        .as_dict()
+        .expect("catalog dictionary")
+        .clone();
+    catalog.insert("Names", Object::Dictionary(names));
+    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+    assert!(!pdf
+        .embedded_files()
+        .remove_embedded_file(b"missing")
+        .expect("absent remove"));
+
+    let catalog = pdf
+        .resolve_borrowed(catalog_ref)
+        .expect("catalog")
+        .as_dict()
+        .expect("catalog dictionary");
+    let root = catalog
+        .get("Names")
+        .and_then(Object::as_dict)
+        .and_then(|names| names.get("EmbeddedFiles"))
+        .and_then(Object::as_dict)
+        .expect("direct root");
+    assert!(matches!(
+        root.get("Kids")
+            .and_then(Object::as_array)
+            .and_then(|kids| kids.first()),
+        Some(Object::Reference(_))
+    ));
+}
+
+#[test]
 fn helper_remove_accepts_a_tree_deeper_than_legacy_limit() {
     let mut pdf = open(build_no_names_pdf());
     let filespec = make_filespec(&mut pdf, b"deep.txt");

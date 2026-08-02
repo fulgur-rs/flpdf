@@ -227,6 +227,13 @@ impl<K: TreeKey> NNTreeCursor<K> {
                 .zip(&other.path)
                 .all(|(left, right)| left.kid_number == right.kid_number)
     }
+
+    fn selected_path(&self) -> Option<(Vec<usize>, usize)> {
+        Some((
+            self.path.iter().map(|element| element.kid_number).collect(),
+            self.item_number?,
+        ))
+    }
 }
 
 impl<K: TreeKey> Clone for NNTreeCursor<K> {
@@ -467,6 +474,10 @@ impl PartialEq for NameTreeCursor {
 impl Eq for NameTreeCursor {}
 
 impl NameTreeCursor {
+    pub(crate) fn selected_path(&self) -> Option<(Vec<usize>, usize)> {
+        self.inner.selected_path()
+    }
+
     /// Whether the cursor points to a valid key/value pair.
     pub fn valid(&self) -> bool {
         self.inner.current().is_some()

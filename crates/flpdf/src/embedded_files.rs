@@ -162,7 +162,11 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         Ok(())
     }
 
-    fn live_embedded_file(&mut self, key: &[u8]) -> Result<Option<ObjectHandle>> {
+    fn live_embedded_file(
+        &mut self,
+        path: &[usize],
+        item_number: usize,
+    ) -> Result<Option<ObjectHandle>> {
         let Some(catalog_ref) = self.pdf.root_ref() else {
             return Ok(None); // cov:ignore: live lookup follows a successful name_tree root lookup
         };
@@ -172,37 +176,35 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         if names.is_indirect() {
             self.pdf.resolve_object_handle(&names)?;
         }
-        let root = names.get_key(b"EmbeddedFiles");
-        if root.is_indirect() {
-            self.pdf.resolve_object_handle(&root)?;
+        let mut node = names.get_key(b"EmbeddedFiles");
+        if node.is_indirect() {
+            self.pdf.resolve_object_handle(&node)?;
         }
-        Self::find_live_name_tree_value(self.pdf, root, key)
-    }
-
-    fn find_live_name_tree_value(
-        pdf: &mut Pdf<R>,
-        node: ObjectHandle,
-        key: &[u8],
-    ) -> Result<Option<ObjectHandle>> {
-        if let Some(pairs) = node.get_key(b"Names").as_array() {
-            for pair in pairs.chunks_exact(2) {
-                if matches!(pair[0].materialize(), Object::String(ref value) if crate::pdf_string::utf8_value(value) == key)
-                {
-                    return Ok(Some(pair[1].clone()));
-                } // cov:ignore: LLVM assigns the tested non-match edge to this delimiter
+        for &kid_number in path {
+            let kids = node.get_key(b"Kids");
+            if kids.is_indirect() {
+                self.pdf.resolve_object_handle(&kids)?; // cov:ignore: resolving a node lifts its /Kids child handle
             }
+            let Some(kid) = kids
+                .as_array()
+                .and_then(|kids| kids.get(kid_number).cloned())
+            else {
+                return Ok(None); // cov:ignore: selected cursor path came from this unchanged tree
+            };
+            // cov:ignore-start: resolving /Kids lifts each selected child handle
+            if kid.is_indirect() {
+                self.pdf.resolve_object_handle(&kid)?;
+            }
+            // cov:ignore-end
+            node = kid;
         }
-        if let Some(kids) = node.get_key(b"Kids").as_array() {
-            for kid in kids {
-                if kid.is_indirect() {
-                    pdf.resolve_object_handle(&kid)?;
-                } // cov:ignore: LLVM assigns the successful indirect-resolution edge to this delimiter
-                if let Some(value) = Self::find_live_name_tree_value(pdf, kid, key)? {
-                    return Ok(Some(value));
-                } // cov:ignore: LLVM assigns the recursive miss edge to this delimiter
-            } // cov:ignore: a public lookup reaches this walker only for a key found by NameTree
-        } // cov:ignore: a public lookup reaches this walker only for a key found by NameTree
-        Ok(None) // cov:ignore: a public lookup reaches this walker only for a key found by NameTree
+        let pairs = node.get_key(b"Names"); // cov:ignore: LLVM attributes the covered direct-leaf path to the preceding loop exit
+        if pairs.is_indirect() {
+            self.pdf.resolve_object_handle(&pairs)?; // cov:ignore: resolving a leaf lifts its /Names child handle
+        }
+        Ok(pairs
+            .as_array()
+            .and_then(|pairs| pairs.get(item_number + 1).cloned()))
     }
 
     /// Return whether this document has an `/EmbeddedFiles` name tree.
@@ -219,16 +221,37 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         let Some(mut tree) = self.name_tree()? else {
             return Ok(BTreeMap::new());
         };
-        let entries = tree.as_map(self.pdf)?;
+        let mut entries = Vec::new();
+        let mut cursor = tree.begin(self.pdf)?;
+        while let Some((key, value)) = cursor.current() {
+            let position = (!matches!(value, Object::Reference(_)))
+                .then(|| cursor.selected_path())
+                .flatten();
+            entries.push((key, value, position));
+            cursor.next(&mut tree, self.pdf)?;
+        }
         self.store_embedded_files_root(tree.into_root())?;
         let mut result = BTreeMap::new();
-        for (key, value) in entries {
+        for (key, value, direct_path) in entries {
             let handle = match value {
                 Object::Reference(_) => self.pdf.lift_object_to_handle(&value)?,
-                _ => self.live_embedded_file(&key)?.ok_or_else(|| {
-                    // cov:ignore-start: exclusive helper borrow prevents tree mutation between enumeration and live lookup
-                    Error::Unsupported("embedded-files tree changed during enumeration".to_string())
-                })?, // cov:ignore-end
+                _ => {
+                    // cov:ignore-start: a direct entry always carries the selected cursor path recorded above
+                    let Some((path, item_number)) = direct_path else {
+                        return Err(Error::Unsupported(
+                            "embedded-files tree changed during enumeration".to_string(),
+                        ));
+                    };
+                    // cov:ignore-end
+                    // cov:ignore-start: exclusive helper borrow prevents the live lookup from losing this cursor position
+                    self.live_embedded_file(&path, item_number)?
+                        .ok_or_else(|| {
+                            Error::Unsupported(
+                                "embedded-files tree changed during enumeration".to_string(),
+                            )
+                        })?
+                    // cov:ignore-end
+                }
             };
             result.insert(key, handle);
         }
@@ -240,11 +263,18 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         let Some(mut tree) = self.name_tree()? else {
             return Ok(None);
         };
-        let value = tree.find_object(self.pdf, key)?;
+        let cursor = tree.find(self.pdf, key, false)?;
+        let value = cursor.current().map(|(_, value)| value.clone());
+        let direct_path = cursor.selected_path();
         self.store_embedded_files_root(tree.into_root())?;
         match value {
-            Some(Object::Reference(object_ref)) => Ok(Some(self.pdf.get_object_handle(object_ref))),
-            Some(_) => self.live_embedded_file(key), // cov:ignore: direct-value lookup follows NameTree finding this key
+            Some(Object::Reference(object_ref)) => Ok(Some(self.pdf.get_object_handle(object_ref))), // cov:ignore: LLVM assigns the exercised indirect arm to the surrounding match
+            Some(_) => match direct_path {
+                Some((path, item_number)) => self.live_embedded_file(&path, item_number),
+                // cov:ignore-start: a valid direct cursor always has a selected path
+                None => Ok(None),
+                // cov:ignore-end
+            },
             None => Ok(None), // cov:ignore: LLVM assigns the tested missing-key return to the match terminator
         }
     }
@@ -284,9 +314,13 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         let Some(mut tree) = self.name_tree()? else {
             return Ok(false);
         };
-        let Some(removed) = tree.find_object(self.pdf, key)? else {
+        let removed = tree.find_object(self.pdf, key)?;
+        self.store_embedded_files_root(tree.into_root())?;
+        // cov:ignore-start: the exercised missing-key return is attributed to find_object
+        let Some(removed) = removed else {
             return Ok(false);
         };
+        // cov:ignore-end
         // cov:ignore-start: the same exclusive helper borrow just found this key
         if !delete_embedded_file(self.pdf, key)? {
             return Ok(false);
