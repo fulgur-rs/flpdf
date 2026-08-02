@@ -9,13 +9,6 @@ use crate::object::{Dictionary, Object, ObjectRef};
 use crate::ref_chain::terminal_ref_of_chain;
 use crate::{Error, Pdf, Result};
 
-/// Defensive cycle/depth bound. qpdf relies on an earlier `cache()` pass (which
-/// repairs duplicate page objects and detects loops) before its own recursive
-/// push runs unguarded; flpdf has no equivalent repair pass, so this function
-/// guards itself. Matches the bound already used for page-tree walks elsewhere
-/// in this crate ([`crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH`]).
-const MAX_DEPTH: usize = crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
-
 /// The effective `/Pages` root and leaf order after qpdf-compatible repair.
 ///
 /// Returned by [`prepare_for_optimization`]; see that function for what "repair" covers.
@@ -48,6 +41,15 @@ pub enum PageTreeRoot {
 /// returns [`Error::Unsupported`] if the tree exceeds
 /// [`DEFAULT_MAX_PAGE_TREE_DEPTH`](crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH).
 pub fn prepare_for_optimization<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<PreparedPages>> {
+    prepare_for_optimization_with_max_depth(pdf, crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH)
+}
+
+/// Like [`prepare_for_optimization`], but uses the caller's page-tree depth
+/// bound for both qpdf-style repair and page enumeration.
+pub(crate) fn prepare_for_optimization_with_max_depth<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    max_depth: usize,
+) -> Result<Option<PreparedPages>> {
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(None);
     };
@@ -59,7 +61,7 @@ pub fn prepare_for_optimization<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Opti
         return Ok(None);
     };
 
-    let (mut pages_ref, direct_root) = match pages {
+    let (mut pages_ref, mut direct_root) = match pages {
         Object::Reference(pages_ref) => (pages_ref, None),
         Object::Dictionary(pages) => (ObjectRef::new(0, 0), Some(pages)),
         _ => return Ok(None),
@@ -86,35 +88,47 @@ pub fn prepare_for_optimization<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Opti
     // before `repair_page_tree` so the subsequent walk (and `push_internal`
     // below) start from the corrected root, matching qpdf's getAllPages order.
     let mut seen_parent: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut corrected = pages_ref;
     let mut changed_pages = false;
-    while direct_root.is_none() {
-        let parent = match pdf.resolve_borrowed(corrected)? {
-            Object::Dictionary(d) => match d.get("Parent") {
-                Some(Object::Reference(r)) => Some(*r),
-                // No `/Parent` (the true root) or a non-reference `/Parent`:
-                // stop. qpdf would follow a direct-dict parent as a handle, but
-                // flpdf needs a ref to rewrite/continue; such inputs are
-                // unrealistic and have no golden.
-                _ => None,
-            },
-            _ => None, // Not a dictionary: stop.
+    loop {
+        let parent = if let Some(direct) = direct_root.as_ref() {
+            direct.get("Parent").cloned()
+        } else {
+            if !seen_parent.insert(pages_ref) {
+                break; // Loop guard (qpdf's `seen.add`): a `/Parent` cycle.
+            }
+            match pdf.resolve_borrowed(pages_ref)? {
+                Object::Dictionary(d) => d.get("Parent").cloned(),
+                _ => None, // Not a dictionary: stop.
+            }
         };
-        let Some(parent_ref) = parent else {
+        let Some(parent) = parent else {
             break;
         };
-        if !seen_parent.insert(corrected) {
-            break; // Loop guard (qpdf's `seen.add`): a `/Parent` cycle.
+        match parent {
+            Object::Reference(parent_ref) => {
+                pages_ref = parent_ref;
+                direct_root = None;
+            }
+            Object::Dictionary(parent) => {
+                direct_root = Some(parent);
+            }
+            // qpdf would replace catalog `/Pages` with this non-dictionary
+            // handle and then enumerate no pages. The repair result has no
+            // page-tree owner for that malformed shape, so retain the current
+            // root rather than pretending a scalar is a `/Pages` dictionary.
+            _ => break,
         }
-        corrected = parent_ref;
         changed_pages = true;
     }
     if changed_pages {
         if let Object::Dictionary(mut root_dict) = pdf.resolve(root_ref)? {
-            root_dict.insert("Pages", Object::Reference(corrected));
+            let corrected = match &direct_root {
+                Some(root) => Object::Dictionary(root.clone()),
+                None => Object::Reference(pages_ref),
+            };
+            root_dict.insert("Pages", corrected);
             pdf.set_object(root_ref, Object::Dictionary(root_dict));
         }
-        pages_ref = corrected;
     }
 
     // Compute the first free object number once and carry it through the
@@ -128,7 +142,7 @@ pub fn prepare_for_optimization<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Opti
         pages: Vec::new(),
     };
     let page_root = if let Some(mut direct_root) = direct_root {
-        repair_direct_page_tree(pdf, &mut direct_root, &mut state, 0, false)?;
+        repair_direct_page_tree(pdf, &mut direct_root, &mut state, 0, false, max_depth)?;
         let Object::Dictionary(mut catalog) = pdf.resolve(root_ref)? else {
             // cov:ignore-start: root_ref was resolved as a catalog dictionary before reading /Pages
             return Ok(None);
@@ -138,7 +152,7 @@ pub fn prepare_for_optimization<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Opti
         pdf.set_object(root_ref, Object::Dictionary(catalog));
         PageTreeRoot::Direct { catalog: root_ref }
     } else {
-        repair_page_tree(pdf, pages_ref, &mut state, 0, false)?;
+        repair_page_tree(pdf, pages_ref, &mut state, 0, false, max_depth)?;
         PageTreeRoot::Indirect(pages_ref)
     };
 
@@ -207,10 +221,11 @@ fn repair_page_tree<R: Read + Seek>(
     state: &mut RepairState,
     depth: usize,
     media_box: bool,
+    max_depth: usize,
 ) -> Result<()> {
-    if depth >= MAX_DEPTH {
+    if depth >= max_depth {
         return Err(Error::Unsupported(format!(
-            "page tree depth exceeds maximum of {MAX_DEPTH} at {node_ref}"
+            "page tree depth exceeds maximum of {max_depth} at {node_ref}"
         )));
     }
     if !state.visited.insert(node_ref) {
@@ -260,7 +275,7 @@ fn repair_page_tree<R: Read + Seek>(
                 // (1i) Direct *interior* node (a direct dict WITH /Kids). qpdf
                 // recurses into it in place (:101-102) and keeps the node direct;
                 // only direct leaves are materialized.
-                repair_direct_page_tree(pdf, d, state, depth + 1, media_box)?;
+                repair_direct_page_tree(pdf, d, state, depth + 1, media_box, max_depth)?;
                 changed = true;
                 continue;
             }
@@ -298,7 +313,7 @@ fn repair_page_tree<R: Read + Seek>(
         };
         if has_kids {
             // Interior /Pages node: descend, threading the /MediaBox flag.
-            repair_page_tree(pdf, kid_ref, state, depth + 1, media_box)?;
+            repair_page_tree(pdf, kid_ref, state, depth + 1, media_box, max_depth)?;
             continue;
         }
         // Leaf branch.
@@ -380,19 +395,14 @@ fn repair_direct_page_tree<R: Read + Seek>(
     state: &mut RepairState,
     depth: usize,
     media_box: bool,
+    max_depth: usize,
 ) -> Result<()> {
-    if depth >= MAX_DEPTH {
+    if depth >= max_depth {
         return Err(Error::Unsupported(format!(
-            "page tree depth exceeds maximum of {MAX_DEPTH} in direct /Pages node"
+            "page tree depth exceeds maximum of {max_depth} in direct /Pages node"
         )));
     }
 
-    let mut changed = false;
-    if !type_name_is(dict, b"Pages") {
-        dict.insert("Type", Object::Name(b"Pages".to_vec()));
-        changed = true;
-    }
-    let media_box = media_box || is_rectangle(pdf, dict.get("MediaBox"))?;
     let Some(mut kids) = dict
         .get("Kids")
         .and_then(Object::as_array)
@@ -401,12 +411,21 @@ fn repair_direct_page_tree<R: Read + Seek>(
         return Ok(());
     };
 
+    // qpdf invokes getAllPagesInternal only after `pages.hasKey("/Kids")`.
+    // A direct dictionary without /Kids is therefore left byte-for-byte intact.
+    let mut changed = false;
+    if !type_name_is(dict, b"Pages") {
+        dict.insert("Type", Object::Name(b"Pages".to_vec()));
+        changed = true;
+    }
+    let media_box = media_box || is_rectangle(pdf, dict.get("MediaBox"))?;
+
     for kid in kids.iter_mut() {
         let kid_ref = if let Object::Reference(reference) = &*kid {
             *reference
         } else if let Object::Dictionary(child) = &mut *kid {
             if child.get("Kids").is_some() {
-                repair_direct_page_tree(pdf, child, state, depth + 1, media_box)?;
+                repair_direct_page_tree(pdf, child, state, depth + 1, media_box, max_depth)?;
                 changed = true;
                 continue;
             }
@@ -432,7 +451,7 @@ fn repair_direct_page_tree<R: Read + Seek>(
             _ => continue,
         };
         if has_kids {
-            repair_page_tree(pdf, kid_ref, state, depth + 1, media_box)?;
+            repair_page_tree(pdf, kid_ref, state, depth + 1, media_box, max_depth)?;
             continue;
         }
         if !media_box && !is_rectangle(pdf, leaf_media_box.as_ref())? {
@@ -1354,7 +1373,7 @@ mod tests {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
 
-        let depth = MAX_DEPTH + 1;
+        let depth = crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH + 1;
         // Object numbers: 1 = Catalog, 2..=(1+depth) = Pages chain,
         // (2+depth) = the leaf Page.
         let leaf_num = 2 + depth as u32;
@@ -3964,9 +3983,8 @@ mod tests {
     /// DIRECT-dictionary `/Parent` rather than an indirect reference. Object
     /// layout: 1 Catalog (`/Pages 2 0 R`), 2 the root `/Pages` (`/Parent << >>`,
     /// `/Kids [3 0 R]`), 3 the `/Page` leaf (`/Parent 2 0 R`). The root->/Pages
-    /// correction stops at the non-reference `/Parent` (flpdf needs a ref to
-    /// continue; qpdf would follow a direct-dict parent as a handle), leaving
-    /// `/Pages` unchanged.
+    /// correction follows that direct dictionary as qpdf's object handle does,
+    /// replacing the catalog's `/Pages` with the direct parent.
     fn pdf_with_root_pages_non_reference_parent() -> Vec<u8> {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
@@ -3997,7 +4015,7 @@ mod tests {
     }
 
     #[test]
-    fn root_pages_non_reference_parent_stops_correction() {
+    fn root_pages_direct_parent_replaces_catalog_root() {
         let bytes = pdf_with_root_pages_non_reference_parent();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         assert!(
@@ -4009,17 +4027,16 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        // A non-reference /Parent is a stop condition for the /Parent walk: the
-        // catalog's /Pages must be left pointing at the same object (2 0 R), not
-        // rewritten. This pins the non-reference-/Parent break arm.
+        // qpdf's dictionary handle follows a direct /Parent and replaces the
+        // catalog root with that direct parent (QPDF_pages.cc:50-67).
         let catalog = pdf.resolve(ObjectRef::new(1, 0)).expect("catalog resolves");
         let Object::Dictionary(catalog_dict) = catalog else {
             panic!("catalog is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(
             catalog_dict.get("Pages"),
-            Some(&Object::Reference(ObjectRef::new(2, 0))),
-            "a non-reference /Parent must stop the walk, leaving /Pages unchanged"
+            Some(&Object::Dictionary(Dictionary::new())),
+            "a direct /Parent must become the repaired catalog /Pages value"
         );
     }
 }

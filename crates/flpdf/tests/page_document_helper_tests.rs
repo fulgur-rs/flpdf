@@ -149,6 +149,30 @@ fn get_all_pages_repairs_catalog_pages_pointer() {
     );
 }
 
+/// qpdf follows `/Parent` even when the catalog embeds the first `/Page`
+/// dictionary directly in `/Pages` (QPDF_pages.cc:47-67).
+#[test]
+fn get_all_pages_follows_parent_from_direct_catalog_page_value() {
+    let mut pdf = open(build_n_page_pdf(2));
+    let direct_page = pdf.resolve(ObjectRef::new(3, 0)).unwrap();
+    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    catalog.insert("Pages", direct_page);
+    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+    let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
+    assert_eq!(pages, vec![ObjectRef::new(3, 0), ObjectRef::new(4, 0)]);
+
+    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must remain a dictionary");
+    };
+    assert_eq!(
+        catalog.get("Pages"),
+        Some(&Object::Reference(ObjectRef::new(2, 0)))
+    );
+}
+
 #[test]
 fn get_all_pages_traverses_a_direct_catalog_pages_root() {
     let mut pdf = open(build_n_page_pdf(1));
@@ -1160,6 +1184,132 @@ fn add_page_preserves_direct_catalog_pages_root() {
         .unwrap();
 
     assert_direct_catalog_pages_root(&mut pdf, 3);
+}
+
+#[test]
+fn add_page_materializes_attributes_from_a_direct_parent() {
+    let mut pdf = open(build_n_page_pdf(2));
+    let mut fonts = Dictionary::new();
+    fonts.insert("F1", Object::Dictionary(Dictionary::new()));
+    let mut resources = Dictionary::new();
+    resources.insert("Font", Object::Dictionary(fonts));
+
+    let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+        panic!("pages root must be a dictionary");
+    };
+    root.insert("Resources", Object::Dictionary(resources.clone()));
+    root.insert("Rotate", Object::Integer(90));
+    root.insert(
+        "MediaBox",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(200),
+            Object::Integer(300),
+        ]),
+    );
+    root.insert(
+        "CropBox",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(100),
+            Object::Integer(150),
+        ]),
+    );
+    let direct_parent = Object::Dictionary(root.clone());
+    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    catalog.insert("Pages", direct_parent.clone());
+    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+    for page_ref in [ObjectRef::new(3, 0), ObjectRef::new(4, 0)] {
+        let Object::Dictionary(mut page) = pdf.resolve(page_ref).unwrap() else {
+            panic!("page must be a dictionary");
+        };
+        page.remove("MediaBox");
+        page.insert("Parent", direct_parent.clone());
+        pdf.set_object(page_ref, Object::Dictionary(page));
+    }
+
+    PageDocumentHelper::new(&mut pdf)
+        .add_page(ObjectRef::new(3, 0), false)
+        .unwrap();
+
+    let expected_media_box = Object::Array(vec![
+        Object::Integer(0),
+        Object::Integer(0),
+        Object::Integer(200),
+        Object::Integer(300),
+    ]);
+    let expected_crop_box = Object::Array(vec![
+        Object::Integer(0),
+        Object::Integer(0),
+        Object::Integer(100),
+        Object::Integer(150),
+    ]);
+    for page_ref in PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap() {
+        let Object::Dictionary(page) = pdf.resolve(page_ref).unwrap() else {
+            panic!("page must be a dictionary");
+        };
+        assert_eq!(
+            page.get("Resources"),
+            Some(&Object::Dictionary(resources.clone()))
+        );
+        assert_eq!(page.get("Rotate"), Some(&Object::Integer(90)));
+        assert_eq!(page.get("MediaBox"), Some(&expected_media_box));
+        assert_eq!(page.get("CropBox"), Some(&expected_crop_box));
+    }
+}
+
+#[test]
+fn helper_prunes_resources_inherited_from_a_direct_parent() {
+    let mut pdf = open(build_n_page_pdf(1));
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        Object::Stream(Stream::new(Dictionary::new(), b"BT /F1 12 Tf ET".to_vec())),
+    );
+
+    let mut fonts = Dictionary::new();
+    fonts.insert("F1", Object::Dictionary(Dictionary::new()));
+    fonts.insert("F2", Object::Dictionary(Dictionary::new()));
+    let mut resources = Dictionary::new();
+    resources.insert("Font", Object::Dictionary(fonts));
+
+    let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+        panic!("pages root must be a dictionary");
+    };
+    root.insert("Resources", Object::Dictionary(resources));
+    let direct_parent = Object::Dictionary(root.clone());
+    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    catalog.insert("Pages", direct_parent.clone());
+    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Parent", direct_parent);
+    page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .remove_unreferenced_resources()
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    let Some(Object::Dictionary(resources)) = page.get("Resources") else {
+        panic!("inherited resources must be materialized onto the page");
+    };
+    let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
+        panic!("page resources must retain a font dictionary");
+    };
+    assert!(fonts.get("F1").is_some());
+    assert!(fonts.get("F2").is_none());
 }
 
 #[test]
