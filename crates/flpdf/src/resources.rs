@@ -135,6 +135,13 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
         };
         let local_unresolved = unresolved_resource_names(pdf, resources.as_ref(), &used)?;
         unresolved.extend(local_unresolved.iter().cloned());
+        // qpdf's forEachFormXObject retains the original child object handle
+        // while its action prunes the parent. Capture those children before
+        // pruning can remove their names from this Form's /XObject dictionary.
+        let child_forms = match resources.as_ref() {
+            Some(resources) => form_xobjects_in_resources(pdf, resources)?,
+            None => Vec::new(),
+        };
 
         if !local_unresolved.is_empty() && resources.is_some() {
             any_failures = true;
@@ -145,9 +152,7 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
             pdf.set_object(form_ref, Object::Stream(form));
         }
 
-        if let Some(resources) = resources.as_ref() {
-            pending.extend(form_xobjects_in_resources(pdf, resources)?);
-        }
+        pending.extend(child_forms);
     }
     Ok((unresolved, any_failures))
 }
